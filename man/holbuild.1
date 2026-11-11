@@ -1,0 +1,920 @@
+.TH HOLBUILD 1 "" "holbuild" "User Commands"
+.
+.SH NAME
+holbuild \- project-aware build tool for HOL4
+.
+.SH SYNOPSIS
+.B holbuild
+.RI [ "GLOBAL OPTIONS" ]
+.RB [ build ]
+.RI [ "BUILD OPTIONS" ]
+.RI [ TARGET " ...]"
+.br
+.B holbuild
+.RI [ "GLOBAL OPTIONS" ]
+.I COMMAND
+.RI [ ARGS ]
+.br
+.B holbuild \-\-version
+.br
+.B holbuild \-\-help
+.br
+.B holbuild
+.I COMMAND
+.B \-\-help
+.
+.SH DESCRIPTION
+.B holbuild
+builds HOL4 projects.
+A project describes its sources, HOL revision and dependencies in a
+.I holproject.toml
+(or
+.IR holbuild.toml )
+manifest.
+holbuild builds or reuses the HOL toolchain the manifest declares,
+keeps build outputs under
+.IR .holbuild/ ,
+and builds logical targets such as
+.I MyTheory
+without the user managing Holmake state.
+.PP
+Global options go before the command, or before the target list when the
+default
+.B build
+command is used.
+Options of a command follow its name.
+This page lists every command and option;
+the README in the holbuild repository covers the manifest format and the
+behaviour behind them in more depth.
+.
+.SH COMMANDS
+.TP
+.RB [ build "] [" \fITARGET\fR ...]
+Build the targets, or the project's default targets when there are none.
+Independent work continues after a failure, and the failure and everything
+skipped because of it are reported at the end.
+See
+.BR "BUILD OPTIONS" .
+.TP
+.B context \fR[\fB\-\-trknl\fR]
+Show the resolved project context.
+Resolves metadata but does not build the toolchain.
+.B \-\-trknl
+selects the tracing-kernel context.
+.TP
+.B repl \fR[\fB\-\-from \fITHEORY\fR] [\fB\-\-remote\-exec \fIURL\fR [\fB\-\-remote\-only\fR]] [\fIARG\fR ...]
+Start the HOL REPL with the project's context.
+.TP
+.B run \fR[\fB\-\-from \fITHEORY\fR] [\fB\-\-remote\-exec \fIURL\fR [\fB\-\-remote\-only\fR]] [\fIARG\fR ...]
+Run HOL with the project's context.
+.IP
+For both
+.B repl
+and
+.BR run ,
+extra arguments go to HOL, except holbuild's global options and
+.BR \-h / \-\-help ,
+which holbuild takes wherever they appear, and Poly/ML runtime options
+(such as
+.BR \-\-gcthreads ", " \-\-maxheap " and " \-H ),
+which holbuild's own runtime consumes and which it rejects where it can
+detect them (Linux).
+holbuild itself passes
+.B \-\-holstate
+and
+.B \-\-noconfig
+to HOL.
+Targets are built without proof steps, as heap targets are: no step timeout
+applies, and theories built by
+.B build \-\-skip\-proof\-steps
+are reused.
+.RS
+.TP
+.BI \-\-from " THEORY"
+Start from the
+.I deps_loaded
+checkpoint of
+.IR THEORY ,
+with its ancestors loaded, and load
+.I THEORY
+on top when it is built for its current sources.
+Without a current checkpoint, start from the
+.B [run].heap
+the manifest configures, or the HOL base state.
+Does not build
+.IR THEORY .
+Without
+.BR \-\-from ,
+when
+.I .sml
+scripts are given,
+.I THEORY
+is inferred: of the project theories the scripts depend on, the one with the
+most ancestors.
+.TP
+.BI \-\-remote\-exec " URL"
+Build the manifest's
+.B [run].loads
+and any
+.B \-\-from
+or inferred theory as
+.B build \-\-remote\-exec
+does, on the coordinator's workers, then start HOL locally.
+.TP
+.B \-\-remote\-only
+With
+.BR \-\-remote\-exec ,
+fail instead of building locally.
+.RE
+.TP
+.BI execution\-plan " THEORY" : THEOREM
+Print the proof-step execution plan for a theorem (or an explicit termination
+proof).
+If a theorem and a terminating definition have the same name, the theorem
+takes precedence.
+.TP
+.B check \fITHEORY\fR[:\fITHEOREM\fR] ...
+Build each theory if needed, load it in HOL and check the tags and hypotheses
+of its stored theorems, or of
+.I THEOREM
+alone.
+Prints one line per theorem that depends on an oracle other than
+.B DISK_THM
+(\fBcheat\fR, for instance), per theorem with undischarged hypotheses, per axiom
+declared in the theory or its ancestors outside HOL itself, and per use of a
+kernel-bypass call
+.RB ( Thm.disk_thm ,
+.BR RunCall ,
+\&...) in the sources the theory is built from outside HOL.
+Exits non-zero if there are any findings; otherwise prints a clean line and
+exits zero.
+Selectors are checked in order in one HOL session; findings do not stop later
+checks, but an invalid selector or a load error aborts the command.
+The build runs without proof steps or checkpoints, reuses theories built by
+.BR "build \-\-skip\-proof\-steps" ,
+and applies no step timeout.
+Accepts
+.B \-\-remote\-exec
+.I URL
+.RB [ \-\-remote\-only ].
+.RS
+.TP
+.B \-\-fingerprint \fITHEORY\fR ...
+Print instead one line per axiom, definition and theorem stored in the
+selected theories and their ancestors (HOL's included), sorted and
+deduplicated:
+.RS
+.IP
+.nf
+fingerprint<TAB>THEORY<TAB>KIND<TAB>NAME<TAB>FINGERPRINT<TAB>ORACLES
+.fi
+.RE
+.IP
+.I KIND
+is
+.BR axiom ,
+.B definition
+or
+.BR theorem .
+.I FINGERPRINT
+is the SHA-256 of the statement's term structure, the same for
+alpha-equivalent statements.
+.I ORACLES
+lists the oracles other than
+.BR DISK_THM ,
+comma-separated, or is
+.BR \- .
+A script computes the same fingerprint with
+.B HolbuildFingerprint.thm
+or
+.BR HolbuildFingerprint.term .
+.TP
+.B \-\-with\-fingerprints \fITHEORY\fR[:\fITHEOREM\fR] ...
+Check the selectors and also print the fingerprint lines of their theories,
+in the same HOL session.
+The exit status is the check's.
+.RE
+.TP
+.B buildhol \fR[\fB\-\-trknl\fR]
+Build or reuse the declared HOL tree and print its path.
+A configured remote cache restores toolchains and publishes successful local
+builds automatically.
+A global
+.B \-j
+is passed to HOL's
+.B bin/build
+when the toolchain is built here.
+.B \-\-trknl
+selects the tracing kernel.
+.TP
+.BI heap " NAME " [ \-\-remote\-exec " URL " [ \-\-remote\-only ]]
+Build a heap the manifest configures.
+.TP
+.BI executable " NAME " [ \-\-remote\-exec " URL " [ \-\-remote\-only ]]
+Build an executable heap the manifest configures.
+.TP
+.BI clean " THEORY" ...
+Remove local build outputs of theories.
+A later build may restore the outputs from the global cache; to execute a
+theory from the beginning, run
+.B clean
+and then
+.BR "build \-\-force=theory" .
+.TP
+.B export \fR[\fB\-\-build\fR [\fB\-\-remote\-exec \fIURL\fR [\fB\-\-remote\-only\fR]]] \fB\-o \fIFILE\fR [\fB\-\-metadata\-out \fIFILE\fR] [\fITARGET\fR ...]
+Export the cached build outputs of the targets as an hbx archive.
+.RS
+.TP
+.B \-o \fIFILE\fR, \-\-output \fIFILE\fR
+The archive to write.
+.TP
+.BI \-\-metadata\-out " FILE"
+Also write the outputs' metadata to
+.IR FILE .
+.TP
+.B \-\-build
+Build the targets first.
+With
+.BR \-\-remote\-exec ,
+as
+.B build
+does.
+.RE
+.TP
+.BI import " FILE"
+Import the cached build outputs from an hbx archive into the global cache.
+.TP
+.B gc \fR[\fIOPTIONS\fR]
+Remove stale project and cache state, including HOL toolchains unused for the
+retention period.
+.RS
+.TP
+.BI \-\-retention\-days " DAYS" "\fR, \fB\-\-days " DAYS
+Retention period (default: 7).
+.TP
+.BI \-\-max\-checkpoints\-gb " GB"
+Size limit for the project's checkpoints, in GB (default: the
+.B [build].checkpoint_limit_gb
+of
+.IR .holconfig.toml ,
+or 5).
+Applies only to project cleanup.
+.TP
+.B \-\-clean\-only
+Project state only.
+.TP
+.B \-\-cache\-only
+Global cache only; no project is needed.
+.TP
+.B \-\-toolchains\-only
+Installed HOL toolchains only; no project is needed.
+.RE
+.IP
+The three
+.B \-\-*\-only
+options are mutually exclusive.
+.TP
+.BI cache " gc"
+Deprecated; use
+.BR "gc \-\-cache\-only" .
+Takes
+.B \-\-retention\-days
+and
+.BR \-\-days .
+.TP
+.B action\-spec \fR[\fB\-\-upload\fR] [\fIOPTIONS\fR] [\fITARGET\fR ...]
+Plan the targets as
+.B build
+would and write the action specification of every theory the remote cache
+cannot satisfy to
+.IR .holbuild/action\-specs/SHA256 ,
+then print the action batch.
+Takes
+.BR build 's
+cache and proof options and
+.BR \-\-tool\-cache .
+Needs
+.BR \-\-remote\-cache .
+.RS
+.TP
+.B \-\-upload
+Also upload the specs and their sources to the remote cache.
+.RE
+.TP
+.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-share\-heaps\fR] [\fB\-\-result \fIFILE\fR]
+Run the action specification stored in the remote cache as
+.I SPEC\-SHA256
+(see
+.BR action\-spec ),
+or the run spec (see
+.BR run\-action ),
+as a remote worker would, and publish its result to the remote cache.
+Needs
+.BR \-\-remote\-cache .
+The action runs in
+.IR CACHE/action ,
+with checkpoints in
+.IR CACHE/checkpoints ,
+where
+.I CACHE
+is the cache root.
+Writes a
+.I holbuild\-action\-result\-v1
+record to
+.IR FILE ,
+or to standard output.
+.IP
+Exit status: 0 built or cached; 1 proof, tactic-timeout, script or timeout
+failure; 2 out of memory; 3 input-missing, publish, toolchain, disk or
+internal failure; 4 spec rejected.
+.RS
+.TP
+.BI \-\-cache\-limit\-gb " N"
+Before the action, evict least recently used checkpoints, toolchains and local
+cache entries until the cache root holds at most
+.I N
+GB minus the reserve.
+.TP
+.BI \-\-cache\-reserve\-gb " N"
+Room to keep free under the limit (default: a tenth).
+.TP
+.B \-\-share\-heaps
+Resume from the deps-loaded heap and theorem checkpoints other workers
+published, and publish this run's.
+The host store
+.I CACHE/checkpoint\-store
+keeps their files.
+.TP
+.BI \-\-result " FILE"
+Where to write the result record (default: standard output).
+.RE
+.TP
+.B run\-action \fR[\fIOPTIONS\fR] \fB\-\-script \fIS\fR \fITARGET\fR ...
+Run script
+.I S
+in the context of each target on remote workers, once per set of inputs:
+runs the remote cache already holds are not run again.
+The others go to the coordinator as one batch; then every run's outputs are
+fetched into
+.IR D/PACKAGE/THEORY
+.RI ( D/HOL/THEORY
+for a toolchain theory), beside
+.I KEY
+(the run key) and
+.IR CONTEXT .
+Runs never execute locally.
+For each run a line is printed:
+.IR "CONTEXT RUN\-KEY" " done|cached|failed " "CLASS|missing" .
+A target is a project theory (a logical name as
+.B build
+takes, or
+.IR PACKAGE:NAME ),
+a theory of the HOL toolchain
+.RB ( hol:bool
+or
+.BR hol:boolTheory ),
+or
+.B hol:*
+for every theory of the toolchain.
+A project theory must be built, in the local or remote cache, first.
+Takes
+.BR build 's
+cache options.
+Needs
+.BR \-\-remote\-cache .
+.IP
+Exits 0 when every run ended (done, cached, failed or, with
+.BR \-\-fetch\-only ,
+missing), 75 when the coordinator cannot take or finish the batch or an
+ended run cannot be fetched, and 1 on errors, a cancelled batch, or a target
+that is not built.
+.RS
+.TP
+.BI \-\-remote\-exec " URL"
+The coordinator to submit to.
+.TP
+.B \-\-remote\-only
+Exit 75, not 1, when no
+.B \-\-remote\-exec
+is given.
+.TP
+.BI \-\-outputs\-dir " D"
+Where to fetch the outputs.
+.TP
+.BI \-\-script " S"
+The script to run.
+.TP
+.BI \-\-support " F"
+A file the script reads, under the script's directory.
+May be repeated.
+.TP
+.BI \-\-load " L"
+A library to load before the script, in order.
+May be repeated.
+.TP
+.BI \-\-output " N"
+A file the script writes.
+At least one is required; may be repeated.
+.TP
+.BI \-\-option " timeout=SECONDS"
+How long a run may take; not part of its key.
+.TP
+.B \-\-closure
+Also run in the context of each project target's ancestry.
+.TP
+.BI \-\-profile " P"
+The coordinator's memory profile for the batch.
+.TP
+.B \-\-fetch\-only
+Fetch what the remote cache holds; submit nothing.
+.TP
+.B \-\-export\-only
+Only write and upload each run's spec, and print
+.IR "CONTEXT RUN\-KEY SPEC\-SHA256" .
+.RE
+.
+.SH GLOBAL OPTIONS
+Global options come before the command.
+.TP
+.BI \-\-source\-dir " PATH"
+The project source directory.
+Defaults to
+.B HOLBUILD_SOURCE_DIR
+or the current working directory.
+.TP
+.BI \-\-cache\-dir " PATH"
+The global cache directory.
+Overrides
+.B HOLBUILD_CACHE
+and the platform default, normally
+.IR $HOME/.cache/holbuild .
+.TP
+.B \-\-offline
+Disable holbuild-managed network access (Git, remote cache and coordinator).
+Also enabled by
+.BR HOLBUILD_OFFLINE=1 .
+Explicit
+.B \-\-remote\-cache
+or
+.B \-\-remote\-exec
+conflicts with it.
+.TP
+.BI \-\-remote\-cache " URL"
+Comma-separated Bazel-style HTTP remote cache endpoints.
+Also configurable with
+.B HOLBUILD_REMOTE_CACHE_URL
+or the project's
+.IR .holconfig.toml ;
+the option overrides the environment variable.
+.TP
+.B \-\-json
+Emit newline-delimited JSON where supported.
+Several commands reject it.
+.TP
+.B \-\-quiet\fR, \fB\-\-verbose\fR, \fB\-\-verbosity \fILEVEL
+Adjust status output.
+.I LEVEL
+is one of
+.BR quiet ,
+.B normal
+and
+.BR verbose .
+.TP
+.B \-j \fIN\fR, \-j\fIN\fR, \-\-jobs \fIN
+Build parallelism.
+When holbuild builds a HOL toolchain it also passes
+.BI \-j " N"
+to HOL's
+.BR bin/build ;
+without it,
+.B bin/build
+uses HOL's own default.
+.TP
+.BI \-\-max\-heap " MB"
+Poly/ML maximum heap size for child HOL processes, including remote workers
+(which use their configured default, 12000 MB, without it).
+Do not use
+.BR \-\-maxheap :
+holbuild is itself a Poly/ML program, whose runtime takes
+.B \-\-maxheap
+as the cap on its own heap, so the option never reaches holbuild and the
+children run uncapped.
+holbuild rejects it where it can detect it (Linux).
+.TP
+.BI \-\-prefetch\-concurrency " N"
+How many remote cache entries a build copies into the local cache at once,
+ahead of the build workers; also limits remote-cache existence checks before
+batch export.
+Defaults to 50 or twice the number of jobs, whichever is larger.
+Only used with a remote cache.
+.TP
+.BI \-\-cooperate\-dir " DIR"
+Share a machine memory budget with every holbuild process using
+.IR DIR .
+Also settable with
+.BR HOLBUILD_COOPERATE_DIR .
+See
+.BR "MEMORY ADMISSION" .
+.TP
+.BI \-\-machine\-max\-mem " MB"
+The budget to record in
+.I DIR/budget
+when that file does not exist yet (default without it:
+.B MemTotal
+less a reserve).
+A value that differs from the file at this process's first admission is an
+error.
+.TP
+.BI \-\-child\-charge " MB"
+What each child reserves against the budget.
+Defaults to
+.BR \-\-max\-heap ,
+at most 3072 (3072 without
+.BR \-\-max\-heap );
+where
+.B MemAvailable
+cannot be read, to
+.BR \-\-max\-heap " + 1024,"
+and then
+.B \-\-max\-heap
+or
+.B \-\-child\-charge
+is required.
+.TP
+.B \-h\fR, \fB\-\-help
+Print help.
+With a command name, print that command's help.
+.TP
+.B \-\-version
+Print the version.
+.
+.SH BUILD OPTIONS
+Options of
+.BR build ,
+placed after the word
+.B build
+or, when it is omitted, before the targets.
+.TP
+.B \-\-watch
+Build, then watch the project inputs with
+.B inotifywait
+(from inotify-tools) and rebuild after changes.
+Does not support
+.BR \-\-json ,
+.B \-\-dry\-run
+or
+.BR \-\-repl\-on\-failure .
+.TP
+.B \-\-fail\-fast
+Stop after the first failure and cancel unfinished work.
+The default is to finish independent work and skip only the dependents of
+failures.
+.TP
+.B \-\-dry\-run
+Show what would be built without building.
+.TP
+.BR \-\-force [=\fILEVEL\fR]
+Bypass cached outputs.
+.I LEVEL
+is
+.B theory
+(the requested targets; also
+.BR target ),
+.B project
+(every theory of the root package in the build plan) or
+.B full
+(every theory in the plan, dependencies included; also
+.BR all );
+a bare
+.B \-\-force
+means
+.BR full .
+Valid checkpoints, including failed proof prefixes, may still resume.
+To execute a theory from the beginning while keeping cache hits for its
+ancestors, run
+.B holbuild clean
+on it, then
+.BR "build \-\-force=theory" .
+.B \-\-force\-theory ,
+.B \-\-force\-project
+and
+.B \-\-force\-full
+are the same levels as separate flags.
+.TP
+.B \-\-no\-cache
+Do not use the global or remote build cache.
+.TP
+.B \-\-allow\-cache\-timeout\-discrepancy
+Reuse cached theory artifacts even when their recorded proof timeout does not
+satisfy the requested one.
+Project metadata keeps the artifact's recorded timeout, so a later build
+without the flag applies the strict check.
+.TP
+.B \-\-no\-stat\-cache
+Hash every source file instead of trusting an unchanged file status.
+.TP
+.B \-\-skip\-checkpoints
+Do not create checkpoints.
+.TP
+.B \-\-all\-checkpoints
+All root-package theories save checkpoints by default, except a theory that
+is not a target and that a parallel build pipelines into an idle slot.
+With this flag every such theory saves them.
+Checkpoint policy does not change theory outputs or cache keys.
+.TP
+.B \-\-skip\-proof\-steps
+Do not execute proof steps (no per-step timeout, tracing or step
+diagnostics).
+.TP
+.BR \-\-proof\-scope " \fIroot\fR|\fIall\fR (default: " root )
+Which theories receive proof instrumentation and the invocation's timeout.
+.B all
+includes dependency theories in the selected build plan, and conflicts with
+.BR \-\-skip\-proof\-steps .
+Use
+.B \-\-force=full \-\-no\-cache
+for a full audit.
+Also accepted as
+.BR \-\-proof\-scope=\fIscope .
+.TP
+.BI \-\-tactic\-timeout " SECONDS"
+Per-step timeout for proof steps;
+.B 0
+disables it.
+A step that times out runs once more with half the timeout; if that finishes,
+the step passes, and otherwise it fails the build, even inside
+.B TRY
+or an
+.B ORELSE
+alternative.
+Also accepted as
+.BR \-\-tactic\-timeout=\fISECONDS .
+.TP
+.B \-\-trace\-steps
+Execute and record proof-step traces for theories in the proof scope,
+including up-to-date ones; skips checkpoint replay.
+Not supported with
+.BR \-\-json .
+.TP
+.B \-\-repl\-on\-failure
+After a theory fails, start a HOL REPL from the newest useful checkpoint.
+Serialises the build; not supported with
+.BR \-\-json .
+.TP
+.B \-\-retain\-debug\-artifacts
+Retain the durable failure logs of failed theories (reported as
+.I debug_artifacts.log
+in JSON mode, where failure evidence is otherwise bounded).
+.TP
+.B \-\-emit\-output\-hashes
+Record output hashes for diagnostics.
+.TP
+.B \-\-warn\-unreachable
+Report discoverable theory scripts that are outside the root dependency closure.
+.TP
+.B \-\-trknl
+Use the tracing-kernel toolchain.
+Needs a Poly/ML that provides the tracing-kernel export support; set
+.B HOLBUILD_POLY
+to it.
+Tracing builds record the proof trace of each theory as
+.IR Theory.tr.gz .
+.TP
+.BI \-\-tool\-cache " NAME"
+Give each theory's HOL processes
+.BR HOLBUILD_TOOL_CACHE_DIR ,
+a directory a tool keeps files in from one build to the next:
+.IR $HOLBUILD_CACHE/tool\-cache/ NAME
+locally; on a remote worker, one the remote cache fills and saves per
+theory dependencies.
+.I NAME
+is letters, digits,
+.BR . ,
+.B _
+and
+.BR \- .
+.TP
+.BI \-\-remote\-exec " URL"
+Build the theories the remote cache lacks, and that are not built here for
+their current inputs (except with
+.BR \-\-detach ),
+on the coordinator's workers and restore them from the remote cache.
+Needs
+.BR \-\-remote\-cache .
+A closure that cannot run remotely, or an unreachable coordinator, builds
+locally.
+.TP
+.B \-\-remote\-only
+With
+.BR \-\-remote\-exec :
+fail instead of building locally, with exit status 75.
+.TP
+.BI \-\-priority " N"
+The batch's priority with the coordinator (default 0).
+.TP
+.B \-\-detach
+Submit the batch and exit.
+.TP
+.BI \-\-attach " BATCH\-ID"
+Follow a submitted batch and restore it.
+.
+.SH DEPRECATED AND REMOVED OPTIONS
+.TP
+.B \-\-skip\-goalfrag
+Deprecated; warns and behaves like
+.BR \-\-skip\-proof\-steps .
+.TP
+.B \-\-goalfrag\-trace
+Deprecated; warns and behaves like
+.BR \-\-trace\-steps .
+.TP
+.B \-\-new\-ir
+Deprecated; accepted and ignored.
+.TP
+.BR \-\-goalfrag ", " \-\-goalfrag\-plan
+Removed: proof steps are on by default, and
+.B execution\-plan
+replaces the plan flag.
+.TP
+.B \-\-holdir
+Removed: the HOL used is the manifest's
+.BR [dependencies.hol] .
+.
+.SH MEMORY ADMISSION
+Independent holbuild processes on one machine can share a memory budget with
+.BR \-\-cooperate\-dir .
+Each theory, generator or heap-export child reserves
+.BR \-\-child\-charge ,
+and starts only while all reservations in
+.I DIR
+plus its own fit the budget and, while other children hold reservations,
+.B MemAvailable
+less the charges of children started in the last 30 seconds covers its charge
+plus a margin.
+The reserve is a quarter of
+.BR MemTotal ,
+at least 1 GiB and at most 30 GiB; the margin is the reserve, or what the budget
+leaves out of
+.B MemTotal
+if that is less (at least 1 GiB).
+This bounds admission; it does not enforce resident size.
+HOL toolchain builds,
+.BR check ,
+.B run
+and
+.B repl
+reserve nothing.
+.PP
+The budget is the byte count in
+.IR DIR/budget .
+To set or resize it, write the file while holding
+.IR DIR/lock :
+.IP
+.nf
+flock DIR/lock sh \-c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'
+.fi
+.PP
+To return to the default, remove it:
+.BR "flock DIR/lock rm DIR/budget" .
+Waiting for
+.I DIR/lock
+gives up after
+.B HOLBUILD_COOPERATE_LOCK_TIMEOUT
+seconds.
+.
+.SH ENVIRONMENT
+.TP
+.B HOLBUILD_CACHE
+The global cache directory (default
+.IR $HOME/.cache/holbuild ;
+overridden by
+.BR \-\-cache\-dir ).
+.TP
+.B HOLBUILD_SOURCE_DIR
+The project source directory (overridden by
+.BR \-\-source\-dir ).
+.TP
+.B HOLBUILD_OFFLINE
+.B 1
+enables
+.BR \-\-offline ;
+.B 0
+leaves online behaviour unchanged.
+.TP
+.B HOLBUILD_REMOTE_CACHE_URL
+Remote cache endpoints (overridden by
+.BR \-\-remote\-cache ).
+.TP
+.B HOLBUILD_REMOTE_CACHE_CURL_CONFIG
+A curl configuration file for remote cache requests; overrides the
+.I .holconfig.toml
+setting.
+.TP
+.B HOLBUILD_REMOTE_EXEC_CURL_CONFIG
+A curl configuration file for requests to the remote-execution coordinator.
+.TP
+.B HOLBUILD_COOPERATE_DIR
+As
+.BR \-\-cooperate\-dir .
+.TP
+.B HOLBUILD_COOPERATE_LOCK_TIMEOUT
+Seconds to wait for the memory-budget lock before failing (default 600;
+.B 0
+waits without limit).
+.TP
+.B HOLBUILD_POLY
+The
+.B poly
+executable used to build or run project HOL toolchains, for example a
+tracing-kernel Poly/ML for
+.BR \-\-trknl .
+.TP
+.B HOLBUILD_POLYC
+The
+.B polyc
+executable used to build HOL toolchains (default
+.BR polyc ).
+.TP
+.BR HOLDIR ", " HOLBUILD_HOLDIR
+Ignored by project builds, which use the manifest's
+.BR [dependencies.hol] .
+.TP
+.B HOLBUILD_PIPELINE
+.B off
+turns off pipelining of non-target cold theories into idle job slots.
+.TP
+.B HOLBUILD_PLAN_RECORD
+.B off
+turns off the plan record;
+.B check
+also plans in full and fails the build if the two plans differ.
+.TP
+.B HOLBUILD_PROOF_THREADS
+Number of threads for checking a theory's proofs (default: up to 4 of the
+build's jobs).
+.TP
+.BR HOLBUILD_FAILED_GOALS_LIMIT ", " HOLBUILD_GOAL_STATE_LIMIT
+Byte limits for the all-input-goals section of
+.I instrumented\-failure.log
+and for the top-goal preview in diagnostics.
+Both default to 4096; a nonnegative integer sets the limit, and
+.B 0
+or
+.B unlimited
+removes it.
+.TP
+.B HOLBUILD_CACHE_TRACE
+.B 1
+prints cache and pipeline trace lines.
+.TP
+.B HOLBUILD_TOOL_CACHE_DIR
+Set by holbuild, with
+.BR \-\-tool\-cache ,
+for each theory's HOL processes.
+.TP
+.BR HOLBUILD_RUN_ROOT ", " HOLBUILD_RUN_CONTEXT ", " HOLBUILD_RUN_CONTEXT_KEY ", " HOLBUILD_RUN_SOURCE ", " HOLBUILD_RUN_OUTPUT_DIR ", " HOLBUILD_RUN_SCRATCH
+Set by holbuild for a script started by
+.BR run\-action .
+.TP
+.B HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES
+Which HOL repositories a worker running
+.B exec\-action
+trusts; see the remote-execution README.
+.
+.SH FILES
+.TP
+.IR holproject.toml ", " holbuild.toml
+The project manifest.
+.TP
+.I .holconfig.toml
+Local configuration beside the manifest (remote cache, dependency paths).
+.TP
+.I .holbuild/
+Project build outputs, logs and state.
+.TP
+.IR $HOLBUILD_CACHE/hol\-toolchains/
+Built HOL toolchains and analysers.
+.
+.SH EXIT STATUS
+0 on success, 1 on failure, including interruption.
+75 when a
+.B \-\-remote\-only
+build or
+.B run\-action
+stopped where a local build would go on.
+.
+.SH EXAMPLES
+.nf
+holbuild MyTheory
+holbuild \-j4 \-\-max\-heap 4096 build MyTheory
+holbuild build \-\-force=theory \-\-tactic\-timeout 10 MyTheory
+holbuild check MyTheory
+holbuild \-\-remote\-cache URL build \-\-remote\-exec URL MyTheory
+holbuild export \-o out.hbx MyTheory
+holbuild gc \-\-cache\-only \-\-retention\-days 30
+.fi
+.
+.SH SEE ALSO
+The README in the holbuild repository,
+.UR https://github.com/HOL-Theorem-Prover/holbuild
+.UE .

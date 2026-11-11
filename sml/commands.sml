@@ -82,7 +82,8 @@ fun global_help () = print
   \To return to the default, remove it: flock DIR/lock rm DIR/budget\n\
   \Waiting for DIR/lock gives up after $HOLBUILD_COOPERATE_LOCK_TIMEOUT seconds\n\
   \(default 600; 0 for no limit).\n\n\
-  \Use `holbuild COMMAND --help` for command-specific help.\n"
+  \Use `holbuild COMMAND --help` for command-specific help.\n\
+  \Full reference: man holbuild.\n"
 
 fun build_help () = print
   "Usage:\n\
@@ -124,14 +125,14 @@ fun build_help () = print
   \coordinator builds locally; --remote-only fails instead, with exit\n\
   \status 75. --detach submits the batch and exits; --attach follows a\n\
   \submitted batch and restores it.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun context_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] context [--trknl]\n\n\
   \Show resolved project context. Use --trknl to select the tracing-kernel\n\
   \context. This command resolves metadata but does not build the toolchain.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun repl_help () = print
   "Usage:\n\
@@ -156,7 +157,7 @@ fun repl_help () = print
   \                 of building locally.\n\n\
   \Targets are built without proof steps, as heap targets are: no step timeout\n\
   \applies, and theories built by `build --skip-proof-steps` are reused.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun run_help () = print
   "Usage:\n\
@@ -181,13 +182,13 @@ fun run_help () = print
   \                 of building locally.\n\n\
   \Targets are built without proof steps, as heap targets are: no step timeout\n\
   \applies, and theories built by `build --skip-proof-steps` are reused.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun execution_plan_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] execution-plan THEORY:THEOREM\n\n\
   \Inspect the proof-step execution plan for a theorem.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun check_help () = print
   "Usage:\n\
@@ -219,7 +220,7 @@ fun check_help () = print
   \built by build --skip-proof-steps and applies no step timeout. With\n\
   \--remote-exec URL [--remote-only], uncached theories are built on the\n\
   \coordinator's workers and restored from the remote cache.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun buildhol_help () = print
   "Usage:\n\
@@ -228,26 +229,26 @@ fun buildhol_help () = print
   \the tracing kernel. A configured remote cache restores toolchains and\n\
   \publishes successful local builds automatically. A global -j N is passed to\n\
   \HOL's bin/build when the toolchain is built here.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun heap_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] heap NAME [--remote-exec URL [--remote-only]]\n\n\
   \Build a configured heap.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun executable_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] executable NAME [--remote-exec URL [--remote-only]]\n\n\
   \Build a configured executable heap.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun clean_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] clean THEORY...\n\n\
   \Remove local build outputs for theories. Subsequent builds may restore outputs\n\
   \from the global cache.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun gc_help () = print
   "Usage:\n\
@@ -261,7 +262,7 @@ fun gc_help () = print
   \  --cache-only        global cache only; no project needed\n\
   \  --toolchains-only   installed HOL toolchains only; no project needed\n\n\
   \The --*-only options are mutually exclusive.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun cache_help () = print
   "`holbuild cache gc` is deprecated; use `holbuild gc --cache-only`.\n"
@@ -274,7 +275,7 @@ fun action_spec_help () = print
   \action batch. With --upload, also upload the specs and their sources to the\n\
   \remote cache. Takes build's cache and proof options and --tool-cache. Needs\n\
   \--remote-cache.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun exec_action_help () = print
   "Usage:\n\
@@ -295,7 +296,7 @@ fun exec_action_help () = print
   \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
   \                     other workers published, and publish this run's. The\n\
   \                     host store CACHE/checkpoint-store keeps their files.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun run_action_help () = print
   "Usage:\n\
@@ -333,19 +334,19 @@ fun run_action_help () = print
   \ended run can't be fetched, and 1 on errors, a cancelled batch, or a\n\
   \TARGET that isn't built.\n\n\
   \Takes build's cache options. Needs --remote-cache.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun export_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] export [--build [--remote-exec URL [--remote-only]]] -o FILE [--metadata-out FILE] [TARGET ...]\n\n\
   \Export cached build outputs for targets. With --build, build targets first.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun import_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] import FILE\n\n\
   \Import cached build outputs from an hbx archive into the global cache.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun help_arg arg = arg = "--help" orelse arg = "-h"
 fun has_help_arg args = List.exists help_arg args
