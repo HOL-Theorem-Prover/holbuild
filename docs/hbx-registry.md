@@ -65,7 +65,11 @@ A target in another package is left out of the default export. An unbuilt
 dependency theory fails only `--closure`.
 
 `holbuild import F` imports the cache part only, and nothing from a capsule
-without one.
+without one (it reports `imported 0 cache action(s)`). It never unpacks the
+package part. Archives come from outside, so before it unpacks anything it
+lists the members and refuses the archive if one is not a regular file or a
+directory (a symbolic or hard link, a device, a FIFO), has a `..` component or
+is an absolute path; the error names the member.
 
 HBX archives are trusted build inputs, not sandboxed packages. Their cached
 Poly/ML outputs may be loaded by a later build. Import only from a trusted
