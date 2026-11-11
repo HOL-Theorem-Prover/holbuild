@@ -69,11 +69,12 @@ require_grep "ATheory built" "$tmpdir/stalled.log"
 build_log=$tmpdir/stalled/.holbuild/logs/current/retry/ATheory/build.log
 require_grep "^holbuild tactic timeout retry passed: stall_tac (budget 1.0s; retry [0-9.]* ms wall; GC during first attempt [0-9.]* ms)$" "$build_log"
 [[ $(grep -c "tactic timeout retry passed" "$build_log") -eq 1 ]] || { cat "$build_log" >&2; exit 1; }
+require_grep $'^holbuild slow-proof-step\tt\t[0-9]*\tstep\tok\t[0-9.]*\t1000.000\tstall_tac$' "$build_log"
 
 # (b) A step whose retry needs more than half the budget fails as it did
 # without the retry: the full budget in the message and in the marker.
 write_project "$tmpdir/slow" 0.7
-if (cd "$tmpdir/slow" && "$HOLBUILD_BIN" --json build ATheory) > "$tmpdir/slow.log" 2>&1; then
+if (cd "$tmpdir/slow" && "$HOLBUILD_BIN" --json build --retain-debug-artifacts ATheory) > "$tmpdir/slow.log" 2>&1; then
   echo "build succeeded although the retry exceeded half the budget" >&2
   cat "$tmpdir/slow.log" >&2
   exit 1
@@ -82,3 +83,5 @@ require_grep "tactic timed out after 1.0s while building ATheory: stall_tac" "$t
 require_grep "holbuild tactic timeout after 1.0s: stall_tac" "$tmpdir/slow.log"
 require_grep '"kind":"tactic_timeout"' "$tmpdir/slow.log"
 if grep -q "tactic timeout retry passed" "$tmpdir/slow.log"; then cat "$tmpdir/slow.log" >&2; exit 1; fi
+require_grep $'^holbuild slow-proof-step\tt\t[0-9]*\tstep\tfailed\t[0-9.]*\t1000.000\tstall_tac$' \
+  "$tmpdir/slow/.holbuild/logs/current/retry/ATheory/instrumented-failure.log"
