@@ -8908,14 +8908,24 @@ type spec_deps =
 fun theory_spec_deps (spec : action_spec) : spec_deps =
   {libraries = #libraries spec, deps = #deps spec, libs = #libs spec, orders = #orders spec}
 
-fun spec_load_stems (spec : spec_deps) =
+(* The stem and load order of a theory or library the spec names, the first
+   stem given for a name winning.  Built once per spec: a hydrate resolves
+   every dependency's parents in it. *)
+fun spec_resolver (spec : spec_deps) =
   let
-    fun add ((name, stem), acc) =
-      if List.exists (fn (n, _) => n = name) acc then acc else acc @ [(name, stem)]
+    fun lookup pairs =
+      List.foldl (fn ((name, value), dict) => insert_first_string_dict (dict, name, value))
+        (Binarymap.mkDict String.compare) pairs
+    val stems =
+      lookup (map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#deps spec) @
+              map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#libs spec))
+    val orders = lookup (map (fn {target, order} => (#2 (target_name target), order)) (#orders spec))
+    fun order name =
+      case Binarymap.peek (orders, name) of
+          SOME order => order
+        | NONE => reject_spec ("spec has no load order for " ^ name)
   in
-    List.foldl add []
-      (map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#deps spec) @
-       map (fn {target, stem, ...} => (#2 (target_name target), stem)) (#libs spec))
+    fn name => Option.map (fn stem => (stem, order name)) (Binarymap.peek (stems, name))
   end
 
 (* The spec's theory action, its checkpoints keyed on DEPS_KEY. *)
@@ -8993,7 +9003,7 @@ fun fetch_spec_blob remote {hash, dst} =
 
 (* Restores a theory the action depends on, or the action's own entry, into
    the action root, writing its load manifests with the spec's stems. *)
-fun restore_spec_theory remote root (spec : spec_deps) {key, subject, stem, extra_outputs, requested_timeout} =
+fun restore_spec_theory remote root resolver {key, subject, stem, extra_outputs, requested_timeout} =
   let
     val cache = cache_root ()
     val entry =
@@ -9002,13 +9012,7 @@ fun restore_spec_theory remote root (spec : spec_deps) {key, subject, stem, extr
          expected_extra_outputs = extra_outputs,
          requested_timeout = requested_timeout, require_trace = false}
     val resident = #manifest_text entry
-    val stems = spec_load_stems spec
-    fun order name =
-      case List.find (fn {target, ...} => #2 (target_name target) = name) (#orders spec) of
-          SOME {order, ...} => order
-        | NONE => reject_spec ("spec has no load order for " ^ name)
-    fun resolve name =
-      Option.map (fn (_, s) => (in_root root s, order name)) (List.find (fn (n, _) => n = name) stems)
+    fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
     val stem_path = in_root root stem
     val sig_path = stem_path ^ ".sig"
     val sml_path = stem_path ^ ".sml"
@@ -9108,9 +9112,10 @@ fun hydrate_spec_deps remote root files (spec : spec_deps) direct =
     fun write_lib {stem, suffix, loads, ...} =
       (ensure_parent (in_root root stem);
        write_object_manifest (in_root root (stem ^ suffix)) (map lib_load loads))
+    val resolver = spec_resolver spec
     fun restore_dep {target, stem, key} =
       (ensure_parent (in_root root stem);
-       restore_spec_theory remote root spec
+       restore_spec_theory remote root resolver
          {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | e => raise action_failed (InputMissing ("theory " ^ key))
@@ -9177,7 +9182,7 @@ fun action_already_done remote root (spec : action_spec) =
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
     fun restored () =
-      (restore_spec_theory remote root (theory_spec_deps spec)
+      (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
          {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
           extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
        spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
@@ -10330,7 +10335,7 @@ fun reuse_earlier_build remote root (spec : action_spec) pair_key =
           val data_path = #data_path (#outputs spec)
         in
           sha256_text old_key andalso old_key <> new_key andalso
-          (restore_spec_theory remote root (theory_spec_deps spec)
+          (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
              {key = old_key, subject = #package spec ^ ":" ^ #logical spec,
               stem = drop_suffix ".dat" data_path, extra_outputs = SOME (#extra_outputs spec),
               requested_timeout = #tactic_timeout spec};
