@@ -1172,14 +1172,24 @@ Any failure costs only time. A deferred proof that fails, leaves
 an extra hypothesis, changes the theory, or writes theory data makes the
 theory build again with its proofs in place. "Changes the theory" means a
 theory change HOL reports (a new constant, type or saved theorem) or a write
-to theory data of a type holbuild knows; a proof that changes some other ML
+to theory data of a type holbuild knows. A proof that changes some other ML
 state that a later declaration reads isn't caught, since the declaration
-already ran with the state as it was. A failed gate drops everything
-that loaded the outline. Either way the theory's input key is remembered
+already ran with the state as it was: a tactic that writes a `ref`, directly or
+through a helper, still runs deferred (Poly has no write barrier, and a
+helper's writes can't be seen), and the theory is built as if that were fine.
+A script that relies on this must build with `HOLBUILD_PIPELINE=off`, or not
+use the pattern. Likewise, until the script ends a deferred theorem's ML value
+is the stub, so top-level code that reads `Thm.tag` of its own theorem and
+branches without failing (prints, or saves a theorem conditionally, rather than
+raising) sees the `holbuild_deferred_<k>` oracle and marker dependency in the
+tag, and what it outputs goes to the caches under the ordinary key. A failed
+gate drops everything that loaded the outline. Either way the theory's input key is remembered
 in `.holbuild/plan/outline-skip`, and that input is never pipelined again.
 
-Proofs that use `cheat` or `suspend`, and theorems the script `Resume`s,
-run in place. A theory is not pipelined if it saves checkpoints and is a
+Proofs that use `cheat` or `suspend`, theorems the script `Resume`s, and
+`Resume` blocks whose header names `smlname` (the stub would give the name a
+theorem with the subgoal's assumptions as hypotheses) run in place; a label
+that only contains the word `smlname` is run in place too. A theory is not pipelined if it saves checkpoints and is a
 requested target or the build passes `--all-checkpoints`, if it declares
 extra outputs, or under `--trace-steps`, `--repl-on-failure`, a tracing
 kernel or an execution plan.
@@ -2374,14 +2384,20 @@ tagged before it is published are drafts.
 
 ### Steps
 
-1. Ensure CI is green on `master`.
-2. Bump `HolbuildVersion.version` in `sml/version.sml` if needed.
-3. Run the key inventory above against your consumers.
-4. Create and push an annotated tag:
+1. Bump `HolbuildVersion.version` in `sml/version.sml` if needed and merge
+   the change to `master`.
+2. Run the key inventory above against your consumers, with holbuild built
+   at the commit to be tagged.
+3. On the exact `master` commit to be tagged, ensure **CI** and **Release
+   binaries** have passed. The latter must include both platform builds and
+   their smoke checks. If the version bump changed the commit, wait for the
+   checks on the new commit.
+4. Create and push an annotated tag on that checked commit:
 
    ```sh
    version=X.Y.Z
-   git tag -a "v$version" -m "holbuild v$version"
+   commit=FULL_CHECKED_MASTER_COMMIT_SHA
+   git tag -a "v$version" "$commit" -m "holbuild v$version"
    git push origin "v$version"
    ```
 
@@ -2394,10 +2410,10 @@ tagged before it is published are drafts.
    otherwise published. An existing release (including a draft) retains its
    notes and publication state.
 
-The workflow also checks packaging on relevant pull requests without
-publishing anything. To rebuild assets, rerun the tag's workflow; uploads
-replace assets with the same names. A manual workflow run only builds and
-tests; publication requires a version-tag push.
+The workflow also checks packaging on every `master` push and relevant pull
+requests without publishing anything. To rebuild assets, rerun the tag's
+workflow; uploads replace assets with the same names. A manual workflow run
+only builds and tests; publication requires a version-tag push.
 
 ### Publishing a breaking release
 
