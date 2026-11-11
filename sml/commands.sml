@@ -1730,6 +1730,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                unknown, so none of the others are copied before it ends. *)
             fun follow in_batch batch_id =
               let
+                (* Planning, export and early cutoff leave garbage that a
+                   major collection would only reclaim once the heap grows
+                   again; following waits on the coordinator for as long as
+                   the batch runs, so collect it now rather than hold it. *)
+                val _ = PolyML.fullGC ()
                 val {add, stop} =
                   HolbuildBuildExec.start_remote_exec_prefetch build_options tc project plan toolchain_key jobs in_batch
                 val logs = ref []

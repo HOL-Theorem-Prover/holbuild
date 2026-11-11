@@ -11,7 +11,12 @@
    is what holds children back when the running ones grow past their charge.
    With no reservation held in DIR, a child that fits the budget starts
    whatever MemAvailable says, so a domain never waits on memory it does not
-   use.  This bounds admission; it does not enforce RSS.
+   use.  Where cgroup v2 limits the memory of this process's group or of a
+   group enclosing it, the new child must also fit in what the tightest of
+   them has left, less the charges of children still starting, reservation
+   or none: other processes in the group (build drivers, other tools) use
+   memory that DIR knows nothing of.  This bounds admission; it does not
+   enforce RSS.
 
    A reservation is a file DIR/lease-* holding its byte charge.  It counts
    while some process holds an flock(2) on it.  The parent creates and locks
@@ -226,6 +231,74 @@ fun meminfo () =
   end
   handle IO.Io _ => {total = NONE, available = NONE}
 
+(* The least headroom, in bytes, over the cgroup v2 groups this process is
+   in that have a memory limit: its own and each ancestor, since a limit set
+   on an enclosing group (a Slurm or systemd scope, say) binds every process
+   below it.  A group's headroom is memory.max less memory.current, plus its
+   inactive_file pages from memory.stat: page cache counts in memory.current,
+   and the kernel reclaims those pages before it kills anything in the group;
+   active file pages may be the working set, so they are left out.  Also the
+   least limit itself, which no child larger than it can ever fit.  NONE
+   where no group has a limit or there is no cgroup v2.  Tests point
+   HOLBUILD_TEST_CGROUP at a stand-in group directory, or set it empty for
+   none. *)
+fun read_text path =
+  SOME (let val ins = TextIO.openIn path in TextIO.inputAll ins before TextIO.closeIn ins end)
+  handle IO.Io _ => NONE
+
+fun decimal text =
+  case String.tokens Char.isSpace text of
+      [n] => if CharVector.all Char.isDigit n then Int.fromString n else NONE
+    | _ => NONE
+
+fun cgroup_dir () =
+  case OS.Process.getEnv "HOLBUILD_TEST_CGROUP" of
+      SOME "" => NONE
+    | SOME dir => SOME dir
+    | NONE =>
+        (* The v2 entry is the line "0::PATH". *)
+        case Option.map (String.tokens (fn c => c = #"\n")) (read_text "/proc/self/cgroup") of
+            NONE => NONE
+          | SOME lines =>
+              Option.map (fn line => Path.mkCanonical ("/sys/fs/cgroup" ^ String.extract (line, 3, NONE)))
+                (List.find (String.isPrefix "0::") lines)
+
+fun cgroup_limits () =
+  let
+    fun inactive_file dir =
+      case read_text (Path.concat (dir, "memory.stat")) of
+          NONE => 0
+        | SOME text =>
+            List.foldl (fn (line, found) =>
+                           case String.tokens Char.isSpace line of
+                               ["inactive_file", n] => Option.getOpt (decimal n, found)
+                             | _ => found)
+                       0 (String.tokens (fn c => c = #"\n") text)
+    fun least (a, NONE) = SOME a
+      | least (a, SOME b) = SOME (Int.min (a, b))
+    (* Up to the first directory that isn't a group: the hierarchy's root
+       has no memory.current. *)
+    fun walk dir (found as {headroom, limit}) =
+      case Option.mapPartial decimal (read_text (Path.concat (dir, "memory.current"))) of
+          NONE => found
+        | SOME current =>
+            let
+              val found =
+                case Option.mapPartial decimal (read_text (Path.concat (dir, "memory.max"))) of
+                    NONE => found (* "max": no limit here *)
+                  | SOME max =>
+                      {headroom = least (max - current + inactive_file dir, headroom),
+                       limit = least (max, limit)}
+              val parent = Path.dir dir
+            in
+              if parent = dir then found else walk parent found
+            end
+  in
+    case cgroup_dir () of
+        NONE => {headroom = NONE, limit = NONE}
+      | SOME dir => walk dir {headroom = NONE, limit = NONE}
+  end
+
 fun mem_total () = #total (meminfo ())
 
 fun has_mem_available () = isSome (#available (meminfo ()))
@@ -365,6 +438,24 @@ fun live_shortfall budget charge starting =
         end
     | _ => NONE
 
+(* A group's limit binds whatever holds the machine-memory reservations, and
+   whatever runs in the group without them (build drivers, other tools): the
+   new child must fit in the least headroom, less what children still
+   starting will take.  There is no margin, as the limit is already what the
+   group may use.  Unlike the MemAvailable check, this holds with no
+   reservation in DIR too: the group can be full of work that takes none. *)
+fun cgroup_shortfall dir charge starting =
+  case cgroup_limits () of
+      {headroom = SOME headroom, limit = SOME limit} =>
+        if charge > limit then
+          raise Error ("a child's reservation of " ^ mib_text charge ^ " (--child-charge or its default) " ^
+                       "exceeds the cgroup memory limit of " ^ mib_text limit ^ " for " ^ dir)
+        else if headroom - starting >= charge then NONE
+        else SOME ("cgroup memory headroom is " ^ mib_text headroom ^
+                   (if starting > 0 then " less " ^ mib_text starting ^ " for children starting" else "") ^
+                   ", below the charge")
+    | _ => NONE
+
 fun acquire {dir, budget_mb, charge_mb} =
   let
     val charge = charge_mb * mib
@@ -386,11 +477,15 @@ fun acquire {dir, budget_mb, charge_mb} =
             in
               if reserved + charge > budget then
                 Wait (mib_text reserved ^ " of " ^ mib_text budget ^ " reserved in " ^ dir)
-              else if reserved = 0 then Admitted (create_lease dir charge)
               else
-                case live_shortfall budget charge starting of
-                    NONE => Admitted (create_lease dir charge)
-                  | SOME why => Wait why
+                case cgroup_shortfall dir charge starting of
+                    SOME why => Wait why
+                  | NONE =>
+                      if reserved = 0 then Admitted (create_lease dir charge)
+                      else
+                        case live_shortfall budget charge starting of
+                            NONE => Admitted (create_lease dir charge)
+                          | SOME why => Wait why
             end
         end)
     fun loop waiting =
