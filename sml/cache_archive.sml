@@ -351,16 +351,14 @@ fun is_capsule stage_dir =
   String.isPrefix (capsule_format ^ "\n") (read_text (capsule_manifest_path stage_dir))
   handle _ => false
 
-(* The spelling an archive uses for `part` (a bare name, or one with a leading
-   `./`) when it holds that part itself or anything under it. *)
-fun part_member names part =
+(* The spellings an archive uses for `part` (a bare name, a name with a leading
+   `./`, or both) among the members that are it or under it. *)
+fun part_members names part =
   let
     fun holds spelling =
       List.exists (fn name => name = spelling orelse String.isPrefix (spelling ^ "/") name) names
   in
-    if holds part then SOME part
-    else if holds ("./" ^ part) then SOME ("./" ^ part)
-    else NONE
+    List.filter holds [part, "./" ^ part]
   end
 
 fun checked_names archive_path =
@@ -372,8 +370,8 @@ fun with_entries {archive_path, f} =
   let
     val names = checked_names archive_path
     val manifest_member = Path.concat(package_part, "manifest")
-    val cache_member = part_member names payload_dir
-    val wanted = List.mapPartial (part_member names) [payload_dir, manifest_member]
+    val cache_members = part_members names payload_dir
+    val wanted = cache_members @ part_members names manifest_member
     val stage_dir = temp_dir_near archive_path
     val payload = Path.concat(stage_dir, payload_dir)
     val cache = HolbuildFSCacheBackend.filesystem payload
@@ -386,7 +384,7 @@ fun with_entries {archive_path, f} =
      let
        (* A capsule without a cache part holds no actions. *)
        val keys =
-         if not (Option.isSome cache_member) andalso is_capsule stage_dir then []
+         if null cache_members andalso is_capsule stage_dir then []
          else action_keys_from_manifest (require_manifest payload)
      in
        f {source = fs_source cache, keys = keys} before cleanup ()
@@ -460,10 +458,10 @@ fun extract_sources {archive_path, destination} =
     val names = checked_names archive_path
     val manifest_member = Path.concat(package_part, "manifest")
     val source_member = Path.concat(package_part, source_dir)
-    val members =
-      case (part_member names manifest_member, part_member names source_member) of
-          (SOME manifest, SOME source) => [manifest, source]
-        | _ => raise Error ("archive has no source snapshot: " ^ archive_path)
+    val manifest_members = part_members names manifest_member
+    val source_members = part_members names source_member
+    val _ = if null manifest_members orelse null source_members
+            then raise Error ("archive has no source snapshot: " ^ archive_path) else ()
     val _ = require_free_destination destination
     val stage_dir = temp_dir_near destination
     fun cleanup () = remove_tree stage_dir handle _ => ()
@@ -472,7 +470,7 @@ fun extract_sources {archive_path, destination} =
      ensure_dir stage_dir;
      tar_operation (fn () => HolbuildTar.extract_members
        {archive_path = archive_path, destination = stage_dir,
-        members = members});
+        members = manifest_members @ source_members});
      let
        val manifest = read_text (Path.concat(stage_dir, manifest_member))
          handle IO.Io _ => raise Error ("could not read capsule manifest in " ^ archive_path)

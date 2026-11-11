@@ -75,11 +75,11 @@ with tarfile.open(base) as src, tarfile.open(out, "w", format=tarfile.PAX_FORMAT
             content = data.read().replace(b"name=capsule", b"name=../outside")
             member.size = len(content)
             data = io.BytesIO(content)
-        if kind == "dotslash":
+        if kind == "dotslash" or (kind == "mixed" and member.name.endswith("AScript.sml")):
             member.name = "./" + member.name
             member.pax_headers.pop("path", None)
         dst.addfile(member, data)
-    if kind in locked or kind in ("badname", "dotslash"):
+    if kind in locked or kind in ("badname", "dotslash", "mixed"):
         sys.exit(0)
     extra = tarfile.TarInfo()
     extra.mode = 0o644
@@ -113,7 +113,7 @@ with tarfile.open(base) as src, tarfile.open(out, "w", format=tarfile.PAX_FORMAT
     else:
         dst.addfile(extra)
 PY
-for kind in dotdot absolute symlink hardlink device fifo decoy lockedsource lockedcache badname dotslash; do
+for kind in dotdot absolute symlink hardlink device fifo decoy lockedsource lockedcache badname dotslash mixed; do
   python3 -I "$tmpdir/make-archive.py" "$archives/capsule.hbx" "$archives/$kind.hbx" "$kind"
 done
 python3 -I "$tmpdir/make-archive.py" "$archives/sources.hbx" "$archives/dotslashsources.hbx" dotslash
@@ -244,6 +244,7 @@ val _ = extract "lockedsource" "lockedsource";
 val _ = extract "badname" "badname";
 val _ = extract "dotslash" "dotslash";
 val _ = extract "dotslashsources" "dotslashsources";
+val _ = extract "mixed" "mixed";
 val _ = print "== done\n";
 SML
 work=$tmpdir/extract
@@ -258,7 +259,7 @@ require_grep '^== done$' "$tmpdir/extract.log"
 
 # The snapshot, and only the snapshot, lands in the destination.
 expected_files=$(cd "$project" && find holproject.toml src -type f | LC_ALL=C sort)
-for dest in fresh sources-only decoy empty nested/parent/fresh dotslash dotslashsources; do
+for dest in fresh sources-only decoy empty nested/parent/fresh dotslash dotslashsources mixed; do
   actual_files=$(cd "$work/$dest" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
   if [[ "$actual_files" != "$expected_files" ]]; then
     echo "extracted $dest holds unexpected files:" >&2
