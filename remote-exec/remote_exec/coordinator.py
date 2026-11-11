@@ -473,13 +473,14 @@ CROSS JOIN LATERAL (
 WHERE b.state = 'running' AND b.ahead_cap IS NOT NULL
 ORDER BY b.priority DESC, a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
 """)
-# Lock the best of a batch's candidates ``keys`` that may still be claimed ahead, in AHEAD_CANDIDATES' order, of
-# any of ``tiers``.
+# Lock the best of a batch's candidates ``keys`` that may still be claimed ahead, its tier in the order of ``tiers``,
+# as _claim_ahead orders the batches.
 CLAIM_AHEAD_ACTION = sa.text(f"""
 SELECT a.input_key, a.spec_sha256, a.theory, a.tier FROM actions a
 WHERE a.batch_id = :batch_id AND a.input_key = ANY(CAST(:keys AS text[])) AND a.tier = ANY(CAST(:tiers AS text[]))
 AND {AHEAD_ELIGIBLE}
-ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
+ORDER BY array_position(CAST(:tiers AS text[]), a.tier), a.critical_depth DESC, a.descendant_count DESC, a.theory,
+    a.input_key
 LIMIT 1 FOR UPDATE SKIP LOCKED
 """)
 # The actions of a batch claimed ahead and still waiting for a parent, which count against its ``ahead_cap``.
@@ -982,9 +983,12 @@ class Coordinator:
         and completions. A batch and tier found with nothing to claim are skipped until the next read.
         """
         read = await self._ahead_candidates()
+        # The claim's first tier first, as a plain claim takes it, then the read's order.
         batches = list(dict.fromkeys(
-            batch_id for batch_id, _, tier in read.candidates
-            if tier in tiers and (batch_id, tier) not in read.exhausted
+            batch_id for batch_id, _, tier in sorted(
+                (c for c in read.candidates if c[2] in tiers and (c[0], c[2]) not in read.exhausted),
+                key=lambda c: tiers.index(c[2]),
+            )
         ))
         for batch_id in batches:
             keys = [key for b, key, tier in read.candidates if b == batch_id and tier in tiers]

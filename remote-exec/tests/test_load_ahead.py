@@ -249,7 +249,7 @@ async def test_claims_ahead_sharing_a_read_take_the_deepest_child_of_any_batch_n
     assert [c["theory"] for c in claimed if c is not None] == ["pkg:x", "pkg:z", "pkg:y"]
 
 
-async def test_a_claim_ahead_of_several_tiers_takes_the_deepest_child_whatever_its_tier(
+async def test_a_claim_ahead_of_several_tiers_takes_the_deepest_child_of_its_first_tier_with_one(
     http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
 ) -> None:
     await submit(
@@ -264,5 +264,5 @@ async def test_a_claim_ahead_of_several_tiers_takes_the_deepest_child_whatever_i
     await claim_named(http, "a")
     await claim_named(http, "b")
 
-    claimed = await claim_ahead(http, "high", also_claim=["standard"])
-    assert claimed is not None and claimed["theory"] == "pkg:x"
+    claimed = [await claim_ahead(http, "high", also_claim=["standard"]) for _ in range(3)]
+    assert [c["theory"] for c in claimed if c is not None] == ["pkg:z", "pkg:y", "pkg:x"]
