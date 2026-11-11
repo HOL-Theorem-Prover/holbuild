@@ -363,51 +363,30 @@ fun write_plain_preload load_lines path =
    checkpoint.  The trace was renamed in HOL, so tolerate either spelling. *)
 val child_policy_traces = ["TheoryPP.include_docs", "TheoryPP.include_html_docs"]
 
-fun module_stores () =
-  HolbuildCache.theory_modules_dir
-    (Path.mkAbsolute {path = HolbuildCacheConfig.cache_root (), relativeTo = FS.getDir ()})
-
-(* Each HOL toolchain keeps its modules in its own directory, named by its
-   HOL directory.  A worker may trust any HOL repository, and a toolchain's
-   module writer runs that toolchain's code, so it must not be able to put
-   a module where another toolchain loads from.  On a worker the HOL
-   directory is named by the toolchain's repository, commit and kernel. *)
-fun module_store holdir =
-  Path.concat (module_stores (),
-               HolbuildHash.string_sha256 (Path.mkAbsolute {path = holdir, relativeTo = FS.getDir ()}))
-
-(* Older HOL installations keep their source loader.  Compile [code] only
-   after checking that Meta has the optional [values]. *)
-fun if_meta_has values code =
-  "val _ = case #lookupStruct PolyML.globalNameSpace \"Meta\" of " ^
-  "NONE => () | SOME meta => " ^
-  "if List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents meta)) " ^
-  "[" ^ String.concatWith ", " (map HolbuildToolchain.sml_string values) ^ "] then " ^
-  "CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string code ^ " else ();"
-
-(* The child policy's theory-module lines.  A sandboxed (remote) action
-   only reads the host's modules: the worker writes them
-   (fill_module_store). *)
-fun module_policy {sandboxed, store, base_state} =
-  let
-    val configure =
-      "val _ = Meta.configureTheoryModuleCache {directory = " ^
-      HolbuildToolchain.sml_string store ^ ", base_state = " ^
-      HolbuildToolchain.sml_string base_state ^ "};"
-  in
-    if sandboxed then
-      if_meta_has ["configureTheoryModuleCache", "theoryModuleWriteLimit"]
-        ("val _ = Meta.theoryModuleWriteLimit := 0; " ^ configure)
-    else if_meta_has ["configureTheoryModuleCache"] configure
-  end
-
 (* A speculative child (pipelined builds) configures no theory module cache,
    so nothing it compiles is published there. *)
 fun write_child_policy_with {module_cache = use_module_cache} tc path =
   let
+    val directory = if HolbuildActionSandbox.active () then
+                      (case !(HolbuildActionSandbox.private_roots) of
+                           SOME (root, _) => Path.concat(root, ".holbuild/theory-modules")
+                         | NONE => raise Error "missing sandbox root")
+                    else HolbuildCache.theory_modules_dir
+                      (Path.mkAbsolute {path = HolbuildCacheConfig.cache_root (),
+                                        relativeTo = FS.getDir ()})
+    val configure =
+      "val _ = Meta.configureTheoryModuleCache {directory = " ^
+      HolbuildToolchain.sml_string directory ^ ", base_state = " ^
+      HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^ "};"
+    (* Older HOL installations keep their source loader.  Compile the call
+       only after checking the optional capability in the live namespace. *)
     val module_cache =
-      module_policy {sandboxed = HolbuildActionSandbox.active (), store = module_store (#holdir tc),
-                     base_state = HolbuildToolchain.base_state tc}
+      "val _ = case #lookupStruct PolyML.globalNameSpace \"Meta\" of " ^
+      "NONE => () | SOME meta => " ^
+      "if Option.isSome (#lookupVal (PolyML.NameSpace.Structures.contents meta) " ^
+      "\"configureTheoryModuleCache\") then " ^
+      "CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string configure ^
+      "else ();"
   in
     write_text path
       (String.concat
@@ -443,6 +422,16 @@ fun generated_metadata_report_lines {parents_report, mldeps_report} =
 
 fun export_theory_if_needed_line sig_path =
   "val _ = HolbuildRuntime.export_theory_if_needed " ^ HolbuildToolchain.sml_string sig_path ^ ";"
+
+fun hfs_unmapped_path path =
+  let
+    val {dir, file} = Path.splitDirFile path
+    val {dir = parent, file = leaf} = Path.splitDirFile dir
+  in
+    if leaf = "objs" andalso Path.file parent = ".hol" then
+      Path.concat(Path.dir parent, file)
+    else path
+  end
 
 (* Export now seals a theory in current HOL versions, so the source child
    captures metadata and exports, but never loads the generated theory module. *)
@@ -487,6 +476,15 @@ val pipeline_proof_threads = ref 1
    publishes its outline after the export and then proves them. *)
 fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipelined} =
   let
+    val produce = "Meta.produceTheoryModule " ^
+      HolbuildToolchain.sml_string
+        (hfs_unmapped_path (drop_suffix ".sig" sig_path ^ ".sml")) ^ ";"
+    val module_producer =
+      "val _ = case #lookupStruct PolyML.globalNameSpace \"Meta\" of " ^
+      "NONE => () | SOME meta => " ^
+      "if Option.isSome (#lookupVal (PolyML.NameSpace.Structures.contents meta) " ^
+      "\"produceTheoryModule\") then CompilerSpecific.quietbind " ^
+      HolbuildToolchain.sml_string produce ^ " else ();"
     val lines =
       generated_metadata_report_lines {parents_report = parents_report,
                                        mldeps_report = mldeps_report} @
@@ -499,7 +497,8 @@ fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipeli
           "val _ = HolbuildRuntime.write_text " ^
             HolbuildToolchain.sml_string (stage_finalized_marker (Path.dir path)) ^ " \"\";"]
        else
-         ["val _ = HolbuildRuntime.normalize_theory_export " ^ HolbuildToolchain.sml_string sig_path ^ ";"]) @
+         ["val _ = HolbuildRuntime.normalize_theory_export " ^ HolbuildToolchain.sml_string sig_path ^ ";",
+          module_producer]) @
       [peak_rss_report_line (Path.concat(Path.dir path, peak_rss_report_name))]
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
@@ -10513,108 +10512,6 @@ fun exec_run check_cancelled remote root tc (spec : run_spec) log =
           else raise ActionFailed (PublishFailure, "the remote cache holds different outputs for the run")
   end
 
-(* Whether the writer's output [file] is one of the [expected] modules,
-   each `<theory>-<.dat SHA-1>.pmo`: HOL names them
-   `<base id>-<theory>-<.dat SHA-1>.pmo`, the base id in hex. *)
-fun module_file_wanted expected file =
-  let val (id, rest) = Substring.position "-" (Substring.full file)
-  in
-    Substring.size id > 0 andalso Substring.size rest > 0 andalso
-    CharVector.all Char.isHexDigit (Substring.string id) andalso
-    List.exists (fn e => e = Substring.string (Substring.triml 1 rest)) expected
-  end
-
-(* The most theory modules one worker-run writer saves. *)
-val module_writer_limit = 32
-
-(* A remote action only reads the host's HOL theory modules (the child
-   policy), so that no action can plant one another loads.  Before the
-   action runs, a sandboxed child that runs no project code writes the
-   modules missing from the store for the theories the action loads, from
-   their restored .dat files alone (HOL's Meta.writeTheoryModules), and the
-   worker moves into the store only modules named for those theories'
-   current .dat files.  Each theory is given after its parents: the
-   project's from the spec, the toolchain's beside their objects in its
-   sigobj.  A failure leaves the action to load from .dat files. *)
-fun fill_module_store cache root tc (spec : action_spec) =
-  let
-    val store = module_store (#holdir tc)
-    val project =
-      map (fn {target, stem, ...} =>
-              (theory_name_from_logical (#2 (target_name target)), in_root root stem))
-          (#deps spec)
-    fun toolchain_base name =
-      let val uo = Path.concat (Path.concat (#holdir tc, "sigobj"), name ^ "Theory.uo")
-      in SOME (Path.concat (Path.dir (FS.realPath uo), name ^ "Theory"))
-      end
-      handle OS.SysErr _ => NONE
-    fun base name =
-      case List.find (fn (n, _) => n = name) project of
-          SOME (_, stem) => SOME stem
-        | NONE => toolchain_base name
-    (* Parents first; a name with no files is no theory of this build. *)
-    fun visit (name, (seen, order)) =
-      if List.exists (fn n => n = name) seen then (seen, order)
-      else
-        case base name of
-            NONE => (name :: seen, order)
-          | SOME b =>
-              let
-                val parents =
-                  map #1 (Binarymap.listItems (parse_dat_parent_hashes (read_text (b ^ ".dat"))))
-                val (seen', order') = List.foldl visit (name :: seen, order) parents
-              in
-                (seen', (name, b) :: order')
-              end
-    (* The action's direct HOL theory imports, and its project theories. *)
-    val roots =
-      List.mapPartial
-        (fn LoadTheory name =>
-              if has_suffix "Theory" name then SOME (drop_suffix "Theory" name) else NONE
-          | _ => NONE)
-        (#loads spec) @ map #1 project
-    val theories = rev (#2 (List.foldl visit ([], []) roots))
-    val expected =
-      map (fn (name, b) => name ^ "-" ^ hol_file_sha1 (b ^ ".dat") ^ ".pmo") theories
-    (* HOL maps <dir>/xTheory.sml to <dir>/.hol/objs/xTheory.sml itself,
-       so it is given the unmapped name of a toolchain theory. *)
-    fun hol_name b =
-      let val dir = Path.dir b
-      in
-        if Path.file dir = "objs" andalso Path.file (Path.dir dir) = ".hol"
-        then Path.concat (Path.dir (Path.dir dir), Path.file b)
-        else b
-      end
-    val output = Path.concat (cache, "theory-modules-writer")
-    val script = in_root root ".holbuild/theory-module-writer.sml"
-    val log = in_root root ".holbuild/theory-module-writer.log"
-    val call =
-      "val _ = Meta.writeTheoryModules {theories = [" ^
-      String.concatWith ", " (map (fn (_, b) => HolbuildToolchain.sml_string (hol_name b ^ ".sml")) theories) ^
-      "], directory = " ^ HolbuildToolchain.sml_string store ^
-      ", base_state = " ^ HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^
-      ", output = " ^ HolbuildToolchain.sml_string output ^
-      ", limit = " ^ Int.toString module_writer_limit ^ "};"
-    fun move file =
-      if module_file_wanted expected file then
-        FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)}
-      else ()
-  in
-    if null theories then () else
-    (HolbuildRemoveTree.remove_untrusted output;
-     ensure_dir output;
-     ensure_dir store;
-     write_text script (if_meta_has ["writeTheoryModules"] call ^ "\n");
-     HolbuildActionSandbox.with_output_dirs [output] (fn () =>
-       ignore (HolbuildToolchain.run_in_dir_to_file root
-                 (HolbuildToolchain.hol_subcommand_argv tc "run" @
-                  ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
-                 log));
-     List.app (move o Path.file) (HolbuildCache.children output);
-     HolbuildRemoveTree.remove_untrusted output)
-  end
-  handle e => warn ("theory modules not written: " ^ General.exnMessage e)
-
 (* Tool caches (build --tool-cache NAME).  A theory child may keep files in
    HOLBUILD_TOOL_CACHE_DIR that a later action with the same dependencies and
    toolchain can reuse on any worker: the worker restores them from the
@@ -10749,7 +10646,6 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val root = Path.concat(cache, "action")
     val checkpoint_root = Path.concat(cache, "checkpoints")
     val _ = HolbuildActionSandbox.enable (root, checkpoint_root)
-    val _ = HolbuildActionSandbox.shared_reads := [module_stores ()]
     val _ = HolbuildActionSandbox.result_file :=
               (* Not normalized: the sandbox resolves ".." after links as open does. *)
               Option.map (fn file => if Path.isAbsolute file then file else FS.getDir () ^ "/" ^ file) result_file
@@ -10885,7 +10781,6 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
            "cached")
         else
           let
-            val _ = phase "modules" (fn () => fill_module_store cache root tc spec)
             val action =
               spec_theory_action root spec
                 (case cutoff of SOME {deps_key, ...} => deps_key | NONE => #deps_key spec)

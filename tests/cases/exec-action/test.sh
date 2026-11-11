@@ -349,23 +349,12 @@ worker b "$spec_b"
 expect b 0 "status=built"
 # Its record times the action and its phases.
 require_grep '^wall-ms=[0-9][0-9]*$' "$tmpdir/b.result"
-for phase in hydrate modules hol check; do
+for phase in hydrate hol check; do
   grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/b.result" || {
     echo "b's record lacks phase $phase:" >&2; cat "$tmpdir/b.result" >&2; exit 1; }
 done
 worker c "$spec_c"
 expect c 0 "status=built"
-# Before C's child ran, the worker wrote the modules of the theories it
-# loads into the host's store, which the child itself only reads.
-if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
-  for theory in A B; do
-    compgen -G "$tmpdir/worker-c/theory-modules/*/*-$theory-*.pmo" > /dev/null || {
-      echo "worker c wrote no module for $theory" >&2
-      cat "$tmpdir/c.log" >&2
-      exit 1
-    }
-  done
-fi
 
 # The original checkout restores all three results without building.
 hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; exit 1; }

@@ -4,7 +4,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 source "$ROOT/tests/lib.sh"
 tmpdir=$(make_temp_dir)
 trap 'cleanup_temp_dir "$tmpdir"' EXIT
-mkdir -p "$tmpdir/home/bin" "$tmpdir/home/lib" "$tmpdir/action" "$tmpdir/checkpoints" "$tmpdir/toolchain" "$tmpdir/cache" "$tmpdir/store" "$tmpdir/out"
+mkdir -p "$tmpdir/home/bin" "$tmpdir/home/lib" "$tmpdir/action" "$tmpdir/checkpoints" "$tmpdir/toolchain" "$tmpdir/cache"
 touch "$tmpdir/home/bin/poly" "$tmpdir/home/lib/libpolyml.so"
 cat > "$tmpdir/grants.sml" <<'SML'
 use "sml/holbuild-script.sml";
@@ -24,29 +24,6 @@ val _ = if contains home orelse contains (home ^ "/bin") then
           raise Fail "Poly executable path exposed its whole installation parent" else ();
 val _ = if contains (home ^ "/bin/poly") andalso contains (home ^ "/lib") then ()
         else raise Fail "Poly executable or shared library was not granted";
-(* The host's theory-module store: every child reads it, none writes it;
-   the worker's module writer writes only its own output directory. *)
-fun writes ("--write" :: path :: rest) = path :: writes rest
-  | writes (_ :: rest) = writes rest
-  | writes [] = [];
-val _ = HolbuildActionSandbox.shared_reads := [root ^ "/store"];
-fun launched () =
-  HolbuildActionSandbox.wrap (root ^ "/completed")
-    (HolbuildActionSandbox.action_grants (root ^ "/action", root ^ "/checkpoints")) ["true"];
-val action = launched ();
-val writer = HolbuildActionSandbox.with_output_dirs [root ^ "/out"] launched;
-fun has path paths = List.exists (fn p => p = path) paths;
-val _ = if writes action = [root ^ "/action", root ^ "/checkpoints"] then ()
-        else raise Fail "an action writes more than its roots";
-val _ = if has (root ^ "/store") (reads action) then ()
-        else raise Fail "an action cannot read the module store";
-val _ = if writes writer = [root ^ "/out"] then ()
-        else raise Fail "the module writer writes more than its output directory";
-val _ = if List.all (fn p => has p (reads writer))
-             [root ^ "/action", root ^ "/checkpoints", root ^ "/store"] then ()
-        else raise Fail "the module writer cannot read the action root or the store";
-val _ = if writes (launched ()) = writes action then ()
-        else raise Fail "the writer's grants outlived it";
 SML
 (cd "$ROOT" && env -u HOLBUILD_ACTION_READ_DIRS HOLBUILD_CACHE="$tmpdir/cache" \
   HOLBUILD_SANDBOX_TEST_ROOT="$tmpdir" "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/grants.sml")

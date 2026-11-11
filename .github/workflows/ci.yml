@@ -150,14 +150,17 @@ jobs:
   theory-modules:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      HOLBUILD_TEST_HOL_GIT: https://github.com/SequentAI/HOL.git
+      HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES: https://github.com/SequentAI/HOL.git=sequent
     steps:
       - uses: actions/checkout@v6
 
-      - name: Read theory-module HOL pin
+      - name: Read compiled initializer HOL pin
         id: module-hol4-pin
         run: echo "hol4-ref=$(tr -d '[:space:]' < tests/HOL_THEORY_MODULES_REV)" >> "$GITHUB_OUTPUT"
 
-      # Theory modules need the dependent-module support of the
+      # Compiled initializers need the dependent-module support of the
       # v5.9.2-seq4 runtime; v5.9.2-seq5 leaves it out.
       - uses: ./.github/actions/setup-polyml
         id: polyml
@@ -167,7 +170,7 @@ jobs:
       - name: Configure holbuild test cache
         run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
 
-      - name: Restore theory-module HOL toolchain cache
+      - name: Restore compiled initializer HOL toolchain cache
         id: module-hol-toolchain-cache
         uses: actions/cache/restore@v5
         with:
@@ -177,7 +180,7 @@ jobs:
       - name: Build holbuild
         run: make
 
-      - name: Run theory-module integration tests
+      - name: Run compiled initializer integration tests
         env:
           TMPDIR: ${{ runner.temp }}
           HOLBUILD_TEST_JOBS: '4'
@@ -187,7 +190,7 @@ jobs:
           tests/run.sh theory-modules basic-theory checkpoint-extra-inputs
           checkpoint-recovery exec-action exec-action-share-heaps
 
-      - name: Save theory-module HOL toolchain cache
+      - name: Save compiled initializer HOL toolchain cache
         if: steps.module-hol-toolchain-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
