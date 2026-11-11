@@ -175,6 +175,17 @@ fun package_relative_path field path =
   else path
 fun package_relative_paths field paths = map (package_relative_path field) paths
 
+(* Package-relative path spelled in its canonical form ("./gen/F" is "gen/F"),
+   for paths compared by string equality against discovered sources. *)
+fun canonical_package_relative_path field path =
+  let
+    val path = package_relative_path field path
+    val canonical = Path.mkCanonical path handle Path.InvalidArc => path
+  in
+    if canonical = "" orelse canonical = "." then die (field ^ " must name a file: " ^ path)
+    else canonical
+  end
+
 fun has_suffix suffix s =
   let val n = size s val m = size suffix
   in n >= m andalso String.substring(s, n - m, m) = suffix end
