@@ -2235,7 +2235,8 @@ async def test_cache_ring_read_fallback(
     expected = (True if secondary == 200 else None if secondary == 403
                 else False if 404 in (primary, secondary) else None)
     assert result is expected
-    assert asked == ranked[:2]
+    # A miss asks every node; a hit or a refusal stops the walk.
+    assert asked == (ranked[:2] if secondary in (200, 403) else ranked)
     if expected is not None:
         assert not caplog.records
     else:

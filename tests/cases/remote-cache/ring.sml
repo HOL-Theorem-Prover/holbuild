@@ -149,7 +149,28 @@ val _ = assert "two weak replicas do not hide a strict third"
   (RC.get_action_using timed replicas theory_key = SOME (theory_manifest "10.0"));
 val _ = RC.remove_file (stored first "ac" theory_ac);
 val _ = RC.remove_file (stored second "ac" theory_ac);
-val _ = assert "ordinary misses remain bounded to two replicas" (RC.get_action replicas theory_key = NONE);
+val _ = assert "a miss walks the whole ring" (RC.get_action replicas theory_key = SOME (theory_manifest "10.0"));
+val _ = RC.remove_file (stored third "ac" theory_ac);
+val _ = assert "missing everywhere is a miss" (RC.get_action replicas theory_key = NONE);
+
+(* A preferred node takes writes and is read first; the rest keep rendezvous order. *)
+val _ = HolbuildRemoteCacheConfig.set_preferred_urls (authenticated third);
+val _ = assert "preferred node ranks first"
+  (RC.ranked_urls replicas theory_ac = [third, first, second]);
+val preferred_text = "written near";
+val preferred_hash = HolbuildHash.string_sha256 preferred_text;
+val _ = RC.write_text src preferred_text;
+val _ = assert "PUT goes to the preferred node"
+  (publish replicas preferred_hash = CB.Published andalso
+   RC.path_exists (stored third "cas" preferred_hash) andalso
+   not (RC.path_exists (stored first "cas" preferred_hash)) andalso
+   not (RC.path_exists (stored second "cas" preferred_hash)));
+val _ = HolbuildRemoteCacheConfig.set_preferred_urls (one ^ "," ^ two);
+val _ = assert "a reader preferring other nodes still finds it"
+  (fetch replicas preferred_hash = CB.Hit andalso RC.read_text dst = preferred_text);
+val _ = HolbuildRemoteCacheConfig.set_preferred_urls "";
+val _ = assert "no preference keeps rendezvous order"
+  (RC.ranked_urls replicas theory_ac = [first, second, third]);
 
 val _ = seed first (theory_manifest "10.0");
 val _ = seed second (theory_manifest "none");

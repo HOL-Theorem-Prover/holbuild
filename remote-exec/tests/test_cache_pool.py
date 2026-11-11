@@ -87,6 +87,19 @@ async def test_concurrent_controllers_claim_four_distinct_slots_and_refuse_fifth
     assert "instance-4" not in {r.owner for r in rows}
 
 
+async def test_zoned_slots_go_only_to_instances_in_their_zone(pool: CachePool) -> None:
+    p = provider(pool)
+    zoned = CachePool(pool.engine, [CacheSlot(name=str(n), url=f"https://cache-{n}.example", zone=zone)
+                                    for n, zone in ((4, "a"), (5, "b"), (6, "c"))], p, drain_seconds=60)
+    p.instances = [Instance(id="first-in-c", state="launching", zone="c"),
+                   Instance(id="second-in-c", state="launching", zone="c"),
+                   Instance(id="in-a", state="launching", zone="a")]
+    await zoned.reconcile(p.now)
+    async with pool.engine.connect() as conn:
+        rows = dict((await conn.execute(sa.text("SELECT owner,slot FROM cache_slots"))).all())
+    assert rows == {"first-in-c": "6", "in-a": "4"}
+
+
 async def test_no_discovery_until_readiness_and_launch_hook_not_completed_before_probe(pool: CachePool) -> None:
     p = provider(pool)
     p.instances = [Instance(id="a", state="launching")]
