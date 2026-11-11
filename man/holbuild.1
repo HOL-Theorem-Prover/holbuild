@@ -658,6 +658,13 @@ Hash every source file instead of trusting an unchanged file status.
 .B \-\-skip\-checkpoints
 Do not create checkpoints.
 .TP
+.BI \-\-checkpoint\-seconds " SECONDS"
+Save a theorem or definition context checkpoint only once
+.I SECONDS
+(default 2), and ten times the last such save's duration, have passed since
+that save; 0 saves every context.
+Remote workers use the same value, and no cache key depends on it.
+.TP
 .B \-\-all\-checkpoints
 All root-package theories save checkpoints by default, except a theory that
 is not a target and that a parallel build pipelines into an idle slot.
