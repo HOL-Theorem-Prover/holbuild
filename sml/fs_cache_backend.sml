@@ -96,14 +96,104 @@ fun action_dir cache key = Path.concat(actions_dir cache, key)
 fun action_manifest cache key = Path.concat(action_dir cache key, "manifest")
 fun blob_path cache hash = Path.concat(blobs_dir cache, hash)
 
+(* Automatic GC triggers on the bytes written into a cache since its last GC:
+   the sum of the root's journal, where each command that wrote appends one
+   line at exit, plus what this process has written and not yet appended.
+   Every GC replaces the journal with 0. *)
+val growth = ref (Redblackmap.mkDict String.compare : (string, Position.int) Redblackmap.dict)
+val growth_lock = Mutex.mutex ()
+
+fun with_growth f =
+  (Mutex.lock growth_lock;
+   (f () before Mutex.unlock growth_lock) handle e => (Mutex.unlock growth_lock; raise e))
+
+fun add_growth cache bytes =
+  with_growth (fn () =>
+    growth := Redblackmap.insert (!growth, root cache,
+                                   bytes + Option.getOpt (Redblackmap.peek (!growth, root cache), 0)))
+
+fun take_growth root =
+  with_growth (fn () =>
+    case Redblackmap.peek (!growth, root) of
+        NONE => 0
+      | SOME bytes => (growth := #1 (Redblackmap.remove (!growth, root)); bytes))
+
+fun growth_journal cache = Path.concat(locks_dir cache, "gc-growth.journal")
+
+(* One short O_APPEND write per command, so concurrent commands need no lock;
+   a line lost to a concurrent reset only delays the next trigger. *)
+fun flush_growth () =
+  let
+    val pending = with_growth (fn () => Redblackmap.listItems (!growth) before
+                                         growth := Redblackmap.mkDict String.compare)
+    fun append (root, bytes) =
+      let
+        val path = growth_journal (filesystem root)
+        val _ = ensure_parent path
+        val output = TextIO.openAppend path
+      in
+        TextIO.output (output, Position.toString bytes ^ "\n") handle e => (TextIO.closeOut output; raise e);
+        TextIO.closeOut output
+      end
+      handle IO.Io _ => () | OS.SysErr _ => ()
+  in
+    List.app append (List.filter (fn (_, bytes) => bytes > 0) pending)
+  end
+
+fun growth_since_gc cache =
+  let
+    val journal =
+      List.foldl (fn (line, sum) => sum + Option.getOpt (Position.fromString line, 0))
+                 0 (String.tokens (fn c => c = #"\n") (read_text (growth_journal cache)))
+      handle IO.Io _ => 0
+  in
+    journal + with_growth (fn () => Option.getOpt (Redblackmap.peek (!growth, root cache), 0))
+  end
+
+fun reset_growth cache =
+  (ignore (take_growth (root cache)); write_text (growth_journal cache) "0\n")
+
+val manifest_growth_bytes : Position.int = 1048576
+
 fun ensure_layout cache =
   (ensure_dir (actions_dir cache); ensure_dir (blobs_dir cache); ensure_dir (tmp_dir cache))
 
-fun write_action cache {key, text} = write_text (action_manifest cache key) text
+fun take_token s =
+  let
+    fun loop i =
+      if i >= size s then i
+      else
+        case String.sub(s, i) of
+            #" " => i
+          | #"\t" => i
+          | #"\n" => i
+          | _ => loop (i + 1)
+  in
+    String.substring(s, 0, loop 0)
+  end
+
+fun blob_ref line =
+  case String.tokens Char.isSpace line of
+      ["blob", _, hash] => SOME hash
+    | _ =>
+        if String.isPrefix "blob=" line then SOME (take_token (String.extract(line, 5, NONE)))
+        else NONE
+
+fun touch path = FS.setTime(path, NONE) handle OS.SysErr _ => ()
+
+(* GC snapshots the blobs live manifests reference, then sweeps unreferenced
+   blobs older than its cutoff. A build that reuses an old blob does not
+   rewrite it, so its manifest, if written after the snapshot, would not keep
+   the blob from the sweep. Refreshing each referenced blob first does. *)
+fun write_action cache {key, text} =
+  (List.app (fn line => Option.app (touch o blob_path cache) (blob_ref line))
+            (String.tokens (fn c => c = #"\n") text);
+   write_text (action_manifest cache key) text;
+   add_growth cache manifest_growth_bytes)
 
 fun remove_action cache key = remove_file (action_manifest cache key)
 
-fun touch_action cache key = FS.setTime(action_manifest cache key, NONE) handle OS.SysErr _ => ()
+fun touch_action cache key = touch (action_manifest cache key)
 
 fun get_action cache key =
   SOME (read_text (action_manifest cache key)) handle _ => NONE
@@ -162,7 +252,8 @@ fun publish_blob cache {hash, src} =
     if verify_blob cache hash then HolbuildCacheBackend.AlreadyPresent
     else
       (copy_binary src blob;
-       if verify_blob cache hash then HolbuildCacheBackend.Published
+       if verify_blob cache hash then
+         (add_growth cache (FS.fileSize blob); HolbuildCacheBackend.Published)
        else HolbuildCacheBackend.Conflict blob)
   end
   handle Error msg => HolbuildCacheBackend.Conflict msg
@@ -176,6 +267,7 @@ fun consume_verified_blob cache (request as {hash, src}) =
   in
     (ensure_parent blob;
      FS.rename {old = src, new = blob};
+     add_growth cache (FS.fileSize blob);
      HolbuildCacheBackend.Published)
     handle e as OS.SysErr (_, SOME err) =>
       if err = Posix.Error.xdev then publish_blob cache request

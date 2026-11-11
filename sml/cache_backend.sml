@@ -50,6 +50,8 @@ sig
   val action_dir : t -> string -> string
   val action_manifest : t -> string -> string
   val blob_path : t -> string -> string
+  (* The blob hash a manifest line references, if any. *)
+  val blob_ref : string -> string option
 
   val copy_binary : string -> string -> unit
   val link_or_copy : {src : string, dst : string} -> unit
@@ -67,4 +69,12 @@ sig
   val with_action_publish_lock : t -> string -> (unit -> 'a) -> (unit -> 'a) -> 'a
   (* Waits for a concurrent publisher before running the callback. *)
   val with_action_publish_lock_wait : t -> string -> (unit -> 'a) -> 'a
+
+  (* Bytes written into the cache since its last GC, counting this process's
+     writes not yet flushed. *)
+  val growth_since_gc : t -> Position.int
+  (* Appends this process's writes to each cache's growth journal. *)
+  val flush_growth : unit -> unit
+  (* Called by every cache GC: the cache counts as just collected. *)
+  val reset_growth : t -> unit
 end

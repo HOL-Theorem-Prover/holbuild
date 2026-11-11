@@ -28,9 +28,9 @@ The same holbuild executable supports the current HOL pin in `vendor/hol/REV`
 and the legacy compatibility floor recorded in `tests/HOL_LEGACY_TACTICS_REV`
 (`e395eb6e69054ff6f7cef9d1107fd1a04dd5848f`). CI covers those two revisions;
 this is not a guarantee for every intervening or future HOL commit.
-Compiled initializer integration is also checked against the public HOL fork
-revision in `tests/HOL_THEORY_MODULES_REV`, which includes the optional loader
-API; the main and legacy jobs continue checking source-loader compatibility.
+Theory-module loading is also checked against the HOL revision in
+`tests/HOL_THEORY_MODULES_REV`, which includes the optional loader API; the
+main and legacy jobs continue checking `.dat`-loader compatibility.
 
 Compatibility boundaries select implementations by the installed HOL API,
 not branch names or revision ordering. In particular, the analyser retains its
@@ -39,12 +39,13 @@ constructor shapes, before and after HOL added combinator-token spans. Small
 adapter tests cover both shapes without adding a third HOL toolchain to CI.
 The new token annotations do not change existing proof-step labels or extents.
 
-On HOL and Poly/ML versions supporting compiled theory initializers, holbuild
-automatically caches their compiled code under `<cache root>/theory-modules`.
-Loading a cached initializer still reads the theory data, registers its types,
-constants and theorems, and runs its load hooks in the usual dependency order.
-ML libraries retain their usual source-loading behavior. Older toolchains and
-missing or incompatible module files use the source loader automatically.
+On HOL and Poly/ML versions supporting theory modules, holbuild
+automatically keeps each loaded theory's decoded data in a module under
+`<cache root>/theory-modules/<toolchain>`, so later loads skip reading its `.dat` file.
+Loading a module still registers the theory's types, constants and theorems
+and runs its load hooks in the usual dependency order. ML libraries retain
+their usual source-loading behavior. Older toolchains and missing or
+incompatible module files load from the `.dat` file automatically.
 
 These module files belong to one exact HOL saved state. They stay in the local
 cache, including on remote workers, and do not change portable theory artifacts
@@ -78,7 +79,9 @@ holbuild --version
 
 Keep the extracted directory together: `bin/holbuild` loads runtime and
 analyser sources from `share/holbuild`. You can move the directory or symlink
-the executable into a directory already on `PATH`.
+the executable into a directory already on `PATH`. The manual page is
+`share/man/man1/holbuild.1`; read it with `man -l share/man/man1/holbuild.1`,
+or put `share/man` on `MANPATH` and run `man holbuild`.
 
 The executable includes the Poly/ML runtime, so running it does not require
 an installed Poly/ML. Building HOL toolchains still requires `poly` and
@@ -132,15 +135,40 @@ By default this installs to:
 
 ```text
 $HOME/.local/bin/holbuild
+$HOME/.local/share/man/man1/holbuild.1
 ```
 
-You can override the destination with `PREFIX`, `BINDIR`, or `DESTDIR`.
+`man holbuild` finds the manual page when `$HOME/.local/share/man` is on the
+manpath (most systems add it when it exists). The page lists every command,
+option and environment variable.
+
+You can override the destination with `PREFIX`, `BINDIR`, `MANDIR`, or `DESTDIR`.
 Installation also places runtime sources and notices in
 `$PREFIX/share/holbuild`; keep that directory beside `$PREFIX/bin` when moving
 an installation.
 Custom `BINDIR`/`DATADIR` layouts are also supported: `make install` rebuilds
 the executable with that data path. Keep custom data at the configured path;
 use the standard layout for an installation that can move as a directory.
+
+`make install` also installs shell completion for Bash, Zsh and Fish, under
+`$PREFIX/share` (`BASHCOMPDIR`, `ZSHCOMPDIR` and `FISHCOMPDIR` override each
+directory). Bash with bash-completion, and Fish, load it from there when
+`$PREFIX` is `$HOME/.local` or `/usr/local`. Zsh needs the directory on its
+`fpath` before `compinit`, in `~/.zshrc`:
+
+```sh
+fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+autoload -Uz compinit && compinit
+```
+
+To use the completion from a checkout instead, source
+`completions/holbuild.bash` in Bash, add `completions/` to Zsh's `fpath`, or
+source `completions/holbuild.fish` in Fish. It completes commands, options,
+option values, build targets, `@group` names, theory names, heap and
+executable names, reading the project in the current directory (or the one
+`--source-dir` names) and the dependencies already on disk. It never builds,
+fetches or locks anything. Where it has nothing to offer, the shell completes
+file names.
 
 ## A minimal project
 
@@ -1280,9 +1308,16 @@ For each `/ac/<digest>` or `/cas/<digest>` request, nodes rank by descending
 SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie). Only the first two
 nodes are tried. Reads try the second node after a 404, connection failure,
 timeout, 429 or 5xx; writes do so after a connection failure, timeout, 429 or
-5xx. A theory's `/ac` read also tries the second node when the first one's
+5xx. A theory's `/ac` read also tries the next node when the first one's
 entry was built under a weaker tactic-timeout contract than the build asks for,
-so a stale replica can't hide a stronger entry on the other node. A write whose nodes all failed without an HTTP response (an unresolvable
+continuing through the current ring after such a rejected entry. Ordinary
+404 misses remain bounded to two nodes. When publishing or confirming an
+existing timed theory, workers also strengthen older compatible manifests on
+reachable replicas, so a reader with a narrower cache view can restore the
+result. This repair preserves stronger contracts, does not create missing
+replicas, and never changes manifests whose outputs differ. Secondary repair
+failures warn without failing successful primary publication; timeout checks
+still apply on every restore. A write whose nodes all failed without an HTTP response (an unresolvable
 name, no connection, a timeout) goes on down the ranking until a node answers,
 so one more healthy node takes it. A single-node list keeps the ordinary single-cache behavior. A successful
 backup keeps the ring available; the circuit breaker below counts the final
@@ -1741,7 +1776,10 @@ with no `log` (a spec rejected before any HOL ran, say) gives its message in
 For a run, `input-key` is its run key and `built` means it ran.
 `phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
 cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
-dependencies), `cutoff` (whether an earlier build stands), `restore` (shared
+dependencies; its steps follow it, and are part of it: `hydfiles` the
+sources and libraries, `hyddeps` restoring the dependencies, `hydstale`
+probing the remote cache for stale dependency copies, `hydmisfit` checking
+the dependencies against their parents), `cutoff` (whether an earlier build stands), `restore` (shared
 checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
 checks) and `log`; stderr ends with the same times and `wall`.
@@ -1905,7 +1943,8 @@ theory in the batch depends on one, holbuild publishes its local cache entry
 there first; it goes in the batch only when it has no usable local entry or
 the publish fails. `--detach` follows no local build, so it checks and
 submits such theories like any other. What these checks and the source
-uploads find the remote cache to hold is kept in `.holbuild/remote-ledger/`,
+uploads find the remote cache to hold is kept in the cache root's
+`remote-ledger/`, shared by every project and worktree using that cache root,
 so a later build doesn't ask again.
 
 The build never waits on remote execution alone. If the closure can't run
@@ -2231,11 +2270,11 @@ env -u HOLDIR -u HOLBUILD_HOLDIR \
   HOLBUILD_TEST_HOL_REV=<full-40-character-commit> make test
 ```
 
-The focused `theory-modules` CI job selects the public HOL fork with
-`HOLBUILD_TEST_HOL_GIT` and the commit in `tests/HOL_THEORY_MODULES_REV`.
+The focused `theory-modules` CI job tests the HOL commit in
+`tests/HOL_THEORY_MODULES_REV`.
 It sets `HOLBUILD_TEST_REQUIRE_THEORY_MODULES=1` so an unsupported toolchain
-fails this job instead of checking only the source fallback. The ordinary
-suite also runs the same case on its default HOL revision, where the source
+fails this job instead of checking only the `.dat` fallback. The ordinary
+suite also runs the same case on its default HOL revision, where the `.dat`
 fallback remains valid.
 
 ## Release process

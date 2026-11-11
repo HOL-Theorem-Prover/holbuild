@@ -117,6 +117,7 @@ jobs:
           test -s "$root/share/holbuild/copyrights/smlnj.txt"
           test -s "$root/share/holbuild/copyrights/polyml-LGPL-2.1.txt"
           test -s "$root/share/holbuild/sml/holbuild_runtime.sml"
+          test -s "$root/share/man/man1/holbuild.1"
           if [[ "$PLATFORM" == linux-* ]]; then
             ldd "$root/bin/holbuild" | tee dependencies.txt
             if grep -E 'libpolyml|libgmp|not found' dependencies.txt; then
