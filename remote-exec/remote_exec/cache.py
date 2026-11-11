@@ -22,10 +22,17 @@ def cache_nodes(text: str) -> list[str]:
     return nodes
 
 
-def ranked_nodes(nodes: list[str], digest: str) -> list[str]:
-    """Descending SHA256(identity + ':' + digest), then ascending identity, as in SML."""
+def preferred_identities(text: str | None) -> frozenset[str]:
+    """Identities of the nodes in a HOLBUILD_REMOTE_CACHE_PREFERRED_URLS value; empty when it is unset or empty."""
+    return frozenset(node_identity(url) for url in cache_nodes(text)) if text and text.strip() else frozenset()
+
+
+def ranked_nodes(nodes: list[str], digest: str, preferred: frozenset[str] = frozenset()) -> list[str]:
+    """Preferred nodes first, then the rest; each group by descending SHA256(identity + ':' + digest), then
+    ascending identity, as in SML."""
     if len(nodes) == 1:
         return nodes
-    scored = [(hashlib.sha256(f"{node_identity(url)}:{digest}".encode()).hexdigest(), node_identity(url), url)
+    scored = [(node_identity(url) not in preferred, -int(hashlib.sha256(f"{node_identity(url)}:{digest}".encode())
+                                                             .hexdigest(), 16), node_identity(url), url)
               for url in nodes]
-    return [url for _, _, url in sorted(scored, key=lambda item: (-int(item[0], 16), item[1]))]
+    return [url for *_, url in sorted(scored)]

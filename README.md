@@ -1315,13 +1315,18 @@ the HTTP request retains its full URL. Every client and worker must use the same
 and node set; different public/private hostnames give different rankings.
 
 For each `/ac/<digest>` or `/cas/<digest>` request, nodes rank by descending
-SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie). Only the first two
-nodes are tried. Reads try the second node after a 404, connection failure,
-timeout, 429 or 5xx; writes do so after a connection failure, timeout, 429 or
-5xx. A theory's `/ac` read also tries the next node when the first one's
-entry was built under a weaker tactic-timeout contract than the build asks for,
-continuing through the current ring after such a rejected entry. Ordinary
-404 misses remain bounded to two nodes. When publishing or confirming an
+SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie).
+`HOLBUILD_REMOTE_CACHE_PREFERRED_URLS`, a comma-separated list of ring nodes,
+moves those nodes to the front, each group keeping that order: a client in
+one data center can name the replicas there, so it writes to them and reads
+from them first. Reads try the next node after a 404, connection failure,
+timeout, 429 or 5xx, through the whole ring: a node writes a new entry to the
+shared backing store only after answering the PUT, so until then a reader that
+prefers another node finds it only on the writer's node. A genuine miss costs
+one 404 per node. Writes try the second node after a connection failure,
+timeout, 429 or 5xx. A theory's `/ac` read also tries the next node when the
+first one's entry was built under a weaker tactic-timeout contract than the
+build asks for. When publishing or confirming an
 existing timed theory, workers also strengthen older compatible manifests on
 reachable replicas, so a reader with a narrower cache view can restore the
 result. This repair preserves stronger contracts, does not create missing
@@ -1331,10 +1336,11 @@ still apply on every restore. A write whose nodes all failed without an HTTP res
 name, no connection, a timeout) goes on down the ranking until a node answers,
 so one more healthy node takes it. A single-node list keeps the ordinary single-cache behavior. A successful
 backup keeps the ring available; the circuit breaker below counts the final
-outcome of a request. If neither node hits, a 404 from either node gives a miss, even if the
-other node failed transiently; this allows a new action to build and publish
-on the healthy node. Two transient failures remain unavailable. Replicas should share a backing store: the second
-node covers handoff while a newly added node cannot yet see a recent upload.
+outcome of a request. If no node hits, a 404 from any node gives a miss, even if
+others failed transiently; this allows a new action to build and publish on a
+healthy node. Transient failures from every node remain unavailable. Replicas
+should share a backing store, so that any node can serve an entry another node
+wrote once it is uploaded.
 
 Remote cache misses or errors fall back to the local cache/source build path.
 A request waits at most 5 s for its connection. After three requests in a row
