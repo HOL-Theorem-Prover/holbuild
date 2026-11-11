@@ -1949,8 +1949,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (fn () => run_with_stat_cache (export_run_specs request))
       | RemoteRun run => remote_run run ()
       | BuildTargets =>
-          if dry_run then run_with_stat_cache describe_dry_run
-          else HolbuildBuildExec.with_project_lock project "build" (fn () => run_with_stat_cache execute_build)
+          HolbuildBuildExec.with_project_lock project (if dry_run then "dry-run" else "build")
+            (fn () => run_with_stat_cache (if dry_run then describe_dry_run else execute_build))
       | RemoteExec remote =>
           HolbuildBuildExec.with_project_lock project "build"
             (fn () => run_with_stat_cache (fn () => remote_build remote))
