@@ -65,9 +65,14 @@ import sys
 import tarfile
 
 base, out, kind = sys.argv[1:]
+locked = {"lockedsource": "holbuild-package/source", "lockedcache": "holbuild-cache"}
 with tarfile.open(base) as src, tarfile.open(out, "w", format=tarfile.PAX_FORMAT) as dst:
     for member in src.getmembers():
+        if member.name == locked.get(kind):
+            member.mode = 0
         dst.addfile(member, src.extractfile(member) if member.isfile() else None)
+    if kind in locked:
+        sys.exit(0)
     extra = tarfile.TarInfo()
     extra.mode = 0o644
     prefix = "holbuild-package/source/"
@@ -100,7 +105,7 @@ with tarfile.open(base) as src, tarfile.open(out, "w", format=tarfile.PAX_FORMAT
     else:
         dst.addfile(extra)
 PY
-for kind in dotdot absolute symlink hardlink device fifo decoy; do
+for kind in dotdot absolute symlink hardlink device fifo decoy lockedsource lockedcache; do
   python3 -I "$tmpdir/make-archive.py" "$archives/capsule.hbx" "$archives/$kind.hbx" "$kind"
 done
 
@@ -176,6 +181,17 @@ for kind in dotdot absolute symlink hardlink device fifo; do
   tree "$archives" | diff -u "$tmpdir/archives-$kind.before" -
 done
 
+# A directory without owner access must not outlive the failure: the cache
+# part unreadable fails the import, and the staging tree is still removed.
+mkdir -p "$tmpdir/work-lockedcache"
+tree "$tmpdir/work-lockedcache" > "$tmpdir/work-lockedcache.before"
+tree "$archives" > "$tmpdir/archives-lockedcache.before"
+expect_failure import-lockedcache "could not read cache archive manifest" \
+  env -C "$tmpdir/work-lockedcache" HOLBUILD_CACHE="$tmpdir/import-lockedcache-cache" \
+    "$HOLBUILD_BIN" import "$archives/lockedcache.hbx"
+tree "$tmpdir/work-lockedcache" | diff -u "$tmpdir/work-lockedcache.before" -
+tree "$archives" | diff -u "$tmpdir/archives-lockedcache.before" -
+
 # extract_sources, called directly: the module is internal.
 cat > "$tmpdir/extract-test.sml" <<'SML'
 fun env name =
@@ -209,6 +225,7 @@ val _ = extract "capsule" "nested/parent/fresh";
 val _ = extract "closure" "closure";
 val _ = List.app (fn kind => extract kind kind)
   ["dotdot", "absolute", "symlink", "hardlink", "device", "fifo"];
+val _ = extract "lockedsource" "lockedsource";
 val _ = print "== done\n";
 SML
 work=$tmpdir/extract
@@ -250,6 +267,8 @@ for kind in dotdot absolute symlink hardlink device fifo; do
   require_grep "^error $kind: $(member_pattern "$kind")" "$tmpdir/extract.log"
   require_no_file "$work/$kind"
 done
+require_grep "^error lockedsource: could not install capsule source at " "$tmpdir/extract.log"
+require_no_file "$work/lockedsource"
 require_no_file /tmp/holbuild-absolute-escape.txt
 require_no_file "$work/escape.txt"
 tree "$archives" | diff -u "$tmpdir/archives.before" -

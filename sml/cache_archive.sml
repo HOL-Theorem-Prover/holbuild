@@ -35,8 +35,10 @@ fun ensure_dir path =
 
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 
+(* Archives can hold a directory without owner access, so staging trees are
+   removed as untrusted ones. *)
 fun remove_tree path =
-  HolbuildRemoveTree.remove path handle HolbuildRemoveTree.Error msg => raise Error msg
+  HolbuildRemoveTree.remove_untrusted path handle HolbuildRemoveTree.Error msg => raise Error msg
 
 fun read_text path =
   let val input = TextIO.openIn path
@@ -345,11 +347,9 @@ fun create {archive_path, source, keys} =
 
 fun capsule_manifest_path stage_dir = Path.concat(Path.concat(stage_dir, package_part), "manifest")
 
-(* A capsule without a cache part holds no actions. *)
-fun is_package_only stage_dir =
-  not (path_exists (manifest_path (Path.concat(stage_dir, payload_dir)))) andalso
-  (String.isPrefix (capsule_format ^ "\n") (read_text (capsule_manifest_path stage_dir))
-   handle _ => false)
+fun is_capsule stage_dir =
+  String.isPrefix (capsule_format ^ "\n") (read_text (capsule_manifest_path stage_dir))
+  handle _ => false
 
 (* The members of an archive that holds `part` itself or anything under it. *)
 fun has_part names part =
@@ -377,8 +377,9 @@ fun with_entries {archive_path, f} =
      else tar_operation (fn () => HolbuildTar.extract_members
             {archive_path = archive_path, destination = stage_dir, members = wanted});
      let
+       (* A capsule without a cache part holds no actions. *)
        val keys =
-         if is_package_only stage_dir then []
+         if not (has_part names payload_dir) andalso is_capsule stage_dir then []
          else action_keys_from_manifest (require_manifest payload)
      in
        f {source = fs_source cache, keys = keys} before cleanup ()
