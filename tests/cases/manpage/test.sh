@@ -30,7 +30,8 @@ commands=$(sed -n '/^val command_names =/,/\]/p' "$ROOT/sml/commands.sml" | grep
 {
   grep -Eo -- '(^|[^-A-Za-z0-9])--[a-z][a-z-]*' "$tmpdir/help.txt" | sed -E 's/^[^-]*//'
   grep -o '"--[a-z][a-z-]*"' "$ROOT/sml/commands.sml" | tr -d '"'
-  printf '%s\n' -j -o -h
+  grep -o '"-[A-Za-z]"' "$ROOT/sml/commands.sml" | tr -d '"'
+  grep -Eo -- '(^|[[:space:]\[,])-[A-Za-z]([^-A-Za-z0-9]|$)' "$tmpdir/help.txt" | grep -Eo -- '-[A-Za-z]'
 } | sort -u > "$tmpdir/flags.txt"
 grep -Eo 'HOLBUILD_[A-Z_]+' "$tmpdir/help.txt" | sort -u > "$tmpdir/env.txt"
 
