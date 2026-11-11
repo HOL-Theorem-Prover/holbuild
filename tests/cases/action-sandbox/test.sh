@@ -30,9 +30,11 @@ fun writes ("--write" :: path :: rest) = path :: writes rest
   | writes (_ :: rest) = writes rest
   | writes [] = [];
 val _ = HolbuildActionSandbox.shared_reads := [root ^ "/store"];
-val action = HolbuildActionSandbox.wrap (root ^ "/completed") ["true"];
-val writer = HolbuildActionSandbox.with_output_dirs [root ^ "/out"]
-               (fn () => HolbuildActionSandbox.wrap (root ^ "/completed") ["true"]);
+fun launched () =
+  HolbuildActionSandbox.wrap (root ^ "/completed")
+    (HolbuildActionSandbox.action_grants (root ^ "/action", root ^ "/checkpoints")) ["true"];
+val action = launched ();
+val writer = HolbuildActionSandbox.with_output_dirs [root ^ "/out"] launched;
 fun has path paths = List.exists (fn p => p = path) paths;
 val _ = if writes action = [root ^ "/action", root ^ "/checkpoints"] then ()
         else raise Fail "an action writes more than its roots";
@@ -43,8 +45,7 @@ val _ = if writes writer = [root ^ "/out"] then ()
 val _ = if List.all (fn p => has p (reads writer))
              [root ^ "/action", root ^ "/checkpoints", root ^ "/store"] then ()
         else raise Fail "the module writer cannot read the action root or the store";
-val _ = if writes (HolbuildActionSandbox.wrap (root ^ "/completed") ["true"]) =
-           writes action then ()
+val _ = if writes (launched ()) = writes action then ()
         else raise Fail "the writer's grants outlived it";
 SML
 (cd "$ROOT" && env -u HOLBUILD_ACTION_READ_DIRS HOLBUILD_CACHE="$tmpdir/cache" \

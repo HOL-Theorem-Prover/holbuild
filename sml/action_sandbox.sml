@@ -263,19 +263,17 @@ fun confined grants argv execute =
 (* The theory action: its private roots are what the worker harvests.
    Under with_output_dirs (the worker's module writer), the child writes
    only those directories and reads the roots. *)
+fun action_grants (root, checkpoints) : grants =
+  case !output_dirs of
+      NONE => {writable = [root, checkpoints], readable = [], toolchain = false}
+    | SOME dirs => {writable = dirs, readable = [root, checkpoints], toolchain = false}
+
 fun launch argv execute =
   case !private_roots of
       NONE => execute argv
-    | SOME (root, checkpoints) =>
-        let
-          val grants =
-            case !output_dirs of
-                NONE => {writable = [root, checkpoints], readable = [], toolchain = false}
-              | SOME dirs => {writable = dirs, readable = [root, checkpoints], toolchain = false}
-        in
-          (outputs_validated := false;
-           confined grants argv execute before outputs_validated := true)
-        end
+    | SOME roots =>
+        (outputs_validated := false;
+         confined (action_grants roots) argv execute before outputs_validated := true)
 
 (* Runs the shell script SCRIPT work, with a fresh work directory WORK as its
    first writable root (its HOME and TMPDIR), through RUN, a runner of trusted
