@@ -142,7 +142,7 @@ at 1999 "$cache/theory-modules/old.pmo"
 # 10 GB in all; a 6 GB cap with a 1 GB reserve leaves room for 5 GB, which
 # evicting everything but the pinned toolchain and the newest checkpoints
 # reaches (4 GB).
-start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 absent=$(printf absent | sha256sum | cut -d' ' -f1)
 set +e
 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" --result "$tmpdir/result" \
@@ -292,6 +292,75 @@ sweep4 100 1
 (( $(date +%s) - started < 20 )) || { echo "the refresh waited for gc.lock" >&2; exit 1; }
 kill "$holder"; wait "$holder" 2>/dev/null || true
 cmp "$state" "$tmpdir/aged-state" || { echo "the refresh scanned while gc.lock was held" >&2; exit 1; }
+# An idle host can defer an expired fitting estimate, but only after waiting
+# for GC. Hold the separate scan lock to observe the grace before the
+# post-result refresh replaces it.
+python3 - "$HOLBUILD_BIN" "$cache4" "$remote_url" "$absent" "$tmpdir" <<'GRACE'
+import fcntl, os, pathlib, subprocess, sys, time
+
+binary, cache, remote, absent, tmp = sys.argv[1:]
+locks = pathlib.Path(cache) / "locks"
+state = locks / "worker-cache-cap.state"
+grace = locks / "worker-cache-cap.grace"
+lines = state.read_text().splitlines()
+lines[1] = str(time.time_ns() - 2 * 3600 * 10**9)
+original = "\n".join(lines) + "\n"
+state.write_text(original)
+command = [binary, "--remote-cache", remote, "exec-action", absent,
+           "--result", str(pathlib.Path(tmp) / "grace-result"),
+           "--cache-limit-gb", "100", "--cache-reserve-gb", "1"]
+env = {**os.environ, "HOLBUILD_CACHE": cache}
+with open(locks / "worker-cache-cap-scan.lock", "a") as scanner, \
+     open(locks / "gc.lock", "a") as gc, \
+     open(pathlib.Path(tmp) / "grace.log", "w") as log:
+    fcntl.lockf(scanner, fcntl.LOCK_EX)
+    fcntl.lockf(gc, fcntl.LOCK_EX)
+    child = subprocess.Popen(command, env=env, stdout=log, stderr=log)
+    try:
+        try:
+            child.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            raise AssertionError("stale reuse did not wait for GC")
+        fcntl.lockf(gc, fcntl.LOCK_UN)
+        assert child.wait(timeout=30) == 4
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    assert state.read_text() == original, "idle reuse repeated a full pre-action scan"
+    first = grace.read_text()
+    started, saved = first.split("\n", 1)
+    assert saved == original and 0 <= time.time_ns() - int(started) < 30 * 10**9
+
+    def run():
+        result = subprocess.run(command, env=env, stdout=log, stderr=log, timeout=30)
+        assert result.returncode == 4
+
+    run()
+    assert grace.read_text() == first, "each action renewed the same grace"
+    assert state.read_text() == original, "post-result scan ignored single-flight lock"
+    grace.write_text(str(time.time_ns() - 301 * 10**9) + "\n" + original)
+    run()
+    assert state.read_text() != original, "exhausted grace did not force a scan"
+    assert not grace.exists(), "fresh scan left stale grace"
+
+    # Old clients may replace the v2 stamp without removing our grace file.
+    lines = state.read_text().splitlines()
+    lines[1] = str(time.time_ns() - 2 * 3600 * 10**9)
+    replaced = "\n".join(lines) + "\n"
+    state.write_text(replaced)
+    grace.write_text(str(time.time_ns() - 301 * 10**9) + "\n" + original)
+    run()
+    assert state.read_text() == replaced, "a replaced measurement inherited exhausted grace"
+    _, saved = grace.read_text().split("\n", 1)
+    assert saved == replaced, "new grace was not bound to the replaced stamp"
+    grace.write_text("broken\n" + replaced)
+    run()
+    assert state.read_text() != replaced, "corrupt matching grace did not force a scan"
+    assert not grace.exists()
+GRACE
 # A small cap scans apparent bytes, including nested sparse growth.
 mkdir -p "$cache4/checkpoint-store/family/nested"
 sparse "$cache4/checkpoint-store/family/nested/heap" 1
@@ -315,6 +384,8 @@ stamped_within "$state" 2 "private checkpoint growth caused eviction"
 evicted "$cache4/blobs/first" "old shared data before a new private checkpoint"
 evicted "$cache4/checkpoints/pkg/PrivateScript.deps" "private checkpoints after the action"
 sparse "$cache4/blobs/first" 1
+sparse "$cache4/blobs/second" 1
+sparse "$cache4/checkpoint-store/family/nested/heap" 1
 sweep4 100 1
 # Expired, future-dated and malformed state must all fall back to a scan.
 for measured in 0 999999999999999999999999 broken; do
@@ -388,6 +459,8 @@ evicted "$cache4/blobs/first" "old shared data before a new private module"
 kept "$cache5/theory-modules/large.pmo" "private modules under the target"
 rm "$cache5/theory-modules/large.pmo"
 sparse "$cache4/blobs/first" 1
+sparse "$cache4/blobs/second" 1
+sparse "$cache4/checkpoint-store/family/nested/heap" 1
 # Refresh through the aliases, preserving coverage of their apparent bytes.
 python3 - "$state" <<'EXPIRE'
 import pathlib, sys
@@ -546,3 +619,96 @@ for limits in "100 10 89" "400 40 359"; do
   sweep_mature "$limit" 0
   ! cmp -s "$mature_state" "$tmpdir/mature-state" || { echo "zero-reserve cache reused a measurement" >&2; exit 1; }
 done
+
+# Mature hosts repeatedly crossed the target as each container added private
+# files. One eviction must leave room for the next container's private bytes;
+# reuse still uses the full target, including the old mature-cache cases above.
+for limits in "100 10 89" "400 40 359"; do
+  read -r limit reserve bytes <<< "$limits"
+  mature_cache=$tmpdir/headroom-$limit
+  chunk=$((reserve / 5))
+  sparse "$mature_cache/blobs/base" "$((bytes - 5 * chunk))"
+  at 2010 "$mature_cache/blobs/base"
+  for n in 1 2 3 4 5; do
+    sparse "$mature_cache/blobs/old-$n" "$chunk"
+    at 2000 "$mature_cache/blobs/old-$n"
+  done
+  sweep_mature "$limit" "$reserve"
+  sparse "$mature_cache/theory-modules/private.pmo" "$chunk"
+  sweep_mature "$limit" "$reserve"
+  mature_state=$mature_cache/locks/worker-cache-cap.state
+  cp "$mature_state" "$tmpdir/headroom-state"
+  python3 - "$mature_state" "$limit" "$reserve" "$chunk" <<'HEADROOM'
+import pathlib, sys
+state, limit, reserve, private = sys.argv[1:]
+shared = sum(map(int, pathlib.Path(state).read_text().split()[3::2]))
+low = int(limit) - int(reserve) - int(reserve) // 2
+assert shared + int(private) * 1024**3 <= low * 1024**3, "eviction left no headroom"
+HEADROOM
+  sparse "$mature_cache/theory-modules/private.pmo" "$((reserve / 2))"
+  sweep_mature "$limit" "$reserve"
+  cmp "$mature_state" "$tmpdir/headroom-state" || { echo "private growth caused another sweep" >&2; exit 1; }
+  kept "$mature_cache/blobs/base" "retained mature data after leaving headroom"
+done
+
+# Leased families can prevent reaching the low-water mark while still fitting
+# under the target. Publish that result so siblings do not repeat the sweep.
+mature_cache=$tmpdir/pinned-headroom
+sparse "$mature_cache/checkpoint-store/family/heap" 88
+sparse "$mature_cache/blobs/old" 3
+at 2000 "$mature_cache/blobs/old"
+python3 - "$HOLBUILD_BIN" "$mature_cache" "$remote_url" "$absent" "$tmpdir" <<'PINNED'
+import fcntl, os, pathlib, subprocess, sys
+binary, cache, remote, absent, tmp = sys.argv[1:]
+root = pathlib.Path(cache)
+command = [binary, "--remote-cache", remote, "exec-action", absent,
+           "--result", str(pathlib.Path(tmp) / "pinned-result"),
+           "--cache-limit-gb", "100", "--cache-reserve-gb", "10"]
+with open(root / "checkpoint-store/family.lease", "a+") as lease:
+    fcntl.lockf(lease, fcntl.LOCK_SH)
+    with open(pathlib.Path(tmp) / "pinned-headroom.log", "w") as log:
+        for attempt in range(2):
+            assert subprocess.call(command, env={**os.environ, "HOLBUILD_CACHE": cache}, stdout=log, stderr=log) == 4
+            state = (root / "locks/worker-cache-cap.state").read_text()
+            if attempt == 0:
+                first = state
+            else:
+                assert state == first, "leased cache repeated its sweep"
+assert (root / "checkpoint-store/family/heap").exists()
+assert not (root / "blobs/old").exists()
+PINNED
+
+# A sibling can invalidate the stamp while an action fetches its spec. The
+# post-result refresh must treat missing state as a refresh, not an IO warning.
+mature_cache=$tmpdir/missing-state
+sweep_mature 100 10
+mkdir -p "$tmpdir/remote/cas"
+invalid=$(printf 'invalid spec\n' | sha256sum | cut -d' ' -f1)
+printf 'invalid spec\n' > "$tmpdir/remote/cas/$invalid"
+touch "$tmpdir/control/download-enable"
+python3 - "$HOLBUILD_BIN" "$mature_cache" "$remote_url" "$invalid" "$tmpdir" <<'MISSING'
+import os, pathlib, subprocess, sys, time
+binary, cache, remote, absent, tmp = sys.argv[1:]
+tmp = pathlib.Path(tmp)
+state = pathlib.Path(cache) / "locks/worker-cache-cap.state"
+with open(tmp / "missing-state.log", "w") as log:
+    child = subprocess.Popen(
+        [binary, "--remote-cache", remote, "exec-action", absent,
+         "--result", str(tmp / "missing-result"), "--cache-limit-gb", "100", "--cache-reserve-gb", "10"],
+        env={**os.environ, "HOLBUILD_CACHE": cache}, stdout=log, stderr=log)
+    try:
+        deadline = time.monotonic() + 30
+        while not (tmp / "control/download-event").exists():
+            assert child.poll() is None and time.monotonic() < deadline, "spec fetch did not start"
+            time.sleep(0.01)
+        state.unlink()
+        (tmp / "control/download-release").touch()
+        assert child.wait(timeout=30) == 4
+        assert state.exists(), "post-result refresh did not restore missing state"
+    finally:
+        (tmp / "control/download-release").touch()
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+assert "worker cache sweep failed" not in (tmp / "missing-state.log").read_text()
+MISSING
