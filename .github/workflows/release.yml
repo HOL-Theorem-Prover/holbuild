@@ -2,6 +2,7 @@ name: Release binaries
 
 on:
   push:
+    branches: [master]
     tags: ['v*']
   pull_request:
     paths:
