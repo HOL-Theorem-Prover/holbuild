@@ -74,8 +74,11 @@ fun global_help () = print
   \The reserve is a quarter of MemTotal, at least 1 GiB and at most 30 GiB; the\n\
   \margin is the reserve, or what the budget leaves out of MemTotal if that is\n\
   \less (at least 1 GiB).\n\
-  \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
-  \run and repl reserve nothing.\n\
+  \Where cgroup v2 limits the memory of holbuild's group or of a group enclosing\n\
+  \it, a child also starts only while the tightest of them has its charge left,\n\
+  \reservations or none. The HOL session of check and run reserves too.\n\
+  \This bounds admission; it does not enforce RSS. HOL toolchain builds and repl\n\
+  \reserve nothing.\n\
   \To set or resize the budget, write DIR/budget (a byte count) while holding\n\
   \DIR/lock:\n\
   \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\
