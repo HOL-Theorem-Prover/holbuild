@@ -79,7 +79,9 @@ holbuild --version
 
 Keep the extracted directory together: `bin/holbuild` loads runtime and
 analyser sources from `share/holbuild`. You can move the directory or symlink
-the executable into a directory already on `PATH`.
+the executable into a directory already on `PATH`. The manual page is
+`share/man/man1/holbuild.1`; read it with `man -l share/man/man1/holbuild.1`,
+or put `share/man` on `MANPATH` and run `man holbuild`.
 
 The executable includes the Poly/ML runtime, so running it does not require
 an installed Poly/ML. Building HOL toolchains still requires `poly` and
@@ -133,9 +135,14 @@ By default this installs to:
 
 ```text
 $HOME/.local/bin/holbuild
+$HOME/.local/share/man/man1/holbuild.1
 ```
 
-You can override the destination with `PREFIX`, `BINDIR`, or `DESTDIR`.
+`man holbuild` finds the manual page when `$HOME/.local/share/man` is on the
+manpath (most systems add it when it exists). The page lists every command,
+option and environment variable.
+
+You can override the destination with `PREFIX`, `BINDIR`, `MANDIR`, or `DESTDIR`.
 Installation also places runtime sources and notices in
 `$PREFIX/share/holbuild`; keep that directory beside `$PREFIX/bin` when moving
 an installation.

@@ -251,7 +251,7 @@ fun parse_generator templates value =
             in List.concat (map expand values) end
           val command = array "command" true
           val inputs = package_relative_paths (context ^ ".inputs") (array "inputs" false)
-          val outputs = package_relative_paths (context ^ ".outputs") (array "outputs" true)
+          val outputs = map (canonical_package_relative_path (context ^ ".outputs")) (array "outputs" true)
           val deps = string_array_field table "deps"
           val _ = if name = "" then die "generate.name must not be empty" else ()
           val _ = if null command then die ("generate." ^ name ^ ".command must not be empty") else ()
