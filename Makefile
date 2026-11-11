@@ -6,6 +6,9 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share/holbuild
 MANDIR ?= $(PREFIX)/share/man/man1
+BASHCOMPDIR ?= $(PREFIX)/share/bash-completion/completions
+ZSHCOMPDIR ?= $(PREFIX)/share/zsh/site-functions
+FISHCOMPDIR ?= $(PREFIX)/share/fish/vendor_completions.d
 VENDORED_HOL_FILES := $(shell sed 's|^|vendor/hol/|' vendor/hol/FILES)
 RUNTIME_SOURCES := sml/action_sandbox.py sml/checkpoint_save_runtime.sml sml/holbuild_runtime.sml sml/deferred_proofs_runtime.sml \
 	sml/fingerprint_runtime.sml sml/proof_runtime.sml sml/tactic_compat_runtime.sml sml/diagnostic_limits.sml sml/sha256.sml \
@@ -55,10 +58,15 @@ endif
 		install -d "$(DESTDIR)$(DATADIR)/$$(dirname "$$file")"; \
 		install -m 644 "$$file" "$(DESTDIR)$(DATADIR)/$$file" || exit; \
 	done
+	install -d "$(DESTDIR)$(BASHCOMPDIR)" "$(DESTDIR)$(ZSHCOMPDIR)" "$(DESTDIR)$(FISHCOMPDIR)"
+	install -m 644 completions/holbuild.bash "$(DESTDIR)$(BASHCOMPDIR)/holbuild"
+	install -m 644 completions/_holbuild "$(DESTDIR)$(ZSHCOMPDIR)/_holbuild"
+	install -m 644 completions/holbuild.fish "$(DESTDIR)$(FISHCOMPDIR)/holbuild.fish"
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/holbuild" "$(DESTDIR)$(MANDIR)/holbuild.1" "$(DESTDIR)$(DATADIR)/copyrights/smlnj.txt" "$(DESTDIR)$(DATADIR)/LICENSE"
 	@for file in $(RUNTIME_SOURCES); do rm -f "$(DESTDIR)$(DATADIR)/$$file"; done
+	rm -f "$(DESTDIR)$(BASHCOMPDIR)/holbuild" "$(DESTDIR)$(ZSHCOMPDIR)/_holbuild" "$(DESTDIR)$(FISHCOMPDIR)/holbuild.fish"
 
 test: bin/holbuild
 	HOLBUILD_KEEP_TEST_LOGS="$(HOLBUILD_KEEP_TEST_LOGS)" HOLDIR="$(HOLDIR)" tests/run.sh $(TESTS)

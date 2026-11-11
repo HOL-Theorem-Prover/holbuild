@@ -150,6 +150,26 @@ Custom `BINDIR`/`DATADIR` layouts are also supported: `make install` rebuilds
 the executable with that data path. Keep custom data at the configured path;
 use the standard layout for an installation that can move as a directory.
 
+`make install` also installs shell completion for Bash, Zsh and Fish, under
+`$PREFIX/share` (`BASHCOMPDIR`, `ZSHCOMPDIR` and `FISHCOMPDIR` override each
+directory). Bash with bash-completion, and Fish, load it from there when
+`$PREFIX` is `$HOME/.local` or `/usr/local`. Zsh needs the directory on its
+`fpath` before `compinit`, in `~/.zshrc`:
+
+```sh
+fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+autoload -Uz compinit && compinit
+```
+
+To use the completion from a checkout instead, source
+`completions/holbuild.bash` in Bash, add `completions/` to Zsh's `fpath`, or
+source `completions/holbuild.fish` in Fish. It completes commands, options,
+option values, build targets, `@group` names, theory names, heap and
+executable names, reading the project in the current directory (or the one
+`--source-dir` names) and the dependencies already on disk. It never builds,
+fetches or locks anything. Where it has nothing to offer, the shell completes
+file names.
+
 ## A minimal project
 
 Create `holproject.toml` in the root of your HOL project (`holbuild.toml`
