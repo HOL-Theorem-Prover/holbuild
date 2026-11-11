@@ -7874,15 +7874,17 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
        depend on, so each one built here goes there from the local cache
        unless it is there already; one that can't joins the batch.  The
        batch then holds every theory its theories depend on that the remote
-       cache lacks, as before. *)
+       cache lacks, as before.  The remote cache is asked afresh about
+       the theories in PUBLISH, which nothing has published yet. *)
+    val held = key_set publish
     val batch_deps =
       List.foldl (fn ((node, _), set) =>
                      Binaryset.addList (set, map HolbuildBuildPlan.key (HolbuildBuildPlan.transitive_project_deps plan node)))
-                 (key_set publish) uncached_actions
+                 held uncached_actions
     fun available remote (node, action) =
       let val key = #input_key action
       in
-        known ("theory " ^ key) orelse
+        (not (Binaryset.member (held, HolbuildBuildPlan.key node)) andalso known ("theory " ^ key)) orelse
         (remote_available remote options project plan node key upload andalso
          (learn ("theory " ^ key); true))
       end

@@ -853,6 +853,33 @@ require_grep "could not publish remote cache entry" "$tmpdir/client-cutoff-unpub
 [[ "$(< "$state/ran")" == $'rxk:ATheory\nrxk:BTheory\nrxk:CTheory' ]] ||
   { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
 
+# The remote cache is asked afresh about reused theories, whatever the
+# remote ledger says: back at an earlier edit whose entries for B and C both
+# caches have lost, the ledger still lists them, and they are published again.
+write_cutoff six one "$a2"
+run client-cutoff-six 0 build --remote-exec "$coordinator" CTheory
+require_grep "early cutoff reused 2 of 2 deferred theories" "$tmpdir/client-cutoff-six.log"
+declare -A key_six
+for t in B C; do
+  key_six[$t]=$(sed -n 's/^input_key=//p' "$project/.holbuild/dep/rxk/src/${t}Script.sml.key")
+done
+write_cutoff seven one "$a2"
+run client-cutoff-seven 0 build --remote-exec "$coordinator" CTheory
+require_grep "early cutoff reused 2 of 2 deferred theories" "$tmpdir/client-cutoff-seven.log"
+for t in B C; do
+  rm -r "$HOLBUILD_CACHE/actions/${key_six[$t]}"
+  rm "$remote_root/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "${key_six[$t]}" | sha256sum | cut -d' ' -f1)"
+done
+: > "$state/ran"
+write_cutoff six one "$a2"
+run client-cutoff-relisted 0 build --remote-exec "$coordinator" CTheory
+require_grep "early cutoff reused 2 of 2 deferred theories" "$tmpdir/client-cutoff-relisted.log"
+[[ ! -s "$state/ran" ]] || { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
+for t in B C; do
+  [[ -e "$remote_root/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "${key_six[$t]}" | sha256sum | cut -d' ' -f1)" ]] ||
+    { echo "${t}Theory's reused entry was not published again" >&2; exit 1; }
+done
+
 # A theory is cut off only once everything it depends on has settled: X <- V
 # <- W <- Y, with a proof edit to X and a statement edit to W.  V is reused;
 # Y, whose own inputs are unchanged, builds on a worker against the new W.
