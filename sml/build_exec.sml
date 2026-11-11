@@ -8890,6 +8890,24 @@ fun spec_parent_hashes_match root spec data_path =
    replaces it for the dependencies selected by direct, which a build
    records as parents even when their copies fit the rest, and for all of
    them when one doesn't fit the others. *)
+(* The time each step of a hydrate took, summed over repeats; exec-action
+   reports them beside its hydrate phase. *)
+val hydrate_steps = ref ([] : (string * LargeInt.int) list)
+
+fun hydrate_step name f =
+  let
+    val t0 = Time.now ()
+    fun record () =
+      let
+        val ms = Time.toMilliseconds (Time.-(Time.now (), t0))
+        val earlier = case List.find (fn (n, _) => n = name) (!hydrate_steps) of SOME (_, e) => e | NONE => 0
+      in
+        hydrate_steps := (name, earlier + ms) :: List.filter (fn (n, _) => n <> name) (!hydrate_steps)
+      end
+  in
+    (f () before record ()) handle e => (record (); raise e)
+  end
+
 fun hydrate_spec_deps remote root files (spec : spec_deps) direct =
   let
     fun library {path, sha256, ...} = {hash = sha256, dst = in_root root path}
@@ -8914,18 +8932,21 @@ fun hydrate_spec_deps remote root files (spec : spec_deps) direct =
                            General.exnMessage e)
     (* One check of the restored files, hashing each once. *)
     fun misfit () =
-      let val dat_hashes = new_file_hash_cache ()
-      in
-        List.find
-          (fn {stem, ...} => not (spec_parent_hashes_match_in dat_hashes root spec (in_root root (stem ^ ".dat"))))
-          (#deps spec)
-      end
+      hydrate_step "hydmisfit" (fn () =>
+        let val dat_hashes = new_file_hash_cache ()
+        in
+          List.find
+            (fn {stem, ...} => not (spec_parent_hashes_match_in dat_hashes root spec (in_root root (stem ^ ".dat"))))
+            (#deps spec)
+        end)
+    fun restore_deps () = hydrate_step "hyddeps" (fn () => transfer_all restore_dep (#deps spec))
     fun refresh wanted =
-      drop_stale_dep_copies remote spec wanted andalso (transfer_all restore_dep (#deps spec); true)
+      hydrate_step "hydstale" (fn () => drop_stale_dep_copies remote spec wanted) andalso (restore_deps (); true)
   in
-    transfer_all (fetch_spec_blob remote) (last_per_dst (files @ map library (#libraries spec)));
-    List.app write_lib (#libs spec);
-    transfer_all restore_dep (#deps spec);
+    hydrate_step "hydfiles" (fn () =>
+      (transfer_all (fetch_spec_blob remote) (last_per_dst (files @ map library (#libraries spec)));
+       List.app write_lib (#libs spec)));
+    restore_deps ();
     ignore (refresh direct);
     case misfit () of
         NONE => ()
@@ -10762,7 +10783,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
+        val _ = hydrate_steps := []
         val _ = phase "hydrate" (fn () => hydrate_action_root remote root spec)
+        (* Its steps, after it in the report. *)
+        val _ = phases := !hydrate_steps @ !phases
         val (done, cutoff) =
           phase "cutoff" (fn () =>
             let

@@ -349,7 +349,7 @@ worker b "$spec_b"
 expect b 0 "status=built"
 # Its record times the action and its phases.
 require_grep '^wall-ms=[0-9][0-9]*$' "$tmpdir/b.result"
-for phase in hydrate modules hol check; do
+for phase in hydrate hydfiles hyddeps hydstale hydmisfit modules hol check; do
   grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/b.result" || {
     echo "b's record lacks phase $phase:" >&2; cat "$tmpdir/b.result" >&2; exit 1; }
 done
