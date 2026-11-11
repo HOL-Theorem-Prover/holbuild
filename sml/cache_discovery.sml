@@ -11,6 +11,10 @@ val attempted = ref Time.zeroTime
 val succeeded = ref Time.zeroTime
 val members : string list ref = ref []
 val scope = ref ""
+val joined = ref Time.zeroTime
+
+fun joining () = Time.< (Time.- (Time.now (), !joined), Time.fromSeconds stale_seconds)
+
 fun env name =
   case OS.Process.getEnv name of SOME "" => NONE | value => value
 
@@ -111,7 +115,7 @@ fun urls defaults =
       val _ = Mutex.lock mutex
       val requested_scope = String.concatWith "," defaults
       val _ = if !scope <> requested_scope andalso not (!refreshing) then
-          (scope := requested_scope; attempted := Time.zeroTime; succeeded := Time.zeroTime; members := [])
+          (scope := requested_scope; attempted := Time.zeroTime; succeeded := Time.zeroTime; members := []; joined := Time.zeroTime)
         else ()
       val same_scope = !scope = requested_scope
       val update = same_scope andalso not (!refreshing) andalso
@@ -126,7 +130,11 @@ fun urls defaults =
       val published = Time.now ()
       val _ = Mutex.lock mutex
       val _ = if update then
-          ((case fetched of SOME nodes => (members := nodes; succeeded := published)
+          ((case fetched of SOME nodes =>
+              (if List.exists (fn node => not (List.exists (fn old => old = node)
+                    (if null (!members) orelse Time.>= (Time.- (published, !succeeded), Time.fromSeconds stale_seconds)
+                     then defaults else !members))) nodes then joined := published else ();
+               members := nodes; succeeded := published)
             | NONE => ()); refreshing := false)
         else ()
       val result = if not same_scope orelse null (!members) orelse

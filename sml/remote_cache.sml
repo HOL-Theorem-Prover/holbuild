@@ -35,8 +35,7 @@ fun remote url =
 
 fun base_url (RemoteCache {urls, ...}) = String.concatWith "," urls
 
-(* Authentication does not change node identity; full URLs are kept for requests.
-   Preferred nodes come first, each group in rendezvous order. *)
+(* Authentication does not change node identity; full URLs are kept for requests. *)
 fun ranked_urls (RemoteCache {urls, ...}) digest =
   let
     val urls = HolbuildCacheDiscovery.urls urls
@@ -45,17 +44,10 @@ fun ranked_urls (RemoteCache {urls, ...}) digest =
       in ((HolbuildHash.string_sha256 (identity ^ ":" ^ digest), identity), url) end
     fun compare (((a, u), _), ((b, v), _)) =
       case String.compare (b, a) of EQUAL => String.compare (u, v) | order => order
-    val preferred = HolbuildRemoteCacheConfig.preferred_identities ()
-    fun is_preferred url =
-      List.exists (fn identity => identity = HolbuildRemoteCacheConfig.node_identity url) preferred
   in
     case urls of
         [_] => urls
-      | _ =>
-          let
-            val ranked = map #2 (Redblackset.listItems (Redblackset.fromList compare (map score urls)))
-            val (first, rest) = List.partition is_preferred ranked
-          in first @ rest end
+      | _ => map #2 (Redblackset.listItems (Redblackset.fromList compare (map score urls)))
   end
 
 fun request_urls cache kind digest =
@@ -310,19 +302,18 @@ fun transient (HolbuildHttp.Failed _) = true
 (* The breaker observes the whole request: a dead primary must not disable a healthy backup.
    A write goes past the first two nodes only while none of them answered at all
    (a member whose name doesn't resolve yet, say), and stops at the first answer.
-   A read walks the whole ring until a hit: a node writes to the shared backing
-   store after it answers the PUT, so until then only the writer's node holds a
-   blob, and a reader that prefers another node must still find it.
    A read whose 200 body fails `usable` counts as that node's 404, so a replica
    holding a weaker copy does not hide a better one on the next node. *)
 fun routed_status_using usable method urls path request =
   let
     val read = method = "GET" orelse method = "HEAD"
+    val grace = read andalso HolbuildCacheDiscovery.joining ()
     fun unanswered (HolbuildHttp.Failed _) = true
       | unanswered (HolbuildHttp.Response _) = false
-    fun loop [] _ _ missing last = Option.getOpt (missing, last)
-      | loop (node :: rest) count silent missing last =
-          if not read andalso count >= 2 andalso not silent then
+    fun loop [] _ _ _ missing last = Option.getOpt (missing, last)
+      | loop (node :: rest) count silent passed_over missing last =
+          if count >= 2 andalso not grace andalso not passed_over andalso
+             (if read then count = 2 andalso Option.isSome missing else not silent) then
             Option.getOpt (missing, last)
           else
             let
@@ -337,10 +328,11 @@ fun routed_status_using usable method urls path request =
               val missing = if read andalso result = HolbuildHttp.Response 404 then SOME (node, result) else missing
             in
               if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
-                loop rest (count + 1) (silent andalso unanswered result) missing (node, result)
+                loop rest (count + 1) (silent andalso unanswered result)
+                     (passed_over orelse rejected) missing (node, result)
               else (node, result)
             end
-  in loop urls 0 true NONE (hd urls, HolbuildHttp.Failed "no cache response") end
+  in loop urls 0 true false NONE (hd urls, HolbuildHttp.Failed "no cache response") end
 
 fun routed_status method urls path request = routed_status_using (fn _ => true) method urls path request
 

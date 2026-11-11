@@ -70,9 +70,11 @@ def test_unresolvable_members_wait_for_a_later_refresh_and_then_join(monkeypatch
     membership = Membership(DEFAULTS, ALLOWED)
     membership.update(SNAPSHOT, 0, resolve=True)
     assert membership.current(0) == DEFAULTS  # permanent nodes stay, resolvable or not
+    assert not membership.joining(0)
     unresolvable.clear()
     membership.update(SNAPSHOT, 30, resolve=True)
     assert membership.current(30) == [*DEFAULTS, 'https://ci:password@cache-c.example']
+    assert membership.joining(30)
 
 
 def test_worker_discovery_is_rate_limited_and_a_failure_does_not_disable_the_cache(monkeypatch) -> None:
@@ -191,7 +193,18 @@ async def test_discovery_token_cannot_use_client_or_worker_routes(
     assert response.status_code == 401
 
 
-async def test_coordinator_asks_every_node_before_a_miss(coordinator, monkeypatch) -> None:
+def test_join_grace_expires_without_steady_state_miss_amplification() -> None:
+    defaults = ALLOWED[:2]
+    all_nodes = [*defaults, *[f'https://cache-{n}.example' for n in range(3, 7)]]
+    membership = Membership(defaults, all_nodes)
+    membership.update('holbuild-cache-members-v1\n' + '\n'.join(all_nodes), 0)
+    assert membership.joining(59)
+    # A successful unchanged refresh keeps the ring but does not extend the join grace.
+    membership.update('holbuild-cache-members-v1\n' + '\n'.join(all_nodes), 30)
+    assert not membership.joining(60)
+
+
+async def test_coordinator_reads_a_former_owner_below_rank_two_only_during_join_grace(coordinator, monkeypatch) -> None:
     import asyncio
     from unittest.mock import AsyncMock, Mock
 
@@ -219,9 +232,10 @@ async def test_coordinator_asks_every_node_before_a_miss(coordinator, monkeypatc
         monkeypatch.setattr(coordinator, 'cache', cache)
         assert await coordinator._check_cache(key, asyncio.Semaphore(1)) is True
         assert len(asked) == 6
+        coordinator.membership.joined -= 61
         asked.clear()
-        assert await coordinator._check_cache('missing-entry', asyncio.Semaphore(1)) is False
-        assert len(asked) == 6
+        assert await coordinator._check_cache(key, asyncio.Semaphore(1)) is False
+        assert len(asked) == 2
         coordinator.cache_pool.ready_urls.assert_awaited_once()
         other_status[0] = 503
         asked.clear()
@@ -229,8 +243,9 @@ async def test_coordinator_asks_every_node_before_a_miss(coordinator, monkeypatc
         assert len(asked) == 6
 
 
-def test_worker_spec_read_asks_every_node_before_a_miss_and_its_preferred_node_first(monkeypatch) -> None:
+def test_worker_spec_reads_all_members_in_join_grace_and_two_otherwise(monkeypatch) -> None:
     import subprocess
+    from dataclasses import replace
 
     from remote_exec.cache import ranked_nodes
     from remote_exec.worker import Releases
@@ -250,21 +265,17 @@ def test_worker_spec_read_asks_every_node_before_a_miss_and_its_preferred_node_f
                                            stdout='holbuild-version=1.2.3\n200' if url == former else f'\n{status}', stderr='')
 
     monkeypatch.setattr(subprocess, 'run', curl)
-    releases = Releases('unused', 'unused', ','.join(nodes), None)
+    releases = Releases('unused', 'unused', ','.join(nodes), None, joining=True)
     assert releases.spec_version(key) == '1.2.3'
     assert len(asked) == 6
     asked.clear()
     with pytest.raises(RuntimeError):
-        releases.spec_version('missing-spec')
-    assert len(asked) == 6
+        replace(releases, joining=False).spec_version(key)
+    assert len(asked) == 2
     other_status[0] = 503
     asked.clear()
-    assert releases.spec_version(key) == '1.2.3'
+    assert replace(releases, joining=False).spec_version(key) == '1.2.3'
     assert len(asked) == 6
-    asked.clear()
-    monkeypatch.setenv('HOLBUILD_REMOTE_CACHE_PREFERRED_URLS', former)
-    assert releases.spec_version(key) == '1.2.3'
-    assert asked == [former]
 
 
 @pytest.mark.parametrize("error", [http.client.BadStatusLine("broken"), http.client.IncompleteRead(b"partial")])
@@ -280,9 +291,13 @@ def test_worker_protocol_failure_retains_then_expires_membership(monkeypatch, er
     assert refresh_cache_members(coordinator, membership, url, 60) == DEFAULTS
 
 
-def test_recovered_discovery_restores_the_ring_after_permanent_fallback() -> None:
+def test_recovered_discovery_restarts_join_grace_after_permanent_fallback() -> None:
     membership = Membership(DEFAULTS, ALLOWED)
     membership.update(SNAPSHOT, 0)
     assert membership.current(61) == DEFAULTS
+    assert not membership.joining(61)
     membership.update(SNAPSHOT, 62)
     assert len(membership.current(62)) == 3
+    assert membership.joining(62)
+    membership.update(SNAPSHOT, 92)
+    assert not membership.joining(122)

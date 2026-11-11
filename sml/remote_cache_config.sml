@@ -6,8 +6,6 @@ exception Error of string
 val override_url : string option ref = ref NONE
 val local_url : string option ref = ref NONE
 val local_curl_config : string option ref = ref NONE
-(* Overrides HOLBUILD_REMOTE_CACHE_PREFERRED_URLS when set. *)
-val override_preferred : string option ref = ref NONE
 (* How many threads copy remote theory entries ahead of the build; NONE
    means max(50, 2 * jobs). *)
 val prefetch_concurrency : int option ref = ref NONE
@@ -68,18 +66,6 @@ fun env_url () =
       SOME "" => NONE
     | SOME url => SOME (normalize_url url)
     | NONE => NONE
-
-(* Nodes this client reaches most cheaply, such as replicas in its own data
-   center; requests try them before the rest of the ring. *)
-fun preferred_identities () =
-  case (case !override_preferred of
-            SOME text => SOME text
-          | NONE => OS.Process.getEnv "HOLBUILD_REMOTE_CACHE_PREFERRED_URLS") of
-      SOME "" => []
-    | SOME text => map node_identity (urls text)
-    | NONE => []
-
-fun set_preferred_urls text = override_preferred := SOME text
 
 fun configured_url () =
   if HolbuildOffline.enabled () then NONE else

@@ -1525,7 +1525,7 @@ class Coordinator:
     async def cache_read_nodes(self, digest: str) -> list[str]:
         """Refresh ready slots at most once per thirty seconds, retaining the permanent fallback."""
         if self.cache_pool is None:
-            return ranked_nodes(self.cache_nodes, digest)
+            return ranked_nodes(self.cache_nodes, digest)[:2]
         now = asyncio.get_running_loop().time()
         if now - self.membership.attempted >= REFRESH_SECONDS:
             async with self.membership_lock:
@@ -1543,9 +1543,11 @@ class Coordinator:
         forgotten = self.cache_forgotten
         missing = False
         failure: httpx.Response | None = None
-        # Every node is asked before a miss: a worker writes to the node nearest to it, and until that node has
-        # written the entry through to the shared store, no other node holds it.
-        for node in await self.cache_read_nodes(ac_key):
+        nodes = await self.cache_read_nodes(ac_key)
+        joining = self.membership.joining(asyncio.get_running_loop().time())
+        for attempt, node in enumerate(nodes, 1):
+            if attempt == 3 and not joining and missing:
+                break
             try:
                 async with limit:
                     response = await self.cache.get(f"{node}/ac/{ac_key}")

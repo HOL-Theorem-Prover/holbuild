@@ -44,15 +44,15 @@ val former = List.last ranked;
 val asked = ref ([] : string list);
 fun request url = (asked := !asked @ [url];
   HolbuildHttp.Response (if url = former then 200 else 404));
-val _ = assert "reads reach a node below rank two"
+val _ = assert "join grace reads a former owner below rank two"
   (#2 (RC.routed_status "GET" ranked "" request) = HolbuildHttp.Response 200 andalso length (!asked) = 6);
 val _ = asked := [];
-val _ = assert "HEAD reaches a node below rank two"
+val _ = assert "join grace also covers HEAD"
   (#2 (RC.routed_status "HEAD" ranked "" request) = HolbuildHttp.Response 200 andalso length (!asked) = 6);
 val _ = asked := [];
 fun unavailable url = (asked := !asked @ [url]; HolbuildHttp.Response 503);
 val _ = ignore (RC.routed_status "PUT" ranked "" unavailable);
-val _ = assert "writes retain two-node bound" (length (!asked) = 2);
+val _ = assert "writes retain two-node bound during joins" (length (!asked) = 2);
 val _ = asked := [];
 fun unresolved url = (asked := !asked @ [url];
   if url = List.nth (ranked, 2) then HolbuildHttp.Response 201 else HolbuildHttp.Failed "Couldn't resolve host name");
@@ -63,10 +63,10 @@ fun answered url = (asked := !asked @ [url];
   if url = hd ranked then HolbuildHttp.Failed "Couldn't resolve host name" else HolbuildHttp.Response 503);
 val _ = ignore (RC.routed_status "PUT" ranked "" answered);
 val _ = assert "writes stop at two nodes once one answered" (length (!asked) = 2);
+val _ = D.joined := Time.- (Time.now (), Time.fromSeconds 61);
 val _ = asked := [];
-fun missing url = (asked := !asked @ [url]; HolbuildHttp.Response 404);
-val _ = assert "a miss asks every node"
-  (#2 (RC.routed_status "GET" ranked "" missing) = HolbuildHttp.Response 404 andalso length (!asked) = 6);
+val _ = ignore (RC.routed_status "GET" ranked "" request);
+val _ = assert "steady-state misses retain two-node bound" (length (!asked) = 2);
 val _ = asked := [];
 fun two_retired url = (asked := !asked @ [url];
   HolbuildHttp.Response (if url = former then 200 else if url = List.nth (ranked, 2) then 404 else 503));
@@ -79,7 +79,7 @@ val _ = D.succeeded := Time.- (Time.now (), Time.fromSeconds 61);
 val _ = assert "stale discovery falls back to permanent pair" (D.urls defaults = defaults);
 val _ = D.attempted := Time.zeroTime;
 val _ = RC.write_text (dir ^ "/body") snapshot;
-val _ = assert "recovery from permanent fallback restores the ring" (D.urls defaults = nodes);
+val _ = assert "recovery from permanent fallback starts join grace" (D.urls defaults = nodes andalso D.joining ());
 val _ = D.attempted := Time.zeroTime;
 val _ = RC.write_text (dir ^ "/body") (header ^ String.concatWith "\n" (List.take (identities, 2)));
 val _ = assert "scale-in withdraws burst members" (D.urls defaults = defaults);

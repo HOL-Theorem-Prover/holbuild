@@ -21,13 +21,11 @@ Phase = Literal["boot", "dns", "ready", "admit", "serving", "drain", "flush", "s
 
 
 class CacheSlot(BaseModel):
-    """A stable cache identity reserved for one temporary instance at a time; with a zone, only for an instance
-    the provider placed in that zone, so clients can prefer the slots near them."""
+    """A stable cache identity reserved for one temporary instance at a time."""
 
     model_config = ConfigDict(extra="forbid")
     name: str
     url: str
-    zone: str | None = None
 
     @field_validator("url")
     @classmethod
@@ -48,7 +46,6 @@ class Instance(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str
     state: Literal["launching", "running", "terminating", "gone"]
-    zone: str | None = None
 
 
 class AdapterRequest(BaseModel):
@@ -226,15 +223,13 @@ class CachePool:
                                    {"error": str(error), "slot": member.slot, "owner": member.owner})
         owners = {member.owner for member in members}
         occupied = {member.slot for member in await self._members(conn)}
-        vacant = [slot for slot in self.slots if slot.name not in occupied]
+        vacant = iter(slot for slot in self.slots if slot.name not in occupied)
         for instance in inventory.instances:
             if instance.state != "launching" or instance.id in owners:
                 continue
-            # An instance in a zone whose slot is taken waits; the provider's lifecycle hook bounds the wait.
-            slot = next((slot for slot in vacant if slot.zone in (None, instance.zone)), None)
+            slot = next(vacant, None)
             if slot is None:
-                continue
-            vacant.remove(slot)
+                break
             await conn.execute(sa.text(
                 "INSERT INTO cache_slots (slot,url,owner,phase,assigned_at) VALUES (:slot,:url,:owner,'boot',:now)"
             ), {"slot": slot.name, "url": slot.url, "owner": instance.id, "now": now})

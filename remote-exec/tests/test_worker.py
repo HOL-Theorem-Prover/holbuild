@@ -1547,6 +1547,7 @@ def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(
 
     def run(_coordinator, _args, releases, *_rest):
         assert "https://joined.example" in releases.remote_cache
+        assert releases.joining
         events.append("run")
         raise KeyboardInterrupt
 
