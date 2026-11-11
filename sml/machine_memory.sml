@@ -276,23 +276,23 @@ fun cgroup_limits () =
                        0 (String.tokens (fn c => c = #"\n") text)
     fun least (a, NONE) = SOME a
       | least (a, SOME b) = SOME (Int.min (a, b))
-    (* Up to the first directory that isn't a group: the hierarchy's root
-       has no memory.current. *)
+    (* Every ancestor up to "/": a group whose parent doesn't enable the
+       memory controller for its children has no memory files, yet a limit
+       above it still holds, and the hierarchy's root and the directories
+       above it have none either. *)
     fun walk dir (found as {headroom, limit}) =
-      case Option.mapPartial decimal (read_text (Path.concat (dir, "memory.current"))) of
-          NONE => found
-        | SOME current =>
-            let
-              val found =
-                case Option.mapPartial decimal (read_text (Path.concat (dir, "memory.max"))) of
-                    NONE => found (* "max": no limit here *)
-                  | SOME max =>
-                      {headroom = least (max - current + inactive_file dir, headroom),
-                       limit = least (max, limit)}
-              val parent = Path.dir dir
-            in
-              if parent = dir then found else walk parent found
-            end
+      let
+        val found =
+          case (Option.mapPartial decimal (read_text (Path.concat (dir, "memory.current"))),
+                Option.mapPartial decimal (read_text (Path.concat (dir, "memory.max")))) of
+              (SOME current, SOME max) =>
+                {headroom = least (max - current + inactive_file dir, headroom),
+                 limit = least (max, limit)}
+            | _ => found (* no memory files, or "max": no limit here *)
+        val parent = Path.dir dir
+      in
+        if parent = dir then found else walk parent found
+      end
   in
     case cgroup_dir () of
         NONE => {headroom = NONE, limit = NONE}

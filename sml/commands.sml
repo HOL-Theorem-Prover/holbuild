@@ -3107,7 +3107,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
   end
 
 fun run_hol tc cli_jobs subcommand user_args =
-  run_hol_with HolbuildToolchain.run tc cli_jobs subcommand user_args
+  run_hol_with HolbuildToolchain.run_reserved tc cli_jobs subcommand user_args
 
 fun repl_hol tc cli_jobs user_args =
   run_hol_with HolbuildToolchain.run_interactive tc cli_jobs "repl" user_args
@@ -3341,7 +3341,7 @@ fun run_check_script tc cli_jobs build_mode theories make_script =
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run tc cli_jobs build_mode plain_build_request false from "run" [script_path]
+      run_hol_status HolbuildToolchain.run_reserved tc cli_jobs build_mode plain_build_request false from "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();

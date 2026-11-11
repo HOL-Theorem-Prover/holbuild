@@ -322,11 +322,12 @@ fi
 wait "$hold_pid" || { cat "$tmpdir/hold2.out" >&2; exit 1; }
 
 # A cgroup limit binds whether or not DIR holds a reservation: a stand-in
-# job group (no limit of its own) inside a scope limited to 8 GiB, with
-# 7.5 GiB used, holds back a 1 GiB child even alone.  The scope's inactive
+# step group (no memory files: its parent doesn't enable the controller for
+# it) in a job group (no limit of its own) inside a scope limited to 8 GiB,
+# with 7.5 GiB used, holds back a 1 GiB child even alone.  The scope's inactive
 # page cache counts as free: once 1 GiB of it shows up, the child starts.
 cgroup=$tmpdir/cgroup
-mkdir -p "$cgroup/scope/job"
+mkdir -p "$cgroup/scope/job/step"
 write_group() {
   local dir=$1 max=$2 current=$3 inactive=$4
   printf '%s\n' "$max" > "$dir/memory.max.new"
@@ -340,7 +341,7 @@ write_group "$cgroup/scope/job" max $((7 * gib)) 0
 write_group "$cgroup/scope" $((8 * gib)) $((15 * gib / 2)) 0
 : > "$events"
 make_project capped 0 Capped
-(cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job exec "$HOLBUILD_BIN" \
+(cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job/step exec "$HOLBUILD_BIN" \
   --cooperate-dir "$tmpdir/cgroup-coop" --child-charge 1024 \
   build --skip-checkpoints --skip-proof-steps) > "$tmpdir/capped.out" 2>&1 &
 holbuild_pid=$!
@@ -360,10 +361,40 @@ holbuild_pid=""
 require_grep '^END Capped' "$events"
 require_no_live_leases "$tmpdir/cgroup-coop"
 
+# The HOL session of run and check waits the same way.
+printf 'val _ = TextIO.print "SESSION RAN\\n";\n' > "$tmpdir/capped/probe.sml"
+for command in "run probe.sml" "check CappedTheory"; do
+  out=$tmpdir/session-${command%% *}.out
+  write_group "$cgroup/scope" $((8 * gib)) $((15 * gib / 2)) 0
+  # shellcheck disable=SC2086
+  (cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job/step exec "$HOLBUILD_BIN" \
+    --cooperate-dir "$tmpdir/cgroup-coop" --child-charge 1024 $command) > "$out" 2>&1 &
+  holbuild_pid=$!
+  for _ in $(seq 1 600); do
+    grep -q 'waiting for machine memory' "$out" && break
+    sleep 0.1
+  done
+  require_grep 'waiting for machine memory: needs 1024 MiB, cgroup memory headroom is 512 MiB' "$out"
+  sleep 2
+  if ! kill -0 "$holbuild_pid" 2>/dev/null; then
+    echo "holbuild $command did not wait for the cgroup's headroom" >&2
+    cat "$out" >&2
+    exit 1
+  fi
+  write_group "$cgroup/scope" $((8 * gib)) $((15 * gib / 2)) $((gib))
+  # check reports the theory's kernel bypasses (its OS.Process.system calls)
+  # as findings and exits 1, so its session is known to have run by them.
+  wait "$holbuild_pid" || true
+  holbuild_pid=""
+done
+require_grep 'SESSION RAN' "$tmpdir/session-run.out"
+require_grep 'CappedTheory: 2 findings' "$tmpdir/session-check.out"
+require_no_live_leases "$tmpdir/cgroup-coop"
+
 # With no limit anywhere ("max"), however much the groups use, a child starts.
 write_group "$cgroup/scope" max $((1024 * gib)) 0
 : > "$events"
-(cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job timeout 60 "$HOLBUILD_BIN" \
+(cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job/step timeout 60 "$HOLBUILD_BIN" \
   --cooperate-dir "$tmpdir/cgroup-coop" --child-charge 1024 \
   build --force --skip-checkpoints --skip-proof-steps) > "$tmpdir/uncapped.out" 2>&1 || {
   echo "a child waited with no cgroup limit" >&2
@@ -374,7 +405,7 @@ require_grep '^END Capped' "$events"
 
 # A child larger than the least limit fails at once instead of waiting.
 write_group "$cgroup/scope/job" $((2 * gib)) 0 0
-if (cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job timeout 60 "$HOLBUILD_BIN" \
+if (cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job/step timeout 60 "$HOLBUILD_BIN" \
       --cooperate-dir "$tmpdir/cgroup-coop" --child-charge 3072 build --force) > "$tmpdir/over-limit.out" 2>&1; then
   echo "reservation larger than the cgroup limit succeeded" >&2
   exit 1
