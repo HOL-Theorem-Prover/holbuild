@@ -812,6 +812,12 @@ require_grep "remote workers finished 1 of 1 theories" "$tmpdir/client-cutoff-pr
 require_grep "early cutoff reused 2 of 2 deferred theories" "$tmpdir/client-cutoff-proof.log"
 refute_grep "Theory built" "$tmpdir/client-cutoff-proof.log"
 [[ "$(< "$state/ran")" == "rxk:ATheory" ]] || { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
+# The reused entries reach the remote cache.
+for t in B C; do
+  key=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rxk/src/${t}Script.sml.key")
+  [[ -e "$remote_root/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "$key" | sha256sum | cut -d' ' -f1)" ]] ||
+    { echo "${t}Theory's reused entry was not published" >&2; exit 1; }
+done
 
 # An edit that changes what A produces: B and C go to the workers next.
 : > "$state/ran"

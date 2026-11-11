@@ -4940,11 +4940,17 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
     remove_tree (stage_root_at root (#input_key action))
   end
 
+(* Whether an alias goes to the remote cache at once.  Settling deferred
+   theories turns it off: the next export publishes their entries, checking
+   them all in parallel. *)
+val publish_aliases = ref true
+
 (* After early cutoff, the theory's cache entry under its old input key also
    describes its outputs for the new one, so the entry is copied to the new
    key, where commands that read the cache by current key (export) find it,
-   and published to the remote cache as a build would.  Only a usable entry
-   is copied, and only where the new key has none. *)
+   and published to the remote cache as a build would (see
+   publish_aliases).  Only a usable entry is copied, and only where the
+   new key has none. *)
 fun alias_cache_entry old_key new_key =
   let
     val root = cache_root ()
@@ -4960,7 +4966,7 @@ fun alias_cache_entry old_key new_key =
             else false
         | _ => false
   in
-    if HolbuildCache.with_action_publish_lock root new_key alias (fn () => false)
+    if HolbuildCache.with_action_publish_lock root new_key alias (fn () => false) andalso !publish_aliases
     then publish_remote_cache_key_if_usable root new_key
     else ()
   end
@@ -7142,8 +7148,9 @@ fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets
    nodes they depend on, and runs each deferred theory's early cutoff, as
    restore_only does, without reporting progress.  As in build, a node is
    tried only when every dependency settled, so its dependencies' outputs
-   are final; the rest are left for the next batch.  Returns how many
-   deferred theories settled. *)
+   are final; the rest are left for the next batch.  The entries it reuses
+   stay local for the next export to publish.  Returns how many deferred
+   theories settled. *)
 fun settle_deferred (options : build_options) tc project plan toolchain_key deferred =
   let
     val options = remote_restore_options true options
@@ -7174,8 +7181,11 @@ fun settle_deferred (options : build_options) tc project plan toolchain_key defe
                | ErrorWithDebugArtifacts _ => (unsettled := Binaryset.add (!unsettled, key); false)
       end
     val _ = HolbuildBuildPlan.forget_output_digests plan
+    val _ = publish_aliases := false
     val settled = length (List.filter settle (HolbuildBuildPlan.selected_nodes plan))
+                  handle e => (publish_aliases := true; raise e)
   in
+    publish_aliases := true;
     (* Digests taken here go stale once the next batch's outputs land. *)
     HolbuildBuildPlan.forget_output_digests plan;
     HolbuildHolSharedCache.local_build_needed := local_build_needed;
