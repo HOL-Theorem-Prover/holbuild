@@ -7690,10 +7690,14 @@ fun publish_spec_blob remote {hash, path} =
    lives in the cache root and every project and worktree using that root
    shares it.  The remote cache can lose either; a worker that finds one
    missing fails its batch, and the build then forgets the ledger
-   (forget_remote_ledger) and resubmits.  Builds change it under its lock. *)
+   (forget_remote_ledger) and resubmits.  Builds change it under its lock,
+   rewriting it whole, so it holds at most max_remote_ledger_entries
+   entries: a build that would pass that keeps only those it used. *)
 fun remote_ledger_path remote =
   Path.concat(Path.concat(cache_root (), "remote-ledger"),
               HolbuildHash.string_sha256 (HolbuildRemoteCache.base_url remote))
+
+val max_remote_ledger_entries = 100000
 
 fun read_remote_ledger path =
   Binaryset.addList (Binaryset.empty String.compare, String.tokens (fn c => c = #"\n") (read_text path))
@@ -7726,16 +7730,25 @@ fun sorted_lines_member text item =
   end
 
 fun with_remote_ledger_lock path f =
-  let val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = path ^ ".lock"}
+  let val lock = detail_time_phase "action_spec.ledger.lock" (fn () =>
+                   HolbuildFileLock.acquire_exclusive_path_wait {path = path ^ ".lock"})
   in (f () before HolbuildFileLock.release lock) handle e => (HolbuildFileLock.release lock; raise e) end
 
-(* Adds entries to the ledger, keeping those other builds added meanwhile,
-   but not entries this build read before a concurrent forget dropped them. *)
-fun record_remote_ledger_entries path entries =
+(* Adds LEARNED to the ledger, keeping the entries other builds added
+   meanwhile, but not those a concurrent forget dropped.  When that would
+   pass max_remote_ledger_entries, it keeps of the others only those in USED. *)
+fun record_remote_ledger_entries path {learned, used} =
   with_remote_ledger_lock path (fn () =>
-    write_text path
-      (String.concat (map (fn line => line ^ "\n")
-                          (Binaryset.listItems (Binaryset.addList (read_remote_ledger path, entries))))))
+    let
+      val existing = detail_time_phase "action_spec.ledger.parse" (fn () => read_remote_ledger path)
+      val merged = Binaryset.addList (existing, learned)
+      val entries =
+        if Binaryset.numItems merged <= max_remote_ledger_entries then merged
+        else Binaryset.addList (Binaryset.intersection (existing, used), learned)
+    in
+      detail_time_phase "action_spec.ledger.write" (fn () =>
+        write_text path (String.concat (map (fn line => line ^ "\n") (Binaryset.listItems entries))))
+    end)
   handle e => warn ("could not record the remote ledger " ^ path ^ ": " ^ General.exnMessage e)
 
 fun forget_remote_ledger () =
@@ -7839,7 +7852,8 @@ fun failing_on_pool remote jobs doing items_name pred items =
    pool.  Specs share their sources, so each file goes up once.  After the
    first failure the uploads not yet started are skipped, for the caller to
    fall back at once.  A file whose (path, sha256) known holds is taken as
-   present; learn is told each sha256 uploaded or found present. *)
+   present; learn is told the (path, sha256) of each one uploaded or found
+   present. *)
 fun upload_spec_files hash_file remote jobs {known, learn} files =
   let
     val upload_failed = ref false
@@ -7852,7 +7866,7 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
       (let val hash = hash_file path
        in
          if known (path, hash) then ()
-         else (publish_spec_blob remote {hash = hash, path = path}; learn hash)
+         else (publish_spec_blob remote {hash = hash, path = path}; learn (path, hash))
        end;
        true)
       handle e => (with_failure_lock (fn () => upload_failed := true); raise e)
@@ -7893,17 +7907,16 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         raise Error "action-spec: a remote action's result is its cache entry, so --no-cache can't apply"
       else ()
     val ledger_path = remote_ledger_path remote
-    (* Read once, without the lock: writers replace the file by rename. *)
-    val ledger_text = if ledger then (read_text ledger_path handle IO.Io _ => "") else ""
+    (* The ledger's entries this export found it to hold, and those it
+       learned the remote cache to hold. *)
+    val used = ref (Binaryset.empty String.compare)
     val learned = ref (Binaryset.empty String.compare)
     val ledger_mutex = Mutex.mutex ()
-    fun known item = sorted_lines_member ledger_text item
-    fun learn item =
-      if not ledger then ()
-      else
-        (Mutex.lock ledger_mutex;
-         (learned := Binaryset.add (!learned, item); Mutex.unlock ledger_mutex)
-         handle e => (Mutex.unlock ledger_mutex; raise e))
+    fun add set item =
+      (Mutex.lock ledger_mutex;
+       (set := Binaryset.add (!set, item); Mutex.unlock ledger_mutex)
+       handle e => (Mutex.unlock ledger_mutex; raise e))
+    fun learn item = if ledger then add learned item else ()
     val root = project_artifact_root project
     val config_lines = build_config_lines_for_node options project
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
@@ -7987,6 +8000,15 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       List.foldl (fn ((node, _), set) =>
                      Binaryset.addList (set, map HolbuildBuildPlan.key (HolbuildBuildPlan.transitive_project_deps plan node)))
                  held uncached_actions
+    val deps_actions = List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions
+    (* Read once, without the lock, as writers replace the file by rename;
+       and only by an export with something to look up, so a build with
+       nothing to do reads none of it. *)
+    val ledger_text =
+      if ledger andalso not (null uncached_actions andalso null deps_actions) then
+        (read_text ledger_path handle IO.Io _ => "")
+      else ""
+    fun known item = sorted_lines_member ledger_text item andalso (add used item; true)
     fun available remote (node, action) =
       let val key = #input_key action
       in
@@ -7996,8 +8018,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       end
     val unavailable =
       detail_time_phase "action_spec.export.publish_deps" (fn () =>
-        failing "checking remote cache" "theories" available
-          (List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions))
+        failing "checking remote cache" "theories" available deps_actions)
     val uncached_actions =
       if null unavailable then uncached_actions
       else List.filter (fn (node, _) => uncached_in (uncached_actions @ unavailable) node) actions
@@ -8032,20 +8053,21 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val action_lines = List.concat (map #lines exported)
     (* A worker rejects a spec it can't fetch rather than reporting it
        missing, so a spec the ledger hid would never be uploaded again: specs
-       skip the ledger. *)
+       skip the ledger, and as no lookup would read them, the ledger doesn't
+       learn them. *)
     fun is_spec path = String.isPrefix (spec_dir ^ "/") path
     val _ =
       if upload then
         upload_spec_files hash_file remote jobs
           {known = fn (path, hash) => not (is_spec path) andalso known ("blob " ^ hash),
-           learn = fn hash => learn ("blob " ^ hash)}
+           learn = fn (path, hash) => if is_spec path then () else learn ("blob " ^ hash)}
           (List.concat (map #files exported))
       else ()
     (* The caller records the ledger once the batch is submitted: it waits
        for the ledger's lock, which other builds hold to rewrite it. *)
     fun record () =
       if not ledger orelse Binaryset.isEmpty (!learned) then ()
-      else record_remote_ledger_entries ledger_path (Binaryset.listItems (!learned))
+      else record_remote_ledger_entries ledger_path {learned = Binaryset.listItems (!learned), used = !used}
   in
     {batch = String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n",
      deferred = map (HolbuildBuildPlan.key o #1) deferred, record = record}
