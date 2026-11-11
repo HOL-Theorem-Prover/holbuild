@@ -15,6 +15,7 @@ cache=$tmpdir/cache
 mkdir -p "$cache/tmp/oldtmp" "$cache/blobs" "$cache/actions/live" "$cache/actions/old" "$cache/actions/nomani" "$cache/actions/fresh-nomani" "$cache/actions/old/nested/dir" "$cache/locks/action-stale.lock"
 : > "$cache/blobs/live"
 : > "$cache/blobs/dead"
+: > "$cache/actions/stray-file"
 printf 'holbuild-cache-action-v2\nblob sig live\n' > "$cache/actions/live/manifest"
 printf 'holbuild-cache-action-v2\nblob=old\n' > "$cache/actions/old/manifest"
 touch -d '10 days ago' \
@@ -31,6 +32,7 @@ require_file "$cache/blobs/live"
 [[ ! -e "$cache/blobs/dead" ]] || { echo "unreferenced blob survived" >&2; exit 1; }
 [[ ! -e "$cache/actions/old" ]] || { echo "old action survived" >&2; exit 1; }
 [[ -d "$cache/actions/live" ]] || { echo "live action was removed" >&2; exit 1; }
+[[ -f "$cache/actions/stray-file" ]] || { echo "fresh non-directory action entry was removed" >&2; exit 1; }
 [[ -d "$cache/actions/fresh-nomani" ]] || { echo "fresh incomplete action was removed" >&2; exit 1; }
 [[ ! -e "$cache/actions/nomani" ]] || { echo "stale incomplete action survived" >&2; exit 1; }
 [[ ! -e "$cache/tmp/oldtmp" ]] || { echo "stale tmp survived" >&2; exit 1; }

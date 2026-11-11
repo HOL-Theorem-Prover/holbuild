@@ -221,11 +221,13 @@ fun add_blob (blob, blobs) = Redblackset.add(blobs, blob)
 
 fun manifest_path action_dir = Path.concat(action_dir, "manifest")
 
-fun missing_file (IO.Io {cause = OS.SysErr (_, SOME err), ...}) = err = Posix.Error.noent
+fun missing_file (IO.Io {cause = OS.SysErr (_, SOME err), ...}) =
+      err = Posix.Error.noent orelse err = Posix.Error.notdir
   | missing_file _ = false
 
-(* Adds the blobs a manifest names; a missing manifest adds none, and any other
-   failure to read it stops GC, which would otherwise delete the blobs it names. *)
+(* Adds the blobs a manifest names; a missing manifest, or an action entry that
+   is not a directory, adds none. Any other failure to read it stops GC, which
+   would otherwise delete the blobs it names. *)
 fun add_manifest_blobs (action_dir, live_blobs) =
   case SOME (TextIO.openIn (manifest_path action_dir))
        handle e => if missing_file e then NONE else raise e of
