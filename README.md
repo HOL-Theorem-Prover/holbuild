@@ -1814,8 +1814,10 @@ when it can't go on as a plain run would:
 * HOL stops early;
 * the parents don't all arrive within `--ahead-wait-seconds` (default 3600).
 A retry without the option builds it. The result's `phase-ms` adds
-`aheadload`, the time from HOL's start to its last stand-in's wait, and
-`aheadwait`, the time from then to the last parent's arrival.
+`aheadwait`, the time HOL spent waiting: at each stand-in from its wait to
+that parent's arrival, and at the end of the preload until every parent has
+arrived and the script is written; and `aheadload`, the rest of the time
+from HOL's start to then.
 
 A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
 execution") is checked the same way, its run text against its `run-key`,
