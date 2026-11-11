@@ -3434,7 +3434,9 @@ fun check_stored_data tc cli_jobs build_mode selections {project, index, compone
     val _ = if null run_loads then () else
       build_once_with_prepared_mode build_mode tc cli_jobs NONE (plain_build_request run_loads)
     val hol = hol_package_id tc project
-    val sources = List.filter (fn source => theory_source source andalso #package_id (#node source) <> hol) index
+    val sources = List.filter theory_source index
+    val project_theories = Redblackset.addList
+      (Redblackset.empty String.compare, project_theory_names hol index)
     val paths = List.foldl (fn (source, acc) =>
       Redblackmap.insert (acc, HolbuildBuildExec.theory_name_from_logical (#logical_name source),
         HolbuildBuildExec.one_with_suffix ".dat" (#theory_data (#artifacts source))))
@@ -3464,11 +3466,11 @@ fun check_stored_data tc cli_jobs build_mode selections {project, index, compone
                  | found => found)
         (* Theory.Graph.ancestryl folds left, prepending before visiting parents. *)
         fun ancestors parents state = List.foldl (fn (parent, (seen, acc)) =>
-          if not (Option.isSome (Redblackmap.peek (paths, parent))) orelse
+          if not (Redblackset.member (project_theories, parent)) orelse
              Redblackset.member (seen, parent) then (seen, acc)
           else ancestors (#parents (data parent)) (Redblackset.add (seen, parent), parent :: acc)) state parents
         val (_, ancestry) = ancestors (#parents summary) (Redblackset.empty String.compare, [])
-        val ancestry = thy :: ancestry
+        val ancestry = if Redblackset.member (project_theories, thy) then thy :: ancestry else ancestry
         fun axioms ancestor = map (fn (name, _) => qualified ancestor name ^ ": axiom")
           (List.filter (fn (_, info) => #axiom info) (#stored (data ancestor)))
         val findings = kernel_bypass_findings tc hol components index logical_name @

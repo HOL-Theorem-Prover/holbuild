@@ -165,6 +165,14 @@ require_grep "CleanTheory built" "$log"
 require_grep "^CleanTheory: clean (1 theorem)$" "$log"
 require_no_grep "axiom" "$log"
 
+# HOL theories built from sources remain valid check selectors.
+run_check sortingTheory 0
+require_grep '^sortingTheory: clean (' "$log"
+grep '^sortingTheory[.:]' "$log" > "$tmpdir/sorting.reports"
+run_check --with-fingerprints 0 sortingTheory
+grep '^sortingTheory[.:]' "$log" > "$log.reports"
+diff -u "$tmpdir/sorting.reports" "$log.reports"
+
 run_check CheatTheory 1
 require_grep "^CheatTheory.cheated_thm: cheat$" "$log"
 require_grep "^CheatTheory: 1 finding$" "$log"
@@ -256,6 +264,12 @@ val _ = Theory.delete_binding "rebound";
 val _ = save_thm ("rebound", TRUTH);
 val _ = Theory.save_private_thm ("private_hyp", ASSUME ``T``);
 val _ = save_thm ("oracle_thm", Thm.mk_oracle_thm "quote\"back\\slash" ([], ``T``));
+val data = ThyDataSexp.new
+  {thydataty = "check-quoted-symbols", merge = ThyDataSexp.append_merge,
+   load = fn _ => (), other_tds = fn (s, _) => SOME s};
+val _ = #export data (ThyDataSexp.List
+  [ThyDataSexp.Sym "(", ThyDataSexp.Sym ")", ThyDataSexp.Sym "a|b",
+   ThyDataSexp.Sym "line\nbreak"]);
 SML
 for side in Left Right; do
   cat > "$project/src/${side}Script.sml" <<SML
