@@ -36,7 +36,7 @@ members = ["src"]
 exclude_globs = ["*/Selftest.sml"]
 
 [actions.ATheory]
-extra_inputs = ["data/manifest-input.txt", "gendata"]
+extra_inputs = ["data/manifest-input.txt", "gendata", "gendata/out.txt"]
 
 [[generate]]
 name = "gen"
@@ -98,7 +98,7 @@ cp -a "$base" "$tmpdir/built"
 mkdir -p "$tmpdir/built/gendata"
 printf 'val () = holbuild_extra_deps ["../notes/other.txt"];\n' > "$tmpdir/built/src/Generated.sml"
 printf 'x\n' > "$tmpdir/built/data/dir/gen.out"
-printf 'x\n' > "$tmpdir/built/gendata/out.txt"
+ln -s ../README.md "$tmpdir/built/gendata/out.txt"
 printf 'x\n' > "$tmpdir/built/gendata/chained.txt"
 
 # Links the glob walk passes but its matches do not contain.

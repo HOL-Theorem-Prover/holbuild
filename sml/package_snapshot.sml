@@ -90,7 +90,6 @@ fun declared (context : context) base decl =
     val glob = HolbuildBuildPlan.path_has_glob decl
     val abs = HolbuildSourceIndex.normalize_path
                 (if Path.isAbsolute decl then decl else Path.concat(base, decl))
-    val _ = if glob then () else (reject_symlinks root (relative root abs))
     fun walk () =
       let val {files, dirs} = HolbuildBuildPlan.expand_extra_dep_walk base decl
       in
@@ -101,10 +100,17 @@ fun declared (context : context) base decl =
         List.concat (map (fn (_, path) => keep context (relative root path)) files)
       end
   in
-    if not glob andalso not (FS.access(abs, []) handle OS.SysErr _ => false) then
-      if generated_under context abs then []
-      else die ("extra dependency not found: " ^ relative root abs)
-    else walk ()
+    if glob then walk ()
+    else
+      let val rel = relative root abs
+      in
+        if ignored rel orelse is_output context rel then []
+        else
+          (reject_symlinks root rel;
+           if FS.access(abs, []) handle OS.SysErr _ => false then walk ()
+           else if generated_under context abs then []
+           else die ("extra dependency not found: " ^ rel))
+      end
   end
 
 fun shim_manifests definition =
