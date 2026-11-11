@@ -835,6 +835,18 @@ for t in B C; do
     { echo "${t}Theory's reused entry was not published" >&2; exit 1; }
 done
 
+# Admitting A's unchanged statement changes its oracle tags: B and C
+# must go to the workers in a second batch rather than be cut off.
+: > "$state/ran"
+write_cutoff cheat one "" "" "cheat"
+run client-cutoff-cheat 0 build --remote-exec "$coordinator" CTheory
+require_grep "early cutoff reused 0 of 2 deferred theories" "$tmpdir/client-cutoff-cheat.log"
+[[ $(grep -c "^holbuild: remote batch " "$tmpdir/client-cutoff-cheat.log") -eq 2 ]] ||
+  { cat "$tmpdir/client-cutoff-cheat.log" >&2; exit 1; }
+refute_grep "Theory built" "$tmpdir/client-cutoff-cheat.log"
+[[ "$(< "$state/ran")" == $'rxk:ATheory\nrxk:BTheory\nrxk:CTheory' ]] ||
+  { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
+
 # An edit that changes what A produces: B and C go to the workers next.
 : > "$state/ran"
 write_cutoff three one "$a2"
