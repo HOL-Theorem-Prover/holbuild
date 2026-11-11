@@ -11136,9 +11136,18 @@ fun write_ahead_preload {load_lines, dir, path} =
         "else (HolbuildRuntime.write_text " ^ HolbuildToolchain.sml_string (Path.concat (dir, "abandoned")) ^
         " " ^ no_loader ^ "; OS.Process.exit OS.Process.failure);" ::
       "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (ahead_runtime_path ()) ^ ";" ::
+      if_meta_has ["moduleSourceLoader"]
+        ("val _ = let val loader = !Meta.moduleSourceLoader in " ^
+         "Meta.moduleSourceLoader := (fn use => fn file => (HolbuildAheadLoad.record file; loader use file)); " ^
+         "HolbuildAheadLoad.loader := Meta.load; " ^
+         "HolbuildAheadLoad.restore := (fn () => Meta.moduleSourceLoader := loader) end;") ::
       "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ ";" ::
+      "structure HolbuildAheadPlainRuntime = HolbuildRuntime;" ::
       "structure HolbuildRuntime = struct open HolbuildRuntime val load = HolbuildAheadLoad.load end;" ::
-      (load_lines @ ["val _ = HolbuildAheadLoad.finish ();"])
+      (load_lines @
+       ["val _ = HolbuildAheadLoad.finish ();",
+        (* The plain preload saves the heap later actions resume from. *)
+        "structure HolbuildRuntime = HolbuildAheadPlainRuntime;"])
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -11543,25 +11552,27 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         fun await_child () = if child_done () then () else (OS.Process.sleep (Time.fromMilliseconds 50); await_child ())
         fun stop_child () = if child_done () then () else (HolbuildToolchain.cleanup_active_children (); await_child ())
         fun abandoned () = if file_exists (marker "abandoned") then SOME (read_text (marker "abandoned")) else NONE
-        val last_arrival = ref started
-        (* aheadload: from the child's start to its last wait step entered
-           (to the last arrival if it never waited); aheadwait: from then to
-           the last arrival. *)
+        (* When each late parent arrived, and when the child was let past
+           the preload's barrier. *)
+        val arrivals = ref ([] : (string * Time.time) list)
+        val released = ref (NONE : Time.time option)
+        (* aheadwait: the time the child spent in its waits, each from its
+           entry (waiting-P, finishing) to its marker (or to now, for one
+           still waiting); aheadload: the rest of its preload. *)
         fun record_timings () =
           let
-            val waited =
-              List.mapPartial
-                (fn (dep, _) =>
-                   let val path = marker ("waiting-" ^ Path.file (#stem dep))
-                   in if file_exists path then SOME (FS.modTime path) else NONE end)
-                late
-            val loaded =
-              case waited of
-                  [] => !last_arrival
-                | t :: ts => List.foldl (fn (a, b) => if Time.> (a, b) then a else b) t ts
+            val now = Time.now ()
+            fun entered name = if file_exists (marker name) then SOME (FS.modTime (marker name)) else NONE
             fun ms (a, b) = LargeInt.max (0, Time.toMilliseconds (Time.- (a, b)))
+            fun waited (name, ended) = case entered name of SOME t => ms (ended, t) | NONE => 0
+            val parents =
+              map (fn (dep, _) =>
+                     let val name = Path.file (#stem dep)
+                     in waited ("waiting-" ^ name, getOpt (Option.map #2 (List.find (fn (n, _) => n = name) (!arrivals)), now)) end)
+                  late
+            val wait = List.foldl op+ (waited ("finishing", getOpt (!released, now))) parents
           in
-            phases := ("aheadwait", ms (!last_arrival, loaded)) :: ("aheadload", ms (loaded, started)) :: !phases
+            phases := ("aheadwait", wait) :: ("aheadload", LargeInt.max (0, ms (getOpt (!released, now), started) - wait)) :: !phases
           end
         val deadline = Time.+ (started, !ahead_wait_limit)
         (* Polls READY every INTERVAL while the child runs. *)
@@ -11652,7 +11663,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             copy_binary (staged ^ ".uo") (marker (name ^ ".uo"));
             drop ("arrived-" ^ name);
             arrived := key :: !arrived;
-            last_arrival := Time.now ()
+            arrivals := (name, Time.now ()) :: !arrivals
           end
         fun poll () =
           (List.app (fn parent as (dep, _) =>
@@ -11699,6 +11710,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                 (SOME {source_text = source_text, tool_cache = tool_cache,
                        join = fn () =>
                          (drop "ready";
+                          released := SOME (Time.now ());
                           await_child ();
                           record_timings ();
                           case (abandoned (), !outcome) of

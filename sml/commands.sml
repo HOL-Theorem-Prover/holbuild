@@ -3645,7 +3645,13 @@ fun exec_action_command maxheap jobs args =
             else raise Error ("--ahead-parent takes INPUT_KEY:SPEC-SHA256, not " ^ text)
         | _ => raise Error ("--ahead-parent takes INPUT_KEY:SPEC-SHA256, not " ^ text)
     fun take_ahead [] = []
-      | take_ahead ("--ahead-parent" :: text :: xs) = (ahead_parents := ahead_parent text :: !ahead_parents; take_ahead xs)
+      | take_ahead ("--ahead-parent" :: text :: xs) =
+          let val parent = ahead_parent text
+          in
+            if List.exists (fn {input_key, ...} => input_key = #input_key parent) (!ahead_parents)
+            then raise Error ("--ahead-parent names " ^ #input_key parent ^ " twice")
+            else (ahead_parents := parent :: !ahead_parents; take_ahead xs)
+          end
       | take_ahead ("--ahead-wait-seconds" :: n :: xs) =
           (case Int.fromString n of
                SOME seconds =>

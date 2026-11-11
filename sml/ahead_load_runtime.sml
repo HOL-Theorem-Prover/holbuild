@@ -9,11 +9,16 @@
    recorded since entry.  It then evaluates the parent's signature and
    theory files, which a plain load evaluates before and after the walk.
 
+   The preload ends in a barrier: it waits for exec-action's ready, which
+   comes only once every late parent has arrived and the script is written,
+   then puts the loader back as a plain load has it, before the plain
+   preload saves its heap.
+
    The steps talk to exec-action through marker files in one directory:
    base-loaded (written here, the modules loaded and the load path),
-   stand-ins, arrived-P and ready (written by exec-action), waiting-P
-   (written here, for the timings) and abandoned (written here, its reason;
-   the child then exits with failure). *)
+   stand-ins, arrived-P and ready (written by exec-action), waiting-P and
+   finishing (written here, for the timings) and abandoned (written here,
+   its reason; the child then exits with failure). *)
 structure HolbuildAheadLoad =
 struct
   val dir = ref ""
@@ -24,8 +29,16 @@ struct
      count of files recorded before its enter step. *)
   val entries : (string * string list * int) list ref = ref []
 
-  fun recording_use file = (recorded := file :: !recorded; count := !count + 1; Meta.qquse file)
-  val load = Meta.loadPlan recording_use
+  (* Paths as the loader evaluates them, with HOL's path variables expanded. *)
+  fun record file = (recorded := holpathdb.subst_pathvars file :: !recorded; count := !count + 1)
+  fun recording_use file = (record file; Meta.qquse file)
+  (* How the preload loads a module.  On a HOL with theory modules the
+     preload makes it Meta.load, recording through Meta.moduleSourceLoader,
+     so modules load from the module store as in a plain load. *)
+  val loader = ref (Meta.loadPlan recording_use)
+  fun load module = !loader module
+  (* Puts back what the preload changed of HOL's loader. *)
+  val restore = ref (fn () => ())
 
   fun path name = OS.Path.concat (!dir, name)
   fun exists name = OS.FileSys.access (path name, []) handle OS.SysErr _ => false
@@ -47,7 +60,7 @@ struct
                        map (fn d => "path " ^ d ^ "\n") (!Meta.loadPath)));
      await "stand-ins")
 
-  fun finish () = await "ready"
+  fun finish () = (write "finishing" ""; await "ready"; !restore ())
 
   fun enter parent = entries := (parent, Meta.loaded (), !count - 1) :: !entries
 
@@ -78,7 +91,7 @@ struct
             | NONE => raise Fail ("no manifest " ^ module ^ ext)
         end
       fun visit entry =
-        if is_file entry then [entry]
+        if is_file entry then [holpathdb.subst_pathvars entry]
         else
           let
             val module = holpathdb.subst_pathvars entry
