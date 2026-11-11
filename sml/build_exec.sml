@@ -410,7 +410,10 @@ fun write_child_policy_with {module_cache = use_module_cache} tc path =
                      base_state = HolbuildToolchain.base_state tc}
   in
     write_text path
-      (String.concat
+      ("(* HOL discovers sibling stages at startup; they can disappear during a load. *)\n" ^
+       "val _ = Meta.loadPath := List.filter (fn dir => not " ^
+       "(String.isSubstring \"/.holbuild/stage/\" (dir ^ \"/\"))) (!Meta.loadPath);\n" ^
+       String.concat
          (map (fn trace => "val _ = (Feedback.set_trace " ^ HolbuildToolchain.sml_string trace ^
                            " 0 handle _ => ());\n")
               child_policy_traces) ^ (if use_module_cache then module_cache else "") ^ "\n")
