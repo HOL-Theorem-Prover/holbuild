@@ -147,6 +147,7 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "running_run": 1,
         "ready_priority": 0,
         "running_priority": 0,
+        "waiting_ahead": 0,
         "run_slots": 30,
         "run_floor": 0,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
@@ -357,7 +358,7 @@ async def test_claim_forwards_optional_host_id_and_rank(
     assert response.status_code == 204
     assert claim.await_args is not None
     assert claim.await_args.args[:3] == (["high", "standard"], "w1", 0)
-    assert claim.await_args.kwargs == {"host_id": host_id, "host_rank": host_rank}
+    assert claim.await_args.kwargs == {"host_id": host_id, "host_rank": host_rank, "ahead": False}
 
 
 async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, coordinator: Coordinator) -> None:

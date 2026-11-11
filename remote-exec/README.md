@@ -475,6 +475,20 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   the completion is dropped. Since a worker may run an action twice after a
   network partition, nothing depends on exactly-once execution: a second run
   finds the result cached.
+- **Loading ahead**, for a batch submitted with `speculative_loading=<cap>`:
+  a worker that says it can (`"ahead": true`) and finds nothing ready in any
+  batch may claim a waiting build action of the batch whose parents that
+  aren't done are all running and wait for no parent of their own, so a claim
+  goes one generation ahead. Its worker loads the action's ancestors that
+  exist and waits for the running parents' outputs, which the claim names in
+  `ahead_parents`. At most `<cap>` of a batch's actions wait ahead at once;
+  among the candidates of the batches below their cap, the claim takes the
+  highest batch priority, then the longest chain of dependents. A parent
+  finishing recounts its running children's unfinished parents; a parent that
+  fails for good cancels them as it does every descendant, and a done parent
+  built again (an evicted entry) revokes their leases and sends them back to
+  waiting without counting the claim. Batches without the parameter are
+  never claimed ahead.
 - **Retries** by the result's failure class:
 
   | `failure` | What happens |
@@ -485,6 +499,7 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   | `input-missing` naming a theory of the batch other than the action itself or one that depends on it | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
   | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`, naming the theory as `theory <input_key>`; the client resubmits once with that theory and every theory that depends on it, and otherwise the next build exports a new batch |
   | `unavailable` | retried without counting the claim, `MAX_INTERRUPTIONS` times; after that like `internal` |
+  | `ahead-abandoned` | from an action claimed ahead: back to waiting without counting the claim, and claimed only once its parents are done from then on; from any other, like `internal` |
   | `proof`, `tactic-timeout`, `spec-rejected`, `script`, `timeout` | final; `script` means the script failed or omitted an output, `timeout` means it exceeded its time limit |
 
   A worker that gets no answer from the cache for the action's spec, 429,
@@ -534,7 +549,9 @@ action beyond the warm workers, but at least one per ready or running
 high-tier action, since warm workers take only standard-tier work, and at
 most `REMOTE_EXEC_MAX_BURST_WORKERS`. Runs contribute only up to
 `REMOTE_EXEC_RUN_SLOTS` in both the total and high-tier demand terms;
-high-tier builds remain uncapped except by `MAX_BURST_WORKERS`:
+high-tier builds remain uncapped except by `MAX_BURST_WORKERS`. An action
+claimed ahead counts as running only once its parents are done: no burst
+worker starts for an action that waits.
 
 ```text
 active = ready_build + running_build + min(RUN_SLOTS, ready_run + running_run)
@@ -621,10 +638,13 @@ retries, and a request still queued for a connection would be done twice.
 
 ### Client
 
-`POST /v1/batches?profile=<name>&class=build|run&priority=<integer>` with the batch text as the body
-(`text/plain`). `profile` defaults to `default`; `class` defaults to `build`.
+`POST /v1/batches?profile=<name>&class=build|run&priority=<integer>&speculative_loading=<cap>` with the batch
+text as the body (`text/plain`). `profile` defaults to `default`; `class` defaults to `build`.
 An unknown class returns 422. `priority` defaults to 0 and accepts integers
 from 0 to 2147483647; invalid values return 422. Existing batches retain priority 0.
+`speculative_loading`, from 1 to 64, lets that many of the batch's actions
+at once be claimed ahead of their parents (see "Loading ahead"); without it
+none is.
 
 - 201 `{"batch_id": "<uuid>"}`
 - 400 when the batch is malformed (bad header or line, duplicate action, an
@@ -679,7 +699,7 @@ from 0 to 2147483647; invalid values return 422. Existing batches retain priorit
 
 `GET /v1/queue`
 
-- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "run_slots": 30, "run_floor": 0, "desired_burst_workers": 0, "max_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
+- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "waiting_ahead": 0, "run_slots": 30, "run_floor": 0, "desired_burst_workers": 0, "max_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
   the unfinished actions of running batches, the configured run cap (`run_slots`)
   and effective reserved floor (`run_floor`, clamped to that cap), the burst worker target and its cap
   (`max_burst_workers`), the
@@ -696,7 +716,8 @@ from 0 to 2147483647; invalid values return 422. Existing batches retain priorit
   {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3, "after_result": 3020.4}}
   ```
   Tier counts include both classes; `ready_run` and `running_run` are the
-  run subsets across tiers. A phase's share of the workers' time is its
+  run subsets across tiers. `waiting_ahead` counts the actions claimed ahead
+  that still wait for a parent, which the running counts leave out. A phase's share of the workers' time is its
   seconds over the sum of all. A host is its workers' latest report,
   `age_s` seconds old,
   except that `cpu_idle_pct` is the latest one measured:
@@ -711,8 +732,9 @@ from 0 to 2147483647; invalid values return 422. Existing batches retain priorit
 
 ### Worker
 
-`POST /v1/work/claim` with `{"tier": "standard|high", "also_claim": ["standard|high", …], "worker": "<name>", "wait_s": 20, "host": <report>, "phases": {"<phase>": <seconds>, …}}`
-(`also_claim`, `wait_s`, `host` and `phases` are optional; `phases` gives the
+`POST /v1/work/claim` with `{"tier": "standard|high", "also_claim": ["standard|high", …], "worker": "<name>", "wait_s": 20, "host": <report>, "phases": {"<phase>": <seconds>, …}, "ahead": true}`
+(`also_claim`, `wait_s`, `host`, `phases` and `ahead` are optional; `ahead`
+says the worker can run an action claimed ahead of its parents, false by default; `phases` gives the
 seconds the worker spent in each phase since its previous claim, each
 non-negative, a missing phase 0; `wait_s` is how long the coordinator
 holds the request open for an action to become ready, 0 by default and at
@@ -721,7 +743,9 @@ the worker's report of its host, a host of `GET /v1/queue` without `age_s`,
 with `cpu_idle_pct` measured since the worker's previous CPU sample, or null
 when that is under a second old)
 
-- 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120}`
+- 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120, "max_heap_mb": null, "ahead_parents": [{"input_key": "<sha256>", "spec_sha256": "<sha256>"}, …]}`:
+  `ahead_parents` lists the parents still building when the action was claimed ahead of them, and is empty for
+  any other claim
 - 204 when nothing became ready for the tier within `wait_s`
 
 `POST /v1/work/<attempt_token>/heartbeat`, with no body or `{"host": <report>}`
@@ -754,6 +778,11 @@ these subsets to the tier totals. Priority does not change burst demand.
 Strict priority suits occasional finite batches; there is no aging or reserved
 normal share. Normal work can use workers for which no priority action is ready,
 including while a priority batch waits on dependencies.
+
+Migration `0015` adds `batches.ahead_cap` and `actions.ahead`. Before rolling
+back to a coordinator image predating it, stop the coordinator and use the new
+image to run `alembic downgrade 0014`, then start the older image. Actions
+running ahead then look like any running action to the older image.
 
 ## Tests
 
