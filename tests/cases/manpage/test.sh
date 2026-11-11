@@ -19,8 +19,8 @@ trap 'cleanup_temp_dir "$tmpdir"' EXIT
 sed -e 's/\\&//g' -e 's/\\-/-/g' -e 's/\\fB//g' -e 's/\\fI//g' -e 's/\\fR//g' "$manpage" > "$tmpdir/page.txt"
 
 # Everything the help texts and the parser source name.
-commands=$(sed -n '/^val command_names =/,/\]/p' "$ROOT/sml/commands.sml" | grep -o '"[a-z-]*"' | tr -d '"')
-[[ -n "$commands" ]] || { echo "no commands found in sml/commands.sml" >&2; exit 1; }
+commands=$(sed -n '/^val command_names =/,/\]/p' "$ROOT/sml/names.sml" | grep -o '"[a-z-]*"' | tr -d '"')
+[[ -n "$commands" ]] || { echo "no commands found in sml/names.sml" >&2; exit 1; }
 
 {
   "$HOLBUILD_BIN" --help
