@@ -359,7 +359,7 @@ expect c 0 "status=built"
 # loads into the host's store, which the child itself only reads.
 if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   for theory in A B; do
-    compgen -G "$tmpdir/worker-c/theory-modules/*-$theory-*.pmo" > /dev/null || {
+    compgen -G "$tmpdir/worker-c/theory-modules/*/*-$theory-*.pmo" > /dev/null || {
       echo "worker c wrote no module for $theory" >&2
       cat "$tmpdir/c.log" >&2
       exit 1

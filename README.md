@@ -41,7 +41,7 @@ The new token annotations do not change existing proof-step labels or extents.
 
 On HOL and Poly/ML versions supporting theory modules, holbuild
 automatically keeps each loaded theory's decoded data in a module under
-`<cache root>/theory-modules`, so later loads skip reading its `.dat` file.
+`<cache root>/theory-modules/<toolchain>`, so later loads skip reading its `.dat` file.
 Loading a module still registers the theory's types, constants and theorems
 and runs its load hooks in the usual dependency order. ML libraries retain
 their usual source-loading behavior. Older toolchains and missing or

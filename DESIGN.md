@@ -176,6 +176,10 @@ plant a module another one loads. Before an action runs, the worker has a
 sandboxed child that runs no project code write the missing modules of the
 theories the action loads, from their restored `.dat` files alone, and moves
 into the store only the files named for those theories' `.dat` files.
+Each HOL toolchain has its own directory in the store, named by its HOL
+directory (on a worker, by the toolchain's repository, commit and kernel).
+A worker may trust any HOL repository and the writer runs the toolchain's
+own code, so a toolchain can write only the modules its own actions load.
 
 ## Main binary and project-HOL helper direction
 

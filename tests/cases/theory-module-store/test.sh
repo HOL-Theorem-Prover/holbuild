@@ -23,6 +23,11 @@ val _ = check "the store is not configured"
           (List.all (fn s => has "configureTheoryModuleCache {directory = \\\"/s\\\", base_state = \\\"/b\\\"}" s)
                     [policy true, policy false]);
 
+val _ = check "two toolchains share a module store"
+          (E.module_store "/h1" <> E.module_store "/h2");
+val _ = check "a toolchain's store is outside the stores directory"
+          (OS.Path.dir (E.module_store "/h1") = E.module_stores ());
+
 val sha = "0123456789abcdef0123456789abcdef01234567";
 val expected = ["A-" ^ sha ^ ".pmo"];
 val wanted = E.module_file_wanted expected;

@@ -363,9 +363,18 @@ fun write_plain_preload load_lines path =
    checkpoint.  The trace was renamed in HOL, so tolerate either spelling. *)
 val child_policy_traces = ["TheoryPP.include_docs", "TheoryPP.include_html_docs"]
 
-fun module_store () =
+fun module_stores () =
   HolbuildCache.theory_modules_dir
     (Path.mkAbsolute {path = HolbuildCacheConfig.cache_root (), relativeTo = FS.getDir ()})
+
+(* Each HOL toolchain keeps its modules in its own directory, named by its
+   HOL directory.  A worker may trust any HOL repository, and a toolchain's
+   module writer runs that toolchain's code, so it must not be able to put
+   a module where another toolchain loads from.  On a worker the HOL
+   directory is named by the toolchain's repository, commit and kernel. *)
+fun module_store holdir =
+  Path.concat (module_stores (),
+               HolbuildHash.string_sha256 (Path.mkAbsolute {path = holdir, relativeTo = FS.getDir ()}))
 
 (* Older HOL installations keep their source loader.  Compile [code] only
    after checking that Meta has the optional [values]. *)
@@ -397,7 +406,7 @@ fun module_policy {sandboxed, store, base_state} =
 fun write_child_policy_with {module_cache = use_module_cache} tc path =
   let
     val module_cache =
-      module_policy {sandboxed = HolbuildActionSandbox.active (), store = module_store (),
+      module_policy {sandboxed = HolbuildActionSandbox.active (), store = module_store (#holdir tc),
                      base_state = HolbuildToolchain.base_state tc}
   in
     write_text path
@@ -10416,7 +10425,7 @@ val module_writer_limit = 32
    sigobj.  A failure leaves the action to load from .dat files. *)
 fun fill_module_store cache root tc (spec : action_spec) =
   let
-    val store = HolbuildCache.theory_modules_dir cache
+    val store = module_store (#holdir tc)
     val project =
       map (fn {target, stem, ...} =>
               (theory_name_from_logical (#2 (target_name target)), in_root root stem))
@@ -10627,7 +10636,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val root = Path.concat(cache, "action")
     val checkpoint_root = Path.concat(cache, "checkpoints")
     val _ = HolbuildActionSandbox.enable (root, checkpoint_root)
-    val _ = HolbuildActionSandbox.shared_reads := [module_store ()]
+    val _ = HolbuildActionSandbox.shared_reads := [module_stores ()]
     val _ = HolbuildActionSandbox.result_file :=
               (* Not normalized: the sandbox resolves ".." after links as open does. *)
               Option.map (fn file => if Path.isAbsolute file then file else FS.getDir () ^ "/" ^ file) result_file
