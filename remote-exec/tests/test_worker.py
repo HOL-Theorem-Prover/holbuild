@@ -1040,9 +1040,16 @@ def test_claim_asks_the_coordinator_to_wait(server: Server) -> None:
     assert server.claims == [
         {
             "tier": "standard", "also_claim": ["high"], "worker": "w", "wait_s": 20, "phases": {"hol": 1.5},
-            "ahead": True, "host": None,
+            "host": None,
         }
     ]
+
+
+def test_only_a_worker_that_loads_ahead_claims_ahead(tmp_path: Path, server: Server) -> None:
+    assert not worker_args(tmp_path, server).load_ahead
+    assert worker_args(tmp_path, server, "--load-ahead").load_ahead
+    assert Coordinator(server.url, "w", load_ahead=True).claim(["standard"], "w", 0, {}) is None
+    assert server.claims[-1]["ahead"] is True
 
 
 def test_claim_wait_is_at_most_50_seconds(tmp_path: Path, server: Server) -> None:

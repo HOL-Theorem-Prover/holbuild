@@ -127,7 +127,7 @@ fun build_help () = print
   \status 75. --detach submits the batch and exits; --attach follows a\n\
   \submitted batch and restores it. --speculative-loading starts loading a\n\
   \theory's ancestors on a worker before its parents are built, at most N\n\
-  \theories of the batch at a time (1-64, default 16); it costs worker time\n\
+  \theories of the batch at a time (1-16, default 4); it costs worker time\n\
   \when a parent fails.\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
@@ -2263,13 +2263,13 @@ fun split_speculative_loading args =
     fun parse value =
       case Int.fromString value of
           SOME n =>
-            if n >= 1 andalso n <= 64 andalso List.all Char.isDigit (String.explode value) then n
-            else raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 64")
-        | NONE => raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 64")
+            if n >= 1 andalso n <= 16 andalso List.all Char.isDigit (String.explode value) then n
+            else raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 16")
+        | NONE => raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 16")
     fun loop cap acc xs =
       case xs of
           [] => (cap, rev acc)
-        | "--speculative-loading" :: rest => loop (SOME 16) acc rest
+        | "--speculative-loading" :: rest => loop (SOME 4) acc rest
         | arg :: rest =>
             if String.isPrefix "--speculative-loading=" arg then
               loop (SOME (parse (String.extract (arg, size "--speculative-loading=", NONE)))) acc rest

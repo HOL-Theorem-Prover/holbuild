@@ -203,15 +203,20 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Coordinator:
-    """The worker endpoints of the coordinator. Claims and heartbeats carry ``host``'s report, when given."""
+    """The worker endpoints of the coordinator. Claims and heartbeats carry ``host``'s report, when given; with
+    ``load_ahead``, claims also take actions whose parents still build (exec-action --ahead-parent)."""
 
     opener = urllib.request.build_opener(NoRedirect)
 
-    def __init__(self, url: str, token: str, host: "HostTelemetry | None" = None, drain: Drain | None = None) -> None:
+    def __init__(
+        self, url: str, token: str, host: "HostTelemetry | None" = None, drain: Drain | None = None,
+        *, load_ahead: bool = False,
+    ) -> None:
         self.url = url.rstrip("/")
         self.token = token
         self.host = host
         self.drain = drain or Drain()
+        self.load_ahead = load_ahead
 
     def post(self, path: str, body: bytes, content_type: str, timeout: float = 30) -> tuple[int, Any]:
         request = urllib.request.Request(
@@ -248,8 +253,7 @@ class Coordinator:
         went since its last claim."""
         body = {
             "tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s, "phases": phases,
-            "ahead": True,
-        }
+        } | ({"ahead": True} if self.load_ahead else {})
         status, response = self.post_reporting("/v1/work/claim", body, 30 + wait_s)
         if status == 204:
             return None
@@ -1086,6 +1090,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cooperate-dir", help="holbuild --cooperate-dir, shared by a host's workers")
     parser.add_argument("--share-heaps", action="store_true", help="holbuild exec-action --share-heaps")
     parser.add_argument(
+        "--load-ahead",
+        action="store_true",
+        help="also claim theories of batches that load ahead while their parents still build, and wait for them; "
+        "for burst workers, so the warm pool stays free for ready work",
+    )
+    parser.add_argument(
         "--holbuild-releases-dir",
         default="/opt/holbuild-releases",
         help="where holbuild releases are built, one directory per version; a host's workers can share it",
@@ -1162,7 +1172,7 @@ def main() -> None:
         print(f"not reporting the host to the coordinator: {error}", file=sys.stderr)
         host = None
     drain = Drain(args.drain_seconds)
-    coordinator = Coordinator(args.coordinator, token, host, drain)
+    coordinator = Coordinator(args.coordinator, token, host, drain, load_ahead=args.load_ahead)
     releases = Releases(
         args.holbuild_releases_dir,
         args.holbuild_source_url,
