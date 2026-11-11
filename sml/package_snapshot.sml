@@ -90,13 +90,22 @@ fun declared (context : context) base decl =
     val glob = HolbuildBuildPlan.path_has_glob decl
     val abs = HolbuildSourceIndex.normalize_path
                 (if Path.isAbsolute decl then decl else Path.concat(base, decl))
+    (* The walk lists directories and the entries it cannot read (a dangling
+       link among them) apart from the files.  A glob walks all of BASE but
+       selects only some of it, so only the entries it matches are checked. *)
+    fun check_entry entry =
+      let val rel = relative root entry
+      in
+        if rel = "" orelse ignored rel orelse is_output context rel then ()
+        else if glob andalso
+                not (HolbuildSourceIndex.glob_match decl (HolbuildSourceIndex.relative_path base entry))
+        then ()
+        else reject_symlinks root rel
+      end
     fun walk () =
       let val {files, dirs} = HolbuildBuildPlan.expand_extra_dep_walk base decl
       in
-        (* A glob walks all of BASE but selects only some of it, so only the
-           selected files' own paths matter. *)
-        if glob then ()
-        else List.app (fn dir => ignore (keep context (relative root dir))) dirs;
+        List.app check_entry dirs;
         List.concat (map (fn (_, path) => keep context (relative root path)) files)
       end
   in

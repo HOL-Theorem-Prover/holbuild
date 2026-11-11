@@ -106,6 +106,9 @@ cp -a "$base" "$tmpdir/glob-links"
 ln -s ../data "$tmpdir/glob-links/src/linkdir"
 ln -s nowhere "$tmpdir/glob-links/src/dangling"
 
+cp -a "$base" "$tmpdir/glob-dangling"
+ln -s nowhere "$tmpdir/glob-dangling/src/globdata/g3.txt"
+
 # Errors: a symlink in an expanded directory, a symlinked declared file, a
 # dangling one, and a declaration outside the package.
 cp -a "$base" "$tmpdir/link-in-dir"
@@ -121,7 +124,7 @@ printf 'val () = holbuild_extra_deps ["../../escape.txt"];\n' >> "$tmpdir/outsid
 cp -a "$base" "$tmpdir/missing"
 rm "$tmpdir/missing/data/manifest-input.txt"
 
-for name in base copy configured built glob-links link-in-dir link-declared link-dangling outside missing; do
+for name in base copy configured built glob-links glob-dangling link-in-dir link-declared link-dangling outside missing; do
   printf '%s %s\n' "$name" "$tmpdir/$name"
 done > "$tmpdir/projects"
 
@@ -184,6 +187,7 @@ expect_error() {
 }
 expect_error link-in-dir 'symlink in package snapshot: data/dir/link.txt'
 expect_error link-declared 'symlink in package snapshot: data/manifest-input.txt'
+expect_error glob-dangling 'symlink in package snapshot: src/globdata/g3.txt'
 expect_error link-dangling 'symlink in package snapshot: gen/input.txt'
 expect_error outside 'snapshot path is outside the package root: .*/escape.txt'
 expect_error missing 'extra dependency not found: data/manifest-input.txt'
