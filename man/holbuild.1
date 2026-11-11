@@ -349,7 +349,7 @@ keeps their files.
 Where to write the result record (default: standard output).
 .RE
 .TP
-.B run\-action \fR[\fIOPTIONS\fR] \fB\-\-script \fIS\fR \fITARGET\fR ...
+.B run\-action \fIFORM\fR \fITARGET\fR ...
 Run script
 .I S
 in the context of each target on remote workers, once per set of inputs:
@@ -382,6 +382,29 @@ Takes
 cache options.
 Needs
 .BR \-\-remote\-cache .
+.IP
+There are three forms; a
+.I \-\-script
+is required in each:
+.RS
+.IP
+.nf
+run\-action \-\-remote\-exec URL [\-\-remote\-only] \-\-outputs\-dir D [\-\-profile P]
+    \-\-script S [\-\-support F]... [\-\-load L]... \-\-output N...
+    [\-\-option timeout=SECONDS] [\-\-closure] TARGET...
+run\-action \-\-fetch\-only \-\-outputs\-dir D \-\-script S ... TARGET...
+run\-action \-\-export\-only \-\-script S ... TARGET...
+.fi
+.RE
+.IP
+.B \-\-export\-only
+takes none of
+.BR \-\-fetch\-only ,
+.BR \-\-remote\-exec ,
+.BR \-\-remote\-only ,
+.B \-\-outputs\-dir
+and
+.BR \-\-profile .
 .IP
 Exits 0 when every run ended (done, cached, failed or, with
 .BR \-\-fetch\-only ,
