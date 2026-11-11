@@ -7699,6 +7699,32 @@ fun read_remote_ledger path =
   Binaryset.addList (Binaryset.empty String.compare, String.tokens (fn c => c = #"\n") (read_text path))
   handle IO.Io _ => Binaryset.empty String.compare
 
+(* Whether ITEM is a whole line of TEXT, by binary search: the ledger is
+   written sorted by String.compare.  Only an exact whole line matches, so a
+   ledger out of order can only hide entries, which costs a check or an
+   upload, never claim one. *)
+fun sorted_lines_member text item =
+  let
+    val n = size text
+    fun line_start i = if i > 0 andalso String.sub (text, i - 1) <> #"\n" then line_start (i - 1) else i
+    fun line_end i = if i < n andalso String.sub (text, i) <> #"\n" then line_end (i + 1) else i
+    (* LO and HI are line starts, or HI is the end of TEXT. *)
+    fun search lo hi =
+      if lo >= hi then false
+      else
+        let
+          val start = line_start ((lo + hi) div 2)
+          val stop = line_end start
+        in
+          case String.compare (item, String.substring (text, start, stop - start)) of
+              EQUAL => true
+            | LESS => search lo start
+            | GREATER => search (stop + 1) hi
+        end
+  in
+    search 0 n
+  end
+
 fun with_remote_ledger_lock path f =
   let val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = path ^ ".lock"}
   in (f () before HolbuildFileLock.release lock) handle e => (HolbuildFileLock.release lock; raise e) end
@@ -7867,11 +7893,11 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         raise Error "action-spec: a remote action's result is its cache entry, so --no-cache can't apply"
       else ()
     val ledger_path = remote_ledger_path remote
-    val ledger_known =
-      if ledger then read_remote_ledger ledger_path else Binaryset.empty String.compare
+    (* Read once, without the lock: writers replace the file by rename. *)
+    val ledger_text = if ledger then (read_text ledger_path handle IO.Io _ => "") else ""
     val learned = ref (Binaryset.empty String.compare)
     val ledger_mutex = Mutex.mutex ()
-    fun known item = Binaryset.member (ledger_known, item)
+    fun known item = sorted_lines_member ledger_text item
     fun learn item =
       if not ledger then ()
       else
@@ -7883,11 +7909,11 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
     val keys = HolbuildBuildPlan.input_keys config_lines action_toolchain_key plan
     val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
+    (* No deps key: nothing here reads it, and action_spec_text writes the
+       spec's own.  Computing it for every theory is quadratic in the plan. *)
     val actions =
       detail_time_phase "action_spec.export.actions" (fn () =>
-        map (fn node => (node, theory_action root plan keys toolchain_key
-                                 (dependency_input_context_key toolchain_key plan keys node) node))
-            theories)
+        map (fn node => (node, theory_action root plan keys toolchain_key "" node)) theories)
     val _ =
       List.app
         (fn (node, action) =>
@@ -8015,12 +8041,14 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
            learn = fn hash => learn ("blob " ^ hash)}
           (List.concat (map #files exported))
       else ()
-    val _ =
+    (* The caller records the ledger once the batch is submitted: it waits
+       for the ledger's lock, which other builds hold to rewrite it. *)
+    fun record () =
       if not ledger orelse Binaryset.isEmpty (!learned) then ()
       else record_remote_ledger_entries ledger_path (Binaryset.listItems (!learned))
   in
     {batch = String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n",
-     deferred = map (HolbuildBuildPlan.key o #1) deferred}
+     deferred = map (HolbuildBuildPlan.key o #1) deferred, record = record}
   end
 
 (* Run specs: a caller's script to run in the context of a built theory, or

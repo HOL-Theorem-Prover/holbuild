@@ -379,6 +379,38 @@ require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdi
 refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
 require_grep "^PUT /cas/$a_copy_source$" "$tmpdir/server/requests.log"
 [[ ! -e "$copy/.holbuild/remote-ledger" ]] || { echo "the copy kept a ledger of its own" >&2; exit 1; }
+# The export looks entries up by binary search over the ledger's lines, matching
+# whole lines only: BScript.sml's blob is found as the first line, and as the
+# last line without a newline.  Out of order it is missed, so the export checks
+# it again, and the build records the ledger sorted again.
+ledger_file=$(ls "$HOLBUILD_CACHE"/remote-ledger/* | grep -v '\.lock$')
+b_entry="blob $b_source"
+b_line=$(grep -nxF "$b_entry" "$ledger_file" | cut -d: -f1)
+[[ -n "$b_line" && $(wc -l < "$ledger_file") -gt 1 ]] || { cat "$ledger_file" >&2; exit 1; }
+cp "$ledger_file" "$tmpdir/ledger.sorted"
+# Without its metadata, the copy can't cut BTheory off, so both export.
+ledger_copy_build() {
+  sed -i "s/(\* ledger[^*]*\*)/(* $1 *)/" "$copy/src/AScript.sml"
+  rm -r "$copy/.holbuild/dep"
+  : > "$tmpdir/server/requests.log"
+  (cd "$copy" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only BTheory) \
+    > "$tmpdir/$1.log" 2>&1 || { cat "$tmpdir/$1.log" >&2; exit 1; }
+  require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/$1.log"
+}
+tail -n +"$b_line" "$tmpdir/ledger.sorted" > "$ledger_file"
+ledger_copy_build ledger-first
+refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+head -n "$b_line" "$tmpdir/ledger.sorted" | head -c -1 > "$ledger_file"
+ledger_copy_build ledger-last
+refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+# A long line sorting after every entry sits between the search and the
+# misplaced last line, so no search reaches it.
+{ grep -vxF "$b_entry" "$tmpdir/ledger.sorted"; printf '~%.0s' {1..200}; echo; echo "$b_entry"; } > "$ledger_file"
+ledger_copy_build ledger-unsorted
+require_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+LC_ALL=C sort -c "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+grep -qxF "$b_entry" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+sed -i '/^~/d' "$ledger_file"
 # ATheory changes and BScript.sml doesn't, so its blob is remembered.  Without
 # its metadata, the client can't cut BTheory off itself.
 sed -i 's/(\* ledger \*)/(* ledger-a *)/' "$project/src/AScript.sml"
