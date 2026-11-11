@@ -410,7 +410,10 @@ fun write_child_policy_with {module_cache = use_module_cache} tc path =
                      base_state = HolbuildToolchain.base_state tc}
   in
     write_text path
-      (String.concat
+      ("(* HOL discovers sibling stages at startup; they can disappear during a load. *)\n" ^
+       "val _ = Meta.loadPath := List.filter (fn dir => not " ^
+       "(String.isSubstring \"/.holbuild/stage/\" (dir ^ \"/\"))) (!Meta.loadPath);\n" ^
+       String.concat
          (map (fn trace => "val _ = (Feedback.set_trace " ^ HolbuildToolchain.sml_string trace ^
                            " 0 handle _ => ());\n")
               child_policy_traces) ^ (if use_module_cache then module_cache else "") ^ "\n")
@@ -1560,25 +1563,41 @@ fun checkpoint_eviction_text ({before_bytes, after_bytes, max_bytes, evicted} : 
   " checkpoint_max_bytes=" ^ bytes_text max_bytes ^
   " evicted=" ^ Int.toString evicted
 
-fun clean_project project days max_checkpoints_gb =
+fun gc_state_path project = project_state_dir project "gc.state"
+
+type project_gc_counts =
+  {stage : int, logs : int, checkpoints : int, checkpoint_bytes_initial : Position.int,
+   eviction : checkpoint_eviction}
+
+(* One full project collection; the caller holds the project lock. Work done
+   while it runs counts towards the next automatic GC. *)
+fun collect_project project days max_checkpoints_gb : project_gc_counts =
   let
+    val _ = write_text (gc_state_path project) "0\n"
     val cutoff = retention_cutoff days
     val checkpoint_dir = project_state_dir project "checkpoints"
     val checkpoint_bytes_initial = checkpoint_bytes checkpoint_dir
-    val stage_removed = remove_stale_children cutoff (project_state_dir project "stage")
-    val log_removed = remove_stale_children cutoff (project_state_dir project "logs")
-    val checkpoint_removed = remove_stale_checkpoint_families cutoff checkpoint_dir
+    val stage = remove_stale_children cutoff (project_state_dir project "stage")
+    val logs = remove_stale_children cutoff (project_state_dir project "logs")
+    val checkpoints = remove_stale_checkpoint_families cutoff checkpoint_dir
     val eviction = evict_oldest_checkpoints_with_stats checkpoint_dir (gb_to_bytes max_checkpoints_gb)
     val _ = write_checkpoint_index_atomically (rebuild_checkpoint_index checkpoint_dir)
     val _ = remove_file (checkpoint_index_dirty_path checkpoint_dir)
   in
-    print ("project clean: removed stage=" ^ Int.toString stage_removed ^
-           " logs=" ^ Int.toString log_removed ^
-           " checkpoints=" ^ Int.toString checkpoint_removed ^
-           " checkpoint_gb_initial=" ^ gb_decimal_text checkpoint_bytes_initial ^
-           " checkpoint_bytes_initial=" ^ bytes_text checkpoint_bytes_initial ^
-           " " ^ checkpoint_eviction_text eviction ^ "\n")
+    {stage = stage, logs = logs, checkpoints = checkpoints,
+     checkpoint_bytes_initial = checkpoint_bytes_initial, eviction = eviction}
   end
+
+fun project_gc_text ({stage, logs, checkpoints, checkpoint_bytes_initial, eviction} : project_gc_counts) =
+  "removed stage=" ^ Int.toString stage ^
+  " logs=" ^ Int.toString logs ^
+  " checkpoints=" ^ Int.toString checkpoints ^
+  " checkpoint_gb_initial=" ^ gb_decimal_text checkpoint_bytes_initial ^
+  " checkpoint_bytes_initial=" ^ bytes_text checkpoint_bytes_initial ^
+  " " ^ checkpoint_eviction_text eviction
+
+fun clean_project project days max_checkpoints_gb =
+  print ("project clean: " ^ project_gc_text (collect_project project days max_checkpoints_gb) ^ "\n")
 
 fun file_exists path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 
@@ -3307,20 +3326,56 @@ fun resumed_theorems kinds_names =
         else NONE)
     kinds_names
 
+(* Whether the header of the `Resume` block that starts at THEORY_START in
+   SOURCE_TEXT, up to its tactic at TACTIC_START, names `smlname` among its
+   attributes, which follow the first `[`.  (The boundary's and the
+   checkpoint's name has the attributes stripped, so the header is read
+   here.)  A label that merely contains the word counts too, which only
+   keeps that proof in place. *)
+fun resume_header_names_smlname source_text theorem_start tactic_start =
+  tactic_start < theorem_start orelse tactic_start > size source_text orelse
+  let
+    val header = String.substring (source_text, theorem_start, tactic_start - theorem_start)
+  in
+    case CharVector.findi (fn (_, c) => c = #"[") header of
+        NONE => false
+      | SOME (i, _) => mentions_at_identifier_start (String.extract (header, i + 1, NONE)) "smlname"
+  end
+
 (* Whether a pipelined build defers the proof TACTIC of a theorem or
    `Resume` block (KIND) named NAME, given the theorems RESUMED: see
-   deferred_source. *)
-fun deferrable_proof resumed kind name tactic =
+   deferred_source.  NAMES_SMLNAME says the block's header names `smlname`
+   (resume_header_names_smlname).
+
+   A `Resume` block whose header names `smlname` stays in place, since its
+   deferred stub would give `smlname` a theorem the real proof doesn't:
+   the stub is an oracle theorem of the goal, whose assumptions include
+   the subgoal's, while a proof that doesn't use them has none.  That is
+   the only way the stub's extra hypotheses reach the script.  The theorem
+   markerLib.resume proves goes to exactly three places: the check that no
+   suspendlabel hypothesis of it belongs to a still-suspended theorem
+   (which looks only at those hypotheses); build_suspendlabel_thms, which
+   discharges the goal's assumptions (so a stub `p |- T` and a real
+   `|- T` record the same resumption); and the value of the declaration,
+   which the expansion of `Resume` binds to the `smlname` name, or to `_`
+   without one.  So without `smlname` the stub's extra hypotheses go no
+   further, and HolbuildDeferred accepts a deferred proof whose theorem
+   has fewer hypotheses than its goal's assumptions.  Only that Resume
+   block stays in place; the other proofs of the theory stay deferred. *)
+fun deferrable_proof resumed kind name names_smlname tactic =
   (kind = "resume" orelse (kind = "theorem" andalso not (List.exists (fn r => r = name) resumed))) andalso
+  not (kind = "resume" andalso names_smlname) andalso
   not (mentions_at_identifier_start tactic "cheat") andalso
   not (mentions_at_identifier_start tactic "suspend")
 
-(* For a pipelined build, which of CHECKPOINTS the instrumented script
-   defers (HolbuildTheoryCheckpoints.instrument). *)
-fun deferrable_checkpoint (checkpoints : HolbuildTheoryCheckpoints.checkpoint list) =
+(* For a pipelined build, which of CHECKPOINTS, of the script SOURCE_TEXT,
+   the instrumented script defers (HolbuildTheoryCheckpoints.instrument). *)
+fun deferrable_checkpoint source_text (checkpoints : HolbuildTheoryCheckpoints.checkpoint list) =
   let val resumed = resumed_theorems (map (fn {kind, name, ...} => (kind, name)) checkpoints)
-  in fn ({kind, name, tactic_text, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
-          deferrable_proof resumed kind name tactic_text
+  in fn ({kind, name, theorem_start, tactic_start, tactic_text, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
+          deferrable_proof resumed kind name
+            (kind = "resume" andalso resume_header_names_smlname source_text theorem_start tactic_start)
+            tactic_text
   end
 
 (* DEFER_PROOFS: the script is a pipelined build's, which defers what
@@ -3338,7 +3393,7 @@ fun instrumented_source defer_proofs policy timeout_marker plan_only_marker sour
        trace_all = trace_steps policy,
        plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy,
-       defer = if defer_proofs then deferrable_checkpoint checkpoints else (fn _ => false)}
+       defer = if defer_proofs then deferrable_checkpoint source_text checkpoints else (fn _ => false)}
   else plain_source_from_checkpoint source_name source_text start_offset
 
 fun replay_candidate policy base theorem_checkpoints declaration_checkpoints =
@@ -5607,18 +5662,22 @@ fun unoutline_path root run_dir path =
    that prove them and its `Finalise` saves the theorem where the real
    build does.  A theorem the script resumes suspends, whether or not its
    proof names `suspend` (a helper tactic can call it), so it stays as
-   well; HolbuildDeferred fails any other deferred proof that suspends. *)
+   well; HolbuildDeferred fails any other deferred proof that suspends.  A
+   `Resume` block that names `smlname` stays too (deferrable_proof). *)
 fun deferred_source source_text boundaries =
   let
     val deferred = deferrable_proof (resumed_theorems (map (fn {kind, name, ...} => (kind, name)) boundaries))
     fun splice [] _ pos acc = String.concat (rev (String.extract (source_text, pos, NONE) :: acc))
-      | splice ({kind, name, tactic_start, tactic_end, ...} :: rest) k pos acc =
+      | splice ({kind, name, theorem_start, tactic_start, tactic_end, ...} :: rest) k pos acc =
           if tactic_start < pos orelse tactic_end < tactic_start then
             raise Error "theorem spans out of order"
           else
             let val tactic = String.substring (source_text, tactic_start, tactic_end - tactic_start)
             in
-              if not (deferred kind name tactic) then splice rest k pos acc
+              if not (deferred kind name
+                        (kind = "resume" andalso resume_header_names_smlname source_text theorem_start tactic_start)
+                        tactic)
+              then splice rest k pos acc
               else
                 splice rest (k + 1) tactic_end
                   (String.concat ["HolbuildDeferred.defer ", Int.toString k, " ",
@@ -9474,6 +9533,39 @@ fun auto_cache_gc threshold =
   handle HolbuildCache.Error msg => warn ("automatic gc failed: " ^ msg)
        | e => warn ("automatic gc failed: " ^ General.exnMessage e)
 
+fun read_gc_state project =
+  Option.getOpt (Int.fromString (read_text (gc_state_path project)), 0)
+  handle IO.Io _ => 0
+
+(* After a command that built in PROJECT: the collection `holbuild gc` runs on
+   the project, once THRESHOLD theories were built, restored or exported there
+   since its last GC. The count since the last GC is kept in
+   .holbuild/gc.state. Skipped while another
+   process holds the project lock, as auto_cache_gc is for the GC lock. *)
+fun auto_project_gc project threshold =
+  let
+    val work = !HolbuildStatus.project_work
+    val since_gc = read_gc_state project + work
+    fun collect () =
+      collect_project project HolbuildCache.default_retention_days (project_checkpoint_limit_gb project)
+    fun removed_any ({stage, logs, checkpoints, eviction, ...} : project_gc_counts) =
+      stage + logs + checkpoints + #evicted eviction > 0
+  in
+    HolbuildStatus.project_work := 0;
+    if since_gc < threshold then
+      (if work > 0 then write_text (gc_state_path project) (Int.toString since_gc ^ "\n") else ())
+    else
+      case HolbuildProjectLock.try_with_lock project "automatic gc" collect of
+          SOME counts =>
+            if removed_any counts andalso
+               not (HolbuildStatus.quiet_mode () orelse HolbuildStatus.json_mode ()) then
+              HolbuildStatus.message_stderr ("holbuild: automatic project gc: " ^ project_gc_text counts ^ "\n")
+            else ()
+        | NONE => write_text (gc_state_path project) (Int.toString since_gc ^ "\n")
+  end
+  handle HolbuildProjectLock.Error msg => warn ("automatic gc failed: " ^ msg)
+       | e => warn ("automatic gc failed: " ^ General.exnMessage e)
+
 (* Factory modules have no on-disk module parents.  Once loaded their code
    is resident, so concurrent eviction only makes a later load use source. *)
 fun module_cache_families cache =
@@ -11210,7 +11302,8 @@ fun export_heap tc (project : HolbuildProject.t) plan output heap_kind =
   in
     if HolbuildToolchain.success status then
       (if echo_child_logs () then HolbuildStatus.message_stdout (read_text log handle _ => "") else ();
-       remove_tree stage)
+       remove_tree stage;
+       HolbuildStatus.count_project_work ())
     else
       raise Error (String.concatWith "\n"
         ["hol buildheap failed while exporting heap: " ^ output,

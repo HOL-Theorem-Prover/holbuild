@@ -2,13 +2,32 @@ name: Release binaries
 
 on:
   push:
+    branches: [master]
     tags: ['v*']
   pull_request:
     paths:
       - .github/workflows/release.yml
+      - .github/actions/**
       - Makefile
       - LICENSE
-      - sml/**
+      - man/**
+      - completions/**
+      - sml/holbuild-script.sml
+      - sml/action_sandbox.py
+      - sml/checkpoint_save_runtime.sml
+      - sml/holbuild_runtime.sml
+      - sml/deferred_proofs_runtime.sml
+      - sml/fingerprint_runtime.sml
+      - sml/proof_runtime.sml
+      - sml/tactic_compat_runtime.sml
+      - sml/diagnostic_limits.sml
+      - sml/sha256.sml
+      - sml/spawn.sml
+      - sml/temp_path.sml
+      - sml/hash.sml
+      - sml/proof_ir_types.sml
+      - sml/proof_ir.sml
+      - sml/analyser/**
       - vendor/hol/**
       - tests/lib.sh
       - tests/cases/installed-runtime/**
@@ -143,6 +162,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -155,9 +178,29 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            # A breaking release stays a draft until its consumers are ready;
+            # see "Release process" in README.md.
+            hold=()
+            if ! base=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name); then
+              reasons="no published release to compare with"
+              hold=(--draft)
+            else
+              status=0
+              reasons=$(tools/release-breaking.sh "$base" "$TAG") || status=$?
+              case $status in
+                0) ;;
+                1) hold=(--draft) ;;
+                *) exit "$status" ;;
+              esac
+            fi
+            if [[ ${#hold[@]} -ne 0 ]]; then
+              notes=$(printf 'Breaking release:\n\n%s\n' "$(sed 's/^/- /' <<< "$reasons")")
+              printf '%s\n' "$notes" >> "$GITHUB_STEP_SUMMARY"
+              hold+=(--notes "$notes")
+            fi
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes "${hold[@]}"
+          fi
           cd dist
           cat ./*.sha256 > SHA256SUMS
-          if ! gh release view "$TAG" > /dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
-          fi
           gh release upload "$TAG" ./*.tar.gz SHA256SUMS --clobber

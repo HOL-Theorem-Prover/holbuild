@@ -139,7 +139,7 @@ fun parse_local_config root =
 
 fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, local_config} =
   let
-    val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config} = local_config
+    val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config, gc = _} = local_config
     val {definition, compatibility = _,
          tactic_timeout = manifest_timeout,
          theory_tactic_timeouts} =

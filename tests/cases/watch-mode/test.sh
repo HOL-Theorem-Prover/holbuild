@@ -144,6 +144,11 @@ write_good_source
 # holbuild's own directories below a watched one: writes there must
 # not trigger a rebuild.
 mkdir -p "$project/src/.holbuild" "$project/src/_build"
+# Residue that would trigger an automatic project GC, which watch never runs.
+printf '[gc]\nproject_builds = 1\n' > "$project/.holconfig.toml"
+mkdir -p "$project/.holbuild/stage/abandoned"
+: > "$project/.holbuild/stage/abandoned/leftover"
+touch -d '10 days ago' "$project/.holbuild/stage/abandoned"
 watch_log=$tmpdir/watch.log
 (trap - INT; cd "$project" && exec "$WATCH_HOLBUILD_BIN" build --watch ATheory) >"$watch_log" 2>&1 &
 watch_pid=$!
@@ -211,3 +216,5 @@ wait_for_count "waiting for changes" "$watch_log" 10 45
 
 kill -INT "$watch_pid"
 wait_for_exit "$watch_pid" 10
+require_file "$project/.holbuild/stage/abandoned/leftover"
+! grep -q "automatic" "$watch_log" || { echo "watch ran automatic gc" >&2; cat "$watch_log" >&2; exit 1; }
