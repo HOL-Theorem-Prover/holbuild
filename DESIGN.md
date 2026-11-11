@@ -375,6 +375,14 @@ extra dependencies with static literal `holbuild_extra_deps [...]` annotations.
 Entries may name files, directories, or simple globs (which skip `.holbuild/`
 directories inside them), and entries are staged so matching relative
 filesystem reads work during the action.
+
+Before loading dependencies or running a theory script, each HOL child removes
+`.holbuild/stage` and its subdirectories from `Meta.loadPath`. HOL's project
+discovery can add sibling stages at startup, but those directories disappear as
+parallel actions finish. Other project directories retain their search order,
+including built objects needed by dynamic library loads. The same policy runs
+when a child resumes from a checkpoint.
+
 Theory-script sources may declare deterministic, source-file-relative fixed
 output files with static literal `holbuild_extra_outputs [...]` annotations.
 These paths are part of the action identity and owned output set: successful
