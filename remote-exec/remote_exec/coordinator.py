@@ -1084,12 +1084,6 @@ class Coordinator:
                     await self._record_peak(conn, package, theory, action.profile, result.peak_rss_mb)
                 await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [action.input_key]})
                 await self._finish_if_done(conn, batch_id)
-            elif (
-                result.failure == "memory"
-                and action.tier == "standard"
-                and action.attempts < self.settings.max_attempts
-            ):
-                await self._retry(conn, batch_id, action.input_key)
             elif result.failure == "unavailable" and action.interruptions < self.settings.max_interruptions:
                 # The worker couldn't start or finish it, so it doesn't count as an attempt.
                 await conn.execute(
