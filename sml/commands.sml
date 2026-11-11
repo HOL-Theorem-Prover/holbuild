@@ -3407,7 +3407,7 @@ fun read_check_data path theory : check_data =
           [SInteger name, SCons (_, tags), info, terms] =>
             let
               val name =
-                case Int.fromString name of
+                case strict_nonnegative_int name of
                     SOME i => Vector.sub (strings, i)
                   | NONE => raise BadTheoryData
               val axiom =
