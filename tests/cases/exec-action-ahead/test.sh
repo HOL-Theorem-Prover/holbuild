@@ -61,6 +61,21 @@ Proof
   ACCEPT_TAC (CONJUNCT1 a_thm)
 QED
 SML
+# F reaches A only through a library's manifest.
+cat > "$project/src/aLib.sml" <<'SML'
+structure aLib = struct val a = ATheory.a_thm end
+SML
+cat > "$project/src/FScript.sml" <<'SML'
+Theory F
+Ancestors bool
+Libs aLib
+
+Theorem f_thm:
+  T
+Proof
+  ACCEPT_TAC (CONJUNCT1 aLib.a)
+QED
+SML
 cat > "$project/src/CScript.sml" <<'SML'
 Theory C
 Ancestors B
@@ -171,12 +186,12 @@ spec_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $4 }' "$1"; 
 key_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $2 }' "$1"; }
 
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
-hb action-spec --upload CTheory ETheory > "$tmpdir/batch.txt"
-for theory in A B C D E; do
+hb action-spec --upload CTheory ETheory FTheory > "$tmpdir/batch.txt"
+for theory in A B C D E F; do
   declare "spec_$theory=$(spec_for "$tmpdir/batch.txt" "ahead:${theory}Theory")"
   declare "key_$theory=$(key_for "$tmpdir/batch.txt" "ahead:${theory}Theory")"
 done
-[[ -n "$spec_A" && -n "$spec_B" && -n "$spec_C" && -n "$spec_D" && -n "$spec_E" ]] || {
+[[ -n "$spec_A" && -n "$spec_B" && -n "$spec_C" && -n "$spec_D" && -n "$spec_E" && -n "$spec_F" ]] || {
   cat "$tmpdir/batch.txt" >&2
   exit 1
 }
@@ -186,14 +201,19 @@ worker never "$spec_B" --ahead-parent "$key_A:$spec_A" --ahead-wait-seconds 3
 expect never 3 "status=failed" "failure=ahead-abandoned"
 require_grep 'did not arrive in time' "$tmpdir/never.log"
 
-# The parent arrives while the child waits for it, and the child builds.
+# The parent arrives while the children wait for it, and they build, also
+# the one that loads it through a library.
 worker_start ahead "$spec_B" --ahead-parent "$key_A:$spec_A"
+worker_start ahead-lib "$spec_F" --ahead-parent "$key_A:$spec_A"
 await_marker ahead waiting-ATheory
+await_marker ahead-lib waiting-ATheory
 worker a "$spec_A"
 expect a 0 "status=built"
-worker_wait ahead
-expect ahead 0 "status=built"
-ahead_phases ahead || { echo "no load-ahead timings:" >&2; cat "$tmpdir/ahead.result" >&2; exit 1; }
+for name in ahead ahead-lib; do
+  worker_wait "$name"
+  expect "$name" 0 "status=built"
+  ahead_phases "$name" || { echo "no load-ahead timings:" >&2; cat "$tmpdir/$name.result" >&2; exit 1; }
+done
 
 # An action built already is given up, since the claim of a plain run finds it.
 worker again "$spec_B" --ahead-parent "$key_A:$spec_A"
