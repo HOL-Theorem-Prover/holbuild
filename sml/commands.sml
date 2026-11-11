@@ -281,7 +281,8 @@ fun action_spec_help () = print
 fun exec_action_help () = print
   "Usage:\n\
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
-  \      --cache-limit-gb N [--cache-reserve-gb N] [--share-heaps] [--result FILE]\n\n\
+  \      --cache-limit-gb N [--cache-reserve-gb N] [--share-heaps] [--result FILE]\n\
+  \      [--ahead-parent INPUT_KEY:SPEC-SHA256 ... [--ahead-wait-seconds N]]\n\n\
   \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
   \action-spec), or the run spec (see run-action), and publish its result to\n\
   \the remote cache. The action runs in CACHE/action, with checkpoints in\n\
@@ -296,7 +297,16 @@ fun exec_action_help () = print
   \--cache-reserve-gb N Room to keep free under the limit (default: a tenth).\n\
   \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
   \                     other workers published, and publish this run's. The\n\
-  \                     host store CACHE/checkpoint-store keeps their files.\n\n\
+  \                     host store CACHE/checkpoint-store keeps their files.\n\
+  \--ahead-parent INPUT_KEY:SPEC-SHA256\n\
+  \                     Load ahead of this parent, a dependency of the theory\n\
+  \                     that another worker is still building from SPEC-SHA256:\n\
+  \                     load what is present, wait for the parent's entry in\n\
+  \                     the remote cache, then build. Repeat for each such\n\
+  \                     parent. A run that cannot go on as a plain build would\n\
+  \                     fails as ahead-abandoned (exit status 3).\n\
+  \--ahead-wait-seconds N\n\
+  \                     How long to wait for the parents (default: 3600).\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun run_action_help () = print
@@ -1615,15 +1625,20 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (* The theories an earlier pass deferred: whatever settled them,
                a later batch makes sure the remote cache has them. *)
             val held_back = ref []
+            (* Records in the ledger what the last export learned: submit runs
+               it once the batch is submitted, or found empty. *)
+            val pending_record = ref (fn () => ())
+            fun record_pending () = (!pending_record ()) before pending_record := (fn () => ())
             fun export defer skip forced =
               let
-                val {batch, deferred = held} =
+                val {batch, deferred = held, record} =
                   timed_phase "action_spec.export"
                     (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
                                 {upload = true, local_resumable = not detach, forced = forced, skip = skip,
                                  defer = defer, publish = !held_back, ledger = true})
               in
                 deferred := held;
+                pending_record := record;
                 batch
               end
             fun batch_keys batch =
@@ -1870,20 +1885,23 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                     (if priority = 0 then "" else " --priority " ^ Int.toString priority))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
             and submit resubmit skip batch =
-              if null (batch_keys batch) andalso not (null (!deferred)) then submit_deferred resubmit skip
-              else if null (batch_keys batch) andalso not (null skip) then restore_after_failures ()
-              else if null (batch_keys batch) then
-                (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
-                 build_locally ())
+              if null (batch_keys batch) then
+                (record_pending ();
+                 if not (null (!deferred)) then submit_deferred resubmit skip
+                 else if not (null skip) then restore_after_failures ()
+                 else
+                   (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
+                    build_locally ()))
               else
                 case HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
                        ((if fail_fast then "?fail_fast=true" else "") ^
                         (if priority = 0 then "" else
                          (if fail_fast then "&" else "?") ^ "priority=" ^ Int.toString priority))
                        (#maxheap tc) batch of
-                    HolbuildRemoteExec.Refused reason => fall_back reason
+                    HolbuildRemoteExec.Refused reason => (record_pending (); fall_back reason)
                   | HolbuildRemoteExec.Ok batch_id =>
                       (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
+                       record_pending ();
                        if detach then () else finish resubmit skip (SOME (batch_keys batch)) batch_id)
             (* Settles the deferred theories; those early cutoff can't reuse, and
                those that depend on them, go in the next batch, except those
@@ -3578,8 +3596,27 @@ fun exec_action_command maxheap jobs args =
               case spec of
                   NONE => parse {spec = SOME arg, result = result, limit = limit, reserve = reserve, share = share} xs
                 | SOME _ => raise Error "exec-action takes one SPEC-SHA256"
+    val ahead_parents = ref []
+    fun ahead_parent text =
+      case String.fields (fn c => c = #":") text of
+          [input_key, spec_sha256] =>
+            if input_key <> "" andalso spec_sha256 <> "" then {input_key = input_key, spec_sha256 = spec_sha256}
+            else raise Error ("--ahead-parent takes INPUT_KEY:SPEC-SHA256, not " ^ text)
+        | _ => raise Error ("--ahead-parent takes INPUT_KEY:SPEC-SHA256, not " ^ text)
+    fun take_ahead [] = []
+      | take_ahead ("--ahead-parent" :: text :: xs) = (ahead_parents := ahead_parent text :: !ahead_parents; take_ahead xs)
+      | take_ahead ("--ahead-wait-seconds" :: n :: xs) =
+          (case Int.fromString n of
+               SOME seconds =>
+                 if seconds > 0 then HolbuildBuildExec.ahead_wait_limit := Time.fromSeconds (IntInf.fromInt seconds)
+                 else raise Error "--ahead-wait-seconds must be a positive integer"
+             | NONE => raise Error "--ahead-wait-seconds must be a positive integer";
+           take_ahead xs)
+      | take_ahead ["--ahead-parent"] = raise Error "--ahead-parent requires INPUT_KEY:SPEC-SHA256"
+      | take_ahead ["--ahead-wait-seconds"] = raise Error "--ahead-wait-seconds requires N"
+      | take_ahead (x :: xs) = x :: take_ahead xs
     val {spec, result, limit, reserve, share} =
-      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, share = false} args
+      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, share = false} (take_ahead args)
     val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
     val cache_cap =
       case limit of
@@ -3610,7 +3647,7 @@ fun exec_action_command maxheap jobs args =
        HolbuildRemoteCacheConfig.setup_client ();
        HolbuildBuildExec.exec_action
          {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, share_heaps = share,
-          toolchain = toolchain})
+          toolchain = toolchain, ahead_parents = rev (!ahead_parents)})
       handle e =>
         (HolbuildStatus.message_stderr
            ("holbuild: exec-action failed: " ^

@@ -3838,6 +3838,36 @@ fun install_theory_stage check_cancelled cache_allowed policy {stage, logical, s
     remove_file (current_checkpoint_failure_log log_dir)
   end
 
+(* The files of a theory child's stage that don't depend on its parents'
+   outputs: the extra inputs, the child policy and the theory exporter. *)
+fun prepare_theory_stage speculative tc root (action : theory_action) =
+  let
+    val stage_root = stage_root_at root (#input_key action)
+    val stage = action_stage root action
+    fun stage_input {path, from} =
+      let val dst = normalize_path (in_root stage_root path)
+      in ensure_parent dst; copy_binary from dst end
+  in
+    remove_tree stage_root;
+    ensure_dir stage;
+    (* Extra inputs go in first, so holbuild's own files (the instrumented
+       script above all) overwrite any input staged at the same path. *)
+    List.app stage_input (#inputs action);
+    write_child_policy_with {module_cache = not speculative} tc (Path.concat(stage, "holbuild-child-policy.sml"));
+    write_theory_exporter
+      {sig_path = staged_theory_file stage (#logical action) ".sig",
+       path = Path.concat(stage, "holbuild-export-theory.sml"),
+       parents_report = SOME (Path.concat(stage, "holbuild-theory-parents.txt")),
+       mldeps_report = SOME (Path.concat(stage, "holbuild-theory-mldeps.txt")),
+       pipelined = speculative}
+  end
+
+(* Set by exec-action for the next run_theory_action: the theory child it
+   started ahead of the action's parents, which the run joins instead of
+   starting one, once it has written the preload and the script the child
+   evaluates next. *)
+val attached_child : (unit -> unit) option ref = ref NONE
+
 (* SPECULATIVE_LOG: the run is a pipelined build's speculative one (an
    outline, or a proof on outlined parents), which logs there, produces no
    theory module, and leaves its outputs in the stage for the caller to
@@ -3864,25 +3894,12 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val deps_key = #deps_key action
     val deps_loaded = deps_loaded_path checkpoint_base deps_key
     val {sig_path, sml_path, data_path} = action_outputs root action
-    val staged_sig = staged_theory_file stage logical ".sig"
     val staged_extra_outputs =
       map (fn declaration => (declaration, staged_extra_output_path stage declaration))
           (#extra_outputs action)
-    fun stage_input {path, from} =
-      let val dst = normalize_path (in_root stage_root path)
-      in ensure_parent dst; copy_binary from dst end
-    val _ = remove_tree stage_root
-    val _ = ensure_dir stage
-    (* Extra inputs go in first, so holbuild's own files (the instrumented
-       script above all) overwrite any input staged at the same path. *)
-    val _ = List.app stage_input (#inputs action)
-    val _ = write_child_policy_with {module_cache = not speculative} tc child_policy
-    val _ =
-      write_theory_exporter
-        {sig_path = staged_sig, path = theory_exporter,
-         parents_report = SOME parents_report,
-         mldeps_report = SOME mldeps_report,
-         pipelined = speculative}
+    (* A child started ahead of its parents runs in the stage already. *)
+    val attached = !attached_child before attached_child := NONE
+    val _ = if Option.isSome attached then () else prepare_theory_stage speculative tc root action
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
     val _ =
       if theorem_checkpoints_enabled policy then
@@ -3985,12 +4002,17 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
        validate_hol_context (#context run_spec);
        detail_time_phase "build.exec.node.child_run"
          (fn () =>
-             run_hol_files_to_log tc stage stage
-               (#context run_spec)
-               (child_policy :: (#files run_spec @ [theory_exporter]))
-               "holbuild-build.log"
-               (SOME (current_build_log log_dir))
-               "hol run failed while building theory script"))
+             case attached of
+                 SOME join =>
+                   if #files run_spec = [preload, staged_script] then join ()
+                   else raise Error "a child loading ahead needs a fresh preload"
+               | NONE =>
+                   run_hol_files_to_log tc stage stage
+                     (#context run_spec)
+                     (child_policy :: (#files run_spec @ [theory_exporter]))
+                     "holbuild-build.log"
+                     (SOME (current_build_log log_dir))
+                     "hol run failed while building theory script"))
       handle Error msg =>
         (check_cancelled ();
         if invalid_checkpoint_retryable base_context (#context run_spec) msg then
@@ -7733,26 +7755,66 @@ fun publish_spec_blob remote {hash, path} =
    lives in the cache root and every project and worktree using that root
    shares it.  The remote cache can lose either; a worker that finds one
    missing fails its batch, and the build then forgets the ledger
-   (forget_remote_ledger) and resubmits.  Builds change it under its lock. *)
+   (forget_remote_ledger) and resubmits.  Builds change it under its lock,
+   rewriting it whole; a build that would take it past
+   max_remote_ledger_entries keeps only those it used or learned, so it
+   grows past that bound only as far as one build's own entries. *)
 fun remote_ledger_path remote =
   Path.concat(Path.concat(cache_root (), "remote-ledger"),
               HolbuildHash.string_sha256 (HolbuildRemoteCache.base_url remote))
+
+val max_remote_ledger_entries = 100000
 
 fun read_remote_ledger path =
   Binaryset.addList (Binaryset.empty String.compare, String.tokens (fn c => c = #"\n") (read_text path))
   handle IO.Io _ => Binaryset.empty String.compare
 
+(* Whether ITEM is a whole line of TEXT, by binary search: the ledger is
+   written sorted by String.compare.  Only an exact whole line matches, so a
+   ledger out of order can only hide entries, which costs a check or an
+   upload, never claim one. *)
+fun sorted_lines_member text item =
+  let
+    val n = size text
+    fun line_start i = if i > 0 andalso String.sub (text, i - 1) <> #"\n" then line_start (i - 1) else i
+    fun line_end i = if i < n andalso String.sub (text, i) <> #"\n" then line_end (i + 1) else i
+    (* LO and HI are line starts, or HI is the end of TEXT. *)
+    fun search lo hi =
+      if lo >= hi then false
+      else
+        let
+          val start = line_start ((lo + hi) div 2)
+          val stop = line_end start
+        in
+          case String.compare (item, String.substring (text, start, stop - start)) of
+              EQUAL => true
+            | LESS => search lo start
+            | GREATER => search (stop + 1) hi
+        end
+  in
+    search 0 n
+  end
+
 fun with_remote_ledger_lock path f =
-  let val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = path ^ ".lock"}
+  let val lock = detail_time_phase "action_spec.ledger.lock" (fn () =>
+                   HolbuildFileLock.acquire_exclusive_path_wait {path = path ^ ".lock"})
   in (f () before HolbuildFileLock.release lock) handle e => (HolbuildFileLock.release lock; raise e) end
 
-(* Adds entries to the ledger, keeping those other builds added meanwhile,
-   but not entries this build read before a concurrent forget dropped them. *)
-fun record_remote_ledger_entries path entries =
+(* Adds LEARNED to the ledger, keeping the entries other builds added
+   meanwhile, but not those a concurrent forget dropped.  When that would
+   pass max_remote_ledger_entries, it keeps of the others only those in USED. *)
+fun record_remote_ledger_entries path {learned, used} =
   with_remote_ledger_lock path (fn () =>
-    write_text path
-      (String.concat (map (fn line => line ^ "\n")
-                          (Binaryset.listItems (Binaryset.addList (read_remote_ledger path, entries))))))
+    let
+      val existing = detail_time_phase "action_spec.ledger.parse" (fn () => read_remote_ledger path)
+      val merged = Binaryset.addList (existing, learned)
+      val entries =
+        if Binaryset.numItems merged <= max_remote_ledger_entries then merged
+        else Binaryset.addList (Binaryset.intersection (existing, used), learned)
+    in
+      detail_time_phase "action_spec.ledger.write" (fn () =>
+        write_text path (String.concat (map (fn line => line ^ "\n") (Binaryset.listItems entries))))
+    end)
   handle e => warn ("could not record the remote ledger " ^ path ^ ": " ^ General.exnMessage e)
 
 fun forget_remote_ledger () =
@@ -7856,7 +7918,8 @@ fun failing_on_pool remote jobs doing items_name pred items =
    pool.  Specs share their sources, so each file goes up once.  After the
    first failure the uploads not yet started are skipped, for the caller to
    fall back at once.  A file whose (path, sha256) known holds is taken as
-   present; learn is told each sha256 uploaded or found present. *)
+   present; learn is told the (path, sha256) of each one uploaded or found
+   present. *)
 fun upload_spec_files hash_file remote jobs {known, learn} files =
   let
     val upload_failed = ref false
@@ -7869,7 +7932,7 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
       (let val hash = hash_file path
        in
          if known (path, hash) then ()
-         else (publish_spec_blob remote {hash = hash, path = path}; learn hash)
+         else (publish_spec_blob remote {hash = hash, path = path}; learn (path, hash))
        end;
        true)
       handle e => (with_failure_lock (fn () => upload_failed := true); raise e)
@@ -7910,27 +7973,26 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         raise Error "action-spec: a remote action's result is its cache entry, so --no-cache can't apply"
       else ()
     val ledger_path = remote_ledger_path remote
-    val ledger_known =
-      if ledger then read_remote_ledger ledger_path else Binaryset.empty String.compare
+    (* The ledger's entries this export found it to hold, and those it
+       learned the remote cache to hold. *)
+    val used = ref (Binaryset.empty String.compare)
     val learned = ref (Binaryset.empty String.compare)
     val ledger_mutex = Mutex.mutex ()
-    fun known item = Binaryset.member (ledger_known, item)
-    fun learn item =
-      if not ledger then ()
-      else
-        (Mutex.lock ledger_mutex;
-         (learned := Binaryset.add (!learned, item); Mutex.unlock ledger_mutex)
-         handle e => (Mutex.unlock ledger_mutex; raise e))
+    fun add set item =
+      (Mutex.lock ledger_mutex;
+       (set := Binaryset.add (!set, item); Mutex.unlock ledger_mutex)
+       handle e => (Mutex.unlock ledger_mutex; raise e))
+    fun learn item = if ledger then add learned item else ()
     val root = project_artifact_root project
     val config_lines = build_config_lines_for_node options project
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
     val keys = HolbuildBuildPlan.input_keys config_lines action_toolchain_key plan
     val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
+    (* No deps key: nothing here reads it, and action_spec_text writes the
+       spec's own.  Computing it for every theory is quadratic in the plan. *)
     val actions =
       detail_time_phase "action_spec.export.actions" (fn () =>
-        map (fn node => (node, theory_action root plan keys toolchain_key
-                                 (dependency_input_context_key toolchain_key plan keys node) node))
-            theories)
+        map (fn node => (node, theory_action root plan keys toolchain_key "" node)) theories)
     val _ =
       List.app
         (fn (node, action) =>
@@ -8004,6 +8066,15 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       List.foldl (fn ((node, _), set) =>
                      Binaryset.addList (set, map HolbuildBuildPlan.key (HolbuildBuildPlan.transitive_project_deps plan node)))
                  held uncached_actions
+    val deps_actions = List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions
+    (* Read once, without the lock, as writers replace the file by rename;
+       and only by an export with something to look up, so a build with
+       nothing to do reads none of it. *)
+    val ledger_text =
+      if ledger andalso not (null uncached_actions andalso null deps_actions) then
+        (read_text ledger_path handle IO.Io _ => "")
+      else ""
+    fun known item = sorted_lines_member ledger_text item andalso (add used item; true)
     fun available remote (node, action) =
       let val key = #input_key action
       in
@@ -8013,8 +8084,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       end
     val unavailable =
       detail_time_phase "action_spec.export.publish_deps" (fn () =>
-        failing "checking remote cache" "theories" available
-          (List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions))
+        failing "checking remote cache" "theories" available deps_actions)
     val uncached_actions =
       if null unavailable then uncached_actions
       else List.filter (fn (node, _) => uncached_in (uncached_actions @ unavailable) node) actions
@@ -8049,21 +8119,24 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val action_lines = List.concat (map #lines exported)
     (* A worker rejects a spec it can't fetch rather than reporting it
        missing, so a spec the ledger hid would never be uploaded again: specs
-       skip the ledger. *)
+       skip the ledger, and as no lookup would read them, the ledger doesn't
+       learn them. *)
     fun is_spec path = String.isPrefix (spec_dir ^ "/") path
     val _ =
       if upload then
         upload_spec_files hash_file remote jobs
           {known = fn (path, hash) => not (is_spec path) andalso known ("blob " ^ hash),
-           learn = fn hash => learn ("blob " ^ hash)}
+           learn = fn (path, hash) => if is_spec path then () else learn ("blob " ^ hash)}
           (List.concat (map #files exported))
       else ()
-    val _ =
+    (* The caller records the ledger once the batch is submitted: it waits
+       for the ledger's lock, which other builds hold to rewrite it. *)
+    fun record () =
       if not ledger orelse Binaryset.isEmpty (!learned) then ()
-      else record_remote_ledger_entries ledger_path (Binaryset.listItems (!learned))
+      else record_remote_ledger_entries ledger_path {learned = Binaryset.listItems (!learned), used = !used}
   in
     {batch = String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n",
-     deferred = map (HolbuildBuildPlan.key o #1) deferred}
+     deferred = map (HolbuildBuildPlan.key o #1) deferred, record = record}
   end
 
 (* Run specs: a caller's script to run in the context of a built theory, or
@@ -8598,6 +8671,7 @@ datatype action_failure =
   | UnavailableFailure  (* the remote cache didn't answer; not the action's fault *)
   | ScriptFailure  (* a run's script failed or left a declared output unwritten *)
   | TimeoutFailure  (* a run outlasted its option timeout *)
+  | AheadAbandoned  (* a load ahead of late parents stopped; built plain later *)
 
 exception ActionFailed of action_failure * string
 
@@ -8613,6 +8687,7 @@ fun failure_name ProofFailure = "proof"
   | failure_name UnavailableFailure = "unavailable"
   | failure_name ScriptFailure = "script"
   | failure_name TimeoutFailure = "timeout"
+  | failure_name AheadAbandoned = "ahead-abandoned"
 
 (* 1 is final, 2 retries on more memory, 3 retries or resubmits, 4 rejects. *)
 fun failure_exit_code ProofFailure = 1
@@ -9002,8 +9077,9 @@ fun fetch_spec_blob remote {hash, dst} =
   end
 
 (* Restores a theory the action depends on, or the action's own entry, into
-   the action root, writing its load manifests with the spec's stems. *)
-fun restore_spec_theory remote root resolver {key, subject, stem, extra_outputs, requested_timeout} =
+   the directory FILES, writing its load manifests with the spec's stems in
+   the action root NAMED, where its files are loaded from. *)
+fun restore_spec_theory_in remote {files, named} resolver {key, subject, stem, extra_outputs, requested_timeout} =
   let
     val cache = cache_root ()
     val entry =
@@ -9012,28 +9088,29 @@ fun restore_spec_theory remote root resolver {key, subject, stem, extra_outputs,
          expected_extra_outputs = extra_outputs,
          requested_timeout = requested_timeout, require_trace = false}
     val resident = #manifest_text entry
-    fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
-    val stem_path = in_root root stem
-    val sig_path = stem_path ^ ".sig"
-    val sml_path = stem_path ^ ".sml"
+    fun resolve name = Option.map (fn (s, order) => (in_root named s, order)) (resolver name)
+    val stem_path = in_root files stem
     fun write_manifests metadata =
-      (write_object_manifest (stem_path ^ ".ui") [sig_path];
-       write_object_manifest (stem_path ^ ".uo") (generated_theory_loads resolve metadata @ [sml_path]))
+      (write_object_manifest (stem_path ^ ".ui") [in_root named stem ^ ".sig"];
+       write_object_manifest (stem_path ^ ".uo")
+         (generated_theory_loads resolve metadata @ [in_root named stem ^ ".sml"]))
   in
     ignore
       (install_cache_entry (fn hash => fn dst => fetch_spec_blob remote {hash = hash, dst = dst})
          cache key subject entry
-         {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = stem_path ^ ".dat"},
+         {outputs = {sig_path = stem_path ^ ".sig", sml_path = stem_path ^ ".sml", data_path = stem_path ^ ".dat"},
           (* Apart from the sources, so a restored output never replaces an
              input the action fetched by its hash; the build reads none. *)
           extra_destination = fn decl =>
             if escapes decl then raise Error ("cache entry " ^ key ^ " has an extra output outside the action root: " ^ decl)
-            else in_root root (normalize_path (String.concatWith "/" [".holbuild/action-extra", key, decl])),
+            else in_root files (normalize_path (String.concatWith "/" [".holbuild/action-extra", key, decl])),
           write_manifests = write_manifests})
       handle e as ActionFailed (InputMissing _, _) =>
         (ignore (drop_cache_manifest_if_unchanged cache key resident);
          raise e)
   end
+
+fun restore_spec_theory remote root = restore_spec_theory_in remote {files = root, named = root}
 
 (* Whether a theory's .dat, given by the parent hashes it records, records
    the dependency as a parent. *)
@@ -10274,9 +10351,10 @@ fun unkeyed_dep_line line =
 
 (* The pair key, and the key of the dependency context (deps_loaded.save and
    the checkpoints above it) on the same dependency outputs, from the files
-   restored in ROOT.  Those name ROOT, so both keys are for one action root,
-   as the shared heap key is.  NONE when a file can't be read. *)
-fun spec_early_cutoff root (spec : action_spec) : early_cutoff option =
+   restored in ROOT, hashed by DAT_HASH (a .dat) and FILE_HASHES (the rest).
+   Those name ROOT, so both keys are for one action root, as the shared heap
+   key is.  NONE when a file can't be read. *)
+fun spec_early_cutoff_with {dat_hash, file_hashes} root (spec : action_spec) : early_cutoff option =
   let
     val text_lines = String.fields (fn c => c = #"\n") (#action_text spec)
     val self_key =
@@ -10290,7 +10368,7 @@ fun spec_early_cutoff root (spec : action_spec) : early_cutoff option =
              (#deps spec))
     val theory_lines =
       ListPair.map (fn (path, hash) => "theory-file " ^ path ^ " " ^ hash)
-        (dat_files @ other_files, map hol_dat_hash dat_files @ HolbuildHash.files_sha256 other_files)
+        (dat_files @ other_files, map dat_hash dat_files @ file_hashes other_files)
     val library_lines = map (fn {path, sha256, ...} => "library " ^ path ^ " " ^ sha256) (#libraries spec)
     val lib_lines =
       map (fn {target, stem, suffix, loads} => String.concatWith " " ("lib" :: target :: stem :: suffix :: loads))
@@ -10313,6 +10391,9 @@ fun spec_early_cutoff root (spec : action_spec) : early_cutoff option =
                    "deps-output=" ^ deps_output_key] @ dep_lines) ^ "\n")}
   end
   handle e => (warn ("no early cutoff: " ^ General.exnMessage e); NONE)
+
+fun spec_early_cutoff root spec =
+  spec_early_cutoff_with {dat_hash = hol_dat_hash, file_hashes = HolbuildHash.files_sha256} root spec
 
 (* Restores the entry of the earlier build the pair names as this action's
    outputs, and copies it to the action's input key in the local cache.
@@ -10711,13 +10792,13 @@ val module_writer_limit = 32
    current .dat files.  Each theory is given after its parents: the
    project's from the spec, the toolchain's beside their objects in its
    sigobj.  A failure leaves the action to load from .dat files. *)
-fun fill_module_store cache root tc (spec : action_spec) =
+fun fill_module_store cache root tc {deps, loads} =
   let
     val store = module_store (#holdir tc)
     val project =
       map (fn {target, stem, ...} =>
               (theory_name_from_logical (#2 (target_name target)), in_root root stem))
-          (#deps spec)
+          deps
     fun toolchain_base name =
       let val uo = Path.concat (Path.concat (#holdir tc, "sigobj"), name ^ "Theory.uo")
       in SOME (Path.concat (Path.dir (FS.realPath uo), name ^ "Theory"))
@@ -10747,7 +10828,7 @@ fun fill_module_store cache root tc (spec : action_spec) =
         (fn LoadTheory name =>
               if has_suffix "Theory" name then SOME (drop_suffix "Theory" name) else NONE
           | _ => NONE)
-        (#loads spec) @ map #1 project
+        loads @ map #1 project
     val theories = rev (#2 (List.foldl visit ([], []) roots))
     val expected =
       map (fn (name, b) => name ^ "-" ^ hol_file_sha1 (b ^ ".dat") ^ ".pmo") theories
@@ -10893,9 +10974,179 @@ fun publish_tool_cache remote store key dir restored =
   end
   handle e => warn ("not publishing the tool cache: " ^ tool_cache_failure e)
 
+(* Loading ahead (exec-action --ahead-parent).  A late parent is a
+   dependency whose action was still running when this one was claimed.
+   The child starts loading at once: each late parent's load manifests are
+   stand-ins whose wait step blocks until exec-action, polling the cache,
+   has put the parent's real files in place (sml/ahead_load_runtime.sml says
+   how the child checks them).  Everything exec-action decides is computed
+   from files the child can't write: the late parents are restored in a
+   staging directory outside the sandbox's roots, and the dependencies
+   present at the start are hashed before the child starts. *)
+
+(* How long exec-action waits for its late parents; --ahead-wait-seconds. *)
+val ahead_wait_limit = ref (Time.fromSeconds 3600)
+val ahead_poll_interval = Time.fromSeconds 2
+
+fun ahead_runtime_path () = Path.concat (HolbuildRuntimePaths.runtime_root (), "sml/ahead_load_runtime.sml")
+
+(* The ML modules a script adds by a literal add_ML_dependency call; others
+   it may add are seen only once it has run. *)
+fun literal_ml_dependencies text =
+  let
+    val call = "add_ML_dependency"
+    fun scan rest names =
+      let val (_, found) = Substring.position call rest
+      in
+        if Substring.isEmpty found then rev names
+        else
+          let val after = Substring.dropl Char.isSpace (Substring.triml (size call) found)
+          in
+            if Substring.first after = SOME #"\"" then
+              let val (name, _) = Substring.splitl (fn c => c <> #"\"") (Substring.triml 1 after)
+              in scan after (Substring.string name :: names) end
+            else scan after names
+          end
+      end
+  in
+    unique_strings (scan (Substring.full text) [])
+  end
+
+(* The parent theories a .dat records, read from its header only. *)
+fun dat_parent_names path =
+  let
+    val input = BinIO.openIn path
+    fun read text =
+      let val chunk = Byte.bytesToString (BinIO.inputN (input, 65536))
+      in
+        if chunk = "" orelse String.isSubstring "(core-data" (text ^ chunk) then text ^ chunk
+        else read (text ^ chunk)
+      end
+    val text = (read "" before BinIO.closeIn input) handle e => (BinIO.closeIn input; raise e)
+    val (header, _) = Substring.position "(core-data" (Substring.full text)
+  in
+    map #1 (Binarymap.listItems (parse_dat_parent_hashes (Substring.string header)))
+  end
+
+(* The manifest lines a late parent's entry will have, predicted from its
+   spec before it is built: the theories its preload loads that no other of
+   them has as an ancestor, and the ML modules its script adds literally,
+   ordered as restore_spec_theory orders them.  The walk follows the loader
+   from BASE, the modules the child had loaded at its start, through the
+   manifests on disk (the action root's, the toolchain's and the parent's
+   libraries'), as the child's working directory CWD and load path find
+   them.  PARENTS memoizes each theory's recorded parents across calls. *)
+fun predicted_theory_loads {root, cwd, holdir, base = {loaded, path}, resolve, parents_memo,
+                            parent : action_spec, source_text} =
+  let
+    fun subst entry =
+      if String.isPrefix "$(HOLDIR)" entry then holdir ^ String.extract (entry, size "$(HOLDIR)", NONE) else entry
+    fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
+    val lib_manifests = map (fn {stem, suffix, loads, ...} => (in_root root stem ^ suffix, map lib_load loads)) (#libs parent)
+    fun find module ext =
+      List.find file_exists
+        (map (fn dir => Path.mkAbsolute {path = module ^ ext, relativeTo = Path.mkAbsolute {path = dir, relativeTo = cwd}})
+             ("." :: path))
+    fun manifest module ext =
+      case List.find (fn (file, _) => file = module ^ ext) lib_manifests of
+          SOME (_, lines) => lines
+        | NONE =>
+            case find module ext of
+                SOME file => String.tokens (fn c => c = #"\n") (read_text file)
+              | NONE => raise Error ("no load manifest " ^ module ^ ext)
+    fun is_file entry = has_suffix ".sml" entry orelse has_suffix ".sig" entry
+    val base = Binaryset.addList (Binaryset.empty String.compare, loaded)
+    val visited = ref (Binarymap.mkDict String.compare)
+    fun visit entry =
+      if is_file entry then ()
+      else
+        let
+          val module = subst entry
+          val name = Path.file module
+        in
+          if Binaryset.member (base, name) orelse Option.isSome (Binarymap.peek (!visited, name)) then ()
+          else (visited := Binarymap.insert (!visited, name, module);
+                List.app visit (manifest module ".ui" @ manifest module ".uo"))
+        end
+    fun load_arg (LoadTheory name) = name
+      | load_arg (LoadLibrary name) = name
+      | load_arg (LoadObject stem) = in_root root stem
+    val _ = List.app (visit o load_arg) (#loads parent)
+    fun parents name =
+      case Binarymap.peek (!parents_memo, name) of
+          SOME known => known
+        | NONE =>
+            let
+              val module = Option.getOpt (Binarymap.peek (!visited, name), name)
+              val found =
+                if not (has_suffix "Theory" name) then []
+                else
+                  case find module ".uo" of
+                      NONE => []
+                    | SOME uo =>
+                        let val dat = Path.base (FS.realPath uo) ^ ".dat"
+                        in if file_exists dat then map (fn p => p ^ "Theory") (dat_parent_names dat) else [] end
+            in
+              parents_memo := Binarymap.insert (!parents_memo, name, found);
+              found
+            end
+    val ancestors_memo = ref (Binarymap.mkDict String.compare)
+    fun ancestors name =
+      case Binarymap.peek (!ancestors_memo, name) of
+          SOME known => known
+        | NONE =>
+            let
+              val ps = parents name
+              val all = List.foldl (fn (p, set) => Binaryset.union (set, ancestors p))
+                                   (Binaryset.addList (Binaryset.empty String.compare, ps)) ps
+            in
+              ancestors_memo := Binarymap.insert (!ancestors_memo, name, all);
+              all
+            end
+    val theories =
+      List.filter (fn name => has_suffix "Theory" name andalso not (null (parents name)))
+                  (loaded @ map #1 (Binarymap.listItems (!visited)))
+    val inherited =
+      List.foldl (fn (name, set) => Binaryset.union (set, ancestors name)) (Binaryset.empty String.compare) theories
+    val fringe = List.filter (fn name => not (Binaryset.member (inherited, name))) theories
+  in
+    generated_theory_loads resolve
+      {parents = map (drop_suffix "Theory") fringe, mldeps = literal_ml_dependencies source_text}
+  end
+
+(* The child's report of what its base context loaded and where it looks. *)
+fun read_base_report path =
+  let
+    val lines = String.tokens (fn c => c = #"\n") (read_text path)
+    fun field prefix = List.mapPartial (fn line => if String.isPrefix prefix line then SOME (String.extract (line, size prefix, NONE)) else NONE) lines
+  in
+    {loaded = field "loaded ", path = field "path "}
+  end
+
+(* The file the child evaluates first: the runtime, the recording loader and
+   LOAD_LINES under it, which pass through the stand-ins, and a last step
+   that waits for exec-action to write the files the child evaluates next. *)
+fun write_ahead_preload {load_lines, dir, path} =
+  let
+    val no_loader = HolbuildToolchain.sml_string "this toolchain's HOL has no Meta.loadPlan"
+    val lines =
+      runtime_line () ::
+      "val _ = if (case #lookupStruct PolyML.globalNameSpace \"Meta\" of NONE => false | SOME meta => " ^
+        "Option.isSome (#lookupVal (PolyML.NameSpace.Structures.contents meta) \"loadPlan\")) then () " ^
+        "else (HolbuildRuntime.write_text " ^ HolbuildToolchain.sml_string (Path.concat (dir, "abandoned")) ^
+        " " ^ no_loader ^ "; OS.Process.exit OS.Process.failure);" ::
+      "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (ahead_runtime_path ()) ^ ";" ::
+      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ ";" ::
+      "structure HolbuildRuntime = struct open HolbuildRuntime val load = HolbuildAheadLoad.load end;" ::
+      (load_lines @ ["val _ = HolbuildAheadLoad.finish ();"])
+  in
+    write_text path (String.concatWith "\n" lines ^ "\n")
+  end
+
 (* Runs one ActionSpec, writes its result record and returns the exit code.
-   `toolchain` ensures the spec's HOL toolchain and returns it. *)
-fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
+   `toolchain` ensures the spec's HOL toolchain and returns it; AHEAD_PARENTS are
+   the late parents (--ahead-parent), each its input key and spec. *)
+fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ahead_parents} =
   let
     val cancelled = ref false
     val publishing_checkpoints = ref false
@@ -10945,7 +11196,25 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
     val log_required = ref false
     (* Never reuse a writable directory inode across actions. Shared heaps are
        copied into this action's tree, not exposed as writable store inodes. *)
-    fun empty_root () = (HolbuildRemoveTree.remove_untrusted root; HolbuildRemoveTree.remove_untrusted checkpoint_root)
+    (* A late parent's entry restores here, outside what the child may write. *)
+    val ahead_staging = Path.concat(cache, "action-ahead")
+    fun empty_root () =
+      (HolbuildRemoveTree.remove_untrusted root; HolbuildRemoveTree.remove_untrusted checkpoint_root;
+       HolbuildRemoveTree.remove_untrusted ahead_staging)
+    (* The hydrate's steps, after it in the report, also when it fails. *)
+    fun add_hydrate_steps () = phases := !hydrate_steps @ !phases
+    fun setup_tool_cache (spec : action_spec) =
+      case #tool_cache spec of
+          NONE => NONE
+        | SOME name =>
+            let
+              val key = tool_cache_key spec name
+              val dir = FS.fullPath root ^ "/.holbuild/tool-cache/" ^ name
+            in
+              ensure_dir dir;
+              tool_cache_dir := SOME dir;
+              SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
+            end
     val run_log = ref NONE
     fun build_log () =
       case !run_log of
@@ -11038,11 +11307,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
+      in
+        if forced orelse null ahead_parents then run_plain spec tc forced else run_ahead spec tc
+      end
+    and run_plain spec tc forced =
+      let
         val _ = hydrate_steps := []
-        (* Its steps, after it in the report, also when it fails. *)
-        fun add_steps () = phases := !hydrate_steps @ !phases
-        val _ = (phase "hydrate" (fn () => hydrate_action_root remote root spec) before add_steps ())
-                handle e => (add_steps (); raise e)
+        val _ = (phase "hydrate" (fn () => hydrate_action_root remote root spec) before add_hydrate_steps ())
+                handle e => (add_hydrate_steps (); raise e)
         val (done, cutoff) =
           phase "cutoff" (fn () =>
             let
@@ -11062,108 +11334,376 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain} =
              sure the remote, where the result counts, holds it too. *)
           (phase "check" (fn () => check_remote_publication remote root spec);
            "cached")
-        else
+        else build spec tc forced cutoff NONE
+      end
+    (* The build of an action whose own entry the cache doesn't hold, from
+       the deps context CUTOFF names; AHEAD is the child exec-action started
+       ahead of the action's parents, with what it set up before. *)
+    and build spec tc forced cutoff ahead =
+      let
+        val _ =
+          case ahead of
+              NONE => phase "modules" (fn () => fill_module_store cache root tc {deps = #deps spec, loads = #loads spec})
+            | SOME _ => ()
+        val action =
+          spec_theory_action root spec
+            (case cutoff of SOME {deps_key, ...} => deps_key | NONE => #deps_key spec)
+        (* A local entry that didn't restore must not stand in for this
+           build's when the publication is checked, and, as in a local
+           build, its theory's checkpoints may hold parents other than
+           the ones now restored. *)
+        val _ =
+          case HolbuildCache.get_action cache (#input_key spec) of
+              SOME _ =>
+                (HolbuildCache.remove_action cache (#input_key spec);
+                 if forced then () else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
+            | NONE => ()
+        val stage = action_stage root action
+        val policy = spec_policy spec
+        val oom_before = cgroup_oom_kills ()
+        val _ = last_child_status := NONE
+        val _ =
           let
-            val _ = phase "modules" (fn () => fill_module_store cache root tc spec)
-            val action =
-              spec_theory_action root spec
-                (case cutoff of SOME {deps_key, ...} => deps_key | NONE => #deps_key spec)
-            (* A local entry that didn't restore must not stand in for this
-               build's when the publication is checked, and, as in a local
-               build, its theory's checkpoints may hold parents other than
-               the ones now restored. *)
-            val _ =
-              case HolbuildCache.get_action cache (#input_key spec) of
-                  SOME _ =>
-                    (HolbuildCache.remove_action cache (#input_key spec);
-                     if forced then () else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
+            (* A child loading ahead can write the source by now. *)
+            val source_text =
+              case ahead of SOME {source_text, ...} => source_text | NONE => read_text (#source_file action)
+            val checkpoints = action_checkpoints policy checkpoint_root action source_text
+            val shared =
+              if not share_heaps orelse not (checkpoint_enabled policy) then NONE
+              else
+                SOME (shared_context cache checkpoint_root tc root policy action checkpoints)
+                handle e => (warn ("not sharing heaps: " ^ General.exnMessage e); NONE)
+            (* Loading ahead found no heap to restore before it went on. *)
+            val restored =
+              case (shared, ahead) of
+                  (SOME ctx, NONE) => phase "restore" (fn () => restore_shared_checkpoints remote ctx)
+                | _ => nothing_restored
+            fun publish_shared () =
+              if not (!HolbuildActionSandbox.outputs_validated) then () else
+              case shared of
+                  SOME ctx =>
+                    (publishing_checkpoints := true;
+                     (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
+                      before publishing_checkpoints := false)
+                     handle e => (publishing_checkpoints := false; raise e))
                 | NONE => ()
-            val stage = action_stage root action
-            val policy = spec_policy spec
-            val oom_before = cgroup_oom_kills ()
-            val _ = last_child_status := NONE
-            val _ =
-              let
-                val source_text = read_text (#source_file action)
-                val checkpoints = action_checkpoints policy checkpoint_root action source_text
-                val shared =
-                  if not share_heaps orelse not (checkpoint_enabled policy) then NONE
-                  else
-                    SOME (shared_context cache checkpoint_root tc root policy action checkpoints)
-                    handle e => (warn ("not sharing heaps: " ^ General.exnMessage e); NONE)
-                val restored =
-                  case shared of
-                      SOME ctx => phase "restore" (fn () => restore_shared_checkpoints remote ctx)
-                    | NONE => nothing_restored
-                fun publish_shared () =
-                  if not (!HolbuildActionSandbox.outputs_validated) then () else
-                  case shared of
-                      SOME ctx =>
-                        (publishing_checkpoints := true;
-                         (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
-                          before publishing_checkpoints := false)
-                         handle e => (publishing_checkpoints := false; raise e))
-                    | NONE => ()
-                val tool_cache =
-                  case #tool_cache spec of
-                      NONE => NONE
-                    | SOME name =>
-                        let
-                          val key = tool_cache_key spec name
-                          val dir = FS.fullPath root ^ "/.holbuild/tool-cache/" ^ name
-                        in
-                          ensure_dir dir;
-                          tool_cache_dir := SOME dir;
-                          SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
-                        end
-                fun publish_tools () =
-                  if not (!HolbuildActionSandbox.outputs_validated) then () else
-                  case tool_cache of
-                      SOME (key, dir, restored) =>
-                        phase "toolpublish" (fn () => publish_tool_cache remote (share_store cache) key dir restored)
-                    | NONE => ()
-              in
-                (ignore (phase "hol" (fn () =>
-                           run_theory_action_checkpoints check_cancelled NONE true policy tc root checkpoint_root
-                             (toolchain_base_context tc) action source_text checkpoints))
-                 handle e =>
-                   (deferred := (fn () => (publish_shared (); if !cancelled then () else publish_tools ()));
-                    raise e));
-                deferred :=
-                  (fn () =>
-                     (publish_shared ();
-                      if !cancelled then () else
-                      (publish_tools ();
-                       (* After the publish: the checkpoints saved after
-                          resuming from a failed prefix are its children. *)
-                       remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints))))
-              end
-              handle Error msg =>
-                (* The child's exporter may have recorded its peak before
-                   a later step failed. *)
-                (peak := peak_rss_mb stage;
-                 if not (!HolbuildActionSandbox.outputs_validated) then
-                   raise ActionFailed (InternalFailure, msg)
-                 else
-                 let val log_text = read_text (build_log ()) handle _ => ""
-                 in
-                   raise ActionFailed (classify_run_failure stage log_text oom_before msg)
-                 end)
-            val _ = peak := peak_rss_mb stage
-            val _ =
-              phase "check" (fn () =>
-                (* Outputs built against out-of-date local copies of the parents
-                   never reach the remote; the retry restores the remote's. *)
-                (if drop_stale_dep_copies remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
-                 then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
-                 else ();
-                 check_remote_publication remote root spec;
-                 case cutoff of
-                     SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
-                   | NONE => ()))
+            val tool_cache = case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec
+            fun publish_tools () =
+              if not (!HolbuildActionSandbox.outputs_validated) then () else
+              case tool_cache of
+                  SOME (key, dir, restored) =>
+                    phase "toolpublish" (fn () => publish_tool_cache remote (share_store cache) key dir restored)
+                | NONE => ()
+            val _ = attached_child := Option.map #join ahead
           in
-            "built"
+            (ignore (phase "hol" (fn () =>
+                       run_theory_action_checkpoints check_cancelled NONE true policy tc root checkpoint_root
+                         (toolchain_base_context tc) action source_text checkpoints))
+             handle e =>
+               (attached_child := NONE;
+                deferred := (fn () => (publish_shared (); if !cancelled then () else publish_tools ()));
+                raise e));
+            deferred :=
+              (fn () =>
+                 (publish_shared ();
+                  if !cancelled then () else
+                  (publish_tools ();
+                   (* After the publish: the checkpoints saved after
+                      resuming from a failed prefix are its children. *)
+                   remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints))))
           end
+          handle Error msg =>
+            (* The child's exporter may have recorded its peak before
+               a later step failed. *)
+            (peak := peak_rss_mb stage;
+             if not (!HolbuildActionSandbox.outputs_validated) then
+               raise ActionFailed (InternalFailure, msg)
+             else
+             let val log_text = read_text (build_log ()) handle _ => ""
+             in
+               raise ActionFailed (classify_run_failure stage log_text oom_before msg)
+             end)
+        val _ = peak := peak_rss_mb stage
+        val _ =
+          phase "check" (fn () =>
+            (* Outputs built against out-of-date local copies of the parents
+               never reach the remote; the retry restores the remote's. *)
+            (if drop_stale_dep_copies remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
+             then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
+             else ();
+             check_remote_publication remote root spec;
+             case cutoff of
+                 SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
+               | NONE => ()))
+      in
+        "built"
+      end
+    (* Ahead of the late parents the claim named: built plain when none is
+       late any more, and given up when the action is built already, since
+       the coordinator then finds it in the cache once its parents are. *)
+    and run_ahead spec tc =
+      let
+        fun dependency key =
+          case List.find (fn dep => #key dep = key) (#deps spec) of
+              SOME dep => dep
+            | NONE => reject_spec ("ahead parent " ^ key ^ " is not a dependency of the action")
+        val named = map (fn {input_key, spec_sha256} => (dependency input_key, spec_sha256)) ahead_parents
+        fun cached key = Option.isSome (HolbuildRemoteCache.get_action remote key)
+        val _ = if cached (#input_key spec) then raise ActionFailed (AheadAbandoned, "the action is built already")
+                else ()
+        val late = List.filter (fn (dep, _) => not (cached (#key dep))) named
+      in
+        if null late then run_plain spec tc false else load_ahead spec tc late
+      end
+    and load_ahead spec tc late =
+      let
+        val package = #package spec
+        fun abandon msg = raise ActionFailed (AheadAbandoned, msg)
+        fun is_late key = List.exists (fn (dep, _) => #key dep = key) late
+        val present = List.filter (fn dep => not (is_late (#key dep))) (#deps spec)
+        fun file {path, sha256, ...} = {hash = sha256, dst = in_root root (action_source_path package path)}
+        val _ = hydrate_steps := []
+        val _ =
+          (phase "hydrate" (fn () =>
+             hydrate_spec_deps remote root (map file (#source spec :: #inputs spec))
+               {libraries = #libraries spec, deps = present, libs = #libs spec, orders = #orders spec}
+               (fn {stem, ...} => List.exists (fn loaded => loaded = stem) (spec_loaded_stems spec)))
+           before add_hydrate_steps ())
+          handle e => (add_hydrate_steps (); raise e)
+        (* A dependency built on an earlier build of a late parent names it
+           in its manifest; its parents are checked by a plain build. *)
+        val _ =
+          List.app
+            (fn {stem, target, ...} =>
+               let val uo = in_root root stem ^ ".uo"
+               in
+                 if not (file_exists uo) then () else
+                 if List.exists
+                      (fn line => List.exists (fn (dep, _) => line = Path.file (#stem dep) orelse
+                                                              line = in_root root (#stem dep)) late)
+                      (String.tokens (fn c => c = #"\n") (read_text uo))
+                 then abandon ("dependency " ^ target ^ " was built on an earlier build of a late parent")
+                 else ()
+               end)
+            present
+        (* What the cutoff and the parent checks read, hashed before the
+           child can write the action root, by the paths a plain build has. *)
+        val hashes = ref (Binarymap.mkDict String.compare)
+        fun record path hash = hashes := Binarymap.insert (!hashes, path, hash)
+        fun hash_of path =
+          case Binarymap.peek (!hashes, path) of
+              SOME hash => hash
+            | NONE => raise Error ("no hash recorded for " ^ path)
+        val _ =
+          phase "cutoff" (fn () =>
+            List.app
+              (fn {stem, ...} =>
+                 let
+                   val base = in_root root stem
+                   val others = map (fn suffix => base ^ suffix) [".sig", ".sml", ".ui", ".uo"]
+                 in
+                   record (base ^ ".dat") (hol_dat_hash (base ^ ".dat"));
+                   ListPair.app (fn (path, hash) => record path hash) (others, HolbuildHash.files_sha256 others)
+                 end)
+              present)
+        val source_text = read_text (in_root root (action_source_path package (#path (#source spec))))
+        val _ = phase "modules" (fn () => fill_module_store cache root tc {deps = present, loads = #loads spec})
+        val tool_cache = setup_tool_cache spec
+        (* The stage's names don't depend on the deps context. *)
+        val action = spec_theory_action root spec (#deps_key spec)
+        val stage = action_stage root action
+        val dir = in_root root ".holbuild/ahead"
+        val _ = (prepare_theory_stage false tc root action; remove_tree dir; ensure_dir dir)
+        val dir = FS.fullPath dir
+        val staging = ahead_staging
+        val _ = (HolbuildRemoveTree.remove_untrusted_strict staging; ensure_dir staging)
+        fun marker name = Path.concat (dir, name)
+        fun drop name = write_text (marker name) ""
+        val _ =
+          write_ahead_preload
+            {load_lines = map (theory_load_line root) (#loads spec), dir = dir,
+             path = Path.concat (stage, "holbuild-ahead-preload.sml")}
+        val files =
+          map (fn name => Path.concat (stage, name))
+            ["holbuild-child-policy.sml", "holbuild-ahead-preload.sml", "holbuild-preload.sml",
+             Path.file (#source_file action), "holbuild-export-theory.sml"]
+        val outcome : exn option option ref = ref NONE
+        val started = Time.now ()
+        val _ =
+          Thread.fork
+            (fn () =>
+                outcome :=
+                  SOME ((run_hol_files_to_log tc stage stage (toolchain_base_context tc) files "holbuild-build.log"
+                           (SOME (current_build_log (current_log_dir root package (#logical spec))))
+                           "hol run failed while building theory script";
+                         NONE)
+                        handle e => SOME e),
+             [])
+        fun child_done () = Option.isSome (!outcome)
+        fun await_child () = if child_done () then () else (OS.Process.sleep (Time.fromMilliseconds 50); await_child ())
+        fun stop_child () = if child_done () then () else (HolbuildToolchain.cleanup_active_children (); await_child ())
+        fun abandoned () = if file_exists (marker "abandoned") then SOME (read_text (marker "abandoned")) else NONE
+        val last_arrival = ref started
+        (* aheadload: from the child's start to its last wait step entered
+           (to the last arrival if it never waited); aheadwait: from then to
+           the last arrival. *)
+        fun record_timings () =
+          let
+            val waited =
+              List.mapPartial
+                (fn (dep, _) =>
+                   let val path = marker ("waiting-" ^ Path.file (#stem dep))
+                   in if file_exists path then SOME (FS.modTime path) else NONE end)
+                late
+            val loaded =
+              case waited of
+                  [] => !last_arrival
+                | t :: ts => List.foldl (fn (a, b) => if Time.> (a, b) then a else b) t ts
+            fun ms (a, b) = LargeInt.max (0, Time.toMilliseconds (Time.- (a, b)))
+          in
+            phases := ("aheadwait", ms (!last_arrival, loaded)) :: ("aheadload", ms (loaded, started)) :: !phases
+          end
+        val deadline = Time.+ (started, !ahead_wait_limit)
+        (* Polls READY every INTERVAL while the child runs. *)
+        fun wait_until ready interval =
+          (check_cancelled ();
+           if ready () then ()
+           else if child_done () then
+             (record_timings ();
+              case (abandoned (), !outcome) of
+                  (SOME reason, _) => abandon reason
+                | (NONE, SOME (SOME e)) => abandon ("the child stopped before its parents arrived: " ^ General.exnMessage e)
+                | _ => abandon "the child stopped before its parents arrived")
+           else if Time.>= (Time.now (), deadline) then abandon "a late parent did not arrive in time"
+           else (OS.Process.sleep interval; wait_until ready interval))
+        val resolver = spec_resolver (theory_spec_deps spec)
+        fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
+        fun stand_in ({stem, ...} : {target : string, stem : string, key : string}, parent_sha) base parents_memo =
+          let
+            val name = Path.file stem
+            val parent_spec = Path.concat (staging, name ^ ".spec")
+            val _ =
+              case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = parent_sha, dst = parent_spec} of
+                  HolbuildCacheBackend.Hit => ()
+                | _ => abandon ("the cache has no spec " ^ parent_sha ^ " for " ^ name)
+            val parent = parse_action_spec (read_text parent_spec)
+            val parent_source = Path.concat (staging, name ^ ".source")
+            val _ = fetch_spec_blob remote {hash = #sha256 (#source parent), dst = parent_source}
+            val predicted =
+              predicted_theory_loads
+                {root = root, cwd = FS.fullPath stage, holdir = FS.fullPath (#holdir tc), base = base,
+                 resolve = resolve, parents_memo = parents_memo, parent = parent,
+                 source_text = read_text parent_source}
+            val enter = marker (name ^ "-enter.sml")
+            val wait = marker (name ^ "-wait.sml")
+            val stem_path = in_root root stem
+          in
+            write_text enter ("val _ = HolbuildAheadLoad.enter " ^ HolbuildToolchain.sml_string name ^ ";\n");
+            write_text wait
+              ("val _ = HolbuildAheadLoad.wait {parent = " ^ HolbuildToolchain.sml_string name ^
+               ", ui = " ^ HolbuildToolchain.sml_string (marker (name ^ ".ui")) ^
+               ", uo = " ^ HolbuildToolchain.sml_string (marker (name ^ ".uo")) ^ "};\n");
+            ensure_dir (Path.dir (hfs_remapped_path stem_path));
+            write_object_manifest (stem_path ^ ".ui") [];
+            write_object_manifest (stem_path ^ ".uo") (enter :: predicted @ [wait])
+          end
+          handle e as ActionFailed _ => raise e
+               | e as HolbuildRemoteCache.Unavailable _ => raise e
+               | e => abandon ("cannot predict the load manifest of " ^ Path.file stem ^ ": " ^ General.exnMessage e)
+        val arrived = ref ([] : string list)
+        (* A late parent's entry: restored in the staging directory, checked
+           against its parents, then put in the action root. *)
+        fun arrive ({target, stem, key}, _) =
+          let
+            val name = Path.file stem
+            val staged = in_root staging stem
+            val _ =
+              (ensure_parent staged;
+               restore_spec_theory_in remote {files = staging, named = root} resolver
+                 {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
+              handle e as HolbuildRemoteCache.Unavailable _ => raise e
+                   | e => raise action_failed (InputMissing ("theory " ^ key))
+                                  ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
+                                   General.exnMessage e)
+            val recorded = parse_dat_parent_hashes (read_text (staged ^ ".dat"))
+            val _ =
+              List.app
+                (fn dep =>
+                   case Binarymap.peek (recorded, theory_name_from_logical (#2 (target_name (#target dep)))) of
+                       NONE => ()
+                     | SOME hash =>
+                         if Binarymap.peek (!hashes, in_root root (#stem dep) ^ ".dat") = SOME hash then ()
+                         else abandon ("dependency " ^ target ^ " does not match its parents"))
+                (#deps spec)
+            val base = in_root root stem
+            fun copy suffix =
+              if not (file_exists (staged ^ suffix)) then () else
+              (copy_binary (staged ^ suffix) (base ^ suffix);
+               if file_exists (hfs_remapped_path (staged ^ suffix)) then
+                 (ensure_parent (hfs_remapped_path (base ^ suffix));
+                  copy_binary (hfs_remapped_path (staged ^ suffix)) (hfs_remapped_path (base ^ suffix)))
+               else ())
+          in
+            record (base ^ ".dat") (hol_dat_hash (staged ^ ".dat"));
+            List.app (fn suffix => record (base ^ suffix) (HolbuildHash.file_sha256 (staged ^ suffix)))
+              [".sig", ".sml", ".ui", ".uo"];
+            List.app copy [".dat", ".sig", ".sml", ".tr.gz"];
+            copy_binary (staged ^ ".ui") (marker (name ^ ".ui"));
+            copy_binary (staged ^ ".uo") (marker (name ^ ".uo"));
+            drop ("arrived-" ^ name);
+            arrived := key :: !arrived;
+            last_arrival := Time.now ()
+          end
+        fun poll () =
+          (List.app (fn parent as (dep, _) =>
+                       if List.exists (fn k => k = #key dep) (!arrived) orelse not (cached (#key dep)) then ()
+                       else arrive parent)
+                    late;
+           length (!arrived) = length late)
+        and cached key = Option.isSome (HolbuildRemoteCache.get_action remote key)
+        val cutoff =
+          (wait_until (fn () => file_exists (marker "base-loaded")) (Time.fromMilliseconds 50);
+           let
+             val base = read_base_report (marker "base-loaded")
+             val parents_memo = ref (Binarymap.mkDict String.compare)
+           in
+             List.app (fn parent => stand_in parent base parents_memo) late
+           end;
+           drop "stand-ins";
+           wait_until poll ahead_poll_interval;
+           spec_early_cutoff_with {dat_hash = hash_of, file_hashes = map hash_of} root spec)
+          handle e => (stop_child (); raise e)
+        val built_action =
+          spec_theory_action root spec (case cutoff of SOME {deps_key, ...} => deps_key | NONE => #deps_key spec)
+        (* What a plain build would take instead of running the script:
+           the action's own entry, an earlier build's, or a shared heap
+           (whose checkpoints may resume inside the script).  A plain run
+           starts over from an empty root. *)
+        val hit =
+          cached (#input_key spec) orelse
+          (case cutoff of SOME {pair_key, ...} => cached pair_key | NONE => false) orelse
+          (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
+           cached (shared_heap_key tc root built_action))
+      in
+        if hit then
+          (stop_child ();
+           record_timings ();
+           HolbuildStatus.message_stderr "holbuild: loading ahead found a build to reuse; building plain\n";
+           empty_root ();
+           ensure_dir root;
+           ensure_dir checkpoint_root;
+           run_plain spec tc false)
+        else
+          build spec tc false cutoff
+            (SOME {source_text = source_text, tool_cache = tool_cache,
+                   join = fn () =>
+                     (drop "ready";
+                      await_child ();
+                      record_timings ();
+                      case (abandoned (), !outcome) of
+                          (SOME reason, _) => abandon reason
+                        | (NONE, SOME (SOME e)) => raise e
+                        | _ => ())})
       end
     fun attempt () =
       let
