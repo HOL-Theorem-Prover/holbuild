@@ -326,7 +326,7 @@ fun target_roots lookup nodes selection =
       let
         fun find target =
           case lookup target of
-              [] => raise UnknownTarget (target, map logical_name nodes)
+              [] => raise UnknownTarget (target, HolbuildNames.target_names (map source_of nodes))
             | matches => matches
       in
         List.concat (map find targets)
