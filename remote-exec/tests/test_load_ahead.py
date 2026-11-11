@@ -230,3 +230,18 @@ async def test_a_child_is_not_claimed_ahead_while_any_of_its_parents_waits_ahead
     coordinator.ahead_read = None
     assert await claim_ahead(http) is None
     assert await ahead_state(remote_exec_engine, "c") == ("waiting", "no", 0, 2)
+
+
+async def test_claims_ahead_sharing_a_read_take_the_deepest_child_of_any_batch_next(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(
+        http, ["a", "x", "x2", "x3", "y"], [("x", "a"), ("x2", "x"), ("x3", "x2"), ("y", "a")], speculative_loading="4"
+    )
+    await submit(http, ["b", "z", "z2"], [("z", "b"), ("z2", "z")], speculative_loading="4")
+    await claim_named(http, "a")
+    await claim_named(http, "b")
+
+    claimed = [await claim_ahead(http) for _ in range(3)]
+    assert [c["theory"] for c in claimed if c is not None] == ["pkg:x", "pkg:z", "pkg:y"]

@@ -506,7 +506,8 @@ RETURNING c.remaining_deps
 @dataclass
 class _AheadRead:
     """AHEAD_CANDIDATES read at ``at``, as (batch, input key, tier), best first, which the claims ahead of
-    ``claim_ranking_seconds`` share, and the batches and tiers found since with nothing left to claim ahead."""
+    ``claim_ranking_seconds`` share, less those they claimed, and the batches and tiers found since with nothing
+    left to claim ahead."""
 
     at: float
     candidates: list[tuple[UUID, str, str]]
@@ -1023,6 +1024,8 @@ class Coordinator:
                     worker,
                     ahead_parents,
                 )
+            # Out of the shared read, so the next claim of this read orders the batches by what remains.
+            read.candidates = [c for c in read.candidates if (c[0], c[1]) != (batch_id, row.input_key)]
             self._batch_changed(batch_id)
             return claimed
         return None
