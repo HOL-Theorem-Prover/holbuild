@@ -1426,7 +1426,9 @@ missing, or a declared path outside the package root fails the export. Beside
 the files, `holbuild-package/manifest` (`holbuild-hbx-capsule-v1`) names the
 package, its version if declared, the `toolchain_key` of the toolchain that
 exported it and the holbuild version. Dependencies are not stored beside the
-snapshot: they are the declarations in the snapshot's `holproject.toml`.
+snapshot: they are the declarations in the snapshot's `holproject.toml`. The
+snapshot holds the files as committed, `holproject.toml` included, so a
+dependency URL in it must not carry credentials.
 
 The cache part (`holbuild-cache/`, format `holbuild-hbx-v2`) holds the cached
 build outputs of the root package's theories among the selected targets. Targets
@@ -1438,7 +1440,7 @@ a build unless `--build` is passed.
 - `--closure` writes the cache part of the whole selected target closure,
   dependencies included (`deps/<package>/` views), and no package part.
 - `--sources-only` writes the package part alone. It takes no targets and builds
-  nothing.
+  no theories.
 
 `import` hydrates the global cache from the cache part (a capsule without one
 imports no actions); a later `holbuild build MyTheory` materialises outputs

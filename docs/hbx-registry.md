@@ -40,6 +40,8 @@ files 755 (executable) or 644, whatever the publisher's umask, so the archive's
 bytes do not depend on the checkout beyond the snapshot's content. A package's
 dependencies are not stored beside the snapshot; they are the declarations in
 the snapshot's `holproject.toml`, and dependencies' capsules are never bundled.
+The snapshot holds the files as committed, `holproject.toml` included, so a
+dependency URL in it must not carry credentials.
 
 `toolchain_key` is the identity of the toolchain's theory-building semantics that
 action keys carry. Cache entries in the capsule match only builds on the same
@@ -49,7 +51,7 @@ toolchain; on another toolchain holbuild builds from source.
 |---|---|---|
 | `export -o F [TARGET ...]` | yes | the root package's theories among the targets' closure |
 | `export --closure -o F [TARGET ...]` | no | every theory in the targets' closure, dependencies included |
-| `export --sources-only -o F` | yes | none; no targets, no build |
+| `export --sources-only -o F` | yes | none; no targets, no theories built |
 
 A target in another package is left out of the default export. An unbuilt
 dependency theory fails only `--closure`.

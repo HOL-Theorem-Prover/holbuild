@@ -345,7 +345,7 @@ fun export_help () = print
   \left out. With --build, build targets first.\n\n\
   \  --closure       Write the cached outputs of the whole target closure, dependencies\n\
   \                  included, and no source snapshot.\n\
-  \  --sources-only  Write the source snapshot only. Takes no targets and builds nothing.\n\n\
+  \  --sources-only  Write the source snapshot only. Takes no targets and builds no theories.\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun import_help () = print
