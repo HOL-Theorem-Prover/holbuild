@@ -688,6 +688,8 @@ none is. A run batch with it returns 400.
         "attempts": 1,
         "last_failure": "<failure class>|null",
         "log_sha256": "<sha256 of the last run's build log in /cas/>|null",
+        "log_zstd": "<compressed-sha256> <compressed-size> <raw-sha256> <raw-size>|null",
+        "log_error": "<why the log could not be published>|null",
         "failure_detail": "<the last result's detail: why it failed without a log>|null",
         "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null
       }
@@ -695,6 +697,12 @@ none is. A run batch with it returns 400.
   }
   ```
 - 404 when there is no such batch (or it was deleted by retention)
+
+`log_sha256` identifies a raw log. `log_zstd` identifies an opaque compressed
+log and records both the compressed and raw sizes and hashes. `log_error`
+describes a failed log publication. These fields describe the most recent
+completed attempt; a terminal cancellation or lease expiry without a result
+clears them.
 
 `POST /v1/batches/<batch_id>/cancel`
 
@@ -710,7 +718,7 @@ none is. A run batch with it returns 400.
   stream with nothing to send for `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` sends
   an empty line, which clients skip, so a proxy doesn't close it as idle:
   ```json
-  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null, "failure_detail": null, "timings": null}
+  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null, "log_zstd": null, "log_error": null, "failure_detail": null, "timings": null}
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the
