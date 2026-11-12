@@ -12,7 +12,6 @@ import httpx
 import pytest
 import uvicorn
 from pydantic import SecretStr
-from sqlalchemy.ext.asyncio import AsyncEngine
 
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache
 from remote_exec import coordinator as coordinator_module
@@ -21,14 +20,14 @@ from remote_exec.coordinator import Coordinator, Settings
 from test_coordinator import CLIENT, WORKER, ac_key, input_key, result, submit
 
 
-async def test_http_claim_herd_stays_live(remote_exec_engine: AsyncEngine) -> None:
+async def test_http_claim_herd_stays_live(coordinator: Coordinator) -> None:
     # A timeout on the server loop cannot interrupt a non-yielding completed-task retry.
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("REMOTE_EXEC_", "HOLBUILD_REMOTE_CACHE_"))}
     env["PYTHONPATH"] = str(Path(coordinator_module.__file__).resolve().parents[1])
     process = await asyncio.create_subprocess_exec(
         sys.executable, str(Path(__file__).resolve()),
-        remote_exec_engine.url.render_as_string(hide_password=False), env=env,
+        coordinator.engine.url.render_as_string(hide_password=False), env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
     communicating = asyncio.create_task(process.communicate())
