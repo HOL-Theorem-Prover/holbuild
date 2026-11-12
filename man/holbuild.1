@@ -312,7 +312,7 @@ Needs
 Also upload the specs and their sources to the remote cache.
 .RE
 .TP
-.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-share\-heaps\fR] [\fB\-\-result \fIFILE\fR]
+.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-share\-heaps\fR] [\fB\-\-result \fIFILE\fR] [\fB\-\-ahead\-parent \fIINPUT_KEY\fB:\fISPEC\-SHA256\fR ... [\fB\-\-ahead\-wait\-seconds \fIN\fR]]
 Run the action specification stored in the remote cache as
 .I SPEC\-SHA256
 (see
@@ -336,8 +336,8 @@ record to
 or to standard output.
 .IP
 Exit status: 0 built or cached; 1 proof, tactic-timeout, script or timeout
-failure; 2 out of memory; 3 input-missing, publish, toolchain, disk or
-internal failure; 4 spec rejected.
+failure; 2 out of memory; 3 input-missing, publish, toolchain, disk,
+internal or ahead-abandoned failure; 4 spec rejected.
 .RS
 .TP
 .BI \-\-cache\-limit\-gb " N"
@@ -358,6 +358,19 @@ keeps their files.
 .TP
 .BI \-\-result " FILE"
 Where to write the result record (default: standard output).
+.TP
+.BI \-\-ahead\-parent " INPUT_KEY" : SPEC\-SHA256
+Load ahead of this parent, a dependency of the theory that another worker is
+still building from that spec: restore the other dependencies and start HOL at
+once, and take the parent's outputs from the remote cache when they appear.
+Repeatable, once per such parent.
+A run that can't go on as a plain run would fails as ahead-abandoned
+(exit status 3), and a retry without the option builds it.
+.TP
+.BI \-\-ahead\-wait\-seconds " N"
+How long to wait for the parents named by
+.B \-\-ahead\-parent
+(default 3600).
 .RE
 .TP
 .B run\-action \fIFORM\fR \fITARGET\fR ...
