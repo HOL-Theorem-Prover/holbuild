@@ -38,7 +38,7 @@ val build_cache_valued =
 fun command name : command =
   case name of
       "build" =>
-        {flags = ["--watch", "--dry-run", "--repl-on-failure", "--remote-only", "--detach"] @
+        {flags = ["--watch", "--dry-run", "--repl-on-failure", "--remote-only", "--detach", "--speculative-loading"] @
                  build_cache_flags,
          valued = build_cache_valued @ remote_valued @ [("--priority", Nothing), ("--attach", Nothing)],
          operands = Targets}
@@ -65,7 +65,8 @@ fun command name : command =
     | "cache" => {flags = [], valued = [], operands = Nothing}
     | "exec-action" =>
         {flags = ["--share-heaps"],
-         valued = [("--cache-limit-gb", Nothing), ("--cache-reserve-gb", Nothing), ("--result", Nothing)],
+         valued = [("--cache-limit-gb", Nothing), ("--cache-reserve-gb", Nothing), ("--result", Nothing),
+                   ("--ahead-parent", Nothing), ("--ahead-wait-seconds", Nothing)],
          operands = Nothing}
     | "run-action" =>
         {flags = ["--remote-only", "--closure", "--fetch-only", "--export-only"],

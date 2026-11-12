@@ -25,12 +25,9 @@ fun poly_runtime_args ({maxheap, ...} : t) =
     | SOME n => ["--maxheap", Int.toString n]
 
 fun hol_subcommand_argv tc subcommand =
-  hol tc :: poly_runtime_args tc @ [subcommand]
+  hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ [subcommand]
 
-(* Holmake deliberately confines Poly/ML to one GC thread while playing theory
-   scripts.  Keep that build policy separate from interactive run/repl use. *)
-fun theory_run_argv tc =
-  hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ ["run"]
+fun theory_run_argv tc = hol_subcommand_argv tc "run"
 
 fun quote s =
   "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"
@@ -149,6 +146,15 @@ fun timed_shell kind argv output script =
 
 fun run argv =
   timed_shell "run" argv NONE (command argv)
+
+(* As run, under a machine memory reservation (--cooperate-dir), for the HOL
+   session of check and run. *)
+fun run_reserved argv =
+  HolbuildMachineMemory.with_reservation
+    (fn lease =>
+        timed_system "run" argv NONE
+          (fn () => HolbuildProcessGroup.run_shell_inheriting lease (command argv)))
+  handle HolbuildMachineMemory.Error msg => raise Error msg
 
 fun run_interactive argv =
   timed_system "run_interactive" argv NONE (fn () => OS.Process.system (command argv))

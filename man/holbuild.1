@@ -134,7 +134,8 @@ If a theorem and a terminating definition have the same name, the theorem
 takes precedence.
 .TP
 .B check \fITHEORY\fR[:\fITHEOREM\fR] ...
-Build each theory if needed, load it in HOL and check the tags and hypotheses
+Build each theory if needed, read its restored Theory.dat metadata without
+starting HOL, and check the tags and hypotheses
 of its stored theorems, or of
 .I THEOREM
 alone.
@@ -148,8 +149,8 @@ kernel-bypass call
 \&...) in the sources the theory is built from outside HOL.
 Exits non-zero if there are any findings; otherwise prints a clean line and
 exits zero.
-Selectors are checked in order in one HOL session; findings do not stop later
-checks, but an invalid selector or a load error aborts the command.
+Selectors share one target build and are checked in order; findings do not stop
+later checks, but an invalid selector or unreadable theory data aborts the command.
 The build runs without proof steps or checkpoints, reuses theories built by
 .BR "build \-\-skip\-proof\-steps" ,
 and applies no step timeout.
@@ -311,7 +312,7 @@ Needs
 Also upload the specs and their sources to the remote cache.
 .RE
 .TP
-.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-share\-heaps\fR] [\fB\-\-result \fIFILE\fR]
+.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-share\-heaps\fR] [\fB\-\-result \fIFILE\fR] [\fB\-\-ahead\-parent \fIINPUT_KEY\fB:\fISPEC\-SHA256\fR ... [\fB\-\-ahead\-wait\-seconds \fIN\fR]]
 Run the action specification stored in the remote cache as
 .I SPEC\-SHA256
 (see
@@ -335,8 +336,8 @@ record to
 or to standard output.
 .IP
 Exit status: 0 built or cached; 1 proof, tactic-timeout, script or timeout
-failure; 2 out of memory; 3 input-missing, publish, toolchain, disk or
-internal failure; 4 spec rejected.
+failure; 2 out of memory; 3 input-missing, publish, toolchain, disk,
+internal or ahead-abandoned failure; 4 spec rejected.
 .RS
 .TP
 .BI \-\-cache\-limit\-gb " N"
@@ -357,6 +358,19 @@ keeps their files.
 .TP
 .BI \-\-result " FILE"
 Where to write the result record (default: standard output).
+.TP
+.BI \-\-ahead\-parent " INPUT_KEY" : SPEC\-SHA256
+Load ahead of this parent, a dependency of the theory that another worker is
+still building from that spec: restore the other dependencies and start HOL at
+once, and take the parent's outputs from the remote cache when they appear.
+Repeatable, once per such parent.
+A run that can't go on as a plain run would fails as ahead-abandoned
+(exit status 3), and a retry without the option builds it.
+.TP
+.BI \-\-ahead\-wait\-seconds " N"
+How long to wait for the parents named by
+.B \-\-ahead\-parent
+(default 3600).
 .RE
 .TP
 .B run\-action \fIFORM\fR \fITARGET\fR ...
@@ -760,6 +774,13 @@ fail instead of building locally, with exit status 75.
 .TP
 .BI \-\-priority " N"
 The batch's priority with the coordinator (default 0).
+.TP
+.BR \-\-speculative\-loading [= \fIN\fR]
+Let the coordinator's workers start loading a theory's ancestors before its
+parents are built, at most
+.I N
+theories of the batch at a time (1\(en16, default 4).
+Costs worker time when a parent fails.
 .TP
 .B \-\-detach
 Submit the batch and exit.

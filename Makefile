@@ -10,7 +10,7 @@ BASHCOMPDIR ?= $(PREFIX)/share/bash-completion/completions
 ZSHCOMPDIR ?= $(PREFIX)/share/zsh/site-functions
 FISHCOMPDIR ?= $(PREFIX)/share/fish/vendor_completions.d
 VENDORED_HOL_FILES := $(shell sed 's|^|vendor/hol/|' vendor/hol/FILES)
-RUNTIME_SOURCES := sml/action_sandbox.py sml/checkpoint_save_runtime.sml sml/holbuild_runtime.sml sml/deferred_proofs_runtime.sml \
+RUNTIME_SOURCES := sml/action_sandbox.py sml/ahead_load_runtime.sml sml/checkpoint_save_runtime.sml sml/holbuild_runtime.sml sml/deferred_proofs_runtime.sml \
 	sml/fingerprint_runtime.sml sml/proof_runtime.sml sml/tactic_compat_runtime.sml sml/diagnostic_limits.sml sml/sha256.sml \
 	sml/spawn.sml sml/temp_path.sml sml/hash.sml sml/proof_ir_types.sml sml/proof_ir.sml \
 	$(wildcard sml/analyser/*.sml)
