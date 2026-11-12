@@ -460,6 +460,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   Refreshing an exhausted ranking waits outside the claim transaction.
   Shared reads publish their result and clear their slot before completing:
   a stale completed task must not keep callers spinning while its cleanup waits.
+  Ahead-only notifications wake capable claims without making ordinary idle
+  workers retry, and peer batches invalidate ahead reads only when they opted in.
   Set the floor back to 0 and restart the coordinator
   to restore strict build priority. Claims select with `FOR UPDATE SKIP LOCKED`,
   write a lease with an expiry and commit; no transaction stays open while

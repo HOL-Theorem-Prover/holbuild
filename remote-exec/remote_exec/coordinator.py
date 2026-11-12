@@ -586,7 +586,9 @@ class _AheadRead:
 # the same spec is done with the build, the others are just no longer held. Read by primary key, a probe per running
 # batch: no index leads with input_key.
 PEERS = sa.text("""
-SELECT batch_id, tier, state, spec_sha256 FROM actions
+SELECT batch_id, tier, state, spec_sha256,
+    (SELECT ahead_cap IS NOT NULL FROM batches WHERE id = actions.batch_id) AS ahead_batch
+FROM actions
 WHERE batch_id = ANY(ARRAY(SELECT id FROM batches WHERE state = 'running' AND id <> :batch_id))
 AND input_key = :input_key AND class = 'build' AND state IN ('waiting', 'ready')
 """)
@@ -934,8 +936,8 @@ class Coordinator:
 
         try:
             while True:
-                # Taken before the attempt, so an action made ready during it is tried at once, not waited for.
-                made_ready = self.made_ready
+                # Work made claimable during the attempt is retried at once, for workers that can take it.
+                seen = (self.made_ready, self.ahead_changes if ahead else 0)
                 eligible_tiers = undeferred(ahead_only=False)
                 claimed = await self._claim(eligible_tiers, worker) if eligible_tiers else None
                 # A better-ranked waiter that can't claim ahead leaves the actions claimed ahead to this one.
@@ -945,7 +947,7 @@ class Coordinator:
                 if claimed is not None or remaining <= 0:
                     return claimed
                 woken = loop.create_future()
-                if self.made_ready == made_ready:
+                if (self.made_ready, self.ahead_changes if ahead else 0) == seen:
                     waiter = (tiers, rank, woken, ahead)
                     self.claim_waiters.append(waiter)
                     try:
@@ -1288,9 +1290,10 @@ class Coordinator:
                 self.rankings.pop(key, None)
 
     def _wake_claim(self, tier: str, *, ahead: bool = False) -> None:
-        """Count an action of ``tier`` made ready, or, with ``ahead``, that may be claimed ahead, and wake its
-        best-ranked compatible claim, with FIFO ties."""
-        self.made_ready += 1
+        """Wake the best-ranked compatible claim, with FIFO ties. Only normal wakes count newly ready work;
+        changes for capable claims are recorded by _ahead_changed."""
+        if not ahead:
+            self.made_ready += 1
         waiter = min(
             (w for w in self.claim_waiters if tier in w[0] and not w[2].done() and (w[3] or not ahead)),
             key=lambda w: w[1],
@@ -1303,13 +1306,14 @@ class Coordinator:
     def _pass_wake(self, woken: asyncio.Future[tuple[str, bool]]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""
         if woken.done() and not woken.cancelled():
-            self.made_ready -= 1
             tier, ahead = woken.result()
+            if not ahead:
+                self.made_ready -= 1
             self._wake_claim(tier, ahead=ahead)
 
     async def _peers(self, batch_id: UUID, action: sa.Row[Any]) -> list[sa.Row[Any]]:
         """The waiting and ready copies of build ``action`` of ``batch_id``, whose lease just ended, in other
-        running batches, with their batch, tier, state and spec; see PEERS. Read once the lease's deletion
+        running batches, with their batch, tier, state, spec and ahead opt-in; see PEERS. Read once the lease's deletion
         committed, so a batch submitted meanwhile is either found or was never held."""
         if action.action_class != "build":
             return []
@@ -1319,14 +1323,16 @@ class Coordinator:
     def _wake_peers(self, peers: list[sa.Row[Any]]) -> None:
         """Have claims take the ``peers`` now that the lease holding them back ended: the ready ones as if just made
         ready, the waiting ones ahead of their parents."""
-        for batch_id, tier, state, _ in peers:
-            if state == "ready":
-                self._forget_rankings(batch_id, {tier})
-                self._wake_claim(tier)
-        if peers:
+        for peer in peers:
+            if peer.state == "ready":
+                self._forget_rankings(peer.batch_id, {peer.tier})
+                self._wake_claim(peer.tier)
+        if any(peer.state == "waiting" and peer.ahead_batch for peer in peers):
             self._ahead_changed()
 
-    async def _finish_peer(self, batch_id: UUID, input_key: str, log_sha256: str | None) -> None:
+    async def _finish_peer(
+        self, batch_id: UUID, input_key: str, log_sha256: str | None, *, ahead_batch: bool
+    ) -> None:
         """Mark done the copy in ``batch_id`` of build ``input_key``, which another batch's worker just finished
         and published, if no claim took it meanwhile; it keeps that worker's log for the client to show."""
         async with self.engine.begin() as conn:
@@ -1346,7 +1352,8 @@ class Coordinator:
             await self._finish_if_done(conn, batch_id)
         self._batch_changed(batch_id)
         self.request_release(batch_id)
-        self._ahead_changed()  # its children may now be claimed ahead
+        if ahead_batch:
+            self._ahead_changed()  # its children may now be claimed ahead
 
     def report_host(self, report: HostReport) -> None:
         """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one."""
@@ -1503,7 +1510,7 @@ class Coordinator:
         done = [] if result.status == "failed" else [peer for peer in peers if peer.spec_sha256 == action.spec_sha256]
         self._wake_peers([peer for peer in peers if peer not in done])
         for peer in done:
-            await self._finish_peer(peer.batch_id, action.input_key, result.log_sha256)
+            await self._finish_peer(peer.batch_id, action.input_key, result.log_sha256, ahead_batch=peer.ahead_batch)
         return True
 
     def request_release(self, batch_id: UUID | None = None) -> None:
