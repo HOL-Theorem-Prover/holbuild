@@ -183,22 +183,27 @@ fun blob_ref line =
 
 fun touch path = FS.setTime(path, NONE) handle OS.SysErr _ => ()
 
+fun touch_manifest_blobs cache text =
+  List.app (fn line => Option.app (touch o blob_path cache) (blob_ref line))
+           (String.tokens (fn c => c = #"\n") text)
+
 (* GC snapshots the blobs live manifests reference, then sweeps unreferenced
    blobs older than its cutoff. A build that reuses an old blob does not
    rewrite it, so its manifest, if written after the snapshot, would not keep
    the blob from the sweep. Refreshing each referenced blob first does. *)
 fun write_action cache {key, text} =
-  (List.app (fn line => Option.app (touch o blob_path cache) (blob_ref line))
-            (String.tokens (fn c => c = #"\n") text);
+  (touch_manifest_blobs cache text;
    write_text (action_manifest cache key) text;
    add_growth cache manifest_growth_bytes)
 
 fun remove_action cache key = remove_file (action_manifest cache key)
 
-fun touch_action cache key = touch (action_manifest cache key)
-
 fun get_action cache key =
   SOME (read_text (action_manifest cache key)) handle _ => NONE
+
+fun touch_action cache key =
+  (Option.app (touch_manifest_blobs cache) (get_action cache key);
+   touch (action_manifest cache key))
 
 fun existing_action_result cache policy key expected actual =
   case policy of

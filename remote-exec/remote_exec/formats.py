@@ -23,6 +23,7 @@ FAILURES = frozenset(
         "script",
         "timeout",
         "unavailable",
+        "ahead-abandoned",  # an action claimed ahead of its parents gave up; it is built once they are done
     }
 )
 

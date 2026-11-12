@@ -122,14 +122,18 @@ fun build_help () = print
   \      files in from one build to the next: the cache root's tool-cache/NAME\n\
   \      here; on a remote worker, one the remote cache fills and saves per\n\
   \      theory dependencies.\n\
-  \  --remote-exec URL [--remote-only] [--priority N] [--detach | --attach BATCH-ID]\n\n\
+  \  --remote-exec URL [--remote-only] [--priority N] [--speculative-loading[=N]]\n\
+  \      [--detach | --attach BATCH-ID]\n\n\
   \With --remote-exec, theories the remote cache lacks and that aren't\n\
   \built here for their current inputs (except with --detach) are built\n\
   \by the coordinator's workers and restored from the remote cache. Needs\n\
   \--remote-cache. A closure that can't run remotely or an unreachable\n\
   \coordinator builds locally; --remote-only fails instead, with exit\n\
   \status 75. --detach submits the batch and exits; --attach follows a\n\
-  \submitted batch and restores it.\n\n\
+  \submitted batch and restores it. --speculative-loading starts loading a\n\
+  \theory's ancestors on a worker before its parents are built, at most N\n\
+  \theories of the batch at a time (1-16, default 4); it costs worker time\n\
+  \when a parent fails.\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun context_help () = print
@@ -294,8 +298,8 @@ fun exec_action_help () = print
   \CACHE/checkpoints, where CACHE is the cache root. Writes a\n\
   \holbuild-action-result-v1 record to FILE, or to stdout.\n\n\
   \Exit status: 0 built or cached; 1 proof, tactic-timeout, script or timeout\n\
-  \failure; 2 out of memory; 3 input-missing, publish, toolchain, disk or\n\
-  \internal failure; 4 spec rejected.\n\n\
+  \failure; 2 out of memory; 3 input-missing, publish, toolchain, disk,\n\
+  \ahead-abandoned or internal failure; 4 spec rejected.\n\n\
   \--cache-limit-gb N   Before the action, evict least recently used\n\
   \                     checkpoints, toolchains and local cache entries until\n\
   \                     the cache root holds at most N GB minus the reserve.\n\
@@ -1141,7 +1145,8 @@ datatype build_mode =
   | ExportRunSpecs of HolbuildBuildExec.run_request
   | RemoteRun of {request : HolbuildBuildExec.run_request, url : string option, fetch_only : bool,
                   outputs_dir : string, profile : string option}
-  | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int}
+  | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int,
+                   speculative_loading : int option}
 
 fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
@@ -1620,7 +1625,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
        it finishes, the ordinary build restores them from the remote cache. *)
-    fun remote_build {url, remote_only, detach, attach, priority} =
+    fun remote_build {url, remote_only, detach, attach, priority, speculative_loading} =
       let
         val _ =
           if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
@@ -1896,7 +1901,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 | ((HolbuildRemoteExec.Unreachable reason, progress), _) =>
                     if remote_only
                     then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id ^
-                                    (if priority = 0 then "" else " --priority " ^ Int.toString priority))
+                                    (if priority = 0 then "" else " --priority " ^ Int.toString priority) ^
+                                    (case speculative_loading of
+                                         SOME n => " --speculative-loading=" ^ Int.toString n
+                                       | NONE => ""))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
             and submit resubmit skip batch =
               if null (batch_keys batch) then
@@ -1908,9 +1916,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     build_locally ()))
               else
                 case HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
-                       ((if fail_fast then "?fail_fast=true" else "") ^
-                        (if priority = 0 then "" else
-                         (if fail_fast then "&" else "?") ^ "priority=" ^ Int.toString priority))
+                       (case (if fail_fast then ["fail_fast=true"] else []) @
+                             (if priority = 0 then [] else ["priority=" ^ Int.toString priority]) @
+                             (case speculative_loading of
+                                  SOME n => ["speculative_loading=" ^ Int.toString n]
+                                | NONE => []) of
+                            [] => ""
+                          | params => "?" ^ String.concatWith "&" params)
                        (#maxheap tc) batch of
                     HolbuildRemoteExec.Refused reason => (record_pending (); fall_back reason)
                   | HolbuildRemoteExec.Ok batch_id =>
@@ -2264,6 +2276,29 @@ fun split_build_priority args =
     loop NONE [] args
   end
 
+(* --speculative-loading[=N]: how many theories of a batch may load ahead of
+   their parents at a time. *)
+fun split_speculative_loading args =
+  let
+    fun parse value =
+      (* Two digits at most, so Int.fromString can't overflow. *)
+      case if size value <= 2 andalso List.all Char.isDigit (String.explode value) then Int.fromString value else NONE of
+          SOME n =>
+            if n >= 1 andalso n <= 16 then n
+            else raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 16")
+        | NONE => raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 16")
+    fun loop cap acc xs =
+      case xs of
+          [] => (cap, rev acc)
+        | "--speculative-loading" :: rest => loop (SOME 4) acc rest
+        | arg :: rest =>
+            if String.isPrefix "--speculative-loading=" arg then
+              loop (SOME (parse (String.extract (arg, size "--speculative-loading=", NONE)))) acc rest
+            else loop cap (arg :: acc) rest
+  in
+    loop NONE [] args
+  end
+
 (* After a command that built or imported, outside its project lock: the
    project's automatic GC (when FIND_PROJECT finds one), then the cache's. The
    command has already succeeded, so a project that no longer loads only
@@ -2289,6 +2324,7 @@ fun build tc cli_jobs args =
     val _ = HolbuildDiagnosticLimits.validate ()
     val (batch_priority, args) = split_build_priority args
     val priority = Option.getOpt (batch_priority, 0)
+    val (speculative_loading, args) = split_speculative_loading args
     val args = split_tool_cache_flag args
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
     val parsed as ({dry_run, watch, repl_on_failure, trace_steps, execution_plan, ...}, _) = split_flags args
@@ -2301,6 +2337,8 @@ fun build tc cli_jobs args =
         raise Error "--watch does not support --repl-on-failure"
       else if Option.isSome batch_priority andalso not (Option.isSome url) then
         raise Error "--priority needs --remote-exec URL"
+      else if Option.isSome speculative_loading andalso not (Option.isSome url) then
+        raise Error "--speculative-loading needs --remote-exec URL"
       else if not (Option.isSome url) andalso (remote_only orelse detach orelse Option.isSome attach) then
         raise Error "--remote-only, --detach and --attach need --remote-exec URL"
       else if Option.isSome url andalso
@@ -2315,7 +2353,8 @@ fun build tc cli_jobs args =
     case url of
         SOME url =>
           (build_once_with_prepared_mode
-             (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach, priority = priority})
+             (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach, priority = priority,
+                          speculative_loading = speculative_loading})
              tc cli_jobs NONE parsed;
            if detach then () else auto_gc (SOME o load_project))
       | NONE =>
@@ -2845,7 +2884,8 @@ fun build_heap_kind tc cli_jobs command args =
               val _ = if null expanded then raise Error (command ^ " target has no objects: " ^ target) else ()
             in
               build_once_with_prepared_mode
-                (RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE, priority = 0})
+                (RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE, priority = 0,
+                          speculative_loading = NONE})
                 tc cli_jobs NONE (heap_build_request objects)
             end
     fun execute_heap () =
@@ -3119,7 +3159,8 @@ fun run_hol_with runner tc cli_jobs subcommand args =
     val ({from, url, remote_only}, user_args) = split_run_options args
     val build_mode =
       case url of
-          SOME url => RemoteExec {url = url, remote_only = remote_only, detach = false, attach = NONE, priority = 0}
+          SOME url => RemoteExec {url = url, remote_only = remote_only, detach = false, attach = NONE, priority = 0,
+                          speculative_loading = NONE}
         | NONE =>
             if remote_only then raise Error "--remote-only needs --remote-exec URL"
             else BuildTargets
@@ -3571,7 +3612,8 @@ fun check_command tc cli_jobs args =
         | NONE => ()
     val build_mode =
       case url of
-          SOME u => RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE, priority = 0}
+          SOME u => RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE, priority = 0,
+                          speculative_loading = NONE}
         | NONE => BuildTargets
   in
     case args of
