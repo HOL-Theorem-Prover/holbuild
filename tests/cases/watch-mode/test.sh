@@ -218,3 +218,14 @@ kill -INT "$watch_pid"
 wait_for_exit "$watch_pid" 10
 require_file "$project/.holbuild/stage/abandoned/leftover"
 ! grep -q "automatic" "$watch_log" || { echo "watch ran automatic gc" >&2; cat "$watch_log" >&2; exit 1; }
+
+python3 - "$project" <<'PYCODE'
+import json,pathlib,sys
+records=[json.loads(p.read_text()) for p in (pathlib.Path(sys.argv[1])/'.holbuild/commands').glob('*.json')]
+assert len(records)==1, records
+plans=records[0]['plans']
+assert sum(p['cold_worktree'] for p in plans)==1, plans
+assert plans[1]['changed_sources'], plans
+assert not plans[2]['changed_sources'], plans
+assert all(not p['newly_observed_sources'] for p in plans[1:3]), plans
+PYCODE

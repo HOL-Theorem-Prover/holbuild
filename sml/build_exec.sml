@@ -7743,11 +7743,16 @@ fun uncached_parents plan uncached node =
     fun walk (dep, (seen, parents)) =
       let val key = HolbuildBuildPlan.key dep
       in
-        if List.exists (fn k => k = key) seen then (seen, parents)
-        else if is_theory_node dep andalso uncached dep then (key :: seen, dep :: parents)
-        else List.foldl walk (key :: seen, parents) (HolbuildBuildPlan.direct_project_deps plan dep)
+        if Binaryset.member (seen, key) then (seen, parents)
+        else
+          let val seen = Binaryset.add (seen, key)
+          in
+            if is_theory_node dep andalso uncached dep then (seen, dep :: parents)
+            else List.foldl walk (seen, parents) (HolbuildBuildPlan.direct_project_deps plan dep)
+          end
       end
-    val (_, parents) = List.foldl walk ([], []) (HolbuildBuildPlan.direct_project_deps plan node)
+    val (_, parents) =
+      List.foldl walk (Binaryset.empty String.compare, []) (HolbuildBuildPlan.direct_project_deps plan node)
   in
     rev parents
   end
@@ -8082,8 +8087,10 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       else []
     val (deferred, uncached_actions) =
       List.partition (meets (key_set (map (#input_key o #2) candidates))) uncached_actions
-    fun uncached_in actions node =
-      List.exists (fn (n, _) => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) actions
+    fun uncached_in actions =
+      let val keys = key_set (map (fn (node, _) => HolbuildBuildPlan.key node) actions)
+      in fn node => Binaryset.member (keys, HolbuildBuildPlan.key node)
+      end
     (* The workers restore from the remote cache what the batch's theories
        depend on, so each one built here goes there from the local cache
        unless it is there already; one that can't joins the batch.  The
@@ -8116,7 +8123,10 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         failing "checking remote cache" "theories" available deps_actions)
     val uncached_actions =
       if null unavailable then uncached_actions
-      else List.filter (fn (node, _) => uncached_in (uncached_actions @ unavailable) node) actions
+      else
+        let val included = uncached_in (uncached_actions @ unavailable)
+        in List.filter (fn (node, _) => included node) actions
+        end
     val uncached = uncached_in uncached_actions
     val toolchain_line = spec_toolchain_line tc project
     val spec_dir = Path.concat(root, ".holbuild/action-specs")
@@ -10742,7 +10752,7 @@ fun toolchain_theory_script holdir theory =
   handle OS.SysErr _ => ""
 
 (* Steps 3 to 6 for a run: hydrate the root, run the script, publish. *)
-fun exec_run check_cancelled remote root tc (spec : run_spec) log =
+fun exec_run (hol_phase, publish_phase) check_cancelled remote root tc (spec : run_spec) log =
   let
     val src = in_root root run_source_dir
     val output_dir = in_root root ".holbuild/run-output"
@@ -10789,12 +10799,12 @@ fun exec_run check_cancelled remote root tc (spec : run_spec) log =
     val _ = last_child_status := NONE
     val _ = check_cancelled ()
     val {status, timed_out} =
-      (case #timeout spec of
+      hol_phase (fn () => (case #timeout spec of
            SOME seconds =>
              HolbuildToolchain.run_in_dir_to_file_until src argv log
                (Time.fromSeconds (LargeInt.fromInt seconds))
          | NONE => {status = HolbuildToolchain.run_in_dir_to_file src argv log, timed_out = false})
-      handle HolbuildToolchain.Error msg => raise action_failed InternalFailure msg
+      handle HolbuildToolchain.Error msg => raise action_failed InternalFailure msg)
     val _ = last_child_status := SOME status
     val _ = check_cancelled ()
     val _ =
@@ -10831,20 +10841,24 @@ fun exec_run check_cancelled remote root tc (spec : run_spec) log =
           | HolbuildCacheBackend.AlreadyPresent => (name, hash)
           | _ => raise action_failed PublishFailure ("could not publish output " ^ name)
       end
-    val outputs = map publish files
-    val manifest =
-      run_manifest_text {input_key = #run_key spec, parent = Option.map #key (#context_theory spec),
-                         outputs = outputs}
-    val _ = check_cancelled ()
-    val _ =
-      HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
-        {key = #run_key spec, text = manifest}
   in
-    case remote_run_entry remote (#run_key spec) (#outputs spec) of
-        NONE => raise ActionFailed (PublishFailure, "the remote cache holds no entry for the run after publishing")
-      | SOME (resident, _) =>
-          if cache_manifest_outputs_equal (#run_key spec) manifest resident then ()
-          else raise ActionFailed (PublishFailure, "the remote cache holds different outputs for the run")
+    publish_phase (fn () =>
+      let
+        val outputs = map publish files
+        val manifest =
+          run_manifest_text {input_key = #run_key spec, parent = Option.map #key (#context_theory spec),
+                             outputs = outputs}
+        val _ = check_cancelled ()
+        val _ =
+          HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
+            {key = #run_key spec, text = manifest}
+      in
+        case remote_run_entry remote (#run_key spec) (#outputs spec) of
+            NONE => raise ActionFailed (PublishFailure, "the remote cache holds no entry for the run after publishing")
+          | SOME (resident, _) =>
+              if cache_manifest_outputs_equal (#run_key spec) manifest resident then ()
+              else raise ActionFailed (PublishFailure, "the remote cache holds different outputs for the run")
+      end)
   end
 
 (* Whether the writer's output [file] is one of the [expected] modules,
@@ -11275,7 +11289,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
       let
         val _ = if name = "publish" orelse name = "log" then () else check_cancelled ()
         val t0 = Time.now ()
-        fun record () = phases := (name, Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
+        fun record () =
+          let val ended = Time.now ()
+              val spans = if List.exists (fn n => n = name) ["hol", "publish", "log"] then
+                  [(name ^ "start", Time.toMilliseconds t0), (name ^ "end", Time.toMilliseconds ended)]
+                else []
+          in phases := (name, Time.toMilliseconds (Time.-(ended, t0))) :: spans @ !phases end
       in
         (f () before record ()) handle e => (record (); raise e)
       end
@@ -11303,6 +11322,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
             end
     val run_log = ref NONE
+    val theory_action = ref false
     fun build_log () =
       case !run_log of
           SOME path => path
@@ -11369,12 +11389,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val log = Path.concat(root, ".holbuild/run.log")
           in
             run_log := SOME log;
-            exec_run check_cancelled remote root tc spec log;
+            exec_run ((fn f => phase "hol" f), (fn f => phase "publish" f)) check_cancelled remote root tc spec log;
             "built"
           end
       end
     and run_theory spec_text =
       let
+        val _ = theory_action := true
         val spec = parse_action_spec spec_text
         val _ = input_key := #input_key spec
         val _ = verify_action_spec spec
@@ -11419,7 +11440,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         if done then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
-          (phase "check" (fn () => check_remote_publication remote root spec);
+          (phase "check" (fn () => phase "publish" (fn () => check_remote_publication remote root spec));
            "cached")
         else build spec tc forced cutoff NONE
       end
@@ -11518,7 +11539,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             (if drop_stale_dep_copies remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
              then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
              else ();
-             check_remote_publication remote root spec;
+             phase "publish" (fn () => check_remote_publication remote root spec);
              case cutoff of
                  SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
                | NONE => ()))
@@ -11890,7 +11911,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                   | _ => failure
               val status = if Option.isSome failure then "failed" else status
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
-              val phases = rev (!phases)
+              val phases = rev (!phases) @
+                [("started", Time.toMilliseconds start),
+                 ("finished", Time.toMilliseconds (Time.now ()))] @
+                (if !theory_action then [("rebuilt", if status = "built" then 1 else 0)] else [])
               val text =
                 result_text (spec_sha256, !input_key)
                   {status = status, failure = failure, wall_ms = wall_ms, phases = phases,

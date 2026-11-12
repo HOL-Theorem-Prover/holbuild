@@ -14,7 +14,9 @@ val local_build_needed_status : OS.Process.status = RunCall.unsafeCast (75 : int
 val interrupted = ref false
 
 fun err_with_debug_artifacts msg artifacts =
-  (if HolbuildStatus.json_mode () then HolbuildStatus.error_with_debug_artifacts msg artifacts
+  (HolbuildCommandSummary.exit_code :=
+     (if !HolbuildHolSharedCache.local_build_needed andalso not (!interrupted) then 75 else 1);
+   if HolbuildStatus.json_mode () then HolbuildStatus.error_with_debug_artifacts msg artifacts
    else HolbuildStatus.message_stderr ("holbuild: " ^ msg ^ "\n");
    OS.Process.exit (if !HolbuildHolSharedCache.local_build_needed andalso not (!interrupted)
                     then local_build_needed_status
@@ -1441,23 +1443,27 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun execute (options, plan, toolchain_key) =
           timed_phase "build.execute"
             (fn () => HolbuildBuildExec.build options tc project plan toolchain_key jobs)
-        val ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
+        val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
         fun build_owners owner_plan =
           execute (build_options_for index entry_plan owner_plan [], owner_plan, toolchain_key)
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
           else plan_with_record true
+        fun prepare_requested () =
+          case components of
+              (* A restored plan already holds the writers' current sources. *)
+              NONE => initial
+            | SOME components =>
+                if build_generated_source_owners build_owners components (#holdir tc) index plan then
+                  let val replanned as (planned, _) = replan ()
+                  in warn_unreachable_for planned; replanned end
+                else initial
+        val ({plan = actual, toolchain_key = actual_key, ...}, actual_options) =
+          prepare_requested () handle e => (HolbuildCommandSummary.observe_plan project plan; raise e)
+        val _ = HolbuildCommandSummary.observe_plan project actual
       in
-        case components of
-            (* A plan from the record holds the generated sources as their
-               up-to-date writers left them. *)
-            NONE => execute (options, plan, toolchain_key)
-          | SOME components =>
-              if build_generated_source_owners build_owners components (#holdir tc) index plan then
-                let val (planned as {plan, toolchain_key, ...}, options) = replan ()
-                in warn_unreachable_for planned; execute (options, plan, toolchain_key) end
-              else execute (options, plan, toolchain_key)
+        execute (actual_options, actual, actual_key)
       end
     fun export_action_specs upload () =
       let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
@@ -1973,13 +1979,19 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
            execute_build ())
         else
-          case components of
-              NONE => remote_build_plan (build_options, plan, toolchain_key) attach
-            | SOME components =>
-                if build_generated_source_owners build_owners components (#holdir tc) index plan then
-                  let val (planned as {plan, toolchain_key, ...}, build_options) = replan ()
-                  in warn_unreachable_for planned; remote_build_plan (build_options, plan, toolchain_key) NONE end
-                else remote_build_plan (build_options, plan, toolchain_key) attach
+          let
+            fun prepare_requested () =
+              case components of
+                  NONE => ((build_options, plan, toolchain_key), attach)
+                | SOME components =>
+                    if build_generated_source_owners build_owners components (#holdir tc) index plan then
+                      let val (planned as {plan, toolchain_key, ...}, options) = replan ()
+                      in warn_unreachable_for planned; ((options, plan, toolchain_key), NONE) end
+                    else ((build_options, plan, toolchain_key), attach)
+            val (arguments as (_, actual, _), attached) =
+              prepare_requested () handle e => (HolbuildCommandSummary.observe_plan project plan; raise e)
+            val _ = HolbuildCommandSummary.observe_plan project actual
+          in remote_build_plan arguments attached end
       end
   in
     case mode of
@@ -2898,9 +2910,11 @@ fun build_heap_kind tc cli_jobs command args =
           HolbuildBuildExec.build (heap_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)))
                                  tc project plan toolchain_key jobs
         val {index, components, plan} = plan_heap ()
+        fun observe plan = if Option.isSome url then () else HolbuildCommandSummary.observe_plan project plan
         val plan =
-          if build_generated_source_owners build_plan components (#holdir tc) index plan then #plan (plan_heap ())
-          else plan
+          (if build_generated_source_owners build_plan components (#holdir tc) index plan then #plan (plan_heap ())
+           else plan) handle e => (observe plan; raise e)
+        val _ = observe plan
       in
         build_plan plan;
         HolbuildBuildExec.export_heap tc project plan output_path kind
@@ -3972,6 +3986,7 @@ fun reject_runtime_options options args =
 
 fun main raw_args =
   (let
+     val _ = HolbuildCommandSummary.initialize ()
      val _ = HolbuildOffline.initialize ()
      val _ = install_signal_handlers ()
      (* exec-action leaves through Posix.Process.exit, which skips this, so
@@ -3981,9 +3996,9 @@ fun main raw_args =
      val runtime_options = runtime_options raw_args
      val _ =
        if raw_args = ["--version"] then
-         (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); OS.Process.exit OS.Process.success)
+         (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); HolbuildCommandSummary.exit_code := 0; OS.Process.exit OS.Process.success)
        else if raw_args = ["--help"] orelse raw_args = ["-h"]
-       then (global_help (); OS.Process.exit OS.Process.success)
+       then (global_help (); HolbuildCommandSummary.exit_code := 0; OS.Process.exit OS.Process.success)
        else ()
      val (cooperate_dir, machine_max_mem, child_charge, raw_args) = parse_cooperation_options raw_args
      val (options, args) = parse_global_options raw_args
@@ -4003,7 +4018,8 @@ fun main raw_args =
      val _ = reject_runtime_options runtime_options args
    in
      configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
-     dispatch_with_options options args
+     dispatch_with_options options args;
+     HolbuildCommandSummary.exit_code := 0
    end)
   handle Thread.Interrupt => (interrupted := true; HolbuildToolchain.cleanup_active_children (); err "interrupted")
        | HolbuildOffline.Error msg => err msg
@@ -4034,7 +4050,8 @@ fun main raw_args =
        | HolbuildRemoteCacheConfig.Error msg => err msg
        | HolbuildWatch.Error msg => err msg
        | e => if is_broken_pipe e then
-                OS.Process.exit (if HolbuildStatus.json_mode () then OS.Process.failure else OS.Process.success)
+                (HolbuildCommandSummary.exit_code := (if HolbuildStatus.json_mode () then 1 else 0);
+                 OS.Process.exit (if HolbuildStatus.json_mode () then OS.Process.failure else OS.Process.success))
               else err (General.exnMessage e)
 
 end
