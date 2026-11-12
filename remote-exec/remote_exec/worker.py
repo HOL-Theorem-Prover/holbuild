@@ -23,7 +23,6 @@ import shlex
 import shutil
 import signal
 import socket
-import stat
 import subprocess
 import sys
 import tarfile
@@ -38,7 +37,7 @@ from typing import Any
 
 from remote_exec.auth import cache_discovery_token
 from remote_exec.cache import cache_nodes, preferred_identities, ranked_nodes
-from remote_exec.formats import OUTPUT_TAIL_BYTES, output_tail, sanitize_detail
+from remote_exec.formats import sanitize_detail
 from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
@@ -46,6 +45,7 @@ RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
 MIN_SANDBOX_RELEASE = (0, 13, 58)
 MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
+MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
 
 
 @functools.cache
@@ -203,15 +203,20 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Coordinator:
-    """The worker endpoints of the coordinator. Claims and heartbeats carry ``host``'s report, when given."""
+    """The worker endpoints of the coordinator. Claims and heartbeats carry ``host``'s report, when given; with
+    ``load_ahead``, claims also take actions whose parents still build (exec-action --ahead-parent)."""
 
     opener = urllib.request.build_opener(NoRedirect)
 
-    def __init__(self, url: str, token: str, host: "HostTelemetry | None" = None, drain: Drain | None = None) -> None:
+    def __init__(
+        self, url: str, token: str, host: "HostTelemetry | None" = None, drain: Drain | None = None,
+        *, load_ahead: bool = False,
+    ) -> None:
         self.url = url.rstrip("/")
         self.token = token
         self.host = host
         self.drain = drain or Drain()
+        self.load_ahead = load_ahead
 
     def post(self, path: str, body: bytes, content_type: str, timeout: float = 30) -> tuple[int, Any]:
         request = urllib.request.Request(
@@ -246,7 +251,9 @@ class Coordinator:
     def claim(self, tiers: list[str], worker: str, wait_s: float, phases: dict[str, float]) -> dict[str, Any] | None:
         """An action, waiting up to ``wait_s`` seconds for one, or None. ``phases`` reports where the worker's time
         went since its last claim."""
-        body = {"tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s, "phases": phases}
+        body = {
+            "tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s, "phases": phases,
+        } | ({"ahead": True} if self.load_ahead else {})
         status, response = self.post_reporting("/v1/work/claim", body, 30 + wait_s)
         if status == 204:
             return None
@@ -259,18 +266,6 @@ class Coordinator:
         if status not in (200, 409):
             raise RuntimeError(f"heartbeat answered {status}: {body}")
         return status == 200
-
-    def diagnostic(self, token: str, output: str) -> None:
-        """Best-effort interrupted output, independently of the possibly revoked result lease."""
-        timeout = 5.0 if self.drain.deadline is None else max(
-            0.1, min(5.0, self.drain.deadline + self.drain.publish_seconds + 7 - time.monotonic())
-        )
-        try:
-            status, body = self.post(f"/v1/work/{token}/diagnostic", output.encode(), "text/plain", timeout)
-            if status not in (200, 404, 409):
-                print(f"interrupted output answered {status}: {body}", file=sys.stderr)
-        except COORDINATOR_ERRORS as error:
-            print(f"could not report interrupted output: {error}", file=sys.stderr)
 
     def complete(self, token: str, record: str, retry_s: float) -> None:
         """Report an action's result. A coordinator that can't be reached or answers 5xx, as while it restarts, is
@@ -771,7 +766,8 @@ def exec_action_env(*, version: str, discovery_config: str | None = None) -> dic
 
 
 def exec_action_command(
-    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None
+    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None,
+    ahead_parents: list[dict[str, str]],
 ) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
     command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
@@ -780,6 +776,8 @@ def exec_action_command(
     command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb), "--result", result]
     if args.share_heaps:
         command.append("--share-heaps")
+    for parent in ahead_parents:
+        command += ["--ahead-parent", f"{parent['input_key']}:{parent['spec_sha256']}"]
     return command
 
 
@@ -904,63 +902,6 @@ def read_result(path: str) -> str | None:
         return None
 
 
-@dataclass
-class OutputTail:
-    """Hold a live log inode across exec-action's cleanup, without following untrusted output links."""
-
-    root: str
-    sidecar: str
-    fd: int | None = None
-
-    def refresh(self) -> None:
-        fd: int | None = None
-        try:
-            with open(self.sidecar) as file:
-                announcement = file.read(4096)
-            if not announcement.endswith("\n"):
-                return
-            path = announcement[:-1]
-            if not os.path.isabs(path) or os.path.commonpath((self.root, path)) != self.root:
-                return
-            parts = os.path.relpath(path, self.root).split(os.sep)
-            if any(part in ("", ".", "..") for part in parts):
-                return
-            directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            try:
-                for part in parts[:-1]:
-                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                    dir_fd=directory)
-                    os.close(directory)
-                    directory = child
-                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                             dir_fd=directory)
-            finally:
-                os.close(directory)
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                return
-            self.close()
-            self.fd = fd
-            fd = None
-        except (OSError, ValueError):
-            # A log not created yet, or already unlinked by cleanup, leaves the previous inode held.
-            return
-        finally:
-            if fd is not None:
-                os.close(fd)
-
-    def read(self) -> str:
-        if self.fd is None:
-            return ""
-        info = os.fstat(self.fd)
-        return output_tail(os.pread(self.fd, OUTPUT_TAIL_BYTES, max(0, info.st_size - OUTPUT_TAIL_BYTES)))
-
-    def close(self) -> None:
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
-
-
 def execute(
     args: argparse.Namespace,
     releases: Releases,
@@ -976,11 +917,14 @@ def execute(
     drain.publish_seconds = 0.0
     if drain.stop.is_set():
         return failed_record(spec, "unavailable")
+    ahead_parents = claim.get("ahead_parents", [])
     try:
         with phases.timed("release"):
             version = releases.spec_version(spec)
             if drain.stop.is_set():
                 return failed_record(spec, "unavailable")
+            if ahead_parents and RELEASE.fullmatch(version) and tuple(map(int, version.split("."))) < MIN_AHEAD_RELEASE:
+                return failed_record(spec, "ahead-abandoned", f"holbuild {version} predates loading ahead")
             holbuild = releases.holbuild(version)
     except DrainStopped:
         return failed_record(spec, "unavailable")
@@ -988,21 +932,17 @@ def execute(
         print(f"refusing {spec}: {error}", file=sys.stderr)
         return failed_record(spec, "spec-rejected", f"the worker refuses the action: {error}")
     if lease.lost.is_set():
-        lease.coordinator.diagnostic(claim["attempt_token"], "")
         return None
     if drain.stop.is_set():
         return failed_record(spec, "unavailable")
-    with tempfile.TemporaryDirectory() as scratch, contextlib.closing(OutputTail(
-        os.path.join(os.path.realpath(os.environ.get("HOLBUILD_CACHE", "")), "action"),
-        os.path.join(scratch, "result.log-path"),
-    )) as tail:
+    with tempfile.TemporaryDirectory() as scratch:
         result = os.path.join(scratch, "result")
         # Its own session, so a lost lease stops holbuild's HOL children with it.
         cooperate_dir = None if args.cooperate_dir is None else os.path.realpath(args.cooperate_dir)
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")),
+            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb"), ahead_parents),
             env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )
@@ -1016,15 +956,10 @@ def execute(
         sampled = stepped
         try:
             while process.poll() is None:
-                tail.refresh()
                 if reported is None:
                     if lease.lost.is_set():
                         return None
                     if (record := read_result(result)) is not None:
-                        if "failure=unavailable" in record.splitlines() and not any(
-                            line.startswith("log=") for line in record.splitlines()
-                        ):
-                            lease.coordinator.diagnostic(claim["attempt_token"], tail.read())
                         now = time.monotonic()
                         if cooperate_dir is None:
                             phases.add("exec", now - stepped)
@@ -1053,7 +988,6 @@ def execute(
                     spans.step(now - stepped, hol=runs_hol(process.pid, cooperate_dir))
                     stepped = sampled = now
         finally:
-            tail.refresh()
             if hard_stop is not None:
                 hard_stop.cancel()
             timed_out = seen > 0 and time.monotonic() - seen >= POST_RESULT_SECONDS
@@ -1076,13 +1010,6 @@ def execute(
                     except subprocess.TimeoutExpired:
                         pass
             stop_group(process)
-            try:
-                if reported is None:
-                    final = read_result(result)
-                    if lease.lost.is_set() or drained_out or final is None or "failure=unavailable" in final.splitlines():
-                        lease.coordinator.diagnostic(claim["attempt_token"], tail.read())
-            finally:
-                tail.close()
             if reported is not None:
                 phases.add("after_result", time.monotonic() - after_result)
             elif cooperate_dir is None:
@@ -1163,6 +1090,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cooperate-dir", help="holbuild --cooperate-dir, shared by a host's workers")
     parser.add_argument("--share-heaps", action="store_true", help="holbuild exec-action --share-heaps")
     parser.add_argument(
+        "--load-ahead",
+        action="store_true",
+        help="also claim theories of batches that load ahead while their parents still build, and wait for them; "
+        "for burst workers, so the warm pool stays free for ready work",
+    )
+    parser.add_argument(
         "--holbuild-releases-dir",
         default="/opt/holbuild-releases",
         help="where holbuild releases are built, one directory per version; a host's workers can share it",
@@ -1239,7 +1172,7 @@ def main() -> None:
         print(f"not reporting the host to the coordinator: {error}", file=sys.stderr)
         host = None
     drain = Drain(args.drain_seconds)
-    coordinator = Coordinator(args.coordinator, token, host, drain)
+    coordinator = Coordinator(args.coordinator, token, host, drain, load_ahead=args.load_ahead)
     releases = Releases(
         args.holbuild_releases_dir,
         args.holbuild_source_url,

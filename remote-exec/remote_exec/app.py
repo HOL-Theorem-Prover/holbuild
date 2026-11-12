@@ -29,7 +29,7 @@ from remote_exec.coordinator import (
     Settings,
     is_auth_failure,
 )
-from remote_exec.formats import OUTPUT_TAIL_BYTES, FormatError, output_tail, parse_batch, parse_result
+from remote_exec.formats import FormatError, parse_batch, parse_result
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ class ClaimRequest(BaseModel):
     wait_s: float = Field(default=0, ge=0, le=50)  # how long to wait for an action when none is ready
     host: HostReport | None = None
     phases: PhaseReport | None = None  # where the worker's time went since its last claim
+    ahead: bool = False  # the worker can run an action claimed ahead of its parents
 
 
 class HeartbeatRequest(BaseModel):
@@ -156,6 +157,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         fail_fast: bool = False,
         priority: int = Query(default=0, ge=0, le=2147483647),
         action_class: Literal["build", "run"] = Query(default="build", alias="class"),
+        speculative_loading: int | None = Query(default=None, ge=1, le=16),
     ) -> dict[str, UUID]:
         try:
             batch = parse_batch(await text_body(request))
@@ -163,7 +165,12 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             raise HTTPException(400, str(error)) from error
         if action_class == "run" and batch.edges:
             raise HTTPException(400, "run batches require independent actions: dependency edges are not allowed")
-        return {"batch_id": await coordinator.submit(batch, profile, action_class, max_heap_mb, fail_fast=fail_fast, priority=priority)}
+        if action_class == "run" and speculative_loading is not None:
+            raise HTTPException(400, "run batches have no parents to load ahead of: speculative_loading is not allowed")
+        return {"batch_id": await coordinator.submit(
+            batch, profile, action_class, max_heap_mb, fail_fast=fail_fast, priority=priority,
+            ahead_cap=speculative_loading,
+        )}
 
     @app.get("/v1/batches/{batch_id}", dependencies=client)
     async def status(batch_id: UUID) -> dict[str, object]:
@@ -178,23 +185,6 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         if state is None:
             raise HTTPException(404, f"no batch {batch_id}")
         return {"state": state}
-
-    @app.get("/v1/batches/{batch_id}/interrupted-output", dependencies=client)
-    async def interrupted_output(batch_id: UUID, wait_s: float = Query(default=0, ge=0, le=90)) -> Response:
-        deadline = time.monotonic() + wait_s
-        with coordinator.watch(batch_id) as written:
-            while True:
-                written.clear()
-                report = await coordinator.interrupted_output(batch_id)
-                if report is None:
-                    raise HTTPException(404, f"no batch {batch_id}")
-                tails, pending = report
-                remaining = deadline - time.monotonic()
-                if not pending or remaining <= 0:
-                    return Response("".join(json.dumps({"theory": theory, "output": output}, ensure_ascii=False) + "\n"
-                                            for theory, output in tails), media_type="application/x-ndjson")
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(written.wait(), min(remaining, settings.events_fallback_seconds))
 
     @app.get("/v1/batches/{batch_id}/events", dependencies=client)
     async def events(batch_id: UUID) -> StreamingResponse:
@@ -266,7 +256,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
     async def queue() -> dict[str, object]:
         status = await coordinator.queue()
         return {
-            **{k: v for k, v in asdict(status.counts).items() if k != "high_run"},
+            **{k: v for k, v in asdict(status.counts).items() if k not in ("high_run", "ready_high_run")},
             "run_slots": settings.run_slots,
             "run_floor": min(settings.run_floor, settings.run_slots),
             "desired_burst_workers": status.desired_burst_workers,
@@ -287,6 +277,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             tiers, body.worker, body.wait_s, request.is_disconnected,
             host_id=None if body.host is None else body.host.id,
             host_rank=0 if body.host is None else body.host.rank,
+            ahead=body.ahead,
         )
         if claimed is None:
             return Response(status_code=204)
@@ -309,17 +300,6 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             raise HTTPException(400, str(error)) from error
         if not accepted:
             raise HTTPException(409, "stale attempt token; result dropped")
-        return {"accepted": True}
-
-    @app.post("/v1/work/{attempt_token}/diagnostic", dependencies=worker)
-    async def diagnostic(attempt_token: UUID, request: Request) -> dict[str, bool]:
-        body = bytearray()
-        async for chunk in request.stream():
-            if len(body) + len(chunk) > OUTPUT_TAIL_BYTES:
-                raise HTTPException(413, "interrupted output exceeds 64 KiB")
-            body.extend(chunk)
-        if not await coordinator.diagnostic(attempt_token, output_tail(bytes(body))):
-            raise HTTPException(409, "stale diagnostic token; output dropped")
         return {"accepted": True}
 
     return app

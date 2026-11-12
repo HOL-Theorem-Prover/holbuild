@@ -241,8 +241,9 @@ require_grep "could not cancel remote batch b4 (HTTP 503)" "$tmpdir/down.log"
 require_grep "the coordinator reported no theories; building locally" "$tmpdir/down.log"
 require_grep "BTheory built" "$tmpdir/down.log"
 write_theories five-down-only
-run down-only 75 build --remote-exec "$coordinator" --remote-only --priority 17 BTheory
-require_grep "the coordinator reported no theories; reattach with --attach b5 --priority 17$" "$tmpdir/down-only.log"
+run down-only 75 build --remote-exec "$coordinator" --remote-only --priority 17 --speculative-loading=5 BTheory
+require_grep "the coordinator reported no theories; reattach with --attach b5 --priority 17 --speculative-loading=5$" \
+  "$tmpdir/down-only.log"
 refute_grep "^POST /v1/batches/b5/cancel " "$state/requests.log"
 rm "$state/down"
 run unknown-only 75 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
@@ -312,22 +313,18 @@ interrupt() {
   [[ $status -eq 1 ]] || { echo "$name exited $status after SIGTERM, wanted 1" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
 }
 write_theories interrupted
-printf '%s\n' '{"theory":"rx:ATheory","output":"HOL interrupted marker\n"}' > "$state/interrupted-output"
 touch "$state/hang"
 interrupt interrupted build --remote-exec "$coordinator" BTheory
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/interrupted.log")
 require_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
 require_grep "holbuild: cancelled remote batch $batch" "$tmpdir/interrupted.log"
 require_grep "holbuild: interrupted" "$tmpdir/interrupted.log"
-require_grep "HOL interrupted marker" "$tmpdir/interrupted.log"
 refute_grep "Theory built" "$tmpdir/interrupted.log"
 interrupt interrupted-only build --remote-exec "$coordinator" --remote-only BTheory
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/interrupted-only.log")
 require_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
 require_grep "holbuild: cancelled remote batch $batch" "$tmpdir/interrupted-only.log"
-require_grep "HOL interrupted marker" "$tmpdir/interrupted-only.log"
 rm "$state/hang"
-rm "$state/interrupted-output"
 
 # Forced builds execute on the workers, including under --remote-only.
 run forced-only 0 build --remote-exec "$coordinator" --remote-only --force BTheory
@@ -690,20 +687,13 @@ require_grep "ATheory restored from cache" "$tmpdir/seeded.log"
 # A batch someone cancelled: --remote-only fails with status 1, since a local
 # build would redo what was stopped; without it the build goes on locally.
 write_theories cancelled
-printf '%s\n' '{"theory":"rx:ATheory","output":"HOL budget marker\n"}' > "$state/interrupted-output"
 touch "$state/cancelled"
 run cancelled-only 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "remote execution: batch b[0-9]* cancelled; remote workers finished 0 of 2 theories" "$tmpdir/cancelled-only.log"
-require_grep "HOL budget marker" "$tmpdir/cancelled-only.log"
-batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/cancelled-only.log")
-run cancelled-reattach 1 build --remote-exec "$coordinator" --remote-only --attach "$batch" BTheory
-require_grep "output from interrupted attempt" "$tmpdir/cancelled-reattach.log"
-require_grep "HOL budget marker" "$tmpdir/cancelled-reattach.log"
 run cancelled 0 build --remote-exec "$coordinator" BTheory
 require_grep "batch b[0-9]* cancelled; remote workers finished 0 of 2 theories; building locally" "$tmpdir/cancelled.log"
 require_grep "BTheory built" "$tmpdir/cancelled.log"
 rm "$state/cancelled"
-rm "$state/interrupted-output"
 
 # A theory built here for its current source needs no worker, though the
 # remote cache lacks it (its publish failed, say): with ATheory's remote
@@ -2015,6 +2005,28 @@ if in_copy local-cas build --priority 1 PriorityTheory > "$tmpdir/priority-no-ex
   exit 1
 fi
 require_grep 'priority needs --remote-exec URL' "$tmpdir/priority-no-exec.log"
+
+# So is the cap on theories loading ahead of their parents, 4 when given bare.
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --speculative-loading LocalUntrustedTheory > "$tmpdir/speculative-default.log" 2>&1
+require_grep '^POST /v1/batches?speculative_loading=4 ' "$state/requests.log"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --priority 2 --speculative-loading=4 LocalUntrustedTheory > "$tmpdir/speculative.log" 2>&1
+require_grep '^POST /v1/batches?priority=2&speculative_loading=4 ' "$state/requests.log"
+for value in 0 17 1.5 x '' 999999999999999999999999999999; do
+  if in_copy local-cas build --remote-exec "$coordinator" "--speculative-loading=$value" PriorityTheory \
+       > "$tmpdir/speculative-invalid.log" 2>&1; then
+    echo "accepted invalid --speculative-loading=$value" >&2
+    exit 1
+  fi
+  require_grep "^holbuild: invalid --speculative-loading: $value; expected an integer between 1 and 16$" \
+    "$tmpdir/speculative-invalid.log"
+done
+if in_copy local-cas build --speculative-loading PriorityTheory > "$tmpdir/speculative-no-exec.log" 2>&1; then
+  echo 'accepted --speculative-loading without remote execution' >&2
+  exit 1
+fi
+require_grep 'speculative-loading needs --remote-exec URL' "$tmpdir/speculative-no-exec.log"
 
 # Reattaching can need a replacement batch after an input disappears.
 cat > "$tmpdir/local-cas/src/PriorityChildScript.sml" <<'SML'

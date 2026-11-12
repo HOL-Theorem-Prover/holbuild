@@ -11,19 +11,6 @@ val outputs_validated = ref false
 (* exec-action's --result file: the worker's, so never exposed to the action. *)
 val result_file : string option ref = ref NONE
 
-(* Tell the worker which live HOL log to retain before interrupted cleanup
-   removes the action tree. The child cannot write this sibling of --result. *)
-fun announce_log path =
-  case !result_file of
-      NONE => ()
-    | SOME result =>
-        let val out = TextIO.openOut (result ^ ".log-path")
-        in
-          (TextIO.output (out, OS.FileSys.fullPath (OS.Path.dir path) ^ "/" ^ OS.Path.file path ^ "\n");
-           TextIO.closeOut out)
-          handle e => (TextIO.closeOut out; raise e)
-        end
-
 (* Directories every sandboxed child may read, such as the host's store of
    HOL theory modules, which no child writes. *)
 val shared_reads : string list ref = ref []
@@ -211,7 +198,7 @@ fun wrap completed ({writable, readable = extra, toolchain} : grants) argv =
               | [] => NONE)
         (Posix.ProcEnv.environ ()) @
       (case !(HolbuildMachineMemory.settings) of SOME {dir, ...} => [dir] | NONE => []) @
-      (case !result_file of SOME file => [file, file ^ ".log-path"] | NONE => []) @
+      (case !result_file of SOME file => [file] | NONE => []) @
       (* holbuild's own temporary files, which it hashes and publishes;
          every holbuild process on the host keeps them under TMPDIR. *)
       [HolbuildTempPath.private_temporary_dir ()]

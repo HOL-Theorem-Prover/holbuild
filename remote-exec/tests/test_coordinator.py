@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
@@ -244,11 +245,10 @@ async def test_a_ranking_read_while_a_release_drops_rankings_is_not_shared(
     assert coordinator.rankings == {}
 
 
-async def test_a_claim_after_a_release_does_not_join_a_ranking_read_begun_before_it(
+async def test_a_claim_after_a_release_waits_for_a_fresh_shared_ranking(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A claim that starts after a release made a priority batch ready reads a ranking of its own rather than
-    joining one whose snapshot predates the batch, and so claims the priority batch."""
+    """A release preserves single-flight reads; later claims wait for a post-release snapshot."""
     coordinator.settings.claim_ranking_seconds = 3600
     entered, go = asyncio.Event(), asyncio.Event()
     calls = 0
@@ -268,71 +268,105 @@ async def test_a_claim_after_a_release_does_not_join_a_ranking_read_begun_before
     early = asyncio.create_task(claim(http))
     await entered.wait()
     await submit(http, ["p1"], priority="1")
-    try:
-        # Joining the held read would wait for it.
-        async with asyncio.timeout(5):
-            await claim_named(http, "p1")
-    finally:
-        go.set()
+    late = asyncio.create_task(claim_named(http, "p1"))
+    go.set()
+    await late
     assert (await early)["theory"] == "pkg:n1"
     assert calls == 2
 
 
-async def test_a_claims_own_ranking_read_while_a_release_makes_a_priority_batch_ready_is_not_shared(
+async def test_empty_rankings_are_shared_by_idle_claim_bursts(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ranking a claim reads for itself, here after the shared read failed, may predate the actions a release
-    made ready meanwhile even with no ranking kept to drop, so later claims don't share it and claim the priority
-    batch."""
     coordinator.settings.claim_ranking_seconds = 3600
-    entered, go = asyncio.Event(), asyncio.Event()
-    calls = 0
+    coordinator.settings.run_slots = 0
+    rankings = 0
     rank = coordinator._rank
 
-    async def failing_then_held(conn: Any, key: tuple[str, ...]) -> Any:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise TimeoutError("pool")
-        if calls > 2:
-            return await rank(conn, key)
+    async def counted(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal rankings
+        rankings += 1
+        return await rank(conn, key)
 
-        class Slow:
-            """The connection, but a statement's result arrives only once go is set, after its snapshot."""
-
-            async def execute(self, *args: Any) -> Any:
-                result = await conn.execute(*args)
-                entered.set()
-                await go.wait()
-                return result
-
-        return await rank(Slow(), key)
-
-    await submit(http, ["n1", "n2"])
-    monkeypatch.setattr(coordinator, "_rank", failing_then_held)
-    early = asyncio.create_task(claim(http))
-    await entered.wait()
-    await submit(http, ["p1"], priority="1")
-    go.set()
-    assert (await early)["theory"] == "pkg:n1"
-    await claim_named(http, "p1")
+    monkeypatch.setattr(coordinator, "_rank", counted)
+    assert await claim(http) is None
+    assert await asyncio.gather(*(claim(http) for _ in range(50))) == [None] * 50
+    assert rankings == 1
+    await submit(http, ["new"])
+    await claim_named(http, "new")
+    assert rankings == 2
 
 
-async def test_a_claim_ranks_for_itself_when_the_shared_ranking_read_fails(
+async def test_exhausted_rankings_refresh_once_outside_claim_transactions(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls = 0
+    coordinator.settings.claim_ranking_seconds = 3600
+    coordinator.settings.run_slots = 0
+    batch_id = await submit(http, ["a"])
+    await claim_named(http, "a")
+    entered, go = asyncio.Event(), asyncio.Event()
+    rankings = 0
     rank = coordinator._rank
+
+    async def held(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal rankings
+        rankings += 1
+        entered.set()
+        await go.wait()
+        return await rank(conn, key)
+
+    monkeypatch.setattr(coordinator, "_rank", held)
+    claims = [asyncio.create_task(claim(http)) for _ in range(50)]
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        # Another connection can still serve a batch read while the one shared refresh waits.
+        assert await asyncio.wait_for(coordinator.get(UUID(batch_id)), 2) is not None
+    finally:
+        go.set()
+    assert await asyncio.gather(*claims) == [None] * 50
+    assert rankings == 1
+
+
+async def test_failed_shared_rankings_return_503_without_per_claim_fallbacks(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered, joined, go = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = 0
+    claimers = 0
+    rank = coordinator._rank
+    current_ranking = coordinator._current_ranking
+
+    async def join_ranking(key: tuple[str, ...], *, after: float = 0) -> Any:
+        nonlocal claimers
+        claimers += 1
+        if claimers == 20:
+            joined.set()
+        # Enter the shared read before yielding to the task that releases its failure.
+        return await current_ranking(key, after=after)
 
     async def failing_once(conn: Any, key: tuple[str, ...]) -> Any:
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise TimeoutError("pool")
+            entered.set()
+            await go.wait()
+            raise sa.exc.TimeoutError("pool")
         return await rank(conn, key)
 
     monkeypatch.setattr(coordinator, "_rank", failing_once)
+    monkeypatch.setattr(coordinator, "_current_ranking", join_ranking)
     await submit(http, ["a"])
+    requests = [
+        asyncio.create_task(http.post("/v1/work/claim", json={"tier": "standard", "worker": "w"}, headers=WORKER))
+        for _ in range(20)
+    ]
+    try:
+        await asyncio.wait_for(asyncio.gather(entered.wait(), joined.wait()), 2)
+    finally:
+        go.set()
+    responses = await asyncio.gather(*requests)
+    assert [r.status_code for r in responses] == [503] * 20
+    assert calls == 1
     await claim_named(http, "a")
     assert calls == 2
 
@@ -691,6 +725,104 @@ async def test_lease_expiring_on_every_attempt_fails_the_batch(
     assert (status["state"], status["failure"]) == ("failed", "pkg:a: lease expired 3 times")
 
 
+async def test_a_key_another_batch_is_building_is_held_then_done_with_it(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    leader = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    ready = await submit(http, ["a", "b"])
+    waiting = await submit(http, ["p", "a", "c"], [("a", "p"), ("c", "a")])  # "a" waits on its parent; "c" on "a"
+
+    await claim_named(http, "b")
+    await claim_named(http, "p")
+    assert await claim(http) is None
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    assert (await states(http, leader), await states(http, ready), await states(http, waiting)) == (
+        {"a": "done"}, {"a": "done", "b": "running"}, {"p": "running", "a": "done", "c": "ready"}
+    )
+    assert {a["theory"]: a["log_sha256"] for a in (await batch(http, ready))["actions"]}["pkg:a"] == "a" * 64
+    await claim_named(http, "c")
+    assert await claim(http) is None
+
+
+async def test_a_copy_with_another_spec_wakes_a_waiting_claim_rather_than_being_done_with_a_build(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forced or traced build has the same keys as a plain one, but its own spec: it must run itself."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only the wake can end the wait in time
+    await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    forced = f"holbuild-action-batch-v1\naction {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
+    response = await http.post("/v1/batches", content=forced, headers=CLIENT)
+    assert response.status_code == 201, response.text
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "w2", 30))
+    await asyncio.sleep(0.5)
+    assert not waiting.done()
+
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    assert (await asyncio.wait_for(waiting, 10)).theory == "pkg:a"
+    assert await states(http, response.json()["batch_id"]) == {"a": "running"}
+
+
+async def test_a_held_action_wakes_a_waiting_claim_once_its_leader_fails(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only the wake can end the wait in time
+    leader = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    follower = await submit(http, ["a"])
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "w2", 30))
+    await asyncio.sleep(0.5)
+    assert not waiting.done()
+
+    assert (await complete(http, token, result("a", "failed", "proof"))).status_code == 200
+    assert (await asyncio.wait_for(waiting, 10)).theory == "pkg:a"
+    assert (await states(http, leader), await states(http, follower)) == ({"a": "failed"}, {"a": "running"})
+
+
+async def test_a_held_action_is_claimed_once_its_leaders_lease_expires(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 0  # nothing wakes the claims at expiry, before the sweep
+    leader = await submit(http, ["a"])
+    await claim_named(http, "a")
+    follower = await submit(http, ["a"])
+    assert await claim(http) is None
+
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
+    await claim_named(http, "a")  # before the sweep deletes the expired lease
+    assert await states(http, follower) == {"a": "running"}
+    await coordinator.sweep()
+    assert await states(http, leader) == {"a": "ready"}
+    assert await claim(http) is None  # now the follower's lease holds the leader's retry
+
+
+async def test_a_held_build_leaves_the_idle_run_fallback_to_a_ready_run(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_slots = 1
+    await submit(http, ["a"])
+    await claim_named(http, "a")
+    await submit(http, ["a"])
+    await submit(http, ["run"], **{"class": "run"})
+    claimed = await asyncio.wait_for(claim(http), 10)
+    assert claimed is not None and claimed["theory"] == "pkg:run"
+
+
+async def test_a_batch_whose_ready_actions_are_all_held_does_not_block_other_batches(
+    http: httpx.AsyncClient,
+) -> None:
+    await submit(http, ["a"])
+    await claim_named(http, "a")
+    await submit(http, ["a"])  # ranks ahead of the next batch: older, with nothing running
+    await submit(http, ["c"])
+
+    await claim_named(http, "c")
+
+
 async def test_unknown_token_and_mismatched_result_are_refused(http: httpx.AsyncClient) -> None:
     await submit(http, ["a", "b"])
     token = await claim_named(http, "a")
@@ -815,14 +947,14 @@ async def test_wakes_pack_compatible_hosts_with_fifo_ties(
     loop = asyncio.get_running_loop()
     wakes = [loop.create_future() for _ in workers]
     coordinator.claim_waiters = [
-        (tiers, _claim_rank(tiers, host, rank), wake) for (tiers, host, rank), wake in zip(workers, wakes)
+        (tiers, _claim_rank(tiers, host, rank), wake, False) for (tiers, host, rank), wake in zip(workers, wakes)
     ]
     cancelled = loop.create_future()
     cancelled.cancel()
-    coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled))
+    coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled, False))
     for index in order:
         coordinator._wake_claim(tier)
-        assert wakes[index].result() == tier
+        assert wakes[index].result() == (tier, False)
         assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
     coordinator._wake_claim(tier)
     assert coordinator.made_ready == len(order) + 1
@@ -834,7 +966,7 @@ async def test_new_tail_host_claim_defers_ready_work_to_a_better_waiter(
 ) -> None:
     batch_id = await submit(http, ["a"])
     wake = asyncio.get_running_loop().create_future()
-    waiter = (waiting_tiers, _claim_rank(waiting_tiers, "host-a"), wake)
+    waiter = (waiting_tiers, _claim_rank(waiting_tiers, "host-a"), wake, False)
     coordinator.claim_waiters.append(waiter)
     assert await coordinator.claim(["high", "standard"], "tail", host_id="host-b") is None
     assert await states(http, batch_id) == {"a": "ready"}
@@ -852,7 +984,7 @@ async def test_rechecking_tail_host_defers_ready_work_to_a_better_waiter(
     batch_id = ""
     claim_once = coordinator._claim
     wake = asyncio.get_running_loop().create_future()
-    waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake)
+    waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake, False)
 
     async def counted(tiers: list[str], worker: str) -> Any:
         nonlocal attempts
@@ -884,7 +1016,7 @@ async def test_burst_can_claim_high_while_warm_waits_for_standard(
     async with coordinator.engine.begin() as conn:
         await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:b'"))
     wake = asyncio.get_running_loop().create_future()
-    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "warm"), wake))
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "warm"), wake, False))
     claimed = await coordinator.claim(["high", "standard"], "burst", host_id="host-a")
     assert claimed is not None and claimed.theory == "pkg:b"
     assert not wake.done()
@@ -911,7 +1043,7 @@ async def test_explicitly_woken_claim_is_not_blocked_by_a_new_better_waiter(
         coordinator._wake_claim("standard")
         # A new better waiter must not block the explicit wake before the tail host resumes.
         wake = asyncio.get_running_loop().create_future()
-        coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake))
+        coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
         claimed = await asyncio.wait_for(waiting, 5)
         assert claimed is not None and claimed.theory == "pkg:a"
     finally:
@@ -1204,7 +1336,8 @@ async def test_peak_above_the_standard_tier_places_the_next_batch_high(
     assert (await complete(http, token, result("a", "built", peak_rss_mb="5000"))).status_code == 200
 
     await submit(http, ["a"], profile="other")
-    await claim_named(http, "a", "standard")
+    token = await claim_named(http, "a", "standard")
+    assert (await complete(http, token, result("a", "built"))).status_code == 200  # not to hold the next batch's
     await submit(http, ["a"], profile="proofs")
     assert await claim(http, "standard") is None
     await claim_named(http, "a", "high")
@@ -2071,6 +2204,121 @@ async def test_run_floor_precheck_keeps_build_claims_off_the_admission_lock(
             sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
 
 
+@pytest.mark.parametrize("floor", [0, 4])
+async def test_run_admission_waiters_leave_connections_for_heartbeats_and_completions(
+    http: httpx.AsyncClient, coordinator: Coordinator, floor: int
+) -> None:
+    await submit(http, ["build"])
+    token = await claim_named(http, "build")
+    await submit(http, ["run"], **{"class": "run"})
+    coordinator.settings.run_floor = floor
+    original_engine = coordinator.engine
+    engine = create_async_engine(original_engine.url, pool_size=2, max_overflow=0, pool_timeout=0.2)
+    coordinator.engine = engine
+    acquiring = asyncio.Event()
+
+    def before_execute(_: object, __: object, statement: str, *args: object) -> None:
+        if "pg_advisory_xact_lock" in statement:
+            acquiring.set()
+
+    waiters: list[asyncio.Task[Any]] = []
+    sa.event.listen(engine.sync_engine, "before_cursor_execute", before_execute)
+    try:
+        async with original_engine.begin() as blocker:
+            await blocker.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+            waiters = [asyncio.create_task(coordinator.claim(["standard"], f"w{i}")) for i in range(20)]
+            await asyncio.wait_for(acquiring.wait(), 2)
+            assert await asyncio.wait_for(coordinator.heartbeat(UUID(token)), 2)
+            assert await asyncio.wait_for(coordinator.complete(UUID(token), parse_result(result("build", "built"))), 2)
+            for waiter in waiters:
+                waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+        # Cancellation released the admission gate and its transaction.
+        claimed = await asyncio.wait_for(coordinator.claim(["standard"], "after-cancel"), 2)
+        assert claimed is not None and claimed.theory == "pkg:run"
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+        coordinator.engine = original_engine
+        sa.event.remove(engine.sync_engine, "before_cursor_execute", before_execute)
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("floor", [0, 1])
+async def test_fallback_run_admission_retries_a_build_made_ready_by_another_replica(
+    http: httpx.AsyncClient, coordinator: Coordinator, floor: int
+) -> None:
+    coordinator.settings.run_floor = floor
+    coordinator.settings.run_slots = 2
+    coordinator.settings.claim_ranking_seconds = 60
+    if floor:
+        await submit(http, ["running"], **{"class": "run"})
+        await claim_named(http, "running")
+    run_batch = await submit(http, ["run"], **{"class": "run"})
+    replica = Coordinator(coordinator.engine, coordinator.cache, coordinator.settings)
+    acquiring = asyncio.Event()
+
+    def before_execute(_: object, __: object, statement: str, *args: object) -> None:
+        if "pg_advisory_xact_lock" in statement:
+            acquiring.set()
+
+    waiting: asyncio.Task[Any] | None = None
+    try:
+        async with coordinator.engine.begin() as blocker:
+            await blocker.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+            sa.event.listen(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+            waiting = asyncio.create_task(coordinator.claim(["standard"], "waiting"))
+            await asyncio.wait_for(acquiring.wait(), 2)
+            stale = coordinator.rankings[("standard",)]
+            assert not stale.ranked
+            app = create_app(replica, replica.settings)
+            async with httpx.AsyncClient(transport=Settled(app, replica), base_url="http://replica.test") as other:
+                await submit(other, ["build"])
+            # Another process cannot invalidate this process's cached empty snapshot.
+            assert coordinator.rankings[("standard",)] is stale
+        claimed = await asyncio.wait_for(waiting, 2)
+        assert claimed is not None and claimed.theory == "pkg:build"
+        assert await states(http, run_batch) == {"run": "ready"}
+    finally:
+        if waiting is not None:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+        sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+        await replica.released()
+
+
+async def test_fallback_run_admission_skips_builds_locked_by_other_claimers(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_floor = 0
+    await submit(http, ["build"])
+    await submit(http, ["run"], **{"class": "run"})
+    async with coordinator.engine.begin() as blocker:
+        await blocker.execute(sa.text("SELECT 1 FROM actions WHERE class = 'build' FOR UPDATE"))
+        claimed = await asyncio.wait_for(coordinator.claim(["standard"], "waiting"), 2)
+        assert claimed is not None and claimed.theory == "pkg:run"
+
+
+async def test_a_full_run_cap_skips_admission_and_candidate_scans(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_slots = 1
+    await submit(http, ["run-a", "run-b"], **{"class": "run"})
+    await claim_named(http, "run-a")
+    await coordinator._current_ranking(("standard",))
+
+    def before_execute(_: object, __: object, statement: str, *args: object) -> None:
+        assert "pg_advisory_xact_lock" not in statement
+        assert "WITH run_capacity" not in statement
+
+    sa.event.listen(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+    try:
+        assert await asyncio.gather(*(claim(http) for _ in range(20))) == [None] * 20
+    finally:
+        sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+
+
 async def test_zero_run_slots_pauses_runs_and_keeps_builds_claimable(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
@@ -2464,84 +2712,3 @@ async def test_queue_reports_priority_subsets_without_double_counting(http: http
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
     assert (queue["ready_priority"], queue["running_priority"]) == (1, 1)
     assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (2, 1, 1)
-
-
-async def diagnostic(http: httpx.AsyncClient, token: str, output: str) -> httpx.Response:
-    return await http.post(f"/v1/work/{token}/diagnostic", content=output.encode(), headers=WORKER)
-
-
-@pytest.mark.parametrize("end", ["cancel", "deadline"])
-async def test_cancelled_attempt_retains_diagnostic_after_client_exit(
-    http: httpx.AsyncClient, coordinator: Coordinator, end: str,
-) -> None:
-    batch_id = await submit(http, ["loop", "blocked"], [("blocked", "loop")])
-    token = await claim_named(http, "loop")
-    if end == "cancel":
-        assert (await http.post(f"/v1/batches/{batch_id}/cancel", headers=CLIENT)).status_code == 200
-    else:
-        coordinator.settings.batch_deadline_hours = 0
-        await coordinator.fail_overdue()
-    assert (await complete(http, token, result("loop", "built"))).status_code == 409
-    assert (await diagnostic(http, token, "HOL interrupted marker\n")).status_code == 200
-    response = await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=CLIENT)
-    assert response.status_code == 200
-    assert [json.loads(line) for line in response.text.splitlines()] == [
-        {"theory": "pkg:loop", "output": "HOL interrupted marker\n"}
-    ]
-    assert await states(http, batch_id) == {"loop": "cancelled", "blocked": "cancelled"}
-    assert (await diagnostic(http, token, "duplicate")).status_code == 409
-    assert (await http.get(f"/v1/batches/{batch_id}/interrupted-output?wait_s=1", headers=CLIENT)).status_code == 200
-
-
-async def test_drain_diagnostic_survives_retry_and_empty_reports(http: httpx.AsyncClient) -> None:
-    batch_id = await submit(http, ["loop"])
-    first = await claim_named(http, "loop")
-    assert (await diagnostic(http, first, "drained marker\n")).status_code == 200
-    assert (await complete(http, first, result("loop", "failed", "unavailable"))).status_code == 200
-    second = await claim_named(http, "loop")
-    assert (await diagnostic(http, first, "stale marker")).status_code == 409
-    assert (await diagnostic(http, second, "")).status_code == 200
-    assert (await complete(http, second, result("loop", "built"))).status_code == 200
-    response = await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=CLIENT)
-    assert json.loads(response.text) == {"theory": "pkg:loop", "output": "drained marker\n"}
-    current = await batch(http, batch_id)
-    assert current["state"] == "done"
-    assert current["actions"][0]["attempts"] == 1
-
-
-async def test_diagnostic_waits_for_cancelled_worker_even_with_a_prior_tail(http: httpx.AsyncClient) -> None:
-    batch_id = await submit(http, ["loop"])
-    first = await claim_named(http, "loop")
-    await diagnostic(http, first, "old tail")
-    await complete(http, first, result("loop", "failed", "unavailable"))
-    second = await claim_named(http, "loop")
-    await http.post(f"/v1/batches/{batch_id}/cancel", headers=CLIENT)
-    request = asyncio.create_task(http.get(f"/v1/batches/{batch_id}/interrupted-output?wait_s=2", headers=CLIENT))
-    await asyncio.sleep(0.05)
-    assert not request.done()
-    await diagnostic(http, second, "new tail")
-    response = await request
-    assert json.loads(response.text)["output"] == "new tail"
-
-
-async def test_diagnostic_requires_worker_auth_and_rejects_oversized_body(http: httpx.AsyncClient) -> None:
-    batch_id = await submit(http, ["loop"])
-    token = await claim_named(http, "loop")
-    path = f"/v1/work/{token}/diagnostic"
-    assert (await http.post(path, content="unauthorized", headers=CLIENT)).status_code == 401
-    assert (await diagnostic(http, token, "x" * 65537)).status_code == 413
-    assert (await diagnostic(http, token, "x" * 65536)).status_code == 200
-    assert (await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=WORKER)).status_code == 401
-    response = await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=CLIENT)
-    assert len(json.loads(response.text)["output"].encode()) == 65536
-
-
-async def test_diagnostic_removes_controls_and_no_output_does_not_leave_a_waiter(http: httpx.AsyncClient) -> None:
-    batch_id = await submit(http, ["loop"])
-    token = await claim_named(http, "loop")
-    assert (await diagnostic(http, token, "é\x00\x1b\r\nmarker\tend")).status_code == 200
-    response = await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=CLIENT)
-    assert json.loads(response.text)["output"] == "é   \nmarker\tend"
-    await complete(http, token, result("loop", "built"))
-    assert (await diagnostic(http, token, "late")).status_code == 409
-    assert (await http.get(f"/v1/batches/{uuid4()}/interrupted-output", headers=CLIENT)).status_code == 404

@@ -201,28 +201,6 @@ fun report_action line =
     HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ state ^ failure ^ log ^ "\n")
   end
 
-(* A diagnostic has no bearing on the result or cache. It remains fetchable
-   after cancellation and after the original client has exited. Older
-   coordinators do not serve this endpoint. *)
-fun report_interrupted_within seconds url batch_id =
-  if seconds <= 0 then () else
-  ignore (HolbuildSpawn.run_lines
-    {program = "curl",
-     args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/interrupted-output?wait_s=" ^
-              Int.toString (Int.min (90, Int.max (0, seconds - 1)))))
-              ["--max-time", Int.toString seconds],
-     stderr = HolbuildSpawn.Merge}
-    (fn line =>
-        case (json_string_field "theory" line, json_string_field "output" line) of
-            (SOME theory, SOME output) =>
-              if output = "" then () else
-                HolbuildStatus.message_stderr
-                  ("holbuild: remote " ^ theory ^ ": output from interrupted attempt\n" ^
-                   "--- worker output tail ---\n" ^ output ^
-                   (if String.isSuffix "\n" output then "" else "\n") ^ "--- end worker output tail ---\n")
-          | _ => ()))
-  handle OS.SysErr _ => ()
-
 (* Follows a batch's event stream until the batch finishes, printing each
    action whose state changes, and passing on_change the input key, the
    new state, last failure and log hash, if any, of each.  A stream that breaks (the connection drops,
@@ -317,11 +295,6 @@ fun follow url batch_id (on_change : string * string * string option * string op
                   | delay :: rest => again delay rest
       end
     val outcome = attach (retry_delays_seconds ())
-    val _ = case outcome of
-                Done => report_interrupted_within 91 url batch_id
-              | Failed _ => report_interrupted_within 91 url batch_id
-              | Cancelled => report_interrupted_within 91 url batch_id
-              | _ => ()
     val skipped = List.filter (fn (_, (state, reason, _)) =>
       state = "cancelled" andalso String.isPrefix "skipped because of " (Option.getOpt (reason, ""))) (!states)
     fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
@@ -368,9 +341,7 @@ fun cancel_within max_time_seconds url batch_id =
        false)
   end
 
-fun cancel url batch_id =
-  let val cancelled = cancel_within request_max_time_seconds url batch_id
-  in if cancelled then report_interrupted_within 91 url batch_id else (); cancelled end
+val cancel = cancel_within request_max_time_seconds
 
 (* The batch a build is following and would cancel if it stopped following
    it, so that an interrupted build cancels it too (cancel_followed) rather
@@ -390,15 +361,9 @@ fun cancel_followed () =
   case !followed of
       NONE => ()
     | SOME (url, batch_id) =>
-        let
-          val deadline = Time.+ (Time.now (), Time.fromSeconds (Int.toLarge interrupt_cancel_seconds))
-          val _ = followed := NONE
-        in
-          if cancel_within interrupt_cancel_seconds url batch_id then
-            (HolbuildStatus.message_stderr ("holbuild: cancelled remote batch " ^ batch_id ^ "\n");
-             report_interrupted_within
-               (Int.max (0, LargeInt.toInt (Time.toSeconds (Time.- (deadline, Time.now ()))))) url batch_id)
-          else ()
-        end
+        (followed := NONE;
+         if cancel_within interrupt_cancel_seconds url batch_id
+         then HolbuildStatus.message_stderr ("holbuild: cancelled remote batch " ^ batch_id ^ "\n")
+         else ())
 
 end
