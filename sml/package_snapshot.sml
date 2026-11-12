@@ -154,6 +154,27 @@ fun discovered_sources (context : context) package =
     List.filter declared_source (List.foldl scan [] members)
   end
 
+(* Declared member directories must survive even when no file in them is
+   included, or discovery of the extracted snapshot rejects the manifest. *)
+fun directories package =
+  let
+    val root = HolbuildProject.package_root package
+    val definition = HolbuildProject.package_definition_of package
+    val {members, ...} = HolbuildPackageDefinition.sources definition
+    fun directory member =
+      let
+        val abs = HolbuildProject.abs_under root member
+        val rel = relative root abs
+      in
+        if rel = "" orelse ignored rel orelse not (HolbuildSourceIndex.is_dir abs) then NONE
+        else (reject_symlinks root rel; SOME rel)
+      end
+  in
+    Redblackset.listItems
+      (List.foldl (fn (rel, set) => Redblackset.add(set, rel))
+         (Redblackset.empty String.compare) (List.mapPartial directory members))
+  end
+
 (* The sorted package-relative paths of PACKAGE's snapshot: its manifest, its
    discovered sources, the files its action policies, its sources
    (`holbuild_extra_deps`) and its generators declare as inputs, and the shim

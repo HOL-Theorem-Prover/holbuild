@@ -65,7 +65,8 @@ fun command name : command =
     | "cache" => {flags = [], valued = [], operands = Nothing}
     | "exec-action" =>
         {flags = ["--share-heaps"],
-         valued = [("--cache-limit-gb", Nothing), ("--cache-reserve-gb", Nothing), ("--result", Nothing)],
+         valued = [("--cache-limit-gb", Nothing), ("--cache-reserve-gb", Nothing), ("--result", Nothing),
+                   ("--ahead-parent", Nothing), ("--ahead-wait-seconds", Nothing)],
          operands = Nothing}
     | "run-action" =>
         {flags = ["--remote-only", "--closure", "--fetch-only", "--export-only"],
