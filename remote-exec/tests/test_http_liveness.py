@@ -86,7 +86,9 @@ async def serve(url: str) -> None:
         sock.bind(("127.0.0.1", 0))
         sock.listen(2048)
         print(f"http://127.0.0.1:{sock.getsockname()[1]}", flush=True)
-        server = uvicorn.Server(uvicorn.Config(app, log_level="critical", timeout_graceful_shutdown=0))
+        # Keep idle sockets beyond this test's watchdog, so reuse cannot race a server keep-alive close.
+        server = uvicorn.Server(uvicorn.Config(app, log_level="critical", timeout_graceful_shutdown=0,
+                                             timeout_keep_alive=30))
         await server.serve(sockets=[sock])
 
 
