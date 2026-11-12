@@ -328,6 +328,29 @@ async def test_a_lease_lost_while_waiting_ahead_frees_its_slot_of_the_cap(
     assert c is not None and c["theory"] == "pkg:c"
 
 
+async def test_a_parent_lease_expired_wakes_a_claim_waiting_for_the_slot_its_revoked_child_frees(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "b", "c", "d"], [("b", "a"), ("c", "d")], speculative_loading="1")
+    assert sorted(await claim_all(http, 2)) == ["a", "d"]
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+
+    started = time.monotonic()
+    waiting = asyncio.create_task(claim_ahead(http, wait_s=CLAIM_RECHECK_SECONDS * 2))
+    await asyncio.sleep(0.2)
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text("UPDATE leases SET expires_at = now() - interval '1 second' WHERE input_key = :key"),
+            {"key": input_key("a")},
+        )
+    await coordinator.expire_leases()
+    claimed = await waiting
+    assert claimed is not None and claimed["theory"] == "pkg:c"
+    assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
+
+
 async def test_a_parent_back_to_waiting_revokes_what_was_claimed_ahead_of_it_and_of_that(
     http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
 ) -> None:
