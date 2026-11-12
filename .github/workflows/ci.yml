@@ -145,7 +145,7 @@ jobs:
           HOLBUILD_TEST_HOL_REV: ${{ steps.legacy-hol4-pin.outputs.hol4-ref }}
         run: >-
           make HOLDIR="$HOLDIR" test
-          TESTS="proof-attributes tactic-parse-compatibility proof-step-runtime-semantics proof-ir-branch-composition-behavior failed-prefix-structural-edit checkpoint-recovery termination-diagnostics"
+          TESTS="proof-attributes tactic-parse-compatibility proof-step-runtime-semantics proof-ir-branch-composition-behavior failed-prefix-structural-edit checkpoint-recovery termination-diagnostics smt-tactic-timeout"
 
   theory-modules:
     runs-on: ubuntu-latest

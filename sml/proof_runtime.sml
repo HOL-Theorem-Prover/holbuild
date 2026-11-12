@@ -249,10 +249,51 @@ fun retry_after_timeout label seconds first_attempt f x =
     y
   end
 
-fun with_tactic_timeout label f x =
+(* Match public HolSmtLib tactic names, including re-exports under other
+   structures. Lower quotations first so HOL constants and string literals
+   cannot accidentally disable the timer. *)
+fun smt_tactic_step program =
+  let
+    val names = ["GENERIC_SMT_TAC", "CVC_ORACLE_TAC", "CVC_TAC", "YICES_TAC",
+                 "Z3_ORACLE_TAC", "Z3_TAC", "cvco_tac", "cvc_tac", "z3_tac", "z3o_tac"]
+    val text = HOLSource.fromString {quietOpen = false, print = fn _ => ()} program
+    val n = size text
+    fun at i s = i + size s <= n andalso String.substring (text, i, size s) = s
+    fun comment i depth =
+      if i >= n then n
+      else if at i "(*" then comment (i + 2) (depth + 1)
+      else if at i "*)" then if depth = 1 then i + 2 else comment (i + 2) (depth - 1)
+      else comment (i + 1) depth
+    fun gap_end i =
+      if i < n andalso Char.isSpace (String.sub (text, i)) then gap_end (i + 1)
+      else i + 1
+    fun string_end i =
+      if i >= n then n
+      else case String.sub (text, i) of
+          #"\\" => string_end (if i + 1 < n andalso Char.isSpace (String.sub (text, i + 1))
+                                     then gap_end (i + 1) else i + 2)
+        | #"\"" => i + 1
+        | _ => string_end (i + 1)
+    fun ident_char c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'" orelse c = #"."
+    fun ident_end i = if i < n andalso ident_char (String.sub (text, i)) then ident_end (i + 1) else i
+    fun scan i =
+      if i >= n then false
+      else if at i "(*" then scan (comment (i + 2) 1)
+      else if at i "\"" then scan (string_end (i + 1))
+      else if ident_char (String.sub (text, i)) then
+        let
+          val stop = ident_end i
+          val parts = String.fields (fn c => c = #".") (String.substring (text, i, stop - i))
+          val name = List.last parts
+        in List.exists (fn candidate => name = candidate) names orelse scan stop end
+      else scan (i + 1)
+  in scan 0 end
+
+fun with_tactic_timeout label program f x =
   case !tactic_timeout_ref of
       NONE => f x
     | SOME seconds =>
+        if smt_tactic_step program then f x else
         let
           val first_attempt = Timer.startCPUTimer ()
           val wall = Timer.startRealTimer ()
@@ -779,10 +820,10 @@ fun append_history f =
    set_history (apply_history f);
    history_step_count_ref := !history_step_count_ref + 1)
 
-fun append_history_with_timeout label f =
+fun append_history_with_timeout label program f =
   let
     val _ = prepare_history_append ()
-    val new_history = with_tactic_timeout label apply_history f
+    val new_history = with_tactic_timeout label program apply_history f
   in
     set_history new_history;
     history_step_count_ref := !history_step_count_ref + 1
@@ -956,7 +997,7 @@ fun active_focus_snapshot label =
          end
          handle e => if tail_count = 0 andalso history_is_proved () then {goals = [], total_count = 0, generated_count = 0, tail_count = tail_count} else raise e)
 
-fun apply_focus_list_tactic label make_list_tactic =
+fun apply_focus_list_tactic label program make_list_tactic =
   let
     val {goals, total_count, generated_count, ...} = active_focus_snapshot label
     val input_goals = take_goals generated_count goals
@@ -977,13 +1018,13 @@ fun apply_focus_list_tactic label make_list_tactic =
        (if total_count = 0 then ()
         else append_history (HolbuildTacticCompat.expand_listf (current_proof_context ()) Tactical.ALL_LT))
      else
-       append_history_with_timeout label expand)
+       append_history_with_timeout label program expand)
     handle e => report_step_failure_with_goals label input_goals e
   end
 
 fun apply_tactic_step label program =
   let val make_tactic = compile_tactic label program
-  in apply_focus_list_tactic label (fn () => Tactical.ALLGOALS (make_tactic ())) end
+  in apply_focus_list_tactic label program (fn () => Tactical.ALLGOALS (make_tactic ())) end
 
 fun no_open_goals () =
   ((history_top_goals (); false)
@@ -995,7 +1036,7 @@ fun apply_list_tactic_step label program =
   if allgoals_suffix_label label andalso no_open_goals () then ()
   else
     let val list_tactic = compile_list_tactic label program
-    in apply_focus_list_tactic label list_tactic end
+    in apply_focus_list_tactic label program list_tactic end
 
 fun split_by_lengths lengths xs =
   let
@@ -1046,7 +1087,7 @@ fun matching_selector_count label selector goals =
       NONE => if null goals then NONE else SOME 1
     | SOME program =>
         let val make = compile_tactic label program
-        in with_tactic_timeout label (fn () =>
+        in with_tactic_timeout label program (fn () =>
         let
           val tac = make ()
           val probe = HolbuildTacticCompat.run_tactic (current_proof_context ()) tac
@@ -1079,7 +1120,7 @@ fun push_select_focus label selector =
       case HolbuildProofIr.selector_list_tactic selector of
           NONE => ()
         | SOME program =>
-            apply_focus_list_tactic label (compile_list_tactic label program)
+            apply_focus_list_tactic label program (compile_list_tactic label program)
   in push_branch_tail_count (tail_count + generated_count - selected_count); selected_count end
 
 fun push_first_focus label = push_select_focus label HolbuildProofIr.SelectFirst
@@ -1108,7 +1149,7 @@ fun reorder_focused_front_after label front_count middle_count =
               val (front_thms, tail_thms) = Lib.split_after front_count rest_thms
             in front_thms @ middle_thms @ tail_thms end
         in (middle @ front @ tail, validate) end
-    in apply_focus_list_tactic label (fn () => HolbuildTacticCompat.lift_list_tactic reorder) end
+    in apply_focus_list_tactic label "" (fn () => HolbuildTacticCompat.lift_list_tactic reorder) end
 
 fun restore_focused_group_order label lengths =
   case List.filter (fn n => n <> 0) lengths of
@@ -1126,7 +1167,7 @@ fun restore_focused_group_order label lengths =
                   val (normal_groups, tail_thms) = split_by_lengths nonzero_lengths thms
                 in List.concat (rev normal_groups) @ tail_thms end
             in (List.concat groups @ tail, validate) end
-        in apply_focus_list_tactic label (fn () => HolbuildTacticCompat.lift_list_tactic reorder) end
+        in apply_focus_list_tactic label "" (fn () => HolbuildTacticCompat.lift_list_tactic reorder) end
 
 fun step proof_step =
   case proof_step of
@@ -1658,7 +1699,7 @@ fun backup_n 0 = ()
 fun drop_all () = clear_history ()
 
 fun atomic_prove label g tac =
-  with_tactic_timeout label
+  with_tactic_timeout label ""
     (fn () => HolbuildTacticCompat.tac_proof (current_proof_context ()) (g, tac)) ()
   handle e => (init_history g 15; report_step_failure label e)
 
