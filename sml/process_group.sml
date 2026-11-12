@@ -150,32 +150,13 @@ fun mutation_lease_setup NONE = []
    few hundred milliseconds, and must not keep holding the mutation lease. *)
 (* The EXIT trap keeps this shell alive instead of exec'ing its last command;
    sandbox launchers use that stable shell PID to detect parent death. *)
-(* A cancelled leader stays a zombie until its output drains. kill -0 alone
-   would keep the watcher waiting while a helper still holds stdout open.
-   Read proc stat without forking on Linux; its last line and final ') '
-   delimiter put the state after even a multiline process name. *)
 fun parent_watch_script parent_pid mutation_lease script =
   String.concatWith "\n"
     (["holbuild_parent=" ^ pid_text parent_pid] @
      mutation_lease_setup mutation_lease @
      ["holbuild_leader=$$",
       "holbuild_group=$$",
-      "( trap '' TERM",
-      "  while kill -0 \"$holbuild_parent\" 2>/dev/null && kill -0 \"$holbuild_leader\" 2>/dev/null; do",
-      "    sleep 0.1",
-      "    kill -0 \"$holbuild_leader\" 2>/dev/null || break",
-      "    if [ -r /proc/self/stat ]; then",
-      "      holbuild_stat=",
-      "      while IFS= read -r holbuild_line; do holbuild_stat=$holbuild_line; done < \"/proc/$holbuild_leader/stat\"",
-      "      case \"${holbuild_stat##*) }\" in Z*) break ;; esac",
-      "    else",
-      "      case \"$(ps -o stat= -p \"$holbuild_leader\" 2>/dev/null)\" in *Z*) break ;; esac",
-      "    fi",
-      "  done",
-      "  kill -TERM -\"$holbuild_group\" 2>/dev/null",
-      "  sleep 0.2",
-      "  kill -KILL -\"$holbuild_group\" 2>/dev/null",
-      ") </dev/null >/dev/null 2>&1 9>&- &",
+      "( trap '' TERM; while kill -0 \"$holbuild_parent\" 2>/dev/null && kill -0 \"$holbuild_leader\" 2>/dev/null; do sleep 0.1; done; kill -TERM -\"$holbuild_group\" 2>/dev/null; sleep 0.2; kill -KILL -\"$holbuild_group\" 2>/dev/null ) </dev/null >/dev/null 2>&1 9>&- &",
       "holbuild_parent_watch=$!",
       "trap 'holbuild_status=$?; kill \"$holbuild_parent_watch\" 2>/dev/null; exit $holbuild_status' EXIT",
       script])
