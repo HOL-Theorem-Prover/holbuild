@@ -51,6 +51,8 @@ fun list_files () =
   in loop [] end
 
 val paths = list_files ()
+val _ = if HolbuildHash.external_files_sha256 [] = SOME [] then ()
+        else fail "empty external batch did not return empty digests"
 val batched = HolbuildHash.files_sha256 paths
 val expected =
   case OS.Process.getEnv "BATCH_FILE_HASH_EXPECT" of
