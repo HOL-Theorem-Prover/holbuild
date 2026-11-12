@@ -6,12 +6,13 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
+import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from conftest import FakeCache
 from remote_exec import coordinator as coordinator_module
-from remote_exec.coordinator import CLAIM_RECHECK_SECONDS, Coordinator
+from remote_exec.coordinator import CLAIM_RECHECK_SECONDS, Coordinator, _claim_rank
 from test_coordinator import (
     CLIENT,
     WORKER,
@@ -288,8 +289,10 @@ async def test_a_batch_at_its_cap_is_left_out_of_the_read_of_candidates(
     assert (await coordinator._ahead_candidates()).candidates == []
 
 
+# An action abandoned ahead waits for its parents from then on; one retried may be claimed ahead again.
+@pytest.mark.parametrize(("failure", "next_ahead"), [("ahead-abandoned", "c"), ("unavailable", "b"), ("publish", "b")])
 async def test_a_claim_ahead_given_up_wakes_a_claim_waiting_for_its_slot_of_the_cap(
-    http: httpx.AsyncClient, coordinator: Coordinator
+    http: httpx.AsyncClient, coordinator: Coordinator, failure: str, next_ahead: str
 ) -> None:
     coordinator.settings.claim_ranking_seconds = 3600
     await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")], speculative_loading="1")
@@ -300,9 +303,9 @@ async def test_a_claim_ahead_given_up_wakes_a_claim_waiting_for_its_slot_of_the_
     started = time.monotonic()
     waiting = asyncio.create_task(claim_ahead(http, wait_s=CLAIM_RECHECK_SECONDS * 2))
     await asyncio.sleep(0.2)
-    assert (await complete(http, b["attempt_token"], result("b", "failed", "ahead-abandoned"))).status_code == 200
+    assert (await complete(http, b["attempt_token"], result("b", "failed", failure))).status_code == 200
     claimed = await waiting
-    assert claimed is not None and claimed["theory"] == "pkg:c"
+    assert claimed is not None and claimed["theory"] == f"pkg:{next_ahead}"
     assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
 
 
@@ -510,3 +513,22 @@ async def test_claiming_and_revoking_ahead_read_each_actions_edges_by_key(
             sa.text("SELECT ahead FROM actions WHERE batch_id = :id AND input_key = 'k10'"), {"id": new}
         ) == "abandoned"
         await connection.rollback()
+
+
+async def test_a_better_ranked_waiter_that_cant_claim_ahead_leaves_the_claims_ahead_to_one_that_can(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    await claim_named(http, "a")
+    loop = asyncio.get_running_loop()
+    plain, capable = loop.create_future(), loop.create_future()
+    coordinator.claim_waiters += [
+        (["standard"], _claim_rank(["standard"], None), plain, False),  # a warm worker's, ranked first
+        (["high", "standard"], _claim_rank(["high", "standard"], "host-b"), capable, True),
+    ]
+
+    # A change that may make actions claimable ahead wakes the claim that can take them.
+    coordinator._ahead_changed()
+    assert not plain.done() and capable.result() == ("standard", True)
+    claimed = await coordinator.claim(["high", "standard"], "burst", host_id="host-c", ahead=True)
+    assert claimed is not None and claimed.theory == "pkg:b"
