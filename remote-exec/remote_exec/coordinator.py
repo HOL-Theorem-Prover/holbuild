@@ -320,8 +320,9 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int,
         - counts.high_run + min(run_slots, counts.high_run)
     )
     demand = max(0, active - warm_workers, high)
-    # High-tier work beyond the running high actions is ready work a burst worker could take; capped runs are not.
-    if high > counts.running_high - counts.waiting_ahead_high or (counts.ready_standard > 0 and active > warm_workers):
+    # Work beyond what runs is ready work a burst worker could take; runs the run slots hold back are not.
+    running_active = running - ahead - counts.running_run + min(run_slots, counts.running_run)
+    if high > counts.running_high - counts.waiting_ahead_high or active > max(warm_workers, running_active):
         demand += ahead
     return min(demand, max_burst_workers)
 
@@ -663,10 +664,11 @@ class Coordinator:
         self.scale_lock = asyncio.Lock()
         self.scale_pending = False
         self.scale_task: asyncio.Task[None] | None = None
-        # How many actions this process's release has made ready, and waiting claims' tiers, rank and wake,
-        # oldest first (the tie-breaker within a host); see claim.
+        # How many actions this process's release has made ready, and waiting claims' tiers, rank, wake (the tier
+        # and whether it was for a claim ahead) and whether they may claim ahead, oldest first (the tie-breaker
+        # within a host); see claim.
         self.made_ready = 0
-        self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[str]]] = []
+        self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[tuple[str, bool]], bool]] = []
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
@@ -893,27 +895,33 @@ class Coordinator:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
         rank = _claim_rank(tiers, host_id, host_rank)
-        woken: asyncio.Future[str] = loop.create_future()  # done once a wake was handed to this claim
+        woken: asyncio.Future[tuple[str, bool]] = loop.create_future()  # done once a wake was handed to this claim
+
+        def undeferred(*, ahead_only: bool) -> list[str]:
+            """The tiers no better-ranked unwoken waiter takes, of those that may claim ahead if ``ahead_only``."""
+            return tiers if woken.done() else [
+                tier for tier in tiers
+                if not any(
+                    tier in w_tiers and not w_woken.done() and w_rank < rank and (w_ahead or not ahead_only)
+                    for w_tiers, w_rank, w_woken, w_ahead in self.claim_waiters
+                )
+            ]
+
         try:
             while True:
                 # Taken before the attempt, so an action made ready during it is tried at once, not waited for.
                 made_ready = self.made_ready
-                eligible_tiers = tiers if woken.done() else [
-                    tier for tier in tiers
-                    if not any(
-                        tier in w_tiers and not w_woken.done() and w_rank < rank
-                        for w_tiers, w_rank, w_woken in self.claim_waiters
-                    )
-                ]
+                eligible_tiers = undeferred(ahead_only=False)
                 claimed = await self._claim(eligible_tiers, worker) if eligible_tiers else None
-                if claimed is None and ahead and eligible_tiers:
-                    claimed = await self._claim_ahead(eligible_tiers, worker)
+                # A better-ranked waiter that can't claim ahead leaves the actions claimed ahead to this one.
+                if claimed is None and ahead and (ahead_tiers := undeferred(ahead_only=True)):
+                    claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
                     return claimed
                 woken = loop.create_future()
                 if self.made_ready == made_ready:
-                    waiter = (tiers, rank, woken)
+                    waiter = (tiers, rank, woken, ahead)
                     self.claim_waiters.append(waiter)
                     try:
                         with contextlib.suppress(TimeoutError):
@@ -1108,11 +1116,11 @@ class Coordinator:
 
     def _ahead_changed(self) -> None:
         """Drop the claims ahead's shared read, since actions of a batch that loads ahead may have become
-        candidates, and wake a claim of each tier for them: their tiers aren't known here."""
+        candidates, and wake a claim of each tier that may claim ahead: their tiers aren't known here."""
         self.ahead_read = None
         self.ahead_changes += 1
         for tier in ("standard", "high"):
-            self._wake_claim(tier)
+            self._wake_claim(tier, ahead=True)
 
     @staticmethod
     async def _claim_first(conn: AsyncConnection, params: dict[str, object]) -> _Claimed | None:
@@ -1229,23 +1237,25 @@ class Coordinator:
             for key in stale:
                 self.rankings.pop(key, None)
 
-    def _wake_claim(self, tier: str) -> None:
-        """Count an action of ``tier`` made ready, and wake its best-ranked compatible claim, with FIFO ties."""
+    def _wake_claim(self, tier: str, *, ahead: bool = False) -> None:
+        """Count an action of ``tier`` made ready, or, with ``ahead``, that may be claimed ahead, and wake its
+        best-ranked compatible claim, with FIFO ties."""
         self.made_ready += 1
         waiter = min(
-            (w for w in self.claim_waiters if tier in w[0] and not w[2].done()),
+            (w for w in self.claim_waiters if tier in w[0] and not w[2].done() and (w[3] or not ahead)),
             key=lambda w: w[1],
             default=None,
         )
         if waiter is not None:
-            waiter[2].set_result(tier)
+            waiter[2].set_result((tier, ahead))
             self.claim_waiters.remove(waiter)
 
-    def _pass_wake(self, woken: asyncio.Future[str]) -> None:
-        """Hand the wake of a claim leaving without trying, if it got one, to the next claim that takes its tier."""
+    def _pass_wake(self, woken: asyncio.Future[tuple[str, bool]]) -> None:
+        """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""
         if woken.done() and not woken.cancelled():
             self.made_ready -= 1
-            self._wake_claim(woken.result())
+            tier, ahead = woken.result()
+            self._wake_claim(tier, ahead=ahead)
 
     def report_host(self, report: HostReport) -> None:
         """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one."""
@@ -1335,7 +1345,10 @@ class Coordinator:
                 },
             )
             package, theory = action.theory.split(":", 1)
-            unblocked = False  # whether an action claimed ahead of this one waits for no parent now
+            # Whether a slot of the batch's cap may be free, or the action's children may be claimed ahead, now: a
+            # failure frees the action's slot if it was claimed ahead, and those of the actions claimed ahead of it,
+            # which it revokes or cancels.
+            unblocked = action.ahead_batch and result.status == "failed"
             if result.failure == "memory" and action.tier == "standard":
                 # The tier it failed on is the hint: future batches place this theory on the high tier.
                 await self._record_peak(conn, package, theory, action.profile, self.settings.standard_tier_mb)
@@ -1364,7 +1377,6 @@ class Coordinator:
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
                 await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)
-                unblocked = True  # a slot of the batch's cap is free
             elif result.failure == "unavailable" and action.interruptions < self.settings.max_interruptions:
                 # The worker couldn't start or finish it, so it doesn't count as an attempt.
                 await conn.execute(
@@ -1395,7 +1407,6 @@ class Coordinator:
         self._batch_changed(batch_id)
         self.request_release(batch_id)
         if unblocked:
-            # A slot of the batch's cap is free, and the action's children may be claimed ahead.
             self._ahead_changed()
         return True
 

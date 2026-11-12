@@ -2731,6 +2731,8 @@ fun export_archive tc jobs args =
                   version = #version package_info,
                   toolchain_key = #toolchain_key package_info,
                   root = #root project,
+                  directories = HolbuildPackageSnapshot.directories (HolbuildProject.project_package project)
+                                handle HolbuildPackageSnapshot.Error msg => raise Error msg,
                   files = HolbuildPackageSnapshot.files (HolbuildProject.project_package project)
                           handle HolbuildPackageSnapshot.Error msg => raise Error msg}
     val entries = case cache_part of SOME {entries, ...} => entries | NONE => []

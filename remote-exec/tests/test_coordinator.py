@@ -837,14 +837,14 @@ async def test_wakes_pack_compatible_hosts_with_fifo_ties(
     loop = asyncio.get_running_loop()
     wakes = [loop.create_future() for _ in workers]
     coordinator.claim_waiters = [
-        (tiers, _claim_rank(tiers, host, rank), wake) for (tiers, host, rank), wake in zip(workers, wakes)
+        (tiers, _claim_rank(tiers, host, rank), wake, False) for (tiers, host, rank), wake in zip(workers, wakes)
     ]
     cancelled = loop.create_future()
     cancelled.cancel()
-    coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled))
+    coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled, False))
     for index in order:
         coordinator._wake_claim(tier)
-        assert wakes[index].result() == tier
+        assert wakes[index].result() == (tier, False)
         assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
     coordinator._wake_claim(tier)
     assert coordinator.made_ready == len(order) + 1
@@ -856,7 +856,7 @@ async def test_new_tail_host_claim_defers_ready_work_to_a_better_waiter(
 ) -> None:
     batch_id = await submit(http, ["a"])
     wake = asyncio.get_running_loop().create_future()
-    waiter = (waiting_tiers, _claim_rank(waiting_tiers, "host-a"), wake)
+    waiter = (waiting_tiers, _claim_rank(waiting_tiers, "host-a"), wake, False)
     coordinator.claim_waiters.append(waiter)
     assert await coordinator.claim(["high", "standard"], "tail", host_id="host-b") is None
     assert await states(http, batch_id) == {"a": "ready"}
@@ -874,7 +874,7 @@ async def test_rechecking_tail_host_defers_ready_work_to_a_better_waiter(
     batch_id = ""
     claim_once = coordinator._claim
     wake = asyncio.get_running_loop().create_future()
-    waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake)
+    waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake, False)
 
     async def counted(tiers: list[str], worker: str) -> Any:
         nonlocal attempts
@@ -906,7 +906,7 @@ async def test_burst_can_claim_high_while_warm_waits_for_standard(
     async with coordinator.engine.begin() as conn:
         await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:b'"))
     wake = asyncio.get_running_loop().create_future()
-    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "warm"), wake))
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "warm"), wake, False))
     claimed = await coordinator.claim(["high", "standard"], "burst", host_id="host-a")
     assert claimed is not None and claimed.theory == "pkg:b"
     assert not wake.done()
@@ -933,7 +933,7 @@ async def test_explicitly_woken_claim_is_not_blocked_by_a_new_better_waiter(
         coordinator._wake_claim("standard")
         # A new better waiter must not block the explicit wake before the tail host resumes.
         wake = asyncio.get_running_loop().create_future()
-        coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake))
+        coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
         claimed = await asyncio.wait_for(waiting, 5)
         assert claimed is not None and claimed.theory == "pkg:a"
     finally:
