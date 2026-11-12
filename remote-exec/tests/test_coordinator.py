@@ -330,9 +330,19 @@ async def test_exhausted_rankings_refresh_once_outside_claim_transactions(
 async def test_failed_shared_rankings_return_503_without_per_claim_fallbacks(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    entered, go = asyncio.Event(), asyncio.Event()
+    entered, joined, go = asyncio.Event(), asyncio.Event(), asyncio.Event()
     calls = 0
+    claimers = 0
     rank = coordinator._rank
+    current_ranking = coordinator._current_ranking
+
+    async def join_ranking(key: tuple[str, ...], *, after: float = 0) -> Any:
+        nonlocal claimers
+        claimers += 1
+        if claimers == 20:
+            joined.set()
+        # Enter the shared read before yielding to the task that releases its failure.
+        return await current_ranking(key, after=after)
 
     async def failing_once(conn: Any, key: tuple[str, ...]) -> Any:
         nonlocal calls
@@ -344,14 +354,16 @@ async def test_failed_shared_rankings_return_503_without_per_claim_fallbacks(
         return await rank(conn, key)
 
     monkeypatch.setattr(coordinator, "_rank", failing_once)
+    monkeypatch.setattr(coordinator, "_current_ranking", join_ranking)
     await submit(http, ["a"])
     requests = [
         asyncio.create_task(http.post("/v1/work/claim", json={"tier": "standard", "worker": "w"}, headers=WORKER))
         for _ in range(20)
     ]
-    await asyncio.wait_for(entered.wait(), 2)
-    await asyncio.sleep(0)
-    go.set()
+    try:
+        await asyncio.wait_for(asyncio.gather(entered.wait(), joined.wait()), 2)
+    finally:
+        go.set()
     responses = await asyncio.gather(*requests)
     assert [r.status_code for r in responses] == [503] * 20
     assert calls == 1
