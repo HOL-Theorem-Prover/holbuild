@@ -18,7 +18,7 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
-from typing import Annotated, Self
+from typing import Annotated, Any, Self
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -414,6 +414,7 @@ CROSS JOIN (SELECT DISTINCT unnest(CAST(:classes AS text[]))) c (class)
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:tiers AS text[]))) t (tier)
 CROSS JOIN LATERAL (
     SELECT FROM actions a WHERE a.batch_id = b.id AND a.state = 'ready' AND a.class = c.class AND a.tier = t.tier
+    AND (a.class = 'run' OR a.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()))
     ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
     LIMIT 1
 ) ready
@@ -428,11 +429,30 @@ ORDER BY
     b.created_at,
     b.id
 """)
+# A build action whose key another batch's live lease is building is held back (single-flight), here and in
+# CLAIM_CANDIDATES: once that build succeeds, Coordinator.complete marks the action done as well; once it fails or
+# its lease expires, the action is claimed again. An expired lease stops holding at once, before the sweep deletes it.
+# An unclaimed action has no lease in its own batch, so every live lease of its key is another batch's; uncorrelated,
+# the lease keys are read once per statement into a hash, rather than once per ready action probed.
 CLAIM_ACTION = sa.text("""
 SELECT input_key, spec_sha256, theory FROM actions
 WHERE batch_id = :batch_id AND state = 'ready' AND class = :class AND tier = :tier
+AND (class = 'run' OR input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()))
 ORDER BY critical_depth DESC, descendant_count DESC, theory, input_key
 LIMIT 1 FOR UPDATE SKIP LOCKED
+""")
+
+
+# The unfinished, unclaimed build actions of other running batches with the same keys as a build whose lease just
+# ended; see CLAIM_ACTION. Probed by primary key per running batch: no index leads with input_key.
+PEERS = sa.text("""
+SELECT a.batch_id, a.tier, a.state FROM batches b
+CROSS JOIN LATERAL (
+    SELECT batch_id, tier, state FROM actions
+    WHERE batch_id = b.id AND input_key = :input_key AND ac_key = :ac_key AND class = 'build'
+    AND state IN ('waiting', 'ready')
+) a
+WHERE b.state = 'running' AND b.id <> :batch_id
 """)
 
 
@@ -987,6 +1007,45 @@ class Coordinator:
             self.made_ready -= 1
             self._wake_claim(woken.result())
 
+    @staticmethod
+    async def _peers(conn: AsyncConnection, batch_id: UUID, action: sa.Row[Any]) -> list[tuple[UUID, str, str]]:
+        """The waiting and ready copies of build ``action`` of ``batch_id``, whose lease just ended, in other
+        running batches, by batch, tier and state; see CLAIM_ACTION."""
+        if action.action_class != "build":
+            return []
+        rows = await conn.execute(
+            PEERS, {"batch_id": batch_id, "input_key": action.input_key, "ac_key": action.ac_key}
+        )
+        return [(row.batch_id, row.tier, row.state) for row in rows]
+
+    def _wake_peers(self, peers: list[tuple[UUID, str, str]]) -> None:
+        """Have claims take the ready ``peers`` now that the lease holding them back ended, as if just made ready."""
+        for batch_id, tier, state in peers:
+            if state == "ready":
+                self._forget_rankings(batch_id, {tier})
+                self._wake_claim(tier)
+
+    async def _finish_peer(self, batch_id: UUID, input_key: str, log_sha256: str | None) -> None:
+        """Mark done the copy in ``batch_id`` of build ``input_key``, which another batch's worker just finished
+        and published, if no claim took it meanwhile; it keeps that worker's log for the client to show."""
+        async with self.engine.begin() as conn:
+            if await self._lock_batch(conn, batch_id) != "running":
+                return
+            done = await conn.scalar(
+                sa.text(
+                    "UPDATE actions SET state = 'done', log_sha256 = :log, last_failure = NULL, failure_detail = NULL "
+                    "WHERE batch_id = :batch_id AND input_key = :input_key AND state IN ('waiting', 'ready') "
+                    "RETURNING input_key"
+                ),
+                {"batch_id": batch_id, "input_key": input_key, "log": log_sha256},
+            )
+            if done is None:
+                return
+            await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [input_key]})
+            await self._finish_if_done(conn, batch_id)
+        self._batch_changed(batch_id)
+        self.request_release(batch_id)
+
     def report_host(self, report: HostReport) -> None:
         """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one."""
         previous = self.hosts.get(report.id)
@@ -1046,8 +1105,8 @@ class Coordinator:
             action = (
                 await conn.execute(
                     sa.text(
-                        "SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions, a.last_failure, "
-                        "a.class AS action_class, b.profile "
+                        "SELECT a.input_key, a.ac_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions, "
+                        "a.last_failure, a.class AS action_class, b.profile "
                         "FROM actions a JOIN batches b ON b.id = a.batch_id "
                         "WHERE a.batch_id = :batch_id AND a.input_key = :input_key"
                     ),
@@ -1059,6 +1118,7 @@ class Coordinator:
                     f"result for {result.input_key} (spec {result.spec_sha256}) does not match the lease's action "
                     f"{action.input_key} (spec {action.spec_sha256})"
                 )
+            peers = await self._peers(conn, batch_id, action)
             await conn.execute(
                 sa.text(
                     "UPDATE actions SET log_sha256 = :log, last_failure = :failure, failure_detail = :detail, "
@@ -1113,6 +1173,11 @@ class Coordinator:
                 )
         self._batch_changed(batch_id)
         self.request_release(batch_id)
+        if result.status == "failed":
+            self._wake_peers(peers)
+        else:
+            for peer in dict.fromkeys(peer_batch for peer_batch, _, _ in peers):
+                await self._finish_peer(peer, action.input_key, result.log_sha256)
         return True
 
     def request_release(self, batch_id: UUID | None = None) -> None:
@@ -1246,15 +1311,16 @@ class Coordinator:
                 action = (
                     await conn.execute(
                         sa.text(
-                            "SELECT theory, state, attempts, class AS action_class FROM actions "
+                            "SELECT input_key, ac_key, theory, state, attempts, class AS action_class FROM actions "
                             "WHERE batch_id = :batch_id AND input_key = :input_key FOR UPDATE"
                         ),
                         {"batch_id": batch_id, "input_key": lease.input_key},
                     )
                 ).one()
+                peers = await self._peers(conn, batch_id, action)
                 if action.state != "running":
-                    continue
-                if action.attempts >= self.settings.max_attempts:
+                    pass
+                elif action.attempts >= self.settings.max_attempts:
                     await conn.execute(
                         sa.text(
                             "UPDATE actions SET last_failure = CASE WHEN class = 'run' THEN 'internal' "
@@ -1273,7 +1339,9 @@ class Coordinator:
                     )
                 else:
                     await self._retry(conn, batch_id, lease.input_key)
-            self._batch_changed(batch_id)
+            self._wake_peers(peers)
+            if action.state == "running":
+                self._batch_changed(batch_id)
 
     async def fail_overdue(self) -> None:
         """Fail the batches still running ``batch_deadline_hours`` after their submission: one that can't finish,
