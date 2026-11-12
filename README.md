@@ -495,16 +495,23 @@ child that fits the budget starts whatever `MemAvailable` says, so a build
 never waits on memory none of its children use. Where `/proc/meminfo` has no
 `MemAvailable` (outside Linux), only the reservations count, and the default
 charge is `--max-heap` + 1 GiB, what a child can reach. `/proc/meminfo` shows
-the whole machine, not a container's memory limit, so inside a
-memory-limited container set `--child-charge` to what a child can reach. A child
+the whole machine, not a container's memory limit. Where cgroup v2 limits the
+memory of holbuild's group or of a group enclosing it (a container, a systemd
+or Slurm scope), a child also starts only while the tightest of those groups
+has its charge left (`memory.max` less `memory.current`, plus its reclaimable
+`inactive_file` page cache, less the charges of children still starting),
+whether or not any reservation is held, and a charge larger than the least
+`memory.max` fails at once. Under cgroup v1, or another memory limit holbuild
+can't read, set `--child-charge` to what a child can reach. A child
 that waits shows as `(waiting for memory)` in the status line, as a
 `waiting for machine memory` line otherwise, and as a `waiting_for_memory`
 event with `--json`. A charge larger than the whole budget fails at once.
 
 This bounds admission; it does not enforce RSS: children already running can
 still grow together, up to their `--max-heap`, past what the machine has left,
-since nothing re-checks a child once it has started. It covers neither HOL
-toolchain builds nor `check`, `run` or `repl`.
+since nothing re-checks a child once it has started. The HOL session of
+fingerprint checks and `run` takes a reservation like a theory child; HOL toolchain
+builds and `repl` take none.
 
 - The budget is the byte count in `DIR/budget`, which `--machine-max-mem`
   creates on first use. Without that file, it is the default, recomputed from
@@ -536,8 +543,9 @@ manifest in use is watched as well (not recursively), so a `holbuild.toml` or
 currently requires `inotifywait` from `inotify-tools` and does not support
 `--json`, `--dry-run`, or `--repl-on-failure`.
 
-`holbuild check MyTheory` builds the theory if needed, loads it in HOL and
-checks the tags and hypotheses of its stored theorems. It prints one line per
+`holbuild check MyTheory` builds the theory if needed, then reads the restored
+`Theory.dat` files directly, without starting HOL or loading ancestor terms.
+It checks the tags and hypotheses of its stored theorems. It prints one line per
 theorem whose tag carries an oracle other than `DISK_THM` (for instance
 `MyTheory.my_theorem: cheat`) and one per axiom declared in the theory or its
 ancestors outside HOL itself, that is, in the root package or a dependency
@@ -553,23 +561,22 @@ line per use (`mypkg:src/MyScript.sml:12: kernel bypass: disk_thm`). Names in
 comments and string literals don't count; the scan is a backstop, not a
 sandbox. With findings it exits non-zero; otherwise it prints
 `MyTheory: clean (N theorems)` and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
-Pass several selectors to share one build of the distinct targets and one HOL
-session: `holbuild check MyTheory OtherTheory:my_theorem`. Each selector keeps
+Pass several selectors to share one build of the distinct targets:
+`holbuild check MyTheory OtherTheory:my_theorem`. Each selector keeps
 its own findings or clean line, in argument order (including repeated selectors).
 Findings do not stop later checks; the command exits non-zero if any selector
-has findings. Invalid selectors, missing theorems and load errors abort the
+has findings. Invalid selectors, missing theorems and unreadable theory data abort the
 command.
 
 `check` builds the theories, and any `[run].loads`, without proof steps or
 checkpoints: it applies no step timeout (that is `build`'s check) and reuses
-theories built by `holbuild build --skip-proof-steps`. The tags are those
+theories built by `holbuild build --skip-proof-steps`. Plain checks do not execute
+`[run].loads`; fingerprint modes load them in HOL. The tags are those
 recorded in the built theory, which may have been restored from a cache;
-run `holbuild build --no-cache MyTheory` first to check a fresh build. HOL
-starts from a valid dependency checkpoint or the toolchain's base state, never
-from `[run].heap`, which may hold an older copy of a theory.
+run `holbuild build --no-cache MyTheory` first to check a fresh build.
 
-`holbuild check --fingerprint MyTheory` builds and loads the theory the same
-way and prints one tab-separated line per axiom, definition and theorem stored
+`holbuild check --fingerprint MyTheory` builds the theory, then loads it in HOL
+and prints one tab-separated line per axiom, definition and theorem stored
 in it and in each of its ancestors, HOL's own theories included, sorted
 bytewise so that two runs diff cleanly. Several theories can be passed together
 (`holbuild check --fingerprint MyTheory OtherTheory`); their shared ancestors
@@ -584,7 +591,10 @@ fingerprint	MyTheory	theorem	other_theorem	77d0…	cheat
 `holbuild check --with-fingerprints MyTheory:my_theorem` does both in one HOL
 session: it checks the selectors as plain `check` does and prints the
 fingerprint lines of their theories, and exits with the check's status. A
-tool that wants both pays for one theory load instead of two.
+tool that wants both pays for one theory load. Both fingerprint modes start HOL
+from a valid dependency checkpoint or the toolchain's base state, never from
+`[run].heap`, which may hold an older copy of a theory. These HOL sessions use
+one GC thread and take the same `--cooperate-dir` memory reservation as builds.
 
 Build progress and HOL's own messages share stdout, so keep the lines that
 start with `fingerprint` and a tab (`grep '^fingerprint'`). After that column
@@ -1790,6 +1800,38 @@ without the tool cache. The newest publication replaces the
 entry, so a tool should write each file whole (to a temporary name, then
 renamed) and treat the directory as a cache it may find empty.
 
+With `--ahead-parent INPUT_KEY:SPEC-SHA256`, given once per dependency that
+another worker is still building from that spec (a late parent), the worker
+loads ahead of those parents rather than waiting to be claimed after them. It
+restores the other dependencies and starts HOL at once. In each late parent's
+place, HOL loads a stand-in manifest that names what the parent's manifest
+will name, predicted from its spec, then waits. The worker polls the remote
+cache every 2 seconds. It restores each parent's entry outside the directories
+HOL may write, checks it against the parents it records, and moves it into
+place. HOL then checks the stand-in: loading the parent's real manifest from
+where HOL stood must load exactly the files the stand-in loaded. Once every
+parent has arrived, the worker takes a plain run's reuse checks: the theory's
+own entry, an earlier build on the same dependency outputs, or with
+`--share-heaps` a shared dependency heap. If one applies, it stops HOL and
+runs as without the option. Otherwise the parents' real manifests replace
+the stand-ins, so a parent the script loads itself is the real one, and HOL
+goes on to build the theory; everything after is as in a plain run. A forced or traced action, or one
+whose late parents are all in the remote cache by the time it starts, runs
+as without the option. The action fails as `ahead-abandoned` (exit status 3)
+when it can't go on as a plain run would:
+* its own entry is in the remote cache already;
+* a late parent's spec or source, which only the prediction reads, isn't in
+  the remote cache;
+* a stand-in doesn't match;
+* a restored dependency was built on another build of a late parent;
+* HOL stops early;
+* the parents don't all arrive within `--ahead-wait-seconds` (default 3600).
+A retry without the option builds it. The result's `phase-ms` adds
+`aheadwait`, the time HOL spent waiting: at each stand-in from its wait to
+that parent's arrival, and at the end of the preload until every parent has
+arrived and the script is written; and `aheadload`, the rest of the time
+from HOL's start to then.
+
 A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
 execution") is checked the same way, its run text against its `run-key`,
 and reported `cached`, without installing the toolchain or starting HOL, if
@@ -2009,7 +2051,9 @@ the publish fails. `--detach` follows no local build, so it checks and
 submits such theories like any other. What these checks and the source
 uploads find the remote cache to hold is kept in the cache root's
 `remote-ledger/`, shared by every project and worktree using that cache root,
-so a later build doesn't ask again.
+so a later build doesn't ask again. A build that would take it past 100000
+entries keeps only the entries it used or learned, so it grows past that only
+as far as one build's own entries.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the

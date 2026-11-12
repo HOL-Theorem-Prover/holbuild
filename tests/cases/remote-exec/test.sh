@@ -363,6 +363,22 @@ require_grep "^POST /v1/batches Bearer stub-token$" "$state/requests.log"
 write_theories ledger
 run ledger-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
 [[ -n $(ls "$HOLBUILD_CACHE/remote-ledger") ]] || { echo "the export left no remote ledger" >&2; exit 1; }
+ledger_file=$(ls "$HOLBUILD_CACHE"/remote-ledger/* | grep -v '\.lock$')
+# The specs it uploaded aren't in it: no later export has the same spec.
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/ledger-seed.log")
+for spec in $(awk '$1 == "action" { print $4 }' "$state/$batch.batch"); do
+  refute_grep "^blob $spec$" "$ledger_file"
+done
+# A build with nothing to do doesn't read the ledger: a FIFO in its place
+# would block the read.
+cp "$ledger_file" "$tmpdir/ledger.seed"
+rm "$ledger_file"
+mkfifo "$ledger_file"
+(cd "$project" && timeout 120 "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only BTheory) \
+  > "$tmpdir/ledger-noop.log" 2>&1 || { cat "$tmpdir/ledger-noop.log" >&2; exit 1; }
+[[ -p "$ledger_file" ]] || { echo "the no-op build replaced the ledger" >&2; exit 1; }
+rm "$ledger_file"
+cp "$tmpdir/ledger.seed" "$ledger_file"
 # The ledger is the cache root's, so another directory of the project, as a
 # fresh worktree is, doesn't ask about the blob of the unchanged BScript.sml
 # again; the changed AScript.sml it uploads.
@@ -379,6 +395,81 @@ require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdi
 refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
 require_grep "^PUT /cas/$a_copy_source$" "$tmpdir/server/requests.log"
 [[ ! -e "$copy/.holbuild/remote-ledger" ]] || { echo "the copy kept a ledger of its own" >&2; exit 1; }
+# The export looks entries up by binary search over the ledger's lines, matching
+# whole lines only: BScript.sml's blob is found as the first line, and as the
+# last line without a newline.  Out of order it is missed, so the export checks
+# it again, and the build records the ledger sorted again.
+b_entry="blob $b_source"
+b_line=$(grep -nxF "$b_entry" "$ledger_file" | cut -d: -f1)
+[[ -n "$b_line" && $(wc -l < "$ledger_file") -gt 1 ]] || { cat "$ledger_file" >&2; exit 1; }
+cp "$ledger_file" "$tmpdir/ledger.sorted"
+# Without its metadata, the copy can't cut BTheory off, so both export.
+ledger_copy_build() {
+  sed -i "s/(\* ledger[^*]*\*)/(* $1 *)/" "$copy/src/AScript.sml"
+  rm -r "$copy/.holbuild/dep"
+  : > "$tmpdir/server/requests.log"
+  (cd "$copy" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only BTheory) \
+    > "$tmpdir/$1.log" 2>&1 || { cat "$tmpdir/$1.log" >&2; exit 1; }
+  require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/$1.log"
+}
+tail -n +"$b_line" "$tmpdir/ledger.sorted" > "$ledger_file"
+ledger_copy_build ledger-first
+refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+head -n "$b_line" "$tmpdir/ledger.sorted" | head -c -1 > "$ledger_file"
+ledger_copy_build ledger-last
+refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+# A long line sorting after every entry sits between the search and the
+# misplaced last line, so no search reaches it.
+{ grep -vxF "$b_entry" "$tmpdir/ledger.sorted"; printf '~%.0s' {1..200}; echo; echo "$b_entry"; } > "$ledger_file"
+ledger_copy_build ledger-unsorted
+require_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+LC_ALL=C sort -c "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+grep -qxF "$b_entry" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+sed -i '/^~/d' "$ledger_file"
+# A forced BTheory uploads its spec every time.  The first learns that the
+# remote cache holds ATheory; the second learns nothing, so doesn't record
+# the ledger.
+forced_copy_build() {
+  : > "$tmpdir/server/requests.log"
+  (cd "$copy" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only --force=theory BTheory) \
+    > "$tmpdir/$1.log" 2>&1 || { cat "$tmpdir/$1.log" >&2; exit 1; }
+  require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/$1.log"
+  local batch spec
+  batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/$1.log")
+  spec=$(awk '$1 == "action" { print $4 }' "$state/$batch.batch")
+  require_grep "^\(HEAD\|PUT\) /cas/$spec$" "$tmpdir/server/requests.log"
+}
+forced_copy_build ledger-forced
+touch -d '2000-01-01' "$ledger_file"
+forced_copy_build ledger-forced-again
+[[ $(stat -c %Y "$ledger_file") == $(date -d '2000-01-01' +%s) ]] ||
+  { echo "a build that learned nothing recorded the ledger" >&2; exit 1; }
+cp "$ledger_file" "$tmpdir/ledger.sorted"
+# Past 100000 entries, the build recording the ledger keeps only the entries it
+# used or learned: BScript.sml's blob, which it used, and the new
+# AScript.sml's, which it learned, but none of the filler.
+filler() { seq -f "blob f%063g" 1 100000; }
+{ cat "$tmpdir/ledger.sorted"; filler; } | LC_ALL=C sort > "$ledger_file"
+ledger_copy_build ledger-cap
+a_copy_source=$(sha256sum "$copy/src/AScript.sml" | cut -d' ' -f1)
+LC_ALL=C sort -c "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+refute_grep "^blob f" "$ledger_file"
+grep -qxF "$b_entry" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+grep -qxF "blob $a_copy_source" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+# Each entry kept was in the ledger, or one the build asked the remote cache about.
+while read -r kind hash; do
+  grep -qxF "$kind $hash" "$tmpdir/ledger.sorted" || grep -q "^\(HEAD\|PUT\) /cas/$hash$" "$tmpdir/server/requests.log" ||
+    { echo "the ledger kept $kind $hash, which the build didn't use" >&2; exit 1; }
+done < "$ledger_file"
+# Another build forgets the ledger and fills it past the limit while this one
+# runs: BScript.sml's blob, which this build used, doesn't come back.
+cp "$tmpdir/ledger.sorted" "$ledger_file"
+printf 'rm %q\n{ seq -f "blob f%%063g" 1 100001; } > %q\n' "$ledger_file" "$ledger_file" > "$state/on-submit"
+ledger_copy_build ledger-forget-race
+rm "$state/on-submit"
+refute_grep "^blob f" "$ledger_file"
+refute_grep "^$b_entry$" "$ledger_file"
+cp "$tmpdir/ledger.sorted" "$ledger_file"
 # ATheory changes and BScript.sml doesn't, so its blob is remembered.  Without
 # its metadata, the client can't cut BTheory off itself.
 sed -i 's/(\* ledger \*)/(* ledger-a *)/' "$project/src/AScript.sml"

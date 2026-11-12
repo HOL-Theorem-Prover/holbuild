@@ -13,6 +13,7 @@ on:
       - completions/**
       - sml/holbuild-script.sml
       - sml/action_sandbox.py
+      - sml/ahead_load_runtime.sml
       - sml/checkpoint_save_runtime.sml
       - sml/holbuild_runtime.sml
       - sml/deferred_proofs_runtime.sml
