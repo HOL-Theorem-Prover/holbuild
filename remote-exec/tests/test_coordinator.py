@@ -708,6 +708,7 @@ async def test_a_key_another_batch_is_building_is_held_then_done_with_it(
         {"a": "done"}, {"a": "done", "b": "running"}, {"p": "running", "a": "done", "c": "ready"}
     )
     assert {a["theory"]: a["log_sha256"] for a in (await batch(http, ready))["actions"]}["pkg:a"] == "a" * 64
+    await claim_named(http, "c")
     assert await claim(http) is None
 
 
@@ -1268,7 +1269,8 @@ async def test_peak_above_the_standard_tier_places_the_next_batch_high(
     assert (await complete(http, token, result("a", "built", peak_rss_mb="5000"))).status_code == 200
 
     await submit(http, ["a"], profile="other")
-    await claim_named(http, "a", "standard")
+    token = await claim_named(http, "a", "standard")
+    assert (await complete(http, token, result("a", "built"))).status_code == 200  # not to hold the next batch's
     await submit(http, ["a"], profile="proofs")
     assert await claim(http, "standard") is None
     await claim_named(http, "a", "high")

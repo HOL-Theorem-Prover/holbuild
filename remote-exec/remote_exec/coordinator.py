@@ -444,15 +444,11 @@ LIMIT 1 FOR UPDATE SKIP LOCKED
 
 
 # The unfinished, unclaimed build actions of other running batches with the same keys as a build whose lease just
-# ended; see CLAIM_ACTION. Probed by primary key per running batch: no index leads with input_key.
+# ended; see CLAIM_ACTION. Read by primary key, a probe per running batch: no index leads with input_key.
 PEERS = sa.text("""
-SELECT a.batch_id, a.tier, a.state FROM batches b
-CROSS JOIN LATERAL (
-    SELECT batch_id, tier, state FROM actions
-    WHERE batch_id = b.id AND input_key = :input_key AND ac_key = :ac_key AND class = 'build'
-    AND state IN ('waiting', 'ready')
-) a
-WHERE b.state = 'running' AND b.id <> :batch_id
+SELECT batch_id, tier, state FROM actions
+WHERE batch_id = ANY(ARRAY(SELECT id FROM batches WHERE state = 'running' AND id <> :batch_id))
+AND input_key = :input_key AND ac_key = :ac_key AND class = 'build' AND state IN ('waiting', 'ready')
 """)
 
 
