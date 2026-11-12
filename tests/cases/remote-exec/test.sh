@@ -744,6 +744,24 @@ require_grep "^edge [0-9a-f]* $key_a$" "$state/$batch.batch"
 require_grep "remote execution: remote workers finished 3 of 3 theories" "$tmpdir/built-here-unpublished.log"
 rm "$project/src/CScript.sml"
 
+# A fresh tree cannot classify a local manifest as built here when one blob
+# is missing and another has corrupt bytes. The absent remote entry needs a
+# worker even though the dependent theory's local cache entry is intact.
+write_theories local-cache-integrity
+run local-cache-integrity-base 0 build BTheory
+key_a=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rx/src/AScript.sml.key")
+ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
+dat_a=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$HOLBUILD_CACHE/actions/$key_a/manifest")
+sig_a=$(awk '$1 == "blob" && $2 == "sig" { print $3 }' "$HOLBUILD_CACHE/actions/$key_a/manifest")
+rm "$remote_root/ac/$ac_a" "$HOLBUILD_CACHE/blobs/$dat_a"
+printf 'corrupt local signature\n' > "$HOLBUILD_CACHE/blobs/$sig_a"
+rm -r "$project/.holbuild" "$HOLBUILD_CACHE/remote-ledger"
+run local-cache-integrity 0 build --remote-exec "$coordinator" --remote-only BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/local-cache-integrity.log")
+require_grep "^action $key_a .* rx:ATheory$" "$state/$batch.batch"
+refute_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/local-cache-integrity.log"
+
 # A submission answered 502 while the coordinator restarts is retried, and
 # given up on when it stays down.
 write_theories restarting

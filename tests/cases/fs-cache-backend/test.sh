@@ -90,6 +90,25 @@ val _ = assert "repair left corrupt bytes" (HolbuildFSCacheBackend.verify_blob c
 val _ = assert "verified temporary blob was copied again"
   (!transferred_inode = SOME (Posix.FileSys.ST.ino
     (Posix.FileSys.stat (HolbuildFSCacheBackend.blob_path cache hash))));
+
+(* A missing last blob in a chunk must not discard intact neighbours, and
+   a present blob with corrupt bytes must still be classified as a miss. *)
+val batch_hashes = List.tabulate (300, fn i =>
+  let
+    val text = "batch blob " ^ Int.toString i
+    val hash = HolbuildHash.string_sha256 text
+  in write_text (HolbuildFSCacheBackend.blob_path cache hash) text; hash end);
+val _ = assert "batched verification changed valid hashes or their order"
+  (HolbuildFSCacheBackend.verified_blobs cache batch_hashes = batch_hashes);
+val missing = List.nth (batch_hashes, 255);
+val corrupt = List.nth (batch_hashes, 5);
+val _ = OS.FileSys.remove (HolbuildFSCacheBackend.blob_path cache missing);
+val _ = write_text (HolbuildFSCacheBackend.blob_path cache corrupt) "corrupt batch blob";
+val _ = assert "batched verification accepted a missing or corrupt blob, or lost a valid neighbour"
+  (HolbuildFSCacheBackend.verified_blobs cache batch_hashes =
+   List.filter (fn hash => hash <> missing andalso hash <> corrupt) batch_hashes);
+val _ = assert "empty verification should need no external input"
+  (HolbuildFSCacheBackend.verified_blobs cache [] = []);
 val _ = OS.FileSys.remove (HolbuildFSCacheBackend.blob_path cache hash);
 val _ = assert "missing blob was not transferred" (transfer () = (1, 0));
 val _ = write_text source "invalid upload\n";
@@ -201,6 +220,17 @@ PATH="$tmpdir/bin:$PATH" FS_CACHE_BACKEND_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-p
 }
 
 grep -q "filesystem cache backend tests passed" "$tmpdir/fs-cache-backend-test.log"
+
+# The same missing/corrupt chunk must work when external hashing is unavailable.
+mkdir -p "$tmpdir/no-sha" "$tmpdir/fallback"
+printf '#!/bin/sh\nexit 1\n' > "$tmpdir/no-sha/sha256sum"
+chmod +x "$tmpdir/no-sha/sha256sum"
+PATH="$tmpdir/no-sha:$tmpdir/bin:$PATH" FS_CACHE_BACKEND_TEST_TMP="$tmpdir/fallback" \
+  "${HOLBUILD_POLY:-poly}" < "$tmpdir/fs-cache-backend-test.sml" > "$tmpdir/fallback.log" 2>&1 || {
+  cat "$tmpdir/fallback.log" >&2
+  exit 1
+}
+grep -q "filesystem cache backend tests passed" "$tmpdir/fallback.log"
 
 if [[ -s "$tmpdir/cp.log" ]]; then
   echo "the fetch started cp:" >&2

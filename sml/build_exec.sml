@@ -8017,17 +8017,34 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     fun is_forced (node, action) =
       force_node options project node orelse trace_steps (checkpoint_policy_for_node options project node) orelse
       List.exists (fn key => key = #input_key action) forced
-    fun built_here (node, action) =
-      local_resumable andalso not (is_forced (node, action)) andalso
-      ((case current_metadata (metadata_path project node) of
-           SOME text =>
-             metadata_input_key_matches (#input_key action) text andalso
-             metadata_timeout_satisfies (#allow_cache_timeout_discrepancy options)
-               (checkpoint_policy_for_node options project node) node text
-         | NONE => false)
-       orelse local_entry_satisfies options project plan node (#input_key action))
+    fun local_blobs (node, action) =
+      if not local_resumable orelse is_forced (node, action) then NONE
+      else if
+        (case current_metadata (metadata_path project node) of
+             SOME text =>
+               metadata_input_key_matches (#input_key action) text andalso
+               metadata_timeout_satisfies (#allow_cache_timeout_discrepancy options)
+                 (checkpoint_policy_for_node options project node) node text
+           | NONE => false)
+      then SOME []
+      else
+        case HolbuildCache.get_action (cache_root ()) (#input_key action) of
+            NONE => NONE
+          | SOME text =>
+              if entry_satisfies options project plan node (#input_key action) (fn _ => true) text
+              then SOME (HolbuildCacheTransfer.unique_blobs text)
+              else NONE
     val (here_actions, other_actions) =
-      detail_time_phase "action_spec.export.built_here" (fn () => List.partition built_here actions)
+      detail_time_phase "action_spec.export.built_here" (fn () =>
+        let
+          val prepared = map (fn action => (action, local_blobs action)) actions
+          val blobs = unique_strings (List.concat (List.mapPartial #2 prepared))
+          val verified = Binaryset.addList
+            (Binaryset.empty String.compare, HolbuildCache.verified_blobs (cache_root ()) blobs)
+          fun built_here (_, NONE) = false
+            | built_here (_, SOME hashes) = List.all (fn hash => Binaryset.member (verified, hash)) hashes
+          val (here, other) = List.partition built_here prepared
+        in (map #1 here, map #1 other) end)
     val uncached_actions =
       detail_time_phase "action_spec.export.remote_check" (fn () =>
         failing "checking remote cache" "theories" (fn remote => fn (node, action) =>

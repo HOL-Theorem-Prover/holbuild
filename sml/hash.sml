@@ -92,12 +92,10 @@ fun file_sha256 path =
       | NONE => string_sha256 (read_binary_all path)
   else string_sha256 (read_binary_all path)
 
-(* Spawning one process per file, or hashing in SML, costs far more than the
-   hashing itself, so hash a batch of files with one sha256sum per chunk.  Any
-   chunk whose output doesn't give one digest per file is hashed file by file. *)
-fun files_sha256 paths =
+(* Try one external batch without hashing a partially missing batch natively. *)
+fun external_files_sha256 [] = SOME []
+  | external_files_sha256 paths =
   let
-    val chunk_size = 256
     fun digest line =
       let val hex = if String.isPrefix "\\" line then String.extract(line, 1, NONE) else line
       in
@@ -105,23 +103,28 @@ fun files_sha256 paths =
         then SOME (String.map Char.toLower (String.substring(hex, 0, 64)))
         else NONE
       end
-    fun external chunk =
-      let
-        val result = HolbuildSpawn.run
-          {program = "sha256sum", args = "--" :: chunk, stderr = HolbuildSpawn.Discard}
-        val lines =
-          if HolbuildSpawn.succeeded result
-          then String.tokens (fn c => c = #"\n") (#output result)
-          else []
-        val digests = List.mapPartial digest lines
-      in
-        if length digests = length chunk andalso length lines = length chunk
-        then SOME digests
-        else NONE
-      end
-      handle _ => NONE
+    val result = HolbuildSpawn.run
+      {program = "sha256sum", args = "--" :: paths, stderr = HolbuildSpawn.Discard}
+    val lines =
+      if HolbuildSpawn.succeeded result
+      then String.tokens (fn c => c = #"\n") (#output result)
+      else []
+    val digests = List.mapPartial digest lines
+  in
+    if length digests = length paths andalso length lines = length paths
+    then SOME digests
+    else NONE
+  end
+  handle _ => NONE
+
+(* Spawning one process per file, or hashing in SML, costs far more than the
+   hashing itself, so hash a batch of files with one sha256sum per chunk.  Any
+   chunk whose output doesn't give one digest per file is hashed file by file. *)
+fun files_sha256 paths =
+  let
+    val chunk_size = 256
     fun hash_chunk chunk =
-      case external chunk of
+      case external_files_sha256 chunk of
           SOME digests => digests
         | NONE => map file_sha256 chunk
     fun loop [] acc = List.concat (rev acc)
