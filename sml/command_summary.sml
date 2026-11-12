@@ -15,6 +15,9 @@ val actions = ref (Binarymap.mkDict String.compare : (string, string) Binarymap.
 val counts = Array.array (4, 0)
 val mutex = Mutex.mutex ()
 
+(* Polling cannot certify that no execution occurred between snapshots. *)
+fun fleet_history_complete () = Binaryset.isEmpty (!batches) andalso Binarymap.numItems (!actions) = 0
+
 fun object fields = "{" ^ String.concatWith "," fields ^ "}"
 fun array values = "[" ^ String.concatWith "," values ^ "]"
 fun number name n = "\"" ^ name ^ "\":" ^ LargeInt.toString n
@@ -137,13 +140,18 @@ fun observe_action (batch, line) =
     val raw = Substring.string (Substring.dropr Char.isSpace (Substring.full line))
     val marker = object [J.json_string_field "input_key" key,
       J.json_string_field "state" "running", number "attempts" attempt]
+    val failure_fields = List.mapPartial (fn name =>
+      case field name of SOME text => if text = "" then NONE else SOME (J.json_string_field name text)
+                       | NONE => NONE) ["last_failure", "failure_detail", "log_sha256"]
   in
     (* A retry snapshot may be the only observation of the preceding result.
        Retain that payload independently, without assigning it to an attempt. *)
     (case began of
          SOME ms => retain ("result\000" ^ LargeInt.toString ms) "result" raw
        | NONE =>
-           if field "state" = SOME "running" then () else
+           if not (null failure_fields) then
+             retain ("untimed-failure\000" ^ HolbuildSha256.string_hex (object failure_fields)) "untimed" raw
+           else if field "state" = SOME "running" then () else
              retain ("untimed\000" ^ HolbuildSha256.string_hex raw) "untimed" raw);
     if field "state" = SOME "running" then
       retain ("attempt\000" ^ LargeInt.toString attempt) "attempt" marker
@@ -167,6 +175,7 @@ fun finish () = best_effort (fn () =>
            "\"plans\":" ^ array (rev (!plans)),
            "\"fleet_follows\":" ^ array (rev (!follows)),
            "\"fleet_batches\":" ^ array (map (fn id => "\"" ^ J.json_escape id ^ "\"") (Binaryset.listItems (!batches))),
+           J.json_bool_field "fleet_history_complete" (fleet_history_complete ()),
            "\"fleet_actions\":" ^ array (map #2 (Binarymap.listItems (!actions))),
            J.json_object_field "local_outcomes"
              (ListPair.mapEq (fn (name, i) => J.json_int_field name (Array.sub (counts, i)))

@@ -2030,6 +2030,10 @@ Observed worker results are retained once per action/execution start,
 independently of bare running-attempt markers. A result may first appear in
 a retry snapshot; its attempt is not inferred. Attempt markers keep coverage
 incomplete rather than claiming an exact retry history.
+`fleet_history_complete` is false whenever a remote batch or action was
+observed: polling cannot certify that no execution happened between snapshots.
+Untimed failure payloads are retained too, deduplicated by their failure fields
+without assigning an execution identity.
 These diagnostic snapshots do not participate in build or cache keys.
 
 Supervisors can set `HOLBUILD_COMMAND_RECORD` to a destination file and

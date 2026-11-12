@@ -1,6 +1,7 @@
 use "sml/holbuild-script.sml";
 
-fun reset () = HolbuildCommandSummary.actions := Binarymap.mkDict String.compare;
+fun reset () = (HolbuildCommandSummary.actions := Binarymap.mkDict String.compare;
+                HolbuildCommandSummary.batches := Binaryset.empty String.compare);
 fun event state attempt timing =
   "{\"input_key\":\"key\",\"state\":\"" ^ state ^ "\",\"attempts\":" ^ Int.toString attempt ^ timing ^ "}";
 fun result state attempt started failure = event state attempt
@@ -37,6 +38,8 @@ val _ = reset ();
 val _ = List.app observe [event "running" 1 "", event "waiting" 1 "", event "done" 2 ""];
 val _ = assert (length (entries "attempt") = 1 andalso null (entries "result"))
   "invented an execution result for an expired lease";
+val _ = assert (not (HolbuildCommandSummary.fleet_history_complete ()))
+  "claimed complete history after a missed result";
 
 (* Attaching during a retry sees an old result and a separate running marker, never a binding between them. *)
 val _ = reset ();
@@ -46,3 +49,23 @@ val _ = observe (result "running" 3 1000 "unavailable");
 val _ = observe (result "done" 3 5000 "");
 val _ = assert (length (entries "result") = 2 andalso length (entries "attempt") = 2)
   "late attachment lost an observed result or expired running marker";
+val _ = assert (not (HolbuildCommandSummary.fleet_history_complete ()))
+  "claimed complete history after late attachment";
+
+(* Worker failures with no timings can first appear in a running retry. *)
+val _ = reset ();
+val failed = ",\"last_failure\":\"memory\",\"failure_detail\":\"oom\",\"log_sha256\":\"log\",\"timings\":null";
+val _ = observe (event "running" 2 failed);
+val untimed = hd (entries "untimed");
+val _ = observe (event "waiting" 2 failed);
+val _ = observe (event "running" 3 failed);
+val _ = assert (entries "untimed" = [untimed] andalso length (entries "attempt") = 2)
+  "lost or duplicated an untimed failure across retry states";
+val _ = assert (HolbuildRemoteExec.json_string_field "failure_detail" untimed = SOME "oom" andalso
+                HolbuildRemoteExec.json_string_field "log_sha256" untimed = SOME "log" andalso
+                not (HolbuildCommandSummary.fleet_history_complete ()))
+  "dropped untimed failure fields or claimed complete coverage";
+val _ = reset ();
+val _ = HolbuildCommandSummary.batches := Binaryset.add (!HolbuildCommandSummary.batches, "submitted");
+val _ = assert (not (HolbuildCommandSummary.fleet_history_complete ()))
+  "claimed complete history for an unobserved batch";
