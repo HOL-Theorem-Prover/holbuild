@@ -17,6 +17,10 @@ val next_child_id = ref 0
 val active_child_mutex = Mutex.mutex ()
 val child_output_mutex = Mutex.mutex ()
 
+(* A token lives across a caller's retries, including gaps with no child.
+   Cancellation marks it before taking the children to signal. *)
+val cancellation_tokens = ref ([] : (Thread.thread * bool ref) list)
+
 fun with_active_child_lock f =
   let
     val _ = Mutex.lock active_child_mutex
@@ -26,10 +30,28 @@ fun with_active_child_lock f =
   end
   handle e => (Mutex.unlock active_child_mutex; raise e)
 
-fun register_child_group launch =
+fun require_uncancelled_locked NONE = ()
+  | require_uncancelled_locked (SOME token) = if !token then raise Thread.Interrupt else ()
+
+fun require_uncancelled token =
+  with_active_child_lock (fn () => require_uncancelled_locked (SOME token))
+
+fun with_cancellation_token f =
+  let
+    val token = ref false
+    val _ = with_active_child_lock
+      (fn () => cancellation_tokens := (Thread.self (), token) :: !cancellation_tokens)
+    fun remove () = with_active_child_lock
+      (fn () => cancellation_tokens := List.filter (fn (_, t) => t <> token) (!cancellation_tokens))
+  in
+    (f token before remove ()) handle e => (remove (); raise e)
+  end
+
+fun register_child_group_checked token launch =
   with_active_child_lock
     (fn () =>
         let
+          val _ = require_uncancelled_locked token
           (* Unix.execute briefly owns pipe ends that must not leak through
              another concurrent fork/exec.  Serialize only this short launch
              window, then release the registry lock while the child runs. *)
@@ -42,6 +64,8 @@ fun register_child_group launch =
                                  !active_child_groups;
           {id = id, process = process, reaped = reaped}
         end)
+
+fun register_child_group launch = register_child_group_checked NONE launch
 
 fun unregister_child_group id =
   with_active_child_lock
@@ -63,14 +87,21 @@ fun kill_group_forcefully ({process, reaped, ...} : active_child) =
   let fun signal s = with_active_child_lock (fn () => if !reaped then () else kill_child s process)
   in signal Posix.Signal.term; OS.Process.sleep (Time.fromReal 0.2); signal Posix.Signal.kill end
 
-fun kill_active_child_groups () = List.app kill_group_forcefully (active_child_group_snapshot ())
+fun cancel_children matches =
+  with_active_child_lock
+    (fn () =>
+        (List.app (fn (owner, token) => if matches owner then token := true else ())
+                  (!cancellation_tokens);
+         List.filter (fn {owner, ...} => matches owner) (!active_child_groups)))
 
-(* Stops, in the background, the children THREAD has running now: the
-   snapshot is taken here, so a child the thread launches later lives. *)
+fun kill_active_child_groups () = List.app kill_group_forcefully (cancel_children (fn _ => true))
+
+(* Stops THREAD's current children and active retry sequences. A new call
+   begun after this snapshot gets a new token and may launch children. *)
 fun kill_thread_children thread =
   let
     val children =
-      List.filter (fn {owner, ...} => Thread.equal (owner, thread)) (active_child_group_snapshot ())
+      cancel_children (fn owner => Thread.equal (owner, thread))
   in
     if null children then ()
     else ignore (Thread.fork (fn () => List.app kill_group_forcefully children, []))
@@ -203,10 +234,10 @@ fun with_inherited NONE launch = launch ()
 
 (* Runs SCRIPT and returns CONSUME (process, reap), where reap () reaps the
    child; consumers reap only through it. *)
-fun run_shell_process mutation_lease inherit script consume =
+fun run_shell_process_checked token mutation_lease inherit script consume =
   let
     val {id, process, reaped} =
-      register_child_group
+      register_child_group_checked token
         (fn () => with_inherited inherit
                     (fn () => launch_shell (Posix.ProcEnv.getpid ()) mutation_lease script))
     fun cleanup () = unregister_child_group id
@@ -219,6 +250,9 @@ fun run_shell_process mutation_lease inherit script consume =
   in
     (consume (process, reap) before cleanup ()) handle e => (abort (); raise e)
   end
+
+fun run_shell_process mutation_lease inherit script consume =
+  run_shell_process_checked NONE mutation_lease inherit script consume
 
 fun reap_with_output (process, reap) =
   let
@@ -272,6 +306,10 @@ fun run_shell_inheriting_until inherit deadline script =
   end
 
 fun run_shell_output script = run_shell_process NONE NONE script reap_with_output
+
+(* The token check and registration share the cancellation snapshot lock. *)
+fun run_shell_output_cancellable token script =
+  run_shell_process_checked (SOME token) NONE NONE script reap_with_output
 
 fun run_shell_with_mutation_lease {lease_path, script} =
   run_shell_process (SOME lease_path) NONE script

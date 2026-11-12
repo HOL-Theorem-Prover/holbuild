@@ -1270,6 +1270,15 @@ the analyser is built against, so another checkout of the same sources on the
 machine reads it instead of analysing again, and a different HOL pin never
 uses it.
 
+An analyser failure reports its exit status or signal and stderr. On systems
+with cgroup v2, it also reports available `memory.events` counters before and
+after the attempt. These counters cover a shared group; they do not identify
+the analyser as an OOM victim or establish why it was killed. Outside the
+action sandbox, SIGKILL or exit status 137 retries at most twice, after 100 ms
+and 200 ms, with fresh temporary files. Caller cancellation, other failures
+and sandboxed calls do not retry. Exit status 137 is compatible with a shell
+reporting SIGKILL, but can also be an explicit program exit.
+
 ### Keeping a tool's files between builds
 
 A tool run from theory scripts (a proof search with an index of the
