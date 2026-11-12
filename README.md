@@ -2040,6 +2040,35 @@ success with an old or absent log. The client restores the
 finished outputs without forcing a second build locally. Detached builds
 return their logs when attached.
 
+Each planned build also leaves a command record in
+`.holbuild/commands/<start>-<pid>.json`. It contains the command's timestamps
+and exit status, local build/restore counts, source changes since this
+worktree's previous attempted build, and fleet batch events with worker
+timings. Source comparisons survive changes of target; newly observed
+sources are reported separately. `source_hashes_complete` reports whether the
+planner supplied every selected source hash; recording never prepares or
+generates an extra source. A changed source's affected-theory count
+includes itself and covers only the requested plan, not the full project.
+Observed worker results are retained once per action/execution start,
+independently of bare running-attempt markers. A result may first appear in
+a retry snapshot; its attempt is not inferred. Attempt markers keep coverage
+incomplete rather than claiming an exact retry history.
+`fleet_history_complete` is false whenever a remote batch or action was
+observed: polling cannot certify that no execution happened between snapshots.
+Untimed failure payloads are retained too, deduplicated by their failure fields
+without assigning an execution identity.
+These diagnostic snapshots do not participate in build or cache keys.
+
+Supervisors can set `HOLBUILD_COMMAND_RECORD` to a destination file and
+`HOLBUILD_COMMAND_RECORD_PID` to the process ID which will exec holbuild.
+The PID check keeps inherited settings from overwriting a parent's record.
+Worker phase sums overlap across actions and within nested phases; they
+are not command wall time or CPU time. Worker timestamp spans permit a
+wall-time analysis when clocks are synchronized. Deferred checkpoint
+uploads continue after the action result and are outside its client wait.
+The `rebuilt` counter describes theory-build actions only. Remote run actions
+carry execution, HOL, publication and log spans without claiming a source rebuild.
+
 It exports and uploads the batch as `action-spec --upload` does, submits it
 with `POST URL/v1/batches`, and follows `GET URL/v1/batches/<id>/events`,
 printing each theory's state as it changes. While it follows the batch, it

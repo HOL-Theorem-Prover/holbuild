@@ -483,6 +483,7 @@ fun watched_dirs graph observed =
 fun recorded_env_var entry =
   String.isPrefix "HOLBUILD_" entry andalso
   not (String.isPrefix "HOLBUILD_TIMING_" entry) andalso
+  not (String.isPrefix "HOLBUILD_COMMAND_RECORD" entry) andalso
   not (String.isPrefix "HOLBUILD_PLAN_RECORD=" entry)
 
 (* An argument naming a file names it through any links it follows, which

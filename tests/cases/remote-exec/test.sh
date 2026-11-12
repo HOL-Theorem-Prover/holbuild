@@ -179,6 +179,21 @@ refute_grep "Theory built" "$tmpdir/follow.log"
 [[ $(grep -c . "$state/ran") -eq 2 ]] || { cat "$state/ran" >&2; exit 1; }
 require_grep "^action .* rx:ATheory$" "$state/b1.batch"
 require_grep "^edge " "$state/b1.batch"
+python3 - "$project" <<'PY'
+import json,pathlib,sys
+records=[json.loads(p.read_text()) for p in (pathlib.Path(sys.argv[1])/'.holbuild/commands').glob('*.json')]
+record=next(r for r in records if r['fleet_batches']==['b1'])
+assert record['exit_code']==0
+assert len(record['fleet_follows'])==1
+results=[a for a in record['fleet_actions'] if a['observation']=='result']
+assert len(results)==2
+assert all(a['action']['timings']['finished'] >= a['action']['timings']['started'] for a in results)
+assert sum(a['action']['timings']['rebuilt'] for a in results)==2
+assert record['fleet_history_complete'] is False
+assert all(set(a['action'])=={'input_key','state','attempts'} for a in record['fleet_actions'] if a['observation']=='attempt')
+assert record['local_outcomes']['built']==0
+assert record['local_outcomes']['restored_remote']==2
+PY
 
 # With everything cached there is nothing to submit.
 run cached 0 build --remote-exec "$coordinator" BTheory
@@ -1601,6 +1616,14 @@ require_grep "Use2Lib built" "$tmpdir/gen2.log"
 require_grep "AfterGenTheory restored from cache" "$tmpdir/gen2.log"
 refute_grep "Theory built" "$tmpdir/gen2.log"
 require_file "$gen2/src/Gen2ML.sml"
+python3 - "$gen2" <<'PYCODE'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+records=[json.loads(p.read_text()) for p in (root/'.holbuild/commands').glob('*.json')]
+assert len(records)==1 and len(records[0]['plans'])==1, records
+source=next(s for s in records[0]['plans'][0]['newly_observed_sources'] if s['path']=='src/Gen2ML.sml')
+assert source['sha256']==hashlib.sha256((root/'src/Gen2ML.sml').read_bytes()).hexdigest(), source
+PYCODE
 
 # check and check --fingerprint pre-build on the remote coordinator and run the
 # check script locally; when a valid deps_loaded checkpoint exists, check
