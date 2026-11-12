@@ -216,6 +216,7 @@ class QueueCounts:
     waiting_ahead_standard: int = 0  # of the running ones, claimed ahead and waiting for a parent
     waiting_ahead_high: int = 0
     high_run: int = 0  # internal: ready or running high-tier runs, for capped burst demand
+    ready_high_run: int = 0  # internal: of those, the ready ones
 
 
 # What a host report's counts and sizes may be: JSON's exact integers.
@@ -322,7 +323,9 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int,
     demand = max(0, active - warm_workers, high)
     # Work beyond what runs is ready work a burst worker could take; runs the run slots hold back are not.
     running_active = running - ahead - counts.running_run + min(run_slots, counts.running_run)
-    if high > counts.running_high - counts.waiting_ahead_high or active > max(warm_workers, running_active):
+    free_run_slots = max(0, run_slots - counts.running_run)
+    ready_high = counts.ready_high - counts.ready_high_run + min(counts.ready_high_run, free_run_slots)
+    if ready_high > 0 or active > max(warm_workers, running_active):
         demand += ahead
     return min(demand, max_burst_workers)
 
@@ -1670,6 +1673,7 @@ class Coordinator:
         count: defaultdict[tuple[str, str], int] = defaultdict(int)
         runs: defaultdict[str, int] = defaultdict(int)
         high_run = 0
+        ready_high_run = 0
         priorities: defaultdict[str, int] = defaultdict(int)
         for state, tier, action_class, prioritized, n in await conn.execute(statement):
             if state == "ahead":
@@ -1682,6 +1686,8 @@ class Coordinator:
                 runs[state] += n
                 if tier == "high" and state in ("ready", "running"):
                     high_run += n
+                if tier == "high" and state == "ready":
+                    ready_high_run += n
         return QueueCounts(
             waiting=count["waiting", "standard"] + count["waiting", "high"],
             ready_standard=count["ready", "standard"],
@@ -1691,6 +1697,7 @@ class Coordinator:
             ready_run=runs["ready"],
             running_run=runs["running"],
             high_run=high_run,
+            ready_high_run=ready_high_run,
             ready_priority=priorities["ready"],
             running_priority=priorities["running"],
             waiting_ahead_standard=count["ahead", "standard"],
