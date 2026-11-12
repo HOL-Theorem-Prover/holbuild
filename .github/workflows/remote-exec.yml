@@ -2,10 +2,11 @@ name: remote-exec
 
 on:
   pull_request:
-    paths: ['remote-exec/**', '.github/workflows/remote-exec.yml', 'sml/action_sandbox.*', 'tests/fixtures/action_sandbox_probe.py', 'Makefile']
+    paths: ['remote-exec/**', '.github/workflows/remote-exec.yml', '.github/workflows/release.yml', 'sml/action_sandbox.*', 'tests/fixtures/action_sandbox_probe.py', 'Makefile']
+  merge_group:
   push:
     branches: [master]
-    paths: ['remote-exec/**', '.github/workflows/remote-exec.yml', 'sml/action_sandbox.*', 'tests/fixtures/action_sandbox_probe.py', 'Makefile']
+    paths: ['remote-exec/**', '.github/workflows/remote-exec.yml', '.github/workflows/release.yml', 'sml/action_sandbox.*', 'tests/fixtures/action_sandbox_probe.py', 'Makefile']
   workflow_dispatch:
 
 concurrency:
