@@ -3,6 +3,7 @@
 import asyncio
 import time
 from typing import Any
+from uuid import UUID, uuid4
 
 import httpx
 import sqlalchemy as sa
@@ -18,6 +19,7 @@ from test_coordinator import (
     batch,
     build,
     claim,
+    claim_all,
     claim_named,
     complete,
     input_key,
@@ -372,3 +374,139 @@ async def test_input_missing_from_a_claim_ahead_counts_its_attempt_and_makes_it_
     missing = result("b", "failed", "input-missing", missing=f"theory {input_key('p')}")
     assert (await complete(http, b["attempt_token"], missing)).status_code == 200
     assert await ahead_state(remote_exec_engine, "b") == ("waiting", "no", 1, 2)
+
+
+async def test_a_claim_ahead_of_several_tiers_takes_its_first_tier_before_a_lower_tier_of_a_batch_with_one(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "x"], [("x", "a")], speculative_loading="4", priority="1")
+    await submit(http, ["b", "h", "s"], [("h", "b"), ("s", "b")], speculative_loading="4")
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE input_key = :key"), {"key": input_key("h")})
+    await claim_named(http, "a")
+    await claim_named(http, "b")
+    await coordinator._ahead_candidates()
+
+    # "h", the shared read's only high-tier candidate, may no longer be claimed ahead; "x" outranks "s".
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE actions SET ahead = 'abandoned' WHERE input_key = :key"), {"key": input_key("h")}
+        )
+    claimed = await claim_ahead(http, "high", also_claim=["standard"])
+    assert claimed is not None and claimed["theory"] == "pkg:x"
+
+
+async def test_a_parent_evicted_before_a_release_revokes_the_child_claimed_ahead_as_abandoned(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    await submit(
+        http, ["p1", "p2", "q", "c", "d"], [("c", "p1"), ("c", "p2"), ("d", "p1"), ("d", "q")], speculative_loading="1"
+    )
+    await build(http, cache, "p1")
+    await claim_named(http, "p2")
+    q = await claim_named(http, "q")
+    c = await claim_ahead(http)
+    assert c is not None and c["theory"] == "pkg:c"
+
+    # "d" is released once "q" is done, and finds "p1" evicted.
+    cache.keys.discard(ac_key("p1"))
+    cache.keys.add(ac_key("q"))
+    assert (await complete(http, q, result("q", "built"))).status_code == 200
+    await coordinator.released()
+    assert await ahead_state(remote_exec_engine, "p1") == ("ready", "no", 1, 0)
+    assert await ahead_state(remote_exec_engine, "c") == ("waiting", "abandoned", 0, 2)
+
+
+async def test_requeueing_a_parent_of_a_batch_that_does_not_load_ahead_looks_for_no_claim_ahead(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    statements: list[str] = []
+
+    def executed(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        statements.append(statement)
+
+    sa.event.listen(remote_exec_engine.sync_engine, "before_cursor_execute", executed)
+    batch_id = await submit(http, ["a", "b", "p", "q", "d"], [("b", "a"), ("d", "p"), ("d", "q")])
+    await build(http, cache, "a")
+    await build(http, cache, "p")
+    tokens = await claim_all(http, 2)
+
+    cache.keys -= {ac_key("a"), ac_key("p")}
+    missing = result("b", "failed", "input-missing", missing=f"theory {input_key('a')}")
+    assert (await complete(http, tokens["b"], missing)).status_code == 200
+    cache.keys.add(ac_key("q"))
+    assert (await complete(http, tokens["q"], result("q", "built"))).status_code == 200
+    await coordinator.released()
+    sa.event.remove(remote_exec_engine.sync_engine, "before_cursor_execute", executed)
+    assert await states(http, batch_id) == {"a": "ready", "b": "waiting", "p": "ready", "q": "done", "d": "waiting"}
+    assert not [statement for statement in statements if "revoked" in statement]
+
+
+async def test_claiming_and_revoking_ahead_read_each_actions_edges_by_key(
+    coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    """Claiming ahead, recounting a parent's children claimed ahead and revoking them read a few pages per action,
+    even in a batch the database's statistics don't know yet, as after every submit."""
+    old, new = uuid4(), uuid4()
+    width, layers, parents = 10, 20, 5
+
+    async def add(connection: Any, batch_id: UUID) -> None:
+        values = {"id": batch_id, "width": width, "parents": parents, "n": width * layers}
+        await connection.execute(
+            sa.text("INSERT INTO batches (id, state, profile, ahead_cap) VALUES (:id, 'running', 'default', 4)"), values
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, 'k' || g, 'ac' || g, 's', 'pkg:t' || g, CASE WHEN g < :width THEN 0 ELSE :parents END, "
+                "'waiting', 'standard' FROM generate_series(0, :n - 1) g"
+            ),
+            values,
+        )
+        await connection.execute(  # each action after the first layer has parents in the layer before it
+            sa.text(
+                "INSERT INTO edges (batch_id, input_key, parent_key) "
+                "SELECT :id, 'k' || g, 'k' || ((g / :width - 1) * :width + (g + p) % :width) "
+                "FROM generate_series(:width, :n - 1) g, generate_series(0, :parents - 1) p"
+            ),
+            values,
+        )
+
+    async def pages(connection: Any, query: sa.TextClause, parameters: dict[str, object]) -> int:
+        plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query.text}"), parameters)
+        return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
+
+    roots = [f"k{i}" for i in range(width)]
+    children = [f"k{i}" for i in range(width, 2 * width)]
+    async with remote_exec_engine.begin() as connection:  # autovacuum can't see this transaction
+        await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
+        await add(connection, old)
+        await connection.execute(sa.text("ANALYZE"))
+        await add(connection, new)
+        # The roots run, and a child of theirs runs claimed ahead of them.
+        await connection.execute(
+            sa.text("UPDATE actions SET state = 'running' WHERE batch_id = :id AND input_key = ANY(:keys)"),
+            {"id": new, "keys": roots},
+        )
+        await connection.execute(
+            sa.text("UPDATE actions SET state = 'running', ahead = 'ahead' WHERE batch_id = :id AND input_key = 'k10'"),
+            {"id": new},
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO leases (attempt_token, batch_id, input_key, worker, expires_at) "
+                "VALUES (:token, :id, 'k10', 'w', now() + interval '1 hour')"
+            ),
+            {"token": uuid4(), "id": new},
+        )
+        for query, parameters in [
+            (coordinator_module.CLAIM_AHEAD_ACTION, {"batch_id": new, "keys": children, "tier": "standard"}),
+            (coordinator_module.REFRESH_AHEAD_CHILDREN, {"batch_id": new, "key": "k0"}),
+            (coordinator_module.REVOKE_AHEAD, {"batch_id": new, "keys": ["k0"]}),
+        ]:
+            assert await pages(connection, query, parameters) < 50 * width, query.text
+        assert await connection.scalar(
+            sa.text("SELECT ahead FROM actions WHERE batch_id = :id AND input_key = 'k10'"), {"id": new}
+        ) == "abandoned"
+        await connection.rollback()

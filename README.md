@@ -495,16 +495,23 @@ child that fits the budget starts whatever `MemAvailable` says, so a build
 never waits on memory none of its children use. Where `/proc/meminfo` has no
 `MemAvailable` (outside Linux), only the reservations count, and the default
 charge is `--max-heap` + 1 GiB, what a child can reach. `/proc/meminfo` shows
-the whole machine, not a container's memory limit, so inside a
-memory-limited container set `--child-charge` to what a child can reach. A child
+the whole machine, not a container's memory limit. Where cgroup v2 limits the
+memory of holbuild's group or of a group enclosing it (a container, a systemd
+or Slurm scope), a child also starts only while the tightest of those groups
+has its charge left (`memory.max` less `memory.current`, plus its reclaimable
+`inactive_file` page cache, less the charges of children still starting),
+whether or not any reservation is held, and a charge larger than the least
+`memory.max` fails at once. Under cgroup v1, or another memory limit holbuild
+can't read, set `--child-charge` to what a child can reach. A child
 that waits shows as `(waiting for memory)` in the status line, as a
 `waiting for machine memory` line otherwise, and as a `waiting_for_memory`
 event with `--json`. A charge larger than the whole budget fails at once.
 
 This bounds admission; it does not enforce RSS: children already running can
 still grow together, up to their `--max-heap`, past what the machine has left,
-since nothing re-checks a child once it has started. It covers neither HOL
-toolchain builds nor `check`, `run` or `repl`.
+since nothing re-checks a child once it has started. The HOL session of
+fingerprint checks and `run` takes a reservation like a theory child; HOL toolchain
+builds and `repl` take none.
 
 - The budget is the byte count in `DIR/budget`, which `--machine-max-mem`
   creates on first use. Without that file, it is the default, recomputed from
@@ -536,8 +543,9 @@ manifest in use is watched as well (not recursively), so a `holbuild.toml` or
 currently requires `inotifywait` from `inotify-tools` and does not support
 `--json`, `--dry-run`, or `--repl-on-failure`.
 
-`holbuild check MyTheory` builds the theory if needed, loads it in HOL and
-checks the tags and hypotheses of its stored theorems. It prints one line per
+`holbuild check MyTheory` builds the theory if needed, then reads the restored
+`Theory.dat` files directly, without starting HOL or loading ancestor terms.
+It checks the tags and hypotheses of its stored theorems. It prints one line per
 theorem whose tag carries an oracle other than `DISK_THM` (for instance
 `MyTheory.my_theorem: cheat`) and one per axiom declared in the theory or its
 ancestors outside HOL itself, that is, in the root package or a dependency
@@ -553,23 +561,22 @@ line per use (`mypkg:src/MyScript.sml:12: kernel bypass: disk_thm`). Names in
 comments and string literals don't count; the scan is a backstop, not a
 sandbox. With findings it exits non-zero; otherwise it prints
 `MyTheory: clean (N theorems)` and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
-Pass several selectors to share one build of the distinct targets and one HOL
-session: `holbuild check MyTheory OtherTheory:my_theorem`. Each selector keeps
+Pass several selectors to share one build of the distinct targets:
+`holbuild check MyTheory OtherTheory:my_theorem`. Each selector keeps
 its own findings or clean line, in argument order (including repeated selectors).
 Findings do not stop later checks; the command exits non-zero if any selector
-has findings. Invalid selectors, missing theorems and load errors abort the
+has findings. Invalid selectors, missing theorems and unreadable theory data abort the
 command.
 
 `check` builds the theories, and any `[run].loads`, without proof steps or
 checkpoints: it applies no step timeout (that is `build`'s check) and reuses
-theories built by `holbuild build --skip-proof-steps`. The tags are those
+theories built by `holbuild build --skip-proof-steps`. Plain checks do not execute
+`[run].loads`; fingerprint modes load them in HOL. The tags are those
 recorded in the built theory, which may have been restored from a cache;
-run `holbuild build --no-cache MyTheory` first to check a fresh build. HOL
-starts from a valid dependency checkpoint or the toolchain's base state, never
-from `[run].heap`, which may hold an older copy of a theory.
+run `holbuild build --no-cache MyTheory` first to check a fresh build.
 
-`holbuild check --fingerprint MyTheory` builds and loads the theory the same
-way and prints one tab-separated line per axiom, definition and theorem stored
+`holbuild check --fingerprint MyTheory` builds the theory, then loads it in HOL
+and prints one tab-separated line per axiom, definition and theorem stored
 in it and in each of its ancestors, HOL's own theories included, sorted
 bytewise so that two runs diff cleanly. Several theories can be passed together
 (`holbuild check --fingerprint MyTheory OtherTheory`); their shared ancestors
@@ -584,7 +591,10 @@ fingerprint	MyTheory	theorem	other_theorem	77d0…	cheat
 `holbuild check --with-fingerprints MyTheory:my_theorem` does both in one HOL
 session: it checks the selectors as plain `check` does and prints the
 fingerprint lines of their theories, and exits with the check's status. A
-tool that wants both pays for one theory load instead of two.
+tool that wants both pays for one theory load. Both fingerprint modes start HOL
+from a valid dependency checkpoint or the toolchain's base state, never from
+`[run].heap`, which may hold an older copy of a theory. These HOL sessions use
+one GC thread and take the same `--cooperate-dir` memory reservation as builds.
 
 Build progress and HOL's own messages share stdout, so keep the lines that
 start with `fingerprint` and a tab (`grep '^fingerprint'`). After that column
@@ -1925,14 +1935,44 @@ analysers, and a toolchain another holbuild process is using is kept.
 Workers sharing a host coordinate sweeps through `<cache root>/locks/gc.lock`;
 share `locks/` along with the cache directories. Private checkpoints and theory modules are sized
 on every action. With a positive reserve and a target of at least 64 GiB,
-shared sizes can be reused for up to 60 seconds when the last measurement plus
-current private sizes fit under the target. Smaller targets and zero-reserve
-runs are scanned live. This is a housekeeping limit: shared growth during
-that interval is accounted for at the next scan, rather than reserved on each
-write. Each cached root's device and inode must match the measurement; roots
+shared sizes can be reused for 60 seconds when the last measurement plus
+current private sizes fit under the target. An expired fitting estimate is
+rechecked under `gc.lock` and may defer scanning for five minutes from its
+first reuse; subsequent actions reuse an already-active grace without waiting
+on the sweep lock again. Its grace is bound to that exact measurement in
+`locks/worker-cache-cap.grace`; replacing the measurement resets the grace.
+Idle time does not consume it. After the result, background maintenance
+uses a separate single-flight scan lock. It skips a measurement younger than
+30 seconds only when it fits the lower background threshold, or when this
+worker implementation completed maintenance within 30 seconds. Completed
+refresh walks and eviction sweeps record this separate cooldown in
+`locks/worker-cache-cap.refresh`, so older workers publishing near-target
+measurements cannot postpone trimming. This cooldown also prevents repeated
+scans of entries still in use; it never permits foreground estimate reuse.
+The read-only walk leaves `gc.lock` available; publication briefly tries that
+lock and checks that the old stamp and root identities have not changed.
+A background refresh above a quarter-reserve below the target waits for
+`gc.lock` and trims the cache, reusing its
+walk if the stamp and root identities still match; otherwise it rechecks a
+sibling's fresh estimate or scans again.
+
+Smaller targets and zero-reserve runs are scanned live. Measurements are
+dated at scan completion. This is a housekeeping limit: concurrent writes
+during scans and reuse are accounted for by later scans, rather than
+reserved on each write. Each cached root's device and inode must match the measurement; roots
 that differ are sized live, so partial directory sharing remains safe without
 repeatedly replacing a sibling's measurement. Eviction lists are built only
-when the measured cache exceeds its target.
+when the measured cache exceeds the relevant foreground or background threshold.
+With a positive reserve and a
+target of at least 64 GiB, eviction then continues to half a reserve below
+the target, leaving room for private action files and concurrent writes.
+For example, a 400 GiB cap with a 40 GiB reserve triggers foreground eviction
+at 360 GiB, background trimming at 350 GiB, and evicts to 340 GiB. The ordinary
+360 GiB ceiling still controls foreground estimate reuse. A fitting shared
+measurement remains available during preemptive trimming; an actually
+over-target sweep invalidates it until remeasured.
+If entries in use prevent reaching it, a remaining size under the ordinary
+target still publishes a measurement for waiting actions.
 Unreferenced blobs younger than five minutes are evicted after other families,
 and are still removable if needed to reach the target.
 
