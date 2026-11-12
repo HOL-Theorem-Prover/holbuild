@@ -482,8 +482,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   goes one generation ahead. Its worker loads the action's ancestors that
   exist and waits for the running parents' outputs, which the claim names in
   `ahead_parents`. At most `<cap>` of a batch's actions wait ahead at once;
-  among the candidates of the batches below their cap, the claim takes the
-  highest batch priority, then the longest chain of dependents. A parent
+  among the candidates of the batches below their cap, the claim takes its
+  first tier with one, then the highest batch priority, then the longest chain
+  of dependents. A parent
   finishing recounts its running children's unfinished parents; a parent that
   fails for good cancels them as it does every descendant. A parent that goes
   back to waiting (a retry, an expired lease, a done parent built again)
@@ -561,7 +562,7 @@ they don't take it.
 active = ready_build + running_build - waiting_ahead + min(RUN_SLOTS, ready_run + running_run)
 high = ready_high_build + running_high_build - waiting_ahead_high + min(RUN_SLOTS, ready_high_run + running_high_run)
 plain = max(0, active - WARM_WORKERS, high)
-demand = min(MAX_BURST_WORKERS, plain + waiting_ahead)   if ready_high > 0 or (ready_standard > 0 and active > WARM_WORKERS)
+demand = min(MAX_BURST_WORKERS, plain + waiting_ahead)   if high > running_high - waiting_ahead_high or (ready_standard > 0 and active > WARM_WORKERS)
 demand = min(MAX_BURST_WORKERS, plain)                   otherwise
 ```
 
