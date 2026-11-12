@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOLBUILD_BIN=$1
+_HOLBUILD_BIN=$1
 _HOLDIR=$2
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 trap 'cleanup_temp_dir "$tmpdir"' EXIT
 export HOLBUILD_CACHE=$tmpdir/cache
-mkdir -p "$HOLBUILD_CACHE" "$tmpdir/bin" "$tmpdir/group/child" "$tmpdir/root" "$tmpdir/checkpoints"
+mkdir -p "$HOLBUILD_CACHE" "$tmpdir/bin" "$tmpdir/group/child" "$tmpdir/root" "$tmpdir/checkpoints" "$tmpdir/toolchain/analyser/bin"
 
 cat > "$tmpdir/bin/analyser" <<'HELPER'
 #!/bin/sh
@@ -52,12 +52,12 @@ esac
 printf 'version 1\nok\nbegin-file 1\nend-file 1\nend\n' > "$response"
 HELPER
 chmod +x "$tmpdir/bin/analyser"
-cat > "$tmpdir/bin/sandbox-analyser" <<'HELPER'
+cat > "$tmpdir/toolchain/analyser/bin/analyser" <<'HELPER'
 #!/bin/sh
 printf 'confined failure\n' >&2
 exit 137
 HELPER
-chmod +x "$tmpdir/bin/sandbox-analyser"
+chmod +x "$tmpdir/toolchain/analyser/bin/analyser"
 
 cat > "$tmpdir/test.sml" <<'SML'
 val root = valOf (OS.Process.getEnv "HOLBUILD_ROOT");
@@ -170,6 +170,19 @@ val _ = write "group/memory.events" "oom invalid\noom_kill -3\n";
 val _ = assert "malformed optional counters ignored" (null (HolbuildMachineMemory.cgroup_memory_events ()));
 val _ = setenv ("HOLBUILD_TEST_CGROUP", "", 1);
 
+(* Sandbox validation stays real; the launch counter is in the trusted parent. *)
+val _ = if OS.Process.getEnv "ANALYSER_FAILURE_TEST_SANDBOX" = SOME "1" then
+  let
+    val _ = G.launches := 0
+    val _ = HolbuildActionSandbox.enable (path "root", path "checkpoints")
+    val _ = HolbuildActionSandbox.poly_executable := "/usr/bin/true"
+    val result = D.run_analyser {analyser = path "toolchain/analyser/bin/analyser", request = "test", capture_stderr = true}
+    val _ = HolbuildActionSandbox.disable ()
+  in
+    assert "sandbox failure not retried" (!G.launches = 1 andalso #response result = NONE);
+    assert "sandbox stderr preserved" (contains (#stderr result) "confined failure")
+  end else ();
+
 fun await label predicate =
   let val deadline = Time.+ (Time.now (), Time.fromSeconds 15)
       fun loop () = if predicate () then () else if Time.>= (Time.now (), deadline)
@@ -210,18 +223,6 @@ val _ = G.with_cancellation_token (fn token =>
   assert "new scope works after prior cancellation"
     (OS.Process.isSuccess (#status (G.run_shell_output_cancellable token "true"))));
 
-(* Sandbox validation stays real; the launch counter is in the trusted parent. *)
-val _ = if OS.Process.getEnv "ANALYSER_FAILURE_TEST_SANDBOX" = SOME "1" then
-  let
-    val _ = G.launches := 0
-    val _ = HolbuildActionSandbox.enable (path "root", path "checkpoints")
-    val _ = HolbuildActionSandbox.poly_executable := "/usr/bin/true"
-    val result = D.run_analyser {analyser = path "bin/sandbox-analyser", request = "test", capture_stderr = true}
-    val _ = HolbuildActionSandbox.disable ()
-  in
-    assert "sandbox failure not retried" (!G.launches = 1 andalso #response result = NONE);
-    assert "sandbox stderr preserved" (contains (#stderr result) "confined failure")
-  end else ();
 val _ = print "analyser failure tests passed\n";
 SML
 
