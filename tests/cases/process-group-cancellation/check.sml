@@ -1,5 +1,6 @@
 val root = valOf (OS.Process.getEnv "HOLBUILD_ROOT");
 val tmp = valOf (OS.Process.getEnv "HOLBUILD_PROCESS_TEST_DIR");
+val ps = valOf (OS.Process.getEnv "HOLBUILD_PROCESS_TEST_PS");
 val _ = OS.FileSys.chDir root;
 use "sml/holbuild-script.sml";
 structure G = HolbuildProcessGroup;
@@ -26,7 +27,7 @@ fun leader_pid name = List.nth (String.tokens Char.isSpace (read (tmp ^ "/" ^ na
 fun process_alive pid =
   let
     val {status, output} = HolbuildSpawn.run
-      {program = "ps", args = ["-o", "stat=", "-p", pid],
+      {program = ps, args = ["-o", "stat=", "-p", pid],
        stderr = HolbuildSpawn.Discard}
   in
     HolbuildSpawn.succeeded {status = status, output = output} andalso
