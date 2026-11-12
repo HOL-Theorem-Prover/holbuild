@@ -20,14 +20,14 @@ fun run wants source_path =
        P.join ["command", "analyse"],
        P.join (["file", "1", source_path] @ wants),
        P.join ["end"]] ^ "\n"
-    val {output, stderr, response} =
+    val result as {output, response, ...} =
       HolbuildDependencies.run_analyser {analyser = analyser (), request = request, capture_stderr = true}
   in
     print output;
     case response of
         SOME text => String.tokens (fn c => c = #"\n") text
       | NONE => raise HolbuildTheoryCheckpoints.Error ("holbuild-hol-analyser failed for " ^ source_path ^
-                                                       (if stderr = "" then "" else "\n" ^ stderr))
+          "\n" ^ HolbuildDependencies.analyser_failure result)
   end
 
 fun parse_boundary fields =
