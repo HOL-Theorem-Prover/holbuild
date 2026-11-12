@@ -94,7 +94,7 @@ key_c=$(plan_key CTheory)
 # text hashes to its input key, and its source line matches that text.
 check_specs() {
   python3 - "$project/.holbuild/action-specs" "$1" <<'PY'
-import hashlib, pathlib, sys
+import hashlib, pathlib, re, sys
 spec_dir, batch = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).read_text().splitlines()
 assert batch[0] == "holbuild-action-batch-v1", batch
 for line in batch[1:]:
@@ -112,6 +112,7 @@ for line in batch[1:]:
     assert f"input-key={key}" in lines, (target, key)
     assert hashlib.sha256(action_text).hexdigest() == key, target
     assert f"action-text-sha256={key}" in lines, target
+    assert any(re.fullmatch("deps-key=[0-9a-f]{64}", l) for l in lines), target
     assert f"target {target}" in lines, target
     source = [l.split() for l in lines if l.startswith("source ")]
     assert len(source) == 1, source

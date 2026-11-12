@@ -251,6 +251,7 @@ type capsule_package =
    version : string option,
    toolchain_key : string,
    root : string,
+   directories : string list,
    files : string list}
 
 fun capsule_manifest_text ({name, version, toolchain_key, ...} : capsule_package) =
@@ -304,6 +305,7 @@ fun stage_package stage_dir (package : capsule_package) =
     val source_root = Path.concat(dir, source_dir)
   in
     ensure_stage_dir source_root;
+    List.app (fn rel => ensure_stage_dir (Path.concat(source_root, rel))) (#directories package);
     List.app (stage_source_file (#root package) source_root) (#files package);
     write_text (Path.concat(dir, "manifest")) (capsule_manifest_text package);
     Posix.FileSys.chmod (Path.concat(dir, "manifest"), plain_mode)
