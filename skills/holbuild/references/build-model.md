@@ -73,7 +73,14 @@ Proof engine/checkpoint/timeout/trace flags are intentionally not final artifact
 
 `extra_deps` are filesystem dependencies outside the normal HOL dependency graph. Manifest entries are package-root-relative; source annotations of the form `holbuild_extra_deps ["../data/table.txt"]` are source-file-relative. Entries may name files, directories, or simple globs. Expanded contents are hashed into the action key, and source-declared entries are staged so matching relative filesystem reads work during the action.
 
-Theory scripts can declare deterministic extra output files with `holbuild_extra_outputs ["results/test.nsv"]`. Paths are source-file-relative fixed paths inside the package; absolute paths, `.`/`..` components, directories, and globs are not supported. Declared files are required after execution, included in local up-to-date checks and action-cache blobs, restored by local/remote/HBX caches, and removed by `clean TARGET`. Cleaning does not force source regeneration because the next build may restore the file from cache.
+Theory scripts can declare deterministic extra output files with a static literal annotation. Define the no-op function before calling it; HOL does not provide it, and holbuild scans the literal list in the source:
+
+```sml
+fun holbuild_extra_outputs (_ : string list) = ();
+val _ = holbuild_extra_outputs ["results/test.nsv"];
+```
+
+The script must write the declared files itself. Paths are source-file-relative fixed paths inside the package; absolute paths, `.`/`..` components, directories, and globs are not supported. Declared files are required after execution, included in local up-to-date checks and action-cache blobs, restored by local/remote/HBX caches, and removed by `clean TARGET`. Cleaning does not force source regeneration because the next build may restore the file from cache.
 
 ## Up-to-date check
 
