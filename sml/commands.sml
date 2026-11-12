@@ -2870,9 +2870,11 @@ fun build_heap_kind tc cli_jobs command args =
           HolbuildBuildExec.build (heap_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)))
                                  tc project plan toolchain_key jobs
         val {index, components, plan} = plan_heap ()
+        fun observe plan = if Option.isSome url then () else HolbuildCommandSummary.observe_plan project plan
         val plan =
-          if build_generated_source_owners build_plan components (#holdir tc) index plan then #plan (plan_heap ())
-          else plan
+          (if build_generated_source_owners build_plan components (#holdir tc) index plan then #plan (plan_heap ())
+           else plan) handle e => (observe plan; raise e)
+        val _ = observe plan
       in
         build_plan plan;
         HolbuildBuildExec.export_heap tc project plan output_path kind

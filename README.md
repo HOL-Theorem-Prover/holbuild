@@ -2026,6 +2026,8 @@ sources are reported separately. `source_hashes_complete` reports whether the
 planner supplied every selected source hash; recording never prepares or
 generates an extra source. A changed source's affected-theory count
 includes itself and covers only the requested plan, not the full project.
+Retried action snapshots mark inherited result timings as
+`timings_current: false`; those timings do not describe the pending attempt.
 These diagnostic snapshots do not participate in build or cache keys.
 
 Supervisors can set `HOLBUILD_COMMAND_RECORD` to a destination file and

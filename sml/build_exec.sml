@@ -11359,7 +11359,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         if done then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
-          (phase "publish" (fn () => check_remote_publication remote root spec);
+          (phase "check" (fn () => phase "publish" (fn () => check_remote_publication remote root spec));
            "cached")
         else build spec tc forced cutoff NONE
       end
