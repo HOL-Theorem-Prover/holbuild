@@ -43,7 +43,7 @@ fun command name : command =
          valued = build_cache_valued @ remote_valued @ [("--priority", Nothing), ("--attach", Nothing)],
          operands = Targets}
     | "action-spec" =>
-        {flags = "--upload" :: build_cache_flags, valued = build_cache_valued, operands = Targets}
+        {flags = ["--upload", "--remote-only"] @ build_cache_flags, valued = build_cache_valued, operands = Targets}
     | "context" => {flags = ["--trknl"], valued = [], operands = Nothing}
     | "buildhol" => {flags = ["--trknl"], valued = [], operands = Nothing}
     | "repl" => {flags = ["--remote-only"], valued = ("--from", Theories) :: remote_valued, operands = Nothing}

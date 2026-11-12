@@ -2477,8 +2477,9 @@ fallback remains valid.
 
 Publishing a GitHub release is what makes it live: installs and deployments
 that follow the latest release pick it up, while a pushed tag or a draft
-release changes nothing for them. A release that would break its consumers
-is therefore created as a draft and published only once they are ready.
+release changes nothing for them. Every tag release is created as a draft
+and published only after the candidate passes validation against its
+consumers.
 
 ### Breaking releases
 
@@ -2498,8 +2499,8 @@ A release is breaking if, compared with the latest published release:
 
 `tools/release-breaking.sh BASE TAG` applies these two checks and prints the
 reasons. Because it compares with the latest published release rather than
-the previous tag, every release tagged while a breaking draft is pending is
-a draft too.
+the previous tag, every candidate tagged while a breaking draft is pending
+still reports the outstanding breaking changes.
 
 The golden key dump covers one small fixture project. Before tagging, run
 `tools/release-key-inventory.sh` against your consumers to catch key changes
@@ -2511,14 +2512,16 @@ tools/release-key-inventory.sh /path/to/published/holbuild \
   /path/to/candidate/bin/holbuild [action-spec arguments...]
 ```
 
-It plans the project with `action-spec` under both binaries, building
-nothing, and lists the theories the published release can restore from the
+It plans the project with `action-spec` under both binaries and lists the
+theories the published release can restore from the
 remote cache but the candidate can't. Pass the consumer's own build flags
 and targets (`--skip-proof-steps`, say), since they select the cache entries.
+Pass `--remote-only` to prevent a local HOL toolchain build: an uncached
+toolchain then exits 75. The inventory exits 1 only for lost restorable
+theories; command errors exit at least 2, preserving exit 75.
 If it lists any theory, the release is breaking: record that with a
 `Breaking-change:` trailer on a commit of the release before tagging (the
-version bump, or an empty commit), so that this release and every later one
-tagged before it is published are drafts.
+version bump, or an empty commit), so the release notes record the break.
 
 ### Steps
 
@@ -2540,10 +2543,16 @@ tagged before it is published are drafts.
    archives, then tests downloaded copies on fresh runners without Poly/ML.
    Only after both platforms pass does it attach the archives and
    `SHA256SUMS`, plus the shared Poly/ML source archive, to the release. If
-   no release exists for the tag, it creates one with generated notes: a
-   draft, with the reasons first in its notes, if the release is breaking;
-   otherwise published. An existing release (including a draft) retains its
-   notes and publication state.
+   no release exists for the tag, it creates a draft with generated notes,
+   with the reasons first in its notes if the release is breaking. An
+   existing release (including a draft) retains its notes and publication
+   state.
+6. Validate the draft candidate against its consumers before publishing it:
+   compare cache-key inventories before warming the cache, run consumer
+   builds with their usual flags, and check any affected runtime tools.
+   Publish only once these checks and packaging pass. For a non-breaking
+   candidate, publish the draft with `gh release edit vX.Y.Z --draft=false
+   --latest`; breaking candidates also need the coordinated steps below.
 
 The workflow also checks packaging on relevant pull requests without
 publishing anything. To rebuild assets, rerun the tag's
