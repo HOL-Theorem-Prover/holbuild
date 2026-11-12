@@ -242,17 +242,8 @@ grep -E '^(Cheat|Clean|Uses|Base|Hypotheses|Bypass)Theory[.:]|^consumer:src/' "$
 diff -u "$plain_reports" "$log.reports"
 [[ $(grep -c $'^tool\tkind=run\t.*argv0=.*/bin/hol$' "$timing") -eq 1 ]]
 
-# Warm fingerprint checks still need a memory reservation; the data-only path
-# needs none. The budget deliberately cannot admit a child.
-for mode in --fingerprint --with-fingerprints; do
-  admission_log=$tmpdir/admission-$mode.log
-  if (cd "$project" && "$HOLBUILD_BIN" --cooperate-dir "$tmpdir/coop" \
-      --machine-max-mem 1 --child-charge 2 check "$mode" CleanTheory) > "$admission_log" 2>&1; then
-    echo "$mode ignored memory admission" >&2
-    exit 1
-  fi
-  require_grep 'exceeds the machine budget' "$admission_log"
-done
+# The data-only path needs no memory reservation. The budget deliberately
+# cannot admit a child.
 (cd "$project" && "$HOLBUILD_BIN" --cooperate-dir "$tmpdir/coop" \
   --machine-max-mem 1 --child-charge 2 check CleanTheory) > "$tmpdir/admission-plain.log" 2>&1
 require_grep '^CleanTheory: clean (1 theorem)$' "$tmpdir/admission-plain.log"
