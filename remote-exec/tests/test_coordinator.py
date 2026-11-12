@@ -2146,6 +2146,61 @@ async def test_run_admission_waiters_leave_connections_for_heartbeats_and_comple
         await engine.dispose()
 
 
+@pytest.mark.parametrize("floor", [0, 1])
+async def test_fallback_run_admission_retries_a_build_made_ready_by_another_replica(
+    http: httpx.AsyncClient, coordinator: Coordinator, floor: int
+) -> None:
+    coordinator.settings.run_floor = floor
+    coordinator.settings.run_slots = 2
+    coordinator.settings.claim_ranking_seconds = 60
+    if floor:
+        await submit(http, ["running"], **{"class": "run"})
+        await claim_named(http, "running")
+    run_batch = await submit(http, ["run"], **{"class": "run"})
+    replica = Coordinator(coordinator.engine, coordinator.cache, coordinator.settings)
+    acquiring = asyncio.Event()
+
+    def before_execute(_: object, __: object, statement: str, *args: object) -> None:
+        if "pg_advisory_xact_lock" in statement:
+            acquiring.set()
+
+    waiting: asyncio.Task[Any] | None = None
+    try:
+        async with coordinator.engine.begin() as blocker:
+            await blocker.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+            sa.event.listen(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+            waiting = asyncio.create_task(coordinator.claim(["standard"], "waiting"))
+            await asyncio.wait_for(acquiring.wait(), 2)
+            stale = coordinator.rankings[("standard",)]
+            assert not stale.ranked
+            app = create_app(replica, replica.settings)
+            async with httpx.AsyncClient(transport=Settled(app, replica), base_url="http://replica.test") as other:
+                await submit(other, ["build"])
+            # Another process cannot invalidate this process's cached empty snapshot.
+            assert coordinator.rankings[("standard",)] is stale
+        claimed = await asyncio.wait_for(waiting, 2)
+        assert claimed is not None and claimed.theory == "pkg:build"
+        assert await states(http, run_batch) == {"run": "ready"}
+    finally:
+        if waiting is not None:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+        sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+        await replica.released()
+
+
+async def test_fallback_run_admission_skips_builds_locked_by_other_claimers(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_floor = 0
+    await submit(http, ["build"])
+    await submit(http, ["run"], **{"class": "run"})
+    async with coordinator.engine.begin() as blocker:
+        await blocker.execute(sa.text("SELECT 1 FROM actions WHERE class = 'build' FOR UPDATE"))
+        claimed = await asyncio.wait_for(coordinator.claim(["standard"], "waiting"), 2)
+        assert claimed is not None and claimed.theory == "pkg:run"
+
+
 async def test_a_full_run_cap_skips_admission_and_candidate_scans(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
