@@ -469,9 +469,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   not claimed (single-flight across batches). When that build succeeds, the
   coordinator marks the waiting and ready copies of the action (same key and
   spec, so not a forced or traced copy of a plain build) in other running
-  batches done, with its log, and releases their children; when it fails or
-  its lease expires, the copies are claimable again and waiting claims are
-  woken. Two claims committing at the same moment can still both build a key.
+  batches done, with its log, and releases their children; copies with
+  another spec, and every copy once the build fails or its lease expires,
+  are claimable again and waiting claims are woken. Two claims committing at the same moment can still both build a key.
   A heartbeat or completion with an expired or revoked token is refused, and
   the completion is dropped. Since a worker may run an action twice after a
   network partition, nothing depends on exactly-once execution: a second run

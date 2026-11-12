@@ -443,12 +443,14 @@ LIMIT 1 FOR UPDATE SKIP LOCKED
 """)
 
 
-# The unfinished, unclaimed build actions of other running batches with the same key and spec as a build whose lease
-# just ended; see CLAIM_ACTION. The spec too, since a forced or traced build has the same keys as a plain one. Read by primary key, a probe per running batch: no index leads with input_key.
+# The unfinished, unclaimed build actions of other running batches with the same key as a build whose lease just ended;
+# see CLAIM_ACTION. With their spec, since a forced or traced build has the same keys as a plain one: only a copy with
+# the same spec is done with the build, the others are just no longer held. Read by primary key, a probe per running
+# batch: no index leads with input_key.
 PEERS = sa.text("""
-SELECT batch_id, tier, state FROM actions
+SELECT batch_id, tier, state, spec_sha256 FROM actions
 WHERE batch_id = ANY(ARRAY(SELECT id FROM batches WHERE state = 'running' AND id <> :batch_id))
-AND input_key = :input_key AND spec_sha256 = :spec_sha256 AND class = 'build' AND state IN ('waiting', 'ready')
+AND input_key = :input_key AND class = 'build' AND state IN ('waiting', 'ready')
 """)
 
 
@@ -1003,21 +1005,18 @@ class Coordinator:
             self.made_ready -= 1
             self._wake_claim(woken.result())
 
-    async def _peers(self, batch_id: UUID, action: sa.Row[Any]) -> list[tuple[UUID, str, str]]:
+    async def _peers(self, batch_id: UUID, action: sa.Row[Any]) -> list[sa.Row[Any]]:
         """The waiting and ready copies of build ``action`` of ``batch_id``, whose lease just ended, in other
-        running batches, by batch, tier and state; see CLAIM_ACTION. Read once the lease's deletion committed, so
-        a batch submitted meanwhile is either found or was never held."""
+        running batches, with their batch, tier, state and spec; see PEERS. Read once the lease's deletion
+        committed, so a batch submitted meanwhile is either found or was never held."""
         if action.action_class != "build":
             return []
         async with self.engine.connect() as conn:
-            rows = await conn.execute(
-                PEERS, {"batch_id": batch_id, "input_key": action.input_key, "spec_sha256": action.spec_sha256}
-            )
-        return [(row.batch_id, row.tier, row.state) for row in rows]
+            return list(await conn.execute(PEERS, {"batch_id": batch_id, "input_key": action.input_key}))
 
-    def _wake_peers(self, peers: list[tuple[UUID, str, str]]) -> None:
+    def _wake_peers(self, peers: list[sa.Row[Any]]) -> None:
         """Have claims take the ready ``peers`` now that the lease holding them back ended, as if just made ready."""
-        for batch_id, tier, state in peers:
+        for batch_id, tier, state, _ in peers:
             if state == "ready":
                 self._forget_rankings(batch_id, {tier})
                 self._wake_claim(tier)
@@ -1170,11 +1169,10 @@ class Coordinator:
         self._batch_changed(batch_id)
         self.request_release(batch_id)
         peers = await self._peers(batch_id, action)
-        if result.status == "failed":
-            self._wake_peers(peers)
-        else:
-            for peer in dict.fromkeys(peer_batch for peer_batch, _, _ in peers):
-                await self._finish_peer(peer, action.input_key, result.log_sha256)
+        done = [] if result.status == "failed" else [peer for peer in peers if peer.spec_sha256 == action.spec_sha256]
+        self._wake_peers([peer for peer in peers if peer not in done])
+        for peer in done:
+            await self._finish_peer(peer.batch_id, action.input_key, result.log_sha256)
         return True
 
     def request_release(self, batch_id: UUID | None = None) -> None:
