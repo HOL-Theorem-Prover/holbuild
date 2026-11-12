@@ -21,7 +21,7 @@ commit=$(awk '$2 ~ /\^\{\}$/ {print $1; found=1} END {if (!found) print first} N
 [[ $commit == "$GITHUB_SHA" ]] || { echo "Tag $tag does not resolve to candidate source $GITHUB_SHA" >&2; exit 2; }
 
 work="$RUNNER_TEMP/release-consumers"
-mkdir -p "$work/evidence" "$work/candidate" "$work/baseline"
+mkdir -p "$work/evidence" "$work/candidate"
 auth=$(mktemp -d "$RUNNER_TEMP/release-consumer-auth.XXXXXX")
 trap 'rm -rf "$auth"' EXIT
 export HOLBUILD_REMOTE_EXEC_CURL_CONFIG="$auth/exec.curl"
@@ -31,7 +31,7 @@ install -m 600 /dev/null "$HOLBUILD_REMOTE_CACHE_CURL_CONFIG"
 printf '%s\n' "$EXEC_CURL_CONFIG_CONTENT" > "$HOLBUILD_REMOTE_EXEC_CURL_CONFIG"
 printf '%s\n' "$CACHE_CURL_CONFIG_CONTENT" > "$HOLBUILD_REMOTE_CACHE_CURL_CONFIG"
 unset EXEC_CURL_CONFIG_CONTENT CACHE_CURL_CONFIG_CONTENT
-export HOLBUILD_CACHE="$work/cache"
+export HOLBUILD_CACHE="$HOME/.cache/holbuild"
 export HOLBUILD_REMOTE_CACHE_URL
 
 status=$(curl -q -sS -o /dev/null -w '%{http_code}' --max-time 15 \
@@ -60,51 +60,6 @@ for consumer in "${consumers[@]}"; do
     | tee "$work/evidence/$consumer.md" >> "$GITHUB_STEP_SUMMARY"
 done
 
-base=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
-[[ $base =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid published release tag: $base" >&2; exit 2; }
-old_name="holbuild-$base-linux-x86_64"
-gh release download "$base" --pattern "$old_name.tar.gz" --pattern SHA256SUMS --dir "$work/baseline"
-(cd "$work/baseline" && awk -v name="$old_name.tar.gz" '$2 == name' SHA256SUMS | sha256sum -c -)
-tar -xzf "$work/baseline/$old_name.tar.gz" -C "$work/baseline"
-old="$work/baseline/$old_name/bin/holbuild"
-[[ $("$old" --version) == "holbuild ${base#v}" ]] || { echo 'Published binary version differs from tag' >&2; exit 2; }
-printf 'Cache compatibility baseline: `%s`\n\n' "$base" >> "$GITHUB_STEP_SUMMARY"
-lost=0
-# Complete every inventory before any consumer can warm shared dependency keys.
-for consumer in "${consumers[@]}"; do
-  status=0
-  (cd "$work/$consumer" && "$root/tools/release-key-inventory.sh" "$old" "$candidate" --skip-proof-steps) \
-    > "$work/evidence/$consumer-inventory.txt" 2>&1 || status=$?
-  {
-    printf '\n%s initial cache inventory:\n\n```text\n' "$consumer"
-    cat "$work/evidence/$consumer-inventory.txt"
-    printf '```\n\n'
-  } >> "$GITHUB_STEP_SUMMARY"
-  case $status in
-    0) ;;
-    1) lost=1 ;;
-    *) echo "$consumer cache inventory failed (exit $status)" >&2; exit "$status" ;;
-  esac
-done
-if [[ $lost == 1 ]]; then
-  # Save the loss before warming: a retry must not silently publish after its
-  # predecessor has filled the candidate cache entries.
-  releases=$(gh api --paginate --slurp "repos/$GH_REPO/releases")
-  existing=$(jq -c --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | first // empty' <<< "$releases")
-  notes="$work/evidence/compatibility-loss.md"
-  printf 'Breaking release: consumer cache compatibility changed since %s.\n\n' "$base" > "$notes"
-  for consumer in "${consumers[@]}"; do
-    printf '%s\n\n' "$consumer" >> "$notes"
-    cat "$work/evidence/$consumer-inventory.txt" >> "$notes"
-    printf '\n' >> "$notes"
-  done
-  if [[ -n $existing ]]; then
-    jq -r '.body // ""' <<< "$existing" >> "$notes"
-    gh release edit "$tag" --draft=true --notes-file "$notes"
-  else
-    gh release create "$tag" --verify-tag --draft --title "$tag" --notes-file "$notes"
-  fi
-fi
 
 for consumer in "${consumers[@]}"; do
   status=0

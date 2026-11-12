@@ -1,6 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=${HOLBUILD_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
+python3 - "$root/.github/workflows/release.yml" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+jobs = yaml.safe_load(Path(sys.argv[1]).read_text())["jobs"]
+needs = jobs["publish"]["needs"]
+assert "consumers" in (needs if isinstance(needs, list) else [needs]), "publication must require consumers"
+tag_only = {
+    "startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'",
+}
+assert jobs["consumers"].get("if") in tag_only
+assert jobs["consumers"]["permissions"]["contents"] == "read"
+assert "secrets.HOLBUILD_REMOTE_" not in str(yaml.safe_load(Path(sys.argv[1]).read_text()).get("env", {}))
+for name, job in jobs.items():
+    if "secrets.HOLBUILD_REMOTE_" in str(job):
+        assert job.get("if") in tag_only, f"{name} can expose service credentials outside tag runs"
+guard = jobs["guard"]["steps"][-1]["run"]
+assert guard.index("release-consumers-verified.sh") < guard.index("^Consumers ready:"), "readiness must not bypass consumer evidence"
+print("release workflow dependencies and credential isolation checks passed")
+PY
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 trap 'echo "release-consumers test failed at line $LINENO" >&2; [[ ! -f $tmp/output ]] || tail -n 40 "$tmp/output" >&2' ERR
@@ -13,7 +35,10 @@ git config --global url."file://$tmp/remotes/".insteadOf https://github.com/
 git init -q -b main "$tmp/source"
 echo fixture > "$tmp/source/fixture"
 git -C "$tmp/source" add .
-git -C "$tmp/source" commit -qm fixture
+git -C "$tmp/source" commit -qm base
+git -C "$tmp/source" tag -a v1.0.0 -m base
+echo candidate >> "$tmp/source/fixture"
+git -C "$tmp/source" commit -qam candidate
 git -C "$tmp/source" tag -a v1.0.1 -m candidate
 git clone -q --bare "$tmp/source" "$tmp/remotes/HOL-Theorem-Prover/holbuild.git"
 for consumer in vyper-hol verifereum solidity-hol; do
@@ -33,31 +58,22 @@ fi
 consumer=$(basename "$PWD")
 printf '%s %s %s\n' "$consumer" "$version" "$*" >> "$TEST_ROOT/trace"
 case $1 in
-  action-spec)
-    if [[ ${TEST_INVENTORY_ERROR:-} == "$consumer" && ${TEST_INVENTORY_ERROR_VERSION:-1.0.0} == "$version" ]]; then exit 1; fi
-    echo 'holbuild-action-batch-v1'
-    echo 'action key ac spec fixture:Shared'
-    if [[ $version == 1.0.1 && ${TEST_LOST:-} == "$consumer" ]]; then
-      echo 'action changed ac spec fixture:Lost'
-    fi
-    ;;
   build)
     [[ $* == 'build --skip-proof-steps --remote-only --remote-exec https://fleet.invalid' ]]
     [[ -f $HOLBUILD_REMOTE_EXEC_CURL_CONFIG && -f $HOLBUILD_REMOTE_CACHE_CURL_CONFIG ]]
-    [[ ${TEST_FAIL_CONSUMER:-} != "$consumer" ]] || exit 75
+    [[ ${TEST_FAIL_CONSUMER:-} != "$consumer" && ${TEST_TOOLCHAIN_MISS:-} != "$consumer" ]] || exit 75
     ;;
   *) exit 98 ;;
 esac
 CLIENT
 chmod +x "$tmp/client"
-for version in 1.0.0 1.0.1; do
+for version in 1.0.1; do
   name="holbuild-v$version-linux-x86_64"
   mkdir -p "$tmp/package/$name/bin" "$tmp/assets-$version"
   cp "$tmp/client" "$tmp/package/$name/bin/holbuild"
   tar -czf "$tmp/assets-$version/$name.tar.gz" -C "$tmp/package" "$name"
   (cd "$tmp/assets-$version" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 done
-cp "$tmp/assets-1.0.0/"*.sha256 "$tmp/assets-1.0.0/SHA256SUMS"
 mkdir -p "$tmp/source/download"
 cp "$tmp/assets-1.0.1/"* "$tmp/source/download/"
 
@@ -87,22 +103,13 @@ case "$*" in
   'api --paginate '*'/actions/runs/42/jobs?'*)
     [[ -z ${TEST_JOBS_FAIL:-} ]] || exit 1
     if [[ -z ${TEST_NO_JOB:-} ]]; then echo "${TEST_JOB_RESULT:-success}"; fi ;;
-  'api repos/HOL-Theorem-Prover/holbuild/releases/latest --jq .tag_name') echo v1.0.0 ;;
-  'api --paginate --slurp repos/HOL-Theorem-Prover/holbuild/releases')
-    if [[ -f $TEST_ROOT/draft ]]; then
-      printf '[[{"tag_name":"v1.0.1","draft":true,"body":"saved compatibility loss"}]]\n'
-    else echo '[[]]'; fi ;;
-  'release download v1.0.0 '*)
-    while [[ $1 != --dir ]]; do shift; done
-    cp "$TEST_ROOT/assets-1.0.0/"* "$2/" ;;
-  'release create v1.0.1 '*|'release edit v1.0.1 '*)
-    [[ $* == *--draft* ]]
-    touch "$TEST_ROOT/draft" ;;
   *) echo "unexpected gh call: $*" >&2; exit 99 ;;
 esac
 GH
 chmod +x "$tmp/bin/"*
 export PATH="$tmp/bin:$PATH"
+export HOME="$tmp/home"
+mkdir -p "$HOME"
 export GITHUB_WORKSPACE="$tmp/source" GITHUB_SHA
 GITHUB_SHA=$(git -C "$tmp/source" rev-parse HEAD)
 export GITHUB_REF_NAME=v1.0.1 GH_REPO=HOL-Theorem-Prover/holbuild GH_TOKEN=fixture-only
@@ -133,11 +140,10 @@ for consumer in vyper-hol verifereum solidity-hol; do
   grep -q "$consumer main: .*$GITHUB_SHA" "$tmp/summary"
   grep -q "^$consumer 1.0.1 build --skip-proof-steps --remote-only" "$tmp/trace"
 done
-# Every initial inventory precedes every warming build.
-[[ $(grep -n 'action-spec' "$tmp/trace" | tail -1 | cut -d: -f1) -lt $(grep -n ' build ' "$tmp/trace" | head -1 | cut -d: -f1) ]]
-[[ ! -e $tmp/draft ]]
 check 75 TEST_FAIL_CONSUMER=verifereum
 ! grep -q '^solidity-hol .* build ' "$tmp/trace"
+check 75 TEST_TOOLCHAIN_MISS=vyper-hol
+! grep -q '^verifereum .* build ' "$tmp/trace"
 check 1 TEST_FLEET_STATUS=401
 check 1 TEST_CACHE_STATUS=503
 check 7 TEST_CURL_FAIL=1
@@ -147,18 +153,6 @@ check 2 GITHUB_REF_NAME=master
 check 2 GITHUB_REF_NAME=v1.0.0
 check 2 GITHUB_SHA=0000000000000000000000000000000000000000
 check 2 TEST_CANDIDATE_VERSION=1.0.0
-# A command failure must not be treated as a compatibility loss.
-check 2 TEST_INVENTORY_ERROR=verifereum
-check 2 TEST_INVENTORY_ERROR=verifereum TEST_INVENTORY_ERROR_VERSION=1.0.1
-! grep -q ' build ' "$tmp/trace"
-[[ ! -e $tmp/draft ]]
-check 0 TEST_LOST=vyper-hol
-[[ -e $tmp/draft ]]
-grep -q 'release create .*--draft' "$tmp/gh-trace"
-check 0
-# Re-running after warming must retain the draft created on first key loss.
-[[ -e $tmp/draft ]]
-! grep -q -- '--draft=false' "$tmp/gh-trace"
 printf corrupt >> "$tmp/source/download/holbuild-v1.0.1-linux-x86_64.tar.gz"
 check 1
 ! grep -q ' build ' "$tmp/trace"
@@ -177,4 +171,4 @@ verified 1 TEST_NO_JOB=1
 verified 1 TEST_NO_RUNS=1
 verified 1 TEST_API_FAIL=1
 verified 1 TEST_JOBS_FAIL=1
-echo 'release consumer success/failure/identity/compatibility checks passed'
+echo 'release consumer success/failure/identity checks passed'

@@ -6,7 +6,7 @@
 # both holbuild binaries (no theory is built) and lists the theories whose
 # cached results OLD restores but NEW can't: a cache-key change the golden
 # key dump missed.  Theories neither release can restore yet are ignored.
-# Exits 1 when it lists any, or 2 when either inventory cannot be produced.
+# Exits 1 when it lists any.
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
@@ -20,8 +20,8 @@ shift 2
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-"$old" action-spec "$@" > "$tmp/old.batch" || exit 2
-"$new" action-spec "$@" > "$tmp/new.batch" || exit 2
+"$old" action-spec "$@" > "$tmp/old.batch"
+"$new" action-spec "$@" > "$tmp/new.batch"
 # Batch lines: action <input_key> <ac-key> <spec-sha256> <package>:<logical>
 awk '$1 == "action" { print $5 }' "$tmp/old.batch" | sort -u > "$tmp/old"
 awk '$1 == "action" { print $5 }' "$tmp/new.batch" | sort -u > "$tmp/new"

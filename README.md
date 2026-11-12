@@ -2442,14 +2442,8 @@ and `consumer-evidence-<attempt>` artifact.
 Configure repository variables `HOLBUILD_REMOTE_EXEC_URL` and
 `HOLBUILD_REMOTE_CACHE_URL` with HTTPS endpoints, and Actions secrets
 `HOLBUILD_REMOTE_EXEC_CURL_CONFIG` and `HOLBUILD_REMOTE_CACHE_CURL_CONFIG`
-with their curl-config contents. These credentials are used only on tag pushes
-and manual dispatches of release tags, never pull requests or branch dispatches.
-A manual tag dispatch runs the checks without publishing.
-
-Before warming any theories, the workflow compares the published binary's
-cache inventory with the candidate on all three frozen consumer commits. Losing
-previously restorable theories holds the release as a draft before the builds
-start; rerunning after warming keeps that draft and its recorded reasons.
+with their curl-config contents. These credentials are used only on release
+tag pushes. Pull requests and manual dispatches run packaging checks only.
 Hand-publication also requires a successful exact-tag/source consumer run,
 including when the release notes say `Consumers ready:`.
 
