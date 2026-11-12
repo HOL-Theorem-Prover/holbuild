@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
@@ -244,11 +245,10 @@ async def test_a_ranking_read_while_a_release_drops_rankings_is_not_shared(
     assert coordinator.rankings == {}
 
 
-async def test_a_claim_after_a_release_does_not_join_a_ranking_read_begun_before_it(
+async def test_a_claim_after_a_release_waits_for_a_fresh_shared_ranking(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A claim that starts after a release made a priority batch ready reads a ranking of its own rather than
-    joining one whose snapshot predates the batch, and so claims the priority batch."""
+    """A release preserves single-flight reads; later claims wait for a post-release snapshot."""
     coordinator.settings.claim_ranking_seconds = 3600
     entered, go = asyncio.Event(), asyncio.Event()
     calls = 0
@@ -268,59 +268,69 @@ async def test_a_claim_after_a_release_does_not_join_a_ranking_read_begun_before
     early = asyncio.create_task(claim(http))
     await entered.wait()
     await submit(http, ["p1"], priority="1")
-    try:
-        # Joining the held read would wait for it.
-        async with asyncio.timeout(5):
-            await claim_named(http, "p1")
-    finally:
-        go.set()
+    late = asyncio.create_task(claim_named(http, "p1"))
+    go.set()
+    await late
     assert (await early)["theory"] == "pkg:n1"
     assert calls == 2
 
 
-async def test_a_claims_own_ranking_read_while_a_release_makes_a_priority_batch_ready_is_not_shared(
+async def test_empty_rankings_are_shared_by_idle_claim_bursts(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ranking a claim reads for itself, here after the shared read failed, may predate the actions a release
-    made ready meanwhile even with no ranking kept to drop, so later claims don't share it and claim the priority
-    batch."""
     coordinator.settings.claim_ranking_seconds = 3600
-    entered, go = asyncio.Event(), asyncio.Event()
-    calls = 0
+    coordinator.settings.run_slots = 0
+    rankings = 0
     rank = coordinator._rank
 
-    async def failing_then_held(conn: Any, key: tuple[str, ...]) -> Any:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise TimeoutError("pool")
-        if calls > 2:
-            return await rank(conn, key)
+    async def counted(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal rankings
+        rankings += 1
+        return await rank(conn, key)
 
-        class Slow:
-            """The connection, but a statement's result arrives only once go is set, after its snapshot."""
-
-            async def execute(self, *args: Any) -> Any:
-                result = await conn.execute(*args)
-                entered.set()
-                await go.wait()
-                return result
-
-        return await rank(Slow(), key)
-
-    await submit(http, ["n1", "n2"])
-    monkeypatch.setattr(coordinator, "_rank", failing_then_held)
-    early = asyncio.create_task(claim(http))
-    await entered.wait()
-    await submit(http, ["p1"], priority="1")
-    go.set()
-    assert (await early)["theory"] == "pkg:n1"
-    await claim_named(http, "p1")
+    monkeypatch.setattr(coordinator, "_rank", counted)
+    assert await claim(http) is None
+    assert await asyncio.gather(*(claim(http) for _ in range(50))) == [None] * 50
+    assert rankings == 1
+    await submit(http, ["new"])
+    await claim_named(http, "new")
+    assert rankings == 2
 
 
-async def test_a_claim_ranks_for_itself_when_the_shared_ranking_read_fails(
+async def test_exhausted_rankings_refresh_once_outside_claim_transactions(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    coordinator.settings.claim_ranking_seconds = 3600
+    coordinator.settings.run_slots = 0
+    batch_id = await submit(http, ["a"])
+    await claim_named(http, "a")
+    entered, go = asyncio.Event(), asyncio.Event()
+    rankings = 0
+    rank = coordinator._rank
+
+    async def held(conn: Any, key: tuple[str, ...]) -> Any:
+        nonlocal rankings
+        rankings += 1
+        entered.set()
+        await go.wait()
+        return await rank(conn, key)
+
+    monkeypatch.setattr(coordinator, "_rank", held)
+    claims = [asyncio.create_task(claim(http)) for _ in range(50)]
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        # Another connection can still serve a batch read while the one shared refresh waits.
+        assert await asyncio.wait_for(coordinator.get(UUID(batch_id)), 2) is not None
+    finally:
+        go.set()
+    assert await asyncio.gather(*claims) == [None] * 50
+    assert rankings == 1
+
+
+async def test_failed_shared_rankings_return_503_without_per_claim_fallbacks(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered, go = asyncio.Event(), asyncio.Event()
     calls = 0
     rank = coordinator._rank
 
@@ -328,11 +338,23 @@ async def test_a_claim_ranks_for_itself_when_the_shared_ranking_read_fails(
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise TimeoutError("pool")
+            entered.set()
+            await go.wait()
+            raise sa.exc.TimeoutError("pool")
         return await rank(conn, key)
 
     monkeypatch.setattr(coordinator, "_rank", failing_once)
     await submit(http, ["a"])
+    requests = [
+        asyncio.create_task(http.post("/v1/work/claim", json={"tier": "standard", "worker": "w"}, headers=WORKER))
+        for _ in range(20)
+    ]
+    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.sleep(0)
+    go.set()
+    responses = await asyncio.gather(*requests)
+    assert [r.status_code for r in responses] == [503] * 20
+    assert calls == 1
     await claim_named(http, "a")
     assert calls == 2
 
@@ -815,14 +837,14 @@ async def test_wakes_pack_compatible_hosts_with_fifo_ties(
     loop = asyncio.get_running_loop()
     wakes = [loop.create_future() for _ in workers]
     coordinator.claim_waiters = [
-        (tiers, _claim_rank(tiers, host, rank), wake) for (tiers, host, rank), wake in zip(workers, wakes)
+        (tiers, _claim_rank(tiers, host, rank), wake, False) for (tiers, host, rank), wake in zip(workers, wakes)
     ]
     cancelled = loop.create_future()
     cancelled.cancel()
-    coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled))
+    coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled, False))
     for index in order:
         coordinator._wake_claim(tier)
-        assert wakes[index].result() == tier
+        assert wakes[index].result() == (tier, False)
         assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
     coordinator._wake_claim(tier)
     assert coordinator.made_ready == len(order) + 1
@@ -834,7 +856,7 @@ async def test_new_tail_host_claim_defers_ready_work_to_a_better_waiter(
 ) -> None:
     batch_id = await submit(http, ["a"])
     wake = asyncio.get_running_loop().create_future()
-    waiter = (waiting_tiers, _claim_rank(waiting_tiers, "host-a"), wake)
+    waiter = (waiting_tiers, _claim_rank(waiting_tiers, "host-a"), wake, False)
     coordinator.claim_waiters.append(waiter)
     assert await coordinator.claim(["high", "standard"], "tail", host_id="host-b") is None
     assert await states(http, batch_id) == {"a": "ready"}
@@ -852,7 +874,7 @@ async def test_rechecking_tail_host_defers_ready_work_to_a_better_waiter(
     batch_id = ""
     claim_once = coordinator._claim
     wake = asyncio.get_running_loop().create_future()
-    waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake)
+    waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake, False)
 
     async def counted(tiers: list[str], worker: str) -> Any:
         nonlocal attempts
@@ -884,7 +906,7 @@ async def test_burst_can_claim_high_while_warm_waits_for_standard(
     async with coordinator.engine.begin() as conn:
         await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:b'"))
     wake = asyncio.get_running_loop().create_future()
-    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "warm"), wake))
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "warm"), wake, False))
     claimed = await coordinator.claim(["high", "standard"], "burst", host_id="host-a")
     assert claimed is not None and claimed.theory == "pkg:b"
     assert not wake.done()
@@ -911,7 +933,7 @@ async def test_explicitly_woken_claim_is_not_blocked_by_a_new_better_waiter(
         coordinator._wake_claim("standard")
         # A new better waiter must not block the explicit wake before the tail host resumes.
         wake = asyncio.get_running_loop().create_future()
-        coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake))
+        coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
         claimed = await asyncio.wait_for(waiting, 5)
         assert claimed is not None and claimed.theory == "pkg:a"
     finally:
@@ -2069,6 +2091,66 @@ async def test_run_floor_precheck_keeps_build_claims_off_the_admission_lock(
             await asyncio.wait_for(claim_named(http, "build"), 2)
         finally:
             sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+
+
+@pytest.mark.parametrize("floor", [0, 4])
+async def test_run_admission_waiters_leave_connections_for_heartbeats_and_completions(
+    http: httpx.AsyncClient, coordinator: Coordinator, floor: int
+) -> None:
+    await submit(http, ["build"])
+    token = await claim_named(http, "build")
+    await submit(http, ["run"], **{"class": "run"})
+    coordinator.settings.run_floor = floor
+    original_engine = coordinator.engine
+    engine = create_async_engine(original_engine.url, pool_size=2, max_overflow=0, pool_timeout=0.2)
+    coordinator.engine = engine
+    acquiring = asyncio.Event()
+
+    def before_execute(_: object, __: object, statement: str, *args: object) -> None:
+        if "pg_advisory_xact_lock" in statement:
+            acquiring.set()
+
+    waiters: list[asyncio.Task[Any]] = []
+    sa.event.listen(engine.sync_engine, "before_cursor_execute", before_execute)
+    try:
+        async with original_engine.begin() as blocker:
+            await blocker.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+            waiters = [asyncio.create_task(coordinator.claim(["standard"], f"w{i}")) for i in range(20)]
+            await asyncio.wait_for(acquiring.wait(), 2)
+            assert await asyncio.wait_for(coordinator.heartbeat(UUID(token)), 2)
+            assert await asyncio.wait_for(coordinator.complete(UUID(token), parse_result(result("build", "built"))), 2)
+            for waiter in waiters:
+                waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+        # Cancellation released the admission gate and its transaction.
+        claimed = await asyncio.wait_for(coordinator.claim(["standard"], "after-cancel"), 2)
+        assert claimed is not None and claimed.theory == "pkg:run"
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+        coordinator.engine = original_engine
+        sa.event.remove(engine.sync_engine, "before_cursor_execute", before_execute)
+        await engine.dispose()
+
+
+async def test_a_full_run_cap_skips_admission_and_candidate_scans(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_slots = 1
+    await submit(http, ["run-a", "run-b"], **{"class": "run"})
+    await claim_named(http, "run-a")
+    await coordinator._current_ranking(("standard",))
+
+    def before_execute(_: object, __: object, statement: str, *args: object) -> None:
+        assert "pg_advisory_xact_lock" not in statement
+        assert "WITH run_capacity" not in statement
+
+    sa.event.listen(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+    try:
+        assert await asyncio.gather(*(claim(http) for _ in range(20))) == [None] * 20
+    finally:
+        sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
 
 
 async def test_zero_run_slots_pauses_runs_and_keeps_builds_claimable(
