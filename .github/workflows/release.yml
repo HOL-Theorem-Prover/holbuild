@@ -203,27 +203,26 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           if ! gh release view "$TAG" > /dev/null 2>&1; then
-            # A breaking release stays a draft until its consumers are ready;
+            # Every release stays a draft until candidate validation passes;
             # see "Release process" in README.md.
-            hold=()
+            notes_args=()
             if ! base=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name); then
               reasons="no published release to compare with"
-              hold=(--draft)
             else
               status=0
               reasons=$(tools/release-breaking.sh "$base" "$TAG") || status=$?
               case $status in
                 0) ;;
-                1) hold=(--draft) ;;
+                1) ;;
                 *) exit "$status" ;;
               esac
             fi
-            if [[ ${#hold[@]} -ne 0 ]]; then
+            if [[ -n "${reasons:-}" ]]; then
               notes=$(printf 'Breaking release:\n\n%s\n' "$(sed 's/^/- /' <<< "$reasons")")
               printf '%s\n' "$notes" >> "$GITHUB_STEP_SUMMARY"
-              hold+=(--notes "$notes")
+              notes_args=(--notes "$notes")
             fi
-            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes "${hold[@]}"
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes "${notes_args[@]}"
           fi
           cd dist
           cat ./*.sha256 > SHA256SUMS

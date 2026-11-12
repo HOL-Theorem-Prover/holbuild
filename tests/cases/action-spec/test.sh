@@ -126,6 +126,8 @@ PY
 # Nothing is cached: every theory is exported, each waiting for its parent.
 hb action-spec CTheory > "$tmpdir/batch1.txt"
 check_specs "$tmpdir/batch1.txt"
+hb action-spec --remote-only CTheory > "$tmpdir/batch-remote-only.txt"
+diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-remote-only.txt"
 grep '^edge' "$tmpdir/batch1.txt" | sort > "$tmpdir/edges1.txt"
 printf 'edge %s %s\nedge %s %s\n' "$key_b" "$key_a" "$key_c" "$key_b" | sort > "$tmpdir/edges1.expected"
 diff -u "$tmpdir/edges1.expected" "$tmpdir/edges1.txt"
@@ -361,3 +363,31 @@ if (cd "$project" && env -u HOLBUILD_REMOTE_CACHE_URL "$HOLBUILD_BIN" action-spe
   exit 1
 fi
 require_grep "action-spec needs a remote cache" "$tmpdir/no-remote.log"
+
+# An uncached toolchain must fail without building HOL locally.
+fake_hol=$tmpdir/fake-hol
+write_fake_hol "$fake_hol"
+fake_rev=$(init_git_repo "$fake_hol")
+mkdir -p "$tmpdir/fake-project"
+cat > "$tmpdir/fake-project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "spec-fake"
+
+[dependencies.hol]
+git = "$fake_hol"
+rev = "$fake_rev"
+TOML
+: > "$tmpdir/fake-build-count"
+status=0
+(cd "$tmpdir/fake-project" &&
+  HOLBUILD_CACHE=$tmpdir/fake-cache \
+  HOLBUILD_TEST_BUILD_COUNT=$tmpdir/fake-build-count \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --remote-only) \
+  > "$tmpdir/toolchain-only.log" 2>&1 || status=$?
+[[ $status -eq 75 ]] || { cat "$tmpdir/toolchain-only.log" >&2; echo "wanted 75, got $status" >&2; exit 1; }
+require_grep 'HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally' "$tmpdir/toolchain-only.log"
+[[ ! -s "$tmpdir/fake-build-count" ]] || { cat "$tmpdir/fake-build-count" >&2; exit 1; }

@@ -279,12 +279,13 @@ fun cache_help () = print
 
 fun action_spec_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] action-spec [--upload] [OPTIONS] [TARGET ...]\n\n\
+  \  holbuild [GLOBAL OPTIONS] action-spec [--upload] [--remote-only] [OPTIONS] [TARGET ...]\n\n\
   \Plan TARGETs as build would and write the ActionSpec of every theory the\n\
   \remote cache can't satisfy to .holbuild/action-specs/SHA256, then print the\n\
   \action batch. With --upload, also upload the specs and their sources to the\n\
   \remote cache. Takes build's cache and proof options and --tool-cache. Needs\n\
-  \--remote-cache.\n\n\
+  \--remote-cache. With --remote-only, an uncached HOL toolchain exits 75\n\
+  \instead of building locally.\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun exec_action_help () = print
@@ -2041,7 +2042,8 @@ fun action_spec_command tc cli_jobs args =
   let
     val upload = List.exists (fn arg => arg = "--upload") args
     val parsed as ({dry_run, watch, repl_on_failure, execution_plan, ...}, _) =
-      split_flags (split_tool_cache_flag (List.filter (fn arg => arg <> "--upload") args))
+      split_flags (split_tool_cache_flag
+        (List.filter (fn arg => arg <> "--upload" andalso arg <> "--remote-only") args))
     val _ =
       if dry_run orelse watch orelse repl_on_failure orelse Option.isSome execution_plan then
         raise Error "action-spec does not run builds: remove --dry-run, --watch and --repl-on-failure"
