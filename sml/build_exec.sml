@@ -71,9 +71,13 @@ fun copy_binary src dst =
     handle e => (close_input (); close_output (); remove_file tmp; raise e)
   end
 
-fun link_or_copy {src, dst} =
-  HolbuildCache.link_or_copy {src = src, dst = dst}
-  handle HolbuildCache.Error msg => raise Error msg
+(* Shared cache blobs still cross the filesystem backend's copying boundary. *)
+fun link_or_copy_file src dst =
+  (ensure_parent dst;
+   remove_file dst;
+   if HolbuildActionSandbox.active () then copy_binary src dst
+   else Posix.FileSys.link {old = src, new = dst}
+   handle OS.SysErr _ => copy_binary src dst)
 
 fun read_text path =
   let
@@ -2649,17 +2653,17 @@ fun install_cache_entry copy root input_key subject
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
   in
     copy dat_hash data_path;
-    link_or_copy {src = data_path, dst = hfs_remapped_path data_path};
+    link_or_copy_file data_path (hfs_remapped_path data_path);
     copy sig_hash sig_path;
-    link_or_copy {src = sig_path, dst = hfs_remapped_path sig_path};
+    link_or_copy_file sig_path (hfs_remapped_path sig_path);
     copy sml_hash sml_path;
     write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
-    link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path};
+    link_or_copy_file sml_path (hfs_remapped_path sml_path);
     (case trace_hash of
          NONE => ()
        | SOME hash =>
            (copy hash trace_path;
-            link_or_copy {src = trace_path, dst = hfs_remapped_path trace_path}));
+            link_or_copy_file trace_path (hfs_remapped_path trace_path)));
     List.app
       (fn (declaration, hash) =>
           let val destination = extra_destination declaration
@@ -3622,13 +3626,6 @@ fun store_path store heap sha = Path.concat(Path.concat(store, heap), sha)
 fun store_temp path =
   HolbuildTempPath.near path ("." ^ LargeInt.toString (Time.toNanoseconds (Time.now ())) ^ ".tmp")
 
-fun link_or_copy_file src dst =
-  (ensure_parent dst;
-   remove_file dst;
-   if HolbuildActionSandbox.active () then copy_binary src dst
-   else Posix.FileSys.link {old = src, new = dst}
-   handle OS.SysErr _ => copy_binary src dst)
-
 fun touch_dir dir = Posix.FileSys.utime (dir, NONE) handle OS.SysErr _ => ()
 
 (* Only Poly/ML states are linked: the run writes a failed prefix's .meta and
@@ -3813,17 +3810,17 @@ fun install_theory_stage check_cancelled cache_allowed policy {stage, logical, s
       if trknl_enabled policy then
         if file_exists staged_trace then
           (copy_binary staged_trace trace_path;
-           copy_binary staged_trace (hfs_remapped_path trace_path))
+           link_or_copy_file trace_path (hfs_remapped_path trace_path))
         else raise Error ("tracing kernel did not produce expected proof trace: " ^ staged_trace)
       else ()
     val _ = copy_binary staged_dat data_path
-    val _ = link_or_copy {src = data_path, dst = hfs_remapped_path data_path}
+    val _ = link_or_copy_file data_path (hfs_remapped_path data_path)
     val _ = copy_binary staged_sig sig_path
-    val _ = link_or_copy {src = sig_path, dst = hfs_remapped_path sig_path}
+    val _ = link_or_copy_file sig_path (hfs_remapped_path sig_path)
     val dat_replacements = stage_dat_replacements stage logical data_path
     val _ = copy_rewriting_path {src = staged_sml, dst = sml_path,
                                  replacements = dat_replacements}
-    val _ = link_or_copy {src = sml_path, dst = hfs_remapped_path sml_path}
+    val _ = link_or_copy_file sml_path (hfs_remapped_path sml_path)
     val _ = check_cancelled ()
     val _ =
       if cache_allowed then
@@ -4128,10 +4125,8 @@ fun output_paths checkpoint_policy _ node =
 fun output_hash_line path hash = "output-sha256=" ^ path ^ " " ^ hash
 
 fun output_hash_lines_for_paths paths =
-  (* Remapped artifacts are normally copied from their canonical counterparts,
-     but they remain separate files and can be changed independently.  Hash
-     each emitted path rather than treating the copy relationship as an
-     integrity assertion. *)
+  (* Remapped artifacts can be replaced independently of their canonical
+     counterparts. Hash each emitted path rather than trusting their link. *)
   map (fn path => output_hash_line path (file_hash path))
       (paths @ map hfs_remapped_path paths)
 
@@ -5941,7 +5936,7 @@ fun install_theory_outline root plan view stage base node =
     fun install ext path =
       (ensure_parent (place path);
        copy_binary (Path.concat(published, logical ^ ext)) (place path);
-       link_or_copy {src = place path, dst = hfs_remapped_path (place path)})
+       link_or_copy_file (place path) (hfs_remapped_path (place path)))
     val metadata =
       read_generated_load_metadata
         {parents_report = Path.concat(stage, "holbuild-theory-parents.txt"),
@@ -5951,7 +5946,7 @@ fun install_theory_outline root plan view stage base node =
     install ".sig" sig_path;
     copy_rewriting_path {src = Path.concat(published, logical ^ ".sml"), dst = place sml_path,
                          replacements = stage_dat_replacements stage logical (place data_path)};
-    link_or_copy {src = place sml_path, dst = hfs_remapped_path (place sml_path)};
+    link_or_copy_file (place sml_path) (hfs_remapped_path (place sml_path));
     write_object_manifest (place theory_ui) [place sig_path];
     write_object_manifest (place theory_uo)
       (map (view_stem view) (generated_theory_loads (plan_load_stem plan) metadata) @ [place sml_path])
