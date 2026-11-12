@@ -11730,7 +11730,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                 (SOME {source_text = source_text, tool_cache = tool_cache,
                        join = fn () =>
                          (await_preload ();
-                          if child_done () then () else replace_stand_ins ();
+                          (* Stopping before the barrier is the load ahead
+                             failing, whatever stopped it; a plain retry
+                             reports what a plain build would. *)
+                          if file_exists (marker "finishing") then () else
+                            (record_timings ();
+                             case (abandoned (), !outcome) of
+                                 (SOME reason, _) => abandon reason
+                               | (NONE, SOME (SOME e)) =>
+                                   abandon ("the child stopped before the end of its preload: " ^ General.exnMessage e)
+                               | _ => abandon "the child stopped before the end of its preload");
+                          replace_stand_ins ();
                           drop "ready";
                           released := SOME (Time.now ());
                           await_child ();

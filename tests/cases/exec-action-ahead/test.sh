@@ -80,6 +80,21 @@ Proof
   ACCEPT_TAC (CONJUNCT1 aLib.a)
 QED
 SML
+# K's preload fails only after A is in place: its library loads A first.
+cat > "$project/src/badLib.sml" <<'SML'
+structure badLib = struct val a = ATheory.a_thm val _ = raise Fail "badLib" end
+SML
+cat > "$project/src/KScript.sml" <<'SML'
+Theory K
+Ancestors bool
+Libs badLib
+
+Theorem k_thm:
+  T
+Proof
+  simp[]
+QED
+SML
 cat > "$project/src/CScript.sml" <<'SML'
 Theory C
 Ancestors B
@@ -234,8 +249,8 @@ spec_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $4 }' "$1"; 
 key_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $2 }' "$1"; }
 
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
-hb action-spec --upload CTheory ETheory FTheory GTheory ZTheory > "$tmpdir/batch.txt"
-for theory in A B C D E F G X Y Z; do
+hb action-spec --upload CTheory ETheory FTheory GTheory KTheory ZTheory > "$tmpdir/batch.txt"
+for theory in A B C D E F G K X Y Z; do
   declare "spec_$theory=$(spec_for "$tmpdir/batch.txt" "ahead:${theory}Theory")"
   declare "key_$theory=$(key_for "$tmpdir/batch.txt" "ahead:${theory}Theory")"
 done
@@ -269,7 +284,9 @@ mv "$tmpdir/source-A" "$tmpdir/remote/cas/$source_A"
 worker_start ahead "$spec_B" --ahead-parent "$key_A:$spec_A"
 worker_start ahead-lib "$spec_F" --ahead-parent "$key_A:$spec_A"
 worker_start ahead-order "$spec_G" --ahead-parent "$key_A:$spec_A"
+worker_start ahead-fails "$spec_K" --ahead-parent "$key_A:$spec_A"
 await_marker ahead waiting-ATheory
+await_marker ahead-fails waiting-ATheory
 await_marker ahead-lib waiting-ATheory
 await_marker ahead-order finishing
 sleep 3
@@ -288,6 +305,11 @@ for name in ahead ahead-lib ahead-order; do
   expect "$name" 0 "status=built"
   ahead_phases "$name" || { echo "no load-ahead timings:" >&2; cat "$tmpdir/$name.result" >&2; exit 1; }
 done
+# A preload that stops after its parents arrived gives the run up, whatever
+# stopped it: a plain retry reports what a plain build would.
+worker_wait ahead-fails
+expect ahead-fails 3 "status=failed" "failure=ahead-abandoned"
+require_grep 'stopped before the end of its preload' "$tmpdir/ahead-fails.log"
 
 # An action built already is given up, since the claim of a plain run finds it.
 worker again "$spec_B" --ahead-parent "$key_A:$spec_A"
