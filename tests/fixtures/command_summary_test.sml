@@ -13,3 +13,13 @@ val snapshots = Binarymap.listItems (!HolbuildCommandSummary.actions);
 val _ = if length snapshots = 2 andalso
     List.exists (fn (_, line) => Option.isSome (HolbuildStatus.find_substring "unavailable" line)) snapshots
   then () else raise Fail "lost interrupted execution when its attempt number was reused";
+
+val _ = HolbuildCommandSummary.actions := Binarymap.mkDict String.compare;
+fun lease_event state attempt =
+  "{\"type\":\"action\",\"input_key\":\"key\",\"state\":\"" ^ state ^ "\",\"attempts\":" ^ Int.toString attempt ^ "}";
+val _ = List.app (fn (state, attempt) => HolbuildCommandSummary.observe_action ("batch", lease_event state attempt))
+  [("running", 1), ("waiting", 1), ("ready", 1), ("running", 2), ("done", 2)];
+val snapshots = map #2 (Binarymap.listItems (!HolbuildCommandSummary.actions));
+val _ = if length snapshots = 2 andalso
+    List.exists (fn line => HolbuildCommandSummary.integer_field "attempts" line = SOME 1) snapshots
+  then () else raise Fail "lost the observed attempt whose lease expired without a result";

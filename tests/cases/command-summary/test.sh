@@ -87,3 +87,51 @@ PY
 HOLBUILD_COMMAND_RECORD="$tmpdir/not-this-process.json" HOLBUILD_COMMAND_RECORD_PID=not-a-pid \
   build --version
 [[ ! -e "$tmpdir/not-this-process.json" ]]
+
+# A theory's generated sources belong to the attempt which built their owner.
+mkdir -p "$tmpdir/generated/src"
+cd "$tmpdir/generated"
+cat > holproject.toml <<TOML
+[holbuild]
+schema = 2
+[dependencies.hol]
+git = "https://github.com/HOL-Theorem-Prover/HOL.git"
+rev = "$hol_rev"
+[project]
+name = "summary_generated"
+[build]
+members = ["src"]
+[actions.UseLib]
+deps = ["GenTheory"]
+TOML
+cat > src/GenScript.sml <<'SML'
+Theory Gen
+Ancestors bool
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["GenML.sml"];
+val () = let val out = TextIO.openOut "GenML.sml"
+         in TextIO.output (out, "structure GenML = struct val x = 42 end\n"); TextIO.closeOut out end;
+SML
+cat > src/UseLib.sml <<'SML'
+structure UseLib = struct val y = GenML.x + 1 end
+SML
+build build UseLib
+build build UseLib
+sed -i 's/x = 42/x = 43/' src/GenScript.sml
+build build UseLib
+build build UseLib
+python3 - <<'PYCODE'
+import hashlib,json,pathlib
+records=sorted((json.loads(p.read_text()) for p in pathlib.Path('.holbuild/commands').glob('*.json')),
+               key=lambda r:r['started_at_ms'])
+assert len(records)==4, records
+assert all(len(r['plans'])==1 for r in records), records
+first=records[0]['plans'][0]
+assert any(s['path']=='src/GenML.sml' for s in first['newly_observed_sources']), first
+for i in (1,3):
+    plan=records[i]['plans'][0]
+    assert not plan['changed_sources'] and not plan['newly_observed_sources'], plan
+changed=records[2]['plans'][0]['changed_sources']
+generated=next(s for s in changed if s['path']=='src/GenML.sml')
+assert generated['sha256']==hashlib.sha256(pathlib.Path('src/GenML.sml').read_bytes()).hexdigest(), changed
+PYCODE

@@ -1424,10 +1424,6 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             | NONE => if watch then with_options (prepare_plan (prepared_sources ())) else plan_with_record false
       in
         warn_unreachable_for sources;
-        if dry_run then () else
-          (case mode of BuildTargets => HolbuildCommandSummary.observe_plan project (#plan sources)
-                      | RemoteExec _ => HolbuildCommandSummary.observe_plan project (#plan sources)
-                      | _ => ());
         planned
       end
     fun describe_dry_run () =
@@ -1442,23 +1438,27 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun execute (options, plan, toolchain_key) =
           timed_phase "build.execute"
             (fn () => HolbuildBuildExec.build options tc project plan toolchain_key jobs)
-        val ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
+        val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
         fun build_owners owner_plan =
           execute (build_options_for index entry_plan owner_plan [], owner_plan, toolchain_key)
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
           else plan_with_record true
+        fun prepare_requested () =
+          case components of
+              (* A restored plan already holds the writers' current sources. *)
+              NONE => initial
+            | SOME components =>
+                if build_generated_source_owners build_owners components (#holdir tc) index plan then
+                  let val replanned as (planned, _) = replan ()
+                  in warn_unreachable_for planned; replanned end
+                else initial
+        val ({plan = actual, toolchain_key = actual_key, ...}, actual_options) =
+          prepare_requested () handle e => (HolbuildCommandSummary.observe_plan project plan; raise e)
+        val _ = HolbuildCommandSummary.observe_plan project actual
       in
-        case components of
-            (* A plan from the record holds the generated sources as their
-               up-to-date writers left them. *)
-            NONE => execute (options, plan, toolchain_key)
-          | SOME components =>
-              if build_generated_source_owners build_owners components (#holdir tc) index plan then
-                let val (planned as {plan, toolchain_key, ...}, options) = replan ()
-                in warn_unreachable_for planned; execute (options, plan, toolchain_key) end
-              else execute (options, plan, toolchain_key)
+        execute (actual_options, actual, actual_key)
       end
     fun export_action_specs upload () =
       let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
@@ -1967,13 +1967,19 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
            execute_build ())
         else
-          case components of
-              NONE => remote_build_plan (build_options, plan, toolchain_key) attach
-            | SOME components =>
-                if build_generated_source_owners build_owners components (#holdir tc) index plan then
-                  let val (planned as {plan, toolchain_key, ...}, build_options) = replan ()
-                  in warn_unreachable_for planned; remote_build_plan (build_options, plan, toolchain_key) NONE end
-                else remote_build_plan (build_options, plan, toolchain_key) attach
+          let
+            fun prepare_requested () =
+              case components of
+                  NONE => ((build_options, plan, toolchain_key), attach)
+                | SOME components =>
+                    if build_generated_source_owners build_owners components (#holdir tc) index plan then
+                      let val (planned as {plan, toolchain_key, ...}, options) = replan ()
+                      in warn_unreachable_for planned; ((options, plan, toolchain_key), NONE) end
+                    else ((build_options, plan, toolchain_key), attach)
+            val (arguments as (_, actual, _), attached) =
+              prepare_requested () handle e => (HolbuildCommandSummary.observe_plan project plan; raise e)
+            val _ = HolbuildCommandSummary.observe_plan project actual
+          in remote_build_plan arguments attached end
       end
   in
     case mode of

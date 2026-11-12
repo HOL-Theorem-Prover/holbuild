@@ -1612,6 +1612,14 @@ require_grep "Use2Lib built" "$tmpdir/gen2.log"
 require_grep "AfterGenTheory restored from cache" "$tmpdir/gen2.log"
 refute_grep "Theory built" "$tmpdir/gen2.log"
 require_file "$gen2/src/Gen2ML.sml"
+python3 - "$gen2" <<'PYCODE'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+records=[json.loads(p.read_text()) for p in (root/'.holbuild/commands').glob('*.json')]
+assert len(records)==1 and len(records[0]['plans'])==1, records
+source=next(s for s in records[0]['plans'][0]['newly_observed_sources'] if s['path']=='src/Gen2ML.sml')
+assert source['sha256']==hashlib.sha256((root/'src/Gen2ML.sml').read_bytes()).hexdigest(), source
+PYCODE
 
 # check and check --fingerprint pre-build on the remote coordinator and run the
 # check script locally; when a valid deps_loaded checkpoint exists, check

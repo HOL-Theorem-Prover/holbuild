@@ -136,7 +136,15 @@ fun observe_action (batch, line) =
     val entry = object [J.json_string_field "batch_id" batch,
       "\"action\":" ^ Substring.string (Substring.dropr Char.isSpace (Substring.full line))]
   in
-    if pending then actions := Binarymap.insert (!actions, pending_key, entry)
+    if pending then
+      (case Binarymap.peek (!actions, pending_key) of
+           SOME previous =>
+             let val prior_attempt = getOpt (integer_field "attempts" previous, 0)
+             in if prior_attempt > 0 andalso prior_attempt < attempt then
+                  actions := Binarymap.insert (!actions, pending_key ^ "\000" ^ LargeInt.toString prior_attempt, previous)
+                else () end
+         | NONE => ();
+       actions := Binarymap.insert (!actions, pending_key, entry))
     else
       (if Option.isSome (Binarymap.peek (!actions, pending_key)) then
          actions := #1 (Binarymap.remove (!actions, pending_key)) else ();
