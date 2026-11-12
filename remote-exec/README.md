@@ -563,7 +563,8 @@ active = ready_build + running_build - waiting_ahead + min(RUN_SLOTS, ready_run 
 high = ready_high_build + running_high_build - waiting_ahead_high + min(RUN_SLOTS, ready_high_run + running_high_run)
 plain = max(0, active - WARM_WORKERS, high)
 running_active = running_build - waiting_ahead + min(RUN_SLOTS, running_run)
-demand = min(MAX_BURST_WORKERS, plain + waiting_ahead)   if high > running_high - waiting_ahead_high or active > max(WARM_WORKERS, running_active)
+ready_high = ready_high_build + min(ready_high_run, max(0, RUN_SLOTS - running_run))
+demand = min(MAX_BURST_WORKERS, plain + waiting_ahead)   if ready_high > 0 or active > max(WARM_WORKERS, running_active)
 demand = min(MAX_BURST_WORKERS, plain)                   otherwise
 ```
 
