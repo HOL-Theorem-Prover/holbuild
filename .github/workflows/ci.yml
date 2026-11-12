@@ -33,7 +33,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Bound coordinator HTTP liveness under 400 concurrent claimers
         working-directory: remote-exec
-        run: uv run --frozen pytest -q tests/test_http_liveness.py
+        run: uv run --frozen pytest -q -s tests/test_http_liveness.py
         env:
           REMOTE_EXEC_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
 
