@@ -71,7 +71,7 @@ theory actions also produce `.tr.gz` Poly/ML exports.
 
 Proof engine/checkpoint/timeout/trace flags are intentionally not final artifact action-key inputs. Switching `--skip-checkpoints`, `--all-checkpoints`, `--skip-proof-steps`, or root tactic timeout should not rebuild an otherwise up-to-date semantic artifact.
 
-`extra_deps` are filesystem dependencies outside the normal HOL dependency graph. Manifest entries are package-root-relative; source annotations of the form `holbuild_extra_deps ["../data/table.txt"]` are source-file-relative. Entries may name files, directories, or simple globs. Expanded contents are hashed into the action key, and source-declared entries are staged so matching relative filesystem reads work during the action.
+`extra_deps` are filesystem dependencies outside the normal HOL dependency graph. Manifest entries are package-root-relative; source annotations of the form `holbuild_extra_deps ["../data/table.txt"]` are source-file-relative. As with `holbuild_extra_outputs` below, define `fun holbuild_extra_deps (_ : string list) = ();` before calling it; HOL does not provide it. Entries may name files, directories, or simple globs. Expanded contents are hashed into the action key, and source-declared entries are staged so matching relative filesystem reads work during the action.
 
 Theory scripts can declare deterministic extra output files with a static literal annotation. Define the no-op function before calling it; HOL does not provide it, and holbuild scans the literal list in the source:
 
