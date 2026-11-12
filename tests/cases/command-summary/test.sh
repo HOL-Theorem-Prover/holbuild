@@ -7,6 +7,8 @@ source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 trap 'cleanup_temp_dir "$tmpdir"' EXIT
 use_case_cache "$tmpdir/cache"
+(cd "$HOLBUILD_ROOT" && "${HOLBUILD_POLY:-poly}" -q --error-exit < tests/fixtures/command_summary_test.sml) \
+  > "$tmpdir/summary-unit.log" 2>&1 || { cat "$tmpdir/summary-unit.log" >&2; exit 1; }
 hol_rev=$(holbuild_pinned_hol_rev)
 mkdir -p "$tmpdir/project/src"
 cd "$tmpdir/project"
@@ -47,6 +49,7 @@ import json,pathlib
 records=[json.loads(p.read_text()) for p in pathlib.Path('.holbuild/commands').glob('*.json')]
 assert len(records)==1, records
 assert records[0]['exit_code']==0
+assert len(records[0]['plans'])==1
 assert records[0]['plans'][0]['source_hashes_complete']
 assert records[0]['plans'][0]['cold_worktree']
 assert len(records[0]['plans'][0]['newly_observed_sources'])>=3

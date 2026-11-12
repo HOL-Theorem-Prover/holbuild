@@ -7202,8 +7202,6 @@ fun trace_cpu_pressure_delta start =
         cache_trace ("system cpu pressure some delta: " ^ LargeInt.toString (after_us - before_us) ^ "us")
     | _ => ()
 
-val command_plan = ref (fn (_ : HolbuildProject.t * HolbuildBuildPlan.t) => ())
-
 fun build (options : build_options) tc project plan toolchain_key jobs =
   let
     val cpu_pressure_start =
@@ -7216,7 +7214,6 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val base_context = toolchain_base_context tc
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
-    val _ = !command_plan (project, plan)
     val _ = dump_keys_if_requested (build_config_lines_for_node options project) toolchain_key plan keys
     val dat_hash_cache = new_file_hash_cache ()
     val _ = HolbuildBuildPlan.forget_output_digests plan

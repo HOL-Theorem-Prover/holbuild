@@ -12,8 +12,6 @@ val plans = ref ([] : string list)
 val follows = ref ([] : string list)
 val batches = ref (Binaryset.empty String.compare)
 val actions = ref (Binarymap.mkDict String.compare : (string, string) Binarymap.dict)
-val baselines = ref (Binarymap.mkDict String.compare :
-  (string, (string, string) Binarymap.dict option) Binarymap.dict)
 val counts = Array.array (4, 0)
 val mutex = Mutex.mutex ()
 
@@ -55,11 +53,7 @@ fun observe_plan project plan = best_effort (fn () =>
   let
     val root = HolbuildProject.artifact_root project
     val state = OS.Path.concat (root, ".holbuild/command-sources")
-    val old =
-      case Binarymap.peek (!baselines, root) of
-          SOME saved => saved
-        | NONE => let val saved = read_sources state
-                  in baselines := Binarymap.insert (!baselines, root, saved); saved end
+    val old = read_sources state
     val previous = getOpt (old, Binarymap.mkDict String.compare)
     val selected = BP.selected_nodes plan
     (* Observe the planner's hashes without preparing outputs or invoking generators. *)
@@ -68,7 +62,7 @@ fun observe_plan project plan = best_effort (fn () =>
       Option.map (fn hash => (node, hash))
         (Binarymap.peek (hashes, HolbuildComponentProvider.analysis_key (BP.source_of node)))
     val current = List.mapPartial observed selected
-    val known = getOpt (read_sources state, Binarymap.mkDict String.compare)
+    val known = previous
     val updated = List.foldl (fn ((node, hash), map) => Binarymap.insert (map, BP.key node, hash)) known current
     val nodes = List.foldl (fn (node, map) => Binarymap.insert (map, BP.key node, node))
                           (Binarymap.mkDict String.compare) selected
@@ -130,10 +124,24 @@ fun observe_action (batch, line) =
     val field = fn name => HolbuildRemoteExec.json_string_field name line
     val key = getOpt (field "input_key", "")
     val attempt = getOpt (integer_field "attempts" line, 0)
-    val identity = batch ^ "\000" ^ key ^ "\000" ^ LargeInt.toString attempt
+    val began = integer_field "started" line
+    val failure = getOpt (field "last_failure", "")
+    val execution = case began of SOME ms => LargeInt.toString ms
+                     | NONE => HolbuildSha256.string_hex line
+    val identity = batch ^ "\000" ^ key ^ "\000" ^ LargeInt.toString attempt ^ "\000" ^ execution ^ "\000" ^ failure
+    val terminal = List.exists (fn state => field "state" = SOME state) ["done", "failed", "cancelled"]
+    val pending = field "state" = SOME "running" orelse
+                  (not (Option.isSome began) andalso failure = "" andalso not terminal)
+    val pending_key = batch ^ "\000" ^ key ^ "\000pending"
     val entry = object [J.json_string_field "batch_id" batch,
       "\"action\":" ^ Substring.string (Substring.dropr Char.isSpace (Substring.full line))]
-  in actions := Binarymap.insert (!actions, identity, entry) end
+  in
+    if pending then actions := Binarymap.insert (!actions, pending_key, entry)
+    else
+      (if Option.isSome (Binarymap.peek (!actions, pending_key)) then
+         actions := #1 (Binarymap.remove (!actions, pending_key)) else ();
+       actions := Binarymap.insert (!actions, identity, entry))
+  end
 
 fun observe_follow (batch, start, finish) =
   (batches := Binaryset.add (!batches, batch);
@@ -163,7 +171,6 @@ fun initialize () =
        (SOME path, SOME expected) => if expected = pid () then SOME path else NONE
      | _ => NONE);
    J.command_outcome := outcome;
-   HolbuildBuildExec.command_plan := (fn (project, plan) => observe_plan project plan);
    HolbuildRemoteExec.command_action := observe_action;
    HolbuildRemoteExec.command_follow := observe_follow;
    HolbuildRemoteExec.command_batch := (fn batch => batches := Binaryset.add (!batches, batch));
