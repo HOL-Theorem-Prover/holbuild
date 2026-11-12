@@ -185,9 +185,12 @@ records=[json.loads(p.read_text()) for p in (pathlib.Path(sys.argv[1])/'.holbuil
 record=next(r for r in records if r['fleet_batches']==['b1'])
 assert record['exit_code']==0
 assert len(record['fleet_follows'])==1
-assert len(record['fleet_actions'])==2
-assert all(a['action']['timings']['finished'] >= a['action']['timings']['started'] for a in record['fleet_actions'])
-assert sum(a['action']['timings']['rebuilt'] for a in record['fleet_actions'])==2
+results=[a for a in record['fleet_actions'] if a['observation']=='result']
+assert len(results)==2
+assert all(a['action']['timings']['finished'] >= a['action']['timings']['started'] for a in results)
+assert sum(a['action']['timings']['rebuilt'] for a in results)==2
+assert record['fleet_history_complete'] is False
+assert all(set(a['action'])=={'input_key','state','attempts'} for a in record['fleet_actions'] if a['observation']=='attempt')
 assert record['local_outcomes']['built']==0
 assert record['local_outcomes']['restored_remote']==2
 PY
