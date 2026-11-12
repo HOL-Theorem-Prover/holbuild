@@ -37,6 +37,8 @@ def counts(
     ready_run: int = 0,
     running_run: int = 0,
     high_run: int = 0,
+    ahead: int = 0,
+    ahead_high: int = 0,
 ) -> QueueCounts:
     return QueueCounts(
         waiting=0,
@@ -47,6 +49,8 @@ def counts(
         ready_run=ready_run,
         running_run=running_run,
         high_run=high_run,
+        waiting_ahead_standard=ahead,
+        waiting_ahead_high=ahead_high,
     )
 
 
@@ -59,10 +63,24 @@ def counts(
         (counts(ready_high=1), 1),  # warm workers are standard-tier, so a high action needs a burst worker
         (counts(running=2, ready_high=1, running_high=1), 2),
         (counts(ready=30, running=10), 16),  # capped
+        # Running actions waiting ahead ask for no worker while no ready work needs a burst worker...
+        (counts(running=6, ahead=4), 0),
+        (counts(running_high=3, ahead_high=3), 0),
+        (counts(ready=1, running=4, ahead=3), 0),  # the warm workers take the rest
+        # ...and count once some does, since they don't take it, whatever their tier.
+        (counts(ready_high=2, running_high=6, ahead_high=4), 4 + 4),
+        (counts(ready_high=1, running=4, running_high=3, ahead=4), 4 + 4),
+        (counts(ready=2, running=4, ahead=3), 1 + 3),
     ],
 )
 def test_burst_demand(queue: QueueCounts, expected: int) -> None:
     assert burst_demand(queue, warm_workers=2, max_burst_workers=16) == expected
+
+
+def test_burst_demand_counts_the_workers_held_ahead_for_no_high_run_the_run_slots_hold_back() -> None:
+    # One run slot, taken by the running high run: the ready one waits for it, not for a burst worker.
+    queue = counts(running=4, ready_high=1, running_high=1, ready_run=1, running_run=1, high_run=2, ahead=4)
+    assert burst_demand(queue, warm_workers=2, max_burst_workers=16, run_slots=1) == 1
 
 
 def scaled_coordinator(coordinator: Coordinator, tmp_path: Path, script: str) -> tuple[Coordinator, Path]:
@@ -147,6 +165,8 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "running_run": 1,
         "ready_priority": 0,
         "running_priority": 0,
+        "waiting_ahead_standard": 0,
+        "waiting_ahead_high": 0,
         "run_slots": 30,
         "run_floor": 0,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
@@ -357,7 +377,7 @@ async def test_claim_forwards_optional_host_id_and_rank(
     assert response.status_code == 204
     assert claim.await_args is not None
     assert claim.await_args.args[:3] == (["high", "standard"], "w1", 0)
-    assert claim.await_args.kwargs == {"host_id": host_id, "host_rank": host_rank}
+    assert claim.await_args.kwargs == {"host_id": host_id, "host_rank": host_rank, "ahead": False}
 
 
 async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
