@@ -361,9 +361,9 @@ holbuild_pid=""
 require_grep '^END Capped' "$events"
 require_no_live_leases "$tmpdir/cgroup-coop"
 
-# The HOL session of run and check waits the same way.
+# The HOL session of run and fingerprint checks waits the same way.
 printf 'val _ = TextIO.print "SESSION RAN\\n";\n' > "$tmpdir/capped/probe.sml"
-for command in "run probe.sml" "check CappedTheory"; do
+for command in "run probe.sml" "check --with-fingerprints CappedTheory"; do
   out=$tmpdir/session-${command%% *}.out
   write_group "$cgroup/scope" $((8 * gib)) $((15 * gib / 2)) 0
   # shellcheck disable=SC2086
@@ -389,6 +389,23 @@ for command in "run probe.sml" "check CappedTheory"; do
 done
 require_grep 'SESSION RAN' "$tmpdir/session-run.out"
 require_grep 'CappedTheory: 2 findings' "$tmpdir/session-check.out"
+require_no_live_leases "$tmpdir/cgroup-coop"
+
+# A warm plain check reads metadata without starting a HOL session, so needs
+# no child reservation even while the cgroup has no room for a child.
+write_group "$cgroup/scope" $((8 * gib)) $((15 * gib / 2)) 0
+set +e
+(cd "$tmpdir/capped" && HOLBUILD_TEST_CGROUP=$cgroup/scope/job/step timeout 60 "$HOLBUILD_BIN" \
+  --cooperate-dir "$tmpdir/cgroup-coop" --child-charge 1024 check CappedTheory) \
+  > "$tmpdir/plain-check.out" 2>&1
+status=$?
+set -e
+[[ $status -eq 1 ]] || { cat "$tmpdir/plain-check.out" >&2; exit 1; }
+require_grep 'CappedTheory: 2 findings' "$tmpdir/plain-check.out"
+if grep -q 'waiting for machine memory' "$tmpdir/plain-check.out"; then
+  echo 'plain check waited for a child it does not start' >&2
+  exit 1
+fi
 require_no_live_leases "$tmpdir/cgroup-coop"
 
 # With no limit anywhere ("max"), however much the groups use, a child starts.

@@ -76,7 +76,7 @@ fun global_help () = print
   \less (at least 1 GiB).\n\
   \Where cgroup v2 limits the memory of holbuild's group or of a group enclosing\n\
   \it, a child also starts only while the tightest of them has its charge left,\n\
-  \reservations or none. The HOL session of check and run reserves too.\n\
+  \reservations or none. Fingerprint checks and run reserve for their HOL session.\n\
   \This bounds admission; it does not enforce RSS. HOL toolchain builds and repl\n\
   \reserve nothing.\n\
   \To set or resize the budget, write DIR/budget (a byte count) while holding\n\
@@ -3318,9 +3318,8 @@ fun fingerprint_script logical_names =
        ""])
   end
 
-(* Builds the distinct theories, then runs the script make_script writes in
-   a fresh HOL session, and exits non-zero if that fails. *)
-fun run_check_script tc cli_jobs build_mode theories make_script =
+(* Build once for all selectors, then inspect the restored artifacts. *)
+fun with_check_targets tc cli_jobs build_mode theories inspect =
   let
     val project = timed_phase "project.discover" load_project
     val {index, ...} = prepare_source_index "check" (resolution_for_toolchain tc) project
@@ -3329,6 +3328,17 @@ fun run_check_script tc cli_jobs build_mode theories make_script =
     val _ = build_once_with_prepared_mode build_mode tc cli_jobs NONE (plain_build_request targets)
     val project = timed_phase "check.project.rediscover" load_project
     val {index, components} = prepare_source_index "check" (resolution_for_toolchain tc) project
+  in
+    inspect {project = project, index = index, components = components,
+             logical_names = logical_names}
+  end
+
+(* Fingerprinting needs HOL terms; ordinary checks only need stored metadata. *)
+fun run_check_script tc cli_jobs build_mode theories make_script =
+  with_check_targets tc cli_jobs build_mode theories
+  (fn context as {project, index, components, logical_names} =>
+  let
+    val targets = HolbuildBuildPlan.unique_strings logical_names
     val from =
       case targets of
           [target] => FromTheory target
@@ -3339,8 +3349,7 @@ fun run_check_script tc cli_jobs build_mode theories make_script =
                | NONE => NoFrom)
     val script_path = HolbuildToolchain.invocation_sml_file project "holbuild-check"
     val _ = write_text_file script_path
-              (make_script {project = project, index = index, components = components,
-                            logical_names = logical_names})
+              (make_script context)
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
@@ -3349,6 +3358,140 @@ fun run_check_script tc cli_jobs build_mode theories make_script =
   in
     cleanup ();
     if HolbuildToolchain.success status then () else OS.Process.exit OS.Process.failure
+  end)
+
+type check_theorem = {oracles : string list, hypotheses : bool, axiom : bool}
+type check_data = {parents : string list, stored : (string * check_theorem) list}
+
+(* Read no terms: tags and the presence of hypotheses are in the export metadata. *)
+fun read_check_data path theory : check_data =
+  let
+    open HolbuildBuildExec
+    fun items sexp =
+      let fun loop (SSymbol "nil") acc = rev acc
+            | loop (SCons (a, b)) acc = loop b (a :: acc)
+            | loop _ _ = raise BadTheoryData
+      in loop sexp [] end
+    fun tagged tag (SCons (SSymbol name, rest)) =
+          if name = tag then rest else raise BadTheoryData
+      | tagged _ _ = raise BadTheoryData
+    fun string (SString s) =
+          (case String.scan Substring.getc (Substring.full s) of
+               SOME (value, rest) => if Substring.isEmpty rest then value else raise BadTheoryData
+             | NONE => raise BadTheoryData)
+      | string _ = raise BadTheoryData
+    val (header, core) =
+      case items (parse_sexp (read_text path)) of
+          [SSymbol "theory", header, core, _, _] => (header, core)
+        | _ => raise BadTheoryData
+    val parents =
+      case header of
+          SCons (name, parents) =>
+            if string name <> theory then raise BadTheoryData
+            else map (fn SCons (name, _) => string name | _ => raise BadTheoryData) (items parents)
+        | _ => raise BadTheoryData
+    val (tables, exports) =
+      case tagged "core-data" core of
+          SCons pair => pair
+        | _ => raise BadTheoryData
+    val strings =
+      case items (tagged "tables" tables) of
+          table :: _ => Vector.fromList (map string (items (tagged "string-table" table)))
+        | _ => raise BadTheoryData
+    val theorems =
+      case items (tagged "exports" exports) of
+          [_, _, theorems] => items theorems
+        | _ => raise BadTheoryData
+    fun theorem entry =
+      case items entry of
+          [SInteger name, SCons (_, tags), info, terms] =>
+            let
+              val name =
+                case strict_nonnegative_int name of
+                    SOME i => Vector.sub (strings, i)
+                  | NONE => raise BadTheoryData
+              val axiom =
+                case items info of
+                    SInteger class :: SInteger _ :: _ =>
+                      if List.exists (fn c => c = class) ["0", "1", "2"] then class = "0"
+                      else raise BadTheoryData
+                  | _ => raise BadTheoryData
+              val hypotheses =
+                case items terms of [] => raise BadTheoryData | _ :: hyps => not (null hyps)
+              val oracles = Redblackset.listItems (Redblackset.addList
+                (Redblackset.empty String.compare, List.filter (fn s => s <> "DISK_THM") (map string (items tags))))
+            in (name, {oracles = oracles, hypotheses = hypotheses, axiom = axiom}) end
+        | _ => raise BadTheoryData
+    (* DB.bindl replaces an earlier binding with the same exact name. *)
+    val stored = List.foldl (fn (entry, acc) => Redblackmap.insert (acc, #1 entry, #2 entry))
+                  (Redblackmap.mkDict String.compare) (map theorem theorems)
+  in
+    {parents = parents, stored = Redblackmap.listItems stored}
+  end
+  handle HolbuildBuildExec.BadTheoryData => raise Error ("malformed theory data: " ^ path)
+       | Subscript => raise Error ("invalid string index in theory data: " ^ path)
+
+fun check_stored_data tc cli_jobs build_mode selections {project, index, components, logical_names} =
+  let
+    val run_loads = #run_loads project
+    val _ = if null run_loads then () else
+      build_once_with_prepared_mode build_mode tc cli_jobs NONE (plain_build_request run_loads)
+    val hol = hol_package_id tc project
+    val sources = List.filter theory_source index
+    val project_theories = Redblackset.addList
+      (Redblackset.empty String.compare, project_theory_names hol index)
+    val paths = List.foldl (fn (source, acc) =>
+      Redblackmap.insert (acc, HolbuildBuildExec.theory_name_from_logical (#logical_name source),
+        HolbuildBuildExec.one_with_suffix ".dat" (#theory_data (#artifacts source))))
+      (Redblackmap.mkDict String.compare) sources
+    val summaries : (string, check_data) Redblackmap.dict ref = ref (Redblackmap.mkDict String.compare)
+    fun data thy =
+      case Redblackmap.peek (!summaries, thy) of
+          SOME summary => summary
+        | NONE =>
+            let
+              val path = case Redblackmap.peek (paths, thy) of
+                  SOME path => path | NONE => raise Error ("theory data not found: " ^ thy ^ "Theory")
+              val summary = read_check_data path thy
+            in summaries := Redblackmap.insert (!summaries, thy, summary); summary end
+    fun qualified thy name = thy ^ "Theory." ^ name
+    fun count n noun = Int.toString n ^ " " ^ noun ^ (if n = 1 then "" else "s")
+    fun out s = (TextIO.output (TextIO.stdOut, s ^ "\n"); TextIO.flushOut TextIO.stdOut)
+    fun check (logical_name, {theory = _, theorem}) =
+      let
+        val thy = HolbuildBuildExec.theory_name_from_logical logical_name
+        val summary = data thy
+        val checked = case theorem of
+            NONE => #stored summary
+          | SOME name =>
+              (case List.filter (fn (n, _) => n = name) (#stored summary) of
+                   [] => raise Error ("theorem not found: " ^ qualified thy name)
+                 | found => found)
+        (* Theory.Graph.ancestryl folds left, prepending before visiting parents. *)
+        fun ancestors parents state = List.foldl (fn (parent, (seen, acc)) =>
+          if not (Redblackset.member (project_theories, parent)) orelse
+             Redblackset.member (seen, parent) then (seen, acc)
+          else ancestors (#parents (data parent)) (Redblackset.add (seen, parent), parent :: acc)) state parents
+        val (_, ancestry) = ancestors (#parents summary) (Redblackset.empty String.compare, [])
+        val ancestry = if Redblackset.member (project_theories, thy) then thy :: ancestry else ancestry
+        fun axioms ancestor = map (fn (name, _) => qualified ancestor name ^ ": axiom")
+          (List.filter (fn (_, info) => #axiom info) (#stored (data ancestor)))
+        val findings = kernel_bypass_findings tc hol components index logical_name @
+          List.mapPartial (fn (name, info) => if null (#oracles info) then NONE
+            else SOME (qualified thy name ^ ": " ^ String.concatWith ", " (#oracles info))) checked @
+          List.mapPartial (fn (name, info) => if #hypotheses info
+            then SOME (qualified thy name ^ ": undischarged hypotheses") else NONE) checked @
+          List.concat (map axioms ancestry)
+        val subject = case theorem of NONE => thy ^ "Theory" | SOME name => qualified thy name
+      in
+        List.app out findings;
+        out (subject ^ ": " ^ (if null findings then "clean (" ^ count (length checked) "theorem" ^ ")"
+                                else count (length findings) "finding"));
+        not (null findings)
+      end
+    val failed = ListPair.mapEq check (logical_names, selections)
+  in
+    if List.exists (fn failure => failure) failed then OS.Process.exit OS.Process.failure else ()
   end
 
 (* with_fingerprints also prints the fingerprint listing of the selected
@@ -3371,7 +3514,11 @@ fun check_selectors tc cli_jobs build_mode {with_fingerprints} selectors =
         "val _ = if !HolbuildCheckFailed then OS.Process.exit OS.Process.failure else ();\nend;\n"
       end
   in
-    run_check_script tc cli_jobs build_mode (map #theory selections) make_script
+    if with_fingerprints then
+      run_check_script tc cli_jobs build_mode (map #theory selections) make_script
+    else
+      with_check_targets tc cli_jobs build_mode (map #theory selections)
+        (check_stored_data tc cli_jobs build_mode selections)
   end
 
 fun check_fingerprint tc cli_jobs build_mode selectors =

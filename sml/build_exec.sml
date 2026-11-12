@@ -5712,6 +5712,11 @@ fun parse_sexp text =
       else if sub i = #"\\" then string_end (i + 2)
       else if sub i = #"\"" then i
       else string_end (i + 1)
+    fun symbol_end i =
+      if i >= n then raise BadTheoryData
+      else if sub i = #"\\" then symbol_end (i + 2)
+      else if sub i = #"|" then i
+      else symbol_end (i + 1)
     fun close tail items = List.foldl SCons tail items
     fun item i =
       let val i = skip i
@@ -5724,6 +5729,10 @@ fun parse_sexp text =
             | #"\"" =>
                 let val j = string_end (i + 1)
                 in (SString (String.substring (text, i + 1, j - i - 1)), j + 1) end
+            | #"|" =>
+                (* Keep the printed spelling, as with escaped strings. *)
+                let val j = symbol_end (i + 1)
+                in (SSymbol (String.substring (text, i, j - i + 1)), j + 1) end
             | c =>
                 let val j = atom_end i
                     val atom = String.substring (text, i, j - i)
