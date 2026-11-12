@@ -510,7 +510,7 @@ event with `--json`. A charge larger than the whole budget fails at once.
 This bounds admission; it does not enforce RSS: children already running can
 still grow together, up to their `--max-heap`, past what the machine has left,
 since nothing re-checks a child once it has started. The HOL session of
-`check` and `run` takes a reservation like a theory child; HOL toolchain
+fingerprint checks and `run` takes a reservation like a theory child; HOL toolchain
 builds and `repl` take none.
 
 - The budget is the byte count in `DIR/budget`, which `--machine-max-mem`
@@ -543,8 +543,9 @@ manifest in use is watched as well (not recursively), so a `holbuild.toml` or
 currently requires `inotifywait` from `inotify-tools` and does not support
 `--json`, `--dry-run`, or `--repl-on-failure`.
 
-`holbuild check MyTheory` builds the theory if needed, loads it in HOL and
-checks the tags and hypotheses of its stored theorems. It prints one line per
+`holbuild check MyTheory` builds the theory if needed, then reads the restored
+`Theory.dat` files directly, without starting HOL or loading ancestor terms.
+It checks the tags and hypotheses of its stored theorems. It prints one line per
 theorem whose tag carries an oracle other than `DISK_THM` (for instance
 `MyTheory.my_theorem: cheat`) and one per axiom declared in the theory or its
 ancestors outside HOL itself, that is, in the root package or a dependency
@@ -560,23 +561,22 @@ line per use (`mypkg:src/MyScript.sml:12: kernel bypass: disk_thm`). Names in
 comments and string literals don't count; the scan is a backstop, not a
 sandbox. With findings it exits non-zero; otherwise it prints
 `MyTheory: clean (N theorems)` and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
-Pass several selectors to share one build of the distinct targets and one HOL
-session: `holbuild check MyTheory OtherTheory:my_theorem`. Each selector keeps
+Pass several selectors to share one build of the distinct targets:
+`holbuild check MyTheory OtherTheory:my_theorem`. Each selector keeps
 its own findings or clean line, in argument order (including repeated selectors).
 Findings do not stop later checks; the command exits non-zero if any selector
-has findings. Invalid selectors, missing theorems and load errors abort the
+has findings. Invalid selectors, missing theorems and unreadable theory data abort the
 command.
 
 `check` builds the theories, and any `[run].loads`, without proof steps or
 checkpoints: it applies no step timeout (that is `build`'s check) and reuses
-theories built by `holbuild build --skip-proof-steps`. The tags are those
+theories built by `holbuild build --skip-proof-steps`. Plain checks do not execute
+`[run].loads`; fingerprint modes load them in HOL. The tags are those
 recorded in the built theory, which may have been restored from a cache;
-run `holbuild build --no-cache MyTheory` first to check a fresh build. HOL
-starts from a valid dependency checkpoint or the toolchain's base state, never
-from `[run].heap`, which may hold an older copy of a theory.
+run `holbuild build --no-cache MyTheory` first to check a fresh build.
 
-`holbuild check --fingerprint MyTheory` builds and loads the theory the same
-way and prints one tab-separated line per axiom, definition and theorem stored
+`holbuild check --fingerprint MyTheory` builds the theory, then loads it in HOL
+and prints one tab-separated line per axiom, definition and theorem stored
 in it and in each of its ancestors, HOL's own theories included, sorted
 bytewise so that two runs diff cleanly. Several theories can be passed together
 (`holbuild check --fingerprint MyTheory OtherTheory`); their shared ancestors
@@ -591,7 +591,10 @@ fingerprint	MyTheory	theorem	other_theorem	77d0…	cheat
 `holbuild check --with-fingerprints MyTheory:my_theorem` does both in one HOL
 session: it checks the selectors as plain `check` does and prints the
 fingerprint lines of their theories, and exits with the check's status. A
-tool that wants both pays for one theory load instead of two.
+tool that wants both pays for one theory load. Both fingerprint modes start HOL
+from a valid dependency checkpoint or the toolchain's base state, never from
+`[run].heap`, which may hold an older copy of a theory. These HOL sessions use
+one GC thread and take the same `--cooperate-dir` memory reservation as builds.
 
 Build progress and HOL's own messages share stdout, so keep the lines that
 start with `fingerprint` and a tab (`grep '^fingerprint'`). After that column

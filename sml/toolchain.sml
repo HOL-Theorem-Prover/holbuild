@@ -25,12 +25,9 @@ fun poly_runtime_args ({maxheap, ...} : t) =
     | SOME n => ["--maxheap", Int.toString n]
 
 fun hol_subcommand_argv tc subcommand =
-  hol tc :: poly_runtime_args tc @ [subcommand]
+  hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ [subcommand]
 
-(* Holmake deliberately confines Poly/ML to one GC thread while playing theory
-   scripts.  Keep that build policy separate from interactive run/repl use. *)
-fun theory_run_argv tc =
-  hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ ["run"]
+fun theory_run_argv tc = hol_subcommand_argv tc "run"
 
 fun quote s =
   "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"
