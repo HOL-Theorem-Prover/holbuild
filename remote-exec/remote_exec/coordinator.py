@@ -506,6 +506,7 @@ FROM children c
 JOIN ahead_batches b ON b.id = c.batch_id
 JOIN actions a ON a.batch_id = c.batch_id AND a.input_key = c.input_key
 WHERE a.state = 'waiting' AND a.class = 'build' AND a.ahead <> 'abandoned' AND a.remaining_deps = c.running_parents
+AND a.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
 ORDER BY b.priority DESC, a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
 """)
 
@@ -1012,7 +1013,9 @@ class Coordinator:
             if builds_first and await conn.scalar(
                 sa.text(
                     "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'build' "
-                    "AND tier = ANY(CAST(:tiers AS text[])) FOR UPDATE SKIP LOCKED)"
+                    "AND tier = ANY(CAST(:tiers AS text[])) "
+                    "AND input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()) "
+                    "FOR UPDATE SKIP LOCKED)"
                 ),
                 params,
             ):
@@ -1308,11 +1311,14 @@ class Coordinator:
             return list(await conn.execute(PEERS, {"batch_id": batch_id, "input_key": action.input_key}))
 
     def _wake_peers(self, peers: list[sa.Row[Any]]) -> None:
-        """Have claims take the ready ``peers`` now that the lease holding them back ended, as if just made ready."""
+        """Have claims take the ``peers`` now that the lease holding them back ended: the ready ones as if just made
+        ready, the waiting ones ahead of their parents."""
         for batch_id, tier, state, _ in peers:
             if state == "ready":
                 self._forget_rankings(batch_id, {tier})
                 self._wake_claim(tier)
+        if peers:
+            self._ahead_changed()
 
     async def _finish_peer(self, batch_id: UUID, input_key: str, log_sha256: str | None) -> None:
         """Mark done the copy in ``batch_id`` of build ``input_key``, which another batch's worker just finished
@@ -1334,6 +1340,7 @@ class Coordinator:
             await self._finish_if_done(conn, batch_id)
         self._batch_changed(batch_id)
         self.request_release(batch_id)
+        self._ahead_changed()  # its children may now be claimed ahead
 
     def report_host(self, report: HostReport) -> None:
         """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one."""

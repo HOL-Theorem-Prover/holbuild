@@ -800,6 +800,18 @@ async def test_a_held_action_is_claimed_once_its_leaders_lease_expires(
     assert await claim(http) is None  # now the follower's lease holds the leader's retry
 
 
+async def test_a_held_build_leaves_the_idle_run_fallback_to_a_ready_run(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_slots = 1
+    await submit(http, ["a"])
+    await claim_named(http, "a")
+    await submit(http, ["a"])
+    await submit(http, ["run"], **{"class": "run"})
+    claimed = await asyncio.wait_for(claim(http), 10)
+    assert claimed is not None and claimed["theory"] == "pkg:run"
+
+
 async def test_a_batch_whose_ready_actions_are_all_held_does_not_block_other_batches(
     http: httpx.AsyncClient,
 ) -> None:

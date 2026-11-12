@@ -111,6 +111,24 @@ async def test_a_child_another_batch_is_building_is_not_claimed_ahead_and_is_don
     assert (await states(http, leader), await states(http, ahead)) == ({"b": "done"}, {"a": "running", "b": "done"})
 
 
+async def test_a_child_held_by_another_batch_wakes_a_waiting_claim_ahead_once_that_build_fails(
+    http: httpx.AsyncClient,
+) -> None:
+    await submit(http, ["b"])
+    token = await claim_named(http, "b")
+    await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    await claim_named(http, "a")
+
+    started = time.monotonic()
+    waiting = asyncio.create_task(claim_ahead(http, wait_s=CLAIM_RECHECK_SECONDS * 2))
+    await asyncio.sleep(0.2)
+    assert not waiting.done()
+    assert (await complete(http, token, result("b", "failed", "proof"))).status_code == 200
+    claimed = await waiting
+    assert claimed is not None and claimed["theory"] == "pkg:b" and claimed["ahead_parents"] == parents("a")
+    assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
+
+
 async def test_claims_ahead_take_the_deepest_child_first_and_stop_at_the_cap(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
