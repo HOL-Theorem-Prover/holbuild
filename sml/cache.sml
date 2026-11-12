@@ -225,13 +225,13 @@ fun missing_file (IO.Io {cause = OS.SysErr (_, SOME err), ...}) =
       err = Posix.Error.noent orelse err = Posix.Error.notdir
   | missing_file _ = false
 
-(* Adds the blobs a manifest names; a missing manifest, or an action entry that
-   is not a directory, adds none. Any other failure to read it stops GC, which
+(* Folds over the blobs a manifest names; a missing manifest, or an action entry
+   that is not a directory, leaves the set unchanged. Any other read failure stops GC, which
    would otherwise delete the blobs it names. *)
-fun add_manifest_blobs (action_dir, live_blobs) =
+fun fold_manifest_blobs update (action_dir, blobs) =
   case SOME (TextIO.openIn (manifest_path action_dir))
        handle e => if missing_file e then NONE else raise e of
-      NONE => live_blobs
+      NONE => blobs
     | SOME input =>
         let
           fun loop blobs =
@@ -240,11 +240,13 @@ fun add_manifest_blobs (action_dir, live_blobs) =
               | SOME line =>
                   loop (case HolbuildFSCacheBackend.blob_ref line of
                             NONE => blobs
-                          | SOME blob => add_blob (blob, blobs))
+                          | SOME blob => update (blob, blobs))
         in
-          loop live_blobs before TextIO.closeIn input
+          loop blobs before TextIO.closeIn input
           handle e => (TextIO.closeIn input; raise e)
         end
+
+fun add_manifest_blobs entry = fold_manifest_blobs add_blob entry
 
 fun action_live_blobs action_dir = add_manifest_blobs (action_dir, empty_blob_set ())
 
@@ -253,18 +255,24 @@ fun action_modified action_dir =
   SOME (FS.modTime (manifest_path action_dir))
   handle OS.SysErr _ => (SOME (FS.modTime action_dir) handle OS.SysErr _ => NONE)
 
-fun collect_live_actions cutoff actions_dir =
+fun collect_live_actions cutoff root candidates =
   let
-    fun one (action_dir, (live_blobs, removed)) =
+    fun keep_blob (blob, candidates) =
+      if Redblackset.member (candidates, blob) then
+        (* Heal old blobs kept alive by clients that only touched manifests. *)
+        (touch (blob_path root blob); Redblackset.delete (candidates, blob))
+      else candidates
+    fun one (action_dir, (candidates, removed)) =
       case action_modified action_dir of
           SOME time =>
             if Time.< (time, cutoff) then
-              (defer_tree action_dir; ((live_blobs, removed + 1), true))
+              (defer_tree action_dir; ((candidates, removed + 1), true))
             else
-              ((add_manifest_blobs (action_dir, live_blobs), removed), false)
-        | NONE => ((live_blobs, removed), false)
+              ((if Redblackset.isEmpty candidates then candidates
+                else fold_manifest_blobs keep_blob (action_dir, candidates), removed), false)
+        | NONE => ((candidates, removed), false)
   in
-    gc_stage "actions" (children actions_dir) one (empty_blob_set (), 0)
+    gc_stage "actions" (children (actions_dir root)) one (candidates, 0)
   end
 
 fun remove_stale_children stage cutoff dir =
@@ -274,7 +282,10 @@ fun remove_stale_children stage cutoff dir =
     0
 
 fun remove_obsolete_action_lock_dirs cutoff dir =
-  gc_stage "locks" (children dir)
+  (* A conventional directory has two links plus one per subdirectory. Keep
+     regular lock inodes: unlinking one can split holders from new openers. *)
+  if (Posix.FileSys.ST.nlink (Posix.FileSys.stat dir) = 2 handle OS.SysErr _ => false) then 0
+  else gc_stage "locks" (children dir)
     (fn (path, removed) =>
         if has_prefix "action-" (Path.file path) andalso is_dir path andalso stale cutoff path then
           (defer_tree path; (removed + 1, true))
@@ -283,10 +294,18 @@ fun remove_obsolete_action_lock_dirs cutoff dir =
 
 fun blob_name path = Path.file path
 
-fun sweep_blobs cutoff live_blobs blobs_dir =
-  gc_stage "blobs" (children blobs_dir)
+fun stale_blob_candidates cutoff paths =
+  gc_stage "blob candidates" paths
+    (fn (path, candidates) =>
+        ((if stale cutoff path then add_blob (blob_name path, candidates) else candidates), false))
+    (empty_blob_set ())
+
+fun sweep_blobs cutoff candidates paths =
+  gc_stage "blobs" paths
     (fn (path, removed) =>
-        if stale cutoff path andalso not (Redblackset.member(live_blobs, blob_name path)) then
+        (* Preserve #541's pre-unlink mtime recheck when a concurrent publisher
+           refreshed a candidate. This is not an atomic stat-and-unlink. *)
+        if Redblackset.member (candidates, blob_name path) andalso stale cutoff path then
           (remove_tree path; (removed + 1, true))
         else (removed, false))
     0
@@ -392,8 +411,10 @@ fun collect_root root days : gc_counts =
     val modules = remove_stale_children "theory modules" cutoff (theory_modules_dir root)
     val analysis = remove_stale_children "analysis" cutoff (analysis_dir root)
     val locks = remove_obsolete_action_lock_dirs cutoff (locks_dir root)
-    val (live_blobs, actions) = collect_live_actions cutoff (actions_dir root)
-    val blobs = sweep_blobs cutoff live_blobs (blobs_dir root)
+    val blob_paths = children (blobs_dir root)
+    val candidates = stale_blob_candidates cutoff blob_paths
+    val (candidates, actions) = collect_live_actions cutoff root candidates
+    val blobs = sweep_blobs cutoff candidates blob_paths
     val {removed = toolchains, busy = toolchains_busy} = gc_toolchains cutoff
   in
     {tmp = tmp, locks = locks, actions = actions, blobs = blobs, modules = modules,
