@@ -7744,11 +7744,16 @@ fun uncached_parents plan uncached node =
     fun walk (dep, (seen, parents)) =
       let val key = HolbuildBuildPlan.key dep
       in
-        if List.exists (fn k => k = key) seen then (seen, parents)
-        else if is_theory_node dep andalso uncached dep then (key :: seen, dep :: parents)
-        else List.foldl walk (key :: seen, parents) (HolbuildBuildPlan.direct_project_deps plan dep)
+        if Binaryset.member (seen, key) then (seen, parents)
+        else
+          let val seen = Binaryset.add (seen, key)
+          in
+            if is_theory_node dep andalso uncached dep then (seen, dep :: parents)
+            else List.foldl walk (seen, parents) (HolbuildBuildPlan.direct_project_deps plan dep)
+          end
       end
-    val (_, parents) = List.foldl walk ([], []) (HolbuildBuildPlan.direct_project_deps plan node)
+    val (_, parents) =
+      List.foldl walk (Binaryset.empty String.compare, []) (HolbuildBuildPlan.direct_project_deps plan node)
   in
     rev parents
   end
@@ -8066,8 +8071,10 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       else []
     val (deferred, uncached_actions) =
       List.partition (meets (key_set (map (#input_key o #2) candidates))) uncached_actions
-    fun uncached_in actions node =
-      List.exists (fn (n, _) => HolbuildBuildPlan.key n = HolbuildBuildPlan.key node) actions
+    fun uncached_in actions =
+      let val keys = key_set (map (fn (node, _) => HolbuildBuildPlan.key node) actions)
+      in fn node => Binaryset.member (keys, HolbuildBuildPlan.key node)
+      end
     (* The workers restore from the remote cache what the batch's theories
        depend on, so each one built here goes there from the local cache
        unless it is there already; one that can't joins the batch.  The
@@ -8100,7 +8107,10 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         failing "checking remote cache" "theories" available deps_actions)
     val uncached_actions =
       if null unavailable then uncached_actions
-      else List.filter (fn (node, _) => uncached_in (uncached_actions @ unavailable) node) actions
+      else
+        let val included = uncached_in (uncached_actions @ unavailable)
+        in List.filter (fn (node, _) => included node) actions
+        end
     val uncached = uncached_in uncached_actions
     val toolchain_line = spec_toolchain_line tc project
     val spec_dir = Path.concat(root, ".holbuild/action-specs")
