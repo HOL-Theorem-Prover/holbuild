@@ -216,6 +216,11 @@ exception TacticInterrupted of string
 fun display_label label =
   String.translate (fn #"\n" => "\\n" | #"\t" => "\\t" | c => String.str c) label
 
+fun active_theorem_name () =
+  case !theorem_info_ref of
+      SOME (_, name, _, _, _, _, _, _, _) => SOME name
+    | NONE => NONE
+
 fun tactic_interrupted label =
   TacticInterrupted ("holbuild tactic interrupted by Poly/ML (stack overflow or out of memory): " ^ label)
 
@@ -249,11 +254,34 @@ fun with_tactic_timeout label f x =
   case !tactic_timeout_ref of
       NONE => f x
     | SOME seconds =>
-        let val first_attempt = Timer.startCPUTimer ()
+        let
+          val first_attempt = Timer.startCPUTimer ()
+          val wall = Timer.startRealTimer ()
+          val name = Option.getOpt (active_theorem_name (), !trace_current_theorem_ref)
+          val position = !failed_plan_position_ref
+          val result = capture_timeout (fn () =>
+            timeout seconds f x
+            handle FunctionTimeout => retry_after_timeout label seconds first_attempt f x
+                 | FunctionInterrupted => raise tactic_interrupted label) ()
+          val elapsed = Time.toReal (Timer.checkRealTimer wall)
+          val _ =
+            if elapsed <= seconds / 2.0 then ()
+            else
+              let
+                val (index, kind) =
+                  case position of
+                      SOME (index, kind, _) => (Int.toString index, kind)
+                    | NONE => ("unknown", "atomic")
+                val status = case result of TimeoutResult _ => "ok" | TimeoutException _ => "failed"
+              in
+                TextIO.output (TextIO.stdErr,
+                  String.concat ["holbuild slow-proof-step\t", display_label name,
+                    "\t", index, "\t", kind, "\t", status,
+                    "\t", fmt_ms elapsed, "\t", fmt_ms seconds,
+                    "\t", display_label label, "\n"])
+              end
         in
-          timeout seconds f x
-          handle FunctionTimeout => retry_after_timeout label seconds first_attempt f x
-               | FunctionInterrupted => raise tactic_interrupted label
+          release_timeout result
         end
 
 fun save_checkpoint label default_share path ok_text depth =
@@ -691,11 +719,6 @@ fun all_goals_text goals =
       String.concat ["holbuild all failed tactic input goals:\n", limited_all_goals_text text,
                      "holbuild end all failed tactic input goals\n"]
     end
-
-fun active_theorem_name () =
-  case !theorem_info_ref of
-      SOME (_, name, _, _, _, _, _, _, _) => SOME name
-    | NONE => NONE
 
 fun failed_theorem_line () =
   case active_theorem_name () of
@@ -2127,6 +2150,10 @@ fun install ({checkpoint_enabled, checkpoint_seconds, tactic_timeout, timeout_ma
    failed_prefix_resumed_step_count_ref := NONE;
    proving_with_proof_ir_ref := false;
    HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate checkpoint_seconds;
-   HolbuildTacticCompat.install_prover proof_ir_prover)
+   HolbuildTacticCompat.install_prover proof_ir_prover;
+   case tactic_timeout of
+       NONE => ()
+     | SOME seconds => TextIO.output (TextIO.stdErr,
+         "holbuild slow-proof-steps v1 coverage=executed limit_ms=" ^ fmt_ms seconds ^ "\n"))
 
 end

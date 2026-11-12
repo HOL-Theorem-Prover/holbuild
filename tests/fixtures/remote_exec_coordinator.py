@@ -86,6 +86,9 @@ class Handler(BaseHTTPRequestHandler):
             (state / f"{batch_id}.heap").write_text(heap[0])
         if "class=run" in query.split("&"):
             (state / f"{batch_id}.run").touch()
+        # What happens elsewhere while the client submits.
+        if (state / "on-submit").exists():
+            subprocess.run(["bash", str(state / "on-submit")], check=True)
         # Whitespace around the colon is valid JSON the client must accept.
         self.answer(201, {"batch_id": batch_id}, separators=(", ", " : "))
 

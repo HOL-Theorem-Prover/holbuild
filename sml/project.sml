@@ -366,6 +366,7 @@ fun action_cache_enabled (ActionPolicy {impure, cache, always_reexecute, ...}) =
   cache andalso not impure andalso not always_reexecute
 fun action_always_reexecute (ActionPolicy {impure, always_reexecute, ...}) =
   impure orelse always_reexecute
+fun action_impure (ActionPolicy {impure, ...}) = impure
 fun extra_input_path (ExtraInput {path}) = path
 
 fun default_action_policy logical =

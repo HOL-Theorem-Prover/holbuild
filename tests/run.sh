@@ -19,6 +19,9 @@ export HOLBUILD_PLAN_RECORD=${HOLBUILD_PLAN_RECORD:-check}
 # once enough time has passed, so tests see the same checkpoints on every run.
 export HOLBUILD_CHECKPOINT_EVERY_CONTEXT=${HOLBUILD_CHECKPOINT_EVERY_CONTEXT:-1}
 export HOLBUILD_TEST_GLOBAL_CACHE="${HOLBUILD_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/holbuild}"
+# Machine-memory admission reads no cgroup limits unless a case points this
+# at a stand-in group: the machine running the tests may be near its own.
+export HOLBUILD_TEST_CGROUP=${HOLBUILD_TEST_CGROUP-}
 
 vendor_hol_rev=$(tr -d '[:space:]' < "$ROOT/vendor/hol/REV")
 test_hol_rev=${HOLBUILD_TEST_HOL_REV:-$vendor_hol_rev}

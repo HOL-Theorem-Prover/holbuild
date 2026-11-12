@@ -597,12 +597,16 @@ class Coordinator:
         packages = [a.theory.split(":", 1)[0] for a in batch.actions]
         names = [a.theory.split(":", 1)[1] for a in batch.actions]
         async with self.engine.begin() as conn:
+            # Retention takes the same key order: heap/index scan order can otherwise deadlock overlapping writes.
             hints = await conn.execute(
                 sa.text(
-                    "UPDATE peak_hints SET updated_at = now() WHERE profile = :profile "
+                    "WITH locked AS (SELECT package, theory, profile FROM peak_hints WHERE profile = :profile "
                     "AND (package, theory) IN "
                     "(SELECT * FROM unnest(CAST(:packages AS text[]), CAST(:names AS text[]))) "
-                    "RETURNING package || ':' || theory, peak_rss_mb"
+                    "ORDER BY package, theory, profile FOR UPDATE) "
+                    "UPDATE peak_hints h SET updated_at = now() FROM locked l "
+                    "WHERE (h.package, h.theory, h.profile) = (l.package, l.theory, l.profile) "
+                    "RETURNING h.package || ':' || h.theory, h.peak_rss_mb"
                 ),
                 {"profile": profile, "packages": packages, "names": names},
             )
@@ -1071,20 +1075,19 @@ class Coordinator:
                 },
             )
             package, theory = action.theory.split(":", 1)
-            if result.status != "failed":
-                await self._set_state(conn, batch_id, action.input_key, "done")
-                if result.peak_rss_mb is not None:
-                    await self._record_peak(conn, package, theory, action.profile, result.peak_rss_mb)
-                await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [action.input_key]})
-                await self._finish_if_done(conn, batch_id)
-            elif result.failure == "memory" and action.tier == "standard":
+            if result.failure == "memory" and action.tier == "standard":
                 # The tier it failed on is the hint: future batches place this theory on the high tier.
                 await self._record_peak(conn, package, theory, action.profile, self.settings.standard_tier_mb)
                 await conn.execute(
                     sa.text("UPDATE actions SET tier = 'high' WHERE batch_id = :batch_id AND input_key = :input_key"),
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
-                await self._retry(conn, batch_id, action.input_key)
+            if result.status != "failed":
+                await self._set_state(conn, batch_id, action.input_key, "done")
+                if result.peak_rss_mb is not None:
+                    await self._record_peak(conn, package, theory, action.profile, result.peak_rss_mb)
+                await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [action.input_key]})
+                await self._finish_if_done(conn, batch_id)
             elif result.failure == "unavailable" and action.interruptions < self.settings.max_interruptions:
                 # The worker couldn't start or finish it, so it doesn't count as an attempt.
                 await conn.execute(
@@ -1308,7 +1311,13 @@ class Coordinator:
                 break
         async with self.engine.begin() as conn:
             await conn.execute(
-                sa.text("DELETE FROM peak_hints WHERE updated_at < now() - make_interval(days => :days)"),
+                sa.text(
+                    "WITH locked AS (SELECT package, theory, profile FROM peak_hints "
+                    "WHERE updated_at < now() - make_interval(days => :days) "
+                    "ORDER BY package, theory, profile FOR UPDATE) "
+                    "DELETE FROM peak_hints h USING locked l "
+                    "WHERE (h.package, h.theory, h.profile) = (l.package, l.theory, l.profile)"
+                ),
                 {"days": self.settings.hint_ttl_days},
             )
 
@@ -1516,7 +1525,7 @@ class Coordinator:
     async def cache_read_nodes(self, digest: str) -> list[str]:
         """Refresh ready slots at most once per thirty seconds, retaining the permanent fallback."""
         if self.cache_pool is None:
-            return ranked_nodes(self.cache_nodes, digest)[:2]
+            return ranked_nodes(self.cache_nodes, digest)
         now = asyncio.get_running_loop().time()
         if now - self.membership.attempted >= REFRESH_SECONDS:
             async with self.membership_lock:
@@ -1534,11 +1543,9 @@ class Coordinator:
         forgotten = self.cache_forgotten
         missing = False
         failure: httpx.Response | None = None
-        nodes = await self.cache_read_nodes(ac_key)
-        joining = self.membership.joining(asyncio.get_running_loop().time())
-        for attempt, node in enumerate(nodes, 1):
-            if attempt == 3 and not joining and missing:
-                break
+        # Every node is asked before a miss: a worker writes to the node nearest to it, and until that node has
+        # written the entry through to the shared store, no other node holds it.
+        for node in await self.cache_read_nodes(ac_key):
             try:
                 async with limit:
                     response = await self.cache.get(f"{node}/ac/{ac_key}")
