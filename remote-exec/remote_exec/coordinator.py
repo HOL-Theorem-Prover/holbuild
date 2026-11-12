@@ -899,7 +899,8 @@ class Coordinator:
 
         def undeferred(*, ahead_only: bool) -> list[str]:
             """The tiers no better-ranked unwoken waiter takes, of those that may claim ahead if ``ahead_only``."""
-            return tiers if woken.done() else [
+            # An ahead wake bypassed better-ranked waiters that can't claim ahead, so it lifts only the ahead deferral.
+            return tiers if woken.done() and (ahead_only or not woken.result()[1]) else [
                 tier for tier in tiers
                 if not any(
                     tier in w_tiers and not w_woken.done() and w_rank < rank and (w_ahead or not ahead_only)
@@ -1525,6 +1526,7 @@ class Coordinator:
                 await conn.execute(sa.text("SELECT attempt_token, batch_id FROM leases WHERE expires_at <= now()"))
             )
         for token, batch_id in expired:
+            ahead_freed = False
             async with self.engine.begin() as conn:
                 await self._lock_batch(conn, batch_id)
                 lease = (
@@ -1561,7 +1563,7 @@ class Coordinator:
                         {"batch_id": batch_id, "input_key": lease.input_key},
                     )
                     await self._retry(conn, batch_id, lease.input_key, ahead_batch=True)
-                    self._ahead_changed()  # a slot of the batch's cap is free
+                    ahead_freed = True
                 elif action.attempts >= self.settings.max_attempts:
                     await conn.execute(
                         sa.text(
@@ -1581,6 +1583,10 @@ class Coordinator:
                     )
                 else:
                     await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
+                    ahead_freed = action.ahead_batch  # the retry revokes what was claimed ahead of it
+            # After the commit, so the claims woken see the slots of the cap this freed.
+            if ahead_freed:
+                self._ahead_changed()
             self._batch_changed(batch_id)
 
     async def fail_overdue(self) -> None:
