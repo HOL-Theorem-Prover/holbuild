@@ -313,7 +313,7 @@ cat > "$tmpdir/analyse.sml" <<SML
 use "sml/holbuild-script.sml";
 val _ = HolbuildActionSandbox.enable ("$tmpdir/action", "$tmpdir/checkpoints");
 val _ = HolbuildActionSandbox.poly_executable := HolbuildHolSharedCache.poly_executable_path ();
-val {output, response, stderr, ...} =
+val {output, response, stderr} =
   HolbuildDependencies.run_analyser {analyser = "$analyser", request = "request\n", capture_stderr = true};
 val _ = print output;
 val _ = if response = SOME "version 1\n" andalso String.isSuffix "refused\n" stderr then ()

@@ -649,50 +649,6 @@ def test_worker_runs_the_action_on_the_release_that_exported_it(
     assert len(held) >= 2  # renewed on a heartbeat
 
 
-AHEAD_PARENTS = [{"input_key": "7" * 64, "spec_sha256": "8" * 64}, {"input_key": "9" * 64, "spec_sha256": "a" * 64}]
-
-
-def test_worker_passes_an_ahead_claims_late_parents_to_exec_action(
-    tmp_path: Path, server: Server, logs: tuple[Path, Path]
-) -> None:
-    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
-    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
-
-    run_one(
-        Coordinator(server.url, "w"),
-        worker_args(tmp_path, server),
-        releases(tmp_path, server),
-        Protection(None, None),
-        {**claim(), "ahead_parents": AHEAD_PARENTS},
-        Phases(),
-    )
-
-    assert server.completed == [RECORD]
-    assert logs[1].read_text().split()[-5:] == [
-        "--share-heaps", "--ahead-parent", f"{'7' * 64}:{'8' * 64}", "--ahead-parent", f"{'9' * 64}:{'a' * 64}",
-    ]
-
-
-def test_an_ahead_claim_for_a_release_without_ahead_mode_is_abandoned_unrun(
-    tmp_path: Path, server: Server, logs: tuple[Path, Path]
-) -> None:
-    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=0.14.25\n"
-
-    run_one(
-        Coordinator(server.url, "w"),
-        worker_args(tmp_path, server),
-        releases(tmp_path, server),
-        Protection(None, None),
-        {**claim(), "ahead_parents": AHEAD_PARENTS},
-        Phases(),
-    )
-
-    [record] = server.completed
-    result = parse_result(record)
-    assert (result.failure, result.detail) == ("ahead-abandoned", "holbuild 0.14.25 predates loading ahead")
-    assert not logs[1].exists()
-
-
 @pytest.mark.parametrize("version", ["0.13.58", "0.13.68", "0.14.0", "0.14.1"])
 @pytest.mark.parametrize(
     ("trusted", "legacy"),
@@ -1057,18 +1013,8 @@ def test_also_claim_accepts_repeats_and_commas(tmp_path: Path, server: Server) -
 def test_claim_asks_the_coordinator_to_wait(server: Server) -> None:
     assert Coordinator(server.url, "w").claim(["standard", "high"], "w", 20, {"hol": 1.5}) is None
     assert server.claims == [
-        {
-            "tier": "standard", "also_claim": ["high"], "worker": "w", "wait_s": 20, "phases": {"hol": 1.5},
-            "host": None,
-        }
+        {"tier": "standard", "also_claim": ["high"], "worker": "w", "wait_s": 20, "phases": {"hol": 1.5}, "host": None}
     ]
-
-
-def test_only_a_worker_that_loads_ahead_claims_ahead(tmp_path: Path, server: Server) -> None:
-    assert not worker_args(tmp_path, server).load_ahead
-    assert worker_args(tmp_path, server, "--load-ahead").load_ahead
-    assert Coordinator(server.url, "w", load_ahead=True).claim(["standard"], "w", 0, {}) is None
-    assert server.claims[-1]["ahead"] is True
 
 
 def test_claim_wait_is_at_most_50_seconds(tmp_path: Path, server: Server) -> None:
