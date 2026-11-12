@@ -20,8 +20,22 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 2s --health-retries 30
     steps:
       - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+      - name: Bound coordinator HTTP liveness under 400 concurrent claimers
+        working-directory: remote-exec
+        run: uv run --frozen pytest -q -s tests/test_http_liveness.py
+        env:
+          REMOTE_EXEC_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
 
       - name: Read HOL4 pin
         id: hol4-pin

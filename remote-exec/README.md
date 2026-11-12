@@ -696,6 +696,14 @@ none is. A run batch with it returns 400.
   ```
 - 404 when there is no such batch (or it was deleted by retention)
 
+In `timings`, durations are milliseconds. `started` and `finished`, and
+`holstart`/`holend`, `publishstart`/`publishend`, `logstart`/`logend` are
+absolute Unix milliseconds, not durations. `rebuilt` is 1 for a successful
+source build, 0 for a cache hit or failure. Older workers omit these fields.
+Publication here covers the action's result and log; deferred checkpoint
+uploads happen after the result. Parallel action spans overlap, as do
+nested phase durations. Do not add their totals to obtain elapsed wall time.
+
 `POST /v1/batches/<batch_id>/cancel`
 
 - 200 `{"state": "<the batch's state after the call>"}`; cancelling a finished

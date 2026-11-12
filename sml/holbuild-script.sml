@@ -137,6 +137,7 @@ use "sml/build_exec.sml";
 use "sml/proof_ir_types.sml";
 use "sml/watch.sml";
 use "sml/remote_exec.sml";
+use "sml/command_summary.sml";
 use "sml/commands.sml";
 use "sml/complete.sml";
 

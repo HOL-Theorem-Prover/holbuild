@@ -2044,6 +2044,35 @@ success with an old or absent log. The client restores the
 finished outputs without forcing a second build locally. Detached builds
 return their logs when attached.
 
+Each planned build also leaves a command record in
+`.holbuild/commands/<start>-<pid>.json`. It contains the command's timestamps
+and exit status, local build/restore counts, source changes since this
+worktree's previous attempted build, and fleet batch events with worker
+timings. Source comparisons survive changes of target; newly observed
+sources are reported separately. `source_hashes_complete` reports whether the
+planner supplied every selected source hash; recording never prepares or
+generates an extra source. A changed source's affected-theory count
+includes itself and covers only the requested plan, not the full project.
+Observed worker results are retained once per action/execution start,
+independently of bare running-attempt markers. A result may first appear in
+a retry snapshot; its attempt is not inferred. Attempt markers keep coverage
+incomplete rather than claiming an exact retry history.
+`fleet_history_complete` is false whenever a remote batch or action was
+observed: polling cannot certify that no execution happened between snapshots.
+Untimed failure payloads are retained too, deduplicated by their failure fields
+without assigning an execution identity.
+These diagnostic snapshots do not participate in build or cache keys.
+
+Supervisors can set `HOLBUILD_COMMAND_RECORD` to a destination file and
+`HOLBUILD_COMMAND_RECORD_PID` to the process ID which will exec holbuild.
+The PID check keeps inherited settings from overwriting a parent's record.
+Worker phase sums overlap across actions and within nested phases; they
+are not command wall time or CPU time. Worker timestamp spans permit a
+wall-time analysis when clocks are synchronized. Deferred checkpoint
+uploads continue after the action result and are outside its client wait.
+The `rebuilt` counter describes theory-build actions only. Remote run actions
+carry execution, HOL, publication and log spans without claiming a source rebuild.
+
 It exports and uploads the batch as `action-spec --upload` does, submits it
 with `POST URL/v1/batches`, and follows `GET URL/v1/batches/<id>/events`,
 printing each theory's state as it changes. While it follows the batch, it
@@ -2452,8 +2481,9 @@ fallback remains valid.
 
 Publishing a GitHub release is what makes it live: installs and deployments
 that follow the latest release pick it up, while a pushed tag or a draft
-release changes nothing for them. A release that would break its consumers
-is therefore created as a draft and published only once they are ready.
+release changes nothing for them. Every tag release is created as a draft
+and published only after the candidate passes validation against its
+consumers.
 
 ### Breaking releases
 
@@ -2473,8 +2503,8 @@ A release is breaking if, compared with the latest published release:
 
 `tools/release-breaking.sh BASE TAG` applies these two checks and prints the
 reasons. Because it compares with the latest published release rather than
-the previous tag, every release tagged while a breaking draft is pending is
-a draft too.
+the previous tag, every candidate tagged while a breaking draft is pending
+still reports the outstanding breaking changes.
 
 The golden key dump covers one small fixture project. Before tagging, run
 `tools/release-key-inventory.sh` against your consumers to catch key changes
@@ -2486,14 +2516,16 @@ tools/release-key-inventory.sh /path/to/published/holbuild \
   /path/to/candidate/bin/holbuild [action-spec arguments...]
 ```
 
-It plans the project with `action-spec` under both binaries, building
-nothing, and lists the theories the published release can restore from the
+It plans the project with `action-spec` under both binaries and lists the
+theories the published release can restore from the
 remote cache but the candidate can't. Pass the consumer's own build flags
 and targets (`--skip-proof-steps`, say), since they select the cache entries.
+Pass `--remote-only` to prevent a local HOL toolchain build: an uncached
+toolchain then exits 75. The inventory exits 1 only for lost restorable
+theories; command errors exit at least 2, preserving exit 75.
 If it lists any theory, the release is breaking: record that with a
 `Breaking-change:` trailer on a commit of the release before tagging (the
-version bump, or an empty commit), so that this release and every later one
-tagged before it is published are drafts.
+version bump, or an empty commit), so the release notes record the break.
 
 ### Steps
 
@@ -2515,10 +2547,16 @@ tagged before it is published are drafts.
    archives, then tests downloaded copies on fresh runners without Poly/ML.
    Only after both platforms pass does it attach the archives and
    `SHA256SUMS`, plus the shared Poly/ML source archive, to the release. If
-   no release exists for the tag, it creates one with generated notes: a
-   draft, with the reasons first in its notes, if the release is breaking;
-   otherwise published. An existing release (including a draft) retains its
-   notes and publication state.
+   no release exists for the tag, it creates a draft with generated notes,
+   with the reasons first in its notes if the release is breaking. An
+   existing release (including a draft) retains its notes and publication
+   state.
+6. Validate the draft candidate against its consumers before publishing it:
+   compare cache-key inventories before warming the cache, run consumer
+   builds with their usual flags, and check any affected runtime tools.
+   Publish only once these checks and packaging pass. For a non-breaking
+   candidate, publish the draft with `gh release edit vX.Y.Z --draft=false
+   --latest`; breaking candidates also need the coordinated steps below.
 
 The workflow also checks packaging on relevant pull requests without
 publishing anything. To rebuild assets, rerun the tag's

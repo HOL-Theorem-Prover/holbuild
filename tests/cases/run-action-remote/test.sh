@@ -167,6 +167,15 @@ hol_key=$(line hol HOL:boolTheory done)
 [[ $(< "$out/HOL/boolTheory/first") == HOL:boolTheory ]]
 require_no_file "$out/HOL/boolTheory/LOG"
 require_grep '^POST /v1/batches?class=run ' "$state/requests.log"
+python3 - "$state/result-$hol_key" <<'PY'
+import pathlib,sys
+fields=dict(line.split('=',1) for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if '=' in line)
+timings=dict(item.split(':',1) for item in fields['phase-ms'].split(','))
+assert 'rebuilt' not in timings, timings
+for phase in ('hol','publish','log'):
+    assert int(timings[phase+'end']) >= int(timings[phase+'start']), timings
+assert int(timings['finished']) >= int(timings['started'])
+PY
 
 # Two targets, one cached: only the other is submitted, with the profile;
 # C's entry is published from the local cache first.
