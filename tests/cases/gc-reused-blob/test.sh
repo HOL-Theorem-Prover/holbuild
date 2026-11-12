@@ -22,3 +22,4 @@ HOLBUILD_CACHE="$cache" BLOB_HASH="$hash" BLOB_SRC="$tmpdir/output" \
   poly --script "$SCRIPT_DIR/race.sml" > "$tmpdir/race.log" 2>&1 ||
   { cat "$tmpdir/race.log" >&2; exit 1; }
 require_grep "blob-kept" "$tmpdir/race.log"
+require_grep "touched-blob-kept" "$tmpdir/race.log"

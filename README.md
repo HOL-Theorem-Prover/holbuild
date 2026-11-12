@@ -1270,6 +1270,15 @@ the analyser is built against, so another checkout of the same sources on the
 machine reads it instead of analysing again, and a different HOL pin never
 uses it.
 
+An analyser failure reports its exit status or signal and stderr. On systems
+with cgroup v2, it also reports available `memory.events` counters before and
+after the attempt. These counters cover a shared group; they do not identify
+the analyser as an OOM victim or establish why it was killed. Outside the
+action sandbox, SIGKILL or exit status 137 retries at most twice, after 100 ms
+and 200 ms, with fresh temporary files. Caller cancellation, other failures
+and sandboxed calls do not retry. Exit status 137 is compatible with a shell
+reporting SIGKILL, but can also be an explicit program exit.
+
 ### Keeping a tool's files between builds
 
 A tool run from theory scripts (a proof search with an index of the
@@ -1990,6 +1999,20 @@ priority work can delay lower priority batches. `--priority` requires
 for missing inputs; it does not change the batch being followed. Retain the
 same priority when reattaching; the recovery hint includes it.
 
+`build --remote-exec URL --speculative-loading[=N]` lets a theory load ahead
+of its parents. A worker with nothing ready to build may take a theory whose
+unbuilt parents are all running on other workers and have no unbuilt parents
+of their own. It loads everything else the theory needs, waits for those
+parents, and then builds (`exec-action --ahead-parent`). At most N theories of
+the batch wait like this at a time (1 to 16, default 4). Only workers started
+with `--load-ahead` take such theories, and only when they have nothing else
+to do, so the batch never adds workers for them.
+A theory whose load ahead can't go on is built normally once its parents are
+built. That covers a parent that fails, a predicted parent manifest that
+doesn't match, or a parent that is late. The option costs worker time when a
+parent fails, and changes no cache keys. Like `--priority`, it applies to
+replacement batches with `--attach`, and the recovery hint includes it.
+
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with
 `exec-action`, then restores them as an ordinary build would:
@@ -2016,6 +2039,35 @@ returned; with `--remote-only` it fails with status 75. It never reports
 success with an old or absent log. The client restores the
 finished outputs without forcing a second build locally. Detached builds
 return their logs when attached.
+
+Each planned build also leaves a command record in
+`.holbuild/commands/<start>-<pid>.json`. It contains the command's timestamps
+and exit status, local build/restore counts, source changes since this
+worktree's previous attempted build, and fleet batch events with worker
+timings. Source comparisons survive changes of target; newly observed
+sources are reported separately. `source_hashes_complete` reports whether the
+planner supplied every selected source hash; recording never prepares or
+generates an extra source. A changed source's affected-theory count
+includes itself and covers only the requested plan, not the full project.
+Observed worker results are retained once per action/execution start,
+independently of bare running-attempt markers. A result may first appear in
+a retry snapshot; its attempt is not inferred. Attempt markers keep coverage
+incomplete rather than claiming an exact retry history.
+`fleet_history_complete` is false whenever a remote batch or action was
+observed: polling cannot certify that no execution happened between snapshots.
+Untimed failure payloads are retained too, deduplicated by their failure fields
+without assigning an execution identity.
+These diagnostic snapshots do not participate in build or cache keys.
+
+Supervisors can set `HOLBUILD_COMMAND_RECORD` to a destination file and
+`HOLBUILD_COMMAND_RECORD_PID` to the process ID which will exec holbuild.
+The PID check keeps inherited settings from overwriting a parent's record.
+Worker phase sums overlap across actions and within nested phases; they
+are not command wall time or CPU time. Worker timestamp spans permit a
+wall-time analysis when clocks are synchronized. Deferred checkpoint
+uploads continue after the action result and are outside its client wait.
+The `rebuilt` counter describes theory-build actions only. Remote run actions
+carry execution, HOL, publication and log spans without claiming a source rebuild.
 
 It exports and uploads the batch as `action-spec --upload` does, submits it
 with `POST URL/v1/batches`, and follows `GET URL/v1/batches/<id>/events`,

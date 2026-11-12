@@ -179,6 +179,21 @@ refute_grep "Theory built" "$tmpdir/follow.log"
 [[ $(grep -c . "$state/ran") -eq 2 ]] || { cat "$state/ran" >&2; exit 1; }
 require_grep "^action .* rx:ATheory$" "$state/b1.batch"
 require_grep "^edge " "$state/b1.batch"
+python3 - "$project" <<'PY'
+import json,pathlib,sys
+records=[json.loads(p.read_text()) for p in (pathlib.Path(sys.argv[1])/'.holbuild/commands').glob('*.json')]
+record=next(r for r in records if r['fleet_batches']==['b1'])
+assert record['exit_code']==0
+assert len(record['fleet_follows'])==1
+results=[a for a in record['fleet_actions'] if a['observation']=='result']
+assert len(results)==2
+assert all(a['action']['timings']['finished'] >= a['action']['timings']['started'] for a in results)
+assert sum(a['action']['timings']['rebuilt'] for a in results)==2
+assert record['fleet_history_complete'] is False
+assert all(set(a['action'])=={'input_key','state','attempts'} for a in record['fleet_actions'] if a['observation']=='attempt')
+assert record['local_outcomes']['built']==0
+assert record['local_outcomes']['restored_remote']==2
+PY
 
 # With everything cached there is nothing to submit.
 run cached 0 build --remote-exec "$coordinator" BTheory
@@ -241,8 +256,9 @@ require_grep "could not cancel remote batch b4 (HTTP 503)" "$tmpdir/down.log"
 require_grep "the coordinator reported no theories; building locally" "$tmpdir/down.log"
 require_grep "BTheory built" "$tmpdir/down.log"
 write_theories five-down-only
-run down-only 75 build --remote-exec "$coordinator" --remote-only --priority 17 BTheory
-require_grep "the coordinator reported no theories; reattach with --attach b5 --priority 17$" "$tmpdir/down-only.log"
+run down-only 75 build --remote-exec "$coordinator" --remote-only --priority 17 --speculative-loading=5 BTheory
+require_grep "the coordinator reported no theories; reattach with --attach b5 --priority 17 --speculative-loading=5$" \
+  "$tmpdir/down-only.log"
 refute_grep "^POST /v1/batches/b5/cancel " "$state/requests.log"
 rm "$state/down"
 run unknown-only 75 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
@@ -1600,6 +1616,14 @@ require_grep "Use2Lib built" "$tmpdir/gen2.log"
 require_grep "AfterGenTheory restored from cache" "$tmpdir/gen2.log"
 refute_grep "Theory built" "$tmpdir/gen2.log"
 require_file "$gen2/src/Gen2ML.sml"
+python3 - "$gen2" <<'PYCODE'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+records=[json.loads(p.read_text()) for p in (root/'.holbuild/commands').glob('*.json')]
+assert len(records)==1 and len(records[0]['plans'])==1, records
+source=next(s for s in records[0]['plans'][0]['newly_observed_sources'] if s['path']=='src/Gen2ML.sml')
+assert source['sha256']==hashlib.sha256((root/'src/Gen2ML.sml').read_bytes()).hexdigest(), source
+PYCODE
 
 # check and check --fingerprint pre-build on the remote coordinator and run the
 # check script locally; when a valid deps_loaded checkpoint exists, check
@@ -2004,6 +2028,28 @@ if in_copy local-cas build --priority 1 PriorityTheory > "$tmpdir/priority-no-ex
   exit 1
 fi
 require_grep 'priority needs --remote-exec URL' "$tmpdir/priority-no-exec.log"
+
+# So is the cap on theories loading ahead of their parents, 4 when given bare.
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --speculative-loading LocalUntrustedTheory > "$tmpdir/speculative-default.log" 2>&1
+require_grep '^POST /v1/batches?speculative_loading=4 ' "$state/requests.log"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --priority 2 --speculative-loading=4 LocalUntrustedTheory > "$tmpdir/speculative.log" 2>&1
+require_grep '^POST /v1/batches?priority=2&speculative_loading=4 ' "$state/requests.log"
+for value in 0 17 1.5 x '' 999999999999999999999999999999; do
+  if in_copy local-cas build --remote-exec "$coordinator" "--speculative-loading=$value" PriorityTheory \
+       > "$tmpdir/speculative-invalid.log" 2>&1; then
+    echo "accepted invalid --speculative-loading=$value" >&2
+    exit 1
+  fi
+  require_grep "^holbuild: invalid --speculative-loading: $value; expected an integer between 1 and 16$" \
+    "$tmpdir/speculative-invalid.log"
+done
+if in_copy local-cas build --speculative-loading PriorityTheory > "$tmpdir/speculative-no-exec.log" 2>&1; then
+  echo 'accepted --speculative-loading without remote execution' >&2
+  exit 1
+fi
+require_grep 'speculative-loading needs --remote-exec URL' "$tmpdir/speculative-no-exec.log"
 
 # Reattaching can need a replacement batch after an input disappears.
 cat > "$tmpdir/local-cas/src/PriorityChildScript.sml" <<'SML'

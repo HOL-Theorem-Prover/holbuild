@@ -10243,18 +10243,22 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           HolbuildCacheBackend.Published => ()
         | HolbuildCacheBackend.AlreadyPresent => ()
         | _ => raise Error ("could not upload " ^ path)
-    (* Puts the blobs of (path, sha256) pairs the cache may lack, in
-       parallel, each once. *)
+    (* Puts each missing blob once. A failed transfer must not prevent
+       unrelated candidates from publishing their complete spines. *)
     fun upload_all pairs =
       let
         val pending =
           #2 (List.foldl (fn ((path, sha), (seen, kept)) =>
                              if Redblackset.member (seen, sha) orelse not (needs_upload sha) then (seen, kept)
-                             else (Redblackset.add (seen, sha), (path, sha) :: kept))
+                             else (Redblackset.add (seen, sha), (path, sha, ref false) :: kept))
                          (Redblackset.empty String.compare, []) pairs)
+        fun upload (path, sha, succeeded) =
+          (put path sha; succeeded := true)
+          handle e => warn ("could not publish shared checkpoint blob " ^ path ^ ": " ^ General.exnMessage e)
       in
-        transfer_all (fn (path, sha) => put path sha) (rev pending);
-        uploaded := Redblackset.addList (!uploaded, map #2 pending)
+        transfer_all upload (rev pending);
+        uploaded := Redblackset.addList
+          (!uploaded, List.mapPartial (fn (_, sha, succeeded) => if !succeeded then SOME sha else NONE) pending)
       end
     (* A heap this run saved is published only where no other worker's is:
        checkpoints on a heap that lost are chained to bytes no other worker
@@ -10266,6 +10270,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         let
           val manifest = shared_manifest "holbuild-shared-heap-v1" NONE [("heap", sha, "")]
           val _ = upload_all [(deps_loaded, sha)]
+          val _ = if needs_upload sha then raise Error ("could not upload " ^ deps_loaded) else ()
           val _ = HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
         in
           if HolbuildRemoteCache.get_action remote heap_key = SOME manifest then
@@ -10283,25 +10288,33 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun was_restored path =
       List.exists (fn (p, sha) => p = path andalso (hash path = sha handle _ => false))
                   restored
-    val parents = ref (Redblackmap.mkDict String.compare)
-    fun parent p =
-      case Redblackmap.peek (!parents, p) of
-          SOME q => q
-        | NONE => let val q = saved_parent p in parents := Redblackmap.insert (!parents, p, q); q end
-    (* The checkpoint's ancestors in the tree, nearest first, down to the
-       heap. *)
+    val spines = ref (Redblackmap.mkDict String.compare)
+    (* Shared tails make parent walking linear across valid candidates;
+       each manifest still encodes its whole spine in the existing order. *)
     fun ancestors path =
       let
-        fun loop p acc =
-          case parent p of
-              NONE => NONE
-            | SOME q =>
-                if q = deps_loaded then SOME (rev acc)
-                else if Option.isSome (tree_relative checkpoint_root q) andalso length acc < 100000 then
-                  loop q (q :: acc)
-                else NONE
+        fun loop p n =
+          case Redblackmap.peek (!spines, p) of
+              SOME (depth, paths) => if n + depth <= 100000 then SOME (depth, paths) else NONE
+            | NONE =>
+                if n > 100000 then NONE
+                else
+                  let
+                    val result =
+                      case saved_parent p of
+                          NONE => NONE
+                        | SOME q =>
+                            if q = deps_loaded then SOME (0, [])
+                            else if Option.isSome (tree_relative checkpoint_root q) then
+                              Option.map (fn (depth, paths) => (depth + 1, q :: paths)) (loop q (n + 1))
+                            else NONE
+                  in
+                    case result of
+                        NONE => NONE
+                      | SOME spine => (spines := Redblackmap.insert (!spines, p, spine); result)
+                  end
       in
-        loop path []
+        Option.map #2 (loop path 0)
       end
     (* A failed prefix's key doesn't say how far the prefix goes, so a run
        that resumed from the shared one and saved another in its place (it got
@@ -10309,49 +10322,85 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun replaces_restored path =
       List.exists (fn (p, sha) => p = path andalso (HolbuildHash.file_sha256 path <> sha handle _ => false))
                   restored
-    fun publish_candidate heap (c : shared_candidate) =
-      let val key = shared_checkpoint_key heap_key (#kind c) (#key c)
+    fun warning (c : shared_candidate) e =
+      warn ("could not publish shared checkpoint " ^ #path c ^ ": " ^ General.exnMessage e)
+    fun eligible (c : shared_candidate) =
+      if checkpoint_exists (#path c) andalso not (was_restored (#path c)) andalso #accepts c () then
+        SOME (c, shared_checkpoint_key heap_key (#kind c) (#key c), ref false)
+      else NONE
+      handle e => (warning c e; NONE)
+    fun probe (c, key, absent) =
+      (* Presence alone must not mark an un-restored entry's blobs as known:
+         its /ac/ entry can outlive those blobs. *)
+      (absent := (member key stale orelse
+                  not (Option.isSome (HolbuildRemoteCache.fetch_action remote key)) orelse
+                  (#kind c = "failed_prefix" andalso replaces_restored (#path c))))
+      handle e => warning c e
+    fun prepare (c : shared_candidate, key, absent) =
+      if not (!absent) then NONE
+      else
+        case ancestors (#path c) of
+            NONE => (warn ("shared checkpoint chain is not on the heap: " ^ #path c); NONE)
+          | SOME nearest_first =>
+              let
+                val rel = valOf o tree_relative checkpoint_root
+                val spine = rev nearest_first
+                val sidecars = List.filter (fn suffix => file_exists (#path c ^ suffix)) (#sidecars c)
+                fun sidecars_of role p =
+                  List.mapPartial
+                    (fn suffix => if file_exists (p ^ suffix) then SOME (role, p ^ suffix, rel (p ^ suffix))
+                                  else NONE)
+                    shared_sidecar_suffixes
+                val files =
+                  map (fn p => ("spine", p, rel p)) spine @
+                  List.concat (map (sidecars_of "spine-sidecar") spine) @
+                  [("leaf", #path c, rel (#path c))] @
+                  map (fn suffix => ("sidecar", #path c ^ suffix, suffix)) sidecars
+                val entries = map (fn (role, path, arg) => (role, hash path, arg)) files
+                val blobs = ListPair.map
+                  (fn ((role, path, _), (_, sha, _)) =>
+                    (path, sha, role = "spine" orelse role = "leaf")) (files, entries)
+              in
+                SOME (c, key, entries, blobs)
+              end
+      handle e => (warning c e; NONE)
+    fun publish_candidates heap =
+      let
+        val eligible = List.mapPartial eligible candidates
+        val (_, unique) = List.foldl
+          (fn (item as (_, key, _), (seen, kept)) =>
+            if Redblackset.member (seen, key) then (seen, kept)
+            else (Redblackset.add (seen, key), item :: kept))
+          (Redblackset.empty String.compare, []) eligible
+        val probes = rev unique
+        val _ = parallel_all remote_probe_width probe probes
+        val prepared = List.mapPartial prepare probes
+        val _ = upload_all (List.concat (map (fn (_, _, _, blobs) =>
+                                  map (fn (path, sha, _) => (path, sha)) blobs) prepared))
+        val complete = List.filter
+          (fn (_, _, _, blobs) => List.all (fn (_, sha, _) => not (needs_upload sha)) blobs) prepared
+        fun publish (c : shared_candidate, key, entries, _) =
+          (ignore (HolbuildRemoteCache.replace_action_unconditionally remote
+            {key = key, text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
+                                 (("heap", heap, "") :: entries)}))
+          handle e => warning c e
+        val _ = transfer_all publish complete
+        (* Store mutation stays on the main thread, once per physical file,
+           rather than once for every manifest that names the file. *)
+        val stored = ref (Redblackset.empty String.compare)
+        fun add (path, sha, save) =
+          if Redblackset.member (!stored, path) then ()
+          else
+            (stored := Redblackset.add (!stored, path);
+             store_add store heap {sha = sha, src = path, save = save})
+          handle e => warn ("could not store shared checkpoint " ^ path ^ ": " ^ General.exnMessage e)
       in
-        if not (checkpoint_exists (#path c)) orelse was_restored (#path c) orelse not (#accepts c ()) orelse
-           (present key andalso not (#kind c = "failed_prefix" andalso replaces_restored (#path c))) then ()
-        else
-          case ancestors (#path c) of
-              NONE => warn ("shared checkpoint chain is not on the heap: " ^ #path c)
-            | SOME nearest_first =>
-                let
-                  val rel = valOf o tree_relative checkpoint_root
-                  val spine = rev nearest_first
-                  val sidecars = List.filter (fn suffix => file_exists (#path c ^ suffix)) (#sidecars c)
-                  fun sidecars_of role p =
-                    List.mapPartial
-                      (fn suffix => if file_exists (p ^ suffix) then SOME (role, p ^ suffix, rel (p ^ suffix))
-                                    else NONE)
-                      shared_sidecar_suffixes
-                  val files =
-                    map (fn p => ("spine", p, rel p)) spine @
-                    List.concat (map (sidecars_of "spine-sidecar") spine) @
-                    [("leaf", #path c, rel (#path c))] @
-                    map (fn suffix => ("sidecar", #path c ^ suffix, suffix)) sidecars
-                  val entries = map (fn (role, path, arg) => (role, hash path, arg)) files
-                  val _ = upload_all (map (fn (_, path, _) => (path, hash path)) files)
-                  (* An unconditional write: it replaces a failed prefix's
-                     entry, as above. *)
-                  val _ = HolbuildRemoteCache.replace_action_unconditionally remote
-                            {key = key,
-                             text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
-                                      (("heap", heap, "") :: entries)}
-                in
-                  ListPair.app (fn ((role, path, _), (_, sha, _)) =>
-                                   store_add store heap
-                                     {sha = sha, src = path, save = role = "spine" orelse role = "leaf"})
-                               (files, entries)
-                end
+        List.app (fn (_, _, _, blobs) => List.app add blobs) complete
       end
-      handle e => warn ("could not publish shared checkpoint " ^ #path c ^ ": " ^ General.exnMessage e)
   in
     case heap of
         NONE => ()
-      | SOME heap => List.app (publish_candidate heap) candidates
+      | SOME heap => publish_candidates heap
   end
   handle e => warn ("shared checkpoint publish failed: " ^ General.exnMessage e)
 
@@ -10687,7 +10736,7 @@ fun toolchain_theory_script holdir theory =
   handle OS.SysErr _ => ""
 
 (* Steps 3 to 6 for a run: hydrate the root, run the script, publish. *)
-fun exec_run check_cancelled remote root tc (spec : run_spec) log =
+fun exec_run (hol_phase, publish_phase) check_cancelled remote root tc (spec : run_spec) log =
   let
     val src = in_root root run_source_dir
     val output_dir = in_root root ".holbuild/run-output"
@@ -10734,12 +10783,12 @@ fun exec_run check_cancelled remote root tc (spec : run_spec) log =
     val _ = last_child_status := NONE
     val _ = check_cancelled ()
     val {status, timed_out} =
-      (case #timeout spec of
+      hol_phase (fn () => (case #timeout spec of
            SOME seconds =>
              HolbuildToolchain.run_in_dir_to_file_until src argv log
                (Time.fromSeconds (LargeInt.fromInt seconds))
          | NONE => {status = HolbuildToolchain.run_in_dir_to_file src argv log, timed_out = false})
-      handle HolbuildToolchain.Error msg => raise action_failed InternalFailure msg
+      handle HolbuildToolchain.Error msg => raise action_failed InternalFailure msg)
     val _ = last_child_status := SOME status
     val _ = check_cancelled ()
     val _ =
@@ -10776,20 +10825,24 @@ fun exec_run check_cancelled remote root tc (spec : run_spec) log =
           | HolbuildCacheBackend.AlreadyPresent => (name, hash)
           | _ => raise action_failed PublishFailure ("could not publish output " ^ name)
       end
-    val outputs = map publish files
-    val manifest =
-      run_manifest_text {input_key = #run_key spec, parent = Option.map #key (#context_theory spec),
-                         outputs = outputs}
-    val _ = check_cancelled ()
-    val _ =
-      HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
-        {key = #run_key spec, text = manifest}
   in
-    case remote_run_entry remote (#run_key spec) (#outputs spec) of
-        NONE => raise ActionFailed (PublishFailure, "the remote cache holds no entry for the run after publishing")
-      | SOME (resident, _) =>
-          if cache_manifest_outputs_equal (#run_key spec) manifest resident then ()
-          else raise ActionFailed (PublishFailure, "the remote cache holds different outputs for the run")
+    publish_phase (fn () =>
+      let
+        val outputs = map publish files
+        val manifest =
+          run_manifest_text {input_key = #run_key spec, parent = Option.map #key (#context_theory spec),
+                             outputs = outputs}
+        val _ = check_cancelled ()
+        val _ =
+          HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
+            {key = #run_key spec, text = manifest}
+      in
+        case remote_run_entry remote (#run_key spec) (#outputs spec) of
+            NONE => raise ActionFailed (PublishFailure, "the remote cache holds no entry for the run after publishing")
+          | SOME (resident, _) =>
+              if cache_manifest_outputs_equal (#run_key spec) manifest resident then ()
+              else raise ActionFailed (PublishFailure, "the remote cache holds different outputs for the run")
+      end)
   end
 
 (* Whether the writer's output [file] is one of the [expected] modules,
@@ -11220,7 +11273,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
       let
         val _ = if name = "publish" orelse name = "log" then () else check_cancelled ()
         val t0 = Time.now ()
-        fun record () = phases := (name, Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
+        fun record () =
+          let val ended = Time.now ()
+              val spans = if List.exists (fn n => n = name) ["hol", "publish", "log"] then
+                  [(name ^ "start", Time.toMilliseconds t0), (name ^ "end", Time.toMilliseconds ended)]
+                else []
+          in phases := (name, Time.toMilliseconds (Time.-(ended, t0))) :: spans @ !phases end
       in
         (f () before record ()) handle e => (record (); raise e)
       end
@@ -11248,6 +11306,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
             end
     val run_log = ref NONE
+    val theory_action = ref false
     fun build_log () =
       case !run_log of
           SOME path => path
@@ -11314,12 +11373,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val log = Path.concat(root, ".holbuild/run.log")
           in
             run_log := SOME log;
-            exec_run check_cancelled remote root tc spec log;
+            exec_run ((fn f => phase "hol" f), (fn f => phase "publish" f)) check_cancelled remote root tc spec log;
             "built"
           end
       end
     and run_theory spec_text =
       let
+        val _ = theory_action := true
         val spec = parse_action_spec spec_text
         val _ = input_key := #input_key spec
         val _ = verify_action_spec spec
@@ -11364,7 +11424,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         if done then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
-          (phase "check" (fn () => check_remote_publication remote root spec);
+          (phase "check" (fn () => phase "publish" (fn () => check_remote_publication remote root spec));
            "cached")
         else build spec tc forced cutoff NONE
       end
@@ -11463,7 +11523,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             (if drop_stale_dep_copies remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
              then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
              else ();
-             check_remote_publication remote root spec;
+             phase "publish" (fn () => check_remote_publication remote root spec);
              case cutoff of
                  SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
                | NONE => ()))
@@ -11835,7 +11895,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                   | _ => failure
               val status = if Option.isSome failure then "failed" else status
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
-              val phases = rev (!phases)
+              val phases = rev (!phases) @
+                [("started", Time.toMilliseconds start),
+                 ("finished", Time.toMilliseconds (Time.now ()))] @
+                (if !theory_action then [("rebuilt", if status = "built" then 1 else 0)] else [])
               val text =
                 result_text (spec_sha256, !input_key)
                   {status = status, failure = failure, wall_ms = wall_ms, phases = phases,
