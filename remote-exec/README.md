@@ -471,6 +471,13 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   the one with the most dependents, then by theory name, so the critical
   path starts first and the ready frontier widens fastest. An expired lease returns the
   action to waiting (see Retries), or fails it once it has been claimed `MAX_ATTEMPTS` times.
+  A build action whose input key another batch's live lease is building is
+  not claimed (single-flight across batches). When that build succeeds, the
+  coordinator marks the waiting and ready copies of the action (same key and
+  spec, so not a forced or traced copy of a plain build) in other running
+  batches done, with its log, and releases their children; copies with
+  another spec, and every copy once the build fails or its lease expires,
+  are claimable again and waiting claims are woken. Two claims committing at the same moment can still both build a key.
   A heartbeat or completion with an expired or revoked token is refused, and
   the completion is dropped. Since a worker may run an action twice after a
   network partition, nothing depends on exactly-once execution: a second run

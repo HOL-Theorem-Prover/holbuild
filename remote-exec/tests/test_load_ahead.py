@@ -97,6 +97,20 @@ async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_re
     assert await states(http, ahead) == {"a": "running", "b": "running"}
 
 
+async def test_a_child_another_batch_is_building_is_not_claimed_ahead_and_is_done_with_that_build(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    leader = await submit(http, ["b"])
+    token = await claim_named(http, "b")
+    ahead = await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    await claim_named(http, "a")
+    assert await claim_ahead(http) is None
+
+    cache.keys.add(ac_key("b"))
+    assert (await complete(http, token, result("b", "built"))).status_code == 200
+    assert (await states(http, leader), await states(http, ahead)) == ({"b": "done"}, {"a": "running", "b": "done"})
+
+
 async def test_claims_ahead_take_the_deepest_child_first_and_stop_at_the_cap(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
