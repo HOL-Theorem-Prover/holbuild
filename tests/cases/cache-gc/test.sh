@@ -15,6 +15,7 @@ cache=$tmpdir/cache
 mkdir -p "$cache/tmp/oldtmp" "$cache/blobs" "$cache/actions/live" "$cache/actions/old" "$cache/actions/nomani" "$cache/actions/fresh-nomani" "$cache/actions/old/nested/dir" "$cache/locks/action-stale.lock"
 : > "$cache/blobs/live"
 : > "$cache/blobs/dead"
+: > "$cache/locks/action-regular.lock"
 : > "$cache/actions/stray-file"
 printf 'holbuild-cache-action-v2\nblob sig live\n' > "$cache/actions/live/manifest"
 printf 'holbuild-cache-action-v2\nblob=old\n' > "$cache/actions/old/manifest"
@@ -24,11 +25,14 @@ touch -d '10 days ago' \
   "$cache/blobs/dead" \
   "$cache/actions/old/manifest" \
   "$cache/actions/nomani" \
+  "$cache/locks/action-regular.lock" \
   "$cache/locks/action-stale.lock"
 
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/cache-gc.log"
 
 require_file "$cache/blobs/live"
+[[ $(stat -c %Y "$cache/blobs/live") -gt $(date -d '1 day ago' +%s) ]] ||
+  { echo "live stale blob was not refreshed" >&2; exit 1; }
 [[ ! -e "$cache/blobs/dead" ]] || { echo "unreferenced blob survived" >&2; exit 1; }
 [[ ! -e "$cache/actions/old" ]] || { echo "old action survived" >&2; exit 1; }
 [[ -d "$cache/actions/live" ]] || { echo "live action was removed" >&2; exit 1; }
@@ -37,8 +41,21 @@ require_file "$cache/blobs/live"
 [[ ! -e "$cache/actions/nomani" ]] || { echo "stale incomplete action survived" >&2; exit 1; }
 [[ ! -e "$cache/tmp/oldtmp" ]] || { echo "stale tmp survived" >&2; exit 1; }
 [[ ! -e "$cache/locks/action-stale.lock" ]] || { echo "stale action lock survived" >&2; exit 1; }
+require_file "$cache/locks/action-regular.lock"
 [[ -f "$cache/locks/gc.lock" ]] || { echo "cache gc lock file missing" >&2; exit 1; }
 [[ ! -e "$cache/locks/gc.lock.owner" ]] || { echo "cache gc lock owner survived" >&2; exit 1; }
+
+# Once the legacy live blob is healed, no manifest needs reading. The regular
+# lock files also need no scan on filesystems with conventional link counts.
+chmod a-r "$cache/actions/live/manifest"
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/fast-gc.log" 2>&1
+chmod u+r "$cache/actions/live/manifest"
+require_file "$cache/blobs/live"
+if [[ $(stat -c %h "$cache/locks") -eq 2 ]]; then
+  ! grep -q 'cache gc: locks:' "$tmpdir/fast-gc.log" ||
+    { echo "GC scanned a directory containing only regular lock files" >&2; exit 1; }
+fi
 
 # A fresh manifest GC cannot read stops GC before any blob it names is swept.
 unreadable_cache=$tmpdir/unreadable-cache
