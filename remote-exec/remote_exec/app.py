@@ -29,7 +29,7 @@ from remote_exec.coordinator import (
     Settings,
     is_auth_failure,
 )
-from remote_exec.formats import FormatError, parse_batch, parse_result
+from remote_exec.formats import OUTPUT_TAIL_BYTES, FormatError, output_tail, parse_batch, parse_result
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +186,23 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             raise HTTPException(404, f"no batch {batch_id}")
         return {"state": state}
 
+    @app.get("/v1/batches/{batch_id}/interrupted-output", dependencies=client)
+    async def interrupted_output(batch_id: UUID, wait_s: float = Query(default=0, ge=0, le=90)) -> Response:
+        deadline = time.monotonic() + wait_s
+        with coordinator.watch(batch_id) as written:
+            while True:
+                written.clear()
+                report = await coordinator.interrupted_output(batch_id)
+                if report is None:
+                    raise HTTPException(404, f"no batch {batch_id}")
+                tails, pending = report
+                remaining = deadline - time.monotonic()
+                if not pending or remaining <= 0:
+                    return Response("".join(json.dumps({"theory": theory, "output": output}, ensure_ascii=False) + "\n"
+                                            for theory, output in tails), media_type="application/x-ndjson")
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(written.wait(), min(remaining, settings.events_fallback_seconds))
+
     @app.get("/v1/batches/{batch_id}/events", dependencies=client)
     async def events(batch_id: UUID) -> StreamingResponse:
         first = await coordinator.changes(batch_id, 0)
@@ -300,6 +317,17 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             raise HTTPException(400, str(error)) from error
         if not accepted:
             raise HTTPException(409, "stale attempt token; result dropped")
+        return {"accepted": True}
+
+    @app.post("/v1/work/{attempt_token}/diagnostic", dependencies=worker)
+    async def diagnostic(attempt_token: UUID, request: Request) -> dict[str, bool]:
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > OUTPUT_TAIL_BYTES:
+                raise HTTPException(413, "interrupted output exceeds 64 KiB")
+            body.extend(chunk)
+        if not await coordinator.diagnostic(attempt_token, output_tail(bytes(body))):
+            raise HTTPException(409, "stale diagnostic token; output dropped")
         return {"accepted": True}
 
     return app

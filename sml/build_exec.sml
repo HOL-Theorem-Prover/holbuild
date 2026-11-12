@@ -1842,6 +1842,7 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
     val log = Path.concat(stage, log_name)
     val file_args = map (hol_run_file_arg workdir) files
     val _ = ensure_parent log
+    val _ = HolbuildActionSandbox.announce_log log
     val _ = create_current_log_link log current_log
     val _ = last_child_status := NONE
     val tool_cache_env =
@@ -11353,6 +11354,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val log = Path.concat(root, ".holbuild/run.log")
           in
             run_log := SOME log;
+            ensure_parent log;
+            HolbuildActionSandbox.announce_log log;
             exec_run check_cancelled remote root tc spec log;
             "built"
           end
@@ -11893,7 +11896,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               let val t0 = Time.now ()
               in
                 !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
-                empty_root ();
+                (* A worker may not have opened the announced log before an
+                   external signal. The next action strictly removes these
+                   trees, just as it does after a hard-killed driver. *)
+                if !cancelled then () else empty_root ();
                 (* A worker draining after the result has a few seconds left
                    for the publish, not for a cache scan. *)
                 if !cancelled then () else

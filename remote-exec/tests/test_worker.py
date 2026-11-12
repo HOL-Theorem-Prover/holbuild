@@ -51,8 +51,23 @@ RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=
 FAKE_HOLBUILD = f"""#!/bin/sh
 if [ "$1" = sandbox-check ]; then [ -z "$HOLBUILD_FAKE_LOG" ] || env > "$HOLBUILD_FAKE_LOG.sandbox-env"; exit 0; fi
 echo $$ > "$HOLBUILD_FAKE_LOG.pid"
+if [ -n "$HOLBUILD_FAKE_OUTPUT" ]; then
+  result=
+  previous=
+  for arg in "$@"; do
+    [ "$previous" != --result ] || result=$arg
+    previous=$arg
+  done
+  mkdir -p "$HOLBUILD_CACHE/action"
+  python3 -c 'print("x" * 70000); print("HOL interrupted marker")' > "$HOLBUILD_CACHE/action/child.log"
+  printf '%s\\n' "$HOLBUILD_CACHE/action/child.log" > "$result.log-path"
+  echo ready > "$HOLBUILD_FAKE_LOG.output-ready"
+fi
 if [ -n "$HOLBUILD_FAKE_HANG" ]; then
   trap '' TERM
+  if [ -n "$HOLBUILD_FAKE_CANCEL" ]; then
+    trap 'printf "holbuild-action-result-v1\\nspec={SPEC}\\ninput-key=\\nstatus=failed\\nfailure=unavailable\\n" > "$result"; exit 3' TERM
+  fi
   (while :; do sleep 1; done) &
   echo $! > "$HOLBUILD_FAKE_LOG.child"
   wait
@@ -118,6 +133,7 @@ class Server:
     url: str = ""
     specs: dict[str, str] = field(default_factory=dict)
     completed: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
     heartbeats: list[dict[str, object]] = field(default_factory=list)
@@ -158,6 +174,9 @@ def server() -> Iterator[Server]:
 
         def do_POST(self) -> None:
             body = self.body()
+            if self.path.endswith("/diagnostic"):
+                state.diagnostics.append(body)
+                return self.reply(200, '{"accepted": true}')
             if self.path.startswith("/moved/"):
                 self.send_response(303)
                 self.send_header("Location", self.path.removeprefix("/moved"))
@@ -1632,3 +1651,92 @@ def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(
     with pytest.raises(KeyboardInterrupt):
         worker.main()
     assert events == ["memory", "claim", "refresh", "run"]
+
+
+def test_output_tail_keeps_the_inode_after_cleanup_and_bounds_utf8(tmp_path: Path) -> None:
+    from remote_exec.formats import OUTPUT_TAIL_BYTES
+
+    root = tmp_path / "action"
+    root.mkdir()
+    log = root / "child.log"
+    log.write_bytes(b"old prefix" + b"x" * 70000 + b"\xff\x00\x1b\r\nHOL interrupted marker\n")
+    sidecar = tmp_path / "result.log-path"
+    sidecar.write_text(f"{log}\n")
+    tail = worker.OutputTail(str(root), str(sidecar))
+    try:
+        tail.refresh()
+        assert tail.fd is not None
+        log.unlink()
+        tail.refresh()
+        text = tail.read()
+        assert text.endswith("HOL interrupted marker\n")
+        assert len(text.encode()) <= OUTPUT_TAIL_BYTES
+        assert "old prefix" not in text
+        assert not any(c in text for c in "\x00\x1b\r")
+    finally:
+        tail.close()
+    assert tail.fd is None
+
+
+@pytest.mark.parametrize("unsafe", ["outside", "symlink", "parent-link", "root-link", "hardlink", "fifo", "directory"])
+def test_output_tail_rejects_unsafe_paths_without_blocking(tmp_path: Path, unsafe: str) -> None:
+    root = tmp_path / "action"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("must not be read")
+    log = root / "child.log"
+    if unsafe == "outside":
+        log = outside
+    elif unsafe == "symlink":
+        log.symlink_to(outside)
+    elif unsafe == "parent-link":
+        (root / "linked").symlink_to(tmp_path, target_is_directory=True)
+        log = root / "linked/outside"
+    elif unsafe == "root-link":
+        root.rmdir()
+        root.symlink_to(tmp_path, target_is_directory=True)
+        log = root / "outside"
+    elif unsafe == "hardlink":
+        os.link(outside, log)
+    elif unsafe == "fifo":
+        os.mkfifo(log)
+    else:
+        log.mkdir()
+    sidecar = tmp_path / "result.log-path"
+    sidecar.write_text(f"{log}\n")
+    tail = worker.OutputTail(str(root), str(sidecar))
+    try:
+        tail.refresh()
+        assert tail.fd is None
+        assert tail.read() == ""
+    finally:
+        tail.close()
+
+
+@pytest.mark.parametrize("stop", ["drain", "lease-loss", "SIGTERM", "SIGKILL"])
+def test_interrupted_worker_retains_the_hol_tail(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, stop: str,
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.next_claim = claim()
+    monkeypatch.setenv("HOLBUILD_FAKE_OUTPUT", "1")
+    monkeypatch.setenv("HOLBUILD_FAKE_HANG", "1")
+    monkeypatch.setenv("HOLBUILD_FAKE_CANCEL", "1")
+    with running_worker(tmp_path, server, "0", "--claim-wait-seconds", "0") as process:
+        wait_for_file(Path(f"{logs[1]}.output-ready"))
+        if stop == "drain":
+            process.send_signal(signal.SIGTERM)
+        elif stop == "lease-loss":
+            server.lease_lost = True
+        else:
+            os.kill(int(Path(f"{logs[1]}.pid").read_text()), getattr(signal, stop))
+        deadline = time.monotonic() + 10
+        while not server.diagnostics and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.diagnostics, (tmp_path / "worker.log").read_text()
+        assert server.diagnostics[0].endswith("HOL interrupted marker\n")
+        assert len(server.diagnostics[0].encode()) <= 65536
+        if stop != "drain" and process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()

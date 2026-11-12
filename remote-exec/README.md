@@ -162,6 +162,14 @@ committed checkpoints. Repeated signals do not interrupt publication. The worker
 then terminates the remaining process group, escalating to SIGKILL after 2 seconds.
 Interrupted actions never report `built`; a lost lease reports no result.
 Without `--share-heaps`, the worker stops the process group immediately.
+An interrupted action separately reports up to 64 KiB from its live HOL log.
+This diagnostic does not validate outputs or publish a successful result.
+It remains available by batch ID after the original client exits. Terminal
+following and `--attach` print it, including an earlier drain tail if a retry
+later succeeded. Interrupt cleanup keeps its five-second bound, so printing
+there is best effort: workers notice revocation on their next normal heartbeat.
+Cancelled drivers retain their action tree until the next action's strict
+cleanup, allowing the worker to read the log even if its first poll was late.
 Leave at least 20 seconds between the drain window and the container's stop
 timeout when sharing heaps (10 otherwise), for publication, process cleanup,
 result reporting and release of task protection. For example, a 120-second
@@ -714,6 +722,19 @@ none is. A run batch with it returns 400.
   the database is out of reach is retried; the stream stays open.
 - 404 when there is no such batch
 
+`GET /v1/batches/<batch_id>/interrupted-output?wait_s=0`
+
+- 200, `application/x-ndjson`: one `{"theory":"pkg:Theory","output":"..."}`
+  line per action with saved interrupted output; an empty body if none exists.
+  Each tail is at most 65,536 UTF-8 bytes, with invalid UTF-8 replaced and
+  control characters other than newline and tab replaced. It is diagnostic text
+  from an interrupted attempt, not an indication that the final action failed.
+- `wait_s` may be 0–90 seconds (default 0), to wait for cancelled workers
+  still expected to report. A wait can expire without output; a later GET can
+  retrieve a report that arrived afterwards. The output lasts as long as the
+  batch's normal retention. The endpoint uses the client bearer token.
+- 404 when there is no such batch
+
 `GET /v1/queue`
 
 - 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "waiting_ahead_standard": 0, "waiting_ahead_high": 0, "run_slots": 30, "run_floor": 0, "desired_burst_workers": 0, "max_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
@@ -780,6 +801,20 @@ record `exec-action --result` wrote as the body (`text/plain`)
   couldn't read the spec, is matched by its spec alone)
 - 409 when the token is stale; the result is dropped
 
+`POST /v1/work/<attempt_token>/diagnostic` with an interrupted log tail as
+`text/plain`, at most 65,536 bytes
+
+- 200 `{"accepted": true}`; this consumes the latest attempt's separate
+  diagnostic token, even if its result lease was revoked. Post before
+  `complete`; a normal completion or a newer claim invalidates the token.
+  Empty output consumes the token without erasing an older saved tail.
+- 409 when the diagnostic token was consumed or superseded
+- 413 when the body exceeds 64 KiB
+
+This endpoint uses the worker bearer token. It changes no result, retry,
+cache entry or action state. Reporting is best effort when the coordinator
+is unreachable; a killed worker itself cannot report.
+
 A worker that can't reach the coordinator or gets a 5xx, as while the
 coordinator restarts, retries a `complete` until the action's lease would run
 out.
@@ -800,6 +835,12 @@ Migration `0015` adds `batches.ahead_cap` and `actions.ahead`. Before rolling
 back to a coordinator image predating it, stop the coordinator and use the new
 image to run `alembic downgrade 0014`, then start the older image. Actions
 running ahead then look like any running action to the older image.
+
+Migration `0016` adds the latest attempt's diagnostic token and bounded
+interrupted output on `actions`. Apply it before serving the new coordinator.
+To roll back to an image predating it, stop the coordinator and use the new
+image to run `alembic downgrade 0015` first. Only saved diagnostic tails and
+their tokens are discarded; result and scheduling state are unchanged.
 
 ## Tests
 
