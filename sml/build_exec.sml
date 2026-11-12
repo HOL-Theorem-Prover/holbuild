@@ -5133,11 +5133,12 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
     fun materialize_valid_cache () =
       let
         val root = cache_root ()
-        fun cached_parents_match text =
+        fun cached_parents_differ text =
           let
             val {dat_hash, ...} = cache_manifest_blobs_from_lines input_key (cache_manifest_lines text)
           in
-            dat_parent_hashes_match dat_hash_cache plan node (HolbuildCache.blob_path root dat_hash)
+            HolbuildCache.verify_blob root dat_hash andalso
+            not (dat_parent_hashes_match dat_hash_cache plan node (HolbuildCache.blob_path root dat_hash))
           end
           handle _ => false
         (* A local entry built against other parent outputs can sit beside a
@@ -5149,12 +5150,15 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
           let
             (* Passes over replicas whose timeout contract is too weak for this build. *)
             fun hydrate () =
-              (ignore (hydrate_remote_cache_key_using
-                         (manifest_timeout_satisfies allow_timeout_discrepancy (tactic_timeout policy))
-                         root input_key);
-               case HolbuildCache.get_action root input_key of
-                   SOME text => if text = existing then CacheMiss else materialize false text
-                 | NONE => CacheMiss)
+              let
+                val hydrated = hydrate_remote_cache_key_using
+                  (manifest_timeout_satisfies allow_timeout_discrepancy (tactic_timeout policy)) root input_key
+              in
+                (* The manifest can stay identical while hydration repairs its blobs. *)
+                case HolbuildCache.get_action root input_key of
+                    SOME text => if hydrated orelse text <> existing then materialize false text else CacheMiss
+                  | NONE => CacheMiss
+              end
             (* A failed copy may have met an entry another build just published. *)
             fun from_remote () =
               if copied_from_remote input_key then CacheMiss else hydrate ()
@@ -5176,7 +5180,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
                    weaker local entry was copied from the remote cache.
                    Refresh without dropping the usable weaker local entry. *)
                 CacheMiss =>
-                  if not (cached_parents_match existing) then reject_parents ()
+                  if cached_parents_differ existing then reject_parents ()
                   else if retry then hydrate () else CacheMiss
               | restored as CacheRestored _ =>
                   if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
