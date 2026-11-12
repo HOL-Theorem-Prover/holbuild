@@ -2437,7 +2437,7 @@ remote cache and `--remote-only`. All three builds must succeed before
 publication. Missing credentials, rejected probes or a failed build block
 publication. Each run records the three source commits and the candidate's
 version, source commit, archive checksum and executable checksum in its summary
-and `consumer-evidence` artifact.
+and `consumer-evidence-<attempt>` artifact.
 
 Configure repository variables `HOLBUILD_REMOTE_EXEC_URL` and
 `HOLBUILD_REMOTE_CACHE_URL` with HTTPS endpoints, and Actions secrets
