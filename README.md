@@ -587,7 +587,7 @@ fingerprint lines of their theories, and exits with the check's status. A
 tool that wants both pays for one theory load. Both fingerprint modes start HOL
 from a valid dependency checkpoint or the toolchain's base state, never from
 `[run].heap`, which may hold an older copy of a theory. These HOL sessions use
-one GC thread and take the same `--cooperate-dir` memory reservation as builds.
+one GC thread.
 
 Build progress and HOL's own messages share stdout, so keep the lines that
 start with `fingerprint` and a tab (`grep '^fingerprint'`). After that column
