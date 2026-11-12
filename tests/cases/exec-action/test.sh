@@ -657,3 +657,47 @@ PYTHON
 worker stale-deps "$spec_r"
 expect stale-deps 0 "status=built"
 cmp "$tmpdir/worker-replacement/blobs/$new_dat" "$tmpdir/worker-stale-deps/blobs/$new_dat"
+
+# An interrupted driver can exit before the worker's first output poll.
+# Its announced live log survives until the next action's strict cleanup.
+cat > "$project/src/InterruptedScript.sml" <<'SML'
+Theory Interrupted
+Ancestors bool
+
+Theorem interrupted_thm:
+  T
+Proof
+  let fun loop () = (OS.Process.sleep (Time.fromSeconds 60); loop ())
+  in fn _ => (print "HOL live interrupted marker\n"; TextIO.flushOut TextIO.stdOut; loop ()) end
+QED
+SML
+hb action-spec --upload InterruptedTheory > "$tmpdir/batch-interrupted.txt"
+spec_interrupted=$(spec_for "$tmpdir/batch-interrupted.txt" worker:InterruptedTheory)
+link_hol_toolchain_cache "$tmpdir/worker-interrupted"
+mkdir -p "$tmpdir/cwd-interrupted"
+(cd "$tmpdir/cwd-interrupted" && HOLBUILD_CACHE="$tmpdir/worker-interrupted" \
+  exec "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" --remote-cache "$remote_url" exec-action "$spec_interrupted" \
+  --cache-limit-gb 1000 --result "$tmpdir/interrupted.result") > "$tmpdir/interrupted.log" 2>&1 &
+interrupted_pid=$!
+background+=("$interrupted_pid")
+live_log=
+for _ in {1..600}; do
+  if [[ -s "$tmpdir/interrupted.result.log-path" ]]; then
+    live_log=$(cat "$tmpdir/interrupted.result.log-path")
+    if [[ -f "$live_log" ]] && grep -q 'HOL live interrupted marker' "$live_log"; then break; fi
+  fi
+  kill -0 "$interrupted_pid" 2>/dev/null || break
+  sleep 0.1
+done
+[[ -n "$live_log" && -f "$live_log" ]] || { cat "$tmpdir/interrupted.log" >&2; exit 1; }
+require_grep 'HOL live interrupted marker' "$live_log"
+kill -TERM "$interrupted_pid"
+set +e
+wait "$interrupted_pid"
+worker_status=$?
+set -e
+expect interrupted 3 'status=failed' 'failure=unavailable'
+require_grep 'HOL live interrupted marker' "$live_log"
+worker interrupted "$spec_a"
+expect interrupted 0 'status=cached'
+[[ ! -e "$live_log" ]] || { echo 'next action kept the interrupted tree' >&2; exit 1; }

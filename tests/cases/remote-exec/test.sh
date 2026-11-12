@@ -312,18 +312,22 @@ interrupt() {
   [[ $status -eq 1 ]] || { echo "$name exited $status after SIGTERM, wanted 1" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
 }
 write_theories interrupted
+printf '%s\n' '{"theory":"rx:ATheory","output":"HOL interrupted marker\n"}' > "$state/interrupted-output"
 touch "$state/hang"
 interrupt interrupted build --remote-exec "$coordinator" BTheory
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/interrupted.log")
 require_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
 require_grep "holbuild: cancelled remote batch $batch" "$tmpdir/interrupted.log"
 require_grep "holbuild: interrupted" "$tmpdir/interrupted.log"
+require_grep "HOL interrupted marker" "$tmpdir/interrupted.log"
 refute_grep "Theory built" "$tmpdir/interrupted.log"
 interrupt interrupted-only build --remote-exec "$coordinator" --remote-only BTheory
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/interrupted-only.log")
 require_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
 require_grep "holbuild: cancelled remote batch $batch" "$tmpdir/interrupted-only.log"
+require_grep "HOL interrupted marker" "$tmpdir/interrupted-only.log"
 rm "$state/hang"
+rm "$state/interrupted-output"
 
 # Forced builds execute on the workers, including under --remote-only.
 run forced-only 0 build --remote-exec "$coordinator" --remote-only --force BTheory
@@ -686,13 +690,20 @@ require_grep "ATheory restored from cache" "$tmpdir/seeded.log"
 # A batch someone cancelled: --remote-only fails with status 1, since a local
 # build would redo what was stopped; without it the build goes on locally.
 write_theories cancelled
+printf '%s\n' '{"theory":"rx:ATheory","output":"HOL budget marker\n"}' > "$state/interrupted-output"
 touch "$state/cancelled"
 run cancelled-only 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "remote execution: batch b[0-9]* cancelled; remote workers finished 0 of 2 theories" "$tmpdir/cancelled-only.log"
+require_grep "HOL budget marker" "$tmpdir/cancelled-only.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/cancelled-only.log")
+run cancelled-reattach 1 build --remote-exec "$coordinator" --remote-only --attach "$batch" BTheory
+require_grep "output from interrupted attempt" "$tmpdir/cancelled-reattach.log"
+require_grep "HOL budget marker" "$tmpdir/cancelled-reattach.log"
 run cancelled 0 build --remote-exec "$coordinator" BTheory
 require_grep "batch b[0-9]* cancelled; remote workers finished 0 of 2 theories; building locally" "$tmpdir/cancelled.log"
 require_grep "BTheory built" "$tmpdir/cancelled.log"
 rm "$state/cancelled"
+rm "$state/interrupted-output"
 
 # A theory built here for its current source needs no worker, though the
 # remote cache lacks it (its publish failed, say): with ATheory's remote

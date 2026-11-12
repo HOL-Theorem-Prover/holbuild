@@ -2464,3 +2464,84 @@ async def test_queue_reports_priority_subsets_without_double_counting(http: http
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
     assert (queue["ready_priority"], queue["running_priority"]) == (1, 1)
     assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (2, 1, 1)
+
+
+async def diagnostic(http: httpx.AsyncClient, token: str, output: str) -> httpx.Response:
+    return await http.post(f"/v1/work/{token}/diagnostic", content=output.encode(), headers=WORKER)
+
+
+@pytest.mark.parametrize("end", ["cancel", "deadline"])
+async def test_cancelled_attempt_retains_diagnostic_after_client_exit(
+    http: httpx.AsyncClient, coordinator: Coordinator, end: str,
+) -> None:
+    batch_id = await submit(http, ["loop", "blocked"], [("blocked", "loop")])
+    token = await claim_named(http, "loop")
+    if end == "cancel":
+        assert (await http.post(f"/v1/batches/{batch_id}/cancel", headers=CLIENT)).status_code == 200
+    else:
+        coordinator.settings.batch_deadline_hours = 0
+        await coordinator.fail_overdue()
+    assert (await complete(http, token, result("loop", "built"))).status_code == 409
+    assert (await diagnostic(http, token, "HOL interrupted marker\n")).status_code == 200
+    response = await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=CLIENT)
+    assert response.status_code == 200
+    assert [json.loads(line) for line in response.text.splitlines()] == [
+        {"theory": "pkg:loop", "output": "HOL interrupted marker\n"}
+    ]
+    assert await states(http, batch_id) == {"loop": "cancelled", "blocked": "cancelled"}
+    assert (await diagnostic(http, token, "duplicate")).status_code == 409
+    assert (await http.get(f"/v1/batches/{batch_id}/interrupted-output?wait_s=1", headers=CLIENT)).status_code == 200
+
+
+async def test_drain_diagnostic_survives_retry_and_empty_reports(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["loop"])
+    first = await claim_named(http, "loop")
+    assert (await diagnostic(http, first, "drained marker\n")).status_code == 200
+    assert (await complete(http, first, result("loop", "failed", "unavailable"))).status_code == 200
+    second = await claim_named(http, "loop")
+    assert (await diagnostic(http, first, "stale marker")).status_code == 409
+    assert (await diagnostic(http, second, "")).status_code == 200
+    assert (await complete(http, second, result("loop", "built"))).status_code == 200
+    response = await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=CLIENT)
+    assert json.loads(response.text) == {"theory": "pkg:loop", "output": "drained marker\n"}
+    current = await batch(http, batch_id)
+    assert current["state"] == "done"
+    assert current["actions"][0]["attempts"] == 1
+
+
+async def test_diagnostic_waits_for_cancelled_worker_even_with_a_prior_tail(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["loop"])
+    first = await claim_named(http, "loop")
+    await diagnostic(http, first, "old tail")
+    await complete(http, first, result("loop", "failed", "unavailable"))
+    second = await claim_named(http, "loop")
+    await http.post(f"/v1/batches/{batch_id}/cancel", headers=CLIENT)
+    request = asyncio.create_task(http.get(f"/v1/batches/{batch_id}/interrupted-output?wait_s=2", headers=CLIENT))
+    await asyncio.sleep(0.05)
+    assert not request.done()
+    await diagnostic(http, second, "new tail")
+    response = await request
+    assert json.loads(response.text)["output"] == "new tail"
+
+
+async def test_diagnostic_requires_worker_auth_and_rejects_oversized_body(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["loop"])
+    token = await claim_named(http, "loop")
+    path = f"/v1/work/{token}/diagnostic"
+    assert (await http.post(path, content="unauthorized", headers=CLIENT)).status_code == 401
+    assert (await diagnostic(http, token, "x" * 65537)).status_code == 413
+    assert (await diagnostic(http, token, "x" * 65536)).status_code == 200
+    assert (await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=WORKER)).status_code == 401
+    response = await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=CLIENT)
+    assert len(json.loads(response.text)["output"].encode()) == 65536
+
+
+async def test_diagnostic_removes_controls_and_no_output_does_not_leave_a_waiter(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["loop"])
+    token = await claim_named(http, "loop")
+    assert (await diagnostic(http, token, "é\x00\x1b\r\nmarker\tend")).status_code == 200
+    response = await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=CLIENT)
+    assert json.loads(response.text)["output"] == "é   \nmarker\tend"
+    await complete(http, token, result("loop", "built"))
+    assert (await diagnostic(http, token, "late")).status_code == 409
+    assert (await http.get(f"/v1/batches/{uuid4()}/interrupted-output", headers=CLIENT)).status_code == 404

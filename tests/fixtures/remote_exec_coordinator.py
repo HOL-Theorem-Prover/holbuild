@@ -94,6 +94,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.log_request_line()
+        if self.path.split("?", 1)[0].endswith("/interrupted-output"):
+            saved = state / "interrupted-output"
+            data = saved.read_bytes() if saved.exists() else b""
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         parts = self.path.split("/")
         batch = state / f"{parts[3]}.batch" if len(parts) == 5 and parts[4] == "events" else None
         if batch is None or not batch.exists():

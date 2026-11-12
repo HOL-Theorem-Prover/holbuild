@@ -8,6 +8,14 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 THEORY = re.compile(r"[^\s:]+:\S+")
 PHASE = re.compile(r"[a-z]+")
 DETAIL_MAX = 500
+OUTPUT_TAIL_BYTES = 64 * 1024
+
+
+def output_tail(data: bytes) -> str:
+    """At most 64 KiB of UTF-8 diagnostic text, without terminal controls or Postgres NULs."""
+    text = data[-OUTPUT_TAIL_BYTES:].decode(errors="replace")
+    text = "".join(c if c.isprintable() or c in "\n\t" else " " for c in text)
+    return text.encode()[-OUTPUT_TAIL_BYTES:].decode(errors="ignore")
 
 FAILURES = frozenset(
     {
