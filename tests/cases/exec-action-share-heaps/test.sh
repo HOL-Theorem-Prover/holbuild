@@ -452,7 +452,8 @@ PYTEST
 require_grep '^status=failed$' "$tmpdir/interrupted.result"
 require_grep '^failure=unavailable$' "$tmpdir/interrupted.result"
 [[ ! -e "$tmpdir/remote/ac/$key_interrupt" ]] || { echo "interrupted action published a built result" >&2; exit 1; }
-[[ ! -e "$interrupted/checkpoints" ]] || { echo "interrupted action kept private checkpoints" >&2; exit 1; }
+# Interrupted trees remain available for diagnostic collection. The next
+# action removes them before restoring the published checkpoints.
 sed -i 's/OS.Process.sleep (Time.fromSeconds 120)/()/' "$project/src/InterruptedScript.sml"
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload ConsumerTheory) > "$tmpdir/resume.batch"
 spec_interrupt=$(field "$tmpdir/resume.batch" share:InterruptedTheory 4)
@@ -462,3 +463,4 @@ worker interrupted-resume "$shared_url" "$interrupted" "$spec_interrupt" --share
 expect interrupted-resume 0 "status=built"
 require_grep 'restored shared .* checkpoint' "$tmpdir/interrupted-resume.log"
 require_grep 'checkpoint after completed' "$tmpdir/interrupted-resume.log"
+[[ ! -e "$interrupted/checkpoints" ]] || { echo "resumed action kept private checkpoints" >&2; exit 1; }
