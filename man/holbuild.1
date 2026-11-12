@@ -775,6 +775,13 @@ fail instead of building locally, with exit status 75.
 .BI \-\-priority " N"
 The batch's priority with the coordinator (default 0).
 .TP
+.BR \-\-speculative\-loading [= \fIN\fR]
+Let the coordinator's workers start loading a theory's ancestors before its
+parents are built, at most
+.I N
+theories of the batch at a time (1\(en16, default 4).
+Costs worker time when a parent fails.
+.TP
 .B \-\-detach
 Submit the batch and exit.
 .TP
