@@ -12,7 +12,6 @@ val plans = ref ([] : string list)
 val follows = ref ([] : string list)
 val batches = ref (Binaryset.empty String.compare)
 val actions = ref (Binarymap.mkDict String.compare : (string, string) Binarymap.dict)
-val executions = ref (Binarymap.mkDict String.compare : (string, LargeInt.int) Binarymap.dict)
 val counts = Array.array (4, 0)
 val mutex = Mutex.mutex ()
 
@@ -126,42 +125,29 @@ fun observe_action (batch, line) =
     val key = getOpt (field "input_key", "")
     val attempt = getOpt (integer_field "attempts" line, 0)
     val began = integer_field "started" line
-    val failure = getOpt (field "last_failure", "")
-    val execution = case began of SOME ms => LargeInt.toString ms
-                     | NONE => HolbuildSha256.string_hex line
-    val identity = batch ^ "\000" ^ key ^ "\000" ^ LargeInt.toString attempt ^ "\000" ^ execution ^ "\000" ^ failure
-    val terminal = List.exists (fn state => field "state" = SOME state) ["done", "failed", "cancelled"]
-    val pending_key = batch ^ "\000" ^ key ^ "\000pending"
-    val previous = Binarymap.peek (!actions, pending_key)
-    val prior_attempt = Option.map (fn entry => getOpt (integer_field "attempts" entry, 0)) previous
-    val result_key = batch ^ "\000" ^ key ^ "\000" ^ execution
-    val recorded = Binarymap.peek (!executions, result_key)
-    (* Retries retain the preceding result's timings in coordinator snapshots. *)
-    val inherited = (case (began, previous) of
-                         (SOME ms, SOME entry) => integer_field "started" entry = SOME ms
-                       | _ => false) orelse
-                    (case recorded of NONE => false
-                      | SOME prior => prior <> attempt orelse prior_attempt = SOME attempt)
-    val pending = field "state" = SOME "running" orelse
-                  (not terminal andalso (inherited orelse (not (Option.isSome began) andalso failure = "")))
-    val entry = object [J.json_string_field "batch_id" batch,
-      J.json_bool_field "timings_current" (not pending andalso not inherited),
-      "\"action\":" ^ Substring.string (Substring.dropr Char.isSpace (Substring.full line))]
-    val _ = case (previous, prior_attempt) of
-        (SOME entry, SOME prior) =>
-          if prior > 0 andalso prior < attempt then
-            actions := Binarymap.insert (!actions, pending_key ^ "\000" ^ LargeInt.toString prior, entry)
-          else ()
-      | _ => ()
+    val identity = batch ^ "\000" ^ key
+    fun retain suffix observation action =
+      let val id = identity ^ "\000" ^ suffix
+      in if Option.isSome (Binarymap.peek (!actions, id)) then () else
+           actions := Binarymap.insert (!actions, id, object
+             [J.json_string_field "batch_id" batch,
+              J.json_string_field "observation" observation,
+              "\"action\":" ^ action])
+      end
+    val raw = Substring.string (Substring.dropr Char.isSpace (Substring.full line))
+    val marker = object [J.json_string_field "input_key" key,
+      J.json_string_field "state" "running", number "attempts" attempt]
   in
-    if pending then
-      actions := Binarymap.insert (!actions, pending_key, entry)
-    else
-      (if Option.isSome (Binarymap.peek (!actions, pending_key)) then
-         actions := #1 (Binarymap.remove (!actions, pending_key)) else ();
-       if not inherited andalso Option.isSome began then
-         executions := Binarymap.insert (!executions, result_key, attempt) else ();
-       actions := Binarymap.insert (!actions, identity, entry))
+    (* A retry snapshot may be the only observation of the preceding result.
+       Retain that payload independently, without assigning it to an attempt. *)
+    (case began of
+         SOME ms => retain ("result\000" ^ LargeInt.toString ms) "result" raw
+       | NONE =>
+           if field "state" = SOME "running" then () else
+             retain ("untimed\000" ^ HolbuildSha256.string_hex raw) "untimed" raw);
+    if field "state" = SOME "running" then
+      retain ("attempt\000" ^ LargeInt.toString attempt) "attempt" marker
+    else ()
   end
 
 fun observe_follow (batch, start, finish) =
