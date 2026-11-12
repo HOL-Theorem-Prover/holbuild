@@ -60,7 +60,9 @@ class Result:
     missing: Missing | None
     peak_rss_mb: int | None
     log_sha256: str | None
-    timings: dict[str, int] | None = None  # milliseconds: each phase's, and the whole run's as "wall"
+    # Durations in ms; started/finished and hol/publish/log start/end are Unix ms.
+    # rebuilt is 1 for a source build, 0 for a cache hit or failure.
+    timings: dict[str, int] | None = None
     detail: str | None = None  # why a failure with no log failed, as sanitize_detail leaves it
 
 

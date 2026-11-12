@@ -14,7 +14,9 @@ val local_build_needed_status : OS.Process.status = RunCall.unsafeCast (75 : int
 val interrupted = ref false
 
 fun err_with_debug_artifacts msg artifacts =
-  (if HolbuildStatus.json_mode () then HolbuildStatus.error_with_debug_artifacts msg artifacts
+  (HolbuildCommandSummary.exit_code :=
+     (if !HolbuildHolSharedCache.local_build_needed andalso not (!interrupted) then 75 else 1);
+   if HolbuildStatus.json_mode () then HolbuildStatus.error_with_debug_artifacts msg artifacts
    else HolbuildStatus.message_stderr ("holbuild: " ^ msg ^ "\n");
    OS.Process.exit (if !HolbuildHolSharedCache.local_build_needed andalso not (!interrupted)
                     then local_build_needed_status
@@ -1422,6 +1424,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             | NONE => if watch then with_options (prepare_plan (prepared_sources ())) else plan_with_record false
       in
         warn_unreachable_for sources;
+        if dry_run then () else
+          (case mode of BuildTargets => HolbuildCommandSummary.observe_plan project (#plan sources)
+                      | RemoteExec _ => HolbuildCommandSummary.observe_plan project (#plan sources)
+                      | _ => ());
         planned
       end
     fun describe_dry_run () =
@@ -3930,6 +3936,7 @@ fun reject_runtime_options options args =
 
 fun main raw_args =
   (let
+     val _ = HolbuildCommandSummary.initialize ()
      val _ = HolbuildOffline.initialize ()
      val _ = install_signal_handlers ()
      (* exec-action leaves through Posix.Process.exit, which skips this, so
@@ -3939,9 +3946,9 @@ fun main raw_args =
      val runtime_options = runtime_options raw_args
      val _ =
        if raw_args = ["--version"] then
-         (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); OS.Process.exit OS.Process.success)
+         (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); HolbuildCommandSummary.exit_code := 0; OS.Process.exit OS.Process.success)
        else if raw_args = ["--help"] orelse raw_args = ["-h"]
-       then (global_help (); OS.Process.exit OS.Process.success)
+       then (global_help (); HolbuildCommandSummary.exit_code := 0; OS.Process.exit OS.Process.success)
        else ()
      val (cooperate_dir, machine_max_mem, child_charge, raw_args) = parse_cooperation_options raw_args
      val (options, args) = parse_global_options raw_args
@@ -3961,7 +3968,8 @@ fun main raw_args =
      val _ = reject_runtime_options runtime_options args
    in
      configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
-     dispatch_with_options options args
+     dispatch_with_options options args;
+     HolbuildCommandSummary.exit_code := 0
    end)
   handle Thread.Interrupt => (interrupted := true; HolbuildToolchain.cleanup_active_children (); err "interrupted")
        | HolbuildOffline.Error msg => err msg

@@ -179,6 +179,18 @@ refute_grep "Theory built" "$tmpdir/follow.log"
 [[ $(grep -c . "$state/ran") -eq 2 ]] || { cat "$state/ran" >&2; exit 1; }
 require_grep "^action .* rx:ATheory$" "$state/b1.batch"
 require_grep "^edge " "$state/b1.batch"
+python3 - "$project" <<'PY'
+import json,pathlib,sys
+records=[json.loads(p.read_text()) for p in (pathlib.Path(sys.argv[1])/'.holbuild/commands').glob('*.json')]
+record=next(r for r in records if r['fleet_batches']==['b1'])
+assert record['exit_code']==0
+assert len(record['fleet_follows'])==1
+assert len(record['fleet_actions'])==2
+assert all(a['action']['timings']['finished'] >= a['action']['timings']['started'] for a in record['fleet_actions'])
+assert sum(a['action']['timings']['rebuilt'] for a in record['fleet_actions'])==2
+assert record['local_outcomes']['built']==0
+assert record['local_outcomes']['restored_remote']==2
+PY
 
 # With everything cached there is nothing to submit.
 run cached 0 build --remote-exec "$coordinator" BTheory

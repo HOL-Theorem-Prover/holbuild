@@ -5,6 +5,8 @@ struct
    cache; it counts towards from_cache as well. *)
 datatype outcome = Built | UpToDate | Restored | RestoredRemote | Inspected
 
+val command_outcome = ref (fn (_ : outcome) => ())
+
 (* thread is the worker building the node; waiting is set while that worker
    waits for machine memory before launching the node's child. *)
 type active_node = {key : string, label : string, started_at : Time.time,
@@ -359,13 +361,14 @@ fun count_project_work () =
   (Mutex.lock project_work_lock; project_work := !project_work + 1; Mutex.unlock project_work_lock)
 
 fun count_outcome ({built, up_to_date, restored, restored_remote, ...} : t) outcome =
-  case outcome of
+  (!command_outcome outcome;
+   case outcome of
       Built => (built := !built + 1; count_project_work ())
     | UpToDate => up_to_date := !up_to_date + 1
     | Restored => (restored := !restored + 1; count_project_work ())
     | RestoredRemote =>
         (restored := !restored + 1; restored_remote := !restored_remote + 1; count_project_work ())
-    | Inspected => ()
+    | Inspected => ())
 
 fun elapsed ({started_at, ...} : t) = Time.-(Time.now (), started_at)
 

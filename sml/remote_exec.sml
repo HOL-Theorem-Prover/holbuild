@@ -24,6 +24,10 @@ datatype outcome = Done
    said. *)
 type progress = {built : int, total : int}
 
+val command_action = ref (fn (_ : string * string) => ())
+val command_follow = ref (fn (_ : string * Time.time * Time.time) => ())
+val command_batch = ref (fn (_ : string) => ())
+
 val connect_timeout_seconds = 10
 val request_max_time_seconds = 60
 (* Waits before each retry of a request the coordinator couldn't answer (a
@@ -131,7 +135,7 @@ fun submit_with_query wait_unreachable url query maxheap batch_text : attempt =
       in
         if status = 201 then
           case json_string_field "batch_id" text of
-              SOME id => Ok id
+              SOME id => (!command_batch id; Ok id)
             | NONE => Refused ("coordinator answered without a batch_id: " ^ text)
         else if (status = 0 andalso wait_unreachable) orelse status = 429 orelse status >= 500 then
           case delays of
@@ -215,6 +219,7 @@ fun report_action line =
    batch comes with the action whose proof failed, when one did. *)
 fun follow url batch_id (on_change : string * string * string option * string option -> unit) : outcome * progress =
   let
+    val followed_at = Time.now ()
     val _ = HolbuildOffline.require_online "follow a remote batch"
     val states : (string * (string * string option * string option)) list ref = ref []
     val names = ref ([] : (string * string) list)
@@ -230,6 +235,7 @@ fun follow url batch_id (on_change : string * string * string option * string op
       case (if complete line then json_string_field "type" line else NONE) of
           SOME "action" =>
             let
+              val _ = !command_action (batch_id, line)
               val key = Option.getOpt (json_string_field "input_key" line, "")
               val state = Option.getOpt (json_string_field "state" line, "")
               val failure = json_string_field "last_failure" line
@@ -295,6 +301,8 @@ fun follow url batch_id (on_change : string * string * string option * string op
                   | delay :: rest => again delay rest
       end
     val outcome = attach (retry_delays_seconds ())
+                  handle e => (!command_follow (batch_id, followed_at, Time.now ()); raise e)
+    val _ = !command_follow (batch_id, followed_at, Time.now ())
     val skipped = List.filter (fn (_, (state, reason, _)) =>
       state = "cancelled" andalso String.isPrefix "skipped because of " (Option.getOpt (reason, ""))) (!states)
     fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
