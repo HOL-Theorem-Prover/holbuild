@@ -137,8 +137,11 @@ fun observe_action (batch, line) =
     val result_key = batch ^ "\000" ^ key ^ "\000" ^ execution
     val recorded = Binarymap.peek (!executions, result_key)
     (* Retries retain the preceding result's timings in coordinator snapshots. *)
-    val inherited = case recorded of NONE => false
-                      | SOME prior => prior <> attempt orelse prior_attempt = SOME attempt
+    val inherited = (case (began, previous) of
+                         (SOME ms, SOME entry) => integer_field "started" entry = SOME ms
+                       | _ => false) orelse
+                    (case recorded of NONE => false
+                      | SOME prior => prior <> attempt orelse prior_attempt = SOME attempt)
     val pending = field "state" = SOME "running" orelse
                   (not terminal andalso (inherited orelse (not (Option.isSome began) andalso failure = "")))
     val entry = object [J.json_string_field "batch_id" batch,

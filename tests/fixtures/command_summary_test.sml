@@ -48,3 +48,17 @@ val expired = List.filter (fn line => HolbuildCommandSummary.integer_field "atte
 val _ = if length snapshots = 3 andalso length expired = 1 andalso
     Option.isSome (HolbuildStatus.find_substring "\"timings_current\":false" (hd expired))
   then () else raise Fail "inherited result timings hid an expired retry";
+
+val _ = reset ();
+val _ = HolbuildCommandSummary.observe_action ("batch", retry_event "running" 2 1000);
+val _ = HolbuildCommandSummary.observe_action ("batch", retry_event "waiting" 2 1000);
+val snapshots = map #2 (Binarymap.listItems (!HolbuildCommandSummary.actions));
+val _ = if length snapshots = 1 andalso
+    Option.isSome (HolbuildStatus.find_substring "\"timings_current\":false" (hd snapshots))
+  then () else raise Fail "late attachment called inherited timing a current result";
+val _ = HolbuildCommandSummary.observe_action ("batch", retry_event "done" 3 5000);
+val snapshots = map #2 (Binarymap.listItems (!HolbuildCommandSummary.actions));
+val _ = if length snapshots = 2 andalso
+    List.exists (fn line => HolbuildCommandSummary.integer_field "attempts" line = SOME 2 andalso
+      Option.isSome (HolbuildStatus.find_substring "\"timings_current\":false" line)) snapshots
+  then () else raise Fail "late attachment lost the expired retry";
