@@ -12,7 +12,7 @@ val tree = dir ^ "/checkpoints";
 val store = dir ^ "/store";
 val deps = tree ^ "/deps.save";
 val base = dir ^ "/base.save";
-val count = 24;
+val count = if failing then 24 else 451;
 fun path i = tree ^ "/c" ^ Int.toString i ^ ".save";
 fun sidecar i = BE.checkpoint_ok_text "theorem_context"
   [("proof_timeout", "none"), ("test", "checkpoint-" ^ Int.toString i)];
@@ -54,6 +54,20 @@ fun checkpoint name =
 val _ = checkpoint "publish";
 val _ = BE.publish_shared_checkpoints cache ctx
   {heap = SOME heap, files = [], stale = [], missing = if failing then [bad] else []};
+(* An edit can request the next action immediately after publication. Do
+   this before repeat publication or repair, with no local files or store. *)
+fun restore_latest () =
+  let
+    val _ = BE.remove_tree tree
+    val _ = BE.remove_tree store
+    val restored = BE.restore_shared_checkpoints (RC.remote url) ctx
+    val latest = if failing then 11 else count - 1
+  in
+    assert "restored latest complete candidate"
+      (List.exists (fn (p, _) => p = path latest) (#files restored));
+    assert "restored heap" (#heap restored = SOME heap)
+  end;
+val _ = restore_latest ();
 val _ = checkpoint "published";
 (* Existing manifests skip all uploads. *)
 val _ = if failing then () else BE.publish_shared_checkpoints cache ctx
@@ -72,12 +86,5 @@ val _ = if failing then () else
     val _ = BE.publish_shared_checkpoints fresh ctx {heap = SOME heap, files = [], stale = [], missing = []}
   in assert "un-restored manifests must not hide a missing blob" (BE.file_exists (dir ^ "/remote/cas/" ^ sha)) end;
 val _ = checkpoint "repaired";
-(* Restore on a host with no local states or store. *)
-val _ = BE.remove_tree tree;
-val _ = BE.remove_tree store;
-val restored = BE.restore_shared_checkpoints (RC.remote url) ctx;
-val latest = if failing then 11 else count - 1;
-val _ = assert "restored latest complete candidate"
-  (List.exists (fn (p, _) => p = path latest) (#files restored));
-val _ = assert "restored heap" (#heap restored = SOME heap);
+val _ = restore_latest ();
 val _ = print "shared checkpoint publication passed\n";

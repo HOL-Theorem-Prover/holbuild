@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 
 def wait_for(process: subprocess.Popen[bytes], predicate: Callable[[], bool]) -> None:
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + 300
     while not predicate():
         if process.poll() is not None or time.monotonic() >= deadline:
             raise AssertionError("publication exited or timed out before its fixture event")
@@ -20,6 +20,7 @@ def run() -> None:
     directory = Path(os.environ["PUBLISH_DIR"])
     control = directory / "control"
     failing = os.environ["PUBLISH_FAIL"] == "1"
+    count = 24 if failing else 451
     requests = directory / "server/requests.log"
     script = Path(__file__).with_suffix(".sml")
     with (directory / "poly.log").open("wb") as log:
@@ -31,7 +32,7 @@ def run() -> None:
             wait_for(process, lambda: (directory / "publish.ready").exists())
             (control / "action-get-enable").touch()
             (control / "cas-put-enable").touch()
-            for sequence in range(2, 25):
+            for sequence in range(2, count + 1):
                 (control / f"action-put-{sequence}-before-enable").touch()
             if failing:
                 (control / "cas-put-reject-text").write_text("test=checkpoint-12\n")
@@ -43,14 +44,15 @@ def run() -> None:
             wait_for(process, lambda: blob_count.exists() and blob_count.read_text() == "4")
             (control / "cas-put-release").touch()
             wait_for(process, lambda: len(list(control.glob("action-put-*-before-event"))) == 4)
-            for sequence in range(2, 25):
+            for sequence in range(2, count + 1):
                 (control / f"action-put-{sequence}-before-release").touch()
             wait_for(process, lambda: (directory / "published.ready").exists())
             lines = requests.read_text().splitlines()
             puts = [line for line in lines if line.startswith("PUT /cas/")]
             assert len(puts) == len(set(puts)), "a spine blob was uploaded more than once"
+            assert len(puts) == 1 + 2 * (count - 1), "CAS writes must equal the distinct heap/state/sidecar files"
             manifests = list((directory / "remote/ac").glob("*"))
-            expected = 11 if failing else 23
+            expected = 11 if failing else count - 1
             assert len(manifests) == expected + 1, "wrong number of candidate manifests"
             for manifest in manifests:
                 text = manifest.read_text().split("manifest-text-v1\n", 1)[1]
@@ -82,7 +84,7 @@ def run() -> None:
             wait_for(process, lambda: (directory / "repeated.ready").exists())
             assert requests.read_text().splitlines().count("PUT /cas/" + partial) == 0
             if not failing:
-                assert len(requests.read_text().splitlines()) == len(lines) + 23, "present candidate did more than a probe"
+                assert len(requests.read_text().splitlines()) == len(lines) + count - 1, "present candidate did more than a probe"
             (directory / "repeated.release").touch()
             wait_for(process, lambda: (directory / "repaired.ready").exists())
             (directory / "repaired.release").touch()
