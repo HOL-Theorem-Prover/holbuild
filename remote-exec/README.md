@@ -467,7 +467,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   action to waiting (see Retries), or fails it once it has been claimed `MAX_ATTEMPTS` times.
   A build action whose input key another batch's live lease is building is
   not claimed (single-flight across batches). When that build succeeds, the
-  coordinator marks the waiting and ready copies of the key in other running
+  coordinator marks the waiting and ready copies of the action (same key and
+  spec, so not a forced or traced copy of a plain build) in other running
   batches done, with its log, and releases their children; when it fails or
   its lease expires, the copies are claimable again and waiting claims are
   woken. Two claims committing at the same moment can still both build a key.

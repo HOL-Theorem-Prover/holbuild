@@ -443,12 +443,12 @@ LIMIT 1 FOR UPDATE SKIP LOCKED
 """)
 
 
-# The unfinished, unclaimed build actions of other running batches with the same keys as a build whose lease just
-# ended; see CLAIM_ACTION. Read by primary key, a probe per running batch: no index leads with input_key.
+# The unfinished, unclaimed build actions of other running batches with the same key and spec as a build whose lease
+# just ended; see CLAIM_ACTION. The spec too, since a forced or traced build has the same keys as a plain one. Read by primary key, a probe per running batch: no index leads with input_key.
 PEERS = sa.text("""
 SELECT batch_id, tier, state FROM actions
 WHERE batch_id = ANY(ARRAY(SELECT id FROM batches WHERE state = 'running' AND id <> :batch_id))
-AND input_key = :input_key AND ac_key = :ac_key AND class = 'build' AND state IN ('waiting', 'ready')
+AND input_key = :input_key AND spec_sha256 = :spec_sha256 AND class = 'build' AND state IN ('waiting', 'ready')
 """)
 
 
@@ -1003,15 +1003,16 @@ class Coordinator:
             self.made_ready -= 1
             self._wake_claim(woken.result())
 
-    @staticmethod
-    async def _peers(conn: AsyncConnection, batch_id: UUID, action: sa.Row[Any]) -> list[tuple[UUID, str, str]]:
+    async def _peers(self, batch_id: UUID, action: sa.Row[Any]) -> list[tuple[UUID, str, str]]:
         """The waiting and ready copies of build ``action`` of ``batch_id``, whose lease just ended, in other
-        running batches, by batch, tier and state; see CLAIM_ACTION."""
+        running batches, by batch, tier and state; see CLAIM_ACTION. Read once the lease's deletion committed, so
+        a batch submitted meanwhile is either found or was never held."""
         if action.action_class != "build":
             return []
-        rows = await conn.execute(
-            PEERS, {"batch_id": batch_id, "input_key": action.input_key, "ac_key": action.ac_key}
-        )
+        async with self.engine.connect() as conn:
+            rows = await conn.execute(
+                PEERS, {"batch_id": batch_id, "input_key": action.input_key, "spec_sha256": action.spec_sha256}
+            )
         return [(row.batch_id, row.tier, row.state) for row in rows]
 
     def _wake_peers(self, peers: list[tuple[UUID, str, str]]) -> None:
@@ -1101,8 +1102,8 @@ class Coordinator:
             action = (
                 await conn.execute(
                     sa.text(
-                        "SELECT a.input_key, a.ac_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions, "
-                        "a.last_failure, a.class AS action_class, b.profile "
+                        "SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions, a.last_failure, "
+                        "a.class AS action_class, b.profile "
                         "FROM actions a JOIN batches b ON b.id = a.batch_id "
                         "WHERE a.batch_id = :batch_id AND a.input_key = :input_key"
                     ),
@@ -1114,7 +1115,6 @@ class Coordinator:
                     f"result for {result.input_key} (spec {result.spec_sha256}) does not match the lease's action "
                     f"{action.input_key} (spec {action.spec_sha256})"
                 )
-            peers = await self._peers(conn, batch_id, action)
             await conn.execute(
                 sa.text(
                     "UPDATE actions SET log_sha256 = :log, last_failure = :failure, failure_detail = :detail, "
@@ -1169,6 +1169,7 @@ class Coordinator:
                 )
         self._batch_changed(batch_id)
         self.request_release(batch_id)
+        peers = await self._peers(batch_id, action)
         if result.status == "failed":
             self._wake_peers(peers)
         else:
@@ -1307,16 +1308,15 @@ class Coordinator:
                 action = (
                     await conn.execute(
                         sa.text(
-                            "SELECT input_key, ac_key, theory, state, attempts, class AS action_class FROM actions "
+                            "SELECT input_key, spec_sha256, theory, state, attempts, class AS action_class FROM actions "
                             "WHERE batch_id = :batch_id AND input_key = :input_key FOR UPDATE"
                         ),
                         {"batch_id": batch_id, "input_key": lease.input_key},
                     )
                 ).one()
-                peers = await self._peers(conn, batch_id, action)
                 if action.state != "running":
-                    pass
-                elif action.attempts >= self.settings.max_attempts:
+                    continue
+                if action.attempts >= self.settings.max_attempts:
                     await conn.execute(
                         sa.text(
                             "UPDATE actions SET last_failure = CASE WHEN class = 'run' THEN 'internal' "
@@ -1335,9 +1335,8 @@ class Coordinator:
                     )
                 else:
                     await self._retry(conn, batch_id, lease.input_key)
-            self._wake_peers(peers)
-            if action.state == "running":
-                self._batch_changed(batch_id)
+            self._wake_peers(await self._peers(batch_id, action))
+            self._batch_changed(batch_id)
 
     async def fail_overdue(self) -> None:
         """Fail the batches still running ``batch_deadline_hours`` after their submission: one that can't finish,
