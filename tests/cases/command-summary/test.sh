@@ -83,6 +83,20 @@ assert records[4]['plans'][0]['changed_sources']
 assert not records[5]['plans'][0]['changed_sources']
 PY
 
+# The CLI treats a closed non-JSON output pipe as success; its record must agree.
+python3 - "$HOLBUILD_BIN" "$tmpdir/broken-pipe.json" <<'PY'
+import json,os,pathlib,subprocess,sys
+env=dict(os.environ, HOLBUILD_COMMAND_RECORD=sys.argv[2])
+binary=os.environ.get('REAL_HOLBUILD_BIN', sys.argv[1])
+with subprocess.Popen(['/bin/sh','-c','export HOLBUILD_COMMAND_RECORD_PID=$$; exec "$@"','sh',
+                       binary,'build','BTheory'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, restore_signals=False) as p:
+    p.stdout.close()
+    code=p.wait(timeout=60)
+    error=p.stderr.read().decode()
+record=json.loads(pathlib.Path(sys.argv[2]).read_text())
+assert code==0 and record['exit_code']==code, (code, record, error)
+PY
+
 # Caller-owned summaries are per process, and do not enter the plan key.
 HOLBUILD_COMMAND_RECORD="$tmpdir/not-this-process.json" HOLBUILD_COMMAND_RECORD_PID=not-a-pid \
   build --version

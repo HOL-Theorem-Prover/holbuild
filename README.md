@@ -2043,6 +2043,8 @@ Worker phase sums overlap across actions and within nested phases; they
 are not command wall time or CPU time. Worker timestamp spans permit a
 wall-time analysis when clocks are synchronized. Deferred checkpoint
 uploads continue after the action result and are outside its client wait.
+The `rebuilt` counter describes theory-build actions only. Remote run actions
+carry execution, HOL, publication and log spans without claiming a source rebuild.
 
 It exports and uploads the batch as `action-spec --upload` does, submits it
 with `POST URL/v1/batches`, and follows `GET URL/v1/batches/<id>/events`,

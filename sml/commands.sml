@@ -4008,7 +4008,8 @@ fun main raw_args =
        | HolbuildRemoteCacheConfig.Error msg => err msg
        | HolbuildWatch.Error msg => err msg
        | e => if is_broken_pipe e then
-                OS.Process.exit (if HolbuildStatus.json_mode () then OS.Process.failure else OS.Process.success)
+                (HolbuildCommandSummary.exit_code := (if HolbuildStatus.json_mode () then 1 else 0);
+                 OS.Process.exit (if HolbuildStatus.json_mode () then OS.Process.failure else OS.Process.success))
               else err (General.exnMessage e)
 
 end
