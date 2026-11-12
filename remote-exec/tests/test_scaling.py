@@ -77,6 +77,12 @@ def test_burst_demand(queue: QueueCounts, expected: int) -> None:
     assert burst_demand(queue, warm_workers=2, max_burst_workers=16) == expected
 
 
+def test_burst_demand_counts_the_workers_held_ahead_for_no_high_run_the_run_slots_hold_back() -> None:
+    # One run slot, taken by the running high run: the ready one waits for it, not for a burst worker.
+    queue = counts(running=4, ready_high=1, running_high=1, ready_run=1, running_run=1, high_run=2, ahead=4)
+    assert burst_demand(queue, warm_workers=2, max_burst_workers=16, run_slots=1) == 1
+
+
 def scaled_coordinator(coordinator: Coordinator, tmp_path: Path, script: str) -> tuple[Coordinator, Path]:
     """A coordinator with 1 warm worker, at most 4 burst ones, a 100 s hold, and a scale command running
     ``script`` with the count appended to ``tmp_path/scaled``."""
