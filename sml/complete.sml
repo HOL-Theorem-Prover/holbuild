@@ -38,7 +38,7 @@ val build_cache_valued =
 fun command name : command =
   case name of
       "build" =>
-        {flags = ["--watch", "--dry-run", "--repl-on-failure", "--remote-only", "--detach"] @
+        {flags = ["--watch", "--dry-run", "--repl-on-failure", "--remote-only", "--detach", "--speculative-loading"] @
                  build_cache_flags,
          valued = build_cache_valued @ remote_valued @ [("--priority", Nothing), ("--attach", Nothing)],
          operands = Targets}

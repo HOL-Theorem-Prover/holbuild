@@ -297,9 +297,6 @@ kill -0 "${worker_pid[ahead-order]}" 2>/dev/null || {
 }
 worker a "$spec_A"
 expect a 0 "status=built"
-# G's script loads A in a plain build too.
-worker plain-g "$spec_G"
-expect plain-g 0 "status=built"
 for name in ahead ahead-lib ahead-order; do
   worker_wait "$name"
   expect "$name" 0 "status=built"
@@ -348,14 +345,19 @@ worker_wait other-x
 expect other-x 3 "status=failed" "failure=ahead-abandoned"
 require_grep 'does not match its parents' "$tmpdir/other-x.log"
 
-# A plain build of B against a second cache publishes the same entry.
+# Plain builds of B and of G, whose script loads A, against a second cache
+# publish the same entries.
 first_remote=$tmpdir/remote
 kill "$server_pid"; wait "$server_pid" 2>/dev/null || true
 start_remote_cache_server "$tmpdir/remote2" "$tmpdir/server2"
-hb action-spec --upload BTheory > /dev/null
+hb action-spec --upload BTheory GTheory > /dev/null
 worker plain-a "$spec_A"
 expect plain-a 0 "status=built"
 worker plain-b "$spec_B"
 expect plain-b 0 "status=built"
-ac_B=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_B" | sha256sum | cut -d' ' -f1)
-cmp "$first_remote/ac/$ac_B" "$tmpdir/remote2/ac/$ac_B"
+worker plain-g "$spec_G"
+expect plain-g 0 "status=built"
+for key in "$key_B" "$key_G"; do
+  ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key" | sha256sum | cut -d' ' -f1)
+  cmp "$first_remote/ac/$ac" "$tmpdir/remote2/ac/$ac"
+done

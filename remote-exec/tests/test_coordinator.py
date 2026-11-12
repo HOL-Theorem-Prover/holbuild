@@ -725,6 +725,104 @@ async def test_lease_expiring_on_every_attempt_fails_the_batch(
     assert (status["state"], status["failure"]) == ("failed", "pkg:a: lease expired 3 times")
 
 
+async def test_a_key_another_batch_is_building_is_held_then_done_with_it(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    leader = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    ready = await submit(http, ["a", "b"])
+    waiting = await submit(http, ["p", "a", "c"], [("a", "p"), ("c", "a")])  # "a" waits on its parent; "c" on "a"
+
+    await claim_named(http, "b")
+    await claim_named(http, "p")
+    assert await claim(http) is None
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    assert (await states(http, leader), await states(http, ready), await states(http, waiting)) == (
+        {"a": "done"}, {"a": "done", "b": "running"}, {"p": "running", "a": "done", "c": "ready"}
+    )
+    assert {a["theory"]: a["log_sha256"] for a in (await batch(http, ready))["actions"]}["pkg:a"] == "a" * 64
+    await claim_named(http, "c")
+    assert await claim(http) is None
+
+
+async def test_a_copy_with_another_spec_wakes_a_waiting_claim_rather_than_being_done_with_a_build(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forced or traced build has the same keys as a plain one, but its own spec: it must run itself."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only the wake can end the wait in time
+    await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    forced = f"holbuild-action-batch-v1\naction {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
+    response = await http.post("/v1/batches", content=forced, headers=CLIENT)
+    assert response.status_code == 201, response.text
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "w2", 30))
+    await asyncio.sleep(0.5)
+    assert not waiting.done()
+
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    assert (await asyncio.wait_for(waiting, 10)).theory == "pkg:a"
+    assert await states(http, response.json()["batch_id"]) == {"a": "running"}
+
+
+async def test_a_held_action_wakes_a_waiting_claim_once_its_leader_fails(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only the wake can end the wait in time
+    leader = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    follower = await submit(http, ["a"])
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "w2", 30))
+    await asyncio.sleep(0.5)
+    assert not waiting.done()
+
+    assert (await complete(http, token, result("a", "failed", "proof"))).status_code == 200
+    assert (await asyncio.wait_for(waiting, 10)).theory == "pkg:a"
+    assert (await states(http, leader), await states(http, follower)) == ({"a": "failed"}, {"a": "running"})
+
+
+async def test_a_held_action_is_claimed_once_its_leaders_lease_expires(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 0  # nothing wakes the claims at expiry, before the sweep
+    leader = await submit(http, ["a"])
+    await claim_named(http, "a")
+    follower = await submit(http, ["a"])
+    assert await claim(http) is None
+
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
+    await claim_named(http, "a")  # before the sweep deletes the expired lease
+    assert await states(http, follower) == {"a": "running"}
+    await coordinator.sweep()
+    assert await states(http, leader) == {"a": "ready"}
+    assert await claim(http) is None  # now the follower's lease holds the leader's retry
+
+
+async def test_a_held_build_leaves_the_idle_run_fallback_to_a_ready_run(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_slots = 1
+    await submit(http, ["a"])
+    await claim_named(http, "a")
+    await submit(http, ["a"])
+    await submit(http, ["run"], **{"class": "run"})
+    claimed = await asyncio.wait_for(claim(http), 10)
+    assert claimed is not None and claimed["theory"] == "pkg:run"
+
+
+async def test_a_batch_whose_ready_actions_are_all_held_does_not_block_other_batches(
+    http: httpx.AsyncClient,
+) -> None:
+    await submit(http, ["a"])
+    await claim_named(http, "a")
+    await submit(http, ["a"])  # ranks ahead of the next batch: older, with nothing running
+    await submit(http, ["c"])
+
+    await claim_named(http, "c")
+
+
 async def test_unknown_token_and_mismatched_result_are_refused(http: httpx.AsyncClient) -> None:
     await submit(http, ["a", "b"])
     token = await claim_named(http, "a")
@@ -849,14 +947,14 @@ async def test_wakes_pack_compatible_hosts_with_fifo_ties(
     loop = asyncio.get_running_loop()
     wakes = [loop.create_future() for _ in workers]
     coordinator.claim_waiters = [
-        (tiers, _claim_rank(tiers, host, rank), wake) for (tiers, host, rank), wake in zip(workers, wakes)
+        (tiers, _claim_rank(tiers, host, rank), wake, False) for (tiers, host, rank), wake in zip(workers, wakes)
     ]
     cancelled = loop.create_future()
     cancelled.cancel()
-    coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled))
+    coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled, False))
     for index in order:
         coordinator._wake_claim(tier)
-        assert wakes[index].result() == tier
+        assert wakes[index].result() == (tier, False)
         assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
     coordinator._wake_claim(tier)
     assert coordinator.made_ready == len(order) + 1
@@ -868,7 +966,7 @@ async def test_new_tail_host_claim_defers_ready_work_to_a_better_waiter(
 ) -> None:
     batch_id = await submit(http, ["a"])
     wake = asyncio.get_running_loop().create_future()
-    waiter = (waiting_tiers, _claim_rank(waiting_tiers, "host-a"), wake)
+    waiter = (waiting_tiers, _claim_rank(waiting_tiers, "host-a"), wake, False)
     coordinator.claim_waiters.append(waiter)
     assert await coordinator.claim(["high", "standard"], "tail", host_id="host-b") is None
     assert await states(http, batch_id) == {"a": "ready"}
@@ -886,7 +984,7 @@ async def test_rechecking_tail_host_defers_ready_work_to_a_better_waiter(
     batch_id = ""
     claim_once = coordinator._claim
     wake = asyncio.get_running_loop().create_future()
-    waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake)
+    waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake, False)
 
     async def counted(tiers: list[str], worker: str) -> Any:
         nonlocal attempts
@@ -918,7 +1016,7 @@ async def test_burst_can_claim_high_while_warm_waits_for_standard(
     async with coordinator.engine.begin() as conn:
         await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:b'"))
     wake = asyncio.get_running_loop().create_future()
-    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "warm"), wake))
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "warm"), wake, False))
     claimed = await coordinator.claim(["high", "standard"], "burst", host_id="host-a")
     assert claimed is not None and claimed.theory == "pkg:b"
     assert not wake.done()
@@ -945,7 +1043,7 @@ async def test_explicitly_woken_claim_is_not_blocked_by_a_new_better_waiter(
         coordinator._wake_claim("standard")
         # A new better waiter must not block the explicit wake before the tail host resumes.
         wake = asyncio.get_running_loop().create_future()
-        coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake))
+        coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
         claimed = await asyncio.wait_for(waiting, 5)
         assert claimed is not None and claimed.theory == "pkg:a"
     finally:
@@ -1238,7 +1336,8 @@ async def test_peak_above_the_standard_tier_places_the_next_batch_high(
     assert (await complete(http, token, result("a", "built", peak_rss_mb="5000"))).status_code == 200
 
     await submit(http, ["a"], profile="other")
-    await claim_named(http, "a", "standard")
+    token = await claim_named(http, "a", "standard")
+    assert (await complete(http, token, result("a", "built"))).status_code == 200  # not to hold the next batch's
     await submit(http, ["a"], profile="proofs")
     assert await claim(http, "standard") is None
     await claim_named(http, "a", "high")
