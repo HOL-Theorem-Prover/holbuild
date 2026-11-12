@@ -1270,15 +1270,6 @@ the analyser is built against, so another checkout of the same sources on the
 machine reads it instead of analysing again, and a different HOL pin never
 uses it.
 
-An analyser failure reports its exit status or signal and stderr. On systems
-with cgroup v2, it also reports available `memory.events` counters before and
-after the attempt. These counters cover a shared group; they do not identify
-the analyser as an OOM victim or establish why it was killed. Outside the
-action sandbox, SIGKILL or exit status 137 retries at most twice, after 100 ms
-and 200 ms, with fresh temporary files. Caller cancellation, other failures
-and sandboxed calls do not retry. Exit status 137 is compatible with a shell
-reporting SIGKILL, but can also be an explicit program exit.
-
 ### Keeping a tool's files between builds
 
 A tool run from theory scripts (a proof search with an index of the
@@ -1998,20 +1989,6 @@ priority work can delay lower priority batches. `--priority` requires
 `--remote-exec`. With `--attach`, it applies to any replacement batch needed
 for missing inputs; it does not change the batch being followed. Retain the
 same priority when reattaching; the recovery hint includes it.
-
-`build --remote-exec URL --speculative-loading[=N]` lets a theory load ahead
-of its parents. A worker with nothing ready to build may take a theory whose
-unbuilt parents are all running on other workers and have no unbuilt parents
-of their own. It loads everything else the theory needs, waits for those
-parents, and then builds (`exec-action --ahead-parent`). At most N theories of
-the batch wait like this at a time (1 to 16, default 4). Only workers started
-with `--load-ahead` take such theories, and only when they have nothing else
-to do, so the batch never adds workers for them.
-A theory whose load ahead can't go on is built normally once its parents are
-built. That covers a parent that fails, a predicted parent manifest that
-doesn't match, or a parent that is late. The option costs worker time when a
-parent fails, and changes no cache keys. Like `--priority`, it applies to
-replacement batches with `--attach`, and the recovery hint includes it.
 
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with

@@ -263,34 +263,6 @@ fun cgroup_dir () =
               Option.map (fn line => Path.mkCanonical ("/sys/fs/cgroup" ^ String.extract (line, 3, NONE)))
                 (List.find (String.isPrefix "0::") lines)
 
-(* Shared counters, not evidence that a particular child was an OOM victim.
-   A parent may enforce the limit even when the child's group has no files. *)
-fun cgroup_memory_events () =
-  let
-    fun counters text =
-      List.mapPartial
-        (fn line =>
-            case String.tokens Char.isSpace line of
-                [name, n] =>
-                  if (name = "oom" orelse name = "oom_kill") andalso
-                     size n > 0 andalso CharVector.all Char.isDigit n
-                  then Option.map (fn value => (name, value)) (IntInf.fromString n)
-                  else NONE
-              | _ => NONE)
-        (String.tokens (fn c => c = #"\n") text)
-    fun walk dir =
-      let
-        val path = Path.concat (dir, "memory.events")
-        val values = Option.getOpt (Option.map counters (read_text path), [])
-        val parent = Path.dir dir
-      in
-        (if null values then [] else [(path, values)]) @
-        (if parent = dir then [] else walk parent)
-      end
-  in
-    case cgroup_dir () of NONE => [] | SOME dir => walk dir
-  end
-
 fun cgroup_limits () =
   let
     fun inactive_file dir =

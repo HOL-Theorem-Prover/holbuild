@@ -43,7 +43,6 @@ class ClaimRequest(BaseModel):
     wait_s: float = Field(default=0, ge=0, le=50)  # how long to wait for an action when none is ready
     host: HostReport | None = None
     phases: PhaseReport | None = None  # where the worker's time went since its last claim
-    ahead: bool = False  # the worker can run an action claimed ahead of its parents
 
 
 class HeartbeatRequest(BaseModel):
@@ -157,7 +156,6 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         fail_fast: bool = False,
         priority: int = Query(default=0, ge=0, le=2147483647),
         action_class: Literal["build", "run"] = Query(default="build", alias="class"),
-        speculative_loading: int | None = Query(default=None, ge=1, le=16),
     ) -> dict[str, UUID]:
         try:
             batch = parse_batch(await text_body(request))
@@ -165,12 +163,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             raise HTTPException(400, str(error)) from error
         if action_class == "run" and batch.edges:
             raise HTTPException(400, "run batches require independent actions: dependency edges are not allowed")
-        if action_class == "run" and speculative_loading is not None:
-            raise HTTPException(400, "run batches have no parents to load ahead of: speculative_loading is not allowed")
-        return {"batch_id": await coordinator.submit(
-            batch, profile, action_class, max_heap_mb, fail_fast=fail_fast, priority=priority,
-            ahead_cap=speculative_loading,
-        )}
+        return {"batch_id": await coordinator.submit(batch, profile, action_class, max_heap_mb, fail_fast=fail_fast, priority=priority)}
 
     @app.get("/v1/batches/{batch_id}", dependencies=client)
     async def status(batch_id: UUID) -> dict[str, object]:
@@ -256,7 +249,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
     async def queue() -> dict[str, object]:
         status = await coordinator.queue()
         return {
-            **{k: v for k, v in asdict(status.counts).items() if k not in ("high_run", "ready_high_run")},
+            **{k: v for k, v in asdict(status.counts).items() if k != "high_run"},
             "run_slots": settings.run_slots,
             "run_floor": min(settings.run_floor, settings.run_slots),
             "desired_burst_workers": status.desired_burst_workers,
@@ -277,7 +270,6 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             tiers, body.worker, body.wait_s, request.is_disconnected,
             host_id=None if body.host is None else body.host.id,
             host_rank=0 if body.host is None else body.host.rank,
-            ahead=body.ahead,
         )
         if claimed is None:
             return Response(status_code=204)
