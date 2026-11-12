@@ -2006,14 +2006,14 @@ if in_copy local-cas build --priority 1 PriorityTheory > "$tmpdir/priority-no-ex
 fi
 require_grep 'priority needs --remote-exec URL' "$tmpdir/priority-no-exec.log"
 
-# So is the cap on theories loading ahead of their parents, 16 when not given.
+# So is the cap on theories loading ahead of their parents, 4 when given bare.
 in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --detach --speculative-loading LocalUntrustedTheory > "$tmpdir/speculative-default.log" 2>&1
 require_grep '^POST /v1/batches?speculative_loading=4 ' "$state/requests.log"
 in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --detach --priority 2 --speculative-loading=4 LocalUntrustedTheory > "$tmpdir/speculative.log" 2>&1
 require_grep '^POST /v1/batches?priority=2&speculative_loading=4 ' "$state/requests.log"
-for value in 0 17 1.5 x ''; do
+for value in 0 17 1.5 x '' 999999999999999999999999999999; do
   if in_copy local-cas build --remote-exec "$coordinator" "--speculative-loading=$value" PriorityTheory \
        > "$tmpdir/speculative-invalid.log" 2>&1; then
     echo "accepted invalid --speculative-loading=$value" >&2

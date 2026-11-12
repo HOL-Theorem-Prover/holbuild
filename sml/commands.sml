@@ -2269,9 +2269,10 @@ fun split_build_priority args =
 fun split_speculative_loading args =
   let
     fun parse value =
-      case Int.fromString value of
+      (* Two digits at most, so Int.fromString can't overflow. *)
+      case if size value <= 2 andalso List.all Char.isDigit (String.explode value) then Int.fromString value else NONE of
           SOME n =>
-            if n >= 1 andalso n <= 16 andalso List.all Char.isDigit (String.explode value) then n
+            if n >= 1 andalso n <= 16 then n
             else raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 16")
         | NONE => raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 16")
     fun loop cap acc xs =
