@@ -216,6 +216,7 @@ class QueueCounts:
     waiting_ahead_standard: int = 0  # of the running ones, claimed ahead and waiting for a parent
     waiting_ahead_high: int = 0
     high_run: int = 0  # internal: ready or running high-tier runs, for capped burst demand
+    ready_high_run: int = 0  # internal: of those, the ready ones
 
 
 # What a host report's counts and sizes may be: JSON's exact integers.
@@ -322,7 +323,9 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int,
     demand = max(0, active - warm_workers, high)
     # Work beyond what runs is ready work a burst worker could take; runs the run slots hold back are not.
     running_active = running - ahead - counts.running_run + min(run_slots, counts.running_run)
-    if high > counts.running_high - counts.waiting_ahead_high or active > max(warm_workers, running_active):
+    free_run_slots = max(0, run_slots - counts.running_run)
+    ready_high = counts.ready_high - counts.ready_high_run + min(counts.ready_high_run, free_run_slots)
+    if ready_high > 0 or active > max(warm_workers, running_active):
         demand += ahead
     return min(demand, max_burst_workers)
 
@@ -942,8 +945,10 @@ class Coordinator:
         key = tuple(tiers)
         ranking = await self._current_ranking(key)
         floor = min(self.settings.run_floor, self.settings.run_slots)
-        if floor > 0 and (claimed := await self._claim_run(tiers, worker, floor)) is not None:
-            return claimed
+        if floor > 0:
+            claimed, _ = await self._claim_run(tiers, worker, floor)
+            if claimed is not None:
+                return claimed
         while True:
             async with self.engine.begin() as conn:
                 # Never lock a batch after an action: batch writers take those locks in the opposite order.
@@ -954,17 +959,23 @@ class Coordinator:
                 self._leased(row.batch_id, ahead_batch=ahead_batch)
                 return claimed
             if not ranking.ranked or ranking.at >= started:
-                break
+                claimed, retry_builds = await self._claim_run(
+                    tiers, worker, self.settings.run_slots, builds_first=True
+                )
+                if not retry_builds:
+                    return claimed
+                started = asyncio.get_running_loop().time()
             # Refresh outside the transaction: waiting here with a connection could starve the shared read.
             if self.rankings.get(key) is ranking:
                 self.rankings.pop(key)
             ranking = await self._current_ranking(key, after=started)
-        return await self._claim_run(tiers, worker, self.settings.run_slots)
 
-    async def _claim_run(self, tiers: list[str], worker: str, slots: int) -> Claim | None:
-        """Admit a run below ``slots``, queuing in this process before taking a pooled connection."""
+    async def _claim_run(
+        self, tiers: list[str], worker: str, slots: int, *, builds_first: bool = False
+    ) -> tuple[Claim | None, bool]:
+        """Return a run lease or a request to retry builds, queuing before taking a pooled connection."""
         if slots == 0:
-            return None
+            return None, False
         available = sa.text(
             "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'run' "
             "AND tier = ANY(CAST(:tiers AS text[]))) AND "
@@ -973,19 +984,28 @@ class Coordinator:
         params = {"tiers": tiers, "classes": ["run"], "run_slots": slots}
         async with self.engine.connect() as conn:
             if not await conn.scalar(available, params):
-                return None
+                return None, False
         # Only one connection per process may wait for cross-replica run admission. Builds bypass this gate.
         async with self.run_admission, self.engine.begin() as conn:
             await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+            # A build made ready during the wait still precedes a fallback run. Rank it outside this transaction.
+            if builds_first and await conn.scalar(
+                sa.text(
+                    "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'build' "
+                    "AND tier = ANY(CAST(:tiers AS text[])) FOR UPDATE SKIP LOCKED)"
+                ),
+                params,
+            ):
+                return None, True
             # A preceding admission may have filled the floor/cap; don't rank every batch again in that case.
             if not await conn.scalar(available, params):
-                return None
+                return None, False
             row = await self._claim_first(conn, params)
             if row is None:
-                return None
+                return None, False
             claimed, ahead_batch = await self._lease(conn, row, worker)
         self._leased(row.batch_id, ahead_batch=ahead_batch)
-        return claimed
+        return claimed, False
 
     async def _lease(
         self, conn: AsyncConnection, row: _Claimed, worker: str, ahead_parents: tuple[AheadParent, ...] = ()
@@ -1173,7 +1193,7 @@ class Coordinator:
             if (
                 ranking is not None and ranking.forgotten >= forgotten
                 and asyncio.get_running_loop().time() - ranking.at < self.settings.claim_ranking_seconds
-                and (ranking.heap or not ranking.ranked) and (ranking.at >= after or not ranking.ranked)
+                and (ranking.heap or not ranking.ranked) and ranking.at >= after
             ):
                 return ranking
             read = self.ranking_reads.get(key)
@@ -1195,7 +1215,7 @@ class Coordinator:
                 read.add_done_callback(done)
             # Cancellation belongs to the caller; the read still serves other claims.
             ranking = await asyncio.shield(read)
-            if ranking.forgotten >= forgotten and (ranking.at >= after or not ranking.ranked):
+            if ranking.forgotten >= forgotten and ranking.at >= after:
                 return ranking
 
     async def _rank(self, conn: AsyncConnection, key: tuple[str, ...]) -> "_Ranking":
@@ -1670,6 +1690,7 @@ class Coordinator:
         count: defaultdict[tuple[str, str], int] = defaultdict(int)
         runs: defaultdict[str, int] = defaultdict(int)
         high_run = 0
+        ready_high_run = 0
         priorities: defaultdict[str, int] = defaultdict(int)
         for state, tier, action_class, prioritized, n in await conn.execute(statement):
             if state == "ahead":
@@ -1682,6 +1703,8 @@ class Coordinator:
                 runs[state] += n
                 if tier == "high" and state in ("ready", "running"):
                     high_run += n
+                if tier == "high" and state == "ready":
+                    ready_high_run += n
         return QueueCounts(
             waiting=count["waiting", "standard"] + count["waiting", "high"],
             ready_standard=count["ready", "standard"],
@@ -1691,6 +1714,7 @@ class Coordinator:
             ready_run=runs["ready"],
             running_run=runs["running"],
             high_run=high_run,
+            ready_high_run=ready_high_run,
             ready_priority=priorities["ready"],
             running_priority=priorities["running"],
             waiting_ahead_standard=count["ahead", "standard"],

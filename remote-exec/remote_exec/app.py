@@ -256,7 +256,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
     async def queue() -> dict[str, object]:
         status = await coordinator.queue()
         return {
-            **{k: v for k, v in asdict(status.counts).items() if k != "high_run"},
+            **{k: v for k, v in asdict(status.counts).items() if k not in ("high_run", "ready_high_run")},
             "run_slots": settings.run_slots,
             "run_floor": min(settings.run_floor, settings.run_slots),
             "desired_burst_workers": status.desired_burst_workers,
