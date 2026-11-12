@@ -107,16 +107,12 @@ fun files_sha256 paths =
       end
     fun external chunk =
       let
-        val out = HolbuildTempPath.temporary "sha256sum-output"
-        val command =
-          "sha256sum -- " ^ String.concatWith " " (map quote chunk) ^
-          " > " ^ quote out ^ " 2>/dev/null"
-        val status = OS.Process.system command
+        val result = HolbuildSpawn.run
+          {program = "sha256sum", args = "--" :: chunk, stderr = HolbuildSpawn.Discard}
         val lines =
-          if OS.Process.isSuccess status
-          then String.tokens (fn c => c = #"\n") (read_all out)
+          if HolbuildSpawn.succeeded result
+          then String.tokens (fn c => c = #"\n") (#output result)
           else []
-        val _ = remove_quietly out
         val digests = List.mapPartial digest lines
       in
         if length digests = length chunk andalso length lines = length chunk
