@@ -31,6 +31,9 @@ on:
       - vendor/hol/**
       - tests/lib.sh
       - tests/cases/installed-runtime/**
+      - tools/release-consumer*.sh
+      - tools/release-key-inventory.sh
+      - tests/cases/release-consumers/**
   workflow_dispatch:
   release:
     types: [published]
@@ -157,9 +160,49 @@ jobs:
           version=${version%-$PLATFORM}
           test "$("$root/bin/holbuild" --version)" = "holbuild $version"
 
+  consumers:
+    if: startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-x86_64
+          path: download
+
+      - uses: ./.github/actions/setup-polyml
+        with:
+          polyml-tag: ${{ env.POLYML_TAG }}
+
+      - name: Check initial cache compatibility and build three consumer mains
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          HOLBUILD_REMOTE_EXEC_URL: ${{ vars.HOLBUILD_REMOTE_EXEC_URL }}
+          HOLBUILD_REMOTE_CACHE_URL: ${{ vars.HOLBUILD_REMOTE_CACHE_URL }}
+          EXEC_CURL_CONFIG_CONTENT: ${{ secrets.HOLBUILD_REMOTE_EXEC_CURL_CONFIG }}
+          CACHE_CURL_CONFIG_CONTENT: ${{ secrets.HOLBUILD_REMOTE_CACHE_CURL_CONFIG }}
+        run: tools/release-consumer-check.sh
+
+      - name: Retain candidate and consumer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: consumer-evidence
+          path: ${{ runner.temp }}/release-consumers/evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
-    needs: smoke
+    needs: [smoke, consumers]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     permissions:
@@ -218,6 +261,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -231,9 +275,19 @@ jobs:
           BODY: ${{ github.event.release.body }}
           PUBLISHED_AT: ${{ github.event.release.published_at }}
         run: |
+          if ! tools/release-consumers-verified.sh "$TAG" "$(git rev-parse HEAD)"; then
+            gh release edit "$TAG" --draft=true
+            echo "::error::$TAG has no successful exact-candidate consumer check; turned back into a draft"
+            exit 1
+          fi
           if grep -q '^Consumers ready:' <<< "$BODY"; then
             echo "$TAG: consumers marked ready, published on purpose"
             exit 0
+          fi
+          if grep -q '^Breaking release: consumer cache compatibility changed since ' <<< "$BODY"; then
+            gh release edit "$TAG" --draft=true
+            echo "::error::$TAG lost consumer cache compatibility without 'Consumers ready:'; turned back into a draft"
+            exit 1
           fi
           # The base is the newest earlier release that was already trusted
           # when this one was published: out for more than an hour, or marked

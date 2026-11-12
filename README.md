@@ -2428,6 +2428,31 @@ that follow the latest release pick it up, while a pushed tag or a draft
 release changes nothing for them. A release that would break its consumers
 is therefore created as a draft and published only once they are ready.
 
+### Consumer checks
+
+The tag workflow smoke-tests the packaged binaries, then builds `main` of
+`verifereum/vyper-hol`, `verifereum/verifereum` and
+`verifereum/solidity-hol` with the exact Linux package, `--skip-proof-steps`,
+remote cache and `--remote-only`. All three builds must succeed before
+publication. Missing credentials, rejected probes or a failed build block
+publication. Each run records the three source commits and the candidate's
+version, source commit, archive checksum and executable checksum in its summary
+and `consumer-evidence` artifact.
+
+Configure repository variables `HOLBUILD_REMOTE_EXEC_URL` and
+`HOLBUILD_REMOTE_CACHE_URL` with HTTPS endpoints, and Actions secrets
+`HOLBUILD_REMOTE_EXEC_CURL_CONFIG` and `HOLBUILD_REMOTE_CACHE_CURL_CONFIG`
+with their curl-config contents. These credentials are used only on tag pushes
+and manual dispatches of release tags, never pull requests or branch dispatches.
+A manual tag dispatch runs the checks without publishing.
+
+Before warming any theories, the workflow compares the published binary's
+cache inventory with the candidate on all three frozen consumer commits. Losing
+previously restorable theories holds the release as a draft before the builds
+start; rerunning after warming keeps that draft and its recorded reasons.
+Hand-publication also requires a successful exact-tag/source consumer run,
+including when the release notes say `Consumers ready:`.
+
 ### Breaking releases
 
 A release is breaking if, compared with the latest published release:
