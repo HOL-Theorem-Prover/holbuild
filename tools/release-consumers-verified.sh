@@ -6,7 +6,7 @@ set -euo pipefail
 tag=$1
 commit=$2
 [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && $commit =~ ^[0-9a-f]{40}$ ]] || exit 2
-runs=$(gh api --paginate "repos/$GH_REPO/actions/workflows/release.yml/runs?head_sha=$commit&status=success&per_page=100" \
+runs=$(gh api --paginate "repos/$GH_REPO/actions/workflows/release.yml/runs?head_sha=$commit&per_page=100" \
   --jq '.workflow_runs[] | select(.event == "push") | [.id, .head_branch, .head_sha] | @tsv')
 while IFS=$'\t' read -r run branch sha; do
   [[ $branch == "$tag" && $sha == "$commit" ]] || continue
@@ -17,5 +17,5 @@ while IFS=$'\t' read -r run branch sha; do
     exit 0
   fi
 done <<< "$runs"
-echo "$tag: no successful release run verifies all three consumers at $commit" >&2
+echo "$tag: no release run has a successful consumer check at $commit" >&2
 exit 1

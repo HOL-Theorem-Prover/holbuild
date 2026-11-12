@@ -97,6 +97,7 @@ printf '%s\n' "$*" >> "$TEST_ROOT/gh-trace"
 case "$*" in
   'api --paginate '*'/actions/workflows/release.yml/runs?'*)
     [[ -z ${TEST_API_FAIL:-} ]] || exit 1
+    if [[ ${TEST_RUN_FAILED:-} == 1 && $* == *status=success* ]]; then exit 0; fi
     if [[ -z ${TEST_NO_RUNS:-} ]]; then
       printf '42\t%s\t%s\n' "${TEST_RUN_TAG:-v1.0.1}" "${TEST_RUN_SHA:-$GITHUB_SHA}"
     fi ;;
@@ -164,6 +165,7 @@ verified() {
   if [[ $status != "$want" ]]; then cat "$tmp/verified" >&2; exit 1; fi
 }
 verified 0
+verified 0 TEST_RUN_FAILED=1
 verified 1 TEST_RUN_TAG=v1.0.0
 verified 1 TEST_RUN_SHA=0000000000000000000000000000000000000000
 verified 1 TEST_JOB_RESULT=failure
