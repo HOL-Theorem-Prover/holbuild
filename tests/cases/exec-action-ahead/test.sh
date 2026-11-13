@@ -147,6 +147,29 @@ Proof
   ACCEPT_TAC (DB.fetch "A" "a_thm")
 QED
 SML
+# H's ancestors come from the HOL toolchain outside its base heap: bit's
+# manifest names logroot by its path in the source tree, while HOL keeps
+# logroot's objects in .hol/objs there.  I loads ahead of H.
+cat > "$project/src/HScript.sml" <<'SML'
+Theory H
+Ancestors bit
+
+Theorem h_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+cat > "$project/src/IScript.sml" <<'SML'
+Theory I
+Ancestors H
+
+Theorem i_thm:
+  T
+Proof
+  ACCEPT_TAC h_thm
+QED
+SML
 # Each build of X differs, so Y can be built on another X than Z loads.
 cat > "$project/src/XScript.sml" <<'SML'
 Theory X
@@ -249,8 +272,8 @@ spec_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $4 }' "$1"; 
 key_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $2 }' "$1"; }
 
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
-hb action-spec --upload CTheory ETheory FTheory GTheory KTheory ZTheory > "$tmpdir/batch.txt"
-for theory in A B C D E F G K X Y Z; do
+hb action-spec --upload CTheory ETheory FTheory GTheory ITheory KTheory ZTheory > "$tmpdir/batch.txt"
+for theory in A B C D E F G H I K X Y Z; do
   declare "spec_$theory=$(spec_for "$tmpdir/batch.txt" "ahead:${theory}Theory")"
   declare "key_$theory=$(key_for "$tmpdir/batch.txt" "ahead:${theory}Theory")"
 done
@@ -316,6 +339,15 @@ expect again 3 "status=failed" "failure=ahead-abandoned"
 worker late "$spec_C" --ahead-parent "$key_B:$spec_B"
 expect late 0 "status=built"
 if ahead_phases late; then echo "loaded ahead of a published parent" >&2; exit 1; fi
+
+# A parent with toolchain ancestors outside the base heap loads ahead.
+worker_start ahead-toolchain "$spec_I" --ahead-parent "$key_H:$spec_H"
+await_marker ahead-toolchain waiting-HTheory
+worker h "$spec_H"
+expect h 0 "status=built"
+worker_wait ahead-toolchain
+expect ahead-toolchain 0 "status=built"
+ahead_phases ahead-toolchain || { echo "no load-ahead timings for I" >&2; exit 1; }
 
 # A parent whose load evaluates files its predicted manifest doesn't name
 # gives the run up, and the plain retry builds.
