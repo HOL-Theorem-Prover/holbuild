@@ -1270,6 +1270,12 @@ PY
 write_broken json
 run proof-json 1 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
 json_events proof-json $'node_finished ATheory\nnode_failed BTheory proof_failure b_thm\nerror'
+# So is a failure other than a proof's, which --remote-only builds nothing for.
+write_broken json-memory
+echo rxp:BTheory > "$state/memory-failure"
+run memory-json 75 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
+rm "$state/memory-failure"
+json_events memory-json $'node_finished ATheory\nnode_failed BTheory unknown\nerror'
 write_broken json-nolog
 touch "$state/drop-log"
 run proof-json-nolog 1 --json build --remote-exec "$coordinator" BTheory CTheory

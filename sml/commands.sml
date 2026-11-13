@@ -1804,6 +1804,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                            | OS.SysErr (reason, _) => warn_log reason
                            | e as IO.Io _ => warn_log (General.exnMessage e)
                     end
+            (* A theory that failed on a worker other than in a proof, which
+               under --remote-only no local build reports. *)
+            fun report_failed_theory ({input_key, kind, ...} : HolbuildRemoteExec.action_failure) =
+              case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
+                  NONE => ()
+                | SOME node =>
+                    let val name = HolbuildBuildPlan.logical_name node
+                    in
+                      HolbuildStatus.report_remote_failure (HolbuildBuildPlan.key node) name
+                        (name ^ " failed on a remote worker: " ^ kind) HolbuildStatus.no_debug_artifacts
+                    end
             (* Restores what the remote cache holds, and nothing else: after a
                batch failed, the build must not retry its failed theories.  It
                reports only what it restores: the failures are the batch's. *)
@@ -1886,6 +1897,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                      ("holbuild: remote execution: " ^ HolbuildBuildExec.build_error_message e ^ "\n"))
                            (deferred_errors ());
                          restore_finished_logs ();
+                         if remote_only then List.app report_failed_theory failures else ();
                          fall_back reason)
                       else
                         (HolbuildStatus.message_stderr
