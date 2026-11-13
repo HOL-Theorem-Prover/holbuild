@@ -611,7 +611,7 @@ async def test_claiming_and_revoking_ahead_read_each_actions_edges_by_key(
             await pages(connection, coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard"}),
             await pages(connection, coordinator_module.AHEAD_PARENTS, {**walk, "keys": children[:1]}),
             await pages(connection, coordinator_module.REFRESH_AHEAD_CHILDREN, {"batch_id": batch_id, "key": "k0"}),
-            await pages(connection, coordinator_module.REVOKE_AHEAD, {"batch_id": batch_id, "keys": ["k0"], "depth": limit}),
+            await pages(connection, coordinator_module.REVOKE_AHEAD, {"batch_id": batch_id, "keys": ["k0"]}),
         ]
 
     async with remote_exec_engine.begin() as connection:  # autovacuum can't see this transaction
@@ -683,7 +683,7 @@ async def test_with_no_depth_limit_revoking_reads_each_ancestor_claimed_ahead_on
         await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
         plan = await connection.scalar(
             sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.REVOKE_AHEAD.text}"),
-            {"batch_id": batch_id, "keys": ["t0"], "depth": None},
+            {"batch_id": batch_id, "keys": ["t0"]},
         )
         assert plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"] < 20 * n
         assert await connection.scalar(
@@ -790,6 +790,37 @@ async def test_an_ancestor_back_to_waiting_revokes_a_claim_ahead_across_parents_
     assert {name: state for name, state in (await states(http, batch_id)).items() if name in ancestors[1:]} == {
         name: "done" for name in ancestors[1:]
     }
+
+
+@pytest.mark.parametrize("depth", [2, 4])
+async def test_an_ancestor_back_to_waiting_revokes_a_claim_ahead_made_after_parents_between_finished_beyond_the_depth(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, remote_exec_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch, depth: int,
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", depth)
+    names, edges = chain(depth + 2)
+    first, *between, last = names[1:]
+    await submit(http, names, edges, speculative_loading="16")
+    root = await claim_named(http, "t0")
+    claims = {}
+    for name in [first, *between]:
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == f"pkg:{name}"
+        claims[name] = claimed["attempt_token"]
+    assert await claim_ahead(http) is None
+
+    # The first claim ahead finishing before the root's result comes makes the next one generation 0, so the last
+    # is claimed ahead, more than the depth below the root, whose outputs it may hold through its done ancestors.
+    cache.keys.add(ac_key(first))
+    assert (await complete(http, claims[first], result(first, "built"))).status_code == 200
+    claimed = await claim_ahead(http)
+    assert claimed is not None and claimed["theory"] == f"pkg:{last}"
+    for name in between:
+        cache.keys.add(ac_key(name))
+        assert (await complete(http, claims[name], result(name, "built"))).status_code == 200
+    assert (await complete(http, root, result("t0", "failed", "publish"))).status_code == 200
+    assert (await ahead_state(remote_exec_engine, last))[1:3] == ("abandoned", 0)
+    assert (await http.post(f"/v1/work/{claimed['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
 
 
 @pytest.mark.parametrize("depth", [2, 4])

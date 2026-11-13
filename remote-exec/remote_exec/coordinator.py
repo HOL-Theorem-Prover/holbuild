@@ -598,9 +598,11 @@ RETURNING c.remaining_deps
 # Revoke the leases of the running actions claimed ahead of one of :keys, and of those claimed ahead of them, sending
 # them back to waiting as abandoned without the attempt counting. Their parents went back to waiting, so they could
 # only wait out their limit, holding a worker and a slot of the cap; when a parent is re-queued, its outputs they
-# may have taken are gone too. An action claimed ahead of :keys has one as a parent, or up to :depth generations up
-# across parents that were claimed ahead too, running or since done (an action keeps ``ahead`` once done). With no
-# limit, the walk keeps no distance, so it reaches each ancestor once whatever the number of paths to it. The
+# may have taken are gone too. An action claimed ahead of :keys has one as a parent, or one any number of generations
+# up across parents that were claimed ahead too, running or since done (an action keeps ``ahead`` once done): not
+# only ``ahead_depth`` of them, since parents that finish before their own parents make their children generation 0,
+# and the children's claims ahead then reach further up. The walk keeps no distance, so it reaches each ancestor
+# once whatever the number of paths to it. The
 # batch's few running actions claimed ahead are read first and each is tested by its edges, so the statement reads
 # no more than those whatever the planner guesses of a batch inserted since its last statistics; a join here would
 # be planned over all the batch's edges.
@@ -612,14 +614,14 @@ WITH RECURSIVE ahead_running AS MATERIALIZED (
     FROM actions a WHERE a.batch_id = :batch_id AND a.state = 'running' AND a.ahead = 'ahead'
 ), revoked(input_key) AS (
     SELECT c.input_key FROM ahead_running c WHERE EXISTS (
-        WITH RECURSIVE up(input_key, distance) AS (
-            SELECT parent_key, 1 FROM unnest(c.parents) AS parent_key
+        WITH RECURSIVE up(input_key) AS (
+            SELECT parent_key FROM unnest(c.parents) AS parent_key
             UNION
-            SELECT e.parent_key, CASE WHEN CAST(:depth AS integer) IS NULL THEN 0 ELSE u.distance + 1 END FROM up u
+            SELECT e.parent_key FROM up u
             CROSS JOIN LATERAL unnest(ARRAY(
                 SELECT e.parent_key FROM edges e WHERE e.batch_id = c.batch_id AND e.input_key = u.input_key
             )) AS e(parent_key)
-            WHERE (CAST(:depth AS integer) IS NULL OR u.distance < :depth) AND (
+            WHERE (
                 SELECT p.ahead FROM actions p WHERE p.batch_id = c.batch_id AND p.input_key = u.input_key
             ) = 'ahead'
         )
@@ -2257,7 +2259,7 @@ class Coordinator:
         )
         if ahead_batch and requeued.rowcount:
             await conn.execute(
-                REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key], "depth": self.settings.ahead_depth_limit}
+                REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]}
             )
         await conn.execute(REFRESH_KEYS, {"batch_id": batch_id, "keys": [input_key]})
         await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [input_key]})
@@ -2277,7 +2279,7 @@ class Coordinator:
         ahead itself, is a plain one from now on unless it was abandoned."""
         if ahead_batch:
             await conn.execute(
-                REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key], "depth": self.settings.ahead_depth_limit}
+                REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]}
             )
             await conn.execute(
                 sa.text(
