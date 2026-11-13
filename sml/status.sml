@@ -53,6 +53,19 @@ fun quiet_mode () = verbosity () = Quiet
 fun set_retain_debug_artifacts enabled = retain_debug_artifacts_ref := enabled
 fun retain_debug_artifacts () = !retain_debug_artifacts_ref
 
+(* While set, builds report only the nodes they finish: the restore after a
+   remote batch failed misses every theory the workers didn't finish, and
+   those misses are no failures of their own. *)
+val finished_only_ref = ref false
+fun finished_only () = !finished_only_ref
+fun reporting_finished_only f =
+  let val previous = !finished_only_ref
+  in
+    finished_only_ref := true;
+    (f () before finished_only_ref := previous)
+    handle e => (finished_only_ref := previous; raise e)
+  end
+
 fun hex_digit n =
   String.sub("0123456789abcdef", n)
 
@@ -471,7 +484,8 @@ fun start_node status key label =
           else
             (active := {key = key, label = label, started_at = Time.now (),
                         thread = Thread.self (), waiting = false} :: remove_active key (!active);
-             if json_mode () then
+             if finished_only () then ()
+             else if json_mode () then
                emit_json "node_started" (json_node_fields key label)
              else if enabled then redraw status
              else if verbose_mode () then
@@ -515,7 +529,8 @@ fun finish status =
          in
            if !ended then ()
            else
-             (if json_mode () then
+             (if finished_only () then ()
+              else if json_mode () then
                 emit_json "build_finished"
                   [json_int_field "elapsed_ms" (elapsed_ms status),
                    json_int_field "total" total,
@@ -616,7 +631,8 @@ fun fail_with_debug_artifacts status key label msg artifacts =
            else
              (active := remove_active key (!active);
               finished := !finished + 1;
-              if json_mode () then
+              if finished_only () then ()
+              else if json_mode () then
                 emit_json "node_failed"
                   (json_node_fields key label @
                    json_failure_field_for_node key msg @
@@ -626,14 +642,25 @@ fun fail_with_debug_artifacts status key label msg artifacts =
                  TextIO.flushOut TextIO.stdOut)
               else ())
          end);
-   if json_mode () then () else message_stderr (label ^ " failed: " ^ msg ^ "\n"))
+   if json_mode () orelse finished_only () then () else message_stderr (label ^ " failed: " ^ msg ^ "\n"))
+
+(* A node that failed outside any build's status: a theory that failed on a
+   remote worker.  Text mode reports it in the build's error. *)
+fun report_remote_failure key label msg artifacts =
+  if json_mode () then
+    emit_json "node_failed"
+      (json_node_fields key label @
+       json_failure_field_for_node key msg @
+       json_debug_artifacts_fields artifacts)
+  else ()
 
 fun fail status key label msg =
   fail_with_debug_artifacts status key label msg no_debug_artifacts
 
 fun skip status key label reason =
   (with_lock status (fn () => #finished status := !(#finished status) + 1);
-   if json_mode () then
+   if finished_only () then ()
+   else if json_mode () then
      emit_json "node_skipped" (json_node_fields key label @ [json_string_field "reason" reason])
    else message_stderr (label ^ " skipped because of " ^ reason ^ "\n"))
 

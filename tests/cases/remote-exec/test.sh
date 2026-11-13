@@ -1240,6 +1240,45 @@ require_grep "^holbuild: theorem: b_thm (line 4)$" "$tmpdir/proof-nolog.log"
 refute_grep "on a remote worker\|CTheory built" "$tmpdir/proof-nolog.log"
 [[ $(local_hol_runs "$tmpdir/proof-nolog.timing") -gt 0 ]] || { cat "$tmpdir/proof-nolog.timing" >&2; exit 1; }
 
+# --json reports a remote build's targets as a local build's: the theories
+# restored as finished, and a theory that failed on a worker as failed, once,
+# with what its log says.  C, which the batch didn't reach, and B's misses in
+# the restore after the failure are no failures, and nothing is finished.
+# json_events NAME EXPECTED: compares NAME.log's events with EXPECTED, one
+# "event [target] [kind theorem]" line each, the kind and theorem of a
+# node_failed only, node_started and messages left out.
+json_events() {
+  python3 - "$tmpdir/$1.log" "$2" <<'PY'
+import json, sys
+seen = []
+for line in open(sys.argv[1]):
+    if not line.startswith("{"):
+        continue
+    event = json.loads(line)
+    if event["event"] in ("node_started", "message"):
+        continue
+    failure = event.get("failure", {}) if event["event"] == "node_failed" else {}
+    seen.append(" ".join(str(part) for part in
+                         [event["event"], event.get("target", ""), failure.get("kind", ""), failure.get("theorem", "")]
+                         if part != "").strip())
+    if "debug_artifacts" in event:
+        sys.exit(f"debug artifacts without --retain-debug-artifacts: {line}")
+if seen != sys.argv[2].split("\n"):
+    sys.exit("wanted:\n" + sys.argv[2] + "\ngot:\n" + "\n".join(seen))
+PY
+}
+write_broken json
+run proof-json 1 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
+json_events proof-json $'node_finished ATheory\nnode_failed BTheory proof_failure b_thm\nerror'
+write_broken json-nolog
+touch "$state/drop-log"
+run proof-json-nolog 1 --json build --remote-exec "$coordinator" BTheory CTheory
+rm "$state/drop-log"
+json_events proof-json-nolog $'node_finished ATheory\nnode_finished ATheory\nnode_failed BTheory proof_failure b_thm\nerror'
+write_theories json
+run follow-json 0 --json build --remote-exec "$coordinator" --remote-only BTheory
+json_events follow-json $'node_finished ATheory\nnode_finished BTheory\nbuild_finished'
+
 # A theory the remote cache holds that doesn't fit its cached parent, as
 # when a nondeterministic parent was built twice: the workers can't use it,
 # so the batch is resubmitted with it and its dependents, whose workers
