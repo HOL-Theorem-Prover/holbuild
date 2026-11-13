@@ -546,3 +546,29 @@ for limits in "100 10 89" "400 40 359"; do
   sweep_mature "$limit" 0
   ! cmp -s "$mature_state" "$tmpdir/mature-state" || { echo "zero-reserve cache reused a measurement" >&2; exit 1; }
 done
+
+# Large caps evict to half the reserve below the target, leaving headroom so
+# the next actions don't push the cache straight back over it, and publish
+# the scan less what they freed.
+for limits in "400 40 340" "100 10 85"; do
+  read -r limit reserve low_water <<< "$limits"
+  mature_cache=$tmpdir/low-water-$limit
+  store=$mature_cache/checkpoint-store
+  kept_gb=$(( low_water - reserve / 2 + 1 ))
+  sparse "$store/oldest/heap" $(( reserve / 2 ))
+  sparse "$store/older/heap" $(( reserve / 2 ))
+  sparse "$store/newest/heap" "$kept_gb"
+  at 2000 "$store/oldest"
+  at 2001 "$store/older"
+  at 2002 "$store/newest"
+  sweep_mature "$limit" "$reserve"
+  evicted "$store/oldest" "the oldest family over the target"
+  evicted "$store/older" "a family between the target and its low-water mark"
+  kept "$store/newest" "the newest family under the low-water mark"
+  stamped_within "$mature_cache/locks/worker-cache-cap.state" "$low_water" "a low-water eviction"
+  python3 - "$mature_cache/locks/worker-cache-cap.state" "$kept_gb" <<'FREED'
+import pathlib, sys
+total = sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[3::2]))
+assert total >= int(sys.argv[2]) * 1024 ** 3, f"stamp holds {total} bytes, under what was kept"
+FREED
+done

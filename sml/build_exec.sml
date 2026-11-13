@@ -9727,15 +9727,19 @@ fun classify_run_failure stage log_text oom_before msg =
    local cache), swept before each action.  It extends the checkpoint budget
    sweep's family eviction to the whole cache root: a family goes whole, and a
    toolchain another process is using is pinned. *)
-(* A family's eviction returns the bytes it freed, or NONE if it was kept. *)
-type cache_family = {mtime : Time.time, evict : unit -> Position.int option}
+(* The shared root a family's bytes come from; private trees belong to none. *)
+datatype cache_root = StoreRoot | ToolchainRoot | ActionRoot | BlobRoot | PrivateRoot
+
+(* A family's eviction returns the bytes it freed from each root, none if it
+   was kept. *)
+type cache_family = {mtime : Time.time, evict : unit -> (cache_root * Position.int) list}
 
 fun checkpoint_cache_families families =
   List.map
     (fn ({base, mtime, bytes} : checkpoint_family) =>
         {mtime = mtime,
          evict = fn () => (remove_checkpoint_family_base base;
-                           if checkpoint_family_root_exists base then NONE else SOME bytes)})
+                           if checkpoint_family_root_exists base then [] else [(PrivateRoot, bytes)])})
     families
 
 fun toolchain_cache_families () =
@@ -9748,10 +9752,11 @@ fun toolchain_cache_families () =
        evict = fn () =>
          let val bytes = tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k)
          in
-           if HolbuildHolSharedCache.gc_entry cutoff k = HolbuildHolSharedCache.GcRemoved then SOME bytes
-           else NONE
+           if HolbuildHolSharedCache.gc_entry cutoff k = HolbuildHolSharedCache.GcRemoved
+           then [(ToolchainRoot, bytes)]
+           else []
          end
-         handle e => (warn ("could not evict HOL toolchain " ^ k ^ ": " ^ General.exnMessage e); NONE)}
+         handle e => (warn ("could not evict HOL toolchain " ^ k ^ ": " ^ General.exnMessage e); [])}
   in
     List.map family (HolbuildHolSharedCache.toolchain_keys ())
   end
@@ -9785,12 +9790,13 @@ fun local_cache_families cache =
        evict = fn () =>
          let val freed = remove_paths [dir]
          in
-           if path_exists dir then NONE
-           else SOME (freed + remove_paths (List.concat (map release (Redblackset.listItems blobs))))
+           if path_exists dir then []
+           else [(ActionRoot, freed),
+                 (BlobRoot, remove_paths (List.concat (map release (Redblackset.listItems blobs))))]
          end}
     (* An unpublished blob may belong to a sibling's in-flight transfer.
        Prefer all other families until its five-minute grace has elapsed. *)
-    fun orphan_family path = {mtime = modified_time path, evict = fn () => SOME (remove_paths [path])}
+    fun orphan_family path = {mtime = modified_time path, evict = fn () => [(BlobRoot, remove_paths [path])]}
     val orphans =
       List.filter (fn path => not (Option.isSome (Redblackmap.peek (!users, Path.file path))))
                   (HolbuildCache.children blobs_dir)
@@ -9801,7 +9807,10 @@ fun local_cache_families cache =
   end
 
 fun store_cache_families cache =
-  List.map (fn dir => {mtime = modified_time dir, evict = fn () => evict_store_family dir})
+  List.map (fn dir => {mtime = modified_time dir,
+                       evict = fn () => case evict_store_family dir of
+                                            SOME bytes => [(StoreRoot, bytes)]
+                                          | NONE => []})
            (store_families (share_store cache))
 
 (* The store's families no build used within DAYS, except one a running
@@ -9903,7 +9912,7 @@ fun module_cache_families cache =
           let val bytes = tree_bytes path
           in
             HolbuildCache.remove_tree path;
-            if path_exists path then NONE else SOME bytes
+            if path_exists path then [] else [(PrivateRoot, bytes)]
           end})
     (HolbuildCache.children (HolbuildCache.theory_modules_dir cache))
 
@@ -9911,14 +9920,15 @@ fun module_cache_families cache =
 fun toolchain_trash_family () =
   {mtime = Time.zeroTime,
    evict = fn () =>
-     SOME (List.foldl
+     [(ToolchainRoot,
+       List.foldl
              (fn (path, freed) =>
                  let val bytes = tree_bytes path
                  in
                    HolbuildHolSharedCache.remove_unlocked_tree path;
                    if path_exists path then freed else freed + bytes
                  end)
-             (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()))}
+             (0 : Position.int) (HolbuildHolSharedCache.toolchain_trash ()))]}
 
 (* A linked toolchain cache belongs to its target's owner, not this cap. *)
 fun toolchains_owned_by_cache () =
@@ -9938,7 +9948,7 @@ fun cache_root_id path =
 
 fun worker_cache_roots cache =
   let
-    fun tree path = {id = fn () => cache_root_id path, measure = fn () => cache_root_bytes path}
+    fun tree root path = {root = root, id = fn () => cache_root_id path, measure = fn () => cache_root_bytes path}
     fun toolchain_id () =
       let val path = HolbuildHolSharedCache.toolchains_dir ()
       in
@@ -9952,12 +9962,14 @@ fun worker_cache_roots cache =
         List.foldl (fn (k, total) => total + tree_bytes (HolbuildHolSharedCache.entry_dir_for_key k))
                    (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ())
   in
-    [tree (share_store cache), {id = toolchain_id, measure = toolchain_bytes},
-     tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache)]
+    [tree StoreRoot (share_store cache), {root = ToolchainRoot, id = toolchain_id, measure = toolchain_bytes},
+     tree ActionRoot (HolbuildCache.actions_dir cache), tree BlobRoot (HolbuildCache.blobs_dir cache)]
   end
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
-   room under limit_bytes. Reuse a recent shared scan within the target;
+   room under limit_bytes.  Large caps evict to half the reserve below that
+   target, so the next actions do not push the cache straight over it again.
+   Reuse a recent shared scan within the target;
    private checkpoints and modules are always measured locally. Small caps
    and zero reserves scan live.  With refresh, as after an action's result,
    scan only when the stamp is past half its life and no other process holds
@@ -9971,6 +9983,9 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     fun root_ids () = map (fn {id, ...} => id ()) roots
     fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
     val target = limit_bytes - reserve_bytes
+    val sweep_target =
+      if target >= gb_to_bytes 64 andalso reserve_bytes >= gb_to_bytes 4 then target - reserve_bytes div 2
+      else target
     val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.state")
     fun parse_sizes [] = SOME []
       | parse_sizes (id :: bytes :: rest) =
@@ -9998,7 +10013,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                       sum (ListPair.map
                              (* A private root can differ while its siblings
                                 are shared. Keep their hits without stamp churn. *)
-                             (fn (({id = identify, measure}), (id, bytes)) =>
+                             (fn (({id = identify, measure, ...}), (id, bytes)) =>
                                  if identify () = id then bytes else measure ())
                              (roots, entries)) + private_bytes () <= target
                     end
@@ -10007,17 +10022,18 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       handle IO.Io _ => false
            | OS.SysErr _ => false
     fun by_age families = sort_by_mtime_ascending (fn ({mtime, ...} : cache_family) => mtime) families
-    fun sweep total remaining =
-      if total <= target then total
+    (* The total left, and the bytes freed from each root. *)
+    fun sweep total freed remaining =
+      if total <= sweep_target then (total, freed)
       else
         case remaining of
-            [] => total
+            [] => (total, freed)
           | ({evict, ...} : cache_family) :: rest =>
               let
-                val freed =
-                  evict () handle e => (warn ("worker cache eviction failed: " ^ General.exnMessage e); NONE)
+                val bytes =
+                  evict () handle e => (warn ("worker cache eviction failed: " ^ General.exnMessage e); [])
               in
-                sweep (total - Option.getOpt (freed, 0)) rest
+                sweep (total - sum (map #2 bytes)) (bytes @ freed) rest
               end
     fun measure_shared () =
       let
@@ -10044,9 +10060,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
             if total <= target then publish shared
             else
               let
-                (* Eviction mixes private and shared families. Do not publish a
-                   shared-byte estimate derived from the mixed freed total. *)
-                val _ = remove_file state_path
+                (* Siblings keep reusing the old stamp while this sweep runs. *)
                 val (local_families, young_orphans) = local_cache_families cache
                 val families =
                   by_age ((if toolchains_owned_by_cache () then
@@ -10054,14 +10068,23 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                           checkpoint_cache_families (collect_checkpoint_families checkpoint_root) @
                           store_cache_families cache @ module_cache_families cache @
                           local_families) @ by_age young_orphans
-                val after = sweep total families
+                val (after, freed) = sweep total [] families
+                fun freed_from root =
+                  sum (List.mapPartial (fn (r, bytes) => if r = root then SOME bytes else NONE) freed)
               in
-                (* Measure again, so a waiter on gc.lock reuses the result
-                   rather than repeating the scan. *)
-                if after <= target then publish (measure_shared ())
-                else warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
-                           gb_decimal_text target ^ " GB left under the cap after its reserve")
+                (* Publish the scan less what was freed, so a waiter on
+                   gc.lock reuses it rather than repeating the scan. *)
+                if after <= target then
+                  publish {measured = Time.toNanoseconds (Time.now ()), ids = #ids shared,
+                           sizes = ListPair.map (fn ({root, ...}, bytes) =>
+                                                    Position.max (0, bytes - freed_from root))
+                                                (roots, #sizes shared)}
+                else
+                  (remove_file state_path;
+                   warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
+                         gb_decimal_text target ^ " GB left under the cap after its reserve"))
               end
+              handle e => (remove_file state_path; raise e)
           end
       end
     (* gc.lock is also shared by explicit cache gc. The action-root
