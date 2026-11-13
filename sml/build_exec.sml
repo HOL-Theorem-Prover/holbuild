@@ -7243,7 +7243,9 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val _ = register_checkpoint_budget_bases budget_state
               (map (checkpoint_base project) (HolbuildBuildPlan.selected_nodes plan))
     val _ = enforce_checkpoint_budget_state_excluding budget_state []
-    val _ = sweep_local_heap_store ()
+    (* A build that only restores adds nothing to the store; it leaves
+       sweeping it to the builds that do. *)
+    val _ = if #restore_only options then () else sweep_local_heap_store ()
     val base_context = toolchain_base_context tc
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
@@ -8150,16 +8152,16 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         (read_text ledger_path handle IO.Io _ => "")
       else ""
     fun known item = sorted_lines_member ledger_text item andalso (add used item; true)
+    fun known_theory (node, action) =
+      not (Binaryset.member (held, HolbuildBuildPlan.key node)) andalso known ("theory " ^ #input_key action)
     fun available remote (node, action) =
-      let val key = #input_key action
-      in
-        (not (Binaryset.member (held, HolbuildBuildPlan.key node)) andalso known ("theory " ^ key)) orelse
-        (remote_available remote options project plan node key upload andalso
-         (learn ("theory " ^ key); true))
-      end
+      remote_available remote options project plan node (#input_key action) upload andalso
+      (learn ("theory " ^ #input_key action); true)
+    (* Only the theories the ledger doesn't know go to the pool, so with a
+       ledger that knows them all no thread starts. *)
     val unavailable =
       detail_time_phase "action_spec.export.publish_deps" (fn () =>
-        failing "checking remote cache" "theories" available deps_actions)
+        failing "checking remote cache" "theories" available (List.filter (not o known_theory) deps_actions))
     val uncached_actions =
       if null unavailable then uncached_actions
       else
