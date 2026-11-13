@@ -94,6 +94,12 @@ jobs:
           path: ~/.cache/holbuild/hol-toolchains
           key: hol-toolchains-with-trknl-${{ runner.os }}-${{ steps.polyml.outputs.polyml-rev }}-${{ steps.trknl-polyml.outputs.polyml-rev }}-${{ steps.hol4-pin.outputs.hol4-ref }}-v2
 
+      - name: Check native client interruption and reattachment
+        working-directory: remote-exec
+        run: uv run --frozen pytest -q tests/native_interrupted_output.py
+        env:
+          REMOTE_EXEC_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
+
       - name: Run tests
         env:
           TMPDIR: ${{ runner.temp }}
