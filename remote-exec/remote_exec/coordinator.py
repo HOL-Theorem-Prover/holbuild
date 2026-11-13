@@ -837,6 +837,40 @@ class Coordinator:
         changed = await self.changes(batch_id, 0)
         return None if changed is None else changed[0]
 
+    async def diagnostic(self, token: UUID, output: str) -> bool:
+        """Consume the latest attempt's diagnostic token, including after its result lease was revoked."""
+        async with self.engine.begin() as conn:
+            batch_id = await conn.scalar(
+                sa.text(
+                    "UPDATE actions SET latest_attempt_token = NULL, "
+                    "interrupted_output = CASE WHEN :output <> '' THEN :output ELSE interrupted_output END "
+                    "WHERE latest_attempt_token = :token RETURNING batch_id"
+                ),
+                {"token": token, "output": output},
+            )
+        if batch_id is None:
+            return False
+        self._batch_changed(batch_id)
+        return True
+
+    async def interrupted_output(self, batch_id: UUID) -> tuple[list[tuple[str, str]], bool] | None:
+        """Saved diagnostic tails and whether a cancelled worker still owes one; no result state is changed."""
+        async with self.engine.connect() as conn:
+            if not await conn.scalar(sa.text("SELECT 1 FROM batches WHERE id = :id"), {"id": batch_id}):
+                return None
+            rows = await conn.execute(
+                sa.text(
+                    "SELECT theory, interrupted_output, state = 'cancelled' AND latest_attempt_token IS NOT NULL "
+                    "FROM actions WHERE batch_id = :id AND "
+                    "(interrupted_output IS NOT NULL OR (state = 'cancelled' AND latest_attempt_token IS NOT NULL)) "
+                    "ORDER BY theory, input_key"
+                ),
+                {"id": batch_id},
+            )
+            rows = list(rows)
+        return ([(theory, output) for theory, output, _ in rows if output is not None],
+                any(pending for _, _, pending in rows))
+
     async def changes(self, batch_id: UUID, since: int) -> tuple[BatchStatus, int] | None:
         """The batch with only the actions written by transactions numbered ``since`` or later, and the ``since``
         to pass next time; ``since`` 0 gives every action.
@@ -1045,11 +1079,12 @@ class Coordinator:
             await conn.execute(
                 sa.text(
                     "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now(), "
+                    "latest_attempt_token = :token, "
                     "ahead = CASE WHEN :ahead THEN 'ahead' WHEN ahead = 'abandoned' THEN ahead ELSE 'no' END "
                     "WHERE batch_id = :batch_id AND input_key = :input_key "
                     "RETURNING (SELECT ahead_cap IS NOT NULL FROM batches WHERE id = :batch_id) AS ahead_batch"
                 ),
-                {"batch_id": row.batch_id, "input_key": row.input_key, "ahead": bool(ahead_parents)},
+                {"batch_id": row.batch_id, "input_key": row.input_key, "ahead": bool(ahead_parents), "token": token},
             )
         ).one()
         await conn.execute(
@@ -1430,6 +1465,7 @@ class Coordinator:
             await conn.execute(
                 sa.text(
                     "UPDATE actions SET log_sha256 = :log, last_failure = :failure, failure_detail = :detail, "
+                    "latest_attempt_token = NULL, "
                     "timings = CAST(CAST(:timings AS text) AS jsonb) "
                     "WHERE batch_id = :batch_id AND input_key = :input_key"
                 ),
@@ -2193,7 +2229,10 @@ class Coordinator:
                 "WITH RECURSIVE blocked(input_key) AS (SELECT CAST(:key AS text) UNION "
                 "SELECT e.input_key FROM edges e JOIN blocked p ON e.parent_key = p.input_key "
                 "WHERE e.batch_id = :id), skipped AS ("
-                "UPDATE actions SET state = 'cancelled', last_failure = :reason, failure_detail = NULL "
+                "UPDATE actions SET latest_attempt_token = CASE WHEN state = 'running' AND EXISTS "
+                "(SELECT 1 FROM leases l WHERE l.batch_id = actions.batch_id AND l.input_key = actions.input_key "
+                "AND l.expires_at > now()) THEN latest_attempt_token ELSE NULL END, "
+                "state = 'cancelled', last_failure = :reason, failure_detail = NULL "
                 "WHERE batch_id = :id AND input_key IN (SELECT input_key FROM blocked) "
                 "AND state IN ('waiting', 'ready', 'running') RETURNING input_key) "
                 "DELETE FROM leases WHERE batch_id = :id AND input_key IN (SELECT input_key FROM skipped)"
@@ -2214,7 +2253,9 @@ class Coordinator:
         )
         await conn.execute(
             sa.text(
-                "UPDATE actions SET state = 'cancelled' "
+                "UPDATE actions SET latest_attempt_token = CASE WHEN state = 'running' AND EXISTS "
+                "(SELECT 1 FROM leases l WHERE l.batch_id = actions.batch_id AND l.input_key = actions.input_key "
+                "AND l.expires_at > now()) THEN latest_attempt_token ELSE NULL END, state = 'cancelled' "
                 "WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running')"
             ),
             {"id": batch_id},

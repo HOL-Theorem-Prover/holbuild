@@ -33,7 +33,7 @@ async def test_interrupted_output_schema_preserves_existing_actions_and_runtime(
             ))).one()
             assert tuple(row) == (None, None)
 
-        # The baseline runtime never reads the new columns, but still claims and completes old rows.
+        # Existing actions still claim and complete after the schema upgrade.
         await build(http, cache, "a")
         assert (await batch(http, batch_id))["state"] == "done"
         await asyncio.to_thread(migrate, remote_exec_engine, "0015", downgrade=True)
