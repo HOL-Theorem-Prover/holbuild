@@ -175,8 +175,9 @@ make_tree "$fourth"
 sed -i 's/ACCEPT_TAC helperLib.helper_thm/NO_TAC/' "$fourth/src/BScript.sml"
 # Poly/ML checks the parent's time stamp in the header when it loads the
 # state, not when it reads the parent name. On 64-bit hosts that stamp is
-# bytes 68-75 in the v5.9.2-seq4 header and 72-79 in the v5.9.2-seq5 one;
-# bytes 72-75 are in it for both.
+# bytes 68-75 in the header of runtimes with dependent modules (v5.9.2-seq4,
+# v5.9.2-seq8) and 72-79 in the v5.9.2-seq5 to seq7 one; bytes 72-75 are in
+# it for both.
 cp "$stored" "$tmpdir/stale"
 printf '\xff\xff\xff\xff' | dd of="$tmpdir/stale" bs=1 seek=72 conv=notrunc status=none
 mv "$tmpdir/stale" "$stored"

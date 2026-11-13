@@ -171,12 +171,8 @@ jobs:
         id: module-hol4-pin
         run: echo "hol4-ref=$(tr -d '[:space:]' < tests/HOL_THEORY_MODULES_REV)" >> "$GITHUB_OUTPUT"
 
-      # Theory modules need the dependent-module support of the
-      # v5.9.2-seq4 runtime; v5.9.2-seq5 leaves it out.
       - uses: ./.github/actions/setup-polyml
         id: polyml
-        with:
-          polyml-tag: v5.9.2-seq4
 
       - name: Configure holbuild test cache
         run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
