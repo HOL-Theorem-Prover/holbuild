@@ -2038,7 +2038,8 @@ fun captured_output_has_retained_log output =
   (case output of SOME captured => captured_output_retained captured | NONE => false)
 
 fun captured_output_debug_artifacts output =
-  if not (HolbuildStatus.json_mode ()) then HolbuildStatus.no_debug_artifacts
+  if not (HolbuildStatus.json_mode () andalso HolbuildStatus.retain_debug_artifacts ()) then
+    HolbuildStatus.no_debug_artifacts
   else
     case output of
         SOME (RetainedLog path) => {log = SOME path}

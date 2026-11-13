@@ -1704,7 +1704,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val needs_local = ref false
                 fun diagnose ({input_key, kind, log_sha256} : HolbuildRemoteExec.action_failure) =
                   case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
-                      NONE => (input_key, HolbuildBuildExec.Error ("failed remote action " ^ input_key ^ ": " ^ kind))
+                      NONE => (NONE, input_key, HolbuildBuildExec.Error ("failed remote action " ^ input_key ^ ": " ^ kind))
                     | SOME node =>
                         let
                           val name = HolbuildBuildPlan.logical_name node
@@ -1722,7 +1722,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                       (SOME (HolbuildBuildExec.RetainedLog path)))
                                       (HolbuildBuildExec.fetch_remote_build_log project node sha)
                         in
-                          (name,
+                          (SOME (HolbuildBuildPlan.key node), name,
                            case error of
                                SOME e => e
                              | NONE =>
@@ -1732,20 +1732,25 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                      (needs_local := true; HolbuildBuildExec.Error msg)
                                    else if is_proof then
                                      (HolbuildBuildExec.warn ("remote execution: could not fetch the failed theory's build log; building " ^ name ^ " locally");
-                                      (build_theory_locally name;
+                                      (HolbuildStatus.reporting_finished_only (fn () => build_theory_locally name);
                                        HolbuildBuildExec.Error (name ^ " failed remotely: " ^ kind))
                                       handle Thread.Interrupt => raise Thread.Interrupt
                                            | e => e)
                                    else HolbuildBuildExec.Error msg
                                  end)
                         end
-                val errors = map diagnose failures
+                val diagnosed = map diagnose failures
                 val later_errors = later ()
                 val _ = restore_finished_logs ()
+                fun report (SOME key, name, e) =
+                      HolbuildStatus.report_remote_failure key name (HolbuildBuildExec.build_error_message e)
+                        (HolbuildBuildExec.build_error_debug_artifacts e)
+                  | report (NONE, _, _) = ()
               in
+                List.app report diagnosed;
                 HolbuildHolSharedCache.local_build_needed :=
                   (!needs_local orelse !HolbuildHolSharedCache.local_build_needed);
-                HolbuildBuildExec.raise_build_failures (errors @ later_errors)
+                HolbuildBuildExec.raise_build_failures (map (fn (_, name, e) => (name, e)) diagnosed @ later_errors)
               end
             (* A batch that abandon would cancel is cancelled on an interrupt too.
                While it runs, the entries of the theories it finishes, and of a
@@ -1799,11 +1804,24 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                            | OS.SysErr (reason, _) => warn_log reason
                            | e as IO.Io _ => warn_log (General.exnMessage e)
                     end
+            (* A theory that failed on a worker other than in a proof, which
+               under --remote-only no local build reports. *)
+            fun report_failed_theory ({input_key, kind, ...} : HolbuildRemoteExec.action_failure) =
+              case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
+                  NONE => ()
+                | SOME node =>
+                    let val name = HolbuildBuildPlan.logical_name node
+                    in
+                      HolbuildStatus.report_remote_failure (HolbuildBuildPlan.key node) name
+                        (name ^ " failed on a remote worker: " ^ kind) HolbuildStatus.no_debug_artifacts
+                    end
             (* Restores what the remote cache holds, and nothing else: after a
-               batch failed, the build must not retry its failed theories. *)
+               batch failed, the build must not retry its failed theories.  It
+               reports only what it restores: the failures are the batch's. *)
             fun restore_after_failures () =
-              (HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
-                 tc project plan toolchain_key jobs
+              (HolbuildStatus.reporting_finished_only (fn () =>
+                 HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
+                   tc project plan toolchain_key jobs)
                handle HolbuildBuildExec.Error _ => ()
                     | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
                HolbuildHolSharedCache.local_build_needed := false)
@@ -1879,6 +1897,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                      ("holbuild: remote execution: " ^ HolbuildBuildExec.build_error_message e ^ "\n"))
                            (deferred_errors ());
                          restore_finished_logs ();
+                         if remote_only then List.app report_failed_theory failures else ();
                          fall_back reason)
                       else
                         (HolbuildStatus.message_stderr
@@ -2346,8 +2365,6 @@ fun build tc cli_jobs args =
       else if Option.isSome url andalso
               (watch orelse dry_run orelse repl_on_failure orelse Option.isSome execution_plan) then
         raise Error "--remote-exec does not support --watch, --dry-run, --execution-plan or --repl-on-failure"
-      else if Option.isSome url andalso HolbuildStatus.json_mode () then
-        raise Error "--json does not support --remote-exec yet"
       else if detach andalso Option.isSome attach then
         raise Error "--detach and --attach exclude each other"
       else ()
