@@ -428,6 +428,25 @@ if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   done
   compgen -G "$tmpdir/worker-c/theory-modules/*/base-theories" > /dev/null || {
     echo "worker c recorded no base-state theories" >&2; exit 1; }
+  # The next child on worker c loads A and B from those modules, not from
+  # their .dat files.
+  cat > "$project/src/DScript.sml" <<'SML'
+Theory D
+Ancestors B
+
+val _ = if length (PolyML.SaveState.showLoadedModules ()) >= 2 then ()
+        else raise Fail "D's child loaded no theory modules"
+
+Theorem d_thm:
+  T
+Proof
+  ACCEPT_TAC b_thm
+QED
+SML
+  hb action-spec --upload DTheory > "$tmpdir/batch-d.txt"
+  worker c "$(spec_for "$tmpdir/batch-d.txt" worker:DTheory)"
+  expect c 0 "status=built"
+  rm "$project/src/DScript.sml"
 elif [[ ! -e "$HOLDIR/tools-poly/poly/theory_modules.ML" ]]; then
   # A HOL without the module helper starts no writer, which alone makes
   # the store.
