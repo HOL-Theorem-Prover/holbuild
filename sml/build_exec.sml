@@ -1624,6 +1624,9 @@ fun hol_file_sha1 path =
       | NONE => SHA1_ML.sha1_file {filename = path}
   else SHA1_ML.sha1_file {filename = path}
 
+fun hol_files_sha1 paths =
+  HolbuildHash.files_hash {command = "sha1sum", digits = 40, fallback = hol_file_sha1} paths
+
 (* The hash literal of a generated Theory.sml: `hash =` and a quoted
    SHA-1, the only such literal in the file. *)
 fun theory_sml_hash_literal text =
@@ -10998,7 +11001,8 @@ fun write_missing_modules cache root tc {deps, loads} =
     val seen0 = Binaryset.addList (Binaryset.empty String.compare, getOpt (base_theories, []))
     val theories = rev (#2 (List.foldl visit (seen0, []) roots))
     val expected =
-      map (fn (name, b) => name ^ "-" ^ hol_file_sha1 (b ^ ".dat") ^ ".pmo") theories
+      ListPair.mapEq (fn ((name, _), sha1) => name ^ "-" ^ sha1 ^ ".pmo")
+        (theories, hol_files_sha1 (map (fn (_, b) => b ^ ".dat") theories))
     val stored =
       Binaryset.addList (Binaryset.empty String.compare,
                          List.mapPartial (module_file_theory_part o Path.file)

@@ -63,6 +63,12 @@ val _ =
   ListPair.appEq
     (fn (path, (b, e)) => if b = e then () else fail ("digest mismatch for " ^ path ^ ": " ^ b ^ " vs " ^ e))
     (paths, ListPair.zipEq (batched, expected))
+(* The theory module names' .dat SHA-1s, batched through sha1sum. *)
+val _ =
+  ListPair.appEq
+    (fn (path, (b, e)) => if b = e then () else fail ("sha1 mismatch for " ^ path ^ ": " ^ b ^ " vs " ^ e))
+    (paths, ListPair.zipEq (HolbuildBuildExec.hol_files_sha1 paths,
+                            map (fn path => SHA1_ML.sha1_file {filename = path}) paths))
 val _ = print "batch file hash test passed\n"
 SML
 
