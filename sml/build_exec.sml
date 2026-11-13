@@ -3177,6 +3177,87 @@ val theory_manifest_version = "4"
 fun policy_config_lines _ =
   ["theory_manifest_version=" ^ theory_manifest_version]
 
+(* Runs `work` on each item added, on up to `limit` background threads, in
+   the order added; an item added while fewer than `limit` run starts at
+   once.  Returns {add, drain, stop}: drain waits for all added work; stop drops
+   the items not yet started and waits for those in flight.  Failures are
+   silent: for a prefetch, the demand restore of the same key retries and
+   reports. *)
+fun start_background_pool limit work =
+  let
+    val front = ref [] and back = ref []
+    val active = ref 0
+    val stopped = ref false
+    val mutex = Mutex.mutex ()
+    (* Signalled when the last thread ends. *)
+    val idle = ConditionVar.conditionVar ()
+    fun with_lock f =
+      (Mutex.lock mutex; f () before Mutex.unlock mutex)
+      handle e => (Mutex.unlock mutex; raise e)
+    fun pop () =
+      case !front of
+          item :: rest => (front := rest; SOME item)
+        | [] =>
+            case rev (!back) of
+                [] => NONE
+              | item :: rest => (front := rest; back := []; SOME item)
+    (* A thread ends only once nothing is queued, under the lock add takes,
+       so no added item is left behind. *)
+    fun worker item =
+      ((work item handle _ => ());
+       case with_lock (fn () => case pop () of
+                                    NONE => (active := !active - 1;
+                                             if !active = 0 then ConditionVar.broadcast idle else ();
+                                             NONE)
+                                  | next => next) of
+           SOME next => worker next
+         | NONE => ())
+    fun add item =
+      if with_lock (fn () =>
+           if !stopped then false
+           else if !active < limit then (active := !active + 1; true)
+           else (back := item :: !back; false))
+      then ignore (Thread.fork (fn () => worker item, []))
+           handle e => (with_lock (fn () => (active := !active - 1;
+                                             if !active = 0 then ConditionVar.broadcast idle else ()));
+                        raise e)
+      else ()
+    fun wait_locked () =
+      if !active > 0 then (ConditionVar.wait (idle, mutex); wait_locked ()) else ()
+    fun wait () = with_lock wait_locked
+    fun stop () =
+      (with_lock (fn () => (stopped := true; front := []; back := [])); wait ())
+  in
+    {add = add, drain = wait, stop = stop}
+  end
+
+(* Runs work on each of items, up to width at a time, and raises what a
+   serial loop would: the failure of the first item that fails.  Items after
+   a failed one are skipped if not yet started. *)
+fun parallel_all width work items =
+  case items of
+      [] => ()
+    | [item] => work item
+    | _ =>
+        let
+          val failure = ref NONE
+          val mutex = Mutex.mutex ()
+          fun with_lock f = (Mutex.lock mutex; f () before Mutex.unlock mutex)
+          fun after_failure i =
+            with_lock (fn () => case !failure of SOME (j, _) => j < i | NONE => false)
+          fun note i e =
+            with_lock (fn () =>
+              case !failure of
+                  SOME (j, _) => if j < i then () else failure := SOME (i, e)
+                | NONE => failure := SOME (i, e))
+          fun run (i, item) = if after_failure i then () else work item handle e => note i e
+          val {add, drain, stop} = start_background_pool width run
+        in
+          (List.app add (ListPair.zip (List.tabulate (length items, fn i => i), items)); drain ())
+          handle e => (stop (); raise e);
+          case !failure of SOME (_, e) => raise e | NONE => ()
+        end
+
 (* The files a node hands its dependents, by role, plus a line for what they
    don't show.  A theory hands over its generated files, its load manifests
    (which carry its ML dependencies), its kernel trace if it has one, and its
@@ -3212,6 +3293,23 @@ fun output_digest_parts toolchain_key plan node =
            extras)
   end
 
+(* The SHA-256 of each of PATHS, hashed in chunks run side by side: the
+   files are often out of the page cache, and a single process would wait for
+   each read in turn. *)
+fun files_sha256_in_parallel paths =
+  let
+    fun chunks [] = []
+      | chunks paths =
+          let val n = Int.min (256, length paths)
+          in List.take (paths, n) :: chunks (List.drop (paths, n)) end
+    val chunks = chunks paths
+    val hashes = Array.array (length chunks, [])
+  in
+    parallel_all 8 (fn (i, chunk) => Array.update (hashes, i, HolbuildHash.files_sha256 chunk))
+      (ListPair.zip (List.tabulate (length chunks, fn i => i), chunks));
+    List.concat (Array.foldr op:: [] hashes)
+  end
+
 (* Computes and remembers the output digests of NODES, hashing all their files
    in one batch.  A node with a missing output gets none. *)
 fun remember_output_digests toolchain_key plan nodes =
@@ -3230,7 +3328,7 @@ fun remember_output_digests toolchain_key plan nodes =
     (* A .dat by the hash its children record (hol_dat_hash), the rest by content. *)
     fun is_dat (role, _) = role = "dat" orelse role = "remapped dat"
     val hashes =
-      HolbuildHash.files_sha256
+      files_sha256_in_parallel
         (List.concat (map (fn (_, _, files) => map #2 (List.filter (not o is_dat) files)) parts))
     fun file_lines [] hashes = ([], hashes)
       | file_lines ((file as (role, path)) :: files) hashes =
@@ -7050,81 +7148,6 @@ fun prefetch_key (options : build_options) project keys node =
       | _ => NONE
   end
 
-(* Runs `work` on each item added, on up to `limit` background threads, in
-   the order added; an item added while fewer than `limit` run starts at
-   once.  Returns {add, drain, stop}: drain waits for all added work; stop drops
-   the items not yet started and waits for those in flight.  Failures are
-   silent: for a prefetch, the demand restore of the same key retries and
-   reports. *)
-fun start_background_pool limit work =
-  let
-    val front = ref [] and back = ref []
-    val active = ref 0
-    val stopped = ref false
-    val mutex = Mutex.mutex ()
-    fun with_lock f =
-      (Mutex.lock mutex; f () before Mutex.unlock mutex)
-      handle e => (Mutex.unlock mutex; raise e)
-    fun pop () =
-      case !front of
-          item :: rest => (front := rest; SOME item)
-        | [] =>
-            case rev (!back) of
-                [] => NONE
-              | item :: rest => (front := rest; back := []; SOME item)
-    (* A thread ends only once nothing is queued, under the lock add takes,
-       so no added item is left behind. *)
-    fun worker item =
-      ((work item handle _ => ());
-       case with_lock (fn () => case pop () of
-                                    NONE => (active := !active - 1; NONE)
-                                  | next => next) of
-           SOME next => worker next
-         | NONE => ())
-    fun add item =
-      if with_lock (fn () =>
-           if !stopped then false
-           else if !active < limit then (active := !active + 1; true)
-           else (back := item :: !back; false))
-      then ignore (Thread.fork (fn () => worker item, []))
-           handle e => (with_lock (fn () => active := !active - 1); raise e)
-      else ()
-    fun wait () =
-      if with_lock (fn () => !active) > 0 then (OS.Process.sleep (Time.fromReal 0.05); wait ())
-      else ()
-    fun stop () =
-      (with_lock (fn () => (stopped := true; front := []; back := [])); wait ())
-  in
-    {add = add, drain = wait, stop = stop}
-  end
-
-(* Runs work on each of items, up to width at a time, and raises what a
-   serial loop would: the failure of the first item that fails.  Items after
-   a failed one are skipped if not yet started. *)
-fun parallel_all width work items =
-  case items of
-      [] => ()
-    | [item] => work item
-    | _ =>
-        let
-          val failure = ref NONE
-          val mutex = Mutex.mutex ()
-          fun with_lock f = (Mutex.lock mutex; f () before Mutex.unlock mutex)
-          fun after_failure i =
-            with_lock (fn () => case !failure of SOME (j, _) => j < i | NONE => false)
-          fun note i e =
-            with_lock (fn () =>
-              case !failure of
-                  SOME (j, _) => if j < i then () else failure := SOME (i, e)
-                | NONE => failure := SOME (i, e))
-          fun run (i, item) = if after_failure i then () else work item handle e => note i e
-          val {add, drain, stop} = start_background_pool width run
-        in
-          (List.app add (ListPair.zip (List.tabulate (length items, fn i => i), items)); drain ())
-          handle e => (stop (); raise e);
-          case !failure of SOME (_, e) => raise e | NONE => ()
-        end
-
 (* For a worker's transfers. *)
 fun transfer_all work items = parallel_all 4 work items
 
@@ -7421,8 +7444,12 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
         parallel_all remote_probe_width (fn (i, node) => Array.update (results, i, restore node)) indexed;
         Array.foldr (fn (SOME r, acc) => r :: acc | (NONE, acc) => acc) [] results
       end
+    (* An optional log the batch didn't report has nothing to fetch. *)
+    fun optional_log node =
+      not (required_log node) andalso
+      Redblackmap.inDomain (log_table, HolbuildBuildPlan.input_key_for keys node)
     val restored = restore_all (List.filter required_log theories)
-    val restored = restored @ restore_all (List.filter (not o required_log) theories)
+    val restored = restored @ restore_all (List.filter optional_log theories)
     fun report (node, traced, path) =
       if not traced then ()
       else

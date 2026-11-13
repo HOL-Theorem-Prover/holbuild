@@ -498,6 +498,16 @@ val _ = assert "a later request fails without a retry"
 val _ = assert "a later request connects once" (tls_accepted () = accepted_before + 1)
 
 val _ = print "http tests passed\n"
+
+(* A request just before exiting leaves its connection pooled and the reaper
+   waiting for the idle timeout; the caller checks that exiting doesn't wait
+   for the reaper. *)
+val _ = wait_for_empty_pool ()
+val _ = assert "a request before exiting"
+               (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/fast.out", timeout = 30} = HolbuildHttp.Response 200)
+val _ = let val output = TextIO.openOut (dir ^ "/exiting-ms")
+        in TextIO.output (output, LargeInt.toString (Time.toMilliseconds (Time.now ()))); TextIO.closeOut output end
+val _ = OS.Process.exit OS.Process.success
 SML
 
 printf 'user = "name:secret"\n' > "$tmpdir/user.curl"
@@ -507,8 +517,15 @@ HOLBUILD_TEST_HTTP_IDLE_MS=3000 HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$tmpdir/user.c
   cat "$tmpdir/http-test.log" >&2
   exit 1
 }
+exited_ms=$(date +%s%3N)
 grep -q "http tests passed" "$tmpdir/http-test.log" || {
   cat "$tmpdir/http-test.log" >&2
+  exit 1
+}
+# A sleeping reaper would hold the exit until its one-second sleep ends.
+exit_wait_ms=$((exited_ms - $(< "$tmpdir/exiting-ms")))
+(( exit_wait_ms < 500 )) || {
+  echo "exiting after a request waited ${exit_wait_ms} ms for the connection pool's reaper" >&2
   exit 1
 }
 kill "$server_pid"
