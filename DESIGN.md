@@ -638,7 +638,8 @@ manifests the spec ships.
 With the action text, dependencies named but not keyed, that hash gives a pair
 key, and the remote cache maps the pair to the input key of the last build
 on it (an action entry `holbuild-early-cutoff-v1` with one `input-key=` line).
-On a hit, the worker restores that build's entry with the checks a dependency
+The worker looks the pair up beside the action's own entry, since a miss
+asks every cache node in turn. On a hit, the worker restores that build's entry with the checks a dependency
 restore makes (the timeout contract, the extra outputs, and the parent `.dat`
 hashes its `.dat` records), copies it to the action's input key, publishes it
 there and reports `cached`. On a miss or any doubt it builds, and then points

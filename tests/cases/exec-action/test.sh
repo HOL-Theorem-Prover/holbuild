@@ -473,6 +473,12 @@ resident_stem() { awk -F'\t' -v want="$1" '$1 == "theory" && $3 ~ want { print $
 stem_a=$(resident_stem 'ATheory$')
 stem_b=$(resident_stem 'BTheory$')
 [[ -n "$stem_a" && -n "$stem_b" ]] || { cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
+# Each dependency's record holds its files' hashes, which the early cutoff reads.
+for stem in "$stem_a" "$stem_b"; do
+  recorded=$(awk -F'\t' -v stem="$stem" '$1 == "theory" && $2 == stem { print $10 }' "$tmpdir/worker-c/action-resident")
+  files=$(for suffix in sig sml ui uo; do sha256sum < "$stem.$suffix" | cut -d' ' -f1; done | paste -sd,)
+  [[ "$recorded" == "$files" ]] || { echo "record of $stem: $recorded; files: $files" >&2; exit 1; }
+done
 inode_a=$(stat -c %i "$stem_a.dat")
 # Held, so that a reinstall can't get the same inode back.
 ln "$stem_a.dat" "$tmpdir/a-held.dat"
