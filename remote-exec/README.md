@@ -918,7 +918,7 @@ commands must be idempotent across retries and coordinator crashes. Opaque
 provider ownership data is persisted separately from operation tokens, before
 any DNS publication.
 
-Configure one to four `REMOTE_EXEC_CACHE_SLOTS` as a JSON list of
+Configure one or more `REMOTE_EXEC_CACHE_SLOTS` as a JSON list of
 `{"name":"slot-c","url":"https://cache-c.example"}`. A slot may also name a
 `"zone"`: it then goes only to an instance whose inventory entry reports that
 `zone`, so workers in that zone can list the slot's URL among their preferred
