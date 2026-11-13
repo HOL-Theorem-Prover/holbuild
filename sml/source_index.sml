@@ -204,10 +204,8 @@ fun source_with_ids package package_id package_root policy origin kind logical_n
      policy = policy}
   end
 
-fun make_source package package_id package_root policies generated_paths kind logical_name source_path relative_path artifacts =
+fun identified_source package package_id package_root policy origin kind logical_name source_path relative_path artifacts =
   let
-    val origin = source_origin generated_paths relative_path
-    val policy = HolbuildProject.action_policy_for policies logical_name
     val policy_id = HolbuildHash.string_sha256 (policy_render policy)
     val canonical_artifacts = canonical_artifacts_for kind logical_name relative_path
     val ids =
@@ -219,10 +217,14 @@ fun make_source package package_id package_root policies generated_paths kind lo
       canonical_artifacts ids
   end
 
+fun make_source package package_id package_root policies generated_paths kind logical_name source_path relative_path artifacts =
+  identified_source package package_id package_root (HolbuildProject.action_policy_for policies logical_name)
+    (source_origin generated_paths relative_path) kind logical_name source_path relative_path artifacts
+
 (* A source an earlier discovery found, as the plan record kept it.  Its
    node keeps no identities and no canonical artifacts: they serve only
-   package inventories and plan identities, which full planning computes
-   and the record keeps whole. *)
+   package inventories and plan identities, which the record keeps whole;
+   with_ids gives them back when a restore must plan again. *)
 fun restore_source package package_id {kind, logical_name, source_path, relative_path} =
   let
     val artifact_root = HolbuildProject.package_artifact_root package
@@ -239,6 +241,13 @@ fun restore_source package package_id {kind, logical_name, source_path, relative
       (source_origin generated_paths relative_path) kind logical_name source_path relative_path artifacts
       {generated = [], objects = [], theory_data = []} {id = "", policy_id = "", execution_policy_id = ""}
   end
+
+(* A restored source with the identities discovery gives it, for planning
+   again over the sources a plan record kept. *)
+fun with_ids (source : source) =
+  identified_source (#package source) (#package_id (#node source)) (#package_root source) (#policy source)
+    (#origin (#node source)) (#kind source) (#logical_name source) (#source_path source) (#relative_path source)
+    (#artifacts source)
 
 fun generated_theory_artifact file =
   has_suffix "Theory.sml" file orelse
@@ -655,6 +664,15 @@ fun package_inventory package sources : package_inventory =
        map (fn node => (#relative_path node, node)) (List.filter is_generated nodes),
      extra_inputs = List.concat (map node_extra_inputs nodes)}
   end
+
+(* The discovery that found SOURCES, in their order, over PACKAGES. *)
+fun restored_discovery packages sources : discovery =
+  {inventories =
+     map (fn package =>
+            package_inventory package
+              (List.filter (fn (source : source) => #package source = HolbuildProject.package_name package) sources))
+         packages,
+   sources = sources}
 
 fun discover_package_inventory scans package =
   let val sources = sort_sources (discover_package scans package)
