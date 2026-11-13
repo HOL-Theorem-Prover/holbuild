@@ -1467,8 +1467,9 @@ async def test_independent_failures_and_success_finish_before_the_batch_fails(
     assert events[-1]["state"] == "failed"
 
 
+@pytest.mark.parametrize("expire_child", [False, True])
 async def test_failed_requeued_parent_revokes_running_descendants(
-    http: httpx.AsyncClient, cache: FakeCache,
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, expire_child: bool,
 ) -> None:
     batch_id = await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")])
     await build(http, cache, "a")
@@ -1477,11 +1478,20 @@ async def test_failed_requeued_parent_revokes_running_descendants(
     assert (await complete(http, tokens["c"], result("c", "failed", "input-missing",
                            missing=f"theory {input_key('a')}"))).status_code == 200
     retry = await claim_named(http, "a")
+    if expire_child:
+        async with coordinator.engine.begin() as connection:
+            await connection.execute(
+                sa.text("UPDATE leases SET expires_at = now() - interval '1 second' WHERE attempt_token = :token"),
+                {"token": UUID(tokens["b"])},
+            )
     assert (await complete(http, retry, result("a", "failed", "proof"))).status_code == 200
     assert await states(http, batch_id) == {"a": "failed", "b": "cancelled", "c": "cancelled"}
     assert (await http.post(f"/v1/work/{tokens['b']}/heartbeat", headers=WORKER)).status_code == 409
     assert (await complete(http, tokens["b"], result("b", "built"))).status_code == 409
     assert (await batch(http, batch_id))["state"] == "failed"
+    assert (await diagnostic(http, tokens["b"], "skipped child marker\n")).status_code == 200
+    response = await http.get(f"/v1/batches/{batch_id}/interrupted-output", headers=CLIENT)
+    assert json.loads(response.text)["output"] == "skipped child marker\n"
 
 
 async def test_missing_failed_parent_skips_the_action_instead_of_waiting_forever(
@@ -2787,6 +2797,33 @@ async def test_diagnostic_waits_for_failed_worker_after_final_lease_expiry(
     assert not request.done()
     assert (await diagnostic(http, token, "expired lease marker\n")).status_code == 200
     assert json.loads((await request).text)["output"] == "expired lease marker\n"
+
+
+@pytest.mark.parametrize("sweep", [False, True])
+@pytest.mark.parametrize("end", ["cancel", "deadline"])
+async def test_expired_attempt_retains_diagnostic_after_batch_cancellation(
+    http: httpx.AsyncClient, coordinator: Coordinator, sweep: bool, end: str,
+) -> None:
+    batch_id = await submit(http, ["loop"])
+    token = await claim_named(http, "loop")
+    async with coordinator.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
+    if sweep:
+        await coordinator.expire_leases()
+        assert await states(http, batch_id) == {"loop": "waiting"}
+    if end == "cancel":
+        assert (await http.post(f"/v1/batches/{batch_id}/cancel", headers=CLIENT)).status_code == 200
+    else:
+        coordinator.settings.batch_deadline_hours = 0
+        await coordinator.fail_overdue()
+    assert await states(http, batch_id) == {"loop": "cancelled"}
+    assert (await complete(http, token, result("loop", "built"))).status_code == 409
+    request = asyncio.create_task(http.get(f"/v1/batches/{batch_id}/interrupted-output?wait_s=2", headers=CLIENT))
+    await asyncio.sleep(0.05)
+    assert not request.done()
+    assert (await diagnostic(http, token, "expired then cancelled marker\n")).status_code == 200
+    assert json.loads((await request).text)["output"] == "expired then cancelled marker\n"
+    assert (await diagnostic(http, token, "duplicate")).status_code == 409
 
 
 async def test_diagnostic_requires_worker_auth_and_rejects_oversized_body(http: httpx.AsyncClient) -> None:

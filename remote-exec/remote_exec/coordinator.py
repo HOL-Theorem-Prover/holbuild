@@ -2231,10 +2231,7 @@ class Coordinator:
                 "WITH RECURSIVE blocked(input_key) AS (SELECT CAST(:key AS text) UNION "
                 "SELECT e.input_key FROM edges e JOIN blocked p ON e.parent_key = p.input_key "
                 "WHERE e.batch_id = :id), skipped AS ("
-                "UPDATE actions SET latest_attempt_token = CASE WHEN state = 'running' AND EXISTS "
-                "(SELECT 1 FROM leases l WHERE l.batch_id = actions.batch_id AND l.input_key = actions.input_key "
-                "AND l.expires_at > now()) THEN latest_attempt_token ELSE NULL END, "
-                "state = 'cancelled', last_failure = :reason, failure_detail = NULL "
+                "UPDATE actions SET state = 'cancelled', last_failure = :reason, failure_detail = NULL "
                 "WHERE batch_id = :id AND input_key IN (SELECT input_key FROM blocked) "
                 "AND state IN ('waiting', 'ready', 'running') RETURNING input_key) "
                 "DELETE FROM leases WHERE batch_id = :id AND input_key IN (SELECT input_key FROM skipped)"
@@ -2255,9 +2252,7 @@ class Coordinator:
         )
         await conn.execute(
             sa.text(
-                "UPDATE actions SET latest_attempt_token = CASE WHEN state = 'running' AND EXISTS "
-                "(SELECT 1 FROM leases l WHERE l.batch_id = actions.batch_id AND l.input_key = actions.input_key "
-                "AND l.expires_at > now()) THEN latest_attempt_token ELSE NULL END, state = 'cancelled' "
+                "UPDATE actions SET state = 'cancelled' "
                 "WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running')"
             ),
             {"id": batch_id},
