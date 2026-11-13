@@ -272,20 +272,37 @@ curl -fsS -X PUT --data-binary "@$tmpdir/blob-path" "$remote_url/cas/$spec_blob_
 worker blob-path "$spec_blob_path"
 expect blob-path 4 "status=failed" "failure=spec-rejected"
 require_grep "a file's SHA-256 is malformed" "$tmpdir/blob-path.log"
-# Or one with two items writing one path, here a library over a
-# dependency's script, before the worker's root changes.
-python3 - "$project/.holbuild/action-specs/$spec_b" "$tmpdir/overlap" <<'PY'
+# Or one that writes where the worker keeps a dependency other than as
+# that dependency: a library manifest over its object, a library file or
+# an output at its script, or a path spelled two ways.
+for edit in manifest library output dot; do
+  python3 - "$project/.holbuild/action-specs/$spec_b" "$tmpdir/overlap" "$edit" <<'PY'
 import sys
 head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
-stem = [l for l in head.split(b"\n") if l.startswith(b"dep theory ")][0].split(b" ")[3]
-head += b"\nfile library " + stem + b".sml " + b"0" * 64 + b" 24"
-open(sys.argv[2], "wb").write(head + b"\naction-text\n" + text)
+lines = head.split(b"\n")
+dep = [l for l in lines if l.startswith(b"dep theory ")][0].split(b" ")
+target, stem = dep[2], dep[3]
+edit = sys.argv[3]
+if edit == "manifest":
+    lines.append(b"lib " + target + b" " + stem + b" .ui")
+elif edit == "library":
+    lines.append(b"file library " + stem + b".sml " + b"0" * 64 + b" 24")
+elif edit == "output":
+    lines = [b"output sml " + stem + b".sml" if l.startswith(b"output sml ") else l for l in lines]
+else:
+    lines.append(b"file library .holbuild/action-src/./lib/A.sml " + b"0" * 64 + b" 24")
+open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
 PY
-spec_overlap=$(sha256sum "$tmpdir/overlap" | cut -d' ' -f1)
-curl -fsS -X PUT --data-binary "@$tmpdir/overlap" "$remote_url/cas/$spec_overlap"
-worker overlap "$spec_overlap"
-expect overlap 4 "status=failed" "failure=spec-rejected"
-require_grep "two items of the spec write" "$tmpdir/overlap.log"
+  spec_overlap=$(sha256sum "$tmpdir/overlap" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/overlap" "$remote_url/cas/$spec_overlap"
+  worker overlap "$spec_overlap"
+  expect overlap 4 "status=failed" "failure=spec-rejected"
+  case $edit in
+    manifest) require_grep "two items of the spec write" "$tmpdir/overlap.log" ;;
+    library|dot) require_grep "a library file is not a canonical action-src path" "$tmpdir/overlap.log" ;;
+    output) require_grep "the outputs are not one theory's" "$tmpdir/overlap.log" ;;
+  esac
+done
 worker absent "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect absent 4 "status=failed" "failure=spec-rejected"
 
@@ -451,8 +468,14 @@ rm "$tmpdir/worker-c/action-resident"
 worker c "$spec_a2"
 expect c 0
 [[ ! -e "$tmpdir/worker-c/action/stray" ]] || { echo "worker c kept a root it has no records of" >&2; exit 1; }
-# A release that keeps no records removes the root around its actions.
+# A release that keeps no records removes the root around its actions; the
+# records go once the root is emptied, even when the action then fails.
 rm -rf "$tmpdir/worker-c/action"
+worker c "$spec_a2"
+expect c 0
+rm -rf "$tmpdir/worker-c/action"
+worker c "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
+expect c 4 "status=failed" "failure=spec-rejected"
 worker c "$spec_a2"
 expect c 0
 

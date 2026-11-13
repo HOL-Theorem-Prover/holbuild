@@ -708,9 +708,11 @@ came from, the parent names its `.uo` was generated from, and the hashes the
 parent check and the early cutoff read; each source, input and library by
 SHA-256; each library manifest by its text's SHA-256. It trusts them only
 while the root holds the marker `.holbuild/resident`, which an older release,
-removing the root around its actions, removes with it. A spec with two items
-writing one path is rejected, since a kept item could otherwise stand for
-files another replaced. A hydrate keeps an item
+removing the root around its actions, removes with it; emptying the root
+removes the records first. A spec must name each path it writes in canonical
+form, its files under `.holbuild/action-src` and its objects under
+`.holbuild/obj` or `.holbuild/packages`, its outputs as one stem's, and no
+path twice: otherwise a kept item could stand for files another replaced. A hydrate keeps an item
 whose record matches what the spec names and, for a theory, whose local cache
 manifest is unchanged (the stale check drops a local copy, which then
 reinstalls); it rewrites a kept theory's `.uo` when this spec resolves its

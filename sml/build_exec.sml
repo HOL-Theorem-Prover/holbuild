@@ -9014,7 +9014,23 @@ fun verify_action_spec (spec : action_spec) =
        #path (#source spec) :: #extra_outputs spec @ map #path (#inputs spec @ #libraries spec) @
        map #stem (#deps spec) @ map #stem (#libs spec) @
        List.filter (CharVector.exists (fn c => c = #"/")) (List.concat (map #loads (#libs spec))) @
-       [#sig_path (#outputs spec), #sml_path (#outputs spec), #data_path (#outputs spec)])
+       [#sig_path (#outputs spec), #sml_path (#outputs spec), #data_path (#outputs spec)]);
+    (* The worker keeps what a spec writes between actions, by path: each
+       lies where clients put it, under one spelling, outside the rest of
+       .holbuild, which is the worker's. *)
+    let
+      fun under dirs path =
+        path = normalize_path path andalso List.exists (fn dir => String.isPrefix (".holbuild/" ^ dir ^ "/") path) dirs
+      val {sig_path, sml_path, data_path} = #outputs spec
+      val stem = drop_suffix ".dat" data_path
+    in
+      check (List.all (under ["action-src"] o #path) (#libraries spec))
+        "a library file is not a canonical action-src path";
+      check (List.all (under ["obj", "packages"]) (data_path :: map #stem (#deps spec) @ map #stem (#libs spec)))
+        "an object is not a canonical path under .holbuild/obj or .holbuild/packages";
+      check (String.isSuffix ".dat" data_path andalso sig_path = stem ^ ".sig" andalso sml_path = stem ^ ".sml")
+        "the outputs are not one theory's"
+    end
   end
 
 (* The extra-inputs key the build plan records for checkpoint keys, from the
@@ -11604,7 +11620,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                (warn ("could not upload the action log: " ^ msg); log_unavailable := SOME msg; NONE)
            | e => (warn ("could not upload the action log: " ^ General.exnMessage e); NONE)
     fun empty_all () =
-      (Resident.discard (!resident);
+      (remove_file resident_file;
        resident := Resident.fresh resident_file;
        HolbuildRemoveTree.remove_untrusted_strict root)
     (* The writable directories, empty, and the root's records; with no
