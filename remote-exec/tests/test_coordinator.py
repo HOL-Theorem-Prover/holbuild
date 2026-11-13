@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import json
 import time
+from datetime import timedelta
 from collections.abc import Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -14,7 +15,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
-from remote_exec.coordinator import Coordinator, _claim_rank
+from remote_exec.coordinator import Coordinator, HostReport, _claim_rank
 from remote_exec.formats import parse_result
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, Settled
 
@@ -954,10 +955,102 @@ async def test_wakes_pack_compatible_hosts_with_fifo_ties(
     coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled, False))
     for index in order:
         coordinator._wake_claim(tier)
-        assert wakes[index].result() == (tier, False)
+        assert wakes[index].result() == (tier, False, None)
         assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
     coordinator._wake_claim(tier)
     assert coordinator.made_ready == len(order) + 1
+
+
+def busy(host_id: str, leases: int) -> HostReport:
+    return HostReport(host_id, 50.0, 64 << 30, 40 << 30, 52 << 30, 6 << 30, leases, False)
+
+
+@pytest.mark.parametrize(
+    ("workers", "leases", "woken"),
+    [
+        # The busy host that last claimed the theory goes before an earlier host of the same rank.
+        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 0)], 1, 1),
+        # An idle one doesn't, so it can still empty and scale in.
+        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 0)], 0, 0),
+        # Nor does a host no worker reported for.
+        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 0)], None, 0),
+        # A busy one never goes before a warm worker or a host of lower rank.
+        ([(["standard"], "warm", 0), (["high", "standard"], "host-b", 0)], 1, 0),
+        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 1)], 1, 0),
+    ],
+)
+async def test_wakes_prefer_the_busy_host_that_last_claimed_the_theory(
+    coordinator: Coordinator, workers: list[tuple[list[str], str, int]], leases: int | None, woken: int
+) -> None:
+    loop = asyncio.get_running_loop()
+    wakes = [loop.create_future() for _ in workers]
+    coordinator.claim_waiters = [
+        (tiers, _claim_rank(tiers, host, rank), wake, False) for (tiers, host, rank), wake in zip(workers, wakes)
+    ]
+    coordinator.theory_hosts["pkg:a"] = "host-b"
+    if leases is not None:
+        coordinator.report_host(busy("host-b", leases))
+    coordinator._wake_claim("standard", theory="pkg:a")
+    assert [wake.done() for wake in wakes] == [i == woken for i in range(len(wakes))]
+
+
+async def test_a_passed_wake_still_prefers_the_busy_host_of_its_theory(coordinator: Coordinator) -> None:
+    loop = asyncio.get_running_loop()
+    first, second, other = loop.create_future(), loop.create_future(), loop.create_future()
+    coordinator.claim_waiters = [
+        (["high", "standard"], _claim_rank(["high", "standard"], host), wake, False)
+        for host, wake in [("host-a", other), ("host-b", first), ("host-b", second)]
+    ]
+    coordinator.theory_hosts["pkg:a"] = "host-b"
+    coordinator.report_host(busy("host-b", 1))
+    coordinator._wake_claim("standard", theory="pkg:a")
+    assert first.result() == ("standard", False, "pkg:a")
+    coordinator._pass_wake(first)
+    assert second.done() and not other.done()
+
+
+async def test_wakes_ignore_a_busy_report_too_old_to_trust(coordinator: Coordinator) -> None:
+    loop = asyncio.get_running_loop()
+    wakes = [loop.create_future(), loop.create_future()]
+    coordinator.claim_waiters = [
+        (["high", "standard"], _claim_rank(["high", "standard"], host), wake, False)
+        for host, wake in zip(["host-a", "host-b"], wakes)
+    ]
+    coordinator.theory_hosts["pkg:a"] = "host-b"
+    coordinator.report_host(busy("host-b", 1))
+    reported = coordinator.clock()
+    coordinator.clock = lambda: reported + timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS)
+    coordinator._wake_claim("standard", theory="pkg:a")
+    assert wakes[0].done() and not wakes[1].done()
+
+
+async def test_released_work_wakes_the_busy_host_its_theory_last_ran_on(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.report_host(busy("host-b", 1))
+    await submit(http, ["a"])
+    claimed = await coordinator.claim(["high", "standard"], "w1", host_id="host-b")
+    assert claimed is not None and claimed.theory == "pkg:a"
+    assert coordinator.theory_hosts == {"pkg:a": "host-b"}
+    loop = asyncio.get_running_loop()
+    wakes = [loop.create_future(), loop.create_future()]
+    for host, wake in zip(["host-a", "host-b"], wakes):
+        coordinator.claim_waiters.append((["high", "standard"], _claim_rank(["high", "standard"], host), wake, False))
+    # The theory edited: a new action of it.
+    edited = f"holbuild-action-batch-v1\naction {input_key('a2')} {ac_key('a2')} {spec('a2')} pkg:a\n"
+    assert (await http.post("/v1/batches", content=edited, headers=CLIENT)).status_code == 201
+    await coordinator.released()
+    assert not wakes[0].done() and wakes[1].result() == ("standard", False, "pkg:a")
+
+
+async def test_theory_hosts_forget_the_least_recently_claimed_theory(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "MAX_THEORY_HOSTS", 2)
+    await submit(http, ["a", "b", "c"])
+    for host in ["host-a", "host-b", "host-a"]:
+        assert await coordinator.claim(["standard"], host, host_id=host) is not None
+    assert coordinator.theory_hosts == {"pkg:b": "host-b", "pkg:c": "host-a"}
 
 
 @pytest.mark.parametrize("waiting_tiers", [["high", "standard"], ["standard"]])
