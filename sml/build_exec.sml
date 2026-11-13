@@ -2752,8 +2752,10 @@ fun theorem_context_path base deps_key proof_engine prefix_hash safe_name =
   Path.concat(theorem_checkpoint_dir base deps_key proof_engine prefix_hash,
               safe_name ^ "_context.save")
 
+val failed_prefix_dir_name = ".failed"
+
 fun failed_prefix_checkpoint_dir base deps_key proof_engine =
-  Path.concat(theorem_checkpoint_root base, Path.concat(Path.concat(deps_key, proof_engine), ".failed"))
+  Path.concat(theorem_checkpoint_root base, Path.concat(Path.concat(deps_key, proof_engine), failed_prefix_dir_name))
 
 fun theorem_failed_prefix_path base deps_key proof_engine safe_name =
   Path.concat(failed_prefix_checkpoint_dir base deps_key proof_engine,
@@ -10412,6 +10414,11 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun wipe () = remove_tree checkpoint_root
     fun place heap (sha, dst) = place_shared_blob remote store heap {sha = sha, dst = dst, save = true}
     fun place_sidecar heap (sha, dst) = place_shared_blob remote store heap {sha = sha, dst = dst, save = false}
+    (* The run replaces failed prefixes in place and saves new ones beside
+       them, so one there, a leaf or under a context, gets a copy of its own:
+       a link would leave the directory read-only. *)
+    fun place_state_file (file as (_, dst)) =
+      (if Path.file (Path.dir dst) = failed_prefix_dir_name then place_sidecar else place, file)
     fun heap_placed heap =
       (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
        touch_dir (Path.concat(store, heap)))
@@ -10475,11 +10482,9 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                  if not (checkpoint_timeout_satisfies requested_timeout (#path c)) then (wipe (); NONE)
                  else
                    (transfer_all (fn (placer, file) => placer heap file)
-                      ((place, (heap, deps_loaded)) :: map (fn f => (place, f)) spine @
+                      ((place, (heap, deps_loaded)) :: map place_state_file spine @
                        map (fn f => (place_sidecar, f)) spine_sidecars @
-                       (* The run replaces a failed prefix in place, so it
-                          gets a copy of its own. *)
-                       [(if #kind c = "failed_prefix" then place_sidecar else place, (leaf, #path c))]);
+                       [place_state_file (leaf, #path c)]);
                     heap_placed heap;
                     if shared_heap_parent_ok ctx andalso chain_ok (#path c :: rev (map #2 spine)) andalso
                        #accepts c () then

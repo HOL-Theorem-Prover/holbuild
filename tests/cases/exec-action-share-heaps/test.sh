@@ -281,6 +281,21 @@ expect v7 0 "status=built"
 resumed v7 "theorem-context checkpoint after t4" "theorem_context checkpoint"
 same_outputs v7
 
+# That context's restored spine holds t3's failed prefix, yet a later
+# theorem that fails still saves its own failed prefix beside it.
+write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "FAIL_TAC \"after the context\""
+export_t v7f
+forget_local
+worker v7f "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v7f 1 "status=failed" "failure=proof"
+require_grep "after the context" "$tmpdir/v7f.log"
+resumed v7f "theorem-context checkpoint after t4" "theorem_context checkpoint"
+if grep -q "Permission denied" "$tmpdir/v7f.log"; then
+  echo "v7f could not save its failed prefix" >&2
+  cat "$tmpdir/v7f.log" >&2
+  exit 1
+fi
+
 # The cache loses the heap's blob but keeps the entries naming it: the
 # worker loads cold, replaces the entries, and the next edit resumes again.
 heap_blob=$(find "$shared/checkpoint-store" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
