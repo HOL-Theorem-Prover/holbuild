@@ -3775,7 +3775,7 @@ fun place_state stored dst =
                 "holbuild: the checkpoint store is on another file system; linking its states symbolically\n");
         Posix.FileSys.symlink {old = Path.mkAbsolute {path = stored, relativeTo = FS.getDir ()}, new = dst}))
 
-fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
+fun saved_parent path = HolbuildCheckpointModules.parent path
 
 (* Whether a run may start from a context or failed-prefix checkpoint.  Saved
    ML state does not include files written by the script, so a theory with
@@ -3844,14 +3844,27 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
           best_failed_prefix_checkpoint (tactic_timeout policy) checkpoints
         else NONE
       val replay = if resumes then replay_candidate policy base checkpoints declaration_checkpoints else NONE
+      (* A checkpoint whose theory modules are gone is discarded with every
+         checkpoint on it, and the build starts from a fresh preload. *)
+      fun modules_ok path =
+        HolbuildCheckpointModules.ok path orelse
+        (remove_deps_checkpoint_family base deps_key deps_loaded; false)
+      fun from_failed_prefix failed =
+        if modules_ok (#failed_prefix_path (#checkpoint failed)) then run_from_failed_prefix failed
+        else run_from_fresh_preload ()
+      fun from_replay replay' =
+        if modules_ok (#path replay') then run_from_replay replay' else run_from_fresh_preload ()
     in
+      if deps_checkpoint_exists deps_loaded deps_key andalso not (modules_ok deps_loaded) then
+        run_from_fresh_preload ()
+      else
       case failed_prefix of
           SOME failed =>
-            if failed_prefix_at_least_as_late failed replay then run_from_failed_prefix failed
-            else (case replay of SOME replay' => run_from_replay replay' | NONE => run_from_failed_prefix failed)
+            if failed_prefix_at_least_as_late failed replay then from_failed_prefix failed
+            else (case replay of SOME replay' => from_replay replay' | NONE => from_failed_prefix failed)
         | NONE =>
             case replay of
-                SOME replay' => run_from_replay replay'
+                SOME replay' => from_replay replay'
               | NONE =>
                   if deps_checkpoint_exists deps_loaded deps_key then run_from_deps_checkpoint ()
                   else run_from_fresh_preload ()
@@ -5090,7 +5103,7 @@ fun restore_local_heap tc heap_context base_context checkpoint_root (action : th
            (* A copy across file systems: a symbolic link would follow the
               store entry when another tree replaces it, under this tree's .ok. *)
            link_or_copy_file stored deps_loaded;
-           if parent_ok () then
+           if parent_ok () andalso HolbuildCheckpointModules.ok deps_loaded then
              (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
               touch_dir (Path.concat(store, heap));
               placed)
@@ -9893,8 +9906,10 @@ fun auto_project_gc project threshold =
   handle HolbuildProjectLock.Error msg => warn ("automatic gc failed: " ^ msg)
        | e => warn ("automatic gc failed: " ^ General.exnMessage e)
 
-(* Factory modules have no on-disk module parents.  Once loaded their code
-   is resident, so concurrent eviction only makes a later load use source. *)
+(* Module-dependent checkpoints load their modules from here.  One whose
+   modules were evicted is discarded when it is next restored
+   (HolbuildCheckpointModules.ok) and a fresh preload saves a new one.  A
+   process that already loaded them keeps them resident. *)
 fun module_cache_families cache =
   List.map
     (fn path =>
@@ -10191,6 +10206,8 @@ fun shared_heap_key tc root (action : theory_action) =
                        (String.concatWith "\n" (map (theory_load_line root) (#loads action)) ^ "\n"),
         "toolchain-exact=" ^ HolbuildToolchain.toolchain_key tc,
         "holdir=" ^ FS.fullPath (#holdir tc),
+        (* Module-dependent heaps record their modules' absolute paths. *)
+        "module-store=" ^ module_store (#holdir tc),
         "action-root=" ^ FS.fullPath root,
         "platform=" ^ String.concatWith " "
                         (map HolbuildHolSharedCache.platform_value
@@ -10422,7 +10439,8 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                           gets a copy of its own. *)
                        [(if #kind c = "failed_prefix" then place_sidecar else place, (leaf, #path c))]);
                     heap_placed heap;
-                    if shared_heap_parent_ok ctx andalso chain_ok (#path c :: rev (map #2 spine)) andalso
+                    if not (HolbuildCheckpointModules.ok (#path c)) then (wipe (); NONE)
+                    else if shared_heap_parent_ok ctx andalso chain_ok (#path c :: rev (map #2 spine)) andalso
                        #accepts c () then
                       (HolbuildStatus.message_stdout
                          ("restored shared " ^ #kind c ^ " checkpoint " ^ leaf_rel ^ "\n");
@@ -10453,7 +10471,8 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             end
     fun try_heap heap =
       (place_heap heap;
-       if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
+       if not (HolbuildCheckpointModules.ok deps_loaded) then (wipe (); no_files)
+       else if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
          (HolbuildStatus.message_stdout "restored shared deps-loaded heap\n";
           {heap = SOME heap, files = [(deps_loaded, heap)]})
        else (warn "shared deps-loaded heap failed validation"; wipe (); no_files))

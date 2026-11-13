@@ -85,6 +85,25 @@ fun with_toolchain_load_path f =
     Meta.loadPath := path
   end
 
+(* PolyML.SaveState.saveChildWithModules where the runtime has it: a state
+   saved with it refers to the theory modules it was loaded from instead of
+   copying them.  Every checkpoint in a process is saved with the same
+   function, since a plain child of a module-dependent state would copy the
+   modules again.  Looked up by name so this compiles on any Poly/ML. *)
+val save_child : string * int -> unit =
+  let
+    fun contents s = PolyML.NameSpace.Structures.contents s
+    val save_state =
+      Option.mapPartial (fn polyml => #lookupStruct (contents polyml) "SaveState")
+                        (#lookupStruct PolyML.globalNameSpace "PolyML")
+    val with_modules =
+      Option.mapPartial (fn s => #lookupVal (contents s) "saveChildWithModules") save_state
+  in
+    case Option.mapPartial (PolyML.CodeTree.evalue o PolyML.NameSpace.Values.code) with_modules of
+        NONE => PolyML.SaveState.saveChild
+      | SOME f => RunCall.unsafeCast f
+  end
+
 (* After a source parse error QUse's error flag is set, and a heap saved then
    keeps it: `hol run` from that heap exits with failure after its first
    declaration, printing nothing.  So no checkpoint is saved once the flag is
@@ -101,7 +120,7 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
         val _ = begin_replacement path
         val _ = if share then PolyML.shareCommonData PolyML.rootFunction else ()
         val t1 = Time.now()
-        val _ = PolyML.SaveState.saveChild(path, depth)
+        val _ = save_child (path, depth)
         val t2 = Time.now()
         val _ = write_text_atomically (ok_path path) ok_text
         val _ =

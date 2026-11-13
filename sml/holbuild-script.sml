@@ -129,6 +129,7 @@ use "sml/package_snapshot.sml";
 use "sml/plan_record.sml";
 use "sml/theory_checkpoints.sml";
 use "sml/checkpoint_store.sml";
+use "sml/checkpoint_modules.sml";
 use "sml/theory_diagnostics.sml";
 use "sml/project_lock.sml";
 use "sml/theory_spans.sml";
