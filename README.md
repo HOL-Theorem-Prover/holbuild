@@ -2009,10 +2009,11 @@ same priority when reattaching; the recovery hint includes it.
 
 `build --remote-exec URL --speculative-loading[=N]` lets a theory load ahead
 of its parents. A worker with nothing ready to build may take a theory whose
-unbuilt parents are all running on other workers and have no unbuilt parents
-of their own. It loads everything else the theory needs, waits for those
-parents, and then builds (`exec-action --ahead-parent`). At most N theories of
-the batch wait like this at a time (1 to 16, default 4). Only workers started
+unbuilt parents are all running on other workers, themselves at most as many
+generations ahead of built parents as the coordinator allows (by default,
+none). It loads everything else the theory needs, waits for those unbuilt
+ancestors, and then builds (`exec-action --ahead-parent`). At most N theories of
+the batch wait like this at a time (1 to 64, default 16). Only workers started
 with `--load-ahead` take such theories, and only when they have nothing else
 to do, so the batch never adds workers for them.
 A theory whose load ahead can't go on is built normally once its parents are

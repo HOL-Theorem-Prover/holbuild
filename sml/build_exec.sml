@@ -11199,7 +11199,9 @@ fun dat_parent_names path =
    from BASE, the modules the child had loaded at its start, through the
    manifests on disk (the action root's, the toolchain's and the parent's
    libraries'), as the child's working directory CWD and load path find
-   them.  PARENTS memoizes each theory's recorded parents across calls. *)
+   them.  PARENTS memoizes each theory's recorded parents across calls; it
+   gets the parent's own predicted ones, for a later late parent whose walk
+   finds this one's stand-in, which has no .dat. *)
 fun predicted_theory_loads {root, cwd, holdir, base = {loaded, path}, resolve, parents_memo,
                             parent : action_spec, source_text} =
   let
@@ -11278,6 +11280,7 @@ fun predicted_theory_loads {root, cwd, holdir, base = {loaded, path}, resolve, p
     val inherited =
       List.foldl (fn (name, set) => Binaryset.union (set, ancestors name)) (Binaryset.empty String.compare) theories
     val fringe = List.filter (fn name => not (Binaryset.member (inherited, name))) theories
+    val _ = parents_memo := Binarymap.insert (!parents_memo, #logical parent, fringe)
   in
     generated_theory_loads resolve
       {parents = map (drop_suffix "Theory") fringe, mldeps = literal_ml_dependencies source_text}
@@ -11702,6 +11705,25 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         val dir = FS.fullPath dir
         val staging = ahead_staging
         val _ = (HolbuildRemoveTree.remove_untrusted_strict staging; ensure_dir staging)
+        fun fetch_spec (dep as {stem, ...} : {target : string, stem : string, key : string}, parent_sha) =
+          let
+            val name = Path.file stem
+            val parent_spec = Path.concat (staging, name ^ ".spec")
+          in
+            case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = parent_sha, dst = parent_spec} of
+                HolbuildCacheBackend.Hit => ()
+              | _ => abandon ("the cache has no spec " ^ parent_sha ^ " for " ^ name);
+            (dep, parse_action_spec (read_text parent_spec))
+          end
+        val late = map fetch_spec late
+        (* The late parents each late parent depends on.  Dependencies are
+           transitive, so an ancestor has fewer: ordered by their count, each
+           comes after its ancestors, in the claim's order otherwise. *)
+        fun late_ancestors ((_, parent) : {target : string, stem : string, key : string} * action_spec) =
+          List.filter (fn ({key, ...}, _) => List.exists (fn dep => #key dep = key) (#deps parent)) late
+        val late =
+          List.concat
+            (List.tabulate (length late, fn n => List.filter (fn parent => length (late_ancestors parent) = n) late))
         fun marker name = Path.concat (dir, name)
         fun drop name = write_text (marker name) ""
         val _ =
@@ -11765,15 +11787,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
            else (OS.Process.sleep interval; wait_until ready interval))
         val resolver = spec_resolver (theory_spec_deps spec)
         fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
-        fun stand_in ({stem, ...} : {target : string, stem : string, key : string}, parent_sha) base parents_memo =
+        fun stand_in ({stem, ...} : {target : string, stem : string, key : string}, parent : action_spec) base parents_memo =
           let
             val name = Path.file stem
-            val parent_spec = Path.concat (staging, name ^ ".spec")
-            val _ =
-              case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = parent_sha, dst = parent_spec} of
-                  HolbuildCacheBackend.Hit => ()
-                | _ => abandon ("the cache has no spec " ^ parent_sha ^ " for " ^ name)
-            val parent = parse_action_spec (read_text parent_spec)
             val parent_source = Path.concat (staging, name ^ ".source")
             (* Missing only for loading ahead: a plain run never fetches it. *)
             val _ =
@@ -11859,9 +11875,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             arrived := key :: !arrived;
             arrivals := (name, Time.now ()) :: !arrivals
           end
+        (* A late parent arrives after its late ancestors, whose .dat hashes
+           its own .dat is checked against. *)
         fun poll () =
           (List.app (fn parent as (dep, _) =>
-                       if List.exists (fn k => k = #key dep) (!arrived) orelse not (cached (#key dep)) then ()
+                       if List.exists (fn k => k = #key dep) (!arrived) orelse
+                          not (List.all (fn ({key, ...}, _) => List.exists (fn k => k = key) (!arrived))
+                                        (late_ancestors parent)) orelse
+                          not (cached (#key dep)) then ()
                        else arrive parent)
                     late;
            length (!arrived) = length late)
