@@ -617,9 +617,11 @@ worker can't run one fixed holbuild. Before each action it reads the
 `holbuild-version` line of the action's spec (from `/cas/<spec_sha256>` in the
 remote cache) and runs that release. It first checks
 `/opt/holbuild-baked/v<version>/bin/holbuild` for an executable file; override
-the root with `--baked-releases DIR` or `REMOTE_EXEC_BAKED_RELEASES`. Derived
-images can preinstall releases here to avoid downloading and compiling them
-on first use. Keep each release's runtime sources with its executable: use
+the root with `--baked-releases DIR` or `REMOTE_EXEC_BAKED_RELEASES`. The
+image bakes one release there when built with
+`--build-arg HOLBUILD_VERSION=<version>` (the release it is built from, say);
+derived images can preinstall more, to avoid downloading and compiling them on
+first use. Keep each release's runtime sources with its executable: use
 an installed tree (`bin/holbuild` plus `share/holbuild`) or a source tree built
 at that exact path. A hit needs no writable release cache or lock.
 

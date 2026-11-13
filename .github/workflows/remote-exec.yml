@@ -90,6 +90,15 @@ jobs:
             'import sys; from remote_exec.worker import Releases; print(Releases("/opt/holbuild-releases", "file:///source.tar.gz", "", None).holbuild(sys.argv[1]))' "$version"
           docker run --rm -v releases:/opt/holbuild-releases holbuild-remote-exec \
             "/opt/holbuild-releases/v$version/bin/holbuild" --version
+      - name: Bake the latest release into the image and find it the way a worker does
+        run: |
+          version=$(git ls-remote --tags --refs origin 'v*' | sed 's|.*refs/tags/v||' | sort -V | tail -n 1)
+          docker build --build-arg HOLBUILD_VERSION="$version" -t holbuild-remote-exec-baked remote-exec
+          docker run --rm holbuild-remote-exec-baked python3 -c '
+          import sys
+          from remote_exec.worker import Releases
+          path = Releases("/opt/holbuild-releases", "file:///absent.tar.gz", "", None).holbuild(sys.argv[1])
+          assert path == f"/opt/holbuild-baked/v{sys.argv[1]}/bin/holbuild", path' "$version"
       - name: Probe action isolation as root and as a worker user
         run: |
           for user in 0:0 10001:10001; do
