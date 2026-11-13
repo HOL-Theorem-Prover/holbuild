@@ -271,7 +271,12 @@ fun with_pool_lock f =
   end
   handle e => (Mutex.unlock pool_mutex; raise e)
 
-(* Closes the connections idle for the timeout, then sleeps until the
+(* Nothing signals it.  The reaper waits on it rather than sleeping: the
+   process exits only once every thread has stopped, and a sleeping thread
+   stops only when its sleep (up to a second) ends. *)
+val reaper_wake = ConditionVar.conditionVar ()
+
+(* Closes the connections idle for the timeout, then waits until the
    oldest left reaches it; ends once the pool is empty. *)
 fun reaper () =
   let
@@ -291,7 +296,10 @@ fun reaper () =
     List.app (close o #1) expired;
     case wake of
         NONE => ()
-      | SOME wait => (OS.Process.sleep wait; reaper ())
+      | SOME wait =>
+          (with_pool_lock (fn () =>
+             ignore (ConditionVar.waitUntil (reaper_wake, pool_mutex, Time.+ (Time.now (), wait))));
+           reaper ())
   end
 
 fun take () =
