@@ -701,7 +701,9 @@ A worker's action root keeps the dependencies one action restored for the
 next, at the same absolute paths, so heap and checkpoint keys, which name
 those paths, are unchanged. Only `exec-action` writes it, under the worker's
 action lock; a theory child reads it and writes only `.holbuild/stage`,
-`logs`, `tool-cache` and `ahead`, which are emptied around each action. The
+`logs`, `tool-cache` and `ahead`. Around each action the worker removes
+everything in the root but `.holbuild/{obj,packages,action-src,action-extra}`,
+which the hydrate prunes, and its marker. The
 worker records what it installed (`<cache root>/action-resident`): each
 dependency theory with its key, the SHA-256 of the local cache manifest it
 came from, the parent names its `.uo` was generated from, and the hashes the

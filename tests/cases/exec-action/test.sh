@@ -327,10 +327,10 @@ built_worker=$tmpdir/worker-$(basename "$built" .result)
 ac_a=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $3 }' "$tmpdir/batch.txt")
 require_file "$remote_root/ac/$ac_a"
 
-# Both writable trees are discarded: another tenant must not inherit them.
-# The rest of the action root, which only the worker wrote, stays with its
-# records for the next action.
-for dir in stage logs tool-cache ahead; do
+# Only the trees the hydrate keeps stay, with their records, for the next
+# action; the writable trees and the action's own files go, so another
+# tenant can't inherit them.
+for dir in stage logs tool-cache ahead action-spec; do
   [[ ! -e "$built_worker/action/.holbuild/$dir" ]] || { echo "the action's $dir was not emptied" >&2; exit 1; }
 done
 require_file "$built_worker/action-resident"
@@ -463,11 +463,11 @@ printf '\n' >> "$tmpdir/worker-c/actions/$key_a/manifest"
 worker c "$spec_a2"
 expect c 0
 [[ $(stat -c %i "$stem_a.dat") != "$inode_a" ]] || { echo "worker c kept A after its entry changed" >&2; exit 1; }
-touch "$tmpdir/worker-c/action/stray"
+touch "$tmpdir/worker-c/action/.holbuild/obj/stray"
 rm "$tmpdir/worker-c/action-resident"
 worker c "$spec_a2"
 expect c 0
-[[ ! -e "$tmpdir/worker-c/action/stray" ]] || { echo "worker c kept a root it has no records of" >&2; exit 1; }
+[[ ! -e "$tmpdir/worker-c/action/.holbuild/obj/stray" ]] || { echo "worker c kept a root it has no records of" >&2; exit 1; }
 # A release that keeps no records removes the root around its actions; the
 # records go once the root is emptied, even when the action then fails.
 rm -rf "$tmpdir/worker-c/action"

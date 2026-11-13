@@ -11588,9 +11588,21 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     val resident_marker = Path.concat(root, ".holbuild/resident")
     val resident = ref (Resident.empty ())
     val writable_dirs = map (fn dir => Path.concat(root, ".holbuild/" ^ dir)) ["stage", "logs", "tool-cache", "ahead"]
+    (* Everything in the root but the trees the hydrate keeps and its marker:
+       the writable directories and the files an action writes beside them. *)
     fun empty_writable strict =
-      List.app (if strict then HolbuildRemoveTree.remove_untrusted_strict else HolbuildRemoveTree.remove_untrusted)
-        (checkpoint_root :: ahead_staging :: writable_dirs)
+      let
+        val holbuild = Path.concat (root, ".holbuild")
+        val kept = holbuild :: map (fn dir => Path.concat (holbuild, dir))
+                                   ["obj", "packages", "action-src", "action-extra", "resident"]
+        fun entries dir =
+          map (fn name => Path.concat (dir, name))
+              (HolbuildBuildPlan.list_dir dir handle HolbuildBuildPlan.Error _ => [])
+      in
+        List.app (if strict then HolbuildRemoveTree.remove_untrusted_strict else HolbuildRemoveTree.remove_untrusted)
+          (checkpoint_root :: ahead_staging ::
+           List.filter (fn path => not (List.exists (fn k => k = path) kept)) (entries root @ entries holbuild))
+      end
     val theory_action = ref false
     (* After the result: only a theory action's root keeps anything. *)
     fun empty_root () =
