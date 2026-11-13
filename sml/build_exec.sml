@@ -9262,10 +9262,15 @@ structure Resident = HolbuildActionResident
 
 val theory_suffixes = [".sig", ".sml", ".dat", ".tr.gz", ".ui", ".uo"]
 
-(* Removes what an entry of the action root's records stands for. *)
+(* Removes what an entry of the action root's records stands for, and the
+   directories that leaves empty, which a cold root wouldn't have. *)
 fun remove_resident root (path, entry) =
   let
-    fun remove_object path = (remove_file path; remove_file (hfs_remapped_path path))
+    fun remove_empty dir =
+      if dir = root orelse not (String.isPrefix (root ^ "/") dir) then ()
+      else (FS.rmDir dir; remove_empty (Path.dir dir)) handle OS.SysErr _ => ()
+    fun remove path = (remove_file path; remove_empty (Path.dir path))
+    fun remove_object path = (remove path; remove (hfs_remapped_path path))
     fun remove_theory key =
       (List.app (fn suffix => remove_object (path ^ suffix)) theory_suffixes;
        remove_tree (in_root root (Path.concat (".holbuild/action-extra", key))))
@@ -9273,7 +9278,7 @@ fun remove_resident root (path, entry) =
     case entry of
         Resident.Theory {key, ...} => remove_theory key
       | Resident.Scratch key => remove_theory key
-      | Resident.File _ => remove_file path
+      | Resident.File _ => remove path
       | Resident.Manifest _ => remove_object path
   end
 

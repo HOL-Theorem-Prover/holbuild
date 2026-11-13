@@ -455,6 +455,8 @@ stem_a=$(resident_stem 'ATheory$')
 stem_b=$(resident_stem 'BTheory$')
 [[ -n "$stem_a" && -n "$stem_b" ]] || { cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
 inode_a=$(stat -c %i "$stem_a.dat")
+# Held, so that a reinstall can't get the same inode back.
+ln "$stem_a.dat" "$tmpdir/a-held.dat"
 worker c "$spec_a2"
 expect c 0
 [[ $(stat -c %i "$stem_a.dat") == "$inode_a" ]] || { echo "worker c installed A again" >&2; exit 1; }
@@ -478,6 +480,23 @@ worker c "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect c 4 "status=failed" "failure=spec-rejected"
 worker c "$spec_a2"
 expect c 0
+# A file where the previous action had a directory of the same name: the
+# directory a removed file leaves empty goes with it, as in a cold root.
+printf 'payload\n' > "$tmpdir/payload"
+payload=$(sha256sum "$tmpdir/payload" | cut -d' ' -f1)
+curl -fsS -X PUT --data-binary "@$tmpdir/payload" "$remote_url/cas/$payload"
+for path in extra/item extra; do
+  python3 - "$project/.holbuild/action-specs/$spec_a2" "$tmpdir/nested" "$path" "$payload" <<'PY'
+import sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+head += b"\nfile library .holbuild/action-src/worker/" + sys.argv[3].encode() + b" " + sys.argv[4].encode() + b" 8"
+open(sys.argv[2], "wb").write(head + b"\naction-text\n" + text)
+PY
+  spec_nested=$(sha256sum "$tmpdir/nested" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/nested" "$remote_url/cas/$spec_nested"
+  worker c "$spec_nested"
+  expect c 0
+done
 # Extra outputs a dependency's records don't name, as an early cutoff
 # restores under the action's earlier key, go at the next hydrate.
 orphan="$tmpdir/worker-c/action/.holbuild/action-extra/$(printf 'orphan' | sha256sum | cut -d' ' -f1)"
