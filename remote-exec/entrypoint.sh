@@ -13,7 +13,8 @@ fi
 case "${1:-}" in
   coordinator)
     shift
-    exec uvicorn --factory remote_exec.app:app --host 0.0.0.0 --port 8090 "$@" ;;
+    # Open event streams and claim long-polls would otherwise hold shutdown until the supervisor kills the process.
+    exec uvicorn --factory remote_exec.app:app --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2 "$@" ;;
   migrate)
     exec alembic upgrade head ;;
   worker)
