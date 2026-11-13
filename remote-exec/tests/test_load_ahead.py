@@ -498,6 +498,20 @@ async def test_a_claim_ahead_of_several_tiers_takes_its_first_tier_before_a_lowe
     assert claimed is not None and claimed["theory"] == "pkg:x"
 
 
+@pytest.mark.parametrize(("ahead_tier", "first"), [("standard", "n"), ("high", "x")])
+async def test_below_the_priority_zero_floor_only_a_claim_ahead_of_an_earlier_tier_goes_first(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine, ahead_tier: str, first: str
+) -> None:
+    coordinator.settings.default_priority_floor = 1
+    await submit(http, ["a", "x"], [("x", "a")], speculative_loading="4", priority="1")
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE actions SET tier = :tier"), {"tier": ahead_tier})
+    await claim_named(http, "a", tier=ahead_tier)
+    await submit(http, ["n"])
+    claimed = await claim_ahead(http, "high", also_claim=["standard"])
+    assert claimed is not None and claimed["theory"] == f"pkg:{first}"
+
+
 async def test_a_parent_evicted_before_a_release_revokes_the_child_claimed_ahead_as_abandoned(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: AsyncEngine
 ) -> None:

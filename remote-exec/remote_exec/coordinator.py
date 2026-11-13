@@ -1324,8 +1324,8 @@ class Coordinator:
         at a candidate ``outranked`` says ranks after a claim ahead, leaving it first in the ranking.
 
         While fewer than ``default_priority_floor`` builds of priority-0 batches run, the best priority-0
-        candidate in the best candidate's tier goes first, ahead of claims ahead too, so a wave of higher
-        priorities never takes every worker. A priority-0 claim counts against the floor before it awaits its
+        candidate in the best candidate's tier goes first, ahead of claims ahead of that tier too, so a wave of
+        higher priorities never takes every worker. A priority-0 claim counts against the floor before it awaits its
         lock, so concurrent claims sharing the ranking don't all take the floor's last slot.
         """
         floor = self.settings.default_priority_floor
@@ -1333,21 +1333,24 @@ class Coordinator:
             entry = heapq.heappop(ranking.heap)
             if (entry[6], entry[7]) in ranking.exhausted:
                 continue
-            if ranking.running_default < floor and entry[1] != 0:
-                default = min(
+            below_floor = False
+            if ranking.running_default < floor:
+                default = entry if entry[1] == 0 else min(
                     (e for e in ranking.heap
                      if e[1] == 0 and e[0] == entry[0] and (e[6], e[7]) not in ranking.exhausted),
                     default=None,
                 )
-                if default is not None:
-                    ranking.heap[ranking.heap.index(default)] = entry
-                    heapq.heapify(ranking.heap)
-                    entry = default
+                # Claims ahead of an earlier tier still go first, as ready builds of one do.
+                if default is not None and (
+                    outranked is None or all(t == default[7] for t in outranked(default[7], 0))
+                ):
+                    below_floor = True
+                    if default is not entry:
+                        ranking.heap[ranking.heap.index(default)] = entry
+                        heapq.heapify(ranking.heap)
+                        entry = default
             tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
-            if (
-                not (priority == 0 and ranking.running_default < floor)
-                and outranked is not None and outranked(tier, -priority)
-            ):
+            if not below_floor and outranked is not None and outranked(tier, -priority):
                 heapq.heappush(ranking.heap, entry)
                 return None
             heapq.heappush(
