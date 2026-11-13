@@ -129,6 +129,42 @@ worker w
 grep -qx 'status=cached' "$tmpdir/w.result" || { cat "$tmpdir/w.result" "$tmpdir/w.log" >&2; exit 1; }
 require_file "$remote_root/ac/$ac"
 
+# Two builds of one action can record different proof dependencies, as when
+# their proofs took different paths.  The .dat files then differ only in what
+# the digest in the .sml leaves out, and a worker that lost the race to
+# publish keeps the remote's entry.
+python3 - "$remote_root" "$ac" <<'PY'
+import hashlib, pathlib, re, sys
+root, ac = pathlib.Path(sys.argv[1]), sys.argv[2]
+head, manifest = (root / "ac" / ac).read_text().split("manifest-text-v1\n", 1)
+old = re.search(r"^blob dat (\S+)$", manifest, re.M).group(1)
+dat = (root / "cas" / old).read_text()
+# a_thm's record: ((own theory, index) (bool, theorem)) "DISK_THM"; add bool
+# theorem 0 as a dependency.
+record = re.search(r'\(\(\(\d+ \d+\) \((\d+) (\d+)\)\) "DISK_THM"\)', dat)
+if record is None or record.group(2) == "0":
+    sys.exit("a_thm has no dependency record to change")
+dat = dat[:record.end(1)] + " 0" + dat[record.end(1):]
+data = dat.encode()
+new = hashlib.sha256(data).hexdigest()
+(root / "cas" / new).write_bytes(data)
+manifest = manifest.replace(f"blob dat {old}\n", f"blob dat {new}\n")
+out = []
+for line in head.split("\n"):
+    if line.startswith("manifest-sha256 "):
+        line = "manifest-sha256 " + hashlib.sha256(manifest.encode()).hexdigest()
+    elif line.startswith("manifest-size "):
+        line = "manifest-size " + str(len(manifest.encode()))
+    elif line.startswith(f"blob {old} "):
+        line = f"blob {new} {len(data)}"
+    out.append(line)
+(root / "ac" / ac).write_text("\n".join(out) + "manifest-text-v1\n" + manifest)
+PY
+cp "$remote_root/ac/$ac" "$tmpdir/dep-resident"
+worker w
+grep -qx 'status=cached' "$tmpdir/w.result" || { cat "$tmpdir/w.result" "$tmpdir/w.log" >&2; exit 1; }
+cmp "$remote_root/ac/$ac" "$tmpdir/dep-resident"
+
 # A new action must build and publish with either the primary or backup down.
 # Its optional cache lookups and pre-PUT check see one transport failure and 404.
 for rank in primary backup; do
@@ -212,3 +248,6 @@ if [[ "$worker_status" != 3 ]] || ! grep -qx "failure=publish" "$tmpdir/other.re
   exit 1
 fi
 require_grep "the remote cache holds different outputs for the action" "$tmpdir/other.log"
+# It drops its own entry, so that a retry restores the remote's.
+input_key=$(sed -n 's/^input_key=//p' "$remote_root/ac/$ac")
+require_no_file "$tmpdir/worker-other/actions/$input_key/manifest"

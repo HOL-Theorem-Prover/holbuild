@@ -2233,6 +2233,21 @@ fun cache_manifest_outputs_equal input_key left right =
       #extra_hashes left_blobs = #extra_hashes right_blobs
     end
 
+(* Whether two theory entries have the same outputs but for the .dat. *)
+fun cache_manifest_outputs_equal_but_dat input_key left right =
+  not (is_run_manifest left orelse is_run_manifest right) andalso
+  let
+    val l = cache_manifest_blobs_from_lines input_key (cache_manifest_lines left)
+    val r = cache_manifest_blobs_from_lines input_key (cache_manifest_lines right)
+  in
+    #sig_hash l = #sig_hash r andalso
+    #sml_hash l = #sml_hash r andalso
+    #trace_hash l = #trace_hash r andalso
+    #extra_hashes l = #extra_hashes r andalso
+    #parents l = #parents r andalso
+    #mldeps l = #mldeps r
+  end
+
 fun cache_entry_usable root input_key text =
   let
     val lines = cache_manifest_lines text
@@ -2305,10 +2320,15 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
     val incoming = cache_manifest_contract key text
     val initial_resident = HolbuildRemoteCache.get_action remote key
     fun conflict detail = HolbuildCacheBackend.Conflict ("remote theory action " ^ key ^ ": " ^ detail)
+    (* A .dat that differs only in what the .sml's digest leaves out, such
+       as dependency records, is left to check_remote_publication to judge. *)
+    fun without_dat text =
+      String.concatWith "\n"
+        (List.filter (not o String.isPrefix "blob dat ") (String.fields (fn c => c = #"\n") text))
     fun compatible_contract resident_text =
       let val resident = cache_manifest_contract key resident_text
       in
-        if #non_timeout_text resident = #non_timeout_text incoming then resident
+        if without_dat (#non_timeout_text resident) = without_dat (#non_timeout_text incoming) then resident
         else raise Error "resident manifest differs outside proof-timeout"
       end
     fun attempt attempts resident =
@@ -9523,6 +9543,19 @@ fun action_already_done remote root (spec : action_spec) =
      restored ())
   end
 
+(* The remote's .dat for the action, given by its manifest, fetched into the
+   action root; NONE when the remote doesn't serve it. *)
+fun fetch_resident_dat remote root (spec : action_spec) resident =
+  let
+    val {dat_hash, ...} = cache_manifest_blobs_from_lines (#input_key spec) (cache_manifest_lines resident)
+    val path = in_root root ".holbuild/resident.dat"
+  in
+    ensure_parent path;
+    case HolbuildRemoteCache.fetch_blob remote {hash = dat_hash, dst = path} of
+        HolbuildCacheBackend.Hit => SOME path
+      | _ => NONE
+  end
+
 (* Whether the remote's entry for the action, given by its manifest, records
    parents other than the remote's own, as restored in the action root: no
    build that restores them can use it.  Each parent it records must have
@@ -9530,23 +9563,33 @@ fun action_already_done remote root (spec : action_spec) =
    worker's local cache may be out of date. *)
 fun resident_misfits_parents remote root (spec : action_spec) resident =
   let
-    val {dat_hash, ...} = cache_manifest_blobs_from_lines (#input_key spec) (cache_manifest_lines resident)
-    val path = in_root root ".holbuild/resident.dat"
     fun as_remote key =
       case (HolbuildCache.get_action (cache_root ()) key, HolbuildRemoteCache.get_action remote key) of
           (SOME mine, SOME theirs) => cache_manifest_outputs_equal key mine theirs
         | _ => false
   in
-    ensure_parent path;
-    case HolbuildRemoteCache.fetch_blob remote {hash = dat_hash, dst = path} of
-        HolbuildCacheBackend.Hit =>
+    case fetch_resident_dat remote root spec resident of
+        SOME path =>
           let val recorded = dat_records_parent path
           in
             not (spec_parent_hashes_match root (theory_spec_deps spec) path) andalso
             List.all (fn dep => not (recorded dep) orelse as_remote (#key dep)) (#deps spec)
           end
-      | _ => false
+      | NONE => false
   end
+  handle e as HolbuildRemoteCache.Unavailable _ => raise e
+       | _ => false
+
+(* Whether the remote's entry for the action differs from the worker's, MINE,
+   only in a .dat that records the restored parents.  The two .dat files then
+   differ only in what the digest in the .sml leaves out, such as the
+   dependency records of two builds whose proofs took different paths, and
+   either serves the action's dependents. *)
+fun resident_differs_only_in_dat remote root (spec : action_spec) mine resident =
+  cache_manifest_outputs_equal_but_dat (#input_key spec) mine resident andalso
+  (case fetch_resident_dat remote root spec resident of
+       SOME path => spec_parent_hashes_match root (theory_spec_deps spec) path
+     | NONE => false)
   handle e as HolbuildRemoteCache.Unavailable _ => raise e
        | _ => false
 
@@ -9598,14 +9641,17 @@ fun check_remote_publication remote root (spec : action_spec) =
         (NONE, _) => fail "the build published no local cache entry"
       | (_, NONE) => fail "the remote cache holds no entry for the action after publishing"
       | (SOME mine, SOME theirs) =>
-          if not (cache_manifest_outputs_equal key mine theirs) then
-            fail ("the remote cache holds different outputs for the action" ^
-                  "\n  existing outputs: " ^
-                  cache_manifest_output_summary (cache_manifest_blobs_from_lines key (cache_manifest_lines theirs)) ^
-                  "\n  new outputs: " ^
-                  cache_manifest_output_summary (cache_manifest_blobs_from_lines key (cache_manifest_lines mine)) ^
-                  "\nThe same inputs must produce identical outputs, including declared extra outputs; " ^
-                  "put timings in the build log instead.")
+          if not (cache_manifest_outputs_equal key mine theirs) andalso
+             not (resident_differs_only_in_dat remote root spec mine theirs) then
+            (* The retry then restores the remote's entry, not this one. *)
+            (ignore (drop_cache_manifest_if_unchanged (cache_root ()) key mine);
+             fail ("the remote cache holds different outputs for the action" ^
+                   "\n  existing outputs: " ^
+                   cache_manifest_output_summary (cache_manifest_blobs_from_lines key (cache_manifest_lines theirs)) ^
+                   "\n  new outputs: " ^
+                   cache_manifest_output_summary (cache_manifest_blobs_from_lines key (cache_manifest_lines mine)) ^
+                   "\nThe same inputs must produce identical outputs, including declared extra outputs; " ^
+                   "put timings in the build log instead."))
           else if not (timeout_satisfies (#tactic_timeout spec)
                          (cache_manifest_proof_timeout (cache_manifest_lines theirs))) then
             fail "the remote cache's entry has a weaker timeout contract than requested"
