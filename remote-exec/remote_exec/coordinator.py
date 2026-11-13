@@ -115,6 +115,8 @@ class Settings(BaseSettings):
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
     run_floor: int = Field(default=0, ge=0)
+    # Running builds of priority-0 batches allowed ahead of higher priorities; see Coordinator._claim_build.
+    default_priority_floor: int = Field(default=32, ge=0)
     warm_workers: int = 0
     max_burst_workers: int = 0
     scale_down_hold_s: float = 900.0
@@ -443,7 +445,9 @@ WITH run_capacity AS MATERIALIZED (
 SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb, b.priority,
     (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running,
     (SELECT max(l.last_claimed_at) FROM actions l WHERE l.batch_id = b.id) AS last_claimed_at,
-    b.created_at
+    b.created_at,
+    (SELECT count(*) FROM actions r WHERE r.state = 'running' AND r.class = 'build'
+     AND (SELECT priority FROM batches WHERE id = r.batch_id) = 0) AS running_default
 FROM batches b
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:classes AS text[]))) c (class)
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:tiers AS text[]))) t (tier)
@@ -674,6 +678,7 @@ class _Ranking:
     heap: list[tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]]
     ranked: set[tuple[UUID, str]]  # the batches and tiers it ranked
     exhausted: set[tuple[UUID, str]]
+    running_default: int  # running builds of priority-0 batches, and the claims of them since the read
 
 
 _NEVER = datetime.min.replace(tzinfo=UTC)  # the last claim of a batch never claimed from, for ordering
@@ -1317,24 +1322,50 @@ class Coordinator:
         Put each candidate back with one more running action before trying it, so concurrent claims spread over
         batches as fresh rankings would. Exhausted batch/tier pairs are skipped until the next shared read. Stop
         at a candidate ``outranked`` says ranks after a claim ahead, leaving it first in the ranking.
+
+        While fewer than ``default_priority_floor`` builds of priority-0 batches run, the best priority-0
+        candidate in the best candidate's tier goes first, ahead of claims ahead of that tier too, so a wave of
+        higher priorities never takes every worker. A priority-0 claim counts against the floor before it awaits its
+        lock, so concurrent claims sharing the ranking don't all take the floor's last slot.
         """
+        floor = self.settings.default_priority_floor
         while ranking.heap:
             entry = heapq.heappop(ranking.heap)
-            tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
-            if (batch_id, tier) in ranking.exhausted:
+            if (entry[6], entry[7]) in ranking.exhausted:
                 continue
-            if outranked is not None and outranked(tier, -priority):
+            below_floor = False
+            if ranking.running_default < floor:
+                default = entry if entry[1] == 0 else min(
+                    (e for e in ranking.heap
+                     if e[1] == 0 and e[0] == entry[0] and (e[6], e[7]) not in ranking.exhausted),
+                    default=None,
+                )
+                # Claims ahead of an earlier tier still go first, as ready builds of one do.
+                if default is not None and (
+                    outranked is None or all(t == default[7] for t in outranked(default[7], 0))
+                ):
+                    below_floor = True
+                    if default is not entry:
+                        ranking.heap[ranking.heap.index(default)] = entry
+                        heapq.heapify(ranking.heap)
+                        entry = default
+            tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
+            if not below_floor and outranked is not None and outranked(tier, -priority):
                 heapq.heappush(ranking.heap, entry)
                 return None
             heapq.heappush(
                 ranking.heap,
                 (tier_position, priority, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),
             )
+            if priority == 0:
+                ranking.running_default += 1
             row = (
                 await conn.execute(CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
             ).first()
             if row is not None:
                 return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb)
+            if priority == 0:
+                ranking.running_default -= 1
             ranking.exhausted.add((batch_id, tier))
         return None
 
@@ -1395,7 +1426,8 @@ class Coordinator:
             for row in rows
         ]
         heapq.heapify(heap)
-        return _Ranking(at, forgotten, heap, {(row.batch_id, row.tier) for row in rows}, set())
+        running_default = rows[0].running_default if rows else 0
+        return _Ranking(at, forgotten, heap, {(row.batch_id, row.tier) for row in rows}, set(), running_default)
 
     def _keep_ranking(self, key: tuple[str, ...], ranking: "_Ranking") -> None:
         """Share ``ranking`` with later claims, unless a release dropped a ranking while it was read, since its
