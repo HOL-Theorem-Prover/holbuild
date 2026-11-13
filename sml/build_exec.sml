@@ -9409,6 +9409,16 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                 end)
              scratch;
     Resident.prune resident (remove_resident root);
+    (* Extra outputs lie under their theory's key, so a directory there for
+       no recorded key (an early cutoff restores the action's own under its
+       earlier key) is nobody's. *)
+    let
+      val extras = in_root root ".holbuild/action-extra"
+      val keys = Resident.keys resident
+    in
+      List.app (fn key => if List.exists (fn k => k = key) keys then () else remove_tree (Path.concat (extras, key)))
+               (HolbuildBuildPlan.list_dir extras handle HolbuildBuildPlan.Error _ => [])
+    end;
     hydrate_step "hydfiles" (fn () =>
       (transfer_all fetch_file files;
        List.app write_lib (#libs spec)));

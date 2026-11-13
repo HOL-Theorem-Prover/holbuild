@@ -478,6 +478,14 @@ worker c "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect c 4 "status=failed" "failure=spec-rejected"
 worker c "$spec_a2"
 expect c 0
+# Extra outputs a dependency's records don't name, as an early cutoff
+# restores under the action's earlier key, go at the next hydrate.
+orphan="$tmpdir/worker-c/action/.holbuild/action-extra/$(printf 'orphan' | sha256sum | cut -d' ' -f1)"
+mkdir -p "$orphan/results"
+worker c "$spec_a2"
+expect c 0
+[[ ! -e "$orphan" ]] || { echo "worker c kept extra outputs nobody records" >&2; exit 1; }
+require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
 
 # The original checkout restores all three results without building.
 hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; exit 1; }

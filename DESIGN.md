@@ -721,7 +721,10 @@ root ends as a cold hydrate leaves it. The parent check and the cutoff read
 the records rather than hashing ~4 files per dependency. The stems the action
 writes besides its dependencies (its own outputs, and with loading ahead its
 late parents) are emptied and recorded as scratch, which the next hydrate
-removes or reinstalls. The hydrate deletes the record file before it changes
+removes or reinstalls. Extra outputs lie under their theory's key in
+`.holbuild/action-extra`; the hydrate removes those of every key it doesn't
+record, as an early cutoff restores the action's own under its earlier key.
+The hydrate deletes the record file before it changes
 the tree and writes it back once it passed, so a worker stopped part way
 starts from an empty root. Script runs put every object directory under the
 root on `loadPath`, so they start from an empty root, leave no records, and the root is removed

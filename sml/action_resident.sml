@@ -142,6 +142,11 @@ fun unhashed (t as {entries, ...} : t) =
   locked t (fn () => List.mapPartial (fn (path, Theory {hashes = [], ...}) => SOME path | _ => NONE)
                                      (Binarymap.listItems (!entries)))
 
+(* The keys of the recorded theories and scratch stems. *)
+fun keys (t as {entries, ...} : t) =
+  locked t (fn () => List.mapPartial (fn (_, Theory {key, ...}) => SOME key | (_, Scratch key) => SOME key | _ => NONE)
+                                     (Binarymap.listItems (!entries)))
+
 (* Records HASHES, of hashed_suffixes, for the theory at PATH. *)
 fun hashed (t as {entries, ...} : t) path hashes =
   locked t (fn () =>
