@@ -524,6 +524,25 @@ worker c "$spec_a2"
 expect c 0
 [[ ! -e "$orphan" ]] || { echo "worker c kept extra outputs nobody records" >&2; exit 1; }
 require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
+# Two dependencies in one directory, both replaced in one hydrate: each
+# install's directory must survive the removal of the other's old copy.
+key_b=$(key_for "$tmpdir/batch.txt" worker:BTheory)
+worker c "$spec_c"
+expect c 0
+stem_a=$(resident_stem 'ATheory$')
+stem_b=$(resident_stem 'BTheory$')
+[[ -n "$stem_a" && -n "$stem_b" && $(dirname "$stem_a") == $(dirname "$stem_b") ]] || {
+  cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
+inode_a=$(stat -c %i "$stem_a.dat")
+inode_b=$(stat -c %i "$stem_b.dat")
+ln -f "$stem_a.dat" "$tmpdir/a-held.dat"
+ln -f "$stem_b.dat" "$tmpdir/b-held.dat"
+printf '\n' >> "$tmpdir/worker-c/actions/$key_a/manifest"
+printf '\n' >> "$tmpdir/worker-c/actions/$key_b/manifest"
+worker c "$spec_c"
+expect c 0
+[[ $(stat -c %i "$stem_a.dat") != "$inode_a" && $(stat -c %i "$stem_b.dat") != "$inode_b" ]] || {
+  echo "worker c kept A or B after their entries changed" >&2; exit 1; }
 
 # The original checkout restores all three results without building.
 hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; exit 1; }
