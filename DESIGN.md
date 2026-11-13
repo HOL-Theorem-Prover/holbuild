@@ -1067,6 +1067,16 @@ but local metadata/cache records the timeout a successful build satisfied; a suc
 60s may satisfy a later 180s request, while a success under 180s does not satisfy a later
 60s request.
 
+Steps containing a public `HolSmtLib` tactic name (`GENERIC_SMT_TAC`, `CVC_TAC`,
+`CVC_ORACLE_TAC`, `YICES_TAC`, `Z3_TAC`, `Z3_ORACLE_TAC`, `cvc_tac`, `cvco_tac`,
+`z3_tac`, or `z3o_tac`) run without the step timeout: solver execution and proof
+replay can exceed the ordinary tactic budget. Names may be unqualified or under
+any structure qualifier. Matching uses identifiers in the tactic program, ignoring
+comments and string/term quotations. If one executable step mixes an SMT call with
+other work, that entire step is untimed; other planned steps keep their limits.
+Aliases with different names are not recognized. Timeout metadata and cache key
+formats are unchanged; existing successful builds remain reusable.
+
 A step that exceeds its timeout runs once more, at once and in the same process, with
 half the timeout. Each timed call computes its result from the proof state it was given
 and commits it to the proof history only on success, so the first attempt leaves the
