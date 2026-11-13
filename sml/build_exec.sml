@@ -394,18 +394,19 @@ fun if_meta_has values code =
 
 (* The child policy's theory-module lines.  A sandboxed (remote) action
    only reads the host's modules: the worker writes them
-   (fill_module_store). *)
+   (fill_module_store).  quietbind runs only the first declaration of its
+   code, so each policy is one declaration. *)
 fun module_policy {sandboxed, store, base_state} =
   let
     val configure =
-      "val _ = Meta.configureTheoryModuleCache {directory = " ^
+      "Meta.configureTheoryModuleCache {directory = " ^
       HolbuildToolchain.sml_string store ^ ", base_state = " ^
-      HolbuildToolchain.sml_string base_state ^ "};"
+      HolbuildToolchain.sml_string base_state ^ "}"
   in
     if sandboxed then
       if_meta_has ["configureTheoryModuleCache", "theoryModuleWriteLimit"]
-        ("val _ = Meta.theoryModuleWriteLimit := 0; " ^ configure)
-    else if_meta_has ["configureTheoryModuleCache"] configure
+        ("val _ = (Meta.theoryModuleWriteLimit := 0; " ^ configure ^ ");")
+    else if_meta_has ["configureTheoryModuleCache"] ("val _ = " ^ configure ^ ";")
   end
 
 (* A speculative child (pipelined builds) configures no theory module cache,
