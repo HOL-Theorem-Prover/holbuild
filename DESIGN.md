@@ -724,7 +724,8 @@ late parents) are emptied and recorded as scratch, which the next hydrate
 removes or reinstalls. The hydrate deletes the record file before it changes
 the tree and writes it back once it passed, so a worker stopped part way
 starts from an empty root. Script runs put every object directory under the
-root on `loadPath`, so they start from an empty root and leave no records. The
+root on `loadPath`, so they start from an empty root, leave no records, and the root is removed
+after them. The
 cache cap doesn't count the root: it holds one spec's dependencies.
 
 ## Global cache

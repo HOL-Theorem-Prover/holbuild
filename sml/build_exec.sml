@@ -11581,7 +11581,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     fun empty_writable strict =
       List.app (if strict then HolbuildRemoveTree.remove_untrusted_strict else HolbuildRemoveTree.remove_untrusted)
         (checkpoint_root :: ahead_staging :: writable_dirs)
-    fun empty_root () = empty_writable false
+    val theory_action = ref false
+    (* After the result: only a theory action's root keeps anything. *)
+    fun empty_root () =
+      (if !theory_action then () else HolbuildRemoveTree.remove_untrusted root;
+       empty_writable false)
     (* The hydrate's steps, after it in the report, also when it fails. *)
     fun add_hydrate_steps () = phases := !hydrate_steps @ !phases
     fun setup_tool_cache (spec : action_spec) =
@@ -11597,7 +11601,6 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
             end
     val run_log = ref NONE
-    val theory_action = ref false
     fun build_log () =
       case !run_log of
           SOME path => path
