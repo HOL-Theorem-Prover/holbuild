@@ -729,6 +729,9 @@ COUNT_ACTIVE = sa.text(
 
 
 ClaimRank = tuple[bool, bool, int, str]
+# What a wake hands a waiting claim: the tier of the action that woke it, whether for a claim ahead, and its theory
+# (None when unknown), so a claim leaving without trying passes the wake on as it was.
+Wake = tuple[str, bool, str | None]
 
 
 def _claim_rank(tiers: list[str], host_id: str | None, host_rank: int = 0) -> ClaimRank:
@@ -763,7 +766,7 @@ class Coordinator:
         # and whether it was for a claim ahead) and whether they may claim ahead, oldest first (the tie-breaker
         # within a host); see claim.
         self.made_ready = 0
-        self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[tuple[str, bool]], bool]] = []
+        self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[Wake], bool]] = []
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
@@ -993,7 +996,7 @@ class Coordinator:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
         rank = _claim_rank(tiers, host_id, host_rank)
-        woken: asyncio.Future[tuple[str, bool]] = loop.create_future()  # done once a wake was handed to this claim
+        woken: asyncio.Future[Wake] = loop.create_future()  # done once a wake was handed to this claim
 
         def undeferred(*, ahead_only: bool) -> list[str]:
             """The tiers no better-ranked unwoken waiter takes, of those that may claim ahead if ``ahead_only``."""
@@ -1427,7 +1430,8 @@ class Coordinator:
         if not ahead:
             self.made_ready += 1
         preferred = self.theory_hosts.get(theory) if theory is not None else None
-        if preferred is not None and ((report := self.hosts.get(preferred)) is None or report[1].leases == 0):
+        report = self.hosts.get(preferred) if preferred is not None else None
+        if report is None or report[1].leases == 0 or (self.clock() - report[0]).total_seconds() >= HOST_REPORT_SECONDS:
             preferred = None
         waiter = min(
             (w for w in self.claim_waiters if tier in w[0] and not w[2].done() and (w[3] or not ahead)),
@@ -1435,16 +1439,16 @@ class Coordinator:
             default=None,
         )
         if waiter is not None:
-            waiter[2].set_result((tier, ahead))
+            waiter[2].set_result((tier, ahead, theory))
             self.claim_waiters.remove(waiter)
 
-    def _pass_wake(self, woken: asyncio.Future[tuple[str, bool]]) -> None:
+    def _pass_wake(self, woken: asyncio.Future[Wake]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""
         if woken.done() and not woken.cancelled():
-            tier, ahead = woken.result()
+            tier, ahead, theory = woken.result()
             if not ahead:
                 self.made_ready -= 1
-            self._wake_claim(tier, ahead=ahead)
+            self._wake_claim(tier, ahead=ahead, theory=theory)
 
     async def _peers(self, batch_id: UUID, action: sa.Row[Any]) -> list[sa.Row[Any]]:
         """The waiting and ready copies of build ``action`` of ``batch_id``, whose lease just ended, in other

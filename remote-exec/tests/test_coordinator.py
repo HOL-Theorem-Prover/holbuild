@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import json
 import time
+from datetime import timedelta
 from collections.abc import Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -954,7 +955,7 @@ async def test_wakes_pack_compatible_hosts_with_fifo_ties(
     coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled, False))
     for index in order:
         coordinator._wake_claim(tier)
-        assert wakes[index].result() == (tier, False)
+        assert wakes[index].result() == (tier, False, None)
         assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
     coordinator._wake_claim(tier)
     assert coordinator.made_ready == len(order) + 1
@@ -993,6 +994,36 @@ async def test_wakes_prefer_the_busy_host_that_last_claimed_the_theory(
     assert [wake.done() for wake in wakes] == [i == woken for i in range(len(wakes))]
 
 
+async def test_a_passed_wake_still_prefers_the_busy_host_of_its_theory(coordinator: Coordinator) -> None:
+    loop = asyncio.get_running_loop()
+    first, second, other = loop.create_future(), loop.create_future(), loop.create_future()
+    coordinator.claim_waiters = [
+        (["high", "standard"], _claim_rank(["high", "standard"], host), wake, False)
+        for host, wake in [("host-a", other), ("host-b", first), ("host-b", second)]
+    ]
+    coordinator.theory_hosts["pkg:a"] = "host-b"
+    coordinator.report_host(busy("host-b", 1))
+    coordinator._wake_claim("standard", theory="pkg:a")
+    assert first.result() == ("standard", False, "pkg:a")
+    coordinator._pass_wake(first)
+    assert second.done() and not other.done()
+
+
+async def test_wakes_ignore_a_busy_report_too_old_to_trust(coordinator: Coordinator) -> None:
+    loop = asyncio.get_running_loop()
+    wakes = [loop.create_future(), loop.create_future()]
+    coordinator.claim_waiters = [
+        (["high", "standard"], _claim_rank(["high", "standard"], host), wake, False)
+        for host, wake in zip(["host-a", "host-b"], wakes)
+    ]
+    coordinator.theory_hosts["pkg:a"] = "host-b"
+    coordinator.report_host(busy("host-b", 1))
+    reported = coordinator.clock()
+    coordinator.clock = lambda: reported + timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS)
+    coordinator._wake_claim("standard", theory="pkg:a")
+    assert wakes[0].done() and not wakes[1].done()
+
+
 async def test_released_work_wakes_the_busy_host_its_theory_last_ran_on(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
@@ -1009,7 +1040,7 @@ async def test_released_work_wakes_the_busy_host_its_theory_last_ran_on(
     edited = f"holbuild-action-batch-v1\naction {input_key('a2')} {ac_key('a2')} {spec('a2')} pkg:a\n"
     assert (await http.post("/v1/batches", content=edited, headers=CLIENT)).status_code == 201
     await coordinator.released()
-    assert not wakes[0].done() and wakes[1].result() == ("standard", False)
+    assert not wakes[0].done() and wakes[1].result() == ("standard", False, "pkg:a")
 
 
 async def test_theory_hosts_forget_the_least_recently_claimed_theory(
