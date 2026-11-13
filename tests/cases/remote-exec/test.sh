@@ -179,6 +179,10 @@ refute_grep "Theory built" "$tmpdir/follow.log"
 [[ $(grep -c . "$state/ran") -eq 2 ]] || { cat "$state/ran" >&2; exit 1; }
 require_grep "^action .* rx:ATheory$" "$state/b1.batch"
 require_grep "^edge " "$state/b1.batch"
+# Workers fetch the specs from the remote cache: none is left in the project.
+if find "$project/.holbuild/action-specs" -type f 2>/dev/null | grep .; then
+  echo "build --remote-exec left its uploaded specs" >&2; exit 1
+fi
 python3 - "$project" <<'PY'
 import json,pathlib,sys
 records=[json.loads(p.read_text()) for p in (pathlib.Path(sys.argv[1])/'.holbuild/commands').glob('*.json')]
