@@ -1009,7 +1009,7 @@ class Coordinator:
                 outranked = (
                     await self._outranked_by_ahead(tiers, ahead_tiers) if ahead_tiers and eligible_tiers else None
                 )
-                claimed = await self._claim(eligible_tiers, worker, ahead_tiers, outranked) if eligible_tiers else None
+                claimed = await self._claim(eligible_tiers, worker, outranked) if eligible_tiers else None
                 if claimed is None and ahead_tiers:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
@@ -1032,32 +1032,33 @@ class Coordinator:
             self._pass_wake(woken)
             raise
 
-    async def _outranked_by_ahead(self, tiers: list[str], ahead_tiers: list[str]) -> Callable[[str, int], bool] | None:
-        """Whether a ready build of a tier and priority ranks after an action that may be claimed ahead of
-        ``ahead_tiers``: one of a batch of a higher priority, in the same tier or one before it in ``tiers``.
-        Ready builds of the same priority come first, so with no priorities set claims ahead wait for every
-        ready build, as they did before priorities ranked them. None when nothing may be claimed ahead."""
+    async def _outranked_by_ahead(
+        self, tiers: list[str], ahead_tiers: list[str]
+    ) -> Callable[[str, int], list[str]] | None:
+        """For a ready build of a tier and priority, the tiers of ``ahead_tiers`` no later than its tier in
+        ``tiers`` with an action that may be claimed ahead of a batch of a higher priority, which ranks before the
+        build; none when there is no such action. Ready builds of the same priority come first, so with no
+        priorities set claims ahead wait for every ready build, as they did before priorities ranked them. None
+        when nothing may be claimed ahead."""
         read = await self._ahead_candidates()
-        best: dict[int, int] = {}  # tier position: the highest priority of a candidate in it or a tier before
+        best: dict[str, int] = {}  # the highest priority of a candidate of each tier
         for batch_id, _, tier, priority in read.candidates:
             if tier in ahead_tiers and (batch_id, tier) not in read.exhausted:
-                position = tiers.index(tier)
-                best[position] = max(best.get(position, priority), priority)
+                best[tier] = max(best.get(tier, priority), priority)
         if not best:
             return None
-        return lambda tier, priority: any(
-            p > priority for position, p in best.items() if position <= tiers.index(tier)
-        )
+        return lambda tier, priority: [
+            t for t in ahead_tiers if t in best and best[t] > priority and tiers.index(t) <= tiers.index(tier)
+        ]
 
     async def _claim(
         self,
         tiers: list[str],
         worker: str,
-        ahead_tiers: list[str] | None = None,
-        outranked: Callable[[str, int], bool] | None = None,
+        outranked: Callable[[str, int], list[str]] | None = None,
     ) -> Claim | None:
         """Lease a ready build of ``tiers`` from the shared ranking, else a run action. Before a ready build that
-        ``outranked`` says ranks after an action that may be claimed ahead, claim one of ``ahead_tiers`` of a
+        ranks after an action that may be claimed ahead, claim one of the tiers ``outranked`` gives for it, of a
         higher priority than the build's; failing that, the build is claimed after all."""
         started = asyncio.get_running_loop().time()
         key = tuple(tiers)
@@ -1079,7 +1080,9 @@ class Coordinator:
             if ranking.heap and (not ranking.ranked or ranking.at >= started):
                 # The next ready build ranks after an action that may be claimed ahead, by a ranking read since
                 # this claim started.
-                claimed = await self._claim_ahead(ahead_tiers or [], worker, above=-ranking.heap[0][1])
+                assert outranked is not None
+                _, priority, *_, tier, _ = ranking.heap[0]
+                claimed = await self._claim_ahead(outranked(tier, -priority), worker, above=-priority)
                 if claimed is not None:
                     return claimed
                 outranked = None
@@ -1292,7 +1295,7 @@ class Coordinator:
         return None
 
     async def _claim_build(
-        self, conn: AsyncConnection, ranking: "_Ranking", outranked: Callable[[str, int], bool] | None = None
+        self, conn: AsyncConnection, ranking: "_Ranking", outranked: Callable[[str, int], list[str]] | None = None
     ) -> _Claimed | None:
         """Lock a ready build from the shared ranking, without refreshing it inside the transaction.
 

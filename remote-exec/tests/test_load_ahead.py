@@ -113,6 +113,31 @@ async def test_a_claim_ahead_comes_after_ready_builds_of_its_priority_and_before
     assert order[:2] == ["x", "b"] and sorted(order[2:]) == ["y", "z"]
 
 
+async def test_a_ready_build_waits_only_for_a_claim_ahead_of_its_tier_or_an_earlier_one(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "h"], [("h", "a")], speculative_loading="4", priority="2")
+    await submit(http, ["b", "s"], [("s", "b")], speculative_loading="4", priority="2")
+    await claim_named(http, "a")
+    await claim_named(http, "b")
+    await submit(http, ["r"], priority="1")
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE actions SET tier = 'high' WHERE input_key = ANY(:keys)"),
+            {"keys": [input_key("h"), input_key("r")]},
+        )
+    await coordinator._ahead_candidates()
+
+    # "h", which outranks the high-tier "r", may no longer be claimed ahead; "s", of a later tier, doesn't.
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE actions SET ahead = 'abandoned' WHERE input_key = :key"), {"key": input_key("h")}
+        )
+    claimed = await claim_ahead(http, "high", also_claim=["standard"])
+    assert claimed is not None and claimed["theory"] == "pkg:r"
+
+
 async def test_a_child_another_batch_is_building_is_not_claimed_ahead_and_is_done_with_that_build(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
