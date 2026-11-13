@@ -390,6 +390,13 @@ if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
       exit 1
     }
   done
+  compgen -G "$tmpdir/worker-c/theory-modules/*/base-theories" > /dev/null || {
+    echo "worker c recorded no base-state theories" >&2; exit 1; }
+elif [[ ! -e "$HOLDIR/tools-poly/poly/theory_modules.ML" ]]; then
+  # A HOL without the module helper starts no writer, which alone makes
+  # the store.
+  [[ ! -e "$tmpdir/worker-c/theory-modules" ]] || {
+    echo "worker c started a module writer for a HOL without modules" >&2; exit 1; }
 fi
 
 # The original checkout restores all three results without building.
