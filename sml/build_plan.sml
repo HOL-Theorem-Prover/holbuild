@@ -972,18 +972,18 @@ fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, re
      holdir = holdir}
   end
 
-fun plan_selection components holdir sources selection =
+(* Plans over SOURCES from the roots ROOTS_OF picks, given the name lookup
+   and the nodes; ANALYSIS may already hold some sources' facts. *)
+fun plan_roots components analysis holdir sources roots_of =
   let
-    val provider = HolbuildComponentProvider.provider components
     val resolution_context_id =
       HolbuildComponentProvider.resolution_context_id components
     val _ = HolbuildDependencies.configure_analyser_for_holdir holdir
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
-    val analysis = HolbuildComponentProvider.new_analysis_state components
     val nodes = map (make_node external_dirs) sources
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
-    val roots = target_roots lookup nodes selection
+    val roots = roots_of lookup nodes
     val _ = bootstrap_reachable_frontier components analysis lookup nodes roots
     val reachable = bootstrap_topo_sort components analysis lookup nodes roots
     val dependency_graph =
@@ -1012,6 +1012,10 @@ fun plan_selection components holdir sources selection =
               selected_graph_id = selected_graph_id, selected_plan_id = selected_plan_id,
               resolved_plan_id = resolved_plan_id, holdir = holdir}
   end
+
+fun plan_selection components holdir sources selection =
+  plan_roots components (HolbuildComponentProvider.new_analysis_state components) holdir sources
+    (fn lookup => fn nodes => target_roots lookup nodes selection)
 
 (* The plan an earlier planning run made over the same discovered sources,
    from what the plan record kept: the selection, each selected node's

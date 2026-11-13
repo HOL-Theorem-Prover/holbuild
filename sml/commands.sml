@@ -1367,7 +1367,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           in
             planned
           end
-        fun restored {index, targets, plan, toolchain_key, changed, record, stamps, rehashed} =
+        fun restored {index, targets, plan, toolchain_key, changed, reresolved, record, stamps, rehashed} =
           let
             (* With every root that has its own tactic timeout selected, the
                plan holds each such root's closure, which is all the entry
@@ -1393,9 +1393,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     raise HolbuildPlanRecord.Fall (HolbuildBuildPlan.logical_name owner ^
                                                    " writes SML sources and is not up to date")
                 | NONE => ()
-            val changed_keys = HolbuildPlanRecord.changed_keys record plan keys
+            val changed_keys = HolbuildPlanRecord.changed_keys record index plan keys
             val _ = say ("from record (" ^ Int.toString rehashed ^ " files rehashed, " ^
-                         Int.toString changed_keys ^ " keys changed)")
+                         Int.toString changed_keys ^ " keys changed" ^
+                         (if reresolved then ", dependencies re-resolved)" else ")"))
             val _ =
               if changed orelse changed_keys > 0 then
                 write (context {members = #members record,
@@ -1403,7 +1404,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                               (path, Binarymap.peek(stamps, path), entries)) (#dirs record),
                                 stamps = stamps, index = index, targets = targets,
                                 toolchain_key = toolchain_key})
-                  (SOME record) plan keys
+                  (if reresolved then NONE else SOME record) plan keys
               else ()
           in
             (* Check mode builds from the record too, once full planning agrees. *)
