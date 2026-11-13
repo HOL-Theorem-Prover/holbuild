@@ -44,9 +44,10 @@ require_file "$archive"
 require_file "$metadata"
 
 tar -xOf "$archive" holbuild-cache/manifest > "$tmpdir/archive.manifest"
+tar -xOf "$archive" holbuild-package/manifest > "$tmpdir/capsule.manifest"
 require_grep '^source_repo=https://example.org/project.git$' "$tmpdir/archive.manifest"
 require_grep '"source_repo": "https://example.org/project.git"' "$metadata"
-if grep -q "$SECRET" "$tmpdir/archive.manifest" "$metadata"; then
+if grep -q "$SECRET" "$tmpdir/archive.manifest" "$tmpdir/capsule.manifest" "$metadata"; then
   echo "origin credential leaked into the exported manifest or sidecar" >&2
   exit 1
 fi

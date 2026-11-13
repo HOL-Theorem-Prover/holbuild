@@ -14,8 +14,11 @@ use_case_cache "$tmpdir/cache"
 
 # check builds its theory, then [run].loads, under the same process argv.
 # Each prebuild needs its own plan even when record comparison is disabled.
+for reader in data hol; do
 for mode in on check; do
-  project=$tmpdir/$mode
+  project=$tmpdir/$reader-$mode
+  flags=()
+  [[ $reader != hol ]] || flags=(--with-fingerprints)
   mkdir -p "$project/src"
   {
     write_schema2_prelude
@@ -46,17 +49,23 @@ SML
     if [[ $step == edited ]]; then
       sed -i 's/original/edited/' "$project/src/Probe.sml"
     fi
-    log=$tmpdir/$mode-$step.log
+    log=$tmpdir/$reader-$mode-$step.log
     if ! (cd "$project" && HOLBUILD_PLAN_RECORD=$mode \
-        "$HOLBUILD_BIN" --verbose check CleanTheory) > "$log" 2>&1; then
+        "$HOLBUILD_BIN" --verbose check "${flags[@]}" CleanTheory) > "$log" 2>&1; then
       cat "$log" >&2
       exit 1
     fi
     require_grep '^CleanTheory: clean (1 theorem)$' "$log"
     expected=original
     [[ $step != edited ]] || expected=edited
-    require_grep "^independent run load: $expected$" "$log"
-    if [[ $step == cold ]]; then
+    if [[ $reader == hol ]]; then
+      require_grep "^independent run load: $expected$" "$log"
+    elif grep -q '^independent run load:' "$log"; then
+      echo 'plain check executed a run load' >&2
+      cat "$log" >&2
+      exit 1
+    fi
+    if [[ $step != warm ]]; then
       require_grep 'Probe \(built\|restored from cache\)' "$log"
     elif [[ $step == warm ]]; then
       if [[ $(grep -c '^holbuild: plan: from record ' "$log") -ne 2 ]]; then
@@ -66,4 +75,5 @@ SML
       fi
     fi
   done
+done
 done

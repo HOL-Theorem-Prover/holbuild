@@ -38,12 +38,12 @@ val build_cache_valued =
 fun command name : command =
   case name of
       "build" =>
-        {flags = ["--watch", "--dry-run", "--repl-on-failure", "--remote-only", "--detach"] @
+        {flags = ["--watch", "--dry-run", "--repl-on-failure", "--remote-only", "--detach", "--speculative-loading"] @
                  build_cache_flags,
          valued = build_cache_valued @ remote_valued @ [("--priority", Nothing), ("--attach", Nothing)],
          operands = Targets}
     | "action-spec" =>
-        {flags = "--upload" :: build_cache_flags, valued = build_cache_valued, operands = Targets}
+        {flags = ["--upload", "--remote-only"] @ build_cache_flags, valued = build_cache_valued, operands = Targets}
     | "context" => {flags = ["--trknl"], valued = [], operands = Nothing}
     | "buildhol" => {flags = ["--trknl"], valued = [], operands = Nothing}
     | "repl" => {flags = ["--remote-only"], valued = ("--from", Theories) :: remote_valued, operands = Nothing}
@@ -56,7 +56,7 @@ fun command name : command =
     | "executable" => {flags = ["--remote-only"], valued = remote_valued, operands = Executables}
     | "clean" => {flags = [], valued = [], operands = Theories}
     | "export" =>
-        {flags = ["--build", "--remote-only"],
+        {flags = ["--build", "--closure", "--sources-only", "--remote-only"],
          valued = [("-o", Nothing), ("--metadata-out", Nothing)] @ remote_valued, operands = Targets}
     | "import" => {flags = [], valued = [], operands = Nothing}
     | "gc" =>
@@ -65,7 +65,8 @@ fun command name : command =
     | "cache" => {flags = [], valued = [], operands = Nothing}
     | "exec-action" =>
         {flags = ["--share-heaps"],
-         valued = [("--cache-limit-gb", Nothing), ("--cache-reserve-gb", Nothing), ("--result", Nothing)],
+         valued = [("--cache-limit-gb", Nothing), ("--cache-reserve-gb", Nothing), ("--result", Nothing),
+                   ("--ahead-parent", Nothing), ("--ahead-wait-seconds", Nothing)],
          operands = Nothing}
     | "run-action" =>
         {flags = ["--remote-only", "--closure", "--fetch-only", "--export-only"],

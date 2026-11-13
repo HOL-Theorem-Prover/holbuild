@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { cleanup_temp_dir "$tmpdir"; }
+cleanup() { chmod -R u+w "$tmpdir" 2>/dev/null || true; cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
 
 project=$tmpdir/project

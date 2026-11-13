@@ -375,6 +375,14 @@ extra dependencies with static literal `holbuild_extra_deps [...]` annotations.
 Entries may name files, directories, or simple globs (which skip `.holbuild/`
 directories inside them), and entries are staged so matching relative
 filesystem reads work during the action.
+
+Before loading dependencies or running a theory script, each HOL child removes
+`.holbuild/stage` and its subdirectories from `Meta.loadPath`. HOL's project
+discovery can add sibling stages at startup, but those directories disappear as
+parallel actions finish. Other project directories retain their search order,
+including built objects needed by dynamic library loads. The same policy runs
+when a child resumes from a checkpoint.
+
 Theory-script sources may declare deterministic, source-file-relative fixed
 output files with static literal `holbuild_extra_outputs [...]` annotations.
 These paths are part of the action identity and owned output set: successful
@@ -387,9 +395,11 @@ previously owned files without eagerly analysing unrelated sources.
 Absolute paths, `.`/`..` components, directories, and globs are deliberately not
 part of the initial contract.
 `cache = false` disables global-cache restore/publish for the action.
-`always_reexecute = true` disables local up-to-date skipping and any retained/debug
-checkpoint replay for the action. `impure = true`
-is a conservative shorthand for no cache and always re-execute. These fields are
+`always_reexecute = true` disables local up-to-date skipping; checkpoint replay stays
+available, since replay is keyed by the script prefix and dependencies. `impure = true`
+is a conservative shorthand for no cache and always re-execute, and also disables
+checkpoint saving and replay, because an impure script may compute different values
+on each run (a timestamp, say) that a resumed run would take from an earlier one. These fields are
 intended for audited exceptions such as generated data, root-HOL SML modules with
 explicit predecessor requirements, source-implicit external libraries, or
 tool/example side effects; they are not include paths and do not make arbitrary
@@ -1056,6 +1066,16 @@ property of the declared entry point graph, not of the current request, except t
 but local metadata/cache records the timeout a successful build satisfied; a success under
 60s may satisfy a later 180s request, while a success under 180s does not satisfy a later
 60s request.
+
+Steps containing a public `HolSmtLib` tactic name (`GENERIC_SMT_TAC`, `CVC_TAC`,
+`CVC_ORACLE_TAC`, `YICES_TAC`, `Z3_TAC`, `Z3_ORACLE_TAC`, `cvc_tac`, `cvco_tac`,
+`z3_tac`, or `z3o_tac`) run without the step timeout: solver execution and proof
+replay can exceed the ordinary tactic budget. Names may be unqualified or under
+any structure qualifier. Matching uses identifiers in the tactic program, ignoring
+comments and string/term quotations. If one executable step mixes an SMT call with
+other work, that entire step is untimed; other planned steps keep their limits.
+Aliases with different names are not recognized. Timeout metadata and cache key
+formats are unchanged; existing successful builds remain reusable.
 
 A step that exceeds its timeout runs once more, at once and in the same process, with
 half the timeout. Each timed call computes its result from the proof state it was given

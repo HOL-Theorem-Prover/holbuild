@@ -364,6 +364,15 @@ for phase in hydrate hydfiles hyddeps hydstale hydmisfit modules hol check; do
   grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/b.result" || {
     echo "b's record lacks phase $phase:" >&2; cat "$tmpdir/b.result" >&2; exit 1; }
 done
+PYTHONPATH="$HOLBUILD_ROOT/remote-exec" python3 - "$tmpdir/b.result" <<'PY'
+import pathlib,sys
+from remote_exec.formats import parse_result
+timings=parse_result(pathlib.Path(sys.argv[1]).read_text()).timings
+assert timings['started'] <= timings['holstart'] <= timings['holend'] <= timings['publishstart']
+assert timings['publishstart'] <= timings['publishend'] <= timings['finished']
+assert timings['started'] <= timings['logstart'] <= timings['logend'] <= timings['finished']
+assert timings['rebuilt']==1
+PY
 # A corrupt local payload is fetched by the same verified path.
 link_hol_toolchain_cache "$tmpdir/worker-c"
 cp -r "$tmpdir/worker-b/actions" "$tmpdir/worker-b/blobs" "$tmpdir/worker-c/"
