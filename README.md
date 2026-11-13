@@ -1761,8 +1761,8 @@ restores there stay for the next action, which keeps those it names again and
 removes the rest; HOL may read them but writes only the action's stage, logs,
 tool cache and load-ahead markers, which are emptied before and after each
 action. Without its records (`<cache root>/action-resident`), as after a
-worker stopped part way, and before every script run, the action root is
-emptied first. Dependency heaps and checkpoints in `<cache root>/checkpoints`
+worker stopped part way, or a release that keeps no records ran there, and
+before every script run, the action root is emptied first. Dependency heaps and checkpoints in `<cache root>/checkpoints`
 are private to the action and are also emptied before and after it; reuse
 across worker actions requires `--share-heaps` (below). A saved heap records the absolute paths it was
 built at, so every worker should use the same cache root. One `exec-action`

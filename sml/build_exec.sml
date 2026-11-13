@@ -9367,6 +9367,19 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
     fun restore_deps () = hydrate_step "hyddeps" (fn () => (transfer_all restore_dep (#deps spec); hash_installed ()))
     fun refresh wanted =
       hydrate_step "hydstale" (fn () => drop_stale_dep_copies remote spec wanted) andalso (restore_deps (); true)
+    (* Every path an item writes: two items sharing one would let a kept
+       item stand for files another replaced or removed. *)
+    fun objects path = [path, hfs_remapped_path path]
+    fun theory_files stem = List.concat (map (fn suffix => objects (in_root root stem ^ suffix)) theory_suffixes)
+    val claims =
+      map #dst files @
+      List.concat (map (fn {stem, suffix, ...} => objects (in_root root (stem ^ suffix))) (#libs spec)) @
+      List.concat (map (theory_files o #stem) (#deps spec) @ map (theory_files o #1) scratch)
+    val _ =
+      List.foldl (fn (path, seen) =>
+                    if Binaryset.member (seen, path) then reject_spec ("two items of the spec write " ^ path)
+                    else Binaryset.add (seen, path))
+                 (Binaryset.empty String.compare) claims
   in
     Resident.discard resident;
     Resident.start resident;
@@ -11543,6 +11556,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
        Never reuse a writable directory inode across actions.  Shared heaps
        are linked from the store, where the child may only read them. *)
     val resident_file = Path.concat(cache, "action-resident")
+    (* Only a root holding this marker is the one the records describe: a
+       release that doesn't keep them removes the root, marker included,
+       around its actions. *)
+    val resident_marker = Path.concat(root, ".holbuild/resident")
     val resident = ref (Resident.empty ())
     val writable_dirs = map (fn dir => Path.concat(root, ".holbuild/" ^ dir)) ["stage", "logs", "tool-cache", "ahead"]
     fun empty_writable strict =
@@ -11591,13 +11608,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
        resident := Resident.fresh resident_file;
        HolbuildRemoveTree.remove_untrusted_strict root)
     (* The writable directories, empty, and the root's records; with no
-       records, the root is emptied too. *)
+       records for it, the root is emptied too. *)
     fun reset () =
-      (case Resident.read resident_file of
+      (case if file_exists resident_marker then Resident.read resident_file else NONE of
            SOME records => resident := records
          | NONE => empty_all ();
        empty_writable true;
-       List.app ensure_dir (root :: checkpoint_root :: writable_dirs))
+       List.app ensure_dir (root :: checkpoint_root :: writable_dirs);
+       write_text resident_marker "")
     fun run () =
       let
         val _ = reset ()

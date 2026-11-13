@@ -272,6 +272,20 @@ curl -fsS -X PUT --data-binary "@$tmpdir/blob-path" "$remote_url/cas/$spec_blob_
 worker blob-path "$spec_blob_path"
 expect blob-path 4 "status=failed" "failure=spec-rejected"
 require_grep "a file's SHA-256 is malformed" "$tmpdir/blob-path.log"
+# Or one with two items writing one path, here a library over a
+# dependency's script, before the worker's root changes.
+python3 - "$project/.holbuild/action-specs/$spec_b" "$tmpdir/overlap" <<'PY'
+import sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+stem = [l for l in head.split(b"\n") if l.startswith(b"dep theory ")][0].split(b" ")[3]
+head += b"\nfile library " + stem + b".sml " + b"0" * 64 + b" 24"
+open(sys.argv[2], "wb").write(head + b"\naction-text\n" + text)
+PY
+spec_overlap=$(sha256sum "$tmpdir/overlap" | cut -d' ' -f1)
+curl -fsS -X PUT --data-binary "@$tmpdir/overlap" "$remote_url/cas/$spec_overlap"
+worker overlap "$spec_overlap"
+expect overlap 4 "status=failed" "failure=spec-rejected"
+require_grep "two items of the spec write" "$tmpdir/overlap.log"
 worker absent "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect absent 4 "status=failed" "failure=spec-rejected"
 
@@ -437,6 +451,10 @@ rm "$tmpdir/worker-c/action-resident"
 worker c "$spec_a2"
 expect c 0
 [[ ! -e "$tmpdir/worker-c/action/stray" ]] || { echo "worker c kept a root it has no records of" >&2; exit 1; }
+# A release that keeps no records removes the root around its actions.
+rm -rf "$tmpdir/worker-c/action"
+worker c "$spec_a2"
+expect c 0
 
 # The original checkout restores all three results without building.
 hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; exit 1; }

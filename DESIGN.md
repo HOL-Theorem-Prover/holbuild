@@ -706,7 +706,11 @@ worker records what it installed (`<cache root>/action-resident`): each
 dependency theory with its key, the SHA-256 of the local cache manifest it
 came from, the parent names its `.uo` was generated from, and the hashes the
 parent check and the early cutoff read; each source, input and library by
-SHA-256; each library manifest by its text's SHA-256. A hydrate keeps an item
+SHA-256; each library manifest by its text's SHA-256. It trusts them only
+while the root holds the marker `.holbuild/resident`, which an older release,
+removing the root around its actions, removes with it. A spec with two items
+writing one path is rejected, since a kept item could otherwise stand for
+files another replaced. A hydrate keeps an item
 whose record matches what the spec names and, for a theory, whose local cache
 manifest is unchanged (the stale check drops a local copy, which then
 reinstalls); it rewrites a kept theory's `.uo` when this spec resolves its
