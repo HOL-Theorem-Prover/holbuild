@@ -5,9 +5,10 @@
 ARG PYTHON_IMAGE=python:3.14-slim-trixie
 
 FROM ${PYTHON_IMAGE} AS polyml
-# The workers' Poly/ML. It stays on seq7 while clients move to seq8: a
-# worker Poly change makes every shared heap cold at once, so it waits
-# until clients send releases that publish each cold heap once (0.14.38+).
+# The workers' Poly/ML, also release.yml's POLYML_TAG. It stays on seq7
+# while CI (setup-polyml) is on seq8: a worker Poly change makes every
+# shared heap cold at once, so it waits until clients send releases that
+# publish each cold heap once (0.14.38+).
 ARG POLYML_REPO=https://github.com/sequent-dev-bot/polyml.git
 ARG POLYML_TAG=v5.9.2-seq7
 RUN apt-get update \
