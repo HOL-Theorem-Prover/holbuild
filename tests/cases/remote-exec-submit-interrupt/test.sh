@@ -61,8 +61,12 @@ check_interrupt() {
   local code=0 batch
   (cd "$project" && LD_PRELOAD="$tmpdir/interrupt.so" \
     timeout 30 "$HOLBUILD_BIN" --remote-cache "$remote_url" "$@") > "$tmpdir/$name.log" 2>&1 || code=$?
-  [[ $code == 1 ]] || { cat "$tmpdir/$name.log" >&2; echo "$name exited $code, wanted 1" >&2; exit 1; }
-  require_grep '^holbuild: interrupted$' "$tmpdir/$name.log"
+  case "$cancel:$code" in
+    # A detached client may exit before Poly/ML handles SIGTERM.
+    no:0) ;;
+    *:1) require_grep '^holbuild: interrupted$' "$tmpdir/$name.log" ;;
+    *) cat "$tmpdir/$name.log" >&2; echo "$name exited unexpectedly: $code" >&2; exit 1 ;;
+  esac
   batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/$name.log")
   [[ -n $batch ]] || { cat "$tmpdir/$name.log" >&2; exit 1; }
   if [[ $cancel == yes ]]; then
