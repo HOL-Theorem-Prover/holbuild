@@ -1097,8 +1097,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--holbuild-releases-dir",
-        default="/opt/holbuild-releases",
-        help="where holbuild releases are built, one directory per version; a host's workers can share it",
+        default=os.environ.get("REMOTE_EXEC_HOLBUILD_RELEASES", "/opt/holbuild-releases"),
+        help="where holbuild releases are built, one directory per version; a host's workers can share it "
+        "(default: %(default)s)",
     )
     parser.add_argument(
         "--baked-releases",

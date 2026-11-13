@@ -3,11 +3,12 @@
 # See README.md for running it.
 
 ARG PYTHON_IMAGE=python:3.14-slim-trixie
+# The same Poly/ML as holbuild's CI.
+ARG POLYML_TAG=v5.9.2-seq8
 
 FROM ${PYTHON_IMAGE} AS polyml
-# The same Poly/ML as holbuild's CI.
 ARG POLYML_REPO=https://github.com/sequent-dev-bot/polyml.git
-ARG POLYML_TAG=v5.9.2-seq8
+ARG POLYML_TAG
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential ca-certificates git libgmp-dev \
  && rm -rf /var/lib/apt/lists/*
@@ -26,8 +27,12 @@ COPY --from=polyml /opt/polyml /opt/polyml
 COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /usr/local/bin/uv
 # The worker's temporary files (the cache credential, action results) stay out
 # of /tmp, which sandboxed HOL processes may write: Poly/ML puts its own there.
+# Releases built on demand link this Poly/ML's runtime library, so they are kept
+# apart from those other images built on a host that keeps the directory.
+ARG POLYML_TAG
 ENV PATH=/opt/remote-exec/.venv/bin:/opt/polyml/bin:$PATH \
     HOLBUILD_CACHE=/var/cache/holbuild \
+    REMOTE_EXEC_HOLBUILD_RELEASES=/opt/holbuild-releases/polyml-$POLYML_TAG \
     TMPDIR=/var/tmp \
     UV_PYTHON_DOWNLOADS=never
 

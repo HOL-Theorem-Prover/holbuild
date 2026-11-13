@@ -81,6 +81,11 @@ jobs:
           time.sleep(3)
           zombies = [p for p in pathlib.Path("/proc").glob("[0-9]*/status") if "\nState:\tZ" in p.read_text()]
           assert not zombies, zombies'
+      - name: Check that releases built on demand are kept per Poly/ML
+        run: |
+          tag=$(sed -n 's/^ARG POLYML_TAG=//p' remote-exec/Dockerfile)
+          docker run --rm holbuild-remote-exec sh -c \
+            'test "$REMOTE_EXEC_HOLBUILD_RELEASES" = "/opt/holbuild-releases/polyml-$1"' sh "$tag"
       - name: Build a holbuild release the way a worker does
         run: |
           git archive --format=tar.gz --prefix=holbuild/ HEAD > "$RUNNER_TEMP/holbuild-source.tar.gz"
