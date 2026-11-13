@@ -194,6 +194,10 @@ require_file "$(ac_file "$key_c")"
 [[ $(< "$out/rr/CTheory/first") == rr:CTheory ]]
 [[ $(< "$out/rr/CTheory/second") == "$key_c" ]]
 require_grep '^proof_timeout=none$' "$metadata"
+# Workers fetch the specs from the remote cache: none is left in the project.
+if find "$project/.holbuild/run-specs" -type f 2>/dev/null | grep .; then
+  echo "run-action --remote-exec left its uploaded specs" >&2; exit 1
+fi
 
 # --fetch-only fetches what the cache holds and submits nothing, without a
 # coordinator; what it lacks is missing.
