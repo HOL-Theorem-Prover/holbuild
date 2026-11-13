@@ -559,11 +559,27 @@ fun take_n n lines acc =
       | line :: rest => take_n (n - 1) rest (line :: acc)
 
 fun child_failure_excerpt lines =
-  case lines of
-      [] => NONE
-    | line :: rest =>
-        if child_failure_line line then SOME (take_n 12 (line :: rest) [])
-        else child_failure_excerpt rest
+  let
+    (* A worker appends its derived summary to the raw log.  Diagnose only
+       the raw output, and keep preceding output separate from the cause. *)
+    fun scan [] _ failure terminal = (failure, terminal)
+      | scan (remaining as line :: rest) preceding failure terminal =
+          if String.isPrefix "holbuild: exec-action failed:" line then (failure, terminal)
+          else
+            scan rest (take_n 10 (line :: preceding) [])
+              (if child_failure_line line then SOME remaining else failure)
+              (if String.isPrefix "Uncaught exception" line then SOME (line, rev preceding)
+               else terminal)
+    fun raw_excerpt [] = []
+      | raw_excerpt (line :: rest) =
+          if String.isPrefix "holbuild: exec-action failed:" line then []
+          else line :: raw_excerpt rest
+  in
+    case scan lines [] NONE NONE of
+        (_, SOME (line, [])) => SOME [line]
+      | (_, SOME (line, preceding)) => SOME (line :: "preceding HOL output:" :: preceding)
+      | (failure, NONE) => Option.map (fn rest => raw_excerpt (take_n 12 rest [])) failure
+  end
 
 fun child_failure_summary path =
   let val lines = String.fields (fn c => c = #"\n") (read_text path)

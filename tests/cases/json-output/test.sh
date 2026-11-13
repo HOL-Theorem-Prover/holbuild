@@ -96,8 +96,16 @@ cp "$project/holproject.toml" "$bad_project/holproject.toml"
 python3 - <<PY
 from pathlib import Path
 long_goal = "p" * 5000
-Path("$bad_project/src/BadScript.sml").write_text(f'''open HolKernel Parse boolLib bossLib;
+Path("$bad_project/src/BadScript.sml").write_text(fr'''open HolKernel Parse boolLib bossLib;
 val _ = new_theory "Bad";
+val _ = ((raise mk_HOL_ERR "Optional" "branch" "handled diagnostic")
+         handle e as HOL_ERR _ => print (Feedback.exn_to_string e));
+Theorem continued:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = print (String.concat (List.tabulate (16, fn _ => "continued output\\n")));
 Theorem bad_thm:
   {long_goal}
 Proof
@@ -144,6 +152,9 @@ if 'failed tactic top input goal:' not in message:
     raise SystemExit('structured error did not include top-goal context')
 if 'json failure' not in message:
     raise SystemExit('structured error lost failure detail')
+child = message.split('child failure:\n', 1)[1]
+if not child.startswith('Exception raised at boolLib.store_thm_at:') or 'handled diagnostic' in child:
+    raise SystemExit(f'structured error selected a handled diagnostic: {child!r}')
 if 'instrumented log:' in message or 'child log:' in message:
     raise SystemExit(f'structured error exposed a log path: {message!r}')
 failed = [e for e in events if e.get('event') == 'node_failed' and e.get('target') == 'BadTheory']
@@ -378,3 +389,31 @@ with tempfile.TemporaryFile() as errors:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
 PYTHON
+
+# An earlier handled diagnostic must not replace the final uncaught failure.
+cp "$HOLBUILD_ROOT/tests/fixtures/TerminalFailureScript.sml" "$project/src/TerminalFailureScript.sml"
+if (cd "$project" && "$HOLBUILD_BIN" --json build --skip-checkpoints TerminalFailureTheory) \
+    > "$tmpdir/terminal.stdout" 2> "$tmpdir/terminal.stderr"; then
+  echo "expected terminal exception build to fail" >&2
+  exit 1
+fi
+if [[ -s "$tmpdir/terminal.stderr" ]]; then
+  cat "$tmpdir/terminal.stderr" >&2
+  exit 1
+fi
+python3 - "$tmpdir/terminal.stdout" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+events = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+failure = next(e for e in events if e.get('event') == 'node_failed')
+assert failure['target'] == 'TerminalFailureTheory' and failure['failure']['kind'] == 'child_failure', failure
+message = next(e['message'] for e in events if e.get('event') == 'error')
+summary = message.split('child failure:\n', 1)[1]
+assert summary.startswith('Uncaught exception'), summary
+assert 'terminal child failure' in summary.splitlines()[0], summary
+assert 'preceding HOL output:' in summary and 'HOL message: terminal context' in summary, summary
+assert 'handled diagnostic' not in summary, summary
+assert len(summary.strip().splitlines()) <= 12, summary
+PY
