@@ -813,6 +813,17 @@ back to a coordinator image predating it, stop the coordinator and use the new
 image to run `alembic downgrade 0014`, then start the older image. Actions
 running ahead then look like any running action to the older image.
 
+Migration `0016` adds nullable `actions.latest_attempt_token` and
+`actions.interrupted_output` (at most 65,536 UTF-8 bytes). This is a schema-only
+baseline: the coordinator and worker do not use these columns yet. Deploy
+and qualify this image before deploying a runtime that uses the new fields,
+so that its previous-image rollback already recognizes revision `0016`.
+An older coordinator can still serve the upgraded schema, but its `migrate`
+command cannot recognize the revision. To start an image predating `0016`,
+stop the coordinator and use this image to run `alembic downgrade 0015`
+first. This discards only diagnostic fields; result and scheduling state
+are preserved.
+
 ## Tests
 
 The tests need a Postgres role that may create databases:
