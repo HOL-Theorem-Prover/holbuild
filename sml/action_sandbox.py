@@ -901,6 +901,8 @@ def main() -> int:
     parser.add_argument("--read", action="append", default=[])
     parser.add_argument("--forbid", action="append", default=[])
     parser.add_argument("--scratch", action="append", default=[])
+    # Granted at most --read in parts, never scratch.
+    parser.add_argument("--keep-read-only", action="append", default=[])
     parser.add_argument("--completed", type=Path)
     parser.add_argument("--toolchain", action="store_true")
     parser.add_argument("--validate-tree", type=Path)
@@ -929,10 +931,12 @@ def main() -> int:
             ([args.completed.resolve()] if args.completed is not None else []),
             toolchain=args.toolchain,
         )
-        # A scratch directory holding protected state, or a read-only grant
-        # (Landlock grants are a union, so it would become writable), is
-        # left out rather than failing the action: only tools needing it fail.
-        passed = {path for name in args.forbid for path in spellings(name)[1]}
+        # A scratch directory holding protected state, a read-only grant
+        # (Landlock grants are a union, so it would become writable) or a
+        # --keep-read-only tree is left out rather than failing the action:
+        # only tools needing it fail.
+        passed = ({path for name in args.forbid for path in spellings(name)[1]} |
+                  {path for name in args.keep_read_only for paths in spellings(name) for path in paths})
         policy.scratch = [path for path in (Path(path).resolve(strict=True) for path in args.scratch)
                           if not policy.exposes(path) and
                           not any(read == path or path in read.parents for read in [*policy.readable, *passed])]

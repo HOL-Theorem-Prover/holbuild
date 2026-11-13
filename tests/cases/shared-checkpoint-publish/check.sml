@@ -60,7 +60,7 @@ fun restore_latest () =
   let
     val _ = BE.remove_tree tree
     val _ = BE.remove_tree store
-    val restored = BE.restore_shared_checkpoints (RC.remote url) ctx
+    val restored = BE.restore_shared_checkpoints (RC.remote url) ctx true
     val latest = if failing then 11 else count - 1
   in
     assert "restored latest complete candidate"

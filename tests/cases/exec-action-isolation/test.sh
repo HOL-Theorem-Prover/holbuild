@@ -6,7 +6,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 cleanup() {
   if [[ -n "${server_pid:-}" ]]; then kill "$server_pid"; wait "$server_pid" 2>/dev/null || true; fi
-  for dir in "${tmp_worker:-}" "${var_tmp_worker:-}"; do [[ -z "$dir" ]] || rm -rf "$dir"; done
+  for dir in "${tmp_worker:-}" "${var_tmp_worker:-}" "${store_worker:-}" "${tmp_store:-}"; do [[ -z "$dir" ]] || rm -rf "$dir"; done
   cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
@@ -48,6 +48,11 @@ val _ = List.app (fn base => List.app (fn dir =>
   in refuses "shared write" (fn () => TextIO.closeOut (TextIO.openOut path));
      refuses "shared delete" (fn () => OS.FileSys.remove path)
   end) ["actions", "blobs", "locks", "cooperate"]) ["$tmpdir/shared", "$tmpdir/worker"];
+(* The action root outside its writable directories is the worker's, kept
+   for later actions. *)
+val _ = refuses "action root write"
+          (fn () => TextIO.closeOut (TextIO.openAppend "$tmpdir/worker/action/.holbuild/action-spec"));
+val _ = refuses "action root create" (fn () => TextIO.closeOut (TextIO.openOut "$tmpdir/worker/action/stray"));
 val lock = Posix.FileSys.createf ("lock", Posix.FileSys.O_WRONLY, Posix.FileSys.O.flags [],
                                   Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.iwusr]);
 val _ = Posix.IO.setlkw (lock, Posix.IO.FLock.flock {ltype = Posix.IO.F_WRLCK, whence = Posix.IO.SEEK_SET,
@@ -81,8 +86,8 @@ Proof
 QED
 SML
 # Poly/ML creates OS.FileSys.tmpName files in /tmp whatever TMPDIR says.
-# Two copies, since the first one's result would be reused.
-for name in TmpWithheld TmpGranted; do
+# Separate copies, since the first one's result would be reused.
+for name in TmpWithheld TmpGranted TmpStore; do
   cat > "$tmpdir/project/src/${name}Script.sml" <<SML
 Theory $name
 Ancestors bool
@@ -96,12 +101,13 @@ QED
 SML
 done
 (cd "$tmpdir/project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload \
-  IsolatedTheory LockedTheory TmpWithheldTheory TmpGrantedTheory) > "$tmpdir/batch"
+  IsolatedTheory LockedTheory TmpWithheldTheory TmpGrantedTheory TmpStoreTheory) > "$tmpdir/batch"
 spec=$(awk '$1 == "action" && $5 == "isolation:IsolatedTheory" {print $4}' "$tmpdir/batch")
 locked=$(awk '$1 == "action" && $5 == "isolation:LockedTheory" {print $4}' "$tmpdir/batch")
 withheld=$(awk '$1 == "action" && $5 == "isolation:TmpWithheldTheory" {print $4}' "$tmpdir/batch")
 granted=$(awk '$1 == "action" && $5 == "isolation:TmpGrantedTheory" {print $4}' "$tmpdir/batch")
-[[ -n "$spec" && -n "$locked" && -n "$withheld" && -n "$granted" ]]
+store_spec=$(awk '$1 == "action" && $5 == "isolation:TmpStoreTheory" {print $4}' "$tmpdir/batch")
+[[ -n "$spec" && -n "$locked" && -n "$withheld" && -n "$granted" && -n "$store_spec" ]]
 # /tmp is granted only when no worker state lies beneath it.
 run_tmp_action() {
   local worker=$1 tmp_spec=$2
@@ -119,6 +125,12 @@ tmp_worker=$(mktemp -d /tmp/holbuild-test-tmp.XXXXXX)
 var_tmp_worker=$(mktemp -d /var/tmp/holbuild-test-tmp.XXXXXX)
 granted=$(run_tmp_action "$var_tmp_worker" "$granted")
 [[ $granted == "tmpName /tmp/MLTEMP"* ]] || { echo "/tmp not granted: $granted" >&2; exit 1; }
+# Nor over a checkpoint store mounted there, whose states actions only read.
+store_worker=$(mktemp -d /var/tmp/holbuild-test-tmp.XXXXXX)
+tmp_store=$(mktemp -d /tmp/holbuild-test-store.XXXXXX)
+mkdir -p "$store_worker/cache"
+ln -s "$tmp_store" "$store_worker/cache/checkpoint-store"
+[[ $(run_tmp_action "$store_worker" "$store_spec") == "tmpName withheld" ]] || { echo '/tmp granted over the checkpoint store' >&2; exit 1; }
 link_hol_toolchain_cache "$tmpdir/worker"
 set +e
 HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" --max-heap 1024 --remote-cache "$remote_url" \
@@ -128,7 +140,7 @@ set -e
 [[ $locked_status == 3 ]] || { cat "$tmpdir/locked.log" "$tmpdir/locked.result" >&2; exit 1; }
 require_grep '^failure=internal$' "$tmpdir/locked.result"
 require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/locked.log"
-[[ ! -e "$tmpdir/worker/action" ]] || { echo 'an inaccessible directory survived cleanup' >&2; exit 1; }
+[[ ! -e "$tmpdir/worker/action/.holbuild/stage" ]] || { echo 'an inaccessible directory survived cleanup' >&2; exit 1; }
 # A policy/setup failure is retryable infrastructure failure, never a final
 # failed proof. The protected completion marker is not writable by HOL.
 set +e
@@ -192,7 +204,8 @@ require_grep 'credential and cache attacks denied' "$tmpdir/remote/cas/$log"
 for dir in actions blobs locks cooperate; do
   for base in "$tmpdir/shared" "$tmpdir/worker"; do require_grep '^original$' "$base/$dir/other"; done
 done
-[[ ! -e "$tmpdir/worker/action" && ! -e "$tmpdir/worker/checkpoints" ]]
+[[ ! -e "$tmpdir/worker/action/.holbuild/stage" && ! -e "$tmpdir/worker/checkpoints" ]]
+[[ ! -e "$tmpdir/worker/action/stray" ]]
 
 # Trust rejection is final, even for a warm/cached action. No source from an
 # unconfigured repository may reach toolchain bootstrap.

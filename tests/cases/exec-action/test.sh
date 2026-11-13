@@ -272,6 +272,37 @@ curl -fsS -X PUT --data-binary "@$tmpdir/blob-path" "$remote_url/cas/$spec_blob_
 worker blob-path "$spec_blob_path"
 expect blob-path 4 "status=failed" "failure=spec-rejected"
 require_grep "a file's SHA-256 is malformed" "$tmpdir/blob-path.log"
+# Or one that writes where the worker keeps a dependency other than as
+# that dependency: a library manifest over its object, a library file or
+# an output at its script, or a path spelled two ways.
+for edit in manifest library output dot; do
+  python3 - "$project/.holbuild/action-specs/$spec_b" "$tmpdir/overlap" "$edit" <<'PY'
+import sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+lines = head.split(b"\n")
+dep = [l for l in lines if l.startswith(b"dep theory ")][0].split(b" ")
+target, stem = dep[2], dep[3]
+edit = sys.argv[3]
+if edit == "manifest":
+    lines.append(b"lib " + target + b" " + stem + b" .ui")
+elif edit == "library":
+    lines.append(b"file library " + stem + b".sml " + b"0" * 64 + b" 24")
+elif edit == "output":
+    lines = [b"output sml " + stem + b".sml" if l.startswith(b"output sml ") else l for l in lines]
+else:
+    lines.append(b"file library .holbuild/action-src/./lib/A.sml " + b"0" * 64 + b" 24")
+open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
+PY
+  spec_overlap=$(sha256sum "$tmpdir/overlap" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/overlap" "$remote_url/cas/$spec_overlap"
+  worker overlap "$spec_overlap"
+  expect overlap 4 "status=failed" "failure=spec-rejected"
+  case $edit in
+    manifest) require_grep "two items of the spec write" "$tmpdir/overlap.log" ;;
+    library|dot) require_grep "a library file is not a canonical action-src path" "$tmpdir/overlap.log" ;;
+    output) require_grep "the outputs are not one theory's" "$tmpdir/overlap.log" ;;
+  esac
+done
 worker absent "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
 expect absent 4 "status=failed" "failure=spec-rejected"
 
@@ -296,8 +327,13 @@ built_worker=$tmpdir/worker-$(basename "$built" .result)
 ac_a=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $3 }' "$tmpdir/batch.txt")
 require_file "$remote_root/ac/$ac_a"
 
-# Both writable trees are discarded: another tenant must not inherit them.
-[[ ! -e "$built_worker/action" ]] || { echo "the action root was not emptied" >&2; exit 1; }
+# Only the trees the hydrate keeps stay, with their records, for the next
+# action; the writable trees and the action's own files go, so another
+# tenant can't inherit them.
+for dir in stage logs tool-cache ahead action-spec; do
+  [[ ! -e "$built_worker/action/.holbuild/$dir" ]] || { echo "the action's $dir was not emptied" >&2; exit 1; }
+done
+require_file "$built_worker/action-resident"
 [[ ! -e "$built_worker/checkpoints" ]] || { echo "the worker retained private checkpoints" >&2; exit 1; }
 
 # A successful build reports its peak memory and uploads its log.
@@ -398,6 +434,77 @@ elif [[ ! -e "$HOLDIR/tools-poly/poly/theory_modules.ML" ]]; then
   [[ ! -e "$tmpdir/worker-c/theory-modules" ]] || {
     echo "worker c started a module writer for a HOL without modules" >&2; exit 1; }
 fi
+
+# The next action on worker c keeps the dependencies it names again, here
+# A, and removes the rest; a dependency whose local entry changed since is
+# installed again, and without its records the worker empties the root.
+cat > "$project/src/A2Script.sml" <<'SML'
+Theory A2
+Ancestors A
+
+Theorem a2_thm:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+SML
+hb action-spec --upload A2Theory > "$tmpdir/batch-a2.txt"
+spec_a2=$(spec_for "$tmpdir/batch-a2.txt" worker:A2Theory)
+resident_stem() { awk -F'\t' -v want="$1" '$1 == "theory" && $3 ~ want { print $2 }' "$tmpdir/worker-c/action-resident"; }
+stem_a=$(resident_stem 'ATheory$')
+stem_b=$(resident_stem 'BTheory$')
+[[ -n "$stem_a" && -n "$stem_b" ]] || { cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
+inode_a=$(stat -c %i "$stem_a.dat")
+# Held, so that a reinstall can't get the same inode back.
+ln "$stem_a.dat" "$tmpdir/a-held.dat"
+worker c "$spec_a2"
+expect c 0
+[[ $(stat -c %i "$stem_a.dat") == "$inode_a" ]] || { echo "worker c installed A again" >&2; exit 1; }
+[[ ! -e "$stem_b.dat" && -z $(resident_stem 'BTheory$') ]] || { echo "worker c kept B, which A2 doesn't name" >&2; exit 1; }
+printf '\n' >> "$tmpdir/worker-c/actions/$key_a/manifest"
+worker c "$spec_a2"
+expect c 0
+[[ $(stat -c %i "$stem_a.dat") != "$inode_a" ]] || { echo "worker c kept A after its entry changed" >&2; exit 1; }
+touch "$tmpdir/worker-c/action/.holbuild/obj/stray"
+rm "$tmpdir/worker-c/action-resident"
+worker c "$spec_a2"
+expect c 0
+[[ ! -e "$tmpdir/worker-c/action/.holbuild/obj/stray" ]] || { echo "worker c kept a root it has no records of" >&2; exit 1; }
+# A release that keeps no records removes the root around its actions; the
+# records go once the root is emptied, even when the action then fails.
+rm -rf "$tmpdir/worker-c/action"
+worker c "$spec_a2"
+expect c 0
+rm -rf "$tmpdir/worker-c/action"
+worker c "$(printf 'absent' | sha256sum | cut -d' ' -f1)"
+expect c 4 "status=failed" "failure=spec-rejected"
+worker c "$spec_a2"
+expect c 0
+# A file where the previous action had a directory of the same name: the
+# directory a removed file leaves empty goes with it, as in a cold root.
+printf 'payload\n' > "$tmpdir/payload"
+payload=$(sha256sum "$tmpdir/payload" | cut -d' ' -f1)
+curl -fsS -X PUT --data-binary "@$tmpdir/payload" "$remote_url/cas/$payload"
+for path in extra/item extra; do
+  python3 - "$project/.holbuild/action-specs/$spec_a2" "$tmpdir/nested" "$path" "$payload" <<'PY'
+import sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+head += b"\nfile library .holbuild/action-src/worker/" + sys.argv[3].encode() + b" " + sys.argv[4].encode() + b" 8"
+open(sys.argv[2], "wb").write(head + b"\naction-text\n" + text)
+PY
+  spec_nested=$(sha256sum "$tmpdir/nested" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/nested" "$remote_url/cas/$spec_nested"
+  worker c "$spec_nested"
+  expect c 0
+done
+# Extra outputs a dependency's records don't name, as an early cutoff
+# restores under the action's earlier key, go at the next hydrate.
+orphan="$tmpdir/worker-c/action/.holbuild/action-extra/$(printf 'orphan' | sha256sum | cut -d' ' -f1)"
+mkdir -p "$orphan/results"
+worker c "$spec_a2"
+expect c 0
+[[ ! -e "$orphan" ]] || { echo "worker c kept extra outputs nobody records" >&2; exit 1; }
+require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
 
 # The original checkout restores all three results without building.
 hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; exit 1; }
@@ -684,6 +791,9 @@ spec_r=$(spec_for "$tmpdir/batch-r.txt" worker:RTheory)
 old_dat=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$tmpdir/worker-stale-deps/actions/$key_n/manifest")
 rm "$tmpdir/worker-stale-deps/blobs/$old_dat"
 mv "$remote_root/cas/$old_dat" "$tmpdir/old-n.dat"
+# A worker still holding N in its action root needs neither payload; this
+# one must restore it.
+rm "$tmpdir/worker-stale-deps/action-resident"
 worker stale-deps "$spec_r"
 expect stale-deps 3 "status=failed" "failure=input-missing" "missing=theory $key_n"
 [[ ! -f "$tmpdir/worker-stale-deps/actions/$key_n/manifest" ]] || {

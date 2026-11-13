@@ -1759,8 +1759,13 @@ HOLBUILD_CACHE=/var/cache/holbuild holbuild --remote-cache https://cache.example
   exec-action SPEC-SHA256 --result result.txt --cache-limit-gb 200 [--share-heaps]
 ```
 
-It runs in `<cache root>/action`, which it locks and empties before and after
-each action. Dependency heaps and checkpoints in `<cache root>/checkpoints`
+It runs in `<cache root>/action`, which it locks. The dependencies it
+restores there stay for the next action, which keeps those it names again and
+removes the rest; HOL may read them but writes only the action's stage, logs,
+tool cache and load-ahead markers, which are emptied before and after each
+action. Without its records (`<cache root>/action-resident`), as after a
+worker stopped part way, or a release that keeps no records ran there, and
+before every script run, the action root is emptied first. Dependency heaps and checkpoints in `<cache root>/checkpoints`
 are private to the action and are also emptied before and after it; reuse
 across worker actions requires `--share-heaps` (below). A saved heap records the absolute paths it was
 built at, so every worker should use the same cache root. One `exec-action`
@@ -1986,9 +1991,12 @@ the host store `<cache root>/checkpoint-store` keeps the shared files, one
 directory per heap, which the cache cap and `holbuild gc` evict as a unit,
 unless an action on the host is using it. Worker containers on one host can share
 `checkpoint-store/` and `hol-toolchains/`, mounted from host directories, and
-keep the rest of the cache root to themselves. Restored Poly/ML states and
-their records are copied into the private checkpoint tree, so submitted HOL
-code cannot change the shared files through a link. Files published back to
+keep the rest of the cache root to themselves. Restored Poly/ML states are
+linked into the private checkpoint tree (symbolically, where the store is on
+another mount), and their records copied; HOL may only read the directories
+that hold a link and the store directories the links point into, so
+submitted HOL code cannot change the shared files. A restored failed proof's
+prefix, which the run replaces in place, is copied. Files published back to
 the store are also copied, after cleanup and output validation.
 
 ### Building on remote workers

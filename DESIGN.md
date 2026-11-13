@@ -695,6 +695,44 @@ still reject conflicts, except that a remote-exec worker replaces a remote
 entry whose recorded parents differ from the parents it restored from the
 remote cache, since no build can use it.
 
+### Persistent action root on workers
+
+A worker's action root keeps the dependencies one action restored for the
+next, at the same absolute paths, so heap and checkpoint keys, which name
+those paths, are unchanged. Only `exec-action` writes it, under the worker's
+action lock; a theory child reads it and writes only `.holbuild/stage`,
+`logs`, `tool-cache` and `ahead`. Around each action the worker removes
+everything in the root but `.holbuild/{obj,packages,action-src,action-extra}`,
+which the hydrate prunes, and its marker. The
+worker records what it installed (`<cache root>/action-resident`): each
+dependency theory with its key, the SHA-256 of the local cache manifest it
+came from, the parent names its `.uo` was generated from, and the hashes the
+parent check and the early cutoff read; each source, input and library by
+SHA-256; each library manifest by its text's SHA-256. It trusts them only
+while the root holds the marker `.holbuild/resident`, which an older release,
+removing the root around its actions, removes with it; emptying the root
+removes the records first. A spec must name each path it writes in canonical
+form, its files under `.holbuild/action-src` and its objects under
+`.holbuild/obj` or `.holbuild/packages`, its outputs as one stem's, and no
+path twice: otherwise a kept item could stand for files another replaced. A hydrate keeps an item
+whose record matches what the spec names and, for a theory, whose local cache
+manifest is unchanged (the stale check drops a local copy, which then
+reinstalls); it rewrites a kept theory's `.uo` when this spec resolves its
+parents to other stems, and removes every item the spec doesn't name, so the
+root ends as a cold hydrate leaves it. The parent check and the cutoff read
+the records rather than hashing ~4 files per dependency. The stems the action
+writes besides its dependencies (its own outputs, and with loading ahead its
+late parents) are emptied and recorded as scratch, which the next hydrate
+removes or reinstalls. Extra outputs lie under their theory's key in
+`.holbuild/action-extra`; the hydrate removes those of every key it doesn't
+record, as an early cutoff restores the action's own under its earlier key.
+The hydrate deletes the record file before it changes
+the tree and writes it back once it passed, so a worker stopped part way
+starts from an empty root. Script runs put every object directory under the
+root on `loadPath`, so they start from an empty root, leave no records, and the root is removed
+after them. The
+cache cap doesn't count the root: it holds one spec's dependencies.
+
 ## Global cache
 
 The global cache is optional and immutable:
