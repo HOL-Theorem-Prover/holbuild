@@ -1643,10 +1643,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (* Records in the ledger what the last export learned: submit runs
                it once the batch is submitted, or found empty. *)
             val pending_record = ref (fn () => ())
+            (* The keys of the last export's theories that may be restored but aren't here. *)
+            val prefetch_keys = ref []
             fun record_pending () = (!pending_record ()) before pending_record := (fn () => ())
             fun export defer skip forced =
               let
-                val {batch, deferred = held, record} =
+                val {batch, deferred = held, record, prefetch} =
                   timed_phase "action_spec.export"
                     (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
                                 {upload = true, keep_specs = false, local_resumable = not detach, forced = forced, skip = skip,
@@ -1654,6 +1656,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               in
                 deferred := held;
                 pending_record := record;
+                prefetch_keys := prefetch;
                 batch
               end
             fun batch_keys batch =
@@ -1766,8 +1769,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    again; following waits on the coordinator for as long as
                    the batch runs, so collect it now rather than hold it. *)
                 val _ = PolyML.fullGC ()
-                val {add, stop} =
-                  HolbuildBuildExec.start_remote_exec_prefetch build_options tc project plan toolchain_key jobs in_batch
+                val outside_batch =
+                  case in_batch of
+                      SOME batch_keys =>
+                        let val in_batch = Redblackset.addList (Redblackset.empty String.compare, batch_keys)
+                        in List.filter (fn key => not (Redblackset.member (in_batch, key))) (!prefetch_keys) end
+                    | NONE => []
+                val {add, stop} = HolbuildBuildExec.start_remote_exec_prefetch build_options jobs outside_batch
                 val logs = ref []
                 fun on_change (key, state, _, log) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);

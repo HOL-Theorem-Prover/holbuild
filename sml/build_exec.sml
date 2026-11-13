@@ -7191,34 +7191,22 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
     | NONE => (fn () => ())
 
 (* For build --remote-exec while it follows its batch: starts copying into
-   the local cache the remote entries of the plan's theories outside the
-   batch, given its keys (SOME batch_keys), that the remote cache already
-   holds, as start_remote_cache_prefetch does.  Returns {add, stop}: add
-   copies the entry of one more key, as the batch finishes its action; stop
-   drops the copies not yet started, which the build's own prefetch makes,
-   and waits for those in flight. *)
-fun start_remote_exec_prefetch (options : build_options) tc project plan toolchain_key jobs batch_keys =
+   the local cache the remote entries of KEYS, the keys of the plan's
+   theories outside the batch that export found missing here, which the
+   remote cache may hold, as start_remote_cache_prefetch does.  Returns
+   {add, stop}: add copies the entry of one more key, as the batch finishes
+   its action; stop drops the copies not yet started, which the build's own
+   prefetch makes, and waits for those in flight. *)
+fun start_remote_exec_prefetch (options : build_options) jobs keys =
   case HolbuildRemoteCacheConfig.url () of
       SOME url =>
         if not (#use_cache options) then {add = fn _ => (), stop = fn () => ()}
         else
           let
-            val root = cache_root ()
-            val {add, stop, ...} = start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key root url)
-            fun seed batch_keys =
-              let
-                val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                             (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
-                val in_batch = Redblackset.addList (Redblackset.empty String.compare, batch_keys)
-              in
-                List.app (fn node =>
-                             case prefetch_key options project keys node of
-                                 SOME key => if Redblackset.member (in_batch, key) then () else add key
-                               | NONE => ())
-                         (HolbuildBuildPlan.selected_nodes plan)
-              end
+            val {add, stop, ...} =
+              start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key (cache_root ()) url)
           in
-            Option.app seed batch_keys;
+            List.app add keys;
             {add = add, stop = stop}
           end
     | NONE => {add = fn _ => (), stop = fn () => ()}
@@ -8093,7 +8081,12 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val (here_actions, other_actions) =
       detail_time_phase "action_spec.export.built_here" (fn () =>
         let
-          val prepared = map (fn action => (action, local_blobs action)) actions
+          (* Read in parallel: each reads a theory's metadata, and on a busy
+             host those files are often out of the page cache. *)
+          val blobs_of = Array.array (length actions, NONE)
+          val _ = parallel_all remote_probe_width (fn (i, action) => Array.update (blobs_of, i, local_blobs action))
+                    (ListPair.zip (List.tabulate (length actions, fn i => i), actions))
+          val prepared = ListPair.zip (actions, Array.foldr op:: [] blobs_of)
           val blobs = unique_strings (List.concat (List.mapPartial #2 prepared))
           val verified = Binaryset.addList
             (Binaryset.empty String.compare, HolbuildCache.verified_blobs (cache_root ()) blobs)
@@ -8227,7 +8220,13 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
       else record_remote_ledger_entries ledger_path {learned = Binaryset.listItems (!learned), used = !used}
   in
     {batch = String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n",
-     deferred = map (HolbuildBuildPlan.key o #1) deferred, record = record}
+     deferred = map (HolbuildBuildPlan.key o #1) deferred, record = record,
+     (* The cache entries the build may restore that aren't here, for
+        start_remote_exec_prefetch. *)
+     prefetch = List.mapPartial (fn (node, action) =>
+                                   if cache_enabled node andalso not (force_node options project node)
+                                   then SOME (#input_key action) else NONE)
+                                other_actions}
   end
 
 (* Run specs: a caller's script to run in the context of a built theory, or
