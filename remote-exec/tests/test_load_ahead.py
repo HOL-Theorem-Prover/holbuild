@@ -58,7 +58,7 @@ async def ahead_state(engine: AsyncEngine, name: str) -> tuple[str, str, int, in
 
 
 async def test_speculative_loading_is_checked_at_submit(http: httpx.AsyncClient) -> None:
-    for value in ["0", "17", "x"]:
+    for value in ["0", "65", "x"]:
         response = await http.post(
             "/v1/batches", content="holbuild-action-batch-v1\n", headers=CLIENT, params={"speculative_loading": value}
         )
@@ -95,6 +95,47 @@ async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_re
     assert claimed["ahead_parents"] == parents("a")
     assert await ahead_state(remote_exec_engine, "b") == ("running", "ahead", 1, 1)
     assert await states(http, ahead) == {"a": "running", "b": "running"}
+
+
+async def test_a_claim_ahead_comes_after_ready_builds_of_its_priority_and_before_those_of_lower_priorities(
+    http: httpx.AsyncClient,
+) -> None:
+    await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4", priority="2")
+    await claim_named(http, "a")
+    await submit(http, ["x"], priority="2")
+    await submit(http, ["y", "z"])
+
+    order = []
+    for _ in range(4):
+        claimed = await claim_ahead(http)
+        assert claimed is not None
+        order.append(claimed["theory"].removeprefix("pkg:"))
+    assert order[:2] == ["x", "b"] and sorted(order[2:]) == ["y", "z"]
+
+
+async def test_a_ready_build_waits_only_for_a_claim_ahead_of_its_tier_or_an_earlier_one(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "h"], [("h", "a")], speculative_loading="4", priority="2")
+    await submit(http, ["b", "s"], [("s", "b")], speculative_loading="4", priority="2")
+    await claim_named(http, "a")
+    await claim_named(http, "b")
+    await submit(http, ["r"], priority="1")
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE actions SET tier = 'high' WHERE input_key = ANY(:keys)"),
+            {"keys": [input_key("h"), input_key("r")]},
+        )
+    await coordinator._ahead_candidates()
+
+    # "h", which outranks the high-tier "r", may no longer be claimed ahead; "s", of a later tier, doesn't.
+    async with remote_exec_engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE actions SET ahead = 'abandoned' WHERE input_key = :key"), {"key": input_key("h")}
+        )
+    claimed = await claim_ahead(http, "high", also_claim=["standard"])
+    assert claimed is not None and claimed["theory"] == "pkg:r"
 
 
 async def test_a_child_another_batch_is_building_is_not_claimed_ahead_and_is_done_with_that_build(
@@ -501,18 +542,29 @@ async def test_requeueing_a_parent_of_a_batch_that_does_not_load_ahead_looks_for
     assert not [statement for statement in statements if "revoked" in statement]
 
 
+@pytest.mark.parametrize("depth", [1, 2, 8, 0])
 async def test_claiming_and_revoking_ahead_read_each_actions_edges_by_key(
-    coordinator: Coordinator, remote_exec_engine: AsyncEngine
+    coordinator: Coordinator, remote_exec_engine: AsyncEngine, depth: int
 ) -> None:
-    """Claiming ahead, recounting a parent's children claimed ahead and revoking them read a few pages per action,
-    even in a batch the database's statistics don't know yet, as after every submit."""
-    old, new = uuid4(), uuid4()
-    width, layers, parents = 10, 20, 5
+    """Claiming ahead, recounting a parent's children claimed ahead and revoking them read the actions near those
+    claimed ahead, by key, however large the batch, even one the database's statistics don't know yet, as after
+    every submit (a batch four times as large, read no more than half again as much); at depth 1, a few pages per
+    action. Up to 64 actions run claimed ahead, over ``depth`` generations, 8 with no limit."""
+    old, small, large = uuid4(), uuid4(), uuid4()
+    width, parents = 16, 5
+    limit, depth = depth or None, depth or 8
 
-    async def add(connection: Any, batch_id: UUID) -> None:
+    def layer(n: int) -> list[str]:
+        return [f"k{i}" for i in range(n * width, (n + 1) * width)]
+
+    running_ahead = [key for n in range(1, depth) for key in layer(n)[: 64 // (depth - 1)]] or ["k16"]
+    children = layer(depth)
+
+    async def add(connection: Any, batch_id: UUID, layers: int) -> None:
         values = {"id": batch_id, "width": width, "parents": parents, "n": width * layers}
         await connection.execute(
-            sa.text("INSERT INTO batches (id, state, profile, ahead_cap) VALUES (:id, 'running', 'default', 4)"), values
+            sa.text("INSERT INTO batches (id, state, profile, ahead_cap) VALUES (:id, 'running', 'default', 64)"),
+            values,
         )
         await connection.execute(
             sa.text(
@@ -531,42 +583,54 @@ async def test_claiming_and_revoking_ahead_read_each_actions_edges_by_key(
             values,
         )
 
-    async def pages(connection: Any, query: sa.TextClause, parameters: dict[str, object]) -> int:
-        plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query.text}"), parameters)
-        return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
-
-    roots = [f"k{i}" for i in range(width)]
-    children = [f"k{i}" for i in range(width, 2 * width)]
-    async with remote_exec_engine.begin() as connection:  # autovacuum can't see this transaction
-        await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
-        await add(connection, old)
-        await connection.execute(sa.text("ANALYZE"))
-        await add(connection, new)
-        # The roots run, and a child of theirs runs claimed ahead of them.
+    async def run_ahead(connection: Any, batch_id: UUID) -> None:
+        """The roots run, and generations below them run claimed ahead."""
         await connection.execute(
             sa.text("UPDATE actions SET state = 'running' WHERE batch_id = :id AND input_key = ANY(:keys)"),
-            {"id": new, "keys": roots},
+            {"id": batch_id, "keys": layer(0)},
         )
         await connection.execute(
-            sa.text("UPDATE actions SET state = 'running', ahead = 'ahead' WHERE batch_id = :id AND input_key = 'k10'"),
-            {"id": new},
+            sa.text("UPDATE actions SET state = 'running', ahead = 'ahead' WHERE batch_id = :id AND input_key = ANY(:keys)"),
+            {"id": batch_id, "keys": running_ahead},
         )
         await connection.execute(
             sa.text(
                 "INSERT INTO leases (attempt_token, batch_id, input_key, worker, expires_at) "
-                "VALUES (:token, :id, 'k10', 'w', now() + interval '1 hour')"
+                "SELECT gen_random_uuid(), :id, k, 'w', now() + interval '1 hour' FROM unnest(CAST(:keys AS text[])) k"
             ),
-            {"token": uuid4(), "id": new},
+            {"id": batch_id, "keys": running_ahead},
         )
-        for query, parameters in [
-            (coordinator_module.CLAIM_AHEAD_ACTION, {"batch_id": new, "keys": children, "tier": "standard"}),
-            (coordinator_module.REFRESH_AHEAD_CHILDREN, {"batch_id": new, "key": "k0"}),
-            (coordinator_module.REVOKE_AHEAD, {"batch_id": new, "keys": ["k0"]}),
-        ]:
-            assert await pages(connection, query, parameters) < 50 * width, query.text
-        assert await connection.scalar(
-            sa.text("SELECT ahead FROM actions WHERE batch_id = :id AND input_key = 'k10'"), {"id": new}
-        ) == "abandoned"
+
+    async def pages(connection: Any, query: sa.TextClause, parameters: dict[str, object]) -> int:
+        plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query.text}"), parameters)
+        return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
+
+    async def reads(connection: Any, batch_id: UUID) -> list[int]:
+        walk = {"batch_id": batch_id, "keys": children, "depth": limit}
+        return [  # REVOKE_AHEAD last: EXPLAIN ANALYZE runs it
+            await pages(connection, coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard"}),
+            await pages(connection, coordinator_module.AHEAD_PARENTS, {**walk, "keys": children[:1]}),
+            await pages(connection, coordinator_module.REFRESH_AHEAD_CHILDREN, {"batch_id": batch_id, "key": "k0"}),
+            await pages(connection, coordinator_module.REVOKE_AHEAD, {"batch_id": batch_id, "keys": ["k0"]}),
+        ]
+
+    async with remote_exec_engine.begin() as connection:  # autovacuum can't see this transaction
+        await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
+        await add(connection, old, 20)
+        await connection.execute(sa.text("ANALYZE"))
+        await add(connection, small, 20)
+        await add(connection, large, 80)
+        await run_ahead(connection, small)
+        await run_ahead(connection, large)
+        small_reads, large_reads = await reads(connection, small), await reads(connection, large)
+        for small_read, large_read in zip(small_reads, large_reads, strict=True):
+            assert large_read < small_read * 1.5 + 50, (small_reads, large_reads)
+        if depth == 1:
+            assert max(small_reads) < 50 * width, small_reads
+        for batch_id in (small, large):
+            assert await connection.scalar(
+                sa.text("SELECT ahead FROM actions WHERE batch_id = :id AND input_key = 'k16'"), {"id": batch_id}
+            ) == "abandoned"
         await connection.rollback()
 
 
@@ -587,3 +651,225 @@ async def test_a_better_ranked_waiter_that_cant_claim_ahead_leaves_the_claims_ah
     assert not plain.done() and capable.result() == ("standard", True)
     claimed = await coordinator.claim(["high", "standard"], "burst", host_id="host-c", ahead=True)
     assert claimed is not None and claimed.theory == "pkg:b"
+
+
+async def test_with_no_depth_limit_revoking_reads_each_ancestor_claimed_ahead_once_however_many_paths_reach_it(
+    coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    """Each action has its two predecessors as parents, so the number of distances an ancestor is at grows with
+    the chain; all but the first were claimed ahead and are done but the last, which runs."""
+    batch_id, n = uuid4(), 300
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text("INSERT INTO batches (id, state, profile, ahead_cap) VALUES (:id, 'running', 'default', 16)"),
+            {"id": batch_id},
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier, "
+                "ahead) SELECT :id, 't' || g, 'ac' || g, 's', 'pkg:t' || g, 0, CASE WHEN g = 0 THEN 'waiting' "
+                "WHEN g = :n - 1 THEN 'running' ELSE 'done' END, 'standard', CASE WHEN g = 0 THEN 'no' ELSE 'ahead' "
+                "END FROM generate_series(0, :n - 1) g"
+            ),
+            {"id": batch_id, "n": n},
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO edges (batch_id, input_key, parent_key) SELECT :id, 't' || g, 't' || (g - p) "
+                "FROM generate_series(1, :n - 1) g, generate_series(1, 2) p WHERE g - p >= 0"
+            ),
+            {"id": batch_id, "n": n},
+        )
+        await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
+        plan = await connection.scalar(
+            sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.REVOKE_AHEAD.text}"),
+            {"batch_id": batch_id, "keys": ["t0"]},
+        )
+        assert plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"] < 20 * n
+        assert await connection.scalar(
+            sa.text("SELECT ahead FROM actions WHERE batch_id = :id AND input_key = :key"),
+            {"id": batch_id, "key": f"t{n - 1}"},
+        ) == "abandoned"
+        await connection.rollback()
+
+
+async def test_with_no_depth_limit_a_chain_is_claimed_ahead_all_the_way_down(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", 0)
+    names, edges = chain(12)
+    await submit(http, names, edges, speculative_loading="16")
+    await claim_named(http, "t0")
+    for generation in range(1, len(names)):
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == f"pkg:t{generation}"
+        assert claimed["ahead_parents"] == ancestors_first(*names[:generation])
+    assert await claim_ahead(http) is None
+
+
+def chain(n: int) -> tuple[list[str], list[tuple[str, str]]]:
+    """``n`` actions, each the only parent of the next."""
+    names = [f"t{i}" for i in range(n)]
+    return names, list(zip(names[1:], names, strict=False))
+
+
+def ancestors_first(*names: str) -> list[dict[str, str]]:
+    return [{"input_key": input_key(n), "spec_sha256": spec(n)} for n in names]
+
+
+@pytest.mark.parametrize("depth", [2, 4])
+async def test_claims_ahead_go_ahead_depth_generations_deep_naming_every_unfinished_ancestor_ancestors_first(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch, depth: int
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", depth)
+    names, edges = chain(depth + 2)
+    batch_id = await submit(http, names, edges, speculative_loading="16")
+    tokens = {"t0": await claim_named(http, "t0")}
+
+    # Each claim ahead below the last generation lets the next one in at once, without waiting for the shared read.
+    for generation in range(1, depth + 1):
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == f"pkg:t{generation}"
+        assert claimed["ahead_parents"] == ancestors_first(*names[:generation])
+        tokens[names[generation]] = claimed["attempt_token"]
+    assert await claim_ahead(http) is None
+
+    # Its first ancestor done, the generation after the last may go too.
+    cache.keys.add(ac_key("t0"))
+    assert (await complete(http, tokens["t0"], result("t0", "built"))).status_code == 200
+    claimed = await claim_ahead(http)
+    assert claimed is not None and claimed["ahead_parents"] == ancestors_first(*names[1 : depth + 1])
+    tokens[names[depth + 1]] = claimed["attempt_token"]
+
+    for name in names[1:]:
+        cache.keys.add(ac_key(name))
+        assert (await complete(http, tokens[name], result(name, "built"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "done"
+
+
+async def test_a_child_waits_ahead_of_a_diamond_only_within_the_depth(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", 2)
+    # "c" has "a" as a parent and as a grandparent through "b": it is two generations after "a".
+    await submit(http, ["a", "b", "c", "d"], [("b", "a"), ("c", "a"), ("c", "b"), ("d", "c")], speculative_loading="16")
+    await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+    c = await claim_ahead(http)
+    assert c is not None and (c["theory"], c["ahead_parents"]) == ("pkg:c", ancestors_first("a", "b"))
+    assert await claim_ahead(http) is None
+
+
+@pytest.mark.parametrize("depth", [2, 4, 0])
+async def test_an_ancestor_back_to_waiting_revokes_a_claim_ahead_across_parents_that_finished(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, remote_exec_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch, depth: int,
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", depth)
+    names, edges = chain((depth or 4) + 1)
+    *ancestors, last = names
+    batch_id = await submit(http, names, edges, speculative_loading="16")
+    root = await claim_named(http, "t0")
+    claims = {}
+    for name in names[1:]:
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == f"pkg:{name}"
+        claims[name] = claimed["attempt_token"]
+    assert claimed["ahead_parents"] == ancestors_first(*ancestors)
+
+    # The parents between finish before the root's result comes, which then fails to publish: the last may hold
+    # the root's outputs, which are no one's now, though it has no edge to the root and its parents are done.
+    for name in ancestors[1:]:
+        cache.keys.add(ac_key(name))
+        assert (await complete(http, claims[name], result(name, "built"))).status_code == 200
+    assert await ahead_state(remote_exec_engine, last) == ("running", "ahead", 1, 0)
+    assert (await complete(http, root, result("t0", "failed", "publish"))).status_code == 200
+    assert (await ahead_state(remote_exec_engine, last))[1:3] == ("abandoned", 0)
+    assert (await http.post(f"/v1/work/{claims[last]}/heartbeat", headers=WORKER)).status_code == 409
+    assert {name: state for name, state in (await states(http, batch_id)).items() if name in ancestors[1:]} == {
+        name: "done" for name in ancestors[1:]
+    }
+
+
+@pytest.mark.parametrize("depth", [2, 4])
+async def test_an_ancestor_back_to_waiting_revokes_a_claim_ahead_made_after_parents_between_finished_beyond_the_depth(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, remote_exec_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch, depth: int,
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", depth)
+    names, edges = chain(depth + 2)
+    first, *between, last = names[1:]
+    await submit(http, names, edges, speculative_loading="16")
+    root = await claim_named(http, "t0")
+    claims = {}
+    for name in [first, *between]:
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == f"pkg:{name}"
+        claims[name] = claimed["attempt_token"]
+    assert await claim_ahead(http) is None
+
+    # The first claim ahead finishing before the root's result comes makes the next one generation 0, so the last
+    # is claimed ahead, more than the depth below the root, whose outputs it may hold through its done ancestors.
+    cache.keys.add(ac_key(first))
+    assert (await complete(http, claims[first], result(first, "built"))).status_code == 200
+    claimed = await claim_ahead(http)
+    assert claimed is not None and claimed["theory"] == f"pkg:{last}"
+    for name in between:
+        cache.keys.add(ac_key(name))
+        assert (await complete(http, claims[name], result(name, "built"))).status_code == 200
+    assert (await complete(http, root, result("t0", "failed", "publish"))).status_code == 200
+    assert (await ahead_state(remote_exec_engine, last))[1:3] == ("abandoned", 0)
+    assert (await http.post(f"/v1/work/{claimed['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
+
+
+@pytest.mark.parametrize("depth", [2, 4])
+async def test_a_claim_ahead_finishing_before_its_parents_frees_its_slot_of_the_cap_for_a_waiting_claim(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, remote_exec_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch, depth: int,
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", depth)
+    names, edges = chain(depth + 1)
+    last = names[-1]
+    await submit(http, [*names, "x"], [*edges, ("x", "t0")], speculative_loading=str(depth))
+    await claim_named(http, "t0")
+    claims = {}
+    for name in names[1:]:  # the chain leads; "x" then waits for the cap
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == f"pkg:{name}"
+        claims[name] = claimed
+    assert await claim_ahead(http) is None
+
+    started = time.monotonic()
+    waiting = asyncio.create_task(claim_ahead(http, wait_s=CLAIM_RECHECK_SECONDS * 2))
+    await asyncio.sleep(0.2)
+    assert not waiting.done()
+    cache.keys.add(ac_key(last))
+    assert (await complete(http, claims[last]["attempt_token"], result(last, "built"))).status_code == 200
+    assert await ahead_state(remote_exec_engine, last) == ("done", "ahead", 1, 1)
+    x = await waiting
+    assert x is not None and (x["theory"], x["ahead_parents"]) == ("pkg:x", ancestors_first("t0"))
+    assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
+
+
+async def test_a_child_nearer_its_running_ancestors_wakes_a_waiting_claim_ahead_for_its_own_child(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", 2)
+    # "c" waits ahead of "a" and "b"; "d" is a generation too far until "a" finishes.
+    await submit(
+        http, ["a", "b", "c", "d"], [("b", "a"), ("c", "a"), ("c", "b"), ("d", "c")], speculative_loading="16"
+    )
+    a = await claim_named(http, "a")
+    assert await claim_ahead(http) is not None
+    assert await claim_ahead(http) is not None
+    started = time.monotonic()
+    waiting = asyncio.create_task(claim_ahead(http, wait_s=CLAIM_RECHECK_SECONDS * 2))
+    await asyncio.sleep(0.2)
+    assert not waiting.done()
+
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, a, result("a", "built"))).status_code == 200
+    d = await waiting
+    assert d is not None and (d["theory"], d["ahead_parents"]) == ("pkg:d", ancestors_first("b", "c"))
+    assert time.monotonic() - started < CLAIM_RECHECK_SECONDS

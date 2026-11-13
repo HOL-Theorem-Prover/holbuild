@@ -105,6 +105,17 @@ Proof
   ACCEPT_TAC b_thm
 QED
 SML
+# J is two generations ahead of A: its parent B is built ahead of A too.
+cat > "$project/src/JScript.sml" <<'SML'
+Theory J
+Ancestors B
+
+Theorem j_thm:
+  T
+Proof
+  ACCEPT_TAC b_thm
+QED
+SML
 # D records an ML dependency its source doesn't name literally, so the
 # manifest predicted for it misses one its load evaluates.
 cat > "$project/src/DScript.sml" <<'SML'
@@ -272,8 +283,8 @@ spec_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $4 }' "$1"; 
 key_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $2 }' "$1"; }
 
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
-hb action-spec --upload CTheory ETheory FTheory GTheory ITheory KTheory ZTheory > "$tmpdir/batch.txt"
-for theory in A B C D E F G H I K X Y Z; do
+hb action-spec --upload CTheory ETheory FTheory GTheory ITheory JTheory KTheory ZTheory > "$tmpdir/batch.txt"
+for theory in A B C D E F G H I J K X Y Z; do
   declare "spec_$theory=$(spec_for "$tmpdir/batch.txt" "ahead:${theory}Theory")"
   declare "key_$theory=$(key_for "$tmpdir/batch.txt" "ahead:${theory}Theory")"
 done
@@ -302,15 +313,18 @@ require_grep 'cannot fetch the source of ATheory' "$tmpdir/nosource.log"
 mv "$tmpdir/source-A" "$tmpdir/remote/cas/$source_A"
 
 # The parent arrives while the children wait for it, and they build, also
-# the one that loads it through a library and the one that only waits for
-# it, at the end of its preload, then loads it from its script.
+# the one that loads it through a library, the one that only waits for it,
+# at the end of its preload, then loads it from its script, and the one two
+# generations ahead, whose parent B builds ahead of A meanwhile.
 worker_start ahead "$spec_B" --ahead-parent "$key_A:$spec_A"
+worker_start ahead2 "$spec_J" --ahead-parent "$key_B:$spec_B" --ahead-parent "$key_A:$spec_A"
 worker_start ahead-lib "$spec_F" --ahead-parent "$key_A:$spec_A"
 worker_start ahead-order "$spec_G" --ahead-parent "$key_A:$spec_A"
 worker_start ahead-fails "$spec_K" --ahead-parent "$key_A:$spec_A"
 await_marker ahead waiting-ATheory
 await_marker ahead-fails waiting-ATheory
 await_marker ahead-lib waiting-ATheory
+await_marker ahead2 waiting-ATheory
 await_marker ahead-order finishing
 sleep 3
 kill -0 "${worker_pid[ahead-order]}" 2>/dev/null || {
@@ -320,7 +334,7 @@ kill -0 "${worker_pid[ahead-order]}" 2>/dev/null || {
 }
 worker a "$spec_A"
 expect a 0 "status=built"
-for name in ahead ahead-lib ahead-order; do
+for name in ahead ahead-lib ahead-order ahead2; do
   worker_wait "$name"
   expect "$name" 0 "status=built"
   ahead_phases "$name" || { echo "no load-ahead timings:" >&2; cat "$tmpdir/$name.result" >&2; exit 1; }
@@ -377,19 +391,21 @@ worker_wait other-x
 expect other-x 3 "status=failed" "failure=ahead-abandoned"
 require_grep 'does not match its parents' "$tmpdir/other-x.log"
 
-# Plain builds of B and of G, whose script loads A, against a second cache
-# publish the same entries.
+# Plain builds of B, of G, whose script loads A, and of J against a second
+# cache publish the same entries.
 first_remote=$tmpdir/remote
 kill "$server_pid"; wait "$server_pid" 2>/dev/null || true
 start_remote_cache_server "$tmpdir/remote2" "$tmpdir/server2"
-hb action-spec --upload BTheory GTheory > /dev/null
+hb action-spec --upload BTheory GTheory JTheory > /dev/null
 worker plain-a "$spec_A"
 expect plain-a 0 "status=built"
 worker plain-b "$spec_B"
 expect plain-b 0 "status=built"
 worker plain-g "$spec_G"
 expect plain-g 0 "status=built"
-for key in "$key_B" "$key_G"; do
+worker plain-j "$spec_J"
+expect plain-j 0 "status=built"
+for key in "$key_B" "$key_G" "$key_J"; do
   ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key" | sha256sum | cut -d' ' -f1)
   cmp "$first_remote/ac/$ac" "$tmpdir/remote2/ac/$ac"
 done

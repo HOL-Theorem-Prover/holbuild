@@ -1845,7 +1845,7 @@ when it can't go on as a plain run would:
 * a stand-in doesn't match;
 * a restored dependency was built on another build of a late parent;
 * HOL stops early;
-* the parents don't all arrive within `--ahead-wait-seconds` (default 3600).
+* the parents don't all arrive within `--ahead-wait-seconds` (default 14400, counted from the start of the run).
 A retry without the option builds it. The result's `phase-ms` adds
 `aheadwait`, the time HOL spent waiting: at each stand-in from its wait to
 that parent's arrival, and at the end of the preload until every parent has
@@ -2011,13 +2011,15 @@ for missing inputs; it does not change the batch being followed. Retain the
 same priority when reattaching; the recovery hint includes it.
 
 `build --remote-exec URL --speculative-loading[=N]` lets a theory load ahead
-of its parents. A worker with nothing ready to build may take a theory whose
-unbuilt parents are all running on other workers and have no unbuilt parents
-of their own. It loads everything else the theory needs, waits for those
-parents, and then builds (`exec-action --ahead-parent`). At most N theories of
-the batch wait like this at a time (1 to 16, default 4). Only workers started
-with `--load-ahead` take such theories, and only when they have nothing else
-to do, so the batch never adds workers for them.
+of its parents. A worker with nothing ready to build at the batch's priority or
+higher (in the same tier or an earlier one) may take a theory whose
+unbuilt parents are all running on other workers, themselves at most as many
+generations ahead of built parents as the coordinator allows (by default,
+none). It loads everything else the theory needs, waits for those unbuilt
+ancestors, and then builds (`exec-action --ahead-parent`). At most N theories of
+the batch wait like this at a time (1 to 64, default 16). Only workers started
+with `--load-ahead` take such theories, and only when they have nothing ready
+of the batch's priority or higher, so the batch never adds workers for them.
 A theory whose load ahead can't go on is built normally once its parents are
 built. That covers a parent that fails, a predicted parent manifest that
 doesn't match, or a parent that is late. The option costs worker time when a

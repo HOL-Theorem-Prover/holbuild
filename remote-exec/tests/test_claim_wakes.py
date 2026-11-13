@@ -19,7 +19,7 @@ async def test_ahead_changes_retry_only_capable_inflight_claims(
     entered, go, retried = asyncio.Event(), asyncio.Event(), asyncio.Event()
     attempts = 0
 
-    async def empty(tiers: list[str], worker: str) -> None:
+    async def empty(tiers: list[str], worker: str, *_: object) -> None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -28,7 +28,7 @@ async def test_ahead_changes_retry_only_capable_inflight_claims(
         else:
             retried.set()
 
-    async def no_ahead(tiers: list[str], worker: str) -> None:
+    async def no_ahead(tiers: list[str], worker: str, **_: object) -> None:
         return None
 
     monkeypatch.setattr(coordinator, "_claim", empty)

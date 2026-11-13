@@ -370,7 +370,7 @@ A run that can't go on as a plain run would fails as ahead-abandoned
 .BI \-\-ahead\-wait\-seconds " N"
 How long to wait for the parents named by
 .B \-\-ahead\-parent
-(default 3600).
+(default 14400).
 .RE
 .TP
 .B run\-action \fIFORM\fR \fITARGET\fR ...
@@ -779,7 +779,7 @@ The batch's priority with the coordinator (default 0).
 Let the coordinator's workers start loading a theory's ancestors before its
 parents are built, at most
 .I N
-theories of the batch at a time (1\(en16, default 4).
+theories of the batch at a time (1\(en64, default 16).
 Costs worker time when a parent fails.
 .TP
 .B \-\-detach

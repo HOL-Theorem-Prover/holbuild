@@ -132,7 +132,7 @@ fun build_help () = print
   \status 75. --detach submits the batch and exits; --attach follows a\n\
   \submitted batch and restores it. --speculative-loading starts loading a\n\
   \theory's ancestors on a worker before its parents are built, at most N\n\
-  \theories of the batch at a time (1-16, default 4); it costs worker time\n\
+  \theories of the batch at a time (1-64, default 16); it costs worker time\n\
   \when a parent fails.\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
@@ -316,7 +316,7 @@ fun exec_action_help () = print
   \                     parent. A run that cannot go on as a plain build would\n\
   \                     fails as ahead-abandoned (exit status 3).\n\
   \--ahead-wait-seconds N\n\
-  \                     How long to wait for the parents (default: 3600).\n\n\
+  \                     How long to wait for the parents (default: 14400).\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun run_action_help () = print
@@ -2305,13 +2305,13 @@ fun split_speculative_loading args =
       (* Two digits at most, so Int.fromString can't overflow. *)
       case if size value <= 2 andalso List.all Char.isDigit (String.explode value) then Int.fromString value else NONE of
           SOME n =>
-            if n >= 1 andalso n <= 16 then n
-            else raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 16")
-        | NONE => raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 16")
+            if n >= 1 andalso n <= 64 then n
+            else raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 64")
+        | NONE => raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 64")
     fun loop cap acc xs =
       case xs of
           [] => (cap, rev acc)
-        | "--speculative-loading" :: rest => loop (SOME 4) acc rest
+        | "--speculative-loading" :: rest => loop (SOME 16) acc rest
         | arg :: rest =>
             if String.isPrefix "--speculative-loading=" arg then
               loop (SOME (parse (String.extract (arg, size "--speculative-loading=", NONE)))) acc rest

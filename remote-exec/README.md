@@ -122,6 +122,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_EVENTS_POLL_SECONDS` | least time between an event stream's reads of its batch, which a write to it by the same coordinator process starts | 1 |
 | `REMOTE_EXEC_EVENTS_FALLBACK_SECONDS` | most time between an event stream's reads, for other coordinator processes' writes | 10 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
+| `REMOTE_EXEC_AHEAD_DEPTH` | how many generations of running ancestors an action may be claimed ahead of, 0 for no limit (see "Loading ahead") | 1 |
 | `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
@@ -487,12 +488,14 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   network partition, nothing depends on exactly-once execution: a second run
   finds the result cached.
 - **Loading ahead**, for a batch submitted with `speculative_loading=<cap>`:
-  a worker that says it can (`"ahead": true`) and finds nothing ready in any
-  batch may claim a waiting build action of the batch whose parents that
-  aren't done are all running and wait for no parent of their own, so a claim
-  goes one generation ahead. Its worker loads the action's ancestors that
-  exist and waits for the running parents' outputs, which the claim names in
-  `ahead_parents`. At most `<cap>` of a batch's actions wait ahead at once;
+  a worker that says it can (`"ahead": true`) and finds nothing ready of the
+  batch's priority or higher (in the same tier or an earlier one) may claim a
+  waiting build action of the batch whose parents that
+  aren't done are all running, at most `REMOTE_EXEC_AHEAD_DEPTH` generations
+  ahead (with 0, any number): a running action that waits for no parent is generation 0, and one
+  claimed ahead is a generation after its latest running parent. Its worker
+  loads the action's ancestors that exist and waits for the outputs of the
+  running ones, which the claim names in `ahead_parents`, ancestors first. At most `<cap>` of a batch's actions wait ahead at once;
   among the candidates of the batches below their cap, the claim takes its
   first tier with one, then the highest batch priority, then the longest chain
   of dependents. A parent
@@ -500,9 +503,15 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   fails for good cancels them as it does every descendant. A parent that goes
   back to waiting (a retry, an expired lease, a done parent built again)
   revokes the leases of the actions claimed ahead of it, and of those claimed
-  ahead of them, and sends them back to waiting without counting the claim; so
+  ahead of them, also across ancestors claimed ahead that have finished since,
+  and sends them back to waiting without counting the claim; so
   does a lease that expires while its action waits ahead. Batches without the
-  parameter are never claimed ahead.
+  parameter are never claimed ahead. An action runs the `exec-action` of the
+  holbuild release that exported it, and only 0.14.36 and later serve claims
+  more than one generation ahead: raise `REMOTE_EXEC_AHEAD_DEPTH` above 1 only
+  once the clients that submit `speculative_loading` batches run such a
+  release. An older one may abandon such a claim (`ahead-abandoned`), which is
+  then built plain.
 - **Retries** by the result's failure class:
 
   | `failure` | What happens |
@@ -662,7 +671,7 @@ retries, and a request still queued for a connection would be done twice.
 text as the body (`text/plain`). `profile` defaults to `default`; `class` defaults to `build`.
 An unknown class returns 422. `priority` defaults to 0 and accepts integers
 from 0 to 2147483647; invalid values return 422. Existing batches retain priority 0.
-`speculative_loading`, from 1 to 16, lets that many of the batch's actions
+`speculative_loading`, from 1 to 64, lets that many of the batch's actions
 at once be claimed ahead of their parents (see "Loading ahead"); without it
 none is. A run batch with it returns 400.
 
@@ -773,8 +782,8 @@ with `cpu_idle_pct` measured since the worker's previous CPU sample, or null
 when that is under a second old)
 
 - 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120, "max_heap_mb": null, "ahead_parents": [{"input_key": "<sha256>", "spec_sha256": "<sha256>"}, …]}`:
-  `ahead_parents` lists the parents still building when the action was claimed ahead of them, and is empty for
-  any other claim
+  `ahead_parents` lists the ancestors still building when the action was claimed ahead of them, each after its
+  own such ancestors, and is empty for any other claim
 - 204 when nothing became ready for the tier within `wait_s`
 
 `POST /v1/work/<attempt_token>/heartbeat`, with no body or `{"host": <report>}`
