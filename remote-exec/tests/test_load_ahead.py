@@ -648,7 +648,7 @@ async def test_a_better_ranked_waiter_that_cant_claim_ahead_leaves_the_claims_ah
 
     # A change that may make actions claimable ahead wakes the claim that can take them.
     coordinator._ahead_changed()
-    assert not plain.done() and capable.result() == ("standard", True)
+    assert not plain.done() and capable.result() == ("standard", True, None)
     claimed = await coordinator.claim(["high", "standard"], "burst", host_id="host-c", ahead=True)
     assert claimed is not None and claimed.theory == "pkg:b"
 

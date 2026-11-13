@@ -1313,9 +1313,12 @@ starts from it: it checks each recorded file and directory with `stat`,
 hashes again only the files whose size, modification time, change time or
 inode moved (and any recorded within a second of its last change), analyses
 again the sources whose content changed, and recomputes the keys of those
-nodes and everything that depends on them. A source or directory added,
-removed, renamed or made readable, or a changed dependency, sends the build
-back to full planning, except inside HOL and the git dependencies holbuild
+nodes and everything that depends on them. When a changed source's
+dependencies changed too (it mentions a module it didn't before, or no
+longer does), it plans again over the recorded sources, analysing only
+what it hasn't analysed before. A source or directory added, removed,
+renamed or made readable sends the build back to full planning, except
+inside HOL and the git dependencies holbuild
 checked out at their pinned revision: there only the files planning read are
 checked, so edits to their content are still caught, but a change made by
 hand to such a checkout's directories (an added source or `holproject.toml`,

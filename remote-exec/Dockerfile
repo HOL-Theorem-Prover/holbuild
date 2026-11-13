@@ -31,6 +31,19 @@ ENV PATH=/opt/remote-exec/.venv/bin:/opt/polyml/bin:$PATH \
     TMPDIR=/var/tmp \
     UV_PYTHON_DOWNLOADS=never
 
+# With HOLBUILD_VERSION set (say 0.14.37), the image bakes that release where
+# the worker looks first, so a fresh host doesn't build it before its first
+# action (README "holbuild releases"). It is built as the worker builds one:
+# the tag's source archive, compiled where it runs from.
+ARG HOLBUILD_VERSION=
+RUN if [ -n "$HOLBUILD_VERSION" ]; then \
+      dir=/opt/holbuild-baked/v$HOLBUILD_VERSION \
+   && mkdir -p "$dir" \
+   && curl -fsSL "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v$HOLBUILD_VERSION.tar.gz" \
+      | tar xz --strip-components=1 -C "$dir" \
+   && make -C "$dir" bin/holbuild; \
+    fi
+
 WORKDIR /opt/remote-exec
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-default-groups

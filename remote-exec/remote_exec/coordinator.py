@@ -56,6 +56,8 @@ SCALE_CMD_TIMEOUT_S = 60
 HOST_REPORT_SECONDS = 120
 # Hosts the coordinator remembers at most; a report from another host beyond them is dropped.
 MAX_HOSTS = 1000
+# Theories whose last host the coordinator remembers at most, the least recently claimed forgotten first.
+MAX_THEORY_HOSTS = 10_000
 # The highest --host-rank a worker may report (worker.py checks the same bound at start).
 MAX_HOST_RANK = 1000
 # The queue sums the phase reports of workers' last this many seconds; at most MAX_PHASE_REPORTS are kept.
@@ -653,7 +655,7 @@ class _AheadRead:
 # the same spec is done with the build, the others are just no longer held. Read by primary key, a probe per running
 # batch: no index leads with input_key.
 PEERS = sa.text("""
-SELECT batch_id, tier, state, spec_sha256,
+SELECT batch_id, tier, theory, state, spec_sha256,
     (SELECT ahead_cap IS NOT NULL FROM batches WHERE id = actions.batch_id) AS ahead_batch
 FROM actions
 WHERE batch_id = ANY(ARRAY(SELECT id FROM batches WHERE state = 'running' AND id <> :batch_id))
@@ -727,6 +729,9 @@ COUNT_ACTIVE = sa.text(
 
 
 ClaimRank = tuple[bool, bool, int, str]
+# What a wake hands a waiting claim: the tier of the action that woke it, whether for a claim ahead, and its theory
+# (None when unknown), so a claim leaving without trying passes the wake on as it was.
+Wake = tuple[str, bool, str | None]
 
 
 def _claim_rank(tiers: list[str], host_id: str | None, host_rank: int = 0) -> ClaimRank:
@@ -761,7 +766,7 @@ class Coordinator:
         # and whether it was for a claim ahead) and whether they may claim ahead, oldest first (the tie-breaker
         # within a host); see claim.
         self.made_ready = 0
-        self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[tuple[str, bool]], bool]] = []
+        self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[Wake], bool]] = []
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
@@ -782,6 +787,8 @@ class Coordinator:
         # What workers reported of their hosts, by host id, and when. Kept in memory: each coordinator process
         # knows the hosts whose workers' requests reached it.
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
+        # The host that last claimed each theory, least recently claimed first; see _wake_claim. Also in memory.
+        self.theory_hosts: dict[str, str] = {}
         # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
         self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque(maxlen=MAX_PHASE_REPORTS)
         # The wakes of the event streams following each batch; see watch.
@@ -976,8 +983,9 @@ class Coordinator:
 
         A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. Each
         action this process's ``release`` makes ready wakes one compatible claim, preferring warm workers, then
-        hosts of lower ``host_rank``, then hosts in canonical order, with FIFO ties. Unwoken claims defer each tier to better-ranked waiters, so
-        polling workers don't spread work back onto tail hosts. Waits recheck every
+        hosts of lower ``host_rank``, then hosts in canonical order, with FIFO ties; among hosts of the same rank, a busy
+        host that last claimed the action's theory comes first. Unwoken claims defer each tier to better-ranked
+        waiters, so polling workers don't spread work back onto tail hosts. Waits recheck every
         ``CLAIM_RECHECK_SECONDS``, for actions another coordinator process made ready and for an action whose
         woken claim took another one or lost it to another claim; a claim woken that leaves without trying wakes
         the next.
@@ -988,7 +996,7 @@ class Coordinator:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
         rank = _claim_rank(tiers, host_id, host_rank)
-        woken: asyncio.Future[tuple[str, bool]] = loop.create_future()  # done once a wake was handed to this claim
+        woken: asyncio.Future[Wake] = loop.create_future()  # done once a wake was handed to this claim
 
         def undeferred(*, ahead_only: bool) -> list[str]:
             """The tiers no better-ranked unwoken waiter takes, of those that may claim ahead if ``ahead_only``."""
@@ -1015,6 +1023,11 @@ class Coordinator:
                 if claimed is None and ahead_tiers:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
+                if claimed is not None and host_id is not None:
+                    self.theory_hosts.pop(claimed.theory, None)
+                    self.theory_hosts[claimed.theory] = host_id
+                    if len(self.theory_hosts) > MAX_THEORY_HOSTS:
+                        del self.theory_hosts[next(iter(self.theory_hosts))]
                 if claimed is not None or remaining <= 0:
                     return claimed
                 woken = loop.create_future()
@@ -1409,32 +1422,38 @@ class Coordinator:
             for key in stale:
                 self.rankings.pop(key, None)
 
-    def _wake_claim(self, tier: str, *, ahead: bool = False) -> None:
-        """Wake the best-ranked compatible claim, with FIFO ties. Only normal wakes count newly ready work;
+    def _wake_claim(self, tier: str, *, ahead: bool = False, theory: str | None = None) -> None:
+        """Wake the best-ranked compatible claim, with FIFO ties. Among hosts of the same rank, the host that last
+        claimed ``theory`` comes first while it runs anything, as it likely still holds the theory's heaps; an idle
+        host is never preferred, so it can still empty and scale in. Only normal wakes count newly ready work;
         changes for capable claims are recorded by _ahead_changed."""
         if not ahead:
             self.made_ready += 1
+        preferred = self.theory_hosts.get(theory) if theory is not None else None
+        report = self.hosts.get(preferred) if preferred is not None else None
+        if report is None or report[1].leases == 0 or (self.clock() - report[0]).total_seconds() >= HOST_REPORT_SECONDS:
+            preferred = None
         waiter = min(
             (w for w in self.claim_waiters if tier in w[0] and not w[2].done() and (w[3] or not ahead)),
-            key=lambda w: w[1],
+            key=lambda w: (*w[1][:3], preferred is None or w[1][3] != preferred, w[1][3]),
             default=None,
         )
         if waiter is not None:
-            waiter[2].set_result((tier, ahead))
+            waiter[2].set_result((tier, ahead, theory))
             self.claim_waiters.remove(waiter)
 
-    def _pass_wake(self, woken: asyncio.Future[tuple[str, bool]]) -> None:
+    def _pass_wake(self, woken: asyncio.Future[Wake]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""
         if woken.done() and not woken.cancelled():
-            tier, ahead = woken.result()
+            tier, ahead, theory = woken.result()
             if not ahead:
                 self.made_ready -= 1
-            self._wake_claim(tier, ahead=ahead)
+            self._wake_claim(tier, ahead=ahead, theory=theory)
 
     async def _peers(self, batch_id: UUID, action: sa.Row[Any]) -> list[sa.Row[Any]]:
         """The waiting and ready copies of build ``action`` of ``batch_id``, whose lease just ended, in other
-        running batches, with their batch, tier, state, spec and ahead opt-in; see PEERS. Read once the lease's deletion
-        committed, so a batch submitted meanwhile is either found or was never held."""
+        running batches, with their batch, tier, theory, state, spec and ahead opt-in; see PEERS. Read once the lease's
+        deletion committed, so a batch submitted meanwhile is either found or was never held."""
         if action.action_class != "build":
             return []
         async with self.engine.connect() as conn:
@@ -1446,7 +1465,7 @@ class Coordinator:
         for peer in peers:
             if peer.state == "ready":
                 self._forget_rankings(peer.batch_id, {peer.tier})
-                self._wake_claim(peer.tier)
+                self._wake_claim(peer.tier, theory=peer.theory)
         if any(peer.state == "waiting" and peer.ahead_batch for peer in peers):
             self._ahead_changed()
 
@@ -1723,18 +1742,20 @@ class Coordinator:
             async with transactions, self.engine.begin() as conn:
                 if await self._lock_batch(conn, batch_id) != "running":
                     return False
-                tiers = await conn.scalars(
-                    sa.text(
-                        "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
-                        "AND input_key = ANY(:keys) AND state = 'waiting' AND remaining_deps = 0 RETURNING tier"
-                    ),
-                    {"batch_id": batch_id, "keys": ready},
+                made_ready = list(
+                    await conn.execute(
+                        sa.text(
+                            "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
+                            "AND input_key = ANY(:keys) AND state = 'waiting' AND remaining_deps = 0 "
+                            "RETURNING tier, theory"
+                        ),
+                        {"batch_id": batch_id, "keys": ready},
+                    )
                 )
-                made_ready = list(tiers)
             self._batch_changed(batch_id)
-            self._forget_rankings(batch_id, set(made_ready))
-            for tier in made_ready:
-                self._wake_claim(tier)
+            self._forget_rankings(batch_id, {tier for tier, _ in made_ready})
+            for tier, theory in made_ready:
+                self._wake_claim(tier, theory=theory)
         requeued = False
         for parents in candidates.values():
             for parent, ac_key in parents:

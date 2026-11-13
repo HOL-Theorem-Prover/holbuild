@@ -579,6 +579,10 @@ fun prune_records dir =
 
 datatype write_outcome = Written | NotWritten of string
 
+(* A source as BP.key names its node. *)
+fun source_key (source : SI.source) =
+  #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source
+
 (* The record of PLAN and its KEYS.  A plan restored from PRIOR has its
    sources, roots and dependency edges, so only what the files and keys say
    is taken from the plan. *)
@@ -617,8 +621,7 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
               SOME i => i
             | NONE => raise Error ("source of unknown package " ^ name)
         val positions =
-          #2 (List.foldl (fn (source : SI.source, (i, map)) =>
-                            (i + 1, Binarymap.insert(map, #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source, i)))
+          #2 (List.foldl (fn (source, (i, map)) => (i + 1, Binarymap.insert(map, source_key source, i)))
                          (0, Binarymap.mkDict String.compare) index)
         fun position_of_key key =
           case Binarymap.peek(positions, key) of
@@ -737,7 +740,7 @@ fun write dir context prior plan keys =
 
 datatype check =
     Restored of {index : SI.source list, targets : string list, plan : BP.t,
-                 toolchain_key : string, changed : bool, record : t,
+                 toolchain_key : string, changed : bool, reresolved : bool, record : t,
                  stamps : (string, stamp) Binarymap.dict, rehashed : int}
   | Fallback of string
 
@@ -853,8 +856,7 @@ fun restore {dir, graph, tc : HolbuildToolchain.t, fingerprint, start_ns} =
       handle Subscript => fall "malformed plan record: package index"
     val source_vector = Vector.fromList sources
     fun source_at i = Vector.sub(source_vector, i) handle Subscript => fall "malformed plan record: source index"
-    (* Sources whose content moved are analysed again through the .deps cache;
-       other facts would change the graph. *)
+    (* Sources whose content moved are analysed again through the .deps cache. *)
     val selected = #selected record
     val current_hash =
       map (fn (entry : node_entry) =>
@@ -870,41 +872,52 @@ fun restore {dir, graph, tc : HolbuildToolchain.t, fingerprint, start_ns} =
         moved
     val _ = configure_analyser tc
     val facts = HolbuildDependencies.prefetch_cached_with_hash requests
-    val _ =
-      ListPair.app
-        (fn ((entry : node_entry, _), SOME deps) =>
-              if deps = #deps entry then ()
-              else fall ("dependencies of " ^ #logical_name (source_at (#source entry)) ^ " changed")
-          | ((entry, _), NONE) => fall ("cannot analyse " ^ #source_path (source_at (#source entry))))
-        (moved, facts)
-    val analysis =
-      HolbuildComponentProvider.restored_analysis_state (HolbuildPackagePrepare.prepare graph)
-        (ListPair.map (fn (entry : node_entry, hash) => (source_at (#source entry), hash, #deps entry))
+    val moved_deps =
+      ListPair.foldl
+        (fn ((entry : node_entry, _), SOME deps, map) => Binarymap.insert(map, #source entry, deps)
+          | ((entry, _), NONE, _) => fall ("cannot analyse " ^ #source_path (source_at (#source entry))))
+        (Binarymap.mkDict Int.compare) (moved, facts)
+    fun deps_of (entry : node_entry) = getOpt (Binarymap.peek(moved_deps, #source entry), #deps entry)
+    val preparation = HolbuildPackagePrepare.prepare graph
+    fun analysis source_of =
+      HolbuildComponentProvider.restored_analysis_state preparation
+        (ListPair.map (fn (entry : node_entry, hash) => (source_of (#source entry), hash, deps_of entry))
                       (selected, current_hash))
-    val ids = #ids record
+    (* New facts may change any edge, the selection and the plan's identities,
+       so the planner runs again over the recorded sources, as full planning
+       would over the same discovery. *)
+    val reresolved = List.exists (fn (entry, _) => deps_of entry <> #deps entry) moved
     val plan =
-      BP.restore {holdir = #holdir tc, sources = sources, roots = #roots record,
-                  selected = map #source selected, analysis = analysis,
-                  edges = map (fn ({symbolic, resolved, external, ...} : node_entry) =>
-                                 {symbolic = symbolic, resolved = resolved, external = external}) selected,
-                  resolution_context_id = #resolution_context_id ids, selected_graph_id = #selected_graph_id ids,
-                  selected_plan_id = #selected_plan_id ids, resolved_plan_id = #resolved_plan_id ids}
-      handle Subscript => fall "malformed plan record: node index"
-    (* Extra inputs: an expansion whose directories moved is redone; file
-       hashes come from the check above. *)
-    val _ =
-      List.app
-        (fn ({base, decl, files, dirs} : expansion) =>
-           if List.exists dir_moved dirs then ()
-           else BP.remember_input_expansion plan base decl {files = files, dirs = dirs})
-        (#expansions record)
-    val _ = Binarymap.app (fn (path, hash) => BP.remember_input_hash plan path hash) hashes
-    (* Input keys: a node keeps its recorded key while its source hash, its
-       inputs and its dependencies' keys are unchanged. *)
-    (* A node's project dependencies are its resolved targets, first
-       appearance first, as BP.direct_project_deps lists them. *)
+      if reresolved then
+        let
+          val identified = Vector.map SI.with_ids source_vector
+          val discovery = SI.restored_discovery packages (Vector.foldr (op ::) [] identified)
+          val components =
+            HolbuildComponentProvider.load HolbuildComponentProvider.LiveProvider
+              {preparation = preparation, discovery = discovery}
+          fun roots _ nodes =
+            let val node_vector = Vector.fromList nodes
+            in map (fn i => Vector.sub(node_vector, i)) (#roots record) end
+            handle Subscript => fall "malformed plan record: root index"
+        in
+          BP.plan_roots components (analysis (fn i => Vector.sub(identified, i))) (#holdir tc)
+            (SI.sources_of discovery) roots
+        end
+      else
+        let val ids = #ids record
+        in
+          BP.restore {holdir = #holdir tc, sources = sources, roots = #roots record,
+                      selected = map #source selected, analysis = analysis source_at,
+                      edges = map (fn ({symbolic, resolved, external, ...} : node_entry) =>
+                                     {symbolic = symbolic, resolved = resolved, external = external}) selected,
+                      resolution_context_id = #resolution_context_id ids, selected_graph_id = #selected_graph_id ids,
+                      selected_plan_id = #selected_plan_id ids, resolved_plan_id = #resolved_plan_id ids}
+          handle Subscript => fall "malformed plan record: node index"
+        end
     val recorded_key_at = Array.array(Vector.length source_vector, "")
     val _ = List.app (fn (entry : node_entry) => Array.update(recorded_key_at, #source entry, #input_key entry)) selected
+    (* A node's project dependencies are its resolved targets, first
+       appearance first, as BP.direct_project_deps lists them. *)
     fun recorded_dep_keys (entry : node_entry) =
       let
         fun add ((target, _, _), (seen, keys)) =
@@ -931,35 +944,73 @@ fun restore {dir, graph, tc : HolbuildToolchain.t, fingerprint, start_ns} =
       List.app
         (fn path => if file_unchanged ("", path) then () else fall ("a generated SML source changed: " ^ path))
         (List.concat (map (BP.generated_sources plan) (BP.generated_source_owner_nodes plan)))
+    (* Extra inputs of the selected nodes: an expansion whose directories
+       moved is redone; file hashes come from the check above. *)
+    fun recorded_expansion (_, base, decl) =
+      case Binarymap.peek(recorded_expansions, base ^ "\000" ^ decl) of
+          SOME (expansion as {dirs, ...}) => if List.exists dir_moved dirs then NONE else SOME expansion
+        | NONE => NONE
+    val _ =
+      List.app
+        (fn node =>
+           List.app
+             (fn decl =>
+                case recorded_expansion decl of
+                    NONE => ()
+                  | SOME {base, decl, files, dirs} =>
+                      (BP.remember_input_expansion plan base decl {files = files, dirs = dirs};
+                       List.app (fn (_, abs) => Option.app (BP.remember_input_hash plan abs) (hash_of abs)) files))
+             (BP.extra_input_decls plan node))
+        (BP.selected_nodes plan)
     fun inputs_unchanged node =
       List.all
-        (fn (_, base, decl) =>
-           case Binarymap.peek(recorded_expansions, base ^ "\000" ^ decl) of
+        (fn decl =>
+           case recorded_expansion decl of
                NONE => false
-             | SOME {files, dirs, ...} => not (List.exists dir_moved dirs) andalso List.all file_unchanged files)
+             | SOME {files, ...} => List.all file_unchanged files)
         (BP.extra_input_decls plan node)
+    (* Input keys: a node keeps its recorded key while its source hash, its
+       inputs and its dependencies' keys are unchanged. *)
+    val recorded_nodes =
+      ListPair.foldl
+        (fn (entry : node_entry, hash, map) => Binarymap.insert(map, source_key (source_at (#source entry)), (entry, hash)))
+        (Binarymap.mkDict String.compare) (selected, current_hash)
     val _ =
-      ListPair.app
-        (fn (node, (entry : node_entry, hash)) =>
-           if hash <> #hash entry orelse not (inputs_unchanged node) then ()
-           else
-             BP.remember_input_key plan node
-               {toolchain_key = #action_toolchain_key record, config_lines = #config_lines entry,
-                dep_keys = recorded_dep_keys entry,
-                input_key = #input_key entry, extra_inputs_key = #extra_inputs_key entry})
-        (BP.selected_nodes plan, ListPair.zip (selected, current_hash))
+      List.app
+        (fn node =>
+           case Binarymap.peek(recorded_nodes, BP.key node) of
+               SOME (entry, hash) =>
+                 if hash <> #hash entry orelse not (inputs_unchanged node) then ()
+                 else
+                   BP.remember_input_key plan node
+                     {toolchain_key = #action_toolchain_key record, config_lines = #config_lines entry,
+                      dep_keys = recorded_dep_keys entry,
+                      input_key = #input_key entry, extra_inputs_key = #extra_inputs_key entry}
+             | NONE => ())
+        (BP.selected_nodes plan)
   in
     Restored {index = sources, targets = #targets record, plan = plan, toolchain_key = toolchain_key,
-              changed = !changed, record = record, stamps = !stamps, rehashed = !rehashed}
+              changed = !changed, reresolved = reresolved, record = record, stamps = !stamps,
+              rehashed = !rehashed}
   end
   handle Fall reason => Fallback reason
 
 
-(* How many of the plan's keys differ from those the record kept. *)
-fun changed_keys (record : t) plan keys =
-  ListPair.foldl
-    (fn (node, entry : node_entry, n) => if BP.input_key_for keys node = #input_key entry then n else n + 1)
-    0 (BP.selected_nodes plan, #selected record)
+(* How many of the plan's keys differ from those the record kept, whose
+   sources are INDEX. *)
+fun changed_keys (record : t) index plan keys =
+  let
+    val sources = Vector.fromList index
+    val recorded =
+      List.foldl
+        (fn (entry : node_entry, map) =>
+           Binarymap.insert(map, source_key (Vector.sub(sources, #source entry)), #input_key entry))
+        (Binarymap.mkDict String.compare) (#selected record)
+  in
+    List.foldl
+      (fn (node, n) => if Binarymap.peek(recorded, BP.key node) = SOME (BP.input_key_for keys node) then n else n + 1)
+      0 (BP.selected_nodes plan)
+  end
 
 (* ---- Check mode ---- *)
 
