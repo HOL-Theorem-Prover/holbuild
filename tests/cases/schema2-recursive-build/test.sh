@@ -676,10 +676,21 @@ if (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly"
   exit 1
 fi
 require_grep 'dirty HOL toolchain cache entry' "$tmpdir/dirty.log"
-# --remote-only builds nothing against the checkout, so it does not check it.
-(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" \
-  "$HOLBUILD_BIN" --remote-cache http://127.0.0.1:9 build --remote-exec http://127.0.0.1:9 --remote-only Foo) \
-  > "$tmpdir/dirty-remote-only.log" 2>&1 || { cat "$tmpdir/dirty-remote-only.log" >&2; exit 1; }
+# --remote-only builds nothing against the checkout of a complete entry, so it
+# does not check it; it still does before rebuilding the analyser from it.
+remote_only_foo() {
+  (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" \
+    "$HOLBUILD_BIN" --remote-cache http://127.0.0.1:9 build --remote-exec http://127.0.0.1:9 --remote-only Foo)
+}
+remote_only_foo > "$tmpdir/dirty-remote-only.log" 2>&1 || { cat "$tmpdir/dirty-remote-only.log" >&2; exit 1; }
+analyser_ok=( "$toolchain_entry"/analysers/*/build.ok )
+require_file "${analyser_ok[0]}"
+rm -f "${analyser_ok[@]}"
+if remote_only_foo > "$tmpdir/dirty-remote-only-analyser.log" 2>&1; then
+  echo "dirty HOL checkout accepted for an analyser rebuild under --remote-only" >&2
+  exit 1
+fi
+require_grep 'dirty HOL toolchain cache entry' "$tmpdir/dirty-remote-only-analyser.log"
 
 [ -d "$root/.holbuild/src/b/.git" ]
 [ ! -d "$root/.holbuild/src/b/.holbuild" ]
