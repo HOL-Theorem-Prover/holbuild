@@ -107,6 +107,8 @@ class Settings(BaseSettings):
     # Build claims share one ranking of the batches for this long; see Coordinator._claim_build. With 0, only claims
     # that arrive while a ranking is being read share it.
     claim_ranking_seconds: float = Field(default=0.5, ge=0, allow_inf_nan=False)
+    # How many generations of unfinished parents an action may be claimed ahead of; see AHEAD_CANDIDATES.
+    ahead_depth: int = Field(default=1, ge=1)
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
     run_floor: int = Field(default=0, ge=0)
@@ -467,37 +469,67 @@ ORDER BY critical_depth DESC, descendant_count DESC, theory, input_key
 LIMIT 1 FOR UPDATE SKIP LOCKED
 """)
 
-# Loading ahead: in a batch with an ``ahead_cap``, a waiting build action ``a`` may be claimed before its parents are
-# done when each parent that isn't done is running and isn't waiting for parents of its own, so a claim runs at most
-# one generation ahead. Its worker loads what it can and waits for the running parents' outputs. An action whose
-# claim ahead gave up is ``abandoned`` and waits for its parents from then on.
-AHEAD_ELIGIBLE = """
-a.state = 'waiting' AND a.class = 'build' AND a.ahead <> 'abandoned' AND a.remaining_deps > 0
-AND NOT (
-    SELECT coalesce(bool_or((
-        SELECT p.state <> 'done' AND (p.state <> 'running' OR p.remaining_deps > 0)
-        FROM actions p WHERE p.batch_id = e.batch_id AND p.input_key = e.parent_key
-    )), false)
-    FROM edges e WHERE e.batch_id = a.batch_id AND e.input_key = a.input_key
+# Loading ahead: in a batch with an ``ahead_cap``, a waiting build action may be claimed before its parents are done
+# when each parent that isn't done is running, up to ``ahead_depth`` generations ahead: generation 0 is a running
+# action that waits for no parent, and an action claimed ahead is one generation after its latest unfinished parent.
+# Its worker loads what it can and waits for the unfinished ancestors' outputs. An action whose claim ahead gave up
+# is ``abandoned`` and waits for its parents from then on.
+#
+# AHEAD_WALK: the unfinished ancestors of the actions :keys of :batch_id, with the action each was reached from
+# (``root``) and each of its distances from it: their unfinished parents, and, above a running parent that was
+# itself claimed ahead and still waits for parents, its unfinished parents, up to :depth generations up. Each step
+# reads one action's edges and parents by key: the lookups are subqueries on the row they start from, so that the
+# database plans them by key whatever it guesses of a batch inserted since its last statistics.
+AHEAD_WALK = """
+WITH RECURSIVE walk(batch_id, root, input_key, distance) AS (
+    SELECT a.batch_id, a.input_key, e.parent_key, 1 FROM actions a
+    CROSS JOIN LATERAL unnest(ARRAY(
+        SELECT e.parent_key FROM edges e WHERE e.batch_id = a.batch_id AND e.input_key = a.input_key
+    )) AS e(parent_key)
+    WHERE a.batch_id = :batch_id AND a.input_key = ANY(CAST(:keys AS text[]))
+    UNION
+    SELECT w.batch_id, w.root, e.parent_key, w.distance + 1 FROM walk w
+    CROSS JOIN LATERAL unnest(ARRAY(
+        SELECT e.parent_key FROM edges e WHERE e.batch_id = w.batch_id AND e.input_key = w.input_key
+    )) AS e(parent_key)
+    WHERE w.distance < :depth AND (
+        SELECT p.state = 'running' AND p.remaining_deps > 0 FROM actions p
+        WHERE p.batch_id = w.batch_id AND p.input_key = w.input_key
+    )
+), ancestors AS MATERIALIZED (
+    SELECT w.root, w.input_key, w.distance, p.spec_sha256, p.state, p.remaining_deps
+    FROM walk w JOIN actions p ON p.batch_id = w.batch_id AND p.input_key = w.input_key
+    WHERE p.state <> 'done'
 )
 """
-# The actions that may be claimed ahead, best first: the children of running actions of running batches below
-# their ``ahead_cap``. See Coordinator._claim_ahead. Read from the running parents down (edges_parent) rather than
-# per waiting action, since a gate's batch has thousands of those: a child is a candidate when its running parents
-# that wait for no parent are all its unfinished ones, by ``remaining_deps``. CLAIM_AHEAD_ACTION checks the rule
-# itself under the batch's lock. The CTEs are materialized so the children are counted once whatever the planner
-# guesses of a batch inserted since its last statistics.
+# The actions that may be claimed ahead, best first: the children of running actions of generation below
+# ``ahead_depth`` of running batches below their ``ahead_cap``. See Coordinator._claim_ahead. Read from the running
+# parents down (edges_parent) rather than per waiting action, since a gate's batch has thousands of those: a child is
+# a candidate when such running parents are all its unfinished ones, by ``remaining_deps``. An action's generation
+# is its longest chain of running actions claimed ahead, down from one of generation 0. CLAIM_AHEAD_ACTION checks
+# the rule itself under the batch's lock. The CTEs are materialized so the children are counted once whatever the
+# planner guesses of a batch inserted since its last statistics.
 AHEAD_CANDIDATES = sa.text("""
-WITH ahead_batches AS MATERIALIZED (
+WITH RECURSIVE ahead_batches AS MATERIALIZED (
     SELECT b.id, b.priority FROM batches b
     WHERE b.state = 'running' AND b.ahead_cap IS NOT NULL AND (
         SELECT count(*) FROM actions w
         WHERE w.batch_id = b.id AND w.state = 'running' AND w.ahead = 'ahead' AND w.remaining_deps > 0
     ) < b.ahead_cap
+), generations(batch_id, input_key, generation) AS (
+    SELECT r.batch_id, r.input_key, 0
+    FROM ahead_batches b JOIN actions r ON r.batch_id = b.id AND r.state = 'running' AND r.remaining_deps = 0
+    UNION
+    SELECT g.batch_id, c.input_key, g.generation + 1
+    FROM generations g
+    JOIN edges e ON e.batch_id = g.batch_id AND e.parent_key = g.input_key
+    JOIN actions c ON c.batch_id = e.batch_id AND c.input_key = e.input_key
+    WHERE g.generation < :depth AND c.state = 'running' AND c.ahead = 'ahead' AND c.remaining_deps > 0
+), running AS MATERIALIZED (
+    SELECT batch_id, input_key FROM generations GROUP BY batch_id, input_key HAVING max(generation) < :depth
 ), children AS MATERIALIZED (
     SELECT r.batch_id, e.input_key, count(*) AS running_parents
-    FROM ahead_batches b
-    JOIN actions r ON r.batch_id = b.id AND r.state = 'running' AND r.remaining_deps = 0
+    FROM running r
     JOIN edges e ON e.batch_id = r.batch_id AND e.parent_key = r.input_key
     GROUP BY r.batch_id, e.input_key
 )
@@ -511,16 +543,27 @@ ORDER BY b.priority DESC, a.critical_depth DESC, a.descendant_count DESC, a.theo
 """)
 
 # Lock the best of a batch's candidates ``keys`` of ``tier`` that may still be claimed ahead, but not one whose key
-# another batch's live lease is building (single-flight; see CLAIM_ACTION).
-CLAIM_AHEAD_ACTION = sa.text(f"""
+# another batch's live lease is building (single-flight; see CLAIM_ACTION): one with an unfinished ancestor in its
+# walk that isn't running, or one :depth generations up that still waits for parents.
+CLAIM_AHEAD_ACTION = sa.text(f"""{AHEAD_WALK}
 SELECT a.input_key, a.spec_sha256, a.theory FROM actions a
-WHERE a.batch_id = :batch_id AND a.input_key = ANY(CAST(:keys AS text[])) AND a.tier = :tier AND {AHEAD_ELIGIBLE}
+WHERE a.batch_id = :batch_id AND a.input_key = ANY(CAST(:keys AS text[])) AND a.tier = :tier
+AND a.state = 'waiting' AND a.class = 'build' AND a.ahead <> 'abandoned' AND a.remaining_deps > 0
+AND a.input_key NOT IN (
+    SELECT root FROM ancestors WHERE state <> 'running' OR (distance = :depth AND remaining_deps > 0)
+)
 AND a.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
 ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
 LIMIT 1 FOR UPDATE SKIP LOCKED
 """)
+# The unfinished ancestors an action claimed ahead waits for, ancestors first (by their longest distance from it,
+# which for the first is the action's generation), then by key.
+AHEAD_PARENTS = sa.text(f"""{AHEAD_WALK}
+SELECT input_key, spec_sha256, max(distance) AS distance FROM ancestors
+GROUP BY input_key, spec_sha256 ORDER BY max(distance) DESC, input_key
+""")
 # The most candidates of a batch CLAIM_AHEAD_ACTION checks at once, the best of the shared read: its cost grows with
-# their edges, under the batch's lock, and a batch has at most 16 actions waiting ahead.
+# their edges, under the batch's lock.
 AHEAD_CLAIM_KEYS = 32
 # The actions of a batch claimed ahead and still waiting for a parent, which count against its ``ahead_cap``.
 COUNT_WAITING_AHEAD = sa.text(
@@ -528,7 +571,8 @@ COUNT_WAITING_AHEAD = sa.text(
     "WHERE batch_id = :batch_id AND state = 'running' AND ahead = 'ahead' AND remaining_deps > 0"
 )
 # Recount the parents not done of the running actions claimed ahead of :key that waited for one, returning the new
-# counts. REFRESH leaves running actions alone.
+# counts. REFRESH leaves running actions alone. :key's children are read once, by key, rather than per running
+# action claimed ahead, of which a batch may have 64.
 REFRESH_AHEAD_CHILDREN = sa.text("""
 UPDATE actions c SET remaining_deps = (
     SELECT count(*) FROM edges e
@@ -536,9 +580,9 @@ UPDATE actions c SET remaining_deps = (
         SELECT p.state FROM actions p WHERE p.batch_id = e.batch_id AND p.input_key = e.parent_key
     ) <> 'done'
 )
-WHERE c.batch_id = :batch_id AND c.input_key IN (
+WHERE c.batch_id = :batch_id AND c.input_key = ANY(ARRAY(
     SELECT input_key FROM edges WHERE batch_id = :batch_id AND parent_key = :key
-) AND c.state = 'running' AND c.ahead = 'ahead' AND c.remaining_deps > 0
+)) AND c.state = 'running' AND c.ahead = 'ahead' AND c.remaining_deps > 0
 RETURNING c.remaining_deps
 """)
 
@@ -546,22 +590,34 @@ RETURNING c.remaining_deps
 # Revoke the leases of the running actions claimed ahead of one of :keys, and of those claimed ahead of them, sending
 # them back to waiting as abandoned without the attempt counting. Their parents went back to waiting, so they could
 # only wait out their limit, holding a worker and a slot of the cap; when a parent is re-queued, its outputs they
-# may have taken are gone too. The batch's few running actions claimed ahead are read first and each is tested by
-# its edges, so the statement reads no more than those whatever the planner guesses of a batch inserted since its
-# last statistics; an EXISTS here would be planned as a join over all the batch's edges.
+# may have taken are gone too. An action claimed ahead of :keys has one as a parent, or up to :depth generations up
+# across parents that were claimed ahead too, running or since done (an action keeps ``ahead`` once done). The
+# batch's few running actions claimed ahead are read first and each is tested by its edges, so the statement reads
+# no more than those whatever the planner guesses of a batch inserted since its last statistics; a join here would
+# be planned over all the batch's edges.
 REVOKE_AHEAD = sa.text("""
 WITH RECURSIVE ahead_running AS MATERIALIZED (
-    SELECT input_key FROM actions WHERE batch_id = :batch_id AND state = 'running' AND ahead = 'ahead'
+    SELECT a.batch_id, a.input_key, ARRAY(
+        SELECT e.parent_key FROM edges e WHERE e.batch_id = a.batch_id AND e.input_key = a.input_key
+    ) AS parents
+    FROM actions a WHERE a.batch_id = :batch_id AND a.state = 'running' AND a.ahead = 'ahead'
 ), revoked(input_key) AS (
-    SELECT c.input_key FROM ahead_running c WHERE (
-        SELECT count(*) FROM edges e
-        WHERE e.batch_id = :batch_id AND e.input_key = c.input_key AND e.parent_key = ANY(CAST(:keys AS text[]))
-    ) > 0
+    SELECT c.input_key FROM ahead_running c WHERE EXISTS (
+        WITH RECURSIVE up(input_key, distance) AS (
+            SELECT parent_key, 1 FROM unnest(c.parents) AS parent_key
+            UNION
+            SELECT e.parent_key, u.distance + 1 FROM up u
+            CROSS JOIN LATERAL unnest(ARRAY(
+                SELECT e.parent_key FROM edges e WHERE e.batch_id = c.batch_id AND e.input_key = u.input_key
+            )) AS e(parent_key)
+            WHERE u.distance < :depth AND (
+                SELECT p.ahead FROM actions p WHERE p.batch_id = c.batch_id AND p.input_key = u.input_key
+            ) = 'ahead'
+        )
+        SELECT 1 FROM up WHERE input_key = ANY(CAST(:keys AS text[]))
+    )
     UNION
-    SELECT c.input_key FROM revoked r CROSS JOIN ahead_running c WHERE (
-        SELECT count(*) FROM edges e
-        WHERE e.batch_id = :batch_id AND e.input_key = c.input_key AND e.parent_key = r.input_key
-    ) > 0
+    SELECT c.input_key FROM revoked r CROSS JOIN ahead_running c WHERE r.input_key = ANY(c.parents)
 ), unleased AS (
     UPDATE actions SET state = 'waiting', ahead = 'abandoned', attempts = attempts - 1
     WHERE batch_id = :batch_id AND input_key = ANY(ARRAY(SELECT input_key FROM revoked)) RETURNING input_key
@@ -1081,8 +1137,8 @@ class Coordinator:
     async def _claim_ahead(self, tiers: list[str], worker: str) -> Claim | None:
         """Lease an action of ``tiers`` ahead of its parents: of the running batches with an ``ahead_cap`` and
         fewer than that many actions waiting ahead, the action whose chain of dependents is deepest of those whose
-        unfinished parents all run and wait for no parent themselves (AHEAD_ELIGIBLE). Its claim names those
-        parents, whose outputs its worker waits for.
+        unfinished parents all run, at most ``ahead_depth`` generations ahead (CLAIM_AHEAD_ACTION). Its claim names
+        its unfinished ancestors, ancestors first, whose outputs its worker waits for.
 
         Candidates come from a read the claims of ``claim_ranking_seconds`` share; each batch is then locked, as
         every writer of it does first, so its cap and the parents' states are rechecked against concurrent claims
@@ -1113,23 +1169,23 @@ class Coordinator:
                 )
             ).first()
             row = None
-            # Counted after the lock, in a snapshot that sees every claim ahead committed before it.
-            if batch is not None and await conn.scalar(COUNT_WAITING_AHEAD, {"batch_id": batch_id}) < batch.ahead_cap:
-                row = (
-                    await conn.execute(CLAIM_AHEAD_ACTION, {"batch_id": batch_id, "keys": keys, "tier": tier})
-                ).first()
+            depth = self.settings.ahead_depth
+            waiting = 0
+            if batch is not None:
+                # Counted after the lock, in a snapshot that sees every claim ahead committed before it.
+                waiting = await conn.scalar(COUNT_WAITING_AHEAD, {"batch_id": batch_id})
+                if waiting < batch.ahead_cap:
+                    row = (
+                        await conn.execute(
+                            CLAIM_AHEAD_ACTION, {"batch_id": batch_id, "keys": keys, "tier": tier, "depth": depth}
+                        )
+                    ).first()
             if row is None:
                 read.exhausted.add((batch_id, tier))
                 return None
-            parents = await conn.execute(
-                sa.text(
-                    "SELECT p.input_key, p.spec_sha256 FROM edges e "
-                    "JOIN actions p ON p.batch_id = e.batch_id AND p.input_key = e.parent_key "
-                    "WHERE e.batch_id = :batch_id AND e.input_key = :input_key AND p.state <> 'done' "
-                    "ORDER BY p.input_key"
-                ),
-                {"batch_id": batch_id, "input_key": row.input_key},
-            )
+            parents = (
+                await conn.execute(AHEAD_PARENTS, {"batch_id": batch_id, "keys": [row.input_key], "depth": depth})
+            ).all()
             ahead_parents = tuple(AheadParent(p.input_key, p.spec_sha256) for p in parents)
             claimed, _ = await self._lease(
                 conn,
@@ -1140,6 +1196,9 @@ class Coordinator:
         # Out of the shared read, so the next claim of this read orders the batches by what remains.
         read.candidates = [c for c in read.candidates if (c[0], c[1]) != (batch_id, row.input_key)]
         self._batch_changed(batch_id)
+        # Below the last generation, its own waiting children may now be claimed ahead, while the cap has room.
+        if max((p.distance for p in parents), default=depth) < depth and waiting + 1 < batch.ahead_cap:
+            self._ahead_changed()
         return claimed
 
     async def _ahead_candidates(self) -> _AheadRead:
@@ -1153,7 +1212,7 @@ class Coordinator:
             changes = self.ahead_changes
             at = loop.time()
             async with self.engine.connect() as conn:
-                rows = (await conn.execute(AHEAD_CANDIDATES)).all()
+                rows = (await conn.execute(AHEAD_CANDIDATES, {"depth": self.settings.ahead_depth})).all()
             read = _AheadRead(at, [(row.batch_id, row.input_key, row.tier) for row in rows], set())
             # Not shared when a change since the read began may have made other actions candidates.
             if changes == self.ahead_changes:
@@ -1415,7 +1474,7 @@ class Coordinator:
                 await conn.execute(
                     sa.text(
                         "SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions, a.last_failure, "
-                        "a.class AS action_class, a.ahead, b.profile, b.ahead_cap IS NOT NULL AS ahead_batch "
+                        "a.class AS action_class, a.ahead, a.remaining_deps, b.profile, b.ahead_cap IS NOT NULL AS ahead_batch "
                         "FROM actions a JOIN batches b ON b.id = a.batch_id "
                         "WHERE a.batch_id = :batch_id AND a.input_key = :input_key"
                     ),
@@ -1460,10 +1519,15 @@ class Coordinator:
                     await self._record_peak(conn, package, theory, action.profile, result.peak_rss_mb)
                 await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [action.input_key]})
                 if action.ahead_batch:
-                    refreshed = await conn.execute(
-                        REFRESH_AHEAD_CHILDREN, {"batch_id": batch_id, "key": action.input_key}
-                    )
+                    refreshed = (
+                        await conn.execute(REFRESH_AHEAD_CHILDREN, {"batch_id": batch_id, "key": action.input_key})
+                    ).all()
                     unblocked = any(child.remaining_deps == 0 for child in refreshed)
+                    if self.settings.ahead_depth > 1:
+                        # A child still waiting for a parent may be a generation nearer, so its own children may be
+                        # claimed ahead now; and an action claimed ahead that finished before its parents' results
+                        # came frees its slot of the cap.
+                        unblocked = bool(refreshed) or (action.ahead == "ahead" and action.remaining_deps > 0)
                 await self._finish_if_done(conn, batch_id)
             elif result.failure == "ahead-abandoned" and action.ahead == "ahead":
                 # Loading ahead gave up; the action is built once its parents are done, and the try costs no attempt.
@@ -2133,7 +2197,9 @@ class Coordinator:
             {"batch_id": batch_id, "input_key": input_key},
         )
         if ahead_batch and requeued.rowcount:
-            await conn.execute(REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]})
+            await conn.execute(
+                REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key], "depth": self.settings.ahead_depth}
+            )
         await conn.execute(REFRESH_KEYS, {"batch_id": batch_id, "keys": [input_key]})
         await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [input_key]})
 
@@ -2151,7 +2217,9 @@ class Coordinator:
         waits for a running parent, so it is revoked (REVOKE_AHEAD), and the action, if it was claimed
         ahead itself, is a plain one from now on unless it was abandoned."""
         if ahead_batch:
-            await conn.execute(REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]})
+            await conn.execute(
+                REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key], "depth": self.settings.ahead_depth}
+            )
             await conn.execute(
                 sa.text(
                     "UPDATE actions SET ahead = 'no' "

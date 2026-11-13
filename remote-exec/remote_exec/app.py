@@ -157,7 +157,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         fail_fast: bool = False,
         priority: int = Query(default=0, ge=0, le=2147483647),
         action_class: Literal["build", "run"] = Query(default="build", alias="class"),
-        speculative_loading: int | None = Query(default=None, ge=1, le=16),
+        speculative_loading: int | None = Query(default=None, ge=1, le=64),
     ) -> dict[str, UUID]:
         try:
             batch = parse_batch(await text_body(request))
