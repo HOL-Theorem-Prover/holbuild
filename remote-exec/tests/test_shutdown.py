@@ -5,7 +5,6 @@ import os
 import signal
 import socket
 import sys
-import time
 from pathlib import Path
 
 import httpx
@@ -55,10 +54,8 @@ async def test_sigterm_exits_promptly_with_open_events_stream_and_claim(coordina
                     assert '"type": "action"' in await anext(lines)
                     assert not claim.done()
                     process.send_signal(signal.SIGTERM)
-                    sent = time.monotonic()
                     async with asyncio.timeout(3):  # the 2 s graceful limit, then lifespan shutdown
                         await process.wait()
-                    elapsed = time.monotonic() - sent
             finally:
                 claim.cancel()
                 await asyncio.gather(claim, return_exceptions=True)
@@ -67,6 +64,6 @@ async def test_sigterm_exits_promptly_with_open_events_stream_and_claim(coordina
             process.kill()
         output, _ = await process.communicate()
         print(output.decode(), end="")
-    # uvicorn re-raises the SIGTERM it handled once shutdown is done.
+    # uvicorn re-raises the SIGTERM it handled once shutdown is done, whether or not lifespan shutdown succeeded.
     assert process.returncode == -signal.SIGTERM, process.returncode
-    assert elapsed < 3
+    assert b"Application shutdown complete" in output, output.decode()
