@@ -678,9 +678,7 @@ class _Ranking:
     heap: list[tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]]
     ranked: set[tuple[UUID, str]]  # the batches and tiers it ranked
     exhausted: set[tuple[UUID, str]]
-    # The heap's priority-0 entries in a heap of their own, and the running builds of priority-0 batches.
-    default_heap: list[tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]]
-    running_default: int
+    running_default: int  # running builds of priority-0 batches, and the claims of them since the read
 
 
 _NEVER = datetime.min.replace(tzinfo=UTC)  # the last claim of a batch never claimed from, for ordering
@@ -1326,44 +1324,47 @@ class Coordinator:
         at a candidate ``outranked`` says ranks after a claim ahead, leaving it first in the ranking.
 
         While fewer than ``default_priority_floor`` builds of priority-0 batches run, the best priority-0
-        candidate goes first when its tier is no later than the best candidate's, so a wave of higher priorities
-        never takes every worker.
+        candidate in the best candidate's tier goes first, ahead of claims ahead too, so a wave of higher
+        priorities never takes every worker. A priority-0 claim counts against the floor before it awaits its
+        lock, so concurrent claims sharing the ranking don't all take the floor's last slot.
         """
-        while (main := self._head(ranking.heap, ranking.exhausted)) is not None:
-            default = self._head(ranking.default_heap, ranking.exhausted)
-            heap = ranking.heap
-            if (
-                ranking.running_default < self.settings.default_priority_floor
-                and default is not None and default[0] <= main[0]
-            ):
-                heap = ranking.default_heap
-            elif outranked is not None and outranked(main[7], -main[1]):
-                return None
-            entry = heapq.heappop(heap)
+        floor = self.settings.default_priority_floor
+        while ranking.heap:
+            entry = heapq.heappop(ranking.heap)
+            if (entry[6], entry[7]) in ranking.exhausted:
+                continue
+            if ranking.running_default < floor and entry[1] != 0:
+                default = min(
+                    (e for e in ranking.heap
+                     if e[1] == 0 and e[0] == entry[0] and (e[6], e[7]) not in ranking.exhausted),
+                    default=None,
+                )
+                if default is not None:
+                    ranking.heap[ranking.heap.index(default)] = entry
+                    heapq.heapify(ranking.heap)
+                    entry = default
             tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
+            if (
+                not (priority == 0 and ranking.running_default < floor)
+                and outranked is not None and outranked(tier, -priority)
+            ):
+                heapq.heappush(ranking.heap, entry)
+                return None
             heapq.heappush(
-                heap,
+                ranking.heap,
                 (tier_position, priority, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),
             )
+            if priority == 0:
+                ranking.running_default += 1
             row = (
                 await conn.execute(CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
             ).first()
             if row is not None:
-                if priority == 0:
-                    ranking.running_default += 1
                 return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb)
+            if priority == 0:
+                ranking.running_default -= 1
             ranking.exhausted.add((batch_id, tier))
         return None
-
-    @staticmethod
-    def _head(
-        heap: list[tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]],
-        exhausted: set[tuple[UUID, str]],
-    ) -> tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None] | None:
-        """The first entry of ``heap`` not ``exhausted``, dropping exhausted ones before it."""
-        while heap and (heap[0][6], heap[0][7]) in exhausted:
-            heapq.heappop(heap)
-        return heap[0] if heap else None
 
     async def _current_ranking(self, key: tuple[str, ...], *, after: float = 0) -> "_Ranking":
         """Share one read per tier key, fresh enough for invalidations seen on entry and ``after``.
@@ -1421,13 +1422,9 @@ class Coordinator:
             )
             for row in rows
         ]
-        default_heap = [entry for entry in heap if entry[1] == 0]
         heapq.heapify(heap)
-        heapq.heapify(default_heap)
         running_default = rows[0].running_default if rows else 0
-        return _Ranking(
-            at, forgotten, heap, {(row.batch_id, row.tier) for row in rows}, set(), default_heap, running_default
-        )
+        return _Ranking(at, forgotten, heap, {(row.batch_id, row.tier) for row in rows}, set(), running_default)
 
     def _keep_ranking(self, key: tuple[str, ...], ranking: "_Ranking") -> None:
         """Share ``ranking`` with later claims, unless a release dropped a ranking while it was read, since its

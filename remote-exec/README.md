@@ -819,8 +819,9 @@ scheduling metadata; action inputs, outputs and leases are unchanged.
 `GET /v1/queue` includes `ready_priority` and `running_priority`: subsets of
 the tier counts for actions whose batch has a positive priority. Do not add
 these subsets to the tier totals. Priority does not change burst demand.
-Strict priority suits occasional finite batches; there is no aging or reserved
-normal share. Normal work can use workers for which no priority action is ready,
+Priority has no aging; the only reserved normal share is
+`REMOTE_EXEC_DEFAULT_PRIORITY_FLOOR` (see Claims), and with it at 0 priority is
+strict, which suits occasional finite batches. Normal work can use workers for which no priority action is ready,
 including while a priority batch waits on dependencies.
 
 Migration `0015` adds `batches.ahead_cap` and `actions.ahead`. Before rolling

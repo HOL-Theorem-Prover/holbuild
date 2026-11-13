@@ -2834,6 +2834,35 @@ async def test_a_priority_zero_build_ending_frees_its_floor_slot(
     await claim_named(http, "p2")
 
 
+async def test_priority_zero_turns_carry_over_from_the_floor_to_the_ranking_above_it(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """A batch claimed from below the floor has its turn counted once the floor is full, in the same ranking."""
+    coordinator.settings.default_priority_floor = 1
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a1", "a2"])
+    await submit(http, ["b1"])
+    await submit(http, ["p1"], priority="1")
+    for name in ["a1", "p1", "b1", "a2"]:
+        await claim_named(http, name)
+
+
+async def test_concurrent_claims_sharing_a_ranking_take_the_last_floor_slot_once(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.default_priority_floor = 1
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["n1", "n2"])
+    await submit(http, ["p1", "p2"], priority="1")
+    ranking = await coordinator._current_ranking(("standard",))
+    async with coordinator.engine.begin() as first, coordinator.engine.begin() as second:
+        # The first claim awaits its lock while the second picks from the same ranking.
+        claimed = await asyncio.gather(
+            coordinator._claim_build(first, ranking), coordinator._claim_build(second, ranking)
+        )
+        assert sorted(c.theory for c in claimed if c is not None) == ["pkg:n1", "pkg:p1"]
+
+
 async def test_priority_work_takes_every_slot_when_no_priority_zero_build_is_ready(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
