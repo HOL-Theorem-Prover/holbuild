@@ -695,6 +695,31 @@ still reject conflicts, except that a remote-exec worker replaces a remote
 entry whose recorded parents differ from the parents it restored from the
 remote cache, since no build can use it.
 
+### Persistent action root on workers
+
+A worker's action root keeps the dependencies one action restored for the
+next, at the same absolute paths, so heap and checkpoint keys, which name
+those paths, are unchanged. Only `exec-action` writes it, under the worker's
+action lock; a theory child reads it and writes only `.holbuild/stage`,
+`logs`, `tool-cache` and `ahead`, which are emptied around each action. The
+worker records what it installed (`<cache root>/action-resident`): each
+dependency theory with its key, the SHA-256 of the local cache manifest it
+came from, the parent names its `.uo` was generated from, and the hashes the
+parent check and the early cutoff read; each source, input and library by
+SHA-256; each library manifest by its text's SHA-256. A hydrate keeps an item
+whose record matches what the spec names and, for a theory, whose local cache
+manifest is unchanged (the stale check drops a local copy, which then
+reinstalls); it rewrites a kept theory's `.uo` when this spec resolves its
+parents to other stems, and removes every item the spec doesn't name, so the
+root ends as a cold hydrate leaves it. The parent check and the cutoff read
+the records rather than hashing ~4 files per dependency. The stems the action
+writes besides its dependencies (its own outputs, and with loading ahead its
+late parents) are emptied and recorded as scratch, which the next hydrate
+removes or reinstalls. The hydrate deletes the record file before it changes
+the tree and writes it back once it passed, so a worker stopped part way
+starts from an empty root. Script runs put every object directory under the
+root on `loadPath`, so they start from an empty root and leave no records.
+
 ## Global cache
 
 The global cache is optional and immutable:

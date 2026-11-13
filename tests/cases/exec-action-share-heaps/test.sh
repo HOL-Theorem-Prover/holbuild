@@ -318,11 +318,23 @@ if tail -n +"$((before_again + 1))" "$requests" | grep -qxF "$source_get"; then
 fi
 
 # A store on another file system than the action's checkpoints, as a store
-# on its own mount is: states are copied into private writable files, and
-# the worker still resumes from them.
+# on its own mount is: states are linked symbolically, the worker still
+# resumes from them, and the child can't write them.  t5's proof tries to,
+# for each link it finds in the checkpoint tree.
 if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmpdir") ]]; then
   other_fs=$(mktemp -d /dev/shm/holbuild-share-heaps.XXXXXX)
-  write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "MATCH_ACCEPT_TAC TRUTH"
+  probe_links="(fn g => let
+    fun walk dir =
+      let val s = OS.FileSys.openDir dir
+          fun loop () = case OS.FileSys.readDir s of NONE => () | SOME n => (visit (OS.Path.concat (dir, n)); loop ())
+      in loop (); OS.FileSys.closeDir s end
+    and visit p =
+      if Posix.FileSys.ST.isLink (Posix.FileSys.lstat p) then
+        ((TextIO.closeOut (TextIO.openAppend p); raise Fail (\"wrote a restored state: \" ^ p))
+         handle IO.Io _ => print \"restored state read-only\\n\")
+      else if OS.FileSys.isDir p then walk p else ()
+  in (walk \"$shared/checkpoints\" handle OS.SysErr _ => ()); MATCH_ACCEPT_TAC TRUTH g end)"
+  write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "$probe_links"
   export_t v10
   cold v10 0
   forget_local
@@ -330,11 +342,13 @@ if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmp
   ln -s "$other_fs" "$shared/checkpoint-store"
   worker v10 "$shared_url" "$shared" "$spec_t" --share-heaps
   expect v10 0 "status=built"
-  if grep -q 'linking its states symbolically' "$tmpdir/v10.log"; then
-    echo 'sandboxed worker exposed linked checkpoint store states' >&2
-    exit 1
-  fi
+  require_grep 'linking its states symbolically' "$tmpdir/v10.log"
   resumed v10 "theorem-context checkpoint after t4" "theorem_context checkpoint"
+  v10_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/v10.result")
+  require_grep 'restored state read-only' "$tmpdir/remote/cas/$v10_log"
+  for state in "$other_fs"/*/*; do
+    [[ $(sha256sum "$state" | cut -d' ' -f1) == "$(basename "$state")" ]] || { echo "store state changed: $state" >&2; exit 1; }
+  done
   same_outputs v10
 else
   echo "skipping the cross-file-system store: no /dev/shm on another file system"

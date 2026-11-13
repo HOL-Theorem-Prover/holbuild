@@ -297,7 +297,12 @@ ac_a=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $3 }' "$tmpdir/batc
 require_file "$remote_root/ac/$ac_a"
 
 # Both writable trees are discarded: another tenant must not inherit them.
-[[ ! -e "$built_worker/action" ]] || { echo "the action root was not emptied" >&2; exit 1; }
+# The rest of the action root, which only the worker wrote, stays with its
+# records for the next action.
+for dir in stage logs tool-cache ahead; do
+  [[ ! -e "$built_worker/action/.holbuild/$dir" ]] || { echo "the action's $dir was not emptied" >&2; exit 1; }
+done
+require_file "$built_worker/action-resident"
 [[ ! -e "$built_worker/checkpoints" ]] || { echo "the worker retained private checkpoints" >&2; exit 1; }
 
 # A successful build reports its peak memory and uploads its log.
@@ -398,6 +403,40 @@ elif [[ ! -e "$HOLDIR/tools-poly/poly/theory_modules.ML" ]]; then
   [[ ! -e "$tmpdir/worker-c/theory-modules" ]] || {
     echo "worker c started a module writer for a HOL without modules" >&2; exit 1; }
 fi
+
+# The next action on worker c keeps the dependencies it names again, here
+# A, and removes the rest; a dependency whose local entry changed since is
+# installed again, and without its records the worker empties the root.
+cat > "$project/src/A2Script.sml" <<'SML'
+Theory A2
+Ancestors A
+
+Theorem a2_thm:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+SML
+hb action-spec --upload A2Theory > "$tmpdir/batch-a2.txt"
+spec_a2=$(spec_for "$tmpdir/batch-a2.txt" worker:A2Theory)
+resident_stem() { awk -F'\t' -v want="$1" '$1 == "theory" && $3 ~ want { print $2 }' "$tmpdir/worker-c/action-resident"; }
+stem_a=$(resident_stem 'ATheory$')
+stem_b=$(resident_stem 'BTheory$')
+[[ -n "$stem_a" && -n "$stem_b" ]] || { cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
+inode_a=$(stat -c %i "$stem_a.dat")
+worker c "$spec_a2"
+expect c 0
+[[ $(stat -c %i "$stem_a.dat") == "$inode_a" ]] || { echo "worker c installed A again" >&2; exit 1; }
+[[ ! -e "$stem_b.dat" && -z $(resident_stem 'BTheory$') ]] || { echo "worker c kept B, which A2 doesn't name" >&2; exit 1; }
+printf '\n' >> "$tmpdir/worker-c/actions/$key_a/manifest"
+worker c "$spec_a2"
+expect c 0
+[[ $(stat -c %i "$stem_a.dat") != "$inode_a" ]] || { echo "worker c kept A after its entry changed" >&2; exit 1; }
+touch "$tmpdir/worker-c/action/stray"
+rm "$tmpdir/worker-c/action-resident"
+worker c "$spec_a2"
+expect c 0
+[[ ! -e "$tmpdir/worker-c/action/stray" ]] || { echo "worker c kept a root it has no records of" >&2; exit 1; }
 
 # The original checkout restores all three results without building.
 hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; exit 1; }
@@ -643,6 +682,9 @@ spec_r=$(spec_for "$tmpdir/batch-r.txt" worker:RTheory)
 old_dat=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$tmpdir/worker-stale-deps/actions/$key_n/manifest")
 rm "$tmpdir/worker-stale-deps/blobs/$old_dat"
 mv "$remote_root/cas/$old_dat" "$tmpdir/old-n.dat"
+# A worker still holding N in its action root needs neither payload; this
+# one must restore it.
+rm "$tmpdir/worker-stale-deps/action-resident"
 worker stale-deps "$spec_r"
 expect stale-deps 3 "status=failed" "failure=input-missing" "missing=theory $key_n"
 [[ ! -f "$tmpdir/worker-stale-deps/actions/$key_n/manifest" ]] || {

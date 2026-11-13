@@ -17,6 +17,9 @@ val shared_reads : string list ref = ref []
 (* While set, a child writes only these directories and may read, but not
    write, the private roots. *)
 val output_dirs : string list option ref = ref NONE
+(* While set, the directories of the action root a theory child writes; the
+   rest of the root, its dependencies, it may only read. *)
+val action_write_dirs : string list option ref = ref NONE
 
 fun active () = Option.isSome (!private_roots)
 fun enable roots = (outputs_validated := false; private_roots := SOME roots)
@@ -186,7 +189,7 @@ fun wrap completed ({writable, readable = extra, toolchain} : grants) argv =
     val cache = absolute (HolbuildCacheConfig.cache_root ())
     val protected_paths =
       map (fn part => OS.Path.concat (cache, part))
-          ["actions", "blobs", "locks", "cooperate", "checkpoint-store", "toolchain-trust", "git",
+          ["actions", "blobs", "locks", "cooperate", "toolchain-trust", "git",
            "hol-toolchains/.locks", "action.lock"] @
       List.mapPartial
         (fn entry =>
@@ -260,13 +263,67 @@ fun confined grants argv execute =
     (run () before remove ()) handle e => (remove (); raise e)
   end
 
+(* The checkpoint tree's states restored from the store are links to it:
+   hard links, or symbolic ones where the store is on another mount.  A
+   child may only read them, so the tree's writable directories are its
+   largest subtrees without a link, and the store directories symbolic
+   links point into are readable.  Each checkpoint has its own directory,
+   created before the child starts, so it can save every one it hasn't
+   restored. *)
+fun checkpoint_grants checkpoints =
+  let
+    val store = OS.Path.concat (HolbuildCacheConfig.cache_root (), "checkpoint-store")
+    val store = (OS.FileSys.fullPath store handle OS.SysErr _ => store) ^ "/"
+    fun target path =
+      let val dir = OS.FileSys.fullPath (OS.Path.dir (Posix.FileSys.readlink path))
+      in
+        (* A state's family directory, never the store itself. *)
+        if String.isPrefix store dir andalso not (CharVector.exists (fn c => c = #"/") (String.extract (dir, size store, NONE)))
+        then dir
+        else raise Error ("checkpoint link leaves its store family: " ^ path)
+      end
+    (* NONE when the subtree at DIR has no link; else what of it is
+       writable and the store directories its links point into. *)
+    fun visit dir =
+      let
+        val stream = OS.FileSys.openDir dir
+        fun entries acc =
+          case OS.FileSys.readDir stream of
+              NONE => rev acc
+            | SOME name => entries (OS.Path.concat (dir, name) :: acc)
+        val paths = (entries [] before OS.FileSys.closeDir stream) handle e => (OS.FileSys.closeDir stream; raise e)
+        fun child (path, (clean, writable, readable, linked)) =
+          let val st = Posix.FileSys.lstat path
+          in
+            if Posix.FileSys.ST.isDir st then
+              case visit path of
+                  NONE => (path :: clean, writable, readable, linked)
+                | SOME (w, r) => (clean, w @ writable, r @ readable, true)
+            else if Posix.FileSys.ST.isLink st then (clean, writable, target path :: readable, true)
+            else if Posix.FileSys.ST.nlink st > 1 then (clean, writable, readable, true)
+            else (clean, writable, readable, linked)
+          end
+        val (clean, writable, readable, linked) = List.foldl child ([], [], [], false) paths
+      in
+        if linked then SOME (clean @ writable, readable) else NONE
+      end
+  in
+    case visit checkpoints of
+        NONE => {writable = [checkpoints], readable = []}
+      | SOME (writable, readable) => {writable = writable, readable = readable}
+  end
+
 (* The theory action: its private roots are what the worker harvests.
    Under with_output_dirs (the worker's module writer), the child writes
    only those directories and reads the roots. *)
 fun action_grants (root, checkpoints) : grants =
-  case !output_dirs of
-      NONE => {writable = [root, checkpoints], readable = [], toolchain = false}
-    | SOME dirs => {writable = dirs, readable = [root, checkpoints], toolchain = false}
+  let val {writable = saves, readable = stored} = checkpoint_grants checkpoints
+  in
+    case !output_dirs of
+        NONE => {writable = getOpt (!action_write_dirs, [root]) @ saves,
+                 readable = [root, checkpoints] @ stored, toolchain = false}
+      | SOME dirs => {writable = dirs, readable = [root, checkpoints] @ stored, toolchain = false}
+  end
 
 fun launch argv execute =
   case !private_roots of
