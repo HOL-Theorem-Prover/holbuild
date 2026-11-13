@@ -380,6 +380,9 @@ fun validate_entry req k =
     else if not (built holdir) then
       invalid ("broken HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
     else if not (path_exists (Path.concat(holdir, ".git"))) then false
+    (* Under exec-action every action reads a built toolchain and none can
+       write it, so its checkout is as clean as when build.ok was written. *)
+    else if HolbuildActionSandbox.active () then true
     else
       let val output = dirty_status k holdir
       in
