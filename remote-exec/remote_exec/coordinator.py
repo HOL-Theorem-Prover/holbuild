@@ -541,7 +541,7 @@ WITH RECURSIVE ahead_batches AS MATERIALIZED (
     JOIN edges e ON e.batch_id = r.batch_id AND e.parent_key = r.input_key
     GROUP BY r.batch_id, e.input_key
 )
-SELECT a.batch_id, a.input_key, a.tier
+SELECT a.batch_id, a.input_key, a.tier, b.priority
 FROM children c
 JOIN ahead_batches b ON b.id = c.batch_id
 JOIN actions a ON a.batch_id = c.batch_id AND a.input_key = c.input_key
@@ -642,7 +642,7 @@ class _AheadRead:
     left to claim ahead."""
 
     at: float
-    candidates: list[tuple[UUID, str, str]]
+    candidates: list[tuple[UUID, str, str, int]]
     exhausted: set[tuple[UUID, str]]
 
 
@@ -1004,9 +1004,13 @@ class Coordinator:
                 # Work made claimable during the attempt is retried at once, for workers that can take it.
                 seen = (self.made_ready, self.ahead_changes if ahead else 0)
                 eligible_tiers = undeferred(ahead_only=False)
-                claimed = await self._claim(eligible_tiers, worker) if eligible_tiers else None
                 # A better-ranked waiter that can't claim ahead leaves the actions claimed ahead to this one.
-                if claimed is None and ahead and (ahead_tiers := undeferred(ahead_only=True)):
+                ahead_tiers = undeferred(ahead_only=True) if ahead else []
+                outranked = (
+                    await self._outranked_by_ahead(tiers, ahead_tiers) if ahead_tiers and eligible_tiers else None
+                )
+                claimed = await self._claim(eligible_tiers, worker, ahead_tiers, outranked) if eligible_tiers else None
+                if claimed is None and ahead_tiers:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
@@ -1028,7 +1032,33 @@ class Coordinator:
             self._pass_wake(woken)
             raise
 
-    async def _claim(self, tiers: list[str], worker: str) -> Claim | None:
+    async def _outranked_by_ahead(self, tiers: list[str], ahead_tiers: list[str]) -> Callable[[str, int], bool] | None:
+        """Whether a ready build of a tier and priority ranks after an action that may be claimed ahead of
+        ``ahead_tiers``: one of a batch of a higher priority, in the same tier or one before it in ``tiers``.
+        Ready builds of the same priority come first, so with no priorities set claims ahead wait for every
+        ready build, as they did before priorities ranked them. None when nothing may be claimed ahead."""
+        read = await self._ahead_candidates()
+        best: dict[int, int] = {}  # tier position: the highest priority of a candidate in it or a tier before
+        for batch_id, _, tier, priority in read.candidates:
+            if tier in ahead_tiers and (batch_id, tier) not in read.exhausted:
+                position = tiers.index(tier)
+                best[position] = max(best.get(position, priority), priority)
+        if not best:
+            return None
+        return lambda tier, priority: any(
+            p > priority for position, p in best.items() if position <= tiers.index(tier)
+        )
+
+    async def _claim(
+        self,
+        tiers: list[str],
+        worker: str,
+        ahead_tiers: list[str] | None = None,
+        outranked: Callable[[str, int], bool] | None = None,
+    ) -> Claim | None:
+        """Lease a ready build of ``tiers`` from the shared ranking, else a run action. Before a ready build that
+        ``outranked`` says ranks after an action that may be claimed ahead, claim one of ``ahead_tiers`` of a
+        higher priority than the build's; failing that, the build is claimed after all."""
         started = asyncio.get_running_loop().time()
         key = tuple(tiers)
         ranking = await self._current_ranking(key)
@@ -1040,13 +1070,21 @@ class Coordinator:
         while True:
             async with self.engine.begin() as conn:
                 # Never lock a batch after an action: batch writers take those locks in the opposite order.
-                row = await self._claim_build(conn, ranking)
+                row = await self._claim_build(conn, ranking, outranked)
                 if row is not None:
                     claimed, ahead_batch = await self._lease(conn, row, worker)
             if row is not None:
                 self._leased(row.batch_id, ahead_batch=ahead_batch)
                 return claimed
-            if not ranking.ranked or ranking.at >= started:
+            if ranking.heap and (not ranking.ranked or ranking.at >= started):
+                # The next ready build ranks after an action that may be claimed ahead, by a ranking read since
+                # this claim started.
+                claimed = await self._claim_ahead(ahead_tiers or [], worker, above=-ranking.heap[0][1])
+                if claimed is not None:
+                    return claimed
+                outranked = None
+                continue
+            if not ranking.heap and (not ranking.ranked or ranking.at >= started):
                 claimed, retry_builds = await self._claim_run(
                     tiers, worker, self.settings.run_slots, builds_first=True
                 )
@@ -1143,7 +1181,7 @@ class Coordinator:
         if ahead_batch:
             self._ahead_changed()
 
-    async def _claim_ahead(self, tiers: list[str], worker: str) -> Claim | None:
+    async def _claim_ahead(self, tiers: list[str], worker: str, *, above: int | None = None) -> Claim | None:
         """Lease an action of ``tiers`` ahead of its parents: of the running batches with an ``ahead_cap`` and
         fewer than that many actions waiting ahead, the action whose chain of dependents is deepest of those whose
         unfinished parents all run, at most ``ahead_depth`` generations ahead (CLAIM_AHEAD_ACTION). Its claim names
@@ -1151,12 +1189,15 @@ class Coordinator:
 
         Candidates come from a read the claims of ``claim_ranking_seconds`` share; each batch is then locked, as
         every writer of it does first, so its cap and the parents' states are rechecked against concurrent claims
-        and completions. A batch and tier found with nothing to claim are skipped until the next read.
+        and completions. A batch and tier found with nothing to claim are skipped until the next read. With
+        ``above``, only batches of a higher priority are claimed from.
         """
         read = await self._ahead_candidates()
         # Tier by tier, as a plain claim takes them, then in the read's order.
         for tier in tiers:
-            for batch_id in dict.fromkeys(b for b, _, t in read.candidates if t == tier):
+            for batch_id in dict.fromkeys(
+                b for b, _, t, priority in read.candidates if t == tier and (above is None or priority > above)
+            ):
                 if (batch_id, tier) in read.exhausted:
                     continue
                 claimed = await self._claim_ahead_in(read, batch_id, tier, worker)
@@ -1167,7 +1208,7 @@ class Coordinator:
     async def _claim_ahead_in(self, read: _AheadRead, batch_id: UUID, tier: str, worker: str) -> Claim | None:
         """Lease the best action of ``tier`` of ``batch_id`` that ``read`` found may be claimed ahead, if any still
         may, or mark the batch and tier exhausted in ``read``."""
-        keys = [key for b, key, t in read.candidates if (b, t) == (batch_id, tier)][:AHEAD_CLAIM_KEYS]
+        keys = [key for b, key, t, _ in read.candidates if (b, t) == (batch_id, tier)][:AHEAD_CLAIM_KEYS]
         async with self.engine.begin() as conn:
             batch = (
                 await conn.execute(
@@ -1222,7 +1263,7 @@ class Coordinator:
             at = loop.time()
             async with self.engine.connect() as conn:
                 rows = (await conn.execute(AHEAD_CANDIDATES, {"depth": self.settings.ahead_depth_limit})).all()
-            read = _AheadRead(at, [(row.batch_id, row.input_key, row.tier) for row in rows], set())
+            read = _AheadRead(at, [(row.batch_id, row.input_key, row.tier, row.priority) for row in rows], set())
             # Not shared when a change since the read began may have made other actions candidates.
             if changes == self.ahead_changes:
                 self.ahead_read = read
@@ -1250,17 +1291,23 @@ class Coordinator:
                 return _Claimed(candidate.batch_id, row.input_key, row.spec_sha256, row.theory, candidate.max_heap_mb)
         return None
 
-    async def _claim_build(self, conn: AsyncConnection, ranking: "_Ranking") -> _Claimed | None:
+    async def _claim_build(
+        self, conn: AsyncConnection, ranking: "_Ranking", outranked: Callable[[str, int], bool] | None = None
+    ) -> _Claimed | None:
         """Lock a ready build from the shared ranking, without refreshing it inside the transaction.
 
         Put each candidate back with one more running action before trying it, so concurrent claims spread over
-        batches as fresh rankings would. Exhausted batch/tier pairs are skipped until the next shared read.
+        batches as fresh rankings would. Exhausted batch/tier pairs are skipped until the next shared read. Stop
+        at a candidate ``outranked`` says ranks after a claim ahead, leaving it first in the ranking.
         """
         while ranking.heap:
             entry = heapq.heappop(ranking.heap)
             tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
             if (batch_id, tier) in ranking.exhausted:
                 continue
+            if outranked is not None and outranked(tier, -priority):
+                heapq.heappush(ranking.heap, entry)
+                return None
             heapq.heappush(
                 ranking.heap,
                 (tier_position, priority, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),

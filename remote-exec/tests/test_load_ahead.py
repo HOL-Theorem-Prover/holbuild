@@ -97,6 +97,22 @@ async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_re
     assert await states(http, ahead) == {"a": "running", "b": "running"}
 
 
+async def test_a_claim_ahead_comes_after_ready_builds_of_its_priority_and_before_those_of_lower_priorities(
+    http: httpx.AsyncClient,
+) -> None:
+    await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4", priority="2")
+    await claim_named(http, "a")
+    await submit(http, ["x"], priority="2")
+    await submit(http, ["y", "z"])
+
+    order = []
+    for _ in range(4):
+        claimed = await claim_ahead(http)
+        assert claimed is not None
+        order.append(claimed["theory"].removeprefix("pkg:"))
+    assert order[:2] == ["x", "b"] and sorted(order[2:]) == ["y", "z"]
+
+
 async def test_a_child_another_batch_is_building_is_not_claimed_ahead_and_is_done_with_that_build(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:

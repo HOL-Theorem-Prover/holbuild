@@ -855,10 +855,10 @@ async def test_an_action_made_ready_wakes_one_of_the_waiting_claims(
     attempts = 0
     claim_once = coordinator._claim
 
-    async def counted(tiers: list[str], worker: str) -> Any:
+    async def counted(tiers: list[str], worker: str, *rest: Any) -> Any:
         nonlocal attempts
         attempts += 1
-        return await claim_once(tiers, worker)
+        return await claim_once(tiers, worker, *rest)
 
     monkeypatch.setattr(coordinator, "_claim", counted)
     waiting = [asyncio.create_task(coordinator.claim(["standard"], f"w{i}", 30)) for i in range(10)]
@@ -909,10 +909,10 @@ async def test_a_woken_claim_cancelled_hands_its_wake_to_the_next(
     claim_once = coordinator._claim
     hold = asyncio.Event()
 
-    async def held(tiers: list[str], worker: str) -> Any:
+    async def held(tiers: list[str], worker: str, *rest: Any) -> Any:
         if worker == "w1":
             await hold.wait()  # cancelled while trying, after its wake
-        return await claim_once(tiers, worker)
+        return await claim_once(tiers, worker, *rest)
 
     monkeypatch.setattr(coordinator, "_claim", held)
     await submit(http, ["a"])
@@ -986,10 +986,10 @@ async def test_rechecking_tail_host_defers_ready_work_to_a_better_waiter(
     wake = asyncio.get_running_loop().create_future()
     waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake, False)
 
-    async def counted(tiers: list[str], worker: str) -> Any:
+    async def counted(tiers: list[str], worker: str, *rest: Any) -> Any:
         nonlocal attempts
         attempts += 1
-        return await claim_once(tiers, worker)
+        return await claim_once(tiers, worker, *rest)
 
     async def disconnected() -> bool:
         nonlocal checks, batch_id
@@ -1029,10 +1029,10 @@ async def test_explicitly_woken_claim_is_not_blocked_by_a_new_better_waiter(
     claim_once = coordinator._claim
     attempts = 0
 
-    async def missed(tiers: list[str], worker: str) -> Any:
+    async def missed(tiers: list[str], worker: str, *rest: Any) -> Any:
         nonlocal attempts
         attempts += 1
-        return None if attempts == 1 else await claim_once(tiers, worker)
+        return None if attempts == 1 else await claim_once(tiers, worker, *rest)
 
     monkeypatch.setattr(coordinator, "_claim", missed)
     waiting = asyncio.create_task(coordinator.claim(["standard"], "tail", 10, host_id="host-b"))

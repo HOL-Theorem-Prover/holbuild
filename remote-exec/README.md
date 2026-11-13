@@ -488,8 +488,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   network partition, nothing depends on exactly-once execution: a second run
   finds the result cached.
 - **Loading ahead**, for a batch submitted with `speculative_loading=<cap>`:
-  a worker that says it can (`"ahead": true`) and finds nothing ready in any
-  batch may claim a waiting build action of the batch whose parents that
+  a worker that says it can (`"ahead": true`) and finds nothing ready of the
+  batch's priority or higher (in the same tier or an earlier one) may claim a
+  waiting build action of the batch whose parents that
   aren't done are all running, at most `REMOTE_EXEC_AHEAD_DEPTH` generations
   ahead (with 0, any number): a running action that waits for no parent is generation 0, and one
   claimed ahead is a generation after its latest running parent. Its worker
