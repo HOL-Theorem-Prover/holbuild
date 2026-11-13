@@ -79,6 +79,8 @@ def concurrent_publishers_upload_once() -> None:
     first.finish()
     assert uploads.read_text() == "1", "a second publisher uploaded the claimed heap"
     assert published_heap("one") == first.heap(), "the claimant's heap was not published"
+    # Released, so a repair after the cache loses the blob needn't wait.
+    assert claim_path("one").read_text().endswith("\ntime=0\n"), "the published heap kept its claim"
     for name in ("cas-put-enable", "cas-put-release", "cas-put-count"):
         (control / name).unlink()
 

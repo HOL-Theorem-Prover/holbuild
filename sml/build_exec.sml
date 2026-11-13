@@ -10016,9 +10016,10 @@ fun shared_checkpoint_key heap_key kind checkpoint_key =
 
 (* A worker claims a cold heap before uploading it, so other workers that
    built the same heap skip their own upload. The cache has no conditional
-   write: the claim read back after the settle delay wins. A claim lapses
-   after shared_heap_claim_seconds, so an upload killed before it published
-   keeps the heap cold no longer than that. *)
+   write: the claim read back after the settle delay wins. The claimant
+   releases it when its upload ends; a claim lapses after
+   shared_heap_claim_seconds, so an upload killed before it published keeps
+   the heap cold no longer than that. *)
 fun shared_heap_claim_key heap_key =
   HolbuildHash.string_sha256 ("holbuild-shared-heap-claim-v1\nheap=" ^ heap_key ^ "\n")
 
@@ -10350,7 +10351,9 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             case read_claim () of
                 SOME text => not (shared_heap_claim_active owner (now ()) text) andalso claim_new ()
               | NONE => claim_new ()
-          (* A lapsed claim frees the heap for the next worker at once. *)
+          (* A lapsed claim frees the heap at once: for the next worker if
+             this upload failed, and for a repair if the cache later loses
+             the heap's blob. *)
           fun release () = ignore (write_claim 0) handle HolbuildRemoteCache.Unavailable _ => ()
           fun upload () =
             let
@@ -10361,11 +10364,10 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             in
               if HolbuildRemoteCache.get_action remote heap_key = SOME manifest then
                 (store_add store sha {sha = sha, src = deps_loaded, save = true}; SOME sha)
-              else (release (); NONE)
+              else NONE
             end
-            handle e => (release (); raise e)
         in
-          if claim () then upload ()
+          if claim () then (upload () before release ()) handle e => (release (); raise e)
           else (HolbuildStatus.message_stdout "another worker is publishing the shared deps-loaded heap\n";
                 NONE)
         end
