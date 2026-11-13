@@ -1571,8 +1571,8 @@ fun checkpoint_eviction_text ({before_bytes, after_bytes, max_bytes, evicted} : 
 fun gc_state_path project = project_state_dir project "gc.state"
 
 type project_gc_counts =
-  {stage : int, logs : int, checkpoints : int, checkpoint_bytes_initial : Position.int,
-   eviction : checkpoint_eviction}
+  {stage : int, logs : int, action_specs : int, run_specs : int, checkpoints : int,
+   checkpoint_bytes_initial : Position.int, eviction : checkpoint_eviction}
 
 (* One full project collection; the caller holds the project lock. Work done
    while it runs counts towards the next automatic GC. *)
@@ -1584,18 +1584,25 @@ fun collect_project project days max_checkpoints_gb : project_gc_counts =
     val checkpoint_bytes_initial = checkpoint_bytes checkpoint_dir
     val stage = remove_stale_children cutoff (project_state_dir project "stage")
     val logs = remove_stale_children cutoff (project_state_dir project "logs")
+    (* Specs left by action-spec, run-action --export-only, an interrupted
+       remote build, or a holbuild that kept every spec it uploaded. *)
+    val action_specs = remove_stale_children cutoff (project_state_dir project "action-specs")
+    val run_specs = remove_stale_children cutoff (project_state_dir project "run-specs")
     val checkpoints = remove_stale_checkpoint_families cutoff checkpoint_dir
     val eviction = evict_oldest_checkpoints_with_stats checkpoint_dir (gb_to_bytes max_checkpoints_gb)
     val _ = write_checkpoint_index_atomically (rebuild_checkpoint_index checkpoint_dir)
     val _ = remove_file (checkpoint_index_dirty_path checkpoint_dir)
   in
-    {stage = stage, logs = logs, checkpoints = checkpoints,
+    {stage = stage, logs = logs, action_specs = action_specs, run_specs = run_specs, checkpoints = checkpoints,
      checkpoint_bytes_initial = checkpoint_bytes_initial, eviction = eviction}
   end
 
-fun project_gc_text ({stage, logs, checkpoints, checkpoint_bytes_initial, eviction} : project_gc_counts) =
+fun project_gc_text ({stage, logs, action_specs, run_specs, checkpoints, checkpoint_bytes_initial, eviction}
+                     : project_gc_counts) =
   "removed stage=" ^ Int.toString stage ^
   " logs=" ^ Int.toString logs ^
+  " action_specs=" ^ Int.toString action_specs ^
+  " run_specs=" ^ Int.toString run_specs ^
   " checkpoints=" ^ Int.toString checkpoints ^
   " checkpoint_gb_initial=" ^ gb_decimal_text checkpoint_bytes_initial ^
   " checkpoint_bytes_initial=" ^ bytes_text checkpoint_bytes_initial ^
@@ -7962,7 +7969,8 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
 
 (* Writes the ActionSpec of every theory in the plan the remote cache can't
    satisfy, or whose input key is in forced, uploads them and their sources
-   with upload, and returns the batch.
+   with upload, removes the spec files unless keep_specs, and returns the
+   batch.
    With local_resumable, a theory built here for its current input key, and
    not forced, stays out unchecked, unless a theory in the batch depends on
    it and it can't be published from the local cache.
@@ -7975,7 +7983,7 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
    their keys, for settle_deferred.  Deferring only schedules: whether a
    theory's outputs are reused is decided by early cutoff alone. *)
 fun export_action_specs (options : build_options) tc project plan toolchain_key jobs
-      {upload, local_resumable, forced, skip, defer, publish, ledger} =
+      {upload, keep_specs, local_resumable, forced, skip, defer, publish, ledger} =
   let
     val hash_file = export_file_hash ()
     val _ = if upload then HolbuildOffline.require_online "upload action specs" else ()
@@ -8148,7 +8156,7 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         val path = Path.concat(spec_dir, spec_sha256)
         val _ = (ensure_dir spec_dir; write_text path text)
       in
-        {files = files @ [path], lines = String.concatWith " "
+        {files = files @ [path], spec = path, lines = String.concatWith " "
           ["action", #input_key action, HolbuildRemoteCache.remote_action_key (#input_key action),
            spec_sha256, package node ^ ":" ^ logical_name node] ::
         map (fn parent => "edge " ^ #input_key action ^ " " ^ HolbuildBuildPlan.input_key_for keys parent)
@@ -8161,13 +8169,18 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
        skip the ledger, and as no lookup would read them, the ledger doesn't
        learn them. *)
     fun is_spec path = String.isPrefix (spec_dir ^ "/") path
+    (* Once uploaded, workers read a spec from the remote cache alone, so
+       without keep_specs nothing reads the local copy again. *)
+    fun remove_specs () = if keep_specs then () else List.app (remove_file o #spec) exported
     val _ =
-      if upload then
-        upload_spec_files hash_file remote jobs
-          {known = fn (path, hash) => not (is_spec path) andalso known ("blob " ^ hash),
-           learn = fn (path, hash) => if is_spec path then () else learn ("blob " ^ hash)}
-          (List.concat (map #files exported))
-      else ()
+      (if upload then
+         upload_spec_files hash_file remote jobs
+           {known = fn (path, hash) => not (is_spec path) andalso known ("blob " ^ hash),
+            learn = fn (path, hash) => if is_spec path then () else learn ("blob " ^ hash)}
+           (List.concat (map #files exported))
+       else ())
+      handle e => (remove_specs (); raise e)
+    val _ = remove_specs ()
     (* The caller records the ledger once the batch is submitted: it waits
        for the ledger's lock, which other builds hold to rewrite it. *)
     fun record () =
@@ -8353,12 +8366,13 @@ fun run_already_done remote run_key outputs =
    its context's name, the run text's context= value, its run key and the
    theories a worker restores for it; computing them reads no cache.
    EXPORT writes the run specs of the runs given under .holbuild/run-specs
-   and uploads the specs and every file they name to the remote cache.  A
+   and uploads the specs and every file they name to the remote cache, then
+   removes the specs it wrote unless KEEP_SPECS.  A
    theory a worker restores that the remote cache lacks is published there
    from the local cache first; a run with one that neither cache holds is
    refused, and EXPORT returns it among the refused.  PLANNED is the plan of
    the request's run_planning_targets, NONE when it has none. *)
-fun plan_runs tc project planned jobs
+fun plan_runs tc project planned jobs {keep_specs}
               ({contexts, script, supports, loads, outputs, timeout, closure} : run_request) =
   let
     val remote =
@@ -8607,8 +8621,13 @@ fun plan_runs tc project planned jobs
         val _ =
           List.app (fn {run, theories, ...} => refuse run (valOf (List.find is_unavailable theories))) refused
         val written = map (fn {run, write, ...} => (run, write ())) ready
+        fun remove_specs () =
+          if keep_specs then ()
+          else List.app (fn (_, {spec_sha256, ...}) => remove_file (Path.concat (spec_dir, spec_sha256))) written
         val _ = upload_spec_files hash_file remote jobs {known = fn _ => false, learn = fn _ => ()}
                     (List.concat (map (#files o #2) written))
+                handle e => (remove_specs (); raise e)
+        val _ = remove_specs ()
       in
         {exported = map (fn (run, {spec_sha256, ...}) => (run, spec_sha256)) written,
          refused = map #run refused}
@@ -8622,7 +8641,7 @@ fun plan_runs tc project planned jobs
    whether a run was refused. *)
 fun export_run_specs tc project planned jobs request =
   let
-    val {runs, export, ...} = plan_runs tc project planned jobs request
+    val {runs, export, ...} = plan_runs tc project planned jobs {keep_specs = true} request
     val {exported, refused} = export runs
   in
     {lines = map (fn ({name, run_key, ...} : run, spec_sha256) => String.concatWith " " [name, run_key, spec_sha256])
@@ -9664,8 +9683,8 @@ fun auto_project_gc project threshold =
     val since_gc = read_gc_state project + work
     fun collect () =
       collect_project project HolbuildCache.default_retention_days (project_checkpoint_limit_gb project)
-    fun removed_any ({stage, logs, checkpoints, eviction, ...} : project_gc_counts) =
-      stage + logs + checkpoints + #evicted eviction > 0
+    fun removed_any ({stage, logs, action_specs, run_specs, checkpoints, eviction, ...} : project_gc_counts) =
+      stage + logs + action_specs + run_specs + checkpoints + #evicted eviction > 0
   in
     HolbuildStatus.project_work := 0;
     if since_gc < threshold then

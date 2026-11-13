@@ -1471,7 +1471,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       in
         timed_phase "action_spec.export"
           (fn () => print (#batch (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
-                             {upload = upload, local_resumable = false, forced = [], skip = [], defer = false,
+                             {upload = upload, keep_specs = true, local_resumable = false, forced = [], skip = [], defer = false,
                               publish = [], ledger = false})))
       end
     fun run_with_stat_cache f =
@@ -1509,7 +1509,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               let
                 val {remote, runs, export} =
                   timed_phase "run_action.plan"
-                    (fn () => HolbuildBuildExec.plan_runs tc project (planned_runs ()) jobs request)
+                    (fn () => HolbuildBuildExec.plan_runs tc project (planned_runs ()) jobs {keep_specs = false} request)
                 val uncached =
                   if fetch_only then []
                   else
@@ -1649,7 +1649,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val {batch, deferred = held, record} =
                   timed_phase "action_spec.export"
                     (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
-                                {upload = true, local_resumable = not detach, forced = forced, skip = skip,
+                                {upload = true, keep_specs = false, local_resumable = not detach, forced = forced, skip = skip,
                                  defer = defer, publish = !held_back, ledger = true})
               in
                 deferred := held;

@@ -1554,7 +1554,9 @@ holbuild --remote-cache https://cache.example.org action-spec --upload MyTheory
 
 Each spec is written to `.holbuild/action-specs/<sha256>`, named by its
 SHA-256. With `--upload`, the specs and every source file they name are also
-uploaded to the remote cache's `/cas/`. The command prints the batch, the
+uploaded to the remote cache's `/cas/`. `build --remote-exec` writes and uploads
+the same specs, then removes its local copies, since workers fetch them from
+the remote cache. The command prints the batch, the
 uncached theories with the uncached theories each waits for:
 
 ```text
@@ -1674,7 +1676,8 @@ timing, and prints one line per exported target:
 ```
 
 The spec is written to `.holbuild/run-specs/<spec-sha256>` and uploaded to
-`/cas/` with every file it names. The run key is the SHA-256 of the run text:
+`/cas/` with every file it names. `run-action --remote-exec` writes and uploads
+the same specs, then removes its local copies. The run key is the SHA-256 of the run text:
 
 ```text
 holbuild-run-v1
@@ -2263,6 +2266,10 @@ run, unless `--quiet` is given. Progress never goes to stdout, which keeps the
 locking/discovery and does not require a HOL toolchain. Project checkpoint GC
 uses `.holconfig.toml`'s `[build].checkpoint_limit_gb` unless overridden with
 `--max-checkpoints-gb`.
+
+Project GC also removes the spec files in `.holbuild/action-specs` and
+`.holbuild/run-specs` written before the retention period, such as those
+`action-spec` and `run-action --export-only` keep.
 
 Cache GC removes the dependency analyses under `analysis/` that no build has
 read or written within the retention period. A build that finds its analyses
