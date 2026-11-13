@@ -2320,15 +2320,10 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
     val incoming = cache_manifest_contract key text
     val initial_resident = HolbuildRemoteCache.get_action remote key
     fun conflict detail = HolbuildCacheBackend.Conflict ("remote theory action " ^ key ^ ": " ^ detail)
-    (* A .dat that differs only in what the .sml's digest leaves out, such
-       as dependency records, is left to check_remote_publication to judge. *)
-    fun without_dat text =
-      String.concatWith "\n"
-        (List.filter (not o String.isPrefix "blob dat ") (String.fields (fn c => c = #"\n") text))
     fun compatible_contract resident_text =
       let val resident = cache_manifest_contract key resident_text
       in
-        if without_dat (#non_timeout_text resident) = without_dat (#non_timeout_text incoming) then resident
+        if #non_timeout_text resident = #non_timeout_text incoming then resident
         else raise Error "resident manifest differs outside proof-timeout"
       end
     fun attempt attempts resident =
@@ -9593,10 +9588,21 @@ fun resident_differs_only_in_dat remote root (spec : action_spec) mine resident 
   handle e as HolbuildRemoteCache.Unavailable _ => raise e
        | _ => false
 
+(* Whether the remote's entry for the action differs from the worker's, MINE,
+   only in its .dat and has a weaker timeout contract.  MINE records the
+   restored parents, so it replaces the remote's, as an entry with a stronger
+   contract and the same outputs does. *)
+fun resident_weaker_but_for_dat key mine resident =
+  cache_manifest_outputs_equal_but_dat key mine resident andalso
+  not (timeout_at_least_as_strong (cache_manifest_proof_timeout_text key resident)
+                                  (cache_manifest_proof_timeout_text key mine))
+  handle Error _ => false
+
 (* Uploads every blob of the local entry for the action, raising if one fails
    (the build's own publish only warns), then puts the action.  A different
    entry already there is replaced when it records parents other than the
-   restored ones, and otherwise left for check_remote_publication to judge. *)
+   restored ones or only its .dat differs and its timeout contract is weaker,
+   and otherwise left for check_remote_publication to judge. *)
 fun publish_action_entry remote root (spec : action_spec) =
   let
     val key = #input_key spec
@@ -9616,12 +9622,18 @@ fun publish_action_entry remote root (spec : action_spec) =
           | e => raise action_failed PublishFailure ("could not publish the entry: " ^ General.exnMessage e));
     case HolbuildRemoteCache.get_action remote key of
         SOME resident =>
-          if not (cache_manifest_outputs_equal key resident manifest handle _ => false) andalso
-             resident_misfits_parents remote root spec resident
-          then
-            (warn ("replacing remote cache entry " ^ key ^ ": its recorded parents differ from the cache's");
-             ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest}))
-          else ()
+          let
+            fun replace why =
+              (warn ("replacing remote cache entry " ^ key ^ ": " ^ why);
+               ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest}))
+          in
+            if (cache_manifest_outputs_equal key resident manifest handle _ => false) then ()
+            else if resident_misfits_parents remote root spec resident then
+              replace "its recorded parents differ from the cache's"
+            else if resident_weaker_but_for_dat key manifest resident then
+              replace "it differs only in its .dat and has a weaker timeout contract"
+            else ()
+          end
       | NONE => ();
     ignore (#put_action destination HolbuildCacheBackend.PutIfAbsentOrSame {key = key, text = manifest})
   end

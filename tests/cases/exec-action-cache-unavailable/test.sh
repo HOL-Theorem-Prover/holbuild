@@ -131,12 +131,15 @@ require_file "$remote_root/ac/$ac"
 
 # Two builds of one action can record different proof dependencies, as when
 # their proofs took different paths.  The .dat files then differ only in what
-# the digest in the .sml leaves out, and a worker that lost the race to
-# publish keeps the remote's entry.
-python3 - "$remote_root" "$ac" <<'PY'
+# the digest in the .sml leaves out.  dep_only_resident TIMEOUT makes the
+# remote's entry such a build's, with proof-timeout TIMEOUT, from the worker's
+# entry the remote held.
+cp "$remote_root/ac/$ac" "$tmpdir/own-entry"
+dep_only_resident() {
+  python3 - "$remote_root" "$ac" "$tmpdir/own-entry" "$1" <<'PY'
 import hashlib, pathlib, re, sys
-root, ac = pathlib.Path(sys.argv[1]), sys.argv[2]
-head, manifest = (root / "ac" / ac).read_text().split("manifest-text-v1\n", 1)
+root, ac, own, timeout = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+head, manifest = pathlib.Path(own).read_text().split("manifest-text-v1\n", 1)
 old = re.search(r"^blob dat (\S+)$", manifest, re.M).group(1)
 dat = (root / "cas" / old).read_text()
 # a_thm's record: ((own theory, index) (bool, theorem)) "DISK_THM"; add bool
@@ -149,6 +152,7 @@ data = dat.encode()
 new = hashlib.sha256(data).hexdigest()
 (root / "cas" / new).write_bytes(data)
 manifest = manifest.replace(f"blob dat {old}\n", f"blob dat {new}\n")
+manifest = re.sub(r"^proof-timeout=.*$", f"proof-timeout={timeout}", manifest, flags=re.M)
 out = []
 for line in head.split("\n"):
     if line.startswith("manifest-sha256 "):
@@ -160,10 +164,20 @@ for line in head.split("\n"):
     out.append(line)
 (root / "ac" / ac).write_text("\n".join(out) + "manifest-text-v1\n" + manifest)
 PY
+}
+# A worker that lost the race to publish keeps the remote's entry ...
+dep_only_resident 2.5
 cp "$remote_root/ac/$ac" "$tmpdir/dep-resident"
 worker w
 grep -qx 'status=cached' "$tmpdir/w.result" || { cat "$tmpdir/w.result" "$tmpdir/w.log" >&2; exit 1; }
 cmp "$remote_root/ac/$ac" "$tmpdir/dep-resident"
+# ... and replaces it when its timeout contract is weaker, as from a build
+# without proof steps.
+dep_only_resident none
+worker w
+grep -qx 'status=cached' "$tmpdir/w.result" || { cat "$tmpdir/w.result" "$tmpdir/w.log" >&2; exit 1; }
+[[ $(sed -n '/^manifest-text-v1$/,$p' "$remote_root/ac/$ac") == $(sed -n '/^manifest-text-v1$/,$p' "$tmpdir/own-entry") ]] ||
+  { echo "the weaker entry was not replaced" >&2; cat "$remote_root/ac/$ac" "$tmpdir/w.log" >&2; exit 1; }
 
 # A new action must build and publish with either the primary or backup down.
 # Its optional cache lookups and pre-PUT check see one transport failure and 404.
