@@ -11167,8 +11167,10 @@ fun publish_tool_cache remote store key dir restored =
    staging directory outside the sandbox's roots, and the dependencies
    present at the start are hashed before the child starts. *)
 
-(* How long exec-action waits for its late parents; --ahead-wait-seconds. *)
-val ahead_wait_limit = ref (Time.fromSeconds 3600)
+(* How long exec-action waits for its late parents; --ahead-wait-seconds.
+   Counted from the run's start, so it covers the child's own load too,
+   which takes most of an hour for some theories. *)
+val ahead_wait_limit = ref (Time.fromSeconds 14400)
 val ahead_poll_interval = Time.fromSeconds 2
 
 fun ahead_runtime_path () = Path.concat (HolbuildRuntimePaths.runtime_root (), "sml/ahead_load_runtime.sml")

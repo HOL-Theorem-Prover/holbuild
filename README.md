@@ -1845,7 +1845,7 @@ when it can't go on as a plain run would:
 * a stand-in doesn't match;
 * a restored dependency was built on another build of a late parent;
 * HOL stops early;
-* the parents don't all arrive within `--ahead-wait-seconds` (default 3600).
+* the parents don't all arrive within `--ahead-wait-seconds` (default 14400, counted from the start of the run).
 A retry without the option builds it. The result's `phase-ms` adds
 `aheadwait`, the time HOL spent waiting: at each stand-in from its wait to
 that parent's arrival, and at the end of the preload until every parent has

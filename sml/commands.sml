@@ -316,7 +316,7 @@ fun exec_action_help () = print
   \                     parent. A run that cannot go on as a plain build would\n\
   \                     fails as ahead-abandoned (exit status 3).\n\
   \--ahead-wait-seconds N\n\
-  \                     How long to wait for the parents (default: 3600).\n\n\
+  \                     How long to wait for the parents (default: 14400).\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun run_action_help () = print
