@@ -41,18 +41,10 @@ fun runs hol =
   in if exists path then length (String.tokens Char.isSpace (E.read_text path)) else 0 end;
 fun writes files = E.write_text "$tmpdir/writes" (String.concat (map (fn f => f ^ "\n") files));
 fun dep name = {target = "p:" ^ name ^ "Theory", stem = "src/" ^ name ^ "Theory", key = ""};
-val spec =
-  {version = "", runtime = "", toolchain = {git = "", rev = "", kernel = ""},
-   input_key = "", action_text_sha256 = "", deps_key = "", package = "p", logical = "CTheory",
-   source = {path = "", sha256 = "", size = ""}, inputs = [], libraries = [],
-   deps = [dep "A", dep "B"], libs = [], orders = [], loads = [E.LoadTheory "boolTheory"],
-   outputs = {sig_path = "", sml_path = "", data_path = ""}, extra_outputs = [],
-   proof_steps = false, tactic_timeout = NONE, new_ir = false, theorem_checkpoints = false,
-   skip_checkpoints = false, force = false, trace_steps = false, tool_cache = NONE,
-   action_text = ""} : E.action_spec;
+val wanted = {deps = [dep "A", dep "B"], loads = [E.LoadTheory "boolTheory"]};
 fun tc hol = {holdir = "$tmpdir/" ^ hol, maxheap = NONE,
               kernel_variant = HolbuildToolchain.StandardKernel};
-fun fill hol = E.fill_module_store "$tmpdir/cache" "$tmpdir/root" (tc hol) spec;
+fun fill hol = E.fill_module_store "$tmpdir/cache" "$tmpdir/root" (tc hol) wanted;
 fun store hol = E.module_store ("$tmpdir/" ^ hol);
 fun stored hol file = exists (OS.Path.concat (store hol, file));
 val a = "ab12-A-$a_sha.pmo";
