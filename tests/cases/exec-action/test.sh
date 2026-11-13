@@ -411,10 +411,19 @@ cat > "$project/src/DScript.sml" <<'SML'
 Theory D
 Ancestors A
 
+val _ = ((raise mk_HOL_ERR "Optional" "branch" "handled diagnostic")
+         handle e as HOL_ERR _ => print (Feedback.exn_to_string e));
+Theorem d_continued:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = print (String.concat (List.tabulate (16, fn _ => "continued output\n")));
+
 Theorem d_bad:
   F
 Proof
-  simp[]
+  FAIL_TAC "terminal proof failure"
 QED
 SML
 cat > "$project/src/EScript.sml" <<'SML'
@@ -477,6 +486,38 @@ expect d 1 "status=failed" "failure=proof"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/d.result")
 curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/d-action.log"
 require_grep "d_bad" "$tmpdir/d-action.log"
+require_grep 'Saved theorem .*"d_continued"' "$tmpdir/d-action.log"
+require_grep 'handled diagnostic' "$tmpdir/d-action.log"
+python3 - "$tmpdir/d-action.log" <<'PY'
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+summary = text.split('\nholbuild: exec-action failed: ', 1)[1].split('child failure:\n', 1)[1]
+assert summary.startswith('Exception raised at boolLib.store_thm_at:'), summary
+assert 'terminal proof failure' in summary, summary
+assert 'handled diagnostic' not in summary, summary
+PY
+
+cp "$HOLBUILD_ROOT/tests/fixtures/TerminalFailureScript.sml" "$project/src/TerminalFailureScript.sml"
+hb action-spec --upload TerminalFailureTheory > "$tmpdir/batch-terminal.txt"
+worker terminal "$(spec_for "$tmpdir/batch-terminal.txt" worker:TerminalFailureTheory)"
+expect terminal 1 "status=failed" "failure=proof"
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/terminal.result")
+curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/terminal-action.log"
+python3 - "$tmpdir/terminal-action.log" <<'PY'
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+assert 'handled diagnostic' in text and 'Saved theorem' in text, text
+summary = text.split('\nholbuild: exec-action failed: ', 1)[1].split('child failure:\n', 1)[1]
+assert summary.startswith('Uncaught exception'), summary
+assert 'terminal child failure' in summary.splitlines()[0], summary
+assert 'preceding HOL output:' in summary and 'HOL message: terminal context' in summary, summary
+assert 'handled diagnostic' not in summary, summary
+assert len(summary.strip().splitlines()) <= 12, summary
+PY
 worker e "$(spec_for "$tmpdir/batch-e.txt" worker:ETheory)"
 expect e 1 "status=failed" "failure=tactic-timeout"
 
