@@ -149,8 +149,8 @@ class CachePool:
                  hold_seconds: float = 900, workers_per_node: int = 0, max_workers: int = 240, launch_timeout_seconds: int = 900) -> None:
         if drain_seconds < 60:
             raise ValueError("cache drain must be at least 60 seconds")
-        if not 1 <= len(slots) <= 4 or len({s.name for s in slots}) != len(slots):
-            raise ValueError("cache pool must have one to four distinct slots")
+        if not slots or len({s.name for s in slots}) != len(slots):
+            raise ValueError("cache pool must have one or more distinct slots")
         if len({s.url for s in slots}) != len(slots):
             raise ValueError("cache slot URLs must be distinct")
         self.engine = engine
