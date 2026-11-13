@@ -848,15 +848,19 @@ child replaces the local entry, which does not change the remote cache's
 conflict checks. An entry rejected only by the requested proof policy is retained until
 a successful rebuild can publish its stronger contract.
 
-Source files may also declare source-file-relative extra dependencies:
+Source files may also declare source-file-relative extra dependencies. Define the
+no-op function before calling it; HOL does not provide it, and holbuild scans the
+literal list in the source:
 
 ```sml
+fun holbuild_extra_deps (_ : string list) = ();
 val () = holbuild_extra_deps ["../data/table.txt"];
 ```
 
-Theory scripts may declare deterministic extra output files:
+Theory scripts may declare deterministic extra output files with the same pattern:
 
 ```sml
+fun holbuild_extra_outputs (_ : string list) = ();
 val () = holbuild_extra_outputs ["results/test.nsv"];
 ```
 

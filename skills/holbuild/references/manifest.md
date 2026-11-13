@@ -237,16 +237,25 @@ Default policy for any target: `cache = true`, `always_reexecute = false`, `impu
 
 `impure = true` overrides both `cache` and `always_reexecute` — don't set them separately when using `impure`.
 
-Source files can also declare source-file-relative extra dependencies with a static literal annotation:
+Source files can also declare source-file-relative extra dependencies with a static literal annotation. Define the no-op function before calling it; HOL does not provide it, and holbuild scans the literal list in the source:
 
 ```sml
+fun holbuild_extra_deps (_ : string list) = ();
 val () = holbuild_extra_deps ["../data/table.txt"];
 ```
 
 Source-declared extra dependencies are staged so matching relative filesystem reads work during the action.
 
-Theory scripts can similarly declare deterministic fixed-file outputs with
-`holbuild_extra_outputs ["results/test.nsv"]`. These declarations are
+Theory scripts can similarly declare deterministic fixed-file outputs. Define the
+no-op function before calling it; HOL does not provide it, and holbuild scans the
+literal list in the source:
+
+```sml
+fun holbuild_extra_outputs (_ : string list) = ();
+val _ = holbuild_extra_outputs ["results/test.nsv"];
+```
+
+The script must write the declared files itself. These declarations are
 source-file-relative, must remain inside the package without `.`/`..` or glob
 syntax, and participate in up-to-date checking, caches, and target cleaning.
 
