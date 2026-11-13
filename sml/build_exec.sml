@@ -10014,6 +10014,38 @@ fun shared_checkpoint_key heap_key kind checkpoint_key =
     (String.concat ["holbuild-shared-checkpoint-v1\nheap=", heap_key, "\nkind=", kind,
                     "\ncheckpoint-key=", checkpoint_key, "\n"])
 
+(* A worker claims a cold heap before uploading it, so other workers that
+   built the same heap skip their own upload. The cache has no conditional
+   write, so a worker uploads if it reads back its own claim after the
+   settle delay: one uploader, unless a competitor's claim write lands more
+   than the settle delay after its read, when that competitor uploads too.
+   The claimant releases its claim when its upload ends; a claim lapses
+   after shared_heap_claim_seconds, so an upload killed before it published
+   keeps the heap cold no longer than that. *)
+fun shared_heap_claim_key heap_key =
+  HolbuildHash.string_sha256 ("holbuild-shared-heap-claim-v1\nheap=" ^ heap_key ^ "\n")
+
+val shared_heap_claim_seconds = 300
+val shared_heap_claim_settle = Time.fromSeconds 1
+
+fun shared_heap_claim_text owner seconds =
+  String.concat ["holbuild-shared-heap-claim-v1\nowner=", owner,
+                 "\ntime=", LargeInt.toString seconds, "\n"]
+
+(* Whether a claim in the cache holds the heap for a worker other than
+   `owner` at time `now`. A time over a minute ahead of ours is a broken
+   clock or entry, so it holds nothing; nor does an entry that doesn't parse. *)
+fun shared_heap_claim_active owner now text =
+  case String.tokens (fn c => c = #"\n") text of
+      ["holbuild-shared-heap-claim-v1", owner_line, time_line] =>
+        String.isPrefix "owner=" owner_line andalso
+        String.extract (owner_line, 6, NONE) <> owner andalso
+        String.isPrefix "time=" time_line andalso
+        (case LargeInt.fromString (String.extract (time_line, 5, NONE)) of
+             SOME time => time <= now + 60 andalso now - time < LargeInt.fromInt shared_heap_claim_seconds
+           | NONE => false)
+    | _ => false
+
 (* A checkpoint a build can resume from, under its key in the shared cache. *)
 type shared_candidate =
   {kind : string, key : string, boundary : int, path : string, sidecars : string list,
@@ -10307,14 +10339,39 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
          not (shared_heap_parent_ok ctx) then NONE
       else
         let
-          val manifest = shared_manifest "holbuild-shared-heap-v1" NONE [("heap", sha, "")]
-          val _ = upload_all [(deps_loaded, sha)]
-          val _ = if needs_upload sha then raise Error ("could not upload " ^ deps_loaded) else ()
-          val _ = HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
+          val claim_key = shared_heap_claim_key heap_key
+          val owner = HolbuildTempPath.new_token ()
+          fun now () = Time.toSeconds (Time.now ())
+          fun read_claim () = Option.map #manifest (HolbuildRemoteCache.fetch_action remote claim_key)
+          fun write_claim seconds =
+            let val text = shared_heap_claim_text owner seconds
+            in ignore (HolbuildRemoteCache.publish_action remote {key = claim_key, text = text}); text end
+          fun claim_new () =
+            let val text = write_claim (now ())
+            in OS.Process.sleep shared_heap_claim_settle; read_claim () = SOME text end
+          fun claim () =
+            case read_claim () of
+                SOME text => not (shared_heap_claim_active owner (now ()) text) andalso claim_new ()
+              | NONE => claim_new ()
+          (* A lapsed claim frees the heap at once: for the next worker if
+             this upload failed, and for a repair if the cache later loses
+             the heap's blob. *)
+          fun release () = ignore (write_claim 0) handle HolbuildRemoteCache.Unavailable _ => ()
+          fun upload () =
+            let
+              val manifest = shared_manifest "holbuild-shared-heap-v1" NONE [("heap", sha, "")]
+              val _ = upload_all [(deps_loaded, sha)]
+              val _ = if needs_upload sha then raise Error ("could not upload " ^ deps_loaded) else ()
+              val _ = HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
+            in
+              if HolbuildRemoteCache.get_action remote heap_key = SOME manifest then
+                (store_add store sha {sha = sha, src = deps_loaded, save = true}; SOME sha)
+              else NONE
+            end
         in
-          if HolbuildRemoteCache.get_action remote heap_key = SOME manifest then
-            (store_add store sha {sha = sha, src = deps_loaded, save = true}; SOME sha)
-          else NONE
+          if claim () then (upload () before release ()) handle e => (release (); raise e)
+          else (HolbuildStatus.message_stdout "another worker is publishing the shared deps-loaded heap\n";
+                NONE)
         end
     val heap =
       if not (deps_checkpoint_exists deps_loaded deps_key) then NONE
