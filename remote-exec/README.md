@@ -125,6 +125,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_AHEAD_DEPTH` | how many generations of running ancestors an action may be claimed ahead of, 0 for no limit (see "Loading ahead") | 1 |
 | `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
+| `REMOTE_EXEC_DEFAULT_PRIORITY_FLOOR` | running builds of priority-0 batches allowed ahead of higher priorities (see Claims); 0 for strict priority | 32 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
 | `REMOTE_EXEC_SCALE_DOWN_HOLD_S` | how long a higher burst worker count is kept after demand drops | 900 |
@@ -471,7 +472,10 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   equal priorities, then the one that least recently had an action
   claimed (one that never had goes first), then the oldest: a new batch gets
   the next free worker among equal-priority batches even while a wide one holds
-  the rest, and those batches take turns when there are more of them than workers. Within the batch, it
+  the rest, and those batches take turns when there are more of them than workers. One exception: while
+  fewer than `REMOTE_EXEC_DEFAULT_PRIORITY_FLOOR` builds of priority-0 batches are running, the
+  priority-0 batches go first in their tiers, so a wave of higher priorities never takes every worker;
+  0 restores strict priority. Within the batch, it
   picks the action with the longest chain of dependents in the batch, then
   the one with the most dependents, then by theory name, so the critical
   path starts first and the ready frontier widens fastest. An expired lease returns the

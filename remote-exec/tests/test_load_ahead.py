@@ -98,8 +98,9 @@ async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_re
 
 
 async def test_a_claim_ahead_comes_after_ready_builds_of_its_priority_and_before_those_of_lower_priorities(
-    http: httpx.AsyncClient,
+    http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
+    coordinator.settings.default_priority_floor = 0  # strict priority
     await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4", priority="2")
     await claim_named(http, "a")
     await submit(http, ["x"], priority="2")
@@ -479,6 +480,7 @@ async def test_a_claim_ahead_of_several_tiers_takes_its_first_tier_before_a_lowe
     http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
 ) -> None:
     coordinator.settings.claim_ranking_seconds = 3600
+    coordinator.settings.default_priority_floor = 0  # strict priority
     await submit(http, ["a", "x"], [("x", "a")], speculative_loading="4", priority="1")
     await submit(http, ["b", "h", "s"], [("h", "b"), ("s", "b")], speculative_loading="4")
     async with remote_exec_engine.begin() as conn:
