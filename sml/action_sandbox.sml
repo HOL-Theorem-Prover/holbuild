@@ -213,6 +213,8 @@ fun wrap completed ({writable, readable = extra, toolchain} : grants) argv =
     ["python3", "-I", helper ()] @ (if toolchain then ["--toolchain"] else []) @
     options "--write" (map full writable) @
     options "--read" (map full readable) @ options "--forbid" forbidden @
+    (* Restored states link into the store, which actions read in parts. *)
+    options "--keep-read-only" [OS.Path.concat (cache, "checkpoint-store")] @
     (* Poly/ML's OS.FileSys.tmpName always creates files in /tmp, ignoring
        TMPDIR; HolSat and HolSmt need it.  The helper leaves it out if
        protected worker state, holbuild's TMPDIR included, lies beneath it. *)
