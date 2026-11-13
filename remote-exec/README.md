@@ -632,7 +632,10 @@ at that exact path. A hit needs no writable release cache or lock.
 If the baked executable is absent or not executable, the worker automatically
 uses the existing on-demand path, from
 `<--holbuild-releases-dir>/v<version>/bin/holbuild` (by default
-`/opt/holbuild-releases`). A release the directory doesn't have yet is built
+`REMOTE_EXEC_HOLBUILD_RELEASES`, else `/opt/holbuild-releases`). The image
+sets it to `/opt/holbuild-releases/polyml-<POLYML_TAG>`: a release links the
+Poly/ML runtime library of the image that built it, and a host keeps the
+directory across image changes, so each Poly/ML gets its own. A release the directory doesn't have yet is built
 there on first use: the worker downloads its source tarball
 (`--holbuild-source-url`, by default the GitHub archive of tag `v<version>`),
 runs `make bin/holbuild` in place, since holbuild finds its runtime sources
