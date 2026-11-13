@@ -7,6 +7,7 @@ fun env name = valOf (OS.Process.getEnv name);
 val dir = env "RING_DIR";
 val one = env "RING_ONE";
 val two = env "RING_TWO";
+val three = env "RING_THREE";
 fun assert message ok = if ok then () else raise Fail message;
 val cache = RC.remote (one ^ "///, " ^ two ^ "/ " ^ one);
 val reversed = RC.remote (two ^ "," ^ one);
@@ -23,7 +24,7 @@ val _ = if env "RING_TRANSPORT" = "libcurl" then HolbuildRemoteCacheConfig.setup
 val _ = assert "requested HTTP transport"
   (HolbuildRemoteCacheConfig.uses_libcurl () = (env "RING_TRANSPORT" = "libcurl"));
 val _ = RC.fail_closed := true;
-fun node_dir node = dir ^ (if node = one then "/one" else "/two");
+fun node_dir node = dir ^ (if node = one then "/one" else if node = two then "/two" else "/three");
 fun control node name = node_dir node ^ "/control/" ^ name;
 fun stored node kind digest = node_dir node ^ "/store/" ^ kind ^ "/" ^ digest;
 fun put node name text = RC.write_text (control node name) text;
@@ -127,4 +128,77 @@ val _ = List.app (fn _ => assert "PUT down-primary fallback" (publish degraded d
 val _ = assert "GET down-primary fallback" (fetch degraded down_hash = CB.Hit andalso RC.read_text dst = down_text);
 val _ = assert "HEAD down-primary fallback" (RC.blob_present degraded down_hash);
 val _ = assert "healthy backup keeps ring enabled" (not (RC.disabled ()));
+
+val replicas = RC.remote (one ^ "," ^ two ^ "," ^ three);
+val theory_key = "replica-timeout-contract";
+val theory_ac = RC.remote_action_key theory_key;
+val [first, second, third] = RC.ranked_urls replicas theory_ac;
+fun theory_manifest timeout =
+  String.concatWith "\n"
+    ["holbuild-cache-action-v4", "input_key=" ^ theory_key, "kind=theory",
+     "proof-timeout=" ^ timeout, "load-metadata-v1",
+     "blob sig " ^ digest, "blob sml " ^ digest, "blob dat " ^ digest, ""];
+val blob = {sha256 = digest, size = Int.toString (size text)};
+fun seed node manifest = RC.write_text (stored node "ac" theory_ac) (RC.metadata_text manifest [blob]);
+fun manifest_at node = #manifest (RC.metadata_manifest (RC.read_text (stored node "ac" theory_ac)));
+fun timed manifest = HolbuildBuildExec.manifest_timeout_satisfies false (SOME 10.0) manifest;
+val _ = seed first (theory_manifest "none");
+val _ = seed second (theory_manifest "none");
+val _ = seed third (theory_manifest "10.0");
+val _ = assert "two weak replicas do not hide a strict third"
+  (RC.get_action_using timed replicas theory_key = SOME (theory_manifest "10.0"));
+val _ = RC.remove_file (stored first "ac" theory_ac);
+val _ = RC.remove_file (stored second "ac" theory_ac);
+val _ = assert "a miss walks the whole ring" (RC.get_action replicas theory_key = SOME (theory_manifest "10.0"));
+val _ = RC.remove_file (stored third "ac" theory_ac);
+val _ = assert "missing everywhere is a miss" (RC.get_action replicas theory_key = NONE);
+
+(* A preferred node takes writes and is read first; the rest keep rendezvous order. *)
+val _ = HolbuildRemoteCacheConfig.set_preferred_urls (authenticated third);
+val _ = assert "preferred node ranks first"
+  (RC.ranked_urls replicas theory_ac = [third, first, second]);
+val preferred_text = "written near";
+val preferred_hash = HolbuildHash.string_sha256 preferred_text;
+val _ = RC.write_text src preferred_text;
+val _ = assert "PUT goes to the preferred node"
+  (publish replicas preferred_hash = CB.Published andalso
+   RC.path_exists (stored third "cas" preferred_hash) andalso
+   not (RC.path_exists (stored first "cas" preferred_hash)) andalso
+   not (RC.path_exists (stored second "cas" preferred_hash)));
+val _ = HolbuildRemoteCacheConfig.set_preferred_urls (authenticated first ^ "," ^ authenticated second);
+val _ = assert "a reader preferring other nodes still finds it"
+  (fetch replicas preferred_hash = CB.Hit andalso RC.read_text dst = preferred_text);
+val _ = HolbuildRemoteCacheConfig.set_preferred_urls "";
+val _ = assert "no preference keeps rendezvous order"
+  (RC.ranked_urls replicas theory_ac = [first, second, third]);
+
+val _ = seed first (theory_manifest "10.0");
+val _ = seed second (theory_manifest "none");
+val _ = seed third (theory_manifest "2.5");
+val _ = RC.remember_blob replicas blob;
+fun publish_timed () = HolbuildBuildExec.put_remote_theory_action replicas CB.PutIfAbsentOrSame
+  {key = theory_key, text = theory_manifest "10.0"};
+val _ = assert "strict primary repairs weaker secondary" (publish_timed () = CB.AlreadyPresent);
+val _ = assert "weak secondary strengthened" (manifest_at second = theory_manifest "10.0");
+val _ = assert "stronger secondary preserved" (manifest_at third = theory_manifest "2.5");
+val _ = RC.remove_file (stored second "ac" theory_ac);
+val _ = publish_timed ();
+val _ = assert "repair does not replicate absent entries" (not (RC.path_exists (stored second "ac" theory_ac)));
+val different = theory_manifest "none" ^ "parent different\n";
+val _ = seed second different;
+val _ = assert "conflicting secondary does not fail primary" (publish_timed () = CB.AlreadyPresent);
+val _ = assert "different secondary untouched" (manifest_at second = different);
+val _ = seed second (theory_manifest "none");
+val _ = put second "get-status" "503";
+val _ = List.app (fn _ => assert "secondary outage does not fail publication" (publish_timed () = CB.AlreadyPresent)) [1,2,3,4];
+val _ = clear second "get-status";
+val _ = assert "secondary outages do not trip primary breaker" (not (RC.disabled ()));
+val _ = assert "unavailable secondary untouched" (manifest_at second = theory_manifest "none");
+val _ = put second "ac-put-status" "503";
+val _ = assert "failed secondary repair does not fail primary" (publish_timed () = CB.AlreadyPresent);
+val _ = clear second "ac-put-status";
+val _ = assert "failed secondary repair leaves resident intact" (manifest_at second = theory_manifest "none");
+val _ = seed second "malformed manifest";
+val _ = assert "malformed secondary does not fail primary" (publish_timed () = CB.AlreadyPresent);
+val _ = assert "malformed secondary untouched" (manifest_at second = "malformed manifest");
 val _ = print "cache ring passed\n";

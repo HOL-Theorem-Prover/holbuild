@@ -50,10 +50,14 @@ sig
   val action_dir : t -> string -> string
   val action_manifest : t -> string -> string
   val blob_path : t -> string -> string
+  (* The blob hash a manifest line references, if any. *)
+  val blob_ref : string -> string option
 
   val copy_binary : string -> string -> unit
   val link_or_copy : {src : string, dst : string} -> unit
   val verify_blob : t -> string -> bool
+  (* Return the hashes whose resident blobs pass content verification. *)
+  val verified_blobs : t -> string list -> string list
   (* Takes ownership of a temporary file whose bytes have already been
      verified against hash. Other publishers must use publish_blob. *)
   val consume_verified_blob : t -> {hash : string, src : string} -> HolbuildCacheBackend.publish_result
@@ -67,4 +71,15 @@ sig
   val with_action_publish_lock : t -> string -> (unit -> 'a) -> (unit -> 'a) -> 'a
   (* Waits for a concurrent publisher before running the callback. *)
   val with_action_publish_lock_wait : t -> string -> (unit -> 'a) -> 'a
+
+  (* Bytes written into the cache since its last GC, counting this process's
+     writes not yet flushed. *)
+  val growth_since_gc : t -> Position.int
+  (* Appends this process's writes to each cache's growth journal. *)
+  val flush_growth : unit -> unit
+  (* Called by every cache GC: the cache counts as just collected. *)
+  val reset_growth : t -> unit
+  (* Drops this process's unflushed writes, for a throwaway cache that is
+     removed before the process exits. *)
+  val discard_growth : t -> unit
 end

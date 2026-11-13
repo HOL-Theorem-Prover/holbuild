@@ -315,56 +315,132 @@ fun write_file path text =
   let val out = TextIO.openOut path
   in TextIO.output(out, text); TextIO.closeOut out end
 
-(* Runs the analyser on REQUEST, returning its stdout and, if it succeeded,
-   its response; ERRORS is where its stderr goes.  Under exec-action it was
-   built from the action's toolchain, so it runs confined: it reads that
-   analyser, the action tree and checkpoints, writes only a fresh work
-   directory, and its response counts once the sandbox has validated it. *)
-(* Runs ANALYSER on REQUEST.  Under exec-action it runs confined, in a
-   fresh work directory that alone is writable, and the response (and the
-   stderr, when CAPTURE_STDERR) is read only after the sandbox has checked
-   that work directory. *)
+(* Keep shell exit 137 distinct from an observed signal: a program can also
+   exit with that code itself. Both permit bounded retry of this parser. *)
+fun analyser_killed status =
+  case Unix.fromStatus status of
+      Unix.W_SIGNALED signal => signal = Posix.Signal.kill
+    | Unix.W_EXITSTATUS code => code = 0w137
+    | _ => false
+
+fun analyser_status status =
+  let
+    fun signal_text signal =
+      SysWord.fmt StringCvt.DEC (Posix.Signal.toWord signal) ^
+      (if signal = Posix.Signal.kill then " (SIGKILL)" else "")
+  in
+    case Unix.fromStatus status of
+        Unix.W_EXITED => "exit status 0"
+      | Unix.W_EXITSTATUS code =>
+          "exit status " ^ Word8.fmt StringCvt.DEC code ^
+          (if code = 0w137 then " (SIGKILL-compatible shell status)" else "")
+      | Unix.W_SIGNALED signal => "signal " ^ signal_text signal
+      | Unix.W_STOPPED signal => "stopped by signal " ^ signal_text signal
+  end
+
+fun analyser_pressure before_events after_events =
+  let
+    fun group (path, values) =
+      let
+        val after_values = Option.getOpt (assoc path after_events, [])
+        fun counter (name, before_value) =
+          name ^ "=" ^ IntInf.toString before_value ^ "->" ^
+          (case assoc name after_values of
+               NONE => "unavailable (delta unknown)"
+             | SOME after_value =>
+                 IntInf.toString after_value ^ " (delta " ^
+                 IntInf.toString (after_value - before_value) ^ ")")
+      in
+        path ^ ": " ^ String.concatWith ", " (map counter values)
+      end
+  in
+    if null before_events then "cgroup memory.events unavailable"
+    else "shared cgroup pressure (not victim attribution):\n" ^
+         String.concatWith "\n" (map group before_events)
+  end
+
+fun analyser_failure {status, stderr, pressure, ...} =
+  "holbuild-hol-analyser failed: " ^ analyser_status status ^
+  (if analyser_killed status then "; kill cause unknown" else "") ^ "\n" ^ pressure ^
+  (if stderr = "" then "" else "\n" ^ stderr)
+
+(* Capture every attempt's stderr; CAPTURE_STDERR retains successful stderr
+   for the caller instead of echoing it. A confined response is read only
+   after sandbox validation, and confined calls never retry. *)
 fun run_analyser {analyser, request, capture_stderr} =
+  HolbuildProcessGroup.with_cancellation_token (fn token =>
   let
     fun command dir =
+      "exec 2> " ^ HolbuildHash.quote (OS.Path.concat(dir, "stderr")) ^ "\n" ^
       String.concatWith " "
         (map HolbuildHash.quote
            (analyser :: analyser_min_heap_args () @
-            ["--request", OS.Path.concat(dir, "request"), "--response", OS.Path.concat(dir, "response")])) ^
-      (if capture_stderr then " 2> " ^ HolbuildHash.quote (OS.Path.concat(dir, "stderr")) else "")
-    fun result dir {status, output} =
-      {output = output,
-       stderr = if capture_stderr then read_all (OS.Path.concat(dir, "stderr")) handle _ => "" else "",
-       response = if OS.Process.isSuccess status then SOME (read_all (OS.Path.concat(dir, "response")))
-                  else NONE}
+            ["--request", OS.Path.concat(dir, "request"), "--response", OS.Path.concat(dir, "response")]))
+    fun result dir before_events {status, output} =
+      let
+        val _ = HolbuildProcessGroup.require_uncancelled token
+        val after_events = HolbuildMachineMemory.cgroup_memory_events ()
+      in
+        {status = status, output = output,
+         stderr = Option.getOpt (HolbuildMachineMemory.read_text (OS.Path.concat(dir, "stderr")), ""),
+         pressure = analyser_pressure before_events after_events,
+         response = if OS.Process.isSuccess status then SOME (read_all (OS.Path.concat(dir, "response")))
+                    else NONE}
+      end
+    fun attempt () =
+      let val before_events = HolbuildMachineMemory.cgroup_memory_events ()
+      in
+        case !HolbuildActionSandbox.private_roots of
+            SOME (root, checkpoints) =>
+              HolbuildActionSandbox.shell
+                {writable = [], readable = [OS.Path.dir (OS.Path.dir analyser), root, checkpoints], toolchain = false}
+                (fn work => (write_file (OS.Path.concat(work, "request")) request; command work))
+                (HolbuildProcessGroup.run_shell_output_cancellable token)
+                (fn (work, outcome) => result work before_events outcome)
+          | NONE =>
+              let
+                (* tmpName swaps the process umask, racing parallel analysers. *)
+                val dir = HolbuildTempPath.temporary "analyser"
+                fun remove () = HolbuildRemoveTree.remove_untrusted dir handle _ => ()
+                fun go () =
+                  (OS.FileSys.mkDir dir;
+                   write_file (OS.Path.concat(dir, "request")) request;
+                   result dir before_events
+                     (HolbuildProcessGroup.run_shell_output_cancellable token (command dir)))
+              in
+                (go () before remove ()) handle e => (remove (); raise e)
+              end
+      end
+    fun run retries output =
+      let
+        val _ = HolbuildProcessGroup.require_uncancelled token
+        val outcome as {status, stderr, response, pressure, output = attempt_output} = attempt ()
+        val output = output ^ attempt_output
+      in
+        if not (HolbuildActionSandbox.active ()) andalso analyser_killed status andalso retries < 2 then
+          (TextIO.output (TextIO.stdErr, analyser_failure outcome ^
+             "\nretrying analyser (" ^ Int.toString (retries + 1) ^ "/2)\n");
+           HolbuildProcessGroup.require_uncancelled token;
+           OS.Process.sleep (Time.fromReal (0.1 * Real.fromInt (retries + 1)));
+           run (retries + 1) output)
+        else
+          (if OS.Process.isSuccess status andalso not capture_stderr
+           then TextIO.output (TextIO.stdErr, stderr) else ();
+           {status = status, output = output, stderr = stderr, response = response, pressure = pressure})
+      end
   in
-    case !HolbuildActionSandbox.private_roots of
-        SOME (root, checkpoints) =>
-          HolbuildActionSandbox.shell
-            {writable = [], readable = [OS.Path.dir (OS.Path.dir analyser), root, checkpoints], toolchain = false}
-            (fn work => (write_file (OS.Path.concat(work, "request")) request; command work))
-            HolbuildProcessGroup.run_shell_output
-            (fn (work, outcome) => result work outcome)
-      | NONE =>
-          let
-            (* Not OS.FileSys.tmpName: it swaps the process umask, which races
-               when several analysers start at once. *)
-            val dir = HolbuildTempPath.temporary "analyser"
-            fun remove () = HolbuildRemoveTree.remove_untrusted dir handle _ => ()
-            fun go () =
-              (OS.FileSys.mkDir dir;
-               write_file (OS.Path.concat(dir, "request")) request;
-               result dir (HolbuildProcessGroup.run_shell_output (command dir)))
-          in
-            (go () before remove ()) handle e => (remove (); raise e)
-          end
-  end
+    run 0 ""
+  end)
 
-(* The response to REQUEST, or NONE if the analyser failed; its stdout is
-   printed. *)
+(* The response to REQUEST, or NONE after reporting the failed attempt. *)
 fun analyser_response analyser request =
-  let val {output, response, ...} = run_analyser {analyser = analyser, request = request, capture_stderr = false}
-  in print output; response end
+  let val outcome as {output, response, ...} =
+        run_analyser {analyser = analyser, request = request, capture_stderr = false}
+  in
+    print output;
+    if isSome response then () else TextIO.output (TextIO.stdErr, analyser_failure outcome ^ "\n");
+    response
+  end
 
 datatype 'a outcome = Done of 'a | Failed of exn
 
@@ -383,11 +459,11 @@ fun analyse_files analyser files =
         HolbuildAnalysisProtocol.join ["command", "analyse"]] @
        map file_line files @
        [HolbuildAnalysisProtocol.join ["end"]]) ^ "\n"
-    val {output, response, ...} = run_analyser {analyser = analyser, request = request, capture_stderr = false}
+    val result as {output, response, ...} = run_analyser {analyser = analyser, request = request, capture_stderr = false}
     val outcome =
       (case response of
            SOME text => Done (parse_analyser_response text files)
-         | NONE => raise Error "holbuild-hol-analyser failed")
+         | NONE => raise Error (analyser_failure result))
       handle e => Failed e
   in
     (output, outcome)

@@ -14,7 +14,9 @@ val local_build_needed_status : OS.Process.status = RunCall.unsafeCast (75 : int
 val interrupted = ref false
 
 fun err_with_debug_artifacts msg artifacts =
-  (if HolbuildStatus.json_mode () then HolbuildStatus.error_with_debug_artifacts msg artifacts
+  (HolbuildCommandSummary.exit_code :=
+     (if !HolbuildHolSharedCache.local_build_needed andalso not (!interrupted) then 75 else 1);
+   if HolbuildStatus.json_mode () then HolbuildStatus.error_with_debug_artifacts msg artifacts
    else HolbuildStatus.message_stderr ("holbuild: " ^ msg ^ "\n");
    OS.Process.exit (if !HolbuildHolSharedCache.local_build_needed andalso not (!interrupted)
                     then local_build_needed_status
@@ -74,15 +76,19 @@ fun global_help () = print
   \The reserve is a quarter of MemTotal, at least 1 GiB and at most 30 GiB; the\n\
   \margin is the reserve, or what the budget leaves out of MemTotal if that is\n\
   \less (at least 1 GiB).\n\
-  \This bounds admission; it does not enforce RSS. HOL toolchain builds, check,\n\
-  \run and repl reserve nothing.\n\
+  \Where cgroup v2 limits the memory of holbuild's group or of a group enclosing\n\
+  \it, a child also starts only while the tightest of them has its charge left,\n\
+  \reservations or none. Fingerprint checks and run reserve for their HOL session.\n\
+  \This bounds admission; it does not enforce RSS. HOL toolchain builds and repl\n\
+  \reserve nothing.\n\
   \To set or resize the budget, write DIR/budget (a byte count) while holding\n\
   \DIR/lock:\n\
   \  flock DIR/lock sh -c 'echo BYTES > DIR/budget.new && mv DIR/budget.new DIR/budget'\n\
   \To return to the default, remove it: flock DIR/lock rm DIR/budget\n\
   \Waiting for DIR/lock gives up after $HOLBUILD_COOPERATE_LOCK_TIMEOUT seconds\n\
   \(default 600; 0 for no limit).\n\n\
-  \Use `holbuild COMMAND --help` for command-specific help.\n"
+  \Use `holbuild COMMAND --help` for command-specific help.\n\
+  \Full reference: man holbuild.\n"
 
 fun build_help () = print
   "Usage:\n\
@@ -116,22 +122,26 @@ fun build_help () = print
   \      files in from one build to the next: the cache root's tool-cache/NAME\n\
   \      here; on a remote worker, one the remote cache fills and saves per\n\
   \      theory dependencies.\n\
-  \  --remote-exec URL [--remote-only] [--priority N] [--detach | --attach BATCH-ID]\n\n\
+  \  --remote-exec URL [--remote-only] [--priority N] [--speculative-loading[=N]]\n\
+  \      [--detach | --attach BATCH-ID]\n\n\
   \With --remote-exec, theories the remote cache lacks and that aren't\n\
   \built here for their current inputs (except with --detach) are built\n\
   \by the coordinator's workers and restored from the remote cache. Needs\n\
   \--remote-cache. A closure that can't run remotely or an unreachable\n\
   \coordinator builds locally; --remote-only fails instead, with exit\n\
   \status 75. --detach submits the batch and exits; --attach follows a\n\
-  \submitted batch and restores it.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \submitted batch and restores it. --speculative-loading starts loading a\n\
+  \theory's ancestors on a worker before its parents are built, at most N\n\
+  \theories of the batch at a time (1-16, default 4); it costs worker time\n\
+  \when a parent fails.\n\n\
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun context_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] context [--trknl]\n\n\
   \Show resolved project context. Use --trknl to select the tracing-kernel\n\
   \context. This command resolves metadata but does not build the toolchain.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun repl_help () = print
   "Usage:\n\
@@ -156,7 +166,7 @@ fun repl_help () = print
   \                 of building locally.\n\n\
   \Targets are built without proof steps, as heap targets are: no step timeout\n\
   \applies, and theories built by `build --skip-proof-steps` are reused.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun run_help () = print
   "Usage:\n\
@@ -181,13 +191,13 @@ fun run_help () = print
   \                 of building locally.\n\n\
   \Targets are built without proof steps, as heap targets are: no step timeout\n\
   \applies, and theories built by `build --skip-proof-steps` are reused.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun execution_plan_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] execution-plan THEORY:THEOREM\n\n\
   \Inspect the proof-step execution plan for a theorem.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun check_help () = print
   "Usage:\n\
@@ -219,7 +229,7 @@ fun check_help () = print
   \built by build --skip-proof-steps and applies no step timeout. With\n\
   \--remote-exec URL [--remote-only], uncached theories are built on the\n\
   \coordinator's workers and restored from the remote cache.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun buildhol_help () = print
   "Usage:\n\
@@ -228,26 +238,26 @@ fun buildhol_help () = print
   \the tracing kernel. A configured remote cache restores toolchains and\n\
   \publishes successful local builds automatically. A global -j N is passed to\n\
   \HOL's bin/build when the toolchain is built here.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun heap_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] heap NAME [--remote-exec URL [--remote-only]]\n\n\
   \Build a configured heap.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun executable_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] executable NAME [--remote-exec URL [--remote-only]]\n\n\
   \Build a configured executable heap.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun clean_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] clean THEORY...\n\n\
   \Remove local build outputs for theories. Subsequent builds may restore outputs\n\
   \from the global cache.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun gc_help () = print
   "Usage:\n\
@@ -261,41 +271,53 @@ fun gc_help () = print
   \  --cache-only        global cache only; no project needed\n\
   \  --toolchains-only   installed HOL toolchains only; no project needed\n\n\
   \The --*-only options are mutually exclusive.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun cache_help () = print
-  "`holbuild cache gc` is deprecated; use `holbuild gc --cache-only`.\n"
+  "`holbuild cache gc` is deprecated; use `holbuild gc --cache-only`.\n\
+  \Full reference: man holbuild.\n"
 
 fun action_spec_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] action-spec [--upload] [OPTIONS] [TARGET ...]\n\n\
+  \  holbuild [GLOBAL OPTIONS] action-spec [--upload] [--remote-only] [OPTIONS] [TARGET ...]\n\n\
   \Plan TARGETs as build would and write the ActionSpec of every theory the\n\
   \remote cache can't satisfy to .holbuild/action-specs/SHA256, then print the\n\
   \action batch. With --upload, also upload the specs and their sources to the\n\
   \remote cache. Takes build's cache and proof options and --tool-cache. Needs\n\
-  \--remote-cache.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \--remote-cache. With --remote-only, an uncached HOL toolchain exits 75\n\
+  \instead of building locally.\n\n\
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun exec_action_help () = print
   "Usage:\n\
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
-  \      --cache-limit-gb N [--cache-reserve-gb N] [--share-heaps] [--result FILE]\n\n\
+  \      --cache-limit-gb N [--cache-reserve-gb N] [--share-heaps] [--result FILE]\n\
+  \      [--ahead-parent INPUT_KEY:SPEC-SHA256 ... [--ahead-wait-seconds N]]\n\n\
   \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
   \action-spec), or the run spec (see run-action), and publish its result to\n\
   \the remote cache. The action runs in CACHE/action, with checkpoints in\n\
   \CACHE/checkpoints, where CACHE is the cache root. Writes a\n\
   \holbuild-action-result-v1 record to FILE, or to stdout.\n\n\
   \Exit status: 0 built or cached; 1 proof, tactic-timeout, script or timeout\n\
-  \failure; 2 out of memory; 3 input-missing, publish, toolchain, disk or\n\
-  \internal failure; 4 spec rejected.\n\n\
+  \failure; 2 out of memory; 3 input-missing, publish, toolchain, disk,\n\
+  \ahead-abandoned or internal failure; 4 spec rejected.\n\n\
   \--cache-limit-gb N   Before the action, evict least recently used\n\
   \                     checkpoints, toolchains and local cache entries until\n\
   \                     the cache root holds at most N GB minus the reserve.\n\
   \--cache-reserve-gb N Room to keep free under the limit (default: a tenth).\n\
   \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
   \                     other workers published, and publish this run's. The\n\
-  \                     host store CACHE/checkpoint-store keeps their files.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \                     host store CACHE/checkpoint-store keeps their files.\n\
+  \--ahead-parent INPUT_KEY:SPEC-SHA256\n\
+  \                     Load ahead of this parent, a dependency of the theory\n\
+  \                     that another worker is still building from SPEC-SHA256:\n\
+  \                     load what is present, wait for the parent's entry in\n\
+  \                     the remote cache, then build. Repeat for each such\n\
+  \                     parent. A run that cannot go on as a plain build would\n\
+  \                     fails as ahead-abandoned (exit status 3).\n\
+  \--ahead-wait-seconds N\n\
+  \                     How long to wait for the parents (default: 3600).\n\n\
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun run_action_help () = print
   "Usage:\n\
@@ -333,26 +355,29 @@ fun run_action_help () = print
   \ended run can't be fetched, and 1 on errors, a cancelled batch, or a\n\
   \TARGET that isn't built.\n\n\
   \Takes build's cache options. Needs --remote-cache.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun export_help () = print
   "Usage:\n\
-  \  holbuild [GLOBAL OPTIONS] export [--build [--remote-exec URL [--remote-only]]] -o FILE [--metadata-out FILE] [TARGET ...]\n\n\
-  \Export cached build outputs for targets. With --build, build targets first.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \  holbuild [GLOBAL OPTIONS] export [--build [--remote-exec URL [--remote-only]]] [--closure | --sources-only] -o FILE [--metadata-out FILE] [TARGET ...]\n\n\
+  \Write the root package as a capsule: its source snapshot and the cached build\n\
+  \outputs of its own theories among the targets. Targets in other packages are\n\
+  \left out. With --build, build targets first.\n\n\
+  \  --closure       Write the cached outputs of the whole target closure, dependencies\n\
+  \                  included, and no source snapshot.\n\
+  \  --sources-only  Write the source snapshot only. Takes no targets and builds no theories.\n\n\
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun import_help () = print
   "Usage:\n\
   \  holbuild [GLOBAL OPTIONS] import FILE\n\n\
   \Import cached build outputs from an hbx archive into the global cache.\n\n\
-  \Global options: see `holbuild --help`.\n"
+  \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun help_arg arg = arg = "--help" orelse arg = "-h"
 fun has_help_arg args = List.exists help_arg args
 
-val command_names =
-  ["build", "context", "repl", "run", "execution-plan", "check", "buildhol", "heap", "executable",
-   "clean", "export", "import", "gc", "cache", "action-spec", "exec-action", "run-action"]
+val command_names = HolbuildNames.command_names
 
 fun known_command command =
   List.exists (fn name => name = command) command_names orelse command = "goalfrag-plan"
@@ -844,8 +869,7 @@ fun find_theory_source command index theory =
       [source] => source
     | [] =>
         raise Error ("theory not found for " ^ command ^ ": " ^ theory ^
-                     HolbuildSuggest.did_you_mean theory
-                       (map #logical_name (List.filter theory_source index)))
+                     HolbuildSuggest.did_you_mean theory (HolbuildNames.theory_names index))
     | matches =>
         raise Error ("ambiguous theory for " ^ command ^ ": " ^ theory ^ " in " ^
                      String.concatWith ", " (map describe_source matches))
@@ -1122,7 +1146,8 @@ datatype build_mode =
   | ExportRunSpecs of HolbuildBuildExec.run_request
   | RemoteRun of {request : HolbuildBuildExec.run_request, url : string option, fetch_only : bool,
                   outputs_dir : string, profile : string option}
-  | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int}
+  | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int,
+                   speculative_loading : int option}
 
 fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
   let
@@ -1419,23 +1444,27 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun execute (options, plan, toolchain_key) =
           timed_phase "build.execute"
             (fn () => HolbuildBuildExec.build options tc project plan toolchain_key jobs)
-        val ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
+        val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
         fun build_owners owner_plan =
           execute (build_options_for index entry_plan owner_plan [], owner_plan, toolchain_key)
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
           else plan_with_record true
+        fun prepare_requested () =
+          case components of
+              (* A restored plan already holds the writers' current sources. *)
+              NONE => initial
+            | SOME components =>
+                if build_generated_source_owners build_owners components (#holdir tc) index plan then
+                  let val replanned as (planned, _) = replan ()
+                  in warn_unreachable_for planned; replanned end
+                else initial
+        val ({plan = actual, toolchain_key = actual_key, ...}, actual_options) =
+          prepare_requested () handle e => (HolbuildCommandSummary.observe_plan project plan; raise e)
+        val _ = HolbuildCommandSummary.observe_plan project actual
       in
-        case components of
-            (* A plan from the record holds the generated sources as their
-               up-to-date writers left them. *)
-            NONE => execute (options, plan, toolchain_key)
-          | SOME components =>
-              if build_generated_source_owners build_owners components (#holdir tc) index plan then
-                let val (planned as {plan, toolchain_key, ...}, options) = replan ()
-                in warn_unreachable_for planned; execute (options, plan, toolchain_key) end
-              else execute (options, plan, toolchain_key)
+        execute (actual_options, actual, actual_key)
       end
     fun export_action_specs upload () =
       let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
@@ -1597,7 +1626,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
        it finishes, the ordinary build restores them from the remote cache. *)
-    fun remote_build {url, remote_only, detach, attach, priority} =
+    fun remote_build {url, remote_only, detach, attach, priority, speculative_loading} =
       let
         val _ =
           if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
@@ -1611,15 +1640,20 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (* The theories an earlier pass deferred: whatever settled them,
                a later batch makes sure the remote cache has them. *)
             val held_back = ref []
+            (* Records in the ledger what the last export learned: submit runs
+               it once the batch is submitted, or found empty. *)
+            val pending_record = ref (fn () => ())
+            fun record_pending () = (!pending_record ()) before pending_record := (fn () => ())
             fun export defer skip forced =
               let
-                val {batch, deferred = held} =
+                val {batch, deferred = held, record} =
                   timed_phase "action_spec.export"
                     (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
                                 {upload = true, local_resumable = not detach, forced = forced, skip = skip,
                                  defer = defer, publish = !held_back, ledger = true})
               in
                 deferred := held;
+                pending_record := record;
                 batch
               end
             fun batch_keys batch =
@@ -1721,6 +1755,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                unknown, so none of the others are copied before it ends. *)
             fun follow in_batch batch_id =
               let
+                (* Planning, export and early cutoff leave garbage that a
+                   major collection would only reclaim once the heap grows
+                   again; following waits on the coordinator for as long as
+                   the batch runs, so collect it now rather than hold it. *)
+                val _ = PolyML.fullGC ()
                 val {add, stop} =
                   HolbuildBuildExec.start_remote_exec_prefetch build_options tc project plan toolchain_key jobs in_batch
                 val logs = ref []
@@ -1863,23 +1902,33 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 | ((HolbuildRemoteExec.Unreachable reason, progress), _) =>
                     if remote_only
                     then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id ^
-                                    (if priority = 0 then "" else " --priority " ^ Int.toString priority))
+                                    (if priority = 0 then "" else " --priority " ^ Int.toString priority) ^
+                                    (case speculative_loading of
+                                         SOME n => " --speculative-loading=" ^ Int.toString n
+                                       | NONE => ""))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
             and submit resubmit skip batch =
-              if null (batch_keys batch) andalso not (null (!deferred)) then submit_deferred resubmit skip
-              else if null (batch_keys batch) andalso not (null skip) then restore_after_failures ()
-              else if null (batch_keys batch) then
-                (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
-                 build_locally ())
+              if null (batch_keys batch) then
+                (record_pending ();
+                 if not (null (!deferred)) then submit_deferred resubmit skip
+                 else if not (null skip) then restore_after_failures ()
+                 else
+                   (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
+                    build_locally ()))
               else
                 case HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
-                       ((if fail_fast then "?fail_fast=true" else "") ^
-                        (if priority = 0 then "" else
-                         (if fail_fast then "&" else "?") ^ "priority=" ^ Int.toString priority))
+                       (case (if fail_fast then ["fail_fast=true"] else []) @
+                             (if priority = 0 then [] else ["priority=" ^ Int.toString priority]) @
+                             (case speculative_loading of
+                                  SOME n => ["speculative_loading=" ^ Int.toString n]
+                                | NONE => []) of
+                            [] => ""
+                          | params => "?" ^ String.concatWith "&" params)
                        (#maxheap tc) batch of
-                    HolbuildRemoteExec.Refused reason => fall_back reason
+                    HolbuildRemoteExec.Refused reason => (record_pending (); fall_back reason)
                   | HolbuildRemoteExec.Ok batch_id =>
                       (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
+                       record_pending ();
                        if detach then () else finish resubmit skip (SOME (batch_keys batch)) batch_id)
             (* Settles the deferred theories; those early cutoff can't reuse, and
                those that depend on them, go in the next batch, except those
@@ -1931,13 +1980,19 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
            execute_build ())
         else
-          case components of
-              NONE => remote_build_plan (build_options, plan, toolchain_key) attach
-            | SOME components =>
-                if build_generated_source_owners build_owners components (#holdir tc) index plan then
-                  let val (planned as {plan, toolchain_key, ...}, build_options) = replan ()
-                  in warn_unreachable_for planned; remote_build_plan (build_options, plan, toolchain_key) NONE end
-                else remote_build_plan (build_options, plan, toolchain_key) attach
+          let
+            fun prepare_requested () =
+              case components of
+                  NONE => ((build_options, plan, toolchain_key), attach)
+                | SOME components =>
+                    if build_generated_source_owners build_owners components (#holdir tc) index plan then
+                      let val (planned as {plan, toolchain_key, ...}, options) = replan ()
+                      in warn_unreachable_for planned; ((options, plan, toolchain_key), NONE) end
+                    else ((build_options, plan, toolchain_key), attach)
+            val (arguments as (_, actual, _), attached) =
+              prepare_requested () handle e => (HolbuildCommandSummary.observe_plan project plan; raise e)
+            val _ = HolbuildCommandSummary.observe_plan project actual
+          in remote_build_plan arguments attached end
       end
   in
     case mode of
@@ -1949,8 +2004,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (fn () => run_with_stat_cache (export_run_specs request))
       | RemoteRun run => remote_run run ()
       | BuildTargets =>
-          if dry_run then run_with_stat_cache describe_dry_run
-          else HolbuildBuildExec.with_project_lock project "build" (fn () => run_with_stat_cache execute_build)
+          HolbuildBuildExec.with_project_lock project (if dry_run then "dry-run" else "build")
+            (fn () => run_with_stat_cache (if dry_run then describe_dry_run else execute_build))
       | RemoteExec remote =>
           HolbuildBuildExec.with_project_lock project "build"
             (fn () => run_with_stat_cache (fn () => remote_build remote))
@@ -1987,7 +2042,8 @@ fun action_spec_command tc cli_jobs args =
   let
     val upload = List.exists (fn arg => arg = "--upload") args
     val parsed as ({dry_run, watch, repl_on_failure, execution_plan, ...}, _) =
-      split_flags (split_tool_cache_flag (List.filter (fn arg => arg <> "--upload") args))
+      split_flags (split_tool_cache_flag
+        (List.filter (fn arg => arg <> "--upload" andalso arg <> "--remote-only") args))
     val _ =
       if dry_run orelse watch orelse repl_on_failure orelse Option.isSome execution_plan then
         raise Error "action-spec does not run builds: remove --dry-run, --watch and --repl-on-failure"
@@ -2222,11 +2278,55 @@ fun split_build_priority args =
     loop NONE [] args
   end
 
+(* --speculative-loading[=N]: how many theories of a batch may load ahead of
+   their parents at a time. *)
+fun split_speculative_loading args =
+  let
+    fun parse value =
+      (* Two digits at most, so Int.fromString can't overflow. *)
+      case if size value <= 2 andalso List.all Char.isDigit (String.explode value) then Int.fromString value else NONE of
+          SOME n =>
+            if n >= 1 andalso n <= 16 then n
+            else raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 16")
+        | NONE => raise Error ("invalid --speculative-loading: " ^ value ^ "; expected an integer between 1 and 16")
+    fun loop cap acc xs =
+      case xs of
+          [] => (cap, rev acc)
+        | "--speculative-loading" :: rest => loop (SOME 4) acc rest
+        | arg :: rest =>
+            if String.isPrefix "--speculative-loading=" arg then
+              loop (SOME (parse (String.extract (arg, size "--speculative-loading=", NONE)))) acc rest
+            else loop cap (arg :: acc) rest
+  in
+    loop NONE [] args
+  end
+
+(* After a command that built or imported, outside its project lock: the
+   project's automatic GC (when FIND_PROJECT finds one), then the cache's. The
+   command has already succeeded, so a project that no longer loads only
+   skips automatic GC with a warning. *)
+fun auto_gc find_project =
+  let
+    val project_option = find_project ()
+    val {auto, cache_gb, project_builds} =
+      case project_option of
+          SOME project => HolbuildLocalConfig.gc (HolbuildProject.local_config project)
+        | NONE => HolbuildLocalConfig.default_gc
+  in
+    if not auto orelse OS.Process.getEnv "HOLBUILD_AUTO_GC" = SOME "0" then ()
+    else
+      (Option.app (fn project => HolbuildBuildExec.auto_project_gc project project_builds) project_option;
+       HolbuildBuildExec.auto_cache_gc (Position.fromInt cache_gb * 1073741824))
+  end
+  handle Error msg => warn ("automatic gc skipped: " ^ msg)
+       | e => warn ("automatic gc skipped: " ^ General.exnMessage e)
+
 fun build tc cli_jobs args =
   let
     val _ = HolbuildDiagnosticLimits.validate ()
     val (batch_priority, args) = split_build_priority args
     val priority = Option.getOpt (batch_priority, 0)
+    val (speculative_loading, args) = split_speculative_loading args
     val args = split_tool_cache_flag args
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
     val parsed as ({dry_run, watch, repl_on_failure, trace_steps, execution_plan, ...}, _) = split_flags args
@@ -2239,6 +2339,8 @@ fun build tc cli_jobs args =
         raise Error "--watch does not support --repl-on-failure"
       else if Option.isSome batch_priority andalso not (Option.isSome url) then
         raise Error "--priority needs --remote-exec URL"
+      else if Option.isSome speculative_loading andalso not (Option.isSome url) then
+        raise Error "--speculative-loading needs --remote-exec URL"
       else if not (Option.isSome url) andalso (remote_only orelse detach orelse Option.isSome attach) then
         raise Error "--remote-only, --detach and --attach need --remote-exec URL"
       else if Option.isSome url andalso
@@ -2252,12 +2354,16 @@ fun build tc cli_jobs args =
   in
     case url of
         SOME url =>
-          build_once_with_prepared_mode
-            (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach, priority = priority})
-            tc cli_jobs NONE parsed
+          (build_once_with_prepared_mode
+             (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach, priority = priority,
+                          speculative_loading = speculative_loading})
+             tc cli_jobs NONE parsed;
+           if detach then () else auto_gc (SOME o load_project))
       | NONE =>
           if watch then build_watch tc cli_jobs parsed
-          else build_once tc cli_jobs parsed
+          else
+            (build_once tc cli_jobs parsed;
+             if dry_run orelse Option.isSome execution_plan then () else auto_gc (SOME o load_project))
   end
 
 fun chomp text =
@@ -2291,7 +2397,7 @@ fun current_utc_timestamp () =
 fun hol_dependency_metadata project =
   case HolbuildProject.resolved_hol_dependency project of
       SOME (HolbuildProject.Dependency {source = HolbuildProject.GitSource {git, rev}, ...}) =>
-        {hol_repo = SOME git, hol_rev = SOME rev}
+        {hol_repo = SOME (HolbuildRemoteCacheConfig.node_identity git), hol_rev = SOME rev}
     | _ => {hol_repo = NONE, hol_rev = NONE}
 
 fun hbx_export_metadata project =
@@ -2299,40 +2405,58 @@ fun hbx_export_metadata project =
     val {hol_repo, hol_rev} = hol_dependency_metadata project
   in
     {created_at = SOME (current_utc_timestamp ()),
-     source_repo = git_output (#root project) "config --get remote.origin.url",
+     source_repo = Option.map HolbuildRemoteCacheConfig.node_identity
+                     (git_output (#root project) "config --get remote.origin.url"),
      source_rev = git_output (#root project) "rev-parse HEAD",
      hol_repo = hol_repo,
      hol_rev = hol_rev} : HolbuildCacheArchive.metadata
   end
 
-datatype export_args = ExportArgs of {build_first : bool, output : string, metadata_out : string option, targets : string list}
+datatype export_mode = PackageCut | Closure | SourcesOnly
+
+datatype export_args = ExportArgs of {build_first : bool, mode : export_mode, output : string, metadata_out : string option, targets : string list}
 
 fun parse_export_args args =
   let
-    fun done build_first output metadata_out targets =
-      case output of
-          SOME path => ExportArgs {build_first = build_first, output = path, metadata_out = metadata_out, targets = rev targets}
-        | NONE => raise Error "usage: holbuild export [--build] -o FILE [--metadata-out FILE] [TARGET ...]"
-    fun loop build_first output metadata_out targets rest =
+    val usage = "usage: holbuild export [--build] [--closure | --sources-only] -o FILE [--metadata-out FILE] [TARGET ...]"
+    fun done build_first closure sources_only output metadata_out targets =
+      let
+        val mode =
+          if closure andalso sources_only then raise Error "export --closure and --sources-only are exclusive"
+          else if closure then Closure
+          else if sources_only then SourcesOnly
+          else PackageCut
+        val _ =
+          if sources_only andalso build_first then raise Error "export --sources-only does not build; drop --build"
+          else if sources_only andalso not (null targets) then raise Error "export --sources-only takes no targets"
+          else ()
+      in
+        case output of
+            SOME path => ExportArgs {build_first = build_first, mode = mode, output = path, metadata_out = metadata_out, targets = rev targets}
+          | NONE => raise Error usage
+      end
+    fun loop build_first closure sources_only output metadata_out targets rest =
       case rest of
-          [] => done build_first output metadata_out targets
-        | "--build" :: xs => loop true output metadata_out targets xs
-        | "-o" :: path :: xs => loop build_first (SOME path) metadata_out targets xs
-        | "--output" :: path :: xs => loop build_first (SOME path) metadata_out targets xs
-        | "--metadata-out" :: path :: xs => loop build_first output (SOME path) targets xs
+          [] => done build_first closure sources_only output metadata_out targets
+        | "--build" :: xs => loop true closure sources_only output metadata_out targets xs
+        | "--closure" :: xs => loop build_first true sources_only output metadata_out targets xs
+        | "--sources-only" :: xs => loop build_first closure true output metadata_out targets xs
+        | "-o" :: path :: xs => loop build_first closure sources_only (SOME path) metadata_out targets xs
+        | "--output" :: path :: xs => loop build_first closure sources_only (SOME path) metadata_out targets xs
+        | "--metadata-out" :: path :: xs => loop build_first closure sources_only output (SOME path) targets xs
         | "-o" :: [] => raise Error "export -o requires FILE"
         | "--output" :: [] => raise Error "export --output requires FILE"
         | "--metadata-out" :: [] => raise Error "export --metadata-out requires FILE"
         | arg :: xs =>
             if String.isPrefix "--output=" arg then
-              loop build_first (SOME (String.extract(arg, size "--output=", NONE))) metadata_out targets xs
+              loop build_first closure sources_only (SOME (String.extract(arg, size "--output=", NONE))) metadata_out targets xs
             else if String.isPrefix "--metadata-out=" arg then
-              loop build_first output (SOME (String.extract(arg, size "--metadata-out=", NONE))) targets xs
+              loop build_first closure sources_only output (SOME (String.extract(arg, size "--metadata-out=", NONE))) targets xs
             else if String.isPrefix "--" arg then
               raise Error ("unknown export option: " ^ arg)
-            else loop build_first output metadata_out (arg :: targets) xs
+            else loop build_first closure sources_only output metadata_out (arg :: targets) xs
   in
-    loop false NONE NONE [] args
+    loop false false false NONE NONE [] args
   end
 
 fun root_package_name project =
@@ -2446,15 +2570,30 @@ fun export_entry_for_node project root keys node =
      root = package = root_package_name project}
   end
 
-fun export_entries project plan keys =
+(* The theory outputs an export of the selected targets carries.  A capsule
+   keeps the root package's own theories; the others are dropped before their
+   keys are asked for, so an unbuilt dependency does not fail it. *)
+fun export_entries project mode plan keys =
   let
     val root = HolbuildCache.cache_root ()
     val theory_nodes = List.filter theory_node (HolbuildBuildPlan.selected_nodes plan)
     val _ = if null theory_nodes then raise Error "export found no theory build outputs in the selected targets" else ()
+    val kept =
+      case mode of
+          Closure => theory_nodes
+        | _ => List.filter (fn node => HolbuildBuildPlan.package node = root_package_name project) theory_nodes
   in
-    map (export_entry_for_node project root keys) theory_nodes
+    map (export_entry_for_node project root keys) kept
   end
   handle HolbuildBuildExec.Error msg => raise Error msg
+
+(* The requested targets a capsule keeps: those naming a root-package node. *)
+fun root_package_targets project plan targets =
+  List.filter
+    (fn target =>
+        List.exists (fn node => HolbuildBuildPlan.package node = root_package_name project)
+                    (HolbuildBuildPlan.lookup plan target))
+    targets
 
 fun fs_cache_source cache : HolbuildCacheTransfer.source =
   {get_action = HolbuildFSCacheBackend.get_action cache,
@@ -2487,16 +2626,45 @@ fun optional_json_string_field name value =
       SOME text => [json_string_field name text]
     | NONE => []
 
-fun export_metadata_json {archive_path, targets, action_count, metadata} =
+(* What a sidecar says about the root package, whichever parts the archive has. *)
+type package_info =
+  {name : string,
+   version : string option,
+   toolchain_key : string,
+   dependencies : HolbuildPackageDefinition.dependency list}
+
+fun json_object fields = "{" ^ String.concatWith ", " fields ^ "}"
+
+(* A dependency as its manifest declares it; a git URL loses any userinfo,
+   as the repository URLs of the cache manifest do. *)
+fun dependency_json (HolbuildPackageDefinition.Dependency {name, source, ...}) =
+  json_object
+    (json_string_field "name" name ::
+     (case source of
+          HolbuildPackageDefinition.GitSource {git, rev} =>
+            [json_string_field "git" (HolbuildRemoteCacheConfig.node_identity git),
+             json_string_field "rev" rev]
+        | HolbuildPackageDefinition.FromSource {from, path, manifest} =>
+            [json_string_field "from" from,
+             json_string_field "path" path,
+             json_string_field "manifest" manifest]))
+
+fun export_metadata_json {archive_path, targets, action_count, metadata, package, has_cache, has_package} =
   let
     val sha256 = HolbuildHash.file_sha256 archive_path
     val {created_at, source_repo, source_rev, hol_repo, hol_rev} : HolbuildCacheArchive.metadata = metadata
+    val {name, version, toolchain_key, dependencies} : package_info = package
     val fields =
-      [json_string_field "format" "holbuild-hbx-metadata-v1",
-       json_string_field "archive_format" HolbuildCacheArchive.format,
-       json_string_field "archive" (OS.Path.file archive_path),
+      [json_string_field "format" "holbuild-hbx-metadata-v1"] @
+      (if has_cache then [json_string_field "archive_format" HolbuildCacheArchive.format] else []) @
+      (if has_package then [json_string_field "capsule_format" HolbuildCacheArchive.capsule_format] else []) @
+      [json_string_field "archive" (OS.Path.file archive_path),
        json_string_field "sha256" sha256,
        json_raw_field "size" (file_size_string archive_path),
+       json_string_field "name" name] @
+      optional_json_string_field "version" version @
+      [json_string_field "toolchain_key" toolchain_key,
+       json_raw_field "dependencies" ("[" ^ String.concatWith ", " (map dependency_json dependencies) ^ "]"),
        json_array_field "targets" targets,
        json_int_field "action_count" action_count,
        json_string_field "holbuild_version" HolbuildVersion.version] @
@@ -2509,11 +2677,14 @@ fun export_metadata_json {archive_path, targets, action_count, metadata} =
     "{\n  " ^ String.concatWith ",\n  " fields ^ "\n}\n"
   end
 
-fun write_export_metadata {path, archive_path, targets, action_count, metadata} =
+fun write_export_metadata {path, archive_path, targets, action_count, metadata, package, has_cache, has_package} =
   write_text_file path (export_metadata_json {archive_path = archive_path,
                                               targets = targets,
                                               action_count = action_count,
-                                              metadata = metadata})
+                                              metadata = metadata,
+                                              package = package,
+                                              has_cache = has_cache,
+                                              has_package = has_package})
 
 fun split_remote_prebuild_flags command args =
   let
@@ -2531,7 +2702,7 @@ fun split_remote_prebuild_flags command args =
 fun export_archive tc jobs args =
   let
     val ({url, remote_only}, args) = split_remote_prebuild_flags "export" args
-    val ExportArgs {build_first, output, metadata_out, targets = requested_targets} = parse_export_args args
+    val ExportArgs {build_first, mode, output, metadata_out, targets = requested_targets} = parse_export_args args
     val _ =
       if Option.isSome url andalso not build_first then
         raise Error "export --remote-exec requires --build"
@@ -2542,27 +2713,60 @@ fun export_archive tc jobs args =
         | SOME u => "--remote-exec" :: u :: (if remote_only then ["--remote-only"] else [])
     val _ = if build_first then build tc jobs (remote_args @ requested_targets) else ()
     val project = timed_phase "project.discover" load_project
-    val resolution = resolution_for_toolchain tc
-    val {index, components} = prepare_source_index "export" resolution project
-    val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
-    val _ = reject_object_targets targets
-    val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
-    val keys = default_build_input_keys tc project index components plan
-    val entries = export_entries project plan keys
-    val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
+    val package_info =
+      {name = root_package_name project,
+       version = #version project,
+       toolchain_key = HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key,
+       dependencies = HolbuildPackageDefinition.dependencies (HolbuildProject.package_definition project)} : package_info
     val metadata = hbx_export_metadata project
+    (* The cache part: the entries of the selected targets, none for --sources-only. *)
+    val cache_part =
+      case mode of
+          SourcesOnly => NONE
+        | _ =>
+            let
+              val resolution = resolution_for_toolchain tc
+              val {index, components} = prepare_source_index "export" resolution project
+              val targets = timed_phase "targets.default" (fn () => default_build_targets resolution project index requested_targets)
+              val _ = reject_object_targets targets
+              val plan = timed_phase "build.plan" (fn () => build_target_plan resolution components (#holdir tc) project index requested_targets targets)
+              val keys = default_build_input_keys tc project index components plan
+              val entries = export_entries project mode plan keys
+              val cache = HolbuildFSCacheBackend.default () handle HolbuildFSCacheBackend.Error msg => raise Error msg
+              val kept_targets = if mode = Closure then targets else root_package_targets project plan targets
+            in
+              SOME {source = fs_cache_source cache, entries = entries, targets = kept_targets, metadata = metadata}
+            end
+    (* The package part: the root package's source snapshot, none for --closure. *)
+    val package_part =
+      case mode of
+          Closure => NONE
+        | _ =>
+            SOME {name = #name package_info,
+                  version = #version package_info,
+                  toolchain_key = #toolchain_key package_info,
+                  root = #root project,
+                  directories = HolbuildPackageSnapshot.directories (HolbuildProject.project_package project)
+                                handle HolbuildPackageSnapshot.Error msg => raise Error msg,
+                  files = HolbuildPackageSnapshot.files (HolbuildProject.project_package project)
+                          handle HolbuildPackageSnapshot.Error msg => raise Error msg}
+    val entries = case cache_part of SOME {entries, ...} => entries | NONE => []
+    val targets = case cache_part of SOME {targets, ...} => targets | NONE => []
   in
-    HolbuildCacheArchive.create_export {archive_path = output,
-                                        source = fs_cache_source cache,
-                                        entries = entries,
-                                        targets = targets,
-                                        metadata = metadata};
+    HolbuildCacheArchive.create_capsule {archive_path = output, cache = cache_part, package = package_part};
     Option.app (fn path => write_export_metadata {path = path,
                                                   archive_path = output,
                                                   targets = targets,
                                                   action_count = length entries,
-                                                  metadata = metadata}) metadata_out;
-    print ("exported " ^ Int.toString (length entries) ^ " cache action(s) to " ^ output ^ "\n")
+                                                  metadata = metadata,
+                                                  package = package_info,
+                                                  has_cache = Option.isSome cache_part,
+                                                  has_package = Option.isSome package_part}) metadata_out;
+    print ("exported " ^
+           String.concatWith " and "
+             ((if Option.isSome cache_part then [Int.toString (length entries) ^ " cache action(s)"] else []) @
+              (if Option.isSome package_part then ["the source snapshot of " ^ #name package_info] else [])) ^
+           " to " ^ output ^ "\n")
   end
 
 fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
@@ -2595,8 +2799,17 @@ fun import_archive args =
               result_count := length results
             end
         in
-          HolbuildCacheArchive.with_entries {archive_path = archive_path, f = copy};
-          print ("imported " ^ Int.toString (!result_count) ^ " cache action(s) from " ^ archive_path ^ "\n")
+          HolbuildCacheArchive.with_entries
+            {archive_path = archive_path,
+             stage_parent = HolbuildFSCacheBackend.tmp_dir destination,
+             f = copy};
+          print ("imported " ^ Int.toString (!result_count) ^ " cache action(s) from " ^ archive_path ^ "\n");
+          (* Run inside a project, its [gc] settings apply; one that does not
+             load skips automatic GC rather than falling back to the defaults. *)
+          auto_gc (fn () =>
+                     case HolbuildProject.find_manifest_from (HolbuildProject.source_dir ()) of
+                         NONE => NONE
+                       | SOME _ => SOME (load_project ()))
         end
     | _ => raise Error "usage: holbuild import FILE"
 
@@ -2636,9 +2849,7 @@ fun clean_targets args =
 fun heap_kind_name HolbuildProject.HeapImage = "heap"
   | heap_kind_name (HolbuildProject.ExecutableImage _) = "executable"
 
-fun heap_kind_matches "heap" HolbuildProject.HeapImage = true
-  | heap_kind_matches "executable" (HolbuildProject.ExecutableImage _) = true
-  | heap_kind_matches _ _ = false
+val heap_kind_matches = HolbuildNames.heap_kind_matches
 
 fun heap_named project command target =
   let
@@ -2651,10 +2862,7 @@ fun heap_named project command target =
       | NONE =>
           raise Error ("unknown " ^ command ^ " target: " ^ target ^
                        HolbuildSuggest.did_you_mean target
-                         (List.mapPartial
-                            (fn HolbuildProject.Heap {name, kind, ...} =>
-                                if heap_kind_matches command kind then SOME name else NONE)
-                            (#heaps project)))
+                         (HolbuildNames.heap_names command (#heaps project)))
   end
 
 fun build_heap_kind tc cli_jobs command args =
@@ -2678,7 +2886,8 @@ fun build_heap_kind tc cli_jobs command args =
               val _ = if null expanded then raise Error (command ^ " target has no objects: " ^ target) else ()
             in
               build_once_with_prepared_mode
-                (RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE, priority = 0})
+                (RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE, priority = 0,
+                          speculative_loading = NONE})
                 tc cli_jobs NONE (heap_build_request objects)
             end
     fun execute_heap () =
@@ -2703,15 +2912,18 @@ fun build_heap_kind tc cli_jobs command args =
           HolbuildBuildExec.build (heap_build_options (HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc)))
                                  tc project plan toolchain_key jobs
         val {index, components, plan} = plan_heap ()
+        fun observe plan = if Option.isSome url then () else HolbuildCommandSummary.observe_plan project plan
         val plan =
-          if build_generated_source_owners build_plan components (#holdir tc) index plan then #plan (plan_heap ())
-          else plan
+          (if build_generated_source_owners build_plan components (#holdir tc) index plan then #plan (plan_heap ())
+           else plan) handle e => (observe plan; raise e)
+        val _ = observe plan
       in
         build_plan plan;
         HolbuildBuildExec.export_heap tc project plan output_path kind
       end
   in
-    HolbuildBuildExec.with_project_lock project (command ^ " " ^ target) execute_heap
+    HolbuildBuildExec.with_project_lock project (command ^ " " ^ target) execute_heap;
+    auto_gc (fn () => SOME project)
   end
 
 fun build_heap tc cli_jobs args = build_heap_kind tc cli_jobs "heap" args
@@ -2949,7 +3161,8 @@ fun run_hol_with runner tc cli_jobs subcommand args =
     val ({from, url, remote_only}, user_args) = split_run_options args
     val build_mode =
       case url of
-          SOME url => RemoteExec {url = url, remote_only = remote_only, detach = false, attach = NONE, priority = 0}
+          SOME url => RemoteExec {url = url, remote_only = remote_only, detach = false, attach = NONE, priority = 0,
+                          speculative_loading = NONE}
         | NONE =>
             if remote_only then raise Error "--remote-only needs --remote-exec URL"
             else BuildTargets
@@ -2966,7 +3179,7 @@ fun run_hol_with runner tc cli_jobs subcommand args =
   end
 
 fun run_hol tc cli_jobs subcommand user_args =
-  run_hol_with HolbuildToolchain.run tc cli_jobs subcommand user_args
+  run_hol_with HolbuildToolchain.run_reserved tc cli_jobs subcommand user_args
 
 fun repl_hol tc cli_jobs user_args =
   run_hol_with HolbuildToolchain.run_interactive tc cli_jobs "repl" user_args
@@ -3174,9 +3387,8 @@ fun fingerprint_script logical_names =
        ""])
   end
 
-(* Builds the distinct theories, then runs the script make_script writes in
-   a fresh HOL session, and exits non-zero if that fails. *)
-fun run_check_script tc cli_jobs build_mode theories make_script =
+(* Build once for all selectors, then inspect the restored artifacts. *)
+fun with_check_targets tc cli_jobs build_mode theories inspect =
   let
     val project = timed_phase "project.discover" load_project
     val {index, ...} = prepare_source_index "check" (resolution_for_toolchain tc) project
@@ -3185,6 +3397,17 @@ fun run_check_script tc cli_jobs build_mode theories make_script =
     val _ = build_once_with_prepared_mode build_mode tc cli_jobs NONE (plain_build_request targets)
     val project = timed_phase "check.project.rediscover" load_project
     val {index, components} = prepare_source_index "check" (resolution_for_toolchain tc) project
+  in
+    inspect {project = project, index = index, components = components,
+             logical_names = logical_names}
+  end
+
+(* Fingerprinting needs HOL terms; ordinary checks only need stored metadata. *)
+fun run_check_script tc cli_jobs build_mode theories make_script =
+  with_check_targets tc cli_jobs build_mode theories
+  (fn context as {project, index, components, logical_names} =>
+  let
+    val targets = HolbuildBuildPlan.unique_strings logical_names
     val from =
       case targets of
           [target] => FromTheory target
@@ -3195,16 +3418,149 @@ fun run_check_script tc cli_jobs build_mode theories make_script =
                | NONE => NoFrom)
     val script_path = HolbuildToolchain.invocation_sml_file project "holbuild-check"
     val _ = write_text_file script_path
-              (make_script {project = project, index = index, components = components,
-                            logical_names = logical_names})
+              (make_script context)
     fun cleanup () = OS.FileSys.remove script_path handle OS.SysErr _ => ()
     val status =
       (* A run heap may hold an older copy of the theory, which load would keep. *)
-      run_hol_status HolbuildToolchain.run tc cli_jobs build_mode plain_build_request false from "run" [script_path]
+      run_hol_status HolbuildToolchain.run_reserved tc cli_jobs build_mode plain_build_request false from "run" [script_path]
       handle e => (cleanup (); raise e)
   in
     cleanup ();
     if HolbuildToolchain.success status then () else OS.Process.exit OS.Process.failure
+  end)
+
+type check_theorem = {oracles : string list, hypotheses : bool, axiom : bool}
+type check_data = {parents : string list, stored : (string * check_theorem) list}
+
+(* Read no terms: tags and the presence of hypotheses are in the export metadata. *)
+fun read_check_data path theory : check_data =
+  let
+    open HolbuildBuildExec
+    fun items sexp =
+      let fun loop (SSymbol "nil") acc = rev acc
+            | loop (SCons (a, b)) acc = loop b (a :: acc)
+            | loop _ _ = raise BadTheoryData
+      in loop sexp [] end
+    fun tagged tag (SCons (SSymbol name, rest)) =
+          if name = tag then rest else raise BadTheoryData
+      | tagged _ _ = raise BadTheoryData
+    fun string (SString s) =
+          (case String.scan Substring.getc (Substring.full s) of
+               SOME (value, rest) => if Substring.isEmpty rest then value else raise BadTheoryData
+             | NONE => raise BadTheoryData)
+      | string _ = raise BadTheoryData
+    val (header, core) =
+      case items (parse_sexp (read_text path)) of
+          [SSymbol "theory", header, core, _, _] => (header, core)
+        | _ => raise BadTheoryData
+    val parents =
+      case header of
+          SCons (name, parents) =>
+            if string name <> theory then raise BadTheoryData
+            else map (fn SCons (name, _) => string name | _ => raise BadTheoryData) (items parents)
+        | _ => raise BadTheoryData
+    val (tables, exports) =
+      case tagged "core-data" core of
+          SCons pair => pair
+        | _ => raise BadTheoryData
+    val strings =
+      case items (tagged "tables" tables) of
+          table :: _ => Vector.fromList (map string (items (tagged "string-table" table)))
+        | _ => raise BadTheoryData
+    val theorems =
+      case items (tagged "exports" exports) of
+          [_, _, theorems] => items theorems
+        | _ => raise BadTheoryData
+    fun theorem entry =
+      case items entry of
+          [SInteger name, SCons (_, tags), info, terms] =>
+            let
+              val name =
+                case strict_nonnegative_int name of
+                    SOME i => Vector.sub (strings, i)
+                  | NONE => raise BadTheoryData
+              val axiom =
+                case items info of
+                    SInteger class :: SInteger _ :: _ =>
+                      if List.exists (fn c => c = class) ["0", "1", "2"] then class = "0"
+                      else raise BadTheoryData
+                  | _ => raise BadTheoryData
+              val hypotheses =
+                case items terms of [] => raise BadTheoryData | _ :: hyps => not (null hyps)
+              val oracles = Redblackset.listItems (Redblackset.addList
+                (Redblackset.empty String.compare, List.filter (fn s => s <> "DISK_THM") (map string (items tags))))
+            in (name, {oracles = oracles, hypotheses = hypotheses, axiom = axiom}) end
+        | _ => raise BadTheoryData
+    (* DB.bindl replaces an earlier binding with the same exact name. *)
+    val stored = List.foldl (fn (entry, acc) => Redblackmap.insert (acc, #1 entry, #2 entry))
+                  (Redblackmap.mkDict String.compare) (map theorem theorems)
+  in
+    {parents = parents, stored = Redblackmap.listItems stored}
+  end
+  handle HolbuildBuildExec.BadTheoryData => raise Error ("malformed theory data: " ^ path)
+       | Subscript => raise Error ("invalid string index in theory data: " ^ path)
+
+fun check_stored_data tc cli_jobs build_mode selections {project, index, components, logical_names} =
+  let
+    val run_loads = #run_loads project
+    val _ = if null run_loads then () else
+      build_once_with_prepared_mode build_mode tc cli_jobs NONE (plain_build_request run_loads)
+    val hol = hol_package_id tc project
+    val sources = List.filter theory_source index
+    val project_theories = Redblackset.addList
+      (Redblackset.empty String.compare, project_theory_names hol index)
+    val paths = List.foldl (fn (source, acc) =>
+      Redblackmap.insert (acc, HolbuildBuildExec.theory_name_from_logical (#logical_name source),
+        HolbuildBuildExec.one_with_suffix ".dat" (#theory_data (#artifacts source))))
+      (Redblackmap.mkDict String.compare) sources
+    val summaries : (string, check_data) Redblackmap.dict ref = ref (Redblackmap.mkDict String.compare)
+    fun data thy =
+      case Redblackmap.peek (!summaries, thy) of
+          SOME summary => summary
+        | NONE =>
+            let
+              val path = case Redblackmap.peek (paths, thy) of
+                  SOME path => path | NONE => raise Error ("theory data not found: " ^ thy ^ "Theory")
+              val summary = read_check_data path thy
+            in summaries := Redblackmap.insert (!summaries, thy, summary); summary end
+    fun qualified thy name = thy ^ "Theory." ^ name
+    fun count n noun = Int.toString n ^ " " ^ noun ^ (if n = 1 then "" else "s")
+    fun out s = (TextIO.output (TextIO.stdOut, s ^ "\n"); TextIO.flushOut TextIO.stdOut)
+    fun check (logical_name, {theory = _, theorem}) =
+      let
+        val thy = HolbuildBuildExec.theory_name_from_logical logical_name
+        val summary = data thy
+        val checked = case theorem of
+            NONE => #stored summary
+          | SOME name =>
+              (case List.filter (fn (n, _) => n = name) (#stored summary) of
+                   [] => raise Error ("theorem not found: " ^ qualified thy name)
+                 | found => found)
+        (* Theory.Graph.ancestryl folds left, prepending before visiting parents. *)
+        fun ancestors parents state = List.foldl (fn (parent, (seen, acc)) =>
+          if not (Redblackset.member (project_theories, parent)) orelse
+             Redblackset.member (seen, parent) then (seen, acc)
+          else ancestors (#parents (data parent)) (Redblackset.add (seen, parent), parent :: acc)) state parents
+        val (_, ancestry) = ancestors (#parents summary) (Redblackset.empty String.compare, [])
+        val ancestry = if Redblackset.member (project_theories, thy) then thy :: ancestry else ancestry
+        fun axioms ancestor = map (fn (name, _) => qualified ancestor name ^ ": axiom")
+          (List.filter (fn (_, info) => #axiom info) (#stored (data ancestor)))
+        val findings = kernel_bypass_findings tc hol components index logical_name @
+          List.mapPartial (fn (name, info) => if null (#oracles info) then NONE
+            else SOME (qualified thy name ^ ": " ^ String.concatWith ", " (#oracles info))) checked @
+          List.mapPartial (fn (name, info) => if #hypotheses info
+            then SOME (qualified thy name ^ ": undischarged hypotheses") else NONE) checked @
+          List.concat (map axioms ancestry)
+        val subject = case theorem of NONE => thy ^ "Theory" | SOME name => qualified thy name
+      in
+        List.app out findings;
+        out (subject ^ ": " ^ (if null findings then "clean (" ^ count (length checked) "theorem" ^ ")"
+                                else count (length findings) "finding"));
+        not (null findings)
+      end
+    val failed = ListPair.mapEq check (logical_names, selections)
+  in
+    if List.exists (fn failure => failure) failed then OS.Process.exit OS.Process.failure else ()
   end
 
 (* with_fingerprints also prints the fingerprint listing of the selected
@@ -3227,7 +3583,11 @@ fun check_selectors tc cli_jobs build_mode {with_fingerprints} selectors =
         "val _ = if !HolbuildCheckFailed then OS.Process.exit OS.Process.failure else ();\nend;\n"
       end
   in
-    run_check_script tc cli_jobs build_mode (map #theory selections) make_script
+    if with_fingerprints then
+      run_check_script tc cli_jobs build_mode (map #theory selections) make_script
+    else
+      with_check_targets tc cli_jobs build_mode (map #theory selections)
+        (check_stored_data tc cli_jobs build_mode selections)
   end
 
 fun check_fingerprint tc cli_jobs build_mode selectors =
@@ -3254,7 +3614,8 @@ fun check_command tc cli_jobs args =
         | NONE => ()
     val build_mode =
       case url of
-          SOME u => RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE, priority = 0}
+          SOME u => RemoteExec {url = u, remote_only = remote_only, detach = false, attach = NONE, priority = 0,
+                          speculative_loading = NONE}
         | NONE => BuildTargets
   in
     case args of
@@ -3450,8 +3811,33 @@ fun exec_action_command maxheap jobs args =
               case spec of
                   NONE => parse {spec = SOME arg, result = result, limit = limit, reserve = reserve, share = share} xs
                 | SOME _ => raise Error "exec-action takes one SPEC-SHA256"
+    val ahead_parents = ref []
+    fun ahead_parent text =
+      case String.fields (fn c => c = #":") text of
+          [input_key, spec_sha256] =>
+            if input_key <> "" andalso spec_sha256 <> "" then {input_key = input_key, spec_sha256 = spec_sha256}
+            else raise Error ("--ahead-parent takes INPUT_KEY:SPEC-SHA256, not " ^ text)
+        | _ => raise Error ("--ahead-parent takes INPUT_KEY:SPEC-SHA256, not " ^ text)
+    fun take_ahead [] = []
+      | take_ahead ("--ahead-parent" :: text :: xs) =
+          let val parent = ahead_parent text
+          in
+            if List.exists (fn {input_key, ...} => input_key = #input_key parent) (!ahead_parents)
+            then raise Error ("--ahead-parent names " ^ #input_key parent ^ " twice")
+            else (ahead_parents := parent :: !ahead_parents; take_ahead xs)
+          end
+      | take_ahead ("--ahead-wait-seconds" :: n :: xs) =
+          (case Int.fromString n of
+               SOME seconds =>
+                 if seconds > 0 then HolbuildBuildExec.ahead_wait_limit := Time.fromSeconds (IntInf.fromInt seconds)
+                 else raise Error "--ahead-wait-seconds must be a positive integer"
+             | NONE => raise Error "--ahead-wait-seconds must be a positive integer";
+           take_ahead xs)
+      | take_ahead ["--ahead-parent"] = raise Error "--ahead-parent requires INPUT_KEY:SPEC-SHA256"
+      | take_ahead ["--ahead-wait-seconds"] = raise Error "--ahead-wait-seconds requires N"
+      | take_ahead (x :: xs) = x :: take_ahead xs
     val {spec, result, limit, reserve, share} =
-      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, share = false} args
+      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, share = false} (take_ahead args)
     val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
     val cache_cap =
       case limit of
@@ -3482,7 +3868,7 @@ fun exec_action_command maxheap jobs args =
        HolbuildRemoteCacheConfig.setup_client ();
        HolbuildBuildExec.exec_action
          {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, share_heaps = share,
-          toolchain = toolchain})
+          toolchain = toolchain, ahead_parents = rev (!ahead_parents)})
       handle e =>
         (HolbuildStatus.message_stderr
            ("holbuild: exec-action failed: " ^
@@ -3602,15 +3988,19 @@ fun reject_runtime_options options args =
 
 fun main raw_args =
   (let
+     val _ = HolbuildCommandSummary.initialize ()
      val _ = HolbuildOffline.initialize ()
      val _ = install_signal_handlers ()
+     (* exec-action leaves through Posix.Process.exit, which skips this, so
+        fleet workers, whose cache their cap sweep bounds, keep no journal. *)
+     val _ = OS.Process.atExit HolbuildFSCacheBackend.flush_growth
      val _ = HolbuildStatus.set_json_mode (List.exists (fn s => s = "--json") raw_args)
      val runtime_options = runtime_options raw_args
      val _ =
        if raw_args = ["--version"] then
-         (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); OS.Process.exit OS.Process.success)
+         (print ("holbuild " ^ HolbuildVersion.version ^ "\n"); HolbuildCommandSummary.exit_code := 0; OS.Process.exit OS.Process.success)
        else if raw_args = ["--help"] orelse raw_args = ["-h"]
-       then (global_help (); OS.Process.exit OS.Process.success)
+       then (global_help (); HolbuildCommandSummary.exit_code := 0; OS.Process.exit OS.Process.success)
        else ()
      val (cooperate_dir, machine_max_mem, child_charge, raw_args) = parse_cooperation_options raw_args
      val (options, args) = parse_global_options raw_args
@@ -3630,7 +4020,8 @@ fun main raw_args =
      val _ = reject_runtime_options runtime_options args
    in
      configure_cooperation cooperate_dir machine_max_mem child_charge (#maxheap options);
-     dispatch_with_options options args
+     dispatch_with_options options args;
+     HolbuildCommandSummary.exit_code := 0
    end)
   handle Thread.Interrupt => (interrupted := true; HolbuildToolchain.cleanup_active_children (); err "interrupted")
        | HolbuildOffline.Error msg => err msg
@@ -3661,7 +4052,8 @@ fun main raw_args =
        | HolbuildRemoteCacheConfig.Error msg => err msg
        | HolbuildWatch.Error msg => err msg
        | e => if is_broken_pipe e then
-                OS.Process.exit (if HolbuildStatus.json_mode () then OS.Process.failure else OS.Process.success)
+                (HolbuildCommandSummary.exit_code := (if HolbuildStatus.json_mode () then 1 else 0);
+                 OS.Process.exit (if HolbuildStatus.json_mode () then OS.Process.failure else OS.Process.success))
               else err (General.exnMessage e)
 
 end

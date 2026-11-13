@@ -139,7 +139,7 @@ fun parse_local_config root =
 
 fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, local_config} =
   let
-    val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config} = local_config
+    val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config, gc = _} = local_config
     val {definition, compatibility = _,
          tactic_timeout = manifest_timeout,
          theory_tactic_timeouts} =
@@ -366,6 +366,7 @@ fun action_cache_enabled (ActionPolicy {impure, cache, always_reexecute, ...}) =
   cache andalso not impure andalso not always_reexecute
 fun action_always_reexecute (ActionPolicy {impure, always_reexecute, ...}) =
   impure orelse always_reexecute
+fun action_impure (ActionPolicy {impure, ...}) = impure
 fun extra_input_path (ExtraInput {path}) = path
 
 fun default_action_policy logical =
@@ -463,17 +464,20 @@ fun project_package ({root, artifact_root, graph_artifact_root, manifest, defini
 
 fun root_package_name project = package_name (project_package project)
 
-fun dependency_project_with resolution (project : t) (dep as Dependency {name, source, ...}) =
+fun materialize_dependency (project : t) (dep as Dependency {name, source, ...}) =
+  case source of
+      GitSource {git, rev} =>
+        if hol_toolchain_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
+        else
+          let val effective_git = Option.getOpt(override_git (#overrides project) name, git)
+          in ignore (HolbuildGitCache.materialize {name = name, git = effective_git, rev = rev,
+                                                   artifact_root = #graph_artifact_root project}) end
+    | _ => ()
+
+(* The dependency's project as its local path holds it now, without
+   materializing it. *)
+fun local_dependency_project_with resolution (project : t) (dep as Dependency {name, ...}) =
   let
-    val _ =
-      case source of
-          GitSource {git, rev} =>
-            if hol_toolchain_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
-            else
-              let val effective_git = Option.getOpt(override_git (#overrides project) name, git)
-              in ignore (HolbuildGitCache.materialize {name = name, git = effective_git, rev = rev,
-                                                       artifact_root = #graph_artifact_root project}) end
-        | _ => ()
     val dep_root =
       case dependency_local_path_with resolution project dep of
           SOME path => path
@@ -504,6 +508,10 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
   in
     dep_project
   end
+
+fun dependency_project_with resolution project dep =
+  (materialize_dependency project dep;
+   local_dependency_project_with resolution project dep)
 
 fun dependency_project project dep = dependency_project_with standard_resolution project dep
 
@@ -542,10 +550,9 @@ fun resolved_hol_dependency_with (resolution as {kernel_variant} : resolution) p
 
 fun resolved_hol_dependency project = resolved_hol_dependency_with standard_resolution project
 
-fun dependency_package_with resolution artifact_parent project
-      (dep as Dependency {name, source, ...}) =
+fun package_of_dependency_project resolution artifact_parent project
+      (dep as Dependency {name, source, ...}) dep_project =
   let
-    val dep_project = dependency_project_with resolution project dep
     val dep_root =
       case dependency_local_path_with resolution project dep of
           SOME value => value
@@ -636,8 +643,18 @@ fun dependency_package_with resolution artifact_parent project
      dep_project)
   end
 
+fun dependency_package_with resolution artifact_parent project dep =
+  package_of_dependency_project resolution artifact_parent project dep
+    (dependency_project_with resolution project dep)
+
 fun dependency_package artifact_parent project dep =
   dependency_package_with standard_resolution artifact_parent project dep
+
+(* The package of a dependency already on disk, read as it is: nothing is
+   fetched, materialized or locked. *)
+fun local_dependency_package artifact_parent project dep =
+  package_of_dependency_project standard_resolution artifact_parent project dep
+    (local_dependency_project_with standard_resolution project dep)
 
 (* A commit names the same sources in every repository that has it, so two
    hol dependencies at one rev agree whatever their URLs: a HOL fork and HOL

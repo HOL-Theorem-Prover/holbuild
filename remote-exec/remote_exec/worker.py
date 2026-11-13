@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from remote_exec.auth import cache_discovery_token
-from remote_exec.cache import cache_nodes, ranked_nodes
+from remote_exec.cache import cache_nodes, preferred_identities, ranked_nodes
 from remote_exec.formats import sanitize_detail
 from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 
@@ -45,6 +45,7 @@ RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 COMPLETE = ".complete"  # stamp file of a finished release build
 MIN_SANDBOX_RELEASE = (0, 13, 58)
 MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
+MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
 
 
 @functools.cache
@@ -202,15 +203,20 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Coordinator:
-    """The worker endpoints of the coordinator. Claims and heartbeats carry ``host``'s report, when given."""
+    """The worker endpoints of the coordinator. Claims and heartbeats carry ``host``'s report, when given; with
+    ``load_ahead``, claims also take actions whose parents still build (exec-action --ahead-parent)."""
 
     opener = urllib.request.build_opener(NoRedirect)
 
-    def __init__(self, url: str, token: str, host: "HostTelemetry | None" = None, drain: Drain | None = None) -> None:
+    def __init__(
+        self, url: str, token: str, host: "HostTelemetry | None" = None, drain: Drain | None = None,
+        *, load_ahead: bool = False,
+    ) -> None:
         self.url = url.rstrip("/")
         self.token = token
         self.host = host
         self.drain = drain or Drain()
+        self.load_ahead = load_ahead
 
     def post(self, path: str, body: bytes, content_type: str, timeout: float = 30) -> tuple[int, Any]:
         request = urllib.request.Request(
@@ -245,7 +251,9 @@ class Coordinator:
     def claim(self, tiers: list[str], worker: str, wait_s: float, phases: dict[str, float]) -> dict[str, Any] | None:
         """An action, waiting up to ``wait_s`` seconds for one, or None. ``phases`` reports where the worker's time
         went since its last claim."""
-        body = {"tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s, "phases": phases}
+        body = {
+            "tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s, "phases": phases,
+        } | ({"ahead": True} if self.load_ahead else {})
         status, response = self.post_reporting("/v1/work/claim", body, 30 + wait_s)
         if status == 204:
             return None
@@ -335,7 +343,6 @@ class Releases:
     curl_config: str | None
     baked_root: str = field(default="/opt/holbuild-baked", kw_only=True)
     discovery_config: str | None = field(default=None, kw_only=True)
-    joining: bool = field(default=False, kw_only=True)
     drain: Drain = field(default_factory=Drain, kw_only=True, compare=False)
 
     def spec_version(self, spec_sha256: str) -> str:
@@ -353,9 +360,10 @@ class Releases:
         unavailable: str | None = None
         missing: str | None = None
         failure = f"spec {spec_sha256} is missing from the remote cache"
-        for attempt, node in enumerate(ranked_nodes(nodes, spec_sha256), 1):
-            if attempt == 3 and not self.joining and missing is not None:
-                raise RuntimeError(missing)
+        preferred = preferred_identities(os.environ.get("HOLBUILD_REMOTE_CACHE_PREFERRED_URLS"))
+        # Every node is asked before a miss: until a node has written a new spec through to the shared store, only
+        # that node holds it.
+        for node in ranked_nodes(nodes, spec_sha256, preferred):
             # Not check=True: its error would print credentials in the command line.
             try:
                 with self.drain.interruptible():
@@ -758,7 +766,8 @@ def exec_action_env(*, version: str, discovery_config: str | None = None) -> dic
 
 
 def exec_action_command(
-    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None
+    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None,
+    ahead_parents: list[dict[str, str]],
 ) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
     command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
@@ -767,6 +776,8 @@ def exec_action_command(
     command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb), "--result", result]
     if args.share_heaps:
         command.append("--share-heaps")
+    for parent in ahead_parents:
+        command += ["--ahead-parent", f"{parent['input_key']}:{parent['spec_sha256']}"]
     return command
 
 
@@ -906,11 +917,14 @@ def execute(
     drain.publish_seconds = 0.0
     if drain.stop.is_set():
         return failed_record(spec, "unavailable")
+    ahead_parents = claim.get("ahead_parents", [])
     try:
         with phases.timed("release"):
             version = releases.spec_version(spec)
             if drain.stop.is_set():
                 return failed_record(spec, "unavailable")
+            if ahead_parents and RELEASE.fullmatch(version) and tuple(map(int, version.split("."))) < MIN_AHEAD_RELEASE:
+                return failed_record(spec, "ahead-abandoned", f"holbuild {version} predates loading ahead")
             holbuild = releases.holbuild(version)
     except DrainStopped:
         return failed_record(spec, "unavailable")
@@ -928,7 +942,7 @@ def execute(
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb")),
+            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb"), ahead_parents),
             env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )
@@ -1076,6 +1090,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cooperate-dir", help="holbuild --cooperate-dir, shared by a host's workers")
     parser.add_argument("--share-heaps", action="store_true", help="holbuild exec-action --share-heaps")
     parser.add_argument(
+        "--load-ahead",
+        action="store_true",
+        help="also claim theories of batches that load ahead while their parents still build, and wait for them; "
+        "for burst workers, so the warm pool stays free for ready work",
+    )
+    parser.add_argument(
         "--holbuild-releases-dir",
         default="/opt/holbuild-releases",
         help="where holbuild releases are built, one directory per version; a host's workers can share it",
@@ -1152,7 +1172,7 @@ def main() -> None:
         print(f"not reporting the host to the coordinator: {error}", file=sys.stderr)
         host = None
     drain = Drain(args.drain_seconds)
-    coordinator = Coordinator(args.coordinator, token, host, drain)
+    coordinator = Coordinator(args.coordinator, token, host, drain, load_ahead=args.load_ahead)
     releases = Releases(
         args.holbuild_releases_dir,
         args.holbuild_source_url,
@@ -1206,7 +1226,7 @@ def main() -> None:
             if not drain.stop.is_set() and membership is not None and discovery_url is not None:
                 now = time.monotonic()
                 nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
-                releases = replace(releases, remote_cache=",".join(nodes), joining=membership.joining(now))
+                releases = replace(releases, remote_cache=",".join(nodes))
             try:
                 unavailable = run_one(coordinator, args, releases, protection, claim, phases)
             except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on

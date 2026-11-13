@@ -86,6 +86,9 @@ class Handler(BaseHTTPRequestHandler):
             (state / f"{batch_id}.heap").write_text(heap[0])
         if "class=run" in query.split("&"):
             (state / f"{batch_id}.run").touch()
+        # What happens elsewhere while the client submits.
+        if (state / "on-submit").exists():
+            subprocess.run(["bash", str(state / "on-submit")], check=True)
         # Whitespace around the colon is valid JSON the client must accept.
         self.answer(201, {"batch_id": batch_id}, separators=(", ", " : "))
 
@@ -176,6 +179,12 @@ class Handler(BaseHTTPRequestHandler):
                 if event["state"] == "done" and result.exists() and not cancelled:
                     record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
                     event["log_sha256"] = record["log"].split()[0] if "log" in record else None
+                if result.exists():
+                    recorded = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:] if "=" in line)
+                    if "phase-ms" in recorded:
+                        event["timings"] = {name: int(ms) for name, ms in
+                                            (part.split(":") for part in recorded["phase-ms"].split(","))}
+                        event["timings"]["wall"] = int(recorded["wall-ms"])
                 if event["state"] == "done" and (state / "requeue-log").exists():
                     # The first execution's log was evicted; only the final
                     # execution's log is usable after the action is requeued.

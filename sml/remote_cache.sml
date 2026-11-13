@@ -35,7 +35,8 @@ fun remote url =
 
 fun base_url (RemoteCache {urls, ...}) = String.concatWith "," urls
 
-(* Authentication does not change node identity; full URLs are kept for requests. *)
+(* Authentication does not change node identity; full URLs are kept for requests.
+   Preferred nodes come first, each group in rendezvous order. *)
 fun ranked_urls (RemoteCache {urls, ...}) digest =
   let
     val urls = HolbuildCacheDiscovery.urls urls
@@ -44,10 +45,17 @@ fun ranked_urls (RemoteCache {urls, ...}) digest =
       in ((HolbuildHash.string_sha256 (identity ^ ":" ^ digest), identity), url) end
     fun compare (((a, u), _), ((b, v), _)) =
       case String.compare (b, a) of EQUAL => String.compare (u, v) | order => order
+    val preferred = HolbuildRemoteCacheConfig.preferred_identities ()
+    fun is_preferred url =
+      List.exists (fn identity => identity = HolbuildRemoteCacheConfig.node_identity url) preferred
   in
     case urls of
         [_] => urls
-      | _ => map #2 (Redblackset.listItems (Redblackset.fromList compare (map score urls)))
+      | _ =>
+          let
+            val ranked = map #2 (Redblackset.listItems (Redblackset.fromList compare (map score urls)))
+            val (first, rest) = List.partition is_preferred ranked
+          in first @ rest end
   end
 
 fun request_urls cache kind digest =
@@ -302,24 +310,26 @@ fun transient (HolbuildHttp.Failed _) = true
 (* The breaker observes the whole request: a dead primary must not disable a healthy backup.
    A write goes past the first two nodes only while none of them answered at all
    (a member whose name doesn't resolve yet, say), and stops at the first answer.
+   A read walks the whole ring until a hit: a node writes to the shared backing
+   store after it answers the PUT, so until then only the writer's node holds a
+   blob, and a reader that prefers another node must still find it.
    A read whose 200 body fails `usable` counts as that node's 404, so a replica
    holding a weaker copy does not hide a better one on the next node. *)
 fun routed_status_using usable method urls path request =
   let
     val read = method = "GET" orelse method = "HEAD"
-    val grace = read andalso HolbuildCacheDiscovery.joining ()
     fun unanswered (HolbuildHttp.Failed _) = true
       | unanswered (HolbuildHttp.Response _) = false
     fun loop [] _ _ missing last = Option.getOpt (missing, last)
       | loop (node :: rest) count silent missing last =
-          if count >= 2 andalso not grace andalso
-             (if read then count = 2 andalso Option.isSome missing else not silent) then
+          if not read andalso count >= 2 andalso not silent then
             Option.getOpt (missing, last)
           else
             let
               val result = traced method node path (fn () => request node)
+              val rejected = read andalso result = HolbuildHttp.Response 200 andalso not (usable path)
               val result =
-                if read andalso result = HolbuildHttp.Response 200 andalso not (usable path) then
+                if rejected then
                   (HolbuildStatus.cache_trace ("remote cache " ^ method ^ " " ^ redact_userinfo node ^
                                                ": entry passed over");
                    HolbuildHttp.Response 404)
@@ -549,6 +559,53 @@ fun action_metadata cache key text =
   in
     metadata_text text known_blobs
   end
+
+(* Repair only resident entries the caller identifies as weaker compatible
+   copies. Optional replica maintenance must not trip the primary's breaker. *)
+fun repair_action_replicas cache {key, text, attempts, should_replace} =
+  if tripped () then ()
+  else
+    let
+      val download = temp_path "action-repair-get"
+      val upload = temp_path "action-repair-put"
+      fun cleanup () = (remove_file download; remove_file upload)
+      fun repair url =
+        let
+          fun warning detail =
+            warn_restore_once ("could not reconcile cache replica " ^ redact_userinfo url ^ ": " ^ detail)
+          fun request method path call = traced method url path call
+          fun loop remaining =
+            case request "GET" download (fn () => get_status {url = url, dst = download}) of
+                HolbuildHttp.Response 404 => ()
+              | HolbuildHttp.Response 200 =>
+                  if not (should_replace (#manifest (metadata_manifest (read_text download)))) then ()
+                  else if remaining = 0 then warning "weaker timeout contract remains after repair"
+                  else
+                    (case request "PUT" upload (fn () => put_status [] {url = url, src = upload}) of
+                         HolbuildHttp.Response code =>
+                           if successful_put_code code then loop (remaining - 1)
+                           else if remaining > 1 then loop (remaining - 1)
+                           else warning ("HTTP " ^ Int.toString code ^ " during repair")
+                       | HolbuildHttp.Failed message =>
+                           if remaining > 1 then loop (remaining - 1) else warning message)
+              | result =>
+                  HolbuildStatus.cache_trace
+                    ("cache replica repair skipped: " ^ redact_userinfo url ^
+                     (case result of HolbuildHttp.Failed message => ": " ^ message
+                                   | HolbuildHttp.Response code => ": HTTP " ^ Int.toString code))
+        in
+          loop attempts handle Error detail => warning detail
+                             | IO.Io {name, function, ...} => warning (function ^ ": " ^ name)
+                             | OS.SysErr (detail, _) => warning detail
+        end
+    in
+      (write_text upload (action_metadata cache key text);
+       List.app repair (action_urls cache key);
+       cleanup ())
+      handle Error detail => (cleanup (); warn_restore_once detail)
+           | IO.Io {name, function, ...} => (cleanup (); warn_restore_once (function ^ ": " ^ name))
+           | OS.SysErr (detail, _) => (cleanup (); warn_restore_once detail)
+    end
 
 fun publish_action_metadata cache key metadata =
   let

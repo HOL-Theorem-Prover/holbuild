@@ -6,13 +6,34 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
+      - .github/actions/**
       - Makefile
       - LICENSE
-      - sml/**
+      - man/**
+      - completions/**
+      - sml/holbuild-script.sml
+      - sml/action_sandbox.py
+      - sml/ahead_load_runtime.sml
+      - sml/checkpoint_save_runtime.sml
+      - sml/holbuild_runtime.sml
+      - sml/deferred_proofs_runtime.sml
+      - sml/fingerprint_runtime.sml
+      - sml/proof_runtime.sml
+      - sml/tactic_compat_runtime.sml
+      - sml/diagnostic_limits.sml
+      - sml/sha256.sml
+      - sml/spawn.sml
+      - sml/temp_path.sml
+      - sml/hash.sml
+      - sml/proof_ir_types.sml
+      - sml/proof_ir.sml
+      - sml/analyser/**
       - vendor/hol/**
       - tests/lib.sh
       - tests/cases/installed-runtime/**
   workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -25,7 +46,29 @@ env:
   POLYML_TAG: v5.9.2-seq8
 
 jobs:
+  coordinator-liveness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 2s --health-retries 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+      - uses: astral-sh/setup-uv@v7
+      - name: Bound coordinator HTTP liveness under 400 concurrent claimers
+        working-directory: remote-exec
+        run: uv run --frozen pytest -q -s tests/test_http_liveness.py
+        env:
+          REMOTE_EXEC_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
+
   build:
+    if: github.event_name != 'release'
     strategy:
       fail-fast: false
       matrix:
@@ -117,6 +160,7 @@ jobs:
           test -s "$root/share/holbuild/copyrights/smlnj.txt"
           test -s "$root/share/holbuild/copyrights/polyml-LGPL-2.1.txt"
           test -s "$root/share/holbuild/sml/holbuild_runtime.sml"
+          test -s "$root/share/man/man1/holbuild.1"
           if [[ "$PLATFORM" == linux-* ]]; then
             ldd "$root/bin/holbuild" | tee dependencies.txt
             if grep -E 'libpolyml|libgmp|not found' dependencies.txt; then
@@ -136,12 +180,16 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
-    needs: smoke
+    needs: [smoke, coordinator-liveness]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -154,9 +202,105 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            # Every release stays a draft until candidate validation passes;
+            # see "Release process" in README.md.
+            notes_args=()
+            if ! base=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name); then
+              reasons="no published release to compare with"
+            else
+              status=0
+              reasons=$(tools/release-breaking.sh "$base" "$TAG") || status=$?
+              case $status in
+                0) ;;
+                1) ;;
+                *) exit "$status" ;;
+              esac
+            fi
+            if [[ -n "${reasons:-}" ]]; then
+              notes=$(printf 'Breaking release:\n\n%s\n' "$(sed 's/^/- /' <<< "$reasons")")
+              printf '%s\n' "$notes" >> "$GITHUB_STEP_SUMMARY"
+              notes_args=(--notes "$notes")
+            fi
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes "${notes_args[@]}"
+          fi
           cd dist
           cat ./*.sha256 > SHA256SUMS
-          if ! gh release view "$TAG" > /dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
-          fi
           gh release upload "$TAG" ./*.tar.gz SHA256SUMS --clobber
+
+  liveness-guard:
+    if: always() && github.event_name == 'release' && needs.coordinator-liveness.result != 'success'
+    needs: coordinator-liveness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Hold a release whose coordinator liveness check failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release edit "$TAG" --draft=true
+          echo "::error::$TAG failed coordinator HTTP liveness; turned back into a draft"
+          exit 1
+
+  # A release published by hand (a draft made before the tag, say) skips the
+  # check in `publish`; this one turns a breaking release back into a draft
+  # unless its notes say its consumers are ready. Releases the workflow itself
+  # creates use GITHUB_TOKEN, so they don't trigger it.
+  guard:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Hold a breaking release back as a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+          BODY: ${{ github.event.release.body }}
+          PUBLISHED_AT: ${{ github.event.release.published_at }}
+        run: |
+          if grep -q '^Consumers ready:' <<< "$BODY"; then
+            echo "$TAG: consumers marked ready, published on purpose"
+            exit 0
+          fi
+          # The base is the newest earlier release that was already trusted
+          # when this one was published: out for more than an hour, or marked
+          # "Consumers ready:". A release published moments ago may itself be
+          # an unchecked breaking one whose own guard hasn't run yet. A failed
+          # listing fails the step, so an empty base always means there is no
+          # such release.
+          list=$(gh api --paginate "repos/$GH_REPO/releases" \
+                   --jq '.[] | select(.draft or .prerelease | not)
+                         | "\(.tag_name) \(if (.body // "") | test("(?m)^Consumers ready:") then "ready" else "-" end) \(.published_at | fromdateiso8601)"')
+          since=$(( $(date -d "$PUBLISHED_AT" +%s) - 3600 ))
+          base=$({ awk -v t="$TAG" -v since="$since" \
+                     'NF && $1 != t && ($2 == "ready" || $3 <= since) { print $1 }' <<< "$list"
+                   echo "$TAG"; } |
+                 sort -V | awk -v t="$TAG" '$0 == t { print prev; exit } { prev = $0 }')
+          if [[ -z "$base" ]]; then
+            reasons="no earlier published release to compare with"
+          else
+            status=0
+            reasons=$(tools/release-breaking.sh "$base" "$TAG") || status=$?
+            case $status in
+              0) exit 0 ;;
+              1) ;;
+              *) exit "$status" ;;
+            esac
+          fi
+          notes=$(printf 'Breaking release:\n\n%s\n\nHeld as a draft: published without `Consumers ready:` in its notes.\n' \
+                    "$(sed 's/^/- /' <<< "$reasons")")
+          gh release edit "$TAG" --draft=true --notes "$(printf '%s\n\n%s\n' "$notes" "$BODY")"
+          printf '%s\n' "$notes" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::$TAG is breaking and was published without 'Consumers ready:'; turned back into a draft"
+          exit 1

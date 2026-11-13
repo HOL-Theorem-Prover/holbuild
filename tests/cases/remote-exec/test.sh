@@ -179,6 +179,21 @@ refute_grep "Theory built" "$tmpdir/follow.log"
 [[ $(grep -c . "$state/ran") -eq 2 ]] || { cat "$state/ran" >&2; exit 1; }
 require_grep "^action .* rx:ATheory$" "$state/b1.batch"
 require_grep "^edge " "$state/b1.batch"
+python3 - "$project" <<'PY'
+import json,pathlib,sys
+records=[json.loads(p.read_text()) for p in (pathlib.Path(sys.argv[1])/'.holbuild/commands').glob('*.json')]
+record=next(r for r in records if r['fleet_batches']==['b1'])
+assert record['exit_code']==0
+assert len(record['fleet_follows'])==1
+results=[a for a in record['fleet_actions'] if a['observation']=='result']
+assert len(results)==2
+assert all(a['action']['timings']['finished'] >= a['action']['timings']['started'] for a in results)
+assert sum(a['action']['timings']['rebuilt'] for a in results)==2
+assert record['fleet_history_complete'] is False
+assert all(set(a['action'])=={'input_key','state','attempts'} for a in record['fleet_actions'] if a['observation']=='attempt')
+assert record['local_outcomes']['built']==0
+assert record['local_outcomes']['restored_remote']==2
+PY
 
 # With everything cached there is nothing to submit.
 run cached 0 build --remote-exec "$coordinator" BTheory
@@ -241,8 +256,9 @@ require_grep "could not cancel remote batch b4 (HTTP 503)" "$tmpdir/down.log"
 require_grep "the coordinator reported no theories; building locally" "$tmpdir/down.log"
 require_grep "BTheory built" "$tmpdir/down.log"
 write_theories five-down-only
-run down-only 75 build --remote-exec "$coordinator" --remote-only --priority 17 BTheory
-require_grep "the coordinator reported no theories; reattach with --attach b5 --priority 17$" "$tmpdir/down-only.log"
+run down-only 75 build --remote-exec "$coordinator" --remote-only --priority 17 --speculative-loading=5 BTheory
+require_grep "the coordinator reported no theories; reattach with --attach b5 --priority 17 --speculative-loading=5$" \
+  "$tmpdir/down-only.log"
 refute_grep "^POST /v1/batches/b5/cancel " "$state/requests.log"
 rm "$state/down"
 run unknown-only 75 build --remote-exec "$coordinator" --remote-only --attach nope BTheory
@@ -363,6 +379,22 @@ require_grep "^POST /v1/batches Bearer stub-token$" "$state/requests.log"
 write_theories ledger
 run ledger-seed 0 build --remote-exec "$coordinator" --remote-only BTheory
 [[ -n $(ls "$HOLBUILD_CACHE/remote-ledger") ]] || { echo "the export left no remote ledger" >&2; exit 1; }
+ledger_file=$(ls "$HOLBUILD_CACHE"/remote-ledger/* | grep -v '\.lock$')
+# The specs it uploaded aren't in it: no later export has the same spec.
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/ledger-seed.log")
+for spec in $(awk '$1 == "action" { print $4 }' "$state/$batch.batch"); do
+  refute_grep "^blob $spec$" "$ledger_file"
+done
+# A build with nothing to do doesn't read the ledger: a FIFO in its place
+# would block the read.
+cp "$ledger_file" "$tmpdir/ledger.seed"
+rm "$ledger_file"
+mkfifo "$ledger_file"
+(cd "$project" && timeout 120 "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only BTheory) \
+  > "$tmpdir/ledger-noop.log" 2>&1 || { cat "$tmpdir/ledger-noop.log" >&2; exit 1; }
+[[ -p "$ledger_file" ]] || { echo "the no-op build replaced the ledger" >&2; exit 1; }
+rm "$ledger_file"
+cp "$tmpdir/ledger.seed" "$ledger_file"
 # The ledger is the cache root's, so another directory of the project, as a
 # fresh worktree is, doesn't ask about the blob of the unchanged BScript.sml
 # again; the changed AScript.sml it uploads.
@@ -379,6 +411,81 @@ require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdi
 refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
 require_grep "^PUT /cas/$a_copy_source$" "$tmpdir/server/requests.log"
 [[ ! -e "$copy/.holbuild/remote-ledger" ]] || { echo "the copy kept a ledger of its own" >&2; exit 1; }
+# The export looks entries up by binary search over the ledger's lines, matching
+# whole lines only: BScript.sml's blob is found as the first line, and as the
+# last line without a newline.  Out of order it is missed, so the export checks
+# it again, and the build records the ledger sorted again.
+b_entry="blob $b_source"
+b_line=$(grep -nxF "$b_entry" "$ledger_file" | cut -d: -f1)
+[[ -n "$b_line" && $(wc -l < "$ledger_file") -gt 1 ]] || { cat "$ledger_file" >&2; exit 1; }
+cp "$ledger_file" "$tmpdir/ledger.sorted"
+# Without its metadata, the copy can't cut BTheory off, so both export.
+ledger_copy_build() {
+  sed -i "s/(\* ledger[^*]*\*)/(* $1 *)/" "$copy/src/AScript.sml"
+  rm -r "$copy/.holbuild/dep"
+  : > "$tmpdir/server/requests.log"
+  (cd "$copy" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only BTheory) \
+    > "$tmpdir/$1.log" 2>&1 || { cat "$tmpdir/$1.log" >&2; exit 1; }
+  require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/$1.log"
+}
+tail -n +"$b_line" "$tmpdir/ledger.sorted" > "$ledger_file"
+ledger_copy_build ledger-first
+refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+head -n "$b_line" "$tmpdir/ledger.sorted" | head -c -1 > "$ledger_file"
+ledger_copy_build ledger-last
+refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+# A long line sorting after every entry sits between the search and the
+# misplaced last line, so no search reaches it.
+{ grep -vxF "$b_entry" "$tmpdir/ledger.sorted"; printf '~%.0s' {1..200}; echo; echo "$b_entry"; } > "$ledger_file"
+ledger_copy_build ledger-unsorted
+require_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+LC_ALL=C sort -c "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+grep -qxF "$b_entry" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+sed -i '/^~/d' "$ledger_file"
+# A forced BTheory uploads its spec every time.  The first learns that the
+# remote cache holds ATheory; the second learns nothing, so doesn't record
+# the ledger.
+forced_copy_build() {
+  : > "$tmpdir/server/requests.log"
+  (cd "$copy" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only --force=theory BTheory) \
+    > "$tmpdir/$1.log" 2>&1 || { cat "$tmpdir/$1.log" >&2; exit 1; }
+  require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/$1.log"
+  local batch spec
+  batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/$1.log")
+  spec=$(awk '$1 == "action" { print $4 }' "$state/$batch.batch")
+  require_grep "^\(HEAD\|PUT\) /cas/$spec$" "$tmpdir/server/requests.log"
+}
+forced_copy_build ledger-forced
+touch -d '2000-01-01' "$ledger_file"
+forced_copy_build ledger-forced-again
+[[ $(stat -c %Y "$ledger_file") == $(date -d '2000-01-01' +%s) ]] ||
+  { echo "a build that learned nothing recorded the ledger" >&2; exit 1; }
+cp "$ledger_file" "$tmpdir/ledger.sorted"
+# Past 100000 entries, the build recording the ledger keeps only the entries it
+# used or learned: BScript.sml's blob, which it used, and the new
+# AScript.sml's, which it learned, but none of the filler.
+filler() { seq -f "blob f%063g" 1 100000; }
+{ cat "$tmpdir/ledger.sorted"; filler; } | LC_ALL=C sort > "$ledger_file"
+ledger_copy_build ledger-cap
+a_copy_source=$(sha256sum "$copy/src/AScript.sml" | cut -d' ' -f1)
+LC_ALL=C sort -c "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+refute_grep "^blob f" "$ledger_file"
+grep -qxF "$b_entry" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+grep -qxF "blob $a_copy_source" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+# Each entry kept was in the ledger, or one the build asked the remote cache about.
+while read -r kind hash; do
+  grep -qxF "$kind $hash" "$tmpdir/ledger.sorted" || grep -q "^\(HEAD\|PUT\) /cas/$hash$" "$tmpdir/server/requests.log" ||
+    { echo "the ledger kept $kind $hash, which the build didn't use" >&2; exit 1; }
+done < "$ledger_file"
+# Another build forgets the ledger and fills it past the limit while this one
+# runs: BScript.sml's blob, which this build used, doesn't come back.
+cp "$tmpdir/ledger.sorted" "$ledger_file"
+printf 'rm %q\n{ seq -f "blob f%%063g" 1 100001; } > %q\n' "$ledger_file" "$ledger_file" > "$state/on-submit"
+ledger_copy_build ledger-forget-race
+rm "$state/on-submit"
+refute_grep "^blob f" "$ledger_file"
+refute_grep "^$b_entry$" "$ledger_file"
+cp "$tmpdir/ledger.sorted" "$ledger_file"
 # ATheory changes and BScript.sml doesn't, so its blob is remembered.  Without
 # its metadata, the client can't cut BTheory off itself.
 sed -i 's/(\* ledger \*)/(* ledger-a *)/' "$project/src/AScript.sml"
@@ -653,6 +760,24 @@ require_grep "^edge [0-9a-f]* $key_a$" "$state/$batch.batch"
 require_grep "remote execution: remote workers finished 3 of 3 theories" "$tmpdir/built-here-unpublished.log"
 rm "$project/src/CScript.sml"
 
+# A fresh tree cannot classify a local manifest as built here when one blob
+# is missing and another has corrupt bytes. The absent remote entry needs a
+# worker even though the dependent theory's local cache entry is intact.
+write_theories local-cache-integrity
+run local-cache-integrity-base 0 build BTheory
+key_a=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rx/src/AScript.sml.key")
+ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
+dat_a=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$HOLBUILD_CACHE/actions/$key_a/manifest")
+sig_a=$(awk '$1 == "blob" && $2 == "sig" { print $3 }' "$HOLBUILD_CACHE/actions/$key_a/manifest")
+rm "$remote_root/ac/$ac_a" "$HOLBUILD_CACHE/blobs/$dat_a"
+printf 'corrupt local signature\n' > "$HOLBUILD_CACHE/blobs/$sig_a"
+rm -r "$project/.holbuild" "$HOLBUILD_CACHE/remote-ledger"
+run local-cache-integrity 0 build --remote-exec "$coordinator" --remote-only BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/local-cache-integrity.log")
+require_grep "^action $key_a .* rx:ATheory$" "$state/$batch.batch"
+refute_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/local-cache-integrity.log"
+
 # A submission answered 502 while the coordinator restarts is retried, and
 # given up on when it stays down.
 write_theories restarting
@@ -834,6 +959,18 @@ for t in B C; do
   [[ -e "$remote_root/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "$key" | sha256sum | cut -d' ' -f1)" ]] ||
     { echo "${t}Theory's reused entry was not published" >&2; exit 1; }
 done
+
+# Admitting A's unchanged statement changes its oracle tags: B and C
+# must go to the workers in a second batch rather than be cut off.
+: > "$state/ran"
+write_cutoff cheat one "" "" "cheat"
+run client-cutoff-cheat 0 build --remote-exec "$coordinator" CTheory
+require_grep "early cutoff reused 0 of 2 deferred theories" "$tmpdir/client-cutoff-cheat.log"
+[[ $(grep -c "^holbuild: remote batch " "$tmpdir/client-cutoff-cheat.log") -eq 2 ]] ||
+  { cat "$tmpdir/client-cutoff-cheat.log" >&2; exit 1; }
+refute_grep "Theory built" "$tmpdir/client-cutoff-cheat.log"
+[[ "$(< "$state/ran")" == $'rxk:ATheory\nrxk:BTheory\nrxk:CTheory' ]] ||
+  { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
 
 # An edit that changes what A produces: B and C go to the workers next.
 : > "$state/ran"
@@ -1497,6 +1634,14 @@ require_grep "Use2Lib built" "$tmpdir/gen2.log"
 require_grep "AfterGenTheory restored from cache" "$tmpdir/gen2.log"
 refute_grep "Theory built" "$tmpdir/gen2.log"
 require_file "$gen2/src/Gen2ML.sml"
+python3 - "$gen2" <<'PYCODE'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+records=[json.loads(p.read_text()) for p in (root/'.holbuild/commands').glob('*.json')]
+assert len(records)==1 and len(records[0]['plans'])==1, records
+source=next(s for s in records[0]['plans'][0]['newly_observed_sources'] if s['path']=='src/Gen2ML.sml')
+assert source['sha256']==hashlib.sha256((root/'src/Gen2ML.sml').read_bytes()).hexdigest(), source
+PYCODE
 
 # check and check --fingerprint pre-build on the remote coordinator and run the
 # check script locally; when a valid deps_loaded checkpoint exists, check
@@ -1902,6 +2047,28 @@ if in_copy local-cas build --priority 1 PriorityTheory > "$tmpdir/priority-no-ex
 fi
 require_grep 'priority needs --remote-exec URL' "$tmpdir/priority-no-exec.log"
 
+# So is the cap on theories loading ahead of their parents, 4 when given bare.
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --speculative-loading LocalUntrustedTheory > "$tmpdir/speculative-default.log" 2>&1
+require_grep '^POST /v1/batches?speculative_loading=4 ' "$state/requests.log"
+in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --detach --priority 2 --speculative-loading=4 LocalUntrustedTheory > "$tmpdir/speculative.log" 2>&1
+require_grep '^POST /v1/batches?priority=2&speculative_loading=4 ' "$state/requests.log"
+for value in 0 17 1.5 x '' 999999999999999999999999999999; do
+  if in_copy local-cas build --remote-exec "$coordinator" "--speculative-loading=$value" PriorityTheory \
+       > "$tmpdir/speculative-invalid.log" 2>&1; then
+    echo "accepted invalid --speculative-loading=$value" >&2
+    exit 1
+  fi
+  require_grep "^holbuild: invalid --speculative-loading: $value; expected an integer between 1 and 16$" \
+    "$tmpdir/speculative-invalid.log"
+done
+if in_copy local-cas build --speculative-loading PriorityTheory > "$tmpdir/speculative-no-exec.log" 2>&1; then
+  echo 'accepted --speculative-loading without remote execution' >&2
+  exit 1
+fi
+require_grep 'speculative-loading needs --remote-exec URL' "$tmpdir/speculative-no-exec.log"
+
 # Reattaching can need a replacement batch after an input disappears.
 cat > "$tmpdir/local-cas/src/PriorityChildScript.sml" <<'SML'
 Theory PriorityChild
@@ -2039,3 +2206,60 @@ require_grep 'TimeoutTheory restored from cache' "$tmpdir/ring-client.log"
 refute_grep 'remote batch\|Theory built' "$tmpdir/ring-client.log"
 require_grep '^proof-timeout=2.5$' "$tmpdir/ring-client-cache/actions/$ring_key/manifest"
 cmp "${ranked_roots[0]}/ac/$ring_ac" "$tmpdir/ring-weak-ac"
+
+# A worker sees both replicas, while a reader sees only the weaker one.
+# Export the action before restoring the fixture entries so the worker can
+# confirm a cached result without rebuilding it.
+rm "${ranked_roots[0]}/ac/$ring_ac" "${ranked_roots[1]}/ac/$ring_ac"
+write_ring_timeout ring-spec
+in_copy ring-spec --remote-cache "$first_url" action-spec --upload --tactic-timeout 2.5 TimeoutTheory \
+  > "$tmpdir/ring-spec.batch" 2> "$tmpdir/ring-spec.log" ||
+  { cat "$tmpdir/ring-spec.log" >&2; exit 1; }
+ring_spec=$(awk '$1 == "action" && $5 == "rxring:TimeoutTheory" { print $4 }' "$tmpdir/ring-spec.batch")
+[[ -n "$ring_spec" ]]
+if [[ ${ranked_roots[1]} == "$remote_root" ]]; then
+  single_url=$first_url
+else
+  single_url=$second_url
+fi
+
+ring_worker() {
+  local name=$1 expected=${2:-cached}
+  link_hol_toolchain_cache "$tmpdir/$name-cache"
+  mkdir -p "$tmpdir/$name"
+  (cd "$tmpdir/$name" && HOLBUILD_CACHE="$tmpdir/$name-cache" \
+    "$HOLBUILD_BIN" --remote-cache "$first_url,$second_url" exec-action "$ring_spec" \
+      --cache-limit-gb 1000 --result "$tmpdir/$name.result") > "$tmpdir/$name.log" 2>&1 ||
+    { cat "$tmpdir/$name.log" "$tmpdir/$name.result" >&2; exit 1; }
+  require_grep "^status=$expected\$" "$tmpdir/$name.result"
+  if [[ $expected == cached ]]; then
+    refute_grep 'phase-ms=.*hol:' "$tmpdir/$name.result"
+  else
+    require_grep 'phase-ms=.*hol:' "$tmpdir/$name.result"
+  fi
+}
+
+cp "$tmpdir/ring-strong-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-weak-ac" "${ranked_roots[1]}/ac/$ring_ac"
+ring_worker ring-cached-worker
+require_grep '^proof-timeout=2.5$' "${ranked_roots[1]}/ac/$ring_ac"
+write_ring_timeout ring-single-reader
+in_copy ring-single-reader --remote-cache "$single_url" build --remote-exec "$unreachable" \
+  --remote-only --tactic-timeout 2.5 TimeoutTheory > "$tmpdir/ring-single-reader.log" 2>&1 ||
+  { cat "$tmpdir/ring-single-reader.log" >&2; exit 1; }
+require_grep 'remote execution: nothing to build remotely' "$tmpdir/ring-single-reader.log"
+require_grep 'TimeoutTheory restored from cache' "$tmpdir/ring-single-reader.log"
+
+# The first hydrate must filter a weak primary instead of rebuilding a
+# theory already checked on the second replica.
+cp "$tmpdir/ring-weak-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-strong-ac" "${ranked_roots[1]}/ac/$ring_ac"
+ring_worker ring-filtered-worker
+require_grep '^proof-timeout=2.5$' "${ranked_roots[0]}/ac/$ring_ac"
+
+# A source build strengthens both existing copies too.
+cp "$tmpdir/ring-weak-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-weak-ac" "${ranked_roots[1]}/ac/$ring_ac"
+ring_worker ring-built-worker built
+require_grep '^proof-timeout=2.5$' "${ranked_roots[0]}/ac/$ring_ac"
+require_grep '^proof-timeout=2.5$' "${ranked_roots[1]}/ac/$ring_ac"
