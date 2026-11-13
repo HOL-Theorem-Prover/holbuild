@@ -21,8 +21,12 @@ export HOLBUILD_TEST_GLOBAL_CACHE="${HOLBUILD_CACHE:-${XDG_CACHE_HOME:-$HOME/.ca
 export HOLBUILD_TEST_CGROUP=${HOLBUILD_TEST_CGROUP-}
 # Test builds must not read from or publish to a remote cache or exec service
 # configured in the machine's environment; cases that need a remote start their
-# own and pass it explicitly.
-for remote_var in $(compgen -e HOLBUILD_REMOTE_); do unset "$remote_var"; done
+# own and pass it explicitly. The values stay available to remote-exec-live,
+# the one case that opts in to a real remote, as HOLBUILD_TEST_LIVE_REMOTE_*.
+for remote_var in $(compgen -e HOLBUILD_REMOTE_); do
+  export "HOLBUILD_TEST_LIVE_${remote_var#HOLBUILD_}=${!remote_var}"
+  unset "$remote_var"
+done
 
 vendor_hol_rev=$(tr -d '[:space:]' < "$ROOT/vendor/hol/REV")
 test_hol_rev=${HOLBUILD_TEST_HOL_REV:-$vendor_hol_rev}
