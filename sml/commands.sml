@@ -1546,12 +1546,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             case HolbuildRemoteExec.submit_with_query true url query (#maxheap tc) batch of
                 HolbuildRemoteExec.Refused reason => stopped := SOME (reason, true)
               | HolbuildRemoteExec.Ok batch_id =>
+                  HolbuildRemoteExec.while_followed url batch_id (fn () =>
                   let
                     val _ = HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n")
                     val batch = "batch " ^ batch_id
-                    val (outcome, _) =
-                      HolbuildRemoteExec.while_followed url batch_id
-                        (fn () => HolbuildRemoteExec.follow url batch_id on_change)
+                    val (outcome, _) = HolbuildRemoteExec.follow url batch_id on_change
                   in
                     case outcome of
                         HolbuildRemoteExec.Done => ()
@@ -1564,7 +1563,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                            true)
                       | HolbuildRemoteExec.Unreachable reason =>
                           stopped := SOME (reason ^ "; " ^ batch ^ " is left running", true)
-                  end
+                  end)
           end
         val _ =
           case (exported, url) of
@@ -1759,6 +1758,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                that follows to restore.  An attached batch's theories are
                unknown, so none of the others are copied before it ends. *)
             fun follow in_batch batch_id =
+              HolbuildRemoteExec.while_followed url batch_id (fn () =>
               let
                 (* Planning, export and early cutoff leave garbage that a
                    major collection would only reclaim once the heap grows
@@ -1780,8 +1780,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   end
                   handle e => (stop (); raise e)
               in
-                HolbuildRemoteExec.while_followed url batch_id follow_batch
-              end
+                follow_batch ()
+              end)
             fun report_failed_log ({input_key, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
               case log_sha256 of
                   NONE => ()
@@ -1946,9 +1946,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                        (#maxheap tc) batch of
                     HolbuildRemoteExec.Refused reason => (record_pending (); fall_back reason)
                   | HolbuildRemoteExec.Ok batch_id =>
-                      (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
-                       record_pending ();
-                       if detach then () else finish resubmit skip (SOME (batch_keys batch)) batch_id)
+                      let
+                        fun submitted () =
+                          (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
+                           record_pending ();
+                           if detach then () else finish resubmit skip (SOME (batch_keys batch)) batch_id)
+                      in
+                        if detach then submitted ()
+                        else HolbuildRemoteExec.while_followed url batch_id submitted
+                      end
             (* Settles the deferred theories; those early cutoff can't reuse, and
                those that depend on them, go in the next batch, except those
                that are or depend on a theory with its input key in skip.  So
