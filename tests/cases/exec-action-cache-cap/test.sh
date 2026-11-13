@@ -572,3 +572,18 @@ total = sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[3::2]))
 assert total >= int(sys.argv[2]) * 1024 ** 3, f"stamp holds {total} bytes, under what was kept"
 FREED
 done
+
+# A sweep that can't get under the target removes the stamp, so siblings
+# with smaller private trees stop reusing one that fitted before it.
+mature_cache=$tmpdir/stuck
+sparse "$mature_cache/checkpoint-store/family/heap" 80
+sweep_mature 100 10
+[[ -s "$mature_cache/locks/worker-cache-cap.state" ]] || { echo "no stamp under the target" >&2; exit 1; }
+sparse "$mature_cache/theory-modules/large.pmo" 15
+chmod a-w "$mature_cache/checkpoint-store/family" "$mature_cache/theory-modules"
+sweep_mature 100 10
+chmod u+w "$mature_cache/checkpoint-store/family" "$mature_cache/theory-modules"
+grep -q 'over the .* left under the cap' "$tmpdir/mature.log" ||
+  { echo "a stuck sweep did not report the cache over its target" >&2; cat "$tmpdir/mature.log" >&2; exit 1; }
+[[ ! -e "$mature_cache/locks/worker-cache-cap.state" ]] ||
+  { echo "a sweep left over the target kept the stamp" >&2; exit 1; }
