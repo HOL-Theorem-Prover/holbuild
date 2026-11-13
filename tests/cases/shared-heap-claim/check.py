@@ -36,6 +36,10 @@ def heap_uploads() -> int:
     return sum(line.startswith("PUT /cas/") for line in requests.read_text().splitlines())
 
 
+def action_writes() -> int:
+    return sum(line.startswith("PUT /ac/") for line in requests.read_text().splitlines())
+
+
 class Publisher:
     def __init__(self, name: str, heap_key: str) -> None:
         self.dir = directory / name
@@ -85,6 +89,28 @@ def concurrent_publishers_upload_once() -> None:
         (control / name).unlink()
 
 
+def late_claim_write_also_uploads() -> None:
+    """The cache has no conditional write: a claim written after the
+    claimant's settle delay wins too, so its writer uploads as well."""
+    late_write = f"action-put-{action_writes() + 1}-before"
+    (control / f"{late_write}-enable").touch()
+    late = Publisher("late", "three")
+    late.wait_until(lambda: (control / f"{late_write}-event").exists())
+    # The late publisher read no claim and its claim write is held back.
+    (control / "cas-put-enable").touch()
+    uploads = control / "cas-put-count"
+    early = Publisher("early", "three")
+    early.wait_until(lambda: uploads.exists() and uploads.read_text() == "1")
+    (control / f"{late_write}-release").touch()
+    late.wait_until(lambda: uploads.read_text() == "2")
+    (control / "cas-put-release").touch()
+    early.finish()
+    late.finish()
+    assert published_heap("three") in (early.heap(), late.heap())
+    for name in ("cas-put-enable", "cas-put-release", "cas-put-count"):
+        (control / name).unlink()
+
+
 def failed_upload_releases_claim() -> None:
     (control / "cas-put-status").write_text("500")
     failed = Publisher("failed", "two")
@@ -102,6 +128,7 @@ def failed_upload_releases_claim() -> None:
 if __name__ == "__main__":
     try:
         concurrent_publishers_upload_once()
+        late_claim_write_also_uploads()
         failed_upload_releases_claim()
     except BaseException:
         for log in sorted(directory.glob("*/poly.log")):

@@ -10016,10 +10016,12 @@ fun shared_checkpoint_key heap_key kind checkpoint_key =
 
 (* A worker claims a cold heap before uploading it, so other workers that
    built the same heap skip their own upload. The cache has no conditional
-   write: the claim read back after the settle delay wins. The claimant
-   releases it when its upload ends; a claim lapses after
-   shared_heap_claim_seconds, so an upload killed before it published keeps
-   the heap cold no longer than that. *)
+   write, so a worker uploads if it reads back its own claim after the
+   settle delay: one uploader, unless a competitor's claim write lands more
+   than the settle delay after its read, when that competitor uploads too.
+   The claimant releases its claim when its upload ends; a claim lapses
+   after shared_heap_claim_seconds, so an upload killed before it published
+   keeps the heap cold no longer than that. *)
 fun shared_heap_claim_key heap_key =
   HolbuildHash.string_sha256 ("holbuild-shared-heap-claim-v1\nheap=" ^ heap_key ^ "\n")
 
