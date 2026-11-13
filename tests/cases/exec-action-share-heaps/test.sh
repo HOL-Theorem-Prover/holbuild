@@ -476,3 +476,46 @@ worker interrupted-resume "$shared_url" "$interrupted" "$spec_interrupt" --share
 expect interrupted-resume 0 "status=built"
 require_grep 'restored shared .* checkpoint' "$tmpdir/interrupted-resume.log"
 require_grep 'checkpoint after completed' "$tmpdir/interrupted-resume.log"
+
+# A theory with declared outputs replays its whole script, so it saves every
+# theorem context again: the worker restores only the dependency heap, never a
+# context it would save over.
+write_x() {
+  cat > "$project/src/XScript.sml" <<SML
+fun holbuild_extra_outputs (_ : string list) = ()
+val _ = holbuild_extra_outputs ["results/X.out"]
+val _ = let val out = TextIO.openOut "results/X.out" in TextIO.output (out, "x\\n"); TextIO.closeOut out end
+Theory X
+Ancestors A
+Theorem x1:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+Theorem x2:
+  T
+Proof
+  $1
+QED
+SML
+}
+export_x() {
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload XTheory) > "$tmpdir/x-$1.batch"
+  spec_x=$(field "$tmpdir/x-$1.batch" share:XTheory 4)
+}
+write_x "simp[]"
+export_x 1
+worker x1 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x1 0 "status=built"
+write_x "ACCEPT_TAC TRUTH"
+export_x 2
+forget_local
+worker x2 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x2 0 "status=built"
+require_grep "restored shared deps-loaded heap" "$tmpdir/x2.log"
+x2_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/x2.result")
+if grep -q "dropping checkpoint\|restored shared theorem_context" "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log"; then
+  echo "the extra-output theory resumed into restored contexts" >&2
+  cat "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log" >&2
+  exit 1
+fi

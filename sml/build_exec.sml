@@ -3679,6 +3679,13 @@ fun place_state stored dst =
 
 fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
 
+(* Whether a run may start from a context or failed-prefix checkpoint.  Saved
+   ML state does not include files written by the script, so a theory with
+   declared outputs replays the whole script to recreate them in the fresh
+   stage; a traced run replays it too. *)
+fun resumes_from_checkpoints policy (action : theory_action) =
+  null (#extra_outputs action) andalso not (trace_steps policy)
+
 fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
     val source_name = #source_name action
@@ -3733,16 +3740,12 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
       fun failed_prefix_at_least_as_late failed NONE = true
         | failed_prefix_at_least_as_late failed (SOME replay) =
             #boundary (#checkpoint failed) >= #boundary replay
-      (* Saved ML state does not include files written by the script.  Replay
-         the whole script to recreate declared outputs in the fresh stage. *)
-      val script_replay_allowed = null (#extra_outputs action)
+      val resumes = resumes_from_checkpoints policy action
       val failed_prefix =
-        if script_replay_allowed andalso proof_steps_enabled policy andalso not (trace_steps policy) then
+        if resumes andalso proof_steps_enabled policy then
           best_failed_prefix_checkpoint (tactic_timeout policy) checkpoints
         else NONE
-      val replay =
-        if not script_replay_allowed orelse trace_steps policy then NONE
-        else replay_candidate policy base checkpoints declaration_checkpoints
+      val replay = if resumes then replay_candidate policy base checkpoints declaration_checkpoints else NONE
     in
       case failed_prefix of
           SOME failed =>
@@ -10275,8 +10278,10 @@ val nothing_restored : shared_restore = {heap = NONE, files = [], stale = [], mi
 
 (* Before the run: the latest checkpoint the cache holds for this source,
    else the heap, placed in the action's checkpoint tree, which is empty. *)
+(* With RESUMES false the run saves every boundary itself, so only the heap
+   is restored: a linked checkpoint would sit where it saves. *)
 fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, deps_key, deps_loaded,
-                                              requested_timeout, candidates, ...} : shared_context) =
+                                              requested_timeout, candidates, ...} : shared_context) resumes =
   let
     val stale = ref ([] : string list)
     val missing = ref ([] : string list)
@@ -10404,7 +10409,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
                 NONE => no_files
               | SOME heap =>
-                  case first_window heap candidates of
+                  case first_window heap (if resumes then candidates else []) of
                       SOME restored => restored
                     | NONE => try_heap heap
   in
@@ -11805,7 +11810,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             (* Loading ahead found no heap to restore before it went on. *)
             val restored =
               case (shared, ahead) of
-                  (SOME ctx, NONE) => phase "restore" (fn () => restore_shared_checkpoints remote ctx)
+                  (SOME ctx, NONE) =>
+                    phase "restore" (fn () =>
+                      restore_shared_checkpoints remote ctx (resumes_from_checkpoints policy action))
                 | _ => nothing_restored
             fun publish_shared () =
               if not (!HolbuildActionSandbox.outputs_validated) then () else
