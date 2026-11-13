@@ -9882,8 +9882,7 @@ fun worker_cache_roots cache =
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
    room under limit_bytes. Reuse a recent shared scan within the target;
-   private checkpoints, modules and the action root, which keeps its
-   dependencies between actions, are always measured locally. Small caps
+   private checkpoints and modules are always measured locally. Small caps
    and zero reserves scan live.  With refresh, as after an action's result,
    scan only when the stamp is past half its life and no other process holds
    gc.lock, so that busy hosts keep the stamp fresh and actions seldom wait
@@ -9891,8 +9890,7 @@ fun worker_cache_roots cache =
 fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes, refresh} =
   let
     fun private_bytes () =
-      cache_root_bytes checkpoint_root + cache_root_bytes (HolbuildCache.theory_modules_dir cache) +
-      cache_root_bytes (Path.concat (cache, "action"))
+      cache_root_bytes checkpoint_root + cache_root_bytes (HolbuildCache.theory_modules_dir cache)
     val roots = worker_cache_roots cache
     fun root_ids () = map (fn {id, ...} => id ()) roots
     fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
