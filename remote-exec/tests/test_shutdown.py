@@ -50,11 +50,13 @@ async def test_sigterm_exits_promptly_with_open_events_stream_and_claim(coordina
             try:
                 async with http.stream("GET", f"/v1/batches/{batch_id}/events", headers=CLIENT) as events:
                     assert events.status_code == 200
-                    assert '"type": "action"' in await anext(events.aiter_lines())
+                    # Hold the iterator: dropping it would close the stream before the signal.
+                    lines = events.aiter_lines()
+                    assert '"type": "action"' in await anext(lines)
                     assert not claim.done()
                     process.send_signal(signal.SIGTERM)
                     sent = time.monotonic()
-                    async with asyncio.timeout(4):  # the 2 s graceful limit, then lifespan shutdown
+                    async with asyncio.timeout(3):  # the 2 s graceful limit, then lifespan shutdown
                         await process.wait()
                     elapsed = time.monotonic() - sent
             finally:
@@ -67,4 +69,4 @@ async def test_sigterm_exits_promptly_with_open_events_stream_and_claim(coordina
         print(output.decode(), end="")
     # uvicorn re-raises the SIGTERM it handled once shutdown is done.
     assert process.returncode == -signal.SIGTERM, process.returncode
-    assert elapsed < 4
+    assert elapsed < 3

@@ -38,7 +38,7 @@ what building holbuild and HOL takes. Its entrypoint takes `migrate`,
 docker run -e REMOTE_EXEC_DATABASE_URL=postgresql+asyncpg://user:pass@host/remote_exec holbuild-remote-exec migrate
 docker run -p 8090:8090 -e REMOTE_EXEC_DATABASE_URL=... -e REMOTE_EXEC_CLIENT_TOKEN=... \
   -e REMOTE_EXEC_WORKER_TOKEN=... -e REMOTE_EXEC_CACHE_URL=https://user:pass@cache.example.org \
-  holbuild-remote-exec coordinator [uvicorn options, default --host 0.0.0.0 --port 8090]
+  holbuild-remote-exec coordinator [uvicorn options, default --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2]
 ```
 
 Without the image, from this directory: `uv sync`, then `uv run alembic
