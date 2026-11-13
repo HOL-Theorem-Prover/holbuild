@@ -168,6 +168,12 @@ It remains available by batch ID after the original client exits. Terminal
 following and `--attach` print it, including an earlier drain tail if a retry
 later succeeded. Interrupt cleanup keeps its five-second bound, so printing
 there is best effort: workers notice revocation on their next normal heartbeat.
+With the default 120-second lease, that heartbeat is every 40 seconds. A client
+stopped by its time budget can therefore exit before the worker saves its tail.
+Reattach to the printed batch ID with the same build command's `--attach ID`,
+or fetch `/v1/batches/ID/interrupted-output?wait_s=90` using client
+authentication. Reattachment waits for a pending report and prints its tail;
+it does not restart a cancelled batch.
 Cancelled drivers retain their action tree until the next action's strict
 cleanup, allowing the worker to read the log even if its first poll was late.
 Leave at least 20 seconds between the drain window and the container's stop
@@ -741,8 +747,9 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   Each tail is at most 65,536 UTF-8 bytes, with invalid UTF-8 replaced and
   control characters other than newline and tab replaced. It is diagnostic text
   from an interrupted attempt, not an indication that the final action failed.
-- `wait_s` may be 0–90 seconds (default 0), to wait for cancelled workers
-  still expected to report. A wait can expire without output; a later GET can
+- `wait_s` may be 0–90 seconds (default 0), to wait for workers of cancelled
+  actions or final lease-expiry failures still expected to report. A wait can
+  expire without output; a later GET can
   retrieve a report that arrived afterwards. The output lasts as long as the
   batch's normal retention. The endpoint uses the client bearer token.
 - 404 when there is no such batch
@@ -865,6 +872,13 @@ The tests need a Postgres role that may create databases:
 ```bash
 REMOTE_EXEC_TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost/postgres uv run pytest
 ```
+
+After building the native client and preparing its normal HOL test toolchain,
+run `uv run --frozen pytest -q tests/native_interrupted_output.py` too. This
+uses the actual `holbuild build --attach` client with the production heartbeat
+interval: a budget-stopped client may exit before output arrives, while a
+reattached client prints the late marker. It also checks worker drain. The
+primary CI job runs this check after toolchain preparation.
 
 ## Temporary cache members
 

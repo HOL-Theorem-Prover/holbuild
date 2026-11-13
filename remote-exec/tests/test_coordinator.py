@@ -2772,6 +2772,23 @@ async def test_diagnostic_waits_for_cancelled_worker_even_with_a_prior_tail(http
     assert json.loads(response.text)["output"] == "new tail"
 
 
+async def test_diagnostic_waits_for_failed_worker_after_final_lease_expiry(
+    http: httpx.AsyncClient, coordinator: Coordinator,
+) -> None:
+    coordinator.settings.max_attempts = 1
+    batch_id = await submit(http, ["loop"])
+    token = await claim_named(http, "loop")
+    async with coordinator.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
+    await coordinator.expire_leases()
+    assert (await batch(http, batch_id))["state"] == "failed"
+    request = asyncio.create_task(http.get(f"/v1/batches/{batch_id}/interrupted-output?wait_s=2", headers=CLIENT))
+    await asyncio.sleep(0.05)
+    assert not request.done()
+    assert (await diagnostic(http, token, "expired lease marker\n")).status_code == 200
+    assert json.loads((await request).text)["output"] == "expired lease marker\n"
+
+
 async def test_diagnostic_requires_worker_auth_and_rejects_oversized_body(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["loop"])
     token = await claim_named(http, "loop")

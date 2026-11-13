@@ -854,15 +854,17 @@ class Coordinator:
         return True
 
     async def interrupted_output(self, batch_id: UUID) -> tuple[list[tuple[str, str]], bool] | None:
-        """Saved diagnostic tails and whether a cancelled worker still owes one; no result state is changed."""
+        """Saved tails and whether a terminal action's worker still owes one; no result state is changed."""
         async with self.engine.connect() as conn:
             if not await conn.scalar(sa.text("SELECT 1 FROM batches WHERE id = :id"), {"id": batch_id}):
                 return None
             rows = await conn.execute(
                 sa.text(
-                    "SELECT theory, interrupted_output, state = 'cancelled' AND latest_attempt_token IS NOT NULL "
+                    "SELECT theory, interrupted_output, state IN ('cancelled', 'failed') "
+                    "AND latest_attempt_token IS NOT NULL "
                     "FROM actions WHERE batch_id = :id AND "
-                    "(interrupted_output IS NOT NULL OR (state = 'cancelled' AND latest_attempt_token IS NOT NULL)) "
+                    "(interrupted_output IS NOT NULL OR "
+                    "(state IN ('cancelled', 'failed') AND latest_attempt_token IS NOT NULL)) "
                     "ORDER BY theory, input_key"
                 ),
                 {"id": batch_id},
