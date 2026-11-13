@@ -676,6 +676,10 @@ if (cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly"
   exit 1
 fi
 require_grep 'dirty HOL toolchain cache entry' "$tmpdir/dirty.log"
+# --remote-only builds nothing against the checkout, so it does not check it.
+(cd "$root" && env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_POLY="$fakebin/poly" \
+  "$HOLBUILD_BIN" --remote-cache http://127.0.0.1:9 build --remote-exec http://127.0.0.1:9 --remote-only Foo) \
+  > "$tmpdir/dirty-remote-only.log" 2>&1 || { cat "$tmpdir/dirty-remote-only.log" >&2; exit 1; }
 
 [ -d "$root/.holbuild/src/b/.git" ]
 [ ! -d "$root/.holbuild/src/b/.holbuild" ]

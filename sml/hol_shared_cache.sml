@@ -368,6 +368,10 @@ fun theory_toolchain_key_for_holdir holdir =
     parse_theory_toolchain_key path text
   end
 
+(* Set by `build --remote-only`, which must find the toolchain in a cache
+   rather than build HOL locally. *)
+val restore_only = ref false
+
 fun validate_entry req k =
   let val dir = entry_dir_for_key k
       val holdir = holdir_for_key k
@@ -381,8 +385,10 @@ fun validate_entry req k =
       invalid ("broken HOL toolchain cache entry: " ^ dir ^ "\nremove it with: rm -rf " ^ quote dir)
     else if not (path_exists (Path.concat(holdir, ".git"))) then false
     (* Under exec-action every action reads a built toolchain and none can
-       write it, so its checkout is as clean as when build.ok was written. *)
-    else if HolbuildActionSandbox.active () then true
+       write it, so its checkout is as clean as when build.ok was written.
+       --remote-only builds nothing against the checkout: its keys come from
+       files written with the entry, and the workers fetch HOL by commit. *)
+    else if HolbuildActionSandbox.active () orelse !restore_only then true
     else
       let val output = dirty_status k holdir
       in
@@ -575,10 +581,6 @@ fun build_analyser k =
        write_file (analyser_ok_for_key k ak) "ok\n";
        out)
   end
-
-(* Set by `build --remote-only`, which must find the toolchain in a cache
-   rather than build HOL locally. *)
-val restore_only = ref false
 
 (* Set when --remote-only stops for a reason a local build would get past;
    holbuild then exits with status 75 (EX_TEMPFAIL), so that whoever ran it
