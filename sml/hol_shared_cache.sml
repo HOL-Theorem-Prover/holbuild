@@ -368,7 +368,9 @@ fun theory_toolchain_key_for_holdir holdir =
     parse_theory_toolchain_key path text
   end
 
-fun validate_entry req k =
+(* CHECK_CHECKOUT false skips the git status of the checkout, which takes the
+   entry's mutation lease. *)
+fun validate_entry check_checkout req k =
   let val dir = entry_dir_for_key k
       val holdir = holdir_for_key k
       fun invalid message =
@@ -382,7 +384,7 @@ fun validate_entry req k =
     else if not (path_exists (Path.concat(holdir, ".git"))) then false
     (* Under exec-action every action reads a built toolchain and none can
        write it, so its checkout is as clean as when build.ok was written. *)
-    else if HolbuildActionSandbox.active () then true
+    else if HolbuildActionSandbox.active () orelse not check_checkout then true
     else
       let val output = dirty_status k holdir
       in
@@ -856,7 +858,7 @@ fun restore_or_build_entry jobs req k =
 fun finish_entry jobs req k =
   let
     val publication =
-      if validate_entry req k then
+      if validate_entry true req k then
         (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED";
          NoPublication)
       else restore_or_build_entry jobs req k
@@ -883,8 +885,11 @@ fun ensure_built_with_kernel jobs req =
     val ak = analyser_key ()
     (* Lease before validating, so GC cannot remove the entry in between. *)
     val _ = hold_usage_lease k
+    (* --remote-only reads only files written with a complete entry and
+       builds nothing against its checkout, so it skips the checkout's check
+       here; finish_entry, which builds against the checkout, still checks. *)
     val holdir =
-      if validate_entry req k andalso hol_source_manifest_built k andalso
+      if validate_entry (not (!restore_only)) req k andalso hol_source_manifest_built k andalso
          theory_toolchain_built k andalso analyser_built k ak then holdir_for_key k
       else
         let val lock = acquire_lock k
