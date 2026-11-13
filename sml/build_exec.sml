@@ -11135,10 +11135,15 @@ fun predicted_theory_loads {root, cwd, holdir, base = {loaded, path}, resolve, p
       if String.isPrefix "$(HOLDIR)" entry then holdir ^ String.extract (entry, size "$(HOLDIR)", NONE) else entry
     fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
     val lib_manifests = map (fn {stem, suffix, loads, ...} => (in_root root stem ^ suffix, map lib_load loads)) (#libs parent)
+    (* HOL's loader reads <dir>/x.ui from <dir>/.hol/objs/x.ui (HOL's
+       HFS_NameMunge); a toolchain built by recent HOL has it only there. *)
     fun find module ext =
       List.find file_exists
-        (map (fn dir => Path.mkAbsolute {path = module ^ ext, relativeTo = Path.mkAbsolute {path = dir, relativeTo = cwd}})
-             ("." :: path))
+        (List.concat
+           (map (fn dir =>
+                   let val file = Path.mkAbsolute {path = module ^ ext, relativeTo = Path.mkAbsolute {path = dir, relativeTo = cwd}}
+                   in [file, hfs_remapped_path file] end)
+                ("." :: path)))
     fun manifest module ext =
       case List.find (fn (file, _) => file = module ^ ext) lib_manifests of
           SOME (_, lines) => lines
