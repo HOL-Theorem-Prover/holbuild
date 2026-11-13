@@ -720,52 +720,63 @@ async def test_a_child_waits_ahead_of_a_diamond_only_within_the_depth(
     assert await claim_ahead(http) is None
 
 
-@pytest.mark.parametrize("depth", [2, 0])
-async def test_an_ancestor_back_to_waiting_revokes_a_claim_ahead_across_a_parent_that_finished(
+@pytest.mark.parametrize("depth", [2, 4, 0])
+async def test_an_ancestor_back_to_waiting_revokes_a_claim_ahead_across_parents_that_finished(
     http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, remote_exec_engine: AsyncEngine,
     monkeypatch: pytest.MonkeyPatch, depth: int,
 ) -> None:
     monkeypatch.setattr(coordinator.settings, "ahead_depth", depth)
-    batch_id = await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "b")], speculative_loading="16")
-    a = await claim_named(http, "a")
-    b = await claim_ahead(http)
-    c = await claim_ahead(http)
-    assert b is not None and c is not None and c["ahead_parents"] == ancestors_first("a", "b")
-
-    # "b" finishes before its parent's result comes, which then fails to publish: "c" may hold "a"'s outputs, which
-    # are no one's now, though it has no edge to "a" and "b" is done.
-    cache.keys.add(ac_key("b"))
-    assert (await complete(http, b["attempt_token"], result("b", "built"))).status_code == 200
-    assert await ahead_state(remote_exec_engine, "c") == ("running", "ahead", 1, 0)
-    assert (await complete(http, a, result("a", "failed", "publish"))).status_code == 200
-    assert (await ahead_state(remote_exec_engine, "c"))[1:3] == ("abandoned", 0)
-    assert (await http.post(f"/v1/work/{c['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
-    assert (await states(http, batch_id))["b"] == "done"
-
-
-async def test_a_claim_ahead_finishing_before_its_parents_frees_its_slot_of_the_cap_for_a_waiting_claim(
-    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, remote_exec_engine: AsyncEngine,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(coordinator.settings, "ahead_depth", 2)
-    await submit(http, ["a", "b", "c", "x"], [("b", "a"), ("c", "b"), ("x", "a")], speculative_loading="2")
-    await claim_named(http, "a")
-    by_name = {}
-    for name in ["b", "c"]:  # "b" leads the deeper chain; "x" then waits for the cap
+    names, edges = chain((depth or 4) + 1)
+    *ancestors, last = names
+    batch_id = await submit(http, names, edges, speculative_loading="16")
+    root = await claim_named(http, "t0")
+    claims = {}
+    for name in names[1:]:
         claimed = await claim_ahead(http)
         assert claimed is not None and claimed["theory"] == f"pkg:{name}"
-        by_name[name] = claimed
+        claims[name] = claimed["attempt_token"]
+    assert claimed["ahead_parents"] == ancestors_first(*ancestors)
+
+    # The parents between finish before the root's result comes, which then fails to publish: the last may hold
+    # the root's outputs, which are no one's now, though it has no edge to the root and its parents are done.
+    for name in ancestors[1:]:
+        cache.keys.add(ac_key(name))
+        assert (await complete(http, claims[name], result(name, "built"))).status_code == 200
+    assert await ahead_state(remote_exec_engine, last) == ("running", "ahead", 1, 0)
+    assert (await complete(http, root, result("t0", "failed", "publish"))).status_code == 200
+    assert (await ahead_state(remote_exec_engine, last))[1:3] == ("abandoned", 0)
+    assert (await http.post(f"/v1/work/{claims[last]}/heartbeat", headers=WORKER)).status_code == 409
+    assert {name: state for name, state in (await states(http, batch_id)).items() if name in ancestors[1:]} == {
+        name: "done" for name in ancestors[1:]
+    }
+
+
+@pytest.mark.parametrize("depth", [2, 4])
+async def test_a_claim_ahead_finishing_before_its_parents_frees_its_slot_of_the_cap_for_a_waiting_claim(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, remote_exec_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch, depth: int,
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", depth)
+    names, edges = chain(depth + 1)
+    last = names[-1]
+    await submit(http, [*names, "x"], [*edges, ("x", "t0")], speculative_loading=str(depth))
+    await claim_named(http, "t0")
+    claims = {}
+    for name in names[1:]:  # the chain leads; "x" then waits for the cap
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == f"pkg:{name}"
+        claims[name] = claimed
     assert await claim_ahead(http) is None
 
     started = time.monotonic()
     waiting = asyncio.create_task(claim_ahead(http, wait_s=CLAIM_RECHECK_SECONDS * 2))
     await asyncio.sleep(0.2)
     assert not waiting.done()
-    cache.keys.add(ac_key("c"))
-    assert (await complete(http, by_name["c"]["attempt_token"], result("c", "built"))).status_code == 200
-    assert await ahead_state(remote_exec_engine, "c") == ("done", "ahead", 1, 1)
+    cache.keys.add(ac_key(last))
+    assert (await complete(http, claims[last]["attempt_token"], result(last, "built"))).status_code == 200
+    assert await ahead_state(remote_exec_engine, last) == ("done", "ahead", 1, 1)
     x = await waiting
-    assert x is not None and (x["theory"], x["ahead_parents"]) == ("pkg:x", ancestors_first("a"))
+    assert x is not None and (x["theory"], x["ahead_parents"]) == ("pkg:x", ancestors_first("t0"))
     assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
 
 
