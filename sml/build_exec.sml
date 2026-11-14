@@ -9387,10 +9387,12 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
               (Resident.want resident path; HolbuildCache.touch_action cache key; true)
           | NONE => false
       end
+    fun remove_old {stem, ...} =
+      let val path = in_root root stem
+      in Option.app (fn entry => remove_resident root (path, entry)) (Resident.find resident path) end
     fun install {target, stem, key} =
       let
         val path = in_root root stem
-        val _ = Option.app (fn entry => remove_resident root (path, entry)) (Resident.find resident path)
         val _ = ensure_parent path
         val {manifest_text = source_text, metadata = {parents, mldeps}} =
           restore_spec_theory remote root resolver
@@ -9414,12 +9416,24 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
           (paths, split (HolbuildHash.files_sha256
                            (List.concat (map (fn path => map (fn suffix => path ^ suffix) suffixes) paths))))
       end
-    fun restore_dep (dep as {target, key, ...}) =
-      (if kept dep then () else install dep)
+    fun restorable f (dep as {target, key, ...}) =
+      f dep
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | e => raise action_failed (InputMissing ("theory " ^ key))
                           ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                            General.exnMessage e)
+    (* Removing a dependency's old copy removes the directories it leaves
+       empty, which may be the directory another install has just made; so
+       the old copies all go before the installs run in parallel. *)
+    fun restore_deps_now () =
+      let
+        val checks = map (fn dep => (dep, ref false)) (#deps spec)
+        val _ = transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks
+        val stale = map #1 (List.filter (! o #2) checks)
+      in
+        List.app (restorable remove_old) stale;
+        transfer_all (restorable install) stale
+      end
     (* Each dependency's .dat against its parents', from the records. *)
     fun misfit () =
       hydrate_step "hydmisfit" (fn () =>
@@ -9435,7 +9449,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                           | NONE => raise Error ("no record of dependency " ^ stem))))
             (#deps spec)
         end)
-    fun restore_deps () = hydrate_step "hyddeps" (fn () => (transfer_all restore_dep (#deps spec); hash_installed ()))
+    fun restore_deps () = hydrate_step "hyddeps" (fn () => (restore_deps_now (); hash_installed ()))
     fun refresh wanted =
       hydrate_step "hydstale" (fn () => drop_stale_dep_copies remote spec wanted) andalso (restore_deps (); true)
     (* Every path an item writes: two items sharing one would let a kept
