@@ -9953,10 +9953,37 @@ fun classify_run_failure stage log_text oom_before msg =
   end
 
 (* Whether HOL's output says it couldn't find a file under the action root
-   ROOT, where the hydrate put the action's dependencies. *)
-fun lost_root_file root text =
-  List.exists (fn what => String.isSubstring (what ^ root ^ "/") text)
-    ["Cannot find file ", "non-existent file "]
+   ROOT that the records RESIDENT say the hydrate put there: a dependency's
+   file, a library manifest or a fetched file. *)
+fun lost_restored_file resident root text =
+  let
+    fun restored path =
+      case Resident.find resident path of
+          SOME (Resident.Manifest _) => true
+        | SOME (Resident.File _) => true
+        | _ =>
+            List.exists (fn ext => Path.ext path = SOME ext) ["sig", "sml", "dat", "ui", "uo"] andalso
+            Option.isSome (Resident.theory resident (Path.base path))
+    fun paths what =
+      let
+        val prefix = what ^ root ^ "/"
+        fun from text =
+          let val (_, found) = Substring.position prefix text
+          in
+            if Substring.isEmpty found then []
+            else
+              let val (path, rest) = Substring.splitl (not o Char.isSpace) (Substring.triml (size what) found)
+              in Substring.string path :: from rest end
+          end
+      in
+        from (Substring.full text)
+      end
+  in
+    (* HOL names the path it was asked for, and reads a .ui or .uo at its
+       .hol/objs copy. *)
+    List.exists (fn path => restored path orelse restored (hfs_remapped_path path))
+      (List.concat (map paths ["Cannot find file ", "non-existent file "]))
+  end
 
 (* The worker cache cap covers everything a worker keeps between
    actions (its checkpoint tree, the toolchains with their analysers, and the
@@ -12198,7 +12225,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                (* HOL found a file of the root missing, which the hydrate
                   left in place: no fault of the proof.  The records can't
                   be trusted, so the next action starts from an empty root. *)
-               if failure = ProofFailure andalso lost_root_file root (msg ^ "\n" ^ log_text) then
+               if failure = ProofFailure andalso lost_restored_file (!resident) root (msg ^ "\n" ^ log_text) then
                  (remove_file resident_file;
                   raise ActionFailed (InternalFailure, "the action root lost a file the hydrate restored:\n" ^ text))
                else raise ActionFailed (failure, text)

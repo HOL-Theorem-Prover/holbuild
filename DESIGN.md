@@ -724,9 +724,10 @@ parents to other stems, and removes every item the spec doesn't name, so the
 root ends as a cold hydrate leaves it. The parent check and the cutoff read
 the records rather than hashing ~4 files per dependency. A kept item whose
 files went missing is reinstalled with a warning naming the lost path; a HOL
-load that can't find a file under the root fails as `internal`, so the
-coordinator retries it, and removes the records, so the next action starts
-from an empty root. The stems the action
+load that can't find a file the records say the hydrate put in the root fails
+as `internal`, so the coordinator retries it, and removes the records, so the
+next action starts from an empty root. Any other missing file is the script's
+own error. The stems the action
 writes besides its dependencies (its own outputs, and with loading ahead its
 late parents) are emptied and recorded as scratch, which the next hydrate
 removes or reinstalls. Extra outputs lie under their theory's key in
