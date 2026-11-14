@@ -8,9 +8,11 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
+ring_server_pids=()
 cleanup() {
   [[ -z "${server_pid:-}" ]] || kill "$server_pid" 2>/dev/null || true
   [[ -z "${tls_server_pid:-}" ]] || kill "$tls_server_pid" 2>/dev/null || true
+  for pid in "${ring_server_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
   cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
@@ -145,6 +147,25 @@ done
 }
 HTTP_TEST_URL="http://127.0.0.1:$(< "$tmpdir/port")"
 export HTTP_TEST_URL HTTP_TEST_DIR=$tmpdir
+
+# Eight more servers, as the nodes of a cache ring.
+HTTP_TEST_RING_URLS=
+for node in {1..8}; do
+  python3 "$tmpdir/server.py" "$tmpdir/ring-port-$node" "$tmpdir" &
+  ring_server_pids+=($!)
+done
+for node in {1..8}; do
+  for _ in {1..100}; do
+    [[ -s "$tmpdir/ring-port-$node" ]] && break
+    sleep 0.01
+  done
+  [[ -s "$tmpdir/ring-port-$node" ]] || {
+    echo "ring test HTTP server $node did not start" >&2
+    exit 1
+  }
+  HTTP_TEST_RING_URLS+=" http://127.0.0.1:$(< "$tmpdir/ring-port-$node")"
+done
+export HTTP_TEST_RING_URLS
 
 # An HTTPS server with a self-signed certificate, which writes how many
 # connections it has accepted to tls-accepted.
@@ -340,11 +361,12 @@ fun burst () =
    List.app (fn thread => ignore (Thread.fork (fn () => client thread, []))) (List.tabulate (16, fn i => i));
    wait_for "the concurrent requests" (fn () => !finished = 16) (Time.+ (Time.now (), Time.fromSeconds 60));
    assert ("concurrent requests failed: " ^ String.concatWith ", " (!failures)) (null (!failures)))
-fun accepted () =
+fun accepted_at server =
   (assert "GET /connections"
-          (HolbuildHttp.get {url = url ^ "/connections", dst = dir ^ "/connections.out", timeout = 30}
+          (HolbuildHttp.get {url = server ^ "/connections", dst = dir ^ "/connections.out", timeout = 30}
            = HolbuildHttp.Response 200);
    valOf (Int.fromString (read_file (dir ^ "/connections.out"))))
+fun accepted () = accepted_at url
 
 val accepted_before = accepted ()
 val _ = assert "a HEAD answered with Content-Length -1 returns its status"
@@ -354,6 +376,24 @@ val _ = assert "a GET after it on the same handle reads its body by its length"
                 = HolbuildHttp.Response 200
                 andalso read_file (dir ^ "/after-head.out") = "ok\n")
 val _ = assert "the HEAD and the GET kept the connection" (accepted () = accepted_before)
+
+(* Requests from one thread, one pooled handle, to each of 8 servers in
+   turn, 3 times over, as a walk over a cache ring: the handle keeps a
+   connection to every server, more than libcurl's default of 4. *)
+val ring = String.tokens Char.isSpace (valOf (OS.Process.getEnv "HTTP_TEST_RING_URLS"))
+fun ring_accepted () = List.foldl (fn (server, total) => total + accepted_at server) 0 ring
+val ring_accepted_before = ring_accepted ()
+val _ =
+  List.app (fn _ =>
+    List.app (fn server =>
+      assert "a GET to a ring server"
+             (HolbuildHttp.get {url = server ^ "/fast", dst = dir ^ "/ring.out", timeout = 30}
+              = HolbuildHttp.Response 200))
+      ring)
+    [1, 2, 3]
+val ring_opened = ring_accepted () - ring_accepted_before
+val _ = assert ("24 requests over 8 servers opened " ^ Int.toString ring_opened ^ " connections, not 0")
+               (ring_opened = 0)
 
 val accepted_before = accepted ()
 val _ = burst ()
@@ -525,9 +565,10 @@ grep -q "http tests passed" "$tmpdir/http-test.log" || {
   cat "$tmpdir/http-test.log" >&2
   exit 1
 }
-kill "$server_pid"
-wait "$server_pid" 2>/dev/null || true
+kill "$server_pid" "${ring_server_pids[@]}"
+wait "$server_pid" "${ring_server_pids[@]}" 2>/dev/null || true
 server_pid=
+ring_server_pids=()
 
 # When libcurl can't be used, a build says why once and makes its requests
 # with the curl command: a first build publishes to the remote cache and a

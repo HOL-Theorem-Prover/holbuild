@@ -32,8 +32,8 @@ local
   val curl = recorded (getSymbol (loadLibraryIndirect library_name))
   val libc = recorded (getSymbol (loadExecutable ()))
 
-  (* curl_easy_setopt and curl_easy_getinfo take their third argument
-     through `...`.  x86-64 and Linux arm64 pass it like a fixed third
+  (* curl_easy_setopt, curl_easy_getinfo and curl_multi_setopt take their
+     third argument through `...`.  x86-64 and Linux arm64 pass it like a fixed third
      argument, in a register; Apple arm64 passes variadic arguments on the
      stack.  Repeating the value up to the ninth argument, the first stack
      slot, puts it where either convention reads it. *)
@@ -53,6 +53,7 @@ in
   val slist_append = buildCall2 (curl "curl_slist_append", (cPointer, cString), cPointer)
   val slist_free_all = buildCall1 (curl "curl_slist_free_all", cPointer, cVoid)
   val multi_init = buildCall0 (curl "curl_multi_init", (), cPointer)
+  val multi_setopt_long = variadic (buildCall9 (curl "curl_multi_setopt", variadic_conv cLong, cInt))
   val multi_cleanup = buildCall1 (curl "curl_multi_cleanup", cPointer, cInt)
   val multi_add_handle = buildCall2 (curl "curl_multi_add_handle", (cPointer, cPointer), cInt)
   val multi_remove_handle = buildCall2 (curl "curl_multi_remove_handle", (cPointer, cPointer), cInt)
@@ -110,6 +111,7 @@ val CURLOPT_CAPATH = 10097
 val CURLOPT_INFILESIZE_LARGE = 30115
 val CURLOPT_SOCKOPTFUNCTION = 20148
 val CURLINFO_RESPONSE_CODE = 0x200002
+val CURLMOPT_MAXCONNECTS = 6
 val CURLE_PEER_FAILED_VERIFICATION = 60
 val CURL_GLOBAL_DEFAULT = 3
 val CURL_VERSION_ASYNCHDNS = 0wx80 : Word32.word
@@ -226,6 +228,13 @@ fun new_connection () : connection =
     (if easy = Foreign.Memory.null orelse multi = Foreign.Memory.null then
        raise Error "could not create a libcurl handle"
      else ();
+     (* The multi handle keeps the connection cache, by default capped at 4
+        connections per easy handle it drives; this one drives a single easy
+        handle.  With a cache ring of more nodes, each request would close
+        the oldest connection, so a walk over the ring reconnects every time.
+        The cap lets a handle keep a connection to each node of a ring of
+        dozens; the idle reaper closes them with the handle. *)
+     mcheck "curl_multi_setopt MAXCONNECTS" (multi_setopt_long (multi, CURLMOPT_MAXCONNECTS, 64));
      check "NOSIGNAL" (setopt_long (easy, CURLOPT_NOSIGNAL, 1));
      check "CONNECTTIMEOUT" (setopt_long (easy, CURLOPT_CONNECTTIMEOUT, connect_timeout_seconds));
      check "FOLLOWLOCATION" (setopt_long (easy, CURLOPT_FOLLOWLOCATION, 1));
