@@ -9503,8 +9503,15 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                          else (Binaryset.add (seen, dst), item :: kept))
                      (Binaryset.empty String.compare, []) items)
     val files = last_per_dst (files @ map library (#libraries spec))
+    (* Whether the files an entry stands for are all there.  The records
+       alone can't tell: a file they keep may have gone since. *)
+    fun present paths =
+      case List.find (not o path_exists) paths of
+          NONE => true
+        | SOME path => (warn ("the action root lost " ^ path ^ ", which its records keep; restoring it"); false)
+    fun objects path = [path, hfs_remapped_path path]
     fun fetch_file (file as {hash, dst}) =
-      if Resident.find resident dst = SOME (Resident.File hash) then Resident.want resident dst
+      if Resident.find resident dst = SOME (Resident.File hash) andalso present [dst] then Resident.want resident dst
       else (fetch_spec_blob remote file; Resident.put resident dst (Resident.File hash))
     fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
     fun write_lib {stem, suffix, loads, ...} =
@@ -9513,7 +9520,8 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
         val lines = map lib_load loads
         val sha = HolbuildHash.string_sha256 (manifest_text lines)
       in
-        if Resident.find resident path = SOME (Resident.Manifest sha) then Resident.want resident path
+        if Resident.find resident path = SOME (Resident.Manifest sha) andalso present (objects path)
+        then Resident.want resident path
         else (ensure_parent path; write_object_manifest path lines; Resident.put resident path (Resident.Manifest sha))
       end
     val resolver = spec_resolver spec
@@ -9530,6 +9538,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
               t = target andalso k = key andalso source_sha key = SOME source andalso
               Resident.file_hash resident (path ^ ".uo") =
                 SOME (HolbuildHash.string_sha256 (manifest_text (uo_lines stem {parents = parents, mldeps = mldeps}))) andalso
+              present (List.concat (map (fn suffix => objects (path ^ suffix)) [".sig", ".sml", ".dat", ".ui", ".uo"])) andalso
               (Resident.want resident path; true)
           | NONE => false
       end
@@ -9595,7 +9604,6 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       hydrate_step "hydstale" (fn () => drop_stale_dep_copies remote spec wanted) andalso (restore_deps (); true)
     (* Every path an item writes: two items sharing one would let a kept
        item stand for files another replaced or removed. *)
-    fun objects path = [path, hfs_remapped_path path]
     fun theory_files stem = List.concat (map (fn suffix => objects (in_root root stem ^ suffix)) theory_suffixes)
     val claims =
       map #dst files @
@@ -9943,6 +9951,12 @@ fun classify_run_failure stage log_text oom_before msg =
   in
     (failure, String.concatWith "\n" (msg :: kill_notes))
   end
+
+(* Whether HOL's output says it couldn't find a file under the action root
+   ROOT, where the hydrate put the action's dependencies. *)
+fun lost_root_file root text =
+  List.exists (fn what => String.isSubstring (what ^ root ^ "/") text)
+    ["Cannot find file ", "non-existent file "]
 
 (* The worker cache cap covers everything a worker keeps between
    actions (its checkpoint tree, the toolchains with their analysers, and the
@@ -12177,9 +12191,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
              if not (!HolbuildActionSandbox.outputs_validated) then
                raise ActionFailed (InternalFailure, msg)
              else
-             let val log_text = read_text (build_log ()) handle _ => ""
+             let
+               val log_text = read_text (build_log ()) handle _ => ""
+               val (failure, text) = classify_run_failure stage log_text oom_before msg
              in
-               raise ActionFailed (classify_run_failure stage log_text oom_before msg)
+               (* HOL found a file of the root missing, which the hydrate
+                  left in place: no fault of the proof.  The records can't
+                  be trusted, so the next action starts from an empty root. *)
+               if failure = ProofFailure andalso lost_root_file root (msg ^ "\n" ^ log_text) then
+                 (remove_file resident_file;
+                  raise ActionFailed (InternalFailure, "the action root lost a file the hydrate restored:\n" ^ text))
+               else raise ActionFailed (failure, text)
              end)
         val _ = peak := peak_rss_mb stage
         val _ =

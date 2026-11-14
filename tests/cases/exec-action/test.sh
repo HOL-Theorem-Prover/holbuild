@@ -549,6 +549,20 @@ worker c "$spec_c"
 expect c 0
 [[ $(stat -c %i "$stem_a.dat") != "$inode_a" && $(stat -c %i "$stem_b.dat") != "$inode_b" ]] || {
   echo "worker c kept A or B after their entries changed" >&2; exit 1; }
+# A dependency or library manifest the records keep whose files went
+# missing since is restored, not trusted: HOL reads the .hol/objs copies.
+stem_a=$(resident_stem 'ATheory$')
+lib_ui=$(awk -F'\t' '$1 == "manifest" && $2 ~ /helperLib\.ui$/ { print $2 }' "$tmpdir/worker-c/action-resident")
+[[ -n "$stem_a" && -n "$lib_ui" ]] || { cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
+lost_a=$(dirname "$stem_a")/.hol/objs/ATheory.ui
+lost_lib=$(dirname "$lib_ui")/.hol/objs/helperLib.ui
+rm "$lost_a" "$lost_lib"
+worker c "$spec_c"
+expect c 0
+require_file "$lost_a"
+require_file "$lost_lib"
+require_grep "the action root lost $lost_a" "$tmpdir/c.log"
+require_grep "the action root lost $lost_lib" "$tmpdir/c.log"
 
 # The original checkout restores all three results without building.
 hb build CTheory > "$tmpdir/client.log" 2>&1 || { cat "$tmpdir/client.log" >&2; exit 1; }
@@ -611,6 +625,21 @@ if grep -q '^log=' "$tmpdir/budget.result"; then
   echo "pre-HOL failure published an unvalidated action log" >&2
   exit 1
 fi
+
+# HOL missing a file under the action root, which the hydrate put there, is
+# no proof failure: it is retried (exit 3), and the root's records go, so
+# the next action starts from an empty root.
+cat > "$project/src/LostScript.sml" <<SML
+Theory Lost
+Ancestors bool
+val _ = let val f = load in f "$tmpdir/worker-lost/action/.holbuild/obj/gone" end
+SML
+hb action-spec --upload LostTheory > "$tmpdir/batch-lost.txt"
+worker lost "$(spec_for "$tmpdir/batch-lost.txt" worker:LostTheory)"
+expect lost 3 "status=failed" "failure=internal"
+require_grep "the action root lost a file the hydrate restored" "$tmpdir/lost.log"
+[[ ! -e "$tmpdir/worker-lost/action-resident" ]] || { echo "a root that lost a file kept its records" >&2; exit 1; }
+rm "$project/src/LostScript.sml"
 
 # A malformed one-line theorem recovers a boundary with an empty tactic.
 # Its source diagnostic must survive protocol parsing and proof planning.
