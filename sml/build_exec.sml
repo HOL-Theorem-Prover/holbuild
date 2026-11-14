@@ -2316,10 +2316,14 @@ fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
    restore-time compatibility check as the correctness boundary. *)
 val remote_theory_publish_attempts = 3
 
-fun put_remote_theory_action remote _ (request as {key, text}) =
+(* Publishes request over the remote's entry for its key as last read, held
+   in SEEN, and leaves the entry it reads last there.  A miss is followed by
+   a PUT, without another read before it. *)
+fun publish_theory_action_seen seen remote (request as {key, text}) =
   let
     val incoming = cache_manifest_contract key text
-    val initial_resident = HolbuildRemoteCache.get_action remote key
+    val initial_resident = !seen
+    fun read () = (seen := HolbuildRemoteCache.get_action remote key; !seen)
     fun conflict detail = HolbuildCacheBackend.Conflict ("remote theory action " ^ key ^ ": " ^ detail)
     fun compatible_contract resident_text =
       let val resident = cache_manifest_contract key resident_text
@@ -2330,10 +2334,10 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
     fun attempt attempts resident =
       let
         fun retry detail =
-          if attempts > 1 then attempt (attempts - 1) (HolbuildRemoteCache.get_action remote key)
+          if attempts > 1 then attempt (attempts - 1) (read ())
           else conflict detail
         fun verify result =
-          case HolbuildRemoteCache.get_action remote key of
+          case read () of
               NONE => retry "action missing after publication"
             | SOME observed_text =>
                 let val observed = compatible_contract observed_text
@@ -2342,7 +2346,7 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
                   else retry "weaker proof-timeout observed after publication"
                 end
         fun publish_missing () =
-          case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame request of
+          case HolbuildRemoteCache.publish_action remote request of
               result as HolbuildCacheBackend.Published => verify result
             | result as HolbuildCacheBackend.AlreadyPresent => verify result
             | HolbuildCacheBackend.Conflict detail => retry detail
@@ -2385,6 +2389,14 @@ fun put_remote_theory_action remote _ (request as {key, text}) =
   end
   handle e as HolbuildRemoteCache.Unavailable _ => raise e
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+
+(* The result, and the remote's entry for the key as last read. *)
+fun publish_theory_action remote resident request =
+  let val seen = ref resident
+  in (publish_theory_action_seen seen remote request, !seen) end
+
+fun put_remote_theory_action remote _ (request as {key, ...}) =
+  #1 (publish_theory_action remote (HolbuildRemoteCache.get_action remote key) request)
 
 fun remote_cache_destination remote : HolbuildCacheTransfer.destination =
   (* Publishing also records the blob size needed by action metadata.  A
@@ -9605,7 +9617,8 @@ fun resident_weaker_but_for_dat key mine resident =
    (the build's own publish only warns), then puts the action.  A different
    entry already there is replaced when it records parents other than the
    restored ones or only its .dat differs and its timeout contract is weaker,
-   and otherwise left for check_remote_publication to judge. *)
+   and otherwise left for check_remote_publication to judge.  Returns the
+   remote's entry as last read, which saves that check a read. *)
 fun publish_action_entry remote root (spec : action_spec) =
   let
     val key = #input_key spec
@@ -9623,22 +9636,24 @@ fun publish_action_entry remote root (spec : action_spec) =
        (HolbuildCacheTransfer.unique_blobs manifest)
      handle e as HolbuildRemoteCache.Unavailable _ => raise e
           | e => raise action_failed PublishFailure ("could not publish the entry: " ^ General.exnMessage e));
-    case HolbuildRemoteCache.get_action remote key of
-        SOME resident =>
-          let
-            fun replace why =
-              (warn ("replacing remote cache entry " ^ key ^ ": " ^ why);
-               ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest}))
-          in
-            if (cache_manifest_outputs_equal key resident manifest handle _ => false) then ()
-            else if resident_misfits_parents remote root spec resident then
-              replace "its recorded parents differ from the cache's"
-            else if resident_weaker_but_for_dat key manifest resident then
-              replace "it differs only in its .dat and has a weaker timeout contract"
-            else ()
-          end
-      | NONE => ();
-    ignore (#put_action destination HolbuildCacheBackend.PutIfAbsentOrSame {key = key, text = manifest})
+    #2 (publish_theory_action remote
+          (case HolbuildRemoteCache.get_action remote key of
+               SOME resident =>
+                 let
+                   fun replace why =
+                     (warn ("replacing remote cache entry " ^ key ^ ": " ^ why);
+                      ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest});
+                      HolbuildRemoteCache.get_action remote key)
+                 in
+                   if (cache_manifest_outputs_equal key resident manifest handle _ => false) then SOME resident
+                   else if resident_misfits_parents remote root spec resident then
+                     replace "its recorded parents differ from the cache's"
+                   else if resident_weaker_but_for_dat key manifest resident then
+                     replace "it differs only in its .dat and has a weaker timeout contract"
+                   else SOME resident
+                 end
+             | NONE => NONE)
+          {key = key, text = manifest})
   end
 
 (* Step 6: publish the entry, then check that the remote holds an entry for
@@ -9647,9 +9662,12 @@ fun publish_action_entry remote root (spec : action_spec) =
 fun check_remote_publication remote root (spec : action_spec) =
   let
     val key = #input_key spec
-    val _ = publish_action_entry remote root spec
+    val published = publish_action_entry remote root spec
     val local_manifest = HolbuildCache.get_action (cache_root ()) key
-    val remote_manifest = HolbuildRemoteCache.get_action remote key
+    val remote_manifest =
+      case published of
+          NONE => HolbuildRemoteCache.get_action remote key
+        | SOME _ => published
     fun fail msg = raise ActionFailed (PublishFailure, msg)
   in
     case (local_manifest, remote_manifest) of
