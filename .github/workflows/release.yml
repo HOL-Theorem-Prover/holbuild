@@ -43,7 +43,7 @@ defaults:
     shell: bash
 
 env:
-  POLYML_TAG: v5.9.2-seq8
+  POLYML_TAG: v5.9.2-seq7
 
 jobs:
   coordinator-liveness:
