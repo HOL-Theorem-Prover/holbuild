@@ -2390,10 +2390,15 @@ fun publish_theory_action_seen seen remote (request as {key, text}) =
   handle e as HolbuildRemoteCache.Unavailable _ => raise e
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
-(* The result, and the remote's entry for the key as last read. *)
+(* The result, and, when RESIDENT was NONE, the remote's entry for the key as
+   last read, after the PUT.  Over a resident entry, publication may end
+   without reading again, and replica repair writes after its last read, so
+   then the caller reads itself. *)
 fun publish_theory_action remote resident request =
-  let val seen = ref resident
-  in (publish_theory_action_seen seen remote request, !seen) end
+  let
+    val seen = ref resident
+    val result = publish_theory_action_seen seen remote request
+  in (result, if Option.isSome resident then NONE else !seen) end
 
 fun put_remote_theory_action remote _ (request as {key, ...}) =
   #1 (publish_theory_action remote (HolbuildRemoteCache.get_action remote key) request)
@@ -9618,7 +9623,7 @@ fun resident_weaker_but_for_dat key mine resident =
    entry already there is replaced when it records parents other than the
    restored ones or only its .dat differs and its timeout contract is weaker,
    and otherwise left for check_remote_publication to judge.  Returns the
-   remote's entry as last read, which saves that check a read. *)
+   entry read after putting a new one, which saves that check a read. *)
 fun publish_action_entry remote root (spec : action_spec) =
   let
     val key = #input_key spec
