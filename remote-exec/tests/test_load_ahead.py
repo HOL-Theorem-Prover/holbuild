@@ -944,11 +944,12 @@ async def test_a_child_nearer_its_running_ancestors_wakes_a_waiting_claim_ahead_
 async def test_claiming_ahead_reads_each_ancestors_action_by_key(
     coordinator: Coordinator, remote_exec_engine: AsyncEngine
 ) -> None:
-    """Claiming ahead and naming the parents of what was claimed read each ancestor's action by key, whatever join
-    the database would pick for a batch its statistics don't know yet: not a scan of every unfinished action of
-    every batch, as when the ancestors were joined with the actions."""
+    """Claiming ahead and naming the parents of what was claimed read each action, the candidates and their
+    ancestors, by key, whatever join the database would pick for a batch of 5,000 actions its statistics don't know
+    yet: not a scan of every unfinished action of every batch, as when the ancestors were joined with the actions,
+    nor of every action of the batch, as when the candidates were read by their batch with their keys as a filter."""
     old, new = uuid4(), uuid4()
-    width, layers, parents = 32, 40, 5
+    width, layers, parents = 32, 157, 5
 
     async def add(connection: Any, batch_id: UUID) -> None:
         values = {"id": batch_id, "width": width, "parents": parents, "n": width * layers}
@@ -992,21 +993,76 @@ async def test_claiming_ahead_reads_each_ancestors_action_by_key(
             ),
             {"id": new, "keys": [f"k{i}" for i in range(width, 2 * width)]},
         )
-        # The join a large history's statistics led to: all the unfinished actions hashed, for a few ancestors.
-        await connection.execute(sa.text("SET LOCAL enable_nestloop = off"))
         walk = {"batch_id": new, "keys": [f"k{i}" for i in range(2 * width, 3 * width)], "depth": 2}
-        for query, values in (
-            (coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard", "taken": []}),
-            (coordinator_module.AHEAD_PARENTS, {**walk, "keys": walk["keys"][:1]}),
+        claiming = (coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard", "taken": []})
+        naming = (coordinator_module.AHEAD_PARENTS, {**walk, "keys": walk["keys"][:1]})
+        # The planner's own choice; nested loops alone; and the join a large history's statistics led to: all the
+        # unfinished actions hashed, for a few ancestors. Claiming locks its candidate's row through a join, which
+        # only a nested loop reads by key, but which no statistics make cheaper than a probe per candidate.
+        for settings, statements in (
+            ([], (claiming, naming)),
+            (["enable_hashjoin = off", "enable_mergejoin = off"], (claiming, naming)),
+            (["enable_hashjoin = on", "enable_mergejoin = on", "enable_nestloop = off"], (naming,)),
         ):
-            plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query.text}"), values)
-            reads = actions_read(plan[0]["Plan"])
-            assert reads and all("batch_id" in read for read in reads), reads
+            for setting in settings:
+                await connection.execute(sa.text(f"SET LOCAL {setting}"))
+            for query, values in statements:
+                plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query.text}"), values)
+                reads = actions_read(plan[0]["Plan"])
+                assert reads and all("input_key" in read for read in reads), (settings, reads)
         rows = await connection.execute(coordinator_module.AHEAD_PARENTS, {**walk, "keys": ["k64"]})
         assert [(row.input_key, row.distance) for row in rows] == [
             *((f"k{i}", 2) for i in range(2 * parents - 1)), *((f"k{width + i}", 1) for i in range(parents))
         ]
         await connection.rollback()
+
+
+async def test_claiming_ahead_passes_over_a_locked_candidate_and_locks_the_one_it_takes(
+    coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    """Claiming ahead takes the best candidate no other transaction holds, without waiting for one that does, and
+    holds the one it takes."""
+    batch_id = uuid4()
+    async with remote_exec_engine.begin() as connection:  # a running parent with two children, c0 the deeper
+        await connection.execute(
+            sa.text("INSERT INTO batches (id, state, profile, ahead_cap) VALUES (:id, 'running', 'default', 64)"),
+            {"id": batch_id},
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier, "
+                "critical_depth) VALUES (:id, 'p', 'ap', 's', 'pkg:p', 0, 'running', 'standard', 2), "
+                "(:id, 'c0', 'a0', 's', 'pkg:c0', 1, 'waiting', 'standard', 1), "
+                "(:id, 'c1', 'a1', 's', 'pkg:c1', 1, 'waiting', 'standard', 0)"
+            ),
+            {"id": batch_id},
+        )
+        await connection.execute(
+            sa.text("INSERT INTO edges (batch_id, input_key, parent_key) VALUES (:id, 'c0', 'p'), (:id, 'c1', 'p')"),
+            {"id": batch_id},
+        )
+    claiming = {"batch_id": batch_id, "keys": ["c0", "c1"], "tier": "standard", "depth": 2, "taken": []}
+    locking = sa.text("SELECT input_key FROM actions WHERE batch_id = :id AND input_key = :key FOR UPDATE NOWAIT")
+
+    async def claimed() -> str | None:
+        async with remote_exec_engine.begin() as connection:
+            row = (await connection.execute(coordinator_module.CLAIM_AHEAD_ACTION, claiming)).first()
+            await connection.rollback()
+        return None if row is None else row.input_key
+
+    assert await claimed() == "c0"
+    async with remote_exec_engine.connect() as holder, remote_exec_engine.connect() as claimer:
+        await holder.begin()
+        await holder.execute(locking, {"id": batch_id, "key": "c0"})
+        await claimer.begin()
+        await claimer.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+        assert (await claimer.execute(coordinator_module.CLAIM_AHEAD_ACTION, claiming)).scalar() == "c1"
+        await holder.rollback()
+        await holder.begin()
+        with pytest.raises(sa.exc.DBAPIError, match="could not obtain lock"):
+            await holder.execute(locking, {"id": batch_id, "key": "c1"})
+        await holder.rollback()
+        await claimer.rollback()
 
 
 async def test_reading_the_candidates_reads_each_childs_action_by_key(

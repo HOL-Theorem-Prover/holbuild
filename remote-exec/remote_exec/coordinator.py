@@ -505,14 +505,17 @@ KEY_LEASED = sa.text("SELECT EXISTS (SELECT 1 FROM leases WHERE input_key = :key
 # itself claimed ahead and still waits for parents, its unfinished parents, up to :depth generations up. Each step
 # reads one action's edges and parents by key, and so does ``ancestors`` each ancestor's row: the lookups are
 # subqueries on the row they start from, so that the database plans them by key whatever it guesses of a batch
-# inserted since its last statistics (a join with actions was planned as a scan of every unfinished action).
+# inserted since its last statistics (a join with actions was planned as a scan of every unfinished action). The
+# walk starts from the keys themselves, and :batch_id is read in a subquery: the database takes a batch it has no
+# statistics for, compared with a constant, for about one row, and reads it by batch alone, its keys as a filter
+# (every action of the batch); compared with a value it doesn't know in advance, it reads each key alone.
 AHEAD_WALK = """
 WITH RECURSIVE walk(batch_id, root, input_key, distance) AS (
-    SELECT a.batch_id, a.input_key, e.parent_key, 1 FROM actions a
+    SELECT k.batch_id, k.input_key, e.parent_key, 1
+    FROM (SELECT (SELECT CAST(:batch_id AS uuid)) AS batch_id, unnest(CAST(:keys AS text[])) AS input_key) k
     CROSS JOIN LATERAL unnest(ARRAY(
-        SELECT e.parent_key FROM edges e WHERE e.batch_id = a.batch_id AND e.input_key = a.input_key
+        SELECT e.parent_key FROM edges e WHERE e.batch_id = k.batch_id AND e.input_key = k.input_key
     )) AS e(parent_key)
-    WHERE a.batch_id = :batch_id AND a.input_key = ANY(CAST(:keys AS text[]))
     UNION
     SELECT w.batch_id, w.root, e.parent_key, w.distance + 1 FROM walk w
     CROSS JOIN LATERAL unnest(ARRAY(
@@ -584,18 +587,29 @@ ORDER BY b.priority DESC, (c.a).critical_depth DESC, (c.a).descendant_count DESC
 
 # Lock the best of a batch's candidates ``keys`` of ``tier`` that may still be claimed ahead, but not one whose key
 # another batch's live lease is building (single-flight; see CLAIM_ACTION) or in :taken: one with an unfinished
-# ancestor in its walk that isn't running, or one :depth generations up that still waits for parents.
-CLAIM_AHEAD_ACTION = sa.text(f"""{AHEAD_WALK}
-SELECT a.input_key, a.spec_sha256, a.theory FROM actions a
-WHERE a.batch_id = :batch_id AND a.input_key = ANY(CAST(:keys AS text[])) AND a.tier = :tier
-AND a.state = 'waiting' AND a.class = 'build' AND a.ahead <> 'abandoned' AND a.remaining_deps > 0
-AND a.input_key NOT IN (
+# ancestor in its walk that isn't running, or one :depth generations up that still waits for parents. Each
+# candidate's row is read by key, as in AHEAD_WALK, and checked; the one taken is then locked through its key. The
+# checks aren't made again on the row locked, which no other transaction changes in the meantime: it waits, and
+# every writer of a waiting action holds its batch's lock first, as the caller does. Checked on the row locked, they
+# let the database read the batch's unfinished actions of the tier instead, which it takes for none on a batch it has
+# no statistics for.
+CLAIM_AHEAD_ACTION = sa.text(f"""{AHEAD_WALK}, candidates AS MATERIALIZED (
+    SELECT (
+        SELECT c FROM actions c WHERE c.batch_id = (SELECT CAST(:batch_id AS uuid)) AND c.input_key = k.input_key
+    ) AS c
+    FROM unnest(CAST(:keys AS text[])) AS k(input_key)
+)
+SELECT a.input_key, a.spec_sha256, a.theory
+FROM candidates JOIN actions a ON a.batch_id = (c).batch_id AND a.input_key = (c).input_key
+WHERE (c).tier = :tier AND (c).state = 'waiting' AND (c).class = 'build' AND (c).ahead <> 'abandoned'
+AND (c).remaining_deps > 0
+AND (c).input_key NOT IN (
     SELECT root FROM ancestors WHERE state <> 'running' OR (distance = :depth AND remaining_deps > 0)
 )
-AND a.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
-AND a.input_key <> ALL(CAST(:taken AS text[]))
+AND (c).input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
+AND (c).input_key <> ALL(CAST(:taken AS text[]))
 ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
-LIMIT 1 FOR UPDATE SKIP LOCKED
+LIMIT 1 FOR UPDATE OF a SKIP LOCKED
 """)
 # The unfinished ancestors an action claimed ahead waits for, ancestors first (by their longest distance from it,
 # which for the first is the action's generation), then by key.
