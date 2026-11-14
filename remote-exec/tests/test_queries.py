@@ -269,16 +269,28 @@ def module_statements() -> dict[str, sa.TextClause]:
 
 
 def inline_statements() -> set[str]:
-    """The text of every literal ``sa.text`` call in coordinator.py, whitespace collapsed, but the module-level ones."""
+    """The text of every ``sa.text`` call in coordinator.py but the module statements', whitespace collapsed. A call
+    whose text isn't a literal fails, as does a module-level assignment of one that isn't a module statement: their
+    statements can't be matched to a budget."""
     tree = ast.parse(Path(coordinator_module.__file__).read_text())
-    module = {" ".join(value.text.split()) for value in module_statements().values()}
     texts = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "text":
+    module = module_statements()
+    for top in tree.body:
+        calls = [
+            node
+            for node in ast.walk(top)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "text"
+        ]
+        if isinstance(top, ast.Assign) and len(top.targets) == 1 and isinstance(top.targets[0], ast.Name):
+            assert not calls or top.targets[0].id in module, f"coordinator.py:{top.lineno}: not a module statement"
+            continue
+        for node in calls:
             (argument,) = node.args
-            if isinstance(argument, ast.Constant):
-                texts.add(" ".join(argument.value.split()))
-    return texts - module
+            assert isinstance(argument, ast.Constant), (
+                f"coordinator.py:{node.lineno}: sa.text of a computed string; make it a module-level statement"
+            )
+            texts.add(" ".join(argument.value.split()))
+    return texts
 
 
 def matching(fragment: str, texts: set[str]) -> list[str]:
