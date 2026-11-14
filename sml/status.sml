@@ -193,6 +193,9 @@ fun failure_kind message =
           String.isSubstring "\ntheorem: " message orelse String.isPrefix "theorem: " message orelse
           String.isSubstring "\nplan position: " message then
     "proof_failure"
+  (* HOL's term type checker: a statement or definition that does not type-check. *)
+  else if String.isSubstring "Preterm.type-analysis" message then
+    "type_error"
   else if String.isSubstring "child failure:" message orelse
           String.isSubstring "child log:" message orelse
           String.isSubstring "Couldn't load HOL base-state" message orelse

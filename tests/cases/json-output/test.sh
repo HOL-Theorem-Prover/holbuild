@@ -417,3 +417,31 @@ assert 'preceding HOL output:' in summary and 'HOL message: terminal context' in
 assert 'handled diagnostic' not in summary, summary
 assert len(summary.strip().splitlines()) <= 12, summary
 PY
+
+# A statement that HOL's term type checker rejects is a type error, not an opaque child failure.
+cat > "$project/src/StatementTypeErrorScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "StatementTypeError";
+Theorem ill_typed:
+  (0:num) = T
+Proof
+  cheat
+QED
+val _ = export_theory();
+SML
+if (cd "$project" && "$HOLBUILD_BIN" --json build StatementTypeErrorTheory) \
+    > "$tmpdir/statement-type.stdout" 2> "$tmpdir/statement-type.stderr"; then
+  echo "expected ill-typed statement build to fail" >&2
+  exit 1
+fi
+python3 - "$tmpdir/statement-type.stdout" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+events = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+failure = next(e for e in events if e.get('event') == 'node_failed')
+assert failure['target'] == 'StatementTypeErrorTheory' and failure['failure']['kind'] == 'type_error', failure
+message = next(e['message'] for e in events if e.get('event') == 'error')
+assert 'Preterm.type-analysis' in message, message
+PY
