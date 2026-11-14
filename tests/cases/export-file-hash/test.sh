@@ -55,6 +55,8 @@ handle e => (TextIO.output(TextIO.stdErr, General.exnMessage e ^ "\n");
              OS.Process.exit OS.Process.failure);
 SML
 
+# sha256sum calls count the hashes, so libcrypto is kept out.
+HOLBUILD_TEST_LIBCRYPTO=libholbuild-test-no-such-crypto.so \
 PATH="$tmpdir/bin:$PATH" EXPORT_HASH_TMP="$tmpdir" "${HOLBUILD_POLY:-poly}" \
   --gcthreads=1 --error-exit < "$tmpdir/check.sml" > "$tmpdir/check.log" 2>&1 || {
   cat "$tmpdir/check.log" >&2

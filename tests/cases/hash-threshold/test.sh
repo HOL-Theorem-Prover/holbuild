@@ -55,15 +55,22 @@ fun command_hash tool path =
   end
   handle e => (raise e)
 
+(* libcrypto hashes unless the test names a library that doesn't exist. *)
+val expect_libcrypto = not (isSome (OS.Process.getEnv "HOLBUILD_TEST_LIBCRYPTO"))
+val _ = assert ("libcrypto in use should be " ^ Bool.toString expect_libcrypto)
+          (HolbuildHash.uses_libcrypto () = expect_libcrypto)
+
 fun check_size size =
   let
     val path = join(tmp, "blob-" ^ Int.toString size ^ ".bin")
     val sha1 = command_hash "sha1sum" path
     val sha256 = command_hash "sha256sum" path
+    val text = HolbuildHash.read_binary_all path
   in
     assert ("HOL .dat sha1 mismatch at " ^ Int.toString size) (HolbuildBuildExec.hol_dat_hash path = sha1);
     assert ("sha256 mismatch at " ^ Int.toString size) (HolbuildHash.file_sha256 path = sha256);
-    assert ("string sha256 mismatch at " ^ Int.toString size) (HolbuildHash.string_sha256 (HolbuildHash.read_binary_all path) = sha256)
+    assert ("string sha256 mismatch at " ^ Int.toString size) (HolbuildHash.string_sha256 text = sha256);
+    assert ("large string sha256 mismatch at " ^ Int.toString size) (HolbuildHash.string_sha256_large text = sha256)
   end
 
 val sizes = [0, 1, 17, 55, 56, 63, 64, 119, 120, 4096, 5120, 65535, 65536, 196607, 196608, 307200]
@@ -82,12 +89,18 @@ val _ = assert "300 KB file should use large-file path" (HolbuildHash.large_file
 val _ = print "hash threshold and corpus tests passed\n"
 SML
 
-HASH_THRESHOLD_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-poly}" < "$tmpdir/hash-threshold-test.sml" > "$tmpdir/hash-threshold-test.log" 2>&1 || {
-  cat "$tmpdir/hash-threshold-test.log" >&2
-  exit 1
+no_libcrypto=libholbuild-test-no-such-crypto.so
+
+run_corpus() {
+  HASH_THRESHOLD_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-poly}" < "$tmpdir/hash-threshold-test.sml" > "$tmpdir/$1.log" 2>&1 || {
+    cat "$tmpdir/$1.log" >&2
+    exit 1
+  }
+  grep -q "hash threshold and corpus tests passed" "$tmpdir/$1.log"
 }
 
-grep -q "hash threshold and corpus tests passed" "$tmpdir/hash-threshold-test.log"
+run_corpus hash-threshold-libcrypto
+HOLBUILD_TEST_LIBCRYPTO=$no_libcrypto run_corpus hash-threshold-fallback
 
 shimdir="$tmpdir/shim"
 mkdir -p "$shimdir"
@@ -122,21 +135,37 @@ val large = join(tmp, "blob-307200.bin")
 val sentinel = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 val small_hash = HolbuildHash.file_sha256 small
 val large_hash = HolbuildHash.file_sha256 large
+val batch_hashes = HolbuildHash.files_sha256 [small, large]
+val large_text_hash = HolbuildHash.string_sha256_large (HolbuildHash.read_binary_all large)
 
 val _ = assert "5 KB SHA256 unexpectedly used external path" (small_hash <> sentinel)
-val _ = assert "300 KB SHA256 did not use external path" (large_hash = sentinel)
+val _ =
+  if HolbuildHash.uses_libcrypto () then
+    assert "libcrypto hashing used sha256sum"
+      (List.all (fn hash => hash <> sentinel) (large_hash :: large_text_hash :: batch_hashes))
+  else assert "300 KB SHA256 did not use external path" (large_hash = sentinel)
 val _ = print "hash path selection test passed\n"
 SML
 
-: > "$tmpdir/sha256-path.log"
-PATH="$shimdir:$PATH" HASH_THRESHOLD_TEST_TMP="$tmpdir" HASH_THRESHOLD_SHA256_LOG="$tmpdir/sha256-path.log" \
-  "${HOLBUILD_POLY:-poly}" < "$tmpdir/hash-path-selection.sml" > "$tmpdir/hash-path-selection.log" 2>&1 || {
-    cat "$tmpdir/hash-path-selection.log" >&2
-    exit 1
-  }
+run_path_selection() {
+  : > "$tmpdir/sha256-path.log"
+  PATH="$shimdir:$PATH" HASH_THRESHOLD_TEST_TMP="$tmpdir" HASH_THRESHOLD_SHA256_LOG="$tmpdir/sha256-path.log" \
+    "${HOLBUILD_POLY:-poly}" < "$tmpdir/hash-path-selection.sml" > "$tmpdir/$1.log" 2>&1 || {
+      cat "$tmpdir/$1.log" >&2
+      exit 1
+    }
+  grep -q "hash path selection test passed" "$tmpdir/$1.log"
+}
 
-grep -q "hash path selection test passed" "$tmpdir/hash-path-selection.log"
+# With libcrypto nothing starts sha256sum.
+run_path_selection hash-path-selection-libcrypto
+if [[ -s "$tmpdir/sha256-path.log" ]]; then
+  echo "libcrypto hashing started sha256sum:" >&2
+  cat "$tmpdir/sha256-path.log" >&2
+  exit 1
+fi
 
+HOLBUILD_TEST_LIBCRYPTO=$no_libcrypto run_path_selection hash-path-selection-fallback
 if grep -q "blob-5120.bin" "$tmpdir/sha256-path.log"; then
   echo "5 KB file unexpectedly called sha256sum" >&2
   exit 1
