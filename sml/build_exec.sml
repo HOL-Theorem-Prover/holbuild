@@ -10331,6 +10331,10 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
             if total <= target then publish shared
             else
               let
+                (* Eviction can outlast the stamp's life. The fresh walk
+                   only overestimates while it runs, so siblings within the
+                   limit reuse it instead of waiting on gc.lock. *)
+                val _ = publish shared
                 val (local_families, young_orphans) = local_cache_families cache
                 val families =
                   by_age ((if toolchains_owned_by_cache () then
@@ -10343,7 +10347,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                 (* Measure again rather than publish an estimate derived from
                    the mixed private and shared freed total, so a waiter on
                    gc.lock reuses the result rather than repeating the scan.
-                   Until then siblings keep reusing the previous stamp. *)
+                   Until then siblings keep reusing the pre-eviction walk. *)
                 if after <= target then publish (measure_shared ())
                 else (remove_file state_path;
                       warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
