@@ -342,9 +342,8 @@ run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \
   --output result --output manifest spec:CTheory > "$tmpdir/export4.txt"
 [[ $(key_of spec:CTheory "$tmpdir/export4.txt") != "$c_run_key" ]]
 
-# hol:* is every theory of the toolchain.  Its ~70 spec uploads stay under
-# the fixture server's listen backlog.
-hb --prefetch-concurrency 4 run-action --export-only --script "$runner/run.sml" \
+# hol:* is every theory of the toolchain.
+hb run-action --export-only --script "$runner/run.sml" \
   --output o 'hol:*' > "$tmpdir/all.txt"
 grep -q '^HOL:boolTheory ' "$tmpdir/all.txt"
 grep -q '^HOL:arithmeticTheory ' "$tmpdir/all.txt"
