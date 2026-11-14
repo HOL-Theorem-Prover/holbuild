@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
 from remote_exec import app as app_module
 from remote_exec import coordinator as coordinator_module
+from remote_exec.cache_pool import CacheSlot
 from remote_exec.coordinator import (
     Coordinator,
     HostReport,
@@ -23,6 +24,7 @@ from remote_exec.coordinator import (
     burst_demand,
     is_auth_failure,
 )
+from test_cache_pool import Provider
 from test_coordinator import claim, input_key, submit
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -148,6 +150,58 @@ async def test_sweep_runs_the_scale_command_when_the_held_target_changes_and_kee
     await restarted.sweep()
 
     assert calls.read_text().split() == ["0", "2", "2", "0"]
+
+
+async def test_cache_pool_holds_its_worker_floor_past_the_shorter_worker_hold(
+    http: httpx.AsyncClient, coordinator: Coordinator, tmp_path: Path
+) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = start
+
+    def at(seconds: float) -> None:
+        nonlocal now
+        now = start + timedelta(seconds=seconds)
+
+    scaled, calls = scaled_coordinator(coordinator, tmp_path, "")
+    settings = scaled.settings.model_copy(update={
+        "scale_down_hold_s": 60.0,
+        "cache_scale_down_hold_s": 900.0,
+        "cache_pool_cmd": "unused",
+        "cache_slots": [CacheSlot(name=str(n), url=f"http://cache-{n}.test") for n in range(4)],
+        "cache_workers_per_node": 1,
+    })
+    scaled = Coordinator(scaled.engine, scaled.cache, settings)
+    scaled.clock = lambda: now
+    assert scaled.cache_pool is not None
+    provider = Provider()
+    scaled.cache_pool.adapter = provider
+
+    async def capacity() -> int:
+        assert scaled.cache_pool is not None
+        await scaled.cache_pool.reconcile(now)
+        target = [r.target for r in provider.calls if r.op == "capacity"][-1]
+        assert target is not None
+        return target
+
+    await submit(http, ["a", "b", "c"])
+    await scaled.sweep()
+    assert await capacity() == 2
+    async with scaled.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE actions SET state = 'cancelled'"))
+    at(120)
+    await scaled.sweep()  # past the worker hold: the workers go, the caches stay
+    assert calls.read_text().split() == ["2", "0"]
+    assert await capacity() == 2
+    at(901)
+    await scaled.sweep()
+    assert await capacity() == 0
+    provider.cpu_target = 3  # CPU recommendations keep the shorter hold
+    assert await capacity() == 3
+    provider.cpu_target = 0
+    at(959)
+    assert await capacity() == 3
+    at(962)
+    assert await capacity() == 0
 
 
 async def test_queue_reports_the_burst_worker_cap(http: httpx.AsyncClient, coordinator: Coordinator) -> None:

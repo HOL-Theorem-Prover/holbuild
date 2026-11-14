@@ -120,6 +120,10 @@ class Settings(BaseSettings):
     warm_workers: int = 0
     max_burst_workers: int = 0
     scale_down_hold_s: float = 900.0
+    # The burst cache pool's own hold on the worker floor. Worker hosts get a further scale-in delay from their
+    # capacity provider, which lets scale_down_hold_s stay short; cache nodes get none, and each one terminated
+    # loses its warm disk.
+    cache_scale_down_hold_s: float = Field(default=900.0, ge=0, allow_inf_nan=False)
     cache_pool_cmd: str | None = None
     cache_slots: list[CacheSlot] = Field(default_factory=list)
     cache_workers_per_node: int = Field(default=15, ge=0)
@@ -767,7 +771,9 @@ class Coordinator:
         self.serving: tuple[float, list[str]] | None = None  # when the serving slots were last read, and them
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
         self.cache_pool = (CachePool(engine, settings.cache_slots, CommandAdapter(settings.cache_pool_cmd),
-                                     drain_seconds=settings.cache_drain_seconds, hold_seconds=settings.scale_down_hold_s,
+                                     drain_seconds=settings.cache_drain_seconds,
+                                     hold_seconds=settings.cache_scale_down_hold_s,
+                                     cpu_hold_seconds=settings.scale_down_hold_s,
                                      workers_per_node=settings.cache_workers_per_node,
                                      max_workers=settings.max_burst_workers,
                                      launch_timeout_seconds=settings.cache_launch_timeout_seconds)
@@ -2030,7 +2036,8 @@ class Coordinator:
             async with self.engine.begin() as conn:
                 await conn.execute(
                     sa.text("DELETE FROM burst_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"),
-                    {"now": now, "hold": self.settings.scale_down_hold_s},
+                    # The cache pool reads these samples too, over its own hold.
+                    {"now": now, "hold": max(self.settings.scale_down_hold_s, self.settings.cache_scale_down_hold_s)},
                 )
                 await conn.execute(
                     sa.text("INSERT INTO burst_demand (at, workers) VALUES (:now, :workers)"),

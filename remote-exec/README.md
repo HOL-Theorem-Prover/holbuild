@@ -129,6 +129,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
 | `REMOTE_EXEC_SCALE_DOWN_HOLD_S` | how long a higher burst worker count is kept after demand drops | 900 |
+| `REMOTE_EXEC_CACHE_SCALE_DOWN_HOLD_S` | how long the burst cache pool keeps the capacity a higher burst worker count needed (see "Temporary cache members") | 900 |
 | `REMOTE_EXEC_SCALE_CMD` | command run as `<command> <burst workers>` when that count changes | none |
 
 The database URL is read once, at start. When the database refuses the
@@ -935,8 +936,12 @@ without holding a database transaction open during provider calls. The
 controller keeps reconciling and heartbeating hooks when capacity is disabled,
 so disabling scale-out can still drain existing instances.
 
-`REMOTE_EXEC_CACHE_WORKERS_PER_NODE` maps the existing held burst-worker target
-to cache capacity by ceiling division, capped at the number of slots. Each
+`REMOTE_EXEC_CACHE_WORKERS_PER_NODE` maps the burst-worker demand, held for
+`REMOTE_EXEC_CACHE_SCALE_DOWN_HOLD_S` seconds (default 900), to cache capacity
+by ceiling division, capped at the number of slots. That hold is separate from
+the workers' `REMOTE_EXEC_SCALE_DOWN_HOLD_S`, so a deployment whose worker hosts
+get a further scale-in delay elsewhere can keep the worker hold short without
+cache nodes, and their warm disks, following every dip in demand. Each
 controller rereads shared held demand while holding the capacity writer lock;
 a delayed replica cannot overwrite it with a local snapshot. The
 default is 15 worker tasks per added cache; zero requests no temporary capacity.
