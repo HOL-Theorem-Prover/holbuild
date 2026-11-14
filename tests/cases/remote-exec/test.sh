@@ -1200,9 +1200,11 @@ SML
 # The theory builds a run starts: a local build would run HOL here.
 local_hol_runs() { grep -c "kind=run_in_dir_to_file" "$1" || true; }
 write_broken one
-HOLBUILD_TIMING_LOG=$tmpdir/proof.timing run proof 1 build --remote-exec "$coordinator" BTheory
+: > "$tmpdir/server/requests.log"
+HOLBUILD_TIMING_DETAIL=fine HOLBUILD_TIMING_LOG=$tmpdir/proof.timing run proof 1 build --remote-exec "$coordinator" BTheory
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/proof.log")
-log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $2 }' "$state/$batch.batch")")
+b_key=$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $2 }' "$state/$batch.batch")
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$b_key")
 require_grep "remote rxp:BTheory: failed (proof), log /cas/$log_sha" "$tmpdir/proof.log"
 require_grep "remote execution: batch $batch failed: an action failed; remote workers finished 1 of 2 theories" "$tmpdir/proof.log"
 require_grep "ATheory restored from cache" "$tmpdir/proof.log"
@@ -1216,6 +1218,13 @@ refute_grep "Theory built\|building locally" "$tmpdir/proof.log"
 [[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$log_sha" ]] ||
   { echo "the local build log is not the worker's" >&2; exit 1; }
 [[ $(local_hol_runs "$tmpdir/proof.timing") -eq 0 ]] || { cat "$tmpdir/proof.timing" >&2; exit 1; }
+# B is looked up once before the batch and once by its worker; the restore
+# after the batch doesn't look it up again, since it failed.
+b_ac=$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $3 }' "$state/$batch.batch")
+[[ $(grep -c "^GET /ac/$b_ac$" "$tmpdir/server/requests.log") -eq 2 ]] ||
+  { echo "BTheory looked up after its batch failed:" >&2; cat "$tmpdir/server/requests.log" >&2; exit 1; }
+# The report needs only where B's proofs are, not their checkpoints.
+refute_grep "build\.exec\.node\.\(proof_ir_plan\|checkpoint_specs\)" "$tmpdir/proof.timing"
 
 # --remote-only reports it the same way: a local build wouldn't help, so
 # the exit status is 1, not 75.
