@@ -888,6 +888,16 @@ deps_loaded.save         after resolved ancestors are loaded in topological orde
 <thm>_context.save       after the theorem has been stored in the theory context
 ```
 
+Each context save forces a full garbage collection, so a context is saved only
+once the time since the last context save ended reaches max(N, 10 x that
+save's duration), counted from when the dependencies are loaded. N is build's
+`--checkpoint-seconds` (default 2 s; 0 saves every context). It reaches remote
+workers as a spec option and is in no key, since it changes which states are
+saved, not what a build produces. Saving costs at most about a tenth of the
+proof time, and a resume replays at most that much finished work before the
+edit. A skipped context is removed, never left from an earlier run. The test
+suite sets `HOLBUILD_CHECKPOINT_EVERY_CONTEXT=1` to save every context.
+
 Holbuild saves no state after the theory is exported. Current HOL versions seal
 a theory when it is exported, so saving one would take a second process that
 loads the generated theory, and nothing would read the result. Source execution

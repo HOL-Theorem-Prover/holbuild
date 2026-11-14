@@ -33,7 +33,8 @@ val build_cache_flags =
    "--all-checkpoints", "--skip-proof-steps", "--trace-steps", "--retain-debug-artifacts",
    "--emit-output-hashes", "--warn-unreachable", "--trknl"]
 val build_cache_valued =
-  [("--proof-scope", Words ["root", "all"]), ("--tactic-timeout", Nothing), ("--tool-cache", Nothing)]
+  [("--proof-scope", Words ["root", "all"]), ("--tactic-timeout", Nothing), ("--checkpoint-seconds", Nothing),
+   ("--tool-cache", Nothing)]
 
 fun command name : command =
   case name of

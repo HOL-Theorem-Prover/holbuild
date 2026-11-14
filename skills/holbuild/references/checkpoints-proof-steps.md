@@ -42,6 +42,8 @@ During a theory build, checkpoints may be created at syntactic boundaries:
 | `<thm>_context.save` | Theorem stored in theory context | Resume before the next declaration |
 | `<thm>_failed_prefix.save` | Failed proof after a reusable prefix | Fast rebuild after editing a failing suffix |
 
+A context checkpoint (after a theorem or a definition) is saved only once at least max(N, 10 x the last context save's duration) has passed since that save, since each save forces a full GC. N is `build --checkpoint-seconds N` (default 2; 0 saves every context); it changes no cache key. A resume starts from the latest context saved before the edit and replays the declarations after it.
+
 Export seals a theory in current HOL versions, so no state is saved after it: the source process exports and exits, and dependents load the generated theory through its manifest. A generated theory that fails to load fails its first dependent.
 
 Successful source builds retain reusable deps/theorem-context checkpoints for future proof edits and clear stale failed-prefix checkpoints for that source. Failed/interrupted builds may leave failed-prefix and partial debug breadcrumbs. `holbuild gc` removes old checkpoint families and enforces the default 5GB project checkpoint budget.
