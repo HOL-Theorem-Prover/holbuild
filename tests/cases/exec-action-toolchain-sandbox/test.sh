@@ -224,6 +224,12 @@ run_worker "$worker" "$(retarget "$hol_rev")" "$tmpdir/analyser-retry.log"
 require_grep "the toolchain's identity does not match the action text" "$tmpdir/analyser-retry.log"
 [[ -n $(find "$entry/analysers" -name build.ok) ]]
 
+# Actions only read a built toolchain, so the worker does not recheck its
+# checkout: one dirtied from outside still serves.
+echo '# dirty' >> "$entry/hol/.gitignore"
+run_worker "$worker" "$(retarget "$hol_rev")" "$tmpdir/dirty.log"
+require_grep "the toolchain's identity does not match the action text" "$tmpdir/dirty.log"
+
 # A published archive whose manifest is not a regular file is refused before
 # anything reads it (a FIFO would block the reader for good).
 python3 - "$tmpdir/remote" <<'PY'

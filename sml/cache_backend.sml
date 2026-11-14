@@ -56,6 +56,8 @@ sig
   val copy_binary : string -> string -> unit
   val link_or_copy : {src : string, dst : string} -> unit
   val verify_blob : t -> string -> bool
+  (* Return the hashes whose resident blobs pass content verification. *)
+  val verified_blobs : t -> string list -> string list
   (* Takes ownership of a temporary file whose bytes have already been
      verified against hash. Other publishers must use publish_blob. *)
   val consume_verified_blob : t -> {hash : string, src : string} -> HolbuildCacheBackend.publish_result

@@ -497,6 +497,20 @@ val _ = assert "a later request fails without a retry"
                (case tls_get () of HolbuildHttp.Failed _ => true | _ => false)
 val _ = assert "a later request connects once" (tls_accepted () = accepted_before + 1)
 
+(* A request leaves its connection pooled and the reaper waiting for the idle
+   timeout.  Exiting asks every thread to stop, as Thread.kill does, and waits
+   for them: a reaper waiting on its condition variable stops at once, but a
+   sleeping one only once its one-second sleep ends.  Timing the kill rather
+   than the whole exit leaves out Poly/ML freeing its heap, which takes
+   hundreds of milliseconds on a busy machine. *)
+val _ = wait_for_empty_pool ()
+val _ = assert "a request leaves the reaper running"
+               (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/fast.out", timeout = 30} = HolbuildHttp.Response 200)
+val reaper = valOf (!HolbuildHttp.reaper_thread)
+val deadline = Time.+ (Time.now (), Time.fromMilliseconds 500)
+val _ = Thread.kill reaper
+val _ = wait_for "the reaper to stop" (fn () => not (Thread.isActive reaper)) deadline
+
 val _ = print "http tests passed\n"
 SML
 

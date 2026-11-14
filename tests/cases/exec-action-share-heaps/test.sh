@@ -281,6 +281,21 @@ expect v7 0 "status=built"
 resumed v7 "theorem-context checkpoint after t4" "theorem_context checkpoint"
 same_outputs v7
 
+# That context's restored spine holds t3's failed prefix, yet a later
+# theorem that fails still saves its own failed prefix beside it.
+write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "FAIL_TAC \"after the context\""
+export_t v7f
+forget_local
+worker v7f "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v7f 1 "status=failed" "failure=proof"
+require_grep "after the context" "$tmpdir/v7f.log"
+resumed v7f "theorem-context checkpoint after t4" "theorem_context checkpoint"
+if grep -q "Permission denied" "$tmpdir/v7f.log"; then
+  echo "v7f could not save its failed prefix" >&2
+  cat "$tmpdir/v7f.log" >&2
+  exit 1
+fi
+
 # The cache loses the heap's blob but keeps the entries naming it: the
 # worker loads cold, replaces the entries, and the next edit resumes again.
 heap_blob=$(find "$shared/checkpoint-store" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
@@ -318,11 +333,23 @@ if tail -n +"$((before_again + 1))" "$requests" | grep -qxF "$source_get"; then
 fi
 
 # A store on another file system than the action's checkpoints, as a store
-# on its own mount is: states are copied into private writable files, and
-# the worker still resumes from them.
+# on its own mount is: states are linked symbolically, the worker still
+# resumes from them, and the child can't write them.  t5's proof tries to,
+# for each link it finds in the checkpoint tree.
 if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmpdir") ]]; then
   other_fs=$(mktemp -d /dev/shm/holbuild-share-heaps.XXXXXX)
-  write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "MATCH_ACCEPT_TAC TRUTH"
+  probe_links="(fn g => let
+    fun walk dir =
+      let val s = OS.FileSys.openDir dir
+          fun loop () = case OS.FileSys.readDir s of NONE => () | SOME n => (visit (OS.Path.concat (dir, n)); loop ())
+      in loop (); OS.FileSys.closeDir s end
+    and visit p =
+      if Posix.FileSys.ST.isLink (Posix.FileSys.lstat p) then
+        ((TextIO.closeOut (TextIO.openAppend p); raise Fail (\"wrote a restored state: \" ^ p))
+         handle IO.Io _ => print \"restored state read-only\\n\")
+      else if OS.FileSys.isDir p then walk p else ()
+  in (walk \"$shared/checkpoints\" handle OS.SysErr _ => ()); MATCH_ACCEPT_TAC TRUTH g end)"
+  write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "$probe_links"
   export_t v10
   cold v10 0
   forget_local
@@ -330,11 +357,13 @@ if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmp
   ln -s "$other_fs" "$shared/checkpoint-store"
   worker v10 "$shared_url" "$shared" "$spec_t" --share-heaps
   expect v10 0 "status=built"
-  if grep -q 'linking its states symbolically' "$tmpdir/v10.log"; then
-    echo 'sandboxed worker exposed linked checkpoint store states' >&2
-    exit 1
-  fi
+  require_grep 'linking its states symbolically' "$tmpdir/v10.log"
   resumed v10 "theorem-context checkpoint after t4" "theorem_context checkpoint"
+  v10_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/v10.result")
+  require_grep 'restored state read-only' "$tmpdir/remote/cas/$v10_log"
+  for state in "$other_fs"/*/*; do
+    [[ $(sha256sum "$state" | cut -d' ' -f1) == "$(basename "$state")" ]] || { echo "store state changed: $state" >&2; exit 1; }
+  done
   same_outputs v10
 else
   echo "skipping the cross-file-system store: no /dev/shm on another file system"
@@ -462,3 +491,46 @@ worker interrupted-resume "$shared_url" "$interrupted" "$spec_interrupt" --share
 expect interrupted-resume 0 "status=built"
 require_grep 'restored shared .* checkpoint' "$tmpdir/interrupted-resume.log"
 require_grep 'checkpoint after completed' "$tmpdir/interrupted-resume.log"
+
+# A theory with declared outputs replays its whole script, so it saves every
+# theorem context again: the worker restores only the dependency heap, never a
+# context it would save over.
+write_x() {
+  cat > "$project/src/XScript.sml" <<SML
+fun holbuild_extra_outputs (_ : string list) = ()
+val _ = holbuild_extra_outputs ["results/X.out"]
+val _ = let val out = TextIO.openOut "results/X.out" in TextIO.output (out, "x\\n"); TextIO.closeOut out end
+Theory X
+Ancestors A
+Theorem x1:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+Theorem x2:
+  T
+Proof
+  $1
+QED
+SML
+}
+export_x() {
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload XTheory) > "$tmpdir/x-$1.batch"
+  spec_x=$(field "$tmpdir/x-$1.batch" share:XTheory 4)
+}
+write_x "simp[]"
+export_x 1
+worker x1 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x1 0 "status=built"
+write_x "ACCEPT_TAC TRUTH"
+export_x 2
+forget_local
+worker x2 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x2 0 "status=built"
+require_grep "restored shared deps-loaded heap" "$tmpdir/x2.log"
+x2_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/x2.result")
+if grep -q "dropping checkpoint\|restored shared theorem_context" "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log"; then
+  echo "the extra-output theory resumed into restored contexts" >&2
+  cat "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log" >&2
+  exit 1
+fi

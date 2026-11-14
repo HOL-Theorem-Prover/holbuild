@@ -20,8 +20,22 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 2s --health-retries 30
     steps:
       - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+      - name: Bound coordinator HTTP liveness under 400 concurrent claimers
+        working-directory: remote-exec
+        run: uv run --frozen pytest -q -s tests/test_http_liveness.py
+        env:
+          REMOTE_EXEC_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
 
       - name: Read HOL4 pin
         id: hol4-pin
@@ -145,7 +159,7 @@ jobs:
           HOLBUILD_TEST_HOL_REV: ${{ steps.legacy-hol4-pin.outputs.hol4-ref }}
         run: >-
           make HOLDIR="$HOLDIR" test
-          TESTS="proof-attributes tactic-parse-compatibility proof-step-runtime-semantics proof-ir-branch-composition-behavior failed-prefix-structural-edit checkpoint-recovery termination-diagnostics"
+          TESTS="proof-attributes tactic-parse-compatibility proof-step-runtime-semantics proof-ir-branch-composition-behavior failed-prefix-structural-edit checkpoint-recovery termination-diagnostics smt-tactic-timeout"
 
   theory-modules:
     runs-on: ubuntu-latest
@@ -157,12 +171,8 @@ jobs:
         id: module-hol4-pin
         run: echo "hol4-ref=$(tr -d '[:space:]' < tests/HOL_THEORY_MODULES_REV)" >> "$GITHUB_OUTPUT"
 
-      # Theory modules need the dependent-module support of the
-      # v5.9.2-seq4 runtime; v5.9.2-seq5 leaves it out.
       - uses: ./.github/actions/setup-polyml
         id: polyml
-        with:
-          polyml-tag: v5.9.2-seq4
 
       - name: Configure holbuild test cache
         run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"

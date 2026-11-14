@@ -205,6 +205,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class Server(http.server.ThreadingHTTPServer):
+    # The default listen backlog of 5 overflows when a burst of parallel
+    # requests arrives while a loaded machine has this process waiting for a
+    # CPU, and the client then sees its connections reset.
+    request_queue_size = 1024
+
+
+server = Server(("127.0.0.1", 0), Handler)
 port_file.write_text(str(server.server_address[1]), encoding="utf-8")
 server.serve_forever()

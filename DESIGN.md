@@ -638,7 +638,8 @@ manifests the spec ships.
 With the action text, dependencies named but not keyed, that hash gives a pair
 key, and the remote cache maps the pair to the input key of the last build
 on it (an action entry `holbuild-early-cutoff-v1` with one `input-key=` line).
-On a hit, the worker restores that build's entry with the checks a dependency
+The worker looks the pair up beside the action's own entry, since a miss
+asks every cache node in turn. On a hit, the worker restores that build's entry with the checks a dependency
 restore makes (the timeout contract, the extra outputs, and the parent `.dat`
 hashes its `.dat` records), copies it to the action's input key, publishes it
 there and reports `cached`. On a miss or any doubt it builds, and then points
@@ -694,6 +695,44 @@ conflicts still keep the first entry; remote publication and archive import
 still reject conflicts, except that a remote-exec worker replaces a remote
 entry whose recorded parents differ from the parents it restored from the
 remote cache, since no build can use it.
+
+### Persistent action root on workers
+
+A worker's action root keeps the dependencies one action restored for the
+next, at the same absolute paths, so heap and checkpoint keys, which name
+those paths, are unchanged. Only `exec-action` writes it, under the worker's
+action lock; a theory child reads it and writes only `.holbuild/stage`,
+`logs`, `tool-cache` and `ahead`. Around each action the worker removes
+everything in the root but `.holbuild/{obj,packages,action-src,action-extra}`,
+which the hydrate prunes, and its marker. The
+worker records what it installed (`<cache root>/action-resident`): each
+dependency theory with its key, the SHA-256 of the local cache manifest it
+came from, the parent names its `.uo` was generated from, and the hashes the
+parent check and the early cutoff read; each source, input and library by
+SHA-256; each library manifest by its text's SHA-256. It trusts them only
+while the root holds the marker `.holbuild/resident`, which an older release,
+removing the root around its actions, removes with it; emptying the root
+removes the records first. A spec must name each path it writes in canonical
+form, its files under `.holbuild/action-src` and its objects under
+`.holbuild/obj` or `.holbuild/packages`, its outputs as one stem's, and no
+path twice: otherwise a kept item could stand for files another replaced. A hydrate keeps an item
+whose record matches what the spec names and, for a theory, whose local cache
+manifest is unchanged (the stale check drops a local copy, which then
+reinstalls); it rewrites a kept theory's `.uo` when this spec resolves its
+parents to other stems, and removes every item the spec doesn't name, so the
+root ends as a cold hydrate leaves it. The parent check and the cutoff read
+the records rather than hashing ~4 files per dependency. The stems the action
+writes besides its dependencies (its own outputs, and with loading ahead its
+late parents) are emptied and recorded as scratch, which the next hydrate
+removes or reinstalls. Extra outputs lie under their theory's key in
+`.holbuild/action-extra`; the hydrate removes those of every key it doesn't
+record, as an early cutoff restores the action's own under its earlier key.
+The hydrate deletes the record file before it changes
+the tree and writes it back once it passed, so a worker stopped part way
+starts from an empty root. Script runs put every object directory under the
+root on `loadPath`, so they start from an empty root, leave no records, and the root is removed
+after them. The
+cache cap doesn't count the root: it holds one spec's dependencies.
 
 ## Global cache
 
@@ -1076,6 +1115,16 @@ property of the declared entry point graph, not of the current request, except t
 but local metadata/cache records the timeout a successful build satisfied; a success under
 60s may satisfy a later 180s request, while a success under 180s does not satisfy a later
 60s request.
+
+Steps containing a public `HolSmtLib` tactic name (`GENERIC_SMT_TAC`, `CVC_TAC`,
+`CVC_ORACLE_TAC`, `YICES_TAC`, `Z3_TAC`, `Z3_ORACLE_TAC`, `cvc_tac`, `cvco_tac`,
+`z3_tac`, or `z3o_tac`) run without the step timeout: solver execution and proof
+replay can exceed the ordinary tactic budget. Names may be unqualified or under
+any structure qualifier. Matching uses identifiers in the tactic program, ignoring
+comments and string/term quotations. If one executable step mixes an SMT call with
+other work, that entire step is untimed; other planned steps keep their limits.
+Aliases with different names are not recognized. Timeout metadata and cache key
+formats are unchanged; existing successful builds remain reusable.
 
 A step that exceeds its timeout runs once more, at once and in the same process, with
 half the timeout. Each timed call computes its result from the proof state it was given

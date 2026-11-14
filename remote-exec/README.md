@@ -38,7 +38,7 @@ what building holbuild and HOL takes. Its entrypoint takes `migrate`,
 docker run -e REMOTE_EXEC_DATABASE_URL=postgresql+asyncpg://user:pass@host/remote_exec holbuild-remote-exec migrate
 docker run -p 8090:8090 -e REMOTE_EXEC_DATABASE_URL=... -e REMOTE_EXEC_CLIENT_TOKEN=... \
   -e REMOTE_EXEC_WORKER_TOKEN=... -e REMOTE_EXEC_CACHE_URL=https://user:pass@cache.example.org \
-  holbuild-remote-exec coordinator [uvicorn options, default --host 0.0.0.0 --port 8090]
+  holbuild-remote-exec coordinator [uvicorn options, default --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2]
 ```
 
 Without the image, from this directory: `uv sync`, then `uv run alembic
@@ -122,11 +122,14 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_EVENTS_POLL_SECONDS` | least time between an event stream's reads of its batch, which a write to it by the same coordinator process starts | 1 |
 | `REMOTE_EXEC_EVENTS_FALLBACK_SECONDS` | most time between an event stream's reads, for other coordinator processes' writes | 10 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
+| `REMOTE_EXEC_AHEAD_DEPTH` | how many generations of running ancestors an action may be claimed ahead of, 0 for no limit (see "Loading ahead") | 1 |
 | `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
+| `REMOTE_EXEC_DEFAULT_PRIORITY_FLOOR` | running builds of priority-0 batches allowed ahead of higher priorities (see Claims); 0 for strict priority | 32 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
 | `REMOTE_EXEC_SCALE_DOWN_HOLD_S` | how long a higher burst worker count is kept after demand drops | 900 |
+| `REMOTE_EXEC_CACHE_SCALE_DOWN_HOLD_S` | how long the burst cache pool keeps the capacity a higher burst worker count needed (see "Temporary cache members") | 900 |
 | `REMOTE_EXEC_SCALE_CMD` | command run as `<command> <burst workers>` when that count changes | none |
 
 The database URL is read once, at start. When the database refuses the
@@ -458,6 +461,10 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   empty rankings remain valid for `REMOTE_EXEC_CLAIM_RANKING_SECONDS`
   (0.5 s), and releases invalidate rankings that miss newly ready work.
   Refreshing an exhausted ranking waits outside the claim transaction.
+  Shared reads publish their result and clear their slot before completing:
+  a stale completed task must not keep callers spinning while its cleanup waits.
+  Ahead-only notifications wake capable claims without making ordinary idle
+  workers retry, and peer batches invalidate ahead reads only when they opted in.
   Set the floor back to 0 and restart the coordinator
   to restore strict build priority. Claims select with `FOR UPDATE SKIP LOCKED`,
   write a lease with an expiry and commit; no transaction stays open while
@@ -466,7 +473,10 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   equal priorities, then the one that least recently had an action
   claimed (one that never had goes first), then the oldest: a new batch gets
   the next free worker among equal-priority batches even while a wide one holds
-  the rest, and those batches take turns when there are more of them than workers. Within the batch, it
+  the rest, and those batches take turns when there are more of them than workers. One exception: while
+  fewer than `REMOTE_EXEC_DEFAULT_PRIORITY_FLOOR` builds of priority-0 batches are running, the
+  priority-0 batches go first in their tiers, so a wave of higher priorities never takes every worker;
+  0 restores strict priority. Within the batch, it
   picks the action with the longest chain of dependents in the batch, then
   the one with the most dependents, then by theory name, so the critical
   path starts first and the ready frontier widens fastest. An expired lease returns the
@@ -483,22 +493,34 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   network partition, nothing depends on exactly-once execution: a second run
   finds the result cached.
 - **Loading ahead**, for a batch submitted with `speculative_loading=<cap>`:
-  a worker that says it can (`"ahead": true`) and finds nothing ready in any
-  batch may claim a waiting build action of the batch whose parents that
-  aren't done are all running and wait for no parent of their own, so a claim
-  goes one generation ahead. Its worker loads the action's ancestors that
-  exist and waits for the running parents' outputs, which the claim names in
-  `ahead_parents`. At most `<cap>` of a batch's actions wait ahead at once;
+  a worker that says it can (`"ahead": true`) and finds nothing ready of the
+  batch's priority or higher (in the same tier or an earlier one) may claim a
+  waiting build action of the batch whose parents that
+  aren't done are all running, at most `REMOTE_EXEC_AHEAD_DEPTH` generations
+  ahead (with 0, any number): a running action that waits for no parent is generation 0, and one
+  claimed ahead is a generation after its latest running parent. Its worker
+  loads the action's ancestors that exist and waits for the outputs of the
+  running ones, which the claim names in `ahead_parents`, ancestors first. At most `<cap>` of a batch's actions wait ahead at once;
   among the candidates of the batches below their cap, the claim takes its
   first tier with one, then the highest batch priority, then the longest chain
-  of dependents. A parent
+  of dependents. Claims share one read of the candidates: a claim takes the
+  last read if it began after the claim asked, or if it is younger than
+  `REMOTE_EXEC_CLAIM_RANKING_SECONDS` and no parent finished, went back to
+  waiting or was claimed ahead since; so a plain claim's waiting children
+  become candidates from the next read. A parent
   finishing recounts its running children's unfinished parents; a parent that
   fails for good cancels them as it does every descendant. A parent that goes
   back to waiting (a retry, an expired lease, a done parent built again)
   revokes the leases of the actions claimed ahead of it, and of those claimed
-  ahead of them, and sends them back to waiting without counting the claim; so
+  ahead of them, also across ancestors claimed ahead that have finished since,
+  and sends them back to waiting without counting the claim; so
   does a lease that expires while its action waits ahead. Batches without the
-  parameter are never claimed ahead.
+  parameter are never claimed ahead. An action runs the `exec-action` of the
+  holbuild release that exported it, and only 0.14.36 and later serve claims
+  more than one generation ahead: raise `REMOTE_EXEC_AHEAD_DEPTH` above 1 only
+  once the clients that submit `speculative_loading` batches run such a
+  release. An older one may abandon such a claim (`ahead-abandoned`), which is
+  then built plain.
 - **Retries** by the result's failure class:
 
   | `failure` | What happens |
@@ -604,16 +626,21 @@ worker can't run one fixed holbuild. Before each action it reads the
 `holbuild-version` line of the action's spec (from `/cas/<spec_sha256>` in the
 remote cache) and runs that release. It first checks
 `/opt/holbuild-baked/v<version>/bin/holbuild` for an executable file; override
-the root with `--baked-releases DIR` or `REMOTE_EXEC_BAKED_RELEASES`. Derived
-images can preinstall releases here to avoid downloading and compiling them
-on first use. Keep each release's runtime sources with its executable: use
+the root with `--baked-releases DIR` or `REMOTE_EXEC_BAKED_RELEASES`. The
+image bakes one release there when built with
+`--build-arg HOLBUILD_VERSION=<version>` (the release it is built from, say);
+derived images can preinstall more, to avoid downloading and compiling them on
+first use. Keep each release's runtime sources with its executable: use
 an installed tree (`bin/holbuild` plus `share/holbuild`) or a source tree built
 at that exact path. A hit needs no writable release cache or lock.
 
 If the baked executable is absent or not executable, the worker automatically
 uses the existing on-demand path, from
 `<--holbuild-releases-dir>/v<version>/bin/holbuild` (by default
-`/opt/holbuild-releases`). A release the directory doesn't have yet is built
+`REMOTE_EXEC_HOLBUILD_RELEASES`, else `/opt/holbuild-releases`). The image
+sets it to `/opt/holbuild-releases/polyml-<POLYML_TAG>`: a release links the
+Poly/ML runtime library of the image that built it, and a host keeps the
+directory across image changes, so each Poly/ML gets its own. A release the directory doesn't have yet is built
 there on first use: the worker downloads its source tarball
 (`--holbuild-source-url`, by default the GitHub archive of tag `v<version>`),
 runs `make bin/holbuild` in place, since holbuild finds its runtime sources
@@ -658,7 +685,7 @@ retries, and a request still queued for a connection would be done twice.
 text as the body (`text/plain`). `profile` defaults to `default`; `class` defaults to `build`.
 An unknown class returns 422. `priority` defaults to 0 and accepts integers
 from 0 to 2147483647; invalid values return 422. Existing batches retain priority 0.
-`speculative_loading`, from 1 to 16, lets that many of the batch's actions
+`speculative_loading`, from 1 to 64, lets that many of the batch's actions
 at once be claimed ahead of their parents (see "Loading ahead"); without it
 none is. A run batch with it returns 400.
 
@@ -691,6 +718,14 @@ none is. A run batch with it returns 400.
   }
   ```
 - 404 when there is no such batch (or it was deleted by retention)
+
+In `timings`, durations are milliseconds. `started` and `finished`, and
+`holstart`/`holend`, `publishstart`/`publishend`, `logstart`/`logend` are
+absolute Unix milliseconds, not durations. `rebuilt` is 1 for a successful
+source build, 0 for a cache hit or failure. Older workers omit these fields.
+Publication here covers the action's result and log; deferred checkpoint
+uploads happen after the result. Parallel action spans overlap, as do
+nested phase durations. Do not add their totals to obtain elapsed wall time.
 
 `POST /v1/batches/<batch_id>/cancel`
 
@@ -761,8 +796,8 @@ with `cpu_idle_pct` measured since the worker's previous CPU sample, or null
 when that is under a second old)
 
 - 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120, "max_heap_mb": null, "ahead_parents": [{"input_key": "<sha256>", "spec_sha256": "<sha256>"}, …]}`:
-  `ahead_parents` lists the parents still building when the action was claimed ahead of them, and is empty for
-  any other claim
+  `ahead_parents` lists the ancestors still building when the action was claimed ahead of them, each after its
+  own such ancestors, and is empty for any other claim
 - 204 when nothing became ready for the tier within `wait_s`
 
 `POST /v1/work/<attempt_token>/heartbeat`, with no body or `{"host": <report>}`
@@ -792,8 +827,9 @@ scheduling metadata; action inputs, outputs and leases are unchanged.
 `GET /v1/queue` includes `ready_priority` and `running_priority`: subsets of
 the tier counts for actions whose batch has a positive priority. Do not add
 these subsets to the tier totals. Priority does not change burst demand.
-Strict priority suits occasional finite batches; there is no aging or reserved
-normal share. Normal work can use workers for which no priority action is ready,
+Priority has no aging; the only reserved normal share is
+`REMOTE_EXEC_DEFAULT_PRIORITY_FLOOR` (see Claims), and with it at 0 priority is
+strict, which suits occasional finite batches. Normal work can use workers for which no priority action is ready,
 including while a priority batch waits on dependencies.
 
 Migration `0015` adds `batches.ahead_cap` and `actions.ahead`. Before rolling
@@ -887,7 +923,7 @@ commands must be idempotent across retries and coordinator crashes. Opaque
 provider ownership data is persisted separately from operation tokens, before
 any DNS publication.
 
-Configure one to four `REMOTE_EXEC_CACHE_SLOTS` as a JSON list of
+Configure one or more `REMOTE_EXEC_CACHE_SLOTS` as a JSON list of
 `{"name":"slot-c","url":"https://cache-c.example"}`. A slot may also name a
 `"zone"`: it then goes only to an instance whose inventory entry reports that
 `zone`, so workers in that zone can list the slot's URL among their preferred
@@ -900,8 +936,12 @@ without holding a database transaction open during provider calls. The
 controller keeps reconciling and heartbeating hooks when capacity is disabled,
 so disabling scale-out can still drain existing instances.
 
-`REMOTE_EXEC_CACHE_WORKERS_PER_NODE` maps the existing held burst-worker target
-to cache capacity by ceiling division, capped at the number of slots. Each
+`REMOTE_EXEC_CACHE_WORKERS_PER_NODE` maps the burst-worker demand, held for
+`REMOTE_EXEC_CACHE_SCALE_DOWN_HOLD_S` seconds (default 900), to cache capacity
+by ceiling division, capped at the number of slots. That hold is separate from
+the workers' `REMOTE_EXEC_SCALE_DOWN_HOLD_S`, so a deployment whose worker hosts
+get a further scale-in delay elsewhere can keep the worker hold short without
+cache nodes, and their warm disks, following every dip in demand. Each
 controller rereads shared held demand while holding the capacity writer lock;
 a delayed replica cannot overwrite it with a local snapshot. The
 default is 15 worker tasks per added cache; zero requests no temporary capacity.

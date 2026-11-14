@@ -179,6 +179,25 @@ refute_grep "Theory built" "$tmpdir/follow.log"
 [[ $(grep -c . "$state/ran") -eq 2 ]] || { cat "$state/ran" >&2; exit 1; }
 require_grep "^action .* rx:ATheory$" "$state/b1.batch"
 require_grep "^edge " "$state/b1.batch"
+# Workers fetch the specs from the remote cache: none is left in the project.
+if find "$project/.holbuild/action-specs" -type f 2>/dev/null | grep .; then
+  echo "build --remote-exec left its uploaded specs" >&2; exit 1
+fi
+python3 - "$project" <<'PY'
+import json,pathlib,sys
+records=[json.loads(p.read_text()) for p in (pathlib.Path(sys.argv[1])/'.holbuild/commands').glob('*.json')]
+record=next(r for r in records if r['fleet_batches']==['b1'])
+assert record['exit_code']==0
+assert len(record['fleet_follows'])==1
+results=[a for a in record['fleet_actions'] if a['observation']=='result']
+assert len(results)==2
+assert all(a['action']['timings']['finished'] >= a['action']['timings']['started'] for a in results)
+assert sum(a['action']['timings']['rebuilt'] for a in results)==2
+assert record['fleet_history_complete'] is False
+assert all(set(a['action'])=={'input_key','state','attempts'} for a in record['fleet_actions'] if a['observation']=='attempt')
+assert record['local_outcomes']['built']==0
+assert record['local_outcomes']['restored_remote']==2
+PY
 
 # With everything cached there is nothing to submit.
 run cached 0 build --remote-exec "$coordinator" BTheory
@@ -286,6 +305,41 @@ require_grep "^POST /v1/batches/b9/cancel " "$state/requests.log"
 require_grep "the coordinator reported no theories; building locally" "$tmpdir/ended.log"
 refute_grep "cancel" "$tmpdir/ended.log"
 rm "$state/ended"
+
+# While a batch runs, the client checks which theories outside it are up to
+# date, so that the restore after it needn't.  A theory counts only if every
+# theory it depends on does: an ancestor the restore replaces would leave its
+# descendants' check stale.
+write_independent() {
+  cat > "$project/src/CScript.sml" <<SML
+Theory C
+Ancestors bool
+
+Theorem c_thm:
+  T
+Proof
+  simp[] (* $1 *)
+QED
+SML
+}
+write_independent one
+HOLBUILD_CACHE_TRACE=1 run settled 0 build --remote-exec "$coordinator" BTheory CTheory
+require_grep "up to date during the batch: 2 of 2 nodes outside it" "$tmpdir/settled.log"
+require_grep "CTheory restored from cache" "$tmpdir/settled.log"
+refute_grep "ATheory restored" "$tmpdir/settled.log"
+refute_grep "BTheory restored" "$tmpdir/settled.log"
+# ATheory's metadata gone and its data altered: the check finds it out of date
+# but BTheory, whose check reads ATheory's generated module, up to date.  The
+# restore replaces ATheory's data, and BTheory isn't taken as checked.
+cp "$project/.holbuild/obj/src/ATheory.dat" "$tmpdir/ATheory.dat"
+rm "$project/.holbuild/dep/rx/src/AScript.sml.key"
+printf '\n' >> "$project/.holbuild/obj/src/ATheory.dat"
+write_independent two
+HOLBUILD_CACHE_TRACE=1 run settled-ancestor 0 build --remote-exec "$coordinator" BTheory CTheory
+require_grep "up to date during the batch: 0 of 2 nodes outside it" "$tmpdir/settled-ancestor.log"
+require_grep "ATheory restored from cache" "$tmpdir/settled-ancestor.log"
+cmp "$tmpdir/ATheory.dat" "$project/.holbuild/obj/src/ATheory.dat"
+rm "$project/src/CScript.sml"
 
 # An interrupted build cancels the batch it follows, --remote-only too.
 # interrupt NAME ARGS...: starts hb with ARGS, logging to $tmpdir/NAME.log,
@@ -744,6 +798,24 @@ require_grep "^action $key_a .* rx:ATheory$" "$state/$batch.batch"
 require_grep "^edge [0-9a-f]* $key_a$" "$state/$batch.batch"
 require_grep "remote execution: remote workers finished 3 of 3 theories" "$tmpdir/built-here-unpublished.log"
 rm "$project/src/CScript.sml"
+
+# A fresh tree cannot classify a local manifest as built here when one blob
+# is missing and another has corrupt bytes. The absent remote entry needs a
+# worker even though the dependent theory's local cache entry is intact.
+write_theories local-cache-integrity
+run local-cache-integrity-base 0 build BTheory
+key_a=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rx/src/AScript.sml.key")
+ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
+dat_a=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$HOLBUILD_CACHE/actions/$key_a/manifest")
+sig_a=$(awk '$1 == "blob" && $2 == "sig" { print $3 }' "$HOLBUILD_CACHE/actions/$key_a/manifest")
+rm "$remote_root/ac/$ac_a" "$HOLBUILD_CACHE/blobs/$dat_a"
+printf 'corrupt local signature\n' > "$HOLBUILD_CACHE/blobs/$sig_a"
+rm -r "$project/.holbuild" "$HOLBUILD_CACHE/remote-ledger"
+run local-cache-integrity 0 build --remote-exec "$coordinator" --remote-only BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/local-cache-integrity.log")
+require_grep "^action $key_a .* rx:ATheory$" "$state/$batch.batch"
+refute_grep "^action .* rx:BTheory$" "$state/$batch.batch"
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/local-cache-integrity.log"
 
 # A submission answered 502 while the coordinator restarts is retried, and
 # given up on when it stays down.
@@ -1207,6 +1279,51 @@ require_grep "^holbuild: theorem: b_thm (line 4)$" "$tmpdir/proof-nolog.log"
 refute_grep "on a remote worker\|CTheory built" "$tmpdir/proof-nolog.log"
 [[ $(local_hol_runs "$tmpdir/proof-nolog.timing") -gt 0 ]] || { cat "$tmpdir/proof-nolog.timing" >&2; exit 1; }
 
+# --json reports a remote build's targets as a local build's: the theories
+# restored as finished, and a theory that failed on a worker as failed, once,
+# with what its log says.  C, which the batch didn't reach, and B's misses in
+# the restore after the failure are no failures, and nothing is finished.
+# json_events NAME EXPECTED: compares NAME.log's events with EXPECTED, one
+# "event [target] [kind theorem]" line each, the kind and theorem of a
+# node_failed only, node_started and messages left out.
+json_events() {
+  python3 - "$tmpdir/$1.log" "$2" <<'PY'
+import json, sys
+seen = []
+for line in open(sys.argv[1]):
+    if not line.startswith("{"):
+        continue
+    event = json.loads(line)
+    if event["event"] in ("node_started", "message"):
+        continue
+    failure = event.get("failure", {}) if event["event"] == "node_failed" else {}
+    seen.append(" ".join(str(part) for part in
+                         [event["event"], event.get("target", ""), failure.get("kind", ""), failure.get("theorem", "")]
+                         if part != "").strip())
+    if "debug_artifacts" in event:
+        sys.exit(f"debug artifacts without --retain-debug-artifacts: {line}")
+if seen != sys.argv[2].split("\n"):
+    sys.exit("wanted:\n" + sys.argv[2] + "\ngot:\n" + "\n".join(seen))
+PY
+}
+write_broken json
+run proof-json 1 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
+json_events proof-json $'node_finished ATheory\nnode_failed BTheory proof_failure b_thm\nerror'
+# So is a failure other than a proof's, which --remote-only builds nothing for.
+write_broken json-memory
+echo rxp:BTheory > "$state/memory-failure"
+run memory-json 75 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
+rm "$state/memory-failure"
+json_events memory-json $'node_finished ATheory\nnode_failed BTheory unknown\nerror'
+write_broken json-nolog
+touch "$state/drop-log"
+run proof-json-nolog 1 --json build --remote-exec "$coordinator" BTheory CTheory
+rm "$state/drop-log"
+json_events proof-json-nolog $'node_finished ATheory\nnode_finished ATheory\nnode_failed BTheory proof_failure b_thm\nerror'
+write_theories json
+run follow-json 0 --json build --remote-exec "$coordinator" --remote-only BTheory
+json_events follow-json $'node_finished ATheory\nnode_finished BTheory\nbuild_finished'
+
 # A theory the remote cache holds that doesn't fit its cached parent, as
 # when a nondeterministic parent was built twice: the workers can't use it,
 # so the batch is resubmitted with it and its dependents, whose workers
@@ -1601,6 +1718,14 @@ require_grep "Use2Lib built" "$tmpdir/gen2.log"
 require_grep "AfterGenTheory restored from cache" "$tmpdir/gen2.log"
 refute_grep "Theory built" "$tmpdir/gen2.log"
 require_file "$gen2/src/Gen2ML.sml"
+python3 - "$gen2" <<'PYCODE'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+records=[json.loads(p.read_text()) for p in (root/'.holbuild/commands').glob('*.json')]
+assert len(records)==1 and len(records[0]['plans'])==1, records
+source=next(s for s in records[0]['plans'][0]['newly_observed_sources'] if s['path']=='src/Gen2ML.sml')
+assert source['sha256']==hashlib.sha256((root/'src/Gen2ML.sml').read_bytes()).hexdigest(), source
+PYCODE
 
 # check and check --fingerprint pre-build on the remote coordinator and run the
 # check script locally; when a valid deps_loaded checkpoint exists, check
@@ -2009,17 +2134,17 @@ require_grep 'priority needs --remote-exec URL' "$tmpdir/priority-no-exec.log"
 # So is the cap on theories loading ahead of their parents, 4 when given bare.
 in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --detach --speculative-loading LocalUntrustedTheory > "$tmpdir/speculative-default.log" 2>&1
-require_grep '^POST /v1/batches?speculative_loading=4 ' "$state/requests.log"
+require_grep '^POST /v1/batches?speculative_loading=16 ' "$state/requests.log"
 in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --detach --priority 2 --speculative-loading=4 LocalUntrustedTheory > "$tmpdir/speculative.log" 2>&1
 require_grep '^POST /v1/batches?priority=2&speculative_loading=4 ' "$state/requests.log"
-for value in 0 17 1.5 x '' 999999999999999999999999999999; do
+for value in 0 65 1.5 x '' 999999999999999999999999999999; do
   if in_copy local-cas build --remote-exec "$coordinator" "--speculative-loading=$value" PriorityTheory \
        > "$tmpdir/speculative-invalid.log" 2>&1; then
     echo "accepted invalid --speculative-loading=$value" >&2
     exit 1
   fi
-  require_grep "^holbuild: invalid --speculative-loading: $value; expected an integer between 1 and 16$" \
+  require_grep "^holbuild: invalid --speculative-loading: $value; expected an integer between 1 and 64$" \
     "$tmpdir/speculative-invalid.log"
 done
 if in_copy local-cas build --speculative-loading PriorityTheory > "$tmpdir/speculative-no-exec.log" 2>&1; then

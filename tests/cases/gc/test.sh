@@ -8,7 +8,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { cleanup_temp_dir "$tmpdir"; }
+cleanup() { chmod -R u+w "$tmpdir" 2>/dev/null || true; cleanup_temp_dir "$tmpdir"; }
 trap cleanup EXIT
 
 project=$tmpdir/project
@@ -16,6 +16,8 @@ cache=$tmpdir/cache
 mkdir -p \
   "$project/.holbuild/stage/old-stage" \
   "$project/.holbuild/logs" \
+  "$project/.holbuild/action-specs" \
+  "$project/.holbuild/run-specs" \
   "$project/.holbuild/checkpoints/pkg/src/theory.deps/key" \
   "$cache/tmp/old" \
   "$cache/actions/old" \
@@ -40,6 +42,8 @@ TOML
 
 printf 'stage residue\n' > "$project/.holbuild/stage/old-stage/file"
 printf 'old log\n' > "$project/.holbuild/logs/old.log"
+printf 'action spec\n' > "$project/.holbuild/action-specs/old"
+printf 'run spec\n' > "$project/.holbuild/run-specs/old"
 printf 'checkpoint\n' > "$project/.holbuild/checkpoints/pkg/src/theory.deps/key/deps_loaded.save"
 printf 'ok\n' > "$project/.holbuild/checkpoints/pkg/src/theory.deps/key/deps_loaded.save.ok"
 printf 'meta\n' > "$project/.holbuild/checkpoints/pkg/src/theory.deps/key/deps_loaded.save.meta"
@@ -54,6 +58,7 @@ gc_log=$tmpdir/gc.log
   "$HOLBUILD_BIN" --cache-dir "$cache" gc --retention-days 0) > "$gc_log" 2>&1
 
 require_grep "project clean: removed" "$gc_log"
+require_grep " action_specs=1 run_specs=1 " "$gc_log"
 require_grep "checkpoint_gb_initial=" "$gc_log"
 require_grep "checkpoint_gb_before=" "$gc_log"
 require_grep "checkpoint_gb_after=" "$gc_log"
@@ -62,6 +67,8 @@ require_grep "cache gc: removed" "$gc_log"
 require_no_file "$cache/theory-modules/deadbeef.pmo"
 [[ ! -e "$project/.holbuild/stage/old-stage" ]] || { echo "gc left stale stage dir" >&2; exit 1; }
 [[ ! -e "$project/.holbuild/logs/old.log" ]] || { echo "gc left stale log" >&2; exit 1; }
+require_no_file "$project/.holbuild/action-specs/old"
+require_no_file "$project/.holbuild/run-specs/old"
 if find "$project/.holbuild/checkpoints" -type f -print -quit 2>/dev/null | grep -q .; then
   if find "$project/.holbuild/checkpoints" -type f \
       ! -name .index-v2 ! -name .index-v2.tmp -print -quit 2>/dev/null | grep -q .; then

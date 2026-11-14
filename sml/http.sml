@@ -249,8 +249,8 @@ val pool_mutex = Mutex.mutex ()
    first, each with the time it was returned. *)
 val idle : (connection * Time.time) list ref = ref []
 
-(* Whether a reaper thread is running; one runs while idle is non-empty. *)
-val reaping = ref false
+(* The reaper thread, while one runs; one runs while idle is non-empty. *)
+val reaper_thread : Thread.thread option ref = ref NONE
 
 (* How long a connection stays pooled unused before it is closed: well
    below the cache server's own idle timeout, so the pool never holds a
@@ -271,7 +271,12 @@ fun with_pool_lock f =
   end
   handle e => (Mutex.unlock pool_mutex; raise e)
 
-(* Closes the connections idle for the timeout, then sleeps until the
+(* Nothing signals it.  The reaper waits on it rather than sleeping: the
+   process exits only once every thread has stopped, and a sleeping thread
+   stops only when its sleep (up to a second) ends. *)
+val reaper_wake = ConditionVar.conditionVar ()
+
+(* Closes the connections idle for the timeout, then waits until the
    oldest left reaches it; ends once the pool is empty. *)
 fun reaper () =
   let
@@ -284,14 +289,17 @@ fun reaper () =
       in
         idle := kept;
         case rev kept of
-            [] => (reaping := false; (expired, NONE))
+            [] => (reaper_thread := NONE; (expired, NONE))
           | (_, oldest) :: _ => (expired, SOME (Time.- (Time.+ (oldest, timeout), now)))
       end)
   in
     List.app (close o #1) expired;
     case wake of
         NONE => ()
-      | SOME wait => (OS.Process.sleep wait; reaper ())
+      | SOME wait =>
+          (with_pool_lock (fn () =>
+             ignore (ConditionVar.waitUntil (reaper_wake, pool_mutex, Time.+ (Time.now (), wait))));
+           reaper ())
   end
 
 fun take () =
@@ -306,13 +314,10 @@ fun take () =
     | NONE => new_connection ()
 
 fun give connection =
-  if with_pool_lock (fn () =>
-       (idle := (connection, Time.now ()) :: !idle; not (!reaping) before reaping := true))
-  then ignore (Thread.fork (reaper, []))
-       handle e =>
-         (List.app (close o #1) (with_pool_lock (fn () => (reaping := false; !idle before idle := [])));
-          raise e)
-  else ()
+  with_pool_lock (fn () =>
+    (idle := (connection, Time.now ()) :: !idle;
+     if isSome (!reaper_thread) then () else reaper_thread := SOME (Thread.fork (reaper, []))))
+  handle e => (List.app (close o #1) (with_pool_lock (fn () => !idle before idle := [])); raise e)
 
 (* A connection whose request raised may be left mid-transfer, so it is
    closed rather than pooled. *)

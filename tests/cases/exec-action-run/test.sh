@@ -206,6 +206,8 @@ old_run_key=$(sed '1,/^run-text$/d; /^context-input-layout=/d' "$remote_root/cas
 [[ "$run_key" != "$old_run_key" ]]
 worker run "$spec"
 expect run 0 status=built "input-key=$run_key"
+# Only a theory action's root keeps its dependencies for the next one.
+[[ ! -e "$tmpdir/worker-run/action" ]] || { echo "a run left its action root" >&2; exit 1; }
 require_grep '^log=[0-9a-f]\{64\} [0-9]*$' "$tmpdir/run.result"
 log_hash=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/run.result")
 require_file "$remote_root/cas/$log_hash"

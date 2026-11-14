@@ -92,42 +92,45 @@ fun file_sha256 path =
       | NONE => string_sha256 (read_binary_all path)
   else string_sha256 (read_binary_all path)
 
-(* Spawning one process per file, or hashing in SML, costs far more than the
-   hashing itself, so hash a batch of files with one sha256sum per chunk.  Any
-   chunk whose output doesn't give one digest per file is hashed file by file. *)
-fun files_sha256 paths =
+(* Try one external batch of COMMAND (a GNU *sum tool printing DIGITS hex
+   digits per file) without hashing a partially missing batch natively. *)
+fun external_files_hash _ _ [] = SOME []
+  | external_files_hash command digits paths =
   let
-    val chunk_size = 256
     fun digest line =
       let val hex = if String.isPrefix "\\" line then String.extract(line, 1, NONE) else line
       in
-        if size hex >= 64 andalso valid_sha256 (String.substring(hex, 0, 64))
-        then SOME (String.map Char.toLower (String.substring(hex, 0, 64)))
+        if size hex >= digits andalso valid_hex digits (String.substring(hex, 0, digits))
+        then SOME (String.map Char.toLower (String.substring(hex, 0, digits)))
         else NONE
       end
-    fun external chunk =
-      let
-        val out = HolbuildTempPath.temporary "sha256sum-output"
-        val command =
-          "sha256sum -- " ^ String.concatWith " " (map quote chunk) ^
-          " > " ^ quote out ^ " 2>/dev/null"
-        val status = OS.Process.system command
-        val lines =
-          if OS.Process.isSuccess status
-          then String.tokens (fn c => c = #"\n") (read_all out)
-          else []
-        val _ = remove_quietly out
-        val digests = List.mapPartial digest lines
-      in
-        if length digests = length chunk andalso length lines = length chunk
-        then SOME digests
-        else NONE
-      end
-      handle _ => NONE
+    val result = HolbuildSpawn.run
+      {program = command, args = "--" :: paths, stderr = HolbuildSpawn.Discard}
+    val lines =
+      if HolbuildSpawn.succeeded result
+      then String.tokens (fn c => c = #"\n") (#output result)
+      else []
+    val digests = List.mapPartial digest lines
+  in
+    if length digests = length paths andalso length lines = length paths
+    then SOME digests
+    else NONE
+  end
+  handle _ => NONE
+
+fun external_files_sha256 paths = external_files_hash "sha256sum" 64 paths
+
+(* Spawning one process per file, or hashing in SML, costs far more than the
+   hashing itself, so hash a batch of files with one COMMAND per chunk.  Any
+   chunk whose output doesn't give one digest per file is hashed file by file
+   with FALLBACK. *)
+fun files_hash {command, digits, fallback} paths =
+  let
+    val chunk_size = 256
     fun hash_chunk chunk =
-      case external chunk of
+      case external_files_hash command digits chunk of
           SOME digests => digests
-        | NONE => map file_sha256 chunk
+        | NONE => map fallback chunk
     fun loop [] acc = List.concat (rev acc)
       | loop paths acc =
           let
@@ -138,5 +141,8 @@ fun files_sha256 paths =
   in
     loop paths []
   end
+
+fun files_sha256 paths =
+  files_hash {command = "sha256sum", digits = 64, fallback = file_sha256} paths
 
 end

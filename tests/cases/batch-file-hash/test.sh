@@ -51,6 +51,8 @@ fun list_files () =
   in loop [] end
 
 val paths = list_files ()
+val _ = if HolbuildHash.external_files_sha256 [] = SOME [] then ()
+        else fail "empty external batch did not return empty digests"
 val batched = HolbuildHash.files_sha256 paths
 val expected =
   case OS.Process.getEnv "BATCH_FILE_HASH_EXPECT" of
@@ -61,6 +63,12 @@ val _ =
   ListPair.appEq
     (fn (path, (b, e)) => if b = e then () else fail ("digest mismatch for " ^ path ^ ": " ^ b ^ " vs " ^ e))
     (paths, ListPair.zipEq (batched, expected))
+(* The theory module names' .dat SHA-1s, batched through sha1sum. *)
+val _ =
+  ListPair.appEq
+    (fn (path, (b, e)) => if b = e then () else fail ("sha1 mismatch for " ^ path ^ ": " ^ b ^ " vs " ^ e))
+    (paths, ListPair.zipEq (HolbuildBuildExec.hol_files_sha1 paths,
+                            map (fn path => SHA1_ML.sha1_file {filename = path}) paths))
 val _ = print "batch file hash test passed\n"
 SML
 

@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import json
 import time
+from datetime import timedelta
 from collections.abc import Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -14,7 +15,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
-from remote_exec.coordinator import Coordinator, _claim_rank
+from remote_exec.coordinator import Coordinator, HostReport, _claim_rank
 from remote_exec.formats import parse_result
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, Settled
 
@@ -202,6 +203,7 @@ async def test_a_priority_batch_submitted_while_a_ranking_is_shared_is_claimed_n
     """Making a batch the shared ranking lacks ready drops the ranking at once, so a priority batch submitted while
     claims share one goes first on the next claim, not once the ranking expires."""
     coordinator.settings.claim_ranking_seconds = 3600
+    coordinator.settings.default_priority_floor = 0  # strict priority
     rankings = 0
     rank = coordinator._rank
 
@@ -250,6 +252,7 @@ async def test_a_claim_after_a_release_waits_for_a_fresh_shared_ranking(
 ) -> None:
     """A release preserves single-flight reads; later claims wait for a post-release snapshot."""
     coordinator.settings.claim_ranking_seconds = 3600
+    coordinator.settings.default_priority_floor = 0  # strict priority
     entered, go = asyncio.Event(), asyncio.Event()
     calls = 0
     rank = coordinator._rank
@@ -855,10 +858,10 @@ async def test_an_action_made_ready_wakes_one_of_the_waiting_claims(
     attempts = 0
     claim_once = coordinator._claim
 
-    async def counted(tiers: list[str], worker: str) -> Any:
+    async def counted(tiers: list[str], worker: str, *rest: Any) -> Any:
         nonlocal attempts
         attempts += 1
-        return await claim_once(tiers, worker)
+        return await claim_once(tiers, worker, *rest)
 
     monkeypatch.setattr(coordinator, "_claim", counted)
     waiting = [asyncio.create_task(coordinator.claim(["standard"], f"w{i}", 30)) for i in range(10)]
@@ -909,10 +912,10 @@ async def test_a_woken_claim_cancelled_hands_its_wake_to_the_next(
     claim_once = coordinator._claim
     hold = asyncio.Event()
 
-    async def held(tiers: list[str], worker: str) -> Any:
+    async def held(tiers: list[str], worker: str, *rest: Any) -> Any:
         if worker == "w1":
             await hold.wait()  # cancelled while trying, after its wake
-        return await claim_once(tiers, worker)
+        return await claim_once(tiers, worker, *rest)
 
     monkeypatch.setattr(coordinator, "_claim", held)
     await submit(http, ["a"])
@@ -954,10 +957,102 @@ async def test_wakes_pack_compatible_hosts_with_fifo_ties(
     coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled, False))
     for index in order:
         coordinator._wake_claim(tier)
-        assert wakes[index].result() == (tier, False)
+        assert wakes[index].result() == (tier, False, None)
         assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
     coordinator._wake_claim(tier)
     assert coordinator.made_ready == len(order) + 1
+
+
+def busy(host_id: str, leases: int) -> HostReport:
+    return HostReport(host_id, 50.0, 64 << 30, 40 << 30, 52 << 30, 6 << 30, leases, False)
+
+
+@pytest.mark.parametrize(
+    ("workers", "leases", "woken"),
+    [
+        # The busy host that last claimed the theory goes before an earlier host of the same rank.
+        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 0)], 1, 1),
+        # An idle one doesn't, so it can still empty and scale in.
+        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 0)], 0, 0),
+        # Nor does a host no worker reported for.
+        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 0)], None, 0),
+        # A busy one never goes before a warm worker or a host of lower rank.
+        ([(["standard"], "warm", 0), (["high", "standard"], "host-b", 0)], 1, 0),
+        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 1)], 1, 0),
+    ],
+)
+async def test_wakes_prefer_the_busy_host_that_last_claimed_the_theory(
+    coordinator: Coordinator, workers: list[tuple[list[str], str, int]], leases: int | None, woken: int
+) -> None:
+    loop = asyncio.get_running_loop()
+    wakes = [loop.create_future() for _ in workers]
+    coordinator.claim_waiters = [
+        (tiers, _claim_rank(tiers, host, rank), wake, False) for (tiers, host, rank), wake in zip(workers, wakes)
+    ]
+    coordinator.theory_hosts["pkg:a"] = "host-b"
+    if leases is not None:
+        coordinator.report_host(busy("host-b", leases))
+    coordinator._wake_claim("standard", theory="pkg:a")
+    assert [wake.done() for wake in wakes] == [i == woken for i in range(len(wakes))]
+
+
+async def test_a_passed_wake_still_prefers_the_busy_host_of_its_theory(coordinator: Coordinator) -> None:
+    loop = asyncio.get_running_loop()
+    first, second, other = loop.create_future(), loop.create_future(), loop.create_future()
+    coordinator.claim_waiters = [
+        (["high", "standard"], _claim_rank(["high", "standard"], host), wake, False)
+        for host, wake in [("host-a", other), ("host-b", first), ("host-b", second)]
+    ]
+    coordinator.theory_hosts["pkg:a"] = "host-b"
+    coordinator.report_host(busy("host-b", 1))
+    coordinator._wake_claim("standard", theory="pkg:a")
+    assert first.result() == ("standard", False, "pkg:a")
+    coordinator._pass_wake(first)
+    assert second.done() and not other.done()
+
+
+async def test_wakes_ignore_a_busy_report_too_old_to_trust(coordinator: Coordinator) -> None:
+    loop = asyncio.get_running_loop()
+    wakes = [loop.create_future(), loop.create_future()]
+    coordinator.claim_waiters = [
+        (["high", "standard"], _claim_rank(["high", "standard"], host), wake, False)
+        for host, wake in zip(["host-a", "host-b"], wakes)
+    ]
+    coordinator.theory_hosts["pkg:a"] = "host-b"
+    coordinator.report_host(busy("host-b", 1))
+    reported = coordinator.clock()
+    coordinator.clock = lambda: reported + timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS)
+    coordinator._wake_claim("standard", theory="pkg:a")
+    assert wakes[0].done() and not wakes[1].done()
+
+
+async def test_released_work_wakes_the_busy_host_its_theory_last_ran_on(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.report_host(busy("host-b", 1))
+    await submit(http, ["a"])
+    claimed = await coordinator.claim(["high", "standard"], "w1", host_id="host-b")
+    assert claimed is not None and claimed.theory == "pkg:a"
+    assert coordinator.theory_hosts == {"pkg:a": "host-b"}
+    loop = asyncio.get_running_loop()
+    wakes = [loop.create_future(), loop.create_future()]
+    for host, wake in zip(["host-a", "host-b"], wakes):
+        coordinator.claim_waiters.append((["high", "standard"], _claim_rank(["high", "standard"], host), wake, False))
+    # The theory edited: a new action of it.
+    edited = f"holbuild-action-batch-v1\naction {input_key('a2')} {ac_key('a2')} {spec('a2')} pkg:a\n"
+    assert (await http.post("/v1/batches", content=edited, headers=CLIENT)).status_code == 201
+    await coordinator.released()
+    assert not wakes[0].done() and wakes[1].result() == ("standard", False, "pkg:a")
+
+
+async def test_theory_hosts_forget_the_least_recently_claimed_theory(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "MAX_THEORY_HOSTS", 2)
+    await submit(http, ["a", "b", "c"])
+    for host in ["host-a", "host-b", "host-a"]:
+        assert await coordinator.claim(["standard"], host, host_id=host) is not None
+    assert coordinator.theory_hosts == {"pkg:b": "host-b", "pkg:c": "host-a"}
 
 
 @pytest.mark.parametrize("waiting_tiers", [["high", "standard"], ["standard"]])
@@ -986,10 +1081,10 @@ async def test_rechecking_tail_host_defers_ready_work_to_a_better_waiter(
     wake = asyncio.get_running_loop().create_future()
     waiter = (["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake, False)
 
-    async def counted(tiers: list[str], worker: str) -> Any:
+    async def counted(tiers: list[str], worker: str, *rest: Any) -> Any:
         nonlocal attempts
         attempts += 1
-        return await claim_once(tiers, worker)
+        return await claim_once(tiers, worker, *rest)
 
     async def disconnected() -> bool:
         nonlocal checks, batch_id
@@ -1029,10 +1124,10 @@ async def test_explicitly_woken_claim_is_not_blocked_by_a_new_better_waiter(
     claim_once = coordinator._claim
     attempts = 0
 
-    async def missed(tiers: list[str], worker: str) -> Any:
+    async def missed(tiers: list[str], worker: str, *rest: Any) -> Any:
         nonlocal attempts
         attempts += 1
-        return None if attempts == 1 else await claim_once(tiers, worker)
+        return None if attempts == 1 else await claim_once(tiers, worker, *rest)
 
     monkeypatch.setattr(coordinator, "_claim", missed)
     waiting = asyncio.create_task(coordinator.claim(["standard"], "tail", 10, host_id="host-b"))
@@ -2649,7 +2744,10 @@ async def test_submit_rejects_invalid_heap_limit(http: httpx.AsyncClient, value:
     assert await claim(http) is None
 
 
-async def test_priority_precedes_batch_fair_share_and_preserves_equal_priority_turns(http: httpx.AsyncClient) -> None:
+async def test_priority_precedes_batch_fair_share_and_preserves_equal_priority_turns(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.default_priority_floor = 0  # strict priority
     await submit(http, ["normal"])
     await submit(http, ["p11", "p12", "p13"], priority="1")
     await submit(http, ["p21", "p22"], priority="1")
@@ -2662,7 +2760,10 @@ async def test_priority_precedes_batch_fair_share_and_preserves_equal_priority_t
     await claim_named(http, "normal")
 
 
-async def test_normal_build_progresses_while_priority_chain_waits_for_its_parent(http: httpx.AsyncClient) -> None:
+async def test_normal_build_progresses_while_priority_chain_waits_for_its_parent(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.default_priority_floor = 0  # strict priority
     await submit(http, ["normal1", "normal2"])
     await submit(http, ["parent", "child"], [("child", "parent")], priority="1")
     await claim_named(http, "parent")
@@ -2705,7 +2806,92 @@ async def test_invalid_priority_is_rejected(http: httpx.AsyncClient, value: str)
     assert response.status_code == 422
 
 
-async def test_queue_reports_priority_subsets_without_double_counting(http: httpx.AsyncClient) -> None:
+@pytest.mark.parametrize("ranking_seconds", [0, 3600])
+async def test_priority_zero_builds_keep_a_floor_during_a_priority_wave(
+    http: httpx.AsyncClient, coordinator: Coordinator, ranking_seconds: float
+) -> None:
+    """Below the floor priority 0 goes first, counted by fresh rankings and by claims sharing one; at the floor,
+    higher priorities take everything else."""
+    coordinator.settings.default_priority_floor = 2
+    coordinator.settings.claim_ranking_seconds = ranking_seconds
+    await submit(http, ["n1", "n2", "n3"])
+    await submit(http, ["p1", "p2", "p3"], priority="1")
+    for name in ["n1", "n2", "p1", "p2", "p3", "n3"]:
+        await claim_named(http, name)
+
+
+async def test_a_priority_zero_build_ending_frees_its_floor_slot(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.default_priority_floor = 1
+    coordinator.settings.claim_ranking_seconds = 0
+    await submit(http, ["n1", "n2"])
+    await submit(http, ["p1", "p2"], priority="1")
+    token = await claim_named(http, "n1")
+    await claim_named(http, "p1")
+    assert (await complete(http, token, result("n1", "built"))).status_code == 200
+    await claim_named(http, "n2")
+    await claim_named(http, "p2")
+
+
+async def test_priority_zero_turns_carry_over_from_the_floor_to_the_ranking_above_it(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """A batch claimed from below the floor has its turn counted once the floor is full, in the same ranking."""
+    coordinator.settings.default_priority_floor = 1
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a1", "a2"])
+    await submit(http, ["b1"])
+    await submit(http, ["p1"], priority="1")
+    for name in ["a1", "p1", "b1", "a2"]:
+        await claim_named(http, name)
+
+
+async def test_concurrent_claims_sharing_a_ranking_take_the_last_floor_slot_once(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.default_priority_floor = 1
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["n1", "n2"])
+    await submit(http, ["p1", "p2"], priority="1")
+    ranking = await coordinator._current_ranking(("standard",))
+    async with coordinator.engine.begin() as first, coordinator.engine.begin() as second:
+        # The first claim awaits its lock while the second picks from the same ranking.
+        claimed = await asyncio.gather(
+            coordinator._claim_build(first, ranking), coordinator._claim_build(second, ranking)
+        )
+        assert sorted(c.theory for c in claimed if c is not None) == ["pkg:n1", "pkg:p1"]
+
+
+async def test_priority_work_takes_every_slot_when_no_priority_zero_build_is_ready(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.default_priority_floor = 2
+    await submit(http, ["parent", "child"], [("child", "parent")])
+    await claim_named(http, "parent")
+    await submit(http, ["p1", "p2", "p3"], priority="1")
+    for name in ["p1", "p2", "p3"]:
+        await claim_named(http, name)
+    assert await claim(http) is None
+
+
+async def test_the_priority_zero_floor_does_not_override_the_memory_tier(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.default_priority_floor = 2
+    await submit(http, ["normal"])
+    await submit(http, ["priority"], priority="1")
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE theory = 'pkg:priority'"))
+    body = {"tier": "high", "also_claim": ["standard"], "worker": "w1"}
+    assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).json()["theory"] == "pkg:priority"
+    assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).json()["theory"] == "pkg:normal"
+
+
+async def test_queue_reports_priority_subsets_without_double_counting(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.default_priority_floor = 0  # strict priority
     await submit(http, ["normal"])
     await submit(http, ["p1", "p2", "child"], [("child", "p1")], priority="1")
     await claim_named(http, "p1")

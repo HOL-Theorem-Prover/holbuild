@@ -100,6 +100,19 @@ async def test_zoned_slots_go_only_to_instances_in_their_zone(pool: CachePool) -
     assert rows == {"first-in-c": "6", "in-a": "4"}
 
 
+async def test_many_zoned_slots_fill_in_list_order_per_zone(pool: CachePool) -> None:
+    p = provider(pool)
+    slots = [CacheSlot(name=str(n), url=f"https://cache-{n}.example", zone="abc"[(n - 4) % 3]) for n in range(4, 40)]
+    zoned = CachePool(pool.engine, slots, p, drain_seconds=60)
+    p.instances = [Instance(id=f"{zone}{i}", state="launching", zone=zone) for zone in "abc" for i in range(13)]
+    await zoned.reconcile(p.now)
+    async with pool.engine.connect() as conn:
+        rows = dict((await conn.execute(sa.text("SELECT owner,slot FROM cache_slots"))).all())
+    assert len(rows) == 36
+    assert [rows[f"a{i}"] for i in range(12)] == [str(n) for n in range(4, 40, 3)]
+    assert {"a12", "b12", "c12"}.isdisjoint(rows)
+
+
 async def test_no_discovery_until_readiness_and_launch_hook_not_completed_before_probe(pool: CachePool) -> None:
     p = provider(pool)
     p.instances = [Instance(id="a", state="launching")]
@@ -272,6 +285,10 @@ async def test_cancelled_controller_releases_leadership_before_returning_connect
                                                           (60, 15, 4), (240, 15, 4), (240, 0, 0)])
 def test_worker_mapping_is_bounded_and_zero_ratio_disables_capacity(workers: int, ratio: int, expected: int) -> None:
     assert cache_target(workers, ratio, 4) == expected
+
+
+def test_worker_mapping_scales_to_every_slot() -> None:
+    assert cache_target(540, 15, 36) == 36
 
 
 @pytest.mark.parametrize("url", ["ftp://cache.example", "http://u:p@cache.example", "https://u:p@cache.example",

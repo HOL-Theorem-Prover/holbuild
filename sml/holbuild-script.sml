@@ -107,6 +107,7 @@ use "sml/remote_cache.sml";
 use "sml/tar_archive.sml";
 use "sml/toolchain_archive.sml";
 use "sml/action_sandbox.sml";
+use "sml/action_resident.sml";
 use "sml/hol_shared_cache.sml";
 use "sml/manifest_util.sml";
 use "sml/cache_archive.sml";
@@ -137,6 +138,7 @@ use "sml/build_exec.sml";
 use "sml/proof_ir_types.sml";
 use "sml/watch.sml";
 use "sml/remote_exec.sml";
+use "sml/command_summary.sml";
 use "sml/commands.sml";
 use "sml/complete.sml";
 

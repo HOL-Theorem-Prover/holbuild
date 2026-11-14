@@ -135,13 +135,57 @@ rename_over_edit() {
   expect_plan "from record (1 files rehashed, 1 keys changed)" "$p"
 }
 
-new_import() {
-  local p=$tmpdir/new-import
+# An edit that adds or removes a module mention changes the edited source's
+# dependencies: the plan is made again over the recorded sources, and check
+# mode compares it with full planning.
+mention_added() {
+  local p=$tmpdir/mention-added
   recorded_project "$p"
   sed -i 's/^open BTheory;/open BTheory ATheory;/' "$p/src/CScript.sml"
-  expect_plan "full (dependencies of CTheory changed)" "$p"
+  expect_plan "from record (1 files rehashed, 2 keys changed, dependencies re-resolved)" "$p"
   # CScript.sml changed within a second of that build, so it is hashed again.
   expect_plan "from record (1 files rehashed, 0 keys changed)" "$p"
+}
+
+mention_removed() {
+  local p=$tmpdir/mention-removed
+  recorded_project "$p"
+  sed -i 's/^open BTheory;//' "$p/src/CScript.sml"
+  expect_plan "from record (1 files rehashed, 2 keys changed, dependencies re-resolved)" "$p"
+  expect_plan "from record (1 files rehashed, 0 keys changed)" "$p"
+}
+
+# A new mention selects a source the record's plan left out.
+mention_selects_source() {
+  local p=$tmpdir/mention-selects
+  make_project "$p"
+  expect_plan "full (no plan record for these inputs)" "$p" CTheory
+  echo 'val _ = Lib.x;' >> "$p/src/CScript.sml"
+  expect_plan "from record (1 files rehashed, 2 keys changed, dependencies re-resolved)" "$p" CTheory
+  expect_plan "from record (1 files rehashed, 0 keys changed)" "$p" CTheory
+}
+
+# A removed mention drops sources from the plan, and with them their inputs:
+# the record written then is byte for byte what full planning writes.
+mention_drops_sources() {
+  local p=$tmpdir/mention-drops
+  mkdir -p "$p/data"
+  echo one > "$p/data/a.txt"
+  make_project "$p" '
+[actions.BTheory]
+extra_inputs = ["data"]'
+  expect_plan "full (no plan record for these inputs)" "$p" DTheory
+  sed -i 's/^open CTheory;//' "$p/src/DScript.sml"
+  sleep 1.1
+  expect_plan "from record (1 files rehashed, 1 keys changed, dependencies re-resolved)" "$p" DTheory
+  local record
+  record=$(ls "$p"/.holbuild/plan/*)
+  mv "$record" "$tmpdir/reresolved-record"
+  expect_plan "full (no plan record for these inputs)" "$p" DTheory
+  if ! cmp "$record" "$tmpdir/reresolved-record"; then
+    echo "the record written from a re-resolved plan differs from full planning's" >&2
+    exit 1
+  fi
 }
 
 source_added() {
@@ -697,7 +741,10 @@ noop
 racy_entries_are_rehashed
 edit_with_restored_mtime
 rename_over_edit
-new_import
+mention_added
+mention_removed
+mention_selects_source
+mention_drops_sources
 source_added
 source_removed
 source_renamed

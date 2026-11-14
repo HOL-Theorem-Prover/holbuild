@@ -183,22 +183,27 @@ fun blob_ref line =
 
 fun touch path = FS.setTime(path, NONE) handle OS.SysErr _ => ()
 
+fun touch_manifest_blobs cache text =
+  List.app (fn line => Option.app (touch o blob_path cache) (blob_ref line))
+           (String.tokens (fn c => c = #"\n") text)
+
 (* GC snapshots the blobs live manifests reference, then sweeps unreferenced
    blobs older than its cutoff. A build that reuses an old blob does not
    rewrite it, so its manifest, if written after the snapshot, would not keep
    the blob from the sweep. Refreshing each referenced blob first does. *)
 fun write_action cache {key, text} =
-  (List.app (fn line => Option.app (touch o blob_path cache) (blob_ref line))
-            (String.tokens (fn c => c = #"\n") text);
+  (touch_manifest_blobs cache text;
    write_text (action_manifest cache key) text;
    add_growth cache manifest_growth_bytes)
 
 fun remove_action cache key = remove_file (action_manifest cache key)
 
-fun touch_action cache key = touch (action_manifest cache key)
-
 fun get_action cache key =
   SOME (read_text (action_manifest cache key)) handle _ => NONE
+
+fun touch_action cache key =
+  (Option.app (touch_manifest_blobs cache) (get_action cache key);
+   touch (action_manifest cache key))
 
 fun existing_action_result cache policy key expected actual =
   case policy of
@@ -226,6 +231,33 @@ fun existing_action_result cache policy key expected actual =
 fun has_blob cache hash = path_exists (blob_path cache hash)
 
 fun verify_blob cache hash = file_hash_matches (blob_path cache hash) hash
+
+(* Return only hashes whose resident bytes match, without a process per blob. *)
+fun verified_blobs cache hashes =
+  let
+    fun external chunk =
+      Option.map
+        (fn digests => List.mapPartial
+          (fn (hash, digest) => if hash = digest then SOME hash else NONE)
+          (ListPair.zipEq (chunk, digests)))
+        (HolbuildHash.external_files_sha256 (map (blob_path cache) chunk))
+    fun verify chunk =
+      case external chunk of
+          SOME valid => valid
+        | NONE =>
+            let val present = List.filter (has_blob cache) chunk
+            in
+              (* A missing last file must not trigger native hashing of the
+                 preceding files before another fallback hashes them again. *)
+              case if length present < length chunk then external present else NONE of
+                  SOME valid => valid
+                | NONE => List.filter (verify_blob cache) present
+            end
+    fun loop [] acc = List.concat (rev acc)
+      | loop remaining acc =
+          let val n = Int.min (256, length remaining)
+          in loop (List.drop (remaining, n)) (verify (List.take (remaining, n)) :: acc) end
+  in loop hashes [] end
 
 (* dst is a local filesystem path where the caller wants the blob materialized. *)
 fun fetch_blob cache {hash, dst} =

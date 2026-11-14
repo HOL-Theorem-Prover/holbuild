@@ -167,6 +167,15 @@ hol_key=$(line hol HOL:boolTheory done)
 [[ $(< "$out/HOL/boolTheory/first") == HOL:boolTheory ]]
 require_no_file "$out/HOL/boolTheory/LOG"
 require_grep '^POST /v1/batches?class=run ' "$state/requests.log"
+python3 - "$state/result-$hol_key" <<'PY'
+import pathlib,sys
+fields=dict(line.split('=',1) for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if '=' in line)
+timings=dict(item.split(':',1) for item in fields['phase-ms'].split(','))
+assert 'rebuilt' not in timings, timings
+for phase in ('hol','publish','log'):
+    assert int(timings[phase+'end']) >= int(timings[phase+'start']), timings
+assert int(timings['finished']) >= int(timings['started'])
+PY
 
 # Two targets, one cached: only the other is submitted, with the profile;
 # C's entry is published from the local cache first.
@@ -185,6 +194,10 @@ require_file "$(ac_file "$key_c")"
 [[ $(< "$out/rr/CTheory/first") == rr:CTheory ]]
 [[ $(< "$out/rr/CTheory/second") == "$key_c" ]]
 require_grep '^proof_timeout=none$' "$metadata"
+# Workers fetch the specs from the remote cache: none is left in the project.
+if find "$project/.holbuild/run-specs" -type f 2>/dev/null | grep .; then
+  echo "run-action --remote-exec left its uploaded specs" >&2; exit 1
+fi
 
 # --fetch-only fetches what the cache holds and submits nothing, without a
 # coordinator; what it lacks is missing.

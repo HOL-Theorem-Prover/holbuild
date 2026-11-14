@@ -9,6 +9,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 cleanup() {
+  touch "$tmpdir/control/action-get-release" 2>/dev/null || true
   if [[ -n "${mutation_pid:-}" ]]; then
     kill "$mutation_pid" 2>/dev/null || true
     wait "$mutation_pid" 2>/dev/null || true
@@ -24,7 +25,7 @@ unset HOLBUILD_REMOTE_CACHE_URL
 
 remote_root=$tmpdir/remote
 control=$tmpdir/control
-start_remote_cache_server "$remote_root" "$tmpdir/server" "$control"
+start_remote_cache_server "$remote_root" "$tmpdir/server" "$control" 2> "$tmpdir/server.err"
 use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project
@@ -94,6 +95,55 @@ hb() {
 run_export() {
   hb run-action --export-only --script "$runner/run.sml" "$@"
 }
+
+wait_for_availability() {
+  local name=$1 status=0 child='still running'
+  for _ in {1..1000}; do
+    # Concurrent GETs truncate and rewrite the count. Its existence is
+    # persistent and already means a request reached the gate.
+    [[ -e "$control/action-get-count" ]] && return 0
+    kill -0 "$mutation_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  if ! kill -0 "$mutation_pid" 2>/dev/null; then
+    wait "$mutation_pid" || status=$?
+    mutation_pid=
+    child="exited with status $status"
+  fi
+  echo "$name export never reached availability check (child $child)" >&2
+  if kill -0 "$server_pid" 2>/dev/null; then
+    echo 'remote cache server still running' >&2
+  else
+    echo 'remote cache server exited' >&2
+  fi
+  tail -n 40 "$tmpdir/$name.out" "$tmpdir/$name.err" "$tmpdir/server.err" "$request_log" >&2 || true
+  return 1
+}
+
+# A delayed arrival remains observable even during a counter rewrite.
+(
+  sleep 0.05
+  : > "$control/action-get-count"
+  while [[ ! -e "$control/action-get-release" ]]; do sleep 0.01; done
+) > "$tmpdir/wait-delayed.out" 2> "$tmpdir/wait-delayed.err" &
+mutation_pid=$!
+wait_for_availability wait-delayed
+[[ ! -s "$control/action-get-count" ]]
+touch "$control/action-get-release"
+wait "$mutation_pid"
+mutation_pid=
+rm "$control/action-get-count" "$control/action-get-release"
+
+# An exporter that dies before arrival reports its status and stderr.
+(echo 'controlled export failure' >&2; exit 7) \
+  > "$tmpdir/wait-failed.out" 2> "$tmpdir/wait-failed.err" &
+mutation_pid=$!
+if wait_for_availability wait-failed > "$tmpdir/wait-failed.log" 2>&1; then
+  echo 'availability wait accepted a failed child' >&2
+  exit 1
+fi
+require_grep 'child exited with status 7' "$tmpdir/wait-failed.log"
+require_grep 'controlled export failure' "$tmpdir/wait-failed.log"
 
 # The ActionSpec of C while nothing is built, for its context lines.
 hb action-spec CTheory > "$tmpdir/batch.txt"
@@ -292,9 +342,8 @@ run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \
   --output result --output manifest spec:CTheory > "$tmpdir/export4.txt"
 [[ $(key_of spec:CTheory "$tmpdir/export4.txt") != "$c_run_key" ]]
 
-# hol:* is every theory of the toolchain.  Its ~70 spec uploads stay under
-# the fixture server's listen backlog.
-hb --prefetch-concurrency 4 run-action --export-only --script "$runner/run.sml" \
+# hol:* is every theory of the toolchain.
+hb run-action --export-only --script "$runner/run.sml" \
   --output o 'hol:*' > "$tmpdir/all.txt"
 grep -q '^HOL:boolTheory ' "$tmpdir/all.txt"
 grep -q '^HOL:arithmeticTheory ' "$tmpdir/all.txt"
@@ -332,13 +381,11 @@ done
 
 # Declared runtime files must still have the contents used by the plan.
 touch "$control/action-get-enable"
-run_export --output input-mutation spec:CTheory > "$tmpdir/input-mutation.out" 2> "$tmpdir/input-mutation.err" &
+(cd "$project" && exec "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  run-action --export-only --script "$runner/run.sml" --output input-mutation spec:CTheory) \
+  > "$tmpdir/input-mutation.out" 2> "$tmpdir/input-mutation.err" &
 mutation_pid=$!
-for _ in {1..1000}; do
-  [[ -s "$control/action-get-count" ]] && break
-  sleep 0.01
-done
-[[ -s "$control/action-get-count" ]] || { echo 'export never reached availability check' >&2; exit 1; }
+wait_for_availability input-mutation
 printf 'other\n' > "$project/testdata/value.txt"
 touch "$control/action-get-release"
 if wait "$mutation_pid"; then
@@ -353,13 +400,11 @@ rm "$control/action-get-enable" "$control/action-get-release" "$control/action-g
 # A same-size edit with restored mtime between planning and spec writing
 # must still be rejected. Gate the availability lookup after planning.
 touch "$control/action-get-enable"
-run_export --output mutation spec:CTheory > "$tmpdir/mutation.out" 2> "$tmpdir/mutation.err" &
+(cd "$project" && exec "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  run-action --export-only --script "$runner/run.sml" --output mutation spec:CTheory) \
+  > "$tmpdir/mutation.out" 2> "$tmpdir/mutation.err" &
 mutation_pid=$!
-for _ in {1..1000}; do
-  [[ -s "$control/action-get-count" ]] && break
-  sleep 0.01
-done
-[[ -s "$control/action-get-count" ]] || { echo 'export never reached availability check' >&2; exit 1; }
+wait_for_availability mutation
 python3 - "$project/src/AScript.sml" <<'PY'
 import os, pathlib, sys
 path = pathlib.Path(sys.argv[1])
