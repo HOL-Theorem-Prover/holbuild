@@ -949,9 +949,9 @@ async def test_claiming_ahead_reads_each_ancestors_action_by_key(
     yet: not a scan of every unfinished action of every batch, as when the ancestors were joined with the actions,
     nor of every action of the batch, as when the candidates were read by their batch with their keys as a filter."""
     old, new = uuid4(), uuid4()
-    width, layers, parents = 32, 157, 5
+    width, parents = 32, 5
 
-    async def add(connection: Any, batch_id: UUID) -> None:
+    async def add(connection: Any, batch_id: UUID, layers: int) -> None:
         values = {"id": batch_id, "width": width, "parents": parents, "n": width * layers}
         await connection.execute(
             sa.text("INSERT INTO batches (id, state, profile, ahead_cap) VALUES (:id, 'running', 'default', 64)"),
@@ -981,11 +981,11 @@ async def test_claiming_ahead_reads_each_ancestors_action_by_key(
 
     async with remote_exec_engine.begin() as connection:  # autovacuum can't see this transaction
         await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
-        await add(connection, old)  # analyzed while it runs, then built
+        await add(connection, old, 40)  # analyzed while it runs, then built
         await connection.execute(sa.text("ANALYZE"))
         await connection.execute(sa.text("UPDATE batches SET state = 'done' WHERE id = :id"), {"id": old})
         await connection.execute(sa.text("UPDATE actions SET state = 'done' WHERE batch_id = :id"), {"id": old})
-        await add(connection, new)
+        await add(connection, new, 157)  # 5,024 actions
         await connection.execute(  # the second layer runs claimed ahead of the first
             sa.text(
                 "UPDATE actions SET state = 'running', ahead = 'ahead' "
