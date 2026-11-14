@@ -3902,8 +3902,9 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
   end
 
 (* The diagnostic of a theory script that failed, from its build's output:
-   where in the script it failed, the goal state, and what HOL said. *)
-fun failure_detail policy source_file source_text theorem_checkpoints termination_diagnostics failure_output msg =
+   where in the script it failed, the goal state, and what HOL said.
+   BOUNDARIES are where the script's theorems are. *)
+fun failure_detail policy source_file source_text boundaries termination_diagnostics failure_output msg =
   let
     val failure_output_path = captured_output_path_option failure_output
     val goal_state =
@@ -3916,7 +3917,7 @@ fun failure_detail policy source_file source_text theorem_checkpoints terminatio
     val static_error = Option.mapPartial (fn path => HolbuildTheoryDiagnostics.static_error_summary source_file source_text (String.fields (fn c => c = #"\n") (read_text path))) failure_output_path
     val source_context = Option.mapPartial
       (HolbuildTheoryDiagnostics.summarize_failed_fragment_source
-         source_file source_text theorem_checkpoints termination_diagnostics)
+         source_file source_text boundaries termination_diagnostics)
       failure_output_path
     val termination_context =
       Option.mapPartial
@@ -4085,7 +4086,8 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
         val source_context =
           Option.mapPartial
             (HolbuildTheoryDiagnostics.summarize_failed_fragment_source
-               source_file source_text theorem_checkpoints termination_diagnostics)
+               source_file source_text (map HolbuildTheoryCheckpoints.checkpoint_boundary theorem_checkpoints)
+               termination_diagnostics)
             failure_output_path
         val goal_state =
           Option.mapPartial
@@ -4147,7 +4149,8 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
       let val failure_output = checkpoint_failure_output log_dir stage
       in
         error_with_captured_output
-          (failure_detail policy source_file source_text theorem_checkpoints termination_diagnostics
+          (failure_detail policy source_file source_text
+             (map HolbuildTheoryCheckpoints.checkpoint_boundary theorem_checkpoints) termination_diagnostics
              failure_output msg)
           failure_output
       end
@@ -4863,9 +4866,10 @@ fun theory_checkpoints_for_action policy checkpoint_root (action : theory_action
                        #logical action ^ "; using recovered theorem boundaries\n" ^
                        String.concatWith "\n" errors)
     in
-      theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
-        (action_checkpoint_base checkpoint_root action) (#deps_key action)
-        (#inputs_key action) (nondefault_source_name action) source_text proof_ir_plans boundaries
+      detail_time_phase "build.exec.node.checkpoint_specs" (fn () =>
+        theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
+          (action_checkpoint_base checkpoint_root action) (#deps_key action)
+          (#inputs_key action) (nondefault_source_name action) source_text proof_ir_plans boundaries)
     end
     handle Error msg =>
       (reject_unenforced_tactic_timeout policy action msg;
@@ -5482,9 +5486,12 @@ fun report_up_to_date_node status project keys node =
   end
 
 (* IS_SETTLED says whether a check during the batch found NODE up to date,
-   as build_node would: then it is reported so, keeping its output digest. *)
-fun build_one is_settled speculated dat_hash_cache status options tc project base_context plan keys toolchain_key node =
-  if is_settled node then
+   as build_node would: then it is reported so, keeping its output digest.
+   IS_FAILED says whether a remote worker failed it: then it fails, without
+   a lookup of an entry the remote cache can't hold. *)
+fun build_one is_settled is_failed speculated dat_hash_cache status options tc project base_context plan keys toolchain_key node =
+  if is_failed node then raise Error (HolbuildBuildPlan.logical_name node ^ " failed on a remote worker")
+  else if is_settled node then
     ((case #kind (HolbuildBuildPlan.source_of node) of
           HolbuildSourceIndex.TheoryScript => claim_extra_outputs project node (source_extra_output_paths plan node)
         | _ => ());
@@ -6213,7 +6220,7 @@ fun raise_build_failures failures =
           else raise ErrorWithDebugArtifacts (msg, artifacts)
         end
 
-fun build_serial is_settled dat_hash_cache status (options : build_options) tc project base_context plan keys toolchain_key budget_state =
+fun build_serial is_settled is_failed dat_hash_cache status (options : build_options) tc project base_context plan keys toolchain_key budget_state =
   let
     val blocked = ref (Redblackmap.mkDict String.compare)
     val failures = ref []
@@ -6230,7 +6237,7 @@ fun build_serial is_settled dat_hash_cache status (options : build_options) tc p
                HolbuildStatus.skip status key name cause;
                SOME HolbuildStatus.UpToDate)
           | [] =>
-              SOME (build_one is_settled NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
+              SOME (build_one is_settled is_failed NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
               handle Thread.Interrupt => raise Thread.Interrupt
                    | e =>
                        (HolbuildStatus.fail_with_debug_artifacts status key name
@@ -6256,7 +6263,7 @@ fun build_serial is_settled dat_hash_cache status (options : build_options) tc p
     raise_build_failures (rev (!failures))
   end
 
-fun build_parallel is_settled dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state =
+fun build_parallel is_settled is_failed dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state =
   let
     (* Keep scheduler state explicit and reusable: precompute reverse dependency
        edges once, then release dependents by decrementing remaining_dep counts.
@@ -7042,11 +7049,11 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
             | SOME (CommitWork (id, result)) =>
                 build id false
                   (fn node =>
-                      build_one is_settled (SOME result) dat_hash_cache status options tc project base_context plan keys
+                      build_one is_settled is_failed (SOME result) dat_hash_cache status options tc project base_context plan keys
                         toolchain_key node
                       before remove_tree (#stage_root result))
             | SOME (PlainWork id) =>
-                build id true (fn node => build_one is_settled NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
+                build id true (fn node => build_one is_settled is_failed NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
         (* A pipelined build's commit saves no checkpoints, so it needs no
            checkpoint maintenance. *)
         and build id may_checkpoint run =
@@ -7224,15 +7231,16 @@ fun prefetch_limit jobs =
    the nodes not yet started and waits for the copies in flight.  The build
    workers keep their own demand restore, so they never wait behind a
    prefetch. *)
-fun start_remote_cache_prefetch (options : build_options) project plan keys jobs is_settled =
+fun start_remote_cache_prefetch (options : build_options) project plan keys jobs no_entry =
   case HolbuildRemoteCacheConfig.url () of
       SOME url =>
         if not (#use_cache options) then (fn () => ())
         else
           let
             val root = cache_root ()
-            (* A node found up to date has no entry to fetch. *)
-            val nodes = List.filter (not o is_settled) (HolbuildBuildPlan.selected_nodes plan)
+            (* NO_ENTRY says a node has no entry to fetch: one found up to
+               date, or a remote worker failed it or one it depends on. *)
+            val nodes = List.filter (not o no_entry) (HolbuildBuildPlan.selected_nodes plan)
             fun prefetch node =
               case prefetch_key options project keys node of
                   SOME key => prefetch_remote_cache_key root url key
@@ -7383,8 +7391,9 @@ fun trace_cpu_pressure_delta start =
     | _ => ()
 
 (* Builds the plan; SETTLED, from start_settled_check, holds the nodes a
-   check during the batch found up to date. *)
-fun build_checked (settled : settled option) (options : build_options) tc project plan toolchain_key jobs =
+   check during the batch found up to date, and FAILED the input keys of the
+   theories the batch's workers failed. *)
+fun build_checked (settled : settled option) failed (options : build_options) tc project plan toolchain_key jobs =
   let
     val cpu_pressure_start =
       if HolbuildStatus.cache_trace_enabled () then cpu_pressure_total_us () else NONE
@@ -7405,6 +7414,20 @@ fun build_checked (settled : settled option) (options : build_options) tc projec
           SOME {nodes, ...} =>
             Binarymap.peek (nodes, HolbuildBuildPlan.key node) = SOME (HolbuildBuildPlan.input_key_for keys node)
         | NONE => false
+    val failed = Binaryset.addList (Binaryset.empty String.compare, failed)
+    fun is_failed node = Binaryset.member (failed, HolbuildBuildPlan.input_key_for keys node)
+    (* The failed nodes and those depending on them, in plan order, so a
+       node's dependencies come before it. *)
+    val failed_cone =
+      List.foldl
+        (fn (node, cone) =>
+            if is_failed node orelse
+               List.exists (fn dep => Binaryset.member (cone, HolbuildBuildPlan.key dep))
+                 (HolbuildBuildPlan.direct_project_deps plan node)
+            then Binaryset.add (cone, HolbuildBuildPlan.key node)
+            else cone)
+        (Binaryset.empty String.compare) (HolbuildBuildPlan.selected_nodes plan)
+    fun no_entry node = is_settled node orelse Binaryset.member (failed_cone, HolbuildBuildPlan.key node)
     val dat_hash_cache =
       case settled of
           SOME {dat_hash_cache, ...} => dat_hash_cache
@@ -7420,10 +7443,10 @@ fun build_checked (settled : settled option) (options : build_options) tc projec
       val status = HolbuildStatus.create {total = length (HolbuildBuildPlan.selected_nodes plan), jobs = jobs}
       fun run () =
         let
-          val stop_prefetch = start_remote_cache_prefetch options project plan keys jobs is_settled
+          val stop_prefetch = start_remote_cache_prefetch options project plan keys jobs no_entry
           fun build_nodes () =
-            if jobs <= 1 then build_serial is_settled dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
-            else build_parallel is_settled dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
+            if jobs <= 1 then build_serial is_settled is_failed dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
+            else build_parallel is_settled is_failed dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
         in
           (build_nodes (); stop_prefetch ())
           handle e => (stop_prefetch (); raise e)
@@ -7442,7 +7465,7 @@ fun build_checked (settled : settled option) (options : build_options) tc projec
     end
   end
 
-fun build options tc project plan toolchain_key jobs = build_checked NONE options tc project plan toolchain_key jobs
+fun build options tc project plan toolchain_key jobs = build_checked NONE [] options tc project plan toolchain_key jobs
 
 (* After remote execution, force and tracing have already been fulfilled. *)
 fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
@@ -7643,12 +7666,9 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
     val root = project_artifact_root project
     fun diagnose node =
       let
-        (* The diagnosis reads only the script's proof units, not where their
-           checkpoints would live, so the action is keyed on its
-           dependencies' input keys: keying it on their outputs would hash
-           every file of the closure. *)
-        val action = theory_action root plan keys toolchain_key
-                       (dependency_input_context_key toolchain_key plan keys node) node
+        (* The diagnosis reads only where the script's proof units are, so
+           it needs no deps key, nor their proof plans or checkpoints. *)
+        val action = theory_action root plan keys toolchain_key "" node
         val log = current_build_log (current_log_dir root (#package action) (#logical action))
         val fetched =
           detail_time_phase "build.remote_failure.log"
@@ -7660,11 +7680,16 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
             val policy = checkpoint_policy_for_node options project node
             val source_file = #source_file action
             val source_text = read_text source_file
-            (* The script's proof units, to place the failure in it. *)
-            val {theorem_checkpoints, termination_diagnostics, ...} =
-              action_checkpoints policy (default_checkpoint_root root) action source_text
-              handle Error _ =>
-                {theorem_checkpoints = [], declaration_checkpoints = [], termination_diagnostics = []}
+            (* The script's proof units, to place the failure in it, where
+               a local build of it would have them. *)
+            val {source_boundaries, termination_diagnostics} =
+              source_spans_for_action policy action source_text
+              handle Error _ => {source_boundaries = NONE, termination_diagnostics = []}
+            val boundaries =
+              case source_boundaries of
+                  SOME {boundaries, ...} =>
+                    if proof_steps_enabled policy orelse checkpoint_enabled policy then boundaries else []
+                | NONE => []
             val heading =
               (if kind = "tactic-timeout" then "tactic timed out" else "proof failed") ^
               " on a remote worker while building " ^ #logical action
@@ -7672,7 +7697,7 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
           in
             SOME (error_with_captured_output
                     (heading ^ "\n" ^
-                     failure_detail policy source_file source_text theorem_checkpoints termination_diagnostics
+                     failure_detail policy source_file source_text boundaries termination_diagnostics
                        output "hol run failed while building theory script")
                     output)
           end
@@ -12188,7 +12213,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             (* A child loading ahead can write the source by now. *)
             val source_text =
               case ahead of SOME {source_text, ...} => source_text | NONE => read_text (#source_file action)
-            val checkpoints = action_checkpoints policy checkpoint_root action source_text
+            val checkpoints = phase "analyse" (fn () => action_checkpoints policy checkpoint_root action source_text)
             val shared =
               if not share_heaps orelse not (checkpoint_enabled policy) then NONE
               else

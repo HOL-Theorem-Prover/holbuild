@@ -1934,7 +1934,8 @@ cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
 dependencies; its steps follow it, and are part of it: `hydfiles` the
 sources and libraries, `hyddeps` restoring the dependencies, `hydstale`
 probing the remote cache for stale dependency copies, `hydmisfit` checking
-the dependencies against their parents), `cutoff` (whether an earlier build stands), `restore` (shared
+the dependencies against their parents), `cutoff` (whether an earlier build stands), `analyse`
+(the script's proof steps and checkpoints), `restore` (shared
 checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
 checks) and `log`; stderr ends with the same times and `wall`.

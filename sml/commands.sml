@@ -1858,11 +1858,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (* Restores what the remote cache holds, and nothing else: after a
                batch failed, the build must not retry its failed theories.  It
                reports only what it restores: the failures are the batch's.
-               SETTLED is what a check during that batch found up to date. *)
-            fun restore_after_failures settled =
+               SETTLED is what a check during that batch found up to date, and
+               FAILED the input keys of the theories that failed. *)
+            fun restore_after_failures settled failed =
               (timed_phase "build.execute" (fn () =>
                  HolbuildStatus.reporting_finished_only (fn () =>
-                   HolbuildBuildExec.build_checked settled (HolbuildBuildExec.remote_restore_options true build_options)
+                   HolbuildBuildExec.build_checked settled failed (HolbuildBuildExec.remote_restore_options true build_options)
                      tc project plan toolchain_key jobs))
                handle HolbuildBuildExec.Error _ => ()
                     | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
@@ -1890,10 +1891,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         | NONE =>
                             (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
                              if not (null (!deferred)) then submit_deferred resubmit []
-                             else if not (null skip) then restore_after_failures NONE
+                             else if not (null skip) then restore_after_failures NONE skip
                              else
                                timed_phase "build.execute"
-                                 (fn () => HolbuildBuildExec.build_checked settled
+                                 (fn () => HolbuildBuildExec.build_checked settled []
                                    (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
                                    tc project plan toolchain_key jobs))
                     end
@@ -1920,7 +1921,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     val build_deferred = final andalso not fail_fast andalso not (null (!deferred))
                     (* Restore before a terminal failure. A resubmission must first
                        repair its inputs, without installing stale cached outputs. *)
-                    val _ = if final andalso not build_deferred then restore_after_failures settled else ()
+                    val _ = if final andalso not build_deferred then restore_after_failures settled (skip @ map #input_key failures) else ()
                     val _ = HolbuildHolSharedCache.local_build_needed := false
                     fun deferred_errors () =
                       if not build_deferred then []
@@ -1972,7 +1973,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               if null (batch_keys batch) then
                 (record_pending ();
                  if not (null (!deferred)) then submit_deferred resubmit skip
-                 else if not (null skip) then restore_after_failures NONE
+                 else if not (null skip) then restore_after_failures NONE skip
                  else
                    (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
                     build_locally ()))
