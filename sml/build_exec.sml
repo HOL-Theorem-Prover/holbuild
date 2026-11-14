@@ -4611,33 +4611,40 @@ fun theory_parent_hashes_match dat_hash_cache plan node metadata_text =
            | _ => true)
         handle _ => false)
 
+(* The checks of up_to_date, which writes nothing: NODE's current metadata
+   when its outputs are up to date. *)
+fun up_to_date_metadata dat_hash_cache allow_timeout_discrepancy checkpoint_policy project plan input_key node =
+  if List.all (output_exists_for_node node) (output_paths checkpoint_policy plan node) andalso
+     List.all file_exists (source_extra_output_paths plan node) then
+    case current_metadata (metadata_path project node) of
+        SOME text =>
+          if metadata_input_key_matches input_key text andalso
+             metadata_timeout_satisfies allow_timeout_discrepancy checkpoint_policy node text andalso
+             theory_parent_hashes_match dat_hash_cache plan node (SOME text)
+          then SOME text
+          else NONE
+      | NONE => NONE
+  else NONE
+
+(* Whether up_to_date rewrites up-to-date metadata TEXT. *)
+fun metadata_needs_rewrite emit_output_hashes node text =
+  theory_parent_metadata_needs_refresh node text orelse
+  emit_output_hashes orelse
+  List.exists (String.isPrefix "output-sha256=") (metadata_lines text)
+
 fun up_to_date dat_hash_cache emit_output_hashes allow_timeout_discrepancy checkpoint_policy project plan keys input_key toolchain_key node =
   detail_time_phase "build.exec.node.up_to_date"
     (fn () =>
-        List.all (output_exists_for_node node) (output_paths checkpoint_policy plan node) andalso
-        List.all file_exists (source_extra_output_paths plan node) andalso
-        case current_metadata (metadata_path project node) of
-             SOME text =>
-               let
-                 val metadata_ok =
-                   metadata_input_key_matches input_key text andalso
-                   metadata_timeout_satisfies allow_timeout_discrepancy checkpoint_policy node text
-                 val parents_ok =
-                   metadata_ok andalso theory_parent_hashes_match dat_hash_cache plan node (SOME text)
-                 val _ =
-                   if parents_ok andalso
-                       (theory_parent_metadata_needs_refresh node text orelse
-                        emit_output_hashes orelse
-                        List.exists (String.isPrefix "output-sha256=") (metadata_lines text)) then
-                     write_metadata emit_output_hashes checkpoint_policy
-                       (if allow_timeout_discrepancy then metadata_proof_timeout text
-                        else tactic_timeout checkpoint_policy)
-                       project plan keys input_key toolchain_key node
-                   else ()
-               in
-                 metadata_ok andalso parents_ok
-               end
-           | NONE => false)
+        case up_to_date_metadata dat_hash_cache allow_timeout_discrepancy checkpoint_policy project plan input_key node of
+            SOME text =>
+              (if metadata_needs_rewrite emit_output_hashes node text then
+                 write_metadata emit_output_hashes checkpoint_policy
+                   (if allow_timeout_discrepancy then metadata_proof_timeout text
+                    else tactic_timeout checkpoint_policy)
+                   project plan keys input_key toolchain_key node
+               else ();
+               true)
+          | NONE => false)
 
 fun root_package_name project =
   HolbuildProject.package_name (HolbuildProject.project_package project)
@@ -5464,25 +5471,27 @@ fun report_up_to_date_node status project keys node =
     HolbuildStatus.finish_node status key label HolbuildStatus.UpToDate
   end
 
-fun all_nodes_up_to_date options project plan keys toolchain_key =
-  List.all (node_is_up_to_date options project plan keys toolchain_key)
-           (HolbuildBuildPlan.selected_nodes plan)
-
-fun report_all_up_to_date status project keys plan =
-  List.app (report_up_to_date_node status project keys) (HolbuildBuildPlan.selected_nodes plan)
-
-fun build_one speculated dat_hash_cache status options tc project base_context plan keys toolchain_key node =
-  let
-    val key = HolbuildBuildPlan.key node
-    val label = HolbuildBuildPlan.logical_name node
-    val _ = HolbuildStatus.start_node status key label
-    val outcome = build_node speculated dat_hash_cache options tc project base_context plan keys toolchain_key node
-  in
-    (* Its outputs are final now; a digest taken earlier may be stale. *)
-    HolbuildBuildPlan.forget_output_digest plan node;
-    HolbuildStatus.finish_node status key label outcome;
-    outcome
-  end
+(* IS_SETTLED says whether a check during the batch found NODE up to date,
+   as build_node would: then it is reported so, keeping its output digest. *)
+fun build_one is_settled speculated dat_hash_cache status options tc project base_context plan keys toolchain_key node =
+  if is_settled node then
+    ((case #kind (HolbuildBuildPlan.source_of node) of
+          HolbuildSourceIndex.TheoryScript => claim_extra_outputs project node (source_extra_output_paths plan node)
+        | _ => ());
+     report_up_to_date_node status project keys node;
+     HolbuildStatus.UpToDate)
+  else
+    let
+      val key = HolbuildBuildPlan.key node
+      val label = HolbuildBuildPlan.logical_name node
+      val _ = HolbuildStatus.start_node status key label
+      val outcome = build_node speculated dat_hash_cache options tc project base_context plan keys toolchain_key node
+    in
+      (* Its outputs are final now; a digest taken earlier may be stale. *)
+      HolbuildBuildPlan.forget_output_digest plan node;
+      HolbuildStatus.finish_node status key label outcome;
+      outcome
+    end
 
 fun outcome_may_create_checkpoints options project node outcome =
   case outcome of
@@ -6193,7 +6202,7 @@ fun raise_build_failures failures =
           else raise ErrorWithDebugArtifacts (msg, artifacts)
         end
 
-fun build_serial dat_hash_cache status (options : build_options) tc project base_context plan keys toolchain_key budget_state =
+fun build_serial is_settled dat_hash_cache status (options : build_options) tc project base_context plan keys toolchain_key budget_state =
   let
     val blocked = ref (Redblackmap.mkDict String.compare)
     val failures = ref []
@@ -6210,7 +6219,7 @@ fun build_serial dat_hash_cache status (options : build_options) tc project base
                HolbuildStatus.skip status key name cause;
                SOME HolbuildStatus.UpToDate)
           | [] =>
-              SOME (build_one NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
+              SOME (build_one is_settled NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
               handle Thread.Interrupt => raise Thread.Interrupt
                    | e =>
                        (HolbuildStatus.fail_with_debug_artifacts status key name
@@ -6236,7 +6245,7 @@ fun build_serial dat_hash_cache status (options : build_options) tc project base
     raise_build_failures (rev (!failures))
   end
 
-fun build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state =
+fun build_parallel is_settled dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state =
   let
     (* Keep scheduler state explicit and reusable: precompute reverse dependency
        edges once, then release dependents by decrementing remaining_dep counts.
@@ -6397,8 +6406,9 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
         end
 
     fun mark_priority_root id =
-      let val has = node_has_failed_prefix_checkpoint project (Vector.sub (nodes, id))
-                    handle _ => false
+      let val node = Vector.sub (nodes, id)
+          val has = not (is_settled node) andalso
+                    (node_has_failed_prefix_checkpoint project node handle _ => false)
       in
         Array.update (failed_prefix_priority, id, SOME has);
         if has then (priority_mode := true; mark_priority_focus id) else ()
@@ -6467,7 +6477,7 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
         val node = Vector.sub (nodes, id)
         val policy = checkpoint_policy_for_node options project node
       in
-        context_tactics andalso is_theory id andalso Array.sub (cold, id) <> SOME false andalso
+        context_tactics andalso is_theory id andalso not (is_settled node) andalso Array.sub (cold, id) <> SOME false andalso
         (not (theorem_checkpoints_enabled policy) orelse
          not (#all_checkpoints options orelse force_target_node (#force_targets options) node)) andalso
         (not (proof_steps_enabled policy) orelse proof_ir_enabled policy) andalso
@@ -7021,11 +7031,11 @@ fun build_parallel dat_hash_cache status options tc project base_context plan ke
             | SOME (CommitWork (id, result)) =>
                 build id false
                   (fn node =>
-                      build_one (SOME result) dat_hash_cache status options tc project base_context plan keys
+                      build_one is_settled (SOME result) dat_hash_cache status options tc project base_context plan keys
                         toolchain_key node
                       before remove_tree (#stage_root result))
             | SOME (PlainWork id) =>
-                build id true (fn node => build_one NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
+                build id true (fn node => build_one is_settled NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
         (* A pipelined build's commit saves no checkpoints, so it needs no
            checkpoint maintenance. *)
         and build id may_checkpoint run =
@@ -7203,14 +7213,15 @@ fun prefetch_limit jobs =
    the nodes not yet started and waits for the copies in flight.  The build
    workers keep their own demand restore, so they never wait behind a
    prefetch. *)
-fun start_remote_cache_prefetch (options : build_options) project plan keys jobs =
+fun start_remote_cache_prefetch (options : build_options) project plan keys jobs is_settled =
   case HolbuildRemoteCacheConfig.url () of
       SOME url =>
         if not (#use_cache options) then (fn () => ())
         else
           let
             val root = cache_root ()
-            val nodes = HolbuildBuildPlan.selected_nodes plan
+            (* A node found up to date has no entry to fetch. *)
+            val nodes = List.filter (not o is_settled) (HolbuildBuildPlan.selected_nodes plan)
             fun prefetch node =
               case prefetch_key options project keys node of
                   SOME key => prefetch_remote_cache_key root url key
@@ -7245,6 +7256,103 @@ fun start_remote_exec_prefetch (options : build_options) jobs keys =
           end
     | NONE => {add = fn _ => (), stop = fn () => ()}
 
+(* The nodes a check during a batch found up to date, each with the input
+   key it checked, and the hashes of their theories' data it read. *)
+type settled = {nodes : (string, string) Binarymap.dict, dat_hash_cache : file_hash_cache}
+
+(* For build --remote-exec while it follows a batch: checks on JOBS
+   background threads, writing nothing, which selected nodes are up to date
+   as the restore after the batch, with OPTIONS, would find them.  Nodes in
+   the batch (their input keys in BATCH_KEYS) or deferred (their node keys in
+   DEFERRED), and the nodes that depend on them, aren't checked: the restore
+   replaces their outputs.  Then it remembers the output digests of the
+   checked nodes the batch's theories depend on, which their restore takes.
+   Returns a function that drops what hasn't started, waits for what has,
+   and gives the nodes found up to date whose dependencies all were too. *)
+fun start_settled_check (options : build_options) tc project plan toolchain_key jobs batch_keys deferred =
+  let
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+    fun input_key node = HolbuildBuildPlan.input_key_for keys node
+    val key = HolbuildBuildPlan.key
+    val in_batch = Binaryset.addList (Binaryset.empty String.compare, batch_keys)
+    val deferred = Binaryset.addList (Binaryset.empty String.compare, deferred)
+    (* In plan order, so a node's dependencies come before it. *)
+    val (outside, cone) =
+      List.foldl
+        (fn (node, (outside, cone)) =>
+            if Binaryset.member (in_batch, input_key node) orelse Binaryset.member (deferred, key node) orelse
+               List.exists (fn dep => Binaryset.member (cone, key dep)) (HolbuildBuildPlan.direct_project_deps plan node)
+            then (outside, Binaryset.add (cone, key node))
+            else (node :: outside, cone))
+        ([], Binaryset.empty String.compare) (HolbuildBuildPlan.selected_nodes plan)
+    val outside = rev outside
+    val dat_hash_cache = new_file_hash_cache ()
+    val passed = ref (Binarymap.mkDict String.compare)
+    val passed_mutex = Mutex.mutex ()
+    fun check node =
+      let val policy = node_policy options project node
+      in
+        if not (force_node options project node) andalso not (always_reexecute node) andalso
+           not (trace_steps policy) andalso
+           (case up_to_date_metadata dat_hash_cache (#allow_cache_timeout_discrepancy options) policy
+                   project plan (input_key node) node of
+                SOME text => not (metadata_needs_rewrite (#emit_output_hashes options) node text)
+              | NONE => false)
+        then
+          (Mutex.lock passed_mutex;
+           passed := Binarymap.insert (!passed, key node, input_key node);
+           Mutex.unlock passed_mutex)
+        else ()
+      end
+    val batch_ancestors =
+      List.filter (fn node => not (Binaryset.member (cone, key node)))
+        (HolbuildBuildPlan.selected_closure plan
+           (List.filter (fn node => Binaryset.member (in_batch, input_key node)) (HolbuildBuildPlan.selected_nodes plan)))
+    fun chunks [] = []
+      | chunks nodes =
+          let val n = Int.min (64, length nodes)
+          in List.take (nodes, n) :: chunks (List.drop (nodes, n)) end
+    val {add, stop, ...} = start_background_pool (Int.max (1, jobs)) (fn work => work ())
+    fun settled () =
+      let
+        val _ = stop ()
+        val passed = !passed
+        fun up_to_date (node, settled) =
+          case Binarymap.peek (passed, key node) of
+              SOME checked_key =>
+                if List.all (fn dep => Option.isSome (Binarymap.peek (settled, key dep)))
+                     (HolbuildBuildPlan.direct_project_deps plan node)
+                then Binarymap.insert (settled, key node, checked_key)
+                else settled
+            | NONE => settled
+        val nodes = List.foldl up_to_date (Binarymap.mkDict String.compare) outside
+        (* The restore may replace the other nodes' data, so it gets only these hashes. *)
+        val hashes = new_file_hash_cache ()
+        fun keep_hash node =
+          if Option.isSome (Binarymap.peek (nodes, key node)) andalso
+             #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript
+          then
+            let val path = #data_path (theory_outputs node)
+            in
+              case Binarymap.peek (!(#entries dat_hash_cache), path) of
+                  SOME hash => #entries hashes := Binarymap.insert (!(#entries hashes), path, hash)
+                | NONE => ()
+            end
+          else ()
+      in
+        List.app keep_hash outside;
+        cache_trace ("up to date during the batch: " ^ Int.toString (Binarymap.numItems nodes) ^ " of " ^
+                     Int.toString (length outside) ^ " nodes outside it");
+        {nodes = nodes, dat_hash_cache = hashes}
+      end
+  in
+    (List.app (fn node => add (fn () => check node)) outside;
+     List.app (fn nodes => add (fn () => remember_output_digests toolchain_key plan nodes)) (chunks batch_ancestors);
+     settled)
+    handle e => (stop (); raise e)
+  end
+
 (* Linux PSI: total microseconds runnable tasks, machine-wide, waited for a CPU.
    NONE where /proc/pressure/cpu doesn't exist (e.g. macOS). *)
 fun cpu_pressure_total_us () =
@@ -7263,7 +7371,9 @@ fun trace_cpu_pressure_delta start =
         cache_trace ("system cpu pressure some delta: " ^ LargeInt.toString (after_us - before_us) ^ "us")
     | _ => ()
 
-fun build (options : build_options) tc project plan toolchain_key jobs =
+(* Builds the plan; SETTLED, from start_settled_check, holds the nodes a
+   check during the batch found up to date. *)
+fun build_checked (settled : settled option) (options : build_options) tc project plan toolchain_key jobs =
   let
     val cpu_pressure_start =
       if HolbuildStatus.cache_trace_enabled () then cpu_pressure_total_us () else NONE
@@ -7278,17 +7388,31 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val _ = dump_keys_if_requested (build_config_lines_for_node options project) toolchain_key plan keys
-    val dat_hash_cache = new_file_hash_cache ()
-    val _ = HolbuildBuildPlan.forget_output_digests plan
+    (* Only for the input key it was checked for. *)
+    fun is_settled node =
+      case settled of
+          SOME {nodes, ...} =>
+            Binarymap.peek (nodes, HolbuildBuildPlan.key node) = SOME (HolbuildBuildPlan.input_key_for keys node)
+        | NONE => false
+    val dat_hash_cache =
+      case settled of
+          SOME {dat_hash_cache, ...} => dat_hash_cache
+        | NONE => new_file_hash_cache ()
+    val _ =
+      case settled of
+          SOME _ =>
+            List.app (fn node => if is_settled node then () else HolbuildBuildPlan.forget_output_digest plan node)
+              (HolbuildBuildPlan.selected_nodes plan)
+        | NONE => HolbuildBuildPlan.forget_output_digests plan
   in
     let
       val status = HolbuildStatus.create {total = length (HolbuildBuildPlan.selected_nodes plan), jobs = jobs}
       fun run () =
         let
-          val stop_prefetch = start_remote_cache_prefetch options project plan keys jobs
+          val stop_prefetch = start_remote_cache_prefetch options project plan keys jobs is_settled
           fun build_nodes () =
-            if jobs <= 1 then build_serial dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
-            else build_parallel dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
+            if jobs <= 1 then build_serial is_settled dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
+            else build_parallel is_settled dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
         in
           (build_nodes (); stop_prefetch ())
           handle e => (stop_prefetch (); raise e)
@@ -7306,6 +7430,8 @@ fun build (options : build_options) tc project plan toolchain_key jobs =
                    raise e)
     end
   end
+
+fun build options tc project plan toolchain_key jobs = build_checked NONE options tc project plan toolchain_key jobs
 
 (* After remote execution, force and tracing have already been fulfilled. *)
 fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, skip_checkpoints, proof_steps,

@@ -306,6 +306,41 @@ require_grep "the coordinator reported no theories; building locally" "$tmpdir/e
 refute_grep "cancel" "$tmpdir/ended.log"
 rm "$state/ended"
 
+# While a batch runs, the client checks which theories outside it are up to
+# date, so that the restore after it needn't.  A theory counts only if every
+# theory it depends on does: an ancestor the restore replaces would leave its
+# descendants' check stale.
+write_independent() {
+  cat > "$project/src/CScript.sml" <<SML
+Theory C
+Ancestors bool
+
+Theorem c_thm:
+  T
+Proof
+  simp[] (* $1 *)
+QED
+SML
+}
+write_independent one
+HOLBUILD_CACHE_TRACE=1 run settled 0 build --remote-exec "$coordinator" BTheory CTheory
+require_grep "up to date during the batch: 2 of 2 nodes outside it" "$tmpdir/settled.log"
+require_grep "CTheory restored from cache" "$tmpdir/settled.log"
+refute_grep "ATheory restored" "$tmpdir/settled.log"
+refute_grep "BTheory restored" "$tmpdir/settled.log"
+# ATheory's metadata gone and its data altered: the check finds it out of date
+# but BTheory, whose check reads ATheory's generated module, up to date.  The
+# restore replaces ATheory's data, and BTheory isn't taken as checked.
+cp "$project/.holbuild/obj/src/ATheory.dat" "$tmpdir/ATheory.dat"
+rm "$project/.holbuild/dep/rx/src/AScript.sml.key"
+printf '\n' >> "$project/.holbuild/obj/src/ATheory.dat"
+write_independent two
+HOLBUILD_CACHE_TRACE=1 run settled-ancestor 0 build --remote-exec "$coordinator" BTheory CTheory
+require_grep "up to date during the batch: 0 of 2 nodes outside it" "$tmpdir/settled-ancestor.log"
+require_grep "ATheory restored from cache" "$tmpdir/settled-ancestor.log"
+cmp "$tmpdir/ATheory.dat" "$project/.holbuild/obj/src/ATheory.dat"
+rm "$project/src/CScript.sml"
+
 # An interrupted build cancels the batch it follows, --remote-only too.
 # interrupt NAME ARGS...: starts hb with ARGS, logging to $tmpdir/NAME.log,
 # and sends holbuild SIGTERM once it follows its batch.  HOLBUILD_BIN may be

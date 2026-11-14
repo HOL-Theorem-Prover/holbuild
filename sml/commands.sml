@@ -1776,6 +1776,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         in List.filter (fn key => not (Redblackset.member (in_batch, key))) (!prefetch_keys) end
                     | NONE => []
                 val {add, stop} = HolbuildBuildExec.start_remote_exec_prefetch build_options jobs outside_batch
+                (* What the restore after the batch would find up to date is
+                   checked while it runs: on a busy host those reads are slow. *)
+                val settled =
+                  (case in_batch of
+                       SOME batch_keys =>
+                         SOME (HolbuildBuildExec.start_settled_check
+                                 (HolbuildBuildExec.remote_restore_options true build_options) tc project plan
+                                 toolchain_key jobs batch_keys (!deferred))
+                     | NONE => NONE)
+                  handle e => (stop (); raise e)
+                fun stop_all () = (stop (); Option.map (fn settled => settled ()) settled)
                 val logs = ref []
                 fun on_change (key, state, _, log) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
@@ -1783,11 +1794,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 fun follow_batch () =
                   let
                     val result = HolbuildRemoteExec.follow url batch_id on_change
-                    val _ = stop ()
+                    val settled = stop_all ()
                   in
-                    (result, rev (!logs))
+                    (result, rev (!logs), settled)
                   end
-                  handle e => (stop (); raise e)
+                  handle e => (stop_all (); raise e)
               in
                 follow_batch ()
               end)
@@ -1826,11 +1837,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     end
             (* Restores what the remote cache holds, and nothing else: after a
                batch failed, the build must not retry its failed theories.  It
-               reports only what it restores: the failures are the batch's. *)
-            fun restore_after_failures () =
-              (HolbuildStatus.reporting_finished_only (fn () =>
-                 HolbuildBuildExec.build (HolbuildBuildExec.remote_restore_options true build_options)
-                   tc project plan toolchain_key jobs)
+               reports only what it restores: the failures are the batch's.
+               SETTLED is what a check during that batch found up to date. *)
+            fun restore_after_failures settled =
+              (timed_phase "build.execute" (fn () =>
+                 HolbuildStatus.reporting_finished_only (fn () =>
+                   HolbuildBuildExec.build_checked settled (HolbuildBuildExec.remote_restore_options true build_options)
+                     tc project plan toolchain_key jobs))
                handle HolbuildBuildExec.Error _ => ()
                     | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
                HolbuildHolSharedCache.local_build_needed := false)
@@ -1845,7 +1858,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                resubmitted once, for the export to upload it again. *)
             fun finish resubmit skip in_batch batch_id =
               case follow in_batch batch_id of
-                  ((HolbuildRemoteExec.Done, progress), logs) =>
+                  ((HolbuildRemoteExec.Done, progress), logs, settled) =>
                     let
                       val log_error =
                         (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan toolchain_key logs; NONE)
@@ -1857,14 +1870,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         | NONE =>
                             (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
                              if not (null (!deferred)) then submit_deferred resubmit []
-                             else if not (null skip) then restore_after_failures ()
+                             else if not (null skip) then restore_after_failures NONE
                              else
                                timed_phase "build.execute"
-                                 (fn () => HolbuildBuildExec.build
+                                 (fn () => HolbuildBuildExec.build_checked settled
                                    (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
                                    tc project plan toolchain_key jobs))
                     end
-                | ((HolbuildRemoteExec.Failed (reason, failures), progress), logs) =>
+                | ((HolbuildRemoteExec.Failed (reason, failures), progress), logs, settled) =>
                   let
                     val proof_failure = List.exists (fn {kind, ...} => kind = "proof" orelse kind = "tactic-timeout") failures
                     val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
@@ -1887,7 +1900,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     val build_deferred = final andalso not fail_fast andalso not (null (!deferred))
                     (* Restore before a terminal failure. A resubmission must first
                        repair its inputs, without installing stale cached outputs. *)
-                    val _ = if final andalso not build_deferred then restore_after_failures () else ()
+                    val _ = if final andalso not build_deferred then restore_after_failures settled else ()
                     val _ = HolbuildHolSharedCache.local_build_needed := false
                     fun deferred_errors () =
                       if not build_deferred then []
@@ -1918,16 +1931,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          export_and_submit false false skip forced)
                   end
-                | ((HolbuildRemoteExec.Cancelled, progress), _) =>
+                | ((HolbuildRemoteExec.Cancelled, progress), _, _) =>
                     let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                     in
                       (* Whoever cancelled it stopped this work, so a --remote-only
                          build doesn't ask for it to be built locally instead. *)
                       if remote_only then raise Error ("remote execution: " ^ reason) else fall_back reason
                     end
-                | ((HolbuildRemoteExec.Unfollowable reason, progress), _) =>
+                | ((HolbuildRemoteExec.Unfollowable reason, progress), _, _) =>
                     abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
-                | ((HolbuildRemoteExec.Unreachable reason, progress), _) =>
+                | ((HolbuildRemoteExec.Unreachable reason, progress), _, _) =>
                     if remote_only
                     then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id ^
                                     (if priority = 0 then "" else " --priority " ^ Int.toString priority) ^
@@ -1939,7 +1952,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               if null (batch_keys batch) then
                 (record_pending ();
                  if not (null (!deferred)) then submit_deferred resubmit skip
-                 else if not (null skip) then restore_after_failures ()
+                 else if not (null skip) then restore_after_failures NONE
                  else
                    (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
                     build_locally ()))
