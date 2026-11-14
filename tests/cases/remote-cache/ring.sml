@@ -8,6 +8,7 @@ val dir = env "RING_DIR";
 val one = env "RING_ONE";
 val two = env "RING_TWO";
 val three = env "RING_THREE";
+val four = env "RING_FOUR";
 fun assert message ok = if ok then () else raise Fail message;
 val cache = RC.remote (one ^ "///, " ^ two ^ "/ " ^ one);
 val reversed = RC.remote (two ^ "," ^ one);
@@ -24,7 +25,8 @@ val _ = if env "RING_TRANSPORT" = "libcurl" then HolbuildRemoteCacheConfig.setup
 val _ = assert "requested HTTP transport"
   (HolbuildRemoteCacheConfig.uses_libcurl () = (env "RING_TRANSPORT" = "libcurl"));
 val _ = RC.fail_closed := true;
-fun node_dir node = dir ^ (if node = one then "/one" else if node = two then "/two" else "/three");
+fun node_dir node =
+  dir ^ (if node = one then "/one" else if node = two then "/two" else if node = three then "/three" else "/four");
 fun control node name = node_dir node ^ "/control/" ^ name;
 fun stored node kind digest = node_dir node ^ "/store/" ^ kind ^ "/" ^ digest;
 fun put node name text = RC.write_text (control node name) text;
@@ -152,6 +154,42 @@ val _ = RC.remove_file (stored second "ac" theory_ac);
 val _ = assert "a miss walks the whole ring" (RC.get_action replicas theory_key = SOME (theory_manifest "10.0"));
 val _ = RC.remove_file (stored third "ac" theory_ac);
 val _ = assert "missing everywhere is a miss" (RC.get_action replicas theory_key = NONE);
+
+(* Past two 404s a read probes the rest of the ring with HEAD, then GETs
+   only from the nodes whose probe found the entry, in rank order. *)
+val quad = RC.remote (String.concatWith "," [one, two, three, four]);
+fun requests node =
+  String.tokens (fn c => c = #"\n") (RC.read_text (node_dir node ^ "/state/requests.log"));
+fun asked_during f =
+  let
+    val nodes = RC.ranked_urls quad theory_ac
+    val before = map (length o requests) nodes
+    val result = f ()
+  in
+    (result, ListPair.map (fn (node, n) =>
+       List.mapPartial (fn line => case String.tokens Char.isSpace line of
+                                       [method, path] => if String.isSuffix theory_ac path then SOME method else NONE
+                                     | _ => NONE)
+                       (List.drop (requests node, n))) (nodes, before))
+  end;
+val [_, _, q3, q4] = RC.ranked_urls quad theory_ac;
+val _ = seed q3 (theory_manifest "none");
+val _ = seed q4 (theory_manifest "10.0");
+val _ = assert "probes pass a weaker copy over for a stronger later one"
+  (asked_during (fn () => RC.get_action_using timed quad theory_key) =
+   (SOME (theory_manifest "10.0"), [["GET"], ["GET"], ["HEAD", "GET"], ["HEAD", "GET"]]));
+val _ = RC.remove_file (stored q3 "ac" theory_ac);
+val _ = RC.remove_file (stored q4 "ac" theory_ac);
+val _ = assert "a miss asks two nodes, then probes the rest"
+  (asked_during (fn () => RC.get_action quad theory_key) = (NONE, [["GET"], ["GET"], ["HEAD"], ["HEAD"]]));
+val _ = put q3 "head-status" "503";
+val _ = assert "a probe's 503 beside 404s is a miss"
+  (asked_during (fn () => RC.get_action quad theory_key) = (NONE, [["GET"], ["GET"], ["HEAD"], ["HEAD"]]));
+val _ = seed q4 (theory_manifest "10.0");
+val _ = assert "a probe's 503 does not hide a later hit"
+  (#1 (asked_during (fn () => RC.get_action quad theory_key)) = SOME (theory_manifest "10.0"));
+val _ = clear q3 "head-status";
+val _ = RC.remove_file (stored q4 "ac" theory_ac);
 
 (* A preferred node takes writes and is read first; the rest keep rendezvous order. *)
 val _ = HolbuildRemoteCacheConfig.set_preferred_urls (authenticated third);

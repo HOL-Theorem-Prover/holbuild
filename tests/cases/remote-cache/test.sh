@@ -571,6 +571,10 @@ background_pids+=("$server_pid")
 server_pid=
 start_remote_cache_server "$ring_dir/three/store" "$ring_dir/three/state" "$ring_dir/three/control"
 ring_three=$remote_url
+background_pids+=("$server_pid")
+server_pid=
+start_remote_cache_server "$ring_dir/four/store" "$ring_dir/four/state" "$ring_dir/four/control"
+ring_four=$remote_url
 python3 - "$ring_dir/vectors" "$ring_one" "$ring_two" <<'PY'
 import hashlib
 import pathlib
@@ -589,8 +593,9 @@ pathlib.Path(sys.argv[1]).write_text("\n".join(vectors))
 PY
 for transport in libcurl cli; do
   # Remove only this test's objects between runs, retaining the live servers.
-  find "$ring_dir/one/store" "$ring_dir/two/store" "$ring_dir/three/store" -type f -delete
-  RING_DIR="$ring_dir" RING_ONE="$ring_one" RING_TWO="$ring_two" RING_THREE="$ring_three" RING_TRANSPORT="$transport" \
+  find "$ring_dir/one/store" "$ring_dir/two/store" "$ring_dir/three/store" "$ring_dir/four/store" -type f -delete
+  RING_DIR="$ring_dir" RING_ONE="$ring_one" RING_TWO="$ring_two" RING_THREE="$ring_three" RING_FOUR="$ring_four" \
+    RING_TRANSPORT="$transport" \
     poly --script "$SCRIPT_DIR/ring.sml" > "$ring_dir/$transport.log" 2>&1 || {
       cat "$ring_dir/$transport.log" >&2
       exit 1

@@ -307,42 +307,112 @@ fun require_answer method url result =
 fun transient (HolbuildHttp.Failed _) = true
   | transient (HolbuildHttp.Response code) = code = 429 orelse (code >= 500 andalso code < 600)
 
+(* A read's probes past its first nodes run on the caller's thread and on
+   helper threads, at most probe_helpers of them in the whole process, so
+   callers that run many lookups at once don't multiply threads,
+   connections or curl processes. *)
+val probe_helpers = 16
+val free_helpers = ref probe_helpers
+val helpers_mutex = Mutex.mutex ()
+
+fun with_mutex mutex f =
+  (Mutex.lock mutex; f () before Mutex.unlock mutex)
+  handle e => (Mutex.unlock mutex; raise e)
+
+(* The result of probe on each of urls, in order.  The caller probes too, so
+   with every helper busy this is a plain serial walk. *)
+fun probe_all probe urls =
+  let
+    val nodes = Vector.fromList urls
+    val count = Vector.length nodes
+    val results = Array.array (count, HolbuildHttp.Failed "not probed")
+    val mutex = Mutex.mutex ()
+    val finished = ConditionVar.conditionVar ()
+    val next = ref 0
+    val running = ref 0
+    fun take () =
+      with_mutex mutex (fn () => if !next < count then SOME (!next before next := !next + 1) else NONE)
+    fun work () =
+      case take () of
+          NONE => ()
+        | SOME i =>
+            (Array.update (results, i, probe (Vector.sub (nodes, i))
+                                         handle e => HolbuildHttp.Failed (General.exnMessage e));
+             work ())
+    fun release slots = with_mutex helpers_mutex (fn () => free_helpers := !free_helpers + slots)
+    fun stopped () = with_mutex mutex (fn () => (running := !running - 1; ConditionVar.broadcast finished))
+    fun helper () = (work (); release 1; stopped ())
+    fun start 0 = ()
+      | start slots =
+          (with_mutex mutex (fn () => running := !running + 1);
+           ignore (Thread.fork (helper, []));
+           start (slots - 1))
+          handle _ => (release slots; stopped ())
+    val slots = with_mutex helpers_mutex (fn () =>
+      let val slots = Int.min (count - 1, !free_helpers)
+      in free_helpers := !free_helpers - slots; slots end)
+    fun wait () = if !running > 0 then (ConditionVar.wait (finished, mutex); wait ()) else ()
+  in
+    start slots;
+    work ();
+    with_mutex mutex wait;
+    Array.foldr (op ::) [] results
+  end
+
 (* The breaker observes the whole request: a dead primary must not disable a healthy backup.
    A write goes past the first two nodes only while none of them answered at all
    (a member whose name doesn't resolve yet, say), and stops at the first answer.
-   A read walks the whole ring until a hit: a node writes to the shared backing
+   A read must reach every node before a miss: a node writes to the shared backing
    store after it answers the PUT, so until then only the writer's node holds a
-   blob, and a reader that prefers another node must still find it.
+   blob, and a reader that prefers another node must still find it.  It asks
+   its nodes in turn until two of them answer 404, which finds what a writer
+   ranking the nodes the same way wrote, then probes all the rest at once and
+   goes on through their answers in rank order; a GET asks a node whose probe
+   found the entry for its body.
    A read whose 200 body fails `usable` counts as that node's 404, so a replica
    holding a weaker copy does not hide a better one on the next node. *)
-fun routed_status_using usable method urls path request =
+fun routed_status_using usable method probe urls path request =
   let
     val read = method = "GET" orelse method = "HEAD"
     fun unanswered (HolbuildHttp.Failed _) = true
       | unanswered (HolbuildHttp.Response _) = false
-    fun loop [] _ _ missing last = Option.getOpt (missing, last)
-      | loop (node :: rest) count silent missing last =
+    fun ask node () = traced method node path (fn () => request node)
+    fun probed node result () =
+      if method = "GET" andalso result = HolbuildHttp.Response 200 then ask node () else result
+    fun probe_rest rest =
+      let val nodes = map #1 rest
+      in
+        ListPair.mapEq (fn (node, result) => (node, probed node result))
+          (nodes, probe_all (fn node => traced "HEAD" node "" (fn () => probe node)) nodes)
+      end
+    fun loop [] _ _ _ missing last = Option.getOpt (missing, last)
+      | loop ((node, answer) :: rest) count misses silent missing last =
           if not read andalso count >= 2 andalso not silent then
             Option.getOpt (missing, last)
           else
             let
-              val result = traced method node path (fn () => request node)
+              val result = answer ()
               val rejected = read andalso result = HolbuildHttp.Response 200 andalso not (usable path)
-              val result =
+              val _ =
                 if rejected then
-                  (HolbuildStatus.cache_trace ("remote cache " ^ method ^ " " ^ redact_userinfo node ^
-                                               ": entry passed over");
-                   HolbuildHttp.Response 404)
-                else result
+                  HolbuildStatus.cache_trace ("remote cache " ^ method ^ " " ^ redact_userinfo node ^
+                                              ": entry passed over")
+                else ()
+              val miss = read andalso result = HolbuildHttp.Response 404
+              val result = if rejected then HolbuildHttp.Response 404 else result
+              val misses = if miss then misses + 1 else misses
               val missing = if read andalso result = HolbuildHttp.Response 404 then SOME (node, result) else missing
             in
               if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
-                loop rest (count + 1) (silent andalso unanswered result) missing (node, result)
+                loop (if miss andalso misses = 2 andalso not (null rest) then probe_rest rest else rest)
+                     (count + 1) misses (silent andalso unanswered result) missing (node, result)
               else (node, result)
             end
-  in loop urls 0 true NONE (hd urls, HolbuildHttp.Failed "no cache response") end
+  in
+    loop (map (fn node => (node, ask node)) urls) 0 0 true NONE (hd urls, HolbuildHttp.Failed "no cache response")
+  end
 
-fun routed_status method urls path request = routed_status_using (fn _ => true) method urls path request
+fun routed_status method urls path request = routed_status_using (fn _ => true) method request urls path request
 
 (* NONE when the remote cache is disabled, without a request.  With
    fail_closed, raises Unavailable instead, and for no answer, 429 or 5xx. *)
@@ -370,7 +440,7 @@ fun send method url path request =
   Option.map #2 (send_result method url (fn () => (url, traced method url path request)))
 
 fun send_urls_using usable method urls path request =
-  send_result method (hd urls) (fn () => routed_status_using usable method urls path request)
+  send_result method (hd urls) (fn () => routed_status_using usable method head_status urls path request)
 
 fun send_urls method urls path request = send_urls_using (fn _ => true) method urls path request
 

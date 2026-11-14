@@ -1388,8 +1388,11 @@ one data center can name the replicas there, so it writes to them and reads
 from them first. Reads try the next node after a 404, connection failure,
 timeout, 429 or 5xx, through the whole ring: a node writes a new entry to the
 shared backing store only after answering the PUT, so until then a reader that
-prefers another node finds it only on the writer's node. A genuine miss costs
-one 404 per node. Writes try the second node after a connection failure,
+prefers another node finds it only on the writer's node. After two nodes
+answer 404, holbuild asks the rest of the ring at once with HEAD (on up to 16
+helper threads per process) and then reads the body only from a node that
+has the entry, so a genuine miss costs two 404s in turn and one parallel round
+of HEADs. Writes try the second node after a connection failure,
 timeout, 429 or 5xx. A theory's `/ac` read also tries the next node when the
 first one's entry was built under a weaker tactic-timeout contract than the
 build asks for. When publishing or confirming an
