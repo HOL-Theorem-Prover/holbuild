@@ -3,8 +3,9 @@
 # See README.md for running it.
 
 ARG PYTHON_IMAGE=python:3.14-slim-trixie
-# The same Poly/ML as holbuild's CI.
-ARG POLYML_TAG=v5.9.2-seq8
+# The workers' Poly/ML, also release.yml's POLYML_TAG. It stays on seq7
+# for now while CI (setup-polyml) is on seq8.
+ARG POLYML_TAG=v5.9.2-seq7
 
 FROM ${PYTHON_IMAGE} AS polyml
 ARG POLYML_REPO=https://github.com/sequent-dev-bot/polyml.git
