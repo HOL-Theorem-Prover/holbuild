@@ -12,6 +12,7 @@ on:
       - man/**
       - completions/**
       - sml/holbuild-script.sml
+      - sml/driver_main.c
       - sml/action_sandbox.py
       - sml/ahead_load_runtime.sml
       - sml/checkpoint_save_runtime.sml
