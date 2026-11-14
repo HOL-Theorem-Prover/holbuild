@@ -558,3 +558,64 @@ for limits in "100 10 89" "400 40 359"; do
   sweep_mature "$limit" 0
   ! cmp -s "$mature_state" "$tmpdir/mature-state" || { echo "zero-reserve cache reused a measurement" >&2; exit 1; }
 done
+
+# An evicting sweep publishes its fresh walk before eviction, which can
+# outlast the stamp's life, so a sibling within the limit reuses it rather
+# than waiting on gc.lock. A FIFO manifest pauses the sweep as it reads the
+# cache entries to evict. The sibling has its own container root, as on a
+# host, so it doesn't wait on the evictor's action-root lock.
+evicting=$tmpdir/evicting
+sparse "$evicting/checkpoint-store/family/heap" 89
+sparse "$evicting/blobs/old" 6
+mkdir -p "$evicting/actions/held"
+mkfifo "$evicting/actions/held/manifest"
+at 2010 "$evicting/checkpoint-store/family/heap"
+at 2000 "$evicting/blobs/old"
+mkdir -p "$evicting/locks" "$evicting/hol-toolchains" "$tmpdir/evicting-sibling"
+for shared_dir in locks checkpoint-store hol-toolchains actions blobs; do
+  ln -s "$evicting/$shared_dir" "$tmpdir/evicting-sibling/$shared_dir"
+done
+python3 - "$HOLBUILD_BIN" "$evicting" "$tmpdir/evicting-sibling" "$remote_url" "$absent" "$tmpdir" <<'EVICTING'
+import os, pathlib, subprocess, sys, time
+binary, cache, sibling, remote, absent, tmp = sys.argv[1:]
+cache = pathlib.Path(cache)
+state = cache / "locks/worker-cache-cap.state"
+gib = 1024 ** 3
+def sweep(name, root=cache):
+    return ([binary, "--remote-cache", remote, "exec-action", absent,
+             "--result", str(pathlib.Path(tmp) / f"{name}-result"),
+             "--cache-limit-gb", "100", "--cache-reserve-gb", "10"],
+            {**os.environ, "HOLBUILD_CACHE": str(root)})
+def stamp():
+    measured, *entries = state.read_text().split()[1:]
+    return int(measured), sum(map(int, entries[1::2]))
+argv, env = sweep("evicting")
+with open(pathlib.Path(tmp) / "evicting.log", "w") as log:
+    evictor = subprocess.Popen(argv, env=env, stdout=log, stderr=log)
+try:
+    for _ in range(200):
+        if state.exists() or evictor.poll() is not None:
+            break
+        time.sleep(0.1)
+    assert evictor.poll() is None, "the sweep did not pause reading the held manifest"
+    assert state.exists(), "the evicting sweep published no stamp before evicting"
+    measured, total = stamp()
+    assert time.time_ns() - measured < 60 * 10**9, "the stamp published before eviction is stale"
+    assert total >= 95 * gib, f"the stamp published before eviction holds {total} bytes, not the walk"
+    argv, env = sweep("sibling", sibling)
+    with open(pathlib.Path(tmp) / "sibling.log", "w") as log:
+        try:
+            status = subprocess.run(argv, env=env, stdout=log, stderr=log, timeout=20).returncode
+        except subprocess.TimeoutExpired:
+            raise AssertionError("a sibling within the limit waited on the evicting sweep")
+    assert status == 4, f"the sibling exited {status}"
+    os.close(os.open(cache / "actions/held/manifest", os.O_WRONLY))
+    assert evictor.wait(timeout=60) == 4
+finally:
+    if evictor.poll() is None:
+        evictor.kill()
+        evictor.wait()
+assert not (cache / "blobs/old").exists(), "the sweep kept old data over the target"
+assert (cache / "checkpoint-store/family/heap").exists(), "the sweep evicted past the target"
+assert stamp()[1] <= 90 * gib, "the stamp after eviction still holds the pre-eviction walk"
+EVICTING

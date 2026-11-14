@@ -201,7 +201,8 @@ reuse shared byte measurements for up to 60 seconds while shared and private
 sizes stay within the limit, while sizing private checkpoints and theory
 modules on each call. Eviction still goes down to the target, after an
 action's result or once the measurement expires, so the reserve holds what
-arrives in between. A cached directory must match the recorded device
+arrives in between. A sweep publishes its walk before evicting, so actions keep
+reusing a fresh measurement while eviction runs. A cached directory must match the recorded device
 and inode; other directories are sized live. Smaller targets and zero-reserve runs always scan live. Shared writes
 during the reuse interval are accounted for at the next scan. `exec-action` runs
 with the worker's `HOLBUILD_*` build settings, `PATH`, `HOME`, `TMPDIR`, the
