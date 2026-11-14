@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
@@ -826,6 +826,60 @@ async def test_a_batch_whose_ready_actions_are_all_held_does_not_block_other_bat
     await claim_named(http, "c")
 
 
+async def test_a_key_another_batch_s_claim_is_leasing_is_passed_over_for_the_next(
+    http: httpx.AsyncClient, remote_exec_engine: Any
+) -> None:
+    await submit(http, ["a", "b"])
+
+    async with remote_exec_engine.connect() as other, other.begin():
+        # Another batch's claim of "a", between its lock of the key and its commit.
+        await other.execute(coordinator_module.LOCK_KEY, {"key": input_key("a")})
+        await claim_named(http, "b")
+        assert await claim(http) is None
+
+    await claim_named(http, "a")
+
+
+async def test_a_key_another_batch_leased_since_the_claim_read_the_leases_is_passed_over_for_the_next(
+    http: httpx.AsyncClient, remote_exec_engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    leader = await submit(http, ["p", "a"], [("a", "p")])
+    await claim_named(http, "p")  # the leader's "a" waits, so the claim below is the other batch's
+    await submit(http, ["a", "b"])
+    scalar = AsyncConnection.scalar
+
+    async def lease_first(self: AsyncConnection, statement: Any, *args: Any, **kwargs: Any) -> Any:
+        if statement is coordinator_module.LOCK_KEY:
+            monkeypatch.setattr(AsyncConnection, "scalar", scalar)
+            # The leader's claim of "a" commits after this claim's read of the leases, before its lock of the key.
+            async with remote_exec_engine.begin() as connection:
+                await connection.execute(
+                    sa.text(
+                        "INSERT INTO leases (attempt_token, batch_id, input_key, worker, expires_at) "
+                        "VALUES (:token, :batch_id, :key, 'leader', now() + interval '1 minute')"
+                    ),
+                    {"token": uuid4(), "batch_id": leader, "key": input_key("a")},
+                )
+        return await scalar(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "scalar", lease_first)
+    await claim_named(http, "b")
+
+
+async def test_concurrent_claims_of_batches_sharing_keys_lease_each_key_once(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    names = [f"k{i:02}" for i in range(20)]
+    await submit(http, names)
+    await submit(http, names)
+
+    claims = await asyncio.gather(*(coordinator.claim(["standard"], f"w{i}") for i in range(40)))
+    async with remote_exec_engine.connect() as connection:
+        leased = (await connection.execute(sa.text("SELECT input_key FROM leases"))).scalars().all()
+    assert sorted(leased) == sorted(input_key(n) for n in names)
+    assert sum(c is not None for c in claims) == len(names)
+
+
 async def test_unknown_token_and_mismatched_result_are_refused(http: httpx.AsyncClient) -> None:
     await submit(http, ["a", "b"])
     token = await claim_named(http, "a")
@@ -1202,7 +1256,7 @@ async def test_a_claim_reads_no_finished_actions(
             if first is not None:
                 pages += await explained(
                     coordinator_module.CLAIM_ACTION,
-                    {"batch_id": first.batch_id, "class": first.action_class, "tier": first.tier},
+                    {"batch_id": first.batch_id, "class": first.action_class, "tier": first.tier, "taken": []},
                 )
             await connection.rollback()
         return pages

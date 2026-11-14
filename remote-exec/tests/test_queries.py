@@ -338,11 +338,15 @@ STATEMENTS = [
     Statement(
         cm.CLAIM_CANDIDATES, lambda f: {"tiers": ["standard"], "classes": ["build", "run"], "run_slots": 30}, 16_000
     ),
-    Statement(cm.CLAIM_ACTION, lambda f: {"batch_id": f.fresh, "class": "build", "tier": "standard"}, 2_900),
+    Statement(
+        cm.CLAIM_ACTION, lambda f: {"batch_id": f.fresh, "class": "build", "tier": "standard", "taken": []}, 2_900
+    ),
+    Statement(cm.LOCK_KEY, lambda f: {"key": f.arrival.keys("ready")[0]}, 100),
+    Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("ready")[0]}, 2_100),
     Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2}, 120_000),
     Statement(
         cm.CLAIM_AHEAD_ACTION,
-        lambda f: {"batch_id": f.fresh, "keys": f.ahead_candidates(), "tier": "standard", "depth": 2},
+        lambda f: {"batch_id": f.fresh, "keys": f.ahead_candidates(), "tier": "standard", "depth": 2, "taken": []},
         22_000,
     ),
     Statement(
