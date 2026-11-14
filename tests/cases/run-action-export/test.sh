@@ -307,6 +307,8 @@ exec "$real_sha256sum" "\$@"
 SH
 chmod +x "$tmpdir/bin/sha256sum"
 : > "$tmpdir/library-hashes"
+# sha256sum calls count the library hashes, so libcrypto is kept out.
+export HOLBUILD_TEST_LIBCRYPTO=libholbuild-test-no-such-crypto.so
 PATH="$tmpdir/bin:$PATH" hb run-action --fetch-only --closure \
   --script "$runner/run.sml" --load helperLib --output result \
   --outputs-dir "$tmpdir/fetched" spec:CTheory spec:BTheory spec:CTheory spec:ATheory \
@@ -319,6 +321,26 @@ PATH="$tmpdir/bin:$PATH" run_export --closure --load helperLib --output result \
   spec:CTheory spec:BTheory spec:CTheory spec:ATheory > "$tmpdir/shared.txt"
 [[ $(wc -l < "$tmpdir/library-hashes") -eq 1 ]] || {
   echo 'shared library was hashed more than once during export' >&2; exit 1;
+}
+unset HOLBUILD_TEST_LIBCRYPTO
+
+# With libcrypto holbuild starts no sha256sum, where without it the same
+# export does.
+cat > "$tmpdir/bin/sha256sum" <<SH
+#!/bin/sh
+echo "\$*" >> "$tmpdir/sha256sum-calls"
+exec "$real_sha256sum" "\$@"
+SH
+sha256sum_calls() {
+  : > "$tmpdir/sha256sum-calls"
+  PATH="$tmpdir/bin:$PATH" run_export --closure --load helperLib --output result \
+    spec:CTheory spec:BTheory spec:ATheory > /dev/null
+}
+HOLBUILD_TEST_LIBCRYPTO=libholbuild-test-no-such-crypto.so sha256sum_calls
+[[ -s "$tmpdir/sha256sum-calls" ]] || { echo 'the fallback export started no sha256sum' >&2; exit 1; }
+sha256sum_calls
+[[ ! -s "$tmpdir/sha256sum-calls" ]] || {
+  echo 'the export started sha256sum with libcrypto:' >&2; cat "$tmpdir/sha256sum-calls" >&2; exit 1;
 }
 awk '{print $1}' "$tmpdir/shared.txt" > "$tmpdir/order.txt"
 cmp "$tmpdir/expected-order.txt" "$tmpdir/order.txt"

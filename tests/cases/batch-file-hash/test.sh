@@ -60,6 +60,13 @@ val expected =
     | NONE => map (fn path => HolbuildSha256.string_hex (HolbuildHash.read_binary_all path)) paths
 val _ = if length paths < 300 then fail "expected at least 300 files" else ()
 val _ =
+  if not (HolbuildHash.uses_libcrypto ()) then ()
+  else if HolbuildHash.all_files_sha256 paths <> SOME expected then
+    fail "all_files_sha256 did not give every file's digest"
+  else if isSome (HolbuildHash.all_files_sha256 (paths @ [OS.Path.concat(dir, "missing")])) then
+    fail "all_files_sha256 gave digests for a batch with a missing file"
+  else ()
+val _ =
   ListPair.appEq
     (fn (path, (b, e)) => if b = e then () else fail ("digest mismatch for " ^ path ^ ": " ^ b ^ " vs " ^ e))
     (paths, ListPair.zipEq (batched, expected))
@@ -80,7 +87,9 @@ run_check() {
   require_grep "batch file hash test passed" "$tmpdir/$1.log"
 }
 
-run_check with-sha256sum
+no_libcrypto=libholbuild-test-no-such-crypto.so
+run_check libcrypto
+HOLBUILD_TEST_LIBCRYPTO=$no_libcrypto run_check with-sha256sum
 
 # A sha256sum that reports a fixed digest per argument, escaping names the way
 # GNU sha256sum does, shows that the batch output is used and kept in order.
@@ -98,11 +107,14 @@ for f in "\$@"; do
 done
 SH
 chmod +x "$fakedir/sha256sum"
-PATH="$fakedir:$PATH" BATCH_FILE_HASH_EXPECT=$sentinel run_check fake-sha256sum
+HOLBUILD_TEST_LIBCRYPTO=$no_libcrypto PATH="$fakedir:$PATH" BATCH_FILE_HASH_EXPECT=$sentinel \
+  run_check fake-sha256sum
+# With libcrypto the batch never reaches sha256sum, so the digests are real.
+PATH="$fakedir:$PATH" run_check libcrypto-ignores-sha256sum
 
 # Without a working sha256sum every chunk falls back to hashing file by file.
 shimdir="$tmpdir/shim"
 mkdir -p "$shimdir"
 printf '#!/bin/sh\nexit 1\n' > "$shimdir/sha256sum"
 chmod +x "$shimdir/sha256sum"
-PATH="$shimdir:$PATH" run_check failing-sha256sum
+HOLBUILD_TEST_LIBCRYPTO=$no_libcrypto PATH="$shimdir:$PATH" run_check failing-sha256sum

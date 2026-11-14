@@ -240,7 +240,7 @@ fun verified_blobs cache hashes =
         (fn digests => List.mapPartial
           (fn (hash, digest) => if hash = digest then SOME hash else NONE)
           (ListPair.zipEq (chunk, digests)))
-        (HolbuildHash.external_files_sha256 (map (blob_path cache) chunk))
+        (HolbuildHash.all_files_sha256 (map (blob_path cache) chunk))
     fun verify chunk =
       case external chunk of
           SOME valid => valid

@@ -221,10 +221,12 @@ PATH="$tmpdir/bin:$PATH" FS_CACHE_BACKEND_TEST_TMP="$tmpdir" "${HOLBUILD_POLY:-p
 
 grep -q "filesystem cache backend tests passed" "$tmpdir/fs-cache-backend-test.log"
 
-# The same missing/corrupt chunk must work when external hashing is unavailable.
+# The same missing/corrupt chunk must work when neither libcrypto nor
+# external hashing is available.
 mkdir -p "$tmpdir/no-sha" "$tmpdir/fallback"
 printf '#!/bin/sh\nexit 1\n' > "$tmpdir/no-sha/sha256sum"
 chmod +x "$tmpdir/no-sha/sha256sum"
+HOLBUILD_TEST_LIBCRYPTO=libholbuild-test-no-such-crypto.so \
 PATH="$tmpdir/no-sha:$tmpdir/bin:$PATH" FS_CACHE_BACKEND_TEST_TMP="$tmpdir/fallback" \
   "${HOLBUILD_POLY:-poly}" < "$tmpdir/fs-cache-backend-test.sml" > "$tmpdir/fallback.log" 2>&1 || {
   cat "$tmpdir/fallback.log" >&2
