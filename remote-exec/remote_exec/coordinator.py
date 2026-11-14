@@ -476,14 +476,23 @@ ORDER BY
 # CLAIM_CANDIDATES: once that build succeeds, Coordinator.complete marks the action done as well; once it fails or
 # its lease expires, the action is claimed again. An expired lease stops holding at once, before the sweep deletes it.
 # An unclaimed action has no lease in its own batch, so every live lease of its key is another batch's; uncorrelated,
-# the lease keys are read once per statement into a hash, rather than once per ready action probed.
+# the lease keys are read once per statement into a hash, rather than once per ready action probed. A build claim
+# then rechecks its key (Coordinator._lock_unleased), and skips the keys in :taken.
 CLAIM_ACTION = sa.text("""
 SELECT input_key, spec_sha256, theory FROM actions
 WHERE batch_id = :batch_id AND state = 'ready' AND class = :class AND tier = :tier
 AND (class = 'run' OR input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()))
+AND input_key <> ALL(CAST(:taken AS text[]))
 ORDER BY critical_depth DESC, descendant_count DESC, theory, input_key
 LIMIT 1 FOR UPDATE SKIP LOCKED
 """)
+# Two claims of one key from different batches may both pass the statement's check, each in a snapshot without the
+# other's lease. So a build claim then takes a lock on its key, which it holds until it commits, and checks for a
+# live lease again in a later statement, whose snapshot sees every lease of a claim that held the lock before; one
+# whose lock is held or whose key has a live lease skips the key. The lock never waits, so claims that tried several
+# keys can't deadlock; a lock of one 64-bit key never matches run admission's lock of two 32-bit ones.
+LOCK_KEY = sa.text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))")
+KEY_LEASED = sa.text("SELECT EXISTS (SELECT 1 FROM leases WHERE input_key = :key AND expires_at > now())")
 
 # Loading ahead: in a batch with an ``ahead_cap``, a waiting build action may be claimed before its parents are done
 # when each parent that isn't done is running, up to ``ahead_depth`` generations ahead: generation 0 is a running
@@ -574,8 +583,8 @@ ORDER BY b.priority DESC, (c.a).critical_depth DESC, (c.a).descendant_count DESC
 """)
 
 # Lock the best of a batch's candidates ``keys`` of ``tier`` that may still be claimed ahead, but not one whose key
-# another batch's live lease is building (single-flight; see CLAIM_ACTION): one with an unfinished ancestor in its
-# walk that isn't running, or one :depth generations up that still waits for parents.
+# another batch's live lease is building (single-flight; see CLAIM_ACTION) or in :taken: one with an unfinished
+# ancestor in its walk that isn't running, or one :depth generations up that still waits for parents.
 CLAIM_AHEAD_ACTION = sa.text(f"""{AHEAD_WALK}
 SELECT a.input_key, a.spec_sha256, a.theory FROM actions a
 WHERE a.batch_id = :batch_id AND a.input_key = ANY(CAST(:keys AS text[])) AND a.tier = :tier
@@ -584,6 +593,7 @@ AND a.input_key NOT IN (
     SELECT root FROM ancestors WHERE state <> 'running' OR (distance = :depth AND remaining_deps > 0)
 )
 AND a.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
+AND a.input_key <> ALL(CAST(:taken AS text[]))
 ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
 LIMIT 1 FOR UPDATE SKIP LOCKED
 """)
@@ -1276,11 +1286,9 @@ class Coordinator:
                 # Counted after the lock, in a snapshot that sees every claim ahead committed before it.
                 waiting = await conn.scalar(COUNT_WAITING_AHEAD, {"batch_id": batch_id})
                 if waiting < batch.ahead_cap:
-                    row = (
-                        await conn.execute(
-                            CLAIM_AHEAD_ACTION, {"batch_id": batch_id, "keys": keys, "tier": tier, "depth": depth}
-                        )
-                    ).first()
+                    row = await self._lock_unleased(
+                        conn, CLAIM_AHEAD_ACTION, {"batch_id": batch_id, "keys": keys, "tier": tier, "depth": depth}
+                    )
             if row is None:
                 read.exhausted.add((batch_id, tier))
                 return None
@@ -1332,13 +1340,34 @@ class Coordinator:
             self._wake_claim(tier, ahead=True)
 
     @staticmethod
+    async def _lock_unleased(
+        conn: AsyncConnection, statement: sa.TextClause, params: dict[str, object]
+    ) -> sa.Row[Any] | None:
+        """The build action ``statement`` locks with ``params``, passing over those whose key another claim is
+        leasing or leased since the statement's snapshot (see LOCK_KEY)."""
+        taken: list[str] = []
+        while True:
+            row = (await conn.execute(statement, {**params, "taken": taken})).first()
+            if row is None or (
+                await conn.scalar(LOCK_KEY, {"key": row.input_key})
+                and not await conn.scalar(KEY_LEASED, {"key": row.input_key})
+            ):
+                return row
+            taken.append(row.input_key)
+
+    @staticmethod
     async def _claim_first(conn: AsyncConnection, params: dict[str, object]) -> _Claimed | None:
         """Lock the first ready action ``params`` accept that no other claim holds; see CLAIM_CANDIDATES."""
         for candidate in (await conn.execute(CLAIM_CANDIDATES, params)).all():
             row = (
                 await conn.execute(
                     CLAIM_ACTION,
-                    {"batch_id": candidate.batch_id, "class": candidate.action_class, "tier": candidate.tier},
+                    {
+                        "batch_id": candidate.batch_id,
+                        "class": candidate.action_class,
+                        "tier": candidate.tier,
+                        "taken": [],
+                    },
                 )
             ).first()
             if row is not None:
@@ -1390,9 +1419,7 @@ class Coordinator:
             )
             if priority == 0:
                 ranking.running_default += 1
-            row = (
-                await conn.execute(CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
-            ).first()
+            row = await self._lock_unleased(conn, CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
             if row is not None:
                 return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb)
             if priority == 0:

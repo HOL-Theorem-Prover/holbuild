@@ -153,6 +153,24 @@ async def test_a_child_another_batch_is_building_is_not_claimed_ahead_and_is_don
     assert (await states(http, leader), await states(http, ahead)) == ({"b": "done"}, {"a": "running", "b": "done"})
 
 
+async def test_a_child_another_batch_s_claim_is_leasing_is_passed_over_for_the_next_one_ahead(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 0  # the second claim ahead reads the candidates again
+    await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")], speculative_loading="4")
+    await claim_named(http, "a")
+
+    async with remote_exec_engine.connect() as other, other.begin():
+        # Another batch's claim of "b", between its lock of the key and its commit.
+        await other.execute(coordinator_module.LOCK_KEY, {"key": input_key("b")})
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == "pkg:c"
+        assert await claim_ahead(http) is None
+
+    claimed = await claim_ahead(http)
+    assert claimed is not None and claimed["theory"] == "pkg:b"
+
+
 async def test_a_child_held_by_another_batch_wakes_a_waiting_claim_ahead_once_that_build_fails(
     http: httpx.AsyncClient,
 ) -> None:
@@ -656,7 +674,7 @@ async def test_claiming_and_revoking_ahead_read_each_actions_edges_by_key(
     async def reads(connection: Any, batch_id: UUID) -> list[int]:
         walk = {"batch_id": batch_id, "keys": children, "depth": limit}
         return [  # REVOKE_AHEAD last: EXPLAIN ANALYZE runs it
-            await pages(connection, coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard"}),
+            await pages(connection, coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard", "taken": []}),
             await pages(connection, coordinator_module.AHEAD_PARENTS, {**walk, "keys": children[:1]}),
             await pages(connection, coordinator_module.REFRESH_AHEAD_CHILDREN, {"batch_id": batch_id, "key": "k0"}),
             await pages(connection, coordinator_module.REVOKE_AHEAD, {"batch_id": batch_id, "keys": ["k0"]}),
@@ -978,7 +996,7 @@ async def test_claiming_ahead_reads_each_ancestors_action_by_key(
         await connection.execute(sa.text("SET LOCAL enable_nestloop = off"))
         walk = {"batch_id": new, "keys": [f"k{i}" for i in range(2 * width, 3 * width)], "depth": 2}
         for query, values in (
-            (coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard"}),
+            (coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard", "taken": []}),
             (coordinator_module.AHEAD_PARENTS, {**walk, "keys": walk["keys"][:1]}),
         ):
             plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query.text}"), values)
