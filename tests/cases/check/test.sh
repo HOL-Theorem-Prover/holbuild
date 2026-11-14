@@ -242,6 +242,46 @@ grep -E '^(Cheat|Clean|Uses|Base|Hypotheses|Bypass)Theory[.:]|^consumer:src/' "$
 diff -u "$plain_reports" "$log.reports"
 [[ $(grep -c $'^tool\tkind=run\t.*argv0=.*/bin/hol$' "$timing") -eq 1 ]]
 
+# Selectors sharing an ancestry: a kernel bypass in the shared ancestor is
+# reported under each selector that reaches it, as separate checks report it,
+# and however many selectors there are, the sources are planned once.
+cat > "$project/src/SharedBypassScript.sml" <<'SML'
+Theory SharedBypass
+val forge = Thm.disk_thm;
+Theorem shared_thm: T
+Proof simp[]
+QED
+SML
+for user in UserA UserB; do
+  cat > "$project/src/${user}Script.sml" <<SML
+Theory $user
+Ancestors SharedBypass
+Theorem ${user}_thm: T
+Proof simp[]
+QED
+SML
+done
+shared_selectors=(UserATheory UserBTheory:UserB_thm CleanTheory UserATheory SharedBypassTheory)
+for selector in "${shared_selectors[@]}"; do
+  if [[ $selector == CleanTheory ]]; then run_check "$selector" 0; else run_check "$selector" 1; fi
+done
+require_grep '^consumer:src/SharedBypassScript.sml:2: kernel bypass: disk_thm$' "$tmpdir/check-UserATheory.log"
+single_plans=$(grep -c $'^phase\tname=dependency.toposort\t' "$timing")
+expected=$tmpdir/shared-expected
+: > "$expected"
+for selector in "${shared_selectors[@]}"; do
+  grep -E '^(User[AB]|SharedBypass|Clean)Theory[.:]|^consumer:src/' \
+    "$tmpdir/check-${selector//:/-}.log" >> "$expected"
+done
+run_check "${shared_selectors[0]}" 1 "${shared_selectors[@]:1}"
+grep -E '^(User[AB]|SharedBypass|Clean)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
+diff -u "$expected" "$log.reports"
+[[ $(grep -c '^consumer:src/SharedBypassScript.sml:2: kernel bypass: disk_thm$' "$log.reports") -eq 4 ]]
+[[ $(grep -c $'^phase\tname=dependency.toposort\t' "$timing") -eq "$single_plans" ]]
+run_check --with-fingerprints 1 "${shared_selectors[@]}"
+grep -E '^(User[AB]|SharedBypass|Clean)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
+diff -u "$expected" "$log.reports"
+
 # Warm fingerprint checks still need a memory reservation; the data-only path
 # needs none. The budget deliberately cannot admit a child.
 for mode in --fingerprint --with-fingerprints; do
