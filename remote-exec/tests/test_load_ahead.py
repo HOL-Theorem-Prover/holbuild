@@ -287,20 +287,52 @@ async def test_actions_waiting_ahead_ask_for_no_burst_worker_until_their_parents
     assert (queue["running_standard"], queue["waiting_ahead_standard"]) == (1, 0)
 
 
-async def test_a_parent_claimed_wakes_a_waiting_claim_ahead(
-    http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
+async def test_a_parent_claimed_makes_its_child_a_candidate_from_the_next_read_of_the_candidates(
+    http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
+    """A plain claim leaves the shared read of the candidates alone: its children may be claimed ahead from the
+    next read, once that read is ``claim_ranking_seconds`` old."""
+    coordinator.settings.claim_ranking_seconds = 3600
     await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
-    async with remote_exec_engine.begin() as conn:
-        await conn.execute(sa.text("UPDATE actions SET tier = 'high' WHERE input_key = :key"), {"key": input_key("a")})
+    assert await claim_ahead(http, "high") is None  # a is standard: nothing for this worker
+    assert await claim_named(http, "a")
+    assert await claim_ahead(http, "high", also_claim=["standard"]) is None
 
-    started = time.monotonic()
-    waiting = asyncio.create_task(claim_ahead(http, wait_s=CLAIM_RECHECK_SECONDS * 2))
-    await asyncio.sleep(0.2)
-    assert await claim_named(http, "a", "high")
-    claimed = await waiting
+    coordinator.settings.claim_ranking_seconds = 0
+    claimed = await claim_ahead(http, "high", also_claim=["standard"])
     assert claimed is not None and claimed["theory"] == "pkg:b"
-    assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
+
+
+@pytest.mark.parametrize(("together", "ranking_seconds", "most_reads"), [(True, 0, 3), (False, 3600, 1)])
+async def test_claims_of_workers_that_load_ahead_share_reads_of_the_candidates(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine,
+    together: bool, ranking_seconds: float, most_reads: int,
+) -> None:
+    """A worker that loads ahead looks for a candidate of a higher priority before each ready build it claims.
+    Claims arriving together take one read of the candidates, even when every read is too old for a later claim;
+    and plain claims don't outdate the read, so claims one after another keep it for ``claim_ranking_seconds``.
+    A large batch arriving, its builds claimed by hundreds of such workers at once, reads the candidates a few
+    times, not once per claim."""
+    coordinator.settings.claim_ranking_seconds = ranking_seconds
+    names = [f"b{i}" for i in range(200)]
+    await submit(http, ["p", "c", *names], [("c", "p")], speculative_loading="4")
+    await claim_named(http, "p")  # c may now be claimed ahead, after the ready builds of its priority
+    reads = 0
+
+    def count(conn: Any, cursor: Any, statement: str, *_: Any) -> None:
+        nonlocal reads
+        reads += "WITH RECURSIVE ahead_batches AS" in statement  # AHEAD_CANDIDATES
+
+    sa.event.listen(remote_exec_engine.sync_engine, "before_cursor_execute", count)
+    try:
+        if together:
+            claimed = await asyncio.gather(*(claim_ahead(http) for _ in names))
+        else:
+            claimed = [await claim_ahead(http) for _ in names]
+    finally:
+        sa.event.remove(remote_exec_engine.sync_engine, "before_cursor_execute", count)
+    assert sorted(c["theory"] for c in claimed if c is not None) == sorted(f"pkg:{n}" for n in names)
+    assert 1 <= reads <= most_reads
 
 
 async def test_a_child_is_not_claimed_ahead_while_any_of_its_parents_waits_ahead(
@@ -889,3 +921,57 @@ async def test_a_child_nearer_its_running_ancestors_wakes_a_waiting_claim_ahead_
     d = await waiting
     assert d is not None and (d["theory"], d["ahead_parents"]) == ("pkg:d", ancestors_first("b", "c"))
     assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
+
+
+async def test_reading_the_candidates_reads_each_childs_action_by_key(
+    coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    """Reading the candidates handles about as many rows as the running parents have edges, even in a batch the
+    database's statistics don't know yet, as after every submit: not as many as the waiting actions times the
+    children, as when each waiting action was joined with every child."""
+    old, new = uuid4(), uuid4()
+    width, layers, parents = 32, 40, 5
+
+    async def add(connection: Any, batch_id: UUID) -> None:
+        values = {"id": batch_id, "width": width, "parents": parents, "n": width * layers}
+        await connection.execute(
+            sa.text("INSERT INTO batches (id, state, profile, ahead_cap) VALUES (:id, 'running', 'default', 64)"),
+            values,
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, 'k' || g, 'ac' || g, 's', 'pkg:t' || g, CASE WHEN g < :width THEN 0 ELSE :parents END, "
+                "CASE WHEN g < :width THEN 'running' ELSE 'waiting' END, 'standard' FROM generate_series(0, :n - 1) g"
+            ),
+            values,
+        )
+        await connection.execute(  # each action after the first layer has parents in the layer before it
+            sa.text(
+                "INSERT INTO edges (batch_id, input_key, parent_key) "
+                "SELECT :id, 'k' || g, 'k' || ((g / :width - 1) * :width + (g + p) % :width) "
+                "FROM generate_series(:width, :n - 1) g, generate_series(0, :parents - 1) p"
+            ),
+            values,
+        )
+
+    def handled(plan: dict[str, Any]) -> int:
+        return plan["Actual Rows"] * plan["Actual Loops"] + sum(handled(p) for p in plan.get("Plans", []))
+
+    async with remote_exec_engine.begin() as connection:  # autovacuum can't see this transaction
+        await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
+        await add(connection, old)  # analyzed while it runs, then built
+        await connection.execute(sa.text("UPDATE actions SET state = 'running' WHERE batch_id = :id"), {"id": old})
+        await connection.execute(sa.text("ANALYZE"))
+        await connection.execute(sa.text("UPDATE batches SET state = 'done' WHERE id = :id"), {"id": old})
+        await connection.execute(sa.text("UPDATE actions SET state = 'done' WHERE batch_id = :id"), {"id": old})
+        await add(connection, new)
+        for depth in (1, None):
+            query = coordinator_module.AHEAD_CANDIDATES
+            plan = await connection.scalar(
+                sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query.text}"), {"depth": depth}
+            )
+            rows = await connection.execute(query, {"depth": depth})
+            assert {row.input_key for row in rows} == {f"k{i}" for i in range(width, 2 * width)}
+            assert handled(plan[0]["Plan"]) < 10 * width * parents
+        await connection.rollback()
