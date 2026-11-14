@@ -497,17 +497,21 @@ val _ = assert "a later request fails without a retry"
                (case tls_get () of HolbuildHttp.Failed _ => true | _ => false)
 val _ = assert "a later request connects once" (tls_accepted () = accepted_before + 1)
 
-val _ = print "http tests passed\n"
-
-(* A request just before exiting leaves its connection pooled and the reaper
-   waiting for the idle timeout; the caller checks that exiting doesn't wait
-   for the reaper. *)
+(* A request leaves its connection pooled and the reaper waiting for the idle
+   timeout.  Exiting asks every thread to stop, as Thread.kill does, and waits
+   for them: a reaper waiting on its condition variable stops at once, but a
+   sleeping one only once its one-second sleep ends.  Timing the kill rather
+   than the whole exit leaves out Poly/ML freeing its heap, which takes
+   hundreds of milliseconds on a busy machine. *)
 val _ = wait_for_empty_pool ()
-val _ = assert "a request before exiting"
+val _ = assert "a request leaves the reaper running"
                (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/fast.out", timeout = 30} = HolbuildHttp.Response 200)
-val _ = let val output = TextIO.openOut (dir ^ "/exiting-ms")
-        in TextIO.output (output, LargeInt.toString (Time.toMilliseconds (Time.now ()))); TextIO.closeOut output end
-val _ = OS.Process.exit OS.Process.success
+val reaper = valOf (!HolbuildHttp.reaper_thread)
+val deadline = Time.+ (Time.now (), Time.fromMilliseconds 500)
+val _ = Thread.kill reaper
+val _ = wait_for "the reaper to stop" (fn () => not (Thread.isActive reaper)) deadline
+
+val _ = print "http tests passed\n"
 SML
 
 printf 'user = "name:secret"\n' > "$tmpdir/user.curl"
@@ -517,15 +521,8 @@ HOLBUILD_TEST_HTTP_IDLE_MS=3000 HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$tmpdir/user.c
   cat "$tmpdir/http-test.log" >&2
   exit 1
 }
-exited_ms=$(date +%s%3N)
 grep -q "http tests passed" "$tmpdir/http-test.log" || {
   cat "$tmpdir/http-test.log" >&2
-  exit 1
-}
-# A sleeping reaper would hold the exit until its one-second sleep ends.
-exit_wait_ms=$((exited_ms - $(< "$tmpdir/exiting-ms")))
-(( exit_wait_ms < 500 )) || {
-  echo "exiting after a request waited ${exit_wait_ms} ms for the connection pool's reaper" >&2
   exit 1
 }
 kill "$server_pid"
