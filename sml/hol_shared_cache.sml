@@ -600,12 +600,16 @@ fun build_entry jobs req k =
     val run_command = run_mutation k
     (* -j only sets bin/build's concurrency; it stays out of the key. *)
     val jobs_arg = case jobs of NONE => "" | SOME n => "-j " ^ Int.toString n ^ " "
+    (* A clone brings in only branches and tags; a pinned commit on neither
+       is fetched by hash. *)
+    val rev_commit = #rev req ^ "^{commit}"
     (* exec-action fetches the exact commit with the worker's hardened git,
        never the user's configuration, and checks out nothing else first. *)
     fun hardened_fetch () =
       let
+        val run = HolbuildActionSandbox.hardened_git {home = "/nonexistent", protocol = "https:file"}
         fun git args =
-          let val result = HolbuildActionSandbox.hardened_git {home = "/nonexistent", protocol = "https:file"} args
+          let val result = run args
           in
             if HolbuildSpawn.succeeded result then trim (#output result)
             else die ("could not fetch HOL " ^ #rev req ^ " from " ^ #git req ^ ":\n" ^ #output result)
@@ -613,6 +617,9 @@ fun build_entry jobs req k =
       in
         ignore (git ["clone", "--quiet", "--no-checkout", "--no-hardlinks", "--no-recurse-submodules",
                      "--", #git req, hol]);
+        if HolbuildSpawn.succeeded (run ["-C", hol, "cat-file", "-e", rev_commit]) then ()
+        else ignore (git ["-C", hol, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
+                          "--", "origin", #rev req]);
         ignore (git ["-C", hol, "checkout", "--quiet", "--detach", #rev req]);
         if git ["-C", hol, "rev-parse", "--verify", "HEAD^{commit}"] = #rev req then ()
         else die ("HOL checkout is not commit " ^ #rev req ^ ": " ^ hol);
@@ -625,8 +632,13 @@ fun build_entry jobs req k =
        ensure_dir final;
        if HolbuildActionSandbox.active () then hardened_fetch ()
        else
-         (run_in_dir run_command final (HolbuildOffline.git_command () ^ " clone " ^ quote (#git req) ^ " " ^ quote hol);
-          run_in_dir run_command hol (HolbuildOffline.git_command () ^ " checkout --detach " ^ quote (#rev req))))
+         let val git = HolbuildOffline.git_command ()
+         in
+           run_in_dir run_command final (git ^ " clone " ^ quote (#git req) ^ " " ^ quote hol);
+           if HolbuildSpawn.succeeded (HolbuildOffline.git_run ["-C", hol, "cat-file", "-e", rev_commit]) then ()
+           else run_in_dir run_command hol (git ^ " fetch origin " ^ quote (#rev req));
+           run_in_dir run_command hol (git ^ " checkout --detach " ^ quote (#rev req))
+         end)
     (* Under exec-action the build writes only its tree and never sees the
        repository: .git waits beside it, and whatever the build put in its
        place is discarded before it returns. *)
