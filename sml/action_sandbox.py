@@ -909,7 +909,13 @@ def main() -> int:
     parser.add_argument("--toolchain", action="store_true")
     parser.add_argument("--validate-tree", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    # --options FILE: the grant options above, each NUL-terminated, since a
+    # theory's checkpoint grants can exceed the kernel's 128 KiB per argument.
+    options = Path(argv[1]) if argv[:1] == ["--options"] and len(argv) > 1 else None
+    if options is not None:
+        argv = [os.fsdecode(option) for option in options.read_bytes().split(b"\0")[:-1]] + argv[2:]
+    args = parser.parse_args(argv)
     try:
         if args.validate_tree is not None:
             # A restored toolchain must be as closed as one built here.
@@ -930,7 +936,7 @@ def main() -> int:
             [Path(path).resolve(strict=True) for path in args.write],
             [Path(path).resolve(strict=True) for path in args.read],
             [path for name in args.forbid for path in spellings(name)[0]] +
-            ([args.completed.resolve()] if args.completed is not None else []),
+            [path.resolve() for path in (args.completed, options) if path is not None],
             toolchain=args.toolchain,
         )
         # A scratch directory holding protected state, a read-only grant
@@ -957,7 +963,7 @@ def main() -> int:
         print(f"holbuild sandbox: {error}", file=sys.stderr)
         if args.completed is not None:
             try:
-                args.completed.write_text("failed\n")
+                args.completed.write_text(f"failed\n{error}\n")
             except OSError:
                 pass  # Missing confirmation still fails closed in the parent.
         return 125

@@ -413,7 +413,10 @@ def completion_probe(helper: Path) -> None:
                     os.environ["HOLBUILD_SANDBOX_PARENT"] = previous_parent
             failed = bool(fault) or child_status == 125
             assert status == (125 if failed else child_status), status
-            assert completed.read_text() == ("failed\n" if failed else "validated\n")
+            # A failure carries the supervisor's reason after its first line.
+            state = completed.read_text()
+            assert (state.startswith("failed\n") and len(state) > len("failed\n")) if failed \
+                else state == "validated\n", state
             for descriptor in received:
                 try:
                     os.fstat(descriptor)
