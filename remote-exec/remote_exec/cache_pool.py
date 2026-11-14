@@ -146,7 +146,8 @@ class CachePool:
     """Own the slot registry; only the elected controller may advance lifecycle state."""
 
     def __init__(self, engine: AsyncEngine, slots: list[CacheSlot], adapter: CommandAdapter, *, drain_seconds: int,
-                 hold_seconds: float = 900, workers_per_node: int = 0, max_workers: int = 240, launch_timeout_seconds: int = 900) -> None:
+                 hold_seconds: float = 900, cpu_hold_seconds: float = 900, workers_per_node: int = 0,
+                 max_workers: int = 240, launch_timeout_seconds: int = 900) -> None:
         if drain_seconds < 60:
             raise ValueError("cache drain must be at least 60 seconds")
         if not slots or len({s.name for s in slots}) != len(slots):
@@ -157,7 +158,8 @@ class CachePool:
         self.slots = slots
         self.adapter = adapter
         self.drain_seconds = drain_seconds
-        self.hold_seconds = hold_seconds
+        self.hold_seconds = hold_seconds  # on the worker floor
+        self.cpu_hold_seconds = cpu_hold_seconds  # on the provider's CPU recommendations
         self.workers_per_node = workers_per_node
         self.max_workers = max_workers
         self.launch_timeout_seconds = launch_timeout_seconds
@@ -206,7 +208,7 @@ class CachePool:
         workers = await conn.scalar(HELD_TARGET, {"now": now, "hold": self.hold_seconds, "cap": self.max_workers})
         await conn.execute(sa.text(
             "DELETE FROM cache_cpu_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"
-        ), {"now": now, "hold": self.hold_seconds})
+        ), {"now": now, "hold": self.cpu_hold_seconds})
         if inventory.cpu_target and self.workers_per_node > 0:
             await conn.execute(sa.text("INSERT INTO cache_cpu_demand(at,target) VALUES (:now,:target)"),
                                {"now": now, "target": min(len(self.slots), inventory.cpu_target)})
