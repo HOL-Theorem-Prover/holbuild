@@ -306,15 +306,16 @@ cp "$state" "$tmpdir/small-state"
 sweep4 100 50
 ! cmp -s "$state" "$tmpdir/small-state" || { echo "increased reserve reused a measurement" >&2; exit 1; }
 cp "$state" "$tmpdir/reserve-state"
-# Private checkpoint bytes count towards the target, so old shared data is
+# Private checkpoint bytes count towards the limit, so old shared data is
 # evicted; the private checkpoint itself is cleared after the action anyway.
 at 2000 "$cache4/blobs/first"
-sparse "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" 97
+sparse "$cache4/checkpoints/pkg/PrivateScript.deps/key/deps_loaded.save" 98
 sweep4 100 1
 stamped_within "$state" 2 "private checkpoint growth caused eviction"
 evicted "$cache4/blobs/first" "old shared data before a new private checkpoint"
 evicted "$cache4/checkpoints/pkg/PrivateScript.deps" "private checkpoints after the action"
 sparse "$cache4/blobs/first" 1
+sparse "$cache4/checkpoint-store/family/nested/heap" 1
 sweep4 100 1
 # Expired, future-dated and malformed state must all fall back to a scan.
 for measured in 0 999999999999999999999999 broken; do
@@ -377,8 +378,13 @@ LOCK
 
 # A sibling's shared stamp must not omit this container's private modules.
 cp "$state" "$tmpdir/pre-module-state"
+# Stamp an old 10 GB blob, so that the module takes the stamp past the limit
+# while evicting the blob alone gets back under the target.
+sparse "$cache4/blobs/first" 10
 at 2000 "$cache4/blobs/first"
-sparse "$cache5/theory-modules/large.pmo" 97
+rm "$state"
+sweep4 200 1
+sparse "$cache5/theory-modules/large.pmo" 90
 set +e
 HOLBUILD_CACHE=$cache5 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/modules.log" 2>&1
@@ -417,14 +423,14 @@ HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action 
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/partial.log" 2>&1
 set -e
 cmp "$state" "$tmpdir/pre-partial-state" || { echo "partial sharing thrashed the stamp" >&2; exit 1; }
-# Growing a differing private root over the target must force eviction.
-sparse "$cache6/blobs/private" 100
+# Growing a differing private root over the limit must force eviction.
+sparse "$cache6/blobs/private" 101
 set +e
 HOLBUILD_CACHE=$cache6 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/partial-large.log" 2>&1
 set -e
-stamped_within "$state" 99 "a differing private root exceeded the target"
-evicted "$cache6/blobs/private" "the differing private root over the target"
+stamped_within "$state" 99 "a differing private root exceeded the limit"
+evicted "$cache6/blobs/private" "the differing private root over the limit"
 # The next action reuses the post-eviction stamp instead of scanning again.
 cp "$state" "$tmpdir/post-eviction-state"
 set +e
@@ -542,6 +548,12 @@ for limits in "100 10 89" "400 40 359"; do
   sweep_mature "$limit" "$reserve"
   cmp "$mature_state" "$tmpdir/mature-state" || { echo "mature cache repeated a shared scan" >&2; exit 1; }
   kept "$mature_cache/checkpoint-store/family/heap" "mature cached data under the target"
+  # Growth past the target but within the limit reuses the fresh scan: the
+  # reserve absorbs it until a refresh evicts, so actions don't queue on gc.lock.
+  sparse "$mature_cache/checkpoints/pkg/Grown.deps/key/deps_loaded.save" $((reserve / 2))
+  sweep_mature "$limit" "$reserve"
+  cmp "$mature_state" "$tmpdir/mature-state" || { echo "growth within the limit repeated a shared scan" >&2; exit 1; }
+  kept "$mature_cache/checkpoint-store/family/heap" "mature cached data within the limit"
   # An explicit zero reserve cannot safely reuse even a large cache's estimate.
   sweep_mature "$limit" 0
   ! cmp -s "$mature_state" "$tmpdir/mature-state" || { echo "zero-reserve cache reused a measurement" >&2; exit 1; }

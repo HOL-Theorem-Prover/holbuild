@@ -10179,8 +10179,10 @@ fun worker_cache_roots cache =
   end
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
-   room under limit_bytes. Reuse a recent shared scan within the target;
-   private checkpoints and modules are always measured locally. Small caps
+   room under limit_bytes. An action reuses a recent shared scan while the
+   cache stays within limit_bytes, so the reserve absorbs growth between
+   evictions instead of every action waiting on one; private checkpoints and
+   modules are always measured locally. Small caps
    and zero reserves scan live.  With refresh, as after an action's result,
    scan only when the stamp is past half its life and no other process holds
    gc.lock, so that busy hosts keep the stamp fresh and actions seldom wait
@@ -10202,10 +10204,10 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       | parse_sizes _ = NONE
     val stamp_life = 60000000000 : LargeInt.int
     fun stamp_age () =
-      case String.tokens Char.isSpace (read_text state_path) of
-          "holbuild-worker-cache-cap-v2" :: measured :: _ =>
-            Option.map (fn measured => Time.toNanoseconds (Time.now ()) - measured) (LargeInt.fromString measured)
-        | _ => NONE
+      (case String.tokens Char.isSpace (read_text state_path) of
+           "holbuild-worker-cache-cap-v2" :: measured :: _ =>
+             Option.map (fn measured => Time.toNanoseconds (Time.now ()) - measured) (LargeInt.fromString measured)
+         | _ => NONE)
       handle IO.Io _ => NONE
            | OS.SysErr _ => NONE
     fun recent_scan_fits private_bytes =
@@ -10222,7 +10224,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                                 are shared. Keep their hits without stamp churn. *)
                              (fn (({id = identify, measure}), (id, bytes)) =>
                                  if identify () = id then bytes else measure ())
-                             (roots, entries)) + private_bytes () <= target
+                             (roots, entries)) + private_bytes () <= limit_bytes
                     end
                 | _ => false)
          | _ => false)
@@ -10266,9 +10268,6 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
             if total <= target then publish shared
             else
               let
-                (* Eviction mixes private and shared families. Do not publish a
-                   shared-byte estimate derived from the mixed freed total. *)
-                val _ = remove_file state_path
                 val (local_families, young_orphans) = local_cache_families cache
                 val families =
                   by_age ((if toolchains_owned_by_cache () then
@@ -10278,11 +10277,14 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                           local_families) @ by_age young_orphans
                 val after = sweep total families
               in
-                (* Measure again, so a waiter on gc.lock reuses the result
-                   rather than repeating the scan. *)
+                (* Measure again rather than publish an estimate derived from
+                   the mixed private and shared freed total, so a waiter on
+                   gc.lock reuses the result rather than repeating the scan.
+                   Until then siblings keep reusing the previous stamp. *)
                 if after <= target then publish (measure_shared ())
-                else warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
-                           gb_decimal_text target ^ " GB left under the cap after its reserve")
+                else (remove_file state_path;
+                      warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
+                           gb_decimal_text target ^ " GB left under the cap after its reserve"))
               end
           end
       end
