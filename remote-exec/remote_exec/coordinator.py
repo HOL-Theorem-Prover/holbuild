@@ -490,8 +490,9 @@ LIMIT 1 FOR UPDATE SKIP LOCKED
 # AHEAD_WALK: the unfinished ancestors of the actions :keys of :batch_id, with the action each was reached from
 # (``root``) and each of its distances from it: their unfinished parents, and, above a running parent that was
 # itself claimed ahead and still waits for parents, its unfinished parents, up to :depth generations up. Each step
-# reads one action's edges and parents by key: the lookups are subqueries on the row they start from, so that the
-# database plans them by key whatever it guesses of a batch inserted since its last statistics.
+# reads one action's edges and parents by key, and so does ``ancestors`` each ancestor's row: the lookups are
+# subqueries on the row they start from, so that the database plans them by key whatever it guesses of a batch
+# inserted since its last statistics (a join with actions was planned as a scan of every unfinished action).
 AHEAD_WALK = """
 WITH RECURSIVE walk(batch_id, root, input_key, distance) AS (
     SELECT a.batch_id, a.input_key, e.parent_key, 1 FROM actions a
@@ -508,10 +509,14 @@ WITH RECURSIVE walk(batch_id, root, input_key, distance) AS (
         SELECT p.state = 'running' AND p.remaining_deps > 0 FROM actions p
         WHERE p.batch_id = w.batch_id AND p.input_key = w.input_key
     )
+), walked AS MATERIALIZED (
+    SELECT w.root, w.input_key, w.distance, (
+        SELECT p FROM actions p WHERE p.batch_id = w.batch_id AND p.input_key = w.input_key
+    ) AS p
+    FROM walk w
 ), ancestors AS MATERIALIZED (
-    SELECT w.root, w.input_key, w.distance, p.spec_sha256, p.state, p.remaining_deps
-    FROM walk w JOIN actions p ON p.batch_id = w.batch_id AND p.input_key = w.input_key
-    WHERE p.state <> 'done'
+    SELECT root, input_key, distance, (p).spec_sha256, (p).state, (p).remaining_deps
+    FROM walked WHERE (p).state <> 'done'
 )
 """
 # The actions that may be claimed ahead, best first: the children of running actions of generation below
@@ -648,6 +653,24 @@ WITH RECURSIVE ahead_running AS MATERIALIZED (
     WHERE batch_id = :batch_id AND input_key = ANY(ARRAY(SELECT input_key FROM revoked)) RETURNING input_key
 )
 DELETE FROM leases WHERE batch_id = :batch_id AND input_key = ANY(ARRAY(SELECT input_key FROM unleased))
+""")
+# Cancel :key of batch :id and its unfinished descendants, with their leases. Each step reads one action's children
+# by key (edges_parent), and the actions and leases are matched by key: a join with edges was planned, for a batch
+# inserted since the last statistics, as a scan of all of its edges per descendant, tens of seconds under the
+# batch's lock.
+SKIP_DESCENDANTS = sa.text("""
+WITH RECURSIVE blocked(input_key) AS (
+    SELECT CAST(:key AS text)
+    UNION
+    SELECT e.input_key FROM blocked p CROSS JOIN LATERAL unnest(ARRAY(
+        SELECT e.input_key FROM edges e WHERE e.batch_id = :id AND e.parent_key = p.input_key
+    )) AS e(input_key)
+), skipped AS (
+    UPDATE actions SET state = 'cancelled', last_failure = :reason, failure_detail = NULL
+    WHERE batch_id = :id AND input_key = ANY(ARRAY(SELECT input_key FROM blocked))
+    AND state IN ('waiting', 'ready', 'running') RETURNING input_key
+)
+DELETE FROM leases WHERE batch_id = :id AND input_key = ANY(ARRAY(SELECT input_key FROM skipped))
 """)
 
 
@@ -2372,18 +2395,7 @@ class Coordinator:
 
     async def _skip(self, conn: AsyncConnection, batch_id: UUID, input_key: str, reason: str) -> None:
         """Skip a blocked action and its descendants, revoking any leases left by a requeued parent."""
-        await conn.execute(
-            sa.text(
-                "WITH RECURSIVE blocked(input_key) AS (SELECT CAST(:key AS text) UNION "
-                "SELECT e.input_key FROM edges e JOIN blocked p ON e.parent_key = p.input_key "
-                "WHERE e.batch_id = :id), skipped AS ("
-                "UPDATE actions SET state = 'cancelled', last_failure = :reason, failure_detail = NULL "
-                "WHERE batch_id = :id AND input_key IN (SELECT input_key FROM blocked) "
-                "AND state IN ('waiting', 'ready', 'running') RETURNING input_key) "
-                "DELETE FROM leases WHERE batch_id = :id AND input_key IN (SELECT input_key FROM skipped)"
-            ),
-            {"id": batch_id, "key": input_key, "reason": reason},
-        )
+        await conn.execute(SKIP_DESCENDANTS, {"id": batch_id, "key": input_key, "reason": reason})
 
     async def _fail_batch(self, conn: AsyncConnection, batch_id: UUID, input_key: str, failure: str) -> None:
         """Fail ``input_key`` finally and with it the batch; its other unfinished actions are cancelled."""

@@ -1579,6 +1579,67 @@ async def test_failed_requeued_parent_revokes_running_descendants(
     assert (await batch(http, batch_id))["state"] == "failed"
 
 
+async def test_skipping_reads_each_descendants_children_by_key(remote_exec_engine: Any) -> None:
+    """Skipping a failed action's descendants handles about as many rows as they have edges, even in a batch the
+    database's statistics don't know yet, as after every submit: not the batch's edges per descendant, as when the
+    descendants were joined with every edge, tens of seconds under the batch's lock for a gate's batch."""
+    old, new = uuid4(), uuid4()
+    width, layers, parents = 32, 40, 5
+    n = width * layers
+    edges = [(g, (g // width - 1) * width + (g + p) % width) for g in range(width, n) for p in range(parents)]
+    descendants, frontier = {0}, {0}
+    while frontier:
+        frontier = {child for child, parent in edges if parent in frontier} - descendants
+        descendants |= frontier
+
+    async def add(connection: Any, batch_id: UUID) -> None:
+        values = {"id": batch_id, "width": width, "parents": parents, "n": n}
+        await connection.execute(
+            sa.text("INSERT INTO batches (id, state, profile) VALUES (:id, 'running', 'default')"), values
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, 'k' || g, 'ac' || g, 's', 'pkg:t' || g, CASE WHEN g < :width THEN 0 ELSE :parents END, "
+                "CASE WHEN g < :width THEN 'running' ELSE 'waiting' END, 'standard' FROM generate_series(0, :n - 1) g"
+            ),
+            values,
+        )
+        await connection.execute(  # each action after the first layer has parents in the layer before it
+            sa.text(
+                "INSERT INTO edges (batch_id, input_key, parent_key) "
+                "SELECT :id, 'k' || g, 'k' || ((g / :width - 1) * :width + (g + p) % :width) "
+                "FROM generate_series(:width, :n - 1) g, generate_series(0, :parents - 1) p"
+            ),
+            values,
+        )
+
+    def handled(plan: dict[str, Any]) -> int:
+        return plan["Actual Rows"] * plan["Actual Loops"] + sum(handled(p) for p in plan.get("Plans", []))
+
+    async with remote_exec_engine.begin() as connection:  # autovacuum can't see this transaction
+        await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
+        await add(connection, old)  # analyzed while it runs, then built
+        await connection.execute(sa.text("ANALYZE"))
+        await connection.execute(sa.text("UPDATE batches SET state = 'done' WHERE id = :id"), {"id": old})
+        await connection.execute(sa.text("UPDATE actions SET state = 'done' WHERE batch_id = :id"), {"id": old})
+        await add(connection, new)
+        # Planned as for a large edges table, where a join of a step's descendants with the edges of a batch the
+        # statistics put at one edge became a nested loop over all of its edges per step.
+        await connection.execute(sa.text("SET LOCAL enable_hashjoin = off"))
+        await connection.execute(sa.text("SET LOCAL enable_mergejoin = off"))
+        query = coordinator_module.SKIP_DESCENDANTS
+        plan = await connection.scalar(
+            sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query.text}"), {"id": new, "key": "k0", "reason": "r"}
+        )
+        cancelled = await connection.scalars(
+            sa.text("SELECT input_key FROM actions WHERE batch_id = :id AND state = 'cancelled'"), {"id": new}
+        )
+        assert set(cancelled) == {f"k{g}" for g in descendants}
+        assert handled(plan[0]["Plan"]) < 10 * len(descendants) * parents
+        await connection.rollback()
+
+
 async def test_missing_failed_parent_skips_the_action_instead_of_waiting_forever(
     http: httpx.AsyncClient,
 ) -> None:

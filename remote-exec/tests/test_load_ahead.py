@@ -923,6 +923,74 @@ async def test_a_child_nearer_its_running_ancestors_wakes_a_waiting_claim_ahead_
     assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
 
 
+async def test_claiming_ahead_reads_each_ancestors_action_by_key(
+    coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    """Claiming ahead and naming the parents of what was claimed read each ancestor's action by key, whatever join
+    the database would pick for a batch its statistics don't know yet: not a scan of every unfinished action of
+    every batch, as when the ancestors were joined with the actions."""
+    old, new = uuid4(), uuid4()
+    width, layers, parents = 32, 40, 5
+
+    async def add(connection: Any, batch_id: UUID) -> None:
+        values = {"id": batch_id, "width": width, "parents": parents, "n": width * layers}
+        await connection.execute(
+            sa.text("INSERT INTO batches (id, state, profile, ahead_cap) VALUES (:id, 'running', 'default', 64)"),
+            values,
+        )
+        await connection.execute(
+            sa.text(
+                "INSERT INTO actions (batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier) "
+                "SELECT :id, 'k' || g, 'ac' || g, 's', 'pkg:t' || g, CASE WHEN g < :width THEN 0 ELSE :parents END, "
+                "CASE WHEN g < :width THEN 'running' ELSE 'waiting' END, 'standard' FROM generate_series(0, :n - 1) g"
+            ),
+            values,
+        )
+        await connection.execute(  # each action after the first layer has parents in the layer before it
+            sa.text(
+                "INSERT INTO edges (batch_id, input_key, parent_key) "
+                "SELECT :id, 'k' || g, 'k' || ((g / :width - 1) * :width + (g + p) % :width) "
+                "FROM generate_series(:width, :n - 1) g, generate_series(0, :parents - 1) p"
+            ),
+            values,
+        )
+
+    def actions_read(plan: dict[str, Any]) -> list[str]:
+        """How each node of ``plan`` reads actions."""
+        here = [f"{plan['Node Type']} {plan.get('Index Cond', '')}"] if plan.get("Relation Name") == "actions" else []
+        return here + [read for p in plan.get("Plans", []) for read in actions_read(p)]
+
+    async with remote_exec_engine.begin() as connection:  # autovacuum can't see this transaction
+        await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
+        await add(connection, old)  # analyzed while it runs, then built
+        await connection.execute(sa.text("ANALYZE"))
+        await connection.execute(sa.text("UPDATE batches SET state = 'done' WHERE id = :id"), {"id": old})
+        await connection.execute(sa.text("UPDATE actions SET state = 'done' WHERE batch_id = :id"), {"id": old})
+        await add(connection, new)
+        await connection.execute(  # the second layer runs claimed ahead of the first
+            sa.text(
+                "UPDATE actions SET state = 'running', ahead = 'ahead' "
+                "WHERE batch_id = :id AND input_key = ANY(CAST(:keys AS text[]))"
+            ),
+            {"id": new, "keys": [f"k{i}" for i in range(width, 2 * width)]},
+        )
+        # The join a large history's statistics led to: all the unfinished actions hashed, for a few ancestors.
+        await connection.execute(sa.text("SET LOCAL enable_nestloop = off"))
+        walk = {"batch_id": new, "keys": [f"k{i}" for i in range(2 * width, 3 * width)], "depth": 2}
+        for query, values in (
+            (coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard"}),
+            (coordinator_module.AHEAD_PARENTS, {**walk, "keys": walk["keys"][:1]}),
+        ):
+            plan = await connection.scalar(sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query.text}"), values)
+            reads = actions_read(plan[0]["Plan"])
+            assert reads and all("batch_id" in read for read in reads), reads
+        rows = await connection.execute(coordinator_module.AHEAD_PARENTS, {**walk, "keys": ["k64"]})
+        assert [(row.input_key, row.distance) for row in rows] == [
+            *((f"k{i}", 2) for i in range(2 * parents - 1)), *((f"k{width + i}", 1) for i in range(parents))
+        ]
+        await connection.rollback()
+
+
 async def test_reading_the_candidates_reads_each_childs_action_by_key(
     coordinator: Coordinator, remote_exec_engine: AsyncEngine
 ) -> None:
