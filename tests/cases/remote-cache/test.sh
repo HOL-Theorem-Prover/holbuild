@@ -230,9 +230,26 @@ for cache in "$first_cache" "$second_cache" "$third_cache" "$fourth_cache" \
   link_hol_toolchain_cache "$cache"
 done
 
+# Record each zstd command line so the test can check uploads use level 1;
+# the second build hydrating from these uploads checks they round-trip.
+zstd_shim=$tmpdir/zstd-shim
+zstd_args=$tmpdir/zstd-args
+mkdir -p "$zstd_shim"
+cat > "$zstd_shim/zstd" <<SH
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$zstd_args"
+exec "$(command -v zstd)" "\$@"
+SH
+chmod +x "$zstd_shim/zstd"
+
 first_log=$tmpdir/first.log
-(cd "$first" && HOLBUILD_CACHE="$first_cache" HOLBUILD_CACHE_TRACE=1 \
+(cd "$first" && PATH="$zstd_shim:$PATH" HOLBUILD_CACHE="$first_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 ATheory) > "$first_log" 2>&1
+require_grep "^-1 -vv " "$zstd_args"
+if grep -v "^-1 " "$zstd_args"; then
+  echo "remote cache ran zstd without -1" >&2
+  exit 1
+fi
 require_grep "ATheory built" "$first_log"
 require_grep "remote cache published:" "$first_log"
 require_grep "remote cache zstd .*/cas/[0-9a-f]* Completed in" "$first_log"
