@@ -10,6 +10,15 @@ fun parse_positive_finite_real_text text =
         else NONE
     | NONE => NONE
 
+(* The whole of TEXT as a finite number >= 0; Real.fromString would take a
+   prefix ("2x" as 2.0) and infinities. *)
+fun parse_nonnegative_finite_real_text text =
+  case Real.scan Substring.getc (Substring.full text) of
+      SOME (value, rest) =>
+        if Substring.isEmpty rest andalso Real.isFinite value andalso value >= 0.0 then SOME value
+        else NONE
+    | NONE => NONE
+
 fun parse_timeout_text text =
   if text = "none" then SOME NONE
   else Option.map SOME (parse_positive_finite_real_text text)

@@ -2,6 +2,7 @@ structure HolbuildProofRuntime =
 struct
 
 type config = {checkpoint_enabled : bool,
+               checkpoint_seconds : real,
                tactic_timeout : real option,
                timeout_marker : string option,
                plan_theorem : string option,
@@ -650,10 +651,10 @@ fun advance_failed_prefix_checkpoint path ok_text depth =
     fun exists file = OS.FileSys.access (file, []) handle OS.SysErr _ => false
     fun remove file = OS.FileSys.remove file handle OS.SysErr _ => ()
     fun discard_new () =
-      app (fn suffix => (remove (new ^ suffix); remove (new ^ suffix ^ ".tmp"))) suffixes
+      List.app (fn suffix => (remove (new ^ suffix); remove (new ^ suffix ^ ".tmp"))) suffixes
     fun install () =
       (remove (path ^ ".ok");
-       app (fn suffix => OS.FileSys.rename {old = new ^ suffix, new = path ^ suffix}) suffixes)
+       List.app (fn suffix => OS.FileSys.rename {old = new ^ suffix, new = path ^ suffix}) suffixes)
   in
     (discard_new ();
      let val (meta_text, prefix_text) = failed_prefix_texts ()
@@ -691,7 +692,7 @@ fun save_failed_prefix_checkpoint () =
         else if QUse.hadError () then
           (* No checkpoint after a parse error: see HolbuildCheckpointSaveRuntime. *)
           (HolbuildCheckpointSaveRuntime.discard_checkpoint failed_prefix_path;
-           app (fn suffix => OS.FileSys.remove (failed_prefix_path ^ suffix) handle OS.SysErr _ => ())
+           List.app (fn suffix => OS.FileSys.remove (failed_prefix_path ^ suffix) handle OS.SysErr _ => ())
                [".meta", ".prefix"])
         else
           let
@@ -724,7 +725,11 @@ fun save_theorem_context () =
       NONE => ()
     | SOME (context_path, context_ok, depth) =>
         (context_info_ref := NONE;
-         save_checkpoint "theorem_context" false context_path context_ok depth)
+         if not (!checkpoint_enabled_ref) then ()
+         else
+           HolbuildCheckpointSaveRuntime.save_context_checkpoint
+             {label = "theorem_context", default_share = false, path = context_path,
+              ok_text = context_ok, depth = depth})
 
 fun goal_text goal = PP.pp_to_string 100 goalStack.std_pp_goal goal ^ "\n"
 
@@ -2164,7 +2169,7 @@ fun proof_ir_prover ctxt (g, tac) =
              drop_all();
              raise e)
 
-fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
+fun install ({checkpoint_enabled, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
   (checkpoint_enabled_ref := checkpoint_enabled;
    tactic_timeout_ref := tactic_timeout;
    tactic_timeout_marker_ref := timeout_marker;
@@ -2185,6 +2190,7 @@ fun install ({checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, 
    failed_prefix_resume_active_ref := false;
    failed_prefix_resumed_step_count_ref := NONE;
    proving_with_proof_ir_ref := false;
+   HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate checkpoint_seconds;
    HolbuildTacticCompat.install_prover proof_ir_prover;
    case tactic_timeout of
        NONE => ()

@@ -716,12 +716,18 @@ removes the records first. A spec must name each path it writes in canonical
 form, its files under `.holbuild/action-src` and its objects under
 `.holbuild/obj` or `.holbuild/packages`, its outputs as one stem's, and no
 path twice: otherwise a kept item could stand for files another replaced. A hydrate keeps an item
-whose record matches what the spec names and, for a theory, whose local cache
+whose record matches what the spec names, whose files (with their
+`.hol/objs` copies) are all there, and, for a theory, whose local cache
 manifest is unchanged (the stale check drops a local copy, which then
 reinstalls); it rewrites a kept theory's `.uo` when this spec resolves its
 parents to other stems, and removes every item the spec doesn't name, so the
 root ends as a cold hydrate leaves it. The parent check and the cutoff read
-the records rather than hashing ~4 files per dependency. The stems the action
+the records rather than hashing ~4 files per dependency. A kept item whose
+files went missing is reinstalled with a warning naming the lost path; a HOL
+load that can't find a file the records say the hydrate put in the root fails
+as `internal`, so the coordinator retries it, and removes the records, so the
+next action starts from an empty root. Any other missing file is the script's
+own error. The stems the action
 writes besides its dependencies (its own outputs, and with loading ahead its
 late parents) are emptied and recorded as scratch, which the next hydrate
 removes or reinstalls. Extra outputs lie under their theory's key in
@@ -887,6 +893,16 @@ building a theory, the prover/runtime saves PolyML states at boundaries such as:
 deps_loaded.save         after resolved ancestors are loaded in topological order
 <thm>_context.save       after the theorem has been stored in the theory context
 ```
+
+Each context save forces a full garbage collection, so a context is saved only
+once the time since the last context save ended reaches max(N, 10 x that
+save's duration), counted from when the dependencies are loaded. N is build's
+`--checkpoint-seconds` (default 2 s; 0 saves every context). It reaches remote
+workers as a spec option and is in no key, since it changes which states are
+saved, not what a build produces. Saving costs at most about a tenth of the
+proof time, and a resume replays at most that much finished work before the
+edit. A skipped context is removed, never left from an earlier run. The test
+suite sets `HOLBUILD_CHECKPOINT_EVERY_CONTEXT=1` to save every context.
 
 Holbuild saves no state after the theory is exported. Current HOL versions seal
 a theory when it is exported, so saving one would take a second process that

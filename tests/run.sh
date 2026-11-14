@@ -15,6 +15,9 @@ export HOLBUILD_ROOT="$ROOT"
 # Every build that plans from the plan record also plans in full and fails on
 # any difference.
 export HOLBUILD_PLAN_RECORD=${HOLBUILD_PLAN_RECORD:-check}
+# Builds save a context checkpoint after every theorem and definition, not only
+# once enough time has passed, so tests see the same checkpoints on every run.
+export HOLBUILD_CHECKPOINT_EVERY_CONTEXT=${HOLBUILD_CHECKPOINT_EVERY_CONTEXT:-1}
 export HOLBUILD_TEST_GLOBAL_CACHE="${HOLBUILD_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/holbuild}"
 # Machine-memory admission reads no cgroup limits unless a case points this
 # at a stand-in group: the machine running the tests may be near its own.
