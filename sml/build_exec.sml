@@ -3448,6 +3448,7 @@ fun plain_source_from_checkpoint source_name source_text start_offset =
   String.concat
     [if start_offset <= 0 then ""
      else HolbuildTheoryCheckpoints.generated_code_pragma source_text ^
+          checkpoint_save_runtime_line () ^ "\n" ^
           "val _ = HolbuildRuntime.restore_prover();\n",
      HolbuildTheoryCheckpoints.file_pragma source_name,
      HolbuildTheoryCheckpoints.source_line_pragma source_text start_offset,
