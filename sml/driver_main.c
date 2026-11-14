@@ -9,10 +9,14 @@
    fail - the collector reports "Completed with insufficient space", the
    runtime prints "Run out of store - interrupting threads", waits 5 s and
    holbuild stops with "interrupted".  Poly/ML 5.9.2 reads its runtime options
-   only from the command line, so the floor goes in here.  Poly takes the last
-   of a repeated option, so a --minheap the user gives still wins, and the
-   kernel's copy of the command line (/proc/self/cmdline, which holbuild reads
-   for the runtime options a user gave) doesn't hold this one. */
+   only from the command line, so the floor goes in here.
+
+   A user who sizes the heap (-H, --minheap or --maxheap) gets no floor: Poly
+   refuses an initial or maximum size below the minimum, so the floor would
+   turn "-H 64" into a usage error.  The match is Poly's own: an argument that
+   starts with the option's name.  The kernel's copy of the command line
+   (/proc/self/cmdline, which holbuild reads for the runtime options a user
+   gave) doesn't hold the floor. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -21,8 +25,17 @@ struct _exportDescription;
 extern struct _exportDescription poly_exports;
 extern int polymain(int argc, char **argv, struct _exportDescription *exports);
 
+static int sizes_heap(const char *arg)
+{
+    return strncmp(arg, "-H", 2) == 0 || strncmp(arg, "--minheap", 9) == 0
+        || strncmp(arg, "--maxheap", 9) == 0;
+}
+
 int main(int argc, char **argv)
 {
+    for (int i = 1; i < argc; i++)
+        if (sizes_heap(argv[i]))
+            return polymain(argc, argv, &poly_exports);
     char **args = malloc((argc + 2) * sizeof *args);
     if (args == NULL)
         return polymain(argc, argv, &poly_exports);

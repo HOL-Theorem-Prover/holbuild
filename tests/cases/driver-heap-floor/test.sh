@@ -25,9 +25,14 @@ minimum=$(heap_minimum default)
   exit 1
 }
 
-# A --minheap the user gives still wins over the floor.
+# A user who sizes the heap gets their own sizes and no floor.
 minimum=$(heap_minimum user --minheap=256)
 [ "$minimum" = 256.00M ] || {
   echo "expected --minheap=256 to set the floor to 256.00M, got '$minimum'" >&2
+  exit 1
+}
+minimum=$(heap_minimum initial -H 64)
+[ "$minimum" = 0 ] || {
+  echo "expected -H 64 to leave no heap floor, got '$minimum'" >&2
   exit 1
 }
