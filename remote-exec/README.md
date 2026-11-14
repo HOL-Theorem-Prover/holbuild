@@ -502,7 +502,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   running ones, which the claim names in `ahead_parents`, ancestors first. At most `<cap>` of a batch's actions wait ahead at once;
   among the candidates of the batches below their cap, the claim takes its
   first tier with one, then the highest batch priority, then the longest chain
-  of dependents. A parent
+  of dependents. Claims share one read of the candidates: a claim takes the
+  last read if it began after the claim asked, or if it is younger than
+  `REMOTE_EXEC_CLAIM_RANKING_SECONDS` and no parent finished, went back to
+  waiting or was claimed ahead since; so a plain claim's waiting children
+  become candidates from the next read. A parent
   finishing recounts its running children's unfinished parents; a parent that
   fails for good cancels them as it does every descendant. A parent that goes
   back to waiting (a retry, an expired lease, a done parent built again)

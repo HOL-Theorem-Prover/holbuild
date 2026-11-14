@@ -519,8 +519,11 @@ WITH RECURSIVE walk(batch_id, root, input_key, distance) AS (
 # parents down (edges_parent) rather than per waiting action, since a gate's batch has thousands of those: a child is
 # a candidate when such running parents are all its unfinished ones, by ``remaining_deps``. An action's generation
 # is its longest chain of running actions claimed ahead, down from one of generation 0. CLAIM_AHEAD_ACTION checks
-# the rule itself under the batch's lock. The CTEs are materialized so the children are counted once whatever the
-# planner guesses of a batch inserted since its last statistics.
+# the rule itself under the batch's lock. Every read is by key, whatever the planner guesses of a batch inserted since
+# its last statistics: the few actions waiting ahead are read once with their parents, which the generations are
+# matched against; each running parent's children are read from its edges; and each child's row is read alone. A
+# join of the children with actions was once planned per waiting action of every batch, rereading all the children
+# for each: seconds per read when a large batch arrived.
 AHEAD_CANDIDATES = sa.text("""
 WITH RECURSIVE ahead_batches AS MATERIALIZED (
     SELECT b.id, b.priority FROM batches b
@@ -528,32 +531,37 @@ WITH RECURSIVE ahead_batches AS MATERIALIZED (
         SELECT count(*) FROM actions w
         WHERE w.batch_id = b.id AND w.state = 'running' AND w.ahead = 'ahead' AND w.remaining_deps > 0
     ) < b.ahead_cap
+), waiting_ahead AS MATERIALIZED (
+    SELECT w.batch_id, w.input_key, ARRAY(
+        SELECT e.parent_key FROM edges e WHERE e.batch_id = w.batch_id AND e.input_key = w.input_key
+    ) AS parents
+    FROM ahead_batches b JOIN actions w ON w.batch_id = b.id
+    WHERE w.state = 'running' AND w.ahead = 'ahead' AND w.remaining_deps > 0
 ), generations(batch_id, input_key, generation) AS (
     SELECT r.batch_id, r.input_key, 0
     FROM ahead_batches b JOIN actions r ON r.batch_id = b.id AND r.state = 'running' AND r.remaining_deps = 0
     UNION
-    SELECT g.batch_id, c.input_key, g.generation + 1
-    FROM generations g
-    JOIN edges e ON e.batch_id = g.batch_id AND e.parent_key = g.input_key
-    JOIN actions c ON c.batch_id = e.batch_id AND c.input_key = e.input_key
-    WHERE (CAST(:depth AS integer) IS NULL OR g.generation < :depth)
-    AND c.state = 'running' AND c.ahead = 'ahead' AND c.remaining_deps > 0
+    SELECT g.batch_id, w.input_key, g.generation + 1
+    FROM generations g JOIN waiting_ahead w ON w.batch_id = g.batch_id AND g.input_key = ANY(w.parents)
+    WHERE CAST(:depth AS integer) IS NULL OR g.generation < :depth
 ), running AS MATERIALIZED (
     SELECT batch_id, input_key FROM generations GROUP BY batch_id, input_key
     HAVING CAST(:depth AS integer) IS NULL OR max(generation) < :depth
 ), children AS MATERIALIZED (
-    SELECT r.batch_id, e.input_key, count(*) AS running_parents
-    FROM running r
-    JOIN edges e ON e.batch_id = r.batch_id AND e.parent_key = r.input_key
+    SELECT r.batch_id, count(*) AS running_parents, (
+        SELECT a FROM actions a WHERE a.batch_id = r.batch_id AND a.input_key = e.input_key
+    ) AS a
+    FROM running r CROSS JOIN LATERAL unnest(ARRAY(
+        SELECT e.input_key FROM edges e WHERE e.batch_id = r.batch_id AND e.parent_key = r.input_key
+    )) AS e(input_key)
     GROUP BY r.batch_id, e.input_key
 )
-SELECT a.batch_id, a.input_key, a.tier, b.priority
-FROM children c
-JOIN ahead_batches b ON b.id = c.batch_id
-JOIN actions a ON a.batch_id = c.batch_id AND a.input_key = c.input_key
-WHERE a.state = 'waiting' AND a.class = 'build' AND a.ahead <> 'abandoned' AND a.remaining_deps = c.running_parents
-AND a.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
-ORDER BY b.priority DESC, a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
+SELECT (c.a).batch_id, (c.a).input_key, (c.a).tier, b.priority
+FROM children c JOIN ahead_batches b ON b.id = c.batch_id
+WHERE (c.a).state = 'waiting' AND (c.a).class = 'build' AND (c.a).ahead <> 'abandoned'
+AND (c.a).remaining_deps = c.running_parents
+AND (c.a).input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
+ORDER BY b.priority DESC, (c.a).critical_depth DESC, (c.a).descendant_count DESC, (c.a).theory, (c.a).input_key
 """)
 
 # Lock the best of a batch's candidates ``keys`` of ``tier`` that may still be claimed ahead, but not one whose key
@@ -645,11 +653,12 @@ DELETE FROM leases WHERE batch_id = :batch_id AND input_key = ANY(ARRAY(SELECT i
 
 @dataclass
 class _AheadRead:
-    """AHEAD_CANDIDATES read at ``at``, as (batch, input key, tier), best first, which the claims ahead of
-    ``claim_ranking_seconds`` share, less those they claimed, and the batches and tiers found since with nothing
-    left to claim ahead."""
+    """AHEAD_CANDIDATES read from ``at``, as (batch, input key, tier), best first, which the claims ahead share,
+    less those they claimed, and the batches and tiers found since with nothing left to claim ahead; with
+    Coordinator.ahead_changes when it began."""
 
     at: float
+    changes: int
     candidates: list[tuple[UUID, str, str, int]]
     exhausted: set[tuple[UUID, str]]
 
@@ -776,7 +785,7 @@ class Coordinator:
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
         self.rankings_forgotten = 0  # how many times _forget_rankings dropped one, so reads begun before keep none
-        # The claims ahead's shared read, the lock its readers take, and how many times _ahead_changed dropped it.
+        # The claims ahead's shared read, the lock its readers take, and how many times _ahead_changed outdated it.
         self.ahead_read: _AheadRead | None = None
         self.ahead_lock = asyncio.Lock()
         self.ahead_changes = 0
@@ -1093,9 +1102,9 @@ class Coordinator:
                 # Never lock a batch after an action: batch writers take those locks in the opposite order.
                 row = await self._claim_build(conn, ranking, outranked)
                 if row is not None:
-                    claimed, ahead_batch = await self._lease(conn, row, worker)
+                    claimed = await self._lease(conn, row, worker)
             if row is not None:
-                self._leased(row.batch_id, ahead_batch=ahead_batch)
+                self._batch_changed(row.batch_id)
                 return claimed
             if ranking.heap and (not ranking.ranked or ranking.at >= started):
                 # The next ready build ranks after an action that may be claimed ahead, by a ranking read since
@@ -1154,30 +1163,28 @@ class Coordinator:
             row = await self._claim_first(conn, params)
             if row is None:
                 return None, False
-            claimed, ahead_batch = await self._lease(conn, row, worker)
-        self._leased(row.batch_id, ahead_batch=ahead_batch)
+            claimed = await self._lease(conn, row, worker)
+        self._batch_changed(row.batch_id)
         return claimed, False
 
     async def _lease(
         self, conn: AsyncConnection, row: _Claimed, worker: str, ahead_parents: tuple[AheadParent, ...] = ()
-    ) -> tuple[Claim, bool]:
+    ) -> Claim:
         """Record a lease for the action locked by this transaction, claimed ahead of ``ahead_parents`` when there
-        are any. Also whether it was a plain claim in a batch that loads ahead, whose waiting children may now be
-        claimed ahead: see _leased.
+        are any.
 
-        A plain claim of an action a claim ahead left waiting isn't one ahead; one abandoned stays so."""
+        A plain claim of an action a claim ahead left waiting isn't one ahead; one abandoned stays so. Its waiting
+        children, which may now be claimed ahead, are left to the claims ahead's next read (see _ahead_candidates):
+        a large batch's plain claims would otherwise have every claim of a worker that loads ahead read again."""
         token = uuid4()
-        leased = (
-            await conn.execute(
-                sa.text(
-                    "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now(), "
-                    "ahead = CASE WHEN :ahead THEN 'ahead' WHEN ahead = 'abandoned' THEN ahead ELSE 'no' END "
-                    "WHERE batch_id = :batch_id AND input_key = :input_key "
-                    "RETURNING (SELECT ahead_cap IS NOT NULL FROM batches WHERE id = :batch_id) AS ahead_batch"
-                ),
-                {"batch_id": row.batch_id, "input_key": row.input_key, "ahead": bool(ahead_parents)},
-            )
-        ).one()
+        await conn.execute(
+            sa.text(
+                "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now(), "
+                "ahead = CASE WHEN :ahead THEN 'ahead' WHEN ahead = 'abandoned' THEN ahead ELSE 'no' END "
+                "WHERE batch_id = :batch_id AND input_key = :input_key"
+            ),
+            {"batch_id": row.batch_id, "input_key": row.input_key, "ahead": bool(ahead_parents)},
+        )
         await conn.execute(
             sa.text(
                 "INSERT INTO leases (attempt_token, batch_id, input_key, worker, expires_at) "
@@ -1191,18 +1198,10 @@ class Coordinator:
                 "lease": self.settings.lease_seconds,
             },
         )
-        claim = Claim(
+        return Claim(
             token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb,
             ahead_parents,
         )
-        return claim, leased.ahead_batch and not ahead_parents
-
-    def _leased(self, batch_id: UUID, *, ahead_batch: bool) -> None:
-        """After a lease of ``_lease`` committed: tell the batch's followers, and for a plain claim in a batch that
-        loads ahead, let the claims ahead see the children of the action leased."""
-        self._batch_changed(batch_id)
-        if ahead_batch:
-            self._ahead_changed()
 
     async def _claim_ahead(self, tiers: list[str], worker: str, *, above: int | None = None) -> Claim | None:
         """Lease an action of ``tiers`` ahead of its parents: of the running batches with an ``ahead_cap`` and
@@ -1260,7 +1259,7 @@ class Coordinator:
                 await conn.execute(AHEAD_PARENTS, {"batch_id": batch_id, "keys": [row.input_key], "depth": depth})
             ).all()
             ahead_parents = tuple(AheadParent(p.input_key, p.spec_sha256) for p in parents)
-            claimed, _ = await self._lease(
+            claimed = await self._lease(
                 conn,
                 _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, batch.max_heap_mb),
                 worker,
@@ -1275,27 +1274,30 @@ class Coordinator:
         return claimed
 
     async def _ahead_candidates(self) -> _AheadRead:
-        """The last read of AHEAD_CANDIDATES if younger than ``claim_ranking_seconds``, else a new one, which
-        concurrent callers wait for together."""
+        """The last read of AHEAD_CANDIDATES if it began after this call, or if it is younger than
+        ``claim_ranking_seconds`` and began after the last _ahead_changed; else a new one. A read is made under
+        ``ahead_lock``, and the calls that waited for it take it: claims arriving together read once, not once each
+        in turn."""
         loop = asyncio.get_running_loop()
+        called = loop.time()
         async with self.ahead_lock:
             read = self.ahead_read
-            if read is not None and loop.time() - read.at < self.settings.claim_ranking_seconds:
+            if read is not None and (
+                read.at >= called
+                or (read.changes == self.ahead_changes and loop.time() - read.at < self.settings.claim_ranking_seconds)
+            ):
                 return read
-            changes = self.ahead_changes
-            at = loop.time()
+            at, changes = loop.time(), self.ahead_changes
             async with self.engine.connect() as conn:
                 rows = (await conn.execute(AHEAD_CANDIDATES, {"depth": self.settings.ahead_depth_limit})).all()
-            read = _AheadRead(at, [(row.batch_id, row.input_key, row.tier, row.priority) for row in rows], set())
-            # Not shared when a change since the read began may have made other actions candidates.
-            if changes == self.ahead_changes:
-                self.ahead_read = read
-            return read
+            self.ahead_read = _AheadRead(
+                at, changes, [(row.batch_id, row.input_key, row.tier, row.priority) for row in rows], set()
+            )
+            return self.ahead_read
 
     def _ahead_changed(self) -> None:
-        """Drop the claims ahead's shared read, since actions of a batch that loads ahead may have become
+        """Outdate the claims ahead's shared read, since actions of a batch that loads ahead may have become
         candidates, and wake a claim of each tier that may claim ahead: their tiers aren't known here."""
-        self.ahead_read = None
         self.ahead_changes += 1
         for tier in ("standard", "high"):
             self._wake_claim(tier, ahead=True)
