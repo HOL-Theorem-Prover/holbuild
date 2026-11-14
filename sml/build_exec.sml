@@ -5285,6 +5285,21 @@ fun early_cutoff_own_metadata allow_timeout_discrepancy policy project plan tool
           else NONE
   else NONE
 
+(* Early cutoff: on an input-key miss, the outputs on disk are still the
+   ones a build would produce when the theory's own inputs and everything
+   its dependencies produced are as they were at its last build.  Returns
+   that build's metadata. *)
+fun early_cutoff_metadata dat_hash_cache allow_timeout_discrepancy policy project plan toolchain_key node =
+  case early_cutoff_own_metadata allow_timeout_discrepancy policy project plan toolchain_key node of
+      NONE => NONE
+    | SOME text =>
+        if (case deps_output_key toolchain_key plan node of
+                SOME key => metadata_value "deps_output_key" (metadata_lines text) = SOME key
+              | NONE => false) andalso
+           theory_parent_hashes_match dat_hash_cache plan node (SOME text)
+        then SOME text
+        else NONE
+
 fun build_theory_node speculated dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
   let
     val policy = checkpoint_policy_for_node options project node
@@ -5391,20 +5406,6 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
          case materialize_valid_cache () of
              CacheRestored built_timeout => restore_from_cache built_timeout
            | CacheMiss => build_from_source ())
-    (* Early cutoff: on an input-key miss, the outputs on disk are still the
-       ones a build would produce when the theory's own inputs and everything
-       its dependencies produced are as they were at its last build.  Returns
-       that build's metadata. *)
-    fun early_cutoff_metadata () =
-      case early_cutoff_own_metadata allow_timeout_discrepancy policy project plan toolchain_key node of
-          NONE => NONE
-        | SOME text =>
-            if (case deps_output_key toolchain_key plan node of
-                    SOME key => metadata_value "deps_output_key" (metadata_lines text) = SOME key
-                  | NONE => false) andalso
-               theory_parent_hashes_match dat_hash_cache plan node (SOME text)
-            then SOME text
-            else NONE
     fun reuse_outputs text =
       (remove_tree stage;
        if cache_allowed then
@@ -5424,7 +5425,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
       (remove_tree stage;
        HolbuildStatus.UpToDate)
     else
-      case early_cutoff_metadata () of
+      case early_cutoff_metadata dat_hash_cache allow_timeout_discrepancy policy project plan toolchain_key node of
           SOME text => reuse_outputs text
         | NONE => restore_or_build ()
   end
@@ -6325,6 +6326,8 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
     val outline_owner = Array.array (node_count, NONE : (int * Thread.thread) option)
     val attempt_owner = Array.array (node_count, NONE : (int * Thread.thread) option)
     val cold = Array.array (node_count, NONE : bool option)
+    (* Whether a theory's ready outline exports what its outputs on disk do. *)
+    val outline_unchanged = Array.array (node_count, false)
     val outline_skips = ref (Binaryset.addList (Binaryset.empty String.compare,
                                           if pipelining then read_outline_skips root else []))
     val next_gen = ref 0
@@ -6502,6 +6505,19 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
     fun outlinable id =
       not (null (Array.sub (dependents, id))) andalso (not (is_theory id) orelse speculable id)
 
+    (* Whether theory ID would cut off early (build_theory_node) if it built
+       now, on the outputs its dependencies have on disk.  Only scheduling
+       reads it: its build checks again, and reports what fails here. *)
+    fun cuts_off id =
+      let val node = Vector.sub (nodes, id)
+      in
+        not (force_node options project node) andalso
+        Option.isSome
+          (early_cutoff_metadata dat_hash_cache (#allow_cache_timeout_discrepancy options)
+             (checkpoint_policy_for_node options project node) project plan toolchain_key node)
+      end
+      handle _ => false
+
     fun new_gen () = (next_gen := !next_gen + 1; !next_gen)
 
     fun view_of consumed =
@@ -6624,7 +6640,14 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
        theory's speculative attempt, queued.  Once they are all committed,
        its build: a commit of its attempt, if it has one, or the ready
        queue, where pop_plain decides whether to pipeline it.  An attempt
-       still queued then is withdrawn. *)
+       still queued then is withdrawn.
+
+       A theory that would cut off early runs no HOL, so it gets no attempt:
+       not while every theory outline it would load exports what that
+       theory's outputs on disk do and it cuts off on those (they are its
+       real parents' unless a gate then fails, and it builds plain once they
+       commit), and not once its dependencies are committed and it cuts off
+       on them. *)
     fun consider_locked id =
       if Array.sub (committed, id) orelse Array.sub (skipped, id) then ()
       else
@@ -6647,13 +6670,26 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
                 ANone =>
                   if not (Array.sub (plain_started, id)) andalso Array.sub (remaining_deps, id) > 0 andalso
                      all_available andalso speculable id then
-                    let val gen = new_gen ()
+                    let
+                      val consumed = consumed_by deps
+                      fun unchanged p = not (is_theory p) orelse Array.sub (outline_unchanged, p)
                     in
-                      Array.update (attempt, id, AQueued (gen, consumed_by deps));
-                      attempt_queue := !attempt_queue @ [(id, gen)]
+                      if List.all unchanged (Binaryset.listItems consumed) andalso cuts_off id then
+                        (Array.update (attempt, id, AOff);
+                         pipeline_trace ("cutoff expected: " ^ node_name id))
+                      else
+                        let val gen = new_gen ()
+                        in
+                          Array.update (attempt, id, AQueued (gen, consumed));
+                          attempt_queue := !attempt_queue @ [(id, gen)]
+                        end
                     end
                   else ()
               | _ => ()
+          fun make_ready () =
+            (if speculable id andalso cuts_off id then Array.update (cold, id, SOME false) else ();
+             Array.update (plain_started, id, true);
+             add_ready id)
         in
           if Array.sub (plain_started, id) orelse Array.sub (remaining_deps, id) > 0 then ()
           else
@@ -6662,11 +6698,8 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
                   (Array.update (plain_started, id, true);
                    commit_queue := !commit_queue @ [(id, result)])
               | ARunning _ => ()
-              | AQueued _ =>
-                  (Array.update (attempt, id, ANone);
-                   Array.update (plain_started, id, true);
-                   add_ready id)
-              | _ => (Array.update (plain_started, id, true); add_ready id)
+              | AQueued _ => (Array.update (attempt, id, ANone); make_ready ())
+              | _ => make_ready ()
         end
 
     (* Drops every outline and attempt that loaded node P's outline, which
@@ -6964,18 +6997,22 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
                                       (Vector.sub (nodes, id));
                                     Succeeded ())) of
               Succeeded () =>
-                with_lock
-                  (fn () =>
-                      if not (current ()) then ()
-                      else
-                        case Array.sub (outline, id) of
-                            ORunning (_, consumed) =>
-                              (Array.update (outline, id, OReady (gen, base, consumed));
-                               #outlines counts := !(#outlines counts) + 1;
-                               pipeline_trace ("outline ready: " ^ node_name id);
-                               List.app consider_locked (Array.sub (dependents, id));
-                               signal ())
-                          | _ => ())
+                let val unchanged = outline_mismatch root run_dir base (Vector.sub (nodes, id)) = NONE
+                in
+                  with_lock
+                    (fn () =>
+                        if not (current ()) then ()
+                        else
+                          case Array.sub (outline, id) of
+                              ORunning (_, consumed) =>
+                                (Array.update (outline_unchanged, id, unchanged);
+                                 Array.update (outline, id, OReady (gen, base, consumed));
+                                 #outlines counts := !(#outlines counts) + 1;
+                                 pipeline_trace ("outline ready: " ^ node_name id);
+                                 List.app consider_locked (Array.sub (dependents, id));
+                                 signal ())
+                            | _ => ())
+                end
             | outcome =>
                 with_lock
                   (fn () =>
