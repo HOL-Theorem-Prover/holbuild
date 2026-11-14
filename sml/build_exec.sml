@@ -11931,6 +11931,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                     [fn () => done := action_already_done remote root spec,
                      fn () => Option.app look_up_earlier cutoff]
             in
+              (* A failed pair lookup raises here, as it did inside
+                 reuse_earlier_build, whose handler covers only its last case. *)
               (!done orelse (not forced andalso reuse_earlier_build remote root spec (!earlier ())), cutoff)
             end)
       in
