@@ -3351,9 +3351,9 @@ fun files_sha256_in_parallel paths =
     List.concat (Array.foldr op:: [] hashes)
   end
 
-(* Computes and remembers the output digests of NODES, hashing all their files
-   in one batch.  A node with a missing output gets none. *)
-fun remember_output_digests toolchain_key plan nodes =
+(* The output digests of NODES, hashing all their files in one batch.  A node
+   with a missing output gets none. *)
+fun output_digests toolchain_key plan nodes =
   let
     val parts =
       List.mapPartial
@@ -3381,37 +3381,45 @@ fun remember_output_digests toolchain_key plan nodes =
           in
             ((role ^ " " ^ hash) :: lines, hashes)
           end
-    fun digest [] _ = ()
+    fun digest [] _ = []
       | digest ((node, lines, files) :: rest) hashes =
           let
             val (file_lines, hashes) = file_lines files hashes
           in
-            HolbuildBuildPlan.remember_output_digest plan node
-              (HolbuildToolchain.hash_text
-                 (String.concatWith "\n" ("holbuild-output-digest-v1" :: lines @ file_lines) ^ "\n"));
+            (node,
+             HolbuildToolchain.hash_text
+               (String.concatWith "\n" ("holbuild-output-digest-v1" :: lines @ file_lines) ^ "\n")) ::
             digest rest hashes
           end
   in
     digest parts hashes
   end
-  handle _ => ()
+  handle _ => []
 
-(* A hash of everything NODE loads from its project dependencies: the output
-   digest of each node in its closure.  NONE when an output is missing.
-   Digests are memoized for the build; build_one forgets a node's digest when
-   it finishes, since only then are its outputs final. *)
-fun deps_output_key toolchain_key plan node =
+(* Computes and remembers the output digests of NODES; returns them. *)
+fun remember_output_digests toolchain_key plan nodes =
+  let val digests = output_digests toolchain_key plan nodes
+  in
+    List.app (fn (node, digest) => HolbuildBuildPlan.remember_output_digest plan node digest) digests;
+    digests
+  end
+
+(* deps_output_key, with FRESH computing the digests the memo lacks. *)
+fun deps_output_key_with fresh plan node =
   let
     val deps = HolbuildBuildPlan.transitive_project_deps plan node
     fun cached dep = HolbuildBuildPlan.cached_output_digest plan dep
-    val _ =
+    val computed =
       case List.filter (fn dep => not (Option.isSome (cached dep))) deps of
-          [] => ()
-        | missing => remember_output_digests toolchain_key plan missing
-    fun line dep =
+          [] => []
+        | missing => fresh missing
+    fun digest dep =
       case cached dep of
-          SOME digest => SOME (HolbuildBuildPlan.key dep ^ " " ^ digest)
-        | NONE => NONE
+          SOME digest => SOME digest
+        | NONE =>
+            Option.map #2
+              (List.find (fn (node, _) => HolbuildBuildPlan.key node = HolbuildBuildPlan.key dep) computed)
+    fun line dep = Option.map (fn digest => HolbuildBuildPlan.key dep ^ " " ^ digest) (digest dep)
     val lines = map line deps
   in
     if List.all Option.isSome lines then
@@ -3419,6 +3427,18 @@ fun deps_output_key toolchain_key plan node =
               (String.concatWith "\n" ("holbuild-deps-output-v1" :: map valOf lines) ^ "\n"))
     else NONE
   end
+
+(* A hash of everything NODE loads from its project dependencies: the output
+   digest of each node in its closure.  NONE when an output is missing.
+   Digests are memoized for the build; build_one forgets a node's digest when
+   it finishes, since only then are its outputs final. *)
+fun deps_output_key toolchain_key plan node =
+  deps_output_key_with (remember_output_digests toolchain_key plan) plan node
+
+(* deps_output_key while some dependencies may still build: their outputs can
+   change under it, so it remembers nothing build_one would have to forget. *)
+fun probe_deps_output_key toolchain_key plan node =
+  deps_output_key_with (output_digests toolchain_key plan) plan node
 
 (* The key of a theory's loaded dependencies (deps_loaded.save and the
    checkpoints above it).  Keyed on what the dependencies produced, so an edit
@@ -5285,6 +5305,21 @@ fun early_cutoff_own_metadata allow_timeout_discrepancy policy project plan tool
           else NONE
   else NONE
 
+(* Early cutoff: on an input-key miss, the outputs on disk are still the
+   ones a build would produce when the theory's own inputs and everything
+   its dependencies produced are as they were at its last build.  Returns
+   that build's metadata.  DEPS_KEY is deps_output_key or a variant. *)
+fun early_cutoff_metadata deps_key dat_hash_cache allow_timeout_discrepancy policy project plan toolchain_key node =
+  case early_cutoff_own_metadata allow_timeout_discrepancy policy project plan toolchain_key node of
+      NONE => NONE
+    | SOME text =>
+        if (case deps_key toolchain_key plan node of
+                SOME key => metadata_value "deps_output_key" (metadata_lines text) = SOME key
+              | NONE => false) andalso
+           theory_parent_hashes_match dat_hash_cache plan node (SOME text)
+        then SOME text
+        else NONE
+
 fun build_theory_node speculated dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
   let
     val policy = checkpoint_policy_for_node options project node
@@ -5391,20 +5426,6 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
          case materialize_valid_cache () of
              CacheRestored built_timeout => restore_from_cache built_timeout
            | CacheMiss => build_from_source ())
-    (* Early cutoff: on an input-key miss, the outputs on disk are still the
-       ones a build would produce when the theory's own inputs and everything
-       its dependencies produced are as they were at its last build.  Returns
-       that build's metadata. *)
-    fun early_cutoff_metadata () =
-      case early_cutoff_own_metadata allow_timeout_discrepancy policy project plan toolchain_key node of
-          NONE => NONE
-        | SOME text =>
-            if (case deps_output_key toolchain_key plan node of
-                    SOME key => metadata_value "deps_output_key" (metadata_lines text) = SOME key
-                  | NONE => false) andalso
-               theory_parent_hashes_match dat_hash_cache plan node (SOME text)
-            then SOME text
-            else NONE
     fun reuse_outputs text =
       (remove_tree stage;
        if cache_allowed then
@@ -5424,7 +5445,8 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
       (remove_tree stage;
        HolbuildStatus.UpToDate)
     else
-      case early_cutoff_metadata () of
+      case early_cutoff_metadata deps_output_key dat_hash_cache allow_timeout_discrepancy policy project plan
+             toolchain_key node of
           SOME text => reuse_outputs text
         | NONE => restore_or_build ()
   end
@@ -6325,6 +6347,8 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
     val outline_owner = Array.array (node_count, NONE : (int * Thread.thread) option)
     val attempt_owner = Array.array (node_count, NONE : (int * Thread.thread) option)
     val cold = Array.array (node_count, NONE : bool option)
+    (* Whether a theory's ready outline exports what its outputs on disk do. *)
+    val outline_unchanged = Array.array (node_count, false)
     val outline_skips = ref (Binaryset.addList (Binaryset.empty String.compare,
                                           if pipelining then read_outline_skips root else []))
     val next_gen = ref 0
@@ -6502,6 +6526,25 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
     fun outlinable id =
       not (null (Array.sub (dependents, id))) andalso (not (is_theory id) orelse speculable id)
 
+    (* Whether theory ID would cut off early (build_theory_node) if it built
+       now, on the outputs its dependencies have on disk.  Only scheduling
+       reads it: its build checks again, and reports what fails here.  Until
+       its dependencies have built, their outputs can change under the check,
+       so it then remembers no digest or hash of them. *)
+    fun cuts_off id =
+      let
+        val node = Vector.sub (nodes, id)
+        val (deps_key, hashes) =
+          if Array.sub (remaining_deps, id) = 0 then (deps_output_key, dat_hash_cache)
+          else (probe_deps_output_key, new_file_hash_cache ())
+      in
+        not (force_node options project node) andalso
+        Option.isSome
+          (early_cutoff_metadata deps_key hashes (#allow_cache_timeout_discrepancy options)
+             (checkpoint_policy_for_node options project node) project plan toolchain_key node)
+      end
+      handle _ => false
+
     fun new_gen () = (next_gen := !next_gen + 1; !next_gen)
 
     fun view_of consumed =
@@ -6624,7 +6667,14 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
        theory's speculative attempt, queued.  Once they are all committed,
        its build: a commit of its attempt, if it has one, or the ready
        queue, where pop_plain decides whether to pipeline it.  An attempt
-       still queued then is withdrawn. *)
+       still queued then is withdrawn.
+
+       A theory that would cut off early runs no HOL, so it gets no attempt:
+       not while every theory outline it would load exports what that
+       theory's outputs on disk do and it cuts off on those (they are its
+       real parents' unless a gate then fails, and it builds plain once they
+       commit), and not once its dependencies are committed and it cuts off
+       on them. *)
     fun consider_locked id =
       if Array.sub (committed, id) orelse Array.sub (skipped, id) then ()
       else
@@ -6647,13 +6697,26 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
                 ANone =>
                   if not (Array.sub (plain_started, id)) andalso Array.sub (remaining_deps, id) > 0 andalso
                      all_available andalso speculable id then
-                    let val gen = new_gen ()
+                    let
+                      val consumed = consumed_by deps
+                      fun unchanged p = not (is_theory p) orelse Array.sub (outline_unchanged, p)
                     in
-                      Array.update (attempt, id, AQueued (gen, consumed_by deps));
-                      attempt_queue := !attempt_queue @ [(id, gen)]
+                      if List.all unchanged (Binaryset.listItems consumed) andalso cuts_off id then
+                        (Array.update (attempt, id, AOff);
+                         pipeline_trace ("cutoff expected: " ^ node_name id))
+                      else
+                        let val gen = new_gen ()
+                        in
+                          Array.update (attempt, id, AQueued (gen, consumed));
+                          attempt_queue := !attempt_queue @ [(id, gen)]
+                        end
                     end
                   else ()
               | _ => ()
+          fun make_ready () =
+            (if speculable id andalso cuts_off id then Array.update (cold, id, SOME false) else ();
+             Array.update (plain_started, id, true);
+             add_ready id)
         in
           if Array.sub (plain_started, id) orelse Array.sub (remaining_deps, id) > 0 then ()
           else
@@ -6662,11 +6725,8 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
                   (Array.update (plain_started, id, true);
                    commit_queue := !commit_queue @ [(id, result)])
               | ARunning _ => ()
-              | AQueued _ =>
-                  (Array.update (attempt, id, ANone);
-                   Array.update (plain_started, id, true);
-                   add_ready id)
-              | _ => (Array.update (plain_started, id, true); add_ready id)
+              | AQueued _ => (Array.update (attempt, id, ANone); make_ready ())
+              | _ => make_ready ()
         end
 
     (* Drops every outline and attempt that loaded node P's outline, which
@@ -6964,18 +7024,22 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
                                       (Vector.sub (nodes, id));
                                     Succeeded ())) of
               Succeeded () =>
-                with_lock
-                  (fn () =>
-                      if not (current ()) then ()
-                      else
-                        case Array.sub (outline, id) of
-                            ORunning (_, consumed) =>
-                              (Array.update (outline, id, OReady (gen, base, consumed));
-                               #outlines counts := !(#outlines counts) + 1;
-                               pipeline_trace ("outline ready: " ^ node_name id);
-                               List.app consider_locked (Array.sub (dependents, id));
-                               signal ())
-                          | _ => ())
+                let val unchanged = outline_mismatch root run_dir base (Vector.sub (nodes, id)) = NONE
+                in
+                  with_lock
+                    (fn () =>
+                        if not (current ()) then ()
+                        else
+                          case Array.sub (outline, id) of
+                              ORunning (_, consumed) =>
+                                (Array.update (outline_unchanged, id, unchanged);
+                                 Array.update (outline, id, OReady (gen, base, consumed));
+                                 #outlines counts := !(#outlines counts) + 1;
+                                 pipeline_trace ("outline ready: " ^ node_name id);
+                                 List.app consider_locked (Array.sub (dependents, id));
+                                 signal ())
+                            | _ => ())
+                end
             | outcome =>
                 with_lock
                   (fn () =>
@@ -7359,7 +7423,7 @@ fun start_settled_check (options : build_options) tc project plan toolchain_key 
       end
   in
     (List.app (fn node => add (fn () => check node)) outside;
-     List.app (fn nodes => add (fn () => remember_output_digests toolchain_key plan nodes)) (chunks batch_ancestors);
+     List.app (fn nodes => add (fn () => ignore (remember_output_digests toolchain_key plan nodes))) (chunks batch_ancestors);
      settled)
     handle e => (stop (); raise e)
   end

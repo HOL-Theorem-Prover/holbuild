@@ -629,3 +629,43 @@ require_no_grep "dispatch pipelined: .*free 1)" "$log"
 for t in $(sed -n 's/.*pipeline: dispatch plain: \([A-Za-z0-9]*\)Theory .*/\1/p' "$log"); do
   require_no_grep "attempt done: ${t}Theory" "$log"
 done
+
+# Early cutoff: a theory whose dependencies' outputs end up as they were runs
+# no HOL, so no attempt.  A's proof edit leaves its outline what A's outputs
+# on disk export, so B, which cuts off on those, isn't attempted while A
+# proves, and C, ready once B cut off, cuts off without being pipelined.
+new_project cutoff
+write_a_cutoff() {
+  cat > "$tmpdir/cutoff/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem a_thm:
+  T
+Proof
+  $1
+QED
+val _ = export_theory();
+SML
+}
+write_a_cutoff "$slow_truth"
+write_b_and_c cutoff
+build_pipelined cutoff CTheory
+write_a_cutoff "$pause >> $slow_truth"
+build_pipelined cutoff CTheory
+log=$tmpdir/cutoff.log
+require_grep "pipeline: outline ready: ATheory" "$log"
+require_grep "pipeline: gate passed: ATheory" "$log"
+require_grep "pipeline: cutoff expected: BTheory" "$log"
+require_grep "early cutoff: BTheory " "$log"
+require_grep "early cutoff: CTheory " "$log"
+require_no_grep "pipeline: dispatch pipelined: [BC]Theory" "$log"
+require_no_grep "pipeline: attempt [a-z]*: [BC]Theory" "$log"
+# When A's real build then differs from its outline (here its proof makes an
+# oracle), its gate fails and B and C build on the committed A.
+write_a_cutoff "$pause >> $pause >> $pause >> (fn (asl, w) => ACCEPT_TAC (mk_oracle_thm \"made_here\" (asl, w)) (asl, w))"
+build_pipelined cutoff CTheory
+require_grep "pipeline: cutoff expected: BTheory" "$log"
+require_grep "pipeline: gate failed: ATheory (digest differs)" "$log"
+require_no_grep "early cutoff: [BC]Theory " "$log"
+require_grep "BTheory built" "$log"
+require_grep "CTheory built" "$log"
