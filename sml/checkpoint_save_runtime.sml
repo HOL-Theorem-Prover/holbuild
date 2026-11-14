@@ -213,7 +213,7 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
 end
 
 val _ =
-  (ignore (Listener.remove_listener Theory.delta_hook "HolbuildCheckpointSaveRuntime.theory_cpu");
+  (General.ignore (Listener.remove_listener Theory.delta_hook "HolbuildCheckpointSaveRuntime.theory_cpu");
    Theory.register_hook ("HolbuildCheckpointSaveRuntime.theory_cpu",
                          HolbuildCheckpointSaveRuntime.theory_cpu_hook));
 
@@ -221,6 +221,6 @@ val _ =
    file first: its share of the theory's time begins here. *)
 val _ =
   if Option.isSome (!HolbuildTheoryCpuState.carried) andalso
-     not (Option.isSome (!HolbuildTheoryCpuState.since))
+     Bool.not (Option.isSome (!HolbuildTheoryCpuState.since))
   then HolbuildTheoryCpuState.since := SOME (HolbuildCheckpointSaveRuntime.process_cpu ())
   else ();
