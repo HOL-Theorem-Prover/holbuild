@@ -7313,9 +7313,10 @@ fun start_settled_check (options : build_options) tc project plan toolchain_key 
         {nodes = nodes, dat_hash_cache = hashes}
       end
   in
-    List.app (fn node => add (fn () => check node)) outside;
-    List.app (fn nodes => add (fn () => remember_output_digests toolchain_key plan nodes)) (chunks batch_ancestors);
-    settled
+    (List.app (fn node => add (fn () => check node)) outside;
+     List.app (fn nodes => add (fn () => remember_output_digests toolchain_key plan nodes)) (chunks batch_ancestors);
+     settled)
+    handle e => (stop (); raise e)
   end
 
 (* Linux PSI: total microseconds runnable tasks, machine-wide, waited for a CPU.

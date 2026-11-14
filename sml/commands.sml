@@ -1779,12 +1779,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 (* What the restore after the batch would find up to date is
                    checked while it runs: on a busy host those reads are slow. *)
                 val settled =
-                  case in_batch of
-                      SOME batch_keys =>
-                        SOME (HolbuildBuildExec.start_settled_check
-                                (HolbuildBuildExec.remote_restore_options true build_options) tc project plan
-                                toolchain_key jobs batch_keys (!deferred))
-                    | NONE => NONE
+                  (case in_batch of
+                       SOME batch_keys =>
+                         SOME (HolbuildBuildExec.start_settled_check
+                                 (HolbuildBuildExec.remote_restore_options true build_options) tc project plan
+                                 toolchain_key jobs batch_keys (!deferred))
+                     | NONE => NONE)
+                  handle e => (stop (); raise e)
                 fun stop_all () = (stop (); Option.map (fn settled => settled ()) settled)
                 val logs = ref []
                 fun on_change (key, state, _, log) =
