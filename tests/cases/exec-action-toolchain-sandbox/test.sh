@@ -294,6 +294,37 @@ require_grep 'linked or special file: .*/bin/suid' "$tmpdir/setuid.log"
 [[ $(find "$worker/hol-toolchains" -mindepth 1 -maxdepth 1 -type d | wc -l) == 3 ]] ||
   { ls -la "$worker/hol-toolchains" >&2; cat "$tmpdir/setuid.log" >&2; exit 1; }
 
+# A commit the trusted branch held when the worker checked it, but no branch
+# or tag holds now, still builds: a clone leaves it out, so the worker fetches
+# it by hash. A clone of a plain path copies every object, so here git clones
+# over its transport, as from GitHub.
+git -C "$hol" rm -q setuid
+git -C "$hol" commit -qm side
+side_rev=$(git -C "$hol" rev-parse HEAD)
+git -C "$hol" commit -q --allow-empty -m tip
+run_worker "$worker" "$(retarget "$(git -C "$hol" rev-parse HEAD)")" "$tmpdir/tip.log"
+require_grep "the toolchain's identity does not match the action text" "$tmpdir/tip.log"
+git -C "$hol" update-ref refs/hidden/side "$side_rev"
+git -C "$hol" reset -q --hard "$hol_rev"
+git -C "$hol" config uploadpack.allowReachableSHA1InWant true
+mkdir -p "$tmpdir/remote-git"
+cat > "$tmpdir/remote-git/git" <<SH
+#!/bin/sh
+for arg do
+  shift
+  set -- "\$@" "\$arg"
+  if [ "\$arg" = clone ]; then set -- "\$@" --no-local; fi
+done
+exec $(command -v git) "\$@"
+SH
+chmod +x "$tmpdir/remote-git/git"
+PATH=$tmpdir/remote-git:$PATH run_worker "$worker" "$(retarget "$side_rev")" "$tmpdir/side.log"
+require_grep "the toolchain's identity does not match the action text" "$tmpdir/side.log"
+for tree in "$worker"/hol-toolchains/*/hol; do
+  if [[ $(git -C "$tree" rev-parse HEAD 2>/dev/null) == "$side_rev" ]]; then side_tree=$tree; fi
+done
+[[ -n "${side_tree:-}" ]] || { cat "$tmpdir/side.log" >&2; exit 1; }
+
 # The analyser runs confined to a fresh directory, read only once checked.
 analyser=$tmpdir/analysers/key/bin/holbuild-hol-analyser
 mkdir -p "$(dirname "$analyser")" "$tmpdir/action" "$tmpdir/checkpoints"
