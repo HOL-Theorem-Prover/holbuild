@@ -139,7 +139,7 @@ locked_status=$?
 set -e
 [[ $locked_status == 3 ]] || { cat "$tmpdir/locked.log" "$tmpdir/locked.result" >&2; exit 1; }
 require_grep '^failure=internal$' "$tmpdir/locked.result"
-require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/locked.log"
+require_grep 'HOL sandbox failed: cannot validate action output' "$tmpdir/locked.log"
 [[ ! -e "$tmpdir/worker/action/.holbuild/stage" ]] || { echo 'an inaccessible directory survived cleanup' >&2; exit 1; }
 # A policy/setup failure is retryable infrastructure failure, never a final
 # failed proof. The protected completion marker is not writable by HOL.
@@ -155,7 +155,7 @@ if grep -q '^log=' "$tmpdir/setup.result"; then
   echo 'failed confinement harvested an unvalidated log' >&2
   exit 1
 fi
-require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/setup.log"
+require_grep 'HOL sandbox failed: sandbox grant contains protected worker state' "$tmpdir/setup.log"
 
 # A failed output check must bypass checkpoint recovery and diagnostics that
 # inspect child-written logs. Use an isolated runtime to inject the failure.
@@ -185,7 +185,7 @@ output_status=$?
 set -e
 [[ $output_status == 3 ]] || { cat "$tmpdir/rejected-output.log" "$tmpdir/rejected-output.result" >&2; exit 1; }
 require_grep '^failure=internal$' "$tmpdir/rejected-output.result"
-require_grep 'sandbox did not complete cleanup and output validation' "$tmpdir/rejected-output.log"
+require_grep 'HOL sandbox failed: injected post-run output rejection' "$tmpdir/rejected-output.log"
 if grep -q '^log=' "$tmpdir/rejected-output.result" || grep -q 'forged unvalidated diagnostic' "$tmpdir/rejected-output.log"; then
   echo 'failed confinement inspected or published child-written diagnostics' >&2
   exit 1

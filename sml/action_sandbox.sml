@@ -167,7 +167,10 @@ fun helper () = OS.Path.concat (HolbuildRuntimePaths.runtime_root (), "sml/actio
    toolchain: it builds a HOL tree, which links and chmods within itself. *)
 type grants = {writable : string list, readable : string list, toolchain : bool}
 
-fun wrap completed ({writable, readable = extra, toolchain} : grants) argv =
+(* The helper's options granting GRANTS.  confined passes them in a file:
+   one theory's checkpoint directories can exceed the kernel's limit on a
+   single argument (128 KiB), and the launch goes through one sh -c. *)
+fun grant_options ({writable, readable = extra, toolchain} : grants) =
   let
     fun exists path = OS.FileSys.access (path, []) handle OS.SysErr _ => false
     fun full path = OS.FileSys.fullPath path
@@ -210,7 +213,7 @@ fun wrap completed ({writable, readable = extra, toolchain} : grants) argv =
          SOME (absolute path)) protected_paths
     fun options flag paths = List.concat (map (fn path => [flag, path]) paths)
   in
-    ["python3", "-I", helper ()] @ (if toolchain then ["--toolchain"] else []) @
+    (if toolchain then ["--toolchain"] else []) @
     options "--write" (map full writable) @
     options "--read" (map full readable) @ options "--forbid" forbidden @
     (* Restored states link into the store, which actions read in parts. *)
@@ -218,9 +221,11 @@ fun wrap completed ({writable, readable = extra, toolchain} : grants) argv =
     (* Poly/ML's OS.FileSys.tmpName always creates files in /tmp, ignoring
        TMPDIR; HolSat and HolSmt need it.  The helper leaves it out if
        protected worker state, holbuild's TMPDIR included, lies beneath it. *)
-    options "--scratch" (List.filter exists ["/tmp"]) @
-    ["--completed", completed, "--"] @ argv
+    options "--scratch" (List.filter exists ["/tmp"])
   end
+
+fun wrap {completed, options} argv =
+  ["python3", "-I", helper (), "--options", options, "--completed", completed, "--"] @ argv
 
 fun with_output_dirs dirs f =
   (output_dirs := SOME dirs;
@@ -233,9 +238,10 @@ fun confined grants argv execute =
   let
     val completed = OS.Path.concat
       (OS.FileSys.fullPath (HolbuildCacheConfig.cache_root ()), "sandbox-" ^ HolbuildTempPath.suffix ())
-    fun remove () = OS.FileSys.remove completed handle OS.SysErr _ => ()
-    fun write text =
-      let val output = TextIO.openOut completed
+    val options = completed ^ ".options"
+    fun remove () = List.app (fn path => OS.FileSys.remove path handle OS.SysErr _ => ()) [completed, options]
+    fun write path text =
+      let val output = TextIO.openOut path
       in (TextIO.output(output, text); TextIO.closeOut output)
          handle e => (TextIO.closeOut output; raise e)
       end
@@ -244,22 +250,29 @@ fun confined grants argv execute =
       in (TextIO.inputAll input before TextIO.closeIn input)
          handle e => (TextIO.closeIn input; raise e)
       end
+    val unconfirmed = "HOL sandbox did not complete cleanup and output validation"
+    (* NONE once the supervisor validated; else why the result doesn't count. *)
     fun await_completion deadline =
       case completion () of
-          "validated\n" => true
-        | "failed\n" => false
-        | _ => if Time.>= (Time.now (), deadline) then false
-               else (OS.Process.sleep (Time.fromReal 0.01); await_completion deadline)
+          "validated\n" => NONE
+        | text =>
+            if String.isPrefix "failed\n" text then
+              case String.tokens (fn c => c = #"\n") (String.extract (text, size "failed\n", NONE)) of
+                  [] => SOME unconfirmed
+                | lines => SOME ("HOL sandbox failed: " ^ String.concatWith "; " lines)
+            else if Time.>= (Time.now (), deadline) then SOME unconfirmed
+            else (OS.Process.sleep (Time.fromReal 0.01); await_completion deadline)
     fun run () =
       let
-        val _ = write "pending\n"
-        val result = execute (wrap completed grants argv)
+        val _ = write completed "pending\n"
+        val _ = write options (String.concat (map (fn option => option ^ "\000") (grant_options grants)))
+        val result = execute (wrap {completed = completed, options = options} argv)
+      in
         (* A timeout reaps the outer shell before its watcher signals the
            supervisor. Allow the supervisor's bounded cleanup to finish. *)
-        val _ = if await_completion (Time.+ (Time.now (), Time.fromSeconds 6)) then ()
-                else raise Error "HOL sandbox did not complete cleanup and output validation"
-      in
-        result
+        case await_completion (Time.+ (Time.now (), Time.fromSeconds 6)) of
+            NONE => result
+          | SOME reason => raise Error reason
       end
   in
     (run () before remove ()) handle e => (remove (); raise e)
