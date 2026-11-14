@@ -19,7 +19,7 @@ type theory =
    parents : string list, mldeps : string list,
    (* The .dat by the hash its children record, and the parents' it records. *)
    dat_hash : string, dat_parents : (string * string) list,
-   (* SHA-256 of each of hashed_suffixes, once hashed. *)
+   (* SHA-256 of each of hashed_suffixes. *)
    hashes : string list}
 
 val hashed_suffixes = [".sig", ".sml", ".ui", ".uo"]
@@ -137,25 +137,10 @@ fun put (t as {entries, wanted, ...} : t) path entry =
 
 fun theory t path = case find t path of SOME (Theory theory) => SOME theory | _ => NONE
 
-(* The theories recorded without their files' hashes. *)
-fun unhashed (t as {entries, ...} : t) =
-  locked t (fn () => List.mapPartial (fn (path, Theory {hashes = [], ...}) => SOME path | _ => NONE)
-                                     (Binarymap.listItems (!entries)))
-
 (* The keys of the recorded theories and scratch stems. *)
 fun keys (t as {entries, ...} : t) =
   locked t (fn () => List.mapPartial (fn (_, Theory {key, ...}) => SOME key | (_, Scratch key) => SOME key | _ => NONE)
                                      (Binarymap.listItems (!entries)))
-
-(* Records HASHES, of hashed_suffixes, for the theory at PATH. *)
-fun hashed (t as {entries, ...} : t) path hashes =
-  locked t (fn () =>
-    case Binarymap.peek (!entries, path) of
-        SOME (Theory {target, key, source, parents, mldeps, dat_hash, dat_parents, ...}) =>
-          entries := Binarymap.insert (!entries, path,
-                       Theory {target = target, key = key, source = source, parents = parents, mldeps = mldeps,
-                               dat_hash = dat_hash, dat_parents = dat_parents, hashes = hashes})
-      | _ => ())
 
 (* The hash the record of a theory's file at PATH holds, the .dat by the
    hash its children record. *)

@@ -7927,11 +7927,14 @@ fun theory_keys_depending_on (options : build_options) tc project plan toolchain
 fun drop_local_copy_if_stale remote key =
   let val cache = cache_root ()
   in
-    case (HolbuildCache.get_action cache key, HolbuildRemoteCache.get_action remote key) of
-        (SOME mine, SOME theirs) =>
-          not (cache_manifest_outputs_equal key mine theirs handle _ => false) andalso
-          drop_cache_manifest_if_unchanged cache key mine
-      | _ => false
+    case HolbuildCache.get_action cache key of
+        NONE => false
+      | SOME mine =>
+          case HolbuildRemoteCache.get_action remote key of
+              NONE => false
+            | SOME theirs =>
+                not (cache_manifest_outputs_equal key mine theirs handle _ => false) andalso
+                drop_cache_manifest_if_unchanged cache key mine
   end
 
 (* Drops the local cache's entries for keys, so that a build restores them
@@ -9384,7 +9387,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
               t = target andalso k = key andalso source_sha key = SOME source andalso
               Resident.file_hash resident (path ^ ".uo") =
                 SOME (HolbuildHash.string_sha256 (manifest_text (uo_lines stem {parents = parents, mldeps = mldeps}))) andalso
-              (Resident.want resident path; HolbuildCache.touch_action cache key; true)
+              (Resident.want resident path; true)
           | NONE => false
       end
     fun remove_old {stem, ...} =
@@ -9394,27 +9397,22 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       let
         val path = in_root root stem
         val _ = ensure_parent path
-        val {manifest_text = source_text, metadata = {parents, mldeps}} =
+        val {manifest_text = source_text, metadata = metadata as {parents, mldeps}} =
           restore_spec_theory remote root resolver
             {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE}
+        val {sig_hash, ...} = cache_manifest_blobs_from_lines key (cache_manifest_lines source_text)
+        (* Those of Resident.hashed_suffixes: the .sml has its .dat path
+           written in, and the .ui and .uo are the manifests just written. *)
+        val hashes =
+          [sig_hash, HolbuildHash.string_sha256 (read_text (path ^ ".sml")),
+           HolbuildHash.string_sha256 (manifest_text [path ^ ".sig"]),
+           HolbuildHash.string_sha256 (manifest_text (uo_lines stem metadata))]
       in
         Resident.put resident path
           (Resident.Theory {target = target, key = key, source = HolbuildHash.string_sha256 source_text,
                             parents = parents, mldeps = mldeps, dat_hash = hol_dat_hash (path ^ ".dat"),
                             dat_parents = Binarymap.listItems (parse_dat_parent_hashes (read_text (path ^ ".dat"))),
-                            hashes = []})
-      end
-    (* The files of the dependencies just installed, hashed in one batch. *)
-    fun hash_installed () =
-      let
-        val paths = Resident.unhashed resident
-        val suffixes = Resident.hashed_suffixes
-        fun split [] = []
-          | split hashes = List.take (hashes, length suffixes) :: split (List.drop (hashes, length suffixes))
-      in
-        ListPair.app (fn (path, hashes) => Resident.hashed resident path hashes)
-          (paths, split (HolbuildHash.files_sha256
-                           (List.concat (map (fn path => map (fn suffix => path ^ suffix) suffixes) paths))))
+                            hashes = hashes})
       end
     fun restorable f (dep as {target, key, ...}) =
       f dep
@@ -9449,7 +9447,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                           | NONE => raise Error ("no record of dependency " ^ stem))))
             (#deps spec)
         end)
-    fun restore_deps () = hydrate_step "hyddeps" (fn () => (restore_deps_now (); hash_installed ()))
+    fun restore_deps () = hydrate_step "hyddeps" restore_deps_now
     fun refresh wanted =
       hydrate_step "hydstale" (fn () => drop_stale_dep_copies remote spec wanted) andalso (restore_deps (); true)
     (* Every path an item writes: two items sharing one would let a kept
@@ -10849,12 +10847,13 @@ fun resident_hashes resident =
     {dat_hash = hash hol_dat_hash, file_hashes = map (hash HolbuildHash.file_sha256)}
   end
 
-(* Restores the entry of the earlier build the pair names as this action's
-   outputs, and copies it to the action's input key in the local cache.
-   False on a miss, and on any doubt: the entry's timeout contract, extra
-   outputs, or recorded parents don't fit. *)
-fun reuse_earlier_build remote root (spec : action_spec) pair_key =
-  case HolbuildRemoteCache.get_action remote pair_key of
+(* Restores the entry of the earlier build the pair names, given by the
+   remote's ENTRY for the pair key, as this action's outputs, and copies it to
+   the action's input key in the local cache.  False on a miss, and on any
+   doubt: the entry's timeout contract, extra outputs, or recorded parents
+   don't fit. *)
+fun reuse_earlier_build remote root (spec : action_spec) entry =
+  case entry of
       NONE => false
     | SOME text =>
         let
@@ -11916,15 +11915,25 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         val (done, cutoff) =
           phase "cutoff" (fn () =>
             let
-              val done = not forced andalso action_already_done remote root spec
-              val cutoff = if done then NONE else spec_early_cutoff_with (resident_hashes (!resident)) root spec
+              val cutoff = spec_early_cutoff_with (resident_hashes (!resident)) root spec
+              (* A miss walks every cache node, so the action's own entry and
+                 the earlier build's are looked up side by side. *)
+              val done = ref false
+              val earlier = ref (fn () => NONE)
+              fun look_up_earlier {pair_key, deps_key = _} =
+                let val entry = HolbuildRemoteCache.get_action remote pair_key
+                in earlier := (fn () => entry) end
+                handle e => earlier := (fn () => raise e)
+              val _ =
+                if forced then ()
+                else
+                  parallel_all 2 (fn look_up => look_up ())
+                    [fn () => done := action_already_done remote root spec,
+                     fn () => Option.app look_up_earlier cutoff]
             in
-              (done orelse
-               (not forced andalso
-                case cutoff of
-                    SOME {pair_key, ...} => reuse_earlier_build remote root spec pair_key
-                  | NONE => false),
-               cutoff)
+              (* A failed pair lookup raises here, as it did inside
+                 reuse_earlier_build, whose handler covers only its last case. *)
+              (!done orelse (not forced andalso reuse_earlier_build remote root spec (!earlier ())), cutoff)
             end)
       in
         if done then
