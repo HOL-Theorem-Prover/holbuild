@@ -7654,20 +7654,78 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
     List.app report restored
   end
 
+(* Where the proof units are in theory `node`'s script, as read now: what
+   the diagnostic of a proof that failed in it places the failure with, as
+   a local build of it would. *)
+type failure_spans = {source_text : string, boundaries : HolbuildTheoryCheckpoints.boundary list,
+                      terminations : HolbuildTheoryCheckpoints.termination list}
+
+fun remote_failure_spans options project plan keys toolchain_key node : failure_spans =
+  let
+    val policy = checkpoint_policy_for_node options project node
+    (* Where the proof units are needs no deps key. *)
+    val action = theory_action (project_artifact_root project) plan keys toolchain_key "" node
+    val source_text = read_text (#source_file action)
+    val {source_boundaries, termination_diagnostics} =
+      source_spans_for_action policy action source_text
+      handle Error _ => {source_boundaries = NONE, termination_diagnostics = []}
+  in
+    {source_text = source_text,
+     boundaries =
+       case source_boundaries of
+           SOME {boundaries, ...} =>
+             if proof_steps_enabled policy orelse checkpoint_enabled policy then boundaries else []
+         | NONE => [],
+     terminations = termination_diagnostics}
+  end
+
+(* The batches whose theories' spans are worked out while they run: at most
+   this many theories, as an edit's are. *)
+val remote_failure_spans_limit = 4
+
+(* For build --remote-exec while it follows a batch of theories (their input
+   keys BATCH_KEYS): works out each one's failure_spans on background
+   threads, so that the diagnostic of a proof one of them fails needn't wait
+   for the HOL analyser.  Returns {spans, stop}: spans waits for them and
+   gives a node's, if worked out; stop drops those not started and waits for
+   the others. *)
+fun start_remote_failure_spans options tc project plan toolchain_key batch_keys =
+  let
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+    val in_batch = Binaryset.addList (Binaryset.empty String.compare, batch_keys)
+    val nodes =
+      if length batch_keys > remote_failure_spans_limit then []
+      else List.filter (fn node => Binaryset.member (in_batch, HolbuildBuildPlan.input_key_for keys node))
+             (HolbuildBuildPlan.selected_nodes plan)
+    val spans = ref (Binarymap.mkDict String.compare)
+    val mutex = Mutex.mutex ()
+    fun analyse node =
+      let val result = remote_failure_spans options project plan keys toolchain_key node
+      in
+        Mutex.lock mutex;
+        spans := Binarymap.insert (!spans, HolbuildBuildPlan.key node, result);
+        Mutex.unlock mutex
+      end
+    val {add, drain, stop} = start_background_pool remote_failure_spans_limit analyse
+  in
+    List.app add nodes;
+    {spans = fn node => (drain (); Binarymap.peek (!spans, HolbuildBuildPlan.key node)), stop = stop}
+  end
+
 (* The error of theory `node`, whose proof failed on a remote worker
    (failure kind `proof` or `tactic-timeout`): the diagnostic a local build
    would give, from the worker's build log, which the remote cache holds as
-   blob `log_sha256`.  The log goes where a local build leaves it.  NONE when
-   the log can't be fetched.  Runs no HOL. *)
-fun remote_proof_failure (options : build_options) tc project plan toolchain_key node {kind, log_sha256} =
+   blob `log_sha256`, and the script's SPANS if worked out already.  The log
+   goes where a local build leaves it.  NONE when the log can't be fetched.
+   Runs no HOL. *)
+fun remote_proof_failure (options : build_options) tc project plan toolchain_key node spans {kind, log_sha256} =
   let
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val root = project_artifact_root project
     fun diagnose node =
       let
-        (* The diagnosis reads only where the script's proof units are, so
-           it needs no deps key, nor their proof plans or checkpoints. *)
         val action = theory_action root plan keys toolchain_key "" node
         val log = current_build_log (current_log_dir root (#package action) (#logical action))
         val fetched =
@@ -7679,17 +7737,10 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
           let
             val policy = checkpoint_policy_for_node options project node
             val source_file = #source_file action
-            val source_text = read_text source_file
-            (* The script's proof units, to place the failure in it, where
-               a local build of it would have them. *)
-            val {source_boundaries, termination_diagnostics} =
-              source_spans_for_action policy action source_text
-              handle Error _ => {source_boundaries = NONE, termination_diagnostics = []}
-            val boundaries =
-              case source_boundaries of
-                  SOME {boundaries, ...} =>
-                    if proof_steps_enabled policy orelse checkpoint_enabled policy then boundaries else []
-                | NONE => []
+            val {source_text, boundaries, terminations} =
+              case spans of
+                  SOME spans => spans
+                | NONE => remote_failure_spans options project plan keys toolchain_key node
             val heading =
               (if kind = "tactic-timeout" then "tactic timed out" else "proof failed") ^
               " on a remote worker while building " ^ #logical action
@@ -7697,7 +7748,7 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
           in
             SOME (error_with_captured_output
                     (heading ^ "\n" ^
-                     failure_detail policy source_file source_text boundaries termination_diagnostics
+                     failure_detail policy source_file source_text boundaries terminations
                        output "hol run failed while building theory script")
                     output)
           end
