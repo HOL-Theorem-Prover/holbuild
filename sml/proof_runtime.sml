@@ -650,10 +650,10 @@ fun advance_failed_prefix_checkpoint path ok_text depth =
     fun exists file = OS.FileSys.access (file, []) handle OS.SysErr _ => false
     fun remove file = OS.FileSys.remove file handle OS.SysErr _ => ()
     fun discard_new () =
-      app (fn suffix => (remove (new ^ suffix); remove (new ^ suffix ^ ".tmp"))) suffixes
+      List.app (fn suffix => (remove (new ^ suffix); remove (new ^ suffix ^ ".tmp"))) suffixes
     fun install () =
       (remove (path ^ ".ok");
-       app (fn suffix => OS.FileSys.rename {old = new ^ suffix, new = path ^ suffix}) suffixes)
+       List.app (fn suffix => OS.FileSys.rename {old = new ^ suffix, new = path ^ suffix}) suffixes)
   in
     (discard_new ();
      let val (meta_text, prefix_text) = failed_prefix_texts ()
@@ -691,7 +691,7 @@ fun save_failed_prefix_checkpoint () =
         else if QUse.hadError () then
           (* No checkpoint after a parse error: see HolbuildCheckpointSaveRuntime. *)
           (HolbuildCheckpointSaveRuntime.discard_checkpoint failed_prefix_path;
-           app (fn suffix => OS.FileSys.remove (failed_prefix_path ^ suffix) handle OS.SysErr _ => ())
+           List.app (fn suffix => OS.FileSys.remove (failed_prefix_path ^ suffix) handle OS.SysErr _ => ())
                [".meta", ".prefix"])
         else
           let
