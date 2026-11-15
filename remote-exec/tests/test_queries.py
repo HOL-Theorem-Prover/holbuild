@@ -466,7 +466,11 @@ STATEMENTS = [
         "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now()", lambda f: {"token": f.expired}, 100
     ),
     Statement("SELECT a.input_key, a.spec_sha256, a.theory, a.state, a.attempts", lease, 11_000),
-    Statement("UPDATE actions SET last_failure = CASE", lambda f: {**lease(f), "failure": "timeout"}, 10_000),
+    Statement(
+        "UPDATE actions SET last_failure = CASE",
+        lambda f: {**lease(f), "failure": "lease expired", "final": False, "worker": "w1"},
+        10_000,
+    ),
     # sweeps
     Statement("SELECT id FROM batches WHERE state = 'running' AND created_at", lambda f: {"secs": 3600}, 100),
     Statement("DELETE FROM batches WHERE id IN", lambda f: {"hours": 168}, 100),
