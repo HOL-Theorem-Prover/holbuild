@@ -206,7 +206,7 @@ fun static_error_summary source_path source_text lines =
              source_context])
         end
 
-fun proof_unit_label (checkpoint : HolbuildTheoryCheckpoints.checkpoint) =
+fun proof_unit_label (checkpoint : HolbuildTheoryCheckpoints.boundary) =
   if #kind checkpoint = "resume" then "resume" else "theorem"
 
 fun source_span_text source_path source_text start_offset end_offset =
@@ -227,7 +227,7 @@ fun source_span_text source_path source_text start_offset end_offset =
                    source_context_text_span source_text {start_offset = start_offset, end_offset = end_offset}]
   end
 
-fun checkpoint_source_summary source_path source_text (checkpoint : HolbuildTheoryCheckpoints.checkpoint) label {offset, width} =
+fun checkpoint_source_summary source_path source_text (checkpoint : HolbuildTheoryCheckpoints.boundary) label {offset, width} =
   let
     val theorem_line = line_number_at source_text (#theorem_start checkpoint)
     val proof_line = line_number_at source_text (#tactic_start checkpoint)
@@ -371,7 +371,7 @@ fun skip_whitespace source_text limit offset =
   else if Char.isSpace (String.sub(source_text, offset)) then skip_whitespace source_text limit (offset + 1)
   else offset
 
-fun finish_span source_text (checkpoint : HolbuildTheoryCheckpoints.checkpoint) =
+fun finish_span source_text (checkpoint : HolbuildTheoryCheckpoints.boundary) =
   let
     val finish_offset = skip_whitespace source_text (#theorem_stop checkpoint) (#tactic_end checkpoint)
   in
@@ -379,7 +379,7 @@ fun finish_span source_text (checkpoint : HolbuildTheoryCheckpoints.checkpoint) 
   end
 
 fun failed_theorem_source_summary source_path source_text checkpoints label theorem_name failed_span failed_end =
-  case List.find (fn (checkpoint : HolbuildTheoryCheckpoints.checkpoint) => #name checkpoint = theorem_name) checkpoints of
+  case List.find (fn (checkpoint : HolbuildTheoryCheckpoints.boundary) => #name checkpoint = theorem_name) checkpoints of
       NONE => NONE
     | SOME checkpoint =>
         SOME (checkpoint_source_summary source_path source_text checkpoint label
