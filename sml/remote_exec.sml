@@ -92,7 +92,7 @@ fun json_int_field name text =
         NONE => NONE
       | SOME start =>
           case Substring.getc (Substring.dropl Char.isSpace (Substring.extract (text, start + size key, NONE))) of
-              SOME (#":", value) => Int.fromString (Substring.string value)
+              SOME (#":", value) => LargeInt.fromString (Substring.string value)
             | _ => NONE
   end
 
@@ -220,7 +220,7 @@ fun report_action line =
       if not retried then ""
       else
         (case json_int_field "attempts" line of
-             SOME n => ", attempts " ^ Int.toString n
+             SOME n => ", attempts " ^ LargeInt.toString n
            | NONE => "") ^
         (case field "tier" of SOME tier => ", tier " ^ tier | NONE => "")
     val log = case field "log_sha256" of

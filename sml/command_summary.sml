@@ -109,25 +109,12 @@ fun observe_plan project plan = best_effort (fn () =>
         LargeInt.toString (Time.toMicroseconds (!started)) ^ "-" ^ pid () ^ ".json"))
   end)
 
-fun integer_field name text =
-  let val needle = "\"" ^ name ^ "\""
-  in
-    case J.find_substring needle text of
-        NONE => NONE
-      | SOME i =>
-          let val after = Substring.dropl Char.isSpace (Substring.extract (text, i + size needle, NONE))
-          in case Substring.getc after of
-              SOME (#":", rest) => LargeInt.fromString (Substring.string (Substring.dropl Char.isSpace rest))
-            | _ => NONE
-          end
-  end
-
 fun observe_action (batch, line) =
   let
     val field = fn name => HolbuildRemoteExec.json_string_field name line
     val key = getOpt (field "input_key", "")
-    val attempt = getOpt (integer_field "attempts" line, 0)
-    val began = integer_field "started" line
+    val attempt = getOpt (HolbuildRemoteExec.json_int_field "attempts" line, 0)
+    val began = HolbuildRemoteExec.json_int_field "started" line
     val identity = batch ^ "\000" ^ key
     fun retain suffix observation action =
       let val id = identity ^ "\000" ^ suffix
