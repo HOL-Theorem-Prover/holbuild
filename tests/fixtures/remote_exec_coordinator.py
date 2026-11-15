@@ -143,6 +143,12 @@ class Handler(BaseHTTPRequestHandler):
         for line in batch.read_text().splitlines():
             fields = line.split()
             if fields[0] == "action":
+                if (state / "retried").exists():
+                    # A retry after a memory failure, as the coordinator reports it.
+                    retried = {"type": "action", "input_key": fields[1], "theory": fields[4], "state": "waiting",
+                               "tier": "high", "attempts": 1, "last_failure": "memory",
+                               "log_sha256": "c" * 64, "failure_detail": "killed by SIGKILL"}
+                    self.wfile.write((json.dumps(retried) + "\n").encode())
                 for _ in range(2):
                     running = {"type": "action", "input_key": fields[1], "theory": fields[4],
                                "state": "running", "tier": "standard", "attempts": 1,

@@ -2233,7 +2233,11 @@ The coordinator's protocol, in what holbuild uses of it:
   includes the action's failure diagnostic even when it failed before starting
   HOL, provided the worker can write and upload the log; a failure with no
   log, such as a spec the worker rejects, says why in `failure_detail`, which
-  holbuild prints with the failure. A stream may start over: it
+  holbuild prints with the failure. A failure without a log, such as an
+  interrupted attempt, keeps the log an earlier attempt uploaded. An action
+  retried after a failure is printed as
+  `waiting (<failure>), attempts <n>, tier <tier>, log /cas/<sha>`, and
+  likewise when ready and running. A stream may start over: it
   sends every action's current state first.
   A skipped dependent uses the existing action state `cancelled` with
   `last_failure` beginning `skipped because of `; its reason names the failed

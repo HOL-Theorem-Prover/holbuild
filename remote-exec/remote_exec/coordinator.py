@@ -1673,9 +1673,12 @@ class Coordinator:
                     f"result for {result.input_key} (spec {result.spec_sha256}) does not match the lease's action "
                     f"{action.input_key} (spec {action.spec_sha256})"
                 )
+            # A failure without a log, such as an interruption, keeps the log an earlier attempt left, the only
+            # evidence of why that one failed.
+            log = "COALESCE(:log, log_sha256)" if result.status == "failed" else ":log"
             await conn.execute(
                 sa.text(
-                    "UPDATE actions SET log_sha256 = :log, last_failure = :failure, failure_detail = :detail, "
+                    f"UPDATE actions SET log_sha256 = {log}, last_failure = :failure, failure_detail = :detail, "
                     "timings = CAST(CAST(:timings AS text) AS jsonb) "
                     "WHERE batch_id = :batch_id AND input_key = :input_key"
                 ),

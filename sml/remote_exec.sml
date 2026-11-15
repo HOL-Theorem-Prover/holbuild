@@ -83,6 +83,19 @@ fun json_string_field name text =
           end
   end
 
+(* The value of an integer field in one JSON object, as the coordinator
+   writes it: NONE when the field is missing or not a number. *)
+fun json_int_field name text =
+  let val key = "\"" ^ name ^ "\""
+  in
+    case HolbuildStatus.find_substring key text of
+        NONE => NONE
+      | SOME start =>
+          case Substring.getc (Substring.dropl Char.isSpace (Substring.extract (text, start + size key, NONE))) of
+              SOME (#":", value) => Int.fromString (Substring.string value)
+            | _ => NONE
+  end
+
 (* curl's output split into lines, and the HTTP status `-w` appends as the
    last line (0 when no response came). *)
 fun split_status output =
@@ -198,11 +211,23 @@ fun report_action line =
           (SOME f, SOME detail) => " (" ^ f ^ ": " ^ detail ^ ")"
         | (SOME f, NONE) => " (" ^ f ^ ")"
         | (NONE, _) => ""
-    val log = case (state, field "log_sha256") of
-                  ("failed", SOME sha) => ", log /cas/" ^ sha
-                | _ => ""
+    (* An action back to waiting, ready or running after a failure is
+       being retried: the attempts it has used, its tier, and the log a
+       failed attempt left tell a retry loop from a slow proof. *)
+    val retried = Option.isSome (field "last_failure") andalso
+                  List.exists (fn s => s = state) ["waiting", "ready", "running"]
+    val attempt =
+      if not retried then ""
+      else
+        (case json_int_field "attempts" line of
+             SOME n => ", attempts " ^ Int.toString n
+           | NONE => "") ^
+        (case field "tier" of SOME tier => ", tier " ^ tier | NONE => "")
+    val log = case field "log_sha256" of
+                  SOME sha => if state = "failed" orelse retried then ", log /cas/" ^ sha else ""
+                | NONE => ""
   in
-    HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ state ^ failure ^ log ^ "\n")
+    HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ state ^ failure ^ attempt ^ log ^ "\n")
   end
 
 (* Follows a batch's event stream until the batch finishes, printing each

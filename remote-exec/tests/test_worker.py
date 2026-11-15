@@ -21,6 +21,7 @@ from remote_exec import worker
 from remote_exec.auth import cache_discovery_token
 from remote_exec.formats import parse_result
 from remote_exec.worker import (
+    DRAINING,
     CacheUnavailable,
     Coordinator,
     ExecSpans,
@@ -368,7 +369,11 @@ def wait_for_file(path: Path) -> None:
     assert path.exists(), f"worker did not create {path}"
 
 
-@pytest.mark.parametrize(("drain", "expected"), [("5", RECORD), ("0", failed_record(SPEC, "unavailable"))])
+# What the worker reports of an action it stopped at its drain deadline.
+DRAINED = failed_record(SPEC, "unavailable", "the worker's drain deadline passed before exec-action finished")
+
+
+@pytest.mark.parametrize(("drain", "expected"), [("5", RECORD), ("0", DRAINED)])
 def test_sigterm_finishes_or_releases_the_action_without_claiming_again(
     tmp_path: Path, server: Server, logs: tuple[Path, Path], drain: str, expected: str,
 ) -> None:
@@ -405,7 +410,7 @@ def test_sigterm_kills_descendants_that_ignore_term_and_repeated_signals_do_not_
         finally:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(group, signal.SIGKILL)
-    assert server.completed == [failed_record(SPEC, "unavailable")]
+    assert server.completed == [DRAINED]
     assert len(server.claims) == 1
 
 
@@ -427,7 +432,7 @@ def test_interruption_allows_checkpoint_publication_before_teardown(
         if stop == "lease-loss":
             process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
-    assert server.completed == ([failed_record(SPEC, "unavailable")] if stop == "drain" else [])
+    assert server.completed == ([DRAINED] if stop == "drain" else [])
 
 
 def test_the_result_is_reported_before_exec_action_exits_and_a_lost_lease_then_stops_nothing(
@@ -545,7 +550,7 @@ def test_sigterm_interrupts_release_make_and_releases_the_lease(
         wait_for_file(marker)
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=8) == 0, (tmp_path / "worker.log").read_text()
-    assert server.completed == [failed_record(SPEC, "unavailable")]
+    assert server.completed == [failed_record(SPEC, "unavailable", DRAINING)]
     assert server.protection[-1] == {"ProtectionEnabled": False}
     assert not (tmp_path / "releases/v1.2.3/.complete").exists()
     assert not logs[1].exists()
@@ -819,9 +824,22 @@ def test_action_that_ends_without_a_record_is_reported_for_a_retry(
     assert server.completed == [failed_record(SPEC, "internal")]
 
 
-@pytest.mark.parametrize(("crash", "failure"), [("KILL", "memory"), ("TERM", "unavailable"), ("INT", "unavailable")])
+@pytest.mark.parametrize(
+    ("crash", "failure", "detail"),
+    [
+        ("KILL", "memory", "exec-action was killed by SIGKILL without a result, as by the kernel's OOM killer"),
+        ("TERM", "unavailable", "exec-action was stopped by SIGTERM without a result"),
+        ("INT", "unavailable", "exec-action was stopped by SIGINT without a result"),
+    ],
+)
 def test_action_killed_by_a_signal_without_a_record_is_reported_by_the_signal(
-    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, crash: str, failure: str
+    tmp_path: Path,
+    server: Server,
+    logs: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    crash: str,
+    failure: str,
+    detail: str,
 ) -> None:
     release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
@@ -837,27 +855,33 @@ def test_action_killed_by_a_signal_without_a_record_is_reported_by_the_signal(
     )
 
     assert unavailable == (failure == "unavailable")
-    assert server.completed == [failed_record(SPEC, failure)]
+    assert server.completed == [failed_record(SPEC, failure, detail)]
 
 
 @pytest.mark.parametrize(
-    ("returncode", "draining", "failure"),
+    ("returncode", "draining", "failure", "cause"),
     [
-        (-signal.SIGKILL, False, "memory"),
-        (128 + signal.SIGKILL, False, "memory"),
-        (-signal.SIGTERM, False, "unavailable"),
-        (128 + signal.SIGTERM, False, "unavailable"),
-        (-signal.SIGINT, False, "unavailable"),
-        (128 + signal.SIGINT, False, "unavailable"),
+        (-signal.SIGKILL, False, "memory", "SIGKILL"),
+        (128 + signal.SIGKILL, False, "memory", "SIGKILL"),
+        (-signal.SIGTERM, False, "unavailable", "SIGTERM"),
+        (128 + signal.SIGTERM, False, "unavailable", "SIGTERM"),
+        (-signal.SIGINT, False, "unavailable", "SIGINT"),
+        (128 + signal.SIGINT, False, "unavailable", "SIGINT"),
         # Draining, whatever stopped it, the attempt is refunded.
-        (-signal.SIGKILL, True, "unavailable"),
-        (70, True, "unavailable"),
-        (70, False, None),
-        (1, False, None),
+        (-signal.SIGKILL, True, "unavailable", "drained"),
+        (70, True, "unavailable", "drained"),
+        (70, False, None, None),
+        (1, False, None, None),
     ],
 )
-def test_recordless_failure_names_interruptions_and_kills(returncode: int, draining: bool, failure: str | None) -> None:
-    assert recordless_failure(returncode, draining) == failure
+def test_recordless_failure_names_interruptions_and_kills(
+    returncode: int, draining: bool, failure: str | None, cause: str | None
+) -> None:
+    recordless = recordless_failure(returncode, draining)
+    if failure is None:
+        assert recordless is None
+    else:
+        assert recordless is not None and recordless[0] == failure and cause in recordless[1]
 
 
 def test_action_whose_spec_an_unreachable_cache_does_not_give_is_reported_unavailable(
@@ -876,7 +900,8 @@ def test_action_whose_spec_an_unreachable_cache_does_not_give_is_reported_unavai
             Phases(),
         )
 
-    assert server.completed == [failed_record(SPEC, "unavailable")]
+    [record] = server.completed
+    assert record.startswith(failed_record(SPEC, "unavailable") + f"detail=fetching spec {SPEC}")
     assert not logs[1].exists()
 
 
@@ -894,7 +919,8 @@ def test_action_whose_spec_transfer_is_cut_short_is_reported_unavailable(
             Phases(),
         )
 
-    assert server.completed == [failed_record(SPEC, "unavailable")]
+    [record] = server.completed
+    assert record.startswith(failed_record(SPEC, "unavailable") + f"detail=fetching spec {SPEC}")
 
 
 def test_action_whose_spec_the_cache_lost_is_reported_for_a_counted_retry(
