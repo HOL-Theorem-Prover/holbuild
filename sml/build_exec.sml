@@ -11603,7 +11603,14 @@ fun module_file_wanted expected file =
     | NONE => false
 
 (* The most theory modules one worker-run writer saves. *)
-val module_writer_limit = 32
+val module_writer_limit = 64
+
+(* The fewest missing modules a writer starts for once the store has its
+   base theories.  A writer costs about as much to start as loading
+   sixteen theories from their .dat files instead of their modules, so an
+   action that lacks only the few parents just built loads those from
+   their .dat files. *)
+val module_writer_min_missing = 16
 
 (* Files the module writer leaves in a toolchain's store beside its
    modules.  [module_store_unsupported]: the toolchain has HOL's module
@@ -11611,9 +11618,11 @@ val module_writer_limit = 32
    again for it (the store, named by the HOL directory, is per Poly/ML
    runtime).  [module_store_base_theories]: the theories of the toolchain's
    base state, one per line; they are in the state, so HOL writes no
-   module for them. *)
+   module for them.  [module_store_writer_lock]: held by the worker
+   process whose writer is writing for the store. *)
 val module_store_unsupported = "unsupported"
 val module_store_base_theories = "base-theories"
+val module_store_writer_lock = "writer.lock"
 
 (* The writer script: records whether the toolchain can write modules,
    the base state's theories when [base_theories], and then writes the
@@ -11652,9 +11661,10 @@ fun module_writer_script {output, base_theories, call} =
    current .dat files.  Each theory is given after its parents: the
    project's from the spec, the toolchain's beside their objects in its
    sigobj.  No writer starts when the toolchain's HOL has no module helper,
-   when an earlier writer found it cannot write modules, or when the store
-   has every module wanted.  A failure leaves the action to load from .dat
-   files. *)
+   when an earlier writer found it cannot write modules, when the store
+   has its base theories and lacks fewer than module_writer_min_missing of
+   the modules wanted, or while another process writes to the store.  A
+   failure leaves the action to load from .dat files. *)
 fun write_missing_modules cache root tc {deps, loads} =
   let
     val store = module_store (#holdir tc)
@@ -11716,7 +11726,9 @@ fun write_missing_modules cache root tc {deps, loads} =
         then Path.concat (Path.dir (Path.dir dir), Path.file b)
         else b
       end
-    val output = Path.concat (cache, "theory-modules-writer")
+    (* The worker's actions share its cache; the store's lock keeps this
+       directory to one writer. *)
+    val output = Path.concat (Path.concat (cache, "theory-modules-writer"), Path.file store)
     val script = in_root root ".holbuild/theory-module-writer.sml"
     val log = in_root root ".holbuild/theory-module-writer.log"
     val call =
@@ -11732,21 +11744,29 @@ fun write_missing_modules cache root tc {deps, loads} =
          (file = module_store_base_theories andalso not (isSome base_theories))
       then FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)}
       else ()
+    fun write () =
+      (HolbuildRemoveTree.remove_untrusted output;
+       ensure_dir output;
+       write_text script
+         (module_writer_script {output = output, base_theories = not (isSome base_theories),
+                                call = call});
+       HolbuildActionSandbox.with_output_dirs [output] (fn () =>
+         ignore (HolbuildToolchain.run_in_dir_to_file root
+                   (HolbuildToolchain.hol_subcommand_argv tc "run" @
+                    ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
+                   log));
+       List.app (move o Path.file) (HolbuildCache.children output);
+       HolbuildRemoveTree.remove_untrusted output)
+    val missing = List.length (List.filter (fn e => not (Binaryset.member (stored, e))) expected)
   in
-    if List.all (fn e => Binaryset.member (stored, e)) expected then () else
-    (HolbuildRemoveTree.remove_untrusted output;
-     ensure_dir output;
-     ensure_dir store;
-     write_text script
-       (module_writer_script {output = output, base_theories = not (isSome base_theories),
-                              call = call});
-     HolbuildActionSandbox.with_output_dirs [output] (fn () =>
-       ignore (HolbuildToolchain.run_in_dir_to_file root
-                 (HolbuildToolchain.hol_subcommand_argv tc "run" @
-                  ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
-                 log));
-     List.app (move o Path.file) (HolbuildCache.children output);
-     HolbuildRemoveTree.remove_untrusted output)
+    if missing = 0 orelse (isSome base_theories andalso missing < module_writer_min_missing) then ()
+    else
+      case HolbuildFileLock.try_acquire_path
+             {path = Path.concat (store, module_store_writer_lock), obsolete_kind = NONE} of
+          NONE => ()
+        | SOME lock =>
+            (write () before HolbuildFileLock.release lock)
+            handle e => (HolbuildFileLock.release lock; raise e)
   end
 
 fun fill_module_store cache root tc wanted =
