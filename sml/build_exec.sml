@@ -3009,8 +3009,10 @@ fun dependency_input_context_key toolchain_key plan keys node =
                                        HolbuildBuildPlan.input_key_for keys dep)
                             project_deps
     (* The plan may be reused with a different input-key map.  Include the
-       relevant map entries in the memo discriminator, not just the toolchain. *)
-    val context_id = String.concatWith "\n" (toolchain_key :: project_lines)
+       relevant map entries in the memo discriminator, not just the toolchain:
+       their hash, since the plan keeps the discriminator of every node and
+       their text lists the node's whole closure. *)
+    val context_id = HolbuildToolchain.hash_text (String.concatWith "\n" (toolchain_key :: project_lines))
   in
     case HolbuildBuildPlan.cached_dependency_context_key plan node context_id of
         SOME key => key
