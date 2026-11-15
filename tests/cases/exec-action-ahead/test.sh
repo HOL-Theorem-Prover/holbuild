@@ -334,11 +334,6 @@ kill -0 "${worker_pid[ahead-order]}" 2>/dev/null || {
 }
 worker a "$spec_A"
 expect a 0 "status=built"
-# The heap is shared at the first wait step that has to wait, and only there:
-# J waits for A, then for B.
-await_marker ahead2 waiting-BTheory
-shared=$(cat "$tmpdir/worker-ahead2/action/.holbuild/ahead/shared")
-[[ "$shared" == ATheory ]] || { echo "J shared the heap at '$shared', wanted ATheory" >&2; exit 1; }
 for name in ahead ahead-lib ahead-order ahead2; do
   worker_wait "$name"
   expect "$name" 0 "status=built"
@@ -401,7 +396,7 @@ require_grep 'does not match its parents' "$tmpdir/other-x.log"
 first_remote=$tmpdir/remote
 kill "$server_pid"; wait "$server_pid" 2>/dev/null || true
 start_remote_cache_server "$tmpdir/remote2" "$tmpdir/server2"
-hb action-spec --upload BTheory GTheory JTheory > /dev/null
+hb action-spec --upload BTheory GTheory JTheory ZTheory > /dev/null
 worker plain-a "$spec_A"
 expect plain-a 0 "status=built"
 worker plain-b "$spec_B"
@@ -414,3 +409,17 @@ for key in "$key_B" "$key_G" "$key_J"; do
   ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key" | sha256sum | cut -d' ' -f1)
   cmp "$first_remote/ac/$ac" "$tmpdir/remote2/ac/$ac"
 done
+
+# The heap is shared at the first wait step that has to wait, and only there:
+# Z waits for X, then for Y, which arrives only after Z waits for it.
+worker_start share "$spec_Z" --ahead-parent "$key_X:$spec_X" --ahead-parent "$key_Y:$spec_Y"
+await_marker share waiting-XTheory
+worker share-x "$spec_X"
+expect share-x 0 "status=built"
+await_marker share waiting-YTheory
+shared=$(cat "$tmpdir/worker-share/action/.holbuild/ahead/shared")
+[[ "$shared" == XTheory ]] || { echo "Z shared the heap at '$shared', wanted XTheory" >&2; exit 1; }
+worker share-y "$spec_Y"
+expect share-y 0 "status=built"
+worker_wait share
+expect share 0 "status=built"
