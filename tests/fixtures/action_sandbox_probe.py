@@ -526,7 +526,11 @@ if __name__ == "__main__":
                 # This same-UID process is outside the dedicated subreaper,
                 # and is born AFTER the sandbox's signal policy was installed.
                 sibling = subprocess.Popen(["/bin/sleep", "20"])
-                (Path(directory) / "action/future.pid").write_text(str(sibling.pid))
+                # Rename into place: the action polls for future.pid and
+                # could otherwise read it before the pid is written.
+                pid_file = Path(directory) / "action/future.pid.tmp"
+                pid_file.write_text(str(sibling.pid))
+                pid_file.rename(pid_file.with_suffix(""))
                 assert process.wait(timeout=15) == 0, process.returncode
                 assert sibling.poll() is None, "action killed its future sibling"
             finally:
