@@ -22,8 +22,16 @@
    The steps talk to exec-action through marker files in one directory:
    base-loaded (written here, the modules loaded and the load path),
    stand-ins, arrived-P and ready (written by exec-action), waiting-P and
-   finishing (written here, for the timings) and abandoned (written here,
-   its reason; the child then exits with failure). *)
+   finishing (written here, for the timings), shared (written here, the
+   parent whose wait step shared the heap) and abandoned (written here,
+   its reason; the child then exits with failure).
+
+   The plain preload shares the heap's common data before it saves the heap,
+   which on a large load costs minutes after the last parent has arrived.  So
+   the first wait step that has to wait shares it while the child is idle,
+   with most of its ancestors loaded, and the save's own share then has
+   little left to do.  Later waits don't share again: on a chain of late
+   parents they last only as long as one parent's own hand-off. *)
 structure HolbuildAheadLoad =
 struct
   val dir = ref ""
@@ -35,6 +43,8 @@ struct
   val entries : (string * string list * int) list ref = ref []
   (* The parents whose wait steps let the load go on. *)
   val completed : string list ref = ref []
+  (* Whether a wait step that has to wait still shares the heap. *)
+  val share = ref false
 
   (* Paths as the loader evaluates them, with HOL's path variables expanded;
      the steps' own files, in the marker directory, are left out. *)
@@ -66,8 +76,9 @@ struct
      TextIO.output (TextIO.stdErr, "holbuild: loading ahead abandoned: " ^ reason ^ "\n");
      OS.Process.exit OS.Process.failure)
 
-  fun start directory =
+  fun start directory share_heap =
     (dir := directory;
+     share := share_heap;
      write "base-loaded"
        (String.concat (map (fn m => "loaded " ^ m ^ "\n") (Meta.loaded ()) @
                        map (fn d => "path " ^ d ^ "\n") (!Meta.loadPath)));
@@ -79,7 +90,7 @@ struct
     (write "finishing" "";
      await "ready";
      !restore ();
-     dir := ""; recorded := []; count := 0; entries := []; completed := [];
+     dir := ""; recorded := []; count := 0; entries := []; completed := []; share := false;
      loader := (fn _ => ()); restore := (fn () => ()))
 
   fun enter parent = entries := (parent, Meta.loaded (), !count) :: !entries
@@ -154,6 +165,11 @@ struct
             SOME (_, loaded, position) => (loaded, position)
           | NONE => abandon ("the stand-in of " ^ parent ^ " was not entered")
       val since = List.drop (rev (!recorded), position)
+      (* Before waiting-P, so the timings count the share as loading. *)
+      val _ =
+        if !share andalso not (exists ("arrived-" ^ parent)) then
+          (share := false; PolyML.shareCommonData PolyML.rootFunction; write "shared" parent)
+        else ()
       val _ = write ("waiting-" ^ parent) ""
       val _ = await ("arrived-" ^ parent)
       val ui_lines = file_lines ui

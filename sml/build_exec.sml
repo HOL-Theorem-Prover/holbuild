@@ -12066,7 +12066,7 @@ fun read_base_report path =
 (* The file the child evaluates first: the runtime, the recording loader and
    LOAD_LINES under it, which pass through the stand-ins, and a last step
    that waits for exec-action to write the files the child evaluates next. *)
-fun write_ahead_preload {load_lines, dir, path} =
+fun write_ahead_preload {load_lines, dir, share, path} =
   let
     val no_loader = HolbuildToolchain.sml_string "this toolchain's HOL has no Meta.loadPlan"
     val lines =
@@ -12081,7 +12081,7 @@ fun write_ahead_preload {load_lines, dir, path} =
          "Meta.moduleSourceLoader := (fn use => fn file => (HolbuildAheadLoad.record file; loader use file)); " ^
          "HolbuildAheadLoad.loader := Meta.load; " ^
          "HolbuildAheadLoad.restore := (fn () => Meta.moduleSourceLoader := loader) end;") ::
-      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ ";" ::
+      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^ Bool.toString share ^ ";" ::
       "structure HolbuildAheadPlainRuntime = HolbuildRuntime;" ::
       "structure HolbuildRuntime = struct open HolbuildRuntime val load = HolbuildAheadLoad.load end;" ::
       (load_lines @
@@ -12553,6 +12553,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         val _ =
           write_ahead_preload
             {load_lines = map (theory_load_line root) (#loads spec), dir = dir,
+             (* As the plain preload's heap save: none without checkpoints. *)
+             share = checkpoint_enabled (spec_policy spec) andalso env_bool "HOLBUILD_SHARE_COMMON_DATA" true,
              path = Path.concat (stage, "holbuild-ahead-preload.sml")}
         val files =
           map (fn name => Path.concat (stage, name))

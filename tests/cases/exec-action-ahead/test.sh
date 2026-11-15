@@ -334,6 +334,11 @@ kill -0 "${worker_pid[ahead-order]}" 2>/dev/null || {
 }
 worker a "$spec_A"
 expect a 0 "status=built"
+# The heap is shared at the first wait step that has to wait, and only there:
+# J waits for A, then for B.
+await_marker ahead2 waiting-BTheory
+shared=$(cat "$tmpdir/worker-ahead2/action/.holbuild/ahead/shared")
+[[ "$shared" == ATheory ]] || { echo "J shared the heap at '$shared', wanted ATheory" >&2; exit 1; }
 for name in ahead ahead-lib ahead-order ahead2; do
   worker_wait "$name"
   expect "$name" 0 "status=built"
