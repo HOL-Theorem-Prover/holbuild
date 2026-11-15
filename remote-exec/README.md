@@ -718,7 +718,7 @@ none is. A run batch with it returns 400.
         "attempts": 1,
         "last_failure": "<failure class>|null",
         "log_sha256": "<sha256 of the last build log a run uploaded, in /cas/; a failure without a log keeps the earlier one>|null",
-        "failure_detail": "<the last result's detail: why it failed without a log>|null",
+        "failure_detail": "<the last result's detail: why it failed without a log; after lease expiries in a row (last_failure \"lease expired\", or \"lease expired N times\" once it fails), the workers that held it>|null",
         "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null
       }
     ]
