@@ -92,6 +92,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         while not (control / "cas-put-release").exists():
             time.sleep(0.01)
 
+    def cas_put_fail_once(self):
+        """The status in control/cas-put-fail-once, answered to one CAS PUT."""
+        if control is None or not self.path.startswith("/cas/"):
+            return None
+        with action_put_lock:
+            status = control / "cas-put-fail-once"
+            if not status.exists():
+                return None
+            code = int(status.read_text())
+            status.unlink()
+            return code
+
     def do_GET(self):
         self.record_request()
         self.gate_action_get()
@@ -162,6 +174,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.gate_cas_put()
+        failure = self.cas_put_fail_once()
+        if failure is not None:
+            self.send_response(failure)
+            self.end_headers()
+            return
         if (
             control is not None
             and self.path.startswith("/cas/")
