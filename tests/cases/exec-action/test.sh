@@ -681,8 +681,8 @@ expect lost 1 "status=failed" "failure=proof"
 require_file "$tmpdir/worker-lost/action-resident"
 rm -r "$project/src/LostScript.sml" "$project/src/.hol"
 
-# A malformed one-line theorem recovers a boundary with an empty tactic.
-# Its source diagnostic must survive protocol parsing and proof planning.
+# A malformed one-line theorem has no QED, so it gets no boundary and HOL
+# reads it as written.  Its source diagnostic must reach the action log.
 cat > "$project/src/InlineScript.sml" <<'SML'
 Theory Inline
 Ancestors bool
@@ -694,7 +694,7 @@ expect inline 1 "status=failed" "failure=proof"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/inline.result")
 [[ -n "$log_sha" ]] || { echo "malformed source has no action log" >&2; exit 1; }
 curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/inline-action.log"
-require_grep "a theorem's statement ends" "$tmpdir/inline-action.log"
+require_grep "unclosed quotation" "$tmpdir/inline-action.log"
 require_grep "InlineScript.sml:" "$tmpdir/inline-action.log"
 if grep -q "bad analyser boundary record" "$tmpdir/inline-action.log"; then
   echo "malformed source lost its empty boundary field" >&2

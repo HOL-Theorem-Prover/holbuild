@@ -98,7 +98,7 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 
 **Incompatible**: `--skip-proof-steps` + `--tactic-timeout`/`--trace-steps`/`--repl-on-failure`; `--json` + dry-run/trace-steps/repl-on-failure.
 
-Parser recovery policy: HOL source parse errors are build failures. holbuild may still use HOLSourceParser recovery internally to record warnings, recover theorem/resume boundaries where possible, and produce best-effort instrumentation diagnostics before HOL reports the failing script-play status.
+Parser recovery policy: HOL source parse errors are build failures. holbuild may still use HOLSourceParser recovery internally to record warnings and keep the boundaries of the theorem/resume blocks that parsed cleanly; a block with a parse error is never instrumented or resumed, so HOL reports its error as written.
 
 ## Maintenance
 
