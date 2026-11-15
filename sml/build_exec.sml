@@ -92,6 +92,22 @@ fun read_text path =
      handle e => (TextIO.closeIn input; raise e)
   end
 
+(* The start of the file at PATH: the shortest run of reads for which
+   ENOUGH holds of the text, or the whole file.  Each read doubles the
+   text, so a file read whole is copied a bounded number of times. *)
+fun read_prefix enough path =
+  let
+    val input = TextIO.openIn path
+    fun loop text =
+      case TextIO.inputN (input, Int.max (65536, size text)) of
+          "" => text
+        | chunk =>
+            let val text = text ^ chunk
+            in if enough text then text else loop text end
+  in loop "" before TextIO.closeIn input
+     handle e => (TextIO.closeIn input; raise e)
+  end
+
 fun write_text path text =
   let
     val _ = ensure_parent path
@@ -1655,7 +1671,8 @@ fun hol_dat_hash path =
   let
     val literal =
       if has_suffix ".dat" path then
-        theory_sml_hash_literal (read_text (drop_suffix ".dat" path ^ ".sml"))
+        theory_sml_hash_literal
+          (read_prefix (Option.isSome o theory_sml_hash_literal) (drop_suffix ".dat" path ^ ".sml"))
         handle IO.Io _ => NONE
       else NONE
   in
@@ -4392,11 +4409,17 @@ fun parse_dat_parent_hashes dat_text =
     loop 0 empty
   end
 
+(* The header of the .dat at PATH, which records its parents' hashes: the
+   text before its core data, without reading the rest. *)
+fun read_dat_header path =
+  let val text = read_prefix (String.isSubstring "(core-data") path
+  in Substring.string (#1 (Substring.position "(core-data" (Substring.full text))) end
+
 fun parent_hash_metadata_lines plan node =
   case #kind (HolbuildBuildPlan.source_of node) of
       HolbuildSourceIndex.TheoryScript =>
         let
-          val parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
+          val parent_hashes = parse_dat_parent_hashes (read_dat_header (#data_path (theory_outputs node)))
           fun parent_line dep =
             let val parent_name = theory_name_from_logical (logical_name dep)
             in
@@ -4595,7 +4618,7 @@ fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
 
 fun dat_parent_hashes_match dat_hash_cache plan node dat_path =
   let
-    val parent_hashes = parse_dat_parent_hashes (read_text dat_path)
+    val parent_hashes = parse_dat_parent_hashes (read_dat_header dat_path)
   in List.all (theory_parent_hash_matches dat_hash_cache parent_hashes)
               (project_theory_parent_deps parent_hashes (project_theory_deps plan node))
   end
@@ -4606,7 +4629,7 @@ fun child_dat_parent_hashes_match dat_hash_cache plan node =
 fun metadata_parent_hashes_match dat_hash_cache plan node text =
   let
     val lines = metadata_lines text
-    val child_parent_hashes = parse_dat_parent_hashes (read_text (#data_path (theory_outputs node)))
+    val child_parent_hashes = parse_dat_parent_hashes (read_dat_header (#data_path (theory_outputs node)))
     val theory_deps = project_theory_deps plan node
     val child_parent_deps = project_theory_parent_deps child_parent_hashes theory_deps
   in
@@ -7322,22 +7345,26 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
    the local cache the remote entries of KEYS, the keys of the plan's
    theories outside the batch that export found missing here, which the
    remote cache may hold, as start_remote_cache_prefetch does.  Returns
-   {add, stop}: add copies the entry of one more key, as the batch finishes
-   its action; stop drops the copies not yet started, which the build's own
-   prefetch makes, and waits for those in flight. *)
+   {add, drain, stop}: add copies the entry of one more key, as the batch
+   finishes its action; drain waits for the copies added so far; stop drops
+   the copies not yet started, which the build's own prefetch makes, and
+   waits for those in flight. *)
 fun start_remote_exec_prefetch (options : build_options) jobs keys =
-  case HolbuildRemoteCacheConfig.url () of
-      SOME url =>
-        if not (#use_cache options) then {add = fn _ => (), stop = fn () => ()}
-        else
-          let
-            val {add, stop, ...} =
-              start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key (cache_root ()) url)
-          in
-            List.app add keys;
-            {add = add, stop = stop}
-          end
-    | NONE => {add = fn _ => (), stop = fn () => ()}
+  let val none = {add = fn _ => (), drain = fn () => (), stop = fn () => ()}
+  in
+    case HolbuildRemoteCacheConfig.url () of
+        SOME url =>
+          if not (#use_cache options) then none
+          else
+            let
+              val pool as {add, ...} =
+                start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key (cache_root ()) url)
+            in
+              List.app add keys;
+              pool
+            end
+      | NONE => none
+  end
 
 (* The nodes a check during a batch found up to date, each with the input
    key it checked, and the hashes of their theories' data it read. *)
@@ -7350,8 +7377,9 @@ type settled = {nodes : (string, string) Binarymap.dict, dat_hash_cache : file_h
    DEFERRED), and the nodes that depend on them, aren't checked: the restore
    replaces their outputs.  Then it remembers the output digests of the
    checked nodes the batch's theories depend on, which their restore takes.
-   Returns a function that drops what hasn't started, waits for what has,
-   and gives the nodes found up to date whose dependencies all were too. *)
+   Returns {drain, settled}: drain waits for the checks; settled drops those
+   that haven't started, waits for the others, and gives the nodes found up
+   to date whose dependencies all were too. *)
 fun start_settled_check (options : build_options) tc project plan toolchain_key jobs batch_keys deferred =
   let
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
@@ -7396,7 +7424,7 @@ fun start_settled_check (options : build_options) tc project plan toolchain_key 
       | chunks nodes =
           let val n = Int.min (64, length nodes)
           in List.take (nodes, n) :: chunks (List.drop (nodes, n)) end
-    val {add, stop, ...} = start_background_pool (Int.max (1, jobs)) (fn work => work ())
+    val {add, drain, stop} = start_background_pool (Int.max (1, jobs)) (fn work => work ())
     fun settled () =
       let
         val _ = stop ()
@@ -7432,7 +7460,7 @@ fun start_settled_check (options : build_options) tc project plan toolchain_key 
   in
     (List.app (fn node => add (fn () => check node)) outside;
      List.app (fn nodes => add (fn () => ignore (remember_output_digests toolchain_key plan nodes))) (chunks batch_ancestors);
-     settled)
+     {drain = drain, settled = settled})
     handle e => (stop (); raise e)
   end
 
@@ -7762,9 +7790,9 @@ val remote_failure_spans_limit = 4
 (* For build --remote-exec while it follows a batch of theories (their input
    keys BATCH_KEYS): works out each one's failure_spans on background
    threads, so that the diagnostic of a proof one of them fails needn't wait
-   for the HOL analyser.  Returns {spans, stop}: spans waits for them and
-   gives a node's, if worked out; stop drops those not started and waits for
-   the others. *)
+   for the HOL analyser.  Returns {spans, drain, stop}: spans waits for them
+   and gives a node's, if worked out; drain waits for them; stop drops those
+   not started and waits for the others. *)
 fun start_remote_failure_spans options tc project plan toolchain_key batch_keys =
   let
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
@@ -7786,7 +7814,7 @@ fun start_remote_failure_spans options tc project plan toolchain_key batch_keys 
     val {add, drain, stop} = start_background_pool remote_failure_spans_limit analyse
   in
     List.app add nodes;
-    {spans = fn node => (drain (); Binarymap.peek (!spans, HolbuildBuildPlan.key node)), stop = stop}
+    {spans = fn node => (drain (); Binarymap.peek (!spans, HolbuildBuildPlan.key node)), drain = drain, stop = stop}
   end
 
 (* The error of theory `node`, whose proof failed on a remote worker
@@ -9599,7 +9627,7 @@ fun drop_stale_dep_copies remote (spec : spec_deps) wanted =
   end
 
 (* The dependencies a restored or built .dat records as parents. *)
-fun dat_records_parent path = records_parent (parse_dat_parent_hashes (read_text path))
+fun dat_records_parent path = records_parent (parse_dat_parent_hashes (read_dat_header path))
 
 (* The spec's dependencies by the name a .dat records its parents under. *)
 fun deps_by_parent_name (spec : spec_deps) =
@@ -9622,7 +9650,7 @@ fun spec_parent_hashes_match root (spec : spec_deps) data_path =
   in
     parent_hashes_match (deps_by_parent_name spec)
       (fn stem => cached_file_hash dat_hashes (in_root root (stem ^ ".dat")))
-      (Binarymap.listItems (parse_dat_parent_hashes (read_text data_path)))
+      (Binarymap.listItems (parse_dat_parent_hashes (read_dat_header data_path)))
   end
 
 (* The time each step of a hydrate took, summed over repeats; exec-action
@@ -9752,7 +9780,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
         Resident.put resident path
           (Resident.Theory {target = target, key = key, source = HolbuildHash.string_sha256 source_text,
                             parents = parents, mldeps = mldeps, dat_hash = hol_dat_hash (path ^ ".dat"),
-                            dat_parents = Binarymap.listItems (parse_dat_parent_hashes (read_text (path ^ ".dat"))),
+                            dat_parents = Binarymap.listItems (parse_dat_parent_hashes (read_dat_header (path ^ ".dat"))),
                             hashes = hashes})
       end
     fun restorable f (dep as {target, key, ...}) =
@@ -11884,7 +11912,7 @@ fun write_missing_modules cache root tc {deps, loads} =
           | SOME b =>
               let
                 val parents =
-                  map #1 (Binarymap.listItems (parse_dat_parent_hashes (read_text (b ^ ".dat"))))
+                  map #1 (Binarymap.listItems (parse_dat_parent_hashes (read_dat_header (b ^ ".dat"))))
                 val (seen', order') = List.foldl visit (Binaryset.add (seen, name), order) parents
               in
                 (seen', (name, b) :: order')
@@ -12112,19 +12140,7 @@ fun literal_ml_dependencies text =
 
 (* The parent theories a .dat records, read from its header only. *)
 fun dat_parent_names path =
-  let
-    val input = BinIO.openIn path
-    fun read text =
-      let val chunk = Byte.bytesToString (BinIO.inputN (input, 65536))
-      in
-        if chunk = "" orelse String.isSubstring "(core-data" (text ^ chunk) then text ^ chunk
-        else read (text ^ chunk)
-      end
-    val text = (read "" before BinIO.closeIn input) handle e => (BinIO.closeIn input; raise e)
-    val (header, _) = Substring.position "(core-data" (Substring.full text)
-  in
-    map #1 (Binarymap.listItems (parse_dat_parent_hashes (Substring.string header)))
-  end
+  map #1 (Binarymap.listItems (parse_dat_parent_hashes (read_dat_header path)))
 
 (* The manifest lines a late parent's entry will have, predicted from its
    spec before it is built: the theories its preload loads that no other of
@@ -12840,7 +12856,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                    | e => raise action_failed (InputMissing ("theory " ^ key))
                                   ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                                    General.exnMessage e)
-            val recorded = parse_dat_parent_hashes (read_text (staged ^ ".dat"))
+            val recorded = parse_dat_parent_hashes (read_dat_header (staged ^ ".dat"))
             val _ =
               List.app
                 (fn dep =>

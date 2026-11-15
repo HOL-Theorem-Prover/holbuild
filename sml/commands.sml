@@ -1789,7 +1789,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 (* Planning, export and early cutoff leave garbage that a
                    major collection would only reclaim once the heap grows
                    again; following waits on the coordinator for as long as
-                   the batch runs, so collect it now rather than hold it. *)
+                   the batch runs, so collect it now rather than hold it,
+                   and again once the work started below has finished. *)
                 val _ = PolyML.fullGC ()
                 val outside_batch =
                   case in_batch of
@@ -1797,7 +1798,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         let val in_batch = Redblackset.addList (Redblackset.empty String.compare, batch_keys)
                         in List.filter (fn key => not (Redblackset.member (in_batch, key))) (!prefetch_keys) end
                     | NONE => []
-                val {add, stop} = HolbuildBuildExec.start_remote_exec_prefetch build_options jobs outside_batch
+                val {add, drain, stop} = HolbuildBuildExec.start_remote_exec_prefetch build_options jobs outside_batch
                 (* What the restore after the batch would find up to date is
                    checked while it runs: on a busy host those reads are slow. *)
                 val settled =
@@ -1811,8 +1812,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val failure_spans =
                   HolbuildBuildExec.start_remote_failure_spans build_options tc project plan toolchain_key
                     (Option.getOpt (in_batch, []))
-                  handle e => (stop (); Option.app (fn settled => ignore (settled ())) settled; raise e)
-                fun stop_all () = (stop (); Option.map (fn settled => settled ()) settled)
+                  handle e => (stop (); Option.app (fn {settled, ...} => ignore (settled ())) settled; raise e)
+                val following = ref true
+                val _ = Thread.fork (fn () =>
+                  (drain (); Option.app (fn {drain, ...} => drain ()) settled; #drain failure_spans ();
+                   if !following then PolyML.fullGC () else ()), [])
+                fun stop_all () =
+                  (following := false; stop (); Option.map (fn {settled, ...} => settled ()) settled)
                 val logs = ref []
                 fun on_change (key, state, _, log) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
