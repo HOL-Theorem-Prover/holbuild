@@ -1902,7 +1902,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                           SOME reason => fall_back reason
                         | NONE =>
                             (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
-                             if not (null (!deferred)) then submit_deferred resubmit []
+                             if not (null (!deferred)) then submit_deferred resubmit settled []
                              else if not (null skip) then restore_after_failures NONE skip
                              else
                                timed_phase "build.execute"
@@ -1938,7 +1938,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     fun deferred_errors () =
                       if not build_deferred then []
                       else
-                        (submit_deferred resubmit (skip @ map #input_key failures); [])
+                        (submit_deferred resubmit settled (skip @ map #input_key failures); [])
                         handle Thread.Interrupt => raise Thread.Interrupt
                              | e => [("theories deferred for early cutoff", e)]
                   in
@@ -1963,7 +1963,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          HolbuildBuildExec.forget_remote_ledger ();
                          (* Their local entries may be the ones that don't fit. *)
                          HolbuildBuildExec.drop_local_cache_entries forced;
-                         export_and_submit false false skip forced)
+                         export_and_submit false false NONE skip forced)
                   end
                 | (HolbuildRemoteExec.Cancelled, progress) =>
                     let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
@@ -1983,14 +1983,21 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                        | NONE => ""))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
               end
-            and submit resubmit skip batch =
+            (* SETTLED: what earlier checks found up to date, with no batch since. *)
+            and submit resubmit settled skip batch =
               if null (batch_keys batch) then
                 (record_pending ();
-                 if not (null (!deferred)) then submit_deferred resubmit skip
-                 else if not (null skip) then restore_after_failures NONE skip
+                 if not (null (!deferred)) then submit_deferred resubmit settled skip
+                 else if not (null skip) then restore_after_failures settled skip
                  else
                    (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
-                    build_locally ()))
+                    case settled of
+                        NONE => build_locally ()
+                      | SOME _ =>
+                          timed_phase "build.execute"
+                            (fn () => HolbuildBuildExec.build_checked settled []
+                                        (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
+                                        tc project plan toolchain_key jobs)))
               else
                 case HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
                        (case (if fail_fast then ["fail_fast=true"] else []) @
@@ -2017,28 +2024,28 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                that are or depend on a theory with its input key in skip.  So
                do those it reused whose entries the remote cache lacks and
                can't take from the local cache. *)
-            and submit_deferred resubmit skip =
+            and submit_deferred resubmit settled skip =
               let
                 val held = !deferred
                 val _ = (deferred := []; held_back := held)
-                val settled =
+                val (reused, settled) =
                   timed_phase "early_cutoff.settle"
-                    (fn () => HolbuildBuildExec.settle_deferred build_options tc project plan toolchain_key held)
+                    (fn () => HolbuildBuildExec.settle_deferred settled build_options tc project plan toolchain_key held)
               in
                 HolbuildStatus.message_stderr
-                  ("holbuild: remote execution: early cutoff reused " ^ Int.toString settled ^ " of " ^
+                  ("holbuild: remote execution: early cutoff reused " ^ Int.toString reused ^ " of " ^
                    Int.toString (length held) ^ " deferred theories\n");
-                export_and_submit resubmit false skip []
+                export_and_submit resubmit false (SOME settled) skip []
               end
-            and export_and_submit resubmit defer skip forced =
+            and export_and_submit resubmit defer settled skip forced =
               case HolbuildRemoteExec.Ok (export defer skip forced)
                    handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
-                  HolbuildRemoteExec.Ok batch => submit resubmit skip batch
+                  HolbuildRemoteExec.Ok batch => submit resubmit settled skip batch
                 | HolbuildRemoteExec.Refused reason => fall_back reason
           in
             case attach of
                 SOME batch_id => finish true [] NONE batch_id
-              | NONE => export_and_submit true (not detach) [] []
+              | NONE => export_and_submit true (not detach) NONE [] []
           end
         fun build_owners owner_plan =
           remote_build_plan

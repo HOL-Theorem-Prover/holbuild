@@ -987,10 +987,18 @@ run client-cutoff-restore 0 build CTheory
 require_grep "CTheory restored from cache" "$tmpdir/client-cutoff-restore.log"
 : > "$state/ran"
 write_cutoff two one
-run client-cutoff-proof 0 build --remote-exec "$coordinator" CTheory
+HOLBUILD_TIMING_DETAIL=fine HOLBUILD_TIMING_LOG=$tmpdir/client-cutoff-proof.timing \
+  run client-cutoff-proof 0 build --remote-exec "$coordinator" CTheory
 require_grep "remote workers finished 1 of 1 theories" "$tmpdir/client-cutoff-proof.log"
 require_grep "early cutoff reused 2 of 2 deferred theories" "$tmpdir/client-cutoff-proof.log"
 refute_grep "Theory built" "$tmpdir/client-cutoff-proof.log"
+# B and C wait for A, which the remote cache lacks, so the export doesn't
+# ask it for them; and once they are settled, the build that follows checks
+# nothing again.
+require_grep "checking remote cache: 0/1 theories" "$tmpdir/client-cutoff-proof.log"
+refute_grep "checking remote cache: 0/3 theories" "$tmpdir/client-cutoff-proof.log"
+sed '1,/name=early_cutoff.settle/d' "$tmpdir/client-cutoff-proof.timing" > "$tmpdir/client-cutoff-proof.after-settle"
+refute_grep "name=build.exec.node.up_to_date" "$tmpdir/client-cutoff-proof.after-settle"
 [[ "$(< "$state/ran")" == "rxk:ATheory" ]] || { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
 # The reused entries reach the remote cache.
 for t in B C; do

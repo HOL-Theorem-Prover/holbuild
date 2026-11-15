@@ -7551,16 +7551,22 @@ fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets
    nodes they depend on, and runs each deferred theory's early cutoff, as
    restore_only does, without reporting progress.  As in build, a node is
    tried only when every dependency settled, so its dependencies' outputs
-   are final; the rest are left for the next batch.  The entries it reuses
-   stay local for the next export to publish.  Returns how many deferred
-   theories settled. *)
-fun settle_deferred (options : build_options) tc project plan toolchain_key deferred =
+   are final; the rest are left for the next batch.  SETTLED, from
+   start_settled_check, holds nodes already found up to date, which are
+   not checked again.  The entries it reuses stay local for the next export
+   to publish.  Returns how many deferred theories settled, and SETTLED
+   with the nodes settled here added, for the build that follows. *)
+fun settle_deferred (settled : settled option) (options : build_options) tc project plan toolchain_key deferred =
   let
     val options = remote_restore_options true options
     val base_context = toolchain_base_context tc
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
-    val dat_hash_cache = new_file_hash_cache ()
+    val {nodes = checked, dat_hash_cache} =
+      Option.getOpt (settled, {nodes = Binarymap.mkDict String.compare, dat_hash_cache = new_file_hash_cache ()})
+    fun is_checked node =
+      Binarymap.peek (checked, HolbuildBuildPlan.key node) = SOME (HolbuildBuildPlan.input_key_for keys node)
+    val passed = ref checked
     val deferred = Binaryset.addList (Binaryset.empty String.compare, deferred)
     val nodes = List.filter (fn node => Binaryset.member (deferred, HolbuildBuildPlan.key node))
                   (HolbuildBuildPlan.selected_nodes plan)
@@ -7569,30 +7575,36 @@ fun settle_deferred (options : build_options) tc project plan toolchain_key defe
         (map (HolbuildBuildPlan.transitive_project_deps plan) nodes)))
     val unsettled = ref (Binaryset.empty String.compare)
     val local_build_needed = !HolbuildHolSharedCache.local_build_needed
+    (* The checked nodes are neither deferred nor depend on a deferred node. *)
     fun settle node =
       let val key = HolbuildBuildPlan.key node
       in
-        if not (Binaryset.member (needed, key)) then false
+        if not (Binaryset.member (needed, key)) orelse is_checked node then false
         else if List.exists (fn dep => Binaryset.member (!unsettled, HolbuildBuildPlan.key dep))
                   (HolbuildBuildPlan.direct_project_deps plan node) then
           (unsettled := Binaryset.add (!unsettled, key); false)
         else
           (ignore (build_node NONE dat_hash_cache options tc project base_context plan keys toolchain_key node);
            HolbuildBuildPlan.forget_output_digest plan node;
+           passed := Binarymap.insert (!passed, key, HolbuildBuildPlan.input_key_for keys node);
            Binaryset.member (deferred, key))
           handle Error _ => (unsettled := Binaryset.add (!unsettled, key); false)
                | ErrorWithDebugArtifacts _ => (unsettled := Binaryset.add (!unsettled, key); false)
       end
-    val _ = HolbuildBuildPlan.forget_output_digests plan
+    (* As in build_checked, the checked nodes keep their digests. *)
+    fun forget_unchecked_digests () =
+      List.app (fn node => if is_checked node then () else HolbuildBuildPlan.forget_output_digest plan node)
+        (HolbuildBuildPlan.selected_nodes plan)
+    val _ = forget_unchecked_digests ()
     val _ = publish_aliases := false
-    val settled = length (List.filter settle (HolbuildBuildPlan.selected_nodes plan))
-                  handle e => (publish_aliases := true; raise e)
+    val reused = length (List.filter settle (HolbuildBuildPlan.selected_nodes plan))
+                 handle e => (publish_aliases := true; raise e)
   in
     publish_aliases := true;
     (* Digests taken here go stale once the next batch's outputs land. *)
-    HolbuildBuildPlan.forget_output_digests plan;
+    forget_unchecked_digests ();
     HolbuildHolSharedCache.local_build_needed := local_build_needed;
-    settled
+    (reused, {nodes = !passed, dat_hash_cache = dat_hash_cache})
   end
 
 (* The plan's node whose action has input key `input_key`. *)
@@ -8412,19 +8424,24 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
             | built_here (_, SOME hashes) = List.all (fn hash => Binaryset.member (verified, hash)) hashes
           val (here, other) = List.partition built_here prepared
         in (map #1 here, map #1 other) end)
-    val uncached_actions =
-      detail_time_phase "action_spec.export.remote_check" (fn () =>
-        failing "checking remote cache" "theories" (fn remote => fn (node, action) =>
-                    not (is_forced (node, action)) andalso
-                    remote_entry_satisfies remote options project plan node (#input_key action))
-                other_actions)
     fun key_set list = Binaryset.addList (Binaryset.empty String.compare, list)
     (* Whether the theory, or one it depends on, has its input key in SET. *)
     fun meets set (node, _) =
       Binaryset.numItems set > 0 andalso
       List.exists (fn node => Binaryset.member (set, HolbuildBuildPlan.input_key_for keys node))
         (node :: HolbuildBuildPlan.transitive_project_deps plan node)
-    val uncached_actions = List.filter (not o meets (key_set skip)) uncached_actions
+    fun input_keys actions = key_set (map (#input_key o #2) actions)
+    fun uncached_in actions =
+      let val keys = key_set (map (fn (node, _) => HolbuildBuildPlan.key node) actions)
+      in fn node => Binaryset.member (keys, HolbuildBuildPlan.key node)
+      end
+    val unskipped = List.filter (not o meets (key_set skip)) other_actions
+    fun remote_check actions =
+      detail_time_phase "action_spec.export.remote_check" (fn () =>
+        failing "checking remote cache" "theories" (fn remote => fn (node, action) =>
+                    not (is_forced (node, action)) andalso
+                    remote_entry_satisfies remote options project plan node (#input_key action))
+                actions)
     (* Early cutoff aliases the entry of the theory's last build, so one
        without a usable entry gains nothing from waiting. *)
     fun cutoff_candidate (node, _) =
@@ -8441,14 +8458,23 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         | NONE => false
     (* Settling runs without force, so a forced theory must not wait for it. *)
     val candidates =
-      if defer andalso not (List.exists is_forced actions) then List.filter cutoff_candidate uncached_actions
+      if defer andalso not (List.exists is_forced actions) then List.filter cutoff_candidate unskipped
       else []
-    val (deferred, uncached_actions) =
-      List.partition (meets (key_set (map (#input_key o #2) candidates))) uncached_actions
-    fun uncached_in actions =
-      let val keys = key_set (map (fn (node, _) => HolbuildBuildPlan.key node) actions)
-      in fn node => Binaryset.member (keys, HolbuildBuildPlan.key node)
+    (* The theories that may be deferred are checked last: one that depends
+       on a theory the remote cache lacks waits for that theory's batch
+       whatever the cache holds, so it isn't checked.  During the batch the
+       prefetch fetches what the cache does hold. *)
+    val uncached_actions =
+      let
+        val (cone, outside) = List.partition (meets (input_keys candidates)) unskipped
+        val missing = remote_check outside
+        val (waiting, rest) = List.partition (meets (input_keys missing)) cone
+        val uncached = uncached_in (missing @ waiting @ remote_check rest)
+      in
+        List.filter (uncached o #1) unskipped
       end
+    val candidates = List.filter (uncached_in uncached_actions o #1) candidates
+    val (deferred, uncached_actions) = List.partition (meets (input_keys candidates)) uncached_actions
     (* The workers restore from the remote cache what the batch's theories
        depend on, so each one built here goes there from the local cache
        unless it is there already; one that can't joins the batch.  The
