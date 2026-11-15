@@ -1673,13 +1673,17 @@ class Coordinator:
                     f"result for {result.input_key} (spec {result.spec_sha256}) does not match the lease's action "
                     f"{action.input_key} (spec {action.spec_sha256})"
                 )
+            # A failure without a log, such as an interruption, keeps the log an earlier attempt left, the only
+            # evidence of why that one failed.
             await conn.execute(
                 sa.text(
-                    "UPDATE actions SET log_sha256 = :log, last_failure = :failure, failure_detail = :detail, "
+                    "UPDATE actions SET log_sha256 = CASE WHEN CAST(:failed AS boolean) "
+                    "THEN COALESCE(:log, log_sha256) ELSE :log END, last_failure = :failure, failure_detail = :detail, "
                     "timings = CAST(CAST(:timings AS text) AS jsonb) "
                     "WHERE batch_id = :batch_id AND input_key = :input_key"
                 ),
                 {
+                    "failed": result.status == "failed",
                     "log": result.log_sha256,
                     "failure": result.failure,
                     "detail": result.detail,
@@ -1888,7 +1892,7 @@ class Coordinator:
                     await conn.execute(
                         sa.text(
                             "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now() "
-                            "RETURNING input_key"
+                            "RETURNING input_key, worker"
                         ),
                         {"token": token},
                     )
@@ -1920,25 +1924,31 @@ class Coordinator:
                     )
                     await self._retry(conn, batch_id, lease.input_key, ahead_batch=True)
                     ahead_freed = True
-                elif action.attempts >= self.settings.max_attempts:
-                    await conn.execute(
-                        sa.text(
-                            "UPDATE actions SET last_failure = CASE WHEN class = 'run' THEN 'internal' "
-                            "ELSE :failure END, failure_detail = NULL "
-                            "WHERE batch_id = :batch_id AND input_key = :input_key"
-                        ),
-                        {"batch_id": batch_id, "input_key": lease.input_key,
-                         "failure": f"lease expired {action.attempts} times"},
-                    )
-                    await self._fail(
-                        conn,
-                        batch_id,
-                        lease.input_key,
-                        action.action_class,
-                        f"{action.theory}: lease expired {action.attempts} times",
-                    )
                 else:
-                    await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
+                    # The worker never reported, so all there is to go on is which workers lost it: the detail lists
+                    # those of the expiries in a row.
+                    final = action.attempts >= self.settings.max_attempts
+                    detail = await conn.scalar(
+                        sa.text(
+                            "UPDATE actions SET last_failure = CASE WHEN class = 'run' AND CAST(:final AS boolean) "
+                            "THEN 'internal' ELSE :failure END, failure_detail = CASE "
+                            "WHEN last_failure = 'lease expired' AND failure_detail IS NOT NULL "
+                            "THEN failure_detail || ', ' || :worker ELSE :worker END "
+                            "WHERE batch_id = :batch_id AND input_key = :input_key RETURNING failure_detail"
+                        ),
+                        {"batch_id": batch_id, "input_key": lease.input_key, "worker": lease.worker, "final": final,
+                         "failure": f"lease expired {action.attempts} times" if final else "lease expired"},
+                    )
+                    if final:
+                        await self._fail(
+                            conn,
+                            batch_id,
+                            lease.input_key,
+                            action.action_class,
+                            f"{action.theory}: lease expired {action.attempts} times: {detail}",
+                        )
+                    else:
+                        await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
                     ahead_freed = action.ahead_batch  # the retry revokes what was claimed ahead of it
             # After the commit, so the claims woken see the slots of the cap this freed.
             if ahead_freed:

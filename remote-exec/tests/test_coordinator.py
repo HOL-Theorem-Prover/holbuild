@@ -717,15 +717,26 @@ async def test_lease_expiring_on_every_attempt_fails_the_batch(
     http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
 ) -> None:
     batch_id = await submit(http, ["a"])
-    for _ in range(3):
-        await claim_named(http, "a")
+    for worker in ("w1", "w2", "w3"):
+        claimed = (
+            await http.post("/v1/work/claim", json={"tier": "standard", "worker": worker}, headers=WORKER)
+        ).json()
+        assert claimed["theory"] == "pkg:a"
         async with remote_exec_engine.begin() as connection:
             await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
         await coordinator.sweep()
+        if worker == "w2":
+            # Each retry says which workers lost it.
+            action = (await batch(http, batch_id))["actions"][0]
+            assert (action["state"], action["last_failure"], action["failure_detail"]) == (
+                "ready", "lease expired", "w1, w2"
+            )
 
     assert await claim(http) is None
     status = await batch(http, batch_id)
-    assert (status["state"], status["failure"]) == ("failed", "pkg:a: lease expired 3 times")
+    assert (status["state"], status["failure"]) == ("failed", "pkg:a: lease expired 3 times: w1, w2, w3")
+    action = status["actions"][0]
+    assert (action["last_failure"], action["failure_detail"]) == ("lease expired 3 times", "w1, w2, w3")
 
 
 async def test_a_key_another_batch_is_building_is_held_then_done_with_it(
@@ -2621,6 +2632,25 @@ async def test_a_failed_run_without_a_log_gives_its_detail_in_events(http: httpx
     assert events[-1] == {"type": "batch", "state": "done", "failure": None}
 
 
+async def test_a_failure_without_a_log_keeps_the_log_of_an_earlier_attempt(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "memory"))).status_code == 200
+    token = await claim_named(http, "a", tier="high")
+    draining = "the worker drained before exec-action finished"
+    assert (await complete(http, token, result("a", "failed", "unavailable", detail=draining))).status_code == 200
+    action = (await batch(http, batch_id))["actions"][0]
+    assert (action["state"], action["last_failure"], action["failure_detail"], action["log_sha256"]) == (
+        "ready", "unavailable", draining, "a" * 64
+    )
+    # A success's log, or its lack of one, replaces it.
+    token = await claim_named(http, "a", tier="high")
+    built = f"holbuild-action-result-v1\nspec={spec('a')}\ninput-key={input_key('a')}\nstatus=built\nwall-ms=10\n"
+    assert (await complete(http, token, built)).status_code == 200
+    action = (await batch(http, batch_id))["actions"][0]
+    assert (action["state"], action["last_failure"], action["log_sha256"]) == ("done", None, None)
+
+
 async def test_expired_run_attempt_fails_only_its_action(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
     coordinator.settings.max_attempts = 2
     batch_id = await submit(http, ["a", "b"], **{"class": "run"})
@@ -2633,7 +2663,7 @@ async def test_expired_run_attempt_fails_only_its_action(http: httpx.AsyncClient
     status = await batch(http, batch_id)
     assert status["state"] == "running"
     assert await states(http, batch_id) == {"a": "failed", "b": "ready"}
-    assert (status["actions"][0]["last_failure"], status["actions"][0]["failure_detail"]) == ("internal", None)
+    assert (status["actions"][0]["last_failure"], status["actions"][0]["failure_detail"]) == ("internal", "w1")
     b = await claim_named(http, "b")
     assert (await complete(http, b, result("b", "built"))).status_code == 200
     assert (await batch(http, batch_id))["state"] == "done"

@@ -447,8 +447,8 @@ STATEMENTS = [
     ),
     Statement("SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions", lease, 11_000),
     Statement(
-        "UPDATE actions SET log_sha256 = :log, last_failure = :failure",
-        lambda f: {**lease(f), "log": "log", "failure": None, "detail": None, "timings": json.dumps({"total": 1.0})},
+        "UPDATE actions SET log_sha256 = CASE WHEN CAST(:failed AS boolean)",
+        lambda f: {**lease(f), "failed": False, "log": "log", "failure": None, "detail": None, "timings": json.dumps({"total": 1.0})},
         10_000,
     ),
     Statement("UPDATE actions SET tier = 'high'", lease, 10_000),
@@ -466,7 +466,11 @@ STATEMENTS = [
         "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now()", lambda f: {"token": f.expired}, 100
     ),
     Statement("SELECT a.input_key, a.spec_sha256, a.theory, a.state, a.attempts", lease, 11_000),
-    Statement("UPDATE actions SET last_failure = CASE", lambda f: {**lease(f), "failure": "timeout"}, 10_000),
+    Statement(
+        "UPDATE actions SET last_failure = CASE",
+        lambda f: {**lease(f), "failure": "lease expired", "final": False, "worker": "w1"},
+        10_000,
+    ),
     # sweeps
     Statement("SELECT id FROM batches WHERE state = 'running' AND created_at", lambda f: {"secs": 3600}, 100),
     Statement("DELETE FROM batches WHERE id IN", lambda f: {"hours": 168}, 100),

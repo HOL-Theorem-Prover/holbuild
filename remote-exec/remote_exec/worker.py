@@ -716,6 +716,10 @@ def runs_hol(pid: int, cooperate_dir: str) -> bool:
     return False
 
 
+# The detail of an action the worker gives back unstarted because it is draining.
+DRAINING = "the worker is draining"
+
+
 def failed_record(spec_sha256: str, failure: str, detail: str | None = None) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
@@ -727,18 +731,21 @@ def failed_record(spec_sha256: str, failure: str, detail: str | None = None) -> 
     return record if detail is None else f"{record}detail={sanitize_detail(detail)}\n"
 
 
-def recordless_failure(returncode: int, draining: bool) -> str | None:
-    """The failure to report for an exec-action that exited ``returncode`` without writing its result record, or
-    None for an error in the worker (``internal``). One stopped while the worker drains, or by SIGTERM or SIGINT
-    (a host shutting down, as on a Spot reclaim), was interrupted: ``unavailable`` refunds the attempt. One killed by
-    SIGKILL otherwise is what the kernel's OOM killer does: ``memory``."""
+def recordless_failure(returncode: int, draining: bool) -> tuple[str, str] | None:
+    """The failure, and its detail, to report for an exec-action that exited ``returncode`` without writing its
+    result record, or None for an error in the worker (``internal``). One stopped while the worker drains, or by
+    SIGTERM or SIGINT (a host shutting down, as on a Spot reclaim), was interrupted: ``unavailable`` refunds the
+    attempt. One killed by SIGKILL otherwise is what the kernel's OOM killer does: ``memory``."""
     def by(*signals: int) -> bool:
         return any(returncode in (-s, 128 + s) for s in signals)
 
-    if draining or by(signal.SIGTERM, signal.SIGINT):
-        return "unavailable"
+    if draining:
+        return "unavailable", f"the worker drained; exec-action exited {returncode} without a result"
+    for stop in (signal.SIGTERM, signal.SIGINT):
+        if by(stop):
+            return "unavailable", f"exec-action was stopped by {stop.name} without a result"
     if by(signal.SIGKILL):
-        return "memory"
+        return "memory", "exec-action was killed by SIGKILL without a result, as by the kernel's OOM killer"
     return None
 
 
@@ -876,10 +883,10 @@ def run_one(
 
         try:
             record = execute(args, releases, lease, claim, phases, report)
-        except CacheUnavailable:
+        except CacheUnavailable as error:
             # The cache couldn't give the spec, as while it restarts: the action is retried without counting it.
             if not completed:
-                report(failed_record(spec, "unavailable"))
+                report(failed_record(spec, "unavailable", str(error)))
             raise
         except Exception:
             # The coordinator retries the action now rather than when the lease expires.
@@ -916,25 +923,25 @@ def execute(
     drain = releases.drain
     drain.publish_seconds = 0.0
     if drain.stop.is_set():
-        return failed_record(spec, "unavailable")
+        return failed_record(spec, "unavailable", DRAINING)
     ahead_parents = claim.get("ahead_parents", [])
     try:
         with phases.timed("release"):
             version = releases.spec_version(spec)
             if drain.stop.is_set():
-                return failed_record(spec, "unavailable")
+                return failed_record(spec, "unavailable", DRAINING)
             if ahead_parents and RELEASE.fullmatch(version) and tuple(map(int, version.split("."))) < MIN_AHEAD_RELEASE:
                 return failed_record(spec, "ahead-abandoned", f"holbuild {version} predates loading ahead")
             holbuild = releases.holbuild(version)
     except DrainStopped:
-        return failed_record(spec, "unavailable")
+        return failed_record(spec, "unavailable", DRAINING)
     except Unreleased as error:
         print(f"refusing {spec}: {error}", file=sys.stderr)
         return failed_record(spec, "spec-rejected", f"the worker refuses the action: {error}")
     if lease.lost.is_set():
         return None
     if drain.stop.is_set():
-        return failed_record(spec, "unavailable")
+        return failed_record(spec, "unavailable", DRAINING)
     with tempfile.TemporaryDirectory() as scratch:
         result = os.path.join(scratch, "result")
         # Its own session, so a lost lease stops holbuild's HOL children with it.
@@ -1025,12 +1032,13 @@ def execute(
             print(f"{claim['theory']}: exit {process.returncode} after the result", file=sys.stderr, flush=True)
             return reported
         if drained_out:
-            return failed_record(spec, "unavailable")
+            return failed_record(spec, "unavailable", "the worker's drain deadline passed before exec-action finished")
         if (record := read_result(result)) is None:
-            if failure := recordless_failure(process.returncode, drain.stop.is_set()):
+            if recordless := recordless_failure(process.returncode, drain.stop.is_set()):
+                failure, detail = recordless
                 print(f"{claim['theory']}: exec-action exited {process.returncode} without a result record, "
                       f"reporting {failure}", file=sys.stderr, flush=True)
-                return failed_record(spec, failure)
+                return failed_record(spec, failure, detail)
             raise RuntimeError(f"exec-action exited {process.returncode} without a result record")
     print(f"{claim['theory']}: exit {process.returncode}", file=sys.stderr, flush=True)
     return record
