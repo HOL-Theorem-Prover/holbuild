@@ -95,9 +95,15 @@ fun boundaries_from_result source result =
             theorem_stop = theorem_stop, boundary = b, tactic_start = tactic_start, tactic_end = tactic_end,
             tactic_text = slice source tactic_start tactic_end, proof_attrs = proof_attrs,
             prefix_hash = prefix_hash source b} end
+      (* A block whose QED is missing has no boundary: the parser recovered
+         from it, and instrumenting the block (above all, replaying a
+         failed-prefix checkpoint as `Theorem name = ...;`) would close it and
+         hide the parse error, so the script runs as written and fails. *)
       fun loop acc =
         case #parseDec result () of
             NONE => rev acc
+          | SOME (HOLSourceAST.HOLTheoremDecl {qed_ = NONE, ...}) => loop acc
+          | SOME (HOLSourceAST.HOLResume {qed_ = NONE, ...}) => loop acc
           | SOME (HOLSourceAST.HOLTheoremDecl {theorem_, id = (_, name), proof_, tac, stop, ...}) =>
               let val (ts, te) = HOLSourceAST.expSpan tac
                   val proof_attrs = case proof_ of SOME {attrs, ...} => proof_kvals (attr_args attrs) | NONE => []
