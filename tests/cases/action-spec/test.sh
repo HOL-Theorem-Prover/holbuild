@@ -266,8 +266,22 @@ for client in libcurl cli; do
   unset HOLBUILD_TEST_LIBCURL
 done
 
-# After the first upload fails, the rest are skipped and the export fails.
+# A cache of one node asks again after a transient answer to an upload.
 missing_spec=$(awk '$1 == "action" { print $4; exit }' "$tmpdir/batch1.txt")
+rm "$remote_root/cas/$missing_spec"
+echo 502 > "$tmpdir/control/cas-put-fail-once"
+: > "$request_log"
+hb --prefetch-concurrency 1 action-spec --upload CTheory > "$tmpdir/batch-retried.txt"
+diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-retried.txt"
+[[ ! -e "$tmpdir/control/cas-put-fail-once" ]] || { echo "the upload was not refused once" >&2; exit 1; }
+cmp "$project/.holbuild/action-specs/$missing_spec" "$remote_root/cas/$missing_spec"
+[[ $(grep -c "^PUT /cas/$missing_spec\$" "$request_log") -eq 2 ]] || {
+  echo "expected the refused upload and its retry:" >&2
+  grep '^PUT /cas/' "$request_log" >&2
+  exit 1
+}
+
+# After the first upload fails twice, the rest are skipped and the export fails.
 rm "$remote_root/cas/$missing_spec"
 echo 500 > "$tmpdir/control/cas-put-status"
 : > "$request_log"
@@ -278,7 +292,7 @@ fi
 rm "$tmpdir/control/cas-put-status"
 require_grep 'could not upload .*HTTP 500' "$tmpdir/upload-failure.log"
 require_grep 'name=action_spec.upload.*status=fail' "$tmpdir/failed-upload.timing"
-[[ $(grep -c '^PUT /cas/' "$request_log") -eq 1 ]] || {
+[[ $(grep -c '^PUT /cas/' "$request_log") -eq 2 ]] || {
   echo "uploads went on after the first failure:" >&2
   grep '^PUT /cas/' "$request_log" >&2
   exit 1
