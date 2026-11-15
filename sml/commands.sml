@@ -1884,10 +1884,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                too: the ledger is forgotten, and a batch missing a blob is
                resubmitted once, for the export to upload it again. *)
             fun finish resubmit skip in_batch batch_id =
-              case follow in_batch batch_id of
-                  ((HolbuildRemoteExec.Done, progress), logs, settled, failure_spans) =>
+              let
+                val (outcome, logs, settled, failure_spans) = follow in_batch batch_id
+                (* Whatever follows (a restore, a resubmission, a local build)
+                   doesn't overlap the span analysis; its results stay readable. *)
+                val _ = #stop failure_spans ()
+              in
+              case outcome of
+                  (HolbuildRemoteExec.Done, progress) =>
                     let
-                      val _ = #stop failure_spans ()
                       val log_error =
                         (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan toolchain_key logs; NONE)
                         handle HolbuildBuildExec.Error reason => SOME reason
@@ -1905,7 +1910,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                    (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
                                    tc project plan toolchain_key jobs))
                     end
-                | ((HolbuildRemoteExec.Failed (reason, failures), progress), logs, settled, failure_spans) =>
+                | (HolbuildRemoteExec.Failed (reason, failures), progress) =>
                   let
                     val proof_failure = List.exists (fn {kind, ...} => kind = "proof" orelse kind = "tactic-timeout") failures
                     val reason = "batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress
@@ -1960,16 +1965,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          export_and_submit false false skip forced)
                   end
-                | ((HolbuildRemoteExec.Cancelled, progress), _, _, _) =>
+                | (HolbuildRemoteExec.Cancelled, progress) =>
                     let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                     in
                       (* Whoever cancelled it stopped this work, so a --remote-only
                          build doesn't ask for it to be built locally instead. *)
                       if remote_only then raise Error ("remote execution: " ^ reason) else fall_back reason
                     end
-                | ((HolbuildRemoteExec.Unfollowable reason, progress), _, _, _) =>
+                | (HolbuildRemoteExec.Unfollowable reason, progress) =>
                     abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
-                | ((HolbuildRemoteExec.Unreachable reason, progress), _, _, _) =>
+                | (HolbuildRemoteExec.Unreachable reason, progress) =>
                     if remote_only
                     then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id ^
                                     (if priority = 0 then "" else " --priority " ^ Int.toString priority) ^
@@ -1977,6 +1982,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                          SOME n => " --speculative-loading=" ^ Int.toString n
                                        | NONE => ""))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
+              end
             and submit resubmit skip batch =
               if null (batch_keys batch) then
                 (record_pending ();
