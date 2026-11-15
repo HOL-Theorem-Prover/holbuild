@@ -49,8 +49,11 @@ def run() -> None:
             wait_for(process, lambda: (directory / "published.ready").exists())
             lines = requests.read_text().splitlines()
             puts = [line for line in lines if line.startswith("PUT /cas/")]
-            assert len(puts) == len(set(puts)), "a spine blob was uploaded more than once"
-            assert len(puts) == 1 + 2 * (count - 1), "CAS writes must equal the distinct heap/state/sidecar files"
+            # The refused blob is asked again once: a one-node cache's 500 gets a retry.
+            retried = [put for put in set(puts) if puts.count(put) > 1]
+            assert len(retried) == (1 if failing else 0) and all(puts.count(put) == 2 for put in retried), \
+                "a spine blob was uploaded more than once"
+            assert len(set(puts)) == 1 + 2 * (count - 1), "CAS writes must equal the distinct heap/state/sidecar files"
             manifests = list((directory / "remote/ac").glob("*"))
             expected = 11 if failing else count - 1
             assert len(manifests) == expected + 1, "wrong number of candidate manifests"

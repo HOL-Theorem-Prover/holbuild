@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # When the worker starts a theory-module writer: never for a HOL without
 # the module helper, nor once a writer found the toolchain can't write
-# modules, nor when the store has every module the action wants.  A fake
-# HOL stands in for the writer: it counts its runs and leaves the files
-# named in $tmpdir/writes in its output directory.
+# modules, nor when a store with its base theories lacks fewer than 16 of
+# the modules the action wants, nor while another process holds the
+# store's writer lock.  A fake HOL stands in for the writer: it counts its
+# runs and leaves the files named in $tmpdir/writes in its output
+# directory.
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 source "$ROOT/tests/lib.sh"
@@ -21,7 +23,8 @@ for hol in hol1 hol2; do
 #!/usr/bin/env bash
 echo run >> "$tmpdir/$hol.runs"
 cp "\${@: -1}" "$tmpdir/$hol.script"
-while read -r file; do : > "$tmpdir/cache/theory-modules-writer/\$file"; done < "$tmpdir/writes"
+out=\$(echo "$tmpdir"/cache/theory-modules-writer/*)
+while read -r file; do : > "\$out/\$file"; done < "$tmpdir/writes"
 SH
   chmod +x "$tmpdir/$hol/bin/hol"
 done
@@ -30,6 +33,12 @@ printf '(("bool" . "%s"))\n' "$bool_sha" > "$tmpdir/root/src/ATheory.dat"
 a_sha=$(sha "$tmpdir/root/src/ATheory.dat")
 printf '(("A" . "%s") ("bool" . "%s"))\n' "$a_sha" "$bool_sha" > "$tmpdir/root/src/BTheory.dat"
 b_sha=$(sha "$tmpdir/root/src/BTheory.dat")
+# Sixteen more theories, so that an action can lack enough modules for a
+# writer on a store with its base theories.
+for i in $(seq 1 16); do
+  printf '(("bool" . "%s"))\n' "$bool_sha" > "$tmpdir/root/src/P${i}Theory.dat"
+  echo "\"ab12-P$i-$(sha "$tmpdir/root/src/P${i}Theory.dat").pmo\""
+done | paste -sd, > "$tmpdir/p-modules"
 
 cat > "$tmpdir/writer.sml" <<SML
 use "sml/holbuild-script.sml";
@@ -41,7 +50,9 @@ fun runs hol =
   in if exists path then length (String.tokens Char.isSpace (E.read_text path)) else 0 end;
 fun writes files = E.write_text "$tmpdir/writes" (String.concat (map (fn f => f ^ "\n") files));
 fun dep name = {target = "p:" ^ name ^ "Theory", stem = "src/" ^ name ^ "Theory", key = ""};
-val wanted = {deps = [dep "A", dep "B"], loads = [E.LoadTheory "boolTheory"]};
+val ps = [$(cat "$tmpdir/p-modules")];
+val wanted = {deps = [dep "A", dep "B"] @ List.tabulate (16, fn i => dep ("P" ^ Int.toString (i + 1))),
+              loads = [E.LoadTheory "boolTheory"]};
 fun tc hol = {holdir = "$tmpdir/" ^ hol, maxheap = NONE,
               kernel_variant = HolbuildToolchain.StandardKernel};
 fun fill hol = E.fill_module_store "$tmpdir/cache" "$tmpdir/root" (tc hol) wanted;
@@ -57,8 +68,12 @@ val _ = fill "hol1";
 val _ = check "a writer ran for a HOL without the module helper" (runs "hol1" = 0);
 val _ = check "a HOL without the module helper got a store" (not (exists (store "hol1")));
 
-(* The first writer also records the base state's theories. *)
+(* The first writer also records the base state's theories, and runs
+   for however few modules are missing. *)
 val _ = E.write_text "$tmpdir/hol1/tools-poly/poly/theory_modules.ML" "";
+val _ = OS.FileSys.mkDir (E.module_stores ()) handle OS.SysErr _ => ();
+val _ = OS.FileSys.mkDir (store "hol1");
+val _ = List.app (fn p => E.write_text (OS.Path.concat (store "hol1", p)) "") ps;
 val _ = writes [a, b, "base-theories", "ab12-C-$b_sha.pmo", "other"];
 val _ = fill "hol1";
 val _ = check "no writer ran for an empty store" (runs "hol1" = 1);
@@ -75,13 +90,35 @@ val _ = E.write_text (OS.Path.concat (store "hol1", "base-theories")) "min\nbool
 val _ = fill "hol1";
 val _ = check "a writer ran for a filled store" (runs "hol1" = 1);
 
-(* A module missing: the writer runs, without asking for the base theories again. *)
-val _ = OS.FileSys.remove (OS.Path.concat (store "hol1", b));
-val _ = writes [b, "base-theories"];
+(* Fewer than 16 modules missing: the action loads them from .dat files. *)
+fun remove files = List.app (fn f => OS.FileSys.remove (OS.Path.concat (store "hol1", f))) files;
+val _ = remove (b :: List.take (ps, 14));
+val _ = fill "hol1";
+val _ = check "a writer ran for 15 missing modules" (runs "hol1" = 1);
+
+(* No writer while another process writes to the store. *)
+val _ = remove [List.nth (ps, 14)];
+val holder = Posix.Process.fork ();
+val _ = case holder of
+            NONE => (ignore (HolbuildFileLock.try_acquire_path
+                               {path = OS.Path.concat (store "hol1", "writer.lock"), obsolete_kind = NONE});
+                     E.write_text "$tmpdir/locked" "";
+                     OS.Process.sleep (Time.fromSeconds 60);
+                     Posix.Process.exit 0w0)
+          | SOME _ => ();
+fun await () = if exists "$tmpdir/locked" then () else (OS.Process.sleep (Time.fromMilliseconds 50); await ());
+val _ = await ();
+val _ = fill "hol1";
+val _ = check "a writer ran while another held the store's lock" (runs "hol1" = 1);
+val _ = Posix.Process.kill (Posix.Process.K_PROC (valOf holder), Posix.Signal.kill);
+val _ = Posix.Process.waitpid (Posix.Process.W_CHILD (valOf holder), []);
+
+(* 16 missing: the writer runs, without asking for the base theories again. *)
+val _ = writes (b :: List.take (ps, 15) @ ["base-theories"]);
 val _ = E.write_text (OS.Path.concat (store "hol1", "base-theories")) "bool\n";
 val _ = fill "hol1";
-val _ = check "no writer ran for a partial store" (runs "hol1" = 2);
-val _ = check "the missing module was not stored" (stored "hol1" b);
+val _ = check "no writer ran for 16 missing modules" (runs "hol1" = 2);
+val _ = check "the missing modules were not stored" (List.all (stored "hol1") (b :: ps));
 val _ = check "the base theories were asked for again" (not (script_has "hol1" "TheoryReader.is_canonical"));
 val _ = check "the base theories were replaced"
           (E.read_text (OS.Path.concat (store "hol1", "base-theories")) = "bool\n");

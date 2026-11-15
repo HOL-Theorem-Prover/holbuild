@@ -960,7 +960,7 @@ fun evict_store_family_if eligible dir =
               else
                 let val bytes = tree_bytes dir
                 in
-                  (HolbuildCache.remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
+                  (remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
                   HolbuildFileLock.release lock;
                   if path_exists dir then NONE else SOME bytes
                 end)
@@ -3922,8 +3922,9 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
   end
 
 (* The diagnostic of a theory script that failed, from its build's output:
-   where in the script it failed, the goal state, and what HOL said. *)
-fun failure_detail policy source_file source_text theorem_checkpoints termination_diagnostics failure_output msg =
+   where in the script it failed, the goal state, and what HOL said.
+   BOUNDARIES are where the script's theorems are. *)
+fun failure_detail policy source_file source_text boundaries termination_diagnostics failure_output msg =
   let
     val failure_output_path = captured_output_path_option failure_output
     val goal_state =
@@ -3936,7 +3937,7 @@ fun failure_detail policy source_file source_text theorem_checkpoints terminatio
     val static_error = Option.mapPartial (fn path => HolbuildTheoryDiagnostics.static_error_summary source_file source_text (String.fields (fn c => c = #"\n") (read_text path))) failure_output_path
     val source_context = Option.mapPartial
       (HolbuildTheoryDiagnostics.summarize_failed_fragment_source
-         source_file source_text theorem_checkpoints termination_diagnostics)
+         source_file source_text boundaries termination_diagnostics)
       failure_output_path
     val termination_context =
       Option.mapPartial
@@ -4105,7 +4106,8 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
         val source_context =
           Option.mapPartial
             (HolbuildTheoryDiagnostics.summarize_failed_fragment_source
-               source_file source_text theorem_checkpoints termination_diagnostics)
+               source_file source_text (map HolbuildTheoryCheckpoints.checkpoint_boundary theorem_checkpoints)
+               termination_diagnostics)
             failure_output_path
         val goal_state =
           Option.mapPartial
@@ -4167,7 +4169,8 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
       let val failure_output = checkpoint_failure_output log_dir stage
       in
         error_with_captured_output
-          (failure_detail policy source_file source_text theorem_checkpoints termination_diagnostics
+          (failure_detail policy source_file source_text
+             (map HolbuildTheoryCheckpoints.checkpoint_boundary theorem_checkpoints) termination_diagnostics
              failure_output msg)
           failure_output
       end
@@ -4883,9 +4886,10 @@ fun theory_checkpoints_for_action policy checkpoint_root (action : theory_action
                        #logical action ^ "; using recovered theorem boundaries\n" ^
                        String.concatWith "\n" errors)
     in
-      theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
-        (action_checkpoint_base checkpoint_root action) (#deps_key action)
-        (#inputs_key action) (nondefault_source_name action) source_text proof_ir_plans boundaries
+      detail_time_phase "build.exec.node.checkpoint_specs" (fn () =>
+        theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
+          (action_checkpoint_base checkpoint_root action) (#deps_key action)
+          (#inputs_key action) (nondefault_source_name action) source_text proof_ir_plans boundaries)
     end
     handle Error msg =>
       (reject_unenforced_tactic_timeout policy action msg;
@@ -5504,9 +5508,12 @@ fun report_up_to_date_node status project keys node =
   end
 
 (* IS_SETTLED says whether a check during the batch found NODE up to date,
-   as build_node would: then it is reported so, keeping its output digest. *)
-fun build_one is_settled speculated dat_hash_cache status options tc project base_context plan keys toolchain_key node =
-  if is_settled node then
+   as build_node would: then it is reported so, keeping its output digest.
+   IS_FAILED says whether a remote worker failed it: then it fails, without
+   a lookup of an entry the remote cache can't hold. *)
+fun build_one is_settled is_failed speculated dat_hash_cache status options tc project base_context plan keys toolchain_key node =
+  if is_failed node then raise Error (HolbuildBuildPlan.logical_name node ^ " failed on a remote worker")
+  else if is_settled node then
     ((case #kind (HolbuildBuildPlan.source_of node) of
           HolbuildSourceIndex.TheoryScript => claim_extra_outputs project node (source_extra_output_paths plan node)
         | _ => ());
@@ -6235,7 +6242,7 @@ fun raise_build_failures failures =
           else raise ErrorWithDebugArtifacts (msg, artifacts)
         end
 
-fun build_serial is_settled dat_hash_cache status (options : build_options) tc project base_context plan keys toolchain_key budget_state =
+fun build_serial is_settled is_failed dat_hash_cache status (options : build_options) tc project base_context plan keys toolchain_key budget_state =
   let
     val blocked = ref (Redblackmap.mkDict String.compare)
     val failures = ref []
@@ -6252,7 +6259,7 @@ fun build_serial is_settled dat_hash_cache status (options : build_options) tc p
                HolbuildStatus.skip status key name cause;
                SOME HolbuildStatus.UpToDate)
           | [] =>
-              SOME (build_one is_settled NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
+              SOME (build_one is_settled is_failed NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
               handle Thread.Interrupt => raise Thread.Interrupt
                    | e =>
                        (HolbuildStatus.fail_with_debug_artifacts status key name
@@ -6278,7 +6285,7 @@ fun build_serial is_settled dat_hash_cache status (options : build_options) tc p
     raise_build_failures (rev (!failures))
   end
 
-fun build_parallel is_settled dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state =
+fun build_parallel is_settled is_failed dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state =
   let
     (* Keep scheduler state explicit and reusable: precompute reverse dependency
        edges once, then release dependents by decrementing remaining_dep counts.
@@ -7106,11 +7113,11 @@ fun build_parallel is_settled dat_hash_cache status options tc project base_cont
             | SOME (CommitWork (id, result)) =>
                 build id false
                   (fn node =>
-                      build_one is_settled (SOME result) dat_hash_cache status options tc project base_context plan keys
+                      build_one is_settled is_failed (SOME result) dat_hash_cache status options tc project base_context plan keys
                         toolchain_key node
                       before remove_tree (#stage_root result))
             | SOME (PlainWork id) =>
-                build id true (fn node => build_one is_settled NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
+                build id true (fn node => build_one is_settled is_failed NONE dat_hash_cache status options tc project base_context plan keys toolchain_key node)
         (* A pipelined build's commit saves no checkpoints, so it needs no
            checkpoint maintenance. *)
         and build id may_checkpoint run =
@@ -7288,15 +7295,16 @@ fun prefetch_limit jobs =
    the nodes not yet started and waits for the copies in flight.  The build
    workers keep their own demand restore, so they never wait behind a
    prefetch. *)
-fun start_remote_cache_prefetch (options : build_options) project plan keys jobs is_settled =
+fun start_remote_cache_prefetch (options : build_options) project plan keys jobs no_entry =
   case HolbuildRemoteCacheConfig.url () of
       SOME url =>
         if not (#use_cache options) then (fn () => ())
         else
           let
             val root = cache_root ()
-            (* A node found up to date has no entry to fetch. *)
-            val nodes = List.filter (not o is_settled) (HolbuildBuildPlan.selected_nodes plan)
+            (* NO_ENTRY says a node has no entry to fetch: one found up to
+               date, or a remote worker failed it or one it depends on. *)
+            val nodes = List.filter (not o no_entry) (HolbuildBuildPlan.selected_nodes plan)
             fun prefetch node =
               case prefetch_key options project keys node of
                   SOME key => prefetch_remote_cache_key root url key
@@ -7447,8 +7455,9 @@ fun trace_cpu_pressure_delta start =
     | _ => ()
 
 (* Builds the plan; SETTLED, from start_settled_check, holds the nodes a
-   check during the batch found up to date. *)
-fun build_checked (settled : settled option) (options : build_options) tc project plan toolchain_key jobs =
+   check during the batch found up to date, and FAILED the input keys of the
+   theories the batch's workers failed. *)
+fun build_checked (settled : settled option) failed (options : build_options) tc project plan toolchain_key jobs =
   let
     val cpu_pressure_start =
       if HolbuildStatus.cache_trace_enabled () then cpu_pressure_total_us () else NONE
@@ -7469,6 +7478,20 @@ fun build_checked (settled : settled option) (options : build_options) tc projec
           SOME {nodes, ...} =>
             Binarymap.peek (nodes, HolbuildBuildPlan.key node) = SOME (HolbuildBuildPlan.input_key_for keys node)
         | NONE => false
+    val failed = Binaryset.addList (Binaryset.empty String.compare, failed)
+    fun is_failed node = Binaryset.member (failed, HolbuildBuildPlan.input_key_for keys node)
+    (* The failed nodes and those depending on them, in plan order, so a
+       node's dependencies come before it. *)
+    val failed_cone =
+      List.foldl
+        (fn (node, cone) =>
+            if is_failed node orelse
+               List.exists (fn dep => Binaryset.member (cone, HolbuildBuildPlan.key dep))
+                 (HolbuildBuildPlan.direct_project_deps plan node)
+            then Binaryset.add (cone, HolbuildBuildPlan.key node)
+            else cone)
+        (Binaryset.empty String.compare) (HolbuildBuildPlan.selected_nodes plan)
+    fun no_entry node = is_settled node orelse Binaryset.member (failed_cone, HolbuildBuildPlan.key node)
     val dat_hash_cache =
       case settled of
           SOME {dat_hash_cache, ...} => dat_hash_cache
@@ -7484,10 +7507,10 @@ fun build_checked (settled : settled option) (options : build_options) tc projec
       val status = HolbuildStatus.create {total = length (HolbuildBuildPlan.selected_nodes plan), jobs = jobs}
       fun run () =
         let
-          val stop_prefetch = start_remote_cache_prefetch options project plan keys jobs is_settled
+          val stop_prefetch = start_remote_cache_prefetch options project plan keys jobs no_entry
           fun build_nodes () =
-            if jobs <= 1 then build_serial is_settled dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
-            else build_parallel is_settled dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
+            if jobs <= 1 then build_serial is_settled is_failed dat_hash_cache status options tc project base_context plan keys toolchain_key budget_state
+            else build_parallel is_settled is_failed dat_hash_cache status options tc project base_context plan keys toolchain_key jobs budget_state
         in
           (build_nodes (); stop_prefetch ())
           handle e => (stop_prefetch (); raise e)
@@ -7506,7 +7529,7 @@ fun build_checked (settled : settled option) (options : build_options) tc projec
     end
   end
 
-fun build options tc project plan toolchain_key jobs = build_checked NONE options tc project plan toolchain_key jobs
+fun build options tc project plan toolchain_key jobs = build_checked NONE [] options tc project plan toolchain_key jobs
 
 (* After remote execution, force and tracing have already been fulfilled. *)
 fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
@@ -7695,24 +7718,79 @@ fun restore_remote_build_logs (options : build_options) tc project plan toolchai
     List.app report restored
   end
 
+(* Where the proof units are in theory `node`'s script, as read now: what
+   the diagnostic of a proof that failed in it places the failure with, as
+   a local build of it would. *)
+type failure_spans = {source_text : string, boundaries : HolbuildTheoryCheckpoints.boundary list,
+                      terminations : HolbuildTheoryCheckpoints.termination list}
+
+fun remote_failure_spans options project plan keys toolchain_key node : failure_spans =
+  let
+    val policy = checkpoint_policy_for_node options project node
+    (* Where the proof units are needs no deps key. *)
+    val action = theory_action (project_artifact_root project) plan keys toolchain_key "" node
+    val source_text = read_text (#source_file action)
+    val {source_boundaries, termination_diagnostics} =
+      source_spans_for_action policy action source_text
+      handle Error _ => {source_boundaries = NONE, termination_diagnostics = []}
+  in
+    {source_text = source_text,
+     boundaries =
+       case source_boundaries of
+           SOME {boundaries, ...} =>
+             if proof_steps_enabled policy orelse checkpoint_enabled policy then boundaries else []
+         | NONE => [],
+     terminations = termination_diagnostics}
+  end
+
+(* The batches whose theories' spans are worked out while they run: at most
+   this many theories, as an edit's are. *)
+val remote_failure_spans_limit = 4
+
+(* For build --remote-exec while it follows a batch of theories (their input
+   keys BATCH_KEYS): works out each one's failure_spans on background
+   threads, so that the diagnostic of a proof one of them fails needn't wait
+   for the HOL analyser.  Returns {spans, stop}: spans waits for them and
+   gives a node's, if worked out; stop drops those not started and waits for
+   the others. *)
+fun start_remote_failure_spans options tc project plan toolchain_key batch_keys =
+  let
+    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+    val in_batch = Binaryset.addList (Binaryset.empty String.compare, batch_keys)
+    val nodes =
+      if length batch_keys > remote_failure_spans_limit then []
+      else List.filter (fn node => Binaryset.member (in_batch, HolbuildBuildPlan.input_key_for keys node))
+             (HolbuildBuildPlan.selected_nodes plan)
+    val spans = ref (Binarymap.mkDict String.compare)
+    val mutex = Mutex.mutex ()
+    fun analyse node =
+      let val result = remote_failure_spans options project plan keys toolchain_key node
+      in
+        Mutex.lock mutex;
+        spans := Binarymap.insert (!spans, HolbuildBuildPlan.key node, result);
+        Mutex.unlock mutex
+      end
+    val {add, drain, stop} = start_background_pool remote_failure_spans_limit analyse
+  in
+    List.app add nodes;
+    {spans = fn node => (drain (); Binarymap.peek (!spans, HolbuildBuildPlan.key node)), stop = stop}
+  end
+
 (* The error of theory `node`, whose proof failed on a remote worker
    (failure kind `proof` or `tactic-timeout`): the diagnostic a local build
    would give, from the worker's build log, which the remote cache holds as
-   blob `log_sha256`.  The log goes where a local build leaves it.  NONE when
-   the log can't be fetched.  Runs no HOL. *)
-fun remote_proof_failure (options : build_options) tc project plan toolchain_key node {kind, log_sha256} =
+   blob `log_sha256`, and the script's SPANS if worked out already.  The log
+   goes where a local build leaves it.  NONE when the log can't be fetched.
+   Runs no HOL. *)
+fun remote_proof_failure (options : build_options) tc project plan toolchain_key node spans {kind, log_sha256} =
   let
     val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
                  (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val root = project_artifact_root project
     fun diagnose node =
       let
-        (* The diagnosis reads only the script's proof units, not where their
-           checkpoints would live, so the action is keyed on its
-           dependencies' input keys: keying it on their outputs would hash
-           every file of the closure. *)
-        val action = theory_action root plan keys toolchain_key
-                       (dependency_input_context_key toolchain_key plan keys node) node
+        val action = theory_action root plan keys toolchain_key "" node
         val log = current_build_log (current_log_dir root (#package action) (#logical action))
         val fetched =
           detail_time_phase "build.remote_failure.log"
@@ -7723,12 +7801,10 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
           let
             val policy = checkpoint_policy_for_node options project node
             val source_file = #source_file action
-            val source_text = read_text source_file
-            (* The script's proof units, to place the failure in it. *)
-            val {theorem_checkpoints, termination_diagnostics, ...} =
-              action_checkpoints policy (default_checkpoint_root root) action source_text
-              handle Error _ =>
-                {theorem_checkpoints = [], declaration_checkpoints = [], termination_diagnostics = []}
+            val {source_text, boundaries, terminations} =
+              case spans of
+                  SOME spans => spans
+                | NONE => remote_failure_spans options project plan keys toolchain_key node
             val heading =
               (if kind = "tactic-timeout" then "tactic timed out" else "proof failed") ^
               " on a remote worker while building " ^ #logical action
@@ -7736,7 +7812,7 @@ fun remote_proof_failure (options : build_options) tc project plan toolchain_key
           in
             SOME (error_with_captured_output
                     (heading ^ "\n" ^
-                     failure_detail policy source_file source_text theorem_checkpoints termination_diagnostics
+                     failure_detail policy source_file source_text boundaries terminations
                        output "hol run failed while building theory script")
                     output)
           end
@@ -10123,7 +10199,7 @@ fun local_cache_families cache =
       List.foldl
         (fn (path, freed) =>
             let val bytes = tree_bytes path
-            in HolbuildCache.remove_tree path; if path_exists path then freed else freed + bytes end)
+            in remove_tree path; if path_exists path then freed else freed + bytes end)
         (0 : Position.int) paths
     fun release blob =
       case Redblackmap.peek (!users, blob) of
@@ -10252,7 +10328,7 @@ fun module_cache_families cache =
         evict = fn () =>
           let val bytes = tree_bytes path
           in
-            HolbuildCache.remove_tree path;
+            remove_tree path;
             if path_exists path then NONE else SOME bytes
           end})
     (HolbuildCache.children (HolbuildCache.theory_modules_dir cache))
@@ -10359,6 +10435,17 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       handle IO.Io _ => false
            | OS.SysErr _ => false
     fun by_age families = sort_by_mtime_ascending (fn ({mtime, ...} : cache_family) => mtime) families
+    (* Steps a sweep or its lock wait took, logged once so a slow cap or
+       post-result refresh can be attributed. *)
+    val steps : (string * LargeInt.int) list ref = ref []
+    fun timed name f =
+      let
+        val start = Time.now ()
+        val result = f ()
+      in
+        steps := !steps @ [(name, Time.toMilliseconds (Time.-(Time.now (), start)))];
+        result
+      end
     fun sweep total remaining =
       if total <= target then total
       else
@@ -10390,7 +10477,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
         if reuse andalso recent_scan_fits (fn () => private_size) then ()
         else
           let
-            val shared = measure_shared ()
+            val shared = timed "walk" measure_shared
             val total = sum (#sizes shared) + private_size
           in
             if total <= target then publish shared
@@ -10398,22 +10485,28 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
               let
                 (* Eviction can outlast the stamp's life. The fresh walk
                    only overestimates while it runs, so siblings within the
-                   limit reuse it instead of waiting on gc.lock. *)
-                val _ = publish shared
-                val (local_families, young_orphans) = local_cache_families cache
+                   limit reuse it instead of waiting on gc.lock. Stamped
+                   when the walk ends, so eviction gets the stamp's whole
+                   life. *)
+                val _ = publish {measured = Time.toNanoseconds (Time.now ()), ids = #ids shared,
+                                 sizes = #sizes shared}
                 val families =
-                  by_age ((if toolchains_owned_by_cache () then
-                             toolchain_trash_family () :: toolchain_cache_families () else []) @
-                          checkpoint_cache_families (collect_checkpoint_families checkpoint_root) @
-                          store_cache_families cache @ module_cache_families cache @
-                          local_families) @ by_age young_orphans
-                val after = sweep total families
+                  timed "families" (fn () =>
+                    let val (local_families, young_orphans) = local_cache_families cache
+                    in
+                      by_age ((if toolchains_owned_by_cache () then
+                                 toolchain_trash_family () :: toolchain_cache_families () else []) @
+                              checkpoint_cache_families (collect_checkpoint_families checkpoint_root) @
+                              store_cache_families cache @ module_cache_families cache @
+                              local_families) @ by_age young_orphans
+                    end)
+                val after = timed "evict" (fn () => sweep total families)
               in
                 (* Measure again rather than publish an estimate derived from
                    the mixed private and shared freed total, so a waiter on
                    gc.lock reuses the result rather than repeating the scan.
                    Until then siblings keep reusing the pre-eviction walk. *)
-                if after <= target then publish (measure_shared ())
+                if after <= target then publish (timed "rewalk" measure_shared)
                 else (remove_file state_path;
                       warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
                            gb_decimal_text target ^ " GB left under the cap after its reserve"))
@@ -10424,8 +10517,13 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
        lock lives outside locks/ and can be container-private. *)
     val lock_path = HolbuildCache.gc_lock_path cache
     fun locked lock reuse =
-      (scan reuse before HolbuildFileLock.release lock)
-      handle e => (HolbuildFileLock.release lock; raise e)
+      (((scan reuse before HolbuildFileLock.release lock)
+        handle e => (HolbuildFileLock.release lock; raise e));
+       if null (!steps) then ()
+       else HolbuildStatus.message_stderr
+              ("holbuild: worker cache sweep (ms): " ^
+               String.concatWith " " (map (fn (name, ms) => name ^ "=" ^ LargeInt.toString ms) (!steps)) ^
+               "\n"))
   in
     if refresh then
       let
@@ -10442,7 +10540,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     else
       let
         val _ = HolbuildFileLock.remove_obsolete_lock_dir "cache gc" lock_path
-        val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = lock_path}
+        val lock = timed "wait" (fn () => HolbuildFileLock.acquire_exclusive_path_wait {path = lock_path})
       in
         locked lock true
       end
@@ -11590,7 +11688,14 @@ fun module_file_wanted expected file =
     | NONE => false
 
 (* The most theory modules one worker-run writer saves. *)
-val module_writer_limit = 32
+val module_writer_limit = 64
+
+(* The fewest missing modules a writer starts for once the store has its
+   base theories.  A writer costs about as much to start as loading
+   sixteen theories from their .dat files instead of their modules, so an
+   action that lacks only the few parents just built loads those from
+   their .dat files. *)
+val module_writer_min_missing = 16
 
 (* Files the module writer leaves in a toolchain's store beside its
    modules.  [module_store_unsupported]: the toolchain has HOL's module
@@ -11598,9 +11703,11 @@ val module_writer_limit = 32
    again for it (the store, named by the HOL directory, is per Poly/ML
    runtime).  [module_store_base_theories]: the theories of the toolchain's
    base state, one per line; they are in the state, so HOL writes no
-   module for them. *)
+   module for them.  [module_store_writer_lock]: held by the worker
+   process whose writer is writing for the store. *)
 val module_store_unsupported = "unsupported"
 val module_store_base_theories = "base-theories"
+val module_store_writer_lock = "writer.lock"
 
 (* The writer script: records whether the toolchain can write modules,
    the base state's theories when [base_theories], and then writes the
@@ -11639,9 +11746,10 @@ fun module_writer_script {output, base_theories, call} =
    current .dat files.  Each theory is given after its parents: the
    project's from the spec, the toolchain's beside their objects in its
    sigobj.  No writer starts when the toolchain's HOL has no module helper,
-   when an earlier writer found it cannot write modules, or when the store
-   has every module wanted.  A failure leaves the action to load from .dat
-   files. *)
+   when an earlier writer found it cannot write modules, when the store
+   has its base theories and lacks fewer than module_writer_min_missing of
+   the modules wanted, or while another process writes to the store.  A
+   failure leaves the action to load from .dat files. *)
 fun write_missing_modules cache root tc {deps, loads} =
   let
     val store = module_store (#holdir tc)
@@ -11703,7 +11811,9 @@ fun write_missing_modules cache root tc {deps, loads} =
         then Path.concat (Path.dir (Path.dir dir), Path.file b)
         else b
       end
-    val output = Path.concat (cache, "theory-modules-writer")
+    (* The worker's actions share its cache; the store's lock keeps this
+       directory to one writer. *)
+    val output = Path.concat (Path.concat (cache, "theory-modules-writer"), Path.file store)
     val script = in_root root ".holbuild/theory-module-writer.sml"
     val log = in_root root ".holbuild/theory-module-writer.log"
     val call =
@@ -11719,21 +11829,29 @@ fun write_missing_modules cache root tc {deps, loads} =
          (file = module_store_base_theories andalso not (isSome base_theories))
       then FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)}
       else ()
+    fun write () =
+      (HolbuildRemoveTree.remove_untrusted output;
+       ensure_dir output;
+       write_text script
+         (module_writer_script {output = output, base_theories = not (isSome base_theories),
+                                call = call});
+       HolbuildActionSandbox.with_output_dirs [output] (fn () =>
+         ignore (HolbuildToolchain.run_in_dir_to_file root
+                   (HolbuildToolchain.hol_subcommand_argv tc "run" @
+                    ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
+                   log));
+       List.app (move o Path.file) (HolbuildCache.children output);
+       HolbuildRemoveTree.remove_untrusted output)
+    val missing = List.length (List.filter (fn e => not (Binaryset.member (stored, e))) expected)
   in
-    if List.all (fn e => Binaryset.member (stored, e)) expected then () else
-    (HolbuildRemoveTree.remove_untrusted output;
-     ensure_dir output;
-     ensure_dir store;
-     write_text script
-       (module_writer_script {output = output, base_theories = not (isSome base_theories),
-                              call = call});
-     HolbuildActionSandbox.with_output_dirs [output] (fn () =>
-       ignore (HolbuildToolchain.run_in_dir_to_file root
-                 (HolbuildToolchain.hol_subcommand_argv tc "run" @
-                  ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
-                 log));
-     List.app (move o Path.file) (HolbuildCache.children output);
-     HolbuildRemoveTree.remove_untrusted output)
+    if missing = 0 orelse (isSome base_theories andalso missing < module_writer_min_missing) then ()
+    else
+      case HolbuildFileLock.try_acquire_path
+             {path = Path.concat (store, module_store_writer_lock), obsolete_kind = NONE} of
+          NONE => ()
+        | SOME lock =>
+            (write () before HolbuildFileLock.release lock)
+            handle e => (HolbuildFileLock.release lock; raise e)
   end
 
 fun fill_module_store cache root tc wanted =
@@ -12321,7 +12439,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             (* A child loading ahead can write the source by now. *)
             val source_text =
               case ahead of SOME {source_text, ...} => source_text | NONE => read_text (#source_file action)
-            val checkpoints = action_checkpoints policy checkpoint_root action source_text
+            val checkpoints = phase "analyse" (fn () => action_checkpoints policy checkpoint_root action source_text)
             val shared =
               if not share_heaps orelse not (checkpoint_enabled policy) then NONE
               else

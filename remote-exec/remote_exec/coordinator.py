@@ -497,8 +497,9 @@ KEY_LEASED = sa.text("SELECT EXISTS (SELECT 1 FROM leases WHERE input_key = :key
 # Loading ahead: in a batch with an ``ahead_cap``, a waiting build action may be claimed before its parents are done
 # when each parent that isn't done is running, up to ``ahead_depth`` generations ahead: generation 0 is a running
 # action that waits for no parent, and an action claimed ahead is one generation after its latest unfinished parent.
-# Its worker loads what it can and waits for the unfinished ancestors' outputs. An action whose claim ahead gave up
-# is ``abandoned`` and waits for its parents from then on.
+# Its worker loads what it can and waits for the unfinished ancestors' outputs. An action whose claim ahead gave up,
+# or lost its lease while it waited, is ``abandoned`` and waits for its parents from then on; one revoked because an
+# ancestor went back to waiting (REVOKE_AHEAD) may be claimed ahead again once its unfinished parents run again.
 #
 # AHEAD_WALK: the unfinished ancestors of the actions :keys of :batch_id, with the action each was reached from
 # (``root``) and each of its distances from it: their unfinished parents, and, above a running parent that was
@@ -643,16 +644,18 @@ RETURNING c.remaining_deps
 
 
 # Revoke the leases of the running actions claimed ahead of one of :keys, and of those claimed ahead of them, sending
-# them back to waiting as abandoned without the attempt counting. Their parents went back to waiting, so they could
-# only wait out their limit, holding a worker and a slot of the cap; when a parent is re-queued, its outputs they
-# may have taken are gone too. An action claimed ahead of :keys has one as a parent, or one any number of generations
-# up across parents that were claimed ahead too, running or since done (an action keeps ``ahead`` once done): not
-# only ``ahead_depth`` of them, since parents that finish before their own parents make their children generation 0,
-# and the children's claims ahead then reach further up. The walk keeps no distance, so it reaches each ancestor
-# once whatever the number of paths to it. The
-# batch's few running actions claimed ahead are read first and each is tested by its edges, so the statement reads
-# no more than those whatever the planner guesses of a batch inserted since its last statistics; a join here would
-# be planned over all the batch's edges.
+# them back to waiting without the attempt counting. Their parents went back to waiting, so they could only wait out
+# their limit, holding a worker and a slot of the cap; when a parent is re-queued, its outputs they may have taken are
+# gone too. They gave up nothing themselves, so they aren't abandoned: once their unfinished parents run again they
+# may be claimed ahead again, or the rest of a long chain would be built one link at a time after a single retry
+# above it. Each revoke costs the ancestor that went back to waiting an attempt or an interruption, or abandons it.
+# An action claimed ahead of :keys has one as a parent, or one any number of generations up across parents that were
+# claimed ahead too, running or since done (an action keeps ``ahead`` once done): not only ``ahead_depth`` of them,
+# since parents that finish before their own parents make their children generation 0, and the children's claims
+# ahead then reach further up. The walk keeps no distance, so it reaches each ancestor once whatever the number of
+# paths to it. The batch's few running actions claimed ahead are read first and each is tested by its edges, so the
+# statement reads no more than those whatever the planner guesses of a batch inserted since its last statistics; a
+# join here would be planned over all the batch's edges.
 REVOKE_AHEAD = sa.text("""
 WITH RECURSIVE ahead_running AS MATERIALIZED (
     SELECT a.batch_id, a.input_key, ARRAY(
@@ -677,7 +680,7 @@ WITH RECURSIVE ahead_running AS MATERIALIZED (
     UNION
     SELECT c.input_key FROM revoked r CROSS JOIN ahead_running c WHERE r.input_key = ANY(c.parents)
 ), unleased AS (
-    UPDATE actions SET state = 'waiting', ahead = 'abandoned', attempts = attempts - 1
+    UPDATE actions SET state = 'waiting', ahead = 'no', attempts = attempts - 1
     WHERE batch_id = :batch_id AND input_key = ANY(ARRAY(SELECT input_key FROM revoked)) RETURNING input_key
 )
 DELETE FROM leases WHERE batch_id = :batch_id AND input_key = ANY(ARRAY(SELECT input_key FROM unleased))
@@ -2375,7 +2378,7 @@ class Coordinator:
 
     async def _requeue(self, conn: AsyncConnection, batch_id: UUID, input_key: str, *, ahead_batch: bool) -> None:
         """Send a done action back to waiting, to be built again. In a batch that loads ahead, the actions claimed
-        ahead of it lose their leases and wait as abandoned, without the attempt counting (REVOKE_AHEAD)."""
+        ahead of it lose their leases and wait, without the attempt counting (REVOKE_AHEAD)."""
         requeued = await conn.execute(
             sa.text(
                 "UPDATE actions SET state = 'waiting' WHERE batch_id = :batch_id AND input_key = :input_key "
@@ -2402,7 +2405,7 @@ class Coordinator:
     async def _back_to_waiting(self, conn: AsyncConnection, batch_id: UUID, input_key: str, *, ahead_batch: bool) -> None:
         """Set a running action of ``batch_id`` waiting. In a batch that loads ahead, a claim ahead of it no longer
         waits for a running parent, so it is revoked (REVOKE_AHEAD), and the action, if it was claimed
-        ahead itself, is a plain one from now on unless it was abandoned."""
+        ahead itself, is no longer one ahead (an abandoned one stays abandoned)."""
         if ahead_batch:
             await conn.execute(
                 REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]}

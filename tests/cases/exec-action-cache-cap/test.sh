@@ -179,6 +179,10 @@ evicted "$cache/blobs/$blob2" "a blob whose entry was evicted"
 evicted "$cache/blobs/$orphan" "an old unreferenced blob"
 kept "$cache/blobs/$recent_orphan" "a recently used unreferenced blob"
 evicted "$cache/theory-modules/old.pmo" "an old compiled theory module"
+# The sweep logs how long each step held gc.lock.
+grep -Eq '^holbuild: worker cache sweep \(ms\): (wait=[0-9]+ )?walk=[0-9]+ families=[0-9]+ evict=[0-9]+ rewalk=[0-9]+$' \
+  "$tmpdir/exec.log" ||
+  { echo "no step timing for the sweep" >&2; cat "$tmpdir/exec.log" >&2; exit 1; }
 
 # Under the cap, the toolchain remains. Private checkpoints are still cleared
 # after the action, independently of the cap.

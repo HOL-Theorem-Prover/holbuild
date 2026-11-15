@@ -372,7 +372,11 @@ fun probe_all probe urls =
    goes on through their answers in rank order; a GET asks a node whose probe
    found the entry for its body.
    A read whose 200 body fails `usable` counts as that node's 404, so a replica
-   holding a weaker copy does not hide a better one on the next node. *)
+   holding a weaker copy does not hide a better one on the next node.
+   A cache of one node gets the second attempt on that node: a 429 or 5xx
+   answer to its first request is asked again once.  No answer at all is not,
+   so an unreachable cache still costs one attempt per request until the
+   breaker trips. *)
 fun routed_status_using usable method probe urls path request =
   let
     val read = method = "GET" orelse method = "HEAD"
@@ -404,6 +408,10 @@ fun routed_status_using usable method probe urls path request =
               val result = if rejected then HolbuildHttp.Response 404 else result
               val misses = if miss then misses + 1 else misses
               val missing = if read andalso result = HolbuildHttp.Response 404 then SOME (node, result) else missing
+              val rest =
+                if count = 0 andalso null rest andalso transient result andalso not (unanswered result) then
+                  [(node, ask node)]
+                else rest
             in
               if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
                 loop (if miss andalso misses = 2 andalso not (null rest) then probe_rest rest else rest)

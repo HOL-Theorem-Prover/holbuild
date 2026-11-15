@@ -16,6 +16,14 @@ type checkpoint = {kind : string, name : string, safe_name : string, theorem_sta
                    deps_key : string, checkpoint_key : string,
                    proof_ir_plan : string option, proof_ir_factories : string option}
 
+(* Where a checkpoint's proof unit is in the script. *)
+fun checkpoint_boundary ({kind, name, safe_name, theorem_start, theorem_stop, boundary, tactic_start,
+                          tactic_end, tactic_text, proof_attrs, prefix_hash, ...} : checkpoint) : boundary =
+  {kind = kind, name = name, safe_name = safe_name, theorem_start = theorem_start,
+   theorem_stop = theorem_stop, boundary = boundary, tactic_start = tactic_start,
+   tactic_end = tactic_end, tactic_text = tactic_text, proof_attrs = proof_attrs,
+   prefix_hash = prefix_hash}
+
 type termination = {name : string, safe_name : string, definition_start : int,
                     definition_stop : int, boundary : int,
                     quote_start : int, quote_end : int, quote_text : string,
