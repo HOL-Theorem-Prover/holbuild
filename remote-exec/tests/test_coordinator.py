@@ -2621,6 +2621,25 @@ async def test_a_failed_run_without_a_log_gives_its_detail_in_events(http: httpx
     assert events[-1] == {"type": "batch", "state": "done", "failure": None}
 
 
+async def test_a_failure_without_a_log_keeps_the_log_of_an_earlier_attempt(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "memory"))).status_code == 200
+    token = await claim_named(http, "a", tier="high")
+    draining = "the worker drained before exec-action finished"
+    assert (await complete(http, token, result("a", "failed", "unavailable", detail=draining))).status_code == 200
+    action = (await batch(http, batch_id))["actions"][0]
+    assert (action["state"], action["last_failure"], action["failure_detail"], action["log_sha256"]) == (
+        "ready", "unavailable", draining, "a" * 64
+    )
+    # A success's log, or its lack of one, replaces it.
+    token = await claim_named(http, "a", tier="high")
+    built = f"holbuild-action-result-v1\nspec={spec('a')}\ninput-key={input_key('a')}\nstatus=built\nwall-ms=10\n"
+    assert (await complete(http, token, built)).status_code == 200
+    action = (await batch(http, batch_id))["actions"][0]
+    assert (action["state"], action["last_failure"], action["log_sha256"]) == ("done", None, None)
+
+
 async def test_expired_run_attempt_fails_only_its_action(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
     coordinator.settings.max_attempts = 2
     batch_id = await submit(http, ["a", "b"], **{"class": "run"})

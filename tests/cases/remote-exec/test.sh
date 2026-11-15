@@ -2236,6 +2236,25 @@ require_grep 'remote execution: batch .* failed' "$tmpdir/publish-missing-log.lo
 require_no_file "$local_log"
 cmp "$remote_root/ac/$ac" "$tmpdir/publish-resident"
 
+# A retried action reports the attempts it used, its tier and the log its
+# failed attempt left, not only its failure.
+project=$tmpdir/retried
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxr"
+
+[build]
+members = ["src"]
+TOML
+write_theories retried
+touch "$state/retried"
+run retried 0 build --remote-exec "$coordinator" --remote-only BTheory
+rm "$state/retried"
+require_grep "holbuild: remote rxr:BTheory: waiting (memory: killed by SIGKILL), attempts 1, tier high, log /cas/$(printf 'c%.0s' {1..64})$" \
+  "$tmpdir/retried.log"
+require_grep "holbuild: remote rxr:BTheory: done$" "$tmpdir/retried.log"
 
 # Cache ring replicas can disagree on an entry's timeout contract.  With the
 # weaker copy on the node ranked first, batch export and restore must find the

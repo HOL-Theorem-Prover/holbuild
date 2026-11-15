@@ -447,8 +447,8 @@ STATEMENTS = [
     ),
     Statement("SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions", lease, 11_000),
     Statement(
-        "UPDATE actions SET log_sha256 = :log, last_failure = :failure",
-        lambda f: {**lease(f), "log": "log", "failure": None, "detail": None, "timings": json.dumps({"total": 1.0})},
+        "UPDATE actions SET log_sha256 = CASE WHEN CAST(:failed AS boolean)",
+        lambda f: {**lease(f), "failed": False, "log": "log", "failure": None, "detail": None, "timings": json.dumps({"total": 1.0})},
         10_000,
     ),
     Statement("UPDATE actions SET tier = 'high'", lease, 10_000),
