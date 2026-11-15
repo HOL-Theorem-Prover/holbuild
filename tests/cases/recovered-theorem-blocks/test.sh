@@ -7,6 +7,9 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../lib.sh
 source "$SCRIPT_DIR/../../lib.sh"
 
+# A theorem block HOL's source parser reports an error in, and recovers from,
+# is not instrumented: the script runs it as written and fails on that error.
+#
 # A failed-prefix checkpoint matches a theorem by the source before it and its
 # header.  An edit that fixes the proof but deletes its QED keeps both, and
 # replaying the checkpoint as `Theorem target = ...;` closed the block, so the
@@ -29,7 +32,7 @@ git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 rev = "$(holbuild_pinned_hol_rev)"
 
 [project]
-name = "failed-prefix-missing-qed"
+name = "recovered-theorem-blocks"
 
 [build]
 members = ["src"]
@@ -85,5 +88,29 @@ fi
 if [[ -n "$(find "$project" -name 'ATheory.dat' -print -quit)" ]]; then
   find "$project" -name 'ATheory.dat' >&2
   echo "exported the theory of an unclosed theorem" >&2
+  exit 1
+fi
+
+# A block with no tactic was instrumented as `proof_ir_tactic (fn () => ())`,
+# so HOL reported ML type errors in the generated code instead.
+cat > "$project/src/AScript.sml" <<'SML'
+Theory A
+Ancestors list
+
+Theorem target:
+  T
+Proof
+QED
+SML
+empty_log=$tmpdir/empty-tactic.log
+if (cd "$project" && "$HOLBUILD_BIN" build ATheory) > "$empty_log" 2>&1; then
+  cat "$empty_log" >&2
+  echo "built a theory whose theorem has no tactic" >&2
+  exit 1
+fi
+require_grep "AScript.sml:7:1-4: parse error: expected identifier" "$empty_log"
+if grep -q 'proof_ir_tactic' "$empty_log"; then
+  cat "$empty_log" >&2
+  echo "instrumented a theorem with no tactic" >&2
   exit 1
 fi

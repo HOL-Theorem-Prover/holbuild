@@ -82,7 +82,7 @@ A tracing-kernel build runs root-package theories as `--skip-checkpoints --skip-
 
 ## Parser recovery
 
-HOL source parse errors are build failures. When HOLSourceParser recovery occurs, holbuild may warn and keep recovered theorem/resume boundaries for best-effort instrumentation and diagnostics before HOL reports the failing script-play status. This avoids the old all-or-nothing fallback where one later parse recovery could disable proof IR/timeouts for the whole theory.
+HOL source parse errors are build failures. When HOLSourceParser recovery occurs, holbuild warns and keeps the boundaries of the theorem/resume blocks that parsed cleanly, so proof IR, timeouts and checkpoints still cover them. A block the parser reported an error in (a missing `QED` or `Proof`, an empty tactic) gets no boundary: it is neither instrumented nor resumed from a checkpoint, and HOL reports the error at its source line. This avoids the old all-or-nothing fallback where one later parse recovery could disable proof IR/timeouts for the whole theory.
 
 ## Tactic timeout flow
 
