@@ -542,6 +542,30 @@ async def test_a_chain_two_batches_share_is_claimed_ahead_again_after_a_revoke_u
     assert await states(http, first) == await states(http, second) == dict.fromkeys(names, "done")
 
 
+async def test_a_chain_two_batches_share_is_claimed_ahead_by_the_other_once_the_one_holding_it_is_cancelled(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", 0)
+    coordinator.settings.claim_ranking_seconds = 0  # the cancel wakes no claim; the next one reads the batch again
+    names, edges = chain(4)
+    first = await submit(http, names, edges, speculative_loading="16", priority="3")
+    await claim_named(http, "t0")
+    for name in names[1:]:
+        assert (await claim_ahead(http) or {}).get("theory") == f"pkg:{name}"
+    second = await submit(http, names, edges, speculative_loading="16", priority="2")
+
+    assert (await http.post(f"/v1/batches/{first}/cancel", headers=CLIENT)).status_code == 200
+    tokens = {"t0": await claim_named(http, "t0")}
+    for name in names[1:]:
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == f"pkg:{name}"
+        tokens[name] = claimed["attempt_token"]
+    for name in names:
+        cache.keys.add(ac_key(name))
+        assert (await complete(http, tokens[name], result(name, "built"))).status_code == 200
+    assert await states(http, second) == dict.fromkeys(names, "done")
+
+
 async def test_a_lease_lost_while_waiting_ahead_costs_no_attempt(
     http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
 ) -> None:
