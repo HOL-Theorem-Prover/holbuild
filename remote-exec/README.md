@@ -518,8 +518,10 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   back to waiting (a retry, an expired lease, a done parent built again)
   revokes the leases of the actions claimed ahead of it, and of those claimed
   ahead of them, also across ancestors claimed ahead that have finished since,
-  and sends them back to waiting without counting the claim; so
-  does a lease that expires while its action waits ahead. Batches without the
+  and sends them back to waiting without counting the claim, to be claimed
+  ahead again once their unfinished parents run again. A lease that expires
+  while its action waits ahead sends it back to waiting without counting the
+  claim too, but it is then claimed only once its parents are done. Batches without the
   parameter are never claimed ahead. An action runs the `exec-action` of the
   holbuild release that exported it, and only 0.14.36 and later serve claims
   more than one generation ahead: raise `REMOTE_EXEC_AHEAD_DEPTH` above 1 only

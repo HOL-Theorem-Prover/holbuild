@@ -268,7 +268,7 @@ async def test_a_failed_parent_cancels_the_child_claimed_ahead_of_it(http: httpx
     assert (await http.post(f"/v1/work/{b['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
 
 
-async def test_a_requeued_parent_revokes_the_child_claimed_ahead_as_abandoned(
+async def test_a_requeued_parent_revokes_the_child_claimed_ahead(
     http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
 ) -> None:
     await submit(http, ["p1", "p2", "c", "d"], [("c", "p1"), ("c", "p2"), ("d", "p1")], speculative_loading="4")
@@ -281,7 +281,7 @@ async def test_a_requeued_parent_revokes_the_child_claimed_ahead_as_abandoned(
     cache.keys.discard(ac_key("p1"))
     missing = result("d", "failed", "input-missing", missing=f"theory {input_key('p1')}")
     assert (await complete(http, d, missing)).status_code == 200
-    assert await ahead_state(remote_exec_engine, "c") == ("waiting", "abandoned", 0, 2)
+    assert await ahead_state(remote_exec_engine, "c") == ("waiting", "no", 0, 2)
     assert (await http.post(f"/v1/work/{c['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
 
 
@@ -489,8 +489,57 @@ async def test_a_parent_back_to_waiting_revokes_what_was_claimed_ahead_of_it_and
 
     # "b" gives up loading ahead; "c" can't get its parent's outputs before "b" is claimed again.
     assert (await complete(http, b["attempt_token"], result("b", "failed", "ahead-abandoned"))).status_code == 200
-    assert await ahead_state(remote_exec_engine, "c") == ("waiting", "abandoned", 0, 1)
+    assert await ahead_state(remote_exec_engine, "c") == ("waiting", "no", 0, 1)
     assert (await http.post(f"/v1/work/{c['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
+
+
+async def test_a_chain_revoked_by_its_root_s_retry_is_claimed_ahead_again_once_the_root_runs_again(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", 0)
+    names, edges = chain(5)
+    await submit(http, names, edges, speculative_loading="16")
+    root = await claim_named(http, "t0")
+    for name in names[1:]:
+        assert (await claim_ahead(http) or {}).get("theory") == f"pkg:{name}"
+
+    assert (await complete(http, root, result("t0", "failed", "publish"))).status_code == 200
+    assert [await ahead_state(remote_exec_engine, name) for name in names[1:]] == [("waiting", "no", 0, 1)] * 4
+    await claim_named(http, "t0")
+    for generation in range(1, len(names)):
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == f"pkg:{names[generation]}"
+        assert claimed["ahead_parents"] == ancestors_first(*names[:generation])
+
+
+# After the revoke the root is claimed again by the batch that held the chain, whose copies were revoked, or, if the
+# other batch ranks first, by that one, whose copies were never claimed.
+@pytest.mark.parametrize(("first_priority", "root_batch"), [("3", 0), ("1", 1)])
+async def test_a_chain_two_batches_share_is_claimed_ahead_again_after_a_revoke_until_both_are_done(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch,
+    first_priority: str, root_batch: int,
+) -> None:
+    monkeypatch.setattr(coordinator.settings, "ahead_depth", 0)
+    names, edges = chain(4)
+    first = await submit(http, names, edges, speculative_loading="16", priority=first_priority)
+    root = await claim_named(http, "t0")
+    for name in names[1:]:
+        assert (await claim_ahead(http) or {}).get("theory") == f"pkg:{name}"
+    second = await submit(http, names, edges, speculative_loading="16", priority="2")
+    assert await claim_ahead(http) is None  # every key is leased by the first batch
+
+    assert (await complete(http, root, result("t0", "failed", "publish"))).status_code == 200
+    tokens = {"t0": await claim_named(http, "t0")}
+    assert (await states(http, (first, second)[root_batch]))["t0"] == "running"
+    for name in names[1:]:
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"] == f"pkg:{name}"
+        tokens[name] = claimed["attempt_token"]
+    for name in names:
+        cache.keys.add(ac_key(name))
+        assert (await complete(http, tokens[name], result(name, "built"))).status_code == 200
+    assert await states(http, first) == await states(http, second) == dict.fromkeys(names, "done")
 
 
 async def test_a_lease_lost_while_waiting_ahead_costs_no_attempt(
@@ -509,6 +558,7 @@ async def test_a_lease_lost_while_waiting_ahead_costs_no_attempt(
     await coordinator.expire_leases()
     assert await ahead_state(remote_exec_engine, "b") == ("waiting", "abandoned", 0, 1)
     assert await ahead_state(remote_exec_engine, "a") == ("running", "no", 1, 0)
+    assert await claim_ahead(http) is None  # built once "a" is done, as one whose worker gave up
 
 
 async def test_input_missing_from_a_claim_ahead_counts_its_attempt_and_makes_it_plain(
@@ -562,7 +612,7 @@ async def test_below_the_priority_zero_floor_only_a_claim_ahead_of_an_earlier_ti
     assert claimed is not None and claimed["theory"] == f"pkg:{first}"
 
 
-async def test_a_parent_evicted_before_a_release_revokes_the_child_claimed_ahead_as_abandoned(
+async def test_a_parent_evicted_before_a_release_revokes_the_child_claimed_ahead(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: AsyncEngine
 ) -> None:
     await submit(
@@ -580,7 +630,7 @@ async def test_a_parent_evicted_before_a_release_revokes_the_child_claimed_ahead
     assert (await complete(http, q, result("q", "built"))).status_code == 200
     await coordinator.released()
     assert await ahead_state(remote_exec_engine, "p1") == ("ready", "no", 1, 0)
-    assert await ahead_state(remote_exec_engine, "c") == ("waiting", "abandoned", 0, 2)
+    assert await ahead_state(remote_exec_engine, "c") == ("waiting", "no", 0, 2)
 
 
 async def test_requeueing_a_parent_of_a_batch_that_does_not_load_ahead_looks_for_no_claim_ahead(
@@ -696,7 +746,7 @@ async def test_claiming_and_revoking_ahead_read_each_actions_edges_by_key(
         for batch_id in (small, large):
             assert await connection.scalar(
                 sa.text("SELECT ahead FROM actions WHERE batch_id = :id AND input_key = 'k16'"), {"id": batch_id}
-            ) == "abandoned"
+            ) == "no"
         await connection.rollback()
 
 
@@ -755,7 +805,7 @@ async def test_with_no_depth_limit_revoking_reads_each_ancestor_claimed_ahead_on
         assert await connection.scalar(
             sa.text("SELECT ahead FROM actions WHERE batch_id = :id AND input_key = :key"),
             {"id": batch_id, "key": f"t{n - 1}"},
-        ) == "abandoned"
+        ) == "no"
         await connection.rollback()
 
 
@@ -851,7 +901,7 @@ async def test_an_ancestor_back_to_waiting_revokes_a_claim_ahead_across_parents_
         assert (await complete(http, claims[name], result(name, "built"))).status_code == 200
     assert await ahead_state(remote_exec_engine, last) == ("running", "ahead", 1, 0)
     assert (await complete(http, root, result("t0", "failed", "publish"))).status_code == 200
-    assert (await ahead_state(remote_exec_engine, last))[1:3] == ("abandoned", 0)
+    assert (await ahead_state(remote_exec_engine, last))[1:3] == ("no", 0)
     assert (await http.post(f"/v1/work/{claims[last]}/heartbeat", headers=WORKER)).status_code == 409
     assert {name: state for name, state in (await states(http, batch_id)).items() if name in ancestors[1:]} == {
         name: "done" for name in ancestors[1:]
@@ -885,7 +935,7 @@ async def test_an_ancestor_back_to_waiting_revokes_a_claim_ahead_made_after_pare
         cache.keys.add(ac_key(name))
         assert (await complete(http, claims[name], result(name, "built"))).status_code == 200
     assert (await complete(http, root, result("t0", "failed", "publish"))).status_code == 200
-    assert (await ahead_state(remote_exec_engine, last))[1:3] == ("abandoned", 0)
+    assert (await ahead_state(remote_exec_engine, last))[1:3] == ("no", 0)
     assert (await http.post(f"/v1/work/{claimed['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
 
 
