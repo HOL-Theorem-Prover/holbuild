@@ -31,7 +31,9 @@
    the first wait step that has to wait shares it while the child is idle,
    with most of its ancestors loaded, and the save's own share then has
    little left to do.  Later waits don't share again: on a chain of late
-   parents they last only as long as one parent's own hand-off. *)
+   parents they last only as long as one parent's own hand-off.  A full GC
+   follows the share: the share frees the duplicates but leaves them in the
+   heap, and the GC hands that space back while the child waits. *)
 structure HolbuildAheadLoad =
 struct
   val dir = ref ""
@@ -168,7 +170,8 @@ struct
       (* Before waiting-P, so the timings count the share as loading. *)
       val _ =
         if !share andalso not (exists ("arrived-" ^ parent)) then
-          (share := false; PolyML.shareCommonData PolyML.rootFunction; write "shared" parent)
+          (share := false; PolyML.shareCommonData PolyML.rootFunction; PolyML.fullGC ();
+           write "shared" parent)
         else ()
       val _ = write ("waiting-" ^ parent) ""
       val _ = await ("arrived-" ^ parent)
