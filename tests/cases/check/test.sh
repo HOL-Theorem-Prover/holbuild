@@ -33,6 +33,11 @@ val _ = new_constant ("magic", ``:bool``);
 val magic_ax = new_axiom ("magic_ax", ``magic``);
 val _ = export_theory();
 SML
+cat > "$dep/src/depShellLib.sml" <<'SML'
+structure depShellLib = struct
+fun run cmd = OS.Process.system cmd
+end
+SML
 dep_rev=$(init_git_repo "$dep")
 
 {
@@ -218,6 +223,29 @@ run_check BypassTheory 1
 require_grep "^consumer:src/BypassScript.sml:5: kernel bypass: disk_thm$" "$log"
 require_grep "^BypassTheory: 1 finding$" "$log"
 require_no_grep "RunCall\|unsafeCast\|PolyML" "$log"
+
+# HOL's own sources are not scanned, even a library HOL builds on demand
+# (aiLib calls OS.Process.system); a dependency package's sources are.
+cat > "$project/src/HolLibScript.sml" <<'SML'
+Theory HolLib
+Libs aiLib
+Theorem hol_lib_thm: T
+Proof simp[]
+QED
+SML
+cat > "$project/src/DepLibScript.sml" <<'SML'
+Theory DepLib
+Libs depShellLib
+Theorem dep_lib_thm: T
+Proof simp[]
+QED
+SML
+run_check HolLibTheory 0
+require_grep "^HolLibTheory: clean (1 theorem)$" "$log"
+require_no_grep "kernel bypass" "$log"
+run_check DepLibTheory 1
+require_grep "^dep:src/depShellLib.sml:2: kernel bypass: OS.Process.system$" "$log"
+require_grep "^DepLibTheory: 1 finding$" "$log"
 
 # Reports are the same as separate checks, in selector order, even after a finding.
 selectors=(CheatTheory CleanTheory UsesTheory HypothesesTheory BypassTheory CleanTheory)
