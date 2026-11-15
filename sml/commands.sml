@@ -3260,11 +3260,21 @@ fun parse_check_selector selector =
         else {theory = theory, theorem = SOME theorem}
     | _ => raise Error "check requires THEORY or THEORY:THEOREM"
 
+(* The implicit HOL package's id as source-index nodes carry it, so that
+   HOL's own sources can be told apart from the project's. *)
+fun hol_package_id tc project =
+  let
+    val graph = HolbuildProjectGraph.resolve {project = project, resolution = resolution_for_toolchain tc}
+    val hol = HolbuildProjectGraph.hol graph
+  in
+    case List.find (fn package => HolbuildProjectGraph.package_id package = hol)
+                   (HolbuildProjectGraph.packages graph) of
+        SOME package => HolbuildSourceIndex.source_graph_package_id package
+      | NONE => raise Error "dependency graph has no hol package"
+  end
+
 (* The theory names HOL itself does not declare: those of the root package
    and its dependency packages.  Axioms in these theories are findings. *)
-fun hol_package_id tc project =
-  HolbuildProjectGraph.hol
-    (HolbuildProjectGraph.resolve {project = project, resolution = resolution_for_toolchain tc})
 
 fun project_theory_names hol index =
   let
