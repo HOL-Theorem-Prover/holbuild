@@ -88,13 +88,15 @@ fun parse_error_text source_path source_text _ (start, _) msg =
   in String.concat ["HOL source parse error: ", msg, "\n", "source: ", source_path, ":", Int.toString line, ":", Int.toString col, "\n", source_context_text source_text line] end
 fun raise_parse_error source_path source_text loc span msg = raise Error (parse_error_text source_path source_text loc span msg)
 
-(* PARSE_ERROR is called for each error the parser reports, as it parses.  A
-   theorem or resume block it reported an error in has no boundary: the parser
-   recovered from it (a missing QED or Proof, an empty tactic), and
-   instrumenting the block would hide or garble the error (replaying a
-   failed-prefix checkpoint as `Theorem name = ...;` closes a block that has
-   no QED), so the script runs it as written and HOL reports the error. *)
-fun scan_boundaries source_path source parse_error =
+(* PARSE_ERROR is called for each error the parser reports, as it parses.
+   Without KEEP_ERRORED, a theorem or resume block it reported an error in has
+   no boundary.  The build instruments the blocks it gets boundaries for, and
+   instrumenting one the parser recovered from (a missing QED or Proof, an
+   empty tactic) would hide or garble the error: replaying a failed-prefix
+   checkpoint as `Theorem name = ...;` closes a block that has no QED.  So the
+   script runs it as written and HOL reports the error.  Commands that only
+   show a theorem's plan keep such blocks. *)
+fun scan_boundaries source_path source parse_error keep_errored =
   let val error_count = ref 0
       fun record loc span msg = (error_count := !error_count + 1; parse_error loc span msg)
       val result = HOLSourceParser.parseSML source_path (parser_reader source) record HOLSourceParser.initialScope
@@ -107,7 +109,7 @@ fun scan_boundaries source_path source parse_error =
       fun loop acc =
         let val errors_before = !error_count
             val dec = #parseDec result ()
-            val clean = !error_count = errors_before
+            val clean = keep_errored orelse !error_count = errors_before
         in
           case dec of
               NONE => rev acc
@@ -127,13 +129,13 @@ fun scan_boundaries source_path source parse_error =
         end
   in loop [] end
 
-fun scan source_path source_text = scan_boundaries source_path source_text ignore_parse_error
+fun scan source_path source_text = scan_boundaries source_path source_text ignore_parse_error true
 fun scan_strict source_path source_text =
-  scan_boundaries source_path source_text (raise_parse_error source_path source_text)
+  scan_boundaries source_path source_text (raise_parse_error source_path source_text) false
 fun scan_recovering source_path source_text =
   let val errors = ref []
       fun record loc span msg = errors := parse_error_text source_path source_text loc span msg :: !errors
-      val boundaries = scan_boundaries source_path source_text record
+      val boundaries = scan_boundaries source_path source_text record false
   in {boundaries = boundaries, errors = rev (!errors)} end
 
 fun qdecl_start (HOLSourceAST.QuoteLiteral (pos, _)) = pos
