@@ -9440,8 +9440,9 @@ fun spec_resolver (spec : spec_deps) =
     fn name => Option.map (fn stem => (stem, order name)) (Binarymap.peek (stems, name))
   end
 
-(* The spec's theory action, its checkpoints keyed on DEPS_KEY. *)
-fun spec_theory_action root (spec : action_spec) deps_key : theory_action =
+(* The spec's theory action, its checkpoints keyed on DEPS_KEY, preloading
+   LOADS. *)
+fun spec_theory_action root (spec : action_spec) {deps_key, loads} : theory_action =
   let
     val package = #package spec
     val path = #path (#source spec)
@@ -9461,7 +9462,7 @@ fun spec_theory_action root (spec : action_spec) deps_key : theory_action =
           | _ => reject_spec "the action text has more than one source-name line"),
      script_dir = script_dir,
      inputs = map (fn {path, ...} => {path = path, from = in_root root (action_source_path package path)}) (#inputs spec),
-     loads = #loads spec,
+     loads = loads,
      outputs = #outputs spec,
      extra_outputs = #extra_outputs spec}
   end
@@ -11165,7 +11166,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
    earlier build's input key. *)
 val early_cutoff_header = "holbuild-early-cutoff-v1"
 
-type early_cutoff = {pair_key : string, deps_key : string}
+type early_cutoff = {pair_key : string, deps_key : string, loads : theory_load list}
 
 fun unkeyed_dep_line line =
   if String.isPrefix "dep=" line then
@@ -11174,12 +11175,62 @@ fun unkeyed_dep_line line =
       | _ => line
   else line
 
+(* The spec's preloads that HOL's loader skips: Meta.load does nothing for a
+   module it has loaded, so a preload whose module an earlier one already
+   loaded through the load manifests restored in ROOT changes nothing.  A
+   proof that names a theory its ancestors load adds such a preload.  Only
+   project modules, named by path, are followed, so a preload reached only
+   through a HOL module is kept; so is every preload when a manifest can't
+   be read. *)
+fun skipped_preloads root (spec : action_spec) =
+  let
+    fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
+    val lib_manifests =
+      map (fn {stem, suffix, loads, ...} => (in_root root stem ^ suffix, map lib_load loads)) (#libs spec)
+    fun manifest file =
+      case List.find (fn (path, _) => path = file) lib_manifests of
+          SOME (_, lines) => lines
+        | NONE =>
+            String.tokens (fn c => c = #"\n")
+              (read_text (if file_exists file then file else hfs_remapped_path file))
+    fun is_file entry = has_suffix ".sml" entry orelse has_suffix ".sig" entry
+    fun visit (entry, loaded) =
+      if is_file entry orelse not (Path.isAbsolute entry) orelse
+         Binaryset.member (loaded, Path.file entry) then loaded
+      else
+        List.foldl visit (Binaryset.add (loaded, Path.file entry))
+          (manifest (entry ^ ".ui") @ manifest (entry ^ ".uo"))
+    fun module (LoadTheory name) = name
+      | module (LoadLibrary name) = name
+      | module (LoadObject stem) = in_root root stem
+    fun preload (load, (loaded, skipped)) =
+      if Binaryset.member (loaded, Path.file (module load)) then (loaded, load :: skipped)
+      else (visit (module load, loaded), skipped)
+  in
+    rev (#2 (List.foldl preload (Binaryset.empty String.compare, []) (#loads spec)))
+    handle IO.Io _ => []
+  end
+
+(* The action text's dep= line of a preload. *)
+fun preload_dep_lines (spec : action_spec) load =
+  case load of
+      LoadTheory name => ["dep=HOL:" ^ name]
+    | LoadLibrary name => ["dep=HOLLIB:" ^ name]
+    | LoadObject stem =>
+        map (fn {target, ...} => "dep=" ^ target)
+          (List.filter (fn {stem = s, ...} => s = stem)
+             (map (fn {target, stem, ...} => {target = target, stem = stem}) (#deps spec) @
+              map (fn {target, stem, ...} => {target = target, stem = stem}) (#libs spec)))
+
 (* The pair key, and the key of the dependency context (deps_loaded.save and
    the checkpoints above it) on the same dependency outputs, from the files
    restored in ROOT, hashed by DAT_HASH (a .dat) and FILE_HASHES (the rest).
    Those name ROOT, so both keys are for one action root, as the shared heap
-   key is.  NONE when a file can't be read. *)
-fun spec_early_cutoff_with {dat_hash, file_hashes} root (spec : action_spec) : early_cutoff option =
+   key is.  With SKIP_LOADED, the context leaves out the preloads HOL's
+   loader skips (skipped_preloads), so an edit that adds one keeps the
+   context; the root's manifests must then be the dependencies' own.  NONE
+   when a file can't be read. *)
+fun spec_early_cutoff_with {dat_hash, file_hashes, skip_loaded} root (spec : action_spec) : early_cutoff option =
   let
     val text_lines = String.fields (fn c => c = #"\n") (#action_text spec)
     val self_key =
@@ -11202,7 +11253,11 @@ fun spec_early_cutoff_with {dat_hash, file_hashes} root (spec : action_spec) : e
       HolbuildHash.string_sha256
         (String.concatWith "\n"
            ("holbuild-remote-deps-output-v1" :: theory_lines @ library_lines @ lib_lines) ^ "\n")
-    val dep_lines = map unkeyed_dep_line (List.filter (String.isPrefix "dep=") text_lines)
+    val skipped = if skip_loaded then skipped_preloads root spec else []
+    val skipped_lines = List.concat (map (preload_dep_lines spec) skipped)
+    val dep_lines =
+      List.filter (fn line => not (List.exists (fn s => s = line) skipped_lines))
+        (map unkeyed_dep_line (List.filter (String.isPrefix "dep=") text_lines))
   in
     SOME {pair_key =
             HolbuildHash.string_sha256
@@ -11213,7 +11268,8 @@ fun spec_early_cutoff_with {dat_hash, file_hashes} root (spec : action_spec) : e
               (String.concatWith "\n"
                  (["holbuild-remote-dependency-context-v2",
                    "toolchain=" ^ action_text_value spec "toolchain",
-                   "deps-output=" ^ deps_output_key] @ dep_lines) ^ "\n")}
+                   "deps-output=" ^ deps_output_key] @ dep_lines) ^ "\n"),
+          loads = List.filter (fn load => not (List.exists (fn s => s = load) skipped)) (#loads spec)}
   end
   handle e => (warn ("no early cutoff: " ^ General.exnMessage e); NONE)
 
@@ -11268,6 +11324,13 @@ fun reuse_earlier_build remote root (spec : action_spec) entry =
                   true))
         end
   handle e => (warn ("early cutoff failed, building: " ^ General.exnMessage e); false)
+
+(* The dependency context a build of SPEC runs in: CUTOFF's, else the
+   spec's. *)
+fun cutoff_context (spec : action_spec) (cutoff : early_cutoff option) =
+  case cutoff of
+      SOME {deps_key, loads, ...} => {deps_key = deps_key, loads = loads}
+    | NONE => {deps_key = #deps_key spec, loads = #loads spec}
 
 (* After a build: the pair names this action's entry, replacing an entry
    whose build may have left the cache. *)
@@ -12315,12 +12378,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         val (done, cutoff) =
           phase "cutoff" (fn () =>
             let
-              val cutoff = spec_early_cutoff_with (resident_hashes (!resident)) root spec
+              val {dat_hash, file_hashes} = resident_hashes (!resident)
+              val cutoff =
+                spec_early_cutoff_with {dat_hash = dat_hash, file_hashes = file_hashes, skip_loaded = true}
+                  root spec
               (* A miss walks every cache node, so the action's own entry and
                  the earlier build's are looked up side by side. *)
               val done = ref false
               val earlier = ref (fn () => NONE)
-              fun look_up_earlier {pair_key, deps_key = _} =
+              fun look_up_earlier ({pair_key, ...} : early_cutoff) =
                 let val entry = HolbuildRemoteCache.get_action remote pair_key
                 in earlier := (fn () => entry) end
                 handle e => earlier := (fn () => raise e)
@@ -12353,8 +12419,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               NONE => phase "modules" (fn () => fill_module_store cache root tc {deps = #deps spec, loads = #loads spec})
             | SOME _ => ()
         val action =
-          spec_theory_action root spec
-            (case cutoff of SOME {deps_key, ...} => deps_key | NONE => #deps_key spec)
+          spec_theory_action root spec (cutoff_context spec cutoff)
         (* A local entry that didn't restore must not stand in for this
            build's when the publication is checked, and, as in a local
            build, its theory's checkpoints may hold parents other than
@@ -12522,7 +12587,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         val _ = phase "modules" (fn () => fill_module_store cache root tc {deps = present, loads = #loads spec})
         val tool_cache = setup_tool_cache spec
         (* The stage's names don't depend on the deps context. *)
-        val action = spec_theory_action root spec (#deps_key spec)
+        val action = spec_theory_action root spec (cutoff_context spec NONE)
         val stage = action_stage root action
         val dir = in_root root ".holbuild/ahead"
         val _ = (prepare_theory_stage false tc root action; remove_tree dir; ensure_dir dir)
@@ -12723,9 +12788,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                end;
                drop "stand-ins";
                wait_until poll ahead_poll_interval;
-               spec_early_cutoff_with {dat_hash = hash_of, file_hashes = map hash_of} root spec)
+               (* The late parents' manifests in the root are stand-ins. *)
+               spec_early_cutoff_with {dat_hash = hash_of, file_hashes = map hash_of, skip_loaded = false}
+                 root spec)
             val built_action =
-              spec_theory_action root spec (case cutoff of SOME {deps_key, ...} => deps_key | NONE => #deps_key spec)
+              spec_theory_action root spec (cutoff_context spec cutoff)
             (* What a plain build would take instead of running the script:
                the action's own entry, an earlier build's, or a shared heap
                (whose checkpoints may resume inside the script).  A plain run
