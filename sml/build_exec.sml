@@ -10489,13 +10489,16 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                    life. *)
                 val _ = publish {measured = Time.toNanoseconds (Time.now ()), ids = #ids shared,
                                  sizes = #sizes shared}
-                val (local_families, young_orphans) = timed "families" (fn () => local_cache_families cache)
                 val families =
-                  by_age ((if toolchains_owned_by_cache () then
-                             toolchain_trash_family () :: toolchain_cache_families () else []) @
-                          checkpoint_cache_families (collect_checkpoint_families checkpoint_root) @
-                          store_cache_families cache @ module_cache_families cache @
-                          local_families) @ by_age young_orphans
+                  timed "families" (fn () =>
+                    let val (local_families, young_orphans) = local_cache_families cache
+                    in
+                      by_age ((if toolchains_owned_by_cache () then
+                                 toolchain_trash_family () :: toolchain_cache_families () else []) @
+                              checkpoint_cache_families (collect_checkpoint_families checkpoint_root) @
+                              store_cache_families cache @ module_cache_families cache @
+                              local_families) @ by_age young_orphans
+                    end)
                 val after = timed "evict" (fn () => sweep total families)
               in
                 (* Measure again rather than publish an estimate derived from
