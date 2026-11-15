@@ -960,7 +960,7 @@ fun evict_store_family_if eligible dir =
               else
                 let val bytes = tree_bytes dir
                 in
-                  (HolbuildCache.remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
+                  (remove_tree dir handle e => (HolbuildFileLock.release lock; raise e));
                   HolbuildFileLock.release lock;
                   if path_exists dir then NONE else SOME bytes
                 end)
@@ -10198,7 +10198,7 @@ fun local_cache_families cache =
       List.foldl
         (fn (path, freed) =>
             let val bytes = tree_bytes path
-            in HolbuildCache.remove_tree path; if path_exists path then freed else freed + bytes end)
+            in remove_tree path; if path_exists path then freed else freed + bytes end)
         (0 : Position.int) paths
     fun release blob =
       case Redblackmap.peek (!users, blob) of
@@ -10327,7 +10327,7 @@ fun module_cache_families cache =
         evict = fn () =>
           let val bytes = tree_bytes path
           in
-            HolbuildCache.remove_tree path;
+            remove_tree path;
             if path_exists path then NONE else SOME bytes
           end})
     (HolbuildCache.children (HolbuildCache.theory_modules_dir cache))
@@ -10434,6 +10434,17 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       handle IO.Io _ => false
            | OS.SysErr _ => false
     fun by_age families = sort_by_mtime_ascending (fn ({mtime, ...} : cache_family) => mtime) families
+    (* Steps a sweep or its lock wait took, logged once so a slow cap or
+       post-result refresh can be attributed. *)
+    val steps : (string * LargeInt.int) list ref = ref []
+    fun timed name f =
+      let
+        val start = Time.now ()
+        val result = f ()
+      in
+        steps := !steps @ [(name, Time.toMilliseconds (Time.-(Time.now (), start)))];
+        result
+      end
     fun sweep total remaining =
       if total <= target then total
       else
@@ -10465,7 +10476,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
         if reuse andalso recent_scan_fits (fn () => private_size) then ()
         else
           let
-            val shared = measure_shared ()
+            val shared = timed "walk" measure_shared
             val total = sum (#sizes shared) + private_size
           in
             if total <= target then publish shared
@@ -10473,22 +10484,25 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
               let
                 (* Eviction can outlast the stamp's life. The fresh walk
                    only overestimates while it runs, so siblings within the
-                   limit reuse it instead of waiting on gc.lock. *)
-                val _ = publish shared
-                val (local_families, young_orphans) = local_cache_families cache
+                   limit reuse it instead of waiting on gc.lock. Stamped
+                   when the walk ends, so eviction gets the stamp's whole
+                   life. *)
+                val _ = publish {measured = Time.toNanoseconds (Time.now ()), ids = #ids shared,
+                                 sizes = #sizes shared}
+                val (local_families, young_orphans) = timed "families" (fn () => local_cache_families cache)
                 val families =
                   by_age ((if toolchains_owned_by_cache () then
                              toolchain_trash_family () :: toolchain_cache_families () else []) @
                           checkpoint_cache_families (collect_checkpoint_families checkpoint_root) @
                           store_cache_families cache @ module_cache_families cache @
                           local_families) @ by_age young_orphans
-                val after = sweep total families
+                val after = timed "evict" (fn () => sweep total families)
               in
                 (* Measure again rather than publish an estimate derived from
                    the mixed private and shared freed total, so a waiter on
                    gc.lock reuses the result rather than repeating the scan.
                    Until then siblings keep reusing the pre-eviction walk. *)
-                if after <= target then publish (measure_shared ())
+                if after <= target then publish (timed "rewalk" measure_shared)
                 else (remove_file state_path;
                       warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
                            gb_decimal_text target ^ " GB left under the cap after its reserve"))
@@ -10499,8 +10513,13 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
        lock lives outside locks/ and can be container-private. *)
     val lock_path = HolbuildCache.gc_lock_path cache
     fun locked lock reuse =
-      (scan reuse before HolbuildFileLock.release lock)
-      handle e => (HolbuildFileLock.release lock; raise e)
+      (((scan reuse before HolbuildFileLock.release lock)
+        handle e => (HolbuildFileLock.release lock; raise e));
+       if null (!steps) then ()
+       else HolbuildStatus.message_stderr
+              ("holbuild: worker cache sweep (ms): " ^
+               String.concatWith " " (map (fn (name, ms) => name ^ "=" ^ LargeInt.toString ms) (!steps)) ^
+               "\n"))
   in
     if refresh then
       let
@@ -10517,7 +10536,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     else
       let
         val _ = HolbuildFileLock.remove_obsolete_lock_dir "cache gc" lock_path
-        val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = lock_path}
+        val lock = timed "wait" (fn () => HolbuildFileLock.acquire_exclusive_path_wait {path = lock_path})
       in
         locked lock true
       end
