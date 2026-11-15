@@ -207,6 +207,9 @@ forget_local
 worker v2 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v2 0 "status=built"
 resumed v2 "deps-loaded checkpoint" "deps-loaded heap"
+# None of the published checkpoints is on the edited script's prefix, and
+# the index says so without a probe of each.
+require_grep "shared checkpoint index lists 0 of" "$tmpdir/v2.log"
 same_outputs v2
 
 # An edit of a late theorem resumes from the context after the one before.
@@ -217,7 +220,66 @@ forget_local
 worker v3 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v3 0 "status=built"
 resumed v3 "theorem-context checkpoint after t2" "theorem_context checkpoint"
+require_grep "shared checkpoint index lists [1-9][0-9]* of" "$tmpdir/v3.log"
 same_outputs v3
+
+# The index of the checkpoints published on each heap: a restore probes only
+# the checkpoints it lists, and probes every candidate without one.
+index_entries() { grep -lx "holbuild-shared-checkpoint-index-v1" "$tmpdir"/remote/ac/* || true; }
+# set_index KEY...: every index lists just KEYS.
+set_index() {
+  local manifest path
+  manifest="holbuild-shared-checkpoint-index-v1"$'\n'
+  for key in "$@"; do manifest+="checkpoint=$key"$'\n'; done
+  for path in $(index_entries); do
+    printf 'holbuild-remote-cache-action-v2\nmanifest-sha256 %s\nmanifest-size %s\nmanifest-text-v1\n%s' \
+      "$(printf '%s' "$manifest" | sha256sum | cut -d' ' -f1)" "${#manifest}" "$manifest" > "$path"
+  done
+}
+# drop_checkpoint THEOREM: the cache loses every entry of THEOREM's context.
+drop_checkpoint() {
+  local path
+  for path in $(grep -l "^blob=[0-9a-f]* leaf .*/$1_context\.save$" "$tmpdir"/remote/ac/*); do rm "$path"; done
+}
+[[ -n "$(index_entries)" ]] || { echo "no shared checkpoint index was published" >&2; exit 1; }
+
+# Without an index the late edit still resumes from the latest checkpoint,
+# and its publish writes the index again.
+rm $(index_entries)
+write_t "T \\/ F" "REFL_TAC" "ACCEPT_TAC TRUTH"
+export_t v3a
+forget_local
+worker v3a "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v3a 0 "status=built"
+resumed v3a "theorem-context checkpoint after t3" "theorem_context checkpoint"
+require_grep "no shared checkpoint index: probing all" "$tmpdir/v3a.log"
+[[ -n "$(index_entries)" ]] || { echo "v3a published no shared checkpoint index" >&2; exit 1; }
+
+# A listed checkpoint whose entry is gone is passed over for the next one.
+drop_checkpoint t4
+write_t "T \\/ F" "REFL_TAC" "ACCEPT_TAC TRUTH" "ACCEPT_TAC TRUTH"
+export_t v3b
+forget_local
+worker v3b "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v3b 0 "status=built"
+resumed v3b "theorem-context checkpoint after t3" "theorem_context checkpoint"
+
+# A published checkpoint the index doesn't list isn't probed: the edit
+# resumes from the heap, and its publish lists the checkpoints again.
+set_index
+write_t "T \\/ F" "REFL_TAC" "ACCEPT_TAC TRUTH" "REWRITE_TAC []"
+export_t v3c
+forget_local
+worker v3c "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v3c 0 "status=built"
+resumed v3c "deps-loaded checkpoint" "deps-loaded heap"
+require_grep "shared checkpoint index lists 0 of" "$tmpdir/v3c.log"
+write_t "T \\/ F" "REFL_TAC" "ACCEPT_TAC TRUTH" "MATCH_ACCEPT_TAC TRUTH"
+export_t v3d
+forget_local
+worker v3d "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v3d 0 "status=built"
+resumed v3d "theorem-context checkpoint after t4" "theorem_context checkpoint"
 
 # A failed proof shares its failed prefix, and the fixed proof resumes from it.
 write_t "T \\/ F" "FAIL_TAC \"seeded failure\""
