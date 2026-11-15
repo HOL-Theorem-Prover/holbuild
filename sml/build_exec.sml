@@ -11227,8 +11227,6 @@ fun reuse_earlier_build remote root (spec : action_spec) entry =
         end
   handle e => (warn ("early cutoff failed, building: " ^ General.exnMessage e); false)
 
-(* After a build: the pair names this action's entry, replacing an entry
-   whose build may have left the cache. *)
 (* The dependency context a build of SPEC runs in: CUTOFF's, else the
    spec's. *)
 fun cutoff_context (spec : action_spec) (cutoff : early_cutoff option) =
@@ -11236,6 +11234,8 @@ fun cutoff_context (spec : action_spec) (cutoff : early_cutoff option) =
       SOME {deps_key, loads, ...} => {deps_key = deps_key, loads = loads}
     | NONE => {deps_key = #deps_key spec, loads = #loads spec}
 
+(* After a build: the pair names this action's entry, replacing an entry
+   whose build may have left the cache. *)
 fun publish_early_cutoff remote pair_key input_key =
   case HolbuildRemoteCache.publish_action remote
          {key = pair_key, text = early_cutoff_header ^ "\ninput-key=" ^ input_key ^ "\n"} of
