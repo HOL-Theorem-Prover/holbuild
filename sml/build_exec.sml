@@ -10754,16 +10754,44 @@ fun shared_manifest_entries text =
             | _ => raise Error ("malformed shared checkpoint manifest line: " ^ line))
     (String.tokens (fn c => c = #"\n") text)
 
+(* Which of a theory's checkpoints are published on a heap, most recently
+   used first, so that a restore probes those rather than every boundary
+   of the script, most of which no build saved.  Only a hint: a listed
+   checkpoint is validated as any other, and one it doesn't list isn't
+   probed.  Theories can share a heap, so the theory is in the key. *)
+val shared_index_header = "holbuild-shared-checkpoint-index-v1"
+val shared_index_limit = 1024
+
+fun shared_index_key heap_key (action : theory_action) =
+  HolbuildHash.string_sha256
+    (String.concat [shared_index_header, "\nheap=", heap_key, "\npackage=", #package action,
+                    "\npath=", #relative_path action, "\n"])
+
+fun shared_index_text keys =
+  String.concat (shared_index_header ^ "\n" :: map (fn key => "checkpoint=" ^ key ^ "\n") keys)
+
+(* NONE for an entry of another format, which a restore treats as no index. *)
+fun shared_index_keys text =
+  case String.tokens (fn c => c = #"\n") text of
+      header :: lines =>
+        if header <> shared_index_header then NONE
+        else SOME (List.mapPartial (fn line => if String.isPrefix "checkpoint=" line
+                                               then SOME (String.extract (line, 11, NONE)) else NONE)
+                                   lines)
+    | [] => NONE
+
 type shared_context =
-  {store : string, checkpoint_root : string, heap_key : string, base_state : string,
+  {store : string, checkpoint_root : string, heap_key : string, index_key : string, base_state : string,
    deps_key : string, deps_loaded : string, requested_timeout : real option,
    candidates : shared_candidate list}
 
 fun shared_context cache checkpoint_root tc root policy (action : theory_action) checkpoints : shared_context =
-  let val base = action_checkpoint_base checkpoint_root action
+  let
+    val base = action_checkpoint_base checkpoint_root action
+    val heap_key = shared_heap_key tc root action
   in
     {store = share_store cache, checkpoint_root = checkpoint_root,
-     heap_key = shared_heap_key tc root action,
+     heap_key = heap_key, index_key = shared_index_key heap_key action,
      base_state = FS.fullPath (HolbuildToolchain.base_state tc),
      deps_key = #deps_key action,
      deps_loaded = deps_loaded_path base (#deps_key action),
@@ -10795,7 +10823,7 @@ val nothing_restored : shared_restore = {heap = NONE, files = [], stale = [], mi
    else the heap, placed in the action's checkpoint tree, which is empty. *)
 (* With RESUMES false the run saves every boundary itself, so only the heap
    is restored: a linked checkpoint would sit where it saves. *)
-fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, deps_key, deps_loaded,
+fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, deps_key, deps_loaded,
                                               requested_timeout, candidates, ...} : shared_context) resumes =
   let
     val stale = ref ([] : string list)
@@ -10908,6 +10936,29 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   SOME restored => SOME restored
                 | NONE => first_window heap (List.drop (candidates, n))
             end
+    (* Without an index (a heap published before there were any) every
+       candidate is probed. *)
+    fun listed [] = []
+      | listed candidates =
+          let val count = Int.toString (length candidates)
+          in
+            case Option.mapPartial (shared_index_keys o #manifest)
+                                   (HolbuildRemoteCache.fetch_action remote index_key) of
+                NONE =>
+                  (HolbuildStatus.message_stdout
+                     ("no shared checkpoint index: probing all " ^ count ^ " candidates\n");
+                   candidates)
+              | SOME keys =>
+                  let
+                    val published = Redblackset.addList (Redblackset.empty String.compare, keys)
+                    val kept = List.filter (fn c => Redblackset.member (published, candidate_key c)) candidates
+                  in
+                    HolbuildStatus.message_stdout
+                      ("shared checkpoint index lists " ^ Int.toString (length kept) ^ " of " ^ count ^
+                       " candidates\n");
+                    kept
+                  end
+          end
     fun try_heap heap =
       (place_heap heap;
        if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
@@ -10927,7 +10978,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
                 NONE => no_files
               | SOME heap =>
-                  case first_window heap (if resumes then candidates else []) of
+                  case first_window heap (if resumes then listed candidates else []) of
                       SOME restored => restored
                     | NONE => try_heap heap
   in
@@ -10938,7 +10989,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
 
 (* After the run, successful or not: the heap if this run saved it, then,
    if the heap under them is the published one, the new checkpoints. *)
-fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, deps_key, deps_loaded,
+fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, deps_key, deps_loaded,
                                               candidates, ...} : shared_context)
                                ({heap = restored_heap, files = restored, stale, missing} : shared_restore) =
   let
@@ -11042,6 +11093,25 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun was_restored path =
       List.exists (fn (p, sha) => p = path andalso (hash path = sha handle _ => false))
                   restored
+    (* The checkpoints this build used go to the front of the index, so
+       those every edit shares, early in the script, are the last to be
+       dropped.  A heap published anew starts an index of its own: the
+       checkpoints listed before are chained to the heap it replaced. *)
+    fun update_index heap used =
+      let
+        val old =
+          if SOME heap <> restored_heap then NONE
+          else Option.mapPartial (shared_index_keys o #manifest) (HolbuildRemoteCache.fetch_action remote index_key)
+        fun add (key, (seen, kept)) =
+          if Redblackset.member (seen, key) then (seen, kept) else (Redblackset.add (seen, key), key :: kept)
+        val merged = rev (#2 (List.foldl add (Redblackset.empty String.compare, []) (used @ getOpt (old, []))))
+        val keys = if length merged > shared_index_limit then List.take (merged, shared_index_limit) else merged
+      in
+        if old = SOME keys then ()
+        else ignore (HolbuildRemoteCache.replace_action_unconditionally remote
+                       {key = index_key, text = shared_index_text keys})
+      end
+      handle e => warn ("could not update the shared checkpoint index: " ^ General.exnMessage e)
     val spines = ref (Redblackmap.mkDict String.compare)
     (* Shared tails make parent walking linear across valid candidates;
        each manifest still encodes its whole spine in the existing order. *)
@@ -11149,7 +11219,14 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
              store_add store heap {sha = sha, src = path, save = save})
           handle e => warn ("could not store shared checkpoint " ^ path ^ ": " ^ General.exnMessage e)
       in
-        List.app (fn (_, _, _, blobs) => List.app add blobs) complete
+        List.app (fn (_, _, _, blobs) => List.app add blobs) complete;
+        update_index heap
+          (List.mapPartial (fn (c : shared_candidate) =>
+                               if was_restored (#path c) then SOME (shared_checkpoint_key heap_key (#kind c) (#key c))
+                               else NONE)
+                           candidates @
+           List.mapPartial (fn (_, key, absent) => if !absent then NONE else SOME key) probes @
+           map (fn (_, key, _, _) => key) complete)
       end
   in
     case heap of

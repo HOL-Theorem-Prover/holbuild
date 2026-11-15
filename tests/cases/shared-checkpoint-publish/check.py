@@ -56,7 +56,8 @@ def run() -> None:
             assert len(set(puts)) == 1 + 2 * (count - 1), "CAS writes must equal the distinct heap/state/sidecar files"
             manifests = list((directory / "remote/ac").glob("*"))
             expected = 11 if failing else count - 1
-            assert len(manifests) == expected + 1, "wrong number of candidate manifests"
+            # Beside the candidates: the heap's entry and the checkpoint index.
+            assert len(manifests) == expected + 2, "wrong number of candidate manifests"
             for manifest in manifests:
                 text = manifest.read_text().split("manifest-text-v1\n", 1)[1]
                 for line in text.splitlines():
@@ -87,7 +88,8 @@ def run() -> None:
             wait_for(process, lambda: (directory / "repeated.ready").exists())
             assert requests.read_text().splitlines().count("PUT /cas/" + partial) == 0
             if not failing:
-                assert len(requests.read_text().splitlines()) == len(lines) + count - 1, "present candidate did more than a probe"
+                # A probe per candidate, and a read of the index, which is unchanged.
+                assert len(requests.read_text().splitlines()) == len(lines) + count, "present candidate did more than a probe"
             (directory / "repeated.release").touch()
             wait_for(process, lambda: (directory / "repaired.ready").exists())
             (directory / "repaired.release").touch()

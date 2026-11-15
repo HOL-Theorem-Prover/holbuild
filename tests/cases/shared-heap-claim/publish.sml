@@ -27,7 +27,7 @@ val publisher = env "PUBLISHER";
 val _ = PolyML.SaveState.saveChild (deps, length (PolyML.SaveState.showHierarchy ()));
 val _ = BE.write_text (deps ^ ".ok") (BE.deps_checkpoint_ok_text "deps");
 val ctx : BE.shared_context =
-  {store = dir ^ "/store", checkpoint_root = tree, heap_key = env "HEAP_KEY", base_state = base,
+  {store = dir ^ "/store", checkpoint_root = tree, heap_key = env "HEAP_KEY", index_key = "index", base_state = base,
    deps_key = "deps", deps_loaded = deps, requested_timeout = NONE, candidates = []};
 val _ = HolbuildRemoteCacheConfig.set_url url;
 val _ = RC.fail_closed := true;
