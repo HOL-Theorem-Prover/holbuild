@@ -439,6 +439,45 @@ val _ =
      wait_for "that connection to be closed" (fn () => sockets () = 0) (in_10s ()))
   else ()
 
+(* 200 threads at once, each walking the ring twice, as a wide cache check:
+   the process's descriptors stay well below 1024, past which Poly/ML's
+   select() aborts the process.  Before the pool was bounded, each of the
+   200 handles kept a socket to every server and its wakeup pipe. *)
+fun open_fds () =
+  let
+    val fds = OS.FileSys.openDir "/proc/self/fd"
+    fun count n = case OS.FileSys.readDir fds of NONE => n | SOME _ => count (n + 1)
+  in
+    count 0 before OS.FileSys.closeDir fds
+  end
+fun walker () =
+  (List.app (fn _ =>
+     List.app (fn server =>
+       if HolbuildHttp.head {url = server ^ "/fast", timeout = 30} = HolbuildHttp.Response 200 then ()
+       else record (fn () => failures := server :: !failures))
+       ring)
+     [1, 2]
+   handle e => record (fn () => failures := General.exnMessage e :: !failures);
+   record (fn () => finished := !finished + 1))
+val _ =
+  if has_proc then
+    let
+      val _ = (finished := 0; failures := [])
+      val _ = List.app (fn _ => ignore (Thread.fork (walker, []))) (List.tabulate (200, fn i => i))
+      val deadline = Time.+ (Time.now (), Time.fromSeconds 60)
+      fun sample peak =
+        if !finished = 200 then Int.max (peak, open_fds ())
+        else if Time.> (Time.now (), deadline) then fail "the ring walkers did not finish"
+        else (OS.Process.sleep (Time.fromMilliseconds 10); sample (Int.max (peak, open_fds ())))
+      val peak = sample 0
+    in
+      print ("200 ring walkers held at most " ^ Int.toString peak ^ " descriptors\n");
+      assert ("ring walks failed: " ^ String.concatWith ", " (!failures)) (null (!failures));
+      assert ("200 threads walking the ring held " ^ Int.toString peak ^ " descriptors") (peak < 512);
+      wait_for "the ring connections to be closed" (fn () => sockets () = 0) (in_10s ())
+    end
+  else ()
+
 (* A transfer waiting on a response must not hold up another thread's GC.
    The server holds /gated until gate-release exists. *)
 val gated_done = ref false
