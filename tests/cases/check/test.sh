@@ -33,6 +33,11 @@ val _ = new_constant ("magic", ``:bool``);
 val magic_ax = new_axiom ("magic_ax", ``magic``);
 val _ = export_theory();
 SML
+cat > "$dep/src/depShellLib.sml" <<'SML'
+structure depShellLib = struct
+fun run cmd = OS.Process.system cmd
+end
+SML
 dep_rev=$(init_git_repo "$dep")
 
 {
@@ -219,6 +224,29 @@ require_grep "^consumer:src/BypassScript.sml:5: kernel bypass: disk_thm$" "$log"
 require_grep "^BypassTheory: 1 finding$" "$log"
 require_no_grep "RunCall\|unsafeCast\|PolyML" "$log"
 
+# HOL's own sources are not scanned, even a library HOL builds on demand
+# (aiLib calls OS.Process.system); a dependency package's sources are.
+cat > "$project/src/HolLibScript.sml" <<'SML'
+Theory HolLib
+Libs aiLib
+Theorem hol_lib_thm: T
+Proof simp[]
+QED
+SML
+cat > "$project/src/DepLibScript.sml" <<'SML'
+Theory DepLib
+Libs depShellLib
+Theorem dep_lib_thm: T
+Proof simp[]
+QED
+SML
+run_check HolLibTheory 0
+require_grep "^HolLibTheory: clean (1 theorem)$" "$log"
+require_no_grep "kernel bypass" "$log"
+run_check DepLibTheory 1
+require_grep "^dep:src/depShellLib.sml:2: kernel bypass: OS.Process.system$" "$log"
+require_grep "^DepLibTheory: 1 finding$" "$log"
+
 # Reports are the same as separate checks, in selector order, even after a finding.
 selectors=(CheatTheory CleanTheory UsesTheory HypothesesTheory BypassTheory CleanTheory)
 expected=$tmpdir/batch-expected
@@ -241,6 +269,46 @@ run_check --with-fingerprints 1 "${selectors[@]}"
 grep -E '^(Cheat|Clean|Uses|Base|Hypotheses|Bypass)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
 diff -u "$plain_reports" "$log.reports"
 [[ $(grep -c $'^tool\tkind=run\t.*argv0=.*/bin/hol$' "$timing") -eq 1 ]]
+
+# Selectors sharing an ancestry: a kernel bypass in the shared ancestor is
+# reported under each selector that reaches it, as separate checks report it,
+# and however many selectors there are, the sources are planned once.
+cat > "$project/src/SharedBypassScript.sml" <<'SML'
+Theory SharedBypass
+val forge = Thm.disk_thm;
+Theorem shared_thm: T
+Proof simp[]
+QED
+SML
+for user in UserA UserB; do
+  cat > "$project/src/${user}Script.sml" <<SML
+Theory $user
+Ancestors SharedBypass
+Theorem ${user}_thm: T
+Proof simp[]
+QED
+SML
+done
+shared_selectors=(UserATheory UserBTheory:UserB_thm CleanTheory UserATheory SharedBypassTheory)
+for selector in "${shared_selectors[@]}"; do
+  if [[ $selector == CleanTheory ]]; then run_check "$selector" 0; else run_check "$selector" 1; fi
+done
+require_grep '^consumer:src/SharedBypassScript.sml:2: kernel bypass: disk_thm$' "$tmpdir/check-UserATheory.log"
+single_plans=$(grep -c $'^phase\tname=dependency.toposort\t' "$timing")
+expected=$tmpdir/shared-expected
+: > "$expected"
+for selector in "${shared_selectors[@]}"; do
+  grep -E '^(User[AB]|SharedBypass|Clean)Theory[.:]|^consumer:src/' \
+    "$tmpdir/check-${selector//:/-}.log" >> "$expected"
+done
+run_check "${shared_selectors[0]}" 1 "${shared_selectors[@]:1}"
+grep -E '^(User[AB]|SharedBypass|Clean)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
+diff -u "$expected" "$log.reports"
+[[ $(grep -c '^consumer:src/SharedBypassScript.sml:2: kernel bypass: disk_thm$' "$log.reports") -eq 4 ]]
+[[ $(grep -c $'^phase\tname=dependency.toposort\t' "$timing") -eq "$single_plans" ]]
+run_check --with-fingerprints 1 "${shared_selectors[@]}"
+grep -E '^(User[AB]|SharedBypass|Clean)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
+diff -u "$expected" "$log.reports"
 
 # Warm fingerprint checks still need a memory reservation; the data-only path
 # needs none. The budget deliberately cannot admit a child.

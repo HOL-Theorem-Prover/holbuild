@@ -347,12 +347,12 @@ STATEMENTS = [
     Statement(
         cm.CLAIM_AHEAD_ACTION,
         lambda f: {"batch_id": f.fresh, "keys": f.ahead_candidates(), "tier": "standard", "depth": 2, "taken": []},
-        22_000,
+        1_400,
     ),
     Statement(
         cm.AHEAD_PARENTS,
         lambda f: {"batch_id": f.fresh, "keys": f.arrival.keys("running", "ahead")[-1:], "depth": 2},
-        11_000,
+        100,
     ),
     Statement(cm.COUNT_WAITING_AHEAD, lambda f: {"batch_id": f.fresh}, 1_100),
     Statement(cm.REFRESH_AHEAD_CHILDREN, lambda f: {"batch_id": f.fresh, "key": f.parent_of_ahead()}, 1_100),

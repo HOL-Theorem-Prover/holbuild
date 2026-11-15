@@ -32,8 +32,8 @@ local
   val curl = recorded (getSymbol (loadLibraryIndirect library_name))
   val libc = recorded (getSymbol (loadExecutable ()))
 
-  (* curl_easy_setopt and curl_easy_getinfo take their third argument
-     through `...`.  x86-64 and Linux arm64 pass it like a fixed third
+  (* curl_easy_setopt, curl_easy_getinfo and curl_multi_setopt take their
+     third argument through `...`.  x86-64 and Linux arm64 pass it like a fixed third
      argument, in a register; Apple arm64 passes variadic arguments on the
      stack.  Repeating the value up to the ninth argument, the first stack
      slot, puts it where either convention reads it. *)
@@ -53,6 +53,7 @@ in
   val slist_append = buildCall2 (curl "curl_slist_append", (cPointer, cString), cPointer)
   val slist_free_all = buildCall1 (curl "curl_slist_free_all", cPointer, cVoid)
   val multi_init = buildCall0 (curl "curl_multi_init", (), cPointer)
+  val multi_setopt_long = variadic (buildCall9 (curl "curl_multi_setopt", variadic_conv cLong, cInt))
   val multi_cleanup = buildCall1 (curl "curl_multi_cleanup", cPointer, cInt)
   val multi_add_handle = buildCall2 (curl "curl_multi_add_handle", (cPointer, cPointer), cInt)
   val multi_remove_handle = buildCall2 (curl "curl_multi_remove_handle", (cPointer, cPointer), cInt)
@@ -110,6 +111,7 @@ val CURLOPT_CAPATH = 10097
 val CURLOPT_INFILESIZE_LARGE = 30115
 val CURLOPT_SOCKOPTFUNCTION = 20148
 val CURLINFO_RESPONSE_CODE = 0x200002
+val CURLMOPT_MAXCONNECTS = 6
 val CURLE_PEER_FAILED_VERIFICATION = 60
 val CURL_GLOBAL_DEFAULT = 3
 val CURL_VERSION_ASYNCHDNS = 0wx80 : Word32.word
@@ -226,6 +228,12 @@ fun new_connection () : connection =
     (if easy = Foreign.Memory.null orelse multi = Foreign.Memory.null then
        raise Error "could not create a libcurl handle"
      else ();
+     (* The multi handle keeps the connection cache, by default capped at 4
+        connections per easy handle it drives.  A handle keeps one: the pool
+        hands it to requests for the origin it last talked to, so a walk over
+        a cache ring reuses a connection per node without every handle
+        holding a socket to every node. *)
+     mcheck "curl_multi_setopt MAXCONNECTS" (multi_setopt_long (multi, CURLMOPT_MAXCONNECTS, 1));
      check "NOSIGNAL" (setopt_long (easy, CURLOPT_NOSIGNAL, 1));
      check "CONNECTTIMEOUT" (setopt_long (easy, CURLOPT_CONNECTTIMEOUT, connect_timeout_seconds));
      check "FOLLOWLOCATION" (setopt_long (easy, CURLOPT_FOLLOWLOCATION, 1));
@@ -245,9 +253,24 @@ fun new_connection () : connection =
 
 val pool_mutex = Mutex.mutex ()
 
+(* The most connections the pool keeps open, in use or idle.  Each holds
+   its multi handle's wakeup pipe, a socket (two while it moves to another
+   origin) and its request's files.  Poly/ML waits on streams with select(),
+   which aborts the process at a descriptor of 1024 or more, so the pool
+   stays well below that however many threads make requests at once. *)
+val max_connections = 64
+
 (* The pooled connections no request is using, the most recently returned
-   first, each with the time it was returned. *)
-val idle : (connection * Time.time) list ref = ref []
+   first, each with the origin of its last request and the time it was
+   returned. *)
+val idle : (connection * string * Time.time) list ref = ref []
+
+(* The connections open, in use or idle. *)
+val open_connections = ref 0
+
+(* Signalled when a connection is returned or closed, for a request waiting
+   on a full pool. *)
+val pool_changed = ConditionVar.conditionVar ()
 
 (* The reaper thread, while one runs; one runs while idle is non-empty. *)
 val reaper_thread : Thread.thread option ref = ref NONE
@@ -276,6 +299,14 @@ fun with_pool_lock f =
    stops only when its sleep (up to a second) ends. *)
 val reaper_wake = ConditionVar.conditionVar ()
 
+(* Frees the places of count connections closed or never opened. *)
+fun release count =
+  with_pool_lock (fn () =>
+    (open_connections := !open_connections - count; ConditionVar.broadcast pool_changed))
+
+(* Closes pooled connections taken out of the pool. *)
+fun discard connections = (List.app close connections; release (length connections))
+
 (* Closes the connections idle for the timeout, then waits until the
    oldest left reaches it; ends once the pool is empty. *)
 fun reaper () =
@@ -285,15 +316,15 @@ fun reaper () =
         val now = Time.now ()
         val timeout = idle_timeout ()
         val (kept, expired) =
-          List.partition (fn (_, since) => Time.< (Time.- (now, since), timeout)) (!idle)
+          List.partition (fn (_, _, since) => Time.< (Time.- (now, since), timeout)) (!idle)
       in
         idle := kept;
         case rev kept of
             [] => (reaper_thread := NONE; (expired, NONE))
-          | (_, oldest) :: _ => (expired, SOME (Time.- (Time.+ (oldest, timeout), now)))
+          | (_, _, oldest) :: _ => (expired, SOME (Time.- (Time.+ (oldest, timeout), now)))
       end)
   in
-    List.app (close o #1) expired;
+    discard (map #1 expired);
     case wake of
         NONE => ()
       | SOME wait =>
@@ -302,31 +333,60 @@ fun reaper () =
            reaper ())
   end
 
-fun take () =
-  case with_pool_lock (fn () =>
-         case !idle of
-             (connection, _) :: rest => (idle := rest; SOME connection)
-           | [] => NONE) of
-      SOME connection =>
-        if #no_ca_directory connection andalso not (!clear_ca_directory)
-        then (close connection; take ())
-        else connection
-    | NONE => new_connection ()
+datatype taken = Pooled of connection | Opened
 
-fun give connection =
+(* An idle connection last used for origin, else a new one while the pool
+   has room, else the longest idle, which reconnects; with none idle, waits
+   for one.  Each request holds one connection at a time, so the wait ends. *)
+fun take origin =
+  let
+    fun split _ [] = NONE
+      | split newer ((entry as (connection, last, _)) :: older) =
+          if last = origin then (idle := List.revAppend (newer, older); SOME connection)
+          else split (entry :: newer) older
+    fun pick () =
+      case split [] (!idle) of
+          SOME connection => Pooled connection
+        | NONE =>
+            if !open_connections < max_connections then
+              (open_connections := !open_connections + 1; Opened)
+            else
+              case rev (!idle) of
+                  (connection, _, _) :: newer => (idle := rev newer; Pooled connection)
+                | [] => (ConditionVar.wait (pool_changed, pool_mutex); pick ())
+  in
+    case with_pool_lock pick of
+        Pooled connection =>
+          if #no_ca_directory connection andalso not (!clear_ca_directory)
+          then (discard [connection]; take origin)
+          else connection
+      | Opened => new_connection () handle e => (release 1; raise e)
+  end
+
+fun give connection origin =
   with_pool_lock (fn () =>
-    (idle := (connection, Time.now ()) :: !idle;
+    (idle := (connection, origin, Time.now ()) :: !idle;
+     ConditionVar.signal pool_changed;
      if isSome (!reaper_thread) then () else reaper_thread := SOME (Thread.fork (reaper, []))))
-  handle e => (List.app (close o #1) (with_pool_lock (fn () => !idle before idle := [])); raise e)
+  handle e => (discard (map #1 (with_pool_lock (fn () => !idle before idle := []))); raise e)
+
+(* The scheme, host and port of url: what a connection is for. *)
+fun origin url =
+  let val (scheme, rest) = Substring.position "://" (Substring.full url)
+  in
+    Substring.string scheme ^ "://" ^
+    Substring.string (Substring.takel (fn c => c <> #"/") (Substring.triml 3 rest))
+  end
 
 (* A connection whose request raised may be left mid-transfer, so it is
    closed rather than pooled. *)
-fun with_handle f =
+fun with_handle url f =
   let
-    val connection = take ()
-    val result = f connection handle e => (close connection; raise e)
+    val origin = origin url
+    val connection = take origin
+    val result = f connection handle e => (discard [connection]; raise e)
   in
-    give connection; result
+    give connection origin; result
   end
 
 fun c_string_at p =
@@ -383,22 +443,26 @@ fun with_file path mode f =
 (* Runs one request on a pooled connection, writing the response body to
    output.  It fails once it has moved no data for timeout seconds, or after
    max_transfer_seconds: a slow transfer that keeps moving, as a large upload
-   to a busy server, isn't cut off.  set_options sets the request's own
-   options; the data pointers are cleared afterwards, so the pooled handle
-   keeps none of them. *)
-fun request_once {url, timeout, output, set_options} =
+   to a busy server, isn't cut off.  files opens the request's files, then
+   runs the transfer with the output and set_options, which sets the
+   request's own options.  It opens them only once the request has a
+   connection, so requests waiting on a full pool hold no descriptors.  The
+   data pointers are cleared afterwards, so the pooled handle keeps none of
+   them. *)
+fun request_once {url, timeout, files} =
   (HolbuildOffline.require_online "send an HTTP request";
-  with_handle (fn connection as {easy, ...} =>
-    (check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, max_transfer_seconds));
-     check "LOW_SPEED_LIMIT" (setopt_long (easy, CURLOPT_LOW_SPEED_LIMIT, 1));
-     check "LOW_SPEED_TIME" (setopt_long (easy, CURLOPT_LOW_SPEED_TIME, timeout));
-     check "URL" (setopt_str (easy, CURLOPT_URL, url));
-     check "WRITEDATA" (setopt_ptr (easy, CURLOPT_WRITEDATA, output));
-     check "IGNORE_CONTENT_LENGTH" (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 0));
-     set_options easy;
-     transfer connection
-     before List.app (fn option => ignore (setopt_ptr (easy, option, Foreign.Memory.null)))
-              [CURLOPT_WRITEDATA, CURLOPT_READDATA, CURLOPT_HTTPHEADER])))
+  with_handle url (fn connection as {easy, ...} =>
+    files (fn {output, set_options} =>
+      (check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, max_transfer_seconds));
+       check "LOW_SPEED_LIMIT" (setopt_long (easy, CURLOPT_LOW_SPEED_LIMIT, 1));
+       check "LOW_SPEED_TIME" (setopt_long (easy, CURLOPT_LOW_SPEED_TIME, timeout));
+       check "URL" (setopt_str (easy, CURLOPT_URL, url));
+       check "WRITEDATA" (setopt_ptr (easy, CURLOPT_WRITEDATA, output));
+       check "IGNORE_CONTENT_LENGTH" (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 0));
+       set_options easy;
+       transfer connection
+       before List.app (fn option => ignore (setopt_ptr (easy, option, Foreign.Memory.null)))
+                [CURLOPT_WRITEDATA, CURLOPT_READDATA, CURLOPT_HTTPHEADER]))))
 
 (* Verification fails in the TLS handshake, before any data moves, so the
    request can start again on a handle with libcurl's default CA directory. *)
@@ -408,9 +472,10 @@ fun request args =
 
 (* Downloads url into dst, decoding any content encoding. *)
 fun get {url, dst, timeout} =
-  with_file dst "wb" (fn output =>
-    request {url = url, timeout = timeout, output = output,
-             set_options = fn easy => check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1))})
+  request {url = url, timeout = timeout, files = fn run =>
+    with_file dst "wb" (fn output =>
+      run {output = output,
+           set_options = fn easy => check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1))})}
 
 (* Asks for url with HEAD.  HTTPGET first clears a pooled handle's upload
    from an earlier put, which NOBODY alone leaves in place before libcurl
@@ -419,31 +484,33 @@ fun get {url, dst, timeout} =
    bazel-remote answers -1 for a blob it has only in its S3 backend, which
    libcurl otherwise rejects. *)
 fun head {url, timeout} =
-  with_file "/dev/null" "wb" (fn sink =>
-    request {url = url, timeout = timeout, output = sink,
-             set_options = fn easy => (check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1));
-                                       check "NOBODY" (setopt_long (easy, CURLOPT_NOBODY, 1));
-                                       check "IGNORE_CONTENT_LENGTH"
-                                         (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 1)))})
+  request {url = url, timeout = timeout, files = fn run =>
+    with_file "/dev/null" "wb" (fn sink =>
+      run {output = sink,
+           set_options = fn easy => (check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1));
+                                     check "NOBODY" (setopt_long (easy, CURLOPT_NOBODY, 1));
+                                     check "IGNORE_CONTENT_LENGTH"
+                                       (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 1)))})}
 
 (* Uploads src to url with PUT and the given extra request headers; the
    response body is discarded. *)
 fun put {url, src, headers, timeout} =
-  with_file src "rb" (fn input =>
-  with_file "/dev/null" "wb" (fn sink =>
-    let
-      val header_list = List.foldl (fn (h, l) => slist_append (l, h)) Foreign.Memory.null headers
-      fun set_options easy =
-        (check "UPLOAD" (setopt_long (easy, CURLOPT_UPLOAD, 1));
-         check "READDATA" (setopt_ptr (easy, CURLOPT_READDATA, input));
-         check "INFILESIZE_LARGE"
-           (setopt_long (easy, CURLOPT_INFILESIZE_LARGE, Position.toInt (OS.FileSys.fileSize src)));
-         check "HTTPHEADER" (setopt_ptr (easy, CURLOPT_HTTPHEADER, header_list)))
-    in
-      (* request clears HTTPHEADER, or closes the handle, before this frees the list. *)
-      request {url = url, timeout = timeout, output = sink, set_options = set_options}
-      before slist_free_all header_list
-      handle e => (slist_free_all header_list; raise e)
-    end))
+  request {url = url, timeout = timeout, files = fn run =>
+    with_file src "rb" (fn input =>
+    with_file "/dev/null" "wb" (fn sink =>
+      let
+        val header_list = List.foldl (fn (h, l) => slist_append (l, h)) Foreign.Memory.null headers
+        fun set_options easy =
+          (check "UPLOAD" (setopt_long (easy, CURLOPT_UPLOAD, 1));
+           check "READDATA" (setopt_ptr (easy, CURLOPT_READDATA, input));
+           check "INFILESIZE_LARGE"
+             (setopt_long (easy, CURLOPT_INFILESIZE_LARGE, Position.toInt (OS.FileSys.fileSize src)));
+           check "HTTPHEADER" (setopt_ptr (easy, CURLOPT_HTTPHEADER, header_list)))
+      in
+        (* run clears HTTPHEADER, or the handle is closed, before this frees the list. *)
+        run {output = sink, set_options = set_options}
+        before slist_free_all header_list
+        handle e => (slist_free_all header_list; raise e)
+      end))}
 
 end

@@ -1248,6 +1248,12 @@ requested target or the build passes `--all-checkpoints`, if it declares
 extra outputs, or under `--trace-steps`, `--repl-on-failure`, a tracing
 kernel or an execution plan.
 
+A theory that would cut off early (its own inputs unchanged and its
+dependencies' outputs as at its last build) runs no HOL, so it isn't
+pipelined: not once its dependencies have built, and not while the outlines it
+would load export what those theories' outputs on disk do. If such a
+dependency's gate then fails, the theory builds once that dependency has.
+
 A pipelined theory saves no checkpoints, not even `deps_loaded`, so the first
 rebuild after editing it reloads its ancestors. Remote-exec workers never
 pipeline. `HOLBUILD_PIPELINE=off` turns pipelining off. Tools that read

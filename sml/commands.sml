@@ -3260,11 +3260,21 @@ fun parse_check_selector selector =
         else {theory = theory, theorem = SOME theorem}
     | _ => raise Error "check requires THEORY or THEORY:THEOREM"
 
+(* The implicit HOL package's id as source-index nodes carry it, so that
+   HOL's own sources can be told apart from the project's. *)
+fun hol_package_id tc project =
+  let
+    val graph = HolbuildProjectGraph.resolve {project = project, resolution = resolution_for_toolchain tc}
+    val hol = HolbuildProjectGraph.hol graph
+  in
+    case List.find (fn package => HolbuildProjectGraph.package_id package = hol)
+                   (HolbuildProjectGraph.packages graph) of
+        SOME package => HolbuildSourceIndex.source_graph_package_id package
+      | NONE => raise Error "dependency graph has no hol package"
+  end
+
 (* The theory names HOL itself does not declare: those of the root package
    and its dependency packages.  Axioms in these theories are findings. *)
-fun hol_package_id tc project =
-  HolbuildProjectGraph.hol
-    (HolbuildProjectGraph.resolve {project = project, resolution = resolution_for_toolchain tc})
 
 fun project_theory_names hol index =
   let
@@ -3334,20 +3344,32 @@ fun kernel_bypass_uses text =
     scan 0 1 []
   end
 
-(* Kernel-bypass findings in the sources a theory is built from, outside HOL. *)
-fun kernel_bypass_findings tc hol components index logical_name =
+(* For each of LOGICAL_NAMES, the kernel-bypass findings in the sources the
+   theory is built from, outside HOL.  One plan covers them all; a theory's
+   sources are its closure in that plan, in the order its own plan would give,
+   and each source is read and scanned once. *)
+fun kernel_bypass_findings tc hol components index logical_names =
   let
-    val plan = HolbuildBuildPlan.plan_targets components (#holdir tc) index [logical_name]
-    val sources =
-      List.filter (fn source => #package_id (#node source) <> hol)
-                  (map HolbuildBuildPlan.source_of (HolbuildBuildPlan.selected_nodes plan))
+    val plan = HolbuildBuildPlan.plan_targets components (#holdir tc) index
+                 (HolbuildBuildPlan.unique_strings logical_names)
+    val scanned : (string, string list) Redblackmap.dict ref = ref (Redblackmap.mkDict String.compare)
     fun findings source =
-      map (fn (line, name) =>
-              #package source ^ ":" ^ #relative_path source ^ ":" ^ Int.toString line ^
-              ": kernel bypass: " ^ name)
-          (kernel_bypass_uses (read_text (#source_path source)))
+      case Redblackmap.peek (!scanned, #source_path source) of
+          SOME found => found
+        | NONE =>
+            let
+              val found =
+                map (fn (line, name) =>
+                        #package source ^ ":" ^ #relative_path source ^ ":" ^ Int.toString line ^
+                        ": kernel bypass: " ^ name)
+                    (kernel_bypass_uses (read_text (#source_path source)))
+            in scanned := Redblackmap.insert (!scanned, #source_path source, found); found end
   in
-    List.concat (map findings sources)
+    fn logical_name =>
+      List.concat (map findings
+        (List.filter (fn source => #package_id (#node source) <> hol)
+           (map HolbuildBuildPlan.source_of
+              (HolbuildBuildPlan.selected_closure plan (HolbuildBuildPlan.lookup plan logical_name)))))
   end
 
 (* An SML script for `hol run` that loads the theory and prints the
@@ -3571,6 +3593,7 @@ fun check_stored_data tc cli_jobs build_mode selections {project, index, compone
     val _ = if null run_loads then () else
       build_once_with_prepared_mode build_mode tc cli_jobs NONE (plain_build_request run_loads)
     val hol = hol_package_id tc project
+    val bypass_findings = kernel_bypass_findings tc hol components index logical_names
     val sources = List.filter theory_source index
     val project_theories = Redblackset.addList
       (Redblackset.empty String.compare, project_theory_names hol index)
@@ -3610,7 +3633,7 @@ fun check_stored_data tc cli_jobs build_mode selections {project, index, compone
         val ancestry = if Redblackset.member (project_theories, thy) then thy :: ancestry else ancestry
         fun axioms ancestor = map (fn (name, _) => qualified ancestor name ^ ": axiom")
           (List.filter (fn (_, info) => #axiom info) (#stored (data ancestor)))
-        val findings = kernel_bypass_findings tc hol components index logical_name @
+        val findings = bypass_findings logical_name @
           List.mapPartial (fn (name, info) => if null (#oracles info) then NONE
             else SOME (qualified thy name ^ ": " ^ String.concatWith ", " (#oracles info))) checked @
           List.mapPartial (fn (name, info) => if #hypotheses info
@@ -3637,10 +3660,11 @@ fun check_selectors tc cli_jobs build_mode {with_fingerprints} selectors =
       let
         val hol = hol_package_id tc project
         val project_theories = project_theory_names hol index
+        val bypass_findings = kernel_bypass_findings tc hol components index logical_names
         fun block (logical_name, {theory, theorem}) =
           check_script {logical_name = logical_name, theorem = theorem,
                         project_theories = project_theories,
-                        source_findings = kernel_bypass_findings tc hol components index logical_name}
+                        source_findings = bypass_findings logical_name}
       in
         "local val HolbuildCheckFailed = ref false in\n" ^
         String.concat (ListPair.mapEq block (logical_names, selections)) ^

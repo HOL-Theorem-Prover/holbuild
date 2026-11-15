@@ -114,10 +114,14 @@ struct
         let
           val cwd = HOLFileSys.getDir ()
           fun at dir = OS.Path.mkAbsolute {path = module ^ ext, relativeTo = OS.Path.mkAbsolute {path = dir, relativeTo = cwd}}
+          (* Each path is built only when tried: the load path has hundreds
+             of directories and a wait step looks up thousands of manifests. *)
+          fun first [] = raise Fail ("no manifest " ^ module ^ ext)
+            | first (dir :: dirs) =
+                let val file = at dir
+                in if HOLFileSys.access (file, []) then manifest_lines file else first dirs end
         in
-          case List.find (fn file => HOLFileSys.access (file, [])) (map at ("." :: !Meta.loadPath)) of
-              SOME file => manifest_lines file
-            | NONE => raise Fail ("no manifest " ^ module ^ ext)
+          first ("." :: !Meta.loadPath)
         end
       fun visit entry =
         if is_file entry then [holpathdb.subst_pathvars entry]

@@ -9,6 +9,8 @@ default_test_jobs() {
 }
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=lib.sh
+source "$ROOT/tests/lib.sh"
 HOLBUILD_BIN=${HOLBUILD_BIN:-"$ROOT/bin/holbuild"}
 HOLBUILD_TEST_JOBS=${HOLBUILD_TEST_JOBS:-$(default_test_jobs)}
 export HOLBUILD_ROOT="$ROOT"
@@ -212,6 +214,10 @@ run_case() {
   local start_ms end_ms duration_ms
 
   write_holbuild_wrapper "$wrapper"
+  # Each case runs in its own cache, sharing only the HOL toolchains, so no
+  # build in it writes to, locks or collects the machine's cache. A case may
+  # still point HOLBUILD_CACHE elsewhere.
+  use_case_cache "$log_dir/$name.cache"
   start_ms=$(now_ms)
   echo "== $name ==" > "$log"
   if REAL_HOLBUILD_BIN="$HOLBUILD_BIN" \
