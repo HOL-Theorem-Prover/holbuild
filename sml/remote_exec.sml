@@ -223,8 +223,11 @@ fun report_action line =
              SOME n => ", attempts " ^ LargeInt.toString n
            | NONE => "") ^
         (case field "tier" of SOME tier => ", tier " ^ tier | NONE => "")
+    (* A cancelled action's log is the one its worker uploaded as it
+       stopped it, as at the batch deadline. *)
     val log = case field "log_sha256" of
-                  SOME sha => if state = "failed" orelse retried then ", log /cas/" ^ sha else ""
+                  SOME sha => if List.exists (fn s => s = state) ["failed", "cancelled"] orelse retried
+                              then ", log /cas/" ^ sha else ""
                 | NONE => ""
   in
     HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ state ^ failure ^ attempt ^ log ^ "\n")
@@ -248,9 +251,10 @@ fun follow url batch_id (on_change : string * string * string option * string op
     val _ = HolbuildOffline.require_online "follow a remote batch"
     val states : (string * (string * string option * string option)) list ref = ref []
     val names = ref ([] : (string * string) list)
+    (* An action the deadline stopped failed with its batch. *)
     fun failures () =
       List.mapPartial (fn (key, (state, kind, log)) =>
-        if state = "failed" then
+        if state = "failed" orelse (state = "cancelled" andalso kind = SOME "deadline") then
           SOME {input_key = key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
         else NONE) (rev (!states))
     (* A line cut off by a dropped connection, perhaps with curl's error

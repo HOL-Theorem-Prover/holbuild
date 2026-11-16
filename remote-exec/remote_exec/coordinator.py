@@ -778,14 +778,14 @@ class _Claimed:
 # completion, so the check is one entry of actions_batch_unfinished however many actions the batch finished. It looks
 # for the batch's first unfinished action in the index's order rather than for any: with no order asked for, the
 # database scans the table for one whenever unfinished actions look common, and reads every row a batch near its end
-# finished.
+# finished. A batch the deadline failed (``fail_overdue``) waits for its workers' logs, not for this.
 FINISH_IF_DONE = sa.text(
     "UPDATE batches SET (state, failure) = (SELECT "
     "CASE WHEN count(*) = 0 THEN 'done' ELSE 'failed' END, "
     "string_agg(theory || ': ' || COALESCE(last_failure, 'internal') || "
     "COALESCE(': ' || failure_detail, ''), '; ' ORDER BY theory, input_key) "
     "FROM actions WHERE batch_id = :id AND class = 'build' AND state = 'failed') "
-    "WHERE id = :id AND state = 'running' AND (SELECT input_key FROM actions "
+    "WHERE id = :id AND state = 'running' AND failure IS NULL AND (SELECT input_key FROM actions "
     "WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running') ORDER BY input_key LIMIT 1) IS NULL"
 )
 
@@ -1045,7 +1045,8 @@ class Coordinator:
             event.set()
 
     async def cancel(self, batch_id: UUID) -> str | None:
-        """Cancel a running batch; its leases go, so its workers' heartbeats and completions are refused."""
+        """Cancel a running batch; its leases are revoked, so its workers' heartbeats are refused and their
+        completions keep only the logs of the actions they stop."""
         async with self.engine.begin() as conn:
             state = await self._lock_batch(conn, batch_id)
             if state != "running":
@@ -1764,7 +1765,36 @@ class Coordinator:
             if batch_id is None:
                 self.lease_hosts.pop(token, None)
                 return False
-            await self._lock_batch(conn, batch_id)
+            if await self._lock_batch(conn, batch_id) != "running" or await conn.scalar(
+                sa.text("SELECT failure IS NOT NULL FROM batches WHERE id = :id"), {"id": batch_id}
+            ):
+                # Revoked with its batch (a cancel, a final failure, the deadline): the worker stopped the action, and
+                # only the log it left is kept, for the client to show how far it got.
+                revoked = (
+                    await conn.execute(
+                        sa.text("DELETE FROM leases WHERE attempt_token = :token RETURNING input_key"),
+                        {"token": token},
+                    )
+                ).first()
+                if revoked is None:
+                    self.lease_hosts.pop(token, None)
+                    return False
+                # A record for another action rolls the lease's deletion back, as on a live lease.
+                kept = await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET log_sha256 = COALESCE(:log, log_sha256) "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key AND spec_sha256 = :spec"
+                    ),
+                    {"log": result.log_sha256, "batch_id": batch_id, "input_key": revoked.input_key,
+                     "spec": result.spec_sha256},
+                )
+                if kept.rowcount != 1 or result.input_key not in (None, revoked.input_key):
+                    raise ResultMismatch(
+                        f"result for {result.input_key} (spec {result.spec_sha256}) does not match the lease's "
+                        f"action {revoked.input_key}"
+                    )
+                self.lease_hosts.pop(token, None)
+                return True
             lease = (
                 await conn.execute(
                     sa.text(
@@ -1998,11 +2028,19 @@ class Coordinator:
     async def expire_leases(self) -> None:
         """Send the actions of expired leases back to waiting, or fail them once they used up their attempts.
 
-        ``sweep`` asks for their release afterwards.
+        A lease its batch revoked (``_end_batch``, ``fail_overdue``) is kept ``lease_seconds`` longer, for its worker to
+        report the log of the action it stopped. ``sweep`` asks for their release afterwards.
         """
         async with self.engine.connect() as conn:
             expired = list(
-                await conn.execute(sa.text("SELECT attempt_token, batch_id FROM leases WHERE expires_at <= now()"))
+                await conn.execute(
+                    sa.text(
+                        "SELECT l.attempt_token, l.batch_id FROM leases l JOIN batches b ON b.id = l.batch_id "
+                        "WHERE l.expires_at <= now() - CASE WHEN b.state = 'running' AND b.failure IS NULL "
+                        "THEN interval '0' ELSE make_interval(secs => :lease) END"
+                    ),
+                    {"lease": self.settings.lease_seconds},
+                )
             )
         for token, batch_id in expired:
             ahead_freed = False
@@ -2092,10 +2130,30 @@ class Coordinator:
                     {"secs": hours * 3600},
                 )
             )
+        failure = f"deadline: still running after {hours:g} h"
         for batch_id in overdue:
             async with self.engine.begin() as conn:
-                if await self._lock_batch(conn, batch_id) == "running":
-                    await self._end_batch(conn, batch_id, "failed", f"deadline: still running after {hours:g} h")
+                if await self._lock_batch(conn, batch_id) != "running":
+                    continue
+                if not await conn.scalar(
+                    sa.text("SELECT EXISTS (SELECT 1 FROM leases WHERE batch_id = :id)"), {"id": batch_id}
+                ):
+                    await self._end_batch(conn, batch_id, "failed", failure)
+                elif await conn.scalar(sa.text("SELECT failure IS NULL FROM batches WHERE id = :id"), {"id": batch_id}):
+                    # The batch stays running until its workers report the logs of the actions they stop, or their
+                    # leases go, so the client following it gets those logs.
+                    await conn.execute(
+                        sa.text("UPDATE batches SET failure = :failure WHERE id = :id"),
+                        {"id": batch_id, "failure": failure},
+                    )
+                    await conn.execute(
+                        sa.text(
+                            "UPDATE actions SET last_failure = 'deadline', failure_detail = :detail "
+                            "WHERE batch_id = :id AND state = 'running'"
+                        ),
+                        {"id": batch_id, "detail": f"still running after {hours:g} h"},
+                    )
+                    await self._cancel_unfinished(conn, batch_id)
             self._batch_changed(batch_id)
 
     async def delete_expired(self) -> None:
@@ -2601,6 +2659,11 @@ class Coordinator:
             sa.text("UPDATE batches SET state = :state, failure = :failure WHERE id = :id"),
             {"id": batch_id, "state": state, "failure": failure},
         )
+        await self._cancel_unfinished(conn, batch_id)
+
+    async def _cancel_unfinished(self, conn: AsyncConnection, batch_id: UUID) -> None:
+        """Cancel the batch's unfinished actions and revoke their leases: expired, they free the key for another
+        batch and stop the heartbeats, and ``complete`` takes only the log of the action stopped."""
         await conn.execute(
             sa.text(
                 "UPDATE actions SET state = 'cancelled' "
@@ -2608,7 +2671,10 @@ class Coordinator:
             ),
             {"id": batch_id},
         )
-        await conn.execute(sa.text("DELETE FROM leases WHERE batch_id = :id"), {"id": batch_id})
+        await conn.execute(
+            sa.text("UPDATE leases SET expires_at = now() WHERE batch_id = :id AND expires_at > now()"),
+            {"id": batch_id},
+        )
 
     async def _record_peak(self, conn: AsyncConnection, package: str, theory: str, profile: str, peak: int) -> None:
         """Raise the theory's peak hint to ``peak``; a run that took less, perhaps with a quieter neighbour, keeps it."""
