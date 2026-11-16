@@ -2026,6 +2026,16 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
         ring.spec_version(SPEC)
     assert type(caught.value) is error
     assert len(asked) == (4 if statuses == (404, 404) else len(statuses))
+    if statuses == (404, 404):
+        from remote_exec.cache import ranked_nodes
+
+        nodes = ["http://one.test", "http://two.test"]
+        assert asked[2:] == [f"{node}/ac/{blob_key(SPEC)}" for node in ranked_nodes(nodes, blob_key(SPEC))]
+
+
+def test_blob_key_is_the_clients() -> None:
+    # The value holbuild's SML blob_key gives, pinned so neither side drifts alone.
+    assert blob_key("0" * 64) == "f88baeae5f54f92e61dcaf2cc69cd2577dd9d5891059c52ee988f0bf3391c9e9"
 
 
 def test_bootstrap_spec_reads_one_written_compressed_under_ac(tmp_path: Path, server: Server) -> None:
