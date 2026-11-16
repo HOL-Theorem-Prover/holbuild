@@ -295,8 +295,11 @@ fun action_spec_help () = print
 fun exec_action_help () = print
   "Usage:\n\
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
-  \      --cache-limit-gb N [--cache-reserve-gb N] [--share-heaps] [--result FILE]\n\
-  \      [--ahead-parent INPUT_KEY:SPEC-SHA256 ... [--ahead-wait-seconds N]]\n\n\
+  \      --cache-limit-gb N [--cache-reserve-gb N] [--cache-min-free-gb N]\n\
+  \      [--share-heaps] [--result FILE]\n\
+  \      [--ahead-parent INPUT_KEY:SPEC-SHA256 ... [--ahead-wait-seconds N]]\n\
+  \  holbuild [GLOBAL OPTIONS] exec-action --sweep-only\n\
+  \      --cache-limit-gb N [--cache-reserve-gb N] [--cache-min-free-gb N]\n\n\
   \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
   \action-spec), or the run spec (see run-action), and publish its result to\n\
   \the remote cache. The action runs in CACHE/action, with checkpoints in\n\
@@ -309,6 +312,10 @@ fun exec_action_help () = print
   \                     checkpoints, toolchains and local cache entries until\n\
   \                     the cache root holds at most N GB minus the reserve.\n\
   \--cache-reserve-gb N Room to keep free under the limit (default: a tenth).\n\
+  \--cache-min-free-gb N Also evict while the cache's disk has under N GB\n\
+  \                     free, to N GB plus 8 GB (default: 0, off).\n\
+  \--sweep-only         Run no action: only evict, as before one, and exit 0.\n\
+  \                     For a worker waiting for disk space.\n\
   \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
   \                     other workers published, and publish this run's. The\n\
   \                     host store CACHE/checkpoint-store keeps their files.\n\
@@ -2317,13 +2324,18 @@ fun build_watch tc cli_jobs parsed =
     fun loop previous_paths =
       let
         val {prepared, watch_set = previous} = current_watch_state resolution previous_paths
+        val before = HolbuildWatch.snapshot previous
         val _ = attempt prepared
         (* Recompute the watch set after the build so inputs created during the
            build are watched immediately, not only after the next change. *)
         val {prepared = _, watch_set} = current_watch_state resolution (SOME previous)
-        val _ = warn ("watching " ^ Int.toString (length (#paths watch_set)) ^
-                      " project path(s); waiting for changes")
-        val _ = HolbuildWatch.wait_for_change watch_set
+        val _ =
+          if HolbuildWatch.snapshot watch_set <> before then
+            warn "project inputs changed during the build; rebuilding"
+          else
+            (warn ("watching " ^ Int.toString (length (#paths watch_set)) ^
+                   " project path(s); waiting for changes");
+             HolbuildWatch.wait_for_change watch_set)
       in
         loop (SOME watch_set)
       end
@@ -2886,7 +2898,7 @@ fun import_archive args =
               val results = HolbuildCacheTransfer.copy_entries
                               {source = source,
                                destination = fs_cache_destination destination,
-                               tmp_dir = HolbuildFSCacheBackend.tmp_dir destination}
+                               stage_dir = HolbuildFSCacheBackend.blobs_dir destination}
                               keys
             in
               result_count := length results
@@ -3910,23 +3922,35 @@ fun exec_action_command maxheap jobs args =
           SOME n => if n >= 0 then IntInf.fromInt n * 1073741824
                     else raise Error (label ^ " must be a non-negative integer")
         | NONE => raise Error (label ^ " must be a non-negative integer")
-    fun parse (opts as {spec, result, limit, reserve, share}) rest =
+    val sweep_only = List.exists (fn arg => arg = "--sweep-only") args
+    val args = List.filter (fn arg => arg <> "--sweep-only") args
+    fun parse (opts as {spec, result, limit, reserve, floor, share}) rest =
       case rest of
           [] => opts
-        | "--result" :: file :: xs => parse {spec = spec, result = SOME file, limit = limit, reserve = reserve, share = share} xs
+        | "--result" :: file :: xs =>
+            parse {spec = spec, result = SOME file, limit = limit, reserve = reserve, floor = floor, share = share} xs
         | "--cache-limit-gb" :: n :: xs =>
-            parse {spec = spec, result = result, limit = SOME (gb "--cache-limit-gb" n), reserve = reserve, share = share} xs
+            parse {spec = spec, result = result, limit = SOME (gb "--cache-limit-gb" n), reserve = reserve,
+                   floor = floor, share = share} xs
         | "--cache-reserve-gb" :: n :: xs =>
-            parse {spec = spec, result = result, limit = limit, reserve = SOME (gb "--cache-reserve-gb" n), share = share} xs
-        | "--share-heaps" :: xs => parse {spec = spec, result = result, limit = limit, reserve = reserve, share = true} xs
+            parse {spec = spec, result = result, limit = limit, reserve = SOME (gb "--cache-reserve-gb" n),
+                   floor = floor, share = share} xs
+        | "--cache-min-free-gb" :: n :: xs =>
+            parse {spec = spec, result = result, limit = limit, reserve = reserve,
+                   floor = gb "--cache-min-free-gb" n, share = share} xs
+        | "--share-heaps" :: xs =>
+            parse {spec = spec, result = result, limit = limit, reserve = reserve, floor = floor, share = true} xs
         | ["--result"] => raise Error "--result requires FILE"
         | ["--cache-limit-gb"] => raise Error "--cache-limit-gb requires N"
         | ["--cache-reserve-gb"] => raise Error "--cache-reserve-gb requires N"
+        | ["--cache-min-free-gb"] => raise Error "--cache-min-free-gb requires N"
         | arg :: xs =>
             if String.isPrefix "-" arg then raise Error ("unknown exec-action option: " ^ arg)
             else
               case spec of
-                  NONE => parse {spec = SOME arg, result = result, limit = limit, reserve = reserve, share = share} xs
+                  NONE =>
+                    parse {spec = SOME arg, result = result, limit = limit, reserve = reserve, floor = floor,
+                           share = share} xs
                 | SOME _ => raise Error "exec-action takes one SPEC-SHA256"
     val ahead_parents = ref []
     fun ahead_parent text =
@@ -3953,13 +3977,21 @@ fun exec_action_command maxheap jobs args =
       | take_ahead ["--ahead-parent"] = raise Error "--ahead-parent requires INPUT_KEY:SPEC-SHA256"
       | take_ahead ["--ahead-wait-seconds"] = raise Error "--ahead-wait-seconds requires N"
       | take_ahead (x :: xs) = x :: take_ahead xs
-    val {spec, result, limit, reserve, share} =
-      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, share = false} (take_ahead args)
-    val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
+    val {spec, result, limit, reserve, floor, share} =
+      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, floor = 0, share = false} (take_ahead args)
     val cache_cap =
       case limit of
-          SOME limit => {limit_bytes = limit, reserve_bytes = Option.getOpt (reserve, limit div 10)}
+          SOME limit =>
+            {limit_bytes = limit, reserve_bytes = Option.getOpt (reserve, limit div 10), min_free_bytes = floor}
         | NONE => raise Error "exec-action requires --cache-limit-gb N"
+    val _ =
+      if not sweep_only then ()
+      else if Option.isSome spec then raise Error "exec-action --sweep-only takes no SPEC-SHA256"
+      else
+        (HolbuildBuildExec.sweep_worker_cache cache_cap;
+         TextIO.flushOut TextIO.stdErr;
+         Posix.Process.exit 0w0)
+    val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
     fun toolchain {git, rev, kernel = _} =
       let
         val _ = HolbuildActionSandbox.require_trusted_repository {git = git, rev = rev}

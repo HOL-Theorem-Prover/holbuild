@@ -47,6 +47,9 @@ COMPLETE = ".complete"  # stamp file of a finished release build
 MIN_SANDBOX_RELEASE = (0, 13, 58)
 MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
+MIN_FREE_FLOOR_RELEASE = (0, 14, 57)  # the first whose exec-action takes --cache-min-free-gb
+MIN_SWEEP_ONLY_RELEASE = (0, 14, 60)  # the first whose exec-action takes --sweep-only
+CACHE_MIN_FREE_GB = 16  # the free space the cache cap keeps on the cache's disk for writers it doesn't count
 
 
 @functools.cache
@@ -110,6 +113,8 @@ DISK_POLL_SECONDS = 10  # between two looks at the disk while waiting to claim
 
 # What a request to the coordinator raises when it or the network fails; ValueError covers a reply that isn't JSON.
 COORDINATOR_ERRORS = (OSError, RuntimeError, http.client.HTTPException, ValueError)
+# Wait before retrying a heartbeat that failed, while the lease still holds (at most a third of the lease).
+HEARTBEAT_RETRY_SECONDS = 5.0
 # Waits before each retry of a result report the coordinator couldn't take, as while it restarts; then 8 s apart.
 COMPLETE_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
 
@@ -135,9 +140,7 @@ class Drain:
         self.deadline = time.monotonic() + self.seconds
         self.stop.set()
         self.wake.set()
-        # Only the SIGTERM handler, which runs on the main thread, interrupts the main thread's blocking call; a
-        # request from another thread (Protection's, on the lease thread) leaves the call to see ``stop`` after.
-        if self.interrupt and threading.current_thread() is threading.main_thread():
+        if self.interrupt:
             self.interrupt = False
             raise DrainStopped
 
@@ -250,9 +253,12 @@ class Coordinator:
             return response.status, json.loads(payload) if payload else None
 
     def post_reporting(self, path: str, body: dict[str, Any], timeout: float = 30) -> tuple[int, Any]:
-        """``post`` a JSON body with the host's report in it, or none when there is none."""
-        report = None if self.host is None else self.host.report()
-        host = None if report is None else asdict(report)
+        """``post`` a JSON body with the host's report in it, or only the host's id and rank when it can't be read
+        now, since the coordinator quarantines and packs by them; or no host when the worker reports none."""
+        host = None
+        if self.host is not None:
+            report = self.host.report()
+            host = {"id": self.host.id, "rank": self.host.rank} if report is None else asdict(report)
         return self.post(path, json.dumps({**body, "host": host}).encode(), "application/json", timeout)
 
     def claim(self, tiers: list[str], worker: str, wait_s: float, phases: dict[str, float]) -> dict[str, Any] | None:
@@ -319,15 +325,12 @@ class Coordinator:
 
 class Protection:
     """Scale-in protection while the worker holds an action: ``--protection-cmd on|off``, or the ECS agent's
-    task-protection endpoint when ``ECS_AGENT_URI`` is set, or nothing. Failures are logged, never raised; one that
-    names the container instance DRAINING drains ``drain``, since ECS won't stop a worker that keeps protecting
-    itself there. ECS also refuses protection with DEPLOYMENT_BLOCKED on a healthy instance, in a scale-in or a
-    rolling deployment, so that reason alone doesn't drain."""
+    task-protection endpoint when ``ECS_AGENT_URI`` is set, or nothing. Failures, such as ECS refusing protection
+    with DEPLOYMENT_BLOCKED in a scale-in or a rolling deployment, are logged, never raised."""
 
-    def __init__(self, command: str | None, ecs_agent_uri: str | None, drain: Drain | None = None) -> None:
+    def __init__(self, command: str | None, ecs_agent_uri: str | None) -> None:
         self.command = command
         self.ecs_agent_uri = ecs_agent_uri
-        self.drain = drain
 
     def set(self, *, enabled: bool, timeout: float = 30) -> None:
         try:
@@ -349,9 +352,6 @@ class Protection:
                     raise RuntimeError(str(failure))
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
-            if enabled and self.drain is not None and "DRAINING" in str(error):
-                print("the container instance is draining; draining the worker", file=sys.stderr)
-                self.drain.request()
 
 
 @dataclass(frozen=True)
@@ -384,7 +384,8 @@ class Releases:
         failure = f"spec {spec_sha256} is missing from the remote cache"
         preferred = preferred_identities(os.environ.get("HOLBUILD_REMOTE_CACHE_PREFERRED_URLS"))
         # Every node is asked before a miss: until a node has written a new spec through to the shared store, only
-        # that node holds it.
+        # that node holds it.  A spec the client sent must be there, so a node that failed leaves it unavailable even
+        # when another answered 404.
         for node in ranked_nodes(nodes, spec_sha256, preferred):
             # Not check=True: its error would print credentials in the command line.
             try:
@@ -406,11 +407,9 @@ class Releases:
                 raise RuntimeError(failure)
             unavailable = failure
         else:
-            if missing is not None:
-                raise RuntimeError(missing)
             if unavailable is not None:
                 raise CacheUnavailable(unavailable)
-            raise RuntimeError(failure)
+            raise RuntimeError(missing or failure)
         versions = [
             line.removeprefix("holbuild-version=") for line in spec.splitlines() if line.startswith("holbuild-version=")
         ]
@@ -444,6 +443,26 @@ class Releases:
                 self._build(version, directory)
         check_sandbox(executable, version)
         return executable
+
+    def newest(self, minimum: tuple[int, int, int]) -> tuple[str, str] | None:
+        """The version and executable of the newest release at or above ``minimum`` this host has, preinstalled or
+        built, without building one; None if it has none."""
+        found: dict[tuple[int, ...], tuple[str, str]] = {}
+        for root, done in ((self.baked_root, os.path.join("bin", "holbuild")), (self.root, COMPLETE)):
+            try:
+                names = os.listdir(root)
+            except OSError:
+                continue
+            for name in names:
+                version = name.removeprefix("v")
+                executable = os.path.join(root, name, "bin", "holbuild")
+                if (
+                    name.startswith("v") and RELEASE.fullmatch(version)
+                    and tuple(map(int, version.split("."))) >= minimum
+                    and os.path.exists(os.path.join(root, name, done)) and os.access(executable, os.X_OK)
+                ):
+                    found.setdefault(tuple(map(int, version.split("."))), (version, executable))
+        return found[max(found)] if found else None
 
     def _build(self, version: str, directory: str) -> None:
         # holbuild finds its runtime sources where it was compiled, so it's built in the directory it runs from.
@@ -583,12 +602,17 @@ def wait_for_memory(directory: str, charge: int, drain: Drain | None = None) -> 
     return logged
 
 
-def free_bytes(path: str) -> int:
-    """Bytes an unprivileged writer has free on the file system ``path`` is on, or would be created on."""
+def file_system(path: str) -> os.statvfs_result:
+    """The file system ``path`` is on, or would be created on."""
     path = os.path.abspath(path)
     while not os.path.exists(path):
         path = os.path.dirname(path)
-    stat = os.statvfs(path)
+    return os.statvfs(path)
+
+
+def free_bytes(path: str) -> int:
+    """Bytes an unprivileged writer has free on the file system ``path`` is on, or would be created on."""
+    stat = file_system(path)
     return stat.f_bavail * stat.f_frsize
 
 
@@ -609,20 +633,9 @@ def disk_shortfall() -> str | None:
     return None
 
 
-def disk_usage() -> tuple[int, int]:
-    """Free and total bytes of the file system of ``disk_paths`` with the least free, the one ``disk_shortfall``
-    goes by."""
-    least: tuple[int, int] | None = None
-    for path in disk_paths():
-        path = os.path.abspath(path)
-        while not os.path.exists(path):
-            path = os.path.dirname(path)
-        stat = os.statvfs(path)
-        usage = (stat.f_bavail * stat.f_frsize, stat.f_blocks * stat.f_frsize)
-        if least is None or usage[0] < least[0]:
-            least = usage
-    assert least is not None  # the temp dir is always among the paths
-    return least
+def least_free_bytes() -> int:
+    """Free bytes on the file system of ``disk_paths`` with the least free, the one ``disk_shortfall`` goes by."""
+    return min(map(free_bytes, disk_paths()))
 
 
 def remove_children(directory: str) -> None:
@@ -630,7 +643,12 @@ def remove_children(directory: str) -> None:
     directories behind, which are made writable first."""
     def writable(function: Callable[..., Any], path: str, _: BaseException) -> None:
         os.chmod(os.path.dirname(path), 0o700)
-        function(path)
+        if function in (os.open, os.scandir):
+            # A directory rmtree couldn't read (mode 000 or 300): it skipped it, so this removes it.
+            os.chmod(path, 0o700)
+            shutil.rmtree(path, onexc=writable)
+        else:
+            function(path)
 
     try:
         entries = list(os.scandir(directory))
@@ -646,20 +664,53 @@ def remove_children(directory: str) -> None:
             print(f"cleaning {entry.path} failed: {error}", file=sys.stderr)
 
 
-def wait_for_disk(drain: Drain, coordinator: Coordinator, tiers: list[str], worker: str) -> None:
+def sweep_cache(releases: Releases, cache_limit_gb: int) -> None:
+    """Evict from the cache root as exec-action does before an action, down to its cap and the free-space floor,
+    with the newest release this host has that can do it without an action; none, and nothing is evicted."""
+    if (release := releases.newest(MIN_SWEEP_ONLY_RELEASE)) is None:
+        return
+    version, holbuild = release
+    command = [holbuild, "exec-action", "--sweep-only", "--cache-limit-gb", str(cache_limit_gb),
+               "--cache-min-free-gb", str(CACHE_MIN_FREE_GB)]
+    process = subprocess.Popen(command, env=exec_action_env(version=version), stdout=2, start_new_session=True)
+    try:
+        # A drain stops the sweep: the worker is idle, so it stops at once.
+        with releases.drain.interruptible():
+            returncode = process.wait(timeout=900)
+    except subprocess.TimeoutExpired:
+        print("sweeping the cache for disk space timed out", file=sys.stderr)
+        return
+    except DrainStopped:
+        return
+    finally:
+        stop_group(process)
+    if returncode != 0:
+        print(f"sweeping the cache for disk space failed: exit {returncode}", file=sys.stderr)
+
+
+def wait_for_disk(
+    drain: Drain, coordinator: Coordinator, tiers: list[str], worker: str, sweep: Callable[[], None]
+) -> None:
     """Return once the host's disk has room for an action (``disk_shortfall``), or the worker drains, so that a
     worker on a full disk doesn't claim action after action only to fail each at once while other hosts could run
     them. First the worker deletes what its own actions left in its cache root: the action sandboxes and temp
-    files, which no other worker shares and no action of its own uses between claims. While it still waits it
-    reports the host each poll, so the coordinator keeps the host, its disk and its workers in view."""
+    files, which no other worker shares and no action of its own uses between claims, and the record of what its
+    action root holds, which would no longer be true. Each poll it still waits it runs ``sweep``, the cache's own
+    eviction of checkpoints and shared entries, and reports the host, so the coordinator keeps the host, its disk
+    and its workers in view."""
     if disk_shortfall() is None:
         return
     cache = os.environ.get("HOLBUILD_CACHE")
     if cache:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(os.path.join(cache, "action-resident"))
         for directory in ("action", "tmp"):
             remove_children(os.path.join(cache, directory))
     logged = False
-    while (why := disk_shortfall()) is not None:
+    while disk_shortfall() is not None:
+        sweep()
+        if drain.stop.is_set() or (why := disk_shortfall()) is None:
+            return
         if not logged:
             print(f"waiting for disk space before claiming: {why}", file=sys.stderr, flush=True)
         try:
@@ -706,8 +757,7 @@ class HostReport:
     leases: int
     memory_short: bool
     rank: int
-    disk_free: int  # bytes free and in all on the disk ``disk_shortfall`` goes by
-    disk_total: int
+    disk_free: int  # bytes free on the disk ``disk_shortfall`` goes by
 
 
 class HostTelemetry:
@@ -726,12 +776,12 @@ class HostTelemetry:
     def report(self) -> HostReport | None:
         """The host now, or None when it can't be read now. It doesn't wait for the cooperate dir's lock, which
         would hold up the heartbeat that renews a running action's lease: while an admission holds it, there is no
-        report."""
+        reading."""
         try:
             memory = HostMemory.read(self.cooperate_dir, wait=False)
             with open(PROC_STAT) as file:
                 idle, total = cpu_times(file.readline())
-            disk_free, disk_total = disk_usage()
+            disk_free = least_free_bytes()
         except (OSError, ValueError) as error:
             if not isinstance(error, BlockingIOError):
                 print(f"reading the host for the coordinator failed: {error}", file=sys.stderr)
@@ -757,7 +807,6 @@ class HostTelemetry:
             memory.shortfall(self.charge) is not None or waited,
             self.rank,
             disk_free,
-            disk_total,
         )
 
 
@@ -899,14 +948,17 @@ def exec_action_env(*, version: str, discovery_config: str | None = None) -> dic
 
 
 def exec_action_command(
-    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None,
+    args: argparse.Namespace, holbuild: str, version: str, spec: str, result: str, max_heap_mb: int | None,
     ahead_parents: list[dict[str, str]],
 ) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
     command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
     if args.cooperate_dir is not None:
         command += ["--cooperate-dir", args.cooperate_dir]
-    command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb), "--result", result]
+    command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb)]
+    if tuple(map(int, version.split("."))) >= MIN_FREE_FLOOR_RELEASE:
+        command += ["--cache-min-free-gb", str(CACHE_MIN_FREE_GB)]
+    command += ["--result", result]
     if args.share_heaps:
         command.append("--share-heaps")
     for parent in ahead_parents:
@@ -915,14 +967,24 @@ def exec_action_command(
 
 
 class Lease:
-    """Heartbeats an action's lease from a thread while the action runs, and holds scale-in protection."""
+    """Heartbeats an action's lease from a thread while the action runs and its result is posted, and holds scale-in
+    protection. A lease the coordinator can't renew is lost once it may have expired there."""
 
-    def __init__(self, coordinator: Coordinator, token: str, lease_s: float, protection: Protection) -> None:
+    def __init__(
+        self, coordinator: Coordinator, token: str, lease_s: float, protection: Protection,
+        *, claimed: float | None = None,
+    ) -> None:
         self.coordinator = coordinator
         self.token = token
+        self.lease_s = lease_s
         self.interval = max(1.0, lease_s / 3)
+        # The coordinator expires the lease lease_s after it took the claim or after the last heartbeat that renewed
+        # it, each after its request was sent: ``claimed``, by default now, is when the claim's was.
+        self.expires = (time.monotonic() if claimed is None else claimed) + lease_s
         self.protection = protection
         self.lost = threading.Event()
+        self.completing = threading.Event()  # the result is being posted: a stale lease no longer stops anything
+        self.checking = threading.Lock()
         self.done = threading.Event()
         self.thread = threading.Thread(target=self._beat, daemon=True)
 
@@ -944,20 +1006,48 @@ class Lease:
                 ))
                 self.protection.set(enabled=False, timeout=30 if deadline is None else 2)
 
+    def check(self) -> bool:
+        """Whether the lease is lost, marking it lost once it may have expired at the coordinator before the result
+        is posted. The action's poll calls this too, so a heartbeat blocked on an unresponsive coordinator doesn't
+        hold the action past the deadline."""
+        with self.checking:
+            if not self.lost.is_set() and not self.completing.is_set() and time.monotonic() >= self.expires:
+                print("lease ran out without a renewal; stopping the action", file=sys.stderr)
+                self._lose()
+        return self.lost.is_set()
+
     def _beat(self) -> None:
-        while not self.done.wait(self.interval):
+        wait = self.interval
+        while not self.check():
+            left = self.expires - time.monotonic()
+            if self.done.wait(wait if left <= 0 or self.completing.is_set() else min(wait, left)):
+                return
+            if self.check():
+                return
+            sent = time.monotonic()
             try:
                 alive = self.coordinator.heartbeat(self.token)
             except COORDINATOR_ERRORS as error:
-                print(f"heartbeat failed, carrying on: {error}", file=sys.stderr)
+                wait = min(HEARTBEAT_RETRY_SECONDS, self.interval)
+                print(f"heartbeat failed, retrying in {wait:g} s: {error}", file=sys.stderr)
                 continue
             if not alive:
-                print("lease lost; stopping the action", file=sys.stderr)
-                self.lost.set()
-                self.coordinator.drain.wake.set()
+                # A heartbeat that crossed the posted result finds its token spent: the lease ended as it should.
+                if not self.completing.is_set():
+                    print("lease lost; stopping the action", file=sys.stderr)
+                    self._lose()
                 return
+            with self.checking:
+                if self.lost.is_set():
+                    return
+                self.expires = sent + self.lease_s
+            wait = self.interval
             if not self.done.is_set() and not self.coordinator.drain.stop.is_set():
                 self.protection.set(enabled=True, timeout=5)
+
+    def _lose(self) -> None:
+        self.lost.set()
+        self.coordinator.drain.wake.set()
 
 
 def claim_reporting(
@@ -985,27 +1075,34 @@ def run_one(
     protection: Protection,
     claim: dict[str, Any],
     phases: Phases,
+    *,
+    claimed: float | None = None,
 ) -> bool:
     """Run one claimed action to its end, or until its lease is lost, and report it, adding its phases' time to
     ``phases``. An error in the worker is reported for a retry and then raised, so that ``main`` waits before it
-    claims again. True when exec-action reported the remote cache ``unavailable``, after which ``main`` waits too."""
+    claims again. True when exec-action reported the remote cache ``unavailable``, after which ``main`` waits too.
+    ``claimed`` is when the claim's request was sent (``time.monotonic()``), by default now."""
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
     drain = coordinator.drain
     releases = replace(releases, drain=drain)
     print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
-    with Lease(coordinator, token, claim["lease_s"], protection).held(phases) as lease:
+    with Lease(coordinator, token, claim["lease_s"], protection, claimed=claimed).held(phases) as lease:
         completed = False
 
         def report(record: str) -> None:
             """Completes the action once, even if posting it fails: the coordinator then retries it when the
-            lease expires. Its token is stale from then, so the heartbeat stops first: a 409 would mark the
-            lease lost and stop exec-action. Scale-in protection stays on until it exits."""
+            lease expires. The heartbeat goes on while the result is posted, so the lease doesn't lapse while the
+            coordinator restarts, and stops once it is: the token is spent then. Scale-in protection stays on until
+            exec-action exits."""
             nonlocal completed
             completed = True
-            lease.done.set()
-            with phases.timed("complete"):
-                coordinator.complete(token, record, claim["lease_s"])
+            lease.completing.set()
+            try:
+                with phases.timed("complete"):
+                    coordinator.complete(token, record, claim["lease_s"])
+            finally:
+                lease.done.set()
 
         try:
             record = execute(args, releases, lease, claim, phases, report)
@@ -1047,7 +1144,8 @@ def execute(
     report: Callable[[str], None],
 ) -> str | None:
     """The result record of the claimed action, or None once its lease is lost. A record exec-action writes
-    while it runs is passed to ``report`` at once; the record returned is then that one."""
+    while it runs is passed to ``report`` at once; the record returned is then that one. One it writes as it
+    stops for a lost lease is reported too, for the log of the action it stopped."""
     spec = claim["spec_sha256"]
     drain = releases.drain
     drain.publish_seconds = 0.0
@@ -1067,7 +1165,7 @@ def execute(
     except Unreleased as error:
         print(f"refusing {spec}: {error}", file=sys.stderr)
         return failed_record(spec, "spec-rejected", f"the worker refuses the action: {error}")
-    if lease.lost.is_set():
+    if lease.check():
         return None
     if drain.stop.is_set():
         return failed_record(spec, "unavailable", DRAINING)
@@ -1078,11 +1176,11 @@ def execute(
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb"), ahead_parents),
+            exec_action_command(args, holbuild, version, spec, result, claim.get("max_heap_mb"), ahead_parents),
             env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )
-        drained_out = False
+        drained_out = lost = False
         # exec-action writes its result (atomically) before publishing for later actions; it is reported then,
         # and the worker waits for the rest without the lease, at most POST_RESULT_SECONDS.
         reported: str | None = None
@@ -1093,8 +1191,9 @@ def execute(
         try:
             while process.poll() is None:
                 if reported is None:
-                    if lease.lost.is_set():
-                        return None
+                    if lease.check():
+                        lost = True
+                        break
                     if (record := read_result(result)) is not None:
                         now = time.monotonic()
                         if cooperate_dir is None:
@@ -1127,10 +1226,10 @@ def execute(
             if hard_stop is not None:
                 hard_stop.cancel()
             timed_out = seen > 0 and time.monotonic() - seen >= POST_RESULT_SECONDS
-            if args.share_heaps and process.poll() is None and not timed_out:
+            if process.poll() is None and not timed_out:
                 drain.publish_seconds = DRAIN_CHECKPOINT_PUBLISH_SECONDS
-                # Signal only the driver: it stops HOL, then publishes the
-                # sandbox-validated saves. Killing its group here loses them.
+                # Signal only the driver: it stops HOL, publishes the sandbox-validated saves, uploads the log
+                # and writes its record. Killing its group here loses them.
                 with contextlib.suppress(ProcessLookupError):
                     process.send_signal(signal.SIGTERM)
                 deadline = time.monotonic() + CHECKPOINT_PUBLISH_SECONDS
@@ -1160,8 +1259,15 @@ def execute(
             # Reported already: whatever the driver did after its result changes nothing for the client.
             print(f"{claim['theory']}: exit {process.returncode} after the result", file=sys.stderr, flush=True)
             return reported
+        if lost:
+            if (record := read_result(result)) is not None:
+                report(record)
+            return None
         if drained_out:
-            return failed_record(spec, "unavailable", "the worker's drain deadline passed before exec-action finished")
+            record = failed_record(spec, "unavailable", "the worker's drain deadline passed before exec-action finished")
+            # The log exec-action uploaded as it stopped shows how far the action got.
+            log = next((line for line in (read_result(result) or "").splitlines() if line.startswith("log=")), None)
+            return record if log is None else f"{record}{log}\n"
         if (record := read_result(result)) is None:
             if recordless := recordless_failure(process.returncode, drain.stop.is_set()):
                 failure, detail = recordless
@@ -1319,7 +1425,7 @@ def main() -> None:
         baked_root=args.baked_releases,
         drain=drain,
     )
-    protection = Protection(args.protection_cmd, os.environ.get("ECS_AGENT_URI"), drain)
+    protection = Protection(args.protection_cmd, os.environ.get("ECS_AGENT_URI"))
     tiers = list(dict.fromkeys([args.tier, *args.also_claim]))
     phases = Phases()
     discovery_url = os.environ.get("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL")
@@ -1343,9 +1449,10 @@ def main() -> None:
             with open(config, "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as out:
                 out.write('header = "' + header + '"\n')
             releases = replace(releases, discovery_config=config)
+        sweep = functools.partial(sweep_cache, releases, args.cache_limit_gb)
         while not drain.stop.is_set():
             with phases.timed("idle"):
-                wait_for_disk(drain, coordinator, tiers, args.name)
+                wait_for_disk(drain, coordinator, tiers, args.name, sweep)
             if args.cooperate_dir is not None:
                 try:
                     with phases.timed("memory_wait"), drain.interruptible():
@@ -1368,7 +1475,7 @@ def main() -> None:
                 nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
                 releases = replace(releases, remote_cache=",".join(nodes))
             try:
-                unavailable = run_one(coordinator, args, releases, protection, claim, phases)
+                unavailable = run_one(coordinator, args, releases, protection, claim, phases, claimed=started)
             except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
                 # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
                 # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.

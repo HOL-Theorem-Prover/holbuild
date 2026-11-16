@@ -87,7 +87,7 @@ The executable includes the Poly/ML runtime, so running it does not require
 an installed Poly/ML. Building HOL toolchains still requires `poly` and
 `polyc`, plus HOL's other build dependencies. Archives include holbuild's
 `LICENSE`, the SML/NJ notice, and Poly/ML's license in `share/holbuild`.
-The same release also offers `polyml-v5.9.2-seq11-source.tar.gz`, the exact
+The same release also offers `polyml-v5.9.2-seq12-source.tar.gz`, the exact
 Poly/ML sources used for both binaries. Poly/ML is built with
 `--disable-shared --without-gmp`; the holbuild sources for rebuilding/relinking
 are available at the release tag.
@@ -1413,7 +1413,11 @@ so one more healthy node takes it. A single-node list keeps the ordinary single-
 backup keeps the ring available; the circuit breaker below counts the final
 outcome of a request. If no node hits, a 404 from any node gives a miss, even if
 others failed transiently; this allows a new action to build and publish on a
-healthy node. Transient failures from every node remain unavailable. Replicas
+healthy node. Transient failures from every node remain unavailable. Reads of an
+entry that must exist are the exception: when a remote worker restores an
+action's inputs (its spec's blobs and its parent theories), fetches its spec, or
+the coordinator checks that a finished parent is still cached, a 404 beside a
+transient failure is unavailable, since the failed node may hold the entry. Replicas
 should share a backing store, so that any node can serve an entry another node
 wrote once it is uploaded.
 

@@ -179,10 +179,10 @@ grep -qx 'status=cached' "$tmpdir/w.result" || { cat "$tmpdir/w.result" "$tmpdir
 [[ $(sed -n '/^manifest-text-v1$/,$p' "$remote_root/ac/$ac") == $(sed -n '/^manifest-text-v1$/,$p' "$tmpdir/own-entry") ]] ||
   { echo "the weaker entry was not replaced" >&2; cat "$remote_root/ac/$ac" "$tmpdir/w.log" >&2; exit 1; }
 
-# A new action must build and publish with either the primary or backup down.
-# Its optional cache lookups and pre-PUT check see one transport failure and 404.
-for rank in primary backup; do
-  down=$(python3 - "$remote_url" "$ac" "$rank" <<'PYCODE'
+# dead_node RANK: an unreachable node that ranks RANK (primary or backup)
+# beside the stub cache for A's entry.
+dead_node() {
+  python3 - "$remote_url" "$ac" "$1" <<'PYCODE'
 import hashlib, sys
 healthy, digest, rank = sys.argv[1:]
 score = lambda node: hashlib.sha256(f"{node}:{digest}".encode()).hexdigest()
@@ -194,7 +194,12 @@ for i in range(10000):
 else:
     raise SystemExit("could not choose dead primary")
 PYCODE
-)
+}
+
+# A new action must build and publish with either the primary or backup down.
+# Its optional cache lookups and pre-PUT check see one transport failure and 404.
+for rank in primary backup; do
+  down=$(dead_node "$rank")
   rm "$remote_root/ac/$ac"
   worker "ring-$rank" "$down,$remote_url"
   if [[ "$worker_status" != 0 ]]; then
@@ -213,7 +218,24 @@ spec=$(awk '$1 == "action" && $5 == "worker:BTheory" { print $4 }' "$tmpdir/batc
 echo 500 > "$control/ac-get-status-$ac"
 worker b
 expect b 3 unavailable "remote cache server error: HTTP 500 for GET .*/ac/$ac"
+# Nor is a 404 from one node while the other, which may hold the entry,
+# gives no answer, whichever ranks first.
+echo 404 > "$control/ac-get-status-$ac"
+for rank in primary backup; do
+  worker "b-ring-$rank" "$(dead_node "$rank"),$remote_url"
+  expect "b-ring-$rank" 3 unavailable "no answer from the remote cache to GET .*/ac/$ac"
+done
 rm "$control/ac-get-status-$ac"
+# Nor is an internal error restoring it: w holds A's entry but not its .dat,
+# and the cache refuses that blob.
+a_input=$(sed -n 's/^input_key=//p' "$remote_root/ac/$ac")
+dat=$(sed -n 's/^blob dat //p' "$tmpdir/worker-w/actions/$a_input/manifest")
+[[ -n "$dat" ]] || { echo "w holds no entry for A" >&2; exit 1; }
+rm "$tmpdir/worker-w/blobs/$dat"
+echo 403 > "$control/cas-get-status-$dat"
+worker w
+expect w 3 internal "cannot fetch blob $dat"
+rm "$control/cas-get-status-$dat"
 spec=$spec_a
 
 # A traced rerun must return its new log even though the theory outputs are

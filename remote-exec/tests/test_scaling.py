@@ -431,7 +431,6 @@ def host_report(host_id: str, cpu_idle_pct: float | None, rank: int = 0) -> dict
         "memory_short": False,
         "rank": rank,
         "disk_free": 100 << 30,
-        "disk_total": 200 << 30,
     }
 
 

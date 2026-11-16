@@ -297,6 +297,10 @@ tactic_timeout = 180
 url = "$remote_url"
 TOML
 third_log=$tmpdir/third.log
+# Downloads stage beside blobs/, not in tmp/: the two may be on different
+# filesystems, where publishing would copy and re-hash every blob.
+mkdir -p "$third_cache/tmp"
+chmod a-w "$third_cache/tmp"
 (cd "$third" && HOLBUILD_CACHE="$third_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" build ATheory) > "$third_log" 2>&1
 require_grep "remote cache \(hydrated\|prefetched\):" "$third_log"

@@ -425,6 +425,14 @@ fun module_policy {sandboxed, store, base_state} =
     else if_meta_has ["configureTheoryModuleCache"] ("val _ = " ^ configure ^ ";")
   end
 
+(* Runs [call] on HOL's trace structure, ignoring an unknown trace.  The
+   traces moved from Feedback to HOLFlags; naming the structure at run time
+   keeps either HOL from compiling a name it lacks. *)
+fun trace_line call =
+  "val _ = CompilerSpecific.quietbind (\"val _ = (\" ^ " ^
+  "(if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HOLFlags\") then \"HOLFlags\" else \"Feedback\") ^ " ^
+  HolbuildToolchain.sml_string ("." ^ call ^ " handle _ => ());") ^ ");"
+
 (* A speculative child (pipelined builds) configures no theory module cache,
    so nothing it compiles is published there. *)
 fun write_child_policy_with {module_cache = use_module_cache} tc path =
@@ -438,8 +446,7 @@ fun write_child_policy_with {module_cache = use_module_cache} tc path =
        "val _ = Meta.loadPath := List.filter (fn dir => not " ^
        "(String.isSubstring \"/.holbuild/stage/\" (dir ^ \"/\"))) (!Meta.loadPath);\n" ^
        String.concat
-         (map (fn trace => "val _ = (Feedback.set_trace " ^ HolbuildToolchain.sml_string trace ^
-                           " 0 handle _ => ());\n")
+         (map (fn trace => trace_line ("set_trace " ^ HolbuildToolchain.sml_string trace ^ " 0") ^ "\n")
               child_policy_traces) ^ (if use_module_cache then module_cache else "") ^ "\n")
   end
 
@@ -448,8 +455,7 @@ fun write_child_policy tc path = write_child_policy_with {module_cache = true} t
 (* Checkpoints are saved with the child policy in effect.  A `run --from`
    session loads these lines so it exports theories as a plain run does. *)
 val child_policy_reset_lines =
-  map (fn trace => "val _ = (Feedback.reset_trace " ^ HolbuildToolchain.sml_string trace ^
-                   " handle _ => ());")
+  map (fn trace => trace_line ("reset_trace " ^ HolbuildToolchain.sml_string trace))
       child_policy_traces
 
 fun generated_metadata_report_lines {parents_report, mldeps_report} =
@@ -2464,7 +2470,7 @@ fun copy_remote_cache_entry_using usable root url key =
            HolbuildCacheTransfer.copy_entry
              {source = remote_cache_source_with_action remote key manifest,
               destination = fs_cache_destination local_cache,
-              tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache}
+              stage_dir = HolbuildFSCacheBackend.blobs_dir local_cache}
              key;
            true)
   end
@@ -2516,7 +2522,7 @@ fun publish_remote_cache_key root key =
           val _ = HolbuildCacheTransfer.copy_entry
                     {source = fs_cache_source local_cache,
                      destination = remote_cache_destination remote,
-                     tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache}
+                     stage_dir = HolbuildFSCacheBackend.blobs_dir local_cache}
                     key
         in
           cache_trace ("remote cache published: " ^ key)
@@ -9564,12 +9570,13 @@ fun action_failed failure msg = ActionFailed (classify_failure failure msg)
 (* A worker keeps the spec's sources and libraries in its local blob store,
    so it fetches each once rather than once per action.  One no cache entry
    names is evicted on its own when least recently used
-   (local_cache_families). *)
+   (local_cache_families).  The spec names each blob, so its read is
+   required (HolbuildRemoteCache.required). *)
 fun fetch_spec_blob remote {hash, dst} =
   let
     val cache = cache_root ()
     fun fetch_remote () =
-      case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst} of
+      case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst}) of
           HolbuildCacheBackend.Hit =>
             (case HolbuildCache.publish_blob cache {hash = hash, src = dst} of
                  HolbuildCacheBackend.Conflict msg => warn ("could not keep blob " ^ hash ^ ": " ^ msg)
@@ -9798,8 +9805,10 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                             hashes = hashes})
       end
     fun restorable f (dep as {target, key, ...}) =
-      f dep
+      HolbuildRemoteCache.required (fn () => f dep)
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
+           | e as ActionFailed (DiskFailure, _) => raise e
+           | e as ActionFailed (InternalFailure, _) => raise e
            | e => raise action_failed (InputMissing ("theory " ^ key))
                           ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                            General.exnMessage e)
@@ -10007,14 +10016,14 @@ fun publish_action_entry remote root (spec : action_spec) =
     val local_cache = HolbuildFSCacheBackend.filesystem (cache_root ())
     val source = fs_cache_source local_cache
     val destination = remote_cache_destination remote
-    val tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache
+    val stage_dir = HolbuildFSCacheBackend.blobs_dir local_cache
     val manifest =
       case #get_action source key of
           SOME text => text
         | NONE => raise ActionFailed (PublishFailure, "the build published no local cache entry")
   in
-    ensure_dir tmp_dir;
-    (transfer_all (fn hash => ignore (HolbuildCacheTransfer.copy_blob source destination tmp_dir hash (0, 0)))
+    ensure_dir stage_dir;
+    (transfer_all (fn hash => ignore (HolbuildCacheTransfer.copy_blob source destination stage_dir hash (0, 0)))
        (HolbuildCacheTransfer.unique_blobs manifest)
      handle e as HolbuildRemoteCache.Unavailable _ => raise e
           | e => raise action_failed PublishFailure ("could not publish the entry: " ^ General.exnMessage e));
@@ -10203,17 +10212,27 @@ fun lost_restored_file resident root text =
           in
             if Substring.isEmpty found then []
             else
-              let val (path, rest) = Substring.splitl (not o Char.isSpace) (Substring.triml (size what) found)
+              let
+                val (path, rest) = Substring.splitl (not o Char.isSpace) (Substring.triml (size what) found)
+                (* What the message wraps the path in: an exception's
+                   quotes, a following colon. *)
+                val path = Substring.dropr (fn c => c = #"\"" orelse c = #"'" orelse c = #":") path
               in Substring.string path :: from rest end
           end
       in
         from (Substring.full text)
       end
+    (* HOL names the path it was asked for, or the .hol/objs copy it reads
+       a .ui or .uo at; the records name the path beside the source. *)
+    fun unmapped path =
+      if Path.file (Path.dir path) = "objs" andalso Path.file (Path.dir (Path.dir path)) = ".hol" then
+        SOME (Path.concat(Path.dir (Path.dir (Path.dir path)), Path.file path))
+      else NONE
+    fun lost path =
+      restored path orelse restored (hfs_remapped_path path) orelse
+      (case unmapped path of SOME path => restored path | NONE => false)
   in
-    (* HOL names the path it was asked for, and reads a .ui or .uo at its
-       .hol/objs copy. *)
-    List.exists (fn path => restored path orelse restored (hfs_remapped_path path))
-      (List.concat (map paths ["Cannot find file ", "non-existent file "]))
+    List.exists lost (List.concat (map paths ["Cannot find file ", "non-existent file "]))
   end
 
 (* The worker cache cap covers everything a worker keeps between
@@ -10447,27 +10466,46 @@ fun worker_cache_roots cache =
                    (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ())
   in
     [tree (share_store cache), {id = toolchain_id, measure = toolchain_bytes},
-     tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache)]
+     tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache),
+     tree (HolbuildCache.theory_modules_dir cache)]
   end
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
    room under limit_bytes. An action reuses a recent shared scan while the
    cache stays within limit_bytes, so the reserve absorbs growth between
-   evictions instead of every action waiting on one; private checkpoints and
-   modules are always measured locally. Small caps
-   and zero reserves scan live.  With refresh, as after an action's result,
-   scan only when the stamp is past half its life and no other process holds
+   evictions instead of every action waiting on one; private checkpoints are
+   always measured locally. Zero reserves scan live.  With refresh, as after
+   an action's result, scan only when the stamp is past half its life and no other process holds
    gc.lock, so that busy hosts keep the stamp fresh and actions seldom wait
-   on a scan. *)
-fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes, refresh} =
+   on a scan.
+   With min_free_bytes > 0, files outside the cache count too: when the disk
+   has less free (or under 65536 free inodes), the sweep evicts to the floor
+   plus a buffer. A sweep that took that on marks its stamp floor-handled, so
+   that siblings don't queue behind it, nor sweep again for the floor while
+   the stamp is fresh when files the cap can't evict hold the disk below it. *)
+fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes, min_free_bytes, refresh} =
   let
-    fun private_bytes () =
-      cache_root_bytes checkpoint_root + cache_root_bytes (HolbuildCache.theory_modules_dir cache)
+    fun private_bytes () = cache_root_bytes checkpoint_root
     val roots = worker_cache_roots cache
     fun root_ids () = map (fn {id, ...} => id ()) roots
     fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
     val target = limit_bytes - reserve_bytes
-    val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.state")
+    (* Releases before the theory-modules root keep their four-root stamp in
+       worker-cache-cap.state, so a host running both doesn't thrash either. *)
+    val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap-v3.state")
+    val state_header = "holbuild-worker-cache-cap-v3"
+    (* Bytes to evict to bring the disk back over the floor with an 8 GiB
+       buffer, or 0 when it is over. *)
+    fun floor_deficit () =
+      if min_free_bytes <= 0 then 0
+      else
+        case HolbuildCacheTransfer.disk_free cache of
+            NONE => 0
+          | SOME {bytes = free, inodes} =>
+              if free >= min_free_bytes andalso (case inodes of SOME n => n >= 65536 | NONE => true) then 0
+              else
+                let val buffer = gb_to_bytes 8
+                in LargeInt.max (buffer, min_free_bytes + buffer - free) end
     fun parse_sizes [] = SOME []
       | parse_sizes (id :: bytes :: rest) =
           (case (IntInf.fromString bytes, parse_sizes rest) of
@@ -10477,17 +10515,18 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     val stamp_life = 60000000000 : LargeInt.int
     fun stamp_age () =
       (case String.tokens Char.isSpace (read_text state_path) of
-           "holbuild-worker-cache-cap-v2" :: measured :: _ =>
+           header :: measured :: _ =>
+             if header <> state_header then NONE else
              Option.map (fn measured => Time.toNanoseconds (Time.now ()) - measured) (LargeInt.fromString measured)
          | _ => NONE)
       handle IO.Io _ => NONE
            | OS.SysErr _ => NONE
     fun recent_scan_fits private_bytes =
-      target >= gb_to_bytes 64 andalso reserve_bytes > 0 andalso
+      reserve_bytes > 0 andalso
       (case String.tokens Char.isSpace (read_text state_path) of
-           "holbuild-worker-cache-cap-v2" :: measured :: entries =>
-             (case (LargeInt.fromString measured, parse_sizes entries) of
-                  (SOME measured, SOME entries) =>
+           header :: measured :: floor_state :: entries =>
+             (case (header = state_header, LargeInt.fromString measured, parse_sizes entries) of
+                  (true, SOME measured, SOME entries) =>
                     let val age = Time.toNanoseconds (Time.now ()) - measured
                     in
                       age >= 0 andalso age < stamp_life andalso length entries = length roots andalso
@@ -10496,7 +10535,8 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                                 are shared. Keep their hits without stamp churn. *)
                              (fn (({id = identify, measure}), (id, bytes)) =>
                                  if identify () = id then bytes else measure ())
-                             (roots, entries)) + private_bytes () <= limit_bytes
+                             (roots, entries)) + private_bytes () <= limit_bytes andalso
+                      (floor_state = "floor-handled" orelse (floor_state = "floor-ok" andalso floor_deficit () = 0))
                     end
                 | _ => false)
          | _ => false)
@@ -10514,8 +10554,12 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
         steps := !steps @ [(name, Time.toMilliseconds (Time.-(Time.now (), start)))];
         result
       end
-    fun sweep total remaining =
-      if total <= target then total
+    (* The bytes a family held can stay in use after it goes: a heap a
+       checkpoint tree still links, or a sparse file's unallocated bytes. So
+       once they cover a floor deficit, statvfs says whether the disk is back
+       over the floor, and eviction goes on while it isn't. *)
+    fun sweep floor_short goal total remaining =
+      if total <= goal andalso not (floor_short ()) then total
       else
         case remaining of
             [] => total
@@ -10524,7 +10568,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                 val freed =
                   evict () handle e => (warn ("worker cache eviction failed: " ^ General.exnMessage e); NONE)
               in
-                sweep (total - Option.getOpt (freed, 0)) rest
+                sweep floor_short goal (total - Option.getOpt (freed, 0)) rest
               end
     fun measure_shared () =
       let
@@ -10533,10 +10577,11 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       in
         {measured = measured, ids = ids, sizes = map (fn {measure, ...} => measure ()) roots}
       end
-    fun publish {measured, ids, sizes} =
+    fun publish floor_handled {measured, ids, sizes} =
       if ids <> root_ids () then remove_file state_path
       else write_text state_path
-        ("holbuild-worker-cache-cap-v2\n" ^ LargeInt.toString measured ^ "\n" ^
+        (state_header ^ "\n" ^ LargeInt.toString measured ^ "\n" ^
+         (if floor_handled then "floor-handled\n" else "floor-ok\n") ^
          String.concat (ListPair.map (fn (id, bytes) => id ^ " " ^ IntInf.toString bytes ^ "\n")
                                     (ids, sizes)))
     fun scan reuse =
@@ -10547,8 +10592,10 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
           let
             val shared = timed "walk" measure_shared
             val total = sum (#sizes shared) + private_size
+            val deficit = floor_deficit ()
+            val goal = LargeInt.min (target, total - deficit)
           in
-            if total <= target then publish shared
+            if total <= goal then publish false shared
             else
               let
                 (* Eviction can outlast the stamp's life. The fresh walk
@@ -10556,7 +10603,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                    limit reuse it instead of waiting on gc.lock. Stamped
                    when the walk ends, so eviction gets the stamp's whole
                    life. *)
-                val _ = publish {measured = Time.toNanoseconds (Time.now ()), ids = #ids shared,
+                val _ = publish (deficit > 0) {measured = Time.toNanoseconds (Time.now ()), ids = #ids shared,
                                  sizes = #sizes shared}
                 val families =
                   timed "families" (fn () =>
@@ -10568,13 +10615,21 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                               store_cache_families cache @ module_cache_families cache @
                               local_families) @ by_age young_orphans
                     end)
-                val after = timed "evict" (fn () => sweep total families)
+                fun floor_short () = deficit > 0 andalso floor_deficit () > 0
+                val after = timed "evict" (fn () => sweep floor_short goal total families)
+                val unmet = after > goal orelse floor_short ()
               in
                 (* Measure again rather than publish an estimate derived from
                    the mixed private and shared freed total, so a waiter on
                    gc.lock reuses the result rather than repeating the scan.
                    Until then siblings keep reusing the pre-eviction walk. *)
-                if after <= target then publish (timed "rewalk" measure_shared)
+                if after <= target then
+                  (publish unmet (timed "rewalk" measure_shared);
+                   if unmet then
+                     warn ("the disk stays under the " ^ gb_decimal_text min_free_bytes ^
+                           " GB free-space floor with the worker cache down to " ^ gb_decimal_text after ^
+                           " GB of entries in use")
+                   else ())
                 else (remove_file state_path;
                       warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
                            gb_decimal_text target ^ " GB left under the cap after its reserve"))
@@ -10599,7 +10654,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
           case stamp_age () of SOME age => age >= 0 andalso age < stamp_life div 2 | NONE => false
       in
         (* Only caps that reuse a stamp gain from refreshing it. *)
-        if fresh orelse target < gb_to_bytes 64 orelse reserve_bytes <= 0 then ()
+        if fresh orelse reserve_bytes <= 0 then ()
         else
           Option.app (fn lock => locked lock false)
             (HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "cache gc"})
@@ -10622,6 +10677,17 @@ fun with_action_root_lock cache f =
   in
     (f () before HolbuildFileLock.release lock)
     handle e => (HolbuildFileLock.release lock; raise e)
+  end
+
+(* exec-action --sweep-only: the sweep an action starts with, for a worker
+   short of disk space that has no action to start. *)
+fun sweep_worker_cache {limit_bytes, reserve_bytes, min_free_bytes} =
+  let val cache = cache_root ()
+  in
+    with_action_root_lock cache (fn () =>
+      enforce_worker_cache_cap
+        {cache = cache, checkpoint_root = Path.concat(cache, "checkpoints"), limit_bytes = limit_bytes,
+         reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false})
   end
 
 fun phases_text sep unit phases =
@@ -12403,7 +12469,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           SOME path => path
         | NONE => current_build_log (current_log_dir root (#1 (!target)) (#2 (!target)))
     fun upload_log () =
-      if !cancelled orelse not (!HolbuildActionSandbox.outputs_validated) then NONE else
+      if not (!HolbuildActionSandbox.outputs_validated) then NONE else
       let val path = build_log ()
       in
         if not (file_exists path) then NONE
@@ -12870,9 +12936,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val staged = in_root staging stem
             val _ =
               (ensure_parent staged;
-               restore_spec_theory_in remote {files = staging, named = root} resolver
-                 {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
+               HolbuildRemoteCache.required (fn () =>
+                 restore_spec_theory_in remote {files = staging, named = root} resolver
+                   {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE}))
               handle e as HolbuildRemoteCache.Unavailable _ => raise e
+                   | e as ActionFailed (DiskFailure, _) => raise e
+                   | e as ActionFailed (InternalFailure, _) => raise e
                    | e => raise action_failed (InputMissing ("theory " ^ key))
                                   ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                                    General.exnMessage e)
@@ -12998,12 +13067,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         (fn () =>
             let
               val _ =
-                let val {limit_bytes, reserve_bytes} = cache_cap
+                let val {limit_bytes, reserve_bytes, min_free_bytes} = cache_cap
                 in
                   phase "cap" (fn () =>
                     enforce_worker_cache_cap
-                      {cache = cache, checkpoint_root = checkpoint_root,
-                       limit_bytes = limit_bytes, reserve_bytes = reserve_bytes, refresh = false})
+                      {cache = cache, checkpoint_root = checkpoint_root, limit_bytes = limit_bytes,
+                       reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false})
                 end
               val (status, failure) = attempt ()
               val _ =
@@ -13020,6 +13089,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                          TextIO.closeOut out
                        end
                        handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e))
+              (* An interrupted action has a few seconds to stop in: its
+                 saved checkpoints, which a retry resumes from, go before
+                 its log. *)
+              val _ =
+                if !cancelled then
+                  (!deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
+                   deferred := (fn () => ()))
+                else ()
               val log = phase "log" upload_log
               (* A final failure's log is its only diagnostic and nothing
                  retries the action to recover it. *)
@@ -13066,11 +13143,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                 (* A worker draining after the result has a few seconds left
                    for the publish, not for a cache scan. *)
                 if !cancelled then () else
-                  let val {limit_bytes, reserve_bytes} = cache_cap
+                  let val {limit_bytes, reserve_bytes, min_free_bytes} = cache_cap
                   in
                     enforce_worker_cache_cap
-                      {cache = cache, checkpoint_root = checkpoint_root,
-                       limit_bytes = limit_bytes, reserve_bytes = reserve_bytes, refresh = true}
+                      {cache = cache, checkpoint_root = checkpoint_root, limit_bytes = limit_bytes,
+                       reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = true}
                   end;
                 HolbuildStatus.message_stderr
                   ("holbuild: exec-action after the result (ms): " ^

@@ -312,7 +312,12 @@ Needs
 Also upload the specs and their sources to the remote cache.
 .RE
 .TP
-.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-share\-heaps\fR] [\fB\-\-result \fIFILE\fR] [\fB\-\-ahead\-parent \fIINPUT_KEY\fB:\fISPEC\-SHA256\fR ... [\fB\-\-ahead\-wait\-seconds \fIN\fR]]
+.B exec\-action \-\-sweep\-only \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-cache\-min\-free\-gb \fIN\fR]
+Sweep the worker cache only, as
+.B \-\-sweep\-only
+below says, and run no action.
+.TP
+.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-cache\-min\-free\-gb \fIN\fR] [\fB\-\-share\-heaps\fR] [\fB\-\-result \fIFILE\fR] [\fB\-\-ahead\-parent \fIINPUT_KEY\fB:\fISPEC\-SHA256\fR ... [\fB\-\-ahead\-wait\-seconds \fIN\fR]]
 Run the action specification stored in the remote cache as
 .I SPEC\-SHA256
 (see
@@ -348,6 +353,25 @@ GB minus the reserve.
 .TP
 .BI \-\-cache\-reserve\-gb " N"
 Room to keep free under the limit (default: a tenth).
+.TP
+.BI \-\-cache\-min\-free\-gb " N"
+Also evict while the file system holding the cache has less than
+.I N
+GB free, or fewer than 65536 free inodes, until it has
+.I N
+GB plus 8 GB
+(default: 0, off).
+The evicted families' sizes must cover that, and statvfs must show the file
+system back over
+.I N
+GB.
+.TP
+.B \-\-sweep\-only
+Run no action: only evict, as before one, and exit 0.
+Takes no
+.I SPEC\-SHA256
+and needs no remote cache.
+For a worker waiting for disk space.
 .TP
 .B \-\-share\-heaps
 Resume from the deps-loaded heap and theorem checkpoints other workers

@@ -93,8 +93,12 @@ val _ = assert "authorization error is not retried"
 val _ = clear primary "get-status";
 val _ = RC.remove_file (stored backup "cas" digest);
 val _ = assert "both missing" (fetch cache digest = CB.Miss);
+fun unavailable f = (ignore (f ()); false) handle RC.Unavailable _ => true;
 val _ = put primary "get-status" "503";
 val _ = assert "transient plus missing is a miss" (fetch cache digest = CB.Miss);
+val _ = assert "a required read of transient plus missing is unavailable"
+  (unavailable (fn () => RC.required (fn () => fetch cache digest)));
+val _ = assert "a required read ends with its thread" (fetch cache digest = CB.Miss);
 val _ = put backup "get-status" "503";
 val _ = assert "both transient reports backup"
   ((ignore (fetch auth_cache digest); false)
@@ -103,6 +107,8 @@ val _ = assert "both transient reports backup"
      not (String.isSubstring "user:pass" message));
 val _ = clear primary "get-status";
 val _ = assert "missing plus transient is a miss" (fetch cache digest = CB.Miss);
+val _ = assert "a required read of missing plus transient is unavailable"
+  (unavailable (fn () => RC.required (fn () => fetch cache digest)));
 val _ = put backup "get-status" "403";
 val _ = assert "backup authorization failure overrides miss and names backup"
   (case fetch auth_cache digest of
@@ -185,6 +191,8 @@ val _ = assert "a miss asks two nodes, then probes the rest"
 val _ = put q3 "head-status" "503";
 val _ = assert "a probe's 503 beside 404s is a miss"
   (asked_during (fn () => RC.get_action quad theory_key) = (NONE, [["GET"], ["GET"], ["HEAD"], ["HEAD"]]));
+val _ = assert "a required read with a probe's 503 beside 404s is unavailable"
+  (unavailable (fn () => RC.required (fn () => RC.get_action quad theory_key)));
 val _ = seed q4 (theory_manifest "10.0");
 val _ = assert "a probe's 503 does not hide a later hit"
   (#1 (asked_during (fn () => RC.get_action quad theory_key)) = SOME (theory_manifest "10.0"));

@@ -282,7 +282,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
         if body.host is not None:
             coordinator.report_host(body.host)
-            coordinator.report_worker(body.host.id, body.worker, tiers)
+            coordinator.report_worker(body.host.id, body.worker, tiers, idle=True)
         if body.phases is not None:
             coordinator.report_phases(body.phases)
         claimed = await coordinator.claim(
@@ -299,7 +299,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
     async def report(body: ReportRequest) -> None:
         if body.host is not None:
             coordinator.report_host(body.host)
-            coordinator.report_worker(body.host.id, body.worker, [body.tier, *body.also_claim])
+            coordinator.report_worker(body.host.id, body.worker, [body.tier, *body.also_claim], idle=True)
 
     @app.post("/v1/work/{attempt_token}/heartbeat", dependencies=worker)
     async def heartbeat(attempt_token: UUID, body: HeartbeatRequest | None = None) -> dict[str, int]:
