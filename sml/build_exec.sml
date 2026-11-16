@@ -12173,7 +12173,9 @@ fun write_missing_modules root tc {deps, loads} deadline =
             write_text script
               (module_writer_script {output = output, base_theories = not (isSome base_theories),
                                      call = call})
-          (* Timed out or failed, the child's output was validated. *)
+          (* Whether the sandbox validated what the child left, which it
+             does also for a child it killed or that failed: only then
+             are the child's modules stored. *)
           val validated =
             (HolbuildActionSandbox.with_output_dirs [output] (fn () =>
                ignore (HolbuildToolchain.run_in_dir_to_file_by root
