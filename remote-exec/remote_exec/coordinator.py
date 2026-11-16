@@ -1113,11 +1113,11 @@ class Coordinator:
                     now = self.clock()
                     probe = self.probe_at.get(host_id)
                     if quarantine == "failures" and (probe is None or (now - probe).total_seconds() >= PROBE_SECONDS):
+                        self.probe_at[host_id] = now
                         claimed = await self._claim(tiers, worker)
                         if claimed is not None:
-                            self.probe_at[host_id] = now
                             self._lease_host(claimed.attempt_token, host_id)
-                            return claimed
+                        return claimed
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         return None
