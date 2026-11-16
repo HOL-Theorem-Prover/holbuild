@@ -780,6 +780,26 @@ async def test_the_copies_of_a_build_are_done_by_a_release_and_no_claim_takes_on
     assert coordinator.peers_done == {}
 
 
+async def test_one_release_finishes_the_copies_of_several_builds_in_a_batch_each_with_its_own_log(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await submit(http, ["a"])
+    first = await claim_named(http, "a")
+    await submit(http, ["b"])
+    second = await claim_named(http, "b")
+    copy = await submit(http, ["a", "b", "c"], [("c", "a"), ("c", "b")])
+    monkeypatch.setattr(coordinator, "request_release", lambda batch_id=None: None)
+
+    cache.keys |= {ac_key("a"), ac_key("b")}
+    assert (await complete(http, first, result("a", "built"))).status_code == 200
+    assert (await complete(http, second, result("b", "built").replace("a" * 64, "b" * 64))).status_code == 200
+    assert await states(http, copy) == {"a": "ready", "b": "ready", "c": "waiting"}
+    await coordinator.release(UUID(copy))
+    assert await states(http, copy) == {"a": "done", "b": "done", "c": "ready"}
+    logs = {a["theory"]: a["log_sha256"] for a in (await batch(http, copy))["actions"]}
+    assert (logs["pkg:a"], logs["pkg:b"]) == ("a" * 64, "b" * 64)
+
+
 async def test_a_copy_with_another_spec_wakes_a_waiting_claim_rather_than_being_done_with_a_build(
     http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
 ) -> None:
