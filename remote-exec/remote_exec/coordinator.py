@@ -1646,9 +1646,13 @@ class Coordinator:
             report = replace(report, cpu_idle_pct=previous[1].cpu_idle_pct)
         self.hosts[report.id] = (self.clock(), report)
 
-    def report_worker(self, host_id: str, worker: str, tiers: list[str]) -> None:
+    def report_worker(self, host_id: str, worker: str, tiers: list[str], *, idle: bool = False) -> None:
         """Note that ``worker``, claiming ``tiers``, runs on reported host ``host_id``, for the autoscaler's count of
-        the workers quarantined hosts hold."""
+        the workers quarantined hosts hold. An ``idle`` worker, claiming or waiting to claim, runs no action: the
+        leases still noted for it ended without its result, as when their batch was cancelled, and are forgotten."""
+        if idle:
+            for token in [t for t, (h, w, _) in self.lease_hosts.items() if h == host_id and w == worker]:
+                del self.lease_hosts[token]
         if host_id in self.hosts:
             self.host_workers.setdefault(host_id, {})[worker] = (self.clock(), "high" in tiers)
 

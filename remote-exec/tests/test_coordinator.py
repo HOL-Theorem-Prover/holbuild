@@ -1287,6 +1287,22 @@ async def test_a_host_quarantined_mid_action_is_replaced_only_for_its_idle_worke
     assert (await coordinator.queue()).desired_burst_workers == 2
 
 
+async def test_a_quarantined_hosts_worker_whose_batch_was_cancelled_is_replaced_once_it_claims_again(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings = coordinator.settings.model_copy(update={"warm_workers": 1, "max_burst_workers": 10})
+    cancelled = await submit(http, ["a"])
+    claim = {"tier": "standard", "worker": "w1", "host": {**asdict(busy("warm", 0)), "disk_free": 100 << 30}}
+    assert (await http.post("/v1/work/claim", json=claim, headers=WORKER)).status_code == 200
+    assert (await http.post(f"/v1/batches/{cancelled}/cancel", headers=CLIENT)).status_code == 200
+    await submit(http, ["b"])
+    # The cancel took w1's lease, which no result ends; w1, back to claiming on its quarantined host, needs a
+    # burst worker in its place for b.
+    claim["host"] = asdict(short_of_disk("warm"))
+    assert (await http.post("/v1/work/claim", json=claim, headers=WORKER)).status_code == 204
+    assert (await coordinator.queue()).desired_burst_workers == 1
+
+
 @pytest.mark.parametrize("waiting_tiers", [["high", "standard"], ["standard"]])
 async def test_new_tail_host_claim_defers_ready_work_to_a_better_waiter(
     http: httpx.AsyncClient, coordinator: Coordinator, waiting_tiers: list[str]
