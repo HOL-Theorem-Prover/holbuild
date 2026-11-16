@@ -216,6 +216,14 @@ val _ = HolbuildBuildExec.expect_remote_entry theory_key;
 val _ = assert "a client reads a key a batch reported done as required"
   (#1 (asked_during copy) andalso
    HolbuildCache.get_action local_root theory_key = SOME (theory_manifest "10.0"));
+(* A shared-checkpoint blob is read as required: the manifest naming it can
+   reach the store before the blob does. *)
+val blob_nodes = RC.ranked_urls quad digest;
+val _ = List.app (fn node => RC.remove_file (stored node "cas" digest)) (List.take (blob_nodes, 3));
+val placed = dir ^ "/placed-blob";
+val _ = HolbuildBuildExec.place_shared_blob quad (dir ^ "/shared-store") "family"
+          {sha = digest, dst = placed, save = false};
+val _ = assert "a shared blob only the last node holds is placed" (RC.read_text placed = text);
 val _ = RC.remove_file (stored q4 "ac" theory_ac);
 val _ = assert "a required miss asks two nodes, then probes the rest"
   (asked_during (fn () => required (fn () => RC.get_action quad theory_key)) =

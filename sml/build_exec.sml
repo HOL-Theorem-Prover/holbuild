@@ -10781,7 +10781,9 @@ fun place_shared_blob remote store heap {sha, dst, save} =
       let val tmp = store_temp stored
       in
         ensure_parent tmp;
-        case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = sha, dst = tmp} of
+        (* The manifest that names it may have reached the store before it. *)
+        case HolbuildRemoteCache.required (fn () =>
+               HolbuildRemoteCache.fetch_unlisted_blob remote {hash = sha, dst = tmp}) of
             HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = stored}
           | HolbuildCacheBackend.Miss => (remove_file tmp; raise MissingSharedBlob sha)
           | HolbuildCacheBackend.Corrupt msg =>
