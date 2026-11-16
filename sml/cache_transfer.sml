@@ -82,10 +82,67 @@ val no_space = "No space left on device"
    large-object path, which can run a small heap out of store. *)
 val probe_chunk = Word8Vector.tabulate (65536, fn _ => 0w0)
 
-(* Whether the filesystem holding dir can't take a small write (1 MB). *)
-fun out_of_space dir =
-  let val probe = Path.concat(dir, ".holbuild-space-probe")
+local
+  open Foreign
+  val statvfs = buildCall2 (getSymbol (loadExecutable ()) "statvfs", (cString, cPointer), cInt)
+  (* Foreign resolves a symbol on its first call without a lock. *)
+  val statvfs_mutex = Mutex.mutex ()
+  val darwin = List.exists (fn field => field = ("sysname", "Darwin")) o Posix.ProcEnv.uname
+  val word = SysWord.toLargeInt
+  val word32 = Word32.toLargeInt
+in
+(* The bytes and inodes statvfs says unprivileged users may still take on
+   the filesystem holding dir, or NONE where it fails.  Glibc's struct
+   statvfs on 64-bit Linux has 64-bit fields; Darwin's counts are 32-bit,
+   after two 64-bit sizes.  A filesystem with no fixed inode count (btrfs)
+   reports 0 inodes in all, and has no inode limit. *)
+fun disk_free dir =
+  let
+    val buf = Memory.malloc 0w128
+    fun read () =
+      if statvfs (dir, buf) <> 0 then NONE
+      else if darwin () then
+        SOME {bytes = word (Memory.get64 (buf, 0w1)) * word32 (Memory.get32 (buf, 0w6)),
+              inodes = if Memory.get32 (buf, 0w7) = 0w0 then NONE
+                       else SOME (word32 (Memory.get32 (buf, 0w9)))}
+      else
+        SOME {bytes = word (Memory.get64 (buf, 0w1)) * word (Memory.get64 (buf, 0w4)),
+              inodes = if Memory.get64 (buf, 0w5) = 0w0 then NONE
+                       else SOME (word (Memory.get64 (buf, 0w7)))}
   in
+    (Mutex.lock statvfs_mutex;
+     (read () before (Mutex.unlock statvfs_mutex; Memory.free buf))
+     handle e => (Mutex.unlock statvfs_mutex; Memory.free buf; raise e))
+  end
+end
+
+(* Below these a disk counts as full: the free space a fleet worker waits
+   for before it claims an action, and a few theories' files.  A test may
+   set others, as "BYTES INODES" in HOLBUILD_TEST_DISK_FLOOR. *)
+fun disk_floor () =
+  case Option.map (String.tokens Char.isSpace) (OS.Process.getEnv "HOLBUILD_TEST_DISK_FLOOR") of
+      SOME [bytes, inodes] =>
+        (case (IntInf.fromString bytes, IntInf.fromString inodes) of
+             (SOME b, SOME i) => {bytes = b, inodes = i}
+           | _ => raise Error "HOLBUILD_TEST_DISK_FLOOR must be \"BYTES INODES\"")
+    | SOME _ => raise Error "HOLBUILD_TEST_DISK_FLOOR must be \"BYTES INODES\""
+    | NONE => {bytes = 4 * 1024 * 1024 * 1024, inodes = 1024}
+
+(* Whether the filesystem holding dir is below the floor, or can't take a
+   small write (1 MB).  The write alone can miss a full disk that another
+   process has just freed a little of. *)
+fun out_of_space dir =
+  let
+    val probe = Path.concat(dir, ".holbuild-space-probe")
+    val floor = disk_floor ()
+    val below_floor =
+      case disk_free dir of
+          SOME {bytes, inodes} =>
+            bytes < #bytes floor orelse
+            (case inodes of SOME n => n < #inodes floor | NONE => false)
+        | NONE => false
+  in
+    below_floor orelse
     (let val out = BinIO.openOut probe
      in
        (let fun write 0 = () | write n = (BinIO.output (out, probe_chunk); write (n - 1))
