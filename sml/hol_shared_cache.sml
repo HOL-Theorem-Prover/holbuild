@@ -578,6 +578,38 @@ fun build_analyser k =
        out)
   end
 
+fun platform_value command =
+  trim (command_output command) handle Error _ => "unavailable"
+
+(* HOL's configure records its build directory as getcwd reports it, with
+   symlinks resolved, and bakes it into executables, heaps and sigobj links.
+   The archive identity therefore names the physical path, so cache roots
+   reached through different symlinks share an archive exactly when their
+   toolchains would be installed in the same place. *)
+fun physical_holdir_for_key k =
+  (ensure_dir (toolchains_dir ());
+   Path.concat(Path.concat(FS.fullPath (toolchains_dir ()), k), "hol"))
+
+(* What a restored toolchain must share with the one that was published:
+   - toolchain-key: how it was built and against which Poly/ML runtime
+     (key_material);
+   - holdir: the installation path baked into the build;
+   - platform-os, platform-arch: executables and heaps are native code;
+   - platform-libc: bin/hol and the Poly/ML runtime link against the host C
+     library.
+   The restored toolchain runs only the host's libpolyml, never bin/poly, so
+   the poly executable's bytes are not part of it.  The analyser is not
+   archived: it is rebuilt against the restored toolchain under its own key,
+   so analyser changes do not split archives. *)
+fun archive_identity k =
+  String.concatWith "\n"
+    [HolbuildToolchainArchive.archive_format,
+     "toolchain-key=" ^ k,
+     "holdir=" ^ physical_holdir_for_key k,
+     "platform-os=" ^ platform_value "uname -s",
+     "platform-arch=" ^ platform_value "uname -m",
+     "platform-libc=" ^ platform_value "getconf GNU_LIBC_VERSION"]
+
 (* Set by `build --remote-only`, which must find the toolchain in a cache
    rather than build HOL locally. *)
 val restore_only = ref false
@@ -591,7 +623,9 @@ fun build_entry jobs req k =
   (HolbuildOffline.require_online ("prepare HOL toolchain " ^ #rev req ^ " at " ^ holdir_for_key k);
   if !restore_only then
     (local_build_needed := true;
-     die "the HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally")
+     die ("the HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally" ^
+          " (HOL rev " ^ #rev req ^ ", toolchain key " ^ k ^
+          ", remote archive key " ^ HolbuildRemoteCache.remote_action_key (archive_identity k) ^ ")"))
   else
   let
     val final = entry_dir_for_key k
@@ -677,38 +711,6 @@ fun wait_test_gate variable =
   case OS.Process.getEnv variable of
       NONE => ()
     | SOME path => ignore (HolbuildFileLock.read_text path)
-
-fun platform_value command =
-  trim (command_output command) handle Error _ => "unavailable"
-
-(* HOL's configure records its build directory as getcwd reports it, with
-   symlinks resolved, and bakes it into executables, heaps and sigobj links.
-   The archive identity therefore names the physical path, so cache roots
-   reached through different symlinks share an archive exactly when their
-   toolchains would be installed in the same place. *)
-fun physical_holdir_for_key k =
-  (ensure_dir (toolchains_dir ());
-   Path.concat(Path.concat(FS.fullPath (toolchains_dir ()), k), "hol"))
-
-(* What a restored toolchain must share with the one that was published:
-   - toolchain-key: how it was built and against which Poly/ML runtime
-     (key_material);
-   - holdir: the installation path baked into the build;
-   - platform-os, platform-arch: executables and heaps are native code;
-   - platform-libc: bin/hol and the Poly/ML runtime link against the host C
-     library.
-   The restored toolchain runs only the host's libpolyml, never bin/poly, so
-   the poly executable's bytes are not part of it.  The analyser is not
-   archived: it is rebuilt against the restored toolchain under its own key,
-   so analyser changes do not split archives. *)
-fun archive_identity k =
-  String.concatWith "\n"
-    [HolbuildToolchainArchive.archive_format,
-     "toolchain-key=" ^ k,
-     "holdir=" ^ physical_holdir_for_key k,
-     "platform-os=" ^ platform_value "uname -s",
-     "platform-arch=" ^ platform_value "uname -m",
-     "platform-libc=" ^ platform_value "getconf GNU_LIBC_VERSION"]
 
 fun heap_loads k =
   let
