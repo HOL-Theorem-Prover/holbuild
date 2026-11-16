@@ -1622,6 +1622,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         (case Redblackmap.peek (!states, #run_key run) of
                              SOME ("failed", _, log) =>
                                (HolbuildBuildExec.fetch_failed_run remote outputs_dir run log; true)
+                           | SOME ("done", _, _) =>
+                               (* A worker just put it, maybe on its own node only. *)
+                               HolbuildRemoteCache.required (fn () =>
+                                 HolbuildBuildExec.fetch_run remote outputs_dir outputs run)
                            | _ => HolbuildBuildExec.fetch_run remote outputs_dir outputs run)
                         handle e => (error := SOME e; false))
                     fetches)
@@ -1829,7 +1833,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val logs = ref []
                 fun on_change (key, state, _, log) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
-                   if state = "done" then (add key; logs := (key, log) :: !logs) else ())
+                   if state = "done" then
+                     (HolbuildBuildExec.expect_remote_entry key; add key; logs := (key, log) :: !logs)
+                   else ())
                 fun follow_batch () =
                   let
                     val result = HolbuildRemoteExec.follow url batch_id on_change

@@ -46,12 +46,18 @@ val asked_mutex = Mutex.mutex ();
 fun note url = (Mutex.lock asked_mutex; asked := !asked @ [url]; Mutex.unlock asked_mutex);
 fun request url = (note url;
   HolbuildHttp.Response (if url = former then 200 else 404));
-(* A GET asks the node its probe found the entry on again, for the body. *)
-val _ = assert "reads reach a node below rank two"
-  (#2 (RC.routed_status "GET" ranked "" request) = HolbuildHttp.Response 200 andalso length (!asked) = 7);
+(* An optional read ends at the first 404; a required one walks the ring,
+   and a GET asks the node its probe found the entry on again, for the body. *)
+val _ = assert "an optional read asks one node"
+  (#2 (RC.routed_status "GET" ranked "" request) = HolbuildHttp.Response 404 andalso length (!asked) = 1);
 val _ = asked := [];
-val _ = assert "HEAD reaches a node below rank two"
-  (#2 (RC.routed_status "HEAD" ranked "" request) = HolbuildHttp.Response 200 andalso length (!asked) = 6);
+val _ = assert "required reads reach a node below rank two"
+  (#2 (RC.required (fn () => RC.routed_status "GET" ranked "" request)) = HolbuildHttp.Response 200 andalso
+   length (!asked) = 7);
+val _ = asked := [];
+val _ = assert "a required HEAD reaches a node below rank two"
+  (#2 (RC.required (fn () => RC.routed_status "HEAD" ranked "" request)) = HolbuildHttp.Response 200 andalso
+   length (!asked) = 6);
 val _ = asked := [];
 fun unavailable url = (note url; HolbuildHttp.Response 503);
 val _ = ignore (RC.routed_status "PUT" ranked "" unavailable);
@@ -68,13 +74,21 @@ val _ = ignore (RC.routed_status "PUT" ranked "" answered);
 val _ = assert "writes stop at two nodes once one answered" (length (!asked) = 2);
 val _ = asked := [];
 fun missing url = (note url; HolbuildHttp.Response 404);
-val _ = assert "a miss asks every node"
-  (#2 (RC.routed_status "GET" ranked "" missing) = HolbuildHttp.Response 404 andalso length (!asked) = 6);
+val _ = assert "an optional miss asks one node"
+  (#2 (RC.routed_status "GET" ranked "" missing) = HolbuildHttp.Response 404 andalso length (!asked) = 1);
+val _ = asked := [];
+val _ = assert "a required miss asks every node"
+  (#2 (RC.required (fn () => RC.routed_status "GET" ranked "" missing)) = HolbuildHttp.Response 404 andalso
+   length (!asked) = 6);
 val _ = asked := [];
 fun two_retired url = (note url;
   HolbuildHttp.Response (if url = former then 200 else if url = List.nth (ranked, 2) then 404 else 503));
+val _ = assert "optional readers go past drained listeners to the first 404"
+  (#2 (RC.routed_status "GET" ranked "" two_retired) = HolbuildHttp.Response 404 andalso length (!asked) = 3);
+val _ = asked := [];
 val _ = assert "stale readers bypass concurrent drained listeners on transport errors"
-  (#2 (RC.routed_status "GET" ranked "" two_retired) = HolbuildHttp.Response 200 andalso length (!asked) = 6);
+  (#2 (RC.required (fn () => RC.routed_status "GET" ranked "" two_retired)) = HolbuildHttp.Response 200 andalso
+   length (!asked) = 6);
 val _ = D.attempted := Time.zeroTime;
 val _ = RC.write_text (dir ^ "/body") "invalid";
 val _ = assert "bad snapshot retains last complete ring" (D.urls defaults = nodes);
