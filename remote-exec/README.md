@@ -203,8 +203,10 @@ the theory-modules store is a shared root like the others. Eviction still goes
 down to the target, after an action's result or once the measurement expires,
 so the reserve holds what arrives in between. For holbuild 0.14.57 and later
 the worker also passes `--cache-min-free-gb 16`: while the disk has less free
-than that, a sweep evicts below the target until it has freed the floor plus
-8 GB, and when files outside the
+than that, a sweep evicts below the target until the bytes it evicted cover
+the floor plus 8 GB and statvfs says the disk is back over the floor (a heap a
+checkpoint tree still links, or a sparse file, frees fewer blocks than its
+size), and when files outside the
 cache keep the disk short after it evicted all it could, its measurement says
 so, and actions skip further sweeps until it expires. A sweep publishes its walk before evicting, so actions keep
 reusing a fresh measurement while eviction runs. A cached directory must match the recorded device
@@ -231,8 +233,11 @@ for a worker on another host. Likewise a worker claims only while its temp
 dir and its `HOLBUILD_CACHE` root each have 4 GiB free, so a host whose disk
 is full doesn't take actions it would only fail. A worker short of disk first
 empties the `action` and `tmp` directories of its `HOLBUILD_CACHE` root, which
-its own finished actions left behind, and while it still waits it reports its
-host to the coordinator with `POST /v1/work/report` each poll.
+its own finished actions left behind, and drops `action-resident`, the record of
+what `action` held. While it still waits, each poll it runs the cache sweep an
+action would start with, `exec-action --sweep-only` with its cap and the 16 GB
+floor, using the newest release it has that takes it (0.14.59 and later), and
+reports its host to the coordinator with `POST /v1/work/report`.
 
 Each claim and heartbeat also reports the worker's host: its id (the kernel's
 `boot_id`, the same in every container on the host), the share of CPU time

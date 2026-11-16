@@ -10209,17 +10209,27 @@ fun lost_restored_file resident root text =
           in
             if Substring.isEmpty found then []
             else
-              let val (path, rest) = Substring.splitl (not o Char.isSpace) (Substring.triml (size what) found)
+              let
+                val (path, rest) = Substring.splitl (not o Char.isSpace) (Substring.triml (size what) found)
+                (* What the message wraps the path in: an exception's
+                   quotes, a following colon. *)
+                val path = Substring.dropr (fn c => c = #"\"" orelse c = #"'" orelse c = #":") path
               in Substring.string path :: from rest end
           end
       in
         from (Substring.full text)
       end
+    (* HOL names the path it was asked for, or the .hol/objs copy it reads
+       a .ui or .uo at; the records name the path beside the source. *)
+    fun unmapped path =
+      if Path.file (Path.dir path) = "objs" andalso Path.file (Path.dir (Path.dir path)) = ".hol" then
+        SOME (Path.concat(Path.dir (Path.dir (Path.dir path)), Path.file path))
+      else NONE
+    fun lost path =
+      restored path orelse restored (hfs_remapped_path path) orelse
+      (case unmapped path of SOME path => restored path | NONE => false)
   in
-    (* HOL names the path it was asked for, and reads a .ui or .uo at its
-       .hol/objs copy. *)
-    List.exists (fn path => restored path orelse restored (hfs_remapped_path path))
-      (List.concat (map paths ["Cannot find file ", "non-existent file "]))
+    List.exists lost (List.concat (map paths ["Cannot find file ", "non-existent file "]))
   end
 
 (* The worker cache cap covers everything a worker keeps between
@@ -10542,8 +10552,12 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
         steps := !steps @ [(name, Time.toMilliseconds (Time.-(Time.now (), start)))];
         result
       end
-    fun sweep goal total remaining =
-      if total <= goal then total
+    (* The bytes a family held can stay in use after it goes: a heap a
+       checkpoint tree still links, or a sparse file's unallocated bytes. So
+       once they cover a floor deficit, statvfs says whether the disk is back
+       over the floor, and eviction goes on while it isn't. *)
+    fun sweep floor_short goal total remaining =
+      if total <= goal andalso not (floor_short ()) then total
       else
         case remaining of
             [] => total
@@ -10552,7 +10566,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                 val freed =
                   evict () handle e => (warn ("worker cache eviction failed: " ^ General.exnMessage e); NONE)
               in
-                sweep goal (total - Option.getOpt (freed, 0)) rest
+                sweep floor_short goal (total - Option.getOpt (freed, 0)) rest
               end
     fun measure_shared () =
       let
@@ -10599,15 +10613,17 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                               store_cache_families cache @ module_cache_families cache @
                               local_families) @ by_age young_orphans
                     end)
-                val after = timed "evict" (fn () => sweep goal total families)
+                fun floor_short () = deficit > 0 andalso floor_deficit () > 0
+                val after = timed "evict" (fn () => sweep floor_short goal total families)
+                val unmet = after > goal orelse floor_short ()
               in
                 (* Measure again rather than publish an estimate derived from
                    the mixed private and shared freed total, so a waiter on
                    gc.lock reuses the result rather than repeating the scan.
                    Until then siblings keep reusing the pre-eviction walk. *)
                 if after <= target then
-                  (publish (after > goal) (timed "rewalk" measure_shared);
-                   if after > goal then
+                  (publish unmet (timed "rewalk" measure_shared);
+                   if unmet then
                      warn ("the disk stays under the " ^ gb_decimal_text min_free_bytes ^
                            " GB free-space floor with the worker cache down to " ^ gb_decimal_text after ^
                            " GB of entries in use")
@@ -10659,6 +10675,17 @@ fun with_action_root_lock cache f =
   in
     (f () before HolbuildFileLock.release lock)
     handle e => (HolbuildFileLock.release lock; raise e)
+  end
+
+(* exec-action --sweep-only: the sweep an action starts with, for a worker
+   short of disk space that has no action to start. *)
+fun sweep_worker_cache {limit_bytes, reserve_bytes, min_free_bytes} =
+  let val cache = cache_root ()
+  in
+    with_action_root_lock cache (fn () =>
+      enforce_worker_cache_cap
+        {cache = cache, checkpoint_root = Path.concat(cache, "checkpoints"), limit_bytes = limit_bytes,
+         reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false})
   end
 
 fun phases_text sep unit phases =
