@@ -15,64 +15,175 @@ val tactic_timeout_marker_ref = ref (NONE : string option)
 val plan_theorem_ref = ref (NONE : string option)
 val trace_all_ref = ref false
 val plan_only_marker_ref = ref (NONE : string option)
-val plan_active_ref = ref false
-val trace_active_ref = ref false
-val trace_current_theorem_ref = ref ""
-val theorem_info_ref = ref NONE : (string * string * string * string * string * string * string * (string * string list) list * int) option ref
-val context_info_ref = ref NONE : (string * string * int) option ref
-val failed_prefix_resume_active_ref = ref false
-(* While a failed-prefix resume runs, the step count of the prefix it restored,
-   once known. *)
-val failed_prefix_resumed_step_count_ref = ref (NONE : int option)
-val proving_with_proof_ir_ref = ref false
-(* The context handed to the installed prover for the proof being run: every
-   step, selector probe and nested proof runs in it.  A failed-prefix
-   checkpoint saves it with the rest of the heap, so a resumed prefix runs in
-   the context the original proof was given. *)
-val proof_context_ref = ref (NONE : HolbuildTacticCompat.proof_context option)
-val proof_factories_ref = ref (NONE : HolbuildTacticCompat.proof_factories option)
-val plan_runner_ref = ref (NONE : HolbuildTacticCompat.proof_runner option)
-val proof_ir_tactic = HolbuildTacticCompat.intercept_proof plan_runner_ref
-val active_tactic_text_ref = ref ""
-val active_plan_ref = ref (NONE : HolbuildProofIr.step list option)
-val successful_step_count_ref = ref 0
-val successful_prefix_end_ref = ref 0
 (* Each frame records the branch it is in, the branches left, and the number of
    subgoals each earlier branch left; a resume needs those to restore goal order. *)
 datatype structural_frame = EachFrame of HolbuildProofIr.proof_path * int * int * int list
                           | CaseFrame of HolbuildProofIr.proof_path * int * int * int list
 
-val current_path_ref = ref ([] : HolbuildProofIr.proof_path)
-val successful_path_ref = ref ([] : HolbuildProofIr.proof_path)
-val current_frames_ref = ref ([] : structural_frame list)
-val successful_frames_ref = ref ([] : structural_frame list)
-val resume_frames_ref = ref ([] : structural_frame list)
-val successful_branch_tail_counts_ref = ref ([] : int list)
 type leaf_snapshot = {count : int, prefix_end : int, path : HolbuildProofIr.proof_path,
                       focus : int list, frames : structural_frame list,
                       events : HolbuildProofIr.dynamic_event list,
                       sig_text : string * string, prefix_signature : string option,
                       history_count : int}
-val successful_leaf_snapshots_ref = ref ([] : leaf_snapshot list)
-(* Frame stacks are stored innermost-first, matching current_frames_ref push/pop order.
-   Dynamic events are accumulated newest-first internally; metadata stores them in
-   chronological order and resume_events_ref consumes that chronological stream. *)
-val dynamic_events_ref = ref ([] : HolbuildProofIr.dynamic_event list)
-val resume_events_ref = ref ([] : HolbuildProofIr.dynamic_event list)
-val failed_step_end_ref = ref NONE : int option ref
-val failed_step_span_ref = ref NONE : (int * int) option ref
-val failed_plan_position_ref = ref NONE : (int * string * string) option ref
-val failed_goal_state_printed_ref = ref false
-val suppress_expected_failure_diagnostics_ref = ref false
-val suppressed_failure_diagnostic_ref = ref (NONE : (unit -> unit) option)
-val compiled_tactic_ref = ref (fn () => Tactical.ALL_TAC)
-val compiled_list_tactic_ref = ref (fn () => Tactical.ALL_LT)
-val proof_history_ref = ref (NONE : goalStack.gstk History.history option)
-val history_step_count_ref = ref 0
-val branch_tail_count_ref = ref ([] : int list)
-val reverse_group_lengths_ref = ref (NONE : int list option)
 val default_repeat_iteration_limit = 10000
 val repeat_iteration_limit_ref = ref default_repeat_iteration_limit
+
+(* Per-proof state.  Each thread proving a theorem has its own record, so
+   deferred proofs can run their steps on several threads; the main thread
+   (and anything that saves a checkpoint heap) uses main_proof_state. *)
+type proof_state =
+  {plan_active_ref : bool ref,
+   trace_active_ref : bool ref,
+   trace_current_theorem_ref : string ref,
+   theorem_info_ref : (string * string * string * string * string * string * string * (string * string list) list * int) option ref,
+   context_info_ref : (string * string * int) option ref,
+   failed_prefix_resume_active_ref : bool ref,
+   (* While a failed-prefix resume runs, the step count of the prefix it restored,
+      once known. *)
+   failed_prefix_resumed_step_count_ref : int option ref,
+   proving_with_proof_ir_ref : bool ref,
+   (* The context handed to the installed prover for the proof being run: every
+      step, selector probe and nested proof runs in it.  A failed-prefix
+      checkpoint saves it with the rest of the heap, so a resumed prefix runs in
+      the context the original proof was given. *)
+   proof_context_ref : HolbuildTacticCompat.proof_context option ref,
+   proof_factories_ref : HolbuildTacticCompat.proof_factories option ref,
+   plan_runner_ref : HolbuildTacticCompat.proof_runner option ref,
+   active_tactic_text_ref : string ref,
+   active_plan_ref : HolbuildProofIr.step list option ref,
+   successful_step_count_ref : int ref,
+   successful_prefix_end_ref : int ref,
+   current_path_ref : HolbuildProofIr.proof_path ref,
+   successful_path_ref : HolbuildProofIr.proof_path ref,
+   (* Frame stacks are stored innermost-first, matching current_frames_ref push/pop order.
+      Dynamic events are accumulated newest-first internally; metadata stores them in
+      chronological order and resume_events_ref consumes that chronological stream. *)
+   current_frames_ref : structural_frame list ref,
+   successful_frames_ref : structural_frame list ref,
+   resume_frames_ref : structural_frame list ref,
+   successful_branch_tail_counts_ref : int list ref,
+   successful_leaf_snapshots_ref : leaf_snapshot list ref,
+   dynamic_events_ref : HolbuildProofIr.dynamic_event list ref,
+   resume_events_ref : HolbuildProofIr.dynamic_event list ref,
+   failed_step_end_ref : int option ref,
+   failed_step_span_ref : (int * int) option ref,
+   failed_plan_position_ref : (int * string * string) option ref,
+   failed_goal_state_printed_ref : bool ref,
+   suppress_expected_failure_diagnostics_ref : bool ref,
+   suppressed_failure_diagnostic_ref : (unit -> unit) option ref,
+   compiled_tactic_ref : (unit -> Tactical.tactic) ref,
+   compiled_list_tactic_ref : (unit -> Tactical.list_tactic) ref,
+   proof_history_ref : goalStack.gstk History.history option ref,
+   history_step_count_ref : int ref,
+   branch_tail_count_ref : int list ref,
+   reverse_group_lengths_ref : int list option ref,
+   save_checkpoints_ref : bool ref,
+   diagnostic_buffer_ref : string list option ref,
+   timeout_marker_buffer_ref : (string * real) option ref,
+   step_killed_ref : bool ref}
+
+fun fresh_proof_state () : proof_state =
+  {plan_active_ref = ref (false),
+   trace_active_ref = ref (false),
+   trace_current_theorem_ref = ref (""),
+   theorem_info_ref = ref (NONE),
+   context_info_ref = ref (NONE),
+   failed_prefix_resume_active_ref = ref (false),
+   failed_prefix_resumed_step_count_ref = ref (NONE),
+   proving_with_proof_ir_ref = ref (false),
+   proof_context_ref = ref (NONE),
+   proof_factories_ref = ref (NONE),
+   plan_runner_ref = ref (NONE),
+   active_tactic_text_ref = ref (""),
+   active_plan_ref = ref (NONE),
+   successful_step_count_ref = ref (0),
+   successful_prefix_end_ref = ref (0),
+   current_path_ref = ref ([]),
+   successful_path_ref = ref ([]),
+   current_frames_ref = ref ([]),
+   successful_frames_ref = ref ([]),
+   resume_frames_ref = ref ([]),
+   successful_branch_tail_counts_ref = ref ([]),
+   successful_leaf_snapshots_ref = ref ([]),
+   dynamic_events_ref = ref ([]),
+   resume_events_ref = ref ([]),
+   failed_step_end_ref = ref (NONE),
+   failed_step_span_ref = ref (NONE),
+   failed_plan_position_ref = ref (NONE),
+   failed_goal_state_printed_ref = ref (false),
+   suppress_expected_failure_diagnostics_ref = ref (false),
+   suppressed_failure_diagnostic_ref = ref (NONE),
+   compiled_tactic_ref = ref (fn () => Tactical.ALL_TAC),
+   compiled_list_tactic_ref = ref (fn () => Tactical.ALL_LT),
+   proof_history_ref = ref (NONE),
+   history_step_count_ref = ref (0),
+   branch_tail_count_ref = ref ([]),
+   reverse_group_lengths_ref = ref (NONE),
+   save_checkpoints_ref = ref (true),
+   diagnostic_buffer_ref = ref (NONE),
+   timeout_marker_buffer_ref = ref (NONE),
+   step_killed_ref = ref (false)}
+
+val main_proof_state = fresh_proof_state ()
+val proof_state_tag : proof_state Universal.tag = Universal.tag ()
+
+fun current_proof_state () =
+  case Thread.getLocal proof_state_tag of
+      SOME state => state
+    | NONE => main_proof_state
+
+fun with_proof_state state f x =
+  let
+    val old = current_proof_state ()
+    val _ = Thread.setLocal (proof_state_tag, state)
+    val result = f x handle e => (Thread.setLocal (proof_state_tag, old); raise e)
+  in
+    Thread.setLocal (proof_state_tag, old);
+    result
+  end
+
+fun plan_active_ref () = #plan_active_ref (current_proof_state ())
+fun trace_active_ref () = #trace_active_ref (current_proof_state ())
+fun trace_current_theorem_ref () = #trace_current_theorem_ref (current_proof_state ())
+fun theorem_info_ref () = #theorem_info_ref (current_proof_state ())
+fun context_info_ref () = #context_info_ref (current_proof_state ())
+fun failed_prefix_resume_active_ref () = #failed_prefix_resume_active_ref (current_proof_state ())
+fun failed_prefix_resumed_step_count_ref () = #failed_prefix_resumed_step_count_ref (current_proof_state ())
+fun proving_with_proof_ir_ref () = #proving_with_proof_ir_ref (current_proof_state ())
+fun proof_context_ref () = #proof_context_ref (current_proof_state ())
+fun proof_factories_ref () = #proof_factories_ref (current_proof_state ())
+fun plan_runner_ref () = #plan_runner_ref (current_proof_state ())
+fun active_tactic_text_ref () = #active_tactic_text_ref (current_proof_state ())
+fun active_plan_ref () = #active_plan_ref (current_proof_state ())
+fun successful_step_count_ref () = #successful_step_count_ref (current_proof_state ())
+fun successful_prefix_end_ref () = #successful_prefix_end_ref (current_proof_state ())
+fun current_path_ref () = #current_path_ref (current_proof_state ())
+fun successful_path_ref () = #successful_path_ref (current_proof_state ())
+fun current_frames_ref () = #current_frames_ref (current_proof_state ())
+fun successful_frames_ref () = #successful_frames_ref (current_proof_state ())
+fun resume_frames_ref () = #resume_frames_ref (current_proof_state ())
+fun successful_branch_tail_counts_ref () = #successful_branch_tail_counts_ref (current_proof_state ())
+fun successful_leaf_snapshots_ref () = #successful_leaf_snapshots_ref (current_proof_state ())
+fun dynamic_events_ref () = #dynamic_events_ref (current_proof_state ())
+fun resume_events_ref () = #resume_events_ref (current_proof_state ())
+fun failed_step_end_ref () = #failed_step_end_ref (current_proof_state ())
+fun failed_step_span_ref () = #failed_step_span_ref (current_proof_state ())
+fun failed_plan_position_ref () = #failed_plan_position_ref (current_proof_state ())
+fun failed_goal_state_printed_ref () = #failed_goal_state_printed_ref (current_proof_state ())
+fun suppress_expected_failure_diagnostics_ref () = #suppress_expected_failure_diagnostics_ref (current_proof_state ())
+fun suppressed_failure_diagnostic_ref () = #suppressed_failure_diagnostic_ref (current_proof_state ())
+fun compiled_tactic_ref () = #compiled_tactic_ref (current_proof_state ())
+fun compiled_list_tactic_ref () = #compiled_list_tactic_ref (current_proof_state ())
+fun proof_history_ref () = #proof_history_ref (current_proof_state ())
+fun history_step_count_ref () = #history_step_count_ref (current_proof_state ())
+fun branch_tail_count_ref () = #branch_tail_count_ref (current_proof_state ())
+fun reverse_group_lengths_ref () = #reverse_group_lengths_ref (current_proof_state ())
+fun save_checkpoints_ref () = #save_checkpoints_ref (current_proof_state ())
+fun diagnostic_buffer_ref () = #diagnostic_buffer_ref (current_proof_state ())
+fun timeout_marker_buffer_ref () = #timeout_marker_buffer_ref (current_proof_state ())
+fun step_killed_ref () = #step_killed_ref (current_proof_state ())
+
+val proof_ir_tactic = HolbuildTacticCompat.intercept_proof plan_runner_ref
 
 fun env_bool name =
   case OS.Process.getEnv name of
@@ -109,7 +220,15 @@ fun repeat_iteration_guard_message limit =
 fun seconds (a, b) = Time.toReal (Time.-(b, a))
 fun fmt_ms t = Real.fmt (StringCvt.FIX (SOME 3)) (1000.0 * t)
 
-fun write_timeout_marker label seconds =
+(* A thread proving a deferred theorem buffers its diagnostics and timeout
+   marker (diagnostic_buffer_ref is SOME); flush_diagnostics writes them out
+   when that proof's failure is the one the build reports. *)
+fun diagnostic_output text =
+  case !(diagnostic_buffer_ref ()) of
+      NONE => TextIO.output (TextIO.stdErr, text)
+    | SOME texts => diagnostic_buffer_ref () := SOME (text :: texts)
+
+fun write_timeout_marker_file label seconds =
   case !tactic_timeout_marker_ref of
       NONE => ()
     | SOME path =>
@@ -118,11 +237,31 @@ fun write_timeout_marker label seconds =
            TextIO.closeOut out
         end
 
+fun write_timeout_marker label seconds =
+  case !(diagnostic_buffer_ref ()) of
+      NONE => write_timeout_marker_file label seconds
+    | SOME _ => timeout_marker_buffer_ref () := SOME (label, seconds)
+
+fun flush_diagnostics (state : proof_state) =
+  (case !(#diagnostic_buffer_ref state) of
+       NONE => ()
+     | SOME texts => (List.app (fn text => TextIO.output (TextIO.stdErr, text)) (rev texts);
+                      TextIO.flushOut TextIO.stdErr);
+   case !(#timeout_marker_buffer_ref state) of
+       NONE => ()
+     | SOME (label, seconds) => write_timeout_marker_file label seconds)
+
+fun checkpoints_enabled () = !checkpoint_enabled_ref andalso !(save_checkpoints_ref ())
+
 (* Minimal local string compiler used for proof-fragment compilation.  This is
    equivalent to the small quse_string helper holbuild previously loaded from
    HOL's src/AI/sml_inspection/smlExecute, without depending on that
-   post-upto-hol source package at runtime. *)
-fun quse_string s =
+   post-upto-hol source package at runtime.  Threads proving deferred theorems
+   compile one fragment at a time: the compiler and the parser it runs share
+   global state. *)
+val quse_string_lock = Mutex.mutex ()
+
+fun quse_string_unlocked s =
   let
     val stream = TextIO.openString (HOLSource.fromString {quietOpen = false, print = fn _ => ()} s)
     fun infn () = TextIO.input1 stream
@@ -133,6 +272,11 @@ fun quse_string s =
     handle Interrupt => (TextIO.closeIn stream; raise Interrupt)
          | _ => (TextIO.closeIn stream; false)
   end
+
+fun quse_string s =
+  (Mutex.lock quse_string_lock;
+   (quse_string_unlocked s before Mutex.unlock quse_string_lock)
+   handle e => (Mutex.unlock quse_string_lock; raise e))
 
 exception FunctionTimeout
 exception FunctionInterrupted
@@ -162,6 +306,7 @@ fun interruptkill worker =
       if not (isActive worker) then ()
       else if n > 0 then (OS.Process.sleep delay; loop (n - 1))
       else (Feedback.HOL_WARNING "HolbuildProofRuntime" "interruptkill" "thread killed";
+            step_killed_ref () := true;
             kill worker handle Thread _ => ())
   in
     loop 100
@@ -172,6 +317,9 @@ fun interruptkill worker =
    into the shared HOL toolchain. *)
 fun timeout seconds f x =
   let
+    val state = current_proof_state ()
+    val pin = HolbuildTacticCompat.caller_pin ()
+    fun run x = with_proof_state state (HolbuildTacticCompat.run_in_pin pin f) x
     val m = Mutex.mutex ()
     val curattrib = Thread.getAttributes ()
     val _ = Thread.setAttributes timeout_attrib_sync
@@ -179,7 +327,7 @@ fun timeout seconds f x =
     val c = ConditionVar.conditionVar ()
     val resultref = ref NONE
     fun worker_fun () =
-      (resultref := SOME (capture_timeout f x);
+      (resultref := SOME (capture_timeout run x);
        Thread.setAttributes timeout_attrib_sync;
        Mutex.lock m; ConditionVar.signal c; Mutex.unlock m)
     val worker = Thread.fork (worker_fun, timeout_attrib_async)
@@ -187,6 +335,7 @@ fun timeout seconds f x =
     val _ = Mutex.unlock m
     val _ = Thread.setAttributes curattrib
     val _ = if completed then () else interruptkill worker
+    val _ = HolbuildTacticCompat.restore_pin pin
     (* An Interrupt before the deadline didn't come from interruptkill. *)
     val result =
       if not completed then TimeoutException FunctionTimeout
@@ -217,7 +366,7 @@ fun display_label label =
   String.translate (fn #"\n" => "\\n" | #"\t" => "\\t" | c => String.str c) label
 
 fun active_theorem_name () =
-  case !theorem_info_ref of
+  case !(theorem_info_ref ()) of
       SOME (_, name, _, _, _, _, _, _, _) => SOME name
     | NONE => NONE
 
@@ -242,8 +391,7 @@ fun retry_after_timeout label seconds first_attempt f x =
                 raise TacticTimeout (timeout_message label seconds))
            | FunctionInterrupted => raise tactic_interrupted label
   in
-    TextIO.output (TextIO.stdErr,
-      String.concat ["holbuild tactic timeout retry passed: ", display_label label,
+    diagnostic_output (String.concat ["holbuild tactic timeout retry passed: ", display_label label,
                      " (budget ", Real.toString seconds, "s; retry ",
                      fmt_ms (Time.toReal (Timer.checkRealTimer retry)), " ms wall; GC during first attempt ",
                      fmt_ms (Time.toReal gc), " ms)\n"]);
@@ -298,8 +446,8 @@ fun with_tactic_timeout label program f x =
         let
           val first_attempt = Timer.startCPUTimer ()
           val wall = Timer.startRealTimer ()
-          val name = Option.getOpt (active_theorem_name (), !trace_current_theorem_ref)
-          val position = !failed_plan_position_ref
+          val name = Option.getOpt (active_theorem_name (), !(trace_current_theorem_ref ()))
+          val position = !(failed_plan_position_ref ())
           val result = capture_timeout (fn () =>
             timeout seconds f x
             handle FunctionTimeout => retry_after_timeout label seconds first_attempt f x
@@ -315,8 +463,7 @@ fun with_tactic_timeout label program f x =
                     | NONE => ("unknown", "atomic")
                 val status = case result of TimeoutResult _ => "ok" | TimeoutException _ => "failed"
               in
-                TextIO.output (TextIO.stdErr,
-                  String.concat ["holbuild slow-proof-step\t", display_label name,
+                diagnostic_output (String.concat ["holbuild slow-proof-step\t", display_label name,
                     "\t", index, "\t", kind, "\t", status,
                     "\t", fmt_ms elapsed, "\t", fmt_ms seconds,
                     "\t", display_label label, "\n"])
@@ -326,7 +473,7 @@ fun with_tactic_timeout label program f x =
         end
 
 fun save_checkpoint label default_share path ok_text depth =
-  if not (!checkpoint_enabled_ref) then ()
+  if not (checkpoints_enabled ()) then ()
   else
     HolbuildCheckpointSaveRuntime.save_checkpoint
       {label = label, default_share = default_share, path = path,
@@ -594,10 +741,10 @@ fun parse_leaf_snapshot_text text =
    before saving the heap. *)
 fun failed_prefix_texts () =
   let
-    val prefix_end = !successful_prefix_end_ref
-    val step_count = !successful_step_count_ref
+    val prefix_end = !(successful_prefix_end_ref ())
+    val step_count = !(successful_step_count_ref ())
     val leaf_signature_lines =
-      case (!active_plan_ref, step_count, !successful_path_ref) of
+      case (!(active_plan_ref ()), step_count, !(successful_path_ref ())) of
           (SOME plan, n, path) =>
             if n = 0 then []
             else (case step_at_path plan path of
@@ -605,7 +752,7 @@ fun failed_prefix_texts () =
                     | NONE => [])
         | _ => []
     val prefix_signature_lines =
-      case !successful_leaf_snapshots_ref of
+      case !(successful_leaf_snapshots_ref ()) of
           ({prefix_signature = SOME saved_signature, ...} : leaf_snapshot) :: _ =>
             ["prefix_signature=" ^ saved_signature ^ "\n"]
         | _ => []
@@ -613,20 +760,20 @@ fun failed_prefix_texts () =
       String.concat (["proof_ir_failed_prefix_version=5\n",
                       "step_count=", Int.toString step_count, "\n",
                       "prefix_end=", Int.toString prefix_end, "\n",
-                      "path=", path_text (!successful_path_ref), "\n",
-                      "focus=", int_list_text (!successful_branch_tail_counts_ref), "\n",
-                      "history_count=", Int.toString (!history_step_count_ref), "\n"] @
+                      "path=", path_text (!(successful_path_ref ())), "\n",
+                      "focus=", int_list_text (!(successful_branch_tail_counts_ref ())), "\n",
+                      "history_count=", Int.toString (!(history_step_count_ref ())), "\n"] @
                      leaf_signature_lines @ prefix_signature_lines @
-                     map (fn snap => "leaf=" ^ leaf_snapshot_text snap ^ "\n") (rev (!successful_leaf_snapshots_ref)) @
-                     map (fn frame => "frame=" ^ structural_frame_text frame ^ "\n") (!successful_frames_ref) @
-                     map (fn event => "event=" ^ dynamic_event_text event ^ "\n") (rev (!dynamic_events_ref)))
+                     map (fn snap => "leaf=" ^ leaf_snapshot_text snap ^ "\n") (rev (!(successful_leaf_snapshots_ref ()))) @
+                     map (fn frame => "frame=" ^ structural_frame_text frame ^ "\n") (!(successful_frames_ref ())) @
+                     map (fn event => "event=" ^ dynamic_event_text event ^ "\n") (rev (!(dynamic_events_ref ()))))
     val _ =
-      (case !proof_history_ref of
+      (case !(proof_history_ref ()) of
            NONE => ()
          | SOME history =>
-             proof_history_ref := SOME (History.set_limit history (Int.max(15, !history_step_count_ref + 1))))
+             (proof_history_ref ()) := SOME (History.set_limit history (Int.max(15, !(history_step_count_ref ()) + 1))))
   in
-    (meta_text, String.substring(!active_tactic_text_ref, 0, prefix_end))
+    (meta_text, String.substring(!(active_tactic_text_ref ()), 0, prefix_end))
   end
 
 (* A resumed proof runs in the heap it loaded from path, the last state in
@@ -647,14 +794,18 @@ fun failed_prefix_texts () =
 fun advance_failed_prefix_checkpoint path ok_text depth =
   let
     val new = path ^ ".new"
-    val suffixes = ["", ".meta", ".prefix", ".ok"]
+    val suffixes = ["", ".meta", ".prefix", ".proved", ".ok"]
     fun exists file = OS.FileSys.access (file, []) handle OS.SysErr _ => false
     fun remove file = OS.FileSys.remove file handle OS.SysErr _ => ()
     fun discard_new () =
       List.app (fn suffix => (remove (new ^ suffix); remove (new ^ suffix ^ ".tmp"))) suffixes
+    (* .proved exists only in a build that defers proofs. *)
     fun install () =
       (remove (path ^ ".ok");
-       List.app (fn suffix => OS.FileSys.rename {old = new ^ suffix, new = path ^ suffix}) suffixes)
+       List.app (fn suffix =>
+                   if exists (new ^ suffix) then OS.FileSys.rename {old = new ^ suffix, new = path ^ suffix}
+                   else remove (path ^ suffix))
+                suffixes)
   in
     (discard_new ();
      let val (meta_text, prefix_text) = failed_prefix_texts ()
@@ -677,15 +828,15 @@ fun advance_failed_prefix_checkpoint path ok_text depth =
 (* A resumed proof saves only when it got past the prefix it restored: one that
    fails at the same step would save the same state again. *)
 fun save_failed_prefix_checkpoint () =
-  case !theorem_info_ref of
+  case !(theorem_info_ref ()) of
       NONE => ()
     | SOME (kind, _, _, _, _, failed_prefix_path, failed_prefix_ok, proof_attrs, depth) =>
         if not (kind = "theorem" orelse kind = "resume") orelse
-           not (!checkpoint_enabled_ref) orelse not (null proof_attrs) then ()
-        else if !failed_prefix_resume_active_ref then
-          (case !failed_prefix_resumed_step_count_ref of
+           not (checkpoints_enabled ()) orelse not (null proof_attrs) then ()
+        else if !(failed_prefix_resume_active_ref ()) then
+          (case !(failed_prefix_resumed_step_count_ref ()) of
                SOME resumed =>
-                 if !successful_step_count_ref > resumed andalso not (QUse.hadError ()) then
+                 if !(successful_step_count_ref ()) > resumed andalso not (QUse.hadError ()) then
                    advance_failed_prefix_checkpoint failed_prefix_path failed_prefix_ok (depth - 1)
                  else ()
              | NONE => ())
@@ -705,27 +856,27 @@ fun save_failed_prefix_checkpoint () =
 fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok) =
   let val depth = length (PolyML.SaveState.showHierarchy())
   in
-    theorem_info_ref := SOME ("theorem", name, tactic_text, "", "",
+    (theorem_info_ref ()) := SOME ("theorem", name, tactic_text, "", "",
                               failed_prefix_path, failed_prefix_ok, [], depth)
   end
 
-fun set_theorem_plan plan = active_plan_ref := plan
+fun set_theorem_plan plan = (active_plan_ref ()) := plan
 
 fun begin_theorem (kind, name, tactic_text, context_path, context_ok,
                    failed_prefix_path, failed_prefix_ok, proof_attrs) =
   let val depth = length (PolyML.SaveState.showHierarchy())
   in
-    theorem_info_ref := SOME (kind, name, tactic_text, context_path, context_ok,
+    (theorem_info_ref ()) := SOME (kind, name, tactic_text, context_path, context_ok,
                               failed_prefix_path, failed_prefix_ok, proof_attrs, depth);
-    context_info_ref := SOME (context_path, context_ok, depth)
+    (context_info_ref ()) := SOME (context_path, context_ok, depth)
   end
 
 fun save_theorem_context () =
-  case !context_info_ref of
+  case !(context_info_ref ()) of
       NONE => ()
     | SOME (context_path, context_ok, depth) =>
-        (context_info_ref := NONE;
-         if not (!checkpoint_enabled_ref) then ()
+        ((context_info_ref ()) := NONE;
+         if not (checkpoints_enabled ()) then ()
          else
            HolbuildCheckpointSaveRuntime.save_context_checkpoint
              {label = "theorem_context", default_share = false, path = context_path,
@@ -767,26 +918,26 @@ fun failed_theorem_line () =
     | SOME name => "\nholbuild failed theorem: " ^ name
 
 fun failed_step_end_line () =
-  case !failed_step_end_ref of
+  case !(failed_step_end_ref ()) of
       NONE => ""
     | SOME end_pos => "\nholbuild failed fragment end: " ^ Int.toString end_pos
 
 fun failed_step_span_line () =
-  case !failed_step_span_ref of
+  case !(failed_step_span_ref ()) of
       NONE => ""
     | SOME (start_pos, end_pos) =>
         String.concat ["\nholbuild failed fragment span: ", Int.toString start_pos,
                        " ", Int.toString end_pos]
 
 fun failed_plan_position_line () =
-  case !failed_plan_position_ref of
+  case !(failed_plan_position_ref ()) of
       NONE => ""
     | SOME (index, kind, label) =>
         String.concat ["\nholbuild plan position: ", HolbuildProofIr.format_index index,
                        " ", kind, " ", display_label label]
 
 fun current_history () =
-  case !proof_history_ref of
+  case !(proof_history_ref ()) of
       SOME history => history
     | NONE => raise Fail "proof IR goal history is not initialized"
 
@@ -795,15 +946,15 @@ fun install_repl_proof_state () =
      (Manager.PF (Manager.GOALSTACK (current_history()), Manager.id_tacm));
    ())
 
-fun set_history history = proof_history_ref := SOME history
-fun clear_history () = proof_history_ref := NONE
+fun set_history history = (proof_history_ref ()) := SOME history
+fun clear_history () = (proof_history_ref ()) := NONE
 
 fun project_history f = History.project f (current_history())
 
 fun init_history g limit =
   (set_history (History.new_history {obj = goalStack.new_goal g Lib.I,
                                      limit = Int.max(15, limit)});
-   history_step_count_ref := 0)
+   (history_step_count_ref ()) := 0)
 
 fun apply_history f =
   HolbuildHolFlags.quiet_goalstack (fn () => History.apply f (current_history()))
@@ -812,17 +963,17 @@ fun ensure_history_limit limit =
   set_history (History.set_limit (current_history()) (Int.max(15, limit)))
 
 fun prepare_history_append () =
-  ensure_history_limit (!history_step_count_ref + 2)
+  ensure_history_limit (!(history_step_count_ref ()) + 2)
 
 fun current_proof_context () =
-  case !proof_context_ref of
+  case !(proof_context_ref ()) of
       SOME ctxt => ctxt
     | NONE => raise Fail "internal error: no proof context is installed"
 
 fun append_history f =
   (prepare_history_append ();
    set_history (apply_history f);
-   history_step_count_ref := !history_step_count_ref + 1)
+   (history_step_count_ref ()) := !(history_step_count_ref ()) + 1)
 
 fun append_history_with_timeout label program f =
   let
@@ -830,7 +981,7 @@ fun append_history_with_timeout label program f =
     val new_history = with_tactic_timeout label program apply_history f
   in
     set_history new_history;
-    history_step_count_ref := !history_step_count_ref + 1
+    (history_step_count_ref ()) := !(history_step_count_ref ()) + 1
   end
 
 fun history_top_goals () = project_history goalStack.top_goals
@@ -870,9 +1021,8 @@ fun diagnostic_fragment_label label =
   end
 
 fun print_goal_state label goals =
-  (failed_goal_state_printed_ref := true;
-   TextIO.output(TextIO.stdErr,
-    String.concat ["\nholbuild goal state at failed fragment: ", diagnostic_fragment_label label,
+  ((failed_goal_state_printed_ref ()) := true;
+   diagnostic_output (String.concat ["\nholbuild goal state at failed fragment: ", diagnostic_fragment_label label,
                    failed_theorem_line (),
                    failed_step_end_line (),
                    failed_step_span_line (),
@@ -888,21 +1038,21 @@ fun print_current_goal_state label =
 
 fun print_finish_goal_state name =
   let
-    val old_failed_step_end = !failed_step_end_ref
-    val old_failed_step_span = !failed_step_span_ref
-    val tactic_end = size (!active_tactic_text_ref)
+    val old_failed_step_end = !(failed_step_end_ref ())
+    val old_failed_step_span = !(failed_step_span_ref ())
+    val tactic_end = size (!(active_tactic_text_ref ()))
     val has_specific_span = Option.isSome old_failed_step_span
-    val _ = if has_specific_span then () else failed_step_end_ref := SOME tactic_end
-    val _ = if has_specific_span then () else failed_step_span_ref := SOME (tactic_end, tactic_end)
+    val _ = if has_specific_span then () else (failed_step_end_ref ()) := SOME tactic_end
+    val _ = if has_specific_span then () else (failed_step_span_ref ()) := SOME (tactic_end, tactic_end)
     val label =
       if has_specific_span then
-        (case !failed_plan_position_ref of
+        (case !(failed_plan_position_ref ()) of
              SOME (_, _, plan_label) => plan_label
            | NONE => name ^ " finish")
       else name ^ " finish"
-    val result = (print_current_goal_state label; true) handle e => (failed_step_end_ref := old_failed_step_end; failed_step_span_ref := old_failed_step_span; raise e)
-    val _ = failed_step_end_ref := old_failed_step_end
-    val _ = failed_step_span_ref := old_failed_step_span
+    val result = (print_current_goal_state label; true) handle e => ((failed_step_end_ref ()) := old_failed_step_end; (failed_step_span_ref ()) := old_failed_step_span; raise e)
+    val _ = (failed_step_end_ref ()) := old_failed_step_end
+    val _ = (failed_step_span_ref ()) := old_failed_step_span
   in
     result
   end
@@ -910,8 +1060,7 @@ fun print_finish_goal_state name =
 fun print_step_failure_goal_state label goals =
   print_goal_state label goals
   handle print_e =>
-    TextIO.output(TextIO.stdErr,
-      String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"])
+    diagnostic_output (String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"])
 
 fun emit_step_failure_diagnostic label goals =
   (save_failed_prefix_checkpoint ();
@@ -923,7 +1072,7 @@ fun emit_step_failure_diagnostic label goals =
    combinator that chose it.  raise_body_timeout saves one where the outermost
    combinator started the body instead. *)
 fun report_step_failure_with_goals label goals e =
-  case (e, !suppress_expected_failure_diagnostics_ref) of
+  case (e, !(suppress_expected_failure_diagnostics_ref ())) of
       (TacticTimeout _, true) =>
         (print_step_failure_goal_state label goals;
          raise e)
@@ -931,7 +1080,7 @@ fun report_step_failure_with_goals label goals e =
         (print_step_failure_goal_state label goals;
          raise e)
     | (_, true) =>
-        (suppressed_failure_diagnostic_ref := SOME (fn () => emit_step_failure_diagnostic label goals);
+        ((suppressed_failure_diagnostic_ref ()) := SOME (fn () => emit_step_failure_diagnostic label goals);
          raise e)
     | (_, false) =>
         (emit_step_failure_diagnostic label goals;
@@ -942,8 +1091,7 @@ fun report_finish_failure name e =
     val _ =
       (ignore (print_finish_goal_state name)
        handle print_e =>
-         TextIO.output(TextIO.stdErr,
-           String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"]))
+         diagnostic_output (String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"]))
   in
     raise e
   end
@@ -963,26 +1111,26 @@ fun take_goals n goals =
 fun top_input_goals () = take_goals 1 (history_top_goals())
 
 fun compile_tactic label program =
-  case Option.mapPartial (fn {tactics, ...} => List.find (fn (text, _) => text = program) tactics) (!proof_factories_ref) of
+  case Option.mapPartial (fn {tactics, ...} => List.find (fn (text, _) => text = program) tactics) (!(proof_factories_ref ())) of
       SOME (_, make) => make
     | NONE =>
-        if quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (fn () => (" ^ program ^ "));") then
-          !compiled_tactic_ref
+        if quse_string ("(HolbuildProofRuntime.compiled_tactic_ref ()) := (fn () => (" ^ program ^ "));") then
+          !(compiled_tactic_ref ())
         else raise Fail ("tactic fragment did not compile: " ^ label)
 
 fun compile_list_tactic label program =
-  case Option.mapPartial (fn {list_tactics, ...} => List.find (fn (text, _) => text = program) list_tactics) (!proof_factories_ref) of
+  case Option.mapPartial (fn {list_tactics, ...} => List.find (fn (text, _) => text = program) list_tactics) (!(proof_factories_ref ())) of
       SOME (_, make) => make
     | NONE =>
-        if quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (fn () => (" ^ program ^ "));") then
-          !compiled_list_tactic_ref
+        if quse_string ("(HolbuildProofRuntime.compiled_list_tactic_ref ()) := (fn () => (" ^ program ^ "));") then
+          !(compiled_list_tactic_ref ())
         else raise Fail ("list tactic fragment did not compile: " ^ label)
 
 fun history_is_proved () =
   ((project_history goalStack.extract_thm; true) handle _ => false)
 
 fun active_focus_snapshot label =
-  case !branch_tail_count_ref of
+  case !(branch_tail_count_ref ()) of
       [] =>
         (let val goals = history_top_goals()
          in {goals = goals, total_count = length goals, generated_count = length goals, tail_count = 0} end
@@ -1011,7 +1159,7 @@ fun apply_focus_list_tactic label program make_list_tactic =
       let
         val list_tactic = make_list_tactic ()
         val scoped_list_tactic =
-          case !branch_tail_count_ref of
+          case !(branch_tail_count_ref ()) of
               [] => list_tactic
             | _ => Tactical.SPLIT_LT generated_count (list_tactic, Tactical.ALL_LT)
       in
@@ -1057,13 +1205,13 @@ fun split_by_lengths lengths xs =
   end
 
 fun reverse_recorded_groups goals =
-  case !reverse_group_lengths_ref of
+  case !(reverse_group_lengths_ref ()) of
       NONE => raise Fail "reverse_recorded_groups without recorded ALLGOALS groups"
     | SOME lengths =>
         let
           val (goal_groups, remaining_goals) = split_by_lengths lengths goals
           val _ = if null remaining_goals then () else raise Fail "reverse_recorded_groups saw unexpected extra goals"
-          val _ = reverse_group_lengths_ref := NONE
+          val _ = (reverse_group_lengths_ref ()) := NONE
           fun validate thms =
             let
               val (thm_groups, remaining_thms) = split_by_lengths lengths thms
@@ -1078,12 +1226,12 @@ fun reverse_recorded_groups goals =
 fun current_goal_total () = length (history_top_goals()) handle _ => 0
 
 fun push_branch_tail_count tail_count =
-  branch_tail_count_ref := tail_count :: !branch_tail_count_ref
+  (branch_tail_count_ref ()) := tail_count :: !(branch_tail_count_ref ())
 
 fun pop_branch_tail_count label =
-  case !branch_tail_count_ref of
+  case !(branch_tail_count_ref ()) of
       [] => raise Fail ("focus close without active focus: " ^ label)
-    | _ :: rest => branch_tail_count_ref := rest
+    | _ :: rest => (branch_tail_count_ref ()) := rest
 
 
 fun matching_selector_count label selector goals =
@@ -1188,25 +1336,23 @@ fun inspection_matches wanted name =
   case wanted of NONE => false | SOME selected => selected = name
 
 fun trace_enabled () =
-  !trace_active_ref orelse Option.getOpt(env_bool "HOLBUILD_PROOF_STEPS_TRACE", false)
+  !(trace_active_ref ()) orelse Option.getOpt(env_bool "HOLBUILD_PROOF_STEPS_TRACE", false)
 
 fun plan_enabled () =
-  !plan_active_ref orelse trace_enabled ()
+  !(plan_active_ref ()) orelse trace_enabled ()
 
 fun current_goal_count () = length (history_top_goals()) handle _ => ~1
 
 fun trace_line parts =
-  if trace_enabled () then TextIO.output(TextIO.stdErr, String.concat parts) else ()
+  if trace_enabled () then diagnostic_output (String.concat parts) else ()
 
 fun trace_plan theorem_name plan =
   if plan_enabled () then
-    (TextIO.output(TextIO.stdErr,
-       String.concat ["holbuild proof-ir plan theorem=", theorem_name,
+    (diagnostic_output (String.concat ["holbuild proof-ir plan theorem=", theorem_name,
                       " steps=", Int.toString (length plan), "\n"]);
      List.app
        (fn (index, proof_step) =>
-          TextIO.output(TextIO.stdErr,
-            String.concat ["holbuild proof-ir plan step=", Int.toString index,
+          diagnostic_output (String.concat ["holbuild proof-ir plan step=", Int.toString index,
                            " theorem=", theorem_name,
                            " kind=", HolbuildProofIr.step_kind proof_step,
                            " end=", Int.toString (HolbuildProofIr.step_end proof_step),
@@ -1215,7 +1361,7 @@ fun trace_plan theorem_name plan =
   else ()
 
 fun stop_after_plan_if_requested () =
-  if !plan_active_ref andalso not (!trace_active_ref) then
+  if !(plan_active_ref ()) andalso not (!(trace_active_ref ())) then
     case !plan_only_marker_ref of
         NONE => ()
       | SOME path => (write_text_file path "holbuild-proof-ir-plan-ok\n";
@@ -1223,14 +1369,14 @@ fun stop_after_plan_if_requested () =
   else ()
 
 fun trace_before index proof_step =
-  trace_line ["holbuild proof-ir before theorem=", !trace_current_theorem_ref,
+  trace_line ["holbuild proof-ir before theorem=", !(trace_current_theorem_ref ()),
               " step=", Int.toString index,
               " kind=", HolbuildProofIr.step_kind proof_step,
               " goals=", Int.toString (current_goal_count()),
               " label=", display_label (HolbuildProofIr.step_label proof_step), "\n"]
 
 fun trace_after status elapsed index proof_step =
-  trace_line ["holbuild proof-ir after theorem=", !trace_current_theorem_ref,
+  trace_line ["holbuild proof-ir after theorem=", !(trace_current_theorem_ref ()),
               " step=", Int.toString index,
               " kind=", HolbuildProofIr.step_kind proof_step,
               " status=", status,
@@ -1240,51 +1386,51 @@ fun trace_after status elapsed index proof_step =
 
 fun runtime_state_snapshot () =
   {history = current_history(),
-   current_path = !current_path_ref,
-   successful_path = !successful_path_ref,
-   current_frames = !current_frames_ref,
-   successful_frames = !successful_frames_ref,
-   resume_frames = !resume_frames_ref,
-   successful_branch_tail_counts = !successful_branch_tail_counts_ref,
-   successful_count = !successful_step_count_ref,
-   successful_end = !successful_prefix_end_ref,
-   successful_leaf_snapshots = !successful_leaf_snapshots_ref,
-   events = !dynamic_events_ref,
-   resume_events = !resume_events_ref,
-   branch_tail_counts = !branch_tail_count_ref,
-   reverse_group_lengths = !reverse_group_lengths_ref,
-   history_step_count = !history_step_count_ref}
+   current_path = !(current_path_ref ()),
+   successful_path = !(successful_path_ref ()),
+   current_frames = !(current_frames_ref ()),
+   successful_frames = !(successful_frames_ref ()),
+   resume_frames = !(resume_frames_ref ()),
+   successful_branch_tail_counts = !(successful_branch_tail_counts_ref ()),
+   successful_count = !(successful_step_count_ref ()),
+   successful_end = !(successful_prefix_end_ref ()),
+   successful_leaf_snapshots = !(successful_leaf_snapshots_ref ()),
+   events = !(dynamic_events_ref ()),
+   resume_events = !(resume_events_ref ()),
+   branch_tail_counts = !(branch_tail_count_ref ()),
+   reverse_group_lengths = !(reverse_group_lengths_ref ()),
+   history_step_count = !(history_step_count_ref ())}
 
 fun restore_runtime_state {history, current_path, successful_path, current_frames,
                            successful_frames, resume_frames, successful_branch_tail_counts, successful_count,
                            successful_end, successful_leaf_snapshots, events, resume_events, branch_tail_counts,
                            reverse_group_lengths, history_step_count} =
   (set_history history;
-   current_path_ref := current_path;
-   successful_path_ref := successful_path;
-   current_frames_ref := current_frames;
-   successful_frames_ref := successful_frames;
-   resume_frames_ref := resume_frames;
-   successful_branch_tail_counts_ref := successful_branch_tail_counts;
-   successful_step_count_ref := successful_count;
-   successful_prefix_end_ref := successful_end;
-   successful_leaf_snapshots_ref := successful_leaf_snapshots;
-   dynamic_events_ref := events;
-   resume_events_ref := resume_events;
-   branch_tail_count_ref := branch_tail_counts;
-   reverse_group_lengths_ref := reverse_group_lengths;
-   history_step_count_ref := history_step_count)
+   (current_path_ref ()) := current_path;
+   (successful_path_ref ()) := successful_path;
+   (current_frames_ref ()) := current_frames;
+   (successful_frames_ref ()) := successful_frames;
+   (resume_frames_ref ()) := resume_frames;
+   (successful_branch_tail_counts_ref ()) := successful_branch_tail_counts;
+   (successful_step_count_ref ()) := successful_count;
+   (successful_prefix_end_ref ()) := successful_end;
+   (successful_leaf_snapshots_ref ()) := successful_leaf_snapshots;
+   (dynamic_events_ref ()) := events;
+   (resume_events_ref ()) := resume_events;
+   (branch_tail_count_ref ()) := branch_tail_counts;
+   (reverse_group_lengths_ref ()) := reverse_group_lengths;
+   (history_step_count_ref ()) := history_step_count)
 
 fun with_expected_failures_suppressed f =
-  let val old = !suppress_expected_failure_diagnostics_ref
-      val _ = suppress_expected_failure_diagnostics_ref := true
-      val _ = suppressed_failure_diagnostic_ref := NONE
+  let val old = !(suppress_expected_failure_diagnostics_ref ())
+      val _ = (suppress_expected_failure_diagnostics_ref ()) := true
+      val _ = (suppressed_failure_diagnostic_ref ()) := NONE
       val result = (f (); NONE) handle e => SOME e
-      val _ = suppress_expected_failure_diagnostics_ref := old
-      val _ = case result of NONE => suppressed_failure_diagnostic_ref := NONE | SOME _ => ()
+      val _ = (suppress_expected_failure_diagnostics_ref ()) := old
+      val _ = case result of NONE => (suppressed_failure_diagnostic_ref ()) := NONE | SOME _ => ()
   in case result of NONE => () | SOME e => raise e end
 
-fun discard_suppressed_failure_diagnostic () = suppressed_failure_diagnostic_ref := NONE
+fun discard_suppressed_failure_diagnostic () = (suppressed_failure_diagnostic_ref ()) := NONE
 
 (* Re-raises a timeout from a TRY, ORELSE or repeat body.  The outermost such
    combinator restores the state from before it ran the body -- its entry for
@@ -1292,28 +1438,28 @@ fun discard_suppressed_failure_diagnostic () = suppressed_failure_diagnostic_ref
    the failed-prefix checkpoint there, the latest point no combinator choice
    depends on. *)
 fun raise_body_timeout saved e =
-  (if !suppress_expected_failure_diagnostics_ref then ()
+  (if !(suppress_expected_failure_diagnostics_ref ()) then ()
    else (restore_runtime_state saved; save_failed_prefix_checkpoint ());
    raise e)
 
 fun raise_choice_failure (e, diagnostic) =
-  (suppressed_failure_diagnostic_ref := diagnostic;
-   if !suppress_expected_failure_diagnostics_ref then ()
+  ((suppressed_failure_diagnostic_ref ()) := diagnostic;
+   if !(suppress_expected_failure_diagnostics_ref ()) then ()
    else
      (case diagnostic of SOME emit => emit () | NONE => ());
    raise e)
 
 fun with_plan_position display_index kind label span f =
   let
-    val old_failed_step_end = !failed_step_end_ref
-    val old_failed_step_span = !failed_step_span_ref
-    val old_failed_plan_position = !failed_plan_position_ref
-    val _ = failed_step_end_ref := SOME (#2 span)
-    val _ = failed_step_span_ref := SOME span
-    val _ = failed_plan_position_ref := SOME (display_index, kind, label)
-    fun restore () = (failed_step_end_ref := old_failed_step_end;
-                      failed_step_span_ref := old_failed_step_span;
-                      failed_plan_position_ref := old_failed_plan_position)
+    val old_failed_step_end = !(failed_step_end_ref ())
+    val old_failed_step_span = !(failed_step_span_ref ())
+    val old_failed_plan_position = !(failed_plan_position_ref ())
+    val _ = (failed_step_end_ref ()) := SOME (#2 span)
+    val _ = (failed_step_span_ref ()) := SOME span
+    val _ = (failed_plan_position_ref ()) := SOME (display_index, kind, label)
+    fun restore () = ((failed_step_end_ref ()) := old_failed_step_end;
+                      (failed_step_span_ref ()) := old_failed_step_span;
+                      (failed_plan_position_ref ()) := old_failed_plan_position)
     val value = f ()
   in
     restore ();
@@ -1356,12 +1502,12 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
       case resume_after_path of
           SOME target => if path_has_prefix path target then SOME (List.drop(target, length path)) else NONE
         | NONE => NONE
-    fun emit_event event = dynamic_events_ref := event :: !dynamic_events_ref
+    fun emit_event event = (dynamic_events_ref ()) := event :: !(dynamic_events_ref ())
     fun replay_active () = not (!resume_reached_ref)
     fun require_replay_event expected =
-      case !resume_events_ref of
+      case !(resume_events_ref ()) of
           event :: rest =>
-            if event = expected then resume_events_ref := rest
+            if event = expected then (resume_events_ref ()) := rest
             else raise Fail (String.concat ["proof-ir dynamic replay mismatch: expected ",
                                             dynamic_event_text expected,
                                             ", found ", dynamic_event_text event])
@@ -1378,44 +1524,44 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
           SOME target => path_has_prefix (event_path event) target
         | NONE => false
     fun record_or_replay_event event =
-      case !resume_events_ref of
+      case !(resume_events_ref ()) of
           expected :: _ =>
             if expected = event then require_replay_event event
             else if replay_active() then require_replay_event event
-            else (resume_events_ref := []; emit_event event)
+            else ((resume_events_ref ()) := []; emit_event event)
         | [] => if replay_active() then require_replay_event event else emit_event event
     fun finish_resume_boundary () =
       (resume_reached_ref := true;
-       resume_events_ref := List.filter replay_event_is_resume_ancestor (!resume_events_ref))
-    fun push_structural_frame frame = current_frames_ref := frame :: !current_frames_ref
+       (resume_events_ref ()) := List.filter replay_event_is_resume_ancestor (!(resume_events_ref ())))
+    fun push_structural_frame frame = (current_frames_ref ()) := frame :: !(current_frames_ref ())
     fun pop_structural_frame expected label =
-      case !current_frames_ref of
+      case !(current_frames_ref ()) of
           frame :: rest =>
-            if frame = expected then current_frames_ref := rest
+            if frame = expected then (current_frames_ref ()) := rest
             else raise Fail ("proof-ir structural frame mismatch while closing " ^ label)
         | [] => raise Fail ("proof-ir structural frame underflow while closing " ^ label)
     fun record_successful_leaf path proof_step =
       let
-        val count = !successful_step_count_ref + 1
+        val count = !(successful_step_count_ref ()) + 1
         val prefix_end = HolbuildProofIr.step_end proof_step
         val sig_text = (HolbuildProofIr.step_kind proof_step, HolbuildProofIr.step_program proof_step)
         val prefix_signature =
           Option.map HolbuildSha256.string_hex
             (HolbuildProofIr.canonical_dependency_prefix steps path)
       in
-        successful_step_count_ref := count;
-        successful_prefix_end_ref := prefix_end;
-        successful_path_ref := path;
-        successful_frames_ref := !current_frames_ref;
-        successful_branch_tail_counts_ref := !branch_tail_count_ref;
-        successful_leaf_snapshots_ref := {count = count, prefix_end = prefix_end, path = path,
-                                          focus = !branch_tail_count_ref,
-                                          frames = !current_frames_ref,
-                                          events = rev (!dynamic_events_ref),
+        (successful_step_count_ref ()) := count;
+        (successful_prefix_end_ref ()) := prefix_end;
+        (successful_path_ref ()) := path;
+        (successful_frames_ref ()) := !(current_frames_ref ());
+        (successful_branch_tail_counts_ref ()) := !(branch_tail_count_ref ());
+        (successful_leaf_snapshots_ref ()) := {count = count, prefix_end = prefix_end, path = path,
+                                          focus = !(branch_tail_count_ref ()),
+                                          frames = !(current_frames_ref ()),
+                                          events = rev (!(dynamic_events_ref ())),
                                           sig_text = sig_text,
                                           prefix_signature = prefix_signature,
-                                          history_count = !history_step_count_ref} ::
-                                         !successful_leaf_snapshots_ref
+                                          history_count = !(history_step_count_ref ())} ::
+                                         !(successful_leaf_snapshots_ref ())
       end
     fun run_list _ _ _ [] = ()
       | run_list d path i (proof_step :: rest) =
@@ -1430,11 +1576,11 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
         if before_resume_leaf path then (finish_resume_boundary(); d + HolbuildProofIr.display_line_count proof_step)
         else d + HolbuildProofIr.display_line_count proof_step
       else
-        let val n = !successful_step_count_ref
-            val old_path = !current_path_ref
-            val _ = current_path_ref := path
+        let val n = !(successful_step_count_ref ())
+            val old_path = !(current_path_ref ())
+            val _ = (current_path_ref ()) := path
             val result = (run_maybe_traced_step n d proof_step; NONE) handle e => SOME e
-            val _ = current_path_ref := old_path
+            val _ = (current_path_ref ()) := old_path
         in
           case result of
               SOME e => raise e
@@ -1465,7 +1611,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
       skip_or_enter_structural d path proof_step (fn () =>
       let
         fun resume_each_frame () =
-          List.find (fn frame => case frame of EachFrame (p, _, _, _) => p = path | _ => false) (!resume_frames_ref)
+          List.find (fn frame => case frame of EachFrame (p, _, _, _) => p = path | _ => false) (!(resume_frames_ref ()))
         val count = focused_goal_count "each"
         val resume_frame = if !resume_reached_ref then NONE else resume_each_frame()
         fun run_one_each iter remaining prior =
@@ -1499,7 +1645,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
       skip_or_enter_structural d path proof_step (fn () =>
       let
         fun resume_case_frame () =
-          List.find (fn frame => case frame of CaseFrame (p, _, _, _) => p = path | _ => false) (!resume_frames_ref)
+          List.find (fn frame => case frame of CaseFrame (p, _, _, _) => p = path | _ => false) (!(resume_frames_ref ()))
         val count = focused_goal_count "cases"
         val case_count = length cases
         val resume_frame = if !resume_reached_ref then NONE else resume_case_frame()
@@ -1559,7 +1705,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
           | attempt n alt_line (body :: rest) _ =
               let val saved = runtime_state_snapshot()
                   val result = (with_expected_failures_suppressed (fn () => run_list (alt_line + 1) (path @ [HolbuildProofIr.PathAlternative n]) 0 body); NONE) handle e => SOME e
-                  val diagnostic = !suppressed_failure_diagnostic_ref
+                  val diagnostic = !(suppressed_failure_diagnostic_ref ())
               in
                 case result of
                     NONE =>
@@ -1674,22 +1820,22 @@ fun run_structural_steps display_index steps = run_structural_steps_with_resume 
 fun run_steps_from_path path display_index steps = run_structural_steps_with_resume (SOME path) display_index steps
 
 fun run_steps steps =
-  (successful_step_count_ref := 0;
-   successful_prefix_end_ref := 0;
-   current_path_ref := [];
-   successful_path_ref := [];
-   current_frames_ref := [];
-   successful_frames_ref := [];
-   resume_frames_ref := [];
-   successful_branch_tail_counts_ref := [];
-   successful_leaf_snapshots_ref := [];
-   dynamic_events_ref := [];
-   resume_events_ref := [];
-   suppress_expected_failure_diagnostics_ref := false;
-   suppressed_failure_diagnostic_ref := NONE;
-   history_step_count_ref := 0;
-   branch_tail_count_ref := [];
-   reverse_group_lengths_ref := NONE;
+  ((successful_step_count_ref ()) := 0;
+   (successful_prefix_end_ref ()) := 0;
+   (current_path_ref ()) := [];
+   (successful_path_ref ()) := [];
+   (current_frames_ref ()) := [];
+   (successful_frames_ref ()) := [];
+   (resume_frames_ref ()) := [];
+   (successful_branch_tail_counts_ref ()) := [];
+   (successful_leaf_snapshots_ref ()) := [];
+   (dynamic_events_ref ()) := [];
+   (resume_events_ref ()) := [];
+   (suppress_expected_failure_diagnostics_ref ()) := false;
+   (suppressed_failure_diagnostic_ref ()) := NONE;
+   (history_step_count_ref ()) := 0;
+   (branch_tail_count_ref ()) := [];
+   (reverse_group_lengths_ref ()) := NONE;
    run_structural_steps 0 steps)
 
 datatype 'a traced_result = TraceOk of 'a | TraceError of exn
@@ -1697,7 +1843,7 @@ datatype 'a traced_result = TraceOk of 'a | TraceError of exn
 fun backup_n 0 = ()
   | backup_n n =
       (set_history (History.undo (current_history()));
-       history_step_count_ref := !history_step_count_ref - 1;
+       (history_step_count_ref ()) := !(history_step_count_ref ()) - 1;
        backup_n (n - 1))
 
 fun drop_all () = clear_history ()
@@ -1709,63 +1855,63 @@ fun atomic_prove label g tac =
 
 fun with_theorem_trace name f =
   let
-    val old_active = !trace_active_ref
-    val old_plan_active = !plan_active_ref
-    val old_name = !trace_current_theorem_ref
-    val _ = plan_active_ref := (inspection_matches (!plan_theorem_ref) name orelse !trace_all_ref)
-    val _ = trace_active_ref := !trace_all_ref
-    val _ = trace_current_theorem_ref := name
+    val old_active = !(trace_active_ref ())
+    val old_plan_active = !(plan_active_ref ())
+    val old_name = !(trace_current_theorem_ref ())
+    val _ = (plan_active_ref ()) := (inspection_matches (!plan_theorem_ref) name orelse !trace_all_ref)
+    val _ = (trace_active_ref ()) := !trace_all_ref
+    val _ = (trace_current_theorem_ref ()) := name
     val result = TraceOk (f ()) handle e => TraceError e
-    val _ = trace_active_ref := old_active
-    val _ = plan_active_ref := old_plan_active
-    val _ = trace_current_theorem_ref := old_name
+    val _ = (trace_active_ref ()) := old_active
+    val _ = (plan_active_ref ()) := old_plan_active
+    val _ = (trace_current_theorem_ref ()) := old_name
   in
     case result of TraceOk value => value | TraceError e => raise e
   end
 
 fun with_proof_ir_execution ctxt f =
   let
-    val old_proving = !proving_with_proof_ir_ref
-    val old_context = !proof_context_ref
-    val _ = proving_with_proof_ir_ref := true
-    val _ = proof_context_ref := SOME ctxt
+    val old_proving = !(proving_with_proof_ir_ref ())
+    val old_context = !(proof_context_ref ())
+    val _ = (proving_with_proof_ir_ref ()) := true
+    val _ = (proof_context_ref ()) := SOME ctxt
     val result = TraceOk (f ()) handle e => TraceError e
-    val _ = proving_with_proof_ir_ref := old_proving
-    val _ = proof_context_ref := old_context
+    val _ = (proving_with_proof_ir_ref ()) := old_proving
+    val _ = (proof_context_ref ()) := old_context
   in
     case result of TraceOk value => value | TraceError e => raise e
   end
 
 fun proof_ir_prove name g original_tac tactic_text =
   let
-    val _ = active_tactic_text_ref := tactic_text
-    val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
+    val _ = (active_tactic_text_ref ()) := tactic_text
+    val plan = case !(active_plan_ref ()) of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
     val _ = trace_plan name plan
     val _ = stop_after_plan_if_requested ()
     fun run factories ctxt goal =
       let
-        val old_factories = !proof_factories_ref
-        val _ = proof_factories_ref := factories
+        val old_factories = !(proof_factories_ref ())
+        val _ = (proof_factories_ref ()) := factories
         val result = TraceOk (with_proof_ir_execution ctxt (fn () =>
         let
           val _ = init_history goal (HolbuildProofIr.display_step_count plan + 1)
           val _ = run_steps plan
                   handle e =>
-                    if !failed_goal_state_printed_ref then raise e
+                    if !(failed_goal_state_printed_ref ()) then raise e
                     else report_finish_failure name e
         in
           history_top_thm goal handle e => report_finish_failure name e
         end)) handle e => TraceError e
-        val _ = proof_factories_ref := old_factories
+        val _ = (proof_factories_ref ()) := old_factories
       in
         case result of TraceOk th => th | TraceError e => raise e
       end
     (* HOL's supplied tactic owns the native modifier and its lexical scope.
        The injected entry consumes this hook before running any nested proof. *)
-    val _ = plan_runner_ref := SOME run
+    val _ = (plan_runner_ref ()) := SOME run
     val th = HolbuildTacticCompat.tac_proof (current_proof_context ()) (g, original_tac)
-             handle e => (plan_runner_ref := NONE; raise e)
-    val _ = plan_runner_ref := NONE
+             handle e => ((plan_runner_ref ()) := NONE; raise e)
+    val _ = (plan_runner_ref ()) := NONE
     val _ = drop_all ()
   in
     th
@@ -1775,27 +1921,27 @@ fun termination_tactic name tactic_text plan original_tac =
   HolbuildTacticCompat.lift_context_tactic (fn ctxt => fn g =>
   let
     val depth = length (PolyML.SaveState.showHierarchy())
-    val _ = theorem_info_ref := SOME ("termination", name, tactic_text,
+    val _ = (theorem_info_ref ()) := SOME ("termination", name, tactic_text,
                                       "", "", "", "", [], depth)
-    val _ = failed_step_end_ref := NONE
-    val _ = failed_step_span_ref := NONE
-    val _ = failed_plan_position_ref := NONE
-    val _ = failed_goal_state_printed_ref := false
+    val _ = (failed_step_end_ref ()) := NONE
+    val _ = (failed_step_span_ref ()) := NONE
+    val _ = (failed_plan_position_ref ()) := NONE
+    val _ = (failed_goal_state_printed_ref ()) := false
     fun execute () =
       let
-        val _ = active_tactic_text_ref := tactic_text
-        val _ = active_plan_ref := SOME plan
+        val _ = (active_tactic_text_ref ()) := tactic_text
+        val _ = (active_plan_ref ()) := SOME plan
         val _ = trace_plan name plan
         val _ = stop_after_plan_if_requested ()
         val _ = init_history g (HolbuildProofIr.display_step_count plan + 1)
         val _ = run_steps plan
                 handle e =>
-                  if !failed_goal_state_printed_ref then raise e
+                  if !(failed_goal_state_printed_ref ()) then raise e
                   else report_finish_failure name e
         val th = history_top_thm g
                  handle e => report_finish_failure name e
         val _ = drop_all ()
-        val _ = theorem_info_ref := NONE
+        val _ = (theorem_info_ref ()) := NONE
       in
         ([], fn [] => th | _ => raise Fail "termination tactic validation received theorems")
       end
@@ -2066,19 +2212,19 @@ fun resumable_failed_prefix_metadata plan metadata =
 
 fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok =
   let
-    val old_resume_active = !failed_prefix_resume_active_ref
-    val old_resumed_step_count = !failed_prefix_resumed_step_count_ref
+    val old_resume_active = !(failed_prefix_resume_active_ref ())
+    val old_resumed_step_count = !(failed_prefix_resumed_step_count_ref ())
     fun restore_resume_flag () =
-      (failed_prefix_resume_active_ref := old_resume_active;
-       failed_prefix_resumed_step_count_ref := old_resumed_step_count)
-    val _ = failed_prefix_resume_active_ref := true
+      ((failed_prefix_resume_active_ref ()) := old_resume_active;
+       (failed_prefix_resumed_step_count_ref ()) := old_resumed_step_count)
+    val _ = (failed_prefix_resume_active_ref ()) := true
     val result =
       with_proof_ir_execution (current_proof_context ()) (fn () =>
        (restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok);
         with_theorem_trace name (fn () =>
         let
-          val _ = active_tactic_text_ref := tactic_text
-          val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
+          val _ = (active_tactic_text_ref ()) := tactic_text
+          val plan = case !(active_plan_ref ()) of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
           val metadata =
             case parse_failed_prefix_metadata metadata_text of
                 SOME m => m
@@ -2086,9 +2232,9 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = ensure_history_limit (Int.max(HolbuildProofIr.display_step_count plan + 1,
                                                   #history_count metadata + 1))
           val _ =
-            if !history_step_count_ref = #history_count metadata then ()
+            if !(history_step_count_ref ()) = #history_count metadata then ()
             else raise Fail (String.concat ["failed-prefix checkpoint history does not match metadata: heap=",
-                                            Int.toString (!history_step_count_ref),
+                                            Int.toString (!(history_step_count_ref ())),
                                             " metadata=", Int.toString (#history_count metadata)])
           val resume_metadata = resumable_failed_prefix_metadata plan metadata
           val backup_count = #history_count metadata - #history_count resume_metadata
@@ -2105,34 +2251,34 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = trace_plan name plan
           val _ = stop_after_plan_if_requested ()
           val metadata = resume_metadata
-          val _ = failed_prefix_resumed_step_count_ref := SOME (#step_count metadata)
+          val _ = (failed_prefix_resumed_step_count_ref ()) := SOME (#step_count metadata)
           val resume_display =
             if #step_count metadata = 0 andalso #path metadata = [] then 0
             else case path_display_index plan (#path metadata) of
                      SOME d => d
                    | NONE => raise Fail "failed-prefix proof path is not present in current proof-ir plan"
-          val _ = successful_step_count_ref := #step_count metadata
-          val _ = successful_prefix_end_ref := #prefix_end metadata
-          val _ = successful_path_ref := #path metadata
-          val _ = successful_frames_ref := #frames metadata
-          val _ = current_frames_ref := #frames metadata
-          val _ = resume_frames_ref := #frames metadata
+          val _ = (successful_step_count_ref ()) := #step_count metadata
+          val _ = (successful_prefix_end_ref ()) := #prefix_end metadata
+          val _ = (successful_path_ref ()) := #path metadata
+          val _ = (successful_frames_ref ()) := #frames metadata
+          val _ = (current_frames_ref ()) := #frames metadata
+          val _ = (resume_frames_ref ()) := #frames metadata
           (* Metadata lists leaves oldest first; the ref holds them newest first. *)
-          val _ = successful_leaf_snapshots_ref := rev (take_at_most (#step_count metadata) (#leaves metadata))
-          val _ = branch_tail_count_ref := #focus metadata
-          val _ = successful_branch_tail_counts_ref := #focus metadata
-          val _ = dynamic_events_ref := rev (#events metadata)
-          val _ = resume_events_ref := #events metadata
+          val _ = (successful_leaf_snapshots_ref ()) := rev (take_at_most (#step_count metadata) (#leaves metadata))
+          val _ = (branch_tail_count_ref ()) := #focus metadata
+          val _ = (successful_branch_tail_counts_ref ()) := #focus metadata
+          val _ = (dynamic_events_ref ()) := rev (#events metadata)
+          val _ = (resume_events_ref ()) := #events metadata
           val _ =
             (if #step_count metadata = 0 then run_structural_steps 0 plan
              else run_steps_from_path (#path metadata) 0 plan)
             handle e =>
-              if !failed_goal_state_printed_ref then raise e
+              if !(failed_goal_state_printed_ref ()) then raise e
               else report_finish_failure name e
           val th = history_top_thm (project_history goalStack.initial_goal)
                    handle e => report_finish_failure name e
           val _ = drop_all()
-          val _ = theorem_info_ref := NONE
+          val _ = (theorem_info_ref ()) := NONE
         in th end)))
       handle e => (restore_resume_flag (); raise e)
     val _ = restore_resume_flag ()
@@ -2148,23 +2294,23 @@ fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, _, _, _, _) =
         with_theorem_trace name (fn () =>
           if atomic then atomic_prove name g tac
           else proof_ir_prove name g tac tactic_text))
-    val _ = theorem_info_ref := NONE
+    val _ = (theorem_info_ref ()) := NONE
   in
     th
   end
 
 fun proof_ir_prover ctxt (g, tac) =
-  if !proving_with_proof_ir_ref then
+  if !(proving_with_proof_ir_ref ()) then
     HolbuildTacticCompat.tac_proof ctxt (g, tac)
   else
-    case !theorem_info_ref of
+    case !(theorem_info_ref ()) of
         NONE => HolbuildTacticCompat.tac_proof ctxt (g, tac)
       | SOME info =>
           prove_outer_theorem ctxt (g, tac) info
           handle e =>
-            (proving_with_proof_ir_ref := false;
-             theorem_info_ref := NONE;
-             context_info_ref := NONE;
+            ((proving_with_proof_ir_ref ()) := false;
+             (theorem_info_ref ()) := NONE;
+             (context_info_ref ()) := NONE;
              drop_all();
              raise e)
 
@@ -2175,25 +2321,24 @@ fun install ({checkpoint_enabled, checkpoint_seconds, tactic_timeout, timeout_ma
    plan_theorem_ref := plan_theorem;
    trace_all_ref := trace_all;
    plan_only_marker_ref := plan_only_marker;
-   plan_active_ref := false;
-   trace_active_ref := false;
-   theorem_info_ref := NONE;
-   plan_runner_ref := NONE;
-   proof_factories_ref := NONE;
-   context_info_ref := NONE;
-   failed_step_end_ref := NONE;
-   failed_step_span_ref := NONE;
-   failed_plan_position_ref := NONE;
-   failed_goal_state_printed_ref := false;
-   suppressed_failure_diagnostic_ref := NONE;
-   failed_prefix_resume_active_ref := false;
-   failed_prefix_resumed_step_count_ref := NONE;
-   proving_with_proof_ir_ref := false;
+   (plan_active_ref ()) := false;
+   (trace_active_ref ()) := false;
+   (theorem_info_ref ()) := NONE;
+   (plan_runner_ref ()) := NONE;
+   (proof_factories_ref ()) := NONE;
+   (context_info_ref ()) := NONE;
+   (failed_step_end_ref ()) := NONE;
+   (failed_step_span_ref ()) := NONE;
+   (failed_plan_position_ref ()) := NONE;
+   (failed_goal_state_printed_ref ()) := false;
+   (suppressed_failure_diagnostic_ref ()) := NONE;
+   (failed_prefix_resume_active_ref ()) := false;
+   (failed_prefix_resumed_step_count_ref ()) := NONE;
+   (proving_with_proof_ir_ref ()) := false;
    HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate checkpoint_seconds;
    HolbuildTacticCompat.install_prover proof_ir_prover;
    case tactic_timeout of
        NONE => ()
-     | SOME seconds => TextIO.output (TextIO.stdErr,
-         "holbuild slow-proof-steps v1 coverage=executed limit_ms=" ^ fmt_ms seconds ^ "\n"))
+     | SOME seconds => diagnostic_output ("holbuild slow-proof-steps v1 coverage=executed limit_ms=" ^ fmt_ms seconds ^ "\n"))
 
 end

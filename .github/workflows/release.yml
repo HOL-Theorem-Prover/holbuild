@@ -18,6 +18,7 @@ on:
       - sml/checkpoint_save_runtime.sml
       - sml/holbuild_runtime.sml
       - sml/deferred_proofs_runtime.sml
+      - sml/deferred_in_place_runtime.sml
       - sml/fingerprint_runtime.sml
       - sml/proof_runtime.sml
       - sml/tactic_compat_runtime.sml

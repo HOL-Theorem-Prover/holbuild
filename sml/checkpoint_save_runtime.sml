@@ -97,6 +97,7 @@ fun write_text_atomically path text =
 fun begin_replacement path =
   (remove_file (ok_tmp_path path);
    remove_file (ok_path path);
+   remove_file (path ^ ".proved");
    remove_file path)
 
 fun checkpoint_io_failure e =
@@ -115,7 +116,13 @@ fun warn_checkpoint_failure label path e =
 fun discard_checkpoint path =
   (remove_file (ok_tmp_path path);
    remove_file (ok_path path);
+   remove_file (path ^ ".proved");
    remove_file path)
+
+(* Writes a saved checkpoint's .ok.  A build that defers proofs
+   (HolbuildDeferred.commit) writes it only once the proofs the saved
+   heap holds stubs for have passed. *)
+val commit_ok = ref (fn path => fn ok_text => write_text_atomically (ok_path path) ok_text)
 
 (* Runs F with only the toolchain's entries on the load path.  HOL adds the
    project's directories (and its external includes) when it starts, so a
@@ -204,7 +211,7 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
         val t1 = Time.now()
         val _ = with_theory_cpu_carried (fn () => PolyML.SaveState.saveChild(path, depth))
         val t2 = Time.now()
-        val _ = write_text_atomically (ok_path path) ok_text
+        val _ = !commit_ok path ok_text
         val _ =
           if timing then
             TextIO.output

@@ -105,7 +105,7 @@ for mode in plain steps; do
   else
     cat >> "$project/src/AScript.sml" <<'SML'
 fun check_metadata expected =
-  case !HolbuildProofRuntime.theorem_info_ref of
+  case !(HolbuildProofRuntime.theorem_info_ref ()) of
       SOME info => if #8 info = expected then () else raise Fail "attribute metadata changed"
     | NONE => raise Fail "missing theorem metadata";
 SML
@@ -192,7 +192,7 @@ if find "$tmpdir/steps/.holbuild/checkpoints" -name '*end_of_proof*' -o -name '*
 fi
 cat > "$tmpdir/context.sml" <<'SML'
 val _ = check_restored ();
-val _ = if isSome (!HolbuildProofRuntime.proof_factories_ref) then
+val _ = if isSome (!(HolbuildProofRuntime.proof_factories_ref ())) then
           raise Fail "temporary factories survived in context checkpoint" else ();
 val _ = print "ATTR_CONTEXT_OK\n";
 SML

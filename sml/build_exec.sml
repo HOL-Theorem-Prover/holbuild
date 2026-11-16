@@ -8,6 +8,7 @@ exception Error of string
 exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
 exception ExecutionPlanPrinted
 exception RetryInvalidCheckpoint
+exception RetryWithoutDeferral
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
@@ -516,15 +517,37 @@ fun withheld_outline stage =
    on: HOLBUILD_PROOF_THREADS, or else up to 4 of the build's jobs. *)
 val pipeline_proof_threads = ref 1
 
+(* How many threads a plain build with proof steps and checkpoints proves
+   its theories' proofs on, after each theory's export
+   (HolbuildDeferredInPlace.finish): HOLBUILD_PROOF_THREADS when set and HOL has
+   context-taking tactics, else 1, which proves each in place.  Theories
+   whose deferred proofs did something other than prove (input keys in
+   in_place_deferral_off) build in place. *)
+val in_place_proof_threads = ref 1
+val in_place_deferral_off = ref ([] : string list)
+
+(* The file a theory child in STAGE that defers in place writes once its
+   data no longer names a deferred proof. *)
+fun stage_in_place_finalized stage = Path.concat(stage, "holbuild-deferred-finalized")
+
+(* The file it writes when a deferred proof did something a proof run in
+   place may and a deferred one may not (HolbuildDeferredInPlace.Unsupported). *)
+fun stage_deferral_unsupported stage = Path.concat(stage, "holbuild-deferral-unsupported")
+
 (* PIPELINED: whether the child defers its proofs (deferred_source), so it
-   publishes its outline after the export and then proves them. *)
-fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipelined} =
+   publishes its outline after the export and then proves them.  IN_PLACE:
+   whether it defers them in a plain build, proving them after the export. *)
+fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipelined, in_place} =
   let
     val lines =
       generated_metadata_report_lines {parents_report = parents_report,
                                        mldeps_report = mldeps_report} @
       [export_theory_if_needed_line sig_path] @
-      (if pipelined then
+      (if in_place then
+         ["val _ = HolbuildDeferredInPlace.finish {sig_path = " ^ HolbuildToolchain.sml_string sig_path ^
+          ", threads = " ^ Int.toString (!in_place_proof_threads) ^
+          ", finalized = " ^ HolbuildToolchain.sml_string (stage_in_place_finalized (Path.dir path)) ^ "};"]
+       else if pipelined then
          ["val _ = HolbuildDeferred.publish_outline {sig_path = " ^ HolbuildToolchain.sml_string sig_path ^
           ", outline_dir = " ^ HolbuildToolchain.sml_string (stage_outline_dir (Path.dir path)) ^ "};",
           "val _ = HolbuildDeferred.prove_all " ^ Int.toString (!pipeline_proof_threads) ^ ";",
@@ -2974,7 +2997,7 @@ fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs
    holbuild with the same sources. *)
 val runtime_source_files =
   HolbuildToolchain.runtime_files @
-  ["sml/checkpoint_save_runtime.sml", "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml", "sml/deferred_proofs_runtime.sml"] @
+  ["sml/checkpoint_save_runtime.sml", "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml", "sml/deferred_proofs_runtime.sml", "sml/deferred_in_place_runtime.sml"] @
   map (fn file => normalize_path (Path.concat("sml/analyser", file)))
       HolbuildHolSharedCache.analyser_source_files
 
@@ -3219,6 +3242,18 @@ fun trknl_enabled (CheckpointPolicy {trknl, ...}) = trknl
 
 fun execution_plan_only (CheckpointPolicy {execution_plan = SOME _, trace_steps = false, ...}) = true
   | execution_plan_only _ = false
+
+(* Whether ACTION's plain build defers its proofs and proves them after the
+   export on in_place_proof_threads threads.  Not with what pipelining
+   leaves out either (speculable). *)
+fun defers_in_place policy (action : theory_action) =
+  !in_place_proof_threads > 1 andalso
+  proof_steps_enabled policy andalso proof_ir_enabled policy andalso
+  checkpoint_enabled policy andalso theorem_checkpoints_enabled policy andalso
+  not (trace_steps policy) andalso not (Option.isSome (execution_plan policy)) andalso
+  not (repl_on_failure policy) andalso not (trknl_enabled policy) andalso
+  null (#extra_outputs action) andalso
+  not (List.exists (fn key => key = #input_key action) (!in_place_deferral_off))
 
 fun bool_text true = "true"
   | bool_text false = "false"
@@ -3581,7 +3616,9 @@ fun deferrable_checkpoint source_text (checkpoints : HolbuildTheoryCheckpoints.c
 
 (* DEFER_PROOFS: the script is a pipelined build's, which defers what
    proofs it can. *)
-fun instrumented_source defer_proofs policy timeout_marker plan_only_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
+(* IN_PLACE: the prelude text of a plain build that defers its proofs
+   (in_place_prelude), or NONE. *)
+fun instrumented_source defer_proofs in_place policy timeout_marker plan_only_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
   if proof_steps_enabled policy then
     HolbuildTheoryCheckpoints.instrument
       {source = source_text, source_name = source_name, start_offset = start_offset, checkpoints = checkpoints,
@@ -3595,7 +3632,9 @@ fun instrumented_source defer_proofs policy timeout_marker plan_only_marker sour
        trace_all = trace_steps policy,
        plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy,
-       defer = if defer_proofs then deferrable_checkpoint source_text checkpoints else (fn _ => false)}
+       defer = if defer_proofs orelse Option.isSome in_place then deferrable_checkpoint source_text checkpoints
+               else (fn _ => false),
+       in_place = in_place}
   else plain_source_from_checkpoint source_name source_text start_offset
 
 fun replay_candidate policy base theorem_checkpoints declaration_checkpoints =
@@ -3627,7 +3666,7 @@ fun failed_prefix_resume_message logical checkpoint step_count =
     ["from: failed-prefix checkpoint in " ^ #safe_name checkpoint,
      "restoring proof-ir prefix with " ^ Int.toString step_count ^ " successful leaf steps"]
 
-fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
+fun failed_prefix_resume_source in_place policy timeout_marker plan_only_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
   let
     val runtime_config =
       {checkpoint_enabled = theorem_checkpoints_enabled policy,
@@ -3699,10 +3738,11 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_na
          trace_all = trace_steps policy,
          plan_only_marker = plan_only_marker,
          new_ir = proof_ir_enabled policy,
-         defer = fn _ => false}
+         defer = if Option.isSome in_place then deferrable_checkpoint source checkpoints else (fn _ => false),
+         in_place = in_place}
   in
     String.concat
-      [HolbuildTheoryCheckpoints.generated_code_pragma source, prelude,
+      [HolbuildTheoryCheckpoints.generated_code_pragma source, prelude, getOpt (in_place, ""),
        HolbuildTheoryCheckpoints.file_pragma source_name, replay_block, suffix]
   end
 
@@ -3872,15 +3912,28 @@ fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
 fun resumes_from_checkpoints policy (action : theory_action) =
   null (#extra_outputs action) andalso not (trace_steps policy)
 
-fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
+(* The prelude text of a script that defers in place: it loads the
+   deferred-proof runtimes and, resuming from the checkpoint RESUMED, what
+   that checkpoint's stubs resolve to. *)
+fun in_place_prelude resumed =
+  String.concat
+    (map (fn file => "val _ = HolbuildRuntime.use " ^
+                     HolbuildToolchain.sml_string (Path.concat(HolbuildRuntimePaths.runtime_root (), file)) ^ ";\n")
+         ["sml/deferred_proofs_runtime.sml", "sml/deferred_in_place_runtime.sml"] @
+     [case resumed of
+          NONE => ""
+        | SOME path => "val _ = HolbuildDeferredInPlace.load_proved " ^ HolbuildToolchain.sml_string path ^ ";\n"])
+
+fun write_theory_script defer_proofs in_place policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
     val source_name = #source_name action
     val logical = #logical action
     val load_lines = map (theory_load_line root) (#loads action)
+    fun in_place_text resumed = if in_place then SOME (in_place_prelude resumed) else NONE
   in
   if not (checkpoint_enabled policy) then
     (write_plain_preload load_lines preload;
-     write_text staged_script (instrumented_source defer_proofs policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
+     write_text staged_script (instrumented_source defer_proofs NONE policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
      {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
   else
     let
@@ -3897,20 +3950,20 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
            List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints)
       fun run_from_deps_checkpoint () =
         (ensure_source_checkpoint_parents ();
-         write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source false (in_place_text NONE) policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          deps_loaded_resume_message logical;
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
       fun run_from_fresh_preload () =
         (remove_deps_checkpoint_descendants base deps_key;
          ensure_source_checkpoint_parents ();
          write_preload load_lines deps_loaded deps_ok preload;
-         write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source false (in_place_text NONE) policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
         let
           val path = #failed_prefix_path checkpoint
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
+          val _ = write_text staged_script (failed_prefix_resume_source (in_place_text (SOME path)) policy timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
           val _ = failed_prefix_resume_message logical checkpoint step_count
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME (path, step_count)}
@@ -3918,7 +3971,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
       fun run_from_replay {boundary, path, safe_name, kind, failure_checkpoints} =
         let
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
+          val _ = write_text staged_script (instrumented_source false (in_place_text (SOME path)) policy (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
           val _ = source_context_resume_message logical (#source_file action) source_text kind safe_name boundary
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = failure_checkpoints @ [deps_loaded], failed_prefix_context = NONE}
@@ -4041,7 +4094,7 @@ fun install_theory_stage check_cancelled cache_allowed policy {stage, logical, s
 
 (* The files of a theory child's stage that don't depend on its parents'
    outputs: the extra inputs, the child policy and the theory exporter. *)
-fun prepare_theory_stage speculative tc root (action : theory_action) =
+fun prepare_theory_stage speculative in_place tc root (action : theory_action) =
   let
     val stage_root = stage_root_at root (#input_key action)
     val stage = action_stage root action
@@ -4067,7 +4120,8 @@ fun prepare_theory_stage speculative tc root (action : theory_action) =
        path = Path.concat(stage, "holbuild-export-theory.sml"),
        parents_report = SOME (Path.concat(stage, "holbuild-theory-parents.txt")),
        mldeps_report = SOME (Path.concat(stage, "holbuild-theory-mldeps.txt")),
-       pipelined = speculative}
+       pipelined = speculative,
+       in_place = in_place}
   end
 
 (* Set by exec-action for the next run_theory_action: the theory child it
@@ -4084,6 +4138,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
   let
     val _ = check_cancelled ()
     val speculative = Option.isSome speculative_log
+    val in_place = not speculative andalso defers_in_place policy action
     val input_key = #input_key action
     val logical = #logical action
     val source_file = #source_file action
@@ -4107,7 +4162,8 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
           (#extra_outputs action)
     (* A child started ahead of its parents runs in the stage already. *)
     val attached = !attached_child before attached_child := NONE
-    val _ = if Option.isSome attached then () else prepare_theory_stage speculative tc root action
+    val _ = if Option.isSome attached then () else prepare_theory_stage speculative in_place tc root action
+    val _ = remove_file (stage_deferral_unsupported stage)
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
     val _ =
       if theorem_checkpoints_enabled policy then
@@ -4118,7 +4174,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val _ = remove_file timeout_marker
     val _ = remove_file plan_only_marker
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
-    val run_spec = write_theory_script (speculative andalso proof_steps_enabled policy) policy root checkpoint_root base_context action source_text
+    val run_spec = write_theory_script (speculative andalso proof_steps_enabled policy) in_place policy root checkpoint_root base_context action source_text
                                     theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
                                     (if execution_plan_only policy then SOME plan_only_marker else NONE)
     (* A speculative child runs no checkpoints, so it starts from the
@@ -4235,6 +4291,11 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
           end
         else if discard_failed_prefix_after_resume_failure msg then
           raise RetryInvalidCheckpoint
+        else if in_place andalso file_exists (stage_deferral_unsupported stage) then
+          (warn ("building " ^ logical ^ " again without deferring its proofs: " ^
+                 read_text (stage_deferral_unsupported stage));
+           in_place_deferral_off := input_key :: !in_place_deferral_off;
+           raise RetryWithoutDeferral)
         else
           let
             val failure_error =
@@ -4247,6 +4308,10 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
             raise failure_error
           end)
     val _ = check_cancelled ()
+    val _ =
+      if in_place andalso not (file_exists (stage_in_place_finalized stage)) then
+        raise Error (logical ^ ": the build ended before its deferred proofs were finalized")
+      else ()
     val _ =
       if execution_plan_only policy andalso file_exists plan_only_marker then
         (HolbuildStatus.message_stdout (read_text build_log handle _ => "");
@@ -4770,6 +4835,11 @@ fun proof_engine (CheckpointPolicy {proof_steps = false, ...}) = "plain_v1"
   | proof_engine (CheckpointPolicy {new_ir = true, ...}) = "proof_ir_v3"
   | proof_engine _ = "proof_steps_failed_fragment_span_v6"
 
+(* A checkpoint of a build that defers in place can hold stubs, so the
+   builds that don't never resume from one, nor it from theirs. *)
+fun action_proof_engine policy action =
+  proof_engine policy ^ (if defers_in_place policy action then ":deferred_in_place_v1" else "")
+
 fun build_config_lines_for_node options project node =
   case #kind (HolbuildBuildPlan.source_of node) of
       HolbuildSourceIndex.TheoryScript => policy_config_lines (checkpoint_policy_for_node options project node)
@@ -4925,7 +4995,7 @@ fun theory_checkpoints_for_action policy checkpoint_root (action : theory_action
                        String.concatWith "\n" errors)
     in
       detail_time_phase "build.exec.node.checkpoint_specs" (fn () =>
-        theorem_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
+        theorem_checkpoint_specs (action_proof_engine policy action) (tactic_timeout policy)
           (action_checkpoint_base checkpoint_root action) (#deps_key action)
           (#inputs_key action) (nondefault_source_name action) source_text proof_ir_plans boundaries)
     end
@@ -4997,7 +5067,7 @@ fun declaration_checkpoints_for_action policy checkpoint_root (action : theory_a
   if not (checkpoint_enabled policy) orelse not (theorem_checkpoints_enabled policy) orelse
      not (proof_steps_enabled policy) then []
   else
-    declaration_checkpoint_specs (proof_engine policy) (tactic_timeout policy)
+    declaration_checkpoint_specs (action_proof_engine policy action) (tactic_timeout policy)
       (action_checkpoint_base checkpoint_root action) (#deps_key action)
       (#inputs_key action) (nondefault_source_name action) source_text terminations
     handle Error msg =>
@@ -5047,13 +5117,19 @@ fun run_theory_action_checkpoints check_cancelled speculative_log cache_allowed 
 fun build_theory_action cache_allowed policy tc root checkpoint_root base_context (action : theory_action) =
   let
     val source_text = read_text (#source_file action)
-    val checkpoints = action_checkpoints policy checkpoint_root action source_text
-    val generated_metadata =
-      run_theory_action_checkpoints (fn () => ()) NONE cache_allowed policy tc root checkpoint_root base_context action source_text
-        checkpoints
+    fun run () =
+      let
+        val checkpoints = action_checkpoints policy checkpoint_root action source_text
+        val generated_metadata =
+          run_theory_action_checkpoints (fn () => ()) NONE cache_allowed policy tc root checkpoint_root base_context action source_text
+            checkpoints
+      in
+        remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints);
+        generated_metadata
+      end
   in
-    remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints);
-    generated_metadata
+    (* Deferral off for the input key now, so this runs once more at most. *)
+    run () handle RetryWithoutDeferral => run ()
   end
 
 (* The host's deps heaps.  A theory's deps_loaded state is a child of the
@@ -6403,6 +6479,14 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     val counts = {outlines = ref 0, outline_failures = ref 0, gate_failures = ref 0,
                   attempt_failures = ref 0, withheld = ref 0}
     val _ = if pipelining then remove_tree (Path.concat(root, ".holbuild/outline")) else ()
+    val _ = in_place_proof_threads :=
+              (case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_PROOF_THREADS") of
+                   SOME n =>
+                     if n > 1 andalso
+                        (String.isSubstring "val TAC_PROOF_in"
+                           (read_text (Path.concat(#holdir tc, "src/1/Tactical.sig"))) handle IO.Io _ => false)
+                     then n else 1
+                 | NONE => 1)
     val _ = pipeline_proof_threads :=
               (case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_PROOF_THREADS") of
                    SOME n => if n > 0 then n
@@ -12847,7 +12931,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         val action = spec_theory_action root spec (cutoff_context spec NONE)
         val stage = action_stage root action
         val dir = in_root root ".holbuild/ahead"
-        val _ = (prepare_theory_stage false tc root action; remove_tree dir; ensure_dir dir)
+        val _ = (prepare_theory_stage false false tc root action; remove_tree dir; ensure_dir dir)
         val dir = FS.fullPath dir
         val staging = ahead_staging
         val _ = (HolbuildRemoveTree.remove_untrusted_strict staging; ensure_dir staging)

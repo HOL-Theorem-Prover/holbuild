@@ -294,8 +294,18 @@ datatype instrument_event =
    HolbuildDeferred).  A deferred proof keeps its precompiled steps (its
    factories), so no step is compiled after the script has run, where
    later bindings would shadow the theorem's; a theorem without them is
-   not deferred. *)
-fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, defer} :
+   not deferred.
+
+   IN_PLACE: the script is a plain build's that defers its proofs and
+   proves them after the export (HolbuildDeferredInPlace.finish), with this
+   prelude text, which loads the deferred-proof runtime.  The first
+   deferrable theorem after START_OFFSET runs in place, so a build that
+   resumed before it gets its failed-prefix checkpoint; each deferred
+   theorem's goal number is its index in CHECKPOINTS.  Instead of a gated
+   context save after each theorem, a context is saved after the deferred
+   theorems at which the deferred tactic text passes each of
+   HOLBUILD_DEFER_CHECKPOINTS (8 by default) equal shares of its total. *)
+fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, defer, in_place} :
                 {source : string, source_name : string, start_offset : int, checkpoints : checkpoint list,
                  declaration_checkpoints : declaration_checkpoint list,
                  terminations : termination list, save_checkpoints : bool,
@@ -303,10 +313,40 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                  tactic_timeout : real option, timeout_marker : string option,
                  plan_theorem : string option, trace_all : bool,
                  plan_only_marker : string option, new_ir : bool,
-                 defer : checkpoint -> bool}) =
+                 defer : checkpoint -> bool, in_place : string option}) =
   let
     val n = size source
     val deferred = ref 0
+    val in_place_deferred =
+      case in_place of
+          NONE => []
+        | SOME _ =>
+            let
+              val candidates =
+                List.filter (fn (cp as {boundary, proof_ir_factories, ...} : checkpoint, _) =>
+                               boundary > start_offset andalso defer cp andalso Option.isSome proof_ir_factories)
+                  (ListPair.zip (checkpoints, List.tabulate (length checkpoints, fn i => i)))
+              val deferred_ones = case candidates of [] => [] | _ :: rest => rest
+              val shares =
+                case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_DEFER_CHECKPOINTS") of
+                    SOME m => Int.max (0, m)
+                  | NONE => 8
+              val total = List.foldl (fn (({tactic_text, ...} : checkpoint, _), t) => t + size tactic_text) 0 deferred_ones
+              fun mark [] _ _ = []
+                | mark ((cp as {tactic_text, ...} : checkpoint, k) :: rest) sum next =
+                    let
+                      val sum' = sum + size tactic_text
+                      val passes = next <= shares andalso sum' * (shares + 1) >= next * total
+                      fun skip_passed m = if m <= shares andalso sum' * (shares + 1) >= m * total then skip_passed (m + 1) else m
+                    in
+                      (#boundary cp, (k, passes)) :: mark rest sum' (if passes then skip_passed next else next)
+                    end
+            in
+              if total = 0 then map (fn (cp : checkpoint, k) => (#boundary cp, (k, false))) deferred_ones
+              else mark deferred_ones 0 1
+            end
+    fun in_place_entry ({boundary, ...} : checkpoint) =
+      Option.map #2 (List.find (fn (b, _) => b = boundary) in_place_deferred)
     fun one_line text = String.map (fn #"\n" => #" " | c => c) text
     fun source_slice i j = String.substring(source, i, j - i)
     fun active_checkpoint ({boundary, ...} : checkpoint) = boundary > start_offset
@@ -339,7 +379,10 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
     (* A resumed script loads the checkpoint runtime even with no checkpoint
        left to save: it carries the theory's CPU time over from the checkpoint. *)
     fun prelude () =
-      (if null active_checkpoints andalso null active_terminations then
+      (case in_place of
+           SOME text => runtime_prelude (runtime_config ()) ^ text
+         | NONE =>
+       if null active_checkpoints andalso null active_terminations then
          if start_offset > 0 orelse not (null active_declaration_checkpoints)
          then checkpoint_save_runtime_prelude checkpoint_seconds else ""
        else runtime_prelude (runtime_config ())) ^
@@ -373,8 +416,29 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                      setup ::
                      source_slice pos theorem_start ::
                      acc)
+                fun defer_steps k code after =
+                  emit ""
+                       (String.concat
+                          ["HolbuildDeferred.defer_steps ", Int.toString k, " ",
+                           HolbuildToolchain.sml_string (#name checkpoint),
+                           " (fn () => let ", one_line (begin_theorem_line checkpoint),
+                           "in () end) (fn () => HolbuildProofRuntime.proof_ir_tactic (fn () => ("])
+                       (factories_suffix ("SOME (" ^ code ^ ")") ^ ")")
+                       after
               in
-                case (if defer checkpoint then #proof_ir_factories checkpoint else NONE) of
+                case (in_place, in_place_entry checkpoint, #proof_ir_factories checkpoint) of
+                    (SOME _, SOME (k, saved), SOME code) =>
+                      defer_steps k code
+                        (if saved then
+                           String.concat ["val _ = HolbuildDeferredInPlace.save_context ",
+                                          HolbuildToolchain.sml_string (#context_path checkpoint), " ",
+                                          HolbuildToolchain.sml_string (#context_ok checkpoint), ";\n"]
+                         else
+                           "val _ = HolbuildDeferredInPlace.skip_context " ^
+                           HolbuildToolchain.sml_string (#context_path checkpoint) ^ ";\n")
+                  | _ =>
+                case (if Option.isSome in_place then NONE
+                      else if defer checkpoint then #proof_ir_factories checkpoint else NONE) of
                     SOME code =>
                       let val k = !deferred
                       in
@@ -383,14 +447,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                            the proof runs (`begin_theorem` inside the setup
                            thunk), written on one line so the tactic keeps
                            its own lines. *)
-                        emit ""
-                             (String.concat
-                                ["HolbuildDeferred.defer_steps ", Int.toString k, " ",
-                                 HolbuildToolchain.sml_string (#name checkpoint),
-                                 " (fn () => let ", one_line (begin_theorem_line checkpoint),
-                                 "in () end) (fn () => HolbuildProofRuntime.proof_ir_tactic (fn () => ("])
-                             (factories_suffix ("SOME (" ^ code ^ ")") ^ ")")
-                             ""
+                        defer_steps k code ""
                       end
                   | NONE =>
                       let
