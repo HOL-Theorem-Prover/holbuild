@@ -10403,7 +10403,7 @@ fun auto_project_gc project threshold =
 
 (* Factory modules have no on-disk module parents.  Once loaded their code
    is resident, so concurrent eviction only makes a later load use source.
-   A store whose writer is filling it is skipped. *)
+   A store whose writer is filling it is skipped; a file is no store. *)
 fun module_cache_families cache =
   List.map
     (fn path =>
@@ -10417,11 +10417,13 @@ fun module_cache_families cache =
                 if path_exists path then NONE else SOME bytes
               end
           in
-            case HolbuildFileLock.try_acquire_path
-                   {path = Path.concat (path, module_store_writer_lock), obsolete_kind = NONE} of
-                NONE => NONE
-              | SOME lock => (remove () before HolbuildFileLock.release lock)
-                             handle e => (HolbuildFileLock.release lock; raise e)
+            if not (FS.isDir path handle OS.SysErr _ => false) then remove ()
+            else
+              case HolbuildFileLock.try_acquire_path
+                     {path = Path.concat (path, module_store_writer_lock), obsolete_kind = NONE} of
+                  NONE => NONE
+                | SOME lock => (remove () before HolbuildFileLock.release lock)
+                               handle e => (HolbuildFileLock.release lock; raise e)
           end})
     (HolbuildCache.children (HolbuildCache.theory_modules_dir cache))
 
