@@ -299,8 +299,8 @@ workers do when they aren't running HOL:
 - `complete`: reporting the result;
 - `after_result`: `exec-action` after its result is reported, publishing
   shared checkpoints and tools for later actions, emptying the action's
-  directory and refreshing the cache-cap measurement. The worker stops it
-  120 s after the result.
+  directory, refreshing the cache-cap measurement and writing theory
+  modules. The worker stops it 120 s after the result.
 
 ## Action isolation
 

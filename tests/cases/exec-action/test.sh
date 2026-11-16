@@ -428,6 +428,13 @@ if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   done
   compgen -G "$tmpdir/worker-c/theory-modules/*/base-theories" > /dev/null || {
     echo "worker c recorded no base-state theories" >&2; exit 1; }
+  # The writer ran after the action root was emptied, and left nothing in it.
+  require_grep 'exec-action after the result (ms): [0-9]* modules_ms=[0-9]* modules_installed=[1-9][0-9]*/[1-9]' \
+    "$tmpdir/c.log"
+  [[ -z $(find "$tmpdir/worker-c/action" -name 'theory-module-writer*') ]] || {
+    echo "worker c's writer left its files in the action root" >&2; exit 1; }
+  [[ ! -e "$tmpdir/worker-c/checkpoints" ]] || {
+    echo "worker c's action left its checkpoints after the result" >&2; exit 1; }
   # The next child on worker c loads A and B from those modules, not from
   # their .dat files.
   cat > "$project/src/DScript.sml" <<'SML'

@@ -12045,6 +12045,14 @@ fun module_file_wanted expected file =
 (* The most theory modules one worker-run writer saves. *)
 val module_writer_limit = 64
 
+(* How long a writer's HOL child may run.  The worker kills exec-action
+   120 s after its result (POST_RESULT_SECONDS), so exec-action gives the
+   writer what is left of module_writer_budget after the result and starts
+   none with less than module_writer_min_time left. *)
+val module_writer_time = Time.fromSeconds 60
+val module_writer_budget = Time.fromSeconds 100
+val module_writer_min_time = Time.fromSeconds 5
+
 (* The fewest missing modules a writer starts for once the store has its
    base theories.  A writer costs about as much to start as loading
    sixteen theories from their .dat files instead of their modules, so an
@@ -12101,10 +12109,14 @@ fun module_writer_script {output, base_theories, call} =
    sigobj.  No writer starts when the toolchain's HOL has no module helper,
    when an earlier writer found it cannot write modules, when the store
    has its base theories and lacks fewer than module_writer_min_missing of
-   the modules wanted, or while another process writes to the store or
-   the cache cap's sweep removes it.  A failure leaves later actions to
-   load from .dat files. *)
-fun write_missing_modules root tc {deps, loads} =
+   the modules wanted, while another process writes to the store or the
+   cache cap's sweep removes it, or with less than module_writer_min_time
+   left before DEADLINE.  The child is killed at DEADLINE or after
+   module_writer_time; HOL writes each module whole (to a temporary name,
+   then renamed), so the modules it finished are stored all the same.  A
+   failure leaves later actions to load from .dat files.  The result: how
+   many modules were stored, of how many missing. *)
+fun write_missing_modules root tc {deps, loads} deadline =
   let
     val store = module_store (#holdir tc)
     val base_theories_file = Path.concat (store, module_store_base_theories)
@@ -12178,46 +12190,77 @@ fun write_missing_modules root tc {deps, loads} =
       ", base_state = " ^ HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^
       ", output = " ^ HolbuildToolchain.sml_string output ^
       ", limit = " ^ Int.toString module_writer_limit ^ "};"
+    val installed = ref 0
     fun move file =
-      if module_file_wanted expected file orelse
-         file = module_store_unsupported orelse
-         (file = module_store_base_theories andalso not (isSome base_theories))
+      if module_file_wanted expected file then
+        (FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)};
+         installed := !installed + 1)
+      else if file = module_store_unsupported orelse
+              (file = module_store_base_theories andalso not (isSome base_theories))
       then FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)}
       else ()
+    fun child_deadline () =
+      let val limit = Time.+ (Time.now (), module_writer_time)
+      in if Time.< (limit, deadline) then limit else deadline end
+    (* An action root keeps no file of the writer's. *)
+    fun clean () =
+      (remove_file script; remove_file log; HolbuildRemoveTree.remove_untrusted output)
     fun write () =
-      (HolbuildRemoveTree.remove_untrusted output;
-       ensure_dir output;
-       write_text script
-         (module_writer_script {output = output, base_theories = not (isSome base_theories),
-                                call = call});
-       HolbuildActionSandbox.with_output_dirs [output] (fn () =>
-         ignore (HolbuildToolchain.run_in_dir_to_file root
-                   (HolbuildToolchain.hol_subcommand_argv tc "run" @
-                    ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
-                   log));
-       List.app (move o Path.file) (HolbuildCache.children output);
-       HolbuildRemoveTree.remove_untrusted output)
+      if Time.< (Time.- (deadline, Time.now ()), module_writer_min_time) then ()
+      else
+        let
+          val _ = HolbuildRemoveTree.remove_untrusted output
+          val _ = ensure_dir output
+          val _ =
+            write_text script
+              (module_writer_script {output = output, base_theories = not (isSome base_theories),
+                                     call = call})
+          (* Whether the sandbox validated what the child left, which it
+             does also for a child it killed or that failed: only then
+             are the child's modules stored. *)
+          val validated =
+            (HolbuildActionSandbox.with_output_dirs [output] (fn () =>
+               ignore (HolbuildToolchain.run_in_dir_to_file_by root
+                         (HolbuildToolchain.hol_subcommand_argv tc "run" @
+                          ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
+                         log child_deadline));
+             true)
+            handle e => (warn ("theory modules not written: " ^ General.exnMessage e); false)
+        in
+          (if validated then List.app (move o Path.file) (HolbuildCache.children output) else ();
+           clean ())
+          handle e => (clean (); raise e)
+        end
     val missing = List.length (List.filter (fn e => not (Binaryset.member (stored, e))) expected)
   in
     if missing = 0 orelse (isSome base_theories andalso missing < module_writer_min_missing) then ()
     else
-      case HolbuildFileLock.try_acquire_path
-             {path = Path.concat (store, module_store_writer_lock), obsolete_kind = NONE} of
-          NONE => ()
-        | SOME lock =>
-            ((if HolbuildFileLock.at_path lock then write () else ()) before HolbuildFileLock.release lock)
-            handle e => (HolbuildFileLock.release lock; raise e)
+      (case HolbuildFileLock.try_acquire_path
+              {path = Path.concat (store, module_store_writer_lock), obsolete_kind = NONE} of
+           NONE => ()
+         | SOME lock =>
+             ((if HolbuildFileLock.at_path lock then write () else ()) before HolbuildFileLock.release lock)
+             handle e => (HolbuildFileLock.release lock; raise e))
+      handle e => warn ("theory modules not written: " ^ General.exnMessage e);
+    {installed = !installed, missing = missing}
   end
 
-fun fill_module_store root tc wanted =
-  let val holdir = #holdir tc
+(* The writer for an action's theories, given until DEADLINE: how long it
+   took, and how many modules it stored of how many missing. *)
+fun fill_module_store root tc wanted deadline =
+  let
+    val t0 = Time.now ()
+    val holdir = #holdir tc
+    val {installed, missing} =
+      (if file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
+          not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
+       then write_missing_modules root tc wanted deadline
+       else {installed = 0, missing = 0})
+      handle e => (warn ("theory modules not written: " ^ General.exnMessage e);
+                   {installed = 0, missing = 0})
   in
-    if file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
-       not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
-    then write_missing_modules root tc wanted
-    else ()
+    {ms = Time.toMilliseconds (Time.- (Time.now (), t0)), installed = installed, missing = missing}
   end
-  handle e => warn ("theory modules not written: " ^ General.exnMessage e)
 
 (* Tool caches (build --tool-cache NAME).  A theory child may keep files in
    HOLBUILD_TOOL_CACHE_DIR that a later action with the same dependencies and
@@ -12505,10 +12548,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
   let
     val cancelled = ref false
     val publishing_checkpoints = ref false
-    (* Publishing for later actions: shared checkpoints, the tool cache and
-       theory modules.  It runs after the result is written, since the
-       client fetches none of them. *)
+    (* Publishing for later actions: shared checkpoints and the tool cache.
+       It runs after the result is written, since the client fetches
+       neither. *)
     val deferred = ref (fn () => ())
+    (* The theory-module writer, which runs last after the result, given
+       until a deadline: see fill_module_store. *)
+    val write_modules = ref (fn (_ : Time.time) => {ms = LargeInt.fromInt 0, installed = 0, missing = 0})
     fun cancel _ =
       if !cancelled then () else
       (cancelled := true;
@@ -12777,9 +12823,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
            one loads from .dat files what the store lacks, and later ones
            on the host find the modules.  By now a load ahead has its late
            parents in the root too. *)
-        fun write_modules () =
-          if !cancelled orelse not (!HolbuildActionSandbox.outputs_validated) then ()
-          else phase "modules" (fn () => fill_module_store root tc {deps = #deps spec, loads = #loads spec})
+        fun set_write_modules () =
+          if not (!HolbuildActionSandbox.outputs_validated) then ()
+          else write_modules := fill_module_store root tc {deps = #deps spec, loads = #loads spec}
         val action =
           spec_theory_action root spec (cutoff_context spec cutoff)
         (* A local entry that didn't restore must not stand in for this
@@ -12843,12 +12889,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                 deferred :=
                   (fn () =>
                      (publish_shared ();
-                      if !cancelled then () else publish_tools ();
-                      (* An abandoned load ahead is built plain later,
-                         which writes the modules after its own result. *)
-                      case e of
-                          ActionFailed (AheadAbandoned, _) => ()
-                        | _ => write_modules ()));
+                      if !cancelled then () else publish_tools ()));
+                (* An abandoned load ahead is built plain later, which
+                   writes the modules after its own result. *)
+                (case e of
+                     ActionFailed (AheadAbandoned, _) => ()
+                   | _ => set_write_modules ());
                 raise e));
             deferred :=
               (fn () =>
@@ -12890,8 +12936,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
              case cutoff of
                  SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
                | NONE => ()))
-        val publish = !deferred
-        val _ = deferred := (fn () => (publish (); write_modules ()))
+        val _ = set_write_modules ()
       in
         "built"
       end
@@ -13306,22 +13351,30 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               (case result_file of
                    SOME path => write_text path text
                  | NONE => print text);
-              let val t0 = Time.now ()
-              in
-                !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
-                empty_root ();
+              let
+                val t0 = Time.now ()
+                val _ = !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e)
+                val _ = empty_root ()
                 (* A worker draining after the result has a few seconds left
-                   for the publish, not for a cache scan. *)
-                if !cancelled then () else
+                   for the publish, not for a cache scan or the writer.  The
+                   writer goes last: it only saves later actions loading
+                   time, and stops before the worker's kill. *)
+                val {ms, installed, missing} =
+                  if !cancelled then {ms = LargeInt.fromInt 0, installed = 0, missing = 0} else
                   let val {limit_bytes, reserve_bytes, min_free_bytes} = cache_cap
                   in
                     enforce_worker_cache_cap
                       {cache = cache, checkpoint_root = checkpoint_root, limit_bytes = limit_bytes,
-                       reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = true}
-                  end;
+                       reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = true};
+                    if !cancelled then {ms = LargeInt.fromInt 0, installed = 0, missing = 0}
+                    else !write_modules (Time.+ (t0, module_writer_budget))
+                  end
+              in
                 HolbuildStatus.message_stderr
                   ("holbuild: exec-action after the result (ms): " ^
-                   LargeInt.toString (Time.toMilliseconds (Time.-(Time.now (), t0))) ^ "\n")
+                   LargeInt.toString (Time.toMilliseconds (Time.-(Time.now (), t0))) ^
+                   " modules_ms=" ^ LargeInt.toString ms ^
+                   " modules_installed=" ^ Int.toString installed ^ "/" ^ Int.toString missing ^ "\n")
               end;
               (status, failure, log)
             end)
