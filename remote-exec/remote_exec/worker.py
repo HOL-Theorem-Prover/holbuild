@@ -48,6 +48,7 @@ MIN_SANDBOX_RELEASE = (0, 13, 58)
 MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
 MIN_FREE_FLOOR_RELEASE = (0, 14, 57)  # the first whose exec-action takes --cache-min-free-gb
+CACHE_MIN_FREE_GB = 16  # the free space the cache cap keeps on the cache's disk for writers it doesn't count
 
 
 @functools.cache
@@ -598,13 +599,6 @@ def free_bytes(path: str) -> int:
     return stat.f_bavail * stat.f_frsize
 
 
-def cache_min_free_gb(path: str) -> int:
-    """exec-action's --cache-min-free-gb for the cache root ``path``: 5% of its file system, at least 16 GiB, so
-    that files outside the cache (other stores, container layers, tmp) don't fill the disk the cache cap sizes."""
-    stat = file_system(path)
-    return max(16, math.ceil(stat.f_blocks * stat.f_frsize * 0.05 / GIB))
-
-
 def disk_paths() -> list[str]:
     """Where an action needs disk: the temp dir, where the worker keeps its scratch, ``TMPDIR`` (else /tmp), where
     exec-action keeps its own (``tempfile`` falls back from an unwritable one), and the ``HOLBUILD_CACHE`` root, where
@@ -622,17 +616,9 @@ def disk_shortfall() -> str | None:
     return None
 
 
-def disk_usage() -> tuple[int, int]:
-    """Free and total bytes of the file system of ``disk_paths`` with the least free, the one ``disk_shortfall``
-    goes by."""
-    least: tuple[int, int] | None = None
-    for path in disk_paths():
-        stat = file_system(path)
-        usage = (stat.f_bavail * stat.f_frsize, stat.f_blocks * stat.f_frsize)
-        if least is None or usage[0] < least[0]:
-            least = usage
-    assert least is not None  # the temp dir is always among the paths
-    return least
+def least_free_bytes() -> int:
+    """Free bytes on the file system of ``disk_paths`` with the least free, the one ``disk_shortfall`` goes by."""
+    return min(map(free_bytes, disk_paths()))
 
 
 def remove_children(directory: str) -> None:
@@ -716,8 +702,7 @@ class HostReport:
     leases: int
     memory_short: bool
     rank: int
-    disk_free: int  # bytes free and in all on the disk ``disk_shortfall`` goes by
-    disk_total: int
+    disk_free: int  # bytes free on the disk ``disk_shortfall`` goes by
 
 
 class HostTelemetry:
@@ -741,7 +726,7 @@ class HostTelemetry:
             memory = HostMemory.read(self.cooperate_dir, wait=False)
             with open(PROC_STAT) as file:
                 idle, total = cpu_times(file.readline())
-            disk_free, disk_total = disk_usage()
+            disk_free = least_free_bytes()
         except (OSError, ValueError) as error:
             if not isinstance(error, BlockingIOError):
                 print(f"reading the host for the coordinator failed: {error}", file=sys.stderr)
@@ -767,7 +752,6 @@ class HostTelemetry:
             memory.shortfall(self.charge) is not None or waited,
             self.rank,
             disk_free,
-            disk_total,
         )
 
 
@@ -918,7 +902,7 @@ def exec_action_command(
         command += ["--cooperate-dir", args.cooperate_dir]
     command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb)]
     if tuple(map(int, version.split("."))) >= MIN_FREE_FLOOR_RELEASE:
-        command += ["--cache-min-free-gb", str(cache_min_free_gb(os.environ["HOLBUILD_CACHE"]))]
+        command += ["--cache-min-free-gb", str(CACHE_MIN_FREE_GB)]
     command += ["--result", result]
     if args.share_heaps:
         command.append("--share-heaps")

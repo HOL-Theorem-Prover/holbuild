@@ -202,9 +202,9 @@ sizes stay within the limit, while sizing private checkpoints on each call;
 the theory-modules store is a shared root like the others. Eviction still goes
 down to the target, after an action's result or once the measurement expires,
 so the reserve holds what arrives in between. For holbuild 0.14.57 and later
-the worker also passes `--cache-min-free-gb`, max(16, 5% of the cache's file
-system): while the disk has less free than that, a sweep evicts below the
-target until it has freed the floor plus a buffer, and when files outside the
+the worker also passes `--cache-min-free-gb 16`: while the disk has less free
+than that, a sweep evicts below the target until it has freed the floor plus
+8 GB, and when files outside the
 cache keep the disk short after it evicted all it could, its measurement says
 so, and actions skip further sweeps until it expires. A sweep publishes its walk before evicting, so actions keep
 reusing a fresh measurement while eviction runs. A cached directory must match the recorded device
@@ -809,13 +809,13 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   `age_s` seconds old,
   except that `cpu_idle_pct` is the latest one measured:
   ```json
-  {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "rank": 0, "disk_free": 81200000000, "disk_total": 214700000000, "age_s": 1.2, "quarantined": null}
+  {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "rank": 0, "disk_free": 81200000000, "age_s": 1.2, "quarantined": null}
   ```
   Memory is in bytes: `MemTotal` and `MemAvailable`, the `--cooperate-dir`
   budget, the charges of the leases held there and their number;
   `memory_short` is true when admission would hold back a child of the
   worker's `--max-heap` now, or held the worker back from claiming since its
-  previous report. `disk_free` and `disk_total` are null from workers too old
+  previous report. `disk_free` is null from workers too old
   to report them; `quarantined` is `"disk"` or `"failures"` while the host is
   quarantined, else null.
 

@@ -36,7 +36,6 @@ from remote_exec.worker import (
     Protection,
     Releases,
     Unreleased,
-    cache_min_free_gb,
     child_charge,
     claim_reporting,
     cpu_times,
@@ -221,11 +220,8 @@ def logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
 
 @pytest.fixture(autouse=True)
 def roomy_disk(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Whatever the test machine's disk has free, the worker sees room for actions, unless a test says otherwise,
-    and passes exec-action a free-space floor of 16 GiB."""
+    """Whatever the test machine's disk has free, the worker sees room for actions, unless a test says otherwise."""
     monkeypatch.setattr(worker, "free_bytes", lambda _path: 100 * GIB)
-    monkeypatch.setattr(worker, "cache_min_free_gb", lambda _path: 16)
-    monkeypatch.setenv("HOLBUILD_CACHE", "/unused")
 
 
 def releases(tmp_path: Path, server: Server) -> Releases:
@@ -695,21 +691,6 @@ def test_worker_passes_the_free_space_floor_only_to_releases_that_take_it(
     assert ("--cache-min-free-gb" in logs[1].read_text().split()) == floor
 
 
-@pytest.mark.parametrize(("size_gib", "floor_gib"), [(100, 16), (320, 16), (1000, 50), (1679, 84)])
-def test_the_free_space_floor_is_5_percent_of_the_cache_disk_and_at_least_16_gib(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size_gib: int, floor_gib: int
-) -> None:
-    seen = []
-
-    def statvfs(path: str) -> SimpleNamespace:
-        seen.append(path)
-        return SimpleNamespace(f_blocks=size_gib * GIB // 4096, f_frsize=4096)
-
-    monkeypatch.setattr(worker.os, "statvfs", statvfs)
-    assert cache_min_free_gb(str(tmp_path / "cache" / "not-made-yet")) == floor_gib
-    assert seen == [str(tmp_path)]
-
-
 AHEAD_PARENTS = [{"input_key": "7" * 64, "spec_sha256": "8" * 64}, {"input_key": "9" * 64, "spec_sha256": "a" * 64}]
 
 
@@ -950,7 +931,7 @@ def test_a_worker_on_a_full_disk_hands_the_action_back_and_claims_again_only_onc
         if not path.startswith(str(tmp_path)) and path != tempfile.gettempdir():
             return statvfs(path)
         read.append(path)
-        return SimpleNamespace(f_bavail=GIB if full else 100 * GIB, f_blocks=200 * GIB, f_frsize=1)
+        return SimpleNamespace(f_bavail=GIB if full else 100 * GIB, f_frsize=1)
 
     temporary_directory = tempfile.TemporaryDirectory
 
@@ -1060,13 +1041,12 @@ def test_the_host_report_gives_the_disk_with_the_least_free(tmp_path: Path, monk
     monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "python"))
-    sizes = {str(tmp_path / "python"): (50, 100), str(tmp_path / "tmp"): (20, 400), str(tmp_path): (30, 60)}
-    monkeypatch.setattr(worker.os.path, "exists", lambda path: path in sizes)
-    monkeypatch.setattr(
-        worker.os, "statvfs", lambda path: SimpleNamespace(f_bavail=sizes[path][0], f_blocks=sizes[path][1], f_frsize=2)
-    )
+    free = {str(tmp_path / "python"): 50, str(tmp_path / "tmp"): 20, str(tmp_path): 30}
+    monkeypatch.setattr(worker.os.path, "exists", lambda path: path in free)
+    monkeypatch.setattr(worker.os, "statvfs", lambda path: SimpleNamespace(f_bavail=free[path], f_frsize=2))
+    monkeypatch.setattr(worker, "free_bytes", free_bytes)
 
-    assert worker.disk_usage() == (40, 800)
+    assert worker.least_free_bytes() == 40
 
 
 def test_action_that_ends_without_a_record_on_a_full_disk_is_handed_back(
