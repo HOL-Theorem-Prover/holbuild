@@ -1113,6 +1113,32 @@ def test_the_cache_sweep_runs_the_newest_release_that_has_it(
     ) is None
 
 
+def test_a_drain_stops_the_cache_sweep_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    executable = tmp_path / "baked" / "v0.15.0" / "bin" / "holbuild"
+    executable.parent.mkdir(parents=True)
+    executable.write_text(f"#!/bin/sh\necho $$ > {tmp_path}/pid\nexec sleep 60\n")
+    executable.chmod(0o755)
+    drain = worker.Drain()
+    releases = Releases(str(tmp_path / "built"), "unused", "http://cache.test", None,
+                        baked_root=str(tmp_path / "baked"), drain=drain)
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+
+    def stop() -> None:
+        while not (tmp_path / "pid").exists():
+            time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=stop, daemon=True).start()
+    started = time.monotonic()
+    with drain.installed():
+        worker.sweep_cache(releases, 200)
+
+    assert drain.stop.is_set()
+    assert time.monotonic() - started < 10, "the sweep outlived the drain"
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((tmp_path / "pid").read_text()), 0)
+
+
 def test_the_host_report_gives_the_disk_with_the_least_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))

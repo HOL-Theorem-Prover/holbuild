@@ -676,13 +676,20 @@ def sweep_cache(releases: Releases, cache_limit_gb: int) -> None:
     version, holbuild = release
     command = [holbuild, "exec-action", "--sweep-only", "--cache-limit-gb", str(cache_limit_gb),
                "--cache-min-free-gb", str(CACHE_MIN_FREE_GB)]
+    process = subprocess.Popen(command, env=exec_action_env(version=version), stdout=2, start_new_session=True)
     try:
-        swept = subprocess.run(command, env=exec_action_env(version=version), stdout=2, check=False, timeout=900)
+        # A drain stops the sweep: the worker is idle, so it stops at once.
+        with releases.drain.interruptible():
+            returncode = process.wait(timeout=900)
     except subprocess.TimeoutExpired:
         print("sweeping the cache for disk space timed out", file=sys.stderr)
         return
-    if swept.returncode != 0:
-        print(f"sweeping the cache for disk space failed: exit {swept.returncode}", file=sys.stderr)
+    except DrainStopped:
+        return
+    finally:
+        stop_group(process)
+    if returncode != 0:
+        print(f"sweeping the cache for disk space failed: exit {returncode}", file=sys.stderr)
 
 
 def wait_for_disk(
@@ -706,7 +713,7 @@ def wait_for_disk(
     logged = False
     while disk_shortfall() is not None:
         sweep()
-        if (why := disk_shortfall()) is None:
+        if drain.stop.is_set() or (why := disk_shortfall()) is None:
             return
         if not logged:
             print(f"waiting for disk space before claiming: {why}", file=sys.stderr, flush=True)
