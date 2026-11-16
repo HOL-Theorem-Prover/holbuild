@@ -23,6 +23,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("ALTER TABLE actions DROP COLUMN finished_at, DROP COLUMN worker")
+    # First, as in upgrade: the block commits what ran before it, so the column drop stays in one transaction with
+    # the revision change, and a run that failed starts again cleanly.
     with op.get_context().autocommit_block():
         op.execute("DROP INDEX CONCURRENTLY IF EXISTS batches_running")
+    op.execute("ALTER TABLE actions DROP COLUMN finished_at, DROP COLUMN worker")
