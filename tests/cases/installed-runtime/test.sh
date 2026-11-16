@@ -48,7 +48,7 @@ require_file "$tmpdir/relocated/share/man/man1/holbuild.1"
 require_file "$tmpdir/staged/usr/share/man/man1/holbuild.1"
 for file in "${completions[@]}"; do require_file "$tmpdir/staged/usr/$file"; done
 require_file "$tmpdir/custom-man/holbuild.1"
-require_file "$tmpdir/relocated/share/holbuild/copyrights/smlnj.txt"
+for file in smlnj.txt sml-toml hol4.txt; do require_file "$tmpdir/relocated/share/holbuild/copyrights/$file"; done
 require_file "$tmpdir/relocated/share/holbuild/sml/analyser/analyser_main.sml"
 require_file "$tmpdir/relocated/share/holbuild/sml/diagnostic_limits.sml"
 for file in "${completions[@]}"; do require_file "$tmpdir/relocated/$file"; done
@@ -62,6 +62,7 @@ make -C "$HOLBUILD_ROOT" uninstall PREFIX="$tmpdir/relocated" > "$tmpdir/uninsta
 require_no_file "$tmpdir/relocated/bin/holbuild"
 require_no_file "$tmpdir/relocated/share/man/man1/holbuild.1"
 require_no_file "$tmpdir/relocated/share/holbuild/sml/holbuild_runtime.sml"
+for file in smlnj.txt sml-toml hol4.txt; do require_no_file "$tmpdir/relocated/share/holbuild/copyrights/$file"; done
 for file in "${completions[@]}"; do require_no_file "$tmpdir/relocated/$file"; done
 make -C "$HOLBUILD_ROOT" uninstall PREFIX="$tmpdir/custom-prefix" BINDIR="$tmpdir/custom-bin" \
   DATADIR="$tmpdir/custom-data" MANDIR="$tmpdir/custom-man" > "$tmpdir/custom-uninstall.log" 2>&1
