@@ -7,6 +7,12 @@ import subprocess
 import time
 from collections.abc import Callable
 
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def blob_key(digest: str) -> str:
+    return hashlib.sha256(f"holbuild-zstd-blob-v1\n{digest}\n".encode()).hexdigest()
+
 
 def wait_for(process: subprocess.Popen[bytes], predicate: Callable[[], bool]) -> None:
     deadline = time.monotonic() + 300
@@ -48,13 +54,14 @@ def run() -> None:
                 (control / f"action-put-{sequence}-before-release").touch()
             wait_for(process, lambda: (directory / "published.ready").exists())
             lines = requests.read_text().splitlines()
-            puts = [line for line in lines if line.startswith("PUT /cas/")]
+            puts = [line for line in lines if line.startswith("PUT /ac/") and line.endswith(" blob")]
             # The refused blob is asked again once: a one-node cache's 500 gets a retry.
             retried = [put for put in set(puts) if puts.count(put) > 1]
             assert len(retried) == (1 if failing else 0) and all(puts.count(put) == 2 for put in retried), \
                 "a spine blob was uploaded more than once"
             assert len(set(puts)) == 1 + 2 * (count - 1), "CAS writes must equal the distinct heap/state/sidecar files"
-            manifests = list((directory / "remote/ac").glob("*"))
+            manifests = [entry for entry in (directory / "remote/ac").glob("*")
+                         if not entry.read_bytes().startswith(ZSTD_MAGIC)]
             expected = 11 if failing else count - 1
             # Beside the candidates: the heap's entry and the checkpoint index.
             assert len(manifests) == expected + 2, "wrong number of candidate manifests"
@@ -63,9 +70,9 @@ def run() -> None:
                 for line in text.splitlines():
                     if line.startswith("blob="):
                         sha = line.split()[0][5:]
-                        assert (directory / "remote/cas" / sha).exists(), "manifest names a failed blob"
+                        assert (directory / "remote/ac" / blob_key(sha)).exists(), "manifest names a failed blob"
             partial = hashlib.sha256(b"partial-uncommitted-save").hexdigest()
-            assert not (directory / "remote/cas" / partial).exists(), "uncommitted save uploaded"
+            assert not (directory / "remote/ac" / blob_key(partial)).exists(), "uncommitted save uploaded"
             # Independently reconstruct the existing wire format and ordering.
             tree = directory / "checkpoints"
             def digest(path: Path) -> str:
@@ -75,7 +82,7 @@ def run() -> None:
                 key = hashlib.sha256(
                     f"holbuild-shared-checkpoint-v1\nheap=heap\nkind=theorem_context\ncheckpoint-key={index}\n".encode()
                 ).hexdigest()
-                action = hashlib.sha256(f"holbuild-remote-ac-v1\n{key}\n".encode()).hexdigest()
+                action = hashlib.sha256(f"holbuild-remote-ac-v2\n{key}\n".encode()).hexdigest()
                 entries = [f"blob={digest(tree / 'deps.save')} heap\n"]
                 entries += [f"blob={digest(tree / f'c{i}.save')} spine c{i}.save\n" for i in range(1, index)]
                 entries += [f"blob={digest(tree / f'c{i}.save.ok')} spine-sidecar c{i}.save.ok\n" for i in range(1, index)]
@@ -86,7 +93,7 @@ def run() -> None:
                 assert actual == expected_text, "checkpoint manifest bytes changed"
             (directory / "published.release").touch()
             wait_for(process, lambda: (directory / "repeated.ready").exists())
-            assert requests.read_text().splitlines().count("PUT /cas/" + partial) == 0
+            assert requests.read_text().splitlines().count(f"PUT /ac/{blob_key(partial)} blob") == 0
             if not failing:
                 # A probe per candidate, and a read of the index, which is unchanged.
                 assert len(requests.read_text().splitlines()) == len(lines) + count, "present candidate did more than a probe"

@@ -129,7 +129,7 @@ require_cutoff CTheory "$tmpdir/proof-edit.log"
   { echo "B's metadata kept its old input key" >&2; exit 1; }
 # A configured remote cache gets the reused theories' entries under their
 # new keys, as it would from a rebuild.
-b_remote_ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$(sed -n 's/^input_key=//p' "$dep/BScript.sml.key")" |
+b_remote_ac=$(printf 'holbuild-remote-ac-v2\n%s\n' "$(sed -n 's/^input_key=//p' "$dep/BScript.sml.key")" |
                sha256sum | cut -d' ' -f1)
 require_file "$tmpdir/remote/ac/$b_remote_ac"
 # The cache entries of the reused theories are aliased to their new keys,

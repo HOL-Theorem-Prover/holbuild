@@ -8214,9 +8214,11 @@ fun publish_spec_blob remote {hash, path} =
    rewriting it whole; a build that would take it past
    max_remote_ledger_entries keeps only those it used or learned, so it
    grows past that bound only as far as one build's own entries. *)
+(* Per remote layout too: a ledger kept under an older layout names entries
+   and blobs this one doesn't read. *)
 fun remote_ledger_path remote =
   Path.concat(Path.concat(cache_root (), "remote-ledger"),
-              HolbuildHash.string_sha256 (HolbuildRemoteCache.base_url remote))
+              HolbuildHash.string_sha256 (HolbuildRemoteCache.layout ^ "\n" ^ HolbuildRemoteCache.base_url remote))
 
 val max_remote_ledger_entries = 100000
 

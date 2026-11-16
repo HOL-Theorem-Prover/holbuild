@@ -361,8 +361,8 @@ fi
 # The cache loses the heap's blob but keeps the entries naming it: the
 # worker loads cold, replaces the entries, and the next edit resumes again.
 heap_blob=$(find "$shared/checkpoint-store" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
-[[ -f "$tmpdir/remote/cas/$heap_blob" ]] || { echo "no heap blob $heap_blob in the cache" >&2; exit 1; }
-rm "$tmpdir/remote/cas/$heap_blob"
+[[ -f "$(remote_blob "$tmpdir/remote" "$heap_blob")" ]] || { echo "no heap blob $heap_blob in the cache" >&2; exit 1; }
+rm "$(remote_blob "$tmpdir/remote" "$heap_blob")"
 write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "rw[]"
 export_t v8
 cold v8 0
@@ -383,7 +383,7 @@ same_outputs v9
 
 # The worker keeps the sources it fetched: running the spec again fetches
 # none of them.
-source_get="GET /cas/$(sha256sum "$project/src/TScript.sml" | cut -d' ' -f1)"
+source_get="GET /ac/$(blob_key "$(sha256sum "$project/src/TScript.sml" | cut -d' ' -f1)") blob"
 before_again=$(wc -l < "$requests")
 worker v9-again "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v9-again 0 "status=cached"
@@ -422,7 +422,8 @@ if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmp
   require_grep 'linking its states symbolically' "$tmpdir/v10.log"
   resumed v10 "theorem-context checkpoint after t4" "theorem_context checkpoint"
   v10_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/v10.result")
-  require_grep 'restored state read-only' "$tmpdir/remote/cas/$v10_log"
+  remote_blob_text "$tmpdir/remote" "$v10_log" > "$tmpdir/v10.worker.log"
+  require_grep 'restored state read-only' "$tmpdir/v10.worker.log"
   for state in "$other_fs"/*/*; do
     [[ $(sha256sum "$state" | cut -d' ' -f1) == "$(basename "$state")" ]] || { echo "store state changed: $state" >&2; exit 1; }
   done
@@ -448,7 +449,7 @@ export_legacy() {
   spec_legacy=$(field "$tmpdir/legacy.batch" share:LegacyTheory 4)
   sed '/^action-text$/i option theorem-checkpoints=false' "$project/.holbuild/action-specs/$spec_legacy" > "$tmpdir/legacy.spec"
   spec_legacy=$(sha256sum "$tmpdir/legacy.spec" | cut -d' ' -f1)
-  curl -fsS -X PUT --data-binary "@$tmpdir/legacy.spec" "$shared_url/cas/$spec_legacy"
+  zstd -q -c "$tmpdir/legacy.spec" | curl -fsS -X PUT --data-binary @- "$shared_url/ac/$(blob_key "$spec_legacy")"
 }
 legacy=$tmpdir/worker-legacy
 export_legacy
@@ -534,7 +535,8 @@ with open(f"{temp}/interrupted.log", "w") as log:
         incomplete.write_bytes(partial)
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=15) != 0, "interrupted action succeeded"
-        assert not (Path(temp) / "remote/cas" / hashlib.sha256(partial).hexdigest()).exists()
+        blob_key = hashlib.sha256(f"holbuild-zstd-blob-v1\n{hashlib.sha256(partial).hexdigest()}\n".encode()).hexdigest()
+        assert not (Path(temp) / "remote/ac" / blob_key).exists()
     finally:
         if process.poll() is None:
             process.kill()
@@ -545,8 +547,9 @@ require_grep '^failure=unavailable$' "$tmpdir/interrupted.result"
 # The log so far is uploaded, for the client to see how far the action got.
 interrupted_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/interrupted.result")
 [[ -n "$interrupted_log" ]] || { echo "interrupted action uploaded no log" >&2; cat "$tmpdir/interrupted.result" >&2; exit 1; }
-require_grep 'checkpoint-cancel-ready' "$tmpdir/remote/cas/$interrupted_log"
-require_grep 'exec-action failed: interrupted' "$tmpdir/remote/cas/$interrupted_log"
+remote_blob_text "$tmpdir/remote" "$interrupted_log" > "$tmpdir/interrupted.worker.log"
+require_grep 'checkpoint-cancel-ready' "$tmpdir/interrupted.worker.log"
+require_grep 'exec-action failed: interrupted' "$tmpdir/interrupted.worker.log"
 [[ ! -e "$tmpdir/remote/ac/$key_interrupt" ]] || { echo "interrupted action published a built result" >&2; exit 1; }
 [[ ! -e "$interrupted/checkpoints" ]] || { echo "interrupted action kept private checkpoints" >&2; exit 1; }
 sed -i 's/OS.Process.sleep (Time.fromSeconds 120)/()/' "$project/src/InterruptedScript.sml"
@@ -596,8 +599,9 @@ worker x2 "$shared_url" "$shared" "$spec_x" --share-heaps
 expect x2 0 "status=built"
 require_grep "restored shared deps-loaded heap" "$tmpdir/x2.log"
 x2_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/x2.result")
-if grep -q "dropping checkpoint\|restored shared theorem_context" "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log"; then
+remote_blob_text "$tmpdir/remote" "$x2_log" > "$tmpdir/x2.worker.log"
+if grep -q "dropping checkpoint\|restored shared theorem_context" "$tmpdir/x2.log" "$tmpdir/x2.worker.log"; then
   echo "the extra-output theory resumed into restored contexts" >&2
-  cat "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log" >&2
+  cat "$tmpdir/x2.log" "$tmpdir/x2.worker.log" >&2
   exit 1
 fi

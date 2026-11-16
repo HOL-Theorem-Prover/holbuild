@@ -70,11 +70,11 @@ while [[ $# -gt 0 ]]; do
     *) url=$1; shift ;;
   esac
 done
-if [[ $url == */cas/000* ]]; then
+if [[ $url == */ac/"$HOLBUILD_TEST_MISSING_KEY" ]]; then
   echo 'curl: (22) The requested URL returned error: 404' >&2
   exit 22
 fi
-cp "$HOLBUILD_TEST_STEP_LOG" "$out"
+zstd -q -c "$HOLBUILD_TEST_STEP_LOG" > "$out"
 SH
 chmod +x "$tmpdir/bin/curl"
 python3 - "$tmpdir/batch-fetch.json" <<'PY'
@@ -86,7 +86,8 @@ actions = [dict(theory=name, input_key=name, log_sha256=sha)
 with open(sys.argv[1], "w") as output:
     json.dump(dict(state="done", actions=actions), output)
 PY
-PATH="$tmpdir/bin:$PATH" HOLBUILD_TEST_STEP_LOG="$log" python3 "$collector" \
+missing_key=$(printf 'holbuild-zstd-blob-v1\n%s\n' "$(printf '0%.0s' {1..64})" | sha256sum | cut -c1-64)
+PATH="$tmpdir/bin:$PATH" HOLBUILD_TEST_STEP_LOG="$log" HOLBUILD_TEST_MISSING_KEY="$missing_key" python3 "$collector" \
   --batch "$tmpdir/batch-fetch.json" --cache-url https://unused.example.org \
   > "$tmpdir/fetched.tsv" 2> "$tmpdir/fetched-coverage.log"
 require_grep '^before@before' "$tmpdir/fetched.tsv"

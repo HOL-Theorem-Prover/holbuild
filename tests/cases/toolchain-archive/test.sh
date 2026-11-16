@@ -80,16 +80,27 @@ published_holdir=$(tail -n 1 "$publish_log")
 require_file "$published_holdir/bin/hol"
 require_file "$(dirname "$published_holdir")/build.ok"
 [[ -L "$published_holdir/sigobj/Runtime.uo" ]]
-[[ $(find "$remote_root/ac" -type f | wc -l) -eq 1 ]]
-[[ $(find "$remote_root/cas" -type f | wc -l) -eq 1 ]]
-require_grep '^PUT /cas/' "$request_log"
-require_grep '^PUT /ac/' "$request_log"
-action_files=("$remote_root"/ac/*)
-cas_files=("$remote_root"/cas/*)
+# The remote cache's blob entries ($1 = blob) or action entries ($1 = action).
+remote_entries() {
+  local entry kind
+  for entry in "$remote_root"/ac/*; do
+    [[ -f "$entry" ]] || continue
+    kind=action
+    [[ $(head -c4 "$entry" | od -An -tx1 | tr -d ' \n') == 28b52ffd ]] && kind=blob
+    [[ "$kind" == "$1" ]] && printf '%s\n' "$entry"
+  done
+  return 0
+}
+mapfile -t action_files < <(remote_entries action)
+mapfile -t blob_files < <(remote_entries blob)
+[[ ${#action_files[@]} -eq 1 ]]
+[[ ${#blob_files[@]} -eq 1 ]]
+require_grep '^PUT /ac/.* blob$' "$request_log"
+require_grep '^PUT /ac/[0-9a-f]*$' "$request_log"
 original_action=$tmpdir/original-action
 original_archive=$tmpdir/original-archive
 cp "${action_files[0]}" "$original_action"
-cp "${cas_files[0]}" "$original_archive"
+zstd -dcq "${blob_files[0]}" > "$original_archive"
 published_put_count=$(grep -c '^PUT ' "$request_log")
 
 rm -rf "$cache/hol-toolchains"
@@ -112,7 +123,7 @@ require_file "$tmpdir/TinyTheory.uo"
 analyser_dirs=("$(dirname "$restored_holdir")"/analysers/*)
 "${analyser_dirs[0]}/bin/holbuild-hol-analyser" --version > "$tmpdir/analyser-version"
 require_grep '^holbuild-hol-analyser holbuild-hol-analyser-v2$' "$tmpdir/analyser-version"
-require_grep '^GET /cas/' "$request_log"
+require_grep '^GET /ac/.* blob$' "$request_log"
 [[ $(grep -c '^PUT ' "$request_log") -eq "$published_put_count" ]]
 
 # The analyser is rebuilt after a restore rather than archived, so a changed
@@ -155,7 +166,7 @@ other_poly_log=$tmpdir/other-poly.log
 [[ $(wc -l < "$other_poly_build_count") -eq 1 ]]
 
 initial_put_count=$(grep -c '^PUT ' "$request_log")
-initial_cas_get_count=$(grep -c '^GET /cas/' "$request_log")
+initial_cas_get_count=$(grep -c '^GET /ac/.* blob$' "$request_log")
 
 # A different absolute installation path selects a different AC record. Its
 # successful local fallback is published automatically.
@@ -164,7 +175,7 @@ wrong_path_log=$tmpdir/wrong-path.log
 (cd "$project" && HOLBUILD_CACHE="$other_cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_path_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 2 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 2)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq "$initial_cas_get_count" ]]
+[[ $(grep -c '^GET /ac/.* blob$' "$request_log") -eq "$initial_cas_get_count" ]]
 
 # Poly/ML is identified by its runtime release and architecture variant and by
 # its location, not by the bytes of bin/poly, which differ on every build.
@@ -175,7 +186,7 @@ rebuilt_poly_log=$tmpdir/rebuilt-poly.log
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$rebuilt_poly_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 2 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 2)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
+[[ $(grep -c '^GET /ac/.* blob$' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
 
 # Another runtime variant at the same location selects a different toolchain.
 sed 's/RTS version: Fake-1.0/RTS version: Fake32-1.0/' "$tmpdir/original-poly" > "$fakebin/poly"
@@ -184,7 +195,7 @@ wrong_poly_log=$tmpdir/wrong-poly.log
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_poly_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 3 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 4)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
+[[ $(grep -c '^GET /ac/.* blob$' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
 cp "$tmpdir/original-poly" "$fakebin/poly"
 chmod +x "$fakebin/poly"
 
@@ -205,7 +216,7 @@ wrong_platform_log=$tmpdir/wrong-platform.log
 (cd "$project" && PATH="$platformbin:$PATH" "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$wrong_platform_log" 2>&1
 [[ $(wc -l < "$build_count") -eq 4 ]]
 [[ $(grep -c '^PUT ' "$request_log") -eq $((initial_put_count + 6)) ]]
-[[ $(grep -c '^GET /cas/' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
+[[ $(grep -c '^GET /ac/.* blob$' "$request_log") -eq $((initial_cas_get_count + 1)) ]]
 
 # The path identity is the physical path, which the HOL build embeds. A cache
 # reached through a symlink is still a valid same-path installation.
@@ -292,13 +303,14 @@ import copy
 import hashlib
 import io
 import pathlib
+import subprocess
 import sys
 import tarfile
 
 source = pathlib.Path(sys.argv[1])
 destination = pathlib.Path(sys.argv[2])
 action_path = pathlib.Path(sys.argv[3])
-remote_cas = pathlib.Path(sys.argv[4])
+remote_ac = pathlib.Path(sys.argv[4])
 mutation = sys.argv[5]
 manifest_name = ".holbuild-toolchain-archive-manifest"
 
@@ -369,9 +381,11 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
 archive_bytes = destination.read_bytes()
 sha256 = hashlib.sha256(archive_bytes).hexdigest()
 size = str(len(archive_bytes))
-remote_cas.mkdir(parents=True, exist_ok=True)
+remote_ac.mkdir(parents=True, exist_ok=True)
 recorded_sha256 = "0" * 64 if mutation == "digest" else sha256
-(remote_cas / recorded_sha256).write_bytes(archive_bytes)
+blob_key = hashlib.sha256(f"holbuild-zstd-blob-v1\n{recorded_sha256}\n".encode()).hexdigest()
+compressed = subprocess.run(["zstd", "-q", "-c"], input=archive_bytes, capture_output=True, check=True).stdout
+(remote_ac / blob_key).write_bytes(compressed)
 
 action = f"blob={recorded_sha256}\n".encode()
 metadata = (
@@ -392,7 +406,7 @@ invalid_restore() {
   local expected=$2
   local mutated=$tmpdir/mutated-"$mutation".tar
   python3 "$tmpdir/mutate_archive.py" \
-    "$original_archive" "$mutated" "${action_files[0]}" "$remote_root/cas" "$mutation"
+    "$original_archive" "$mutated" "${action_files[0]}" "$remote_root/ac" "$mutation"
   rm -rf "$cache/hol-toolchains"
   local log=$tmpdir/invalid-"$mutation".log
   if (cd "$project" && HOLBUILD_TEST_FAIL_LOCAL_BUILD=1 \
@@ -414,7 +428,7 @@ invalid_restore corrupt-heap 'failed final validation'
 
 # A builder that rejects an archive replaces it with its own local build.
 python3 "$tmpdir/mutate_archive.py" \
-  "$original_archive" "$tmpdir/mutated-replace.tar" "${action_files[0]}" "$remote_root/cas" corrupt-heap
+  "$original_archive" "$tmpdir/mutated-replace.tar" "${action_files[0]}" "$remote_root/ac" corrupt-heap
 cp "${action_files[0]}" "$tmpdir/rejected-action"
 rm -rf "$cache/hol-toolchains"
 builds_before_replace=$(wc -l < "$build_count")
@@ -433,7 +447,7 @@ replaced_log=$tmpdir/replaced-restore.log
 # A blob that does not download intact is a failed fetch, not a bad archive,
 # so the local build leaves the action alone.
 python3 "$tmpdir/mutate_archive.py" \
-  "$original_archive" "$tmpdir/mutated-unfetched.tar" "${action_files[0]}" "$remote_root/cas" digest
+  "$original_archive" "$tmpdir/mutated-unfetched.tar" "${action_files[0]}" "$remote_root/ac" digest
 cp "${action_files[0]}" "$tmpdir/unfetched-action"
 rm -rf "$cache/hol-toolchains"
 unfetched_log=$tmpdir/unfetched.log
@@ -654,7 +668,7 @@ concurrent_done=$tmpdir/concurrent-extract-done
 lock_wait_event=$tmpdir/concurrent-lock-wait
 rm -f "$concurrent_event" "$concurrent_release" "$concurrent_done" "$lock_wait_event"
 mkfifo "$concurrent_event" "$lock_wait_event"
-cas_gets_before=$(grep -c '^GET /cas/' "$request_log")
+cas_gets_before=$(grep -c '^GET /ac/.* blob$' "$request_log")
 (
   cd "$project"
   exec env PATH="$tarbin:$PATH" \
@@ -677,7 +691,7 @@ touch "$concurrent_release"
 wait "$first_pid"
 wait "$second_pid"
 wait_for_file "$concurrent_done" "concurrent extraction completion"
-[[ $(grep -c '^GET /cas/' "$request_log") -eq $((cas_gets_before + 1)) ]]
+[[ $(grep -c '^GET /ac/.* blob$' "$request_log") -eq $((cas_gets_before + 1)) ]]
 require_file "$(dirname "$published_holdir")/build.ok"
 rm -f "$concurrent_event" "$lock_wait_event"
 

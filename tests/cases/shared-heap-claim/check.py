@@ -16,7 +16,7 @@ script = Path(__file__).with_name("publish.sml")
 
 
 def action_key(key: str) -> str:
-    return hashlib.sha256(f"holbuild-remote-ac-v1\n{key}\n".encode()).hexdigest()
+    return hashlib.sha256(f"holbuild-remote-ac-v2\n{key}\n".encode()).hexdigest()
 
 
 def claim_path(heap_key: str) -> Path:
@@ -33,11 +33,11 @@ def published_heap(heap_key: str) -> str | None:
 
 
 def heap_uploads() -> int:
-    return sum(line.startswith("PUT /cas/") for line in requests.read_text().splitlines())
+    return sum(line.startswith("PUT /ac/") and line.endswith(" blob") for line in requests.read_text().splitlines())
 
 
 def action_writes() -> int:
-    return sum(line.startswith("PUT /ac/") for line in requests.read_text().splitlines())
+    return sum(line.startswith("PUT /ac/") and not line.endswith(" blob") for line in requests.read_text().splitlines())
 
 
 class Publisher:

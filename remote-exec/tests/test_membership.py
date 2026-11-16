@@ -235,28 +235,36 @@ def test_worker_spec_read_asks_every_node_before_a_miss_and_its_preferred_node_f
     from remote_exec.cache import ranked_nodes
     from remote_exec.worker import Releases
 
+    from remote_exec.cache import blob_key
+
     nodes = [f'https://cache-{n}.example' for n in range(1, 7)]
     key = 'new-spec'
-    ranked = ranked_nodes(nodes, key)
+    ranked = ranked_nodes(nodes, blob_key(key))
     former = ranked[-1]
     asked = []
     other_status = [404]
+    run = subprocess.run
+    body = run(['zstd', '-qc'], input=b'holbuild-version=1.2.3\n', capture_output=True, check=True).stdout
 
-    def curl(command: list[str], **_kwargs) -> subprocess.CompletedProcess:
-        url = command[-1].removesuffix('/cas/' + key)
+    def curl(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+        if command[0] == 'zstd':
+            return run(command, **kwargs)
+        url = command[-1].removesuffix('/ac/' + blob_key(key))
         asked.append(url)
         status = 404 if other_status[0] == 503 and url == ranked[2] else other_status[0]
         return subprocess.CompletedProcess(command, 0 if url == former else 22,
-                                           stdout='holbuild-version=1.2.3\n200' if url == former else f'\n{status}', stderr='')
+                                           stdout=body + b'\n200' if url == former else f'\n{status}'.encode(),
+                                           stderr=b'')
 
     monkeypatch.setattr(subprocess, 'run', curl)
     releases = Releases('unused', 'unused', ','.join(nodes), None)
     assert releases.spec_version(key) == '1.2.3'
     assert len(asked) == 6
     asked.clear()
+    # A spec found nowhere under /ac/ is looked for under /cas/, where older releases wrote it.
     with pytest.raises(RuntimeError):
         releases.spec_version('missing-spec')
-    assert len(asked) == 6
+    assert len(asked) == 12
     other_status[0] = 503
     asked.clear()
     assert releases.spec_version(key) == '1.2.3'

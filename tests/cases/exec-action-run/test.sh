@@ -182,14 +182,15 @@ expect() {
 
 ac_file() {
   printf '%s/ac/%s' "$remote_root" \
-    "$(printf 'holbuild-remote-ac-v1\n%s\n' "$1" | sha256sum | awk '{ print $1 }')"
+    "$(printf 'holbuild-remote-ac-v2\n%s\n' "$1" | sha256sum | awk '{ print $1 }')"
 }
-# output_blob RUN_KEY NAME: the CAS file of a run's output.
+# output_blob RUN_KEY NAME: a file holding a run's output, as the cache holds it.
 output_blob() {
   local hash
   hash=$(awk -v role="output:$2" '$1 == "blob" && $2 == role { print $3 }' "$(ac_file "$1")")
   [[ -n "$hash" ]] || { echo "no output $2 in the entry of $1" >&2; cat "$(ac_file "$1")" >&2; exit 1; }
-  printf '%s/cas/%s' "$remote_root" "$hash"
+  remote_blob_text "$remote_root" "$hash" > "$tmpdir/output-$1-$2"
+  printf '%s' "$tmpdir/output-$1-$2"
 }
 
 hb build CTheory > /dev/null
@@ -200,9 +201,10 @@ key_c=$(awk '/^[^ ]/ { name = $1 } $1 == "input_key:" && name == "CTheory" { pri
 # A run in a project context: its entry names the context as its parent and
 # holds both outputs, which hold what the script saw.
 read -r run_key spec < <(export_run run.sml --support "$runner/data/conf.txt" --load helperLib run:CTheory)
-require_grep '^context-input-layout=package-v1$' "$remote_root/cas/$spec"
+remote_blob_text "$remote_root" "$spec" > "$tmpdir/spec"
+require_grep '^context-input-layout=package-v1$' "$tmpdir/spec"
 # Successful runs made before declared-input staging must not be reused.
-old_run_key=$(sed '1,/^run-text$/d; /^context-input-layout=/d' "$remote_root/cas/$spec" | sha256sum | cut -d' ' -f1)
+old_run_key=$(sed '1,/^run-text$/d; /^context-input-layout=/d' "$tmpdir/spec" | sha256sum | cut -d' ' -f1)
 [[ "$run_key" != "$old_run_key" ]]
 worker run "$spec"
 expect run 0 status=built "input-key=$run_key"
@@ -210,7 +212,7 @@ expect run 0 status=built "input-key=$run_key"
 [[ ! -e "$tmpdir/worker-run/action" ]] || { echo "a run left its action root" >&2; exit 1; }
 require_grep '^log=[0-9a-f]\{64\} [0-9]*$' "$tmpdir/run.result"
 log_hash=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/run.result")
-require_file "$remote_root/cas/$log_hash"
+require_file "$(remote_blob "$remote_root" "$log_hash")"
 entry=$(ac_file "$run_key")
 require_grep '^kind=run$' "$entry"
 require_grep "^input_key=$run_key\$" "$entry"
@@ -252,7 +254,8 @@ require_file "$(ac_file "$run_key2")"
 
 # A run in a toolchain theory's context has no parent.
 read -r hol_key hol_spec < <(export_run hol.sml hol:bool)
-if grep -q '^context-input-layout=' "$remote_root/cas/$hol_spec"; then
+remote_blob_text "$remote_root" "$hol_spec" > "$tmpdir/hol-spec"
+if grep -q '^context-input-layout=' "$tmpdir/hol-spec"; then
   echo 'a toolchain context changed its input layout key' >&2
   exit 1
 fi
@@ -321,9 +324,9 @@ require_no_file "$(ac_file "$key")"
 # A spec whose run-loads differ from its run text's is rejected: the run key
 # covers the loads.
 read -r key spec < <(export_run run.sml --support "$runner/data/conf.txt" --load helperLib run:CTheory)
-grep -v '^run-load ' "$remote_root/cas/$spec" > "$tmpdir/tampered-spec"
-tampered=$(sha256sum "$tmpdir/tampered-spec" | awk '{ print $1 }')
-cp "$tmpdir/tampered-spec" "$remote_root/cas/$tampered"
+remote_blob_text "$remote_root" "$spec" > "$tmpdir/spec"
+grep -v '^run-load ' "$tmpdir/spec" > "$tmpdir/tampered-spec"
+tampered=$(put_remote_blob "$remote_root" "$tmpdir/tampered-spec")
 worker tampered "$tampered"
 expect tampered 4 status=failed failure=spec-rejected
 require_grep 'the run-loads do not match the run text' "$tmpdir/tampered.log"
@@ -335,7 +338,7 @@ fi
 
 # Runtime inputs stay in the staged package and cannot alias another input.
 for malformed in escape duplicate; do
-  python3 - "$remote_root/cas/$spec" "$tmpdir/tampered-spec" "$malformed" <<'PYTEST'
+  python3 - "$tmpdir/spec" "$tmpdir/tampered-spec" "$malformed" <<'PYTEST'
 from pathlib import Path
 import sys
 src, dst, mode = sys.argv[1:]
@@ -349,8 +352,7 @@ else:
     text = text.replace(line, line + "\n" + line, 1)
 Path(dst).write_text(text)
 PYTEST
-  tampered=$(sha256sum "$tmpdir/tampered-spec" | awk '{ print $1 }')
-  cp "$tmpdir/tampered-spec" "$remote_root/cas/$tampered"
+  tampered=$(put_remote_blob "$remote_root" "$tmpdir/tampered-spec")
   worker "$malformed" "$tampered"
   expect "$malformed" 4 status=failed failure=spec-rejected
 done

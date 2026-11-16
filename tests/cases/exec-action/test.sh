@@ -27,6 +27,16 @@ trap cleanup EXIT
 
 remote_root=$tmpdir/remote
 start_remote_cache_server "$remote_root" "$tmpdir/server"
+
+# Uploads file $1 to the remote cache as a blob, compressed as holbuild does.
+upload_blob() {
+  zstd -q -c "$1" | curl -fsS -X PUT --data-binary @- "$remote_url/ac/$(blob_key "$(sha256sum "$1" | cut -d' ' -f1)")"
+}
+
+# Downloads remote blob $1, decompressed to stdout.
+download_blob() {
+  curl -fsS "$remote_url/ac/$(blob_key "$1")" | zstd -dcq
+}
 use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project
@@ -170,7 +180,7 @@ data = open(sys.argv[1], "rb").read()
 open(sys.argv[2], "wb").write(data.replace(b"\naction-text\n", b"\naction-text\n(* edited *)\n", 1))
 PY
 spec_tampered=$(sha256sum "$tmpdir/tampered" | cut -d' ' -f1)
-curl -fsS -X PUT --data-binary "@$tmpdir/tampered" "$remote_url/cas/$spec_tampered"
+upload_blob "$tmpdir/tampered"
 worker tampered "$spec_tampered"
 expect tampered 4 "status=failed" "failure=spec-rejected"
 require_grep '^detail=.' "$tmpdir/tampered.result"
@@ -194,7 +204,7 @@ else:
 open(sys.argv[2], "wb").write(b"\n".join(lines))
 PY
 spec_other=$(sha256sum "$tmpdir/other-input" | cut -d' ' -f1)
-curl -fsS -X PUT --data-binary "@$tmpdir/other-input" "$remote_url/cas/$spec_other"
+upload_blob "$tmpdir/other-input"
 worker other-input "$spec_other"
 expect other-input 4 "status=failed" "failure=spec-rejected"
 # Or one with an extra output its action text doesn't declare.
@@ -204,7 +214,7 @@ data = open(sys.argv[1], "rb").read()
 open(sys.argv[2], "wb").write(data.replace(b"\naction-text\n", b"\noutput extra extra.txt\naction-text\n", 1))
 PY
 spec_extra=$(sha256sum "$tmpdir/extra-output" | cut -d' ' -f1)
-curl -fsS -X PUT --data-binary "@$tmpdir/extra-output" "$remote_url/cas/$spec_extra"
+upload_blob "$tmpdir/extra-output"
 worker extra-output "$spec_extra"
 expect extra-output 4 "status=failed" "failure=spec-rejected"
 require_grep "the extra outputs do not match the action text" "$tmpdir/extra-output.log"
@@ -228,7 +238,7 @@ for line in head.split(b"\n"):
 open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
 PY
   spec_escape_output=$(sha256sum "$tmpdir/escape-output" | cut -d' ' -f1)
-  curl -fsS -X PUT --data-binary "@$tmpdir/escape-output" "$remote_url/cas/$spec_escape_output"
+  upload_blob "$tmpdir/escape-output"
   worker escape-output "$spec_escape_output"
   expect escape-output 4 "status=failed" "failure=spec-rejected"
   require_grep "leaves the action root" "$tmpdir/escape-output.log"
@@ -253,7 +263,7 @@ for line in head.split(b"\n"):
 open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
 PY
   spec_escape=$(sha256sum "$tmpdir/escape" | cut -d' ' -f1)
-  curl -fsS -X PUT --data-binary "@$tmpdir/escape" "$remote_url/cas/$spec_escape"
+  upload_blob "$tmpdir/escape"
   worker escape "$spec_escape"
   expect escape 4 "status=failed" "failure=spec-rejected"
   require_grep "path $package leaves the action root" "$tmpdir/escape.log"
@@ -268,7 +278,7 @@ head += b"\nfile library lib/Outside.sml " + sys.argv[3].encode() + b" 24"
 open(sys.argv[2], "wb").write(head + b"\naction-text\n" + text)
 PY
 spec_blob_path=$(sha256sum "$tmpdir/blob-path" | cut -d' ' -f1)
-curl -fsS -X PUT --data-binary "@$tmpdir/blob-path" "$remote_url/cas/$spec_blob_path"
+upload_blob "$tmpdir/blob-path"
 worker blob-path "$spec_blob_path"
 expect blob-path 4 "status=failed" "failure=spec-rejected"
 require_grep "a file's SHA-256 is malformed" "$tmpdir/blob-path.log"
@@ -294,7 +304,7 @@ else:
 open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
 PY
   spec_overlap=$(sha256sum "$tmpdir/overlap" | cut -d' ' -f1)
-  curl -fsS -X PUT --data-binary "@$tmpdir/overlap" "$remote_url/cas/$spec_overlap"
+  upload_blob "$tmpdir/overlap"
   worker overlap "$spec_overlap"
   expect overlap 4 "status=failed" "failure=spec-rejected"
   case $edit in
@@ -340,7 +350,7 @@ require_file "$built_worker/action-resident"
 require_grep '^peak-rss-mb=[1-9][0-9]*$' "$built"
 require_grep '^log=[0-9a-f]\{64\} [0-9][0-9]*$' "$built"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$built")
-curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/a-build.log"
+download_blob "$log_sha" > "$tmpdir/a-build.log"
 [[ -s "$tmpdir/a-build.log" ]] || { echo "the uploaded log is empty" >&2; exit 1; }
 
 # A subdirectory theory still publishes when the exporter could not record RSS.
@@ -364,24 +374,24 @@ require_file "$remote_root/ac/$ac_a"
 
 # Likewise for a blob of the entry the remote lost.
 lost_blob=$(grep -oE '[0-9a-f]{64}' "$remote_root/ac/$ac_a" | while read -r h; do
-              [[ -f "$remote_root/cas/$h" ]] && { echo "$h"; break; }; done)
+              [[ -f "$(remote_blob "$remote_root" "$h")" ]] && { echo "$h"; break; }; done)
 [[ -n "$lost_blob" ]] || { echo "no blob of A's entry in the remote" >&2; exit 1; }
-rm "$remote_root/cas/$lost_blob"
+rm "$(remote_blob "$remote_root" "$lost_blob")"
 worker "$(basename "$built_worker" | sed 's/^worker-//')" "$spec_a"
 expect "$(basename "$built_worker" | sed 's/^worker-//')" 0 "status=cached"
-require_file "$remote_root/cas/$lost_blob"
+require_file "$(remote_blob "$remote_root" "$lost_blob")"
 
 # An input the remote lost fails the action as missing, with its blob named,
 # though the worker fetches inputs in parallel.
 data_blob=$(sha256sum "$project/src/data.txt" | cut -d' ' -f1)
-require_file "$remote_root/cas/$data_blob"
-mv "$remote_root/cas/$data_blob" "$tmpdir/data.blob"
+require_file "$(remote_blob "$remote_root" "$data_blob")"
+mv "$(remote_blob "$remote_root" "$data_blob")" "$tmpdir/data.blob"
 worker lost-input "$spec_b"
 expect lost-input 3 "status=failed" "failure=input-missing" "missing=blob $data_blob"
 # A failed hydrate still reports the steps it ran.
 grep -qE "^phase-ms=(.*,)?hydrate:[0-9]+,hydfiles:[0-9]+(,|\$)" "$tmpdir/lost-input.result" || {
   echo "lost-input's record lacks hydrate's steps:" >&2; cat "$tmpdir/lost-input.result" >&2; exit 1; }
-mv "$tmpdir/data.blob" "$remote_root/cas/$data_blob"
+mv "$tmpdir/data.blob" "$(remote_blob "$remote_root" "$data_blob")"
 
 # A resident dependency manifest must not hide a lost local payload.
 link_hol_toolchain_cache "$tmpdir/worker-b"
@@ -509,7 +519,7 @@ expect c 0
 # directory a removed file leaves empty goes with it, as in a cold root.
 printf 'payload\n' > "$tmpdir/payload"
 payload=$(sha256sum "$tmpdir/payload" | cut -d' ' -f1)
-curl -fsS -X PUT --data-binary "@$tmpdir/payload" "$remote_url/cas/$payload"
+upload_blob "$tmpdir/payload"
 for path in extra/item extra; do
   python3 - "$project/.holbuild/action-specs/$spec_a2" "$tmpdir/nested" "$path" "$payload" <<'PY'
 import sys
@@ -518,7 +528,7 @@ head += b"\nfile library .holbuild/action-src/worker/" + sys.argv[3].encode() + 
 open(sys.argv[2], "wb").write(head + b"\naction-text\n" + text)
 PY
   spec_nested=$(sha256sum "$tmpdir/nested" | cut -d' ' -f1)
-  curl -fsS -X PUT --data-binary "@$tmpdir/nested" "$remote_url/cas/$spec_nested"
+  upload_blob "$tmpdir/nested"
   worker c "$spec_nested"
   expect c 0
 done
@@ -693,7 +703,7 @@ worker inline "$(spec_for "$tmpdir/batch-inline.txt" worker:InlineTheory)"
 expect inline 1 "status=failed" "failure=proof"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/inline.result")
 [[ -n "$log_sha" ]] || { echo "malformed source has no action log" >&2; exit 1; }
-curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/inline-action.log"
+download_blob "$log_sha" > "$tmpdir/inline-action.log"
 require_grep "unclosed quotation" "$tmpdir/inline-action.log"
 require_grep "InlineScript.sml:" "$tmpdir/inline-action.log"
 if grep -q "bad analyser boundary record" "$tmpdir/inline-action.log"; then
@@ -704,7 +714,7 @@ fi
 worker d "$spec_d"
 expect d 1 "status=failed" "failure=proof"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/d.result")
-curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/d-action.log"
+download_blob "$log_sha" > "$tmpdir/d-action.log"
 require_grep "d_bad" "$tmpdir/d-action.log"
 require_grep 'Saved theorem .*"d_continued"' "$tmpdir/d-action.log"
 require_grep 'handled diagnostic' "$tmpdir/d-action.log"
@@ -724,7 +734,7 @@ hb action-spec --upload TerminalFailureTheory > "$tmpdir/batch-terminal.txt"
 worker terminal "$(spec_for "$tmpdir/batch-terminal.txt" worker:TerminalFailureTheory)"
 expect terminal 1 "status=failed" "failure=proof"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/terminal.result")
-curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/terminal-action.log"
+download_blob "$log_sha" > "$tmpdir/terminal-action.log"
 python3 - "$tmpdir/terminal-action.log" <<'PY'
 import sys
 from pathlib import Path
@@ -755,7 +765,7 @@ worker killed "$(spec_for "$tmpdir/batch-killed.txt" worker:KilledTheory)"
 expect killed 3 "status=failed" "failure=internal"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/killed.result")
 [[ -n "$log_sha" ]] || { echo "the killed action has no log" >&2; cat "$tmpdir/killed.result" >&2; exit 1; }
-curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/killed-action.log"
+download_blob "$log_sha" > "$tmpdir/killed-action.log"
 require_grep "HOL was killed by signal 9 (SIGKILL)" "$tmpdir/killed-action.log"
 require_grep "largest child resident set so far: [1-9][0-9]* MB" "$tmpdir/killed-action.log"
 if grep -q "instrumented log:" "$tmpdir/killed-action.log"; then
@@ -903,7 +913,7 @@ spec_r=$(spec_for "$tmpdir/batch-r.txt" worker:RTheory)
 [[ -n $spec_r ]] || { cat "$tmpdir/batch-r.txt" >&2; exit 1; }
 old_dat=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$tmpdir/worker-stale-deps/actions/$key_n/manifest")
 rm "$tmpdir/worker-stale-deps/blobs/$old_dat"
-mv "$remote_root/cas/$old_dat" "$tmpdir/old-n.dat"
+mv "$(remote_blob "$remote_root" "$old_dat")" "$tmpdir/old-n.dat"
 # A worker still holding N in its action root needs neither payload; this
 # one must restore it.
 rm "$tmpdir/worker-stale-deps/action-resident"
@@ -917,7 +927,7 @@ new_dat=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$tmpdir/worker-replace
 [[ $old_dat != "$new_dat" ]] || { echo "N did not produce replacement outputs" >&2; exit 1; }
 # Publish that independently checked replacement to the fixture cache.
 python3 - "$tmpdir/worker-replacement" "$remote_root" "$key_n" <<'PYTHON'
-import hashlib, pathlib, shutil, sys
+import hashlib, pathlib, subprocess, sys
 cache, remote = map(pathlib.Path, sys.argv[1:3])
 key = sys.argv[3]
 manifest = (cache / "actions" / key / "manifest").read_bytes()
@@ -929,9 +939,10 @@ for line in manifest.decode().splitlines():
     if fields[:1] == ["blob"]:
         blob = fields[2]
         src = cache / "blobs" / blob
-        shutil.copyfile(src, remote / "cas" / blob)
+        blob_key = hashlib.sha256(f"holbuild-zstd-blob-v1\n{blob}\n".encode()).hexdigest()
+        subprocess.run(["zstd", "-q", "-f", "-o", str(remote / "ac" / blob_key), str(src)], check=True)
         metadata.append("blob " + blob + " " + str(src.stat().st_size))
-ac = hashlib.sha256(("holbuild-remote-ac-v1\n" + key + "\n").encode()).hexdigest()
+ac = hashlib.sha256(("holbuild-remote-ac-v2\n" + key + "\n").encode()).hexdigest()
 (remote / "ac" / ac).write_bytes(("\n".join(metadata) + "\nmanifest-text-v1\n").encode() + manifest)
 PYTHON
 worker stale-deps "$spec_r"

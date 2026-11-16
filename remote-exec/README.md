@@ -680,8 +680,12 @@ several coordinator replicas, give the command to one of them.
 `exec-action` accepts only actions exported by its own holbuild version and
 runtime sources, and clients move to new releases on their own schedule, so a
 worker can't run one fixed holbuild. Before each action it reads the
-`holbuild-version` line of the action's spec (from `/cas/<spec_sha256>` in the
-remote cache) and runs that release. It first checks
+`holbuild-version` line of the action's spec and runs that release. The spec
+is in the remote cache zstd-compressed under
+`/ac/<sha256("holbuild-zstd-blob-v1\n" ^ spec_sha256 ^ "\n")>`, where holbuild
+0.15.0 and later store blobs, or, from older releases, at `/cas/<spec_sha256>`;
+the worker reads either, asking `/ac/` first, so workers must be on a release
+that reads `/ac/` before any client moves to 0.15.0. It first checks
 `/opt/holbuild-baked/v<version>/bin/holbuild` for an executable file; override
 the root with `--baked-releases DIR` or `REMOTE_EXEC_BAKED_RELEASES`. The
 image bakes one release there when built with
@@ -767,7 +771,7 @@ none is. A run batch with it returns 400.
         "tier": "standard|high",
         "attempts": 1,
         "last_failure": "<failure class>|null",
-        "log_sha256": "<sha256 of the last build log a run uploaded, in /cas/; a failure without a log keeps the earlier one>|null",
+        "log_sha256": "<sha256 of the last build log a run uploaded, a blob in the remote cache; a failure without a log keeps the earlier one>|null",
         "failure_detail": "<the last result's detail: why it failed without a log; after lease expiries in a row (last_failure \"lease expired\", or \"lease expired N times\" once it fails), the workers that held it>|null",
         "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null
       }

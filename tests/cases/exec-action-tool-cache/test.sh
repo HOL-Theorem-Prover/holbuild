@@ -94,7 +94,7 @@ worker() {
   local log_sha
   log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/$name.result")
   [[ -n "$log_sha" ]] || { echo "worker $name uploaded no log" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
-  curl -fsS "$remote_url/cas/$log_sha" > "$tmpdir/$name.hol"
+  curl -fsS "$remote_url/ac/$(blob_key "$log_sha")" | zstd -dcq > "$tmpdir/$name.hol"
 }
 
 # expect NAME STATUS HELD: the worker exited STATUS and T saw HELD.
@@ -153,7 +153,7 @@ require_grep "published tool cache (1 files)" "$tmpdir/v1.log"
 spec_file=$specs/$spec_t
 tool_key=$(printf 'holbuild-tool-cache-v1\nname=probe\ndeps_key=%s\ntoolchain=%s' \
   "$(sed -n 's/^deps-key=//p' "$spec_file")" "$(sed -n 's/^toolchain=//p' "$spec_file")" | sha256sum | cut -d' ' -f1)
-tool_ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$tool_key" | sha256sum | cut -d' ' -f1)
+tool_ac=$(printf 'holbuild-remote-ac-v2\n%s\n' "$tool_key" | sha256sum | cut -d' ' -f1)
 [[ -f "$tmpdir/remote/ac/$tool_ac" ]] || { echo "no tool cache entry at the documented key" >&2; exit 1; }
 
 # Another worker restores it into its own action root.
@@ -199,7 +199,7 @@ write_t v7 'val _ = tool_put "seen" "v7";'
 export_t v7 --tool-cache probe
 worker v7 "$spec_t"
 expect v7 0 v3
-v7_blob=$tmpdir/remote/cas/$(printf v7 | sha256sum | cut -d' ' -f1)
+v7_blob=$(remote_blob "$tmpdir/remote" "$(printf v7 | sha256sum | cut -d' ' -f1)")
 [[ -f "$v7_blob" ]] || { echo "v7's file is not in the remote cache" >&2; exit 1; }
 rm "$v7_blob"
 write_t v8 'val _ = tool_put "seen" "v8";'

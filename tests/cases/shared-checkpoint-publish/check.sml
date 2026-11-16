@@ -79,12 +79,12 @@ val _ = if failing then () else
        manifest still needs that blob. Probes must not poison has_blob. *)
     val sha = HolbuildHash.file_sha256 (path 5 ^ ".ok")
     val key = BE.shared_checkpoint_key "heap" "theorem_context" "6"
-    val _ = BE.remove_file (dir ^ "/remote/cas/" ^ sha)
+    val _ = BE.remove_file (dir ^ "/remote/ac/" ^ RC.blob_key sha)
     val _ = BE.remove_file (dir ^ "/remote/ac/" ^ RC.remote_action_key key)
     val fresh = RC.remote url
     val _ = RC.remember_blob fresh {sha256 = heap, size = Position.toString (OS.FileSys.fileSize deps)}
     val _ = BE.publish_shared_checkpoints fresh ctx {heap = SOME heap, files = [], stale = [], missing = []}
-  in assert "un-restored manifests must not hide a missing blob" (BE.file_exists (dir ^ "/remote/cas/" ^ sha)) end;
+  in assert "un-restored manifests must not hide a missing blob" (BE.file_exists (dir ^ "/remote/ac/" ^ RC.blob_key sha)) end;
 val _ = checkpoint "repaired";
 val _ = restore_latest ();
 val _ = print "shared checkpoint publication passed\n";

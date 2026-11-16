@@ -137,11 +137,13 @@ require_file "$remote_root/ac/$ac"
 cp "$remote_root/ac/$ac" "$tmpdir/own-entry"
 dep_only_resident() {
   python3 - "$remote_root" "$ac" "$tmpdir/own-entry" "$1" <<'PY'
-import hashlib, pathlib, re, sys
+import hashlib, pathlib, re, subprocess, sys
 root, ac, own, timeout = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+def blob_path(digest):
+    return root / "ac" / hashlib.sha256(f"holbuild-zstd-blob-v1\n{digest}\n".encode()).hexdigest()
 head, manifest = pathlib.Path(own).read_text().split("manifest-text-v1\n", 1)
 old = re.search(r"^blob dat (\S+)$", manifest, re.M).group(1)
-dat = (root / "cas" / old).read_text()
+dat = subprocess.run(["zstd", "-dcq", blob_path(old)], capture_output=True, check=True).stdout.decode()
 # a_thm's record: ((own theory, index) (bool, theorem)) "DISK_THM"; add bool
 # theorem 0 as a dependency.
 record = re.search(r'\(\(\(\d+ \d+\) \((\d+) (\d+)\)\) "DISK_THM"\)', dat)
@@ -150,7 +152,7 @@ if record is None or record.group(2) == "0":
 dat = dat[:record.end(1)] + " 0" + dat[record.end(1):]
 data = dat.encode()
 new = hashlib.sha256(data).hexdigest()
-(root / "cas" / new).write_bytes(data)
+blob_path(new).write_bytes(subprocess.run(["zstd", "-q", "-c"], input=data, capture_output=True, check=True).stdout)
 manifest = manifest.replace(f"blob dat {old}\n", f"blob dat {new}\n")
 manifest = re.sub(r"^proof-timeout=.*$", f"proof-timeout={timeout}", manifest, flags=re.M)
 out = []
@@ -330,8 +332,9 @@ rm "$remote_root/ac/$big_ac"
 worker big
 [[ "$worker_status" == 0 ]] || { cat "$tmpdir/big.result" "$tmpdir/big.log" >&2; exit 1; }
 read -r big_sha big_bytes < <(sed -n 's/^log=//p' "$tmpdir/big.result")
-blob=$remote_root/cas/$big_sha
-require_file "$blob"
+require_file "$(remote_blob "$remote_root" "$big_sha")"
+blob=$tmpdir/big-build.log
+remote_blob_text "$remote_root" "$big_sha" > "$blob"
 [[ "$(stat -c %s "$blob")" == "$big_bytes" ]] || { echo "log= size $big_bytes, blob $(stat -c %s "$blob")" >&2; exit 1; }
 python3 - "$blob" <<'PY'
 import re, sys

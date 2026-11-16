@@ -305,12 +305,12 @@ require_grep 'did not arrive in time' "$tmpdir/never.log"
 
 # A late parent's source, which only loading ahead fetches, missing from the
 # cache gives the run up rather than reporting a missing input.
-source_A=$(awk '$1 == "source" { print $4 }' "$tmpdir/remote/cas/$spec_A")
-mv "$tmpdir/remote/cas/$source_A" "$tmpdir/source-A"
+source_A=$(awk '$1 == "source" { print $4 }' <(remote_blob_text "$tmpdir/remote" "$spec_A"))
+mv "$(remote_blob "$tmpdir/remote" "$source_A")" "$tmpdir/source-A"
 worker nosource "$spec_B" --ahead-parent "$key_A:$spec_A"
 expect nosource 3 "status=failed" "failure=ahead-abandoned"
 require_grep 'cannot fetch the source of ATheory' "$tmpdir/nosource.log"
-mv "$tmpdir/source-A" "$tmpdir/remote/cas/$source_A"
+mv "$tmpdir/source-A" "$(remote_blob "$tmpdir/remote" "$source_A")"
 
 # The parent arrives while the children wait for it, and they build, also
 # the one that loads it through a library, the one that only waits for it,
@@ -381,7 +381,7 @@ worker x1 "$spec_X"
 expect x1 0 "status=built"
 worker_start other-x "$spec_Z" --ahead-parent "$key_Y:$spec_Y"
 await_marker other-x waiting-YTheory
-ac_X=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_X" | sha256sum | cut -d' ' -f1)
+ac_X=$(printf 'holbuild-remote-ac-v2\n%s\n' "$key_X" | sha256sum | cut -d' ' -f1)
 rm "$tmpdir/remote/ac/$ac_X"
 worker x2 "$spec_X"
 expect x2 0 "status=built"
@@ -406,7 +406,7 @@ expect plain-g 0 "status=built"
 worker plain-j "$spec_J"
 expect plain-j 0 "status=built"
 for key in "$key_B" "$key_G" "$key_J"; do
-  ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key" | sha256sum | cut -d' ' -f1)
+  ac=$(printf 'holbuild-remote-ac-v2\n%s\n' "$key" | sha256sum | cut -d' ' -f1)
   cmp "$first_remote/ac/$ac" "$tmpdir/remote2/ac/$ac"
 done
 

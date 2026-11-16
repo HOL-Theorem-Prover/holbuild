@@ -40,17 +40,20 @@ fun publish remote digest = RC.put_blob remote {hash = digest, src = src};
 val vectors = String.tokens (fn c => c = #"\n") (RC.read_text (dir ^ "/vectors"));
 fun check_vector line =
   let
-    val [digest, primary, backup] = String.tokens Char.isSpace line
+    val [digest, primary, backup, blob_primary, blob_backup] = String.tokens Char.isSpace line
     val _ = assert "SML/Python ranking agrees" (RC.ranked_urls cache digest = [primary, backup])
+    val _ = assert "SML/Python blob URLs agree" (RC.blob_urls cache digest = [blob_primary, blob_backup])
     val _ = assert "credentials do not change rankings"
       (RC.ranked_urls auth_cache digest = map authenticated [primary, backup])
     val _ = assert "order independent" (RC.ranked_urls reversed digest = [primary, backup])
     val _ = RC.write_text src digest
     (* curl PUT takes arbitrary digest paths; publish a real digest below. *)
-    val _ = assert "CAS primary PUT"
-      (RC.curl_put_urls [] {urls = RC.cas_urls cache digest, src = src} = CB.Published)
-    val _ = assert "CAS sharding" (RC.path_exists (stored primary "cas" digest) andalso
-                                  not (RC.path_exists (stored backup "cas" digest)))
+    val _ = assert "blob primary PUT"
+      (RC.curl_put_urls [] {urls = RC.blob_urls cache digest, src = src} = CB.Published)
+    val blob = RC.blob_key digest
+    val [blob_owner, blob_other] = RC.ranked_urls cache blob
+    val _ = assert "blob sharding" (RC.path_exists (stored blob_owner "ac" blob) andalso
+                                   not (RC.path_exists (stored blob_other "ac" blob)))
     val _ = assert "AC primary PUT"
       (RC.publish_action_metadata cache digest (RC.metadata_text digest []) = CB.Published)
     val ac = RC.remote_action_key digest
@@ -61,9 +64,14 @@ val _ = List.app check_vector vectors;
 
 val text = "ring payload";
 val digest = HolbuildHash.string_sha256 text;
-val [primary, backup] = RC.ranked_urls cache digest;
+val blob_key = RC.blob_key digest;
+val _ = assert "blob key formula, pinned as the worker's test pins it"
+  (RC.blob_key (CharVector.tabulate (64, fn _ => #"0")) =
+   "f88baeae5f54f92e61dcaf2cc69cd2577dd9d5891059c52ee988f0bf3391c9e9");
+val [primary, backup] = RC.ranked_urls cache blob_key;
 val _ = RC.write_text src text;
-val _ = RC.write_text (stored backup "cas" digest) text;
+val _ = RC.ensure_parent (stored backup "ac" blob_key);
+val _ = assert "plant compressed blob" (RC.zstd_compress backup src (stored backup "ac" blob_key));
 val _ = put backup "authorization" "Basic dXNlcjpwYXNz";
 val _ = assert "request keeps inline credentials" (RC.required (fn () => fetch auth_cache digest) = CB.Hit);
 val _ = clear backup "authorization";
@@ -94,7 +102,10 @@ val _ = put primary "get-status" "401";
 val _ = assert "authorization error is not retried"
   (case fetch cache digest of CB.Corrupt _ => true | _ => false);
 val _ = clear primary "get-status";
-val _ = RC.remove_file (stored backup "cas" digest);
+val _ = RC.write_text (stored backup "ac" blob_key) "not zstd\n";
+val _ = assert "a blob that does not decompress is corrupt"
+  (case RC.required (fn () => fetch cache digest) of CB.Corrupt _ => true | _ => false);
+val _ = RC.remove_file (stored backup "ac" blob_key);
 val _ = assert "both missing" (fetch cache digest = CB.Miss);
 fun unavailable f = (ignore (f ()); false) handle RC.Unavailable _ => true;
 val _ = put primary "get-status" "503";
@@ -106,7 +117,7 @@ val _ = put backup "get-status" "503";
 val _ = assert "both transient reports backup"
   ((ignore (fetch auth_cache digest); false)
    handle RC.Unavailable message =>
-     String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/cas/" ^ digest) message andalso
+     String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/ac/" ^ blob_key) message andalso
      not (String.isSubstring "user:pass" message));
 val _ = clear primary "get-status";
 val _ = assert "missing plus transient is a miss" (fetch cache digest = CB.Miss);
@@ -116,7 +127,7 @@ val _ = put backup "get-status" "403";
 val _ = assert "an optional read never asks the backup after a 404" (fetch auth_cache digest = CB.Miss);
 val _ = assert "backup authorization failure overrides miss and names backup"
   (case RC.required (fn () => fetch auth_cache digest) of
-       CB.Corrupt message => String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/cas/" ^ digest) message andalso
+       CB.Corrupt message => String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/ac/" ^ blob_key) message andalso
                              not (String.isSubstring "user:pass" message)
      | _ => false);
 val _ = clear backup "get-status";
@@ -132,7 +143,7 @@ val degraded = RC.remote (down ^ "," ^ one);
 fun down_digest i =
   let val text = "down " ^ Int.toString i
       val hash = HolbuildHash.string_sha256 text
-  in if hd (RC.ranked_urls degraded hash) = down then (text, hash) else down_digest (i + 1) end;
+  in if hd (RC.ranked_urls degraded (RC.blob_key hash)) = down then (text, hash) else down_digest (i + 1) end;
 val (down_text, down_hash) = down_digest 0;
 val _ = RC.write_text src down_text;
 (* More than three successful failovers must not trip the transport breaker. *)
@@ -208,27 +219,31 @@ val _ = RC.remove_file (stored q1 "ac" theory_ac);
 (* A client restoring what a remote batch reported done reads it as
    required, on whichever thread copies it. *)
 val local_root = dir ^ "/local-cache";
-val _ = List.app (fn node => RC.write_text (stored node "cas" digest) text) (RC.ranked_urls quad digest);
+fun plant_blob node =
+  (RC.write_text src text;
+   RC.ensure_parent (stored node "ac" blob_key);
+   assert "plant compressed blob" (RC.zstd_compress node src (stored node "ac" blob_key)));
+val _ = List.app plant_blob (RC.ranked_urls quad blob_key);
 fun copy () = HolbuildBuildExec.copy_remote_cache_entry local_root (RC.base_url quad) theory_key;
 val _ = assert "a client reads a key no batch reported done as optional"
   (asked_during copy = (false, [["GET"], [], [], []]));
 (* The blobs a found entry names are read as required, as the entry can
    reach the store before them. *)
 val _ = seed q1 (theory_manifest "10.0");
-val _ = List.app (fn node => RC.remove_file (stored node "cas" digest)) (List.take (RC.ranked_urls quad digest, 3));
+val _ = List.app (fn node => RC.remove_file (stored node "ac" blob_key)) (List.take (RC.ranked_urls quad blob_key, 3));
 val _ = assert "a client restores an entry whose blob only the last node holds"
   (HolbuildBuildExec.copy_remote_cache_entry (dir ^ "/local-cache-2") (RC.base_url quad) theory_key andalso
    HolbuildCache.get_action (dir ^ "/local-cache-2") theory_key = SOME (theory_manifest "10.0"));
 val _ = RC.remove_file (stored q1 "ac" theory_ac);
-val _ = List.app (fn node => RC.write_text (stored node "cas" digest) text) (RC.ranked_urls quad digest);
+val _ = List.app plant_blob (RC.ranked_urls quad blob_key);
 val _ = HolbuildBuildExec.expect_remote_entry theory_key;
 val _ = assert "a client reads a key a batch reported done as required"
   (#1 (asked_during copy) andalso
    HolbuildCache.get_action local_root theory_key = SOME (theory_manifest "10.0"));
 (* A shared-checkpoint blob is read as required: the manifest naming it can
    reach the store before the blob does. *)
-val blob_nodes = RC.ranked_urls quad digest;
-val _ = List.app (fn node => RC.remove_file (stored node "cas" digest)) (List.take (blob_nodes, 3));
+val blob_nodes = RC.ranked_urls quad blob_key;
+val _ = List.app (fn node => RC.remove_file (stored node "ac" blob_key)) (List.take (blob_nodes, 3));
 val placed = dir ^ "/placed-blob";
 val _ = HolbuildBuildExec.place_shared_blob quad (dir ^ "/shared-store") "family"
           {sha = digest, dst = placed, save = false};
@@ -259,9 +274,9 @@ val preferred_hash = HolbuildHash.string_sha256 preferred_text;
 val _ = RC.write_text src preferred_text;
 val _ = assert "PUT goes to the preferred node"
   (publish replicas preferred_hash = CB.Published andalso
-   RC.path_exists (stored third "cas" preferred_hash) andalso
-   not (RC.path_exists (stored first "cas" preferred_hash)) andalso
-   not (RC.path_exists (stored second "cas" preferred_hash)));
+   RC.path_exists (stored third "ac" (RC.blob_key preferred_hash)) andalso
+   not (RC.path_exists (stored first "ac" (RC.blob_key preferred_hash))) andalso
+   not (RC.path_exists (stored second "ac" (RC.blob_key preferred_hash))));
 val _ = HolbuildRemoteCacheConfig.set_preferred_urls (authenticated first ^ "," ^ authenticated second);
 val _ = assert "an optional reader preferring other nodes misses a fresh write"
   (fetch replicas preferred_hash = CB.Miss);

@@ -46,7 +46,8 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
     exec-action "\$spec" --cache-limit-gb 1000 --result "$state/result-\$key" \
     >> "$tmpdir/worker.log" 2>&1 || true
   if [[ -e "$state/drop-log" ]]; then
-    rm -f "$remote_root/cas/\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-\$key")"
+    log=\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-\$key")
+    rm -f "$remote_root/ac/\$(printf 'holbuild-zstd-blob-v1\n%s\n' "\$log" | sha256sum | cut -c1-64)"
   fi
 done
 SH
@@ -145,7 +146,7 @@ line() {
 posts() { grep -c '^POST /v1/batches?' "$state/requests.log" || true; }
 ac_file() {
   printf '%s/ac/%s' "$remote_root" \
-    "$(printf 'holbuild-remote-ac-v1\n%s\n' "$1" | sha256sum | awk '{ print $1 }')"
+    "$(printf 'holbuild-remote-ac-v2\n%s\n' "$1" | sha256sum | awk '{ print $1 }')"
 }
 
 # Untimed root artifacts are valid run contexts. C is built here only:

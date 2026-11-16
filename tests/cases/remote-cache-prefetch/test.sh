@@ -103,20 +103,24 @@ import hashlib
 import sys
 
 root, key = sys.argv[1:]
-print(f"{root}/ac/" + hashlib.sha256(f"holbuild-remote-ac-v1\n{key}\n".encode()).hexdigest())
+print(f"{root}/ac/" + hashlib.sha256(f"holbuild-remote-ac-v2\n{key}\n".encode()).hexdigest())
 PY
 }
 
-# Overwrites the remote CAS object holding the entry's .dat output.
+# Overwrites the remote blob holding the entry's .dat output with other content.
 corrupt_remote_dat_blob() {
   python3 - "$remote_root" "$1" <<'PY'
+import hashlib
 import pathlib
+import subprocess
 import sys
 
 root = pathlib.Path(sys.argv[1])
 manifest = pathlib.Path(sys.argv[2]).read_text().split("manifest-text-v1\n", 1)[1]
 dat = next(line.split()[2] for line in manifest.splitlines() if line.startswith("blob dat "))
-(root / "cas" / dat).write_text("corrupt\n")
+key = hashlib.sha256(f"holbuild-zstd-blob-v1\n{dat}\n".encode()).hexdigest()
+corrupt = subprocess.run(["zstd", "-q", "-c"], input=b"corrupt\n", capture_output=True, check=True).stdout
+(root / "ac" / key).write_bytes(corrupt)
 PY
 }
 
