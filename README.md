@@ -1413,7 +1413,11 @@ so one more healthy node takes it. A single-node list keeps the ordinary single-
 backup keeps the ring available; the circuit breaker below counts the final
 outcome of a request. If no node hits, a 404 from any node gives a miss, even if
 others failed transiently; this allows a new action to build and publish on a
-healthy node. Transient failures from every node remain unavailable. Replicas
+healthy node. Transient failures from every node remain unavailable. Reads of an
+entry that must exist are the exception: when a remote worker restores an
+action's inputs (its spec's blobs and its parent theories), fetches its spec, or
+the coordinator checks that a finished parent is still cached, a 404 beside a
+transient failure is unavailable, since the failed node may hold the entry. Replicas
 should share a backing store, so that any node can serve an entry another node
 wrote once it is uploaded.
 

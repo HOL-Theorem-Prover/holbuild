@@ -2401,14 +2401,17 @@ class Coordinator:
     async def _check_cache(self, ac_key: str, limit: asyncio.Semaphore) -> bool | None:
         forgotten = self.cache_forgotten
         missing = False
+        failed = False
         failure: httpx.Response | None = None
         # Every node is asked before a miss: a worker writes to the node nearest to it, and until that node has
-        # written the entry through to the shared store, no other node holds it.
+        # written the entry through to the shared store, no other node holds it.  The entry is a done parent's, so
+        # a node that failed may be the one holding it: only 404s from every node it asked say it's gone.
         for node in await self.cache_read_nodes(ac_key):
             try:
                 async with limit:
                     response = await self.cache.get(f"{node}/ac/{ac_key}")
             except httpx.HTTPError:
+                failed = True
                 continue
             if response.status_code == 200:
                 if self.cache_forgotten == forgotten:  # else an input went missing since this check began
@@ -2417,11 +2420,11 @@ class Coordinator:
             if response.status_code == 404:
                 missing = True
                 continue
+            failed = True
             failure = response
             if response.status_code != 429 and not 500 <= response.status_code < 600:
-                missing = False
                 break
-        if missing:
+        if missing and not failed:
             return False
         if failure is not None:
             request = failure.request

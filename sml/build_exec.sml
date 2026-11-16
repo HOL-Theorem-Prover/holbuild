@@ -9570,12 +9570,13 @@ fun action_failed failure msg = ActionFailed (classify_failure failure msg)
 (* A worker keeps the spec's sources and libraries in its local blob store,
    so it fetches each once rather than once per action.  One no cache entry
    names is evicted on its own when least recently used
-   (local_cache_families). *)
+   (local_cache_families).  The spec names each blob, so its read is
+   required (HolbuildRemoteCache.required). *)
 fun fetch_spec_blob remote {hash, dst} =
   let
     val cache = cache_root ()
     fun fetch_remote () =
-      case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst} of
+      case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst}) of
           HolbuildCacheBackend.Hit =>
             (case HolbuildCache.publish_blob cache {hash = hash, src = dst} of
                  HolbuildCacheBackend.Conflict msg => warn ("could not keep blob " ^ hash ^ ": " ^ msg)
@@ -9804,8 +9805,10 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                             hashes = hashes})
       end
     fun restorable f (dep as {target, key, ...}) =
-      f dep
+      HolbuildRemoteCache.required (fn () => f dep)
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
+           | e as ActionFailed (DiskFailure, _) => raise e
+           | e as ActionFailed (InternalFailure, _) => raise e
            | e => raise action_failed (InputMissing ("theory " ^ key))
                           ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                            General.exnMessage e)
@@ -12934,9 +12937,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val staged = in_root staging stem
             val _ =
               (ensure_parent staged;
-               restore_spec_theory_in remote {files = staging, named = root} resolver
-                 {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
+               HolbuildRemoteCache.required (fn () =>
+                 restore_spec_theory_in remote {files = staging, named = root} resolver
+                   {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE}))
               handle e as HolbuildRemoteCache.Unavailable _ => raise e
+                   | e as ActionFailed (DiskFailure, _) => raise e
+                   | e as ActionFailed (InternalFailure, _) => raise e
                    | e => raise action_failed (InputMissing ("theory " ^ key))
                                   ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                                    General.exnMessage e)

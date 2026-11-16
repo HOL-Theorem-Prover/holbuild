@@ -1880,8 +1880,9 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
 
     monkeypatch.setattr(subprocess, "run", fetch)
     ring = Releases(str(tmp_path), "unused", "http://one.test,http://two.test", None)
-    error = CacheUnavailable if statuses == (503, 429) else RuntimeError
-    message = "HTTP 403" if 403 in statuses else "HTTP 429" if error is CacheUnavailable else "HTTP 404"
+    # A spec must be there: a node that fails leaves it unavailable, even beside a 404.
+    error = RuntimeError if 403 in statuses or statuses == (404, 404) else CacheUnavailable
+    message = "HTTP 403" if 403 in statuses else "HTTP 404" if error is RuntimeError else "HTTP 429|HTTP 503"
     with pytest.raises(error, match=message) as caught:
         ring.spec_version(SPEC)
     assert type(caught.value) is error

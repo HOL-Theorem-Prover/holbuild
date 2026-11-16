@@ -387,7 +387,8 @@ class Releases:
         failure = f"spec {spec_sha256} is missing from the remote cache"
         preferred = preferred_identities(os.environ.get("HOLBUILD_REMOTE_CACHE_PREFERRED_URLS"))
         # Every node is asked before a miss: until a node has written a new spec through to the shared store, only
-        # that node holds it.
+        # that node holds it.  A spec the client sent must be there, so a node that failed leaves it unavailable even
+        # when another answered 404.
         for node in ranked_nodes(nodes, spec_sha256, preferred):
             # Not check=True: its error would print credentials in the command line.
             try:
@@ -409,11 +410,9 @@ class Releases:
                 raise RuntimeError(failure)
             unavailable = failure
         else:
-            if missing is not None:
-                raise RuntimeError(missing)
             if unavailable is not None:
                 raise CacheUnavailable(unavailable)
-            raise RuntimeError(failure)
+            raise RuntimeError(missing or failure)
         versions = [
             line.removeprefix("holbuild-version=") for line in spec.splitlines() if line.startswith("holbuild-version=")
         ]

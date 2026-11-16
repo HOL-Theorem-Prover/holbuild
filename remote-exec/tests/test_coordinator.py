@@ -2980,17 +2980,17 @@ async def test_cache_ring_read_fallback(
         ring = Coordinator(coordinator.engine, client, coordinator.settings)
         ring.cache_nodes = nodes
         result = await ring._check_cache(digest, asyncio.Semaphore(1))
-    expected = (True if secondary == 200 else None if secondary == 403
-                else False if 404 in (primary, secondary) else None)
+    # A done parent's entry must be there: only 404s from every node count as gone.
+    expected = True if secondary == 200 else False if (primary, secondary) == (404, 404) else None
     assert result is expected
     # A miss asks every node; a hit or a refusal stops the walk.
     assert asked == (ranked[:2] if secondary in (200, 403) else ranked)
     if expected is not None:
         assert not caplog.records
     else:
-        status = secondary if isinstance(secondary, int) else primary
-        if isinstance(status, int):
-            assert f"answered {status}" in caplog.text
+        failed = [status for status in (primary, secondary) if isinstance(status, int) and status != 404]
+        if failed:
+            assert f"answered {failed[-1]}" in caplog.text
     assert (digest in ring.found_in_cache) == (expected is True)
 
 
