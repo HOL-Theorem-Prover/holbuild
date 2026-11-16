@@ -2434,9 +2434,11 @@ fun remote_cache_destination remote : HolbuildCacheTransfer.destination =
    put_action = put_remote_theory_action remote,
    publish_blob = HolbuildRemoteCache.publish_hashed_blob remote}
 
+(* The blobs an entry names are read as required: the entry can reach the
+   backing store before them, leaving them on the writer's node only. *)
 fun remote_cache_source_with_action remote key manifest : HolbuildCacheTransfer.source =
   {get_action = fn requested => if requested = key then SOME manifest else HolbuildRemoteCache.get_action remote requested,
-   fetch_blob = HolbuildRemoteCache.fetch_blob remote}
+   fetch_blob = fn request => HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.fetch_blob remote request)}
 
 (* The keys whose entries this process copied from the remote cache, so that
    restoring one counts as a remote hit. *)
@@ -7964,7 +7966,8 @@ fun remote_entry_satisfies remote (options : build_options) project plan node in
     case HolbuildRemoteCache.get_action_using usable remote input_key of
         NONE => false
       | SOME text =>
-          entry_satisfies options project plan node input_key (HolbuildRemoteCache.blob_present remote) text
+          entry_satisfies options project plan node input_key
+            (fn sha => HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.blob_present remote sha)) text
   end
 
 (* The same for the local cache, whose blobs must also be intact. *)
@@ -8806,7 +8809,8 @@ fun remote_run_entry remote run_key outputs =
 (* Whether the remote cache holds a run's entry and every output it names. *)
 fun run_already_done remote run_key outputs =
   case remote_run_entry remote run_key outputs of
-      SOME (_, found) => List.all (HolbuildRemoteCache.blob_present remote o #2) found
+      SOME (_, found) =>
+        List.all (fn (_, sha) => HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.blob_present remote sha)) found
     | NONE => false
 
 (* The runs of REQUEST, one per context: with --closure, each project
@@ -9113,7 +9117,8 @@ fun fetch_run remote dir outputs ({name, context, run_key} : run) =
           val final = Path.concat (Path.concat (dir, package), theory)
           val tmp = HolbuildTempPath.near final ".fetch"
           fun fetched (output, hash) =
-            HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = Path.concat (tmp, output)} =
+            HolbuildRemoteCache.required (fn () =>
+              HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = Path.concat (tmp, output)}) =
             HolbuildCacheBackend.Hit
           val _ = (remove_tree tmp; ensure_dir tmp)
           val _ = if (FS.isDir tmp handle OS.SysErr _ => false) then ()
@@ -9978,7 +9983,7 @@ fun fetch_resident_dat remote root (spec : action_spec) resident =
     val path = in_root root ".holbuild/resident.dat"
   in
     ensure_parent path;
-    case HolbuildRemoteCache.fetch_blob remote {hash = dat_hash, dst = path} of
+    case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.fetch_blob remote {hash = dat_hash, dst = path}) of
         HolbuildCacheBackend.Hit => SOME path
       | _ => NONE
   end
@@ -12617,8 +12622,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               val cutoff =
                 spec_early_cutoff_with {dat_hash = dat_hash, file_hashes = file_hashes, skip_loaded = true}
                   root spec
-              (* A miss walks every cache node, so the action's own entry and
-                 the earlier build's are looked up side by side. *)
+              (* The action's own entry and the earlier build's are looked up
+                 side by side. *)
               val done = ref false
               val earlier = ref (fn () => NONE)
               fun look_up_earlier ({pair_key, ...} : early_cutoff) =

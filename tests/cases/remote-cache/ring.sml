@@ -212,6 +212,15 @@ val _ = List.app (fn node => RC.write_text (stored node "cas" digest) text) (RC.
 fun copy () = HolbuildBuildExec.copy_remote_cache_entry local_root (RC.base_url quad) theory_key;
 val _ = assert "a client reads a key no batch reported done as optional"
   (asked_during copy = (false, [["GET"], [], [], []]));
+(* The blobs a found entry names are read as required, as the entry can
+   reach the store before them. *)
+val _ = seed q1 (theory_manifest "10.0");
+val _ = List.app (fn node => RC.remove_file (stored node "cas" digest)) (List.take (RC.ranked_urls quad digest, 3));
+val _ = assert "a client restores an entry whose blob only the last node holds"
+  (HolbuildBuildExec.copy_remote_cache_entry (dir ^ "/local-cache-2") (RC.base_url quad) theory_key andalso
+   HolbuildCache.get_action (dir ^ "/local-cache-2") theory_key = SOME (theory_manifest "10.0"));
+val _ = RC.remove_file (stored q1 "ac" theory_ac);
+val _ = List.app (fn node => RC.write_text (stored node "cas" digest) text) (RC.ranked_urls quad digest);
 val _ = HolbuildBuildExec.expect_remote_entry theory_key;
 val _ = assert "a client reads a key a batch reported done as required"
   (#1 (asked_during copy) andalso
