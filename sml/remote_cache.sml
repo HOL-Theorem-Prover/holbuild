@@ -309,6 +309,26 @@ fun require_answer method url result =
 fun transient (HolbuildHttp.Failed _) = true
   | transient (HolbuildHttp.Response code) = code = 429 orelse (code >= 500 andalso code < 600)
 
+(* Reads made inside `required f`, on its thread, are for entries that must be
+   there, such as an action's inputs: a node that failed may be the one
+   holding the entry, so a read that found it nowhere but saw a node fail
+   gives that failure, not a 404.  Any other read takes a 404 beside a
+   failure as a miss, so that a lookup before building or publishing doesn't
+   stop on one dead node.  Per thread, as the hydrate path between the
+   caller and the read doesn't carry the caller's intent. *)
+val required_tag : bool Universal.tag = Universal.tag ()
+
+fun reads_required () = Option.getOpt (Thread.getLocal required_tag, false)
+
+fun required f =
+  let
+    val outer = reads_required ()
+    fun restore () = Thread.setLocal (required_tag, outer)
+  in
+    Thread.setLocal (required_tag, true);
+    (f () before restore ()) handle e => (restore (); raise e)
+  end
+
 (* A read's probes past its first nodes run on the caller's thread and on
    helper threads, at most probe_helpers of them in the whole process, so
    callers that run many lookups at once don't multiply threads,
@@ -373,6 +393,8 @@ fun probe_all probe urls =
    found the entry for its body.
    A read whose 200 body fails `usable` counts as that node's 404, so a replica
    holding a weaker copy does not hide a better one on the next node.
+   A required read (`required`) that saw a node fail ends with that failure
+   rather than a 404.
    A cache of one node gets the second attempt on that node: a 429 or 5xx
    answer to its first request is asked again once.  No answer at all is not,
    so an unreachable cache still costs one attempt per request until the
@@ -391,10 +413,15 @@ fun routed_status_using usable method probe urls path request =
         ListPair.mapEq (fn (node, result) => (node, probed node result))
           (nodes, probe_all (fn node => traced "HEAD" node "" (fn () => probe node)) nodes)
       end
-    fun loop [] _ _ _ missing last = Option.getOpt (missing, last)
-      | loop ((node, answer) :: rest) count misses silent missing last =
+    val required = read andalso reads_required ()
+    fun outcome missing failed last =
+      case (missing, failed) of
+          (SOME found, SOME failure) => if required then failure else found
+        | _ => Option.getOpt (missing, last)
+    fun loop [] _ _ _ missing failed last = outcome missing failed last
+      | loop ((node, answer) :: rest) count misses silent missing failed last =
           if not read andalso count >= 2 andalso not silent then
-            Option.getOpt (missing, last)
+            outcome missing failed last
           else
             let
               val result = answer ()
@@ -412,14 +439,15 @@ fun routed_status_using usable method probe urls path request =
                 if count = 0 andalso null rest andalso transient result andalso not (unanswered result) then
                   [(node, ask node)]
                 else rest
+              val failed = if transient result then SOME (node, result) else failed
             in
               if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
                 loop (if miss andalso misses = 2 andalso not (null rest) then probe_rest rest else rest)
-                     (count + 1) misses (silent andalso unanswered result) missing (node, result)
+                     (count + 1) misses (silent andalso unanswered result) missing failed (node, result)
               else (node, result)
             end
   in
-    loop (map (fn node => (node, ask node)) urls) 0 0 true NONE (hd urls, HolbuildHttp.Failed "no cache response")
+    loop (map (fn node => (node, ask node)) urls) 0 0 true NONE NONE (hd urls, HolbuildHttp.Failed "no cache response")
   end
 
 fun routed_status method urls path request = routed_status_using (fn _ => true) method request urls path request
