@@ -450,7 +450,9 @@ STATEMENTS = [
         10_000,
     ),
     Statement(
-        "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now()", lambda f: {"token": f.token}, 100
+        "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now() RETURNING input_key",
+        lambda f: {"token": f.token},
+        100,
     ),
     Statement("SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions", lease, 11_000),
     Statement(
@@ -460,7 +462,20 @@ STATEMENTS = [
     ),
     Statement("UPDATE actions SET tier = 'high'", lease, 10_000),
     Statement("UPDATE actions SET attempts = attempts - 1, ahead = 'abandoned'", lease, 10_000),
-    Statement("UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1", lease, 10_000),
+    Statement("UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1 WHERE", lease, 10_000),
+    # leases a worker never got
+    # No index on the worker: it reads the leases, one per running action.
+    Statement(cm.UNHELD_LEASES, lambda f: {"worker": "w9", "held": None, "before": datetime.now(UTC)}, 1_200),
+    Statement(
+        "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now() RETURNING input_key, worker",
+        lambda f: {"token": f.token},
+        100,
+    ),
+    Statement(
+        "UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1, last_failure",
+        lambda f: {**lease(f), "detail": "w went on without this lease: its claim's answer or its result was lost"},
+        10_000,
+    ),
     # releases
     Statement(
         "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id",

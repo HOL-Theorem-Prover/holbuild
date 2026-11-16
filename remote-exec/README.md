@@ -25,7 +25,11 @@ a container image with both.
   loses batch status and costs rebuilds, never a wrong build.
 - **Worker loop** (`remote_exec/worker.py`): claims an action, runs `holbuild
   exec-action` on it with the holbuild release that exported it, heartbeats
-  while it runs, and reports the result record.
+  while it runs, and reports the result record. It runs one action at a time,
+  under a name no other worker shares (`--name`, by default `host:pid`), so a
+  lease of that name it isn't running, one whose claim's answer never reached
+  it, ends as soon as it claims or heartbeats again, without counting as an
+  attempt.
 
 ## Running
 

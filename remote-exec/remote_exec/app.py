@@ -10,6 +10,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID
 
@@ -279,6 +280,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
 
     @app.post("/v1/work/claim", dependencies=worker, response_model=None)
     async def claim(body: ClaimRequest, request: Request) -> dict[str, object] | Response:
+        arrived = datetime.now(UTC)
         tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
         if body.host is not None:
             coordinator.report_host(body.host)
@@ -291,6 +293,11 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             host_rank=0 if body.host is None else body.host.rank,
             ahead=body.ahead,
         )
+        # After the claim, so claims arriving together still share their reads. Its worker's next claim comes 30 s
+        # after this one arrived at the soonest, which dwarfs any skew between this clock and the database's.
+        if not await request.is_disconnected():
+            held = None if claimed is None else str(claimed.attempt_token)
+            await coordinator.release_unheld(body.worker, held, arrived)
         if claimed is None:
             return Response(status_code=204)
         return asdict(claimed)

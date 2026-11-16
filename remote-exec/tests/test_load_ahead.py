@@ -34,7 +34,8 @@ from test_coordinator import (
 async def claim_ahead(
     http: httpx.AsyncClient, tier: str = "standard", wait_s: float = 0, also_claim: list[str] | None = None
 ) -> dict[str, Any] | None:
-    body = {"tier": tier, "also_claim": also_claim or [], "worker": "w2", "ahead": True, "wait_s": wait_s}
+    # A worker not seen before: one that claims again holds none of its leases.
+    body = {"tier": tier, "also_claim": also_claim or [], "worker": f"w-{uuid4().hex[:8]}", "ahead": True, "wait_s": wait_s}
     response = await http.post("/v1/work/claim", json=body, headers=WORKER)
     if response.status_code == 204:
         return None

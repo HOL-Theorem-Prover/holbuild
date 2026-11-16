@@ -1092,9 +1092,9 @@ def run_one(
 
         def report(record: str) -> None:
             """Completes the action once, even if posting it fails: the coordinator then retries it when the
-            lease expires. The heartbeat goes on while the result is posted, so the lease doesn't lapse while the
-            coordinator restarts, and stops once it is: the token is spent then. Scale-in protection stays on until
-            exec-action exits."""
+            worker claims again or the lease expires. The heartbeat goes on while the result is posted, so the lease
+            doesn't lapse while the coordinator restarts, and stops once it is: the token is spent then. Scale-in
+            protection stays on until exec-action exits."""
             nonlocal completed
             completed = True
             lease.completing.set()
@@ -1489,8 +1489,9 @@ def main() -> None:
             try:
                 unavailable = run_one(coordinator, args, releases, protection, claim, phases, claimed=started)
             except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
-                # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
-                # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.
+                # Else the next claim ends the lease and the coordinator retries; a rerun finds a published result
+                # cached. Waiting keeps a worker from failing ready action after ready action while the cache or the
+                # coordinator is down.
                 print(f"action failed in the worker: {error}", file=sys.stderr)
                 with phases.timed("idle"):
                     drain.stop.wait(CLAIM_RETRY_SECONDS)

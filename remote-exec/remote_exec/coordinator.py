@@ -418,6 +418,14 @@ UPDATE actions c SET (remaining_deps, state) = (
 )
 WHERE c.batch_id = :batch_id AND c.input_key = ANY({selected}) AND c.state IN ('waiting', 'ready')
 """
+# The live leases of a worker other than the one it ``held``, claimed ``before`` a time: see
+# ``Coordinator.release_unheld``. A lease is claimed in the transaction that sets its action's ``last_claimed_at``.
+UNHELD_LEASES = sa.text(
+    "SELECT l.attempt_token, l.batch_id FROM leases l "
+    "JOIN actions a ON a.batch_id = l.batch_id AND a.input_key = l.input_key "
+    "WHERE l.worker = :worker AND l.expires_at > now() AND l.attempt_token IS DISTINCT FROM CAST(:held AS uuid) "
+    "AND a.last_claimed_at < :before"
+)
 REFRESH_KEYS = sa.text(REFRESH.format(selected="CAST(:keys AS text[])"))
 REFRESH_CHILDREN = sa.text(
     REFRESH.format(
@@ -1735,17 +1743,25 @@ class Coordinator:
         }
         return PhaseTotals(PHASE_WINDOW_SECONDS, len(self.phase_reports), PhaseReport(**sums))
 
-    async def heartbeat(self, token: UUID) -> bool:
-        """Extend a live lease; False when it expired or was revoked, so the worker should stop."""
+    async def heartbeat(self, token: UUID, arrived: datetime | None = None) -> bool:
+        """Extend a live lease; False when it expired or was revoked, so the worker should stop. The worker runs one
+        action at a time, so it holds none of its other live leases claimed before the heartbeat ``arrived``: they end
+        as ``release_unheld`` ends them. One claimed since may be one it runs, the heartbeat having outlasted the
+        worker's wait for it and its result."""
+        arrived = arrived or datetime.now(UTC)
         async with self.engine.begin() as conn:
-            result = await conn.execute(
+            worker = await conn.scalar(
                 sa.text(
                     "UPDATE leases SET expires_at = now() + make_interval(secs => :lease) "
-                    "WHERE attempt_token = :token AND expires_at > now()"
+                    "WHERE attempt_token = :token AND expires_at > now() RETURNING worker"
                 ),
                 {"token": token, "lease": self.settings.lease_seconds},
             )
-            live = result.rowcount == 1
+            unheld = [] if worker is None else list(
+                await conn.execute(UNHELD_LEASES, {"worker": worker, "held": token, "before": arrived})
+            )
+        await self._end_unheld(unheld)
+        live = worker is not None
         # A worker running one long action claims nothing meanwhile: its heartbeats keep it counted on its host.
         if live and (lease := self.lease_hosts.get(token)) is not None:
             self.report_worker(*lease)
@@ -2043,77 +2059,114 @@ class Coordinator:
                 )
             )
         for token, batch_id in expired:
-            ahead_freed = False
-            async with self.engine.begin() as conn:
-                await self._lock_batch(conn, batch_id)
-                lease = (
-                    await conn.execute(
-                        sa.text(
-                            "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now() "
-                            "RETURNING input_key, worker"
-                        ),
-                        {"token": token},
+            await self._end_lease(token, batch_id)
+
+    async def release_unheld(self, worker: str, held: str | None, before: datetime) -> None:
+        """End the live leases of ``worker`` claimed ``before`` the claim that just ``held`` one arrived: it claims
+        only while it runs nothing, so it holds none of them. The answer to the claim that took each never reached it
+        (it gave up waiting for a slow coordinator), or it gave up reporting the result. Each action goes back at once
+        and, as an ``unavailable`` result does, doesn't count the attempt. A lease claimed since may be one the worker
+        runs: it gave up on this claim and claimed again before this ran."""
+        async with self.engine.connect() as conn:
+            unheld = list(await conn.execute(UNHELD_LEASES, {"worker": worker, "held": held, "before": before}))
+        await self._end_unheld(unheld)
+
+    async def _end_unheld(self, unheld: list[sa.Row[Any]]) -> None:
+        for token, batch_id in unheld:
+            await self._end_lease(token, batch_id, unheld=True)
+            self.request_release(batch_id)
+
+    async def _end_lease(self, token: UUID, batch_id: UUID, *, unheld: bool = False) -> None:
+        """End lease ``token`` of ``batch_id`` without its worker's result: one that expired, or with ``unheld`` a
+        live one its worker never got (``release_unheld``)."""
+        ahead_freed = False
+        async with self.engine.begin() as conn:
+            await self._lock_batch(conn, batch_id)
+            lease = (
+                await conn.execute(
+                    sa.text(
+                        "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now() "
+                        "RETURNING input_key, worker"
                     )
-                ).first()
-                if lease is None:
-                    continue
-                self.lease_hosts.pop(token, None)
-                action = (
-                    await conn.execute(
-                        sa.text(
-                            "SELECT a.input_key, a.spec_sha256, a.theory, a.state, a.attempts, a.class AS action_class, "
-                            "a.ahead, a.remaining_deps, b.ahead_cap IS NOT NULL AS ahead_batch "
-                            "FROM actions a JOIN batches b ON b.id = a.batch_id "
-                            "WHERE a.batch_id = :batch_id AND a.input_key = :input_key FOR UPDATE OF a"
-                        ),
-                        {"batch_id": batch_id, "input_key": lease.input_key},
+                    if unheld
+                    else sa.text(
+                        "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now() "
+                        "RETURNING input_key, worker"
+                    ),
+                    {"token": token},
+                )
+            ).first()
+            if lease is None:
+                return
+            self.lease_hosts.pop(token, None)
+            action = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT a.input_key, a.spec_sha256, a.theory, a.state, a.attempts, a.interruptions, "
+                        "a.class AS action_class, a.ahead, a.remaining_deps, b.ahead_cap IS NOT NULL AS ahead_batch "
+                        "FROM actions a JOIN batches b ON b.id = a.batch_id "
+                        "WHERE a.batch_id = :batch_id AND a.input_key = :input_key FOR UPDATE OF a"
+                    ),
+                    {"batch_id": batch_id, "input_key": lease.input_key},
+                )
+            ).one()
+            if action.state != "running":
+                return
+            if unheld and action.interruptions < self.settings.max_interruptions:
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1, "
+                        "last_failure = 'unavailable', failure_detail = :detail "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {"batch_id": batch_id, "input_key": lease.input_key,
+                     "detail": f"{lease.worker} went on without this lease: its claim's answer or its result was lost"},
+                )
+                await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
+                ahead_freed = action.ahead_batch  # the retry revokes what was claimed ahead of it
+            elif action.ahead == "ahead" and action.remaining_deps > 0:
+                # Lost while waiting ahead (a reclaimed burst host, say): given up as loading ahead is, without
+                # the attempt counting.
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET attempts = attempts - 1, ahead = 'abandoned' "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {"batch_id": batch_id, "input_key": lease.input_key},
+                )
+                await self._retry(conn, batch_id, lease.input_key, ahead_batch=True)
+                ahead_freed = True
+            else:
+                # The worker never reported, so all there is to go on is which workers lost it: the detail lists
+                # those of the expiries in a row.
+                final = action.attempts >= self.settings.max_attempts
+                detail = await conn.scalar(
+                    sa.text(
+                        "UPDATE actions SET last_failure = CASE WHEN class = 'run' AND CAST(:final AS boolean) "
+                        "THEN 'internal' ELSE :failure END, failure_detail = CASE "
+                        "WHEN last_failure = 'lease expired' AND failure_detail IS NOT NULL "
+                        "THEN failure_detail || ', ' || :worker ELSE :worker END "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key RETURNING failure_detail"
+                    ),
+                    {"batch_id": batch_id, "input_key": lease.input_key, "worker": lease.worker, "final": final,
+                     "failure": f"lease expired {action.attempts} times" if final else "lease expired"},
+                )
+                if final:
+                    await self._fail(
+                        conn,
+                        batch_id,
+                        lease.input_key,
+                        action.action_class,
+                        f"{action.theory}: lease expired {action.attempts} times: {detail}",
                     )
-                ).one()
-                if action.state != "running":
-                    continue
-                if action.ahead == "ahead" and action.remaining_deps > 0:
-                    # Lost while waiting ahead (a reclaimed burst host, say): given up as loading ahead is, without
-                    # the attempt counting.
-                    await conn.execute(
-                        sa.text(
-                            "UPDATE actions SET attempts = attempts - 1, ahead = 'abandoned' "
-                            "WHERE batch_id = :batch_id AND input_key = :input_key"
-                        ),
-                        {"batch_id": batch_id, "input_key": lease.input_key},
-                    )
-                    await self._retry(conn, batch_id, lease.input_key, ahead_batch=True)
-                    ahead_freed = True
                 else:
-                    # The worker never reported, so all there is to go on is which workers lost it: the detail lists
-                    # those of the expiries in a row.
-                    final = action.attempts >= self.settings.max_attempts
-                    detail = await conn.scalar(
-                        sa.text(
-                            "UPDATE actions SET last_failure = CASE WHEN class = 'run' AND CAST(:final AS boolean) "
-                            "THEN 'internal' ELSE :failure END, failure_detail = CASE "
-                            "WHEN last_failure = 'lease expired' AND failure_detail IS NOT NULL "
-                            "THEN failure_detail || ', ' || :worker ELSE :worker END "
-                            "WHERE batch_id = :batch_id AND input_key = :input_key RETURNING failure_detail"
-                        ),
-                        {"batch_id": batch_id, "input_key": lease.input_key, "worker": lease.worker, "final": final,
-                         "failure": f"lease expired {action.attempts} times" if final else "lease expired"},
-                    )
-                    if final:
-                        await self._fail(
-                            conn,
-                            batch_id,
-                            lease.input_key,
-                            action.action_class,
-                            f"{action.theory}: lease expired {action.attempts} times: {detail}",
-                        )
-                    else:
-                        await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
-                    ahead_freed = action.ahead_batch  # the retry revokes what was claimed ahead of it
-            # After the commit, so the claims woken see the slots of the cap this freed.
-            if ahead_freed:
-                self._ahead_changed()
-            self._wake_peers(await self._peers(batch_id, action))
-            self._batch_changed(batch_id)
+                    await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
+                ahead_freed = action.ahead_batch  # the retry revokes what was claimed ahead of it
+        # After the commit, so the claims woken see the slots of the cap this freed.
+        if ahead_freed:
+            self._ahead_changed()
+        self._wake_peers(await self._peers(batch_id, action))
+        self._batch_changed(batch_id)
 
     async def fail_overdue(self) -> None:
         """Fail the batches still running ``batch_deadline_hours`` after their submission: one that can't finish,
