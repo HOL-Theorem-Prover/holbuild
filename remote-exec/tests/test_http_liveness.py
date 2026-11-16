@@ -39,7 +39,7 @@ async def test_400_claimers_keep_http_live(coordinator: Coordinator) -> None:
             address = (await process.stdout.readline()).decode().strip()
             communicating = asyncio.create_task(process.communicate())
             assert address.startswith("http://127.0.0.1:"), address
-            limits = httpx.Limits(max_connections=450, max_keepalive_connections=450)
+            limits = httpx.Limits(max_connections=490, max_keepalive_connections=490)
             async with httpx.AsyncClient(base_url=address, limits=limits, timeout=4, trust_env=False) as http:
                 await herd(http)
     finally:
@@ -147,6 +147,18 @@ async def herd(http: httpx.AsyncClient) -> None:
                 completed += 1
                 published[input_key(name)].set()
 
+    full_host = {"id": "full-host", "cpu_idle_pct": 90.0, "mem_total": 64 << 30, "mem_available": 60 << 30,
+                 "budget": 52 << 30, "reserved": 0, "leases": 0, "memory_short": False, "rank": 0,
+                 "disk_free": 1 << 30, "disk_total": 200 << 30}
+
+    async def quarantined(index: int) -> None:
+        """A worker on a host reporting too little disk: it waits apart from the herd and gets nothing."""
+        while True:
+            response = await http.post("/v1/work/claim", headers=WORKER, json={
+                "tier": "standard", "worker": f"full-{index}", "wait_s": 20, "host": full_host,
+            }, timeout=25)
+            assert response.status_code == 204, f"quarantined claim: {response.status_code} {response.text}"
+
     async def probes() -> None:
         nonlocal probe_count, probe_max, heartbeat_after_complete
         async with httpx.AsyncClient(base_url=str(http.base_url), timeout=2, trust_env=False) as probe:
@@ -171,6 +183,7 @@ async def herd(http: httpx.AsyncClient) -> None:
 
     async with asyncio.TaskGroup() as group:
         workers = [group.create_task(worker(i)) for i in range(400)]
+        workers += [group.create_task(quarantined(i)) for i in range(40)]
         probing = group.create_task(probes())
         async with asyncio.timeout(12):
             response = await http.post("/_test/arm", timeout=12)

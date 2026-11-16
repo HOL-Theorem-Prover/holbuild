@@ -50,6 +50,15 @@ class HeartbeatRequest(BaseModel):
     host: HostReport | None = None
 
 
+class ReportRequest(BaseModel):
+    """A worker's report of its host while it doesn't claim, as while it waits for disk space."""
+
+    tier: Tier
+    also_claim: list[Tier] = Field(default_factory=list)
+    worker: str
+    host: HostReport | None = None
+
+
 def exit_on_auth_failure(error: BaseException) -> None:
     """Exit when the database refused the coordinator's credentials, so its supervisor restarts it with the
     current ones; the database URL is read only at start."""
@@ -261,18 +270,21 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             "run_floor": min(settings.run_floor, settings.run_slots),
             "desired_burst_workers": status.desired_burst_workers,
             "max_burst_workers": settings.max_burst_workers,
-            "hosts": [{**asdict(host.report), "age_s": host.age_s} for host in status.hosts],
+            "hosts": [
+                {**asdict(host.report), "age_s": host.age_s, "quarantined": host.quarantined} for host in status.hosts
+            ],
             "phases": asdict(status.phases),
             "scaler": None if status.scaler is None else {**asdict(status.scaler), "at": status.scaler.at.isoformat()},
         }
 
     @app.post("/v1/work/claim", dependencies=worker, response_model=None)
     async def claim(body: ClaimRequest, request: Request) -> dict[str, object] | Response:
+        tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
         if body.host is not None:
             coordinator.report_host(body.host)
+            coordinator.report_worker(body.host.id, body.worker, tiers)
         if body.phases is not None:
             coordinator.report_phases(body.phases)
-        tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
         claimed = await coordinator.claim(
             tiers, body.worker, body.wait_s, request.is_disconnected,
             host_id=None if body.host is None else body.host.id,
@@ -282,6 +294,12 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         if claimed is None:
             return Response(status_code=204)
         return asdict(claimed)
+
+    @app.post("/v1/work/report", status_code=204, dependencies=worker)
+    async def report(body: ReportRequest) -> None:
+        if body.host is not None:
+            coordinator.report_host(body.host)
+            coordinator.report_worker(body.host.id, body.worker, [body.tier, *body.also_claim])
 
     @app.post("/v1/work/{attempt_token}/heartbeat", dependencies=worker)
     async def heartbeat(attempt_token: UUID, body: HeartbeatRequest | None = None) -> dict[str, int]:
