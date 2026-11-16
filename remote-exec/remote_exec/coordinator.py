@@ -1544,15 +1544,21 @@ class Coordinator:
             ranking.theories.pop((batch_id, tier), None)
             if priority == 0:
                 ranking.running_default += 1
+            if passed is not None:  # counted before the lock's await, as the floor is, so concurrent claims see it
+                self.passed_over[passed] = self.passed_over.get(passed, 0) + 1
+                if len(self.passed_over) > MAX_LEASE_HOSTS:  # those of batches that ended unclaimed
+                    del self.passed_over[next(iter(self.passed_over))]
             row = await self._lock_unleased(conn, CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
             self.passed_over.pop((batch_id, tier), None)
             if row is not None:
                 if passed is not None:
-                    self.passed_over[passed] = self.passed_over.get(passed, 0) + 1
-                    if len(self.passed_over) > MAX_LEASE_HOSTS:  # those of batches that ended unclaimed
-                        del self.passed_over[next(iter(self.passed_over))]
                     self.locality.claims += 1
                 return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb)
+            if passed is not None and (count := self.passed_over.get(passed)) is not None:
+                if count > 1:
+                    self.passed_over[passed] = count - 1
+                else:
+                    del self.passed_over[passed]
             if priority == 0:
                 ranking.running_default -= 1
             ranking.exhausted.add((batch_id, tier))
@@ -1609,6 +1615,7 @@ class Coordinator:
     def _learn_locality(self, host_id: str, theory: str, result: Result) -> None:
         """Take the dependency context ``result`` reports for ``theory``, which ran on ``host_id``. A host that failed
         an action for its own reasons forgets the action's context, so its retry isn't sent back there."""
+        learned = self._locality_key(theory)
         if result.deps_key is not None:
             self.theory_deps.pop(theory, None)
             self.theory_deps[theory] = result.deps_key
@@ -1616,9 +1623,8 @@ class Coordinator:
                 del self.theory_deps[next(iter(self.theory_deps))]
         keys = self.host_keys.get(host_id, {})
         if result.status == "failed" and result.failure in INFRA_FAILURES:
-            keys.pop(theory, None)
-            if result.deps_key is not None:
-                keys.pop(result.deps_key, None)
+            for key in {theory, learned, result.deps_key} - {None}:
+                keys.pop(key, None)
         elif result.status != "failed" or result.failure in RAN_FAILURES:
             keys.pop(theory, None)  # the name stood for the context until a worker reported it
             self._ran_on(host_id, theory)

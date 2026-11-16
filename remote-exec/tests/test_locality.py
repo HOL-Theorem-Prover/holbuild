@@ -96,6 +96,21 @@ async def test_a_batch_is_passed_over_for_locality_at_most_the_window(
     assert theories == ["pkg:b"] * WINDOW + ["pkg:a"]
 
 
+async def test_concurrent_claims_pass_a_batch_over_at_most_the_window(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await submit_as(http, "a1", "a")
+    for i in range(2 * WINDOW):
+        await submit_as(http, f"b{i + 1}", "b")
+
+    claims = await asyncio.gather(
+        *(coordinator.claim(["standard"], f"host-1-{i}", host_id="host-1") for i in range(WINDOW + 1))
+    )
+
+    assert sorted(c.theory for c in claims if c is not None) == ["pkg:a"] + ["pkg:b"] * WINDOW
+
+
 async def test_a_batch_of_a_higher_priority_is_never_passed_over(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
 ) -> None:
@@ -178,6 +193,10 @@ async def test_hosts_learn_contexts_and_forget_those_of_their_infrastructure_fai
 
     assert coordinator.theory_deps == {"pkg:x": D1, "pkg:y": D2}
     assert list(coordinator.host_keys["host-1"]) == [D1, "pkg:z"]
+
+    await run_on(http, cache, "host-1", "x2", "x", None, failure="internal")  # a worker that reports no deps-key
+
+    assert list(coordinator.host_keys["host-1"]) == ["pkg:z"]
 
 
 async def test_hosts_that_leave_count_the_contexts_no_kept_host_holds(
