@@ -48,6 +48,7 @@ MIN_SANDBOX_RELEASE = (0, 13, 58)
 MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
 MIN_FREE_FLOOR_RELEASE = (0, 14, 57)  # the first whose exec-action takes --cache-min-free-gb
+MIN_SWEEP_ONLY_RELEASE = (0, 14, 60)  # the first whose exec-action takes --sweep-only
 CACHE_MIN_FREE_GB = 16  # the free space the cache cap keeps on the cache's disk for writers it doesn't count
 
 
@@ -447,6 +448,26 @@ class Releases:
         check_sandbox(executable, version)
         return executable
 
+    def newest(self, minimum: tuple[int, int, int]) -> tuple[str, str] | None:
+        """The version and executable of the newest release at or above ``minimum`` this host has, preinstalled or
+        built, without building one; None if it has none."""
+        found: dict[tuple[int, ...], tuple[str, str]] = {}
+        for root, done in ((self.baked_root, os.path.join("bin", "holbuild")), (self.root, COMPLETE)):
+            try:
+                names = os.listdir(root)
+            except OSError:
+                continue
+            for name in names:
+                version = name.removeprefix("v")
+                executable = os.path.join(root, name, "bin", "holbuild")
+                if (
+                    name.startswith("v") and RELEASE.fullmatch(version)
+                    and tuple(map(int, version.split("."))) >= minimum
+                    and os.path.exists(os.path.join(root, name, done)) and os.access(executable, os.X_OK)
+                ):
+                    found.setdefault(tuple(map(int, version.split("."))), (version, executable))
+        return found[max(found)] if found else None
+
     def _build(self, version: str, directory: str) -> None:
         # holbuild finds its runtime sources where it was compiled, so it's built in the directory it runs from.
         shutil.rmtree(directory, ignore_errors=True)
@@ -626,7 +647,12 @@ def remove_children(directory: str) -> None:
     directories behind, which are made writable first."""
     def writable(function: Callable[..., Any], path: str, _: BaseException) -> None:
         os.chmod(os.path.dirname(path), 0o700)
-        function(path)
+        if function in (os.open, os.scandir):
+            # A directory rmtree couldn't read (mode 000 or 300): it skipped it, so this removes it.
+            os.chmod(path, 0o700)
+            shutil.rmtree(path, onexc=writable)
+        else:
+            function(path)
 
     try:
         entries = list(os.scandir(directory))
@@ -642,20 +668,53 @@ def remove_children(directory: str) -> None:
             print(f"cleaning {entry.path} failed: {error}", file=sys.stderr)
 
 
-def wait_for_disk(drain: Drain, coordinator: Coordinator, tiers: list[str], worker: str) -> None:
+def sweep_cache(releases: Releases, cache_limit_gb: int) -> None:
+    """Evict from the cache root as exec-action does before an action, down to its cap and the free-space floor,
+    with the newest release this host has that can do it without an action; none, and nothing is evicted."""
+    if (release := releases.newest(MIN_SWEEP_ONLY_RELEASE)) is None:
+        return
+    version, holbuild = release
+    command = [holbuild, "exec-action", "--sweep-only", "--cache-limit-gb", str(cache_limit_gb),
+               "--cache-min-free-gb", str(CACHE_MIN_FREE_GB)]
+    process = subprocess.Popen(command, env=exec_action_env(version=version), stdout=2, start_new_session=True)
+    try:
+        # A drain stops the sweep: the worker is idle, so it stops at once.
+        with releases.drain.interruptible():
+            returncode = process.wait(timeout=900)
+    except subprocess.TimeoutExpired:
+        print("sweeping the cache for disk space timed out", file=sys.stderr)
+        return
+    except DrainStopped:
+        return
+    finally:
+        stop_group(process)
+    if returncode != 0:
+        print(f"sweeping the cache for disk space failed: exit {returncode}", file=sys.stderr)
+
+
+def wait_for_disk(
+    drain: Drain, coordinator: Coordinator, tiers: list[str], worker: str, sweep: Callable[[], None]
+) -> None:
     """Return once the host's disk has room for an action (``disk_shortfall``), or the worker drains, so that a
     worker on a full disk doesn't claim action after action only to fail each at once while other hosts could run
     them. First the worker deletes what its own actions left in its cache root: the action sandboxes and temp
-    files, which no other worker shares and no action of its own uses between claims. While it still waits it
-    reports the host each poll, so the coordinator keeps the host, its disk and its workers in view."""
+    files, which no other worker shares and no action of its own uses between claims, and the record of what its
+    action root holds, which would no longer be true. Each poll it still waits it runs ``sweep``, the cache's own
+    eviction of checkpoints and shared entries, and reports the host, so the coordinator keeps the host, its disk
+    and its workers in view."""
     if disk_shortfall() is None:
         return
     cache = os.environ.get("HOLBUILD_CACHE")
     if cache:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(os.path.join(cache, "action-resident"))
         for directory in ("action", "tmp"):
             remove_children(os.path.join(cache, directory))
     logged = False
-    while (why := disk_shortfall()) is not None:
+    while disk_shortfall() is not None:
+        sweep()
+        if drain.stop.is_set() or (why := disk_shortfall()) is None:
+            return
         if not logged:
             print(f"waiting for disk space before claiming: {why}", file=sys.stderr, flush=True)
         try:
@@ -1349,9 +1408,10 @@ def main() -> None:
             with open(config, "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as out:
                 out.write('header = "' + header + '"\n')
             releases = replace(releases, discovery_config=config)
+        sweep = functools.partial(sweep_cache, releases, args.cache_limit_gb)
         while not drain.stop.is_set():
             with phases.timed("idle"):
-                wait_for_disk(drain, coordinator, tiers, args.name)
+                wait_for_disk(drain, coordinator, tiers, args.name, sweep)
             if args.cooperate_dir is not None:
                 try:
                     with phases.timed("memory_wait"), drain.interruptible():

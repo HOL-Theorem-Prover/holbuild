@@ -297,7 +297,9 @@ fun exec_action_help () = print
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
   \      --cache-limit-gb N [--cache-reserve-gb N] [--cache-min-free-gb N]\n\
   \      [--share-heaps] [--result FILE]\n\
-  \      [--ahead-parent INPUT_KEY:SPEC-SHA256 ... [--ahead-wait-seconds N]]\n\n\
+  \      [--ahead-parent INPUT_KEY:SPEC-SHA256 ... [--ahead-wait-seconds N]]\n\
+  \  holbuild [GLOBAL OPTIONS] exec-action --sweep-only\n\
+  \      --cache-limit-gb N [--cache-reserve-gb N] [--cache-min-free-gb N]\n\n\
   \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
   \action-spec), or the run spec (see run-action), and publish its result to\n\
   \the remote cache. The action runs in CACHE/action, with checkpoints in\n\
@@ -312,6 +314,8 @@ fun exec_action_help () = print
   \--cache-reserve-gb N Room to keep free under the limit (default: a tenth).\n\
   \--cache-min-free-gb N Also evict while the cache's disk has under N GB\n\
   \                     free, to N GB plus 8 GB (default: 0, off).\n\
+  \--sweep-only         Run no action: only evict, as before one, and exit 0.\n\
+  \                     For a worker waiting for disk space.\n\
   \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
   \                     other workers published, and publish this run's. The\n\
   \                     host store CACHE/checkpoint-store keeps their files.\n\
@@ -3918,6 +3922,8 @@ fun exec_action_command maxheap jobs args =
           SOME n => if n >= 0 then IntInf.fromInt n * 1073741824
                     else raise Error (label ^ " must be a non-negative integer")
         | NONE => raise Error (label ^ " must be a non-negative integer")
+    val sweep_only = List.exists (fn arg => arg = "--sweep-only") args
+    val args = List.filter (fn arg => arg <> "--sweep-only") args
     fun parse (opts as {spec, result, limit, reserve, floor, share}) rest =
       case rest of
           [] => opts
@@ -3973,12 +3979,19 @@ fun exec_action_command maxheap jobs args =
       | take_ahead (x :: xs) = x :: take_ahead xs
     val {spec, result, limit, reserve, floor, share} =
       parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, floor = 0, share = false} (take_ahead args)
-    val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
     val cache_cap =
       case limit of
           SOME limit =>
             {limit_bytes = limit, reserve_bytes = Option.getOpt (reserve, limit div 10), min_free_bytes = floor}
         | NONE => raise Error "exec-action requires --cache-limit-gb N"
+    val _ =
+      if not sweep_only then ()
+      else if Option.isSome spec then raise Error "exec-action --sweep-only takes no SPEC-SHA256"
+      else
+        (HolbuildBuildExec.sweep_worker_cache cache_cap;
+         TextIO.flushOut TextIO.stdErr;
+         Posix.Process.exit 0w0)
+    val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
     fun toolchain {git, rev, kernel = _} =
       let
         val _ = HolbuildActionSandbox.require_trusted_repository {git = git, rev = rev}

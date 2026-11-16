@@ -1024,7 +1024,7 @@ def test_a_worker_short_of_disk_cleans_its_own_action_and_temp_dirs_then_waits_r
     monkeypatch.setattr(worker, "disk_shortfall", shortfall)
     monkeypatch.setattr(drain.stop, "wait", wait)
 
-    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["high", "standard"], "w1")
+    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["high", "standard"], "w1", lambda: None)
 
     assert sorted(p.name for p in cache.rglob("*")) == [
         "action", "kept", "store", "tmp"
@@ -1041,9 +1041,113 @@ def test_a_worker_whose_cleaning_makes_room_waits_for_nothing(
     drain = worker.Drain()
     monkeypatch.setattr(drain.stop, "wait", lambda _: pytest.fail("waited"))
 
-    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["standard"], "w1")
+    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["standard"], "w1", lambda: None)
 
     assert server.reports == []
+
+
+def test_an_idle_worker_short_of_disk_sweeps_the_cache_until_there_is_room_without_claiming(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Emptying its own scratch can't make room the shared cache and the checkpoints hold: the worker runs their
+    eviction each poll while short, and the record of its action root goes before the root does."""
+    (tmp_path / "action" / "a1").mkdir(parents=True)
+    (tmp_path / "action-resident").write_text("holbuild-action-resident-v1\n")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path))
+    sweeps = 0
+
+    def sweep() -> None:
+        nonlocal sweeps
+        assert not (tmp_path / "action-resident").exists(), "the sweep ran before the action root's record went"
+        sweeps += 1
+
+    monkeypatch.setattr(worker, "disk_shortfall", lambda: "short" if sweeps < 3 else None)
+    drain = worker.Drain()
+    waits = 0
+
+    def wait(_: float) -> bool:
+        nonlocal waits
+        waits += 1
+        return waits > 10
+
+    monkeypatch.setattr(drain.stop, "wait", wait)
+
+    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["standard"], "w1", sweep)
+
+    assert (sweeps, waits, len(server.reports)) == (3, 2, 2)
+    assert not (tmp_path / "action-resident").exists()
+
+
+@pytest.mark.parametrize("mode", [0o000, 0o300])
+def test_cleaning_removes_directories_it_cannot_read(tmp_path: Path, mode: int) -> None:
+    (tmp_path / "a1" / "locked" / "deeper").mkdir(parents=True)
+    (tmp_path / "a1" / "locked" / "deeper" / "theory.dat").write_text("x")
+    (tmp_path / "a1" / "locked" / "theory.uo").write_text("x")
+    (tmp_path / "a1" / "locked").chmod(mode)
+    (tmp_path / "top").mkdir()
+    (tmp_path / "top").chmod(mode)
+
+    worker.remove_children(str(tmp_path))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_cache_sweep_runs_the_newest_release_that_has_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = tmp_path / "argv"
+
+    def release(root: Path, version: str, *, built: bool = True) -> None:
+        executable = root / f"v{version}" / "bin" / "holbuild"
+        executable.parent.mkdir(parents=True)
+        executable.write_text(f"#!/bin/sh\necho {version} \"$@\" >> {log}\n")
+        executable.chmod(0o755)
+        if built:
+            (root / f"v{version}" / worker.COMPLETE).touch()
+
+    baked, built = tmp_path / "baked", tmp_path / "built"
+    release(baked, "0.14.58")
+    release(baked, "0.15.0")
+    release(built, "0.15.1", built=False)  # a build that didn't finish
+    release(built, "0.15.0")
+    release(built, "0.14.60")
+    releases = Releases(str(built), "unused", "http://cache.test", None, baked_root=str(baked))
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+
+    worker.sweep_cache(releases, 200)
+
+    assert log.read_text() == "0.15.0 exec-action --sweep-only --cache-limit-gb 200 --cache-min-free-gb 16\n"
+    old = tmp_path / "old"
+    release(old, "0.14.59")  # released before --sweep-only
+    assert Releases(str(tmp_path / "none"), "unused", "", None, baked_root=str(old)).newest(
+        worker.MIN_SWEEP_ONLY_RELEASE
+    ) is None
+
+
+def test_a_drain_stops_the_cache_sweep_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    executable = tmp_path / "baked" / "v0.15.0" / "bin" / "holbuild"
+    executable.parent.mkdir(parents=True)
+    executable.write_text(f"#!/bin/sh\necho $$ > {tmp_path}/pid\nexec sleep 60\n")
+    executable.chmod(0o755)
+    drain = worker.Drain()
+    releases = Releases(str(tmp_path / "built"), "unused", "http://cache.test", None,
+                        baked_root=str(tmp_path / "baked"), drain=drain)
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+
+    def stop() -> None:
+        while not (tmp_path / "pid").exists():
+            time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=stop, daemon=True).start()
+    started = time.monotonic()
+    with drain.installed():
+        worker.sweep_cache(releases, 200)
+
+    assert drain.stop.is_set()
+    assert time.monotonic() - started < 10, "the sweep outlived the drain"
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((tmp_path / "pid").read_text()), 0)
 
 
 def test_the_host_report_gives_the_disk_with_the_least_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
