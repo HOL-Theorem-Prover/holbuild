@@ -50,6 +50,9 @@ from remote_exec.worker import (
 
 SPEC = "5" * 64
 RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=built\n"
+# What exec-action writes once it has stopped an interrupted action: the log it uploaded so far.
+LOG = f"log={'7' * 64} 12"
+INTERRUPTED = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=failed\nfailure=unavailable\n{LOG}\n"
 
 # A stand-in holbuild source tree: `make bin/holbuild` installs a script that logs its arguments and environment and
 # writes RECORD (or HOLBUILD_FAKE_RECORD) to its --result file, or ends without one when HOLBUILD_FAKE_CRASH is set:
@@ -65,10 +68,13 @@ if [ -n "$HOLBUILD_FAKE_HANG" ]; then
 fi
 echo "$@" >> "$HOLBUILD_FAKE_LOG"
 env > "$HOLBUILD_FAKE_LOG.env"
+# HOLBUILD_FAKE_PUBLISH: on TERM, publish for 3 s, then write INTERRUPTED, as exec-action does when interrupted
 if [ -n "$HOLBUILD_FAKE_PUBLISH" ]; then
+  result=; previous=
+  for arg in "$@"; do [ "$previous" != --result ] || result=$arg; previous=$arg; done
   sleep 120 &
   child=$!
-  trap 'sleep 0.1; kill -0 "$child" || exit 1; kill "$child"; wait "$child" || true; sleep 3; echo published > "$HOLBUILD_FAKE_LOG.published"; exit 1' TERM
+  trap 'sleep 0.1; kill -0 "$child" || exit 1; kill "$child"; wait "$child" || true; sleep 3; echo published > "$HOLBUILD_FAKE_LOG.published"; printf "%s" "{INTERRUPTED}" > "$result.tmp"; mv "$result.tmp" "$result"; exit 1' TERM
   echo ready > "$HOLBUILD_FAKE_LOG.ready"
   wait
 fi
@@ -420,7 +426,7 @@ def test_sigterm_kills_descendants_that_ignore_term_and_repeated_signals_do_not_
             process.send_signal(signal.SIGTERM)
             time.sleep(0.2)
             process.send_signal(signal.SIGTERM)
-            assert process.wait(timeout=15 if share_heaps else 8) == 0, (tmp_path / "worker.log").read_text()
+            assert process.wait(timeout=15) == 0, (tmp_path / "worker.log").read_text()
             child = Path(f"/proc/{int(child_file.read_text())}/stat")
             assert not child.exists() or child.read_text().split()[2] == "Z"
         finally:
@@ -430,15 +436,17 @@ def test_sigterm_kills_descendants_that_ignore_term_and_repeated_signals_do_not_
     assert len(server.claims) == 1
 
 
+@pytest.mark.parametrize("share_heaps", [False, True])
 @pytest.mark.parametrize("stop", ["drain", "lease-loss"])
-def test_interruption_allows_checkpoint_publication_before_teardown(
+def test_an_interrupted_action_publishes_its_checkpoints_and_reports_its_log(
     tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, stop: str,
+    share_heaps: bool,
 ) -> None:
     release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     server.next_claim = claim()
     monkeypatch.setenv("HOLBUILD_FAKE_PUBLISH", "1")
-    with running_worker(tmp_path, server, "0", "--share-heaps") as process:
+    with running_worker(tmp_path, server, "0", *(["--share-heaps"] if share_heaps else [])) as process:
         wait_for_file(Path(f"{logs[1]}.ready"))
         if stop == "drain":
             process.send_signal(signal.SIGTERM)
@@ -448,7 +456,8 @@ def test_interruption_allows_checkpoint_publication_before_teardown(
         if stop == "lease-loss":
             process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
-    assert server.completed == ([DRAINED] if stop == "drain" else [])
+    # A drained action is retried at once, keeping the log; a lost lease's report gives the coordinator the log.
+    assert server.completed == ([f"{DRAINED}{LOG}\n"] if stop == "drain" else [INTERRUPTED])
 
 
 def test_the_result_is_reported_before_exec_action_exits_and_a_lost_lease_then_stops_nothing(

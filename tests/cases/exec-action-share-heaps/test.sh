@@ -542,6 +542,11 @@ with open(f"{temp}/interrupted.log", "w") as log:
 PYTEST
 require_grep '^status=failed$' "$tmpdir/interrupted.result"
 require_grep '^failure=unavailable$' "$tmpdir/interrupted.result"
+# The log so far is uploaded, for the client to see how far the action got.
+interrupted_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/interrupted.result")
+[[ -n "$interrupted_log" ]] || { echo "interrupted action uploaded no log" >&2; cat "$tmpdir/interrupted.result" >&2; exit 1; }
+require_grep 'checkpoint-cancel-ready' "$tmpdir/remote/cas/$interrupted_log"
+require_grep 'exec-action failed: interrupted' "$tmpdir/remote/cas/$interrupted_log"
 [[ ! -e "$tmpdir/remote/ac/$key_interrupt" ]] || { echo "interrupted action published a built result" >&2; exit 1; }
 [[ ! -e "$interrupted/checkpoints" ]] || { echo "interrupted action kept private checkpoints" >&2; exit 1; }
 sed -i 's/OS.Process.sleep (Time.fromSeconds 120)/()/' "$project/src/InterruptedScript.sml"

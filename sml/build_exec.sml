@@ -12440,7 +12440,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           SOME path => path
         | NONE => current_build_log (current_log_dir root (#1 (!target)) (#2 (!target)))
     fun upload_log () =
-      if !cancelled orelse not (!HolbuildActionSandbox.outputs_validated) then NONE else
+      if not (!HolbuildActionSandbox.outputs_validated) then NONE else
       let val path = build_log ()
       in
         if not (file_exists path) then NONE
@@ -13057,6 +13057,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                          TextIO.closeOut out
                        end
                        handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e))
+              (* An interrupted action has a few seconds to stop in: its
+                 saved checkpoints, which a retry resumes from, go before
+                 its log. *)
+              val _ =
+                if !cancelled then
+                  (!deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
+                   deferred := (fn () => ()))
+                else ()
               val log = phase "log" upload_log
               (* A final failure's log is its only diagnostic and nothing
                  retries the action to recover it. *)

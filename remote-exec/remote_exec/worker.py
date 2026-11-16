@@ -1044,7 +1044,8 @@ def execute(
     report: Callable[[str], None],
 ) -> str | None:
     """The result record of the claimed action, or None once its lease is lost. A record exec-action writes
-    while it runs is passed to ``report`` at once; the record returned is then that one."""
+    while it runs is passed to ``report`` at once; the record returned is then that one. One it writes as it
+    stops for a lost lease is reported too, for the log of the action it stopped."""
     spec = claim["spec_sha256"]
     drain = releases.drain
     drain.publish_seconds = 0.0
@@ -1079,7 +1080,7 @@ def execute(
             env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )
-        drained_out = False
+        drained_out = lost = False
         # exec-action writes its result (atomically) before publishing for later actions; it is reported then,
         # and the worker waits for the rest without the lease, at most POST_RESULT_SECONDS.
         reported: str | None = None
@@ -1091,7 +1092,8 @@ def execute(
             while process.poll() is None:
                 if reported is None:
                     if lease.lost.is_set():
-                        return None
+                        lost = True
+                        break
                     if (record := read_result(result)) is not None:
                         now = time.monotonic()
                         if cooperate_dir is None:
@@ -1124,10 +1126,10 @@ def execute(
             if hard_stop is not None:
                 hard_stop.cancel()
             timed_out = seen > 0 and time.monotonic() - seen >= POST_RESULT_SECONDS
-            if args.share_heaps and process.poll() is None and not timed_out:
+            if process.poll() is None and not timed_out:
                 drain.publish_seconds = DRAIN_CHECKPOINT_PUBLISH_SECONDS
-                # Signal only the driver: it stops HOL, then publishes the
-                # sandbox-validated saves. Killing its group here loses them.
+                # Signal only the driver: it stops HOL, publishes the sandbox-validated saves, uploads the log
+                # and writes its record. Killing its group here loses them.
                 with contextlib.suppress(ProcessLookupError):
                     process.send_signal(signal.SIGTERM)
                 deadline = time.monotonic() + CHECKPOINT_PUBLISH_SECONDS
@@ -1157,8 +1159,15 @@ def execute(
             # Reported already: whatever the driver did after its result changes nothing for the client.
             print(f"{claim['theory']}: exit {process.returncode} after the result", file=sys.stderr, flush=True)
             return reported
+        if lost:
+            if (record := read_result(result)) is not None:
+                report(record)
+            return None
         if drained_out:
-            return failed_record(spec, "unavailable", "the worker's drain deadline passed before exec-action finished")
+            record = failed_record(spec, "unavailable", "the worker's drain deadline passed before exec-action finished")
+            # The log exec-action uploaded as it stopped shows how far the action got.
+            log = next((line for line in (read_result(result) or "").splitlines() if line.startswith("log=")), None)
+            return record if log is None else f"{record}{log}\n"
         if (record := read_result(result)) is None:
             if recordless := recordless_failure(process.returncode, drain.stop.is_set()):
                 failure, detail = recordless
