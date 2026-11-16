@@ -117,20 +117,22 @@ fun ensure_inotifywait () =
 fun sleep_debounce () = OS.Process.sleep (Time.fromReal 0.25)
 
 (* The watched files and the files under input directories, with their content
-   hashes.  inotifywait only starts after a build, so an edit made during the
-   build fires no event; comparing this from before the build with after it
-   finds such an edit. *)
+   hashes, sorted by path.  inotifywait only starts after a build, so an edit
+   made during the build fires no event; comparing this from before the build
+   with after it finds such an edit.  A directory or file that can't be read
+   is left out: the build reports it. *)
 fun snapshot ({paths, input_dirs, ...} : watch_set) =
   let
     fun files_under dir =
       map #2 (#files (HolbuildBuildPlan.walked_files_under dir ""))
-      handle OS.SysErr _ => []
-    fun file_hash path =
-      SOME (path, HolbuildHash.file_sha256 path)
-      handle IO.Io _ => NONE | OS.SysErr _ => NONE
+      handle OS.SysErr _ => [] | HolbuildBuildPlan.Error _ => []
+    fun add_hash (path, hashes) =
+      Binarymap.insert (hashes, path, HolbuildHash.file_sha256 path)
+      handle IO.Io _ => hashes | OS.SysErr _ => hashes
   in
-    List.mapPartial file_hash
-      (List.filter (not o is_dir) paths @ List.concat (map files_under input_dirs))
+    Binarymap.listItems
+      (List.foldl add_hash (Binarymap.mkDict String.compare)
+                  (List.filter (not o is_dir) paths @ List.concat (map files_under input_dirs)))
   end
 
 fun regex_escape text =
