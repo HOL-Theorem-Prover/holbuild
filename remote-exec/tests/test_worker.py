@@ -2016,7 +2016,7 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
     asked: list[str] = []
 
     def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        # /ac/ answers as given; /cas/, asked only after 404s from every node, misses.
+        # /ac/ answers as given; /cas/, asked after, misses.
         status = statuses[len(asked)] if len(asked) < len(statuses) else 404
         asked.append(command[-1])
         return subprocess.CompletedProcess(command, 22, f"\n{status}".encode(), f"HTTP {status}".encode())
@@ -2029,7 +2029,22 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
     with pytest.raises(error, match=message) as caught:
         ring.spec_version(SPEC)
     assert type(caught.value) is error
-    assert len(asked) == (4 if statuses == (404, 404) else len(statuses))
+    # /cas/ is asked after any /ac/ answer short of a hit or a refusal.
+    assert len(asked) == (len(statuses) if 403 in statuses else 4)
+
+
+def test_bootstrap_spec_under_cas_is_read_while_an_ac_node_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if "/cas/" in command[-1]:
+            return subprocess.CompletedProcess(command, 0, b"holbuild-version=0.14.60\n\n200", b"")
+        status = 503 if command[-1].startswith("http://one.test") else 404
+        return subprocess.CompletedProcess(command, 22, f"\n{status}".encode(), f"HTTP {status}".encode())
+
+    monkeypatch.setattr(subprocess, "run", fetch)
+    ring = Releases(str(tmp_path), "unused", "http://one.test,http://two.test", None)
+    assert ring.spec_version(SPEC) == "0.14.60"
 
 
 def test_bootstrap_spec_reads_one_written_compressed_under_ac(tmp_path: Path, server: Server) -> None:

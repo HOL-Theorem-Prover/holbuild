@@ -530,8 +530,13 @@ fun curl_put_compressed {urls, src} =
   handle e as Unavailable _ => raise e
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
+(* Names this release's remote layout: action entries under this key domain,
+   blobs under blob_key.  What a client recorded about a remote's contents
+   holds only for the layout it was recorded under. *)
+val layout = "holbuild-remote-ac-v2"
+
 fun remote_action_key key =
-  HolbuildHash.string_sha256 ("holbuild-remote-ac-v2\n" ^ key ^ "\n")
+  HolbuildHash.string_sha256 (layout ^ "\n" ^ key ^ "\n")
 
 fun action_urls cache key = request_urls cache "ac" (remote_action_key key)
 
@@ -557,15 +562,19 @@ fun curl_get_compressed {urls, dst} =
         | other => other
     (* A download or decompression that filled the disk need not say so, and
        removing the staged blob frees the space: probe while it is still there. *)
-    fun with_full_disk (result as HolbuildCacheBackend.Corrupt message) =
-          if not (String.isSubstring HolbuildCacheTransfer.no_space message) andalso
-             HolbuildCacheTransfer.out_of_space (OS.Path.dir dst)
-          then HolbuildCacheBackend.Corrupt (message ^ ": " ^ HolbuildCacheTransfer.no_space)
-          else result
+    fun noting_full_disk message =
+      if not (String.isSubstring HolbuildCacheTransfer.no_space message) andalso
+         HolbuildCacheTransfer.out_of_space (OS.Path.dir dst)
+      then message ^ ": " ^ HolbuildCacheTransfer.no_space
+      else message
+    fun with_full_disk (HolbuildCacheBackend.Corrupt message) = HolbuildCacheBackend.Corrupt (noting_full_disk message)
       | with_full_disk result = result
   in
     with_full_disk (fetch ()) before remove_file compressed
-    handle e => (remove_file compressed; raise e)
+    handle Unavailable message =>
+             let val message = noting_full_disk message
+             in remove_file compressed; raise Unavailable message end
+         | e => (remove_file compressed; raise e)
   end
 
 fun lookup_blob cache sha256 =
