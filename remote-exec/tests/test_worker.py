@@ -22,6 +22,7 @@ import pytest
 
 from remote_exec import worker
 from remote_exec.auth import cache_discovery_token
+from remote_exec.cache import blob_key
 from remote_exec.formats import parse_result
 from remote_exec.worker import (
     DISK_FLOOR,
@@ -125,10 +126,11 @@ def release_tarball(path: Path, version: str, makefile: str = FAKE_MAKEFILE) -> 
 
 @dataclass
 class Server:
-    """The coordinator's worker endpoints, the remote cache's ``/cas/``, and the ECS agent's task protection."""
+    """The coordinator's worker endpoints, the remote cache's specs, and the ECS agent's task protection."""
 
     url: str = ""
-    specs: dict[str, str] = field(default_factory=dict)
+    specs: dict[str, str] = field(default_factory=dict)  # zstd-compressed under /ac/<blob key>
+    legacy_specs: dict[str, str] = field(default_factory=dict)  # as releases before 0.15.0 wrote them, under /cas/
     completed: list[str] = field(default_factory=list)
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
@@ -169,7 +171,16 @@ def server() -> Iterator[Server]:
                 self.wfile.write(b"holbuild-action-spec-v1\n")
                 self.close_connection = True
                 return
-            spec = state.specs.get(self.path.removeprefix("/cas/"))
+            compressed = {f"/ac/{blob_key(digest)}": spec for digest, spec in state.specs.items()}
+            if self.path in compressed:
+                body = subprocess.run(["zstd", "-qc"], input=compressed[self.path].encode(), capture_output=True,
+                                      check=True).stdout
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            spec = state.legacy_specs.get(self.path.removeprefix("/cas/"))
             self.reply(404) if spec is None else self.reply(200, spec)
 
         def do_POST(self) -> None:
@@ -1960,7 +1971,7 @@ def test_bootstrap_spec_uses_second_node_when_primary_is_unreachable(tmp_path: P
     nodes = ["http://127.0.0.1:1", server.url]
     digest = next(
         key for i in range(100)
-        if ranked_nodes(nodes, key := hashlib.sha256(str(i).encode()).hexdigest())[0] == nodes[0]
+        if ranked_nodes(nodes, blob_key(key := hashlib.sha256(str(i).encode()).hexdigest()))[0] == nodes[0]
     )
     server.specs[digest] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     ring = Releases(str(tmp_path), "unused", ",".join(nodes), None)
@@ -1975,17 +1986,21 @@ def test_bootstrap_spec_falls_back_before_parsing(
 
     nodes = ["http://one.test", "http://two.test"]
     asked: list[str] = []
+    run = subprocess.run
+    body = run(["zstd", "-qc"], input=b"holbuild-version=1.2.3\n", capture_output=True, check=True).stdout
 
-    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if command[0] == "zstd":
+            return run(command, **kwargs)
         asked.append(command[-1])
         assert "--retry" not in command
         if len(asked) == 1:
-            return subprocess.CompletedProcess(command, 22, f"\n{status}", "HTTP error")
-        return subprocess.CompletedProcess(command, 0, "holbuild-version=1.2.3\n\n200", "")
+            return subprocess.CompletedProcess(command, 22, f"\n{status}".encode(), b"HTTP error")
+        return subprocess.CompletedProcess(command, 0, body + b"\n200", b"")
 
     monkeypatch.setattr(subprocess, "run", fetch)
     assert Releases(str(tmp_path), "unused", ",".join(nodes), None).spec_version(SPEC) == "1.2.3"
-    assert asked == [f"{node}/cas/{SPEC}" for node in ranked_nodes(nodes, SPEC)]
+    assert asked == [f"{node}/ac/{blob_key(SPEC)}" for node in ranked_nodes(nodes, blob_key(SPEC))]
 
 
 def test_worker_cache_ring_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2000,10 +2015,11 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
 ) -> None:
     asked: list[str] = []
 
-    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        status = statuses[len(asked)]
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        # /ac/ answers as given; the /cas/ fallback, asked only after 404s from every node, misses.
+        status = statuses[len(asked)] if len(asked) < len(statuses) else 404
         asked.append(command[-1])
-        return subprocess.CompletedProcess(command, 22, f"\n{status}", f"HTTP {status}")
+        return subprocess.CompletedProcess(command, 22, f"\n{status}".encode(), f"HTTP {status}".encode())
 
     monkeypatch.setattr(subprocess, "run", fetch)
     ring = Releases(str(tmp_path), "unused", "http://one.test,http://two.test", None)
@@ -2013,7 +2029,27 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
     with pytest.raises(error, match=message) as caught:
         ring.spec_version(SPEC)
     assert type(caught.value) is error
-    assert len(asked) == len(statuses)
+    assert len(asked) == (4 if statuses == (404, 404) else len(statuses))
+
+
+def test_bootstrap_spec_reads_one_an_older_release_wrote_under_cas(tmp_path: Path, server: Server) -> None:
+    server.legacy_specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=0.14.60\n"
+    assert Releases(str(tmp_path), "unused", server.url, None).spec_version(SPEC) == "0.14.60"
+
+
+def test_bootstrap_spec_that_does_not_decompress_is_corrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = subprocess.run
+
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if command[0] == "zstd":
+            return run(command, **kwargs)
+        return subprocess.CompletedProcess(command, 0, b"holbuild-version=1.2.3\n\n200", b"")
+
+    monkeypatch.setattr(subprocess, "run", fetch)
+    with pytest.raises(RuntimeError, match="corrupt"):
+        Releases(str(tmp_path), "unused", "http://one.test", None).spec_version(SPEC)
 
 
 def test_worker_discovery_exposes_only_a_scoped_token_to_the_action_and_cleans_it_on_exit(

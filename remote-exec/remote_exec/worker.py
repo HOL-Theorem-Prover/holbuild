@@ -14,7 +14,6 @@ import ctypes
 import errno
 import fcntl
 import functools
-import hashlib
 import http.client
 import itertools
 import json
@@ -371,14 +370,15 @@ class Releases:
     def spec_version(self, spec_sha256: str) -> str:
         """The ``holbuild-version`` of the action spec stored in the remote cache: zstd-compressed under ``/ac/``,
         or as written by releases before 0.15.0, under ``/cas/``."""
-        compressed = self._fetch_spec(f"ac/{blob_key(spec_sha256)}", blob_key(spec_sha256))
+        compressed = self._fetch_spec(spec_sha256, f"ac/{blob_key(spec_sha256)}", blob_key(spec_sha256))
         if compressed is None:
-            spec = self._fetch_spec(f"cas/{spec_sha256}", spec_sha256)
+            spec = self._fetch_spec(spec_sha256, f"cas/{spec_sha256}", spec_sha256)
         else:
+            # zstd checks the frame's checksum; exec-action checks the spec's digest when it fetches it.
             decoded = subprocess.run(["zstd", "-dcq"], input=compressed, check=False, capture_output=True)
-            spec = decoded.stdout if decoded.returncode == 0 else None
-            if spec is None or hashlib.sha256(spec).hexdigest() != spec_sha256:
-                raise RuntimeError(f"spec {spec_sha256} in the remote cache is corrupt")
+            if decoded.returncode != 0:
+                raise RuntimeError(f"spec {spec_sha256} in the remote cache is corrupt: {decoded.stderr.decode().strip()}")
+            spec = decoded.stdout
         if spec is None:
             raise RuntimeError(f"spec {spec_sha256} is missing from the remote cache: HTTP 404")
         versions = [
@@ -390,7 +390,7 @@ class Releases:
             raise RuntimeError(f"spec {spec_sha256} has {len(versions)} holbuild-version lines, expected 1")
         return versions[0]
 
-    def _fetch_spec(self, path: str, digest: str) -> bytes | None:
+    def _fetch_spec(self, spec_sha256: str, path: str, digest: str) -> bytes | None:
         """The body at ``path`` on the first node ranked by ``digest`` that has it; None when every node answers
         404."""
         # -g: no URL globbing, whose errors print the URL with any credentials in it.
@@ -416,12 +416,12 @@ class Releases:
                         [*command, f"{node}/{path}"], check=False, capture_output=True, timeout=120
                     )
             except subprocess.TimeoutExpired:
-                unavailable = f"fetching {path} from the remote cache timed out"
+                unavailable = f"fetching spec {spec_sha256} from the remote cache timed out"
                 continue
             body, _, status = fetched.stdout.rpartition(b"\n")
             if fetched.returncode == 0:
                 return body
-            failure = f"fetching {path} from the remote cache failed: {fetched.stderr.decode(errors='replace').strip()}"
+            failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.decode(errors='replace').strip()}"
             if fetched.returncode == 22 and status.startswith(b"4") and status != b"429":
                 if status == b"404":
                     continue

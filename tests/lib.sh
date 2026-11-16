@@ -62,6 +62,39 @@ start_remote_cache_server() {
   remote_url="http://127.0.0.1:$(< "$port_file")"
 }
 
+# The /ac/ key holbuild stores blob $1 (a SHA-256) under, zstd-compressed.
+blob_key() {
+  printf 'holbuild-zstd-blob-v1\n%s\n' "$1" | sha256sum | cut -c1-64
+}
+
+# Where the test remote cache rooted at $1 keeps blob $2's compressed bytes.
+remote_blob() {
+  printf '%s/ac/%s\n' "$1" "$(blob_key "$2")"
+}
+
+# Blob $2 of the test remote cache rooted at $1, decompressed to stdout.
+remote_blob_text() {
+  zstd -dcq "$(remote_blob "$1" "$2")"
+}
+
+# Stores file $2 in the test remote cache rooted at $1 as holbuild would; prints its digest.
+put_remote_blob() {
+  local digest
+  digest=$(sha256sum "$2" | cut -d' ' -f1)
+  mkdir -p "$1/ac"
+  zstd -q -c "$2" > "$(remote_blob "$1" "$digest")"
+  printf '%s\n' "$digest"
+}
+
+# Removes every blob from the test remote cache rooted at $1, keeping its action entries.
+remove_remote_blobs() {
+  local entry
+  for entry in "$1"/ac/*; do
+    [[ -f "$entry" && $(head -c4 "$entry" | od -An -tx1 | tr -d ' \n') == 28b52ffd ]] && rm -f "$entry"
+  done
+  return 0
+}
+
 holbuild_pinned_hol_rev() {
   if [[ -n "${HOLBUILD_TEST_HOL_REV:-}" ]]; then
     printf '%s\n' "$HOLBUILD_TEST_HOL_REV"

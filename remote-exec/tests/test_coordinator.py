@@ -30,7 +30,7 @@ def input_key(name: str) -> str:
 
 
 def ac_key(name: str) -> str:
-    return hashlib.sha256(f"holbuild-remote-ac-v1\n{input_key(name)}\n".encode()).hexdigest()
+    return hashlib.sha256(f"holbuild-remote-ac-v2\n{input_key(name)}\n".encode()).hexdigest()
 
 
 def spec(name: str) -> str:
