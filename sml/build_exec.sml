@@ -11956,11 +11956,17 @@ fun write_missing_modules cache root tc {deps, loads} =
       ", base_state = " ^ HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^
       ", output = " ^ HolbuildToolchain.sml_string output ^
       ", limit = " ^ Int.toString module_writer_limit ^ "};"
+    (* A worker's containers can share the store on a mount of its own,
+       which rename cannot cross. *)
+    fun install old new =
+      FS.rename {old = old, new = new}
+      handle e as OS.SysErr (_, SOME err) =>
+        if err = Posix.Error.xdev then copy_binary old new else raise e
     fun move file =
       if module_file_wanted expected file orelse
          file = module_store_unsupported orelse
          (file = module_store_base_theories andalso not (isSome base_theories))
-      then FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)}
+      then install (Path.concat (output, file)) (Path.concat (store, file))
       else ()
     fun write () =
       (HolbuildRemoveTree.remove_untrusted output;

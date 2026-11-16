@@ -5,16 +5,18 @@
 # the modules the action wants, nor while another process holds the
 # store's writer lock.  A fake HOL stands in for the writer: it counts its
 # runs and leaves the files named in $tmpdir/writes in its output
-# directory.
+# directory.  Where /dev/shm is another file system, a store there stands
+# for one a worker's containers share on a mount of its own.
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 source "$ROOT/tests/lib.sh"
 tmpdir=$(make_temp_dir)
-trap 'cleanup_temp_dir "$tmpdir"' EXIT
+other_fs=
+trap 'cleanup_temp_dir "$tmpdir"; [[ -z $other_fs ]] || rm -rf "$other_fs"' EXIT
 mkdir -p "$tmpdir/cache" "$tmpdir/root/src" "$tmpdir/root/.holbuild"
 
 sha() { sha1sum "$1" | cut -d' ' -f1; }
-for hol in hol1 hol2; do
+for hol in hol1 hol2 hol3; do
   mkdir -p "$tmpdir/$hol/bin" "$tmpdir/$hol/sigobj" "$tmpdir/$hol/tools-poly/poly"
   : > "$tmpdir/$hol/bin/hol.state"
   : > "$tmpdir/$hol/sigobj/boolTheory.uo"
@@ -131,5 +133,19 @@ val _ = check "the unsupported marker was not stored" (runs "hol2" = 1 andalso s
 val _ = fill "hol2";
 val _ = check "a writer ran for an unsupported toolchain" (runs "hol2" = 1);
 SML
+if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmpdir") ]]; then
+  other_fs=$(mktemp -d /dev/shm/holbuild-module-writer.XXXXXX)
+  cat >> "$tmpdir/writer.sml" <<SML
+(* A store on another file system: rename can't reach it, so modules are copied in. *)
+val _ = E.write_text "$tmpdir/hol3/tools-poly/poly/theory_modules.ML" "";
+val _ = Posix.FileSys.symlink {old = "$other_fs", new = store "hol3"};
+val _ = writes [a, b, "base-theories"];
+val _ = fill "hol3";
+val _ = check "modules were not stored on another file system"
+          (runs "hol3" = 1 andalso List.all (stored "hol3") [a, b, "base-theories"]);
+SML
+else
+  echo "skipping the store on another file system: no /dev/shm on another file system"
+fi
 (cd "$ROOT" && HOLBUILD_CACHE="$tmpdir/cache" \
   "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/writer.sml")
