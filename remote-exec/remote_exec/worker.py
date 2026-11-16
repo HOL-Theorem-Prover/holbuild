@@ -48,7 +48,7 @@ MIN_SANDBOX_RELEASE = (0, 13, 58)
 MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
 MIN_FREE_FLOOR_RELEASE = (0, 14, 57)  # the first whose exec-action takes --cache-min-free-gb
-MIN_SWEEP_ONLY_RELEASE = (0, 14, 59)  # the first whose exec-action takes --sweep-only
+MIN_SWEEP_ONLY_RELEASE = (0, 14, 60)  # the first whose exec-action takes --sweep-only
 CACHE_MIN_FREE_GB = 16  # the free space the cache cap keeps on the cache's disk for writers it doesn't count
 
 

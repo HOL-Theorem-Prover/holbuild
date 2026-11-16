@@ -236,7 +236,7 @@ empties the `action` and `tmp` directories of its `HOLBUILD_CACHE` root, which
 its own finished actions left behind, and drops `action-resident`, the record of
 what `action` held. While it still waits, each poll it runs the cache sweep an
 action would start with, `exec-action --sweep-only` with its cap and the 16 GB
-floor, using the newest release it has that takes it (0.14.59 and later), and
+floor, using the newest release it has that takes it (0.14.60 and later), and
 reports its host to the coordinator with `POST /v1/work/report`.
 
 Each claim and heartbeat also reports the worker's host: its id (the kernel's

@@ -1108,7 +1108,9 @@ def test_the_cache_sweep_runs_the_newest_release_that_has_it(
     worker.sweep_cache(releases, 200)
 
     assert log.read_text() == "0.15.0 exec-action --sweep-only --cache-limit-gb 200 --cache-min-free-gb 16\n"
-    assert Releases(str(tmp_path / "none"), "unused", "", None, baked_root=str(tmp_path / "none")).newest(
+    old = tmp_path / "old"
+    release(old, "0.14.59")  # released before --sweep-only
+    assert Releases(str(tmp_path / "none"), "unused", "", None, baked_root=str(old)).newest(
         worker.MIN_SWEEP_ONLY_RELEASE
     ) is None
 
