@@ -42,17 +42,22 @@ fun package_paths (package, paths) =
                (HolbuildProject.package_generators package)
   end
 
-(* The path to watch for an extra-input declaration DECL relative to BASE: the
-   file or directory it names or, for a glob, the directory of its literal
-   prefix, since a glob is matched against every file below BASE. *)
-fun extra_input_watch_path base decl =
+(* The path to watch for an extra-input declaration DECL relative to BASE in
+   the package at ROOT: the file or directory it names or, for a glob, the
+   directory of its literal prefix, since a glob is matched against every file
+   below BASE.  While that path is missing, its nearest existing ancestor in the
+   package, whose recursive watch sees it appear. *)
+fun extra_input_watch_path root base decl =
   let
     val literal = Substring.takel (fn c => c <> #"*" andalso c <> #"?") (Substring.full decl)
     val path =
       if Substring.size literal = size decl then decl
       else Substring.string (Substring.dropr (fn c => c <> #"/") literal)
+    fun existing path =
+      if exists path orelse not (String.isPrefix (root ^ "/") path) then path
+      else existing (Path.dir path)
   in
-    Path.mkCanonical (if Path.isAbsolute path then path else Path.concat(base, path))
+    existing (Path.mkCanonical (if Path.isAbsolute path then path else Path.concat(base, path)))
   end
 
 (* Adds a source and the extra inputs its action policy and its own
@@ -69,9 +74,11 @@ fun source_paths (source : HolbuildSourceIndex.source, paths) =
             (#extra_deps (HolbuildDependencies.extract_textual source_path))
       else []
   in
-    List.foldl (fn ((base, decl), acc) => add_existing (extra_input_watch_path base decl) acc)
-               (add_readable source_path paths)
-               (manifest_decls @ source_decls)
+    List.foldl
+      (fn ((base, decl), acc) =>
+        add_existing (extra_input_watch_path (Path.mkCanonical (#package_root source)) base decl) acc)
+      (add_readable source_path paths)
+      (manifest_decls @ source_decls)
   end
 
 (* The directories whose manifests are in use. A manifest that takes

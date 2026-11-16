@@ -23,10 +23,11 @@ command -v inotifywait >/dev/null || {
   exit 1
 }
 
-# Extra inputs outside the members: one named by a glob in the manifest, one
-# declared in the source.  Changing either must trigger a rebuild.
+# Extra inputs outside the members: ones named by globs in the manifest, one
+# declared in the source.  Changing any must trigger a rebuild, including
+# creating the missing directory of a glob whose parent exists.
 project=$tmpdir/project
-mkdir -p "$project/src" "$project/data" "$project/extra"
+mkdir -p "$project/src" "$project/data" "$project/extra" "$project/more"
 cat > "$project/holproject.toml" <<TOML
 $(write_schema2_prelude)
 [project]
@@ -36,7 +37,7 @@ name = "watch-extra-deps"
 members = ["src"]
 
 [actions.ATheory]
-extra_deps = ["data/*.txt"]
+extra_deps = ["data/*.txt", "more/tables/*.txt"]
 TOML
 cat > "$project/src/AScript.sml" <<'SML'
 open HolKernel boolLib bossLib;
@@ -86,3 +87,8 @@ sleep 1
 
 echo v2 > "$project/extra/table.txt"
 wait_for_count "waiting for changes" "$watch_log" 3 45
+sleep 1
+
+mkdir "$project/more/tables"
+echo v1 > "$project/more/tables/table.txt"
+wait_for_count "waiting for changes" "$watch_log" 4 45
