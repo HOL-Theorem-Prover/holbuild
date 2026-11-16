@@ -1144,7 +1144,7 @@ async def test_wakes_pack_compatible_hosts_with_fifo_ties(
     coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled, False))
     for index in order:
         coordinator._wake_claim(tier)
-        assert wakes[index].result() == (tier, False)
+        assert wakes[index].result() == (tier, False, None)
         assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
     coordinator._wake_claim(tier)
     assert coordinator.made_ready == len(order) + 1
@@ -1154,7 +1154,8 @@ async def test_tail_hosts_empty_once_demand_falls_after_a_peak_ran_every_theory_
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A peak runs the theories on every slot of every host; a smaller stream of the same theories then packs onto
-    the first hosts, and the others reach no leases, so they can scale in."""
+    the first hosts, and the others reach no leases, so they can scale in, though they hold the theories' contexts
+    (locality steers only hosts below the scale-in line)."""
     monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only wakes end the waits in time
     hosts, slots, theories, demand = [f"host-{i}" for i in range(4)], 3, 12, 6  # demand fits the first two hosts
     running: deque[tuple[str, str, Claim]] = deque()  # host, action name and claim of each lease, oldest first
@@ -1185,9 +1186,11 @@ async def test_tail_hosts_empty_once_demand_falls_after_a_peak_ran_every_theory_
             cache.keys.add(ac_key(name))
             assert (await complete(http, str(claim.attempt_token), result(name, "built"))).status_code == 200
             waiting.append(asyncio.create_task(free_slot(host)))
-        for host in hosts:  # every host still runs something, so it reports leases
+        for host in hosts:  # every host still runs something, so it reports leases and its workers are seen
             leases = sum(h == host for h, _, _ in running)
             coordinator.report_host(HostReport(host, 50.0, 64 << 30, 40 << 30, 52 << 30, 6 << 30, leases, False, 1))
+            for slot in range(slots):
+                coordinator.report_worker(host, f"{host}-{slot}", ["standard"])
         await asyncio.sleep(0.05)
         await submit_action(f"s{step}", f"t{step % theories}")
         host, claim = await asyncio.wait_for(claimed.get(), 10)

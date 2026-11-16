@@ -276,6 +276,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             ],
             "phases": asdict(status.phases),
             "scaler": None if status.scaler is None else {**asdict(status.scaler), "at": status.scaler.at.isoformat()},
+            "locality": asdict(status.locality),
         }
 
     @app.post("/v1/work/claim", dependencies=worker, response_model=None)
