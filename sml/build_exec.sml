@@ -9996,7 +9996,10 @@ fun fetch_resident_dat remote root (spec : action_spec) resident =
 fun resident_misfits_parents remote root (spec : action_spec) resident =
   let
     fun as_remote key =
-      case (HolbuildCache.get_action (cache_root ()) key, HolbuildRemoteCache.get_action remote key) of
+      (* The worker restored the parent, so its entry exists, maybe on another
+         node only. *)
+      case (HolbuildCache.get_action (cache_root ()) key,
+            HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key)) of
           (SOME mine, SOME theirs) => cache_manifest_outputs_equal key mine theirs
         | _ => false
   in
