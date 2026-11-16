@@ -224,17 +224,32 @@ holbuild's memory admission in that directory would start one more child
 there, so an action a busy host couldn't start yet stays at the coordinator
 for a worker on another host. Likewise a worker claims only while its temp
 dir and its `HOLBUILD_CACHE` root each have 4 GiB free, so a host whose disk
-is full doesn't take actions it would only fail.
+is full doesn't take actions it would only fail. A worker short of disk first
+empties the `action` and `tmp` directories of its `HOLBUILD_CACHE` root, which
+its own finished actions left behind, and while it still waits it reports its
+host to the coordinator with `POST /v1/work/report` each poll.
 
 Each claim and heartbeat also reports the worker's host: its id (the kernel's
 `boot_id`, the same in every container on the host), the share of CPU time
 idle since the worker's previous CPU sample (iowait counts as busy), its
 memory as holbuild's admission sees it, whether that admission would
 hold a child back now or held the worker back since its last report, and
-its `--host-rank`. A
+its `--host-rank`, and the bytes free and in all on whichever of the temp
+dir, `TMPDIR` and the `HOLBUILD_CACHE` root has the least free. A
 report is left out when the host can't be read at once, as while an
 admission holds the cooperate dir's lock. `GET /v1/queue` lists them, so a
 reader can tell whether hosts have CPU to spare or are short of memory.
+
+The coordinator quarantines a host while its latest report has less than
+4 GiB free, or while its last five results were all infrastructure failures
+(`internal`, `disk`, `toolchain`, `publish` or `unavailable`) with no success
+since. A quarantined host's claims get no work and don't wait among the other
+claims, so they neither take wakes nor hold back worse-ranked hosts; the
+autoscaler doesn't count its workers as capacity. One quarantined for its
+failures gets one probe claim a minute, and a success ends the quarantine;
+any failed probe keeps it. Both rules live in each coordinator process's
+memory, as host reports do: a replica goes by the reports, claims and results
+that reach it, and starts empty on a restart.
 
 Each claim also reports where the worker's time went since its previous
 claim, in seconds per phase, so a reader of `GET /v1/queue` can tell what
@@ -678,7 +693,9 @@ scale-in protection through the agent's `task-protection/v1/state` endpoint,
 for 180 minutes at a time. ECS refuses to renew protection with
 `DEPLOYMENT_BLOCKED` while a scale-in or rolling deployment wants the task
 gone, so the window set when the action is claimed has to outlast the longest
-action. The worker clears protection when the action ends or loses its lease,
+action. A refusal that names the container instance `DRAINING` drains the
+worker, since ECS doesn't stop a protected task there; `DEPLOYMENT_BLOCKED`
+alone doesn't, since ECS also gives it to healthy instances. The worker clears protection when the action ends or loses its lease,
 and a worker that dies takes its task down with it. Failures are logged and
 the action carries on.
 
@@ -787,13 +804,15 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   `age_s` seconds old,
   except that `cpu_idle_pct` is the latest one measured:
   ```json
-  {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "rank": 0, "age_s": 1.2}
+  {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "rank": 0, "disk_free": 81200000000, "disk_total": 214700000000, "age_s": 1.2, "quarantined": null}
   ```
   Memory is in bytes: `MemTotal` and `MemAvailable`, the `--cooperate-dir`
   budget, the charges of the leases held there and their number;
   `memory_short` is true when admission would hold back a child of the
   worker's `--max-heap` now, or held the worker back from claiming since its
-  previous report.
+  previous report. `disk_free` and `disk_total` are null from workers too old
+  to report them; `quarantined` is `"disk"` or `"failures"` while the host is
+  quarantined, else null.
 
 ### Worker
 
@@ -818,6 +837,11 @@ when that is under a second old)
 - 200 `{"lease_s": 120}`: the lease now runs `lease_s` seconds from now
 - 409 when the lease expired or was revoked (the batch was cancelled or
   failed); the worker stops the action
+
+`POST /v1/work/report` with `{"tier": …, "also_claim": […], "worker": "<name>", "host": <report>}`,
+the fields as for a claim, from a worker that isn't claiming, as while it waits for disk
+
+- 204
 
 `POST /v1/work/<attempt_token>/complete` with the `holbuild-action-result-v1`
 record `exec-action --result` wrote as the body (`text/plain`)

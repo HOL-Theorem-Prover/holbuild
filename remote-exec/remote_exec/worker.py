@@ -47,7 +47,7 @@ COMPLETE = ".complete"  # stamp file of a finished release build
 MIN_SANDBOX_RELEASE = (0, 13, 58)
 MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
-MIN_FREE_FLOOR_RELEASE = (0, 14, 56)  # the first whose exec-action takes --cache-min-free-gb
+MIN_FREE_FLOOR_RELEASE = (0, 14, 57)  # the first whose exec-action takes --cache-min-free-gb
 
 
 @functools.cache
@@ -136,7 +136,9 @@ class Drain:
         self.deadline = time.monotonic() + self.seconds
         self.stop.set()
         self.wake.set()
-        if self.interrupt:
+        # Only the SIGTERM handler, which runs on the main thread, interrupts the main thread's blocking call; a
+        # request from another thread (Protection's, on the lease thread) leaves the call to see ``stop`` after.
+        if self.interrupt and threading.current_thread() is threading.main_thread():
             self.interrupt = False
             raise DrainStopped
 
@@ -267,6 +269,14 @@ class Coordinator:
             raise ClaimRefused(f"claim answered {status}: {response}")
         return response
 
+    def report(self, tiers: list[str], worker: str) -> None:
+        """Report the host while the worker isn't claiming, so the coordinator keeps knowing it and its workers. A
+        coordinator without the endpoint (404) is no error."""
+        body = {"tier": tiers[0], "also_claim": tiers[1:], "worker": worker}
+        status, response = self.post_reporting("/v1/work/report", body, timeout=REQUEST_TIMEOUT_S)
+        if status not in (204, 404):
+            raise RuntimeError(f"host report answered {status}: {response}")
+
     def heartbeat(self, token: str) -> bool:
         status, body = self.post_reporting(f"/v1/work/{token}/heartbeat", {}, timeout=REQUEST_TIMEOUT_S)
         if status not in (200, 409):
@@ -310,11 +320,15 @@ class Coordinator:
 
 class Protection:
     """Scale-in protection while the worker holds an action: ``--protection-cmd on|off``, or the ECS agent's
-    task-protection endpoint when ``ECS_AGENT_URI`` is set, or nothing. Failures are logged, never raised."""
+    task-protection endpoint when ``ECS_AGENT_URI`` is set, or nothing. Failures are logged, never raised; one that
+    names the container instance DRAINING drains ``drain``, since ECS won't stop a worker that keeps protecting
+    itself there. ECS also refuses protection with DEPLOYMENT_BLOCKED on a healthy instance, in a scale-in or a
+    rolling deployment, so that reason alone doesn't drain."""
 
-    def __init__(self, command: str | None, ecs_agent_uri: str | None) -> None:
+    def __init__(self, command: str | None, ecs_agent_uri: str | None, drain: Drain | None = None) -> None:
         self.command = command
         self.ecs_agent_uri = ecs_agent_uri
+        self.drain = drain
 
     def set(self, *, enabled: bool, timeout: float = 30) -> None:
         try:
@@ -336,6 +350,9 @@ class Protection:
                     raise RuntimeError(str(failure))
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
+            if enabled and self.drain is not None and "DRAINING" in str(error):
+                print("the container instance is draining; draining the worker", file=sys.stderr)
+                self.drain.request()
 
 
 @dataclass(frozen=True)
@@ -588,27 +605,79 @@ def cache_min_free_gb(path: str) -> int:
     return max(16, math.ceil(stat.f_blocks * stat.f_frsize * 0.05 / GIB))
 
 
-def disk_shortfall() -> str | None:
-    """Why the host's disk has no room for an action now, or None if it has: the temp dir, where the worker keeps
-    its scratch, ``TMPDIR`` (else /tmp), where exec-action keeps its own (``tempfile`` falls back from an unwritable
-    one), or the
-    ``HOLBUILD_CACHE`` root, where exec-action's sandboxes and stores are, has less than DISK_FLOOR free."""
+def disk_paths() -> list[str]:
+    """Where an action needs disk: the temp dir, where the worker keeps its scratch, ``TMPDIR`` (else /tmp), where
+    exec-action keeps its own (``tempfile`` falls back from an unwritable one), and the ``HOLBUILD_CACHE`` root, where
+    exec-action's sandboxes and stores are."""
     paths = (tempfile.gettempdir(), os.environ.get("TMPDIR", "/tmp"), os.environ.get("HOLBUILD_CACHE"))
-    for path in dict.fromkeys(path for path in paths if path):
+    return list(dict.fromkeys(path for path in paths if path))
+
+
+def disk_shortfall() -> str | None:
+    """Why the host's disk has no room for an action now, or None if it has: one of ``disk_paths`` has less than
+    DISK_FLOOR free."""
+    for path in disk_paths():
         if (free := free_bytes(path)) < DISK_FLOOR:
             return f"{path} has {free // MIB} MiB free, below {DISK_FLOOR // MIB} MiB"
     return None
 
 
-def wait_for_disk(drain: Drain) -> None:
+def disk_usage() -> tuple[int, int]:
+    """Free and total bytes of the file system of ``disk_paths`` with the least free, the one ``disk_shortfall``
+    goes by."""
+    least: tuple[int, int] | None = None
+    for path in disk_paths():
+        stat = file_system(path)
+        usage = (stat.f_bavail * stat.f_frsize, stat.f_blocks * stat.f_frsize)
+        if least is None or usage[0] < least[0]:
+            least = usage
+    assert least is not None  # the temp dir is always among the paths
+    return least
+
+
+def remove_children(directory: str) -> None:
+    """Delete everything in ``directory``, keeping it; a missing one has nothing to delete. HOL leaves read-only
+    directories behind, which are made writable first."""
+    def writable(function: Callable[..., Any], path: str, _: BaseException) -> None:
+        os.chmod(os.path.dirname(path), 0o700)
+        function(path)
+
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path, onexc=writable)
+            else:
+                os.unlink(entry.path)
+        except OSError as error:
+            print(f"cleaning {entry.path} failed: {error}", file=sys.stderr)
+
+
+def wait_for_disk(drain: Drain, coordinator: Coordinator, tiers: list[str], worker: str) -> None:
     """Return once the host's disk has room for an action (``disk_shortfall``), or the worker drains, so that a
     worker on a full disk doesn't claim action after action only to fail each at once while other hosts could run
-    them."""
+    them. First the worker deletes what its own actions left in its cache root: the action sandboxes and temp
+    files, which no other worker shares and no action of its own uses between claims. While it still waits it
+    reports the host each poll, so the coordinator keeps the host, its disk and its workers in view."""
+    if disk_shortfall() is None:
+        return
+    cache = os.environ.get("HOLBUILD_CACHE")
+    if cache:
+        for directory in ("action", "tmp"):
+            remove_children(os.path.join(cache, directory))
     logged = False
     while (why := disk_shortfall()) is not None:
         if not logged:
             print(f"waiting for disk space before claiming: {why}", file=sys.stderr, flush=True)
-            logged = True
+        try:
+            coordinator.report(tiers, worker)
+        except COORDINATOR_ERRORS as error:
+            if not logged:
+                print(f"reporting the host failed: {error}", file=sys.stderr)
+        logged = True
         if drain.stop.wait(DISK_POLL_SECONDS):
             return
 
@@ -647,6 +716,8 @@ class HostReport:
     leases: int
     memory_short: bool
     rank: int
+    disk_free: int  # bytes free and in all on the disk ``disk_shortfall`` goes by
+    disk_total: int
 
 
 class HostTelemetry:
@@ -670,6 +741,7 @@ class HostTelemetry:
             memory = HostMemory.read(self.cooperate_dir, wait=False)
             with open(PROC_STAT) as file:
                 idle, total = cpu_times(file.readline())
+            disk_free, disk_total = disk_usage()
         except (OSError, ValueError) as error:
             if not isinstance(error, BlockingIOError):
                 print(f"reading the host for the coordinator failed: {error}", file=sys.stderr)
@@ -694,6 +766,8 @@ class HostTelemetry:
             memory.leases,
             memory.shortfall(self.charge) is not None or waited,
             self.rank,
+            disk_free,
+            disk_total,
         )
 
 
@@ -1258,7 +1332,7 @@ def main() -> None:
         baked_root=args.baked_releases,
         drain=drain,
     )
-    protection = Protection(args.protection_cmd, os.environ.get("ECS_AGENT_URI"))
+    protection = Protection(args.protection_cmd, os.environ.get("ECS_AGENT_URI"), drain)
     tiers = list(dict.fromkeys([args.tier, *args.also_claim]))
     phases = Phases()
     discovery_url = os.environ.get("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL")
@@ -1284,7 +1358,7 @@ def main() -> None:
             releases = replace(releases, discovery_config=config)
         while not drain.stop.is_set():
             with phases.timed("idle"):
-                wait_for_disk(drain)
+                wait_for_disk(drain, coordinator, tiers, args.name)
             if args.cooperate_dir is not None:
                 try:
                     with phases.timed("memory_wait"), drain.interruptible():

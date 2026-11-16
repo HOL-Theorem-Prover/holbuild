@@ -3,6 +3,8 @@ import contextlib
 import hashlib
 import json
 import time
+from collections import deque
+from dataclasses import asdict, replace
 from datetime import timedelta
 from collections.abc import Callable
 from typing import Any
@@ -15,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
-from remote_exec.coordinator import Coordinator, HostReport, _claim_rank
+from remote_exec.coordinator import Claim, Coordinator, HostReport, _claim_rank
 from remote_exec.formats import parse_result
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, Settled
 
@@ -1022,102 +1024,204 @@ async def test_wakes_pack_compatible_hosts_with_fifo_ties(
     coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled, False))
     for index in order:
         coordinator._wake_claim(tier)
-        assert wakes[index].result() == (tier, False, None)
+        assert wakes[index].result() == (tier, False)
         assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
     coordinator._wake_claim(tier)
     assert coordinator.made_ready == len(order) + 1
+
+
+async def test_tail_hosts_empty_once_demand_falls_after_a_peak_ran_every_theory_on_them(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peak runs the theories on every slot of every host; a smaller stream of the same theories then packs onto
+    the first hosts, and the others reach no leases, so they can scale in."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only wakes end the waits in time
+    hosts, slots, theories, demand = [f"host-{i}" for i in range(4)], 3, 12, 6  # demand fits the first two hosts
+    running: deque[tuple[str, str, Claim]] = deque()  # host, action name and claim of each lease, oldest first
+    claimed: asyncio.Queue[tuple[str, Claim]] = asyncio.Queue()
+    waiting: list[asyncio.Task[None]] = []
+
+    async def submit_action(name: str, theory: str) -> None:
+        text = f"holbuild-action-batch-v1\naction {input_key(name)} {ac_key(name)} {spec(name)} pkg:{theory}\n"
+        assert (await http.post("/v1/batches", content=text, headers=CLIENT)).status_code == 201
+
+    async def free_slot(host: str) -> None:
+        claim = await coordinator.claim(["standard"], host, 30, host_id=host, host_rank=1)
+        assert claim is not None
+        await claimed.put((host, claim))
+
+    for i in range(theories):
+        await submit_action(f"peak-{i}", f"t{i}")
+    for i in range(theories):
+        host = hosts[i % len(hosts)]
+        claim = await coordinator.claim(["standard"], host, host_id=host, host_rank=1)
+        assert claim is not None
+        running.append((host, f"peak-{claim.theory.removeprefix('pkg:t')}", claim))
+    assert len(running) == len(hosts) * slots
+    tail_leases = []
+    for step in range(48):
+        while len(running) >= demand:
+            host, name, claim = running.popleft()
+            cache.keys.add(ac_key(name))
+            assert (await complete(http, str(claim.attempt_token), result(name, "built"))).status_code == 200
+            waiting.append(asyncio.create_task(free_slot(host)))
+        for host in hosts:  # every host still runs something, so it reports leases
+            leases = sum(h == host for h, _, _ in running)
+            coordinator.report_host(HostReport(host, 50.0, 64 << 30, 40 << 30, 52 << 30, 6 << 30, leases, False, 1))
+        await asyncio.sleep(0.05)
+        await submit_action(f"s{step}", f"t{step % theories}")
+        host, claim = await asyncio.wait_for(claimed.get(), 10)
+        running.append((host, f"s{step}", claim))
+        tail_leases.append(sum(h in hosts[2:] for h, _, _ in running))
+    for task in waiting:
+        task.cancel()
+    await asyncio.gather(*waiting, return_exceptions=True)
+    assert tail_leases[-12:] == [0] * 12, tail_leases
 
 
 def busy(host_id: str, leases: int) -> HostReport:
     return HostReport(host_id, 50.0, 64 << 30, 40 << 30, 52 << 30, 6 << 30, leases, False)
 
 
-@pytest.mark.parametrize(
-    ("workers", "leases", "woken"),
-    [
-        # The busy host that last claimed the theory goes before an earlier host of the same rank.
-        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 0)], 1, 1),
-        # An idle one doesn't, so it can still empty and scale in.
-        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 0)], 0, 0),
-        # Nor does a host no worker reported for.
-        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 0)], None, 0),
-        # A busy one never goes before a warm worker or a host of lower rank.
-        ([(["standard"], "warm", 0), (["high", "standard"], "host-b", 0)], 1, 0),
-        ([(["high", "standard"], "host-a", 0), (["high", "standard"], "host-b", 1)], 1, 0),
-    ],
-)
-async def test_wakes_prefer_the_busy_host_that_last_claimed_the_theory(
-    coordinator: Coordinator, workers: list[tuple[list[str], str, int]], leases: int | None, woken: int
-) -> None:
-    loop = asyncio.get_running_loop()
-    wakes = [loop.create_future() for _ in workers]
-    coordinator.claim_waiters = [
-        (tiers, _claim_rank(tiers, host, rank), wake, False) for (tiers, host, rank), wake in zip(workers, wakes)
-    ]
-    coordinator.theory_hosts["pkg:a"] = "host-b"
-    if leases is not None:
-        coordinator.report_host(busy("host-b", leases))
-    coordinator._wake_claim("standard", theory="pkg:a")
-    assert [wake.done() for wake in wakes] == [i == woken for i in range(len(wakes))]
+def short_of_disk(host_id: str, free: int = 1 << 30) -> HostReport:
+    return replace(busy(host_id, 0), disk_free=free, disk_total=200 << 30)
 
 
-async def test_a_passed_wake_still_prefers_the_busy_host_of_its_theory(coordinator: Coordinator) -> None:
-    loop = asyncio.get_running_loop()
-    first, second, other = loop.create_future(), loop.create_future(), loop.create_future()
-    coordinator.claim_waiters = [
-        (["high", "standard"], _claim_rank(["high", "standard"], host), wake, False)
-        for host, wake in [("host-a", other), ("host-b", first), ("host-b", second)]
-    ]
-    coordinator.theory_hosts["pkg:a"] = "host-b"
-    coordinator.report_host(busy("host-b", 1))
-    coordinator._wake_claim("standard", theory="pkg:a")
-    assert first.result() == ("standard", False, "pkg:a")
-    coordinator._pass_wake(first)
-    assert second.done() and not other.done()
+async def fail_on(http: httpx.AsyncClient, coordinator: Coordinator, host_id: str, failure: str | None) -> None:
+    """Submit an action, claim one on ``host_id`` and complete it as built, or failed with ``failure``."""
+    await submit(http, [f"f{uuid4().hex}"])
+    claimed = await coordinator.claim(["high", "standard"], host_id, host_id=host_id)
+    assert claimed is not None
+    name = claimed.theory.removeprefix("pkg:")
+    record = result(name, "built") if failure is None else result(name, "failed", failure)
+    assert (await complete(http, str(claimed.attempt_token), record)).status_code == 200
 
 
-async def test_wakes_ignore_a_busy_report_too_old_to_trust(coordinator: Coordinator) -> None:
-    loop = asyncio.get_running_loop()
-    wakes = [loop.create_future(), loop.create_future()]
-    coordinator.claim_waiters = [
-        (["high", "standard"], _claim_rank(["high", "standard"], host), wake, False)
-        for host, wake in zip(["host-a", "host-b"], wakes)
-    ]
-    coordinator.theory_hosts["pkg:a"] = "host-b"
-    coordinator.report_host(busy("host-b", 1))
-    reported = coordinator.clock()
-    coordinator.clock = lambda: reported + timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS)
-    coordinator._wake_claim("standard", theory="pkg:a")
-    assert wakes[0].done() and not wakes[1].done()
-
-
-async def test_released_work_wakes_the_busy_host_its_theory_last_ran_on(
+async def test_a_host_whose_last_five_results_were_infrastructure_failures_gets_one_probe_claim_a_minute(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    coordinator.report_host(busy("host-b", 1))
+    now = coordinator.clock()
+    coordinator.clock = lambda: now
+    coordinator.report_host(busy("host-a", 0))
+    # A failure of the action's own breaks the streak; only five infrastructure failures in a row quarantine.
+    for failure in ["internal", "disk", "toolchain", "publish", "memory", "unavailable", "internal", "disk", "toolchain"]:
+        await fail_on(http, coordinator, "host-a", failure)
+        assert coordinator._quarantine("host-a") is None
+    await fail_on(http, coordinator, "host-a", "publish")
+    assert coordinator._quarantine("host-a") == "failures"
+
     await submit(http, ["a"])
-    claimed = await coordinator.claim(["high", "standard"], "w1", host_id="host-b")
-    assert claimed is not None and claimed.theory == "pkg:a"
-    assert coordinator.theory_hosts == {"pkg:a": "host-b"}
-    loop = asyncio.get_running_loop()
-    wakes = [loop.create_future(), loop.create_future()]
-    for host, wake in zip(["host-a", "host-b"], wakes):
-        coordinator.claim_waiters.append((["high", "standard"], _claim_rank(["high", "standard"], host), wake, False))
-    # The theory edited: a new action of it.
-    edited = f"holbuild-action-batch-v1\naction {input_key('a2')} {ac_key('a2')} {spec('a2')} pkg:a\n"
-    assert (await http.post("/v1/batches", content=edited, headers=CLIENT)).status_code == 201
-    await coordinator.released()
-    assert not wakes[0].done() and wakes[1].result() == ("standard", False, "pkg:a")
+    assert await coordinator.claim(["high", "standard"], "w", host_id="host-a") is None
+    assert await coordinator.claim(["high", "standard"], "w", host_id="host-b") is not None
+    now += timedelta(seconds=coordinator_module.PROBE_SECONDS - 1)
+    assert await coordinator.claim(["high", "standard"], "w", host_id="host-a") is None
+    # A failed probe, whatever its class, keeps the quarantine and the next probe a minute off.
+    now += timedelta(seconds=1)
+    await fail_on(http, coordinator, "host-a", "memory")
+    assert await coordinator.claim(["high", "standard"], "w", host_id="host-a") is None
+    now += timedelta(seconds=coordinator_module.PROBE_SECONDS)
+    await fail_on(http, coordinator, "host-a", "internal")
+    assert coordinator._quarantine("host-a") == "failures"
+    now += timedelta(seconds=coordinator_module.PROBE_SECONDS)
+    await fail_on(http, coordinator, "host-a", None)
+    assert coordinator._quarantine("host-a") is None
 
 
-async def test_theory_hosts_forget_the_least_recently_claimed_theory(
+async def test_a_completion_retried_after_a_failed_attempt_still_counts_for_its_host(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(coordinator_module, "MAX_THEORY_HOSTS", 2)
+    coordinator.infra_streak["host-a"] = coordinator_module.QUARANTINE_FAILURES
+    await submit(http, ["a"])
+    coordinator.probe_at["host-a"] = coordinator.clock() - timedelta(seconds=coordinator_module.PROBE_SECONDS)
+    claimed = await coordinator.claim(["standard"], "w", host_id="host-a")
+    assert claimed is not None
+    lock_batch = coordinator._lock_batch
+    calls = 0
+
+    async def flaky(*args: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("pool timeout")
+        await lock_batch(*args)
+
+    monkeypatch.setattr(coordinator, "_lock_batch", flaky)
+    with pytest.raises(TimeoutError):
+        await coordinator.complete(claimed.attempt_token, parse_result(result("a", "built")))
+    assert await coordinator.complete(claimed.attempt_token, parse_result(result("a", "built")))
+    assert coordinator._quarantine("host-a") is None and coordinator.lease_hosts == {}
+
+
+async def test_a_host_reporting_too_little_disk_gets_no_work_until_it_reports_room(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a"])
+    coordinator.report_host(short_of_disk("host-a", coordinator_module.DISK_FLOOR - 1))
+    assert coordinator._quarantine("host-a") == "disk"
+    assert await coordinator.claim(["standard"], "w", host_id="host-a") is None
+
+    coordinator.report_host(short_of_disk("host-a", coordinator_module.DISK_FLOOR))
+    assert await coordinator.claim(["standard"], "w", host_id="host-a") is not None
+
+
+async def test_a_disk_report_too_old_to_trust_quarantines_nothing(coordinator: Coordinator) -> None:
+    coordinator.report_host(short_of_disk("host-a"))
+    reported = coordinator.clock()
+    coordinator.clock = lambda: reported + timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS)
+    assert coordinator._quarantine("host-a") is None
+
+
+async def test_a_quarantined_hosts_claim_waits_apart_and_defers_nobody(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 0.01)
+    coordinator.report_host(short_of_disk("host-a"))
+    waiting = asyncio.create_task(coordinator.claim(["high", "standard"], "w", 0.2, host_id="host-a"))
+    await asyncio.sleep(0.05)
+    assert coordinator.claim_waiters == []
+    # A waiter parked before its host was quarantined neither defers a worse-ranked claim nor takes a wake.
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake, False))
+    await submit(http, ["a"])
+    assert not wake.done()
+    assert await coordinator.claim(["high", "standard"], "tail", host_id="host-b", host_rank=1) is not None
+    assert await waiting is None
+
+
+async def test_a_worker_heartbeating_a_long_action_stays_counted_on_its_quarantined_host(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a"])
+    body = {"tier": "standard", "worker": "w1", "host": {**asdict(busy("host-a", 0)), "disk_free": 100 << 30}}
+    response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+    assert response.status_code == 200, response.text
+    claimed = coordinator.clock()
+    coordinator.clock = lambda: claimed + timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS)
+    heartbeat = {"host": asdict(short_of_disk("host-a"))}
+    token = response.json()["attempt_token"]
+    assert (await http.post(f"/v1/work/{token}/heartbeat", json=heartbeat, headers=WORKER)).status_code == 200
+    await coordinator.queue()
+    assert coordinator._quarantined_workers() == (1, 0)
+
+
+async def test_quarantined_hosts_workers_do_not_count_as_capacity(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings = coordinator.settings.model_copy(update={"warm_workers": 2, "max_burst_workers": 10})
     await submit(http, ["a", "b", "c"])
-    for host in ["host-a", "host-b", "host-a"]:
-        assert await coordinator.claim(["standard"], host, host_id=host) is not None
-    assert coordinator.theory_hosts == {"pkg:b": "host-b", "pkg:c": "host-a"}
+    for host, worker, tier in [("warm", "w1", "standard"), ("warm", "w2", "standard"), ("burst", "b1", "high")]:
+        body = {"tier": tier, "worker": worker, "host": {**asdict(busy(host, 0)), "disk_free": 100 << 30}}
+        assert (await http.post("/v1/work/report", json=body, headers=WORKER)).status_code == 204
+    assert (await coordinator.queue()).desired_burst_workers == 1
+
+    coordinator.report_host(short_of_disk("warm"))
+    assert (await coordinator.queue()).desired_burst_workers == 3
+    coordinator.report_host(busy("warm", 0))
+    coordinator.report_host(short_of_disk("burst"))
+    # The quarantined burst worker is replaced, on top of the demand.
+    assert (await coordinator.queue()).desired_burst_workers == 2
+    hosts = (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"]
+    assert [(h["id"], h["quarantined"], h["disk_free"]) for h in hosts] == [("burst", "disk", 1 << 30), ("warm", None, None)]
 
 
 @pytest.mark.parametrize("waiting_tiers", [["high", "standard"], ["standard"]])

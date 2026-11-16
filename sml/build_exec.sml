@@ -4045,6 +4045,13 @@ fun prepare_theory_stage speculative tc root (action : theory_action) =
   in
     remove_tree stage_root;
     ensure_dir stage;
+    (* HOL exports the theory into .hol/objs and reports any failure to
+       create that directory, a full disk included, as a path that "already
+       exists but is not a directory"; created here, a full disk fails the
+       export's own writes, which name it.  Unlike ensure_dir, mkDir raises
+       what stops it, and the stage was just emptied. *)
+    FS.mkDir (Path.concat(stage, ".hol"));
+    FS.mkDir (Path.concat(stage, ".hol/objs"));
     (* Extra inputs go in first, so holbuild's own files (the instrumented
        script above all) overwrite any input staged at the same path. *)
     List.app stage_input (#inputs action);
@@ -9540,11 +9547,16 @@ val no_space = HolbuildCacheTransfer.no_space
    that filesystem, and a handled checkpoint write failure warns into it. *)
 val out_of_space = HolbuildCacheTransfer.out_of_space
 
+(* Whether a worker's disk counts as full: below the floor, or unable to
+   take a small write.  The write alone can miss a full disk that another
+   process has just freed a little of. *)
+fun disk_full dir = HolbuildCacheTransfer.below_disk_floor dir orelse out_of_space dir
+
 (* A full disk is a disk failure, whichever step hit it.  A failed download
    need not say so (curl reports only a failed write, or leaves a short
    file), so the cache root is probed too. *)
 fun classify_failure failure msg =
-  (if String.isSubstring no_space msg orelse out_of_space (cache_root ()) then DiskFailure
+  (if String.isSubstring no_space msg orelse disk_full (cache_root ()) then DiskFailure
    else failure, msg)
 
 fun action_failed failure msg = ActionFailed (classify_failure failure msg)
@@ -10113,35 +10125,6 @@ in
       handle _ => NONE
 end
 
-(* The file system PATH is on, as statvfs(3) sees it: the bytes and inodes an
-   unprivileged writer has free, and its size in bytes. NONE off Linux or if
-   the call fails, so that the worker cache cap keeps to its byte limit. Only
-   exec-action's cap calls it, from one thread, as children_peak_rss_mb. *)
-local
-  open Foreign
-  val statvfs = buildCall2 (getSymbol (loadExecutable ()) "statvfs", (cString, cPointer), cInt)
-  (* glibc's struct statvfs on LP64 Linux: unsigned longs f_bsize, f_frsize,
-     f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail, ... *)
-  val statvfs_bytes = 0w112
-in
-  fun disk_space path =
-    if not (file_exists "/proc/self/status") then NONE
-    else
-      let
-        val buffer = Memory.malloc statvfs_bytes
-        fun field i = SysWord.toLargeInt (Memory.get64 (buffer, i))
-        val space =
-          (if statvfs (path, buffer) = 0 then
-             SOME {free = field 0w4 * field 0w1, inodes = field 0w7, size = field 0w2 * field 0w1}
-           else NONE)
-          handle e => (Memory.free buffer; raise e)
-      in
-        Memory.free buffer;
-        space
-      end
-      handle _ => NONE
-end
-
 fun peak_rss_mb stage =
   (case String.tokens Char.isSpace (read_text (Path.concat(stage, peak_rss_report_name))) of
       ["VmHWM:", kb, "kB"] => Option.map (fn n => n div 1024) (Int.fromString kb)
@@ -10190,7 +10173,7 @@ fun classify_run_failure stage log_text oom_before msg =
        else [])
     val failure =
       if Option.isSome oom_kills orelse String.isSubstring "Run out of store" (msg ^ "\n" ^ log_text) then MemoryFailure
-      else if (if child_failed then child_reports_no_space log_text orelse out_of_space stage
+      else if (if child_failed then child_reports_no_space log_text orelse disk_full stage
                else String.isSubstring no_space msg) then DiskFailure
       else if not child_failed then InternalFailure
       else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure
@@ -10498,10 +10481,10 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     fun floor_deficit () =
       if min_free_bytes <= 0 then 0
       else
-        case disk_space cache of
+        case HolbuildCacheTransfer.disk_free cache of
             NONE => 0
-          | SOME {free, inodes, size} =>
-              if free >= min_free_bytes andalso inodes >= 65536 then 0
+          | SOME {bytes = free, inodes, size} =>
+              if free >= min_free_bytes andalso (case inodes of SOME n => n >= 65536 | NONE => true) then 0
               else
                 let val buffer = LargeInt.max (gb_to_bytes 8, size div 25)
                 in LargeInt.max (buffer, min_free_bytes + buffer - free) end
@@ -12678,7 +12661,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                a later step failed. *)
             (peak := peak_rss_mb stage;
              if not (!HolbuildActionSandbox.outputs_validated) then
-               raise ActionFailed (InternalFailure, msg)
+               raise action_failed InternalFailure msg
              else
              let
                val log_text = read_text (build_log ()) handle _ => ""
