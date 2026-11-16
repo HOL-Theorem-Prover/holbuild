@@ -3,7 +3,8 @@ set -euo pipefail
 
 # An edit made while a watch build runs must be built before the watch waits:
 # the inotify watch only starts after the build, so it never sees that edit.
-# Covers a file inside a directory extra input and the theory script itself.
+# Covers a file in a directory extra input, a holbuild_extra_deps file in a
+# member directory, and the theory script itself.
 
 source "$(dirname "$0")/../../lib.sh"
 
@@ -31,6 +32,7 @@ project=$tmpdir/project
 runs=$tmpdir/runs
 mkdir -p "$project/src" "$project/data"
 echo 1 > "$project/data/value.txt"
+echo 1 > "$project/src/table.txt"
 cat > "$project/holproject.toml" <<TOML
 $(write_schema2_prelude)
 [project]
@@ -46,6 +48,8 @@ TOML
 # edit its inputs while the build is still running.
 cat > "$project/src/AScript.sml" <<SML
 open HolKernel boolLib bossLib;
+fun holbuild_extra_deps (_ : string list) = ()
+val _ = holbuild_extra_deps ["table.txt"]
 val _ = new_theory "A";
 val _ = let val f = TextIO.openAppend "$runs" in TextIO.output (f, "run\n"); TextIO.closeOut f end;
 val _ = OS.Process.sleep (Time.fromSeconds 8);
@@ -72,8 +76,11 @@ wait_for_run() {
 # Edit a file in the directory input while the first run sleeps.
 wait_for_run 1
 echo 2 > "$project/data/value.txt"
-# Edit the script while the second run sleeps; the edited one doesn't sleep.
+# Edit the source-declared input while the second run sleeps.
 wait_for_run 2
+echo 2 > "$project/src/table.txt"
+# Edit the script while the third run sleeps; the edited one doesn't sleep.
+wait_for_run 3
 sed -i 's/Time.fromSeconds 8/Time.fromSeconds 0/' "$project/src/AScript.sml"
 
 deadline=$((SECONDS + 120))
@@ -83,8 +90,8 @@ until grep -q "waiting for changes" "$watch_log"; do
   sleep 0.25
 done
 
-if [[ "$(run_count)" -ne 3 ]]; then
-  echo "edits made during builds were not built before waiting: theory ran $(run_count) time(s), expected 3" >&2
+if [[ "$(run_count)" -ne 4 ]]; then
+  echo "edits made during builds were not built before waiting: theory ran $(run_count) time(s), expected 4" >&2
   cat "$watch_log" >&2
   exit 1
 fi
