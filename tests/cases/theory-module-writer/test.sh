@@ -161,6 +161,15 @@ val _ = sweep ();
 val _ = check "the sweep kept an idle store once its writer finished" (not (exists (store "hol1")));
 val _ = check "the sweep left an evicted store behind"
           (null (HolbuildCache.children (E.module_stores ())));
+
+(* A writer whose lock file the sweep unlinked between its open and its
+   lock holds a lock nobody else sees: it must not write. *)
+val stale = valOf (HolbuildFileLock.try_acquire_path {path = "$tmpdir/stale.lock", obsolete_kind = NONE});
+val _ = check "a fresh lock is not at its path" (HolbuildFileLock.at_path stale);
+val _ = OS.FileSys.remove "$tmpdir/stale.lock";
+val _ = E.write_text "$tmpdir/stale.lock" "";
+val _ = check "an unlinked lock is at its path" (not (HolbuildFileLock.at_path stale));
+val _ = HolbuildFileLock.release stale;
 SML
 if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmpdir") ]]; then
   other_fs=$(mktemp -d /dev/shm/holbuild-module-writer.XXXXXX)

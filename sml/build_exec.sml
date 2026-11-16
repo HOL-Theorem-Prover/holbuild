@@ -11956,8 +11956,9 @@ fun module_writer_script {output, base_theories, call} =
    sigobj.  No writer starts when the toolchain's HOL has no module helper,
    when an earlier writer found it cannot write modules, when the store
    has its base theories and lacks fewer than module_writer_min_missing of
-   the modules wanted, or while another process writes to the store.  A
-   failure leaves the action to load from .dat files. *)
+   the modules wanted, or while another process writes to the store or
+   the cache cap's sweep removes it.  A failure leaves the action to load
+   from .dat files. *)
 fun write_missing_modules root tc {deps, loads} =
   let
     val store = module_store (#holdir tc)
@@ -12059,7 +12060,7 @@ fun write_missing_modules root tc {deps, loads} =
              {path = Path.concat (store, module_store_writer_lock), obsolete_kind = NONE} of
           NONE => ()
         | SOME lock =>
-            (write () before HolbuildFileLock.release lock)
+            ((if HolbuildFileLock.at_path lock then write () else ()) before HolbuildFileLock.release lock)
             handle e => (HolbuildFileLock.release lock; raise e)
   end
 
