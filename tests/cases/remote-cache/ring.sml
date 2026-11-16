@@ -96,6 +96,9 @@ val _ = put primary "get-status" "401";
 val _ = assert "authorization error is not retried"
   (case fetch cache digest of CB.Corrupt _ => true | _ => false);
 val _ = clear primary "get-status";
+val _ = RC.write_text (stored backup "ac" blob_key) "not zstd\n";
+val _ = assert "a blob that does not decompress is corrupt"
+  (case fetch cache digest of CB.Corrupt _ => true | _ => false);
 val _ = RC.remove_file (stored backup "ac" blob_key);
 val _ = assert "both missing" (fetch cache digest = CB.Miss);
 fun unavailable f = (ignore (f ()); false) handle RC.Unavailable _ => true;
