@@ -168,7 +168,9 @@ require_grep "REPL_FROM_OK" "$repl_log"
 # not the build child policy its checkpoint was saved under.
 trace_script=$tmpdir/trace.sml
 cat > "$trace_script" <<'SML'
-val _ = print ("HTML_DOCS=" ^ Int.toString (Feedback.current_trace "TheoryPP.include_html_docs") ^ "\n");
+val flags = if Option.isSome (#lookupStruct PolyML.globalNameSpace "HOLFlags") then "HOLFlags" else "Feedback";
+val _ = CompilerSpecific.quietbind
+  ("val _ = print (\"HTML_DOCS=\" ^ Int.toString (" ^ flags ^ ".current_trace \"TheoryPP.include_html_docs\") ^ \"\\n\");");
 SML
 run_from "$tmpdir/plain-trace.log" "$trace_script"
 plain_trace=$(grep -o 'HTML_DOCS=[0-9]*' "$tmpdir/plain-trace.log")
