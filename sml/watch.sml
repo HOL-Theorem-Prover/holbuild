@@ -6,10 +6,13 @@ structure FS = OS.FileSys
 
 exception Error of string
 
+type watch_set = {paths : string list, manifest_dirs : string list, input_dirs : string list}
+
 fun quote s = HolbuildToolchain.quote s
 
 fun readable path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 fun exists path = FS.access(path, []) handle OS.SysErr _ => false
+fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
 fun add_unique path paths =
   if path = "" orelse List.exists (fn existing => existing = path) paths then paths
@@ -56,6 +59,23 @@ fun source_paths (source : HolbuildSourceIndex.source, paths) =
       extras
   end
 
+fun extra_input_paths (source : HolbuildSourceIndex.source) =
+  map (fn extra => Path.concat(#package_root source, HolbuildProject.extra_input_path extra))
+      (HolbuildProject.action_extra_inputs (#policy source))
+
+fun generator_input_paths package =
+  List.concat
+    (map (fn generator => map (HolbuildProject.abs_under (HolbuildProject.package_root package))
+                              (HolbuildProject.generator_inputs generator))
+         (HolbuildProject.package_generators package))
+
+(* The directories given as extra or generator inputs: their files are inputs,
+   unlike a member directory's, whose inputs are its sources. *)
+fun input_dirs packages index =
+  List.foldl (fn (path, acc) => if is_dir path then add_unique path acc else acc)
+             []
+             (List.concat (map extra_input_paths index @ map generator_input_paths packages))
+
 (* The directories whose manifests are in use. A manifest that takes
    precedence (holbuild.toml beside holproject.toml) or a .holconfig.toml can
    appear there without touching any watched path, so these directories are
@@ -83,7 +103,8 @@ fun watch_paths_with resolution project index =
     val paths = List.foldl package_paths paths packages
     val paths = List.foldl source_paths paths index
   in
-    {paths = rev paths, manifest_dirs = rev (manifest_dirs project packages)}
+    {paths = rev paths, manifest_dirs = rev (manifest_dirs project packages),
+     input_dirs = rev (input_dirs packages index)}
   end
 
 fun watch_paths project index =
@@ -95,19 +116,21 @@ fun ensure_inotifywait () =
 
 fun sleep_debounce () = OS.Process.sleep (Time.fromReal 0.25)
 
-fun is_dir path = FS.isDir path handle OS.SysErr _ => false
-
-(* The watched files with their content hashes.  inotifywait only starts after
-   a build, so an edit made during the build fires no event; comparing this
-   from before the build with after it finds such an edit. *)
-fun snapshot ({paths, ...} : {paths : string list, manifest_dirs : string list}) =
+(* The watched files and the files under input directories, with their content
+   hashes.  inotifywait only starts after a build, so an edit made during the
+   build fires no event; comparing this from before the build with after it
+   finds such an edit. *)
+fun snapshot ({paths, input_dirs, ...} : watch_set) =
   let
+    fun files_under dir =
+      map #2 (#files (HolbuildBuildPlan.walked_files_under dir ""))
+      handle OS.SysErr _ => []
     fun file_hash path =
-      if is_dir path then NONE
-      else SOME (path, HolbuildHash.file_sha256 path)
-           handle IO.Io _ => NONE | OS.SysErr _ => NONE
+      SOME (path, HolbuildHash.file_sha256 path)
+      handle IO.Io _ => NONE | OS.SysErr _ => NONE
   in
-    List.mapPartial file_hash paths
+    List.mapPartial file_hash
+      (List.filter (not o is_dir) paths @ List.concat (map files_under input_dirs))
   end
 
 fun regex_escape text =
@@ -144,7 +167,7 @@ fun inotify_dirs_command dirs =
 (* Two inotifywait processes, since one invocation is either recursive or not:
    the tree watch on the inputs, and a flat watch on the manifest directories.
    The first to exit decides; its status is the command's status. *)
-fun inotify_command {paths, manifest_dirs} =
+fun inotify_command ({paths, manifest_dirs, ...} : watch_set) =
   String.concatWith "\n"
     [inotify_tree_command paths ^ " &",
      "tree=$!",
