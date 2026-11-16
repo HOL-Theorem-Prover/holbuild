@@ -1226,6 +1226,22 @@ async def test_a_quarantined_hosts_claim_waits_apart_and_defers_nobody(
     assert await waiting is None
 
 
+async def test_a_worker_heartbeating_a_long_action_stays_counted_on_its_quarantined_host(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a"])
+    body = {"tier": "standard", "worker": "w1", "host": {**asdict(busy("host-a", 0)), "disk_free": 100 << 30}}
+    response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+    assert response.status_code == 200, response.text
+    claimed = coordinator.clock()
+    coordinator.clock = lambda: claimed + timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS)
+    heartbeat = {"host": asdict(short_of_disk("host-a"))}
+    token = response.json()["attempt_token"]
+    assert (await http.post(f"/v1/work/{token}/heartbeat", json=heartbeat, headers=WORKER)).status_code == 200
+    await coordinator.queue()
+    assert coordinator._quarantined_workers() == (1, 0)
+
+
 async def test_quarantined_hosts_workers_do_not_count_as_capacity(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:

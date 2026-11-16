@@ -875,10 +875,10 @@ class Coordinator:
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
         # The host that last claimed each theory, least recently claimed first; see _wake_claim. Also in memory.
         self.theory_hosts: dict[str, str] = {}
-        # For the quarantine, also in memory: the host of each lease, oldest first; each host's infrastructure
-        # failures in a row and its last probe claim; and the workers that last claimed or reported from each
-        # host, when, and whether they are burst workers. See _quarantine.
-        self.lease_hosts: dict[UUID, str] = {}
+        # For the quarantine, also in memory: the host, worker and tiers of each lease, oldest first; each host's
+        # infrastructure failures in a row and its last probe claim; and the workers that last claimed, reported or
+        # heartbeat from each host, when, and whether they are burst workers. See _quarantine.
+        self.lease_hosts: dict[UUID, tuple[str, str, list[str]]] = {}
         self.infra_streak: dict[str, int] = {}
         self.probe_at: dict[str, datetime] = {}
         self.host_workers: dict[str, dict[str, tuple[datetime, bool]]] = {}
@@ -1116,7 +1116,7 @@ class Coordinator:
                         self.probe_at[host_id] = now
                         claimed = await self._claim(tiers, worker)
                         if claimed is not None:
-                            self._lease_host(claimed.attempt_token, host_id)
+                            self._lease_host(claimed.attempt_token, host_id, worker, tiers)
                         return claimed
                     remaining = deadline - loop.time()
                     if remaining <= 0:
@@ -1138,7 +1138,7 @@ class Coordinator:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
                 if claimed is not None and host_id is not None:
-                    self._lease_host(claimed.attempt_token, host_id)
+                    self._lease_host(claimed.attempt_token, host_id, worker, tiers)
                     self.theory_hosts.pop(claimed.theory, None)
                     self.theory_hosts[claimed.theory] = host_id
                     if len(self.theory_hosts) > MAX_THEORY_HOSTS:
@@ -1664,8 +1664,8 @@ class Coordinator:
         if host_id in self.hosts:
             self.host_workers.setdefault(host_id, {})[worker] = (self.clock(), "high" in tiers)
 
-    def _lease_host(self, token: UUID, host_id: str) -> None:
-        self.lease_hosts[token] = host_id
+    def _lease_host(self, token: UUID, host_id: str, worker: str, tiers: list[str]) -> None:
+        self.lease_hosts[token] = (host_id, worker, tiers)
         if len(self.lease_hosts) > MAX_LEASE_HOSTS:
             del self.lease_hosts[next(iter(self.lease_hosts))]
 
@@ -1743,7 +1743,11 @@ class Coordinator:
                 ),
                 {"token": token, "lease": self.settings.lease_seconds},
             )
-            return result.rowcount == 1
+            live = result.rowcount == 1
+        # A worker running one long action claims nothing meanwhile: its heartbeats keep it counted on its host.
+        if live and (lease := self.lease_hosts.get(token)) is not None:
+            self.report_worker(*lease)
+        return live
 
     async def complete(self, token: UUID, result: Result) -> bool:
         """Apply a worker's result record; False when its lease is stale, and the record is dropped.
@@ -1751,7 +1755,7 @@ class Coordinator:
         Raises ResultMismatch when the record is for another action than the lease's.
         """
         # Forgotten only once the result is applied or dropped: a worker retries a completion that failed.
-        host_id = self.lease_hosts.get(token)
+        leased = self.lease_hosts.get(token)
         async with self.engine.begin() as conn:
             batch_id = await conn.scalar(
                 sa.text("SELECT batch_id FROM leases WHERE attempt_token = :token"), {"token": token}
@@ -1872,8 +1876,8 @@ class Coordinator:
                     conn, batch_id, action.input_key, action.action_class, f"{action.theory}: {result.failure}{detail}"
                 )
         self.lease_hosts.pop(token, None)
-        if host_id is not None:
-            self._record_result(host_id, result)
+        if leased is not None:
+            self._record_result(leased[0], result)
         self._batch_changed(batch_id)
         self.request_release(batch_id)
         if unblocked:
