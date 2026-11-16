@@ -242,7 +242,8 @@ for cache in "$first_cache" "$second_cache" "$third_cache" "$fourth_cache" \
   link_hol_toolchain_cache "$cache"
 done
 
-# Record each zstd command line so the test can check uploads use level 1;
+# Record each zstd command line so the test can check uploads use level 1
+# (besides the version check that zstd runs);
 # the second build hydrating from these uploads checks they round-trip.
 zstd_shim=$tmpdir/zstd-shim
 zstd_args=$tmpdir/zstd-args
@@ -258,7 +259,7 @@ first_log=$tmpdir/first.log
 (cd "$first" && PATH="$zstd_shim:$PATH" HOLBUILD_CACHE="$first_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 ATheory) > "$first_log" 2>&1
 require_grep "^-1 -vv " "$zstd_args"
-if grep -v "^-1 " "$zstd_args"; then
+if grep -v -e "^-1 " -e "^-q -V$" "$zstd_args"; then
   echo "remote cache ran zstd without -1" >&2
   exit 1
 fi
@@ -324,6 +325,28 @@ require_grep "ATheory restored from cache" "$third_log"
 if grep -q "ATheory built" "$third_log"; then
   echo "third build ignored .holconfig.toml remote cache default" >&2
   cat "$third_log" >&2
+  exit 1
+fi
+
+# Without a zstd that runs no blob is usable: the build sends the remote cache
+# nothing, not even a lookup of the entry it holds, and says why.
+no_zstd_shim=$tmpdir/no-zstd-shim
+mkdir -p "$no_zstd_shim"
+printf '#!/bin/sh\nexit 127\n' > "$no_zstd_shim/zstd"
+chmod +x "$no_zstd_shim/zstd"
+no_zstd=$tmpdir/no-zstd
+no_zstd_cache=$tmpdir/cache-no-zstd
+write_project "$no_zstd"
+link_hol_toolchain_cache "$no_zstd_cache"
+no_zstd_log=$tmpdir/no-zstd.log
+requests_before=$(wc -l < "$request_log")
+(cd "$no_zstd" && PATH="$no_zstd_shim:$PATH" HOLBUILD_CACHE="$no_zstd_cache" \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 180 ATheory) > "$no_zstd_log" 2>&1
+require_grep "warning: remote cache disabled: the zstd command could not be run" "$no_zstd_log"
+require_grep "ATheory built" "$no_zstd_log"
+if [[ $(wc -l < "$request_log") != "$requests_before" ]]; then
+  echo "a build without zstd sent remote cache requests:" >&2
+  tail -n "+$((requests_before + 1))" "$request_log" >&2
   exit 1
 fi
 

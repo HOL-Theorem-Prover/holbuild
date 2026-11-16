@@ -7,7 +7,8 @@ structure FS = OS.FileSys
 exception Error of string
 
 (* The remote cache gave no usable answer: no answer at all, 429, 5xx, or
-   the breaker below holds requests back.  Raised only when fail_closed. *)
+   the breaker below holds requests back, or zstd can't run.  Raised only
+   when fail_closed. *)
 exception Unavailable of string
 
 (* Set by exec-action, whose result counts only once the remote cache holds
@@ -205,18 +206,49 @@ fun disabled_unlocked () =
 
 val disabled_message = "the remote cache is disabled after repeated failures"
 
+(* Every blob is stored zstd-compressed (blob_key), so where zstd can't run no
+   entry is usable: the remote cache is then disabled from the first request,
+   as during an outage, rather than fetching blobs it can't decompress.
+   Checked once per process. *)
+val zstd_missing_message = "remote cache disabled: the zstd command could not be run"
+val zstd_checked : bool option ref = ref NONE
+val zstd_mutex = Mutex.mutex ()
+
+fun zstd_missing () =
+  let
+    val _ = Mutex.lock zstd_mutex
+    fun check () =
+      let val missing = not (HolbuildSpawn.succeeded (run "zstd" ["-q", "-V"]))
+      in
+        if missing then
+          (TextIO.output (TextIO.stdErr, "holbuild: warning: " ^ zstd_missing_message ^ "\n");
+           TextIO.flushOut TextIO.stdErr)
+        else ();
+        zstd_checked := SOME missing;
+        missing
+      end
+    val missing = (case !zstd_checked of SOME missing => missing | NONE => check ())
+      handle e => (Mutex.unlock zstd_mutex; raise e)
+  in
+    missing before Mutex.unlock zstd_mutex
+  end
+
 (* Every caller skips a write when this holds; with fail_closed it raises. *)
 fun disabled () =
-  let
-    val _ = Mutex.lock transport_mutex
-    val result = disabled_unlocked ()
-    val _ = Mutex.unlock transport_mutex
-  in
-    if result andalso !fail_closed then raise Unavailable disabled_message else result
-  end
+  if zstd_missing () then
+    if !fail_closed then raise Unavailable zstd_missing_message else true
+  else
+    let
+      val _ = Mutex.lock transport_mutex
+      val result = disabled_unlocked ()
+      val _ = Mutex.unlock transport_mutex
+    in
+      if result andalso !fail_closed then raise Unavailable disabled_message else result
+    end
 
 (* Advisory requests leave recovery probes to send. *)
 fun tripped () =
+  zstd_missing () orelse
   (Mutex.lock transport_mutex;
    !transport_failures >= max_consecutive_transport_failures
    before Mutex.unlock transport_mutex)
@@ -460,24 +492,30 @@ fun routed_status method urls path request = routed_status_using (fn _ => true) 
 (* NONE when the remote cache is disabled, without a request.  With
    fail_closed, raises Unavailable instead, and for no answer, 429 or 5xx. *)
 fun send_result method url request =
-  case begin_request () of
-      NONE =>
-        if !fail_closed then
-          raise Unavailable (disabled_message ^ "; not sent: " ^ method ^ " " ^ redact_userinfo url)
-        else NONE
-    | SOME admission =>
-        let
-          val (answered_url, result) = request ()
-            handle e =>
-              ((if #2 admission then
-                  record_transport_outcome admission (HolbuildHttp.Failed (General.exnMessage e))
-                else ());
-               raise e)
-        in
-          record_transport_outcome admission result;
-          if !fail_closed then require_answer method answered_url result else ();
-          SOME (answered_url, result)
-        end
+  let
+    fun not_sent message =
+      if !fail_closed then
+        raise Unavailable (message ^ "; not sent: " ^ method ^ " " ^ redact_userinfo url)
+      else NONE
+  in
+    if zstd_missing () then not_sent zstd_missing_message
+    else
+      case begin_request () of
+          NONE => not_sent disabled_message
+        | SOME admission =>
+            let
+              val (answered_url, result) = request ()
+                handle e =>
+                  ((if #2 admission then
+                      record_transport_outcome admission (HolbuildHttp.Failed (General.exnMessage e))
+                    else ());
+                   raise e)
+            in
+              record_transport_outcome admission result;
+              if !fail_closed then require_answer method answered_url result else ();
+              SOME (answered_url, result)
+            end
+  end
 
 fun send method url path request =
   Option.map #2 (send_result method url (fn () => (url, traced method url path request)))

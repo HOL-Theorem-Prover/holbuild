@@ -1463,7 +1463,9 @@ decompresses a blob and checks its digest. holbuild 0.15.0 moved blobs there
 from `/cas/<sha256>`, which costs a Bazel-style server a decompression, a hash
 and a recompression per upload; it reads no remote entry earlier releases
 wrote. The server must accept any `/ac/` body (bazel-remote:
-`--disable_http_ac_validation`), and blob transfers need the `zstd` command.
+`--disable_http_ac_validation`), and the client needs the `zstd` command: where
+it can't run, holbuild warns once and goes on without the remote cache, as
+during an outage.
 This is a live accelerator, not remote execution and not an immutable release
 registry. Remote cache contents are trusted build inputs: cache hits can load
 Poly/ML objects, and restored toolchains execute cached binaries. Use an
