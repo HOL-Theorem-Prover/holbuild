@@ -10700,15 +10700,19 @@ fun result_detail msg =
     (if size msg > 500 then String.substring (msg, 0, 500) else msg)
 
 (* A failure without a log says why in detail=, the client's only
-   diagnostic of it; one with a log has the message in the log. *)
-fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak, log} =
+   diagnostic of it; one with a log has the message in the log.  An action
+   that succeeded but whose log upload failed says why the log is missing. *)
+fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak, log, log_error} =
   String.concatWith "\n"
     ([action_result_header,
       "spec=" ^ spec_sha256,
       "input-key=" ^ input_key,
       "status=" ^ status] @
      (case failure of
-          NONE => []
+          NONE =>
+            (case (log, log_error) of
+                 (NONE, SOME msg) => ["detail=" ^ result_detail msg]
+               | _ => [])
         | SOME (kind, msg) =>
             ("failure=" ^ failure_name kind) ::
             (case kind of InputMissing missing => ["missing=" ^ missing] | _ => []) @
@@ -10717,6 +10721,40 @@ fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak
      ["wall-ms=" ^ LargeInt.toString wall_ms] @
      (if null phases then [] else ["phase-ms=" ^ phases_text "," ":" phases]) @
      (case log of SOME (sha, bytes) => ["log=" ^ sha ^ " " ^ bytes] | NONE => [])) ^ "\n"
+
+(* A fleet action's build.log goes to the cache whole up to this size.  A
+   longer one goes as its first log_head_bytes, a line saying how much was
+   cut, and its last log_tail_bytes: a multi-GB log is refused by the cache,
+   and a client restores every action log it is given. *)
+val log_upload_limit = 64 * 1024 * 1024
+val log_head_bytes = 16 * 1024 * 1024
+val log_tail_bytes = log_upload_limit - log_head_bytes
+
+fun write_truncated_log src dst =
+  let
+    val total = FS.fileSize src
+    val marker =
+      "\n... [holbuild: truncated " ^ Position.toString (total - Position.fromInt log_upload_limit) ^
+      " bytes of " ^ Position.toString total ^ "-byte build log] ...\n"
+    val fd = Posix.FileSys.openf (src, Posix.FileSys.O_RDONLY, Posix.FileSys.O.flags [])
+    val out = BinIO.openOut dst
+      handle e => (Posix.IO.close fd; raise e)
+    fun copy 0 = ()
+      | copy n =
+          let val chunk = Posix.IO.readVec (fd, Int.min (n, 65536))
+          in
+            if Word8Vector.length chunk = 0 then ()
+            else (BinIO.output (out, chunk); copy (n - Word8Vector.length chunk))
+          end
+  in
+    (copy log_head_bytes;
+     BinIO.output (out, Byte.stringToBytes marker);
+     ignore (Posix.IO.lseek (fd, total - Position.fromInt log_tail_bytes, Posix.IO.SEEK_SET));
+     copy log_tail_bytes;
+     BinIO.closeOut out;
+     Posix.IO.close fd)
+    handle e => (BinIO.closeOut out handle _ => (); Posix.IO.close fd handle _ => (); raise e)
+  end
 
 fun exception_failure e =
   let val msg = General.exnMessage e
@@ -12468,23 +12506,37 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
       case !run_log of
           SOME path => path
         | NONE => current_build_log (current_log_dir root (#1 (!target)) (#2 (!target)))
+    (* Why the log upload failed, for the result of an action that didn't. *)
+    val log_error = ref NONE
+    fun log_failed msg =
+      let val msg = "could not upload the action log: " ^ msg
+      in warn msg; log_error := SOME msg; NONE end
+    fun publish_log path =
+      let val sha = HolbuildHash.file_sha256 path
+      in
+        case HolbuildRemoteCache.publish_blob remote {hash = sha, src = path} of
+            HolbuildCacheBackend.Published => SOME (sha, Position.toString (FS.fileSize path))
+          | HolbuildCacheBackend.AlreadyPresent => SOME (sha, Position.toString (FS.fileSize path))
+          | HolbuildCacheBackend.Conflict msg => log_failed msg
+          | HolbuildCacheBackend.Skipped => log_failed "the cache skipped it"
+      end
     fun upload_log () =
       if not (!HolbuildActionSandbox.outputs_validated) then NONE else
       let val path = build_log ()
       in
         if not (file_exists path) then NONE
+        else if FS.fileSize path <= Position.fromInt log_upload_limit then publish_log path
         else
-          let val sha = HolbuildHash.file_sha256 path
+          (* Staged outside the root, where the child could have put a
+             link in its place. *)
+          let val upload = temp_near (Path.concat (cache, "action-log"))
           in
-            case HolbuildRemoteCache.publish_blob remote {hash = sha, src = path} of
-                HolbuildCacheBackend.Published => SOME (sha, Position.toString (FS.fileSize path))
-              | HolbuildCacheBackend.AlreadyPresent => SOME (sha, Position.toString (FS.fileSize path))
-              | _ => (warn "could not upload the action log"; NONE)
+            (write_truncated_log path upload; publish_log upload) before remove_file upload
+            handle e => (remove_file upload; raise e)
           end
       end
-      handle HolbuildRemoteCache.Unavailable msg =>
-               (warn ("could not upload the action log: " ^ msg); log_unavailable := SOME msg; NONE)
-           | e => (warn ("could not upload the action log: " ^ General.exnMessage e); NONE)
+      handle HolbuildRemoteCache.Unavailable msg => (log_unavailable := SOME msg; log_failed msg)
+           | e => log_failed (General.exnMessage e)
     fun empty_all () =
       (remove_file resident_file;
        resident := Resident.fresh resident_file;
@@ -13124,7 +13176,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               val text =
                 result_text (spec_sha256, !input_key)
                   {status = status, failure = failure, wall_ms = wall_ms, phases = phases,
-                   peak = !peak, log = log}
+                   peak = !peak, log = log, log_error = !log_error}
             in
               (case failure of
                    SOME (_, msg) => HolbuildStatus.message_stderr ("holbuild: exec-action failed: " ^ msg ^ "\n")
