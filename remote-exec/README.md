@@ -897,14 +897,16 @@ back to a coordinator image predating it, stop the coordinator and use the new
 image to run `alembic downgrade 0014`, then start the older image. Actions
 running ahead then look like any running action to the older image.
 
-Migration `0016` adds nullable `actions.finished_at` and `actions.worker`. It
-is a schema-only baseline: the coordinator and worker do not use these columns
-yet. Deploy and qualify this image before a runtime that uses them, so that
+Migration `0016` adds nullable `actions.finished_at` and `actions.worker`, and
+the index `batches_running`, built concurrently, so that statements that look
+for the running batches read only those rather than every finished batch kept
+for retention. The coordinator and worker do not use the new columns yet. Deploy and qualify this image before a runtime that uses them, so that
 its previous-image rollback already knows revision `0016`. An older
 coordinator still serves the upgraded schema, but its `migrate` command does
 not know the revision: to start an image predating `0016`, stop the
 coordinator and use this image to run `alembic downgrade 0015` first. This
-drops only diagnostic columns; result and scheduling state are kept.
+drops only the diagnostic columns and the index; result and scheduling state
+are kept.
 
 ## Tests
 
