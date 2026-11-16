@@ -6,10 +6,13 @@ structure FS = OS.FileSys
 
 exception Error of string
 
+type watch_set = {paths : string list, manifest_dirs : string list, input_files : string list}
+
 fun quote s = HolbuildToolchain.quote s
 
 fun readable path = FS.access(path, [FS.A_READ]) handle OS.SysErr _ => false
 fun exists path = FS.access(path, []) handle OS.SysErr _ => false
+fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
 fun add_unique path paths =
   if path = "" orelse List.exists (fn existing => existing = path) paths then paths
@@ -60,9 +63,9 @@ fun extra_input_watch_path root base decl =
     existing (Path.mkCanonical (if Path.isAbsolute path then path else Path.concat(base, path)))
   end
 
-(* Adds a source and the extra inputs its action policy and its own
-   holbuild_extra_deps declare. *)
-fun source_paths (source : HolbuildSourceIndex.source, paths) =
+(* The extra-input declarations of a source, each with the directory it is
+   relative to: those of its action policy and of its own holbuild_extra_deps. *)
+fun extra_input_decls (source : HolbuildSourceIndex.source) =
   let
     val source_path = #source_path source
     val manifest_decls =
@@ -74,11 +77,37 @@ fun source_paths (source : HolbuildSourceIndex.source, paths) =
             (#extra_deps (HolbuildDependencies.extract_textual source_path))
       else []
   in
-    List.foldl
-      (fn ((base, decl), acc) =>
-        add_existing (extra_input_watch_path (Path.mkCanonical (#package_root source)) base decl) acc)
-      (add_readable source_path paths)
-      (manifest_decls @ source_decls)
+    manifest_decls @ source_decls
+  end
+
+(* Adds a source and the paths to watch for its extra inputs. *)
+fun source_paths (source : HolbuildSourceIndex.source, paths) =
+  List.foldl
+    (fn ((base, decl), acc) =>
+      add_existing (extra_input_watch_path (Path.mkCanonical (#package_root source)) base decl) acc)
+    (add_readable (#source_path source) paths)
+    (extra_input_decls source)
+
+(* The files a declaration names, as the build expands it into action inputs;
+   none while it names nothing, which the build reports. *)
+fun expand_input base decl =
+  map #2 (HolbuildBuildPlan.expand_extra_dep base decl)
+  handle HolbuildBuildPlan.Error _ => [] | OS.SysErr _ => []
+
+(* The files of the extra and generator inputs.  They may lie in a member
+   directory or match a glob, so the watched paths alone don't list them. *)
+fun input_files packages index =
+  let
+    fun generator_files package =
+      List.concat
+        (map (fn generator =>
+               List.concat (map (expand_input (HolbuildProject.package_root package))
+                                (HolbuildProject.generator_inputs generator)))
+             (HolbuildProject.package_generators package))
+    fun source_files source =
+      List.concat (map (fn (base, decl) => expand_input base decl) (extra_input_decls source))
+  in
+    List.concat (map source_files index @ map generator_files packages)
   end
 
 (* The directories whose manifests are in use. A manifest that takes
@@ -108,7 +137,8 @@ fun watch_paths_with resolution project index =
     val paths = List.foldl package_paths paths packages
     val paths = List.foldl source_paths paths index
   in
-    {paths = rev paths, manifest_dirs = rev (manifest_dirs project packages)}
+    {paths = rev paths, manifest_dirs = rev (manifest_dirs project packages),
+     input_files = input_files packages index}
   end
 
 fun watch_paths project index =
@@ -120,7 +150,21 @@ fun ensure_inotifywait () =
 
 fun sleep_debounce () = OS.Process.sleep (Time.fromReal 0.25)
 
-fun is_dir path = FS.isDir path handle OS.SysErr _ => false
+(* The watched files and the input files, with their content hashes, sorted by
+   path.  inotifywait only starts after a build, so an edit made during the
+   build fires no event; comparing this from before the build with after it
+   finds such an edit.  A file that can't be read is left out: the build
+   reports it. *)
+fun snapshot ({paths, input_files, ...} : watch_set) =
+  let
+    fun add_hash (path, hashes) =
+      Binarymap.insert (hashes, path, HolbuildHash.file_sha256 path)
+      handle IO.Io _ => hashes | OS.SysErr _ => hashes
+  in
+    Binarymap.listItems
+      (List.foldl add_hash (Binarymap.mkDict String.compare)
+                  (List.filter (not o is_dir) paths @ input_files))
+  end
 
 fun regex_escape text =
   String.translate
@@ -156,7 +200,7 @@ fun inotify_dirs_command dirs =
 (* Two inotifywait processes, since one invocation is either recursive or not:
    the tree watch on the inputs, and a flat watch on the manifest directories.
    The first to exit decides; its status is the command's status. *)
-fun inotify_command {paths, manifest_dirs} =
+fun inotify_command ({paths, manifest_dirs, ...} : watch_set) =
   String.concatWith "\n"
     [inotify_tree_command paths ^ " &",
      "tree=$!",
