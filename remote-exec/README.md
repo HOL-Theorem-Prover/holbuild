@@ -150,6 +150,11 @@ docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_
 to hosts of lower rank first, so hosts of higher rank (an interruptible spot
 pool, say) empty first and scale in.
 
+A worker's name in its leases is `--name`, by default `host:pid`. When
+`REMOTE_EXEC_IMAGE` names the image the worker runs as
+`<repository>@sha256:<digest>`, the default name ends in `@` and the digest's
+first 12 hex digits, so a lease says which image ran the action.
+
 On `SIGTERM`, a worker stops claiming and gives its running action up to
 `--drain-seconds` (20 by default) to finish and report its result. At the
 deadline it stops HOL and reports `unavailable`, so
