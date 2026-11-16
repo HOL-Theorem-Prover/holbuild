@@ -152,8 +152,10 @@ fun restore {remote, identity, final_dir} =
           val scratch_dir = restore_scratch_path final_dir
           val archive_path = Path.concat(scratch_dir, "archive.tar")
           fun cleanup () = remove_tree scratch_dir handle _ => ()
+          (* The record names the archive, so it must be there. *)
           fun fetch () =
-            case HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = archive_path} of
+            case HolbuildRemoteCache.required (fn () =>
+                   HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = archive_path}) of
                 HolbuildCacheBackend.Hit => ()
               | HolbuildCacheBackend.Miss => reject "remote toolchain archive blob is missing"
               | HolbuildCacheBackend.Corrupt detail => die ("could not fetch remote toolchain archive blob: " ^ detail)
@@ -197,7 +199,7 @@ fun publish {remote, identity, entry_dir, replace} =
                 (* HTTP has no compare-and-swap: two builders can both see no
                    record and both put one, so only a record that still names
                    this archive counts as ours. *)
-                (case HolbuildRemoteCache.get_action remote identity of
+                (case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote identity) of
                      SOME text =>
                        if (parse_remote_record text = hash handle _ => false) then HolbuildCacheBackend.Published
                        else HolbuildCacheBackend.AlreadyPresent

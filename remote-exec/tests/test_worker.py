@@ -6,6 +6,7 @@ import io
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tarfile
@@ -2186,3 +2187,15 @@ def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(
     with pytest.raises(KeyboardInterrupt):
         worker.main()
     assert events == ["memory", "claim", "refresh", "run"]
+
+
+def test_the_default_worker_name_carries_the_image_digest_the_task_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = ["--coordinator", "http://coordinator.test", "--remote-cache", "http://cache.test", "--cache-limit-gb", "1"]
+    plain = f"{socket.gethostname()}:{os.getpid()}"
+    monkeypatch.delenv("REMOTE_EXEC_IMAGE", raising=False)
+    assert parse_args(args).name == plain
+    monkeypatch.setenv("REMOTE_EXEC_IMAGE", "123.dkr.ecr.eu-west-1.amazonaws.com/holbuild-remote-exec@sha256:" + "ab12" * 16)
+    assert parse_args(args).name == plain + "@ab12ab12ab12"
+    assert parse_args([*args, "--name", "w1"]).name == "w1"
+    monkeypatch.setenv("REMOTE_EXEC_IMAGE", "holbuild-remote-exec:latest")
+    assert parse_args(args).name == plain

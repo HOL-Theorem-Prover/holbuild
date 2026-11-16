@@ -1391,17 +1391,21 @@ SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie).
 `HOLBUILD_REMOTE_CACHE_PREFERRED_URLS`, a comma-separated list of ring nodes,
 moves those nodes to the front, each group keeping that order: a client in
 one data center can name the replicas there, so it writes to them and reads
-from them first. Reads try the next node after a 404, connection failure,
-timeout, 429 or 5xx, through the whole ring: a node writes a new entry to the
-shared backing store only after answering the PUT, so until then a reader that
-prefers another node finds it only on the writer's node. After two nodes
-answer 404, holbuild asks the rest of the ring at once with HEAD (on up to 16
-helper threads per process) and then reads the body only from a node that
-has the entry, so a genuine miss costs two 404s in turn and one parallel round
-of HEADs. Writes try the second node after a connection failure,
+from them first. Reads try the next node after a connection failure, timeout,
+429 or 5xx, and end at the first 404: every node serves what the shared
+backing store holds, so a miss costs one request, and only an entry another
+node took moments ago (a node writes a new entry to the backing store shortly
+after answering the PUT) is missed, which the build then makes again. Reads of
+an entry that must exist go through the whole ring instead: a remote worker's
+action inputs and spec, the outputs and logs a remote batch reported finished,
+and the read-back after a write, which may have gone to a later node. After two
+nodes answer 404, such a read asks the rest of the ring at once with HEAD (on
+up to 16 helper threads per process) and then reads the body only from a node
+that has the entry. Writes try the second node after a connection failure,
 timeout, 429 or 5xx. A theory's `/ac` read also tries the next node when the
 first one's entry was built under a weaker tactic-timeout contract than the
-build asks for. When publishing or confirming an
+build asks for, and then goes through the whole ring looking for a stronger
+one. When publishing or confirming an
 existing timed theory, workers also strengthen older compatible manifests on
 reachable replicas, so a reader with a narrower cache view can restore the
 result. This repair preserves stronger contracts, does not create missing
@@ -1414,12 +1418,11 @@ backup keeps the ring available; the circuit breaker below counts the final
 outcome of a request. If no node hits, a 404 from any node gives a miss, even if
 others failed transiently; this allows a new action to build and publish on a
 healthy node. Transient failures from every node remain unavailable. Reads of an
-entry that must exist are the exception: when a remote worker restores an
-action's inputs (its spec's blobs and its parent theories), fetches its spec, or
-the coordinator checks that a finished parent is still cached, a 404 beside a
-transient failure is unavailable, since the failed node may hold the entry. Replicas
-should share a backing store, so that any node can serve an entry another node
-wrote once it is uploaded.
+entry that must exist (above, and the coordinator checking that a finished
+parent is still cached) are the exception: a 404 beside a transient failure is
+unavailable, since the failed node may hold the entry. Replicas should share a
+backing store, so that any node can serve an entry another node wrote once it
+is uploaded.
 
 Remote cache misses or errors fall back to the local cache/source build path.
 A request waits at most 5 s for its connection. After three requests in a row
