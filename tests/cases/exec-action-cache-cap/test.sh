@@ -164,7 +164,7 @@ stamped_within() {
 import pathlib, sys
 path, gb, what = sys.argv[1:]
 assert pathlib.Path(path).exists(), f"no stamp after {what}"
-total = sum(map(int, pathlib.Path(path).read_text().split()[3::2]))
+total = sum(map(int, pathlib.Path(path).read_text().split()[4::2]))
 assert total <= int(gb) * 1024 ** 3, f"stamp after {what} holds {total} bytes, over {gb} GiB"
 PY
 }
@@ -252,7 +252,7 @@ sweep4() {
   [[ $status -eq 4 ]] || { cat "$tmpdir/stamp.log" >&2; exit 1; }
 }
 sweep4 100 1
-state=$cache4/locks/worker-cache-cap.state
+state=$cache4/locks/worker-cache-cap-v3.state
 [[ -s "$state" ]] || { echo "no shared sweep measurement" >&2; exit 1; }
 cp "$state" "$tmpdir/first-state"
 sparse "$cache4/blobs/second" 1
@@ -303,7 +303,7 @@ sweep4 7 1
 ! cmp -s "$state" "$tmpdir/first-state" || { echo "small cap reused a measurement" >&2; exit 1; }
 python3 - "$state" <<'BYTES'
 import pathlib, sys
-assert sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[3::2])) >= 3 * 1024 ** 3
+assert sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[4::2])) >= 3 * 1024 ** 3
 BYTES
 cp "$state" "$tmpdir/small-state"
 # Current reserve and fresh private checkpoints participate in the target check.
@@ -380,7 +380,8 @@ with open(pathlib.Path(state).parent / "gc.lock", "a") as lock:
                 child.wait()
 LOCK
 
-# A sibling's shared stamp must not omit this container's private modules.
+# A sibling's shared stamp must not omit modules in a store of this
+# container's own: a store not shared with the host's is measured live.
 cp "$state" "$tmpdir/pre-module-state"
 # Stamp an old 10 GB blob, so that the module takes the stamp past the limit
 # while evicting the blob alone gets back under the target.
@@ -393,7 +394,14 @@ set +e
 HOLBUILD_CACHE=$cache5 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 100 --cache-reserve-gb 1 > "$tmpdir/modules.log" 2>&1
 set -e
-stamped_within "$state" 2 "private module growth caused eviction"
+# The stamp re-measured after eviction; its module root is this container's
+# own store, which a sibling with another store measures live.
+python3 - "$state" <<'OWN'
+import pathlib, sys
+sizes = list(map(int, pathlib.Path(sys.argv[1]).read_text().split()[4::2]))
+assert sum(sizes[:4]) <= 2 * 1024 ** 3, f"the stamp after eviction holds {sizes[:4]} shared bytes"
+assert sizes[4] >= 90 * 1024 ** 3, f"the stamp's module root holds {sizes[4]} bytes, not this container's"
+OWN
 evicted "$cache4/blobs/first" "old shared data before a new private module"
 kept "$cache5/theory-modules/large.pmo" "private modules under the target"
 rm "$cache5/theory-modules/large.pmo"
@@ -412,7 +420,7 @@ HOLBUILD_CACHE=$cache5 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action 
 set -e
 python3 - "$state" <<'ALIASES'
 import pathlib, sys
-assert sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[3::2])) >= 3 * 1024 ** 3
+assert sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[4::2])) >= 3 * 1024 ** 3
 ALIASES
 
 # Partial sharing on the same filesystem: differing roots are measured live,
@@ -547,7 +555,7 @@ for limits in "100 10 89" "400 40 359"; do
   mature_cache=$tmpdir/mature-$limit
   sparse "$mature_cache/checkpoint-store/family/heap" "$bytes"
   sweep_mature "$limit" "$reserve"
-  mature_state=$mature_cache/locks/worker-cache-cap.state
+  mature_state=$mature_cache/locks/worker-cache-cap-v3.state
   cp "$mature_state" "$tmpdir/mature-state"
   sweep_mature "$limit" "$reserve"
   cmp "$mature_state" "$tmpdir/mature-state" || { echo "mature cache repeated a shared scan" >&2; exit 1; }
@@ -583,7 +591,7 @@ python3 - "$HOLBUILD_BIN" "$evicting" "$tmpdir/evicting-sibling" "$remote_url" "
 import os, pathlib, subprocess, sys, time
 binary, cache, sibling, remote, absent, tmp = sys.argv[1:]
 cache = pathlib.Path(cache)
-state = cache / "locks/worker-cache-cap.state"
+state = cache / "locks/worker-cache-cap-v3.state"
 gib = 1024 ** 3
 def sweep(name, root=cache):
     return ([binary, "--remote-cache", remote, "exec-action", absent,
@@ -591,7 +599,7 @@ def sweep(name, root=cache):
              "--cache-limit-gb", "100", "--cache-reserve-gb", "10"],
             {**os.environ, "HOLBUILD_CACHE": str(root)})
 def stamp():
-    measured, *entries = state.read_text().split()[1:]
+    measured, _floor, *entries = state.read_text().split()[1:]
     return int(measured), sum(map(int, entries[1::2]))
 argv, env = sweep("evicting")
 with open(pathlib.Path(tmp) / "evicting.log", "w") as log:
@@ -623,3 +631,96 @@ assert not (cache / "blobs/old").exists(), "the sweep kept old data over the tar
 assert (cache / "checkpoint-store/family/heap").exists(), "the sweep evicted past the target"
 assert stamp()[1] <= 90 * gib, "the stamp after eviction still holds the pre-eviction walk"
 EVICTING
+
+# The host-shared theory-modules store is the stamp's fifth root, in a stamp
+# file of its own: releases before it keep theirs in worker-cache-cap.state.
+cache10=$tmpdir/cache10
+sparse "$cache10/theory-modules/shared.pmo" 2
+mkdir -p "$cache10/locks"
+printf 'holbuild-worker-cache-cap-v2\n0\n' > "$cache10/locks/worker-cache-cap.state"
+cp "$cache10/locks/worker-cache-cap.state" "$tmpdir/v2-state"
+sweep10() {
+  local status=0
+  HOLBUILD_CACHE=$cache10 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
+    --result "$tmpdir/result" --cache-limit-gb "$1" --cache-reserve-gb 10 "${@:2}" \
+    > "$tmpdir/floor.log" 2>&1 || status=$?
+  [[ $status -eq 4 ]] || { cat "$tmpdir/floor.log" >&2; exit 1; }
+}
+sweep10 1000
+cmp "$cache10/locks/worker-cache-cap.state" "$tmpdir/v2-state" ||
+  { echo "the sweep rewrote an older release's stamp" >&2; exit 1; }
+python3 - "$cache10/locks/worker-cache-cap-v3.state" <<'MODULES'
+import pathlib, sys
+header, measured, floor, *entries = pathlib.Path(sys.argv[1]).read_text().split()
+assert (header, floor) == ("holbuild-worker-cache-cap-v3", "floor-ok"), (header, floor)
+assert len(entries) == 10, f"the stamp has {len(entries) // 2} roots, not 5"
+assert int(entries[-1]) >= 2 * 1024 ** 3, "the stamp leaves out the theory-modules store"
+MODULES
+
+# Free-space floor. The disk the cache is on, read as the sweep reads it.
+disk() {
+  python3 - "$cache10" <<'DISK'
+import os, sys
+s = os.statvfs(sys.argv[1])
+gib = 1024 ** 3
+free, size = s.f_bavail * s.f_frsize, s.f_blocks * s.f_frsize
+buffer = max(8 * gib, size // 25)
+# A floor 32 GiB over what's free, and families each larger than what the
+# sweep must evict for it, with 64 GiB to spare for other writers on the disk.
+floor = free // gib + 32
+print(floor, (floor * gib + buffer - free) // gib + 64)
+DISK
+}
+read -r floor family <<< "$(disk)"
+rm -rf "$cache10/theory-modules"
+for year in 2001 2002 2003; do
+  sparse "$cache10/blobs/$year" "$family"
+  at "$year" "$cache10/blobs/$year"
+done
+limit=$((family * 3 + 100))
+# A fresh stamp without the floor is no reason to skip a sweep below it.
+sweep10 "$limit"
+cp "$cache10/locks/worker-cache-cap-v3.state" "$tmpdir/floor-ok-state"
+sweep10 "$limit" --cache-min-free-gb "$floor"
+! cmp -s "$cache10/locks/worker-cache-cap-v3.state" "$tmpdir/floor-ok-state" ||
+  { echo "a stamp without the floor was reused below it" >&2; exit 1; }
+# Evicting to the floor plus its buffer goes by the bytes evicted.
+evicted "$cache10/blobs/2001" "the oldest family below the free-space floor"
+kept "$cache10/blobs/2002" "a family once the floor was met"
+kept "$cache10/blobs/2003" "the newest family once the floor was met"
+
+# A disk that evicting everything can't bring over the floor: the sweep says
+# so in its stamp, and siblings neither sweep again nor wait on gc.lock for it
+# while the stamp is fresh.
+sweep10 "$limit" --cache-min-free-gb 1000000
+evicted "$cache10/blobs/2002" "an evictable family below an unreachable floor"
+evicted "$cache10/blobs/2003" "an evictable family below an unreachable floor"
+grep -q 'stays under the 1000000.0 GB free-space floor' "$tmpdir/floor.log" ||
+  { echo "no warning that the floor stays unmet" >&2; cat "$tmpdir/floor.log" >&2; exit 1; }
+python3 - "$cache10/locks/worker-cache-cap-v3.state" <<'HANDLED'
+import pathlib, sys
+floor = pathlib.Path(sys.argv[1]).read_text().split()[2]
+assert floor == "floor-handled", floor
+HANDLED
+cp "$cache10/locks/worker-cache-cap-v3.state" "$tmpdir/handled-state"
+sparse "$cache10/blobs/2004" 1
+at 2004 "$cache10/blobs/2004"
+python3 - "$HOLBUILD_BIN" "$cache10" "$remote_url" "$absent" "$tmpdir" "$limit" <<'CONVOY'
+import fcntl, os, pathlib, subprocess, sys
+binary, cache, remote, absent, tmp, limit = sys.argv[1:]
+with open(pathlib.Path(cache) / "locks/gc.lock", "a") as lock:
+    fcntl.lockf(lock, fcntl.LOCK_EX)
+    with open(pathlib.Path(tmp) / "convoy.log", "w") as log:
+        try:
+            status = subprocess.run(
+                [binary, "--remote-cache", remote, "exec-action", absent,
+                 "--result", str(pathlib.Path(tmp) / "convoy-result"), "--cache-limit-gb", limit,
+                 "--cache-reserve-gb", "10", "--cache-min-free-gb", "1000000"],
+                env={**os.environ, "HOLBUILD_CACHE": cache}, stdout=log, stderr=log, timeout=20).returncode
+        except subprocess.TimeoutExpired:
+            raise AssertionError("a sibling waited on gc.lock below a floor already handled")
+    assert status == 4, f"the sibling exited {status}"
+CONVOY
+cmp "$cache10/locks/worker-cache-cap-v3.state" "$tmpdir/handled-state" ||
+  { echo "a sibling swept again below a floor already handled" >&2; exit 1; }
+kept "$cache10/blobs/2004" "a family while the floor was already handled"
