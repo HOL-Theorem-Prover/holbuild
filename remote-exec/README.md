@@ -777,8 +777,9 @@ none is. A run batch with it returns 400.
 `last_claimed_at` and `worker` describe the latest claim; a new claim clears
 `finished_at`. An accepted worker result sets `finished_at`, including a
 failure that will be retried. Times come from the coordinator database.
-Expired leases and cancellations have no finish time, even when the stopped
-worker's log is kept. Unclaimed actions have null fields; claims an older
+Lease expiry and cancellation set no finish time, even when the stopped
+worker's log is kept, so an action cancelled after an accepted failure keeps
+that failure's finish time. Unclaimed actions have null fields; claims an older
 coordinator made have a timestamp without a worker or finish time. Worker
 names are supplied by the worker, defaulting to its hostname and process ID.
 These fields retain only the latest attempt, not its retry history.

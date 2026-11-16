@@ -215,7 +215,7 @@ class ActionStatus:
     log_sha256: str | None
     failure_detail: str | None  # the last result's detail: why it failed when it has no log
     last_claimed_at: datetime | None
-    finished_at: datetime | None  # accepted result time for the latest claim, not lease expiry or cancellation
+    finished_at: datetime | None  # the latest accepted result's time; lease expiry and cancellation set none
     worker: str | None
     timings: dict[str, int] | None  # the last result's, in milliseconds; see formats.Result
 
