@@ -159,6 +159,8 @@ jobs:
           root=${roots[0]%/}
           test -s "$root/LICENSE"
           test -s "$root/share/holbuild/copyrights/smlnj.txt"
+          test -s "$root/share/holbuild/copyrights/sml-toml"
+          test -s "$root/share/holbuild/copyrights/hol4.txt"
           test -s "$root/share/holbuild/copyrights/polyml-LGPL-2.1.txt"
           test -s "$root/share/holbuild/sml/holbuild_runtime.sml"
           test -s "$root/share/man/man1/holbuild.1"
