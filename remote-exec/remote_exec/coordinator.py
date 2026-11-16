@@ -418,13 +418,13 @@ UPDATE actions c SET (remaining_deps, state) = (
 )
 WHERE c.batch_id = :batch_id AND c.input_key = ANY({selected}) AND c.state IN ('waiting', 'ready')
 """
-# The live leases of a worker other than the one it ``held``, claimed ``before`` a time if one is given: see
+# The live leases of a worker other than the one it ``held``, claimed ``before`` a time: see
 # ``Coordinator.release_unheld``. A lease is claimed in the transaction that sets its action's ``last_claimed_at``.
 UNHELD_LEASES = sa.text(
     "SELECT l.attempt_token, l.batch_id FROM leases l "
     "JOIN actions a ON a.batch_id = l.batch_id AND a.input_key = l.input_key "
     "WHERE l.worker = :worker AND l.expires_at > now() AND l.attempt_token IS DISTINCT FROM CAST(:held AS uuid) "
-    "AND a.last_claimed_at < COALESCE(CAST(:before AS timestamptz), 'infinity')"
+    "AND a.last_claimed_at < :before"
 )
 REFRESH_KEYS = sa.text(REFRESH.format(selected="CAST(:keys AS text[])"))
 REFRESH_CHILDREN = sa.text(
@@ -1743,9 +1743,12 @@ class Coordinator:
         }
         return PhaseTotals(PHASE_WINDOW_SECONDS, len(self.phase_reports), PhaseReport(**sums))
 
-    async def heartbeat(self, token: UUID) -> bool:
+    async def heartbeat(self, token: UUID, arrived: datetime | None = None) -> bool:
         """Extend a live lease; False when it expired or was revoked, so the worker should stop. The worker runs one
-        action at a time, so it holds none of its other live leases: they end as ``release_unheld`` ends them."""
+        action at a time, so it holds none of its other live leases claimed before the heartbeat ``arrived``: they end
+        as ``release_unheld`` ends them. One claimed since may be one it runs, the heartbeat having outlasted the
+        worker's wait for it and its result."""
+        arrived = arrived or datetime.now(UTC)
         async with self.engine.begin() as conn:
             worker = await conn.scalar(
                 sa.text(
@@ -1755,7 +1758,7 @@ class Coordinator:
                 {"token": token, "lease": self.settings.lease_seconds},
             )
             unheld = [] if worker is None else list(
-                await conn.execute(UNHELD_LEASES, {"worker": worker, "held": token, "before": None})
+                await conn.execute(UNHELD_LEASES, {"worker": worker, "held": token, "before": arrived})
             )
         await self._end_unheld(unheld)
         live = worker is not None

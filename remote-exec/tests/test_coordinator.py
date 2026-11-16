@@ -792,6 +792,21 @@ async def test_a_late_claim_leaves_the_leases_its_worker_claimed_since(
     assert (actions[running.theory]["state"], actions[running.theory]["attempts"]) == ("running", 1)
 
 
+async def test_a_late_heartbeat_leaves_the_leases_its_worker_claimed_since(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """A heartbeat answered after its worker moved on mustn't end the lease that worker now runs."""
+    batch_id = await submit(http, ["a", "b"])
+    old = await coordinator.claim(["standard"], "w9")
+    arrived = datetime.now(UTC)
+    running = await coordinator.claim(["standard"], "w9")  # claimed while the heartbeat waited
+    assert old is not None and running is not None
+
+    assert await coordinator.heartbeat(old.attempt_token, arrived)
+    actions = {a["theory"]: a for a in (await batch(http, batch_id))["actions"]}
+    assert (actions[running.theory]["state"], actions[running.theory]["attempts"]) == ("running", 1)
+
+
 async def test_a_heartbeat_ends_the_leases_its_worker_got_no_answer_for(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
