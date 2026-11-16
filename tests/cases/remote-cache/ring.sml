@@ -40,17 +40,20 @@ fun publish remote digest = RC.put_blob remote {hash = digest, src = src};
 val vectors = String.tokens (fn c => c = #"\n") (RC.read_text (dir ^ "/vectors"));
 fun check_vector line =
   let
-    val [digest, primary, backup] = String.tokens Char.isSpace line
+    val [digest, primary, backup, blob_primary, blob_backup] = String.tokens Char.isSpace line
     val _ = assert "SML/Python ranking agrees" (RC.ranked_urls cache digest = [primary, backup])
+    val _ = assert "SML/Python blob URLs agree" (RC.blob_urls cache digest = [blob_primary, blob_backup])
     val _ = assert "credentials do not change rankings"
       (RC.ranked_urls auth_cache digest = map authenticated [primary, backup])
     val _ = assert "order independent" (RC.ranked_urls reversed digest = [primary, backup])
     val _ = RC.write_text src digest
     (* curl PUT takes arbitrary digest paths; publish a real digest below. *)
-    val _ = assert "CAS primary PUT"
-      (RC.curl_put_urls [] {urls = RC.cas_urls cache digest, src = src} = CB.Published)
-    val _ = assert "CAS sharding" (RC.path_exists (stored primary "cas" digest) andalso
-                                  not (RC.path_exists (stored backup "cas" digest)))
+    val _ = assert "blob primary PUT"
+      (RC.curl_put_urls [] {urls = RC.blob_urls cache digest, src = src} = CB.Published)
+    val blob = RC.blob_key digest
+    val [blob_owner, blob_other] = RC.ranked_urls cache blob
+    val _ = assert "blob sharding" (RC.path_exists (stored blob_owner "ac" blob) andalso
+                                   not (RC.path_exists (stored blob_other "ac" blob)))
     val _ = assert "AC primary PUT"
       (RC.publish_action_metadata cache digest (RC.metadata_text digest []) = CB.Published)
     val ac = RC.remote_action_key digest
@@ -61,9 +64,11 @@ val _ = List.app check_vector vectors;
 
 val text = "ring payload";
 val digest = HolbuildHash.string_sha256 text;
-val [primary, backup] = RC.ranked_urls cache digest;
+val blob_key = RC.blob_key digest;
+val [primary, backup] = RC.ranked_urls cache blob_key;
 val _ = RC.write_text src text;
-val _ = RC.write_text (stored backup "cas" digest) text;
+val _ = RC.ensure_parent (stored backup "ac" blob_key);
+val _ = assert "plant compressed blob" (RC.zstd_compress backup src (stored backup "ac" blob_key));
 val _ = put backup "authorization" "Basic dXNlcjpwYXNz";
 val _ = assert "request keeps inline credentials" (fetch auth_cache digest = CB.Hit);
 val _ = clear backup "authorization";
@@ -91,7 +96,7 @@ val _ = put primary "get-status" "401";
 val _ = assert "authorization error is not retried"
   (case fetch cache digest of CB.Corrupt _ => true | _ => false);
 val _ = clear primary "get-status";
-val _ = RC.remove_file (stored backup "cas" digest);
+val _ = RC.remove_file (stored backup "ac" blob_key);
 val _ = assert "both missing" (fetch cache digest = CB.Miss);
 fun unavailable f = (ignore (f ()); false) handle RC.Unavailable _ => true;
 val _ = put primary "get-status" "503";
@@ -103,7 +108,7 @@ val _ = put backup "get-status" "503";
 val _ = assert "both transient reports backup"
   ((ignore (fetch auth_cache digest); false)
    handle RC.Unavailable message =>
-     String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/cas/" ^ digest) message andalso
+     String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/ac/" ^ blob_key) message andalso
      not (String.isSubstring "user:pass" message));
 val _ = clear primary "get-status";
 val _ = assert "missing plus transient is a miss" (fetch cache digest = CB.Miss);
@@ -112,7 +117,7 @@ val _ = assert "a required read of missing plus transient is unavailable"
 val _ = put backup "get-status" "403";
 val _ = assert "backup authorization failure overrides miss and names backup"
   (case fetch auth_cache digest of
-       CB.Corrupt message => String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/cas/" ^ digest) message andalso
+       CB.Corrupt message => String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/ac/" ^ blob_key) message andalso
                              not (String.isSubstring "user:pass" message)
      | _ => false);
 val _ = clear backup "get-status";
@@ -128,7 +133,7 @@ val degraded = RC.remote (down ^ "," ^ one);
 fun down_digest i =
   let val text = "down " ^ Int.toString i
       val hash = HolbuildHash.string_sha256 text
-  in if hd (RC.ranked_urls degraded hash) = down then (text, hash) else down_digest (i + 1) end;
+  in if hd (RC.ranked_urls degraded (RC.blob_key hash)) = down then (text, hash) else down_digest (i + 1) end;
 val (down_text, down_hash) = down_digest 0;
 val _ = RC.write_text src down_text;
 (* More than three successful failovers must not trip the transport breaker. *)
@@ -208,9 +213,9 @@ val preferred_hash = HolbuildHash.string_sha256 preferred_text;
 val _ = RC.write_text src preferred_text;
 val _ = assert "PUT goes to the preferred node"
   (publish replicas preferred_hash = CB.Published andalso
-   RC.path_exists (stored third "cas" preferred_hash) andalso
-   not (RC.path_exists (stored first "cas" preferred_hash)) andalso
-   not (RC.path_exists (stored second "cas" preferred_hash)));
+   RC.path_exists (stored third "ac" (RC.blob_key preferred_hash)) andalso
+   not (RC.path_exists (stored first "ac" (RC.blob_key preferred_hash))) andalso
+   not (RC.path_exists (stored second "ac" (RC.blob_key preferred_hash))));
 val _ = HolbuildRemoteCacheConfig.set_preferred_urls (authenticated first ^ "," ^ authenticated second);
 val _ = assert "a reader preferring other nodes still finds it"
   (fetch replicas preferred_hash = CB.Hit andalso RC.read_text dst = preferred_text);

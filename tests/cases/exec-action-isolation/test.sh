@@ -118,7 +118,7 @@ run_tmp_action() {
   grep -q "^status=built$" "$worker/result" || { cat "$worker/log" "$worker/result" >&2; exit 1; }
   local log
   log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$worker/result")
-  grep '^tmpName ' "$tmpdir/remote/cas/$log"
+  remote_blob_text "$tmpdir/remote" "$log" | grep '^tmpName '
 }
 tmp_worker=$(mktemp -d /tmp/holbuild-test-tmp.XXXXXX)
 [[ $(run_tmp_action "$tmp_worker" "$withheld") == "tmpName withheld" ]] || { echo '/tmp granted over worker state' >&2; exit 1; }
@@ -200,7 +200,8 @@ fi
   { cat "$tmpdir/worker.log" "$tmpdir/result" >&2; exit 1; }
 require_grep '^status=built$' "$tmpdir/result"
 log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/result")
-require_grep 'credential and cache attacks denied' "$tmpdir/remote/cas/$log"
+remote_blob_text "$tmpdir/remote" "$log" > "$tmpdir/action.log"
+require_grep 'credential and cache attacks denied' "$tmpdir/action.log"
 for dir in actions blobs locks cooperate; do
   for base in "$tmpdir/shared" "$tmpdir/worker"; do require_grep '^original$' "$base/$dir/other"; done
 done
@@ -209,10 +210,10 @@ done
 
 # Trust rejection is final, even for a warm/cached action. No source from an
 # unconfigured repository may reach toolchain bootstrap.
+remote_blob_text "$tmpdir/remote" "$spec" > "$tmpdir/spec"
 sed 's|^toolchain git=[^ ]* |toolchain git=https://untrusted.invalid/HOL.git |' \
-  "$tmpdir/remote/cas/$spec" > "$tmpdir/rejected-spec"
-rejected=$(sha256sum "$tmpdir/rejected-spec" | cut -d' ' -f1)
-cp "$tmpdir/rejected-spec" "$tmpdir/remote/cas/$rejected"
+  "$tmpdir/spec" > "$tmpdir/rejected-spec"
+rejected=$(put_remote_blob "$tmpdir/remote" "$tmpdir/rejected-spec")
 set +e
 HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" --remote-cache "$remote_url" \
   exec-action "$rejected" --cache-limit-gb 1000 --result "$tmpdir/rejected.result" \

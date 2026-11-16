@@ -102,7 +102,7 @@ for line in batch[1:]:
     if fields[0] != "action":
         continue
     _, key, ac_key, spec_sha, target = fields
-    expected_ac = hashlib.sha256(f"holbuild-remote-ac-v1\n{key}\n".encode()).hexdigest()
+    expected_ac = hashlib.sha256(f"holbuild-remote-ac-v2\n{key}\n".encode()).hexdigest()
     assert ac_key == expected_ac, (line, expected_ac)
     data = (spec_dir / spec_sha).read_bytes()
     assert hashlib.sha256(data).hexdigest() == spec_sha, spec_sha
@@ -184,15 +184,15 @@ fi
 hb action-spec --upload CTheory > "$tmpdir/batch-upload.txt"
 diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-upload.txt"
 for spec in $(awk '$1 == "action" { print $4 }' "$tmpdir/batch1.txt"); do
-  cmp "$project/.holbuild/action-specs/$spec" "$remote_root/cas/$spec"
+  cmp "$project/.holbuild/action-specs/$spec" <(remote_blob_text "$remote_root" "$spec")
 done
 for file in BScript.sml helperLib.sml data.txt; do
-  require_file "$remote_root/cas/$(sha256sum "$project/src/$file" | cut -d' ' -f1)"
+  require_file "$(remote_blob "$remote_root" "$(sha256sum "$project/src/$file" | cut -d' ' -f1)")"
 done
 
 # The uploads run concurrently too: hold CAS PUTs until two are in flight,
 # which a serial uploader cannot reach.
-rm -rf "$remote_root/cas"
+remove_remote_blobs "$remote_root"
 touch "$tmpdir/control/cas-put-enable"
 (cd "$project" && exec "$HOLBUILD_BIN" --remote-cache "$remote_url" \
   --prefetch-concurrency 2 action-spec --upload CTheory) \
@@ -214,7 +214,7 @@ unset export_pid
 rm "$tmpdir/control/cas-put-enable" "$tmpdir/control/cas-put-release"
 diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-upload-parallel.txt"
 for spec in $(awk '$1 == "action" { print $4 }' "$tmpdir/batch1.txt"); do
-  cmp "$project/.holbuild/action-specs/$spec" "$remote_root/cas/$spec"
+  cmp "$project/.holbuild/action-specs/$spec" <(remote_blob_text "$remote_root" "$spec")
 done
 total=$(sed -n 's|^uploading to remote cache: 0/\([0-9][0-9]*\) files$|\1|p' "$tmpdir/upload-progress.log")
 [[ -n "$total" ]] || { cat "$tmpdir/upload-progress.log" >&2; exit 1; }
@@ -229,8 +229,8 @@ for client in libcurl cli; do
   : > "$request_log"
   hb action-spec --upload CTheory > "$tmpdir/batch-resident.txt"
   diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-resident.txt"
-  [[ $(grep -c '^HEAD /cas/' "$request_log") -eq 8 ]]
-  if grep -q '^PUT /cas/' "$request_log"; then
+  [[ $(grep -c '^HEAD /ac/.* blob$' "$request_log") -eq 8 ]]
+  if grep -q '^PUT /ac/.* blob$' "$request_log"; then
     echo "resident blobs were uploaded again" >&2
     exit 1
   fi
@@ -238,7 +238,7 @@ for client in libcurl cli; do
   : > "$request_log"
   hb action-spec --upload CTheory > "$tmpdir/batch-unknown-head.txt"
   diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-unknown-head.txt"
-  [[ $(grep -c '^PUT /cas/' "$request_log") -eq 8 ]]
+  [[ $(grep -c '^PUT /ac/.* blob$' "$request_log") -eq 8 ]]
   rm "$tmpdir/control/head-status"
   # Hold PUT responses until three follow failed HEADs. Counting optional
   # HEAD failures against the breaker would suppress the third PUT.
@@ -268,21 +268,21 @@ done
 
 # A cache of one node asks again after a transient answer to an upload.
 missing_spec=$(awk '$1 == "action" { print $4; exit }' "$tmpdir/batch1.txt")
-rm "$remote_root/cas/$missing_spec"
+rm "$(remote_blob "$remote_root" "$missing_spec")"
 echo 502 > "$tmpdir/control/cas-put-fail-once"
 : > "$request_log"
 hb --prefetch-concurrency 1 action-spec --upload CTheory > "$tmpdir/batch-retried.txt"
 diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-retried.txt"
 [[ ! -e "$tmpdir/control/cas-put-fail-once" ]] || { echo "the upload was not refused once" >&2; exit 1; }
-cmp "$project/.holbuild/action-specs/$missing_spec" "$remote_root/cas/$missing_spec"
-[[ $(grep -c "^PUT /cas/$missing_spec\$" "$request_log") -eq 2 ]] || {
+cmp "$project/.holbuild/action-specs/$missing_spec" <(remote_blob_text "$remote_root" "$missing_spec")
+[[ $(grep -c "^PUT /ac/$(blob_key "$missing_spec") blob\$" "$request_log") -eq 2 ]] || {
   echo "expected the refused upload and its retry:" >&2
-  grep '^PUT /cas/' "$request_log" >&2
+  grep '^PUT /ac/.* blob$' "$request_log" >&2
   exit 1
 }
 
 # After the first upload fails twice, the rest are skipped and the export fails.
-rm "$remote_root/cas/$missing_spec"
+rm "$(remote_blob "$remote_root" "$missing_spec")"
 echo 500 > "$tmpdir/control/cas-put-status"
 : > "$request_log"
 if HOLBUILD_TIMING_LOG="$tmpdir/failed-upload.timing" hb --prefetch-concurrency 1 action-spec --upload CTheory > /dev/null 2> "$tmpdir/upload-failure.log"; then
@@ -292,9 +292,9 @@ fi
 rm "$tmpdir/control/cas-put-status"
 require_grep 'could not upload .*HTTP 500' "$tmpdir/upload-failure.log"
 require_grep 'name=action_spec.upload.*status=fail' "$tmpdir/failed-upload.timing"
-[[ $(grep -c '^PUT /cas/' "$request_log") -eq 2 ]] || {
+[[ $(grep -c '^PUT /ac/.* blob$' "$request_log") -eq 2 ]] || {
   echo "uploads went on after the first failure:" >&2
-  grep '^PUT /cas/' "$request_log" >&2
+  grep '^PUT /ac/.* blob$' "$request_log" >&2
   exit 1
 }
 
@@ -313,10 +313,10 @@ diff -u "$tmpdir/edges2.expected" "$tmpdir/edges2.txt"
 
 # A's entry whose blobs expired from the remote cache counts as uncached,
 # through libcurl where the host has it and through the curl CLI.
-ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
+ac_a=$(printf 'holbuild-remote-ac-v2\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
 blob_a=$(awk '$1 == "blob" { print $2; exit }' "$remote_root/ac/$ac_a")
 [[ -n "$blob_a" ]] || { cat "$remote_root/ac/$ac_a" >&2; exit 1; }
-mv "$remote_root/cas/$blob_a" "$tmpdir/blob-a"
+mv "$(remote_blob "$remote_root" "$blob_a")" "$tmpdir/blob-a"
 hb action-spec CTheory > "$tmpdir/batch-expired.txt" 2> "$tmpdir/batch-expired.err"
 [[ $(grep -c '^action' "$tmpdir/batch-expired.txt") -eq 3 ]] || { cat "$tmpdir/batch-expired.txt" >&2; exit 1; }
 if grep -q "using the curl command" "$tmpdir/batch-expired.err"; then cat "$tmpdir/batch-expired.err" >&2; exit 1; fi
@@ -324,7 +324,7 @@ HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so hb action-spec CTheory > 
 [[ $(grep -c '^action' "$tmpdir/batch-expired-cli.txt") -eq 3 ]] || { cat "$tmpdir/batch-expired-cli.txt" >&2; exit 1; }
 hb --prefetch-concurrency 1 action-spec CTheory > "$tmpdir/batch-expired-serial.txt"
 diff -u "$tmpdir/batch-expired.txt" "$tmpdir/batch-expired-serial.txt"
-mv "$tmpdir/blob-a" "$remote_root/cas/$blob_a"
+mv "$tmpdir/blob-a" "$(remote_blob "$remote_root" "$blob_a")"
 
 # A stricter timeout than A's entry was built with makes A uncached again.
 hb action-spec --tactic-timeout 1 ATheory > "$tmpdir/batch-strict.txt"

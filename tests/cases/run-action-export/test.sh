@@ -212,15 +212,16 @@ run_export --support "$runner/data/conf.txt" --load helperLib --load bossLib \
   > "$tmpdir/export1.txt"
 require_grep '^proof_timeout=none$' "$metadata"
 
-# Checks the export's specs: each is in the remote CAS under its hash, with
+# Checks the export's specs: each is in the remote cache under its hash, with
 # every file it names; its run text hashes to its run key, and is the one
 # expected.  Prints "<context> <run_key>" per line.
 check_export() {
-  python3 - "$project" "$remote_root/cas" "$tmpdir/c-action-spec" "$1" "$key_c" "$key_helper" "$runner" <<'PY'
-import hashlib, pathlib, sys
-project, cas, c_action, export, key_c, key_helper, runner = map(pathlib.Path, sys.argv[1:])
+  python3 - "$project" "$remote_root" "$tmpdir/c-action-spec" "$1" "$key_c" "$key_helper" "$runner" <<'PY'
+import hashlib, pathlib, subprocess, sys
+project, root, c_action, export, key_c, key_helper, runner = map(pathlib.Path, sys.argv[1:])
 key_c, key_helper = str(key_c), str(key_helper)
 sha = lambda data: hashlib.sha256(data).hexdigest()
+blob = lambda digest: root / "ac" / sha(f"holbuild-zstd-blob-v1\n{digest}\n".encode())
 context_prefixes = ("toolchain ", "dep theory ", "lib ", "file library ", "load ")
 action_head, action_text = c_action.read_bytes().split(b"\naction-text\n", 1)
 action_lines = action_head.decode().splitlines()
@@ -230,7 +231,7 @@ conf_sha = sha((runner / "data/conf.txt").read_bytes())
 lines = export.read_text().splitlines()
 for line in lines:
     context, run_key, spec_sha = line.split()
-    data = (cas / spec_sha).read_bytes()
+    data = subprocess.run(["zstd", "-dcq", blob(spec_sha)], capture_output=True, check=True).stdout
     assert sha(data) == spec_sha, line
     assert data == (project / ".holbuild/run-specs" / spec_sha).read_bytes(), line
     head, run_text = data.split(b"\nrun-text\n", 1)
@@ -240,10 +241,10 @@ for line in lines:
     assert f"run-key={run_key}" in head, context
     for l in head:
         if l.startswith("file "):
-            assert (cas / l.split()[3]).exists(), (context, l)
+            assert blob(l.split()[3]).exists(), (context, l)
         if l.startswith("script "):
             assert l.split()[1] == script_sha, l
-            assert (cas / script_sha).exists(), context
+            assert blob(script_sha).exists(), context
     if context == "spec:CTheory":
         expected = ["holbuild-run-v1", toolchain_key, f"context=spec:CTheory@{key_c}",
                     "context-input-layout=package-v1",

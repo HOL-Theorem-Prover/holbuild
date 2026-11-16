@@ -91,7 +91,7 @@ import pathlib
 import sys
 
 requests = pathlib.Path(sys.argv[1]).read_text().splitlines()
-print(sum(request.startswith("PUT /ac/") for request in requests))
+print(sum(request.startswith("PUT /ac/") and not request.endswith(" blob") for request in requests))
 PY
 }
 
@@ -110,6 +110,15 @@ if len(actions) != 1:
     raise SystemExit(f"expected one remote theory action, found {len(actions)}")
 print(actions[0])
 PY
+}
+
+# A grep pattern matching the /ac/ key of any blob the remote theory action lists.
+remote_theory_blob_keys() {
+  local sha pattern=
+  for sha in $(sed -n 's/^blob [^ ]* \([0-9a-f]*\)$/\1/p' "$(remote_theory_action_path)"); do
+    pattern+="${pattern:+\\|}$(blob_key "$sha")"
+  done
+  printf '\\(%s\\)\n' "$pattern"
 }
 
 mutate_remote_manifest() {
@@ -167,7 +176,7 @@ import re
 import sys
 
 requests = pathlib.Path(sys.argv[1]).read_text().splitlines()
-paths = [request.split(" ", 1)[1] for request in requests]
+paths = [request.split(" ")[1] for request in requests]
 action_paths = [path for path in paths if path.startswith("/ac/")]
 if not action_paths:
     raise SystemExit("remote cache server observed no action-cache requests")
@@ -192,7 +201,10 @@ expected = sys.argv[2]
 marker = "manifest-text-v1\n"
 timeouts = []
 for action in (root / "ac").glob("*"):
-    text = action.read_text()
+    data = action.read_bytes()
+    if data.startswith(b"\x28\xb5\x2f\xfd"):
+        continue
+    text = data.decode()
     if marker not in text:
         continue
     manifest = text.split(marker, 1)[1]
@@ -252,8 +264,10 @@ if grep -v "^-1 " "$zstd_args"; then
 fi
 require_grep "ATheory built" "$first_log"
 require_grep "remote cache published:" "$first_log"
-require_grep "remote cache zstd .*/cas/[0-9a-f]* Completed in" "$first_log"
-require_grep "remote cache PUT .*/cas/[0-9a-f]* wall=[0-9]*ms 20[014] bytes=[0-9]*" "$first_log"
+require_grep "remote cache zstd .*/ac/[0-9a-f]* Completed in" "$first_log"
+# Only blob PUTs are compressed, so the URL the zstd line names is a blob's.
+compressed_url=$(sed -n 's|^.*remote cache zstd \([^ ]*/ac/[0-9a-f]*\) Completed in.*$|\1|p' "$first_log" | head -n 1)
+require_grep "remote cache PUT $compressed_url wall=[0-9]*ms 20[014] bytes=[0-9]*" "$first_log"
 if [[ -r /proc/pressure/cpu ]]; then
   require_grep "system cpu pressure some delta: [0-9]*us" "$first_log"
 fi
@@ -304,7 +318,7 @@ chmod a-w "$third_cache/tmp"
 (cd "$third" && HOLBUILD_CACHE="$third_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" build ATheory) > "$third_log" 2>&1
 require_grep "remote cache \(hydrated\|prefetched\):" "$third_log"
-require_grep "remote cache GET .*/cas/[0-9a-f]* wall=[0-9]*ms 200 bytes=[0-9]*" "$third_log"
+require_grep "remote cache GET .*/ac/$(remote_theory_blob_keys) wall=[0-9]*ms 200 bytes=[0-9]*" "$third_log"
 require_grep "cache hit: ATheory" "$third_log"
 require_grep "ATheory restored from cache" "$third_log"
 if grep -q "ATheory built" "$third_log"; then
@@ -604,12 +618,17 @@ import sys
 nodes = sys.argv[2:]
 vectors = []
 owners = set()
+blob_owners = set()
 for i in range(32):
     digest = hashlib.sha256(str(i).encode()).hexdigest()
     ranked = sorted(nodes, key=lambda url: hashlib.sha256(f"{url}:{digest}".encode()).hexdigest(), reverse=True)
     owners.add(ranked[0])
-    vectors.append(" ".join([digest, *ranked]))
+    blob_key = hashlib.sha256(f"holbuild-zstd-blob-v1\n{digest}\n".encode()).hexdigest()
+    blob_ranked = sorted(nodes, key=lambda url: hashlib.sha256(f"{url}:{blob_key}".encode()).hexdigest(), reverse=True)
+    blob_owners.add(blob_ranked[0])
+    vectors.append(" ".join([digest, *ranked, *(f"{url}/ac/{blob_key}" for url in blob_ranked)]))
 assert owners == set(nodes)
+assert blob_owners == set(nodes)
 pathlib.Path(sys.argv[1]).write_text("\n".join(vectors))
 PY
 for transport in libcurl cli; do

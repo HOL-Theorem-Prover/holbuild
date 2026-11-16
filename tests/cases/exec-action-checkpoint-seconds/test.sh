@@ -102,7 +102,7 @@ for bad in 2x inf 1e999 -1; do
   sed "s/^option checkpoint-seconds=0.0\$/option checkpoint-seconds=$bad/" \
     "$specs/$(field "$tmpdir/batch-every.txt" ck:ATheory 4)" > "$tmpdir/bad-spec"
   bad_sha=$(sha256sum "$tmpdir/bad-spec" | cut -d' ' -f1)
-  curl -fsS -X PUT --data-binary "@$tmpdir/bad-spec" "$remote_url/cas/$bad_sha"
+  zstd -q -c "$tmpdir/bad-spec" | curl -fsS -X PUT --data-binary @- "$remote_url/ac/$(blob_key "$bad_sha")"
   link_hol_toolchain_cache "$tmpdir/worker-bad"
   if HOLBUILD_CACHE=$tmpdir/worker-bad "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$bad_sha" \
        --cache-limit-gb 1000 --result "$tmpdir/bad.result" > "$tmpdir/bad.log" 2>&1; then

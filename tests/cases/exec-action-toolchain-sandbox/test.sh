@@ -155,9 +155,9 @@ chmod +x "$fakebin/polyc-bad"
 
 retarget() {
   local rev=$1 hash
-  sed "s|^toolchain git=[^ ]* rev=[^ ]* |toolchain git=$hol rev=$rev |" "$tmpdir/remote/cas/$spec" > "$tmpdir/spec"
-  hash=$(sha256sum "$tmpdir/spec" | cut -d' ' -f1)
-  mv "$tmpdir/spec" "$tmpdir/remote/cas/$hash"
+  remote_blob_text "$tmpdir/remote" "$spec" > "$tmpdir/spec"
+  sed -i "s|^toolchain git=[^ ]* rev=[^ ]* |toolchain git=$hol rev=$rev |" "$tmpdir/spec"
+  hash=$(put_remote_blob "$tmpdir/remote" "$tmpdir/spec")
   printf '%s\n' "$hash"
 }
 run_worker() {
@@ -233,18 +233,24 @@ require_grep "the toolchain's identity does not match the action text" "$tmpdir/
 # A published archive whose manifest is not a regular file is refused before
 # anything reads it (a FIFO would block the reader for good).
 python3 - "$tmpdir/remote" <<'PY'
-import hashlib, io, pathlib, re, sys, tarfile
+import hashlib, io, pathlib, re, subprocess, sys, tarfile
 root = pathlib.Path(sys.argv[1])
 name = ".holbuild-toolchain-archive-manifest"
+def blob_path(digest):
+    return root / "ac" / hashlib.sha256(f"holbuild-zstd-blob-v1\n{digest}\n".encode()).hexdigest()
 for record in (root / "ac").rglob("*"):
-    if not record.is_file():
+    if not record.is_file() or record.read_bytes().startswith(b"\x28\xb5\x2f\xfd"):
         continue
     text = record.read_text(errors="replace")
     for old in set(re.findall(r"[0-9a-f]{64}", text)):
-        blob = root / "cas" / old
-        if not blob.is_file() or not tarfile.is_tarfile(blob):
+        blob = blob_path(old)
+        if not blob.is_file():
             continue
-        with tarfile.open(blob) as src:
+        raw = io.BytesIO(subprocess.run(["zstd", "-dcq", blob], capture_output=True, check=True).stdout)
+        if not tarfile.is_tarfile(raw):
+            continue
+        raw.seek(0)
+        with tarfile.open(fileobj=raw) as src:
             members = [(m, src.extractfile(m).read() if m.isreg() else None) for m in src.getmembers()]
         if not any(m.name.removeprefix("./") == name for m, _ in members):
             continue
@@ -259,8 +265,8 @@ for record in (root / "ac").rglob("*"):
                     dst.addfile(member, None if data is None else io.BytesIO(data))
         data = out.getvalue()
         new = hashlib.sha256(data).hexdigest()
-        (root / "cas" / new).write_bytes(data)
-        text = text.replace(f"{old} {blob.stat().st_size}", f"{new} {len(data)}").replace(old, new)
+        blob_path(new).write_bytes(subprocess.run(["zstd", "-q", "-c"], input=data, capture_output=True, check=True).stdout)
+        text = text.replace(f"{old} {len(raw.getvalue())}", f"{new} {len(data)}").replace(old, new)
         head, marker, manifest = text.partition("manifest-text-v1\n")
         head = re.sub(r"manifest-sha256 \S+", "manifest-sha256 " + hashlib.sha256(manifest.encode()).hexdigest(), head)
         head = re.sub(r"manifest-size \S+", f"manifest-size {len(manifest.encode())}", head)

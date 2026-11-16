@@ -70,7 +70,8 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   [[ "\$(cat "$state/memory-failure" 2>/dev/null)" != "\$theory" ]] ||
     sed -i 's/^failure=.*/failure=memory/' "$state/result-\$key"
   if [[ -e "$state/drop-log" ]] || { [[ -e "$state/drop-success-log" ]] && [[ \$status -eq 0 ]]; }; then
-    rm -f "$remote_root/cas/\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
+    log=\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")
+    rm -f "$remote_root/ac/\$(printf 'holbuild-zstd-blob-v1\\n%s\\n' "\$log" | sha256sum | cut -c1-64)"
   fi
   if [[ -e "$state/optional-log-outage" && \$theory == *:ATheory ]]; then
     echo 500 > "$tmpdir/cache-control/cas-get-status-\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
@@ -447,8 +448,8 @@ a_copy_source=$(sha256sum "$copy/src/AScript.sml" | cut -d' ' -f1)
 (cd "$copy" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only BTheory) \
   > "$tmpdir/ledger-copy.log" 2>&1 || { cat "$tmpdir/ledger-copy.log" >&2; exit 1; }
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/ledger-copy.log"
-refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
-require_grep "^PUT /cas/$a_copy_source$" "$tmpdir/server/requests.log"
+refute_grep "^\(HEAD\|PUT\) /ac/$(blob_key "$b_source")\( blob\)\?$" "$tmpdir/server/requests.log"
+require_grep "^PUT /ac/$(blob_key "$a_copy_source") blob$" "$tmpdir/server/requests.log"
 [[ ! -e "$copy/.holbuild/remote-ledger" ]] || { echo "the copy kept a ledger of its own" >&2; exit 1; }
 # The export looks entries up by binary search over the ledger's lines, matching
 # whole lines only: BScript.sml's blob is found as the first line, and as the
@@ -469,15 +470,15 @@ ledger_copy_build() {
 }
 tail -n +"$b_line" "$tmpdir/ledger.sorted" > "$ledger_file"
 ledger_copy_build ledger-first
-refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+refute_grep "^\(HEAD\|PUT\) /ac/$(blob_key "$b_source")\( blob\)\?$" "$tmpdir/server/requests.log"
 head -n "$b_line" "$tmpdir/ledger.sorted" | head -c -1 > "$ledger_file"
 ledger_copy_build ledger-last
-refute_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+refute_grep "^\(HEAD\|PUT\) /ac/$(blob_key "$b_source")\( blob\)\?$" "$tmpdir/server/requests.log"
 # A long line sorting after every entry sits between the search and the
 # misplaced last line, so no search reaches it.
 { grep -vxF "$b_entry" "$tmpdir/ledger.sorted"; printf '~%.0s' {1..200}; echo; echo "$b_entry"; } > "$ledger_file"
 ledger_copy_build ledger-unsorted
-require_grep "^\(HEAD\|PUT\) /cas/$b_source$" "$tmpdir/server/requests.log"
+require_grep "^\(HEAD\|PUT\) /ac/$(blob_key "$b_source")\( blob\)\?$" "$tmpdir/server/requests.log"
 LC_ALL=C sort -c "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
 grep -qxF "$b_entry" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
 sed -i '/^~/d' "$ledger_file"
@@ -492,7 +493,7 @@ forced_copy_build() {
   local batch spec
   batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/$1.log")
   spec=$(awk '$1 == "action" { print $4 }' "$state/$batch.batch")
-  require_grep "^\(HEAD\|PUT\) /cas/$spec$" "$tmpdir/server/requests.log"
+  require_grep "^\(HEAD\|PUT\) /ac/$(blob_key "$spec")\( blob\)\?$" "$tmpdir/server/requests.log"
 }
 forced_copy_build ledger-forced
 touch -d '2000-01-01' "$ledger_file"
@@ -513,7 +514,7 @@ grep -qxF "$b_entry" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
 grep -qxF "blob $a_copy_source" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
 # Each entry kept was in the ledger, or one the build asked the remote cache about.
 while read -r kind hash; do
-  grep -qxF "$kind $hash" "$tmpdir/ledger.sorted" || grep -q "^\(HEAD\|PUT\) /cas/$hash$" "$tmpdir/server/requests.log" ||
+  grep -qxF "$kind $hash" "$tmpdir/ledger.sorted" || grep -q "^\(HEAD\|PUT\) /ac/$(blob_key "$hash")\( blob\)\?$" "$tmpdir/server/requests.log" ||
     { echo "the ledger kept $kind $hash, which the build didn't use" >&2; exit 1; }
 done < "$ledger_file"
 # Another build forgets the ledger and fills it past the limit while this one
@@ -530,11 +531,11 @@ cp "$tmpdir/ledger.sorted" "$ledger_file"
 sed -i 's/(\* ledger \*)/(* ledger-a *)/' "$project/src/AScript.sml"
 rm -r "$project/.holbuild/dep"
 b_source=$(sha256sum "$project/src/BScript.sml" | cut -d' ' -f1)
-rm "$remote_root/cas/$b_source" "$tmpdir/worker-cache/blobs/$b_source"
+rm "$(remote_blob "$remote_root" "$b_source")" "$tmpdir/worker-cache/blobs/$b_source"
 run ledger 0 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "still missing blob $b_source after 3 attempts; .*; resubmitting$" "$tmpdir/ledger.log"
 require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/ledger.log"
-[[ -f "$remote_root/cas/$b_source" ]] || { echo "the resubmission did not upload BScript.sml again" >&2; exit 1; }
+[[ -f "$(remote_blob "$remote_root" "$b_source")" ]] || { echo "the resubmission did not upload BScript.sml again" >&2; exit 1; }
 
 # Flags that need --remote-exec, and ones it excludes.
 run no-url 1 build --remote-only BTheory
@@ -755,7 +756,7 @@ rm "$state/cancelled"
 write_theories built-here
 run built-here-base 0 build BTheory
 key_a=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rx/src/AScript.sml.key")
-ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
+ac_a=$(printf 'holbuild-remote-ac-v2\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
 rm "$remote_root/ac/$ac_a"
 : > "$state/requests.log"
 run built-here 0 build --remote-exec "$coordinator" BTheory
@@ -805,7 +806,7 @@ rm "$project/src/CScript.sml"
 write_theories local-cache-integrity
 run local-cache-integrity-base 0 build BTheory
 key_a=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rx/src/AScript.sml.key")
-ac_a=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
+ac_a=$(printf 'holbuild-remote-ac-v2\n%s\n' "$key_a" | sha256sum | cut -d' ' -f1)
 dat_a=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$HOLBUILD_CACHE/actions/$key_a/manifest")
 sig_a=$(awk '$1 == "blob" && $2 == "sig" { print $3 }' "$HOLBUILD_CACHE/actions/$key_a/manifest")
 rm "$remote_root/ac/$ac_a" "$HOLBUILD_CACHE/blobs/$dat_a"
@@ -1003,7 +1004,7 @@ refute_grep "name=build.exec.node.up_to_date" "$tmpdir/client-cutoff-proof.after
 # The reused entries reach the remote cache.
 for t in B C; do
   key=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rxk/src/${t}Script.sml.key")
-  [[ -e "$remote_root/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "$key" | sha256sum | cut -d' ' -f1)" ]] ||
+  [[ -e "$remote_root/ac/$(printf 'holbuild-remote-ac-v2\n%s\n' "$key" | sha256sum | cut -d' ' -f1)" ]] ||
     { echo "${t}Theory's reused entry was not published" >&2; exit 1; }
 done
 
@@ -1068,7 +1069,7 @@ run client-cutoff-seven 0 build --remote-exec "$coordinator" CTheory
 require_grep "early cutoff reused 2 of 2 deferred theories" "$tmpdir/client-cutoff-seven.log"
 for t in B C; do
   rm -r "$HOLBUILD_CACHE/actions/${key_six[$t]}"
-  rm "$remote_root/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "${key_six[$t]}" | sha256sum | cut -d' ' -f1)"
+  rm "$remote_root/ac/$(printf 'holbuild-remote-ac-v2\n%s\n' "${key_six[$t]}" | sha256sum | cut -d' ' -f1)"
 done
 : > "$state/ran"
 write_cutoff six one "$a2"
@@ -1076,7 +1077,7 @@ run client-cutoff-relisted 0 build --remote-exec "$coordinator" CTheory
 require_grep "early cutoff reused 2 of 2 deferred theories" "$tmpdir/client-cutoff-relisted.log"
 [[ ! -s "$state/ran" ]] || { echo "workers ran:" >&2; cat "$state/ran" >&2; exit 1; }
 for t in B C; do
-  [[ -e "$remote_root/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "${key_six[$t]}" | sha256sum | cut -d' ' -f1)" ]] ||
+  [[ -e "$remote_root/ac/$(printf 'holbuild-remote-ac-v2\n%s\n' "${key_six[$t]}" | sha256sum | cut -d' ' -f1)" ]] ||
     { echo "${t}Theory's reused entry was not published again" >&2; exit 1; }
 done
 
@@ -1244,10 +1245,10 @@ require_grep "^theorem: b_thm (line 4)$" "$tmpdir/proof-only.log"
 # export uploads the spec again, though the remote ledger knows its hash.
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/proof-only.log")
 b_spec=$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $4 }' "$state/$batch.batch")
-rm "$remote_root/cas/$b_spec"
+rm "$(remote_blob "$remote_root" "$b_spec")"
 run proof-only-again 1 build --remote-exec "$coordinator" --remote-only BTheory
 require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/proof-only-again.log"
-[[ -f "$remote_root/cas/$b_spec" ]] || { echo "the export did not upload the spec again" >&2; exit 1; }
+[[ -f "$(remote_blob "$remote_root" "$b_spec")" ]] || { echo "the export did not upload the spec again" >&2; exit 1; }
 
 # An action the batch deadline stopped: the log its worker uploaded as it
 # stopped, which arrives after the action's cancellation, is printed and
@@ -1512,7 +1513,8 @@ refute_grep "Theory built\|building locally" "$tmpdir/force-target.log"
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/force-target.log")
 key=$(awk '$1 == "action" { print $2 }' "$state/$batch.batch")
 spec=$(awk '$1 == "action" { print $4 }' "$state/$batch.batch")
-require_grep '^option force=true$' "$remote_root/cas/$spec"
+remote_blob_text "$remote_root" "$spec" > "$tmpdir/spec.txt"
+require_grep '^option force=true$' "$tmpdir/spec.txt"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$key")
 local_log=$project/.holbuild/logs/current/rxf/BTheory/build.log
 [[ -n $log_sha && $(sha256sum < "$local_log" | cut -d' ' -f1) == "$log_sha" ]] ||
@@ -1536,7 +1538,8 @@ for shared in no yes; do
   require_grep '^probe-before-theorem$' "$local_log"
   batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/skip-checkpoints.log")
   spec=$(awk '$1 == "action" { print $4 }' "$state/$batch.batch")
-  require_grep '^option skip-checkpoints=true$' "$remote_root/cas/$spec"
+  remote_blob_text "$remote_root" "$spec" > "$tmpdir/spec.txt"
+  require_grep '^option skip-checkpoints=true$' "$tmpdir/spec.txt"
 done
 rm "$state/share-heaps"
 
@@ -1555,7 +1558,8 @@ for flag in --trace-steps --goalfrag-trace; do
   [[ $(local_hol_runs "$tmpdir/trace-target.timing") -eq 0 ]] || { cat "$tmpdir/trace-target.timing" >&2; exit 1; }
   batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/trace-target.log")
   spec=$(awk '$1 == "action" && $5 == "rxf:BTheory" { print $4 }' "$state/$batch.batch")
-  require_grep '^option trace-steps=true$' "$remote_root/cas/$spec"
+  remote_blob_text "$remote_root" "$spec" > "$tmpdir/spec.txt"
+  require_grep '^option trace-steps=true$' "$tmpdir/spec.txt"
 done
 rm "$state/share-heaps"
 
@@ -1656,7 +1660,8 @@ in_copy heap-cap --max-heap 4096 --remote-cache "$remote_url" build \
   { cat "$tmpdir/heap-cap.log" "$tmpdir/worker.log" >&2; exit 1; }
 heap_key=$(awk '$1 == "action" && $5 == "rxheap:HeapTheory" { print $2 }' "$state/"*.batch)
 heap_log=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$heap_key")
-require_grep '^heap-child-argv: .*/bin/hol .*--maxheap 4096 run ' "$remote_root/cas/$heap_log"
+remote_blob_text "$remote_root" "$heap_log" > "$tmpdir/heap-log.txt"
+require_grep '^heap-child-argv: .*/bin/hol .*--maxheap 4096 run ' "$tmpdir/heap-log.txt"
 
 # A worker strengthens a timeout-free entry, while the client still has its
 # older local manifest. The restore must pick up the stronger remote contract.
@@ -1679,7 +1684,7 @@ cp "$timeout_metadata" "$tmpdir/timeout-weak-metadata"
 timeout_key=$(sed -n 's/^input_key=//p' "$timeout_metadata")
 timeout_manifest=$tmpdir/timeout-contract-cache/actions/$timeout_key/manifest
 cp "$timeout_manifest" "$tmpdir/timeout-weak-manifest"
-timeout_ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$timeout_key" | sha256sum | cut -d' ' -f1)
+timeout_ac=$(printf 'holbuild-remote-ac-v2\n%s\n' "$timeout_key" | sha256sum | cut -d' ' -f1)
 require_grep '^proof-timeout=none$' "$remote_root/ac/$timeout_ac"
 in_copy timeout-contract --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --remote-only --tactic-timeout 2.5 TimeoutTheory > "$tmpdir/timeout-strict.log" 2>&1 ||
@@ -1942,7 +1947,7 @@ in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator
   { cat "$tmpdir/local-cas-restore.log" >&2; exit 1; }
 require_grep 'LocalMidTheory restored from cache' "$tmpdir/local-cas-restore.log"
 refute_grep 'remote batch' "$tmpdir/local-cas-restore.log"
-refute_grep ' /ac/\| /cas/' "$request_log"
+refute_grep ' /ac/' "$request_log"
 
 cat > "$tmpdir/local-cas/src/LocalTopScript.sml" <<'SML'
 Theory LocalTop
@@ -2199,7 +2204,7 @@ in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator
   --remote-only PriorityChildTheory > "$tmpdir/priority-attach-seed.log" 2>&1
 printf '\n(* changed parent *)\n' >> "$tmpdir/local-cas/src/PriorityScript.sml"
 child_source=$(sha256sum "$tmpdir/local-cas/src/PriorityChildScript.sml" | cut -d' ' -f1)
-rm "$remote_root/cas/$child_source" "$tmpdir/worker-cache/blobs/$child_source"
+rm "$(remote_blob "$remote_root" "$child_source")" "$tmpdir/worker-cache/blobs/$child_source"
 in_copy local-cas --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --detach --priority 9 PriorityChildTheory > "$tmpdir/priority-attach-detach.log" 2>&1
 priority_batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/priority-attach-detach.log")
@@ -2300,7 +2305,7 @@ write_ring_timeout ring-seed
 in_copy ring-seed --remote-cache "$remote_url" build --tactic-timeout 0 TimeoutTheory \
   > "$tmpdir/ring-weak.log" 2>&1 || { cat "$tmpdir/ring-weak.log" >&2; exit 1; }
 ring_key=$(sed -n 's/^input_key=//p' "$tmpdir/ring-seed/.holbuild/dep/rxring/src/TimeoutScript.sml.key")
-ring_ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$ring_key" | sha256sum | cut -d' ' -f1)
+ring_ac=$(printf 'holbuild-remote-ac-v2\n%s\n' "$ring_key" | sha256sum | cut -d' ' -f1)
 require_grep '^proof-timeout=none$' "$remote_root/ac/$ring_ac"
 cp "$remote_root/ac/$ring_ac" "$tmpdir/ring-weak-ac"
 in_copy ring-seed --remote-cache "$remote_url" build --tactic-timeout 2.5 TimeoutTheory \
@@ -2318,9 +2323,9 @@ second_url=$remote_url
 server_pid=$first_server_pid
 remote_url=$first_url
 request_log=$first_request_log
-mkdir -p "$second_root/ac" "$second_root/cas"
+mkdir -p "$second_root/ac"
 for blob in $(awk '$1 == "blob" && length($2) == 64 { print $2 }' "$tmpdir/ring-strong-ac"); do
-  cp "$remote_root/cas/$blob" "$second_root/cas/$blob"
+  cp "$(remote_blob "$remote_root" "$blob")" "$(remote_blob "$second_root" "$blob")"
 done
 ring_rank() { printf '%s:%s' "$1" "$ring_ac" | sha256sum | cut -d' ' -f1; }
 if [[ $(ring_rank "$first_url") > $(ring_rank "$second_url") ]]; then
