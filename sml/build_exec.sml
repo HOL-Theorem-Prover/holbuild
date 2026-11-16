@@ -12794,7 +12794,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                          (toolchain_base_context tc) action source_text checkpoints))
              handle e =>
                (attached_child := NONE;
-                deferred := (fn () => (publish_shared (); if !cancelled then () else publish_tools (); write_modules ()));
+                deferred :=
+                  (fn () =>
+                     (publish_shared ();
+                      if !cancelled then () else publish_tools ();
+                      (* An abandoned load ahead is built plain later,
+                         which writes the modules after its own result. *)
+                      case e of
+                          ActionFailed (AheadAbandoned, _) => ()
+                        | _ => write_modules ()));
                 raise e));
             deferred :=
               (fn () =>
