@@ -1138,12 +1138,12 @@ async def test_a_completion_retried_after_a_failed_attempt_still_counts_for_its_
     lock_batch = coordinator._lock_batch
     calls = 0
 
-    async def flaky(*args: Any) -> None:
+    async def flaky(*args: Any) -> str | None:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise TimeoutError("pool timeout")
-        await lock_batch(*args)
+        return await lock_batch(*args)
 
     monkeypatch.setattr(coordinator, "_lock_batch", flaky)
     with pytest.raises(TimeoutError):
@@ -1971,9 +1971,21 @@ async def test_cancel_revokes_leases_and_stops_claims(http: httpx.AsyncClient) -
     assert response.json() == {"state": "cancelled"}
     assert await states(http, batch_id) == {"a": "cancelled", "b": "cancelled"}
     assert (await http.post(f"/v1/work/{token}/heartbeat", headers=WORKER)).status_code == 409
-    assert (await complete(http, token, result("a", "built"))).status_code == 409
     assert await claim(http) is None
     assert (await http.post(f"/v1/batches/{uuid4()}/cancel", headers=CLIENT)).status_code == 404
+
+
+async def test_a_worker_stopped_by_a_cancel_reports_the_log_of_the_action(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    await http.post(f"/v1/batches/{batch_id}/cancel", headers=CLIENT)
+
+    record = result("a", "failed", "unavailable").replace("log=" + "a" * 64, "log=" + "b" * 64)
+    assert (await complete(http, token, record)).status_code == 200
+    assert (await complete(http, token, record)).status_code == 409
+    action = (await batch(http, batch_id))["actions"][0]
+    assert (action["state"], action["log_sha256"]) == ("cancelled", "b" * 64)
+    assert (await batch(http, batch_id))["state"] == "cancelled"
 
 
 async def test_events_stream_action_states_then_the_batch(http: httpx.AsyncClient, cache: FakeCache) -> None:
@@ -2396,10 +2408,19 @@ async def test_batches_past_the_deadline_fail_and_then_expire(
 
     await coordinator.sweep()
 
+    # Running still, until the worker running a reports the log of what it stopped.
     status = await batch(http, overdue)
-    assert (status["state"], status["failure"]) == ("failed", "deadline: still running after 12 h")
+    assert (status["state"], status["failure"]) == ("running", "deadline: still running after 12 h")
     assert await states(http, overdue) == {"a": "cancelled", "b": "cancelled"}
     assert (await http.post(f"/v1/work/{token}/heartbeat", headers=WORKER)).status_code == 409
+    record = result("a", "failed", "unavailable").replace("log=" + "a" * 64, "log=" + "b" * 64)
+    assert (await complete(http, token, record)).status_code == 200
+    await coordinator.sweep()
+
+    status = await batch(http, overdue)
+    assert (status["state"], status["failure"]) == ("failed", "deadline: still running after 12 h")
+    action = next(a for a in status["actions"] if a["theory"] == "pkg:a")
+    assert (action["state"], action["last_failure"], action["log_sha256"]) == ("cancelled", "deadline", "b" * 64)
     assert (await batch(http, current))["state"] == "running"
 
     async with remote_exec_engine.begin() as connection:
@@ -2408,6 +2429,31 @@ async def test_batches_past_the_deadline_fail_and_then_expire(
         )
     await coordinator.sweep()
     assert (await http.get(f"/v1/batches/{overdue}", headers=CLIENT)).status_code == 404
+
+
+async def test_a_batch_past_the_deadline_ends_once_its_revoked_leases_expire(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    """A worker that never reports holds the batch only for a lease's length."""
+    overdue = await submit(http, ["a"])
+    await claim_named(http, "a")
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text("UPDATE batches SET created_at = now() - interval '13 hours' WHERE id = :id"), {"id": UUID(overdue)}
+        )
+    await coordinator.sweep()
+    await coordinator.sweep()
+    assert (await batch(http, overdue))["state"] == "running"
+
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text("UPDATE leases SET expires_at = now() - make_interval(secs => :s)"),
+            {"s": coordinator.settings.lease_seconds},
+        )
+    await coordinator.sweep()
+    status = await batch(http, overdue)
+    assert (status["state"], status["failure"]) == ("failed", "deadline: still running after 12 h")
+    assert status["actions"][0]["attempts"] == 1
 
 
 async def test_batch_class_defaults_to_build_and_rejects_unknown_classes(

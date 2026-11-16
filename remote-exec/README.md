@@ -156,14 +156,17 @@ deadline it stops HOL and reports `unavailable`, so
 the coordinator retries immediately without counting the interrupted attempt.
 Waiting for work or preparing a release stops immediately. Repeated `SIGTERM`
 does not extend the deadline; interactive Ctrl-C retains its usual behavior.
-With `--share-heaps`, the driver gets up to 8 additional seconds after the
-natural-finish drain window to publish completed checkpoints. Lease loss gives
-it up to 15 seconds, also bounded by the drain deadline plus 8 seconds if a
-drain starts meanwhile. Only the driver receives the initial termination signal:
-it stops HOL, waits for sandbox cleanup and output validation, and publishes
-committed checkpoints. Repeated signals do not interrupt publication. The worker
+The driver gets up to 8 additional seconds after the natural-finish drain
+window to publish completed checkpoints (with `--share-heaps`) and upload the
+build log so far. Lease loss gives it up to 15 seconds, also bounded by the
+drain deadline plus 8 seconds if a drain starts meanwhile. Only the driver
+receives the initial termination signal: it stops HOL, waits for sandbox cleanup
+and output validation, publishes committed checkpoints, then uploads the log and
+writes its result. Repeated signals do not interrupt publication. The worker
 then terminates the remaining process group, escalating to SIGKILL after 2 seconds.
-Interrupted actions never report `built`; a lost lease reports no result.
+Interrupted actions never report `built`. A drained action reports `unavailable`
+with the log the driver uploaded; after a lost lease the worker reports the
+driver's result, whose log the coordinator keeps if its batch revoked the lease.
 Without `--share-heaps`, the worker stops the process group immediately.
 Leave at least 20 seconds between the drain window and the container's stop
 timeout when sharing heaps (10 otherwise), for publication, process cleanup,
@@ -515,8 +518,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   are claimable again and waiting claims are woken. A build claim locks its key
   until it commits and rechecks for a live lease, so two batches claiming one
   key at the same moment lease it once.
-  A heartbeat or completion with an expired or revoked token is refused, and
-  the completion is dropped. Since a worker may run an action twice after a
+  A heartbeat or completion with an expired token is refused, and the
+  completion is dropped. A batch that ends (cancelled, or failed for good)
+  revokes its leases: their heartbeats are refused at once, and for a lease's
+  length a completion still records the log of the action its worker stopped,
+  on the cancelled action, and changes nothing else. Since a worker may run an action twice after a
   network partition, nothing depends on exactly-once execution: a second run
   finds the result cached.
 - **Loading ahead**, for a batch submitted with `speculative_loading=<cap>`:
@@ -599,7 +605,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
 - **Deadline.** A batch still running `BATCH_DEADLINE_HOURS` after its
   submission fails with `deadline: …`, so one that can't finish (a high-tier
   action with no high-tier worker, a parent check the cache keeps refusing,
-  a client that went away) neither runs nor keeps workers busy forever.
+  a client that went away) neither runs nor keeps workers busy forever. One
+  with running actions first takes the failure, cancels its actions (the
+  running ones with `last_failure` `deadline`) and revokes their leases; it
+  stays running until its workers have reported their logs or the leases
+  ran out, so a client following it gets the logs.
 - **Retention.** The sweep deletes finished batches older than
   `RETENTION_HOURS`, at most 100 per statement, never a running one, and peak
   hints not used for `HINT_TTL_DAYS`.
@@ -840,8 +850,8 @@ when that is under a second old)
 `POST /v1/work/<attempt_token>/heartbeat`, with no body or `{"host": <report>}`
 
 - 200 `{"lease_s": 120}`: the lease now runs `lease_s` seconds from now
-- 409 when the lease expired or was revoked (the batch was cancelled or
-  failed); the worker stops the action
+- 409 when the lease expired or was revoked (the batch was cancelled,
+  failed or passed its deadline); the worker stops the action
 
 `POST /v1/work/report` with `{"tier": …, "also_claim": […], "worker": "<name>", "host": <report>}`,
 the fields as for a claim, from a worker that isn't claiming, as while it waits for disk
@@ -851,7 +861,8 @@ the fields as for a claim, from a worker that isn't claiming, as while it waits 
 `POST /v1/work/<attempt_token>/complete` with the `holbuild-action-result-v1`
 record `exec-action --result` wrote as the body (`text/plain`)
 
-- 200 `{"accepted": true}`
+- 200 `{"accepted": true}`; for a lease its batch revoked, only the record's
+  log is kept
 - 400 when the record is malformed or is for another action than the lease's
   (a record with an empty `input-key`, which `exec-action` writes when it
   couldn't read the spec, is matched by its spec alone)

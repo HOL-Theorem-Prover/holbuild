@@ -23,7 +23,9 @@ makes the event stream answer 503 and the cancel answer that the batch is
 already done, `skip` reports the batch done without running RUN, `hang` streams one
 running event and then nothing until `hang` is removed, without running RUN, `hold`
 holds the stream after the first action's final event until `hold` is removed, and
-`cancelled` reports every action and the batch cancelled without running RUN.  When RUN
+`cancelled` reports every action and the batch cancelled without running RUN, and
+`deadline` reports a failed action as the batch deadline leaves it: cancelled, with the
+log its worker uploaded as it stopped, and the batch failed at the deadline.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", the batch fails for resubmission naming it,
 as the coordinator does.  Otherwise
@@ -178,6 +180,9 @@ class Handler(BaseHTTPRequestHandler):
                         event["last_failure"] = record["failure"]
                         event["log_sha256"] = record["log"].split()[0] if "log" in record else None
                         event["failure_detail"] = record.get("detail")
+                        if (state / "deadline").exists():
+                            event["state"], event["last_failure"] = "cancelled", "deadline"
+                            event["failure_detail"] = "still running after 12 h"
                     else:
                         event["state"], event["last_failure"] = "done", None
                 elif not ok and not (state / "fail").exists():
@@ -206,7 +211,8 @@ class Handler(BaseHTTPRequestHandler):
         if (state / "drop").exists():
             (state / "drop").unlink()
             return
-        failure = None if ok else "an action failed"
+        failure = None if ok else "deadline: still running after 12 h" if (state / "deadline").exists() \
+            else "an action failed"
         missing = state / "missing"
         if not ok and missing.exists():
             what = missing.read_text().strip()
