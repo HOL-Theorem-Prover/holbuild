@@ -222,7 +222,9 @@ library and `curl`. A batch can override the worker's `--max-heap` default
 high-tier action is ready. With `--cooperate-dir`, a worker claims only while
 holbuild's memory admission in that directory would start one more child
 there, so an action a busy host couldn't start yet stays at the coordinator
-for a worker on another host.
+for a worker on another host. Likewise a worker claims only while its temp
+dir and its `HOLBUILD_CACHE` root each have 4 GiB free, so a host whose disk
+is full doesn't take actions it would only fail.
 
 Each claim and heartbeat also reports the worker's host: its id (the kernel's
 `boot_id`, the same in every container on the host), the share of CPU time
@@ -240,8 +242,8 @@ workers do when they aren't running HOL:
 
 - `memory_wait`: waiting for the host's memory before claiming;
 - `claim`: in claim requests, waiting ones included;
-- `idle`: sleeping after a claim that got nothing or failed, or after an
-  action failed in the worker;
+- `idle`: waiting for disk space before claiming, or sleeping after a claim
+  that got nothing or failed, or after an action failed in the worker;
 - `lease`: taking and giving up a claimed action's lease: setting and
   clearing scale-in protection, and stopping the heartbeat;
 - `release`: finding and, on first use, building the action's holbuild release;
@@ -548,9 +550,13 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   that ends without a result record while the worker drains, or killed by
   SIGTERM or SIGINT (a host shutting down), is reported `unavailable` too;
   one killed by SIGKILL otherwise, as the kernel's OOM killer does, is
-  reported `memory`. Any other error in the worker (`exec-action` crashed
-  without a record, the release didn't build, the cache doesn't have the
-  spec) is reported as `internal`, so the action is retried at once rather
+  reported `memory`. An action that fails in the worker for want of disk (the
+  error is ENOSPC, or the worker's disk is below its free-space floor, as when
+  `exec-action` couldn't write its result record) is reported `unavailable`
+  too, and the worker claims nothing more until space returns. Any other error
+  in the worker (`exec-action` crashed without a record, the release didn't
+  build, the cache doesn't have the spec) is reported as `internal`, so the
+  action is retried at once rather
   than when its lease expires. After either, the worker waits before it
   claims again, so a cache outage doesn't run it through the ready actions.
 
