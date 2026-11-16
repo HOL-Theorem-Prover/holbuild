@@ -222,6 +222,14 @@ expect v3 0 "status=built"
 resumed v3 "theorem-context checkpoint after t2" "theorem_context checkpoint"
 require_grep "shared checkpoint index lists [1-9][0-9]* of" "$tmpdir/v3.log"
 same_outputs v3
+# With an empty store the restore fetched the heap and its chain, and says so.
+for step in rstprobe rstplace rstfetch rstfetchn rstfetchkb rstheap rstheapkb; do
+  grep -qE "^phase-ms=(.*,)?$step:[0-9]+(,|\$)" "$tmpdir/v3.result" || {
+    echo "v3's record lacks restore step $step:" >&2; cat "$tmpdir/v3.result" >&2; exit 1; }
+done
+if grep -qE "^phase-ms=(.*,)?rsthitn:" "$tmpdir/v3.result"; then
+  echo "v3 counted store hits in an empty store:" >&2; cat "$tmpdir/v3.result" >&2; exit 1
+fi
 
 # The index of the checkpoints published on each heap: a restore probes only
 # the checkpoints it lists, and probes every candidate without one.
