@@ -36,6 +36,8 @@ from remote_exec import coordinator as coordinator_module
 # The shape of a gate batch: its actions, the first ROOTS of which have no parents, and each later one up to FAN
 # parents among those before it (about 85,000 edges).
 ACTIONS, ROOTS, FAN = 5000, 1500, 48
+# Finished batches of the last few days, without actions: a busy fleet finishes thousands an hour.
+FINISHED_BATCHES = 50_000
 
 
 def key(i: int, build: str = "") -> str:
@@ -200,6 +202,15 @@ async def seed(engine: AsyncEngine) -> Fleet:
         await insert(connection, old, [[]] * 10, Arrival(["done"] * 10, ["no"] * 10, [0] * 10), state="done")
         await connection.execute(
             sa.text("UPDATE batches SET created_at = now() - interval '30 days' WHERE id = :id"), {"id": old}
+        )
+        # The finished batches retention keeps, among which statements find the running ones.
+        await connection.execute(
+            sa.text(
+                "INSERT INTO batches (id, state, profile, created_at) "
+                "SELECT gen_random_uuid(), (ARRAY['done', 'failed', 'cancelled'])[1 + i % 3], 'default', "
+                "now() - make_interval(secs => i * 10) FROM generate_series(1, :n) i"
+            ),
+            {"n": FINISHED_BATCHES},
         )
         await connection.execute(
             sa.text(
