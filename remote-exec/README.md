@@ -25,7 +25,11 @@ a container image with both.
   loses batch status and costs rebuilds, never a wrong build.
 - **Worker loop** (`remote_exec/worker.py`): claims an action, runs `holbuild
   exec-action` on it with the holbuild release that exported it, heartbeats
-  while it runs, and reports the result record.
+  while it runs, and reports the result record. It runs one action at a time,
+  under a name no other worker shares (`--name`, by default `host:pid`), so a
+  lease of that name it isn't running, one whose claim's answer never reached
+  it, ends as soon as it claims or heartbeats again, without counting as an
+  attempt.
 
 ## Running
 
@@ -149,6 +153,11 @@ docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_
 `--host-rank` (0 to 1000, 0 by default) orders hosts for packing: claims go
 to hosts of lower rank first, so hosts of higher rank (an interruptible spot
 pool, say) empty first and scale in.
+
+A worker's name in its leases is `--name`, by default `host:pid`. When
+`REMOTE_EXEC_IMAGE` names the image the worker runs as
+`<repository>@sha256:<digest>`, the default name ends in `@` and the digest's
+first 12 hex digits, so a lease says which image ran the action.
 
 On `SIGTERM`, a worker stops claiming and gives its running action up to
 `--drain-seconds` (20 by default) to finish and report its result. At the

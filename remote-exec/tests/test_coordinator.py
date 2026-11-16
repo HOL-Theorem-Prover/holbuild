@@ -5,7 +5,7 @@ import json
 import time
 from collections import deque
 from dataclasses import asdict, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from collections.abc import Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -71,16 +71,18 @@ async def batch(http: httpx.AsyncClient, batch_id: str) -> dict[str, Any]:
     return (await http.get(f"/v1/batches/{batch_id}", headers=CLIENT)).json()
 
 
-async def claim(http: httpx.AsyncClient, tier: str = "standard") -> dict[str, Any] | None:
-    response = await http.post("/v1/work/claim", json={"tier": tier, "worker": "w1"}, headers=WORKER)
+async def claim(http: httpx.AsyncClient, tier: str = "standard", worker: str | None = None) -> dict[str, Any] | None:
+    """A claim by ``worker``, by default one not seen before: a worker that claims again holds none of its leases."""
+    worker = f"w-{uuid4().hex[:8]}" if worker is None else worker
+    response = await http.post("/v1/work/claim", json={"tier": tier, "worker": worker}, headers=WORKER)
     if response.status_code == 204:
         return None
     assert response.status_code == 200, response.text
     return response.json()
 
 
-async def claim_named(http: httpx.AsyncClient, name: str, tier: str = "standard") -> str:
-    claimed = await claim(http, tier)
+async def claim_named(http: httpx.AsyncClient, name: str, tier: str = "standard", worker: str | None = None) -> str:
+    claimed = await claim(http, tier, worker)
     assert claimed is not None and claimed["theory"] == f"pkg:{name}", claimed
     return claimed["attempt_token"]
 
@@ -741,6 +743,86 @@ async def test_lease_expiring_on_every_attempt_fails_the_batch(
     assert (action["last_failure"], action["failure_detail"]) == ("lease expired 3 times", "w1, w2, w3")
 
 
+async def test_a_lease_whose_claim_never_reached_its_worker_goes_back_when_it_claims_again(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache
+) -> None:
+    """A worker that gave up waiting for a claim's answer claims again; the lease the answer carried is no attempt."""
+    batch_id = await submit(http, ["a"])
+    lost = (await claim(http, worker="w9"))["attempt_token"]
+
+    assert await claim(http, "high", worker="w9") is None  # a claim of nothing, but it ends the lease
+    action = (await batch(http, batch_id))["actions"][0]
+    assert (action["attempts"], action["last_failure"], action["failure_detail"]) == (
+        0, "unavailable", "w9 went on without this lease: its claim's answer or its result was lost"
+    )
+    assert (await http.post(f"/v1/work/{lost}/heartbeat", headers=WORKER)).status_code == 409
+    await coordinator.released()
+    token = (await claim(http, worker="w9"))["attempt_token"]
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "done"
+
+
+async def test_a_claim_that_gets_an_action_ends_the_leases_its_worker_got_no_answer_for(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a", "b"])
+    lost = await claim(http, worker="w9")
+    held = await claim(http, worker="w9")
+    assert lost is not None and held is not None
+
+    actions = {a["theory"]: a for a in (await batch(http, batch_id))["actions"]}
+    assert (actions[lost["theory"]]["attempts"], actions[lost["theory"]]["last_failure"]) == (0, "unavailable")
+    assert (actions[held["theory"]]["state"], actions[held["theory"]]["attempts"]) == ("running", 1)
+    assert (await http.post(f"/v1/work/{held['attempt_token']}/heartbeat", headers=WORKER)).status_code == 200
+
+
+async def test_a_late_claim_leaves_the_leases_its_worker_claimed_since(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """A claim answered after its worker gave up and claimed again mustn't end the lease that worker now runs."""
+    batch_id = await submit(http, ["a", "b"])
+    arrived = datetime.now(UTC)
+    late = await coordinator.claim(["standard"], "w9")
+    running = await coordinator.claim(["standard"], "w9")  # the worker's next claim, answered first
+    assert late is not None and running is not None
+
+    await coordinator.release_unheld("w9", str(late.attempt_token), arrived)
+    actions = {a["theory"]: a for a in (await batch(http, batch_id))["actions"]}
+    assert (actions[running.theory]["state"], actions[running.theory]["attempts"]) == ("running", 1)
+
+
+async def test_a_late_heartbeat_leaves_the_leases_its_worker_claimed_since(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """A heartbeat answered after its worker moved on mustn't end the lease that worker now runs."""
+    batch_id = await submit(http, ["a", "b"])
+    old = await coordinator.claim(["standard"], "w9")
+    arrived = datetime.now(UTC)
+    running = await coordinator.claim(["standard"], "w9")  # claimed while the heartbeat waited
+    assert old is not None and running is not None
+
+    assert await coordinator.heartbeat(old.attempt_token, arrived)
+    actions = {a["theory"]: a for a in (await batch(http, batch_id))["actions"]}
+    assert (actions[running.theory]["state"], actions[running.theory]["attempts"]) == ("running", 1)
+
+
+async def test_a_heartbeat_ends_the_leases_its_worker_got_no_answer_for(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """A claim the worker gave up on can be leased after its next claim started: the lease it runs ends that one."""
+    batch_id = await submit(http, ["a", "b"])
+    late = await coordinator.claim(["standard"], "w9")
+    held = await coordinator.claim(["standard"], "w9")
+    assert late is not None and held is not None
+
+    assert (await http.post(f"/v1/work/{held.attempt_token}/heartbeat", headers=WORKER)).status_code == 200
+    actions = {a["theory"]: a for a in (await batch(http, batch_id))["actions"]}
+    assert (actions[late.theory]["state"] != "running", actions[late.theory]["attempts"]) == (True, 0)
+    assert (actions[held.theory]["state"], actions[held.theory]["attempts"]) == ("running", 1)
+    assert (await http.post(f"/v1/work/{held.attempt_token}/heartbeat", headers=WORKER)).status_code == 200
+
+
 async def test_a_key_another_batch_is_building_is_held_then_done_with_it(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
@@ -760,6 +842,44 @@ async def test_a_key_another_batch_is_building_is_held_then_done_with_it(
     assert {a["theory"]: a["log_sha256"] for a in (await batch(http, ready))["actions"]}["pkg:a"] == "a" * 64
     await claim_named(http, "c")
     assert await claim(http) is None
+
+
+async def test_the_copies_of_a_build_are_done_by_a_release_and_no_claim_takes_one_before(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The completion only queues its copies; a release marks each batch's done, and frees their children."""
+    await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    copies = [await submit(http, ["a", "c"], [("c", "a")]) for _ in range(3)]
+    monkeypatch.setattr(coordinator, "request_release", lambda batch_id=None: None)
+
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    assert [await states(http, copy) for copy in copies] == [{"a": "ready", "c": "waiting"}] * 3
+    assert await claim(http) is None
+    await coordinator.release()
+    assert [await states(http, copy) for copy in copies] == [{"a": "done", "c": "ready"}] * 3
+    assert coordinator.peers_done == {}
+
+
+async def test_one_release_finishes_the_copies_of_several_builds_in_a_batch_each_with_its_own_log(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await submit(http, ["a"])
+    first = await claim_named(http, "a")
+    await submit(http, ["b"])
+    second = await claim_named(http, "b")
+    copy = await submit(http, ["a", "b", "c"], [("c", "a"), ("c", "b")])
+    monkeypatch.setattr(coordinator, "request_release", lambda batch_id=None: None)
+
+    cache.keys |= {ac_key("a"), ac_key("b")}
+    assert (await complete(http, first, result("a", "built"))).status_code == 200
+    assert (await complete(http, second, result("b", "built").replace("a" * 64, "b" * 64))).status_code == 200
+    assert await states(http, copy) == {"a": "ready", "b": "ready", "c": "waiting"}
+    await coordinator.release(UUID(copy))
+    assert await states(http, copy) == {"a": "done", "b": "done", "c": "ready"}
+    logs = {a["theory"]: a["log_sha256"] for a in (await batch(http, copy))["actions"]}
+    assert (logs["pkg:a"], logs["pkg:b"]) == ("a" * 64, "b" * 64)
 
 
 async def test_a_copy_with_another_spec_wakes_a_waiting_claim_rather_than_being_done_with_a_build(
@@ -2638,6 +2758,7 @@ async def test_builds_beat_older_runs_across_all_accepted_tiers(
     await submit(http, ["build"])
     body = {"tier": "high", "also_claim": ["standard"], "worker": "w"}
     assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).json()["theory"] == "pkg:build"
+    body["worker"] = "w2"
     assert (await http.post("/v1/work/claim", json=body, headers=WORKER)).json()["theory"] == "pkg:run"
 
 
@@ -2954,7 +3075,7 @@ async def test_expired_run_attempt_fails_only_its_action(http: httpx.AsyncClient
     batch_id = await submit(http, ["a", "b"], **{"class": "run"})
     token = await claim_named(http, "a")
     assert (await complete(http, token, result("a", "failed", "toolchain", detail="clone failed"))).status_code == 200
-    await claim_named(http, "a")
+    await claim_named(http, "a", worker="w1")
     async with coordinator.engine.begin() as connection:
         await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
     await coordinator.expire_leases()

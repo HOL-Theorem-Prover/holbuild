@@ -85,5 +85,11 @@ fun acquire_shared_path_wait {path} = acquire_path_wait Posix.IO.F_RDLCK path
 (* Blocks until no other process holds any lock on the path. *)
 fun acquire_exclusive_path_wait {path} = acquire_path_wait Posix.IO.F_WRLCK path
 fun release (FileLock {fd, ...}) = close_fd fd
+(* Whether the locked file is still the one at the lock's path: a remover may
+   have unlinked it between this process opening it and locking it. *)
+fun at_path (FileLock {fd, path}) =
+  let val held = Posix.FileSys.fstat fd val named = Posix.FileSys.stat path
+  in Posix.FileSys.ST.dev held = Posix.FileSys.ST.dev named andalso Posix.FileSys.ST.ino held = Posix.FileSys.ST.ino named end
+  handle OS.SysErr _ => false
 fun path (FileLock {path, ...}) = path
 end
