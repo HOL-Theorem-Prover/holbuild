@@ -77,12 +77,13 @@ fi
 zstd -q -c "$HOLBUILD_TEST_STEP_LOG" > "$out"
 SH
 chmod +x "$tmpdir/bin/curl"
-python3 - "$tmpdir/batch-fetch.json" <<'PY'
+# A blob whose log isn't the one its action names (any bytes may sit under an /ac/ key) gives no timings.
+python3 - "$tmpdir/batch-fetch.json" "$(sha256sum "$log" | cut -c1-64)" <<'PY'
 import json
 import sys
 actions = [dict(theory=name, input_key=name, log_sha256=sha)
-           for name, sha in (("before", "1" * 64), ("missing", "0" * 64),
-                             ("cached", None), ("after", "2" * 64))]
+           for name, sha in (("before", sys.argv[2]), ("missing", "0" * 64), ("cached", None),
+                             ("foreign", "1" * 64), ("after", sys.argv[2]))]
 with open(sys.argv[1], "w") as output:
     json.dump(dict(state="done", actions=actions), output)
 PY
@@ -94,4 +95,5 @@ require_grep '^before@before' "$tmpdir/fetched.tsv"
 require_grep '^after@after' "$tmpdir/fetched.tsv"
 require_grep 'timings unavailable: missing@missing (curl exited 22:' "$tmpdir/fetched-coverage.log"
 require_grep 'timings unavailable: cached@cached' "$tmpdir/fetched-coverage.log"
-require_grep '2/4 logs instrumented' "$tmpdir/fetched-coverage.log"
+require_grep 'timings unavailable: foreign@foreign (log does not match its log_sha256)' "$tmpdir/fetched-coverage.log"
+require_grep '2/5 logs instrumented' "$tmpdir/fetched-coverage.log"

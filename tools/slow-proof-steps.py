@@ -89,6 +89,9 @@ def read_batches(paths: list[Path], cache_url: str, curl_config: Path | None) ->
             if decoded.returncode:
                 results.append(Execution(f"{name}@{key}", False, [],
                                          f"zstd exited {decoded.returncode}: {decoded.stderr.strip()}"))
+            elif hashlib.sha256(log_path.read_bytes()).hexdigest() != sha:
+                # The cache keeps whatever was written under an /ac/ key: check the log is this action's.
+                results.append(Execution(f"{name}@{key}", False, [], "log does not match its log_sha256"))
             else:
                 results.append(read_log(f"{name}@{key}", log_path))
     return results
