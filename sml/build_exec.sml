@@ -546,7 +546,8 @@ fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipeli
       (if in_place then
          ["val _ = HolbuildDeferredInPlace.finish {sig_path = " ^ HolbuildToolchain.sml_string sig_path ^
           ", threads = " ^ Int.toString (!in_place_proof_threads) ^
-          ", finalized = " ^ HolbuildToolchain.sml_string (stage_in_place_finalized (Path.dir path)) ^ "};"]
+          ", finalized = " ^ HolbuildToolchain.sml_string (stage_in_place_finalized (Path.dir path)) ^
+          ", unsupported = " ^ HolbuildToolchain.sml_string (stage_deferral_unsupported (Path.dir path)) ^ "};"]
        else if pipelined then
          ["val _ = HolbuildDeferred.publish_outline {sig_path = " ^ HolbuildToolchain.sml_string sig_path ^
           ", outline_dir = " ^ HolbuildToolchain.sml_string (stage_outline_dir (Path.dir path)) ^ "};",
@@ -3614,6 +3615,14 @@ fun deferrable_checkpoint source_text (checkpoints : HolbuildTheoryCheckpoints.c
             tactic_text
   end
 
+(* For a build that defers in place, the same less every `Resume` block:
+   one can suspend a further subgoal through an ML helper the scan for
+   `suspend` doesn't see, and its stub records no such suspension, so the
+   build would run again without deferring. *)
+fun in_place_deferrable_checkpoint source_text checkpoints =
+  let val deferrable = deferrable_checkpoint source_text checkpoints
+  in fn (checkpoint : HolbuildTheoryCheckpoints.checkpoint) => #kind checkpoint <> "resume" andalso deferrable checkpoint end
+
 (* DEFER_PROOFS: the script is a pipelined build's, which defers what
    proofs it can. *)
 (* IN_PLACE: the prelude text of a plain build that defers its proofs
@@ -3632,7 +3641,8 @@ fun instrumented_source defer_proofs in_place policy timeout_marker plan_only_ma
        trace_all = trace_steps policy,
        plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy,
-       defer = if defer_proofs orelse Option.isSome in_place then deferrable_checkpoint source_text checkpoints
+       defer = if defer_proofs then deferrable_checkpoint source_text checkpoints
+               else if Option.isSome in_place then in_place_deferrable_checkpoint source_text checkpoints
                else (fn _ => false),
        in_place = in_place}
   else plain_source_from_checkpoint source_name source_text start_offset
@@ -3738,7 +3748,7 @@ fun failed_prefix_resume_source in_place policy timeout_marker plan_only_marker 
          trace_all = trace_steps policy,
          plan_only_marker = plan_only_marker,
          new_ir = proof_ir_enabled policy,
-         defer = if Option.isSome in_place then deferrable_checkpoint source checkpoints else (fn _ => false),
+         defer = if Option.isSome in_place then in_place_deferrable_checkpoint source checkpoints else (fn _ => false),
          in_place = in_place}
   in
     String.concat

@@ -14,12 +14,15 @@ struct
      without deferring. *)
   exception Unsupported of string
 
-  fun unsupported_marker sig_path =
-    OS.Path.concat (OS.Path.dir sig_path, "holbuild-deferral-unsupported")
-
+  (* A HOL whose theories seal on export refuses there what a proof would
+     have changed in the theory in place: not a proof failure. *)
   fun proof_failure name e =
-    Fail ("deferred proof of " ^ name ^ " failed: " ^
-          (Feedback.exn_to_string e handle Interrupt => "interrupted"))
+    let val text = Feedback.exn_to_string e handle Interrupt => "interrupted"
+    in
+      if String.isSubstring "\" is sealed; " text
+      then Unsupported ("a deferred proof changed the theory: " ^ name ^ ": " ^ text)
+      else Fail ("deferred proof of " ^ name ^ " failed: " ^ text)
+    end
 
   (* On this thread, unpinned, with the live context set to the goal's, as
      the script would have run it in place.  It saves no checkpoint: the
@@ -202,7 +205,7 @@ struct
      what is deferred, commits the checkpoints that waited for it, and
      rewrites the exported data with what each stub's proof depends on.
      Writes FINALIZED once nothing in the data names a stub. *)
-  fun finish {sig_path, threads, finalized} =
+  fun finish {sig_path, threads, finalized, unsupported} =
     let
       val types = thydata_types ()
       val items = rev (!queue)
@@ -254,7 +257,7 @@ struct
     in
       case failure of
           SOME (e as Unsupported msg) =>
-            (HolbuildRuntime.write_text (unsupported_marker sig_path) (msg ^ "\n"); raise e)
+            (HolbuildRuntime.write_text unsupported (msg ^ "\n"); raise e)
         | SOME e => raise e
         | NONE =>
             (if null (!proved) then HolbuildRuntime.normalize_theory_export sig_path

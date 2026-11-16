@@ -11,7 +11,8 @@ source "$SCRIPT_DIR/../../lib.sh"
 # theorems' proofs and proves them on several threads after the export.  It
 # exports the same theory data as a build that proves them in place, fails
 # a broken deferred proof with the diagnostics of an in-place build, and a
-# later build resumes from a context saved while proofs were deferred.
+# later build resumes from a context saved while proofs were deferred; a
+# deferred proof that changes the theory makes the build run it in place.
 
 tmpdir=$(make_temp_dir)
 cleanup() { cleanup_temp_dir "$tmpdir"; }
@@ -143,3 +144,22 @@ build "$in_place" 1 "$tmpdir/in-place-fixed.log" || { cat "$tmpdir/in-place-fixe
 build "$deferred" 4 "$tmpdir/deferred-fixed.log" || { cat "$tmpdir/deferred-fixed.log" >&2; exit 1; }
 require_grep "checkpoint after times$" "$tmpdir/deferred-fixed.log"
 cmp "$(data "$in_place")" "$(data "$deferred")" || { echo "the resumed deferred build exported other theory data" >&2; exit 1; }
+
+# A deferred proof that declares a constant changes the theory after its
+# export: the build runs the theory again without deferring and exports
+# what an in-place build does.  (The edit to add_one, which runs in place
+# as the first proof after the resume, makes the next ones deferred.)
+for project in "$in_place" "$deferred"; do
+  edit "$project" "  1 + 1 = 2" "  1 + 1 = 2 /\\ T"
+  edit "$project" "Theorem last_thm:" 'fun declare_tac g = (new_constant ("declared", bool); ALL_TAC g);
+Theorem declares:
+  T
+Proof
+  declare_tac >> ACCEPT_TAC TRUTH
+QED
+Theorem last_thm:'
+done
+build "$in_place" 1 "$tmpdir/in-place-declares.log" || { cat "$tmpdir/in-place-declares.log" >&2; exit 1; }
+build "$deferred" 4 "$tmpdir/deferred-declares.log" || { cat "$tmpdir/deferred-declares.log" >&2; exit 1; }
+require_grep "building ATheory again without deferring its proofs: a deferred proof changed the theory: declares" "$tmpdir/deferred-declares.log"
+cmp "$(data "$in_place")" "$(data "$deferred")" || { echo "the build run again exported other theory data" >&2; exit 1; }
