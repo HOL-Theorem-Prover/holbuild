@@ -546,15 +546,25 @@ fun blob_urls cache sha256 = request_urls cache "ac" (blob_key sha256)
 
 (* The compressed copy is staged beside dst, on the file system dst is on. *)
 fun curl_get_compressed {urls, dst} =
-  let val compressed = HolbuildTempPath.near dst ".zst"
+  let
+    val compressed = HolbuildTempPath.near dst ".zst"
+    fun fetch () =
+      case curl_get_urls {urls = urls, dst = compressed} of
+          HolbuildCacheBackend.Hit =>
+            if HolbuildSpawn.succeeded (run "zstd" ["-d", "-q", "-f", "-o", dst, compressed]) then
+              HolbuildCacheBackend.Hit
+            else HolbuildCacheBackend.Corrupt ("zstd could not decompress remote cache blob " ^ OS.Path.file (hd urls))
+        | other => other
+    (* A download or decompression that filled the disk need not say so, and
+       removing the staged blob frees the space: probe while it is still there. *)
+    fun with_full_disk (result as HolbuildCacheBackend.Corrupt message) =
+          if not (String.isSubstring HolbuildCacheTransfer.no_space message) andalso
+             HolbuildCacheTransfer.out_of_space (OS.Path.dir dst)
+          then HolbuildCacheBackend.Corrupt (message ^ ": " ^ HolbuildCacheTransfer.no_space)
+          else result
+      | with_full_disk result = result
   in
-    (case curl_get_urls {urls = urls, dst = compressed} of
-         HolbuildCacheBackend.Hit =>
-           if HolbuildSpawn.succeeded (run "zstd" ["-d", "-q", "-f", "-o", dst, compressed]) then
-             HolbuildCacheBackend.Hit
-           else HolbuildCacheBackend.Corrupt ("zstd could not decompress the remote blob at " ^ redact_userinfo (hd urls))
-       | other => other)
-    before remove_file compressed
+    with_full_disk (fetch ()) before remove_file compressed
     handle e => (remove_file compressed; raise e)
   end
 
