@@ -9547,11 +9547,16 @@ val no_space = HolbuildCacheTransfer.no_space
    that filesystem, and a handled checkpoint write failure warns into it. *)
 val out_of_space = HolbuildCacheTransfer.out_of_space
 
+(* Whether a worker's disk counts as full: below the floor, or unable to
+   take a small write.  The write alone can miss a full disk that another
+   process has just freed a little of. *)
+fun disk_full dir = HolbuildCacheTransfer.below_disk_floor dir orelse out_of_space dir
+
 (* A full disk is a disk failure, whichever step hit it.  A failed download
    need not say so (curl reports only a failed write, or leaves a short
    file), so the cache root is probed too. *)
 fun classify_failure failure msg =
-  (if String.isSubstring no_space msg orelse out_of_space (cache_root ()) then DiskFailure
+  (if String.isSubstring no_space msg orelse disk_full (cache_root ()) then DiskFailure
    else failure, msg)
 
 fun action_failed failure msg = ActionFailed (classify_failure failure msg)
@@ -10168,7 +10173,7 @@ fun classify_run_failure stage log_text oom_before msg =
        else [])
     val failure =
       if Option.isSome oom_kills orelse String.isSubstring "Run out of store" (msg ^ "\n" ^ log_text) then MemoryFailure
-      else if (if child_failed then child_reports_no_space log_text orelse out_of_space stage
+      else if (if child_failed then child_reports_no_space log_text orelse disk_full stage
                else String.isSubstring no_space msg) then DiskFailure
       else if not child_failed then InternalFailure
       else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure

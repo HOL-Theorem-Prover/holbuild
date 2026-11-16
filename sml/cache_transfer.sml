@@ -116,8 +116,8 @@ fun disk_free dir =
   end
 end
 
-(* Below these a disk counts as full: the free space a fleet worker waits
-   for before it claims an action, and a few theories' files.  A test may
+(* Below these a worker's disk counts as full: the free space a fleet
+   worker waits for before it claims an action, and a few theories' files.  A test may
    set others, as "BYTES INODES" in HOLBUILD_TEST_DISK_FLOOR. *)
 fun disk_floor () =
   case Option.map (String.tokens Char.isSpace) (OS.Process.getEnv "HOLBUILD_TEST_DISK_FLOOR") of
@@ -128,21 +128,21 @@ fun disk_floor () =
     | SOME _ => raise Error "HOLBUILD_TEST_DISK_FLOOR must be \"BYTES INODES\""
     | NONE => {bytes = 4 * 1024 * 1024 * 1024, inodes = 1024}
 
-(* Whether the filesystem holding dir is below the floor, or can't take a
-   small write (1 MB).  The write alone can miss a full disk that another
-   process has just freed a little of. *)
+(* Whether the filesystem holding dir is below the floor. *)
+fun below_disk_floor dir =
+  case disk_free dir of
+      SOME {bytes, inodes} =>
+        let val floor = disk_floor ()
+        in
+          bytes < #bytes floor orelse
+          (case inodes of SOME n => n < #inodes floor | NONE => false)
+        end
+    | NONE => false
+
+(* Whether the filesystem holding dir can't take a small write (1 MB). *)
 fun out_of_space dir =
-  let
-    val probe = Path.concat(dir, ".holbuild-space-probe")
-    val floor = disk_floor ()
-    val below_floor =
-      case disk_free dir of
-          SOME {bytes, inodes} =>
-            bytes < #bytes floor orelse
-            (case inodes of SOME n => n < #inodes floor | NONE => false)
-        | NONE => false
+  let val probe = Path.concat(dir, ".holbuild-space-probe")
   in
-    below_floor orelse
     (let val out = BinIO.openOut probe
      in
        (let fun write 0 = () | write n = (BinIO.output (out, probe_chunk); write (n - 1))
