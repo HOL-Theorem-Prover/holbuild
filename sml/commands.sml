@@ -2317,13 +2317,18 @@ fun build_watch tc cli_jobs parsed =
     fun loop previous_paths =
       let
         val {prepared, watch_set = previous} = current_watch_state resolution previous_paths
+        val before = HolbuildWatch.snapshot previous
         val _ = attempt prepared
         (* Recompute the watch set after the build so inputs created during the
            build are watched immediately, not only after the next change. *)
         val {prepared = _, watch_set} = current_watch_state resolution (SOME previous)
-        val _ = warn ("watching " ^ Int.toString (length (#paths watch_set)) ^
-                      " project path(s); waiting for changes")
-        val _ = HolbuildWatch.wait_for_change watch_set
+        val _ =
+          if HolbuildWatch.snapshot watch_set <> before then
+            warn "project inputs changed during the build; rebuilding"
+          else
+            (warn ("watching " ^ Int.toString (length (#paths watch_set)) ^
+                   " project path(s); waiting for changes");
+             HolbuildWatch.wait_for_change watch_set)
       in
         loop (SOME watch_set)
       end
