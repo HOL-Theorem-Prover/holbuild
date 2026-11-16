@@ -419,7 +419,7 @@ STATEMENTS = [
     # leases
     Statement(
         "UPDATE actions SET state = 'running', attempts = attempts + 1",
-        lambda f: {"ahead": False, "batch_id": f.fresh, "input_key": f.arrival.keys("ready")[0]},
+        lambda f: {"ahead": False, "batch_id": f.fresh, "input_key": f.arrival.keys("ready")[0], "worker": "w1"},
         10_000,
     ),
     Statement(

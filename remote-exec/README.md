@@ -764,12 +764,24 @@ none is. A run batch with it returns 400.
         "last_failure": "<failure class>|null",
         "log_sha256": "<sha256 of the last build log a run uploaded, in /cas/; a failure without a log keeps the earlier one>|null",
         "failure_detail": "<the last result's detail: why it failed without a log; after lease expiries in a row (last_failure \"lease expired\", or \"lease expired N times\" once it fails), the workers that held it>|null",
+        "last_claimed_at": "<ISO 8601 timestamp>|null",
+        "finished_at": "<ISO 8601 timestamp>|null",
+        "worker": "<worker name>|null",
         "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null
       }
     ]
   }
   ```
 - 404 when there is no such batch (or it was deleted by retention)
+
+`last_claimed_at` and `worker` describe the latest claim; a new claim clears
+`finished_at`. An accepted worker result sets `finished_at`, including a
+failure that will be retried. Times come from the coordinator database.
+Expired leases and cancellations have no finish time, even when the stopped
+worker's log is kept. Unclaimed actions have null fields; claims an older
+coordinator made have a timestamp without a worker or finish time. Worker
+names are supplied by the worker, defaulting to its hostname and process ID.
+These fields retain only the latest attempt, not its retry history.
 
 In `timings`, durations are milliseconds. `started` and `finished`, and
 `holstart`/`holend`, `publishstart`/`publishend`, `logstart`/`logend` are
@@ -793,7 +805,7 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   stream with nothing to send for `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` sends
   an empty line, which clients skip, so a proxy doesn't close it as idle:
   ```json
-  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null, "failure_detail": null, "timings": null}
+  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null, "failure_detail": null, "last_claimed_at": null, "finished_at": null, "worker": null, "timings": null}
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the
@@ -897,10 +909,10 @@ back to a coordinator image predating it, stop the coordinator and use the new
 image to run `alembic downgrade 0014`, then start the older image. Actions
 running ahead then look like any running action to the older image.
 
-Migration `0016` adds nullable `actions.finished_at` and `actions.worker`. It
-is a schema-only baseline: the coordinator and worker do not use these columns
-yet. Deploy and qualify this image before a runtime that uses them, so that
-its previous-image rollback already knows revision `0016`. An older
+Migration `0016` adds nullable `actions.finished_at` and `actions.worker`,
+which the coordinator writes on each claim and accepted result. Deploy and
+qualify an image carrying only the migration before one whose coordinator uses
+the columns, so that its previous-image rollback already knows revision `0016`. An older
 coordinator still serves the upgraded schema, but its `migrate` command does
 not know the revision: to start an image predating `0016`, stop the
 coordinator and use this image to run `alembic downgrade 0015` first. This
