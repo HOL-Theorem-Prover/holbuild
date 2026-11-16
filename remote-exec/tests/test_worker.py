@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import errno
 import fcntl
 import io
 import json
@@ -8,12 +9,14 @@ import signal
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +24,7 @@ from remote_exec import worker
 from remote_exec.auth import cache_discovery_token
 from remote_exec.formats import parse_result
 from remote_exec.worker import (
+    DISK_FLOOR,
     DRAINING,
     CacheUnavailable,
     Coordinator,
@@ -36,9 +40,10 @@ from remote_exec.worker import (
     claim_reporting,
     cpu_times,
     failed_record,
+    free_bytes,
     parse_args,
-    run_one,
     recordless_failure,
+    run_one,
     runs_hol,
     wait_for_memory,
 )
@@ -206,6 +211,12 @@ def logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     monkeypatch.setenv("FAKE_BUILD_LOG", str(build_log))
     monkeypatch.setenv("HOLBUILD_FAKE_LOG", str(holbuild_log))
     return build_log, holbuild_log
+
+
+@pytest.fixture(autouse=True)
+def roomy_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whatever the test machine's disk has free, the worker sees room for actions, unless a test says otherwise."""
+    monkeypatch.setattr(worker, "free_bytes", lambda _path: 100 * GIB)
 
 
 def releases(tmp_path: Path, server: Server) -> Releases:
@@ -856,6 +867,115 @@ def test_action_killed_by_a_signal_without_a_record_is_reported_by_the_signal(
 
     assert unavailable == (failure == "unavailable")
     assert server.completed == [failed_record(SPEC, failure, detail)]
+
+
+def test_a_worker_on_a_full_disk_hands_the_action_back_and_claims_again_only_once_there_is_room(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))  # not made yet: the disk it would be on is read
+    source = f"file://{tmp_path}/holbuild-{{version}}.tar.gz"
+    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server, "--holbuild-source-url", source))
+    full = False
+    statvfs = os.statvfs
+    read: list[str] = []
+
+    def disk(path: str) -> os.statvfs_result | SimpleNamespace:
+        if not path.startswith(str(tmp_path)) and path != tempfile.gettempdir():
+            return statvfs(path)
+        read.append(path)
+        return SimpleNamespace(f_bavail=GIB if full else 100 * GIB, f_frsize=1)
+
+    temporary_directory = tempfile.TemporaryDirectory
+
+    def scratch(*args: object, **kwargs: object) -> tempfile.TemporaryDirectory[str]:
+        # What the worker makes in the temp dir fails as on 2026-11-16's full hosts; the release build's own does not.
+        if full and kwargs.get("dir") is None:
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), "/var/tmp/tmpfull")
+        return temporary_directory(*args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(worker, "free_bytes", free_bytes)
+    monkeypatch.setattr(worker.os, "statvfs", disk)
+    monkeypatch.setattr(worker.tempfile, "TemporaryDirectory", scratch)
+    events: list[str] = []
+
+    def claim_ready(*_: object) -> dict[str, object]:
+        nonlocal full
+        events.append("claim")
+        if events.count("claim") == 1:
+            full = True  # the disk fills between the worker's look at it and the claim, as siblings write
+        if events.count("claim") == 3:
+            raise KeyboardInterrupt
+        return claim()
+
+    monkeypatch.setattr(worker, "claim_reporting", claim_ready)
+    drain = worker.Drain()
+
+    def wait(seconds: float) -> bool:
+        nonlocal full
+        events.append(f"wait {seconds}")
+        if seconds == worker.DISK_POLL_SECONDS:
+            full = False  # space comes back while the worker waits for it
+        return False
+
+    monkeypatch.setattr(drain.stop, "wait", wait)
+    monkeypatch.setattr(worker, "Drain", lambda *_: drain)
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.main()
+
+    # The action costs no attempt, and the worker claims no other while its disk is full.
+    short = f"{tempfile.gettempdir()} has {GIB // 2**20} MiB free, below {DISK_FLOOR // 2**20} MiB"
+    assert server.completed == [
+        failed_record(
+            SPEC, "unavailable", f"the worker's disk is full: [Errno 28] No space left on device: '/var/tmp/tmpfull'; {short}"
+        ),
+        RECORD,
+    ]
+    assert events == ["claim", f"wait {worker.CLAIM_RETRY_SECONDS}", f"wait {worker.DISK_POLL_SECONDS}", "claim", "claim"]
+    assert str(tmp_path) in read  # the cache root's nearest existing ancestor
+
+
+def test_action_that_ends_without_a_record_on_a_full_disk_is_handed_back(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    monkeypatch.setenv("HOLBUILD_FAKE_CRASH", "1")
+    monkeypatch.setattr(worker, "free_bytes", lambda _path: GIB)
+
+    with pytest.raises(RuntimeError, match="exited 70 without a result record"):
+        run_one(
+            Coordinator(server.url, "w"),
+            worker_args(tmp_path, server),
+            releases(tmp_path, server),
+            Protection(None, None),
+            claim(),
+            Phases(),
+        )
+
+    short = f"{tempfile.gettempdir()} has {GIB // 2**20} MiB free, below {DISK_FLOOR // 2**20} MiB"
+    detail = f"the worker's disk is full: exec-action exited 70 without a result record; {short}"
+    assert server.completed == [failed_record(SPEC, "unavailable", detail)]
+
+
+@pytest.mark.parametrize("tmpdir", ["full", None])
+def test_the_disk_check_measures_exec_actions_temp_root_whatever_python_picked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmpdir: str | None
+) -> None:
+    # exec-action writes under TMPDIR, else /tmp, even when Python's tempfile settled on another directory.
+    full = str(tmp_path / "full") if tmpdir else "/tmp"
+    if tmpdir:
+        monkeypatch.setenv("TMPDIR", full)
+    else:
+        monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "python"))
+    monkeypatch.delenv("HOLBUILD_CACHE", raising=False)
+    monkeypatch.setattr(worker, "free_bytes", lambda path: GIB if path == full else 100 * GIB)
+
+    assert worker.disk_shortfall() == f"{full} has 1024 MiB free, below {DISK_FLOOR // 2**20} MiB"
 
 
 @pytest.mark.parametrize(
