@@ -1250,7 +1250,8 @@ require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/p
 [[ -f "$remote_root/cas/$b_spec" ]] || { echo "the export did not upload the spec again" >&2; exit 1; }
 
 # An action the batch deadline stopped: the log its worker uploaded as it
-# stopped is printed and restored, as a failed action's is.
+# stopped, which arrives after the action's cancellation, is printed and
+# restored, as a failed action's is.
 write_broken deadline
 touch "$state/deadline"
 run deadline-only 75 build --remote-exec "$coordinator" --remote-only BTheory
@@ -1258,7 +1259,7 @@ rm "$state/deadline"
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/deadline-only.log")
 b_key=$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $2 }' "$state/$batch.batch")
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$b_key")
-require_grep "remote rxp:BTheory: cancelled (deadline: still running after 12 h), log /cas/$log_sha" "$tmpdir/deadline-only.log"
+require_grep "remote rxp:BTheory: cancelled (deadline: still running after 12 h)" "$tmpdir/deadline-only.log"
 require_grep "remote rxp:BTheory: failed (deadline), log /cas/$log_sha" "$tmpdir/deadline-only.log"
 require_grep "batch $batch failed: deadline: still running after 12 h" "$tmpdir/deadline-only.log"
 [[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$log_sha" ]] ||

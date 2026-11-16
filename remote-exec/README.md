@@ -167,11 +167,10 @@ then terminates the remaining process group, escalating to SIGKILL after 2 secon
 Interrupted actions never report `built`. A drained action reports `unavailable`
 with the log the driver uploaded; after a lost lease the worker reports the
 driver's result, whose log the coordinator keeps if its batch revoked the lease.
-Without `--share-heaps`, the worker stops the process group immediately.
 Leave at least 20 seconds between the drain window and the container's stop
-timeout when sharing heaps (10 otherwise), for publication, process cleanup,
-result reporting and release of task protection. For example, a 120-second
-container stop timeout allows `--drain-seconds 100` with shared heaps. An unreachable coordinator
+timeout, for publication, process cleanup, result reporting and release of task
+protection. For example, a 120-second container stop timeout allows
+`--drain-seconds 100`. An unreachable coordinator
 can still prevent reporting before the container is forcibly killed; its lease
 then expires normally. ECS protection is best effort, and a rejection in an
 HTTP-success response is logged along with transport failures.

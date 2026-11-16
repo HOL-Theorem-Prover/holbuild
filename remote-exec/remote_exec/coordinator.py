@@ -1751,7 +1751,6 @@ class Coordinator:
             ):
                 # Revoked with its batch (a cancel, a final failure, the deadline): the worker stopped the action, and
                 # only the log it left is kept, for the client to show how far it got.
-                self.lease_hosts.pop(token, None)
                 revoked = (
                     await conn.execute(
                         sa.text("DELETE FROM leases WHERE attempt_token = :token RETURNING input_key"),
@@ -1759,8 +1758,10 @@ class Coordinator:
                     )
                 ).first()
                 if revoked is None:
+                    self.lease_hosts.pop(token, None)
                     return False
-                await conn.execute(
+                # A record for another action rolls the lease's deletion back, as on a live lease.
+                kept = await conn.execute(
                     sa.text(
                         "UPDATE actions SET log_sha256 = COALESCE(:log, log_sha256) "
                         "WHERE batch_id = :batch_id AND input_key = :input_key AND spec_sha256 = :spec"
@@ -1768,6 +1769,12 @@ class Coordinator:
                     {"log": result.log_sha256, "batch_id": batch_id, "input_key": revoked.input_key,
                      "spec": result.spec_sha256},
                 )
+                if kept.rowcount != 1 or result.input_key not in (None, revoked.input_key):
+                    raise ResultMismatch(
+                        f"result for {result.input_key} (spec {result.spec_sha256}) does not match the lease's "
+                        f"action {revoked.input_key}"
+                    )
+                self.lease_hosts.pop(token, None)
                 return True
             lease = (
                 await conn.execute(

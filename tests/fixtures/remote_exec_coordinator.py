@@ -24,8 +24,8 @@ already done, `skip` reports the batch done without running RUN, `hang` streams 
 running event and then nothing until `hang` is removed, without running RUN, `hold`
 holds the stream after the first action's final event until `hold` is removed, and
 `cancelled` reports every action and the batch cancelled without running RUN, and
-`deadline` reports a failed action as the batch deadline leaves it: cancelled, with the
-log its worker uploaded as it stopped, and the batch failed at the deadline.  When RUN
+`deadline` reports a failed action as the batch deadline leaves it: cancelled, then again
+with the log its worker uploaded as it stopped, and the batch failed at the deadline.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", the batch fails for resubmission naming it,
 as the coordinator does.  Otherwise
@@ -181,8 +181,11 @@ class Handler(BaseHTTPRequestHandler):
                         event["log_sha256"] = record["log"].split()[0] if "log" in record else None
                         event["failure_detail"] = record.get("detail")
                         if (state / "deadline").exists():
+                            # As the coordinator sends it: cancelled at the deadline, then the log its
+                            # worker reports as it stops.
                             event["state"], event["last_failure"] = "cancelled", "deadline"
                             event["failure_detail"] = "still running after 12 h"
+                            self.wfile.write((json.dumps(dict(event, log_sha256=None)) + "\n").encode())
                     else:
                         event["state"], event["last_failure"] = "done", None
                 elif not ok and not (state / "fail").exists():
