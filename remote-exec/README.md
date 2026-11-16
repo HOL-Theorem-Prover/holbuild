@@ -131,6 +131,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
 | `REMOTE_EXEC_DEFAULT_PRIORITY_FLOOR` | running builds of priority-0 batches allowed ahead of higher priorities (see Claims); 0 for strict priority | 32 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
+| `REMOTE_EXEC_LOCALITY` | let claims and wakes on hosts below the scale-in line prefer work whose dependency context the host holds (see Claims); `false` for the plain order | true |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
 | `REMOTE_EXEC_SCALE_DOWN_HOLD_S` | how long a higher burst worker count is kept after demand drops | 900 |
 | `REMOTE_EXEC_CACHE_SCALE_DOWN_HOLD_S` | how long the burst cache pool keeps the capacity a higher burst worker count needed (see "Temporary cache members") | 900 |
@@ -494,6 +495,21 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   primary tier. Polling claims defer each tier to better-ranked waiters;
   a waiting standard-only worker still leaves high work available to burst
   workers. This packs work so excess tail hosts can drain for scale-in.
+  With `REMOTE_EXEC_LOCALITY` on, each process also remembers, per host, the
+  last 64 dependency contexts its actions ran with (the `deps-key` its
+  workers report, or the theory name before one is reported; a host loses
+  one whose action failed for an infrastructure reason) and prefers, on the
+  hosts below the scale-in line, work whose context the host holds, since a
+  cold host fetches that context's heap from the cache. The line is
+  where the hosts, in packing order and counting each host's workers or
+  leases, can run the live leases and the ready work, and at least
+  `REMOTE_EXEC_WARM_WORKERS`; hosts above it get no preference, so they
+  still empty when demand falls. A claim from such a host whose context
+  differs from the head batch's takes, of the next 8 batches with the same
+  tier, priority and running count, the first whose context it holds; each
+  batch is passed over that way at most 8 times in a row. A wake for newly
+  ready work goes to a waiting claim on such a host that holds its context,
+  if any. `GET /v1/queue`'s `locality` counts what it did.
   Packing is best effort among that process's waiting claims; it neither
   moves running actions nor coordinates host preference across replicas.
   Run admission is serialized across coordinator replicas and permits at
@@ -816,7 +832,7 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
 
 `GET /v1/queue`
 
-- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "waiting_ahead_standard": 0, "waiting_ahead_high": 0, "run_slots": 30, "run_floor": 0, "desired_burst_workers": 0, "max_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>}`:
+- 200 `{"waiting": 0, "ready_standard": 0, "ready_high": 0, "running_standard": 0, "running_high": 0, "ready_run": 0, "running_run": 0, "waiting_ahead_standard": 0, "waiting_ahead_high": 0, "run_slots": 30, "run_floor": 0, "desired_burst_workers": 0, "max_burst_workers": 0, "hosts": [<host>, …], "phases": <phases>, "scaler": <scaler>, "locality": <locality>}`:
   the unfinished actions of running batches, the configured run cap (`run_slots`)
   and effective reserved floor (`run_floor`, clamped to that cap), the burst worker target and its cap
   (`max_burst_workers`), the
@@ -828,6 +844,11 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   ```json
   {"workers": 8, "at": "2026-01-01T12:00:00+00:00", "error": "scale 8 exited 1"}
   ```
+  and, under `locality`, what locality (see Claims) did in this process:
+  claims that took another batch than the head, wakes sent to another claim
+  than the first in line, and of the hosts forgotten after their workers went
+  quiet, their number, the contexts they held, and how many of those no host
+  below the scale-in line held.
   The phases:
   ```json
   {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3, "after_result": 3020.4}}
@@ -879,7 +900,9 @@ the fields as for a claim, from a worker that isn't claiming, as while it waits 
 - 204
 
 `POST /v1/work/<attempt_token>/complete` with the `holbuild-action-result-v1`
-record `exec-action --result` wrote as the body (`text/plain`)
+record `exec-action --result` wrote as the body (`text/plain`), to which the
+worker adds a `deps-key=<sha256>` line with the spec's dependency context
+when the spec has one
 
 - 200 `{"accepted": true}`; for a lease its batch revoked, only the record's
   log is kept

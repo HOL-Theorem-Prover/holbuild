@@ -13,7 +13,7 @@ import logging
 import os
 import shlex
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
@@ -70,6 +70,13 @@ MAX_LEASE_HOSTS = 10_000
 # The highest --host-rank a worker may report (worker.py checks the same bound at start).
 MAX_HOST_RANK = 1000
 # The queue sums the phase reports of workers' last this many seconds; at most MAX_PHASE_REPORTS are kept.
+# Placement for locality (see Coordinator._local_entry): how many dependency contexts the coordinator remembers per
+# host, and theories' contexts in all; and how many entries of a claim's band it looks past the head, which is also
+# how many times a batch may be passed over.
+HOST_LOCALITY_KEYS = 64
+MAX_THEORY_DEPS = 10_000
+LOCALITY_WINDOW = 8
+
 PHASE_WINDOW_SECONDS = 600
 MAX_PHASE_REPORTS = 100_000
 
@@ -126,6 +133,9 @@ class Settings(BaseSettings):
     run_floor: int = Field(default=0, ge=0)
     # Running builds of priority-0 batches allowed ahead of higher priorities; see Coordinator._claim_build.
     default_priority_floor: int = Field(default=32, ge=0)
+    # Claims and wakes on hosts below the scale-in line prefer actions whose dependency context the host holds; see
+    # Coordinator._local_entry. False claims and wakes as without it.
+    locality: bool = True
     warm_workers: int = 0
     max_burst_workers: int = 0
     scale_down_hold_s: float = 900.0
@@ -326,6 +336,19 @@ class ScaleRun:
     error: str | None
 
 
+@dataclass
+class LocalityCounts:
+    """What locality did in this process: claims that took another batch of the band than its head, and wakes sent
+    to another waiter than the best-ranked, for the claiming host's dependency contexts; and the hosts forgotten
+    holding contexts, those contexts, and how many of them no host below the scale-in line held then."""
+
+    claims: int = 0
+    wakes: int = 0
+    hosts_left: int = 0
+    keys_left: int = 0
+    keys_lost: int = 0
+
+
 @dataclass(frozen=True)
 class QueueStatus:
     counts: QueueCounts
@@ -333,6 +356,7 @@ class QueueStatus:
     hosts: list[HostStatus]
     phases: PhaseTotals
     scaler: ScaleRun | None  # the scale command's last run in this process
+    locality: LocalityCounts
 
 
 def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int, run_slots: int = 30) -> int:
@@ -470,7 +494,7 @@ WITH run_capacity AS MATERIALIZED (
         SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run'
     ) < :run_slots AS available
 )
-SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb, b.priority,
+SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb, b.priority, ready.theory,
     (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running,
     (SELECT max(l.last_claimed_at) FROM actions l WHERE l.batch_id = b.id) AS last_claimed_at,
     b.created_at,
@@ -480,7 +504,8 @@ FROM batches b
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:classes AS text[]))) c (class)
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:tiers AS text[]))) t (tier)
 CROSS JOIN LATERAL (
-    SELECT FROM actions a WHERE a.batch_id = b.id AND a.state = 'ready' AND a.class = c.class AND a.tier = t.tier
+    SELECT a.theory FROM actions a
+    WHERE a.batch_id = b.id AND a.state = 'ready' AND a.class = c.class AND a.tier = t.tier
     AND (a.class = 'run' OR a.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()))
     ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
     LIMIT 1
@@ -774,6 +799,8 @@ class _Ranking:
     ranked: set[tuple[UUID, str]]  # the batches and tiers it ranked
     exhausted: set[tuple[UUID, str]]
     running_default: int  # running builds of priority-0 batches, and the claims of them since the read
+    # The theory of each batch and tier's first ready build, until a claim from it makes that unknown.
+    theories: dict[tuple[UUID, str], str]
 
 
 _NEVER = datetime.min.replace(tzinfo=UTC)  # the last claim of a batch never claimed from, for ordering
@@ -865,7 +892,7 @@ class Coordinator:
         # and whether it was for a claim ahead) and whether they may claim ahead, oldest first (the tie-breaker
         # within a host); see claim.
         self.made_ready = 0
-        self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[tuple[str, bool]], bool]] = []
+        self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[tuple[str, bool, str | None]], bool]] = []
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
@@ -897,6 +924,13 @@ class Coordinator:
         self.infra_streak: dict[str, tuple[int, UUID | None]] = {}
         self.probe_at: dict[str, datetime] = {}
         self.host_workers: dict[str, dict[str, tuple[datetime, bool]]] = {}
+        # For locality, also in memory: the dependency context (deps-key) workers last reported for each theory, and
+        # the contexts (else the theories, before their context is known) each host last ran, least recent first,
+        # with the times a batch and tier was passed over for them and what locality did; see _local_entry.
+        self.theory_deps: dict[str, str] = {}
+        self.host_keys: dict[str, dict[str, None]] = {}
+        self.passed_over: dict[tuple[UUID, str], int] = {}
+        self.locality = LocalityCounts()
         # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
         self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque(maxlen=MAX_PHASE_REPORTS)
         # The wakes of the event streams following each batch; see watch.
@@ -1104,7 +1138,9 @@ class Coordinator:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
         rank = _claim_rank(tiers, host_id, host_rank)
-        woken: asyncio.Future[tuple[str, bool]] = loop.create_future()  # done once a wake was handed to this claim
+        # Done once a wake was handed to this claim: its tier, whether it was for a claim ahead, and the theory made
+        # ready, if it was for one.
+        woken: asyncio.Future[tuple[str, bool, str | None]] = loop.create_future()
 
         def undeferred(*, ahead_only: bool) -> list[str]:
             """The tiers no better-ranked unwoken waiter takes, of those that may claim ahead if ``ahead_only``."""
@@ -1132,6 +1168,7 @@ class Coordinator:
                         claimed = await self._claim(tiers, worker)
                         if claimed is not None:
                             self._lease_host(claimed.attempt_token, host_id, worker, tiers)
+                            self._ran_on(host_id, claimed.theory)
                         return claimed
                     remaining = deadline - loop.time()
                     if remaining <= 0:
@@ -1148,12 +1185,13 @@ class Coordinator:
                 outranked = (
                     await self._outranked_by_ahead(tiers, ahead_tiers) if ahead_tiers and eligible_tiers else None
                 )
-                claimed = await self._claim(eligible_tiers, worker, outranked) if eligible_tiers else None
+                claimed = await self._claim(eligible_tiers, worker, outranked, host_id) if eligible_tiers else None
                 if claimed is None and ahead_tiers:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
                 if claimed is not None and host_id is not None:
                     self._lease_host(claimed.attempt_token, host_id, worker, tiers)
+                    self._ran_on(host_id, claimed.theory)
                 if claimed is not None or remaining <= 0:
                     return claimed
                 woken = loop.create_future()
@@ -1197,10 +1235,12 @@ class Coordinator:
         tiers: list[str],
         worker: str,
         outranked: Callable[[str, int], list[str]] | None = None,
+        host_id: str | None = None,
     ) -> Claim | None:
         """Lease a ready build of ``tiers`` from the shared ranking, else a run action. Before a ready build that
         ranks after an action that may be claimed ahead, claim one of the tiers ``outranked`` gives for it, of a
-        higher priority than the build's; failing that, the build is claimed after all."""
+        higher priority than the build's; failing that, the build is claimed after all. A claim from ``host_id``
+        may take a build its host is warm for; see _local_entry."""
         started = asyncio.get_running_loop().time()
         key = tuple(tiers)
         ranking = await self._current_ranking(key)
@@ -1212,7 +1252,7 @@ class Coordinator:
         while True:
             async with self.engine.begin() as conn:
                 # Never lock a batch after an action: batch writers take those locks in the opposite order.
-                row = await self._claim_build(conn, ranking, outranked)
+                row = await self._claim_build(conn, ranking, outranked, host_id)
                 if row is not None:
                     claimed = await self._lease(conn, row, worker)
             if row is not None:
@@ -1446,7 +1486,11 @@ class Coordinator:
         return None
 
     async def _claim_build(
-        self, conn: AsyncConnection, ranking: "_Ranking", outranked: Callable[[str, int], list[str]] | None = None
+        self,
+        conn: AsyncConnection,
+        ranking: "_Ranking",
+        outranked: Callable[[str, int], list[str]] | None = None,
+        host_id: str | None = None,
     ) -> _Claimed | None:
         """Lock a ready build from the shared ranking, without refreshing it inside the transaction.
 
@@ -1458,6 +1502,8 @@ class Coordinator:
         candidate in the best candidate's tier goes first, ahead of claims ahead of that tier too, so a wave of
         higher priorities never takes every worker. A priority-0 claim counts against the floor before it awaits its
         lock, so concurrent claims sharing the ranking don't all take the floor's last slot.
+
+        A claim from ``host_id`` may then take another candidate of the chosen one's band; see _local_entry.
         """
         floor = self.settings.default_priority_floor
         while ranking.heap:
@@ -1484,19 +1530,127 @@ class Coordinator:
             if not below_floor and outranked is not None and outranked(tier, -priority):
                 heapq.heappush(ranking.heap, entry)
                 return None
+            passed = None  # the candidate passed over for one this host is warm for
+            if (local := self._local_entry(ranking, entry, host_id)) is not None:
+                ranking.heap[ranking.heap.index(local)] = entry
+                heapq.heapify(ranking.heap)
+                passed, entry = (batch_id, tier), local
+                tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
             heapq.heappush(
                 ranking.heap,
                 (tier_position, priority, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),
             )
+            # The batch's next ready build is another one, whose theory the ranking doesn't know.
+            ranking.theories.pop((batch_id, tier), None)
             if priority == 0:
                 ranking.running_default += 1
             row = await self._lock_unleased(conn, CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
+            self.passed_over.pop((batch_id, tier), None)
             if row is not None:
+                if passed is not None:
+                    self.passed_over[passed] = self.passed_over.get(passed, 0) + 1
+                    if len(self.passed_over) > MAX_LEASE_HOSTS:  # those of batches that ended unclaimed
+                        del self.passed_over[next(iter(self.passed_over))]
+                    self.locality.claims += 1
                 return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb)
             if priority == 0:
                 ranking.running_default -= 1
             ranking.exhausted.add((batch_id, tier))
         return None
+
+    def _local_entry(
+        self, ranking: "_Ranking", entry: tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None],
+        host_id: str | None,
+    ) -> tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None] | None:
+        """The candidate a claim from ``host_id`` takes instead of ``entry``, popped from ``ranking``, or None.
+
+        A host keeps the shared heap of each dependency context it ran (deps-key), which a cold host fetches from
+        the cache: most of what restoring a checkpoint moves. So a claim from a host whose recent contexts don't
+        include ``entry``'s takes, of the next LOCALITY_WINDOW candidates of the same band (tier, priority and
+        running actions), the first whose context it holds. Each candidate may be passed over LOCALITY_WINDOW
+        times, so no batch waits for long. Only a host below the scale-in line (_kept_hosts) does: the others are
+        to empty when demand falls."""
+        if not self.settings.locality or host_id is None or not (keys := self.host_keys.get(host_id)):
+            return None
+        head = (entry[6], entry[7])
+        if (theory := ranking.theories.get(head)) is not None and self._locality_key(theory) in keys:
+            return None
+        if self.passed_over.get(head, 0) >= LOCALITY_WINDOW:
+            return None
+        band = heapq.nsmallest(
+            LOCALITY_WINDOW,
+            (e for e in ranking.heap if e[:3] == entry[:3] and (e[6], e[7]) not in ranking.exhausted),
+        )
+        local = next(
+            (
+                e for e in band
+                if (t := ranking.theories.get((e[6], e[7]))) is not None and self._locality_key(t) in keys
+            ),
+            None,
+        )
+        ready = sum((e[6], e[7]) not in ranking.exhausted for e in ranking.heap) + 1
+        if local is None or host_id not in self._kept_hosts(ready):
+            return None
+        return local
+
+    def _locality_key(self, theory: str) -> str:
+        """What locality matches ``theory`` by: its dependency context, once a worker reported it, else its name."""
+        return self.theory_deps.get(theory, theory)
+
+    def _ran_on(self, host_id: str, theory: str) -> None:
+        """Note that ``host_id`` runs an action of ``theory``, so holds its dependency context from now on."""
+        keys = self.host_keys.setdefault(host_id, {})
+        key = self._locality_key(theory)
+        keys.pop(key, None)
+        keys[key] = None
+        while len(keys) > HOST_LOCALITY_KEYS:
+            del keys[next(iter(keys))]
+
+    def _learn_locality(self, host_id: str, theory: str, result: Result) -> None:
+        """Take the dependency context ``result`` reports for ``theory``, which ran on ``host_id``. A host that failed
+        an action for its own reasons forgets the action's context, so its retry isn't sent back there."""
+        if result.deps_key is not None:
+            self.theory_deps.pop(theory, None)
+            self.theory_deps[theory] = result.deps_key
+            if len(self.theory_deps) > MAX_THEORY_DEPS:
+                del self.theory_deps[next(iter(self.theory_deps))]
+        keys = self.host_keys.get(host_id, {})
+        if result.status == "failed" and result.failure in INFRA_FAILURES:
+            keys.pop(theory, None)
+            if result.deps_key is not None:
+                keys.pop(result.deps_key, None)
+        elif result.status != "failed" or result.failure in RAN_FAILURES:
+            keys.pop(theory, None)  # the name stood for the context until a worker reported it
+            self._ran_on(host_id, theory)
+
+    def _kept_hosts(self, ready: int) -> set[str]:
+        """The hosts below the scale-in line: in the order claims pack onto them (warm hosts, then by rank and id),
+        the hosts not quarantined whose workers seen lately could run the live leases and ``ready`` more actions,
+        and at least the warm workers. A host above it is to empty, so locality never sends it work."""
+        now = self.clock()
+        leases = Counter(host for host, _, _ in self.lease_hosts.values())
+        waiting = Counter(w_rank[3] for _, w_rank, w_woken, _ in self.claim_waiters if not w_woken.done())
+        hosts: list[tuple[tuple[bool, int, str], int]] = []
+        for host_id, workers in self.host_workers.items():
+            fresh = [
+                is_burst for seen, is_burst in workers.values() if (now - seen).total_seconds() < HOST_REPORT_SECONDS
+            ]
+            if not fresh or self._quarantine(host_id) is not None:
+                continue
+            report = self.hosts.get(host_id)
+            rank = 0 if report is None else report[1].rank
+            reported = report[1].leases if report is not None and report[1].leases is not None else 0
+            slots = max(len(fresh), reported, leases[host_id] + waiting[host_id], 1)
+            hosts.append(((all(fresh), rank, host_id), slots))
+        budget = max(self.settings.warm_workers, len(self.lease_hosts) + ready)
+        kept: set[str] = set()
+        before = 0
+        for (_, _, host_id), slots in sorted(hosts):
+            if before >= budget:
+                break
+            kept.add(host_id)
+            before += slots
+        return kept
 
     async def _current_ranking(self, key: tuple[str, ...], *, after: float = 0) -> "_Ranking":
         """Share one read per tier key, fresh enough for invalidations seen on entry and ``after``.
@@ -1556,7 +1710,10 @@ class Coordinator:
         ]
         heapq.heapify(heap)
         running_default = rows[0].running_default if rows else 0
-        return _Ranking(at, forgotten, heap, {(row.batch_id, row.tier) for row in rows}, set(), running_default)
+        return _Ranking(
+            at, forgotten, heap, {(row.batch_id, row.tier) for row in rows}, set(), running_default,
+            {(row.batch_id, row.tier): row.theory for row in rows},
+        )
 
     def _keep_ranking(self, key: tuple[str, ...], ranking: "_Ranking") -> None:
         """Share ``ranking`` with later claims, unless a release dropped a ranking while it was read, since its
@@ -1583,30 +1740,37 @@ class Coordinator:
             for key in stale:
                 self.rankings.pop(key, None)
 
-    def _wake_claim(self, tier: str, *, ahead: bool = False) -> None:
-        """Wake the best-ranked compatible claim, with FIFO ties. Only normal wakes count newly ready work;
-        changes for capable claims are recorded by _ahead_changed."""
+    def _wake_claim(self, tier: str, *, ahead: bool = False, theory: str | None = None) -> None:
+        """Wake the best-ranked compatible claim, with FIFO ties; for an action of ``theory`` made ready, the
+        best-ranked of those on hosts below the scale-in line that hold its dependency context, if any (see
+        _local_entry). Only normal wakes count newly ready work; changes for capable claims are recorded by
+        _ahead_changed."""
         if not ahead:
             self.made_ready += 1
-        waiter = min(
-            (
-                w for w in self.claim_waiters
-                if tier in w[0] and not w[2].done() and (w[3] or not ahead) and self._quarantine(w[1][3]) is None
-            ),
-            key=lambda w: w[1],
-            default=None,
-        )
+        compatible = [
+            w for w in self.claim_waiters
+            if tier in w[0] and not w[2].done() and (w[3] or not ahead) and self._quarantine(w[1][3]) is None
+        ]
+        waiter = min(compatible, key=lambda w: w[1], default=None)
+        if waiter is not None and theory is not None and self.settings.locality:
+            key = self._locality_key(theory)
+            if key not in self.host_keys.get(waiter[1][3], {}):
+                holders = [w for w in compatible if key in self.host_keys.get(w[1][3], {})]
+                kept = self._kept_hosts(1) if holders else set()
+                if (local := min((w for w in holders if w[1][3] in kept), key=lambda w: w[1], default=None)):
+                    waiter = local
+                    self.locality.wakes += 1
         if waiter is not None:
-            waiter[2].set_result((tier, ahead))
+            waiter[2].set_result((tier, ahead, theory))
             self.claim_waiters.remove(waiter)
 
-    def _pass_wake(self, woken: asyncio.Future[tuple[str, bool]]) -> None:
+    def _pass_wake(self, woken: asyncio.Future[tuple[str, bool, str | None]]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""
         if woken.done() and not woken.cancelled():
-            tier, ahead = woken.result()
+            tier, ahead, theory = woken.result()
             if not ahead:
                 self.made_ready -= 1
-            self._wake_claim(tier, ahead=ahead)
+            self._wake_claim(tier, ahead=ahead, theory=theory)
 
     async def _peers(self, batch_id: UUID, action: sa.Row[Any]) -> list[sa.Row[Any]]:
         """The waiting and ready copies of build ``action`` of ``batch_id``, whose lease just ended, in other
@@ -1938,6 +2102,7 @@ class Coordinator:
         self.lease_hosts.pop(token, None)
         if leased is not None:
             self._record_result(leased[0], batch_id, result)
+            self._learn_locality(leased[0], action.theory, result)
         self._batch_changed(batch_id)
         self.request_release(batch_id)
         if unblocked:
@@ -2050,18 +2215,20 @@ class Coordinator:
             async with transactions, self.engine.begin() as conn:
                 if await self._lock_batch(conn, batch_id) != "running":
                     return False
-                tiers = await conn.scalars(
-                    sa.text(
-                        "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
-                        "AND input_key = ANY(:keys) AND state = 'waiting' AND remaining_deps = 0 RETURNING tier"
-                    ),
-                    {"batch_id": batch_id, "keys": ready},
+                made_ready = list(
+                    await conn.execute(
+                        sa.text(
+                            "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
+                            "AND input_key = ANY(:keys) AND state = 'waiting' AND remaining_deps = 0 "
+                            "RETURNING tier, theory"
+                        ),
+                        {"batch_id": batch_id, "keys": ready},
+                    )
                 )
-                made_ready = list(tiers)
             self._batch_changed(batch_id)
-            self._forget_rankings(batch_id, set(made_ready))
-            for tier in made_ready:
-                self._wake_claim(tier)
+            self._forget_rankings(batch_id, {row.tier for row in made_ready})
+            for row in made_ready:
+                self._wake_claim(row.tier, theory=row.theory)
         requeued = False
         for parents in candidates.values():
             for parent, ac_key in parents:
@@ -2285,6 +2452,7 @@ class Coordinator:
             sorted(hosts, key=lambda h: h.report.id),
             self._phase_totals(now),
             self.scaler,
+            replace(self.locality),
         )
 
     def _forget_silent_hosts(self, now: datetime) -> None:
@@ -2304,6 +2472,15 @@ class Coordinator:
             if (now - at).total_seconds() < HOST_REPORT_SECONDS or host in self.host_workers
         }
         known = self.hosts.keys() | self.host_workers.keys()
+        if gone := [host for host in self.host_keys if host not in self.host_workers]:
+            # Counted for the drain handoff's case: contexts that leave with their host while no host below the
+            # scale-in line holds them.
+            kept = set().union(*(self.host_keys.get(host, {}).keys() for host in self._kept_hosts(0)))
+            for host in gone:
+                keys = self.host_keys.pop(host)
+                self.locality.hosts_left += 1
+                self.locality.keys_left += len(keys)
+                self.locality.keys_lost += sum(key not in kept for key in keys)
         self.infra_streak = {host: n for host, n in self.infra_streak.items() if host in known}
         self.probe_at = {host: at for host, at in self.probe_at.items() if host in known}
 

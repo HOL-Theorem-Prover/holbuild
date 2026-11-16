@@ -65,6 +65,8 @@ class Result:
     # rebuilt is 1 for a source build, 0 for a cache hit or failure.
     timings: dict[str, int] | None = None
     detail: str | None = None  # why a failure with no log failed, as sanitize_detail leaves it
+    # The spec's deps-key, which the worker adds: the dependency context whose shared heap the action loaded.
+    deps_key: str | None = None
 
 
 def sanitize_detail(text: str) -> str:
@@ -174,4 +176,5 @@ def parse_result(text: str) -> Result:
         log_sha256=_expect(SHA256, log.split(" ")[0], "log") if log else None,
         timings=timings or None,
         detail=sanitize_detail(fields["detail"]) if fields.get("detail") else None,
+        deps_key=_expect(SHA256, fields["deps-key"], "deps-key") if fields.get("deps-key") else None,
     )

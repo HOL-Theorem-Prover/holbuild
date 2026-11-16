@@ -702,6 +702,24 @@ def test_worker_passes_the_free_space_floor_only_to_releases_that_take_it(
     assert ("--cache-min-free-gb" in logs[1].read_text().split()) == floor
 
 
+@pytest.mark.parametrize(
+    ("lines", "deps_key"),
+    [(f"deps-key={'c' * 64}\n", "c" * 64), ("", None), ("deps-key=nope\n", None), (f"deps-key={'c' * 64}\n" * 2, None)],
+)
+def test_worker_adds_the_specs_dependency_context_to_the_result_it_reports(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], lines: str, deps_key: str | None
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = f"holbuild-action-spec-v1\nholbuild-version=1.2.3\n{lines}"
+
+    run_one(
+        Coordinator(server.url, "w"), worker_args(tmp_path, server), releases(tmp_path, server),
+        Protection(None, None), claim(), Phases(),
+    )
+
+    assert server.completed == [RECORD if deps_key is None else f"{RECORD}deps-key={deps_key}\n"]
+
+
 AHEAD_PARENTS = [{"input_key": "7" * 64, "spec_sha256": "8" * 64}, {"input_key": "9" * 64, "spec_sha256": "a" * 64}]
 
 
@@ -1976,7 +1994,7 @@ def test_bootstrap_spec_uses_second_node_when_primary_is_unreachable(tmp_path: P
     )
     server.specs[digest] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     ring = Releases(str(tmp_path), "unused", ",".join(nodes), None)
-    assert ring.spec_version(digest) == "1.2.3"
+    assert ring.read_spec(digest).version == "1.2.3"
 
 
 @pytest.mark.parametrize("status", [404, 429, 503])
@@ -1996,7 +2014,7 @@ def test_bootstrap_spec_falls_back_before_parsing(
         return subprocess.CompletedProcess(command, 0, b"holbuild-version=1.2.3\n\n200", b"")
 
     monkeypatch.setattr(subprocess, "run", fetch)
-    assert Releases(str(tmp_path), "unused", ",".join(nodes), None).spec_version(SPEC) == "1.2.3"
+    assert Releases(str(tmp_path), "unused", ",".join(nodes), None).read_spec(SPEC).version == "1.2.3"
     assert asked == [f"{node}/cas/{SPEC}" for node in ranked_nodes(nodes, SPEC)]
 
 
@@ -2024,7 +2042,7 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
     error = RuntimeError if 403 in statuses or statuses == (404, 404) else CacheUnavailable
     message = "HTTP 403" if 403 in statuses else "HTTP 404" if error is RuntimeError else "HTTP 429|HTTP 503"
     with pytest.raises(error, match=message) as caught:
-        ring.spec_version(SPEC)
+        ring.read_spec(SPEC)
     assert type(caught.value) is error
     assert len(asked) == (4 if statuses == (404, 404) else len(statuses))
     if statuses == (404, 404):
@@ -2041,7 +2059,7 @@ def test_blob_key_is_the_clients() -> None:
 
 def test_bootstrap_spec_reads_one_written_compressed_under_ac(tmp_path: Path, server: Server) -> None:
     server.zstd_specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=0.15.0\n"
-    assert Releases(str(tmp_path), "unused", server.url, None).spec_version(SPEC) == "0.15.0"
+    assert Releases(str(tmp_path), "unused", server.url, None).read_spec(SPEC).version == "0.15.0"
 
 
 def test_bootstrap_spec_under_ac_that_does_not_decompress_is_corrupt(
@@ -2058,7 +2076,7 @@ def test_bootstrap_spec_under_ac_that_does_not_decompress_is_corrupt(
 
     monkeypatch.setattr(subprocess, "run", fetch)
     with pytest.raises(RuntimeError, match="corrupt"):
-        Releases(str(tmp_path), "unused", "http://one.test", None).spec_version(SPEC)
+        Releases(str(tmp_path), "unused", "http://one.test", None).read_spec(SPEC)
 
 
 def test_worker_discovery_exposes_only_a_scoped_token_to_the_action_and_cleans_it_on_exit(
