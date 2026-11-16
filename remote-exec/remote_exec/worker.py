@@ -577,9 +577,10 @@ def free_bytes(path: str) -> int:
 
 def disk_shortfall() -> str | None:
     """Why the host's disk has no room for an action now, or None if it has: the temp dir, where the worker keeps
-    its scratch, ``TMPDIR``, where exec-action keeps its own (``tempfile`` falls back from an unwritable one), or the
+    its scratch, ``TMPDIR`` (else /tmp), where exec-action keeps its own (``tempfile`` falls back from an unwritable
+    one), or the
     ``HOLBUILD_CACHE`` root, where exec-action's sandboxes and stores are, has less than DISK_FLOOR free."""
-    paths = (tempfile.gettempdir(), os.environ.get("TMPDIR"), os.environ.get("HOLBUILD_CACHE"))
+    paths = (tempfile.gettempdir(), os.environ.get("TMPDIR", "/tmp"), os.environ.get("HOLBUILD_CACHE"))
     for path in dict.fromkeys(path for path in paths if path):
         if (free := free_bytes(path)) < DISK_FLOOR:
             return f"{path} has {free // MIB} MiB free, below {DISK_FLOOR // MIB} MiB"

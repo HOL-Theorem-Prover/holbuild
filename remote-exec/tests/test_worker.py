@@ -961,6 +961,23 @@ def test_action_that_ends_without_a_record_on_a_full_disk_is_handed_back(
     assert server.completed == [failed_record(SPEC, "unavailable", detail)]
 
 
+@pytest.mark.parametrize("tmpdir", ["full", None])
+def test_the_disk_check_measures_exec_actions_temp_root_whatever_python_picked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tmpdir: str | None
+) -> None:
+    # exec-action writes under TMPDIR, else /tmp, even when Python's tempfile settled on another directory.
+    full = str(tmp_path / "full") if tmpdir else "/tmp"
+    if tmpdir:
+        monkeypatch.setenv("TMPDIR", full)
+    else:
+        monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "python"))
+    monkeypatch.delenv("HOLBUILD_CACHE", raising=False)
+    monkeypatch.setattr(worker, "free_bytes", lambda path: GIB if path == full else 100 * GIB)
+
+    assert worker.disk_shortfall() == f"{full} has 1024 MiB free, below {DISK_FLOOR // 2**20} MiB"
+
+
 @pytest.mark.parametrize(
     ("returncode", "draining", "failure", "cause"),
     [
