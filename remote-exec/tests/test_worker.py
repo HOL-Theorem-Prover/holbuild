@@ -583,28 +583,6 @@ def test_ecs_protection_rejection_in_a_success_response_is_logged(
     assert "DEPLOYMENT_BLOCKED" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(
-    ("reason", "enabled", "drains"),
-    [
-        ("DRAINING", True, True),
-        # ECS refuses protection so on healthy instances too, in a scale-in or a rolling deployment.
-        ("DEPLOYMENT_BLOCKED", True, False),
-        ("TASK_STOPPING_OR_STOPPED", True, False),
-        ("DRAINING", False, False),
-    ],
-)
-def test_protection_refused_on_a_draining_container_instance_drains_the_worker(
-    server: Server, reason: str, enabled: bool, drains: bool
-) -> None:
-    server.protection_reply = {"failure": {"Reason": reason}}
-    drain = worker.Drain()
-    drain.interrupt = True  # the main thread is in an interruptible call, which only its own SIGTERM handler ends
-    thread = threading.Thread(target=Protection(None, server.url, drain).set, kwargs={"enabled": enabled})
-    thread.start()
-    thread.join()
-    assert (drain.stop.is_set(), drain.interrupt) == (drains, True)
-
-
 @pytest.mark.parametrize("text", ["-1", "nan", "inf"])
 def test_drain_seconds_must_be_finite_and_nonnegative(tmp_path: Path, server: Server, text: str) -> None:
     with pytest.raises(SystemExit):

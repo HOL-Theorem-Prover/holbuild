@@ -58,10 +58,12 @@ HOST_REPORT_SECONDS = 120
 MAX_HOSTS = 1000
 # A host is quarantined (see Coordinator._quarantine) while its latest report has less disk free than this, the floor
 # under which its workers don't claim (worker.py DISK_FLOOR), or while its last QUARANTINE_FAILURES results were
-# INFRA_FAILURES; such a host gets one probe claim each PROBE_SECONDS.
+# INFRA_FAILURES of more than one batch; such a host gets one probe claim each PROBE_SECONDS, and one that ends in
+# success or in RAN_FAILURES, which say the host ran the action, ends the quarantine.
 DISK_FLOOR = 4 * 2**30
 QUARANTINE_FAILURES = 5
 INFRA_FAILURES = frozenset({"internal", "disk", "toolchain", "publish", "unavailable"})
+RAN_FAILURES = frozenset({"proof", "timeout", "tactic-timeout", "memory"})
 PROBE_SECONDS = 60
 # Leases whose host the coordinator remembers at most, the oldest forgotten first.
 MAX_LEASE_HOSTS = 10_000
@@ -254,13 +256,14 @@ class HostReport:
     lower ``rank`` first (the worker's ``--host-rank``)."""
 
     id: Annotated[str, Field(max_length=64)]  # the host's boot_id
-    cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None
-    mem_total: Amount | None
-    mem_available: Amount | None
-    budget: Amount | None
-    reserved: Amount
-    leases: Amount
-    memory_short: bool
+    # The readings, all None when the worker couldn't read its host and sent only its id and rank.
+    cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None = None
+    mem_total: Amount | None = None
+    mem_available: Amount | None = None
+    budget: Amount | None = None
+    reserved: Amount | None = None
+    leases: Amount | None = None
+    memory_short: bool | None = None
     rank: Annotated[int, Field(ge=0, le=MAX_HOST_RANK)] = 0
     disk_free: Amount | None = None  # bytes free on the host disk the worker's claims depend on
 
@@ -868,10 +871,11 @@ class Coordinator:
         # knows the hosts whose workers' requests reached it.
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
         # For the quarantine, also in memory: the host, worker and tiers of each lease, oldest first; each host's
-        # infrastructure failures in a row and its last probe claim; and the workers that last claimed, reported or
-        # heartbeat from each host, when, and whether they are burst workers. See _quarantine.
+        # infrastructure failures in a row, with their batch (None once they span more than one), and its last probe
+        # claim; and the workers that last claimed, reported or heartbeat from each host, when, and whether they are
+        # burst workers. See _quarantine.
         self.lease_hosts: dict[UUID, tuple[str, str, list[str]]] = {}
-        self.infra_streak: dict[str, int] = {}
+        self.infra_streak: dict[str, tuple[int, UUID | None]] = {}
         self.probe_at: dict[str, datetime] = {}
         self.host_workers: dict[str, dict[str, tuple[datetime, bool]]] = {}
         # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
@@ -1631,7 +1635,10 @@ class Coordinator:
             self._ahead_changed()  # its children may now be claimed ahead
 
     def report_host(self, report: HostReport) -> None:
-        """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one."""
+        """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one, and one
+        without readings changes nothing, so the host's last readings keep their age."""
+        if report.memory_short is None:
+            return
         previous = self.hosts.get(report.id)
         if previous is None and len(self.hosts) >= MAX_HOSTS:
             return
@@ -1659,37 +1666,45 @@ class Coordinator:
             free = entry[1].disk_free
             if free is not None and free < DISK_FLOOR:
                 return "disk"
-        if self.infra_streak.get(host_id, 0) >= QUARANTINE_FAILURES:
+        if self._failing(host_id):
             return "failures"
         return None
 
-    def _record_result(self, host_id: str, result: Result) -> None:
-        """Count ``result`` from host ``host_id`` towards its quarantine. Only a success ends a quarantine for
-        failures, so a failed probe, of whatever class, restarts its PROBE_SECONDS; a failure that says nothing
-        about the host, as loading ahead given up, leaves the count as it is."""
-        streak = self.infra_streak.get(host_id, 0)
-        if result.status != "failed":
+    def _failing(self, host_id: str) -> bool:
+        count, batch = self.infra_streak.get(host_id, (0, None))
+        return count >= QUARANTINE_FAILURES and batch is None
+
+    def _record_result(self, host_id: str, batch_id: UUID, result: Result) -> None:
+        """Count ``result`` of batch ``batch_id`` from host ``host_id`` towards its quarantine. Only a result showing
+        the host ran the action ends a quarantine for failures, so another failed probe restarts its PROBE_SECONDS;
+        a failure that says nothing about the host, as loading ahead given up, leaves the count as it is."""
+        failing = self._failing(host_id)
+        if result.status != "failed" or result.failure in RAN_FAILURES:
             self.infra_streak.pop(host_id, None)
             self.probe_at.pop(host_id, None)
         elif result.failure in INFRA_FAILURES:
-            self.infra_streak[host_id] = streak + 1
-            if streak + 1 >= QUARANTINE_FAILURES:
+            count, batch = self.infra_streak.get(host_id, (0, batch_id))
+            self.infra_streak[host_id] = (count + 1, batch if batch == batch_id else None)
+            if self._failing(host_id):
                 self.probe_at[host_id] = self.clock()
         elif result.failure == "ahead-abandoned":
             pass
-        elif streak < QUARANTINE_FAILURES:
+        elif not failing:
             self.infra_streak.pop(host_id, None)
         else:
             self.probe_at[host_id] = self.clock()
 
     def _quarantined_workers(self) -> tuple[int, int]:
-        """The warm and burst workers on quarantined hosts."""
+        """The warm and burst workers on quarantined hosts that hold no lease. One running an action stays
+        capacity for that action, which the queue counts as running, until it ends."""
+        busy = {(host_id, worker) for host_id, worker, _ in self.lease_hosts.values()}
         warm = burst = 0
         for host_id, workers in self.host_workers.items():
             if self._quarantine(host_id) is not None:
-                for _, is_burst in workers.values():
-                    burst += is_burst
-                    warm += not is_burst
+                for worker, (_, is_burst) in workers.items():
+                    if (host_id, worker) not in busy:
+                        burst += is_burst
+                        warm += not is_burst
         return warm, burst
 
     def _burst_demand(self, counts: QueueCounts) -> int:
@@ -1858,7 +1873,7 @@ class Coordinator:
                 )
         self.lease_hosts.pop(token, None)
         if leased is not None:
-            self._record_result(leased[0], result)
+            self._record_result(leased[0], batch_id, result)
         self._batch_changed(batch_id)
         self.request_release(batch_id)
         if unblocked:

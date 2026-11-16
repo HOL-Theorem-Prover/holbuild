@@ -1160,7 +1160,7 @@ async def test_a_probe_that_ran_its_action_to_a_failure_of_its_own_ends_the_quar
 async def test_a_completion_retried_after_a_failed_attempt_still_counts_for_its_host(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    coordinator.infra_streak["host-a"] = coordinator_module.QUARANTINE_FAILURES
+    coordinator.infra_streak["host-a"] = (coordinator_module.QUARANTINE_FAILURES, None)
     await submit(http, ["a"])
     coordinator.probe_at["host-a"] = coordinator.clock() - timedelta(seconds=coordinator_module.PROBE_SECONDS)
     claimed = await coordinator.claim(["standard"], "w", host_id="host-a")

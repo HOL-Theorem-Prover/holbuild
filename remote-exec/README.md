@@ -240,19 +240,22 @@ idle since the worker's previous CPU sample (iowait counts as busy), its
 memory as holbuild's admission sees it, whether that admission would
 hold a child back now or held the worker back since its last report, and
 its `--host-rank`, and the bytes free and in all on whichever of the temp
-dir, `TMPDIR` and the `HOLBUILD_CACHE` root has the least free. A
-report is left out when the host can't be read at once, as while an
-admission holds the cooperate dir's lock. `GET /v1/queue` lists them, so a
+dir, `TMPDIR` and the `HOLBUILD_CACHE` root has the least free. When the
+host can't be read at once, as while an admission holds the cooperate dir's
+lock, the report has only the id and rank, and the coordinator keeps the
+host's previous readings and their age. `GET /v1/queue` lists them, so a
 reader can tell whether hosts have CPU to spare or are short of memory.
 
-The coordinator quarantines a host while its latest report has less than
-4 GiB free, or while its last five results were all infrastructure failures
-(`internal`, `disk`, `toolchain`, `publish` or `unavailable`) with no success
-since. A quarantined host's claims get no work and don't wait among the other
-claims, so they neither take wakes nor hold back worse-ranked hosts; the
-autoscaler doesn't count its workers as capacity. One quarantined for its
-failures gets one probe claim a minute, and a success ends the quarantine;
-any failed probe keeps it. Both rules live in each coordinator process's
+The coordinator quarantines a host while its latest report has less than 4 GiB
+free, or while its last five results were all infrastructure failures
+(`internal`, `disk`, `toolchain`, `publish` or `unavailable`) of more than one
+batch, since a broken batch fails on healthy hosts too. A quarantined host's
+claims get no work and don't wait among the other claims, so they neither take
+wakes nor hold back worse-ranked hosts; the autoscaler doesn't count its idle
+workers as capacity. One quarantined for its failures gets one probe claim a
+minute, and a result showing the host ran the action (a success, or a `proof`,
+`timeout`, `tactic-timeout` or `memory` failure) ends the quarantine; any
+other failed probe keeps it. Both rules live in each coordinator process's
 memory, as host reports do: a replica goes by the reports, claims and results
 that reach it, and starts empty on a restart.
 
@@ -698,9 +701,7 @@ scale-in protection through the agent's `task-protection/v1/state` endpoint,
 for 180 minutes at a time. ECS refuses to renew protection with
 `DEPLOYMENT_BLOCKED` while a scale-in or rolling deployment wants the task
 gone, so the window set when the action is claimed has to outlast the longest
-action. A refusal that names the container instance `DRAINING` drains the
-worker, since ECS doesn't stop a protected task there; `DEPLOYMENT_BLOCKED`
-alone doesn't, since ECS also gives it to healthy instances. The worker clears protection when the action ends or loses its lease,
+action. The worker clears protection when the action ends or loses its lease,
 and a worker that dies takes its task down with it. Failures are logged and
 the action carries on.
 
