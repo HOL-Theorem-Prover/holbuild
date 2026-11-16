@@ -287,3 +287,59 @@ require_grep "the remote cache holds different outputs for the action" "$tmpdir/
 # It drops its own entry, so that a retry restores the remote's.
 input_key=$(sed -n 's/^input_key=//p' "$remote_root/ac/$ac")
 require_no_file "$tmpdir/worker-other/actions/$input_key/manifest"
+
+# A build.log over 64 MiB goes up as its first 16 MiB, a line saying what
+# was cut and its last 48 MiB.  When the cache refuses it, the action still
+# succeeds and its record says why it has no log.
+cat > "$project/src/BigScript.sml" <<'SML'
+Theory Big
+Ancestors bool
+
+val _ =
+  let
+    val line = CharVector.tabulate (1023, fn _ => #"x") ^ "\n"
+    fun lines 0 = () | lines n = (print line; lines (n - 1))
+  in
+    print "big-log-start\n"; lines (48 * 1024);
+    print "big-log-middle\n"; lines (48 * 1024);
+    print "big-log-end\n"
+  end
+
+Theorem big_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload BigTheory) > "$tmpdir/batch-big.txt"
+spec=$(awk '$1 == "action" && $5 == "worker:BigTheory" { print $4 }' "$tmpdir/batch-big.txt")
+big_ac=$(awk '$1 == "action" && $5 == "worker:BigTheory" { print $3 }' "$tmpdir/batch-big.txt")
+[[ -n "$spec" && -n "$big_ac" ]] || { cat "$tmpdir/batch-big.txt" >&2; exit 1; }
+printf '[holbuild: truncated ' > "$control/cas-put-reject-text"
+worker big-refused
+rm "$control/cas-put-reject-text"
+if [[ "$worker_status" != 0 ]] || ! grep -qx 'status=built' "$tmpdir/big-refused.result" ||
+   grep -q '^log=' "$tmpdir/big-refused.result"; then
+  echo "a refused log upload changed the action's result" >&2
+  cat "$tmpdir/big-refused.result" "$tmpdir/big-refused.log" >&2
+  exit 1
+fi
+require_grep '^detail=could not upload the action log: remote cache server error: HTTP 500 for PUT' \
+  "$tmpdir/big-refused.result"
+rm "$remote_root/ac/$big_ac"
+worker big
+[[ "$worker_status" == 0 ]] || { cat "$tmpdir/big.result" "$tmpdir/big.log" >&2; exit 1; }
+read -r big_sha big_bytes < <(sed -n 's/^log=//p' "$tmpdir/big.result")
+blob=$remote_root/cas/$big_sha
+require_file "$blob"
+[[ "$(stat -c %s "$blob")" == "$big_bytes" ]] || { echo "log= size $big_bytes, blob $(stat -c %s "$blob")" >&2; exit 1; }
+python3 - "$blob" <<'PY'
+import re, sys
+data = open(sys.argv[1], "rb").read()
+head, tail = 16 << 20, 48 << 20
+m = re.match(rb"\n\.\.\. \[holbuild: truncated (\d+) bytes of (\d+)-byte build log\] \.\.\.\n", data[head:])
+assert m, data[head:head + 200]
+assert int(m[2]) - int(m[1]) == head + tail and len(data) == head + len(m[0]) + tail, (m[0], len(data))
+assert b"big-log-start\n" in data[:head] and data.endswith(b"big-log-end\n"), "head or tail missing"
+assert b"big-log-middle" not in data, "the middle was kept"
+PY
