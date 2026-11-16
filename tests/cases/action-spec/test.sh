@@ -403,5 +403,6 @@ status=0
   "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --remote-only) \
   > "$tmpdir/toolchain-only.log" 2>&1 || status=$?
 [[ $status -eq 75 ]] || { cat "$tmpdir/toolchain-only.log" >&2; echo "wanted 75, got $status" >&2; exit 1; }
-require_grep 'HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally' "$tmpdir/toolchain-only.log"
+# It names what it looked for, so a failure elsewhere can be traced.
+require_grep "HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally (HOL rev $fake_rev, toolchain key [0-9a-f]\{64\}, remote archive key [0-9a-f]\{64\})" "$tmpdir/toolchain-only.log"
 [[ ! -s "$tmpdir/fake-build-count" ]] || { cat "$tmpdir/fake-build-count" >&2; exit 1; }
