@@ -652,7 +652,7 @@ def test_worker_runs_the_action_on_the_release_that_exported_it(
     assert len(held) >= 2  # renewed on a heartbeat
 
 
-@pytest.mark.parametrize(("version", "floor"), [("0.14.54", False), ("0.14.55", True)])
+@pytest.mark.parametrize(("version", "floor"), [("0.14.55", False), ("0.14.56", True)])
 def test_worker_passes_the_free_space_floor_only_to_releases_that_take_it(
     tmp_path: Path, server: Server, logs: tuple[Path, Path], version: str, floor: bool
 ) -> None:

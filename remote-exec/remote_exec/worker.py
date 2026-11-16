@@ -47,7 +47,7 @@ COMPLETE = ".complete"  # stamp file of a finished release build
 MIN_SANDBOX_RELEASE = (0, 13, 58)
 MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
-MIN_FREE_FLOOR_RELEASE = (0, 14, 55)  # the first whose exec-action takes --cache-min-free-gb
+MIN_FREE_FLOOR_RELEASE = (0, 14, 56)  # the first whose exec-action takes --cache-min-free-gb
 
 
 @functools.cache
