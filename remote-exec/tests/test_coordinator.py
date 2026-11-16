@@ -1115,15 +1115,45 @@ async def test_a_host_whose_last_five_results_were_infrastructure_failures_gets_
     assert await coordinator.claim(["high", "standard"], "w", host_id="host-b") is not None
     now += timedelta(seconds=coordinator_module.PROBE_SECONDS - 1)
     assert await coordinator.claim(["high", "standard"], "w", host_id="host-a") is None
-    # A failed probe, whatever its class, keeps the quarantine and the next probe a minute off.
+    # A probe failing in a way that says nothing of the host keeps the quarantine and the next probe a minute off.
     now += timedelta(seconds=1)
-    await fail_on(http, coordinator, "host-a", "memory")
+    await fail_on(http, coordinator, "host-a", "script")
     assert await coordinator.claim(["high", "standard"], "w", host_id="host-a") is None
     now += timedelta(seconds=coordinator_module.PROBE_SECONDS)
     await fail_on(http, coordinator, "host-a", "internal")
     assert coordinator._quarantine("host-a") == "failures"
     now += timedelta(seconds=coordinator_module.PROBE_SECONDS)
     await fail_on(http, coordinator, "host-a", None)
+    assert coordinator._quarantine("host-a") is None
+
+
+async def test_infrastructure_failures_of_one_batch_alone_quarantine_no_host(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    # A batch whose actions all fail, as on a toolchain that doesn't build, fails them on healthy hosts too.
+    await submit(http, [f"b{i}" for i in range(coordinator_module.QUARANTINE_FAILURES + 1)])
+    for _ in range(coordinator_module.QUARANTINE_FAILURES + 1):
+        claimed = await coordinator.claim(["standard"], "w", host_id="host-a")
+        assert claimed is not None
+        record = result(claimed.theory.removeprefix("pkg:"), "failed", "toolchain")
+        assert (await complete(http, str(claimed.attempt_token), record)).status_code == 200
+        assert coordinator._quarantine("host-a") is None
+    # Once its failures span batches, the host is to blame.
+    await fail_on(http, coordinator, "host-a", "internal")
+    assert coordinator._quarantine("host-a") == "failures"
+
+
+@pytest.mark.parametrize("failure", ["proof", "timeout", "tactic-timeout", "memory"])
+async def test_a_probe_that_ran_its_action_to_a_failure_of_its_own_ends_the_quarantine(
+    http: httpx.AsyncClient, coordinator: Coordinator, failure: str
+) -> None:
+    now = coordinator.clock()
+    coordinator.clock = lambda: now
+    for _ in range(coordinator_module.QUARANTINE_FAILURES):
+        await fail_on(http, coordinator, "host-a", "internal")
+    assert coordinator._quarantine("host-a") == "failures"
+    now += timedelta(seconds=coordinator_module.PROBE_SECONDS)
+    await fail_on(http, coordinator, "host-a", failure)
     assert coordinator._quarantine("host-a") is None
 
 
@@ -1164,6 +1194,19 @@ async def test_a_host_reporting_too_little_disk_gets_no_work_until_it_reports_ro
     assert await coordinator.claim(["standard"], "w", host_id="host-a") is not None
 
 
+async def test_a_claim_reporting_only_its_host_id_is_quarantined_and_freshens_no_reading(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a"])
+    coordinator.report_host(short_of_disk("host-a"))
+    reported = coordinator.hosts["host-a"]
+    # A worker that can't read its host, as while an admission holds the cooperate dir's lock, sends only its id.
+    body = {"tier": "standard", "worker": "w", "host": {"id": "host-a", "rank": 0}}
+    response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+    assert response.status_code == 204, response.text
+    assert coordinator.hosts["host-a"] == reported
+
+
 async def test_a_disk_report_too_old_to_trust_quarantines_nothing(coordinator: Coordinator) -> None:
     coordinator.report_host(short_of_disk("host-a"))
     reported = coordinator.clock()
@@ -1201,6 +1244,9 @@ async def test_a_worker_heartbeating_a_long_action_stays_counted_on_its_quaranti
     token = response.json()["attempt_token"]
     assert (await http.post(f"/v1/work/{token}/heartbeat", json=heartbeat, headers=WORKER)).status_code == 200
     await coordinator.queue()
+    # Busy with its action, it leaves no capacity yet; once the action ends, it does.
+    assert coordinator._quarantined_workers() == (0, 0)
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
     assert coordinator._quarantined_workers() == (1, 0)
 
 
@@ -1222,6 +1268,23 @@ async def test_quarantined_hosts_workers_do_not_count_as_capacity(
     assert (await coordinator.queue()).desired_burst_workers == 2
     hosts = (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"]
     assert [(h["id"], h["quarantined"], h["disk_free"]) for h in hosts] == [("burst", "disk", 1 << 30), ("warm", None, None)]
+
+
+async def test_a_host_quarantined_mid_action_is_replaced_only_for_its_idle_workers(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings = coordinator.settings.model_copy(update={"warm_workers": 2, "max_burst_workers": 10})
+    await submit(http, ["a", "b", "c"])
+    host = {**asdict(busy("warm", 0)), "disk_free": 100 << 30}
+    claim = {"tier": "standard", "worker": "w1", "host": host}
+    assert (await http.post("/v1/work/claim", json=claim, headers=WORKER)).status_code == 200
+    report = {"tier": "standard", "worker": "w2", "host": host}
+    assert (await http.post("/v1/work/report", json=report, headers=WORKER)).status_code == 204
+    assert (await coordinator.queue()).desired_burst_workers == 1
+
+    # w1's running action keeps w1; only idle w2 needs a burst worker in its place: one each for b and c.
+    coordinator.report_host(short_of_disk("warm"))
+    assert (await coordinator.queue()).desired_burst_workers == 2
 
 
 @pytest.mark.parametrize("waiting_tiers", [["high", "standard"], ["standard"]])

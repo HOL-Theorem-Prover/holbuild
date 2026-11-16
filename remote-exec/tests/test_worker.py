@@ -1512,10 +1512,11 @@ def test_cpu_counters_going_backwards_give_no_idle_share(telemetry: tuple[HostTe
     assert reporter.report().cpu_idle_pct is None
 
 
-def test_no_report_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
+def test_only_the_host_id_and_rank_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
     host: Host, telemetry: tuple[HostTelemetry, Path], server: Server
 ) -> None:
     reporter, stat = telemetry
+    reporter.rank = 1
     host.lease(3 * GIB)
     coordinator = Coordinator(server.url, "w", reporter)
     with open(host.dir / "lock") as lock:
@@ -1527,7 +1528,8 @@ def test_no_report_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
     assert coordinator.heartbeat("t")
 
     reports = [beat["host"] for beat in server.heartbeats]
-    assert reports[0] is None and reports[2] is None
+    # The coordinator quarantines and packs hosts by id and rank, which need no reading.
+    assert reports[0] == reports[2] == {"id": "b0a7", "rank": 1}
     assert isinstance(reports[1], dict) and reports[1]["leases"] == 1
 
 
