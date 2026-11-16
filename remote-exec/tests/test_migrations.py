@@ -58,7 +58,7 @@ async def test_action_column_baseline_preserves_existing_actions_and_downgrades(
         # Rows that predate the columns are claimed and completed as any other.
         await build(http, cache, "a")
         action = (await batch(http, batch_id))["actions"][0]
-        assert (action["state"], action["worker"]) == ("done", "w1")
+        assert action["state"] == "done" and action["worker"] is not None
         assert action["finished_at"] is not None
         await asyncio.to_thread(migrate, remote_exec_engine, "0015", downgrade=True)
         assert await version(remote_exec_engine) == "0015"

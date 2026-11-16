@@ -2197,7 +2197,7 @@ async def test_cancel_revokes_leases_and_stops_claims(http: httpx.AsyncClient) -
 
 async def test_a_worker_stopped_by_a_cancel_reports_the_log_of_the_action(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a"])
-    token = await claim_named(http, "a")
+    token = await claim_named(http, "a", worker="w1")
     await http.post(f"/v1/batches/{batch_id}/cancel", headers=CLIENT)
 
     record = result("a", "failed", "unavailable").replace("log=" + "a" * 64, "log=" + "b" * 64)
@@ -2246,7 +2246,7 @@ async def test_batch_status_and_events_retain_execution_times_and_worker(
     }
 
     before_claim = datetime.now(UTC)
-    token = await claim_named(http, "a")
+    token = await claim_named(http, "a", worker="w1")
     action = (await batch(http, batch_id))["actions"][0]
     claimed_at = action["last_claimed_at"]
     assert before_claim <= datetime.fromisoformat(claimed_at) <= datetime.now(UTC)
