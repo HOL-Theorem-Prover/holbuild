@@ -10461,9 +10461,8 @@ fun worker_cache_roots cache =
    room under limit_bytes. An action reuses a recent shared scan while the
    cache stays within limit_bytes, so the reserve absorbs growth between
    evictions instead of every action waiting on one; private checkpoints are
-   always measured locally. Small caps
-   and zero reserves scan live.  With refresh, as after an action's result,
-   scan only when the stamp is past half its life and no other process holds
+   always measured locally. Zero reserves scan live.  With refresh, as after
+   an action's result, scan only when the stamp is past half its life and no other process holds
    gc.lock, so that busy hosts keep the stamp fresh and actions seldom wait
    on a scan.
    With min_free_bytes > 0, files outside the cache count too: when the disk
@@ -10510,7 +10509,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       handle IO.Io _ => NONE
            | OS.SysErr _ => NONE
     fun recent_scan_fits private_bytes =
-      target >= gb_to_bytes 64 andalso reserve_bytes > 0 andalso
+      reserve_bytes > 0 andalso
       (case String.tokens Char.isSpace (read_text state_path) of
            header :: measured :: floor_state :: entries =>
              (case (header = state_header, LargeInt.fromString measured, parse_sizes entries) of
@@ -10636,7 +10635,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
           case stamp_age () of SOME age => age >= 0 andalso age < stamp_life div 2 | NONE => false
       in
         (* Only caps that reuse a stamp gain from refreshing it. *)
-        if fresh orelse target < gb_to_bytes 64 orelse reserve_bytes <= 0 then ()
+        if fresh orelse reserve_bytes <= 0 then ()
         else
           Option.app (fn lock => locked lock false)
             (HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "cache gc"})

@@ -234,7 +234,9 @@ HOLBUILD_CACHE=$cache3 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action 
 set -e
 kept "$cache3/blobs/$young" "an in-flight orphan while another family could free space"
 evicted "$cache3/actions/newer" "a published family before a young orphan"
-# Grace never overrides the requested target.
+# Grace never overrides the requested target. Without the last run's
+# measurement, which the new reserve would reuse until it expires.
+rm "$cache3/locks/worker-cache-cap-v3.state"
 set +e
 HOLBUILD_CACHE=$cache3 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 1 --cache-reserve-gb 1 > "$tmpdir/grace.log" 2>&1
@@ -296,20 +298,31 @@ sweep4 100 1
 (( $(date +%s) - started < 20 )) || { echo "the refresh waited for gc.lock" >&2; exit 1; }
 kill "$holder"; wait "$holder" 2>/dev/null || true
 cmp "$state" "$tmpdir/aged-state" || { echo "the refresh scanned while gc.lock was held" >&2; exit 1; }
-# A small cap scans apparent bytes, including nested sparse growth.
+# A small cap reuses a fresh measurement too, as a 50 GB worker cap does:
+# its reserve absorbs growth until the stamp expires.
+# stamp_age SECONDS: backdate the shared measurement.
+stamp_age() {
+  python3 - "$state" "$1" <<'AGE'
+import sys, time
+lines = open(sys.argv[1]).read().splitlines()
+lines[1] = str(time.time_ns() - int(sys.argv[2]) * 10**9)
+open(sys.argv[1], "w").write("\n".join(lines) + "\n")
+AGE
+}
+stamp_age 0
+cp "$state" "$tmpdir/small-state"
 mkdir -p "$cache4/checkpoint-store/family/nested"
 sparse "$cache4/checkpoint-store/family/nested/heap" 1
 sweep4 7 1
-! cmp -s "$state" "$tmpdir/first-state" || { echo "small cap reused a measurement" >&2; exit 1; }
+cmp "$state" "$tmpdir/small-state" || { echo "small cap repeated a fresh shared scan" >&2; exit 1; }
+# Once the stamp expires, the scan counts apparent bytes, including nested
+# sparse growth.
+stamp_age 61
+sweep4 7 1
 python3 - "$state" <<'BYTES'
 import pathlib, sys
 assert sum(map(int, pathlib.Path(sys.argv[1]).read_text().split()[4::2])) >= 3 * 1024 ** 3
 BYTES
-cp "$state" "$tmpdir/small-state"
-# Current reserve and fresh private checkpoints participate in the target check.
-sweep4 100 50
-! cmp -s "$state" "$tmpdir/small-state" || { echo "increased reserve reused a measurement" >&2; exit 1; }
-cp "$state" "$tmpdir/reserve-state"
 # Private checkpoint bytes count towards the limit, so old shared data is
 # evicted; the private checkpoint itself is cleared after the action anyway.
 at 2000 "$cache4/blobs/first"
@@ -550,7 +563,7 @@ sweep_mature() {
     > "$tmpdir/mature.log" 2>&1 || status=$?
   [[ $status -eq 4 ]] || { cat "$tmpdir/mature.log" >&2; exit 1; }
 }
-for limits in "100 10 89" "400 40 359"; do
+for limits in "50 5 40" "100 10 89" "400 40 359"; do
   read -r limit reserve bytes <<< "$limits"
   mature_cache=$tmpdir/mature-$limit
   sparse "$mature_cache/checkpoint-store/family/heap" "$bytes"
