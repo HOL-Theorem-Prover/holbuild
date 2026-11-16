@@ -291,11 +291,11 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             host_rank=0 if body.host is None else body.host.rank,
             ahead=body.ahead,
         )
+        # After the claim, so claims arriving together still share their reads. A claim its worker gave up on mustn't
+        # end the lease of the worker's next one.
+        if not await request.is_disconnected():
+            await coordinator.release_unheld(body.worker, None if claimed is None else str(claimed.attempt_token))
         if claimed is None:
-            # A worker that got something ends its unheld leases with its first heartbeat. A claim its worker gave
-            # up on mustn't end the lease of the worker's next one.
-            if not await request.is_disconnected():
-                await coordinator.release_unheld(body.worker)
             return Response(status_code=204)
         return asdict(claimed)
 

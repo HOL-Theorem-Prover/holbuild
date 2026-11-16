@@ -2055,13 +2055,13 @@ class Coordinator:
         for token, batch_id in expired:
             await self._end_lease(token, batch_id)
 
-    async def release_unheld(self, worker: str) -> None:
-        """End the live leases of ``worker``, which claims only while it runs nothing, so it holds none of them: the
-        answer to the claim that took each never reached it (it gave up waiting for a slow coordinator), or it gave up
-        reporting the result. Each action goes back at once and, as an ``unavailable`` result does, doesn't count the
-        attempt."""
+    async def release_unheld(self, worker: str, held: str | None) -> None:
+        """End the live leases of ``worker`` but the one its claim just ``held``: it claims only while it runs nothing,
+        so it holds none of the others. The answer to the claim that took each never reached it (it gave up waiting
+        for a slow coordinator), or it gave up reporting the result. Each action goes back at once and, as an
+        ``unavailable`` result does, doesn't count the attempt."""
         async with self.engine.connect() as conn:
-            unheld = list(await conn.execute(UNHELD_LEASES, {"worker": worker, "held": None}))
+            unheld = list(await conn.execute(UNHELD_LEASES, {"worker": worker, "held": held}))
         await self._end_unheld(unheld)
 
     async def _end_unheld(self, unheld: list[sa.Row[Any]]) -> None:

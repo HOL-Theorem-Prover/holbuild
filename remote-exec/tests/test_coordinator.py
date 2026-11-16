@@ -763,6 +763,20 @@ async def test_a_lease_whose_claim_never_reached_its_worker_goes_back_when_it_cl
     assert (await batch(http, batch_id))["state"] == "done"
 
 
+async def test_a_claim_that_gets_an_action_ends_the_leases_its_worker_got_no_answer_for(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a", "b"])
+    lost = await claim(http, worker="w9")
+    held = await claim(http, worker="w9")
+    assert lost is not None and held is not None
+
+    actions = {a["theory"]: a for a in (await batch(http, batch_id))["actions"]}
+    assert (actions[lost["theory"]]["attempts"], actions[lost["theory"]]["last_failure"]) == (0, "unavailable")
+    assert (actions[held["theory"]]["state"], actions[held["theory"]]["attempts"]) == ("running", 1)
+    assert (await http.post(f"/v1/work/{held['attempt_token']}/heartbeat", headers=WORKER)).status_code == 200
+
+
 async def test_a_heartbeat_ends_the_leases_its_worker_got_no_answer_for(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
