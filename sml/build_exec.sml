@@ -10410,19 +10410,27 @@ fun module_cache_families cache =
        {mtime = modified_time path,
         evict = fn () =>
           let
-            fun remove () =
+            fun remove path =
               let val bytes = tree_bytes path
               in
                 remove_tree path;
                 if path_exists path then NONE else SOME bytes
               end
+            (* Moved aside under the lock, so that a writer arriving while
+               it is removed starts a new store instead of filling this one. *)
+            fun move_aside () =
+              let val gone = path ^ ".evicted-" ^ HolbuildTempPath.suffix ()
+              in
+                if (FS.rename {old = path, new = gone}; true) handle OS.SysErr _ => false
+                then remove gone else NONE
+              end
           in
-            if not (FS.isDir path handle OS.SysErr _ => false) then remove ()
+            if not (FS.isDir path handle OS.SysErr _ => false) then remove path
             else
               case HolbuildFileLock.try_acquire_path
                      {path = Path.concat (path, module_store_writer_lock), obsolete_kind = NONE} of
                   NONE => NONE
-                | SOME lock => (remove () before HolbuildFileLock.release lock)
+                | SOME lock => (move_aside () before HolbuildFileLock.release lock)
                                handle e => (HolbuildFileLock.release lock; raise e)
           end})
     (HolbuildCache.children (HolbuildCache.theory_modules_dir cache))

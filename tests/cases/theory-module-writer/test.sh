@@ -159,6 +159,8 @@ val _ = check "the sweep kept an idle store" (not (exists (store "hol2")));
 val _ = unlock writer;
 val _ = sweep ();
 val _ = check "the sweep kept an idle store once its writer finished" (not (exists (store "hol1")));
+val _ = check "the sweep left an evicted store behind"
+          (null (HolbuildCache.children (E.module_stores ())));
 SML
 if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmpdir") ]]; then
   other_fs=$(mktemp -d /dev/shm/holbuild-module-writer.XXXXXX)
