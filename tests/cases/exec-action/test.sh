@@ -447,6 +447,29 @@ SML
   worker c "$(spec_for "$tmpdir/batch-d.txt" worker:DTheory)"
   expect c 0 "status=built"
   rm "$project/src/DScript.sml"
+  # A failed action fills the store too: a theory's failing attempts are
+  # what most often run again on the host.
+  cat > "$project/src/FScript.sml" <<'SML'
+Theory F
+Ancestors B
+
+Theorem f_thm:
+  F
+Proof
+  ACCEPT_TAC b_thm
+QED
+SML
+  hb action-spec --upload FTheory > "$tmpdir/batch-f.txt"
+  worker f "$(spec_for "$tmpdir/batch-f.txt" worker:FTheory)"
+  expect f 1 "status=failed" "failure=proof"
+  for theory in A B; do
+    compgen -G "$tmpdir/worker-f/theory-modules/*/*-$theory-*.pmo" > /dev/null || {
+      echo "worker f wrote no module for $theory after a failed action" >&2
+      cat "$tmpdir/f.log" >&2
+      exit 1
+    }
+  done
+  rm "$project/src/FScript.sml"
 elif [[ ! -e "$HOLDIR/tools-poly/poly/theory_modules.ML" ]]; then
   # A HOL without the module helper starts no writer, which alone makes
   # the store.
