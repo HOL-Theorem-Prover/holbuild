@@ -430,6 +430,8 @@ def host_report(host_id: str, cpu_idle_pct: float | None, rank: int = 0) -> dict
         "leases": 2,
         "memory_short": False,
         "rank": rank,
+        "disk_free": 100 << 30,
+        "disk_total": 200 << 30,
     }
 
 
@@ -472,8 +474,8 @@ async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, c
 
     hosts = (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"]
     assert hosts == [
-        {**host_report("h1", 30.0), "age_s": 5.0},  # the last idle share measured
-        {**host_report("h2", 80.0), "age_s": 5.0},
+        {**host_report("h1", 30.0), "age_s": 5.0, "quarantined": None},  # the last idle share measured
+        {**host_report("h2", 80.0), "age_s": 5.0, "quarantined": None},
     ]
 
     now += timedelta(seconds=120)

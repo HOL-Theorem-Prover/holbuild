@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import json
 import time
+from dataclasses import asdict, replace
 from datetime import timedelta
 from collections.abc import Callable
 from typing import Any
@@ -1118,6 +1119,106 @@ async def test_theory_hosts_forget_the_least_recently_claimed_theory(
     for host in ["host-a", "host-b", "host-a"]:
         assert await coordinator.claim(["standard"], host, host_id=host) is not None
     assert coordinator.theory_hosts == {"pkg:b": "host-b", "pkg:c": "host-a"}
+
+
+def short_of_disk(host_id: str, free: int = 1 << 30) -> HostReport:
+    return replace(busy(host_id, 0), disk_free=free, disk_total=200 << 30)
+
+
+async def fail_on(http: httpx.AsyncClient, coordinator: Coordinator, host_id: str, failure: str | None) -> None:
+    """Submit an action, claim one on ``host_id`` and complete it as built, or failed with ``failure``."""
+    await submit(http, [f"f{uuid4().hex}"])
+    claimed = await coordinator.claim(["high", "standard"], host_id, host_id=host_id)
+    assert claimed is not None
+    name = claimed.theory.removeprefix("pkg:")
+    record = result(name, "built") if failure is None else result(name, "failed", failure)
+    assert (await complete(http, str(claimed.attempt_token), record)).status_code == 200
+
+
+async def test_a_host_whose_last_five_results_were_infrastructure_failures_gets_one_probe_claim_a_minute(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    now = coordinator.clock()
+    coordinator.clock = lambda: now
+    coordinator.report_host(busy("host-a", 0))
+    # A failure of the action's own breaks the streak; only five infrastructure failures in a row quarantine.
+    for failure in ["internal", "disk", "toolchain", "publish", "memory", "unavailable", "internal", "disk", "toolchain"]:
+        await fail_on(http, coordinator, "host-a", failure)
+        assert coordinator._quarantine("host-a") is None
+    await fail_on(http, coordinator, "host-a", "publish")
+    assert coordinator._quarantine("host-a") == "failures"
+
+    await submit(http, ["a"])
+    assert await coordinator.claim(["high", "standard"], "w", host_id="host-a") is None
+    assert await coordinator.claim(["high", "standard"], "w", host_id="host-b") is not None
+    now += timedelta(seconds=coordinator_module.PROBE_SECONDS - 1)
+    assert await coordinator.claim(["high", "standard"], "w", host_id="host-a") is None
+    # A failed probe, whatever its class, keeps the quarantine and the next probe a minute off.
+    now += timedelta(seconds=1)
+    await fail_on(http, coordinator, "host-a", "memory")
+    assert await coordinator.claim(["high", "standard"], "w", host_id="host-a") is None
+    now += timedelta(seconds=coordinator_module.PROBE_SECONDS)
+    await fail_on(http, coordinator, "host-a", "internal")
+    assert coordinator._quarantine("host-a") == "failures"
+    now += timedelta(seconds=coordinator_module.PROBE_SECONDS)
+    await fail_on(http, coordinator, "host-a", None)
+    assert coordinator._quarantine("host-a") is None
+
+
+async def test_a_host_reporting_too_little_disk_gets_no_work_until_it_reports_room(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a"])
+    coordinator.report_host(short_of_disk("host-a", coordinator_module.DISK_FLOOR - 1))
+    assert coordinator._quarantine("host-a") == "disk"
+    assert await coordinator.claim(["standard"], "w", host_id="host-a") is None
+
+    coordinator.report_host(short_of_disk("host-a", coordinator_module.DISK_FLOOR))
+    assert await coordinator.claim(["standard"], "w", host_id="host-a") is not None
+
+
+async def test_a_disk_report_too_old_to_trust_quarantines_nothing(coordinator: Coordinator) -> None:
+    coordinator.report_host(short_of_disk("host-a"))
+    reported = coordinator.clock()
+    coordinator.clock = lambda: reported + timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS)
+    assert coordinator._quarantine("host-a") is None
+
+
+async def test_a_quarantined_hosts_claim_waits_apart_and_defers_nobody(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 0.01)
+    coordinator.report_host(short_of_disk("host-a"))
+    waiting = asyncio.create_task(coordinator.claim(["high", "standard"], "w", 0.2, host_id="host-a"))
+    await asyncio.sleep(0.05)
+    assert coordinator.claim_waiters == []
+    # A waiter parked before its host was quarantined neither defers a worse-ranked claim nor takes a wake.
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["high", "standard"], _claim_rank(["high", "standard"], "host-a"), wake, False))
+    await submit(http, ["a"])
+    assert not wake.done()
+    assert await coordinator.claim(["high", "standard"], "tail", host_id="host-b", host_rank=1) is not None
+    assert await waiting is None
+
+
+async def test_quarantined_hosts_workers_do_not_count_as_capacity(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings = coordinator.settings.model_copy(update={"warm_workers": 2, "max_burst_workers": 10})
+    await submit(http, ["a", "b", "c"])
+    for host, worker, tier in [("warm", "w1", "standard"), ("warm", "w2", "standard"), ("burst", "b1", "high")]:
+        body = {"tier": tier, "worker": worker, "host": {**asdict(busy(host, 0)), "disk_free": 100 << 30}}
+        assert (await http.post("/v1/work/report", json=body, headers=WORKER)).status_code == 204
+    assert (await coordinator.queue()).desired_burst_workers == 1
+
+    coordinator.report_host(short_of_disk("warm"))
+    assert (await coordinator.queue()).desired_burst_workers == 3
+    coordinator.report_host(busy("warm", 0))
+    coordinator.report_host(short_of_disk("burst"))
+    # The quarantined burst worker is replaced, on top of the demand.
+    assert (await coordinator.queue()).desired_burst_workers == 2
+    hosts = (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"]
+    assert [(h["id"], h["quarantined"], h["disk_free"]) for h in hosts] == [("burst", "disk", 1 << 30), ("warm", None, None)]
 
 
 @pytest.mark.parametrize("waiting_tiers", [["high", "standard"], ["standard"]])

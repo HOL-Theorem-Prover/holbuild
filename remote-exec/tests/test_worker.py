@@ -127,6 +127,8 @@ class Server:
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
     heartbeats: list[dict[str, object]] = field(default_factory=list)
+    reports: list[dict[str, object]] = field(default_factory=list)
+    report_status: int = 204  # 404 from a coordinator older than /v1/work/report
     lease_lost: bool = False
     unavailable: int = 0  # how many more completes answer 502, as a proxy does while the coordinator restarts
     cut_short: bool = False  # whether /cas/ answers close the connection before the body they announce is sent
@@ -177,6 +179,9 @@ def server() -> Iterator[Server]:
                     state.hold_claim.wait(15)
                 claimed, state.next_claim = state.next_claim, None
                 return self.reply(204) if claimed is None else self.reply(200, json.dumps(claimed))
+            if self.path == "/v1/work/report":
+                state.reports.append(json.loads(body))
+                return self.reply(state.report_status)
             if self.path.endswith("/complete"):
                 if state.unavailable > 0:
                     state.unavailable -= 1
@@ -578,6 +583,28 @@ def test_ecs_protection_rejection_in_a_success_response_is_logged(
     assert "DEPLOYMENT_BLOCKED" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("reason", "enabled", "drains"),
+    [
+        ("DRAINING", True, True),
+        # ECS refuses protection so on healthy instances too, in a scale-in or a rolling deployment.
+        ("DEPLOYMENT_BLOCKED", True, False),
+        ("TASK_STOPPING_OR_STOPPED", True, False),
+        ("DRAINING", False, False),
+    ],
+)
+def test_protection_refused_on_a_draining_container_instance_drains_the_worker(
+    server: Server, reason: str, enabled: bool, drains: bool
+) -> None:
+    server.protection_reply = {"failure": {"Reason": reason}}
+    drain = worker.Drain()
+    drain.interrupt = True  # the main thread is in an interruptible call, which only its own SIGTERM handler ends
+    thread = threading.Thread(target=Protection(None, server.url, drain).set, kwargs={"enabled": enabled})
+    thread.start()
+    thread.join()
+    assert (drain.stop.is_set(), drain.interrupt) == (drains, True)
+
+
 @pytest.mark.parametrize("text", ["-1", "nan", "inf"])
 def test_drain_seconds_must_be_finite_and_nonnegative(tmp_path: Path, server: Server, text: str) -> None:
     with pytest.raises(SystemExit):
@@ -886,7 +913,7 @@ def test_a_worker_on_a_full_disk_hands_the_action_back_and_claims_again_only_onc
         if not path.startswith(str(tmp_path)) and path != tempfile.gettempdir():
             return statvfs(path)
         read.append(path)
-        return SimpleNamespace(f_bavail=GIB if full else 100 * GIB, f_frsize=1)
+        return SimpleNamespace(f_bavail=GIB if full else 100 * GIB, f_blocks=200 * GIB, f_frsize=1)
 
     temporary_directory = tempfile.TemporaryDirectory
 
@@ -936,6 +963,73 @@ def test_a_worker_on_a_full_disk_hands_the_action_back_and_claims_again_only_onc
     ]
     assert events == ["claim", f"wait {worker.CLAIM_RETRY_SECONDS}", f"wait {worker.DISK_POLL_SECONDS}", "claim", "claim"]
     assert str(tmp_path) in read  # the cache root's nearest existing ancestor
+    # While it waits, the worker reports its host with the disk it waits for.
+    [report] = server.reports
+    assert report["host"]["disk_free"] == GIB  # type: ignore[index]
+
+
+@pytest.mark.parametrize("report_status", [204, 404])
+def test_a_worker_short_of_disk_cleans_its_own_action_and_temp_dirs_then_waits_reporting_its_host(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, report_status: int
+) -> None:
+    cache = tmp_path / "cache"
+    (cache / "action" / "a1" / "ro").mkdir(parents=True)
+    (cache / "action" / "a1" / "ro" / "theory.dat").write_text("x")
+    (cache / "action" / "a1" / "ro").chmod(0o500)  # as HOL leaves its read-only directories
+    (cache / "tmp").mkdir()
+    (cache / "tmp" / "scratch").write_text("x")
+    (cache / "store").mkdir()
+    (cache / "store" / "kept").write_text("x")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(cache))
+    server.report_status = report_status
+    polls = 0
+
+    def shortfall() -> str | None:
+        return "short" if polls < 2 else None
+
+    def wait(seconds: float) -> bool:
+        nonlocal polls
+        assert seconds == worker.DISK_POLL_SECONDS
+        polls += 1
+        return False
+
+    drain = worker.Drain()
+    monkeypatch.setattr(worker, "disk_shortfall", shortfall)
+    monkeypatch.setattr(drain.stop, "wait", wait)
+
+    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["high", "standard"], "w1")
+
+    assert sorted(p.name for p in cache.rglob("*")) == [
+        "action", "kept", "store", "tmp"
+    ]
+    assert [(r["tier"], r["also_claim"], r["worker"]) for r in server.reports] == [("high", ["standard"], "w1")] * 2
+
+
+def test_a_worker_whose_cleaning_makes_room_waits_for_nothing(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "action" / "a1").mkdir(parents=True)
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path))
+    monkeypatch.setattr(worker, "disk_shortfall", lambda: "short" if (tmp_path / "action" / "a1").exists() else None)
+    drain = worker.Drain()
+    monkeypatch.setattr(drain.stop, "wait", lambda _: pytest.fail("waited"))
+
+    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["standard"], "w1")
+
+    assert server.reports == []
+
+
+def test_the_host_report_gives_the_disk_with_the_least_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "python"))
+    sizes = {str(tmp_path / "python"): (50, 100), str(tmp_path / "tmp"): (20, 400), str(tmp_path): (30, 60)}
+    monkeypatch.setattr(worker.os.path, "exists", lambda path: path in sizes)
+    monkeypatch.setattr(
+        worker.os, "statvfs", lambda path: SimpleNamespace(f_bavail=sizes[path][0], f_blocks=sizes[path][1], f_frsize=2)
+    )
+
+    assert worker.disk_usage() == (40, 800)
 
 
 def test_action_that_ends_without_a_record_on_a_full_disk_is_handed_back(

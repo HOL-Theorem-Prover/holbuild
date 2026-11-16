@@ -17,7 +17,7 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -58,6 +58,15 @@ HOST_REPORT_SECONDS = 120
 MAX_HOSTS = 1000
 # Theories whose last host the coordinator remembers at most, the least recently claimed forgotten first.
 MAX_THEORY_HOSTS = 10_000
+# A host is quarantined (see Coordinator._quarantine) while its latest report has less disk free than this, the floor
+# under which its workers don't claim (worker.py DISK_FLOOR), or while its last QUARANTINE_FAILURES results were
+# INFRA_FAILURES; such a host gets one probe claim each PROBE_SECONDS.
+DISK_FLOOR = 4 * 2**30
+QUARANTINE_FAILURES = 5
+INFRA_FAILURES = frozenset({"internal", "disk", "toolchain", "publish", "unavailable"})
+PROBE_SECONDS = 60
+# Leases whose host the coordinator remembers at most, the oldest forgotten first.
+MAX_LEASE_HOSTS = 10_000
 # The highest --host-rank a worker may report (worker.py checks the same bound at start).
 MAX_HOST_RANK = 1000
 # The queue sums the phase reports of workers' last this many seconds; at most MAX_PHASE_REPORTS are kept.
@@ -255,6 +264,8 @@ class HostReport:
     leases: Amount
     memory_short: bool
     rank: Annotated[int, Field(ge=0, le=MAX_HOST_RANK)] = 0
+    disk_free: Amount | None = None  # bytes free and in all on the host disk the worker's claims depend on
+    disk_total: Amount | None = None
 
 
 # Seconds of a worker's time in one phase since its last report. No upper bound: a worker that couldn't report
@@ -293,12 +304,17 @@ class PhaseTotals:
     seconds: PhaseReport
 
 
+Quarantine = Literal["disk", "failures"]
+
+
 @dataclass(frozen=True)
 class HostStatus:
-    """A host's latest report, ``age_s`` seconds old, with the latest ``cpu_idle_pct`` measured."""
+    """A host's latest report, ``age_s`` seconds old, with the latest ``cpu_idle_pct`` measured, and why it is
+    quarantined, if it is."""
 
     report: HostReport
     age_s: float
+    quarantined: Quarantine | None = None
 
 
 @dataclass(frozen=True)
@@ -859,6 +875,13 @@ class Coordinator:
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
         # The host that last claimed each theory, least recently claimed first; see _wake_claim. Also in memory.
         self.theory_hosts: dict[str, str] = {}
+        # For the quarantine, also in memory: the host of each lease, oldest first; each host's infrastructure
+        # failures in a row and its last probe claim; and the workers that last claimed or reported from each
+        # host, when, and whether they are burst workers. See _quarantine.
+        self.lease_hosts: dict[UUID, str] = {}
+        self.infra_streak: dict[str, int] = {}
+        self.probe_at: dict[str, datetime] = {}
+        self.host_workers: dict[str, dict[str, tuple[datetime, bool]]] = {}
         # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
         self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque(maxlen=MAX_PHASE_REPORTS)
         # The wakes of the event streams following each batch; see watch.
@@ -1075,12 +1098,33 @@ class Coordinator:
                 tier for tier in tiers
                 if not any(
                     tier in w_tiers and not w_woken.done() and w_rank < rank and (w_ahead or not ahead_only)
+                    and self._quarantine(w_rank[3]) is None
                     for w_tiers, w_rank, w_woken, w_ahead in self.claim_waiters
                 )
             ]
 
         try:
             while True:
+                if host_id is not None and (quarantine := self._quarantine(host_id)) is not None:
+                    # A quarantined host waits apart from the other claims, so it neither gets their wakes nor
+                    # holds them back, and claims once each PROBE_SECONDS while failures quarantine it.
+                    self._pass_wake(woken)
+                    woken = loop.create_future()
+                    now = self.clock()
+                    probe = self.probe_at.get(host_id)
+                    if quarantine == "failures" and (probe is None or (now - probe).total_seconds() >= PROBE_SECONDS):
+                        claimed = await self._claim(tiers, worker)
+                        if claimed is not None:
+                            self.probe_at[host_id] = now
+                            self._lease_host(claimed.attempt_token, host_id)
+                            return claimed
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        return None
+                    await asyncio.sleep(min(remaining, CLAIM_RECHECK_SECONDS))
+                    if disconnected is not None and await disconnected():
+                        return None
+                    continue
                 # Work made claimable during the attempt is retried at once, for workers that can take it.
                 seen = (self.made_ready, self.ahead_changes if ahead else 0)
                 eligible_tiers = undeferred(ahead_only=False)
@@ -1094,6 +1138,7 @@ class Coordinator:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
                 if claimed is not None and host_id is not None:
+                    self._lease_host(claimed.attempt_token, host_id)
                     self.theory_hosts.pop(claimed.theory, None)
                     self.theory_hosts[claimed.theory] = host_id
                     if len(self.theory_hosts) > MAX_THEORY_HOSTS:
@@ -1541,7 +1586,10 @@ class Coordinator:
         if report is None or report[1].leases == 0 or (self.clock() - report[0]).total_seconds() >= HOST_REPORT_SECONDS:
             preferred = None
         waiter = min(
-            (w for w in self.claim_waiters if tier in w[0] and not w[2].done() and (w[3] or not ahead)),
+            (
+                w for w in self.claim_waiters
+                if tier in w[0] and not w[2].done() and (w[3] or not ahead) and self._quarantine(w[1][3]) is None
+            ),
             key=lambda w: (*w[1][:3], preferred is None or w[1][3] != preferred, w[1][3]),
             default=None,
         )
@@ -1610,6 +1658,68 @@ class Coordinator:
             report = replace(report, cpu_idle_pct=previous[1].cpu_idle_pct)
         self.hosts[report.id] = (self.clock(), report)
 
+    def report_worker(self, host_id: str, worker: str, tiers: list[str]) -> None:
+        """Note that ``worker``, claiming ``tiers``, runs on reported host ``host_id``, for the autoscaler's count of
+        the workers quarantined hosts hold."""
+        if host_id in self.hosts:
+            self.host_workers.setdefault(host_id, {})[worker] = (self.clock(), "high" in tiers)
+
+    def _lease_host(self, token: UUID, host_id: str) -> None:
+        self.lease_hosts[token] = host_id
+        if len(self.lease_hosts) > MAX_LEASE_HOSTS:
+            del self.lease_hosts[next(iter(self.lease_hosts))]
+
+    def _quarantine(self, host_id: str) -> Quarantine | None:
+        """Why host ``host_id`` gets no work, or None if it gets its share: its latest report, if fresh, has less
+        than DISK_FLOOR free, or its last QUARANTINE_FAILURES results were infrastructure failures. A host short
+        on disk gets out by reporting room; one that only fails, by a probe claim that succeeds."""
+        entry = self.hosts.get(host_id)
+        if entry is not None and (self.clock() - entry[0]).total_seconds() < HOST_REPORT_SECONDS:
+            free = entry[1].disk_free
+            if free is not None and free < DISK_FLOOR:
+                return "disk"
+        if self.infra_streak.get(host_id, 0) >= QUARANTINE_FAILURES:
+            return "failures"
+        return None
+
+    def _record_result(self, host_id: str, result: Result) -> None:
+        """Count ``result`` from host ``host_id`` towards its quarantine. Only a success ends a quarantine for
+        failures, so a failed probe, of whatever class, restarts its PROBE_SECONDS; a failure that says nothing
+        about the host, as loading ahead given up, leaves the count as it is."""
+        streak = self.infra_streak.get(host_id, 0)
+        if result.status != "failed":
+            self.infra_streak.pop(host_id, None)
+            self.probe_at.pop(host_id, None)
+        elif result.failure in INFRA_FAILURES:
+            self.infra_streak[host_id] = streak + 1
+            if streak + 1 >= QUARANTINE_FAILURES:
+                self.probe_at[host_id] = self.clock()
+        elif result.failure == "ahead-abandoned":
+            pass
+        elif streak < QUARANTINE_FAILURES:
+            self.infra_streak.pop(host_id, None)
+        else:
+            self.probe_at[host_id] = self.clock()
+
+    def _quarantined_workers(self) -> tuple[int, int]:
+        """The warm and burst workers on quarantined hosts."""
+        warm = burst = 0
+        for host_id, workers in self.host_workers.items():
+            if self._quarantine(host_id) is not None:
+                for _, is_burst in workers.values():
+                    burst += is_burst
+                    warm += not is_burst
+        return warm, burst
+
+    def _burst_demand(self, counts: QueueCounts) -> int:
+        """``burst_demand`` with the workers of quarantined hosts left out of the capacity: their warm workers
+        don't count as warm, and while there is demand, burst workers replace theirs."""
+        warm, burst = self._quarantined_workers()
+        demand = burst_demand(
+            counts, max(0, self.settings.warm_workers - warm), self.settings.max_burst_workers, self.settings.run_slots
+        )
+        return min(self.settings.max_burst_workers, demand + burst) if demand else 0
+
     def report_phases(self, report: PhaseReport) -> None:
         """Take a worker's report of where its time went."""
         self.phase_reports.append((self.clock(), report))
@@ -1640,6 +1750,7 @@ class Coordinator:
 
         Raises ResultMismatch when the record is for another action than the lease's.
         """
+        host_id = self.lease_hosts.pop(token, None)
         async with self.engine.begin() as conn:
             batch_id = await conn.scalar(
                 sa.text("SELECT batch_id FROM leases WHERE attempt_token = :token"), {"token": token}
@@ -1757,6 +1868,8 @@ class Coordinator:
                 await self._fail(
                     conn, batch_id, action.input_key, action.action_class, f"{action.theory}: {result.failure}{detail}"
                 )
+        if host_id is not None:
+            self._record_result(host_id, result)
         self._batch_changed(batch_id)
         self.request_release(batch_id)
         if unblocked:
@@ -1899,6 +2012,7 @@ class Coordinator:
                 ).first()
                 if lease is None:
                     continue
+                self.lease_hosts.pop(token, None)
                 action = (
                     await conn.execute(
                         sa.text(
@@ -2009,12 +2123,13 @@ class Coordinator:
         async with self.engine.connect() as conn:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
             counts = await self._counts(conn, COUNT_UNFINISHED)
-        demand = burst_demand(
-            counts, self.settings.warm_workers, self.settings.max_burst_workers, self.settings.run_slots
-        )
         now = self.clock()
         self._forget_silent_hosts(now)
-        hosts = [HostStatus(report, round((now - at).total_seconds(), 1)) for at, report in self.hosts.values()]
+        demand = self._burst_demand(counts)
+        hosts = [
+            HostStatus(report, round((now - at).total_seconds(), 1), self._quarantine(host_id))
+            for host_id, (at, report) in self.hosts.items()
+        ]
         return QueueStatus(
             counts,
             max(desired, demand),
@@ -2024,12 +2139,22 @@ class Coordinator:
         )
 
     def _forget_silent_hosts(self, now: datetime) -> None:
-        """Drop the hosts no worker reported for in the last ``HOST_REPORT_SECONDS``, making room for new ones."""
+        """Drop the hosts no worker reported for in the last ``HOST_REPORT_SECONDS``, making room for new ones, with
+        what the quarantine knows of them, and the workers that didn't report in that time."""
         self.hosts = {
             host: (at, report)
             for host, (at, report) in self.hosts.items()
             if (now - at).total_seconds() < HOST_REPORT_SECONDS
         }
+        self.host_workers = {
+            host: fresh
+            for host, workers in self.host_workers.items()
+            if host in self.hosts and (fresh := {
+                worker: seen for worker, seen in workers.items() if (now - seen[0]).total_seconds() < HOST_REPORT_SECONDS
+            })
+        }
+        self.infra_streak = {host: n for host, n in self.infra_streak.items() if host in self.hosts}
+        self.probe_at = {host: at for host, at in self.probe_at.items() if host in self.hosts}
 
     @staticmethod
     async def _counts(conn: AsyncConnection, statement: sa.TextClause) -> QueueCounts:
@@ -2105,11 +2230,9 @@ class Coordinator:
         async with self.scale_lock:
             async with self.engine.connect() as conn:
                 counts = await self._counts(conn, COUNT_ACTIVE)
-            demand = burst_demand(
-                counts, self.settings.warm_workers, self.settings.max_burst_workers, self.settings.run_slots
-            )
             now = self.clock()
             self._forget_silent_hosts(now)
+            demand = self._burst_demand(counts)
             async with self.engine.begin() as conn:
                 await conn.execute(
                     sa.text("DELETE FROM burst_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"),
