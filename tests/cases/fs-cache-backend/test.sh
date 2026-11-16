@@ -80,7 +80,7 @@ val transfer_source : HolbuildCacheTransfer.source =
         | result => result)};
 fun transfer () = HolbuildCacheTransfer.copy_blob transfer_source
   (HolbuildBuildExec.fs_cache_destination cache)
-  (HolbuildFSCacheBackend.tmp_dir cache) hash (0, 0);
+  (HolbuildFSCacheBackend.blobs_dir cache) hash (0, 0);
 val _ = assert "resident blob was not reused" (transfer () = (0, 1));
 val _ = assert "resident blob was downloaded again" (!fetches = 0);
 val _ = write_text (HolbuildFSCacheBackend.blob_path cache hash) "corrupt\n";
