@@ -762,6 +762,24 @@ async def test_a_key_another_batch_is_building_is_held_then_done_with_it(
     assert await claim(http) is None
 
 
+async def test_the_copies_of_a_build_are_done_by_a_release_and_no_claim_takes_one_before(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The completion only queues its copies; a release marks each batch's done, and frees their children."""
+    await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    copies = [await submit(http, ["a", "c"], [("c", "a")]) for _ in range(3)]
+    monkeypatch.setattr(coordinator, "request_release", lambda batch_id=None: None)
+
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+    assert [await states(http, copy) for copy in copies] == [{"a": "ready", "c": "waiting"}] * 3
+    assert await claim(http) is None
+    await coordinator.release()
+    assert [await states(http, copy) for copy in copies] == [{"a": "done", "c": "ready"}] * 3
+    assert coordinator.peers_done == {}
+
+
 async def test_a_copy_with_another_spec_wakes_a_waiting_claim_rather_than_being_done_with_a_build(
     http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
 ) -> None:
