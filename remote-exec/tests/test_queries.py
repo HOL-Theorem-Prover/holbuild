@@ -473,7 +473,7 @@ STATEMENTS = [
     ),
     Statement(
         "UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1, last_failure",
-        lambda f: {**lease(f), "detail": "the answer to w's claim never reached it"},
+        lambda f: {**lease(f), "detail": "w went on without this lease: its claim's answer or its result was lost"},
         10_000,
     ),
     # releases

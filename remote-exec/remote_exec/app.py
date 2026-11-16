@@ -285,7 +285,8 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             coordinator.report_worker(body.host.id, body.worker, tiers, idle=True)
         if body.phases is not None:
             coordinator.report_phases(body.phases)
-        await coordinator.release_unheld(body.worker)
+        if not await request.is_disconnected():  # a claim its worker gave up on mustn't end the lease of its next
+            await coordinator.release_unheld(body.worker)
         claimed = await coordinator.claim(
             tiers, body.worker, body.wait_s, request.is_disconnected,
             host_id=None if body.host is None else body.host.id,

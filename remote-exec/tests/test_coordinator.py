@@ -753,7 +753,7 @@ async def test_a_lease_whose_claim_never_reached_its_worker_goes_back_when_it_cl
     assert await claim(http, "high", worker="w9") is None  # a claim of nothing, but it ends the lease
     action = (await batch(http, batch_id))["actions"][0]
     assert (action["attempts"], action["last_failure"], action["failure_detail"]) == (
-        0, "unavailable", "the answer to w9's claim never reached it"
+        0, "unavailable", "w9 went on without this lease: its claim's answer or its result was lost"
     )
     assert (await http.post(f"/v1/work/{lost}/heartbeat", headers=WORKER)).status_code == 409
     await coordinator.released()

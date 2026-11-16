@@ -2057,8 +2057,9 @@ class Coordinator:
 
     async def release_unheld(self, worker: str) -> None:
         """End the live leases of ``worker``, which claims only while it runs nothing, so it holds none of them: the
-        answer to the claim that took each never reached it, as when it gave up waiting for a slow coordinator. Each
-        action goes back at once and, as an ``unavailable`` result does, doesn't count the attempt."""
+        answer to the claim that took each never reached it (it gave up waiting for a slow coordinator), or it gave up
+        reporting the result. Each action goes back at once and, as an ``unavailable`` result does, doesn't count the
+        attempt."""
         async with self.engine.connect() as conn:
             unheld = list(await conn.execute(UNHELD_LEASES, {"worker": worker, "held": None}))
         await self._end_unheld(unheld)
@@ -2112,7 +2113,7 @@ class Coordinator:
                         "WHERE batch_id = :batch_id AND input_key = :input_key"
                     ),
                     {"batch_id": batch_id, "input_key": lease.input_key,
-                     "detail": f"the answer to {lease.worker}'s claim never reached it"},
+                     "detail": f"{lease.worker} went on without this lease: its claim's answer or its result was lost"},
                 )
                 await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
                 ahead_freed = action.ahead_batch  # the retry revokes what was claimed ahead of it
