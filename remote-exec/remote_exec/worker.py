@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from remote_exec.auth import cache_discovery_token
-from remote_exec.cache import cache_nodes, preferred_identities, ranked_nodes
+from remote_exec.cache import blob_key, cache_nodes, preferred_identities, ranked_nodes
 from remote_exec.formats import sanitize_detail
 from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 
@@ -368,7 +368,32 @@ class Releases:
     drain: Drain = field(default_factory=Drain, kw_only=True, compare=False)
 
     def spec_version(self, spec_sha256: str) -> str:
-        """The ``holbuild-version`` of the action spec stored in the remote cache's ``/cas/``."""
+        """The ``holbuild-version`` of the action spec stored in the remote cache: under ``/cas/``, or as releases
+        from 0.15.0 write it, zstd-compressed under ``/ac/``."""
+        # Until clients move to 0.15.0, nearly every spec is under /cas/: asking /ac/ first would cost a miss on
+        # every node.
+        spec = self._fetch_spec(spec_sha256, f"cas/{spec_sha256}", spec_sha256)
+        if spec is None:
+            compressed = self._fetch_spec(spec_sha256, f"ac/{blob_key(spec_sha256)}", blob_key(spec_sha256))
+            if compressed is None:
+                raise RuntimeError(f"spec {spec_sha256} is missing from the remote cache: HTTP 404")
+            # zstd checks the frame's checksum; exec-action checks the spec's digest when it fetches it.
+            decoded = subprocess.run(["zstd", "-dcq"], input=compressed, check=False, capture_output=True)
+            if decoded.returncode != 0:
+                raise RuntimeError(f"spec {spec_sha256} in the remote cache is corrupt: {decoded.stderr.decode().strip()}")
+            spec = decoded.stdout
+        versions = [
+            line.removeprefix("holbuild-version=")
+            for line in spec.decode(errors="replace").splitlines()
+            if line.startswith("holbuild-version=")
+        ]
+        if len(versions) != 1:
+            raise RuntimeError(f"spec {spec_sha256} has {len(versions)} holbuild-version lines, expected 1")
+        return versions[0]
+
+    def _fetch_spec(self, spec_sha256: str, path: str, digest: str) -> bytes | None:
+        """The body at ``path`` on the first node ranked by ``digest`` that has it; None when every node answers
+        404."""
         # -g: no URL globbing, whose errors print the URL with any credentials in it.
         # The status follows the body on its own line: 000 when there was no answer.
         nodes = cache_nodes(self.remote_cache)
@@ -380,42 +405,32 @@ class Releases:
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
         unavailable: str | None = None
-        missing: str | None = None
-        failure = f"spec {spec_sha256} is missing from the remote cache"
         preferred = preferred_identities(os.environ.get("HOLBUILD_REMOTE_CACHE_PREFERRED_URLS"))
         # Every node is asked before a miss: until a node has written a new spec through to the shared store, only
         # that node holds it.  A spec the client sent must be there, so a node that failed leaves it unavailable even
         # when another answered 404.
-        for node in ranked_nodes(nodes, spec_sha256, preferred):
+        for node in ranked_nodes(nodes, digest, preferred):
             # Not check=True: its error would print credentials in the command line.
             try:
                 with self.drain.interruptible():
                     fetched = subprocess.run(
-                        [*command, f"{node}/cas/{spec_sha256}"], check=False, capture_output=True, text=True, timeout=120
+                        [*command, f"{node}/{path}"], check=False, capture_output=True, timeout=120
                     )
             except subprocess.TimeoutExpired:
                 unavailable = f"fetching spec {spec_sha256} from the remote cache timed out"
                 continue
-            spec, _, status = fetched.stdout.rpartition("\n")
+            body, _, status = fetched.stdout.rpartition(b"\n")
             if fetched.returncode == 0:
-                break
-            failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}"
-            if fetched.returncode == 22 and status.startswith("4") and status != "429":
-                if status == "404":
-                    missing = failure
+                return body
+            failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.decode(errors='replace').strip()}"
+            if fetched.returncode == 22 and status.startswith(b"4") and status != b"429":
+                if status == b"404":
                     continue
                 raise RuntimeError(failure)
             unavailable = failure
-        else:
-            if unavailable is not None:
-                raise CacheUnavailable(unavailable)
-            raise RuntimeError(missing or failure)
-        versions = [
-            line.removeprefix("holbuild-version=") for line in spec.splitlines() if line.startswith("holbuild-version=")
-        ]
-        if len(versions) != 1:
-            raise RuntimeError(f"spec {spec_sha256} has {len(versions)} holbuild-version lines, expected 1")
-        return versions[0]
+        if unavailable is not None:
+            raise CacheUnavailable(unavailable)
+        return None
 
     def holbuild(self, version: str) -> str:
         """The holbuild executable of release ``version``, built first if this host doesn't have it yet.
