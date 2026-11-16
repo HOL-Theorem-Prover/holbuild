@@ -12049,19 +12049,19 @@ fun module_writer_script {output, base_theories, call} =
   end
 
 (* A remote action only reads the host's HOL theory modules (the child
-   policy), so that no action can plant one another loads.  Before the
-   action runs, a sandboxed child that runs no project code writes the
-   modules missing from the store for the theories the action loads, from
-   their restored .dat files alone (HOL's Meta.writeTheoryModules), and the
-   worker moves into the store only modules named for those theories'
-   current .dat files.  Each theory is given after its parents: the
+   policy), so that no action can plant one another loads.  After a
+   theory action's result, a sandboxed child that runs no project code
+   writes the modules missing from the store for the theories the action
+   loads, from their restored .dat files alone (HOL's
+   Meta.writeTheoryModules), and the worker moves into the store only
+   modules named for those theories' current .dat files.  Each theory is given after its parents: the
    project's from the spec, the toolchain's beside their objects in its
    sigobj.  No writer starts when the toolchain's HOL has no module helper,
    when an earlier writer found it cannot write modules, when the store
    has its base theories and lacks fewer than module_writer_min_missing of
    the modules wanted, or while another process writes to the store or
-   the cache cap's sweep removes it.  A failure leaves the action to load
-   from .dat files. *)
+   the cache cap's sweep removes it.  A failure leaves later actions to
+   load from .dat files. *)
 fun write_missing_modules root tc {deps, loads} =
   let
     val store = module_store (#holdir tc)
@@ -12463,9 +12463,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
   let
     val cancelled = ref false
     val publishing_checkpoints = ref false
-    (* Publishing for later actions: shared checkpoints and the tool cache.
-       It runs after the result is written, since the client fetches
-       neither. *)
+    (* Publishing for later actions: shared checkpoints, the tool cache and
+       theory modules.  It runs after the result is written, since the
+       client fetches none of them. *)
     val deferred = ref (fn () => ())
     fun cancel _ =
       if !cancelled then () else
@@ -12730,10 +12730,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
        ahead of the action's parents, with what it set up before. *)
     and build spec tc forced cutoff ahead =
       let
-        val _ =
-          case ahead of
-              NONE => phase "modules" (fn () => fill_module_store root tc {deps = #deps spec, loads = #loads spec})
-            | SOME _ => ()
+        (* After the result, so that no action waits for the writer: this
+           one loads from .dat files what the store lacks, and later ones
+           on the host find the modules.  By now a load ahead has its late
+           parents in the root too. *)
+        fun write_modules () =
+          if !cancelled orelse not (!HolbuildActionSandbox.outputs_validated) then ()
+          else phase "modules" (fn () => fill_module_store root tc {deps = #deps spec, loads = #loads spec})
         val action =
           spec_theory_action root spec (cutoff_context spec cutoff)
         (* A local entry that didn't restore must not stand in for this
@@ -12791,7 +12794,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                          (toolchain_base_context tc) action source_text checkpoints))
              handle e =>
                (attached_child := NONE;
-                deferred := (fn () => (publish_shared (); if !cancelled then () else publish_tools ()));
+                deferred := (fn () => (publish_shared (); if !cancelled then () else publish_tools (); write_modules ()));
                 raise e));
             deferred :=
               (fn () =>
@@ -12833,6 +12836,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
              case cutoff of
                  SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
                | NONE => ()))
+        val publish = !deferred
+        val _ = deferred := (fn () => (publish (); write_modules ()))
       in
         "built"
       end
@@ -12900,7 +12905,6 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               SOME hash => hash
             | NONE => raise Error ("no hash recorded for " ^ path)
         val source_text = read_text (in_root root (action_source_path package (#path (#source spec))))
-        val _ = phase "modules" (fn () => fill_module_store root tc {deps = present, loads = #loads spec})
         val tool_cache = setup_tool_cache spec
         (* The stage's names don't depend on the deps context. *)
         val action = spec_theory_action root spec (cutoff_context spec NONE)
