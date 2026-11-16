@@ -198,10 +198,15 @@ root shared with ordinary builds would lose their cache. Containers on one host
 may share cache directories, provided they also share `locks/`: cap sweeps and
 explicit cache GC use its `gc.lock`. With a positive reserve and a target of at least 64 GiB, actions
 reuse shared byte measurements for up to 60 seconds while shared and private
-sizes stay within the limit, while sizing private checkpoints and theory
-modules on each call. Eviction still goes down to the target, after an
-action's result or once the measurement expires, so the reserve holds what
-arrives in between. A sweep publishes its walk before evicting, so actions keep
+sizes stay within the limit, while sizing private checkpoints on each call;
+the theory-modules store is a shared root like the others. Eviction still goes
+down to the target, after an action's result or once the measurement expires,
+so the reserve holds what arrives in between. For holbuild 0.14.57 and later
+the worker also passes `--cache-min-free-gb`, max(16, 5% of the cache's file
+system): while the disk has less free than that, a sweep evicts below the
+target until it has freed the floor plus a buffer, and when files outside the
+cache keep the disk short after it evicted all it could, its measurement says
+so, and actions skip further sweeps until it expires. A sweep publishes its walk before evicting, so actions keep
 reusing a fresh measurement while eviction runs. A cached directory must match the recorded device
 and inode; other directories are sized live. Smaller targets and zero-reserve runs always scan live. Shared writes
 during the reuse interval are accounted for at the next scan. `exec-action` runs
