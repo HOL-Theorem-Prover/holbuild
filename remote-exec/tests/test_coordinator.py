@@ -1207,12 +1207,14 @@ async def test_a_claim_reporting_only_its_host_id_is_quarantined_and_freshens_no
     assert coordinator.hosts["host-a"] == reported
 
 
+@pytest.mark.parametrize("read_before", [True, False])
 async def test_a_failing_host_whose_workers_send_only_its_id_stays_quarantined(
-    http: httpx.AsyncClient, coordinator: Coordinator
+    http: httpx.AsyncClient, coordinator: Coordinator, read_before: bool
 ) -> None:
     now = coordinator.clock()
     coordinator.clock = lambda: now
-    coordinator.report_host(busy("host-a", 0))
+    if read_before:
+        coordinator.report_host(busy("host-a", 0))
     for _ in range(coordinator_module.QUARANTINE_FAILURES):
         await fail_on(http, coordinator, "host-a", "internal")
     await submit(http, ["a"])

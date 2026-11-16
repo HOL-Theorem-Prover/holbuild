@@ -1648,12 +1648,13 @@ class Coordinator:
 
     def report_worker(self, host_id: str, worker: str, tiers: list[str], *, idle: bool = False) -> None:
         """Note that ``worker``, claiming ``tiers``, runs on reported host ``host_id``, for the autoscaler's count of
-        the workers quarantined hosts hold. An ``idle`` worker, claiming or waiting to claim, runs no action: the
-        leases still noted for it ended without its result, as when their batch was cancelled, and are forgotten."""
+        the workers quarantined hosts hold, also before the host sent readings. An ``idle`` worker, claiming or
+        waiting to claim, runs no action: the leases still noted for it ended without its result, as when their batch
+        was cancelled, and are forgotten."""
         if idle:
             for token in [t for t, (h, w, _) in self.lease_hosts.items() if h == host_id and w == worker]:
                 del self.lease_hosts[token]
-        if host_id in self.hosts:
+        if host_id in self.host_workers or len(self.host_workers) < MAX_HOSTS:
             self.host_workers.setdefault(host_id, {})[worker] = (self.clock(), "high" in tiers)
 
     def _lease_host(self, token: UUID, host_id: str, worker: str, tiers: list[str]) -> None:
@@ -2160,8 +2161,9 @@ class Coordinator:
             for host, (at, report) in self.hosts.items()
             if (now - at).total_seconds() < HOST_REPORT_SECONDS or host in self.host_workers
         }
-        self.infra_streak = {host: n for host, n in self.infra_streak.items() if host in self.hosts}
-        self.probe_at = {host: at for host, at in self.probe_at.items() if host in self.hosts}
+        known = self.hosts.keys() | self.host_workers.keys()
+        self.infra_streak = {host: n for host, n in self.infra_streak.items() if host in known}
+        self.probe_at = {host: at for host, at in self.probe_at.items() if host in known}
 
     @staticmethod
     async def _counts(conn: AsyncConnection, statement: sa.TextClause) -> QueueCounts:
