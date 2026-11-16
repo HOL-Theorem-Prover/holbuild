@@ -10845,27 +10845,67 @@ fun exception_failure e =
 (* A blob a shared entry names that the remote cache no longer holds. *)
 exception MissingSharedBlob of string
 
+(* The restore's steps, reported beside its phase as the hydrate's are:
+   milliseconds, or for the names ending in n and kb a count and KiB
+   (rsthitn counts blobs already in the store, rstfetchn those fetched).
+   Blobs are placed in parallel, so the steps summed per blob can exceed
+   the restore's wall time. *)
+val restore_steps = ref ([] : (string * LargeInt.int) list)
+val restore_steps_mutex = Mutex.mutex ()
+
+fun add_restore_step name amount =
+  (Mutex.lock restore_steps_mutex;
+   restore_steps :=
+     (name, amount + (case List.find (fn (n, _) => n = name) (!restore_steps) of SOME (_, e) => e | NONE => 0))
+     :: List.filter (fn (n, _) => n <> name) (!restore_steps);
+   Mutex.unlock restore_steps_mutex)
+
+fun restore_step name f =
+  let
+    val t0 = Time.now ()
+    fun record () = add_restore_step name (Time.toMilliseconds (Time.-(Time.now (), t0)))
+  in
+    (f () before record ()) handle e => (record (); raise e)
+  end
+
+fun file_kb path = Position.toLarge (FS.fileSize path) div 1024
+
 (* Puts blob `sha` of heap `heap`'s family at `dst`, from the store, which
    fetches it from the remote cache if it lacks it. *)
 fun place_shared_blob remote store heap {sha, dst, save} =
   let
     val stored = store_path store heap sha
     fun fetch () =
-      let val tmp = store_temp stored
+      let
+        val tmp = store_temp stored
+        fun get () =
+          HolbuildRemoteCache.required (fn () =>
+            HolbuildRemoteCache.fetch_unlisted_blob remote {hash = sha, dst = tmp})
       in
         ensure_parent tmp;
-        (* The manifest that names it may have reached the store before it. *)
-        case HolbuildRemoteCache.required (fn () =>
-               HolbuildRemoteCache.fetch_unlisted_blob remote {hash = sha, dst = tmp}) of
-            HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = stored}
+        (* The manifest that names it may have reached the store before it.
+           The deps heap, the family's own blob, is also timed apart. *)
+        case restore_step "rstfetch" (fn () => if sha = heap then restore_step "rstheap" get else get ()) of
+            HolbuildCacheBackend.Hit =>
+              let val kb = file_kb tmp
+              in
+                add_restore_step "rstfetchn" 1;
+                add_restore_step "rstfetchkb" kb;
+                if sha = heap then add_restore_step "rstheapkb" kb else ();
+                FS.rename {old = tmp, new = stored}
+              end
           | HolbuildCacheBackend.Miss => (remove_file tmp; raise MissingSharedBlob sha)
           | HolbuildCacheBackend.Corrupt msg =>
               (remove_file tmp; raise Error ("could not fetch shared checkpoint blob " ^ sha ^ ": " ^ msg))
       end
-    fun place () = if save then place_state stored dst else copy_binary stored dst
+    fun copy () =
+      (restore_step "rstcopy" (fn () => copy_binary stored dst);
+       add_restore_step "rstcopykb" (file_kb dst))
+    fun place () = if save then place_state stored dst else copy ()
     (* Another worker's cap sweep may evict the family between the check
        and the link. *)
-    fun from_store () = file_exists stored andalso ((place (); true) handle Error _ => false)
+    fun from_store () =
+      file_exists stored andalso ((place (); add_restore_step "rsthitn" 1; true) handle Error _ => false)
   in
     lease_store_family store heap;
     ensure_parent dst;
@@ -11135,14 +11175,15 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                  if heap <> published_heap then NONE else
                  (* The small .ok first: a checkpoint with a laxer timeout than
                     requested is skipped before its chain is fetched. *)
-                 (List.app (place_sidecar heap) sidecars;
+                 (restore_step "rstplace" (fn () => List.app (place_sidecar heap) sidecars);
                  if not (checkpoint_timeout_satisfies requested_timeout (#path c)) then (wipe (); NONE)
                  else
-                   (transfer_all (fn (placer, file) => placer heap file)
-                      ((place, (heap, deps_loaded)) :: map place_state_file spine @
-                       map (fn f => (place_sidecar, f)) spine_sidecars @
-                       [place_state_file (leaf, #path c)]);
-                    heap_placed heap;
+                   (restore_step "rstplace" (fn () =>
+                      (transfer_all (fn (placer, file) => placer heap file)
+                         ((place, (heap, deps_loaded)) :: map place_state_file spine @
+                          map (fn f => (place_sidecar, f)) spine_sidecars @
+                          [place_state_file (leaf, #path c)]);
+                       heap_placed heap));
                     if shared_heap_parent_ok ctx andalso chain_ok (#path c :: rev (map #2 spine)) andalso
                        #accepts c () then
                       (HolbuildStatus.message_stdout
@@ -11164,9 +11205,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             let
               val n = Int.min (remote_probe_width, length candidates)
               val window = map (fn c => (c, ref NONE)) (List.take (candidates, n))
-              val _ = parallel_all n (fn (c, fetched) =>
-                                        fetched := HolbuildRemoteCache.fetch_action remote (candidate_key c))
-                                     window
+              val _ = restore_step "rstprobe" (fn () =>
+                        parallel_all n (fn (c, fetched) =>
+                                          fetched := HolbuildRemoteCache.fetch_action remote (candidate_key c))
+                                       window)
             in
               case first_some (try_candidate heap) (map (fn (c, fetched) => (c, !fetched)) window) of
                   SOME restored => SOME restored
@@ -11179,7 +11221,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           let val count = Int.toString (length candidates)
           in
             case Option.mapPartial (shared_index_keys o #manifest)
-                                   (HolbuildRemoteCache.fetch_action remote index_key) of
+                                   (restore_step "rstprobe" (fn () => HolbuildRemoteCache.fetch_action remote index_key)) of
                 NONE =>
                   (HolbuildStatus.message_stdout
                      ("no shared checkpoint index: probing all " ^ count ^ " candidates\n");
@@ -11196,7 +11238,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   end
           end
     fun try_heap heap =
-      (place_heap heap;
+      (restore_step "rstplace" (fn () => place_heap heap);
        if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
          (HolbuildStatus.message_stdout "restored shared deps-loaded heap\n";
           {heap = SOME heap, files = [(deps_loaded, heap)]})
@@ -11207,7 +11249,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* No checkpoint is published without its heap, so without one there is
        nothing to look for. *)
     val {heap, files} =
-      case HolbuildRemoteCache.get_action remote heap_key of
+      case restore_step "rstprobe" (fn () => HolbuildRemoteCache.get_action remote heap_key) of
           NONE => no_files
         | SOME text =>
             case (SOME (#1 (single "heap" (shared_manifest_entries text)))
@@ -12547,6 +12589,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
        empty_writable false)
     (* The hydrate's steps, after it in the report, also when it fails. *)
     fun add_hydrate_steps () = phases := !hydrate_steps @ !phases
+    fun add_restore_steps () = phases := !restore_steps @ !phases
     fun setup_tool_cache (spec : action_spec) =
       case #tool_cache spec of
           NONE => NONE
@@ -12768,8 +12811,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val restored =
               case (shared, ahead) of
                   (SOME ctx, NONE) =>
-                    phase "restore" (fn () =>
-                      restore_shared_checkpoints remote ctx (resumes_from_checkpoints policy action))
+                    (restore_steps := [];
+                     (phase "restore" (fn () =>
+                        restore_shared_checkpoints remote ctx (resumes_from_checkpoints policy action))
+                      before add_restore_steps ())
+                     handle e => (add_restore_steps (); raise e))
                 | _ => nothing_restored
             fun publish_shared () =
               if not (!HolbuildActionSandbox.outputs_validated) then () else
