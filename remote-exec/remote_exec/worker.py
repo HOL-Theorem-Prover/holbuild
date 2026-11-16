@@ -11,6 +11,7 @@ Each action runs on the holbuild release that exported it, which the worker buil
 import argparse
 import contextlib
 import ctypes
+import errno
 import fcntl
 import functools
 import http.client
@@ -101,6 +102,10 @@ PROC_STAT = "/proc/stat"
 CPU_SAMPLE_SECONDS = 1.0  # least time a worker measures the host's idle CPU over
 MIB = 2**20
 GIB = 1024 * MIB
+# Free space below which a worker doesn't claim, and puts an action that failed in it down to the full disk: room
+# for one action's scratch, restored checkpoints and theory modules.
+DISK_FLOOR = 4 * GIB
+DISK_POLL_SECONDS = 10  # between two looks at the disk while waiting to claim
 
 
 # What a request to the coordinator raises when it or the network fails; ValueError covers a reply that isn't JSON.
@@ -561,6 +566,47 @@ def wait_for_memory(directory: str, charge: int, drain: Drain | None = None) -> 
     return logged
 
 
+def free_bytes(path: str) -> int:
+    """Bytes an unprivileged writer has free on the file system ``path`` is on, or would be created on."""
+    path = os.path.abspath(path)
+    while not os.path.exists(path):
+        path = os.path.dirname(path)
+    stat = os.statvfs(path)
+    return stat.f_bavail * stat.f_frsize
+
+
+def disk_shortfall() -> str | None:
+    """Why the host's disk has no room for an action now, or None if it has: the temp dir, where the worker and
+    exec-action keep their scratch, or the ``HOLBUILD_CACHE`` root, where exec-action's sandboxes and stores are,
+    has less than DISK_FLOOR free."""
+    for path in (tempfile.gettempdir(), os.environ.get("HOLBUILD_CACHE")):
+        if path and (free := free_bytes(path)) < DISK_FLOOR:
+            return f"{path} has {free // MIB} MiB free, below {DISK_FLOOR // MIB} MiB"
+    return None
+
+
+def wait_for_disk(drain: Drain) -> None:
+    """Return once the host's disk has room for an action (``disk_shortfall``), or the worker drains, so that a
+    worker on a full disk doesn't claim action after action only to fail each at once while other hosts could run
+    them."""
+    logged = False
+    while (why := disk_shortfall()) is not None:
+        if not logged:
+            print(f"waiting for disk space before claiming: {why}", file=sys.stderr, flush=True)
+            logged = True
+        if drain.stop.wait(DISK_POLL_SECONDS):
+            return
+
+
+def full_disk(error: Exception) -> str | None:
+    """Why an action that failed in the worker with ``error`` failed for want of disk, or None if it didn't: the
+    error is ENOSPC, or the disk is short now (as when exec-action couldn't write its result record)."""
+    why = disk_shortfall()
+    if why is None and not (isinstance(error, OSError) and error.errno == errno.ENOSPC):
+        return None
+    return f"the worker's disk is full: {error}" + ("" if why is None else f"; {why}")
+
+
 def cpu_times(stat_line: str) -> tuple[int, int]:
     """Idle and total time of all CPUs from the first line of /proc/stat. iowait isn't idle: a host whose cores
     wait on its disks has no room for more workers. guest and guest_nice are already counted in user and nice."""
@@ -723,9 +769,10 @@ DRAINING = "the worker is draining"
 def failed_record(spec_sha256: str, failure: str, detail: str | None = None) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
-    5xx, or a transfer cut short) or that was interrupted (``recordless_failure``), which is retried without
-    counting the attempt; ``memory`` for one whose exec-action was SIGKILLed; or ``internal`` for any other error in
-    the worker, such as exec-action failing without a record, which is retried. ``detail`` says why, for the client:
+    5xx, or a transfer cut short), that was interrupted (``recordless_failure``) or that the host's disk had no room
+    for (``full_disk``), which is retried without counting the attempt; ``memory`` for one whose exec-action was
+    SIGKILLed; or ``internal`` for any other error in the worker, such as exec-action failing without a record,
+    which is retried. ``detail`` says why, for the client:
     the record has no log."""
     record = f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
     return record if detail is None else f"{record}detail={sanitize_detail(detail)}\n"
@@ -888,10 +935,13 @@ def run_one(
             if not completed:
                 report(failed_record(spec, "unavailable", str(error)))
             raise
-        except Exception:
-            # The coordinator retries the action now rather than when the lease expires.
+        except Exception as error:
+            # The coordinator retries the action now rather than when the lease expires. One the disk had no room
+            # for doesn't count as an attempt: the worker waits for space before it claims again, so it goes to
+            # another host.
             if not completed:
-                report(failed_record(spec, "internal"))
+                full = full_disk(error)
+                report(failed_record(spec, "internal") if full is None else failed_record(spec, "unavailable", full))
             raise
         if record is None:
             return False
@@ -1215,6 +1265,8 @@ def main() -> None:
                 out.write('header = "' + header + '"\n')
             releases = replace(releases, discovery_config=config)
         while not drain.stop.is_set():
+            with phases.timed("idle"):
+                wait_for_disk(drain)
             if args.cooperate_dir is not None:
                 try:
                     with phases.timed("memory_wait"), drain.interruptible():
