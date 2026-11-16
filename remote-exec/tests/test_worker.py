@@ -845,7 +845,7 @@ def test_worker_waits_before_claiming_again_after_the_cache_was_unavailable(
     monkeypatch.setattr(worker, "claim_reporting", lambda *_: events.append("claim") or claim())
     outcomes = iter([True, False, False])
 
-    def run(*_: object) -> bool:
+    def run(*_: object, **__: object) -> bool:
         try:
             return next(outcomes)
         except StopIteration:
@@ -1661,6 +1661,50 @@ def test_a_lease_that_cannot_be_renewed_is_lost_when_it_expires(monkeypatch: pyt
     assert len(coordinator.beats) >= 5  # retried every 0.2 s
 
 
+class StuckCoordinator:
+    """A coordinator whose heartbeats block until ``release`` is set, as on a connection that stopped answering."""
+
+    def __init__(self) -> None:
+        self.drain = worker.Drain()
+        self.release = threading.Event()
+
+    def heartbeat(self, token: str) -> bool:
+        self.release.wait()
+        return True
+
+
+def lost_after(lease: Lease) -> float:
+    """Seconds until ``lease.check()``, polled as the action's loop polls it, finds the lease lost."""
+    started = time.monotonic()
+    while not lease.check() and time.monotonic() - started < 10:
+        time.sleep(0.05)
+    return time.monotonic() - started
+
+
+def test_a_blocked_heartbeat_does_not_hold_the_action_past_its_lease() -> None:
+    coordinator = StuckCoordinator()
+    try:
+        with Lease(coordinator, "t1", 3, Protection(None, None)).held(Phases()) as lease:  # type: ignore[arg-type]
+            elapsed = lost_after(lease)
+            assert 2.9 <= elapsed < 3.5, elapsed
+            assert coordinator.drain.wake.is_set()
+            coordinator.release.set()
+    finally:
+        coordinator.release.set()
+
+
+def test_the_lease_runs_from_when_the_claim_was_answered() -> None:
+    coordinator = StuckCoordinator()
+    try:
+        claimed = time.monotonic() - 2
+        with Lease(coordinator, "t1", 3, Protection(None, None), claimed=claimed).held(Phases()) as lease:  # type: ignore[arg-type]
+            elapsed = lost_after(lease)
+            assert elapsed < 1.5, elapsed
+            coordinator.release.set()
+    finally:
+        coordinator.release.set()
+
+
 def test_taking_and_giving_up_a_lease_counts_as_lease(tmp_path: Path, server: Server) -> None:
     switch = tmp_path / "protect"
     switch.write_text("#!/bin/sh\nsleep 0.5\n")
@@ -1943,7 +1987,7 @@ def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(
         membership.update("holbuild-cache-members-v1\n" + server.url + "\nhttps://joined.example\n", now)
         return membership.current(now)
 
-    def run(_coordinator, _args, releases, *_rest):
+    def run(_coordinator, _args, releases, *_rest, **_kwargs):
         assert "https://joined.example" in releases.remote_cache
         events.append("run")
         raise KeyboardInterrupt
