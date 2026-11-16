@@ -150,8 +150,10 @@ write_project "$consumer"
 link_hol_toolchain_cache "$consumer_cache"
 mkdir -p "$gate"
 consumer_log=$tmpdir/consumer.log
+# The consumer's disk counts as below the workers' free-space floor, which
+# must not make a broken remote entry look like a full disk to a client.
 (cd "$consumer" && HOLBUILD_CACHE="$consumer_cache" HOLBUILD_CACHE_TRACE=1 \
-  HOLBUILD_TEST_PREFETCH_GATE="$gate" \
+  HOLBUILD_TEST_PREFETCH_GATE="$gate" HOLBUILD_TEST_DISK_FLOOR="$((1 << 62)) 0" \
   exec "$HOLBUILD_BIN" --remote-cache "$remote_url" --prefetch-concurrency 1 -j1 build --skip-checkpoints BrokenTheory AbsentTheory LateTheory) \
   > "$consumer_log" 2>&1 &
 consumer_pid=$!
