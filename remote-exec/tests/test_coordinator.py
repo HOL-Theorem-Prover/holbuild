@@ -5,7 +5,7 @@ import json
 import time
 from collections import deque
 from dataclasses import asdict, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from collections.abc import Callable
 from typing import Any
 from uuid import UUID, uuid4
@@ -775,6 +775,21 @@ async def test_a_claim_that_gets_an_action_ends_the_leases_its_worker_got_no_ans
     assert (actions[lost["theory"]]["attempts"], actions[lost["theory"]]["last_failure"]) == (0, "unavailable")
     assert (actions[held["theory"]]["state"], actions[held["theory"]]["attempts"]) == ("running", 1)
     assert (await http.post(f"/v1/work/{held['attempt_token']}/heartbeat", headers=WORKER)).status_code == 200
+
+
+async def test_a_late_claim_leaves_the_leases_its_worker_claimed_since(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """A claim answered after its worker gave up and claimed again mustn't end the lease that worker now runs."""
+    batch_id = await submit(http, ["a", "b"])
+    arrived = datetime.now(UTC)
+    late = await coordinator.claim(["standard"], "w9")
+    running = await coordinator.claim(["standard"], "w9")  # the worker's next claim, answered first
+    assert late is not None and running is not None
+
+    await coordinator.release_unheld("w9", str(late.attempt_token), arrived)
+    actions = {a["theory"]: a for a in (await batch(http, batch_id))["actions"]}
+    assert (actions[running.theory]["state"], actions[running.theory]["attempts"]) == ("running", 1)
 
 
 async def test_a_heartbeat_ends_the_leases_its_worker_got_no_answer_for(

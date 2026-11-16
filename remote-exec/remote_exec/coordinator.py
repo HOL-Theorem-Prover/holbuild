@@ -418,10 +418,13 @@ UPDATE actions c SET (remaining_deps, state) = (
 )
 WHERE c.batch_id = :batch_id AND c.input_key = ANY({selected}) AND c.state IN ('waiting', 'ready')
 """
-# The live leases of a worker other than the one it ``held``: see ``Coordinator.release_unheld``.
+# The live leases of a worker other than the one it ``held``, claimed ``before`` a time if one is given: see
+# ``Coordinator.release_unheld``. A lease is claimed in the transaction that sets its action's ``last_claimed_at``.
 UNHELD_LEASES = sa.text(
-    "SELECT attempt_token, batch_id FROM leases WHERE worker = :worker AND expires_at > now() "
-    "AND attempt_token IS DISTINCT FROM CAST(:held AS uuid)"
+    "SELECT l.attempt_token, l.batch_id FROM leases l "
+    "JOIN actions a ON a.batch_id = l.batch_id AND a.input_key = l.input_key "
+    "WHERE l.worker = :worker AND l.expires_at > now() AND l.attempt_token IS DISTINCT FROM CAST(:held AS uuid) "
+    "AND a.last_claimed_at < COALESCE(CAST(:before AS timestamptz), 'infinity')"
 )
 REFRESH_KEYS = sa.text(REFRESH.format(selected="CAST(:keys AS text[])"))
 REFRESH_CHILDREN = sa.text(
@@ -1752,7 +1755,7 @@ class Coordinator:
                 {"token": token, "lease": self.settings.lease_seconds},
             )
             unheld = [] if worker is None else list(
-                await conn.execute(UNHELD_LEASES, {"worker": worker, "held": token})
+                await conn.execute(UNHELD_LEASES, {"worker": worker, "held": token, "before": None})
             )
         await self._end_unheld(unheld)
         live = worker is not None
@@ -2055,13 +2058,14 @@ class Coordinator:
         for token, batch_id in expired:
             await self._end_lease(token, batch_id)
 
-    async def release_unheld(self, worker: str, held: str | None) -> None:
-        """End the live leases of ``worker`` but the one its claim just ``held``: it claims only while it runs nothing,
-        so it holds none of the others. The answer to the claim that took each never reached it (it gave up waiting
-        for a slow coordinator), or it gave up reporting the result. Each action goes back at once and, as an
-        ``unavailable`` result does, doesn't count the attempt."""
+    async def release_unheld(self, worker: str, held: str | None, before: datetime) -> None:
+        """End the live leases of ``worker`` claimed ``before`` the claim that just ``held`` one arrived: it claims
+        only while it runs nothing, so it holds none of them. The answer to the claim that took each never reached it
+        (it gave up waiting for a slow coordinator), or it gave up reporting the result. Each action goes back at once
+        and, as an ``unavailable`` result does, doesn't count the attempt. A lease claimed since may be one the worker
+        runs: it gave up on this claim and claimed again before this ran."""
         async with self.engine.connect() as conn:
-            unheld = list(await conn.execute(UNHELD_LEASES, {"worker": worker, "held": held}))
+            unheld = list(await conn.execute(UNHELD_LEASES, {"worker": worker, "held": held, "before": before}))
         await self._end_unheld(unheld)
 
     async def _end_unheld(self, unheld: list[sa.Row[Any]]) -> None:

@@ -465,7 +465,7 @@ STATEMENTS = [
     Statement("UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1 WHERE", lease, 10_000),
     # leases a worker never got
     # No index on the worker: it reads the leases, one per running action.
-    Statement(cm.UNHELD_LEASES, lambda f: {"worker": "w9", "held": None}, 1_200),
+    Statement(cm.UNHELD_LEASES, lambda f: {"worker": "w9", "held": None, "before": None}, 1_200),
     Statement(
         "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now() RETURNING input_key, worker",
         lambda f: {"token": f.token},
