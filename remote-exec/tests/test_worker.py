@@ -127,6 +127,7 @@ class Server:
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
     heartbeats: list[dict[str, object]] = field(default_factory=list)
+    lease_posts: list[str] = field(default_factory=list)  # "heartbeat" and "complete", in the order they came
     reports: list[dict[str, object]] = field(default_factory=list)
     report_status: int = 204  # 404 from a coordinator older than /v1/work/report
     lease_lost: bool = False
@@ -182,6 +183,8 @@ def server() -> Iterator[Server]:
             if self.path == "/v1/work/report":
                 state.reports.append(json.loads(body))
                 return self.reply(state.report_status)
+            if self.path.endswith(("/heartbeat", "/complete")):
+                state.lease_posts.append(self.path.rsplit("/", 1)[1])
             if self.path.endswith("/complete"):
                 if state.unavailable > 0:
                     state.unavailable -= 1
@@ -1595,6 +1598,67 @@ def test_reported_phases_start_again_once_the_coordinator_answered_the_claim(
 
     assert claim_reporting(Coordinator("http://127.0.0.1:9", "w"), ["standard"], "w", 0, phases) is None
     assert phases.take()["hol"] == kept
+
+
+def test_heartbeats_go_on_while_the_result_is_posted(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path],
+) -> None:
+    """Posting the result retries while the coordinator restarts; the lease is renewed meanwhile, so it doesn't
+    expire and hand the action to another worker before the result gets in."""
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.unavailable = 2  # retried after 1 s and 2 s more, while the lease is renewed every 2 s
+
+    run_one(Coordinator(server.url, "w"), worker_args(tmp_path, server), releases(tmp_path, server),
+            Protection(None, None), {**claim(), "lease_s": 6}, Phases())
+
+    assert server.completed == [RECORD]
+    first, last = server.lease_posts.index("complete"), len(server.lease_posts) - 1
+    assert server.lease_posts[last] == "complete"
+    assert "heartbeat" in server.lease_posts[first:last], server.lease_posts
+
+
+class FlakyCoordinator:
+    """A coordinator whose heartbeats fail with ``errors`` first, then answer ``alive``."""
+
+    def __init__(self, errors: int, alive: bool = True) -> None:
+        self.drain = worker.Drain()
+        self.errors = errors
+        self.alive = alive
+        self.beats: list[float] = []
+
+    def heartbeat(self, token: str) -> bool:
+        self.beats.append(time.monotonic())
+        if len(self.beats) <= self.errors:
+            raise OSError("unreachable")
+        return self.alive
+
+
+def test_a_failed_heartbeat_is_retried_soon(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "HEARTBEAT_RETRY_SECONDS", 0.2, raising=False)
+    coordinator = FlakyCoordinator(errors=1)
+    # Renewed every second.
+    with Lease(coordinator, "t1", 3, Protection(None, None)).held(Phases()) as lease:  # type: ignore[arg-type]
+        deadline = time.monotonic() + 5
+        while len(coordinator.beats) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+    assert len(coordinator.beats) >= 2
+    assert coordinator.beats[1] - coordinator.beats[0] < 0.45
+    assert not lease.lost.is_set()
+
+
+def test_a_lease_that_cannot_be_renewed_is_lost_when_it_expires(monkeypatch: pytest.MonkeyPatch) -> None:
+    """While the coordinator can't be reached the action stops once its lease has run out, rather than running
+    on beside the worker the coordinator handed it to."""
+    monkeypatch.setattr(worker, "HEARTBEAT_RETRY_SECONDS", 0.2, raising=False)
+    coordinator = FlakyCoordinator(errors=1_000_000)
+    started = time.monotonic()
+    with Lease(coordinator, "t1", 3, Protection(None, None)).held(Phases()) as lease:  # type: ignore[arg-type]
+        lost = lease.lost.wait(6)
+        lost_after = time.monotonic() - started
+    assert lost and coordinator.drain.wake.is_set()
+    assert 2.9 <= lost_after < 4, lost_after
+    assert len(coordinator.beats) >= 5  # retried every 0.2 s
 
 
 def test_taking_and_giving_up_a_lease_counts_as_lease(tmp_path: Path, server: Server) -> None:

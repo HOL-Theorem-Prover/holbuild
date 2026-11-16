@@ -112,6 +112,8 @@ DISK_POLL_SECONDS = 10  # between two looks at the disk while waiting to claim
 
 # What a request to the coordinator raises when it or the network fails; ValueError covers a reply that isn't JSON.
 COORDINATOR_ERRORS = (OSError, RuntimeError, http.client.HTTPException, ValueError)
+# Wait before retrying a heartbeat that failed, while the lease still holds (at most a third of the lease).
+HEARTBEAT_RETRY_SECONDS = 5.0
 # Waits before each retry of a result report the coordinator couldn't take, as while it restarts; then 8 s apart.
 COMPLETE_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
 
@@ -912,14 +914,20 @@ def exec_action_command(
 
 
 class Lease:
-    """Heartbeats an action's lease from a thread while the action runs, and holds scale-in protection."""
+    """Heartbeats an action's lease from a thread while the action runs and its result is posted, and holds scale-in
+    protection. A lease the coordinator can't renew is lost once it may have expired there."""
 
     def __init__(self, coordinator: Coordinator, token: str, lease_s: float, protection: Protection) -> None:
         self.coordinator = coordinator
         self.token = token
+        self.lease_s = lease_s
         self.interval = max(1.0, lease_s / 3)
+        # The coordinator expires the lease lease_s after the claim, which it answered before this, or after the
+        # last heartbeat that renewed it, which arrived after it was sent.
+        self.expires = time.monotonic() + lease_s
         self.protection = protection
         self.lost = threading.Event()
+        self.completing = threading.Event()  # the result is being posted: a stale lease no longer stops anything
         self.done = threading.Event()
         self.thread = threading.Thread(target=self._beat, daemon=True)
 
@@ -942,19 +950,38 @@ class Lease:
                 self.protection.set(enabled=False, timeout=30 if deadline is None else 2)
 
     def _beat(self) -> None:
-        while not self.done.wait(self.interval):
+        wait = self.interval
+        while True:
+            left = self.expires - time.monotonic()
+            if left <= 0 and not self.completing.is_set():
+                print("lease ran out without a renewal; stopping the action", file=sys.stderr)
+                self._lose()
+                return
+            if self.done.wait(wait if left <= 0 or self.completing.is_set() else min(wait, left)):
+                return
+            if time.monotonic() >= self.expires and not self.completing.is_set():
+                continue
+            sent = time.monotonic()
             try:
                 alive = self.coordinator.heartbeat(self.token)
             except COORDINATOR_ERRORS as error:
-                print(f"heartbeat failed, carrying on: {error}", file=sys.stderr)
+                wait = min(HEARTBEAT_RETRY_SECONDS, self.interval)
+                print(f"heartbeat failed, retrying in {wait:g} s: {error}", file=sys.stderr)
                 continue
             if not alive:
-                print("lease lost; stopping the action", file=sys.stderr)
-                self.lost.set()
-                self.coordinator.drain.wake.set()
+                # A heartbeat that crossed the posted result finds its token spent: the lease ended as it should.
+                if not self.completing.is_set():
+                    print("lease lost; stopping the action", file=sys.stderr)
+                    self._lose()
                 return
+            self.expires = sent + self.lease_s
+            wait = self.interval
             if not self.done.is_set() and not self.coordinator.drain.stop.is_set():
                 self.protection.set(enabled=True, timeout=5)
+
+    def _lose(self) -> None:
+        self.lost.set()
+        self.coordinator.drain.wake.set()
 
 
 def claim_reporting(
@@ -996,13 +1023,17 @@ def run_one(
 
         def report(record: str) -> None:
             """Completes the action once, even if posting it fails: the coordinator then retries it when the
-            lease expires. Its token is stale from then, so the heartbeat stops first: a 409 would mark the
-            lease lost and stop exec-action. Scale-in protection stays on until it exits."""
+            lease expires. The heartbeat goes on while the result is posted, so the lease doesn't lapse while the
+            coordinator restarts, and stops once it is: the token is spent then. Scale-in protection stays on until
+            exec-action exits."""
             nonlocal completed
             completed = True
-            lease.done.set()
-            with phases.timed("complete"):
-                coordinator.complete(token, record, claim["lease_s"])
+            lease.completing.set()
+            try:
+                with phases.timed("complete"):
+                    coordinator.complete(token, record, claim["lease_s"])
+            finally:
+                lease.done.set()
 
         try:
             record = execute(args, releases, lease, claim, phases, report)
