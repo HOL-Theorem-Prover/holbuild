@@ -200,7 +200,7 @@ is `/var/cache/holbuild` in the image. It must be the worker's own cache root:
 `exec-action --cache-limit-gb` sweeps the whole root before each action, so a
 root shared with ordinary builds would lose their cache. Containers on one host
 may share cache directories, provided they also share `locks/`: cap sweeps and
-explicit cache GC use its `gc.lock`. With a positive reserve and a target of at least 64 GiB, actions
+explicit cache GC use its `gc.lock`. With a positive reserve, actions
 reuse shared byte measurements for up to 60 seconds while shared and private
 sizes stay within the limit, while sizing private checkpoints on each call;
 the theory-modules store is a shared root like the others. Eviction still goes
@@ -214,7 +214,7 @@ size), and when files outside the
 cache keep the disk short after it evicted all it could, its measurement says
 so, and actions skip further sweeps until it expires. A sweep publishes its walk before evicting, so actions keep
 reusing a fresh measurement while eviction runs. A cached directory must match the recorded device
-and inode; other directories are sized live. Smaller targets and zero-reserve runs always scan live. Shared writes
+and inode; other directories are sized live. Zero-reserve runs always scan live. Shared writes
 during the reuse interval are accounted for at the next scan. `exec-action` runs
 with the worker's `HOLBUILD_*` build settings, `PATH`, `HOME`, `TMPDIR`, the
 locale, curl's certificate and proxy settings, and the solver locations HOL's

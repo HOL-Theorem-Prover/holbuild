@@ -113,6 +113,8 @@ DISK_POLL_SECONDS = 10  # between two looks at the disk while waiting to claim
 
 # What a request to the coordinator raises when it or the network fails; ValueError covers a reply that isn't JSON.
 COORDINATOR_ERRORS = (OSError, RuntimeError, http.client.HTTPException, ValueError)
+# Wait before retrying a heartbeat that failed, while the lease still holds (at most a third of the lease).
+HEARTBEAT_RETRY_SECONDS = 5.0
 # Waits before each retry of a result report the coordinator couldn't take, as while it restarts; then 8 s apart.
 COMPLETE_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
 
@@ -965,14 +967,24 @@ def exec_action_command(
 
 
 class Lease:
-    """Heartbeats an action's lease from a thread while the action runs, and holds scale-in protection."""
+    """Heartbeats an action's lease from a thread while the action runs and its result is posted, and holds scale-in
+    protection. A lease the coordinator can't renew is lost once it may have expired there."""
 
-    def __init__(self, coordinator: Coordinator, token: str, lease_s: float, protection: Protection) -> None:
+    def __init__(
+        self, coordinator: Coordinator, token: str, lease_s: float, protection: Protection,
+        *, claimed: float | None = None,
+    ) -> None:
         self.coordinator = coordinator
         self.token = token
+        self.lease_s = lease_s
         self.interval = max(1.0, lease_s / 3)
+        # The coordinator expires the lease lease_s after it took the claim or after the last heartbeat that renewed
+        # it, each after its request was sent: ``claimed``, by default now, is when the claim's was.
+        self.expires = (time.monotonic() if claimed is None else claimed) + lease_s
         self.protection = protection
         self.lost = threading.Event()
+        self.completing = threading.Event()  # the result is being posted: a stale lease no longer stops anything
+        self.checking = threading.Lock()
         self.done = threading.Event()
         self.thread = threading.Thread(target=self._beat, daemon=True)
 
@@ -994,20 +1006,48 @@ class Lease:
                 ))
                 self.protection.set(enabled=False, timeout=30 if deadline is None else 2)
 
+    def check(self) -> bool:
+        """Whether the lease is lost, marking it lost once it may have expired at the coordinator before the result
+        is posted. The action's poll calls this too, so a heartbeat blocked on an unresponsive coordinator doesn't
+        hold the action past the deadline."""
+        with self.checking:
+            if not self.lost.is_set() and not self.completing.is_set() and time.monotonic() >= self.expires:
+                print("lease ran out without a renewal; stopping the action", file=sys.stderr)
+                self._lose()
+        return self.lost.is_set()
+
     def _beat(self) -> None:
-        while not self.done.wait(self.interval):
+        wait = self.interval
+        while not self.check():
+            left = self.expires - time.monotonic()
+            if self.done.wait(wait if left <= 0 or self.completing.is_set() else min(wait, left)):
+                return
+            if self.check():
+                return
+            sent = time.monotonic()
             try:
                 alive = self.coordinator.heartbeat(self.token)
             except COORDINATOR_ERRORS as error:
-                print(f"heartbeat failed, carrying on: {error}", file=sys.stderr)
+                wait = min(HEARTBEAT_RETRY_SECONDS, self.interval)
+                print(f"heartbeat failed, retrying in {wait:g} s: {error}", file=sys.stderr)
                 continue
             if not alive:
-                print("lease lost; stopping the action", file=sys.stderr)
-                self.lost.set()
-                self.coordinator.drain.wake.set()
+                # A heartbeat that crossed the posted result finds its token spent: the lease ended as it should.
+                if not self.completing.is_set():
+                    print("lease lost; stopping the action", file=sys.stderr)
+                    self._lose()
                 return
+            with self.checking:
+                if self.lost.is_set():
+                    return
+                self.expires = sent + self.lease_s
+            wait = self.interval
             if not self.done.is_set() and not self.coordinator.drain.stop.is_set():
                 self.protection.set(enabled=True, timeout=5)
+
+    def _lose(self) -> None:
+        self.lost.set()
+        self.coordinator.drain.wake.set()
 
 
 def claim_reporting(
@@ -1035,27 +1075,34 @@ def run_one(
     protection: Protection,
     claim: dict[str, Any],
     phases: Phases,
+    *,
+    claimed: float | None = None,
 ) -> bool:
     """Run one claimed action to its end, or until its lease is lost, and report it, adding its phases' time to
     ``phases``. An error in the worker is reported for a retry and then raised, so that ``main`` waits before it
-    claims again. True when exec-action reported the remote cache ``unavailable``, after which ``main`` waits too."""
+    claims again. True when exec-action reported the remote cache ``unavailable``, after which ``main`` waits too.
+    ``claimed`` is when the claim's request was sent (``time.monotonic()``), by default now."""
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
     drain = coordinator.drain
     releases = replace(releases, drain=drain)
     print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
-    with Lease(coordinator, token, claim["lease_s"], protection).held(phases) as lease:
+    with Lease(coordinator, token, claim["lease_s"], protection, claimed=claimed).held(phases) as lease:
         completed = False
 
         def report(record: str) -> None:
             """Completes the action once, even if posting it fails: the coordinator then retries it when the
-            lease expires. Its token is stale from then, so the heartbeat stops first: a 409 would mark the
-            lease lost and stop exec-action. Scale-in protection stays on until it exits."""
+            lease expires. The heartbeat goes on while the result is posted, so the lease doesn't lapse while the
+            coordinator restarts, and stops once it is: the token is spent then. Scale-in protection stays on until
+            exec-action exits."""
             nonlocal completed
             completed = True
-            lease.done.set()
-            with phases.timed("complete"):
-                coordinator.complete(token, record, claim["lease_s"])
+            lease.completing.set()
+            try:
+                with phases.timed("complete"):
+                    coordinator.complete(token, record, claim["lease_s"])
+            finally:
+                lease.done.set()
 
         try:
             record = execute(args, releases, lease, claim, phases, report)
@@ -1118,7 +1165,7 @@ def execute(
     except Unreleased as error:
         print(f"refusing {spec}: {error}", file=sys.stderr)
         return failed_record(spec, "spec-rejected", f"the worker refuses the action: {error}")
-    if lease.lost.is_set():
+    if lease.check():
         return None
     if drain.stop.is_set():
         return failed_record(spec, "unavailable", DRAINING)
@@ -1144,7 +1191,7 @@ def execute(
         try:
             while process.poll() is None:
                 if reported is None:
-                    if lease.lost.is_set():
+                    if lease.check():
                         lost = True
                         break
                     if (record := read_result(result)) is not None:
@@ -1428,7 +1475,7 @@ def main() -> None:
                 nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
                 releases = replace(releases, remote_cache=",".join(nodes))
             try:
-                unavailable = run_one(coordinator, args, releases, protection, claim, phases)
+                unavailable = run_one(coordinator, args, releases, protection, claim, phases, claimed=started)
             except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
                 # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
                 # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.
