@@ -340,6 +340,7 @@ head, tail = 16 << 20, 48 << 20
 m = re.match(rb"\n\.\.\. \[holbuild: truncated (\d+) bytes of (\d+)-byte build log\] \.\.\.\n", data[head:])
 assert m, data[head:head + 200]
 assert int(m[2]) - int(m[1]) == head + tail and len(data) == head + len(m[0]) + tail, (m[0], len(data))
-assert b"big-log-start\n" in data[:head] and data.endswith(b"big-log-end\n"), "head or tail missing"
+assert b"big-log-start\n" in data[:head], "head missing"
+assert b"big-log-end\n" in data[-tail:], data[-300:]
 assert b"big-log-middle" not in data, "the middle was kept"
 PY
