@@ -6,7 +6,8 @@
 # store's writer lock.  A fake HOL stands in for the writer: it counts its
 # runs, records its output directory's file system and leaves the files
 # named in $tmpdir/writes there.  The worker cache cap's sweep leaves a
-# store alone while its writer runs.  Where /dev/shm is another file
+# store alone while its writer runs.  No writer starts too close to its
+# deadline, and one killed at it still stores the modules it finished.  Where /dev/shm is another file
 # system, a store there stands for one a worker's containers share on a
 # mount of its own: the writer writes on that file system.
 set -euo pipefail
@@ -18,7 +19,7 @@ trap 'cleanup_temp_dir "$tmpdir"; [[ -z $other_fs ]] || rm -rf "$other_fs"' EXIT
 mkdir -p "$tmpdir/cache" "$tmpdir/root/src" "$tmpdir/root/.holbuild"
 
 sha() { sha1sum "$1" | cut -d' ' -f1; }
-for hol in hol1 hol2 hol3; do
+for hol in hol1 hol2 hol3 hol4; do
   mkdir -p "$tmpdir/$hol/bin" "$tmpdir/$hol/sigobj" "$tmpdir/$hol/tools-poly/poly"
   : > "$tmpdir/$hol/bin/hol.state"
   : > "$tmpdir/$hol/sigobj/boolTheory.uo"
@@ -30,6 +31,7 @@ cp "\${@: -1}" "$tmpdir/$hol.script"
 out=\$(dirname "\$(grep -o 'openOut "[^"]*/unsupported"' "\${@: -1}" | cut -d'"' -f2)")
 stat -L -c %d "\$out" > "$tmpdir/$hol.output-device"
 while read -r file; do : > "\$out/\$file"; done < "$tmpdir/writes"
+[[ ! -e "$tmpdir/hang" ]] || sleep 20
 SH
   chmod +x "$tmpdir/$hol/bin/hol"
 done
@@ -60,7 +62,9 @@ val wanted = {deps = [dep "A", dep "B"] @ List.tabulate (16, fn i => dep ("P" ^ 
               loads = [E.LoadTheory "boolTheory"]};
 fun tc hol = {holdir = "$tmpdir/" ^ hol, maxheap = NONE,
               kernel_variant = HolbuildToolchain.StandardKernel};
-fun fill hol = E.fill_module_store "$tmpdir/root" (tc hol) wanted;
+fun fill_by hol seconds =
+  E.fill_module_store "$tmpdir/root" (tc hol) wanted (Time.+ (Time.now (), Time.fromSeconds seconds));
+fun fill hol = ignore (fill_by hol 100);
 fun store hol = E.module_store ("$tmpdir/" ^ hol);
 fun stored hol file = exists (OS.Path.concat (store hol, file));
 val a = "ab12-A-$a_sha.pmo";
@@ -161,6 +165,24 @@ val _ = sweep ();
 val _ = check "the sweep kept an idle store once its writer finished" (not (exists (store "hol1")));
 val _ = check "the sweep left an evicted store behind"
           (null (HolbuildCache.children (E.module_stores ())));
+
+(* Too close to its deadline, no writer starts; one that runs past it is
+   killed there, and the modules it finished are stored. *)
+val _ = E.write_text "$tmpdir/hol4/tools-poly/poly/theory_modules.ML" "";
+val _ = writes [a, b];
+val _ = check "a writer started with 3 s left" (#installed (fill_by "hol4" 3) = 0 andalso runs "hol4" = 0);
+val _ = E.write_text "$tmpdir/hang" "";
+val t0 = Time.now ();
+val {installed, missing, ...} = fill_by "hol4" 6;
+val _ = OS.FileSys.remove "$tmpdir/hang";
+val _ = check "the writer was not stopped at its deadline"
+          (runs "hol4" = 1 andalso Time.< (Time.- (Time.now (), t0), Time.fromSeconds 15));
+val _ = check "a stopped writer's modules were not stored"
+          (installed = 2 andalso missing > 2 andalso List.all (stored "hol4") [a, b]);
+val _ = check "a stopped writer left its output" (not (exists (OS.Path.concat (store "hol4", ".writer"))));
+val _ = check "a stopped writer left its script or log"
+          (not (exists "$tmpdir/root/.holbuild/theory-module-writer.sml") andalso
+           not (exists "$tmpdir/root/.holbuild/theory-module-writer.log"));
 
 (* A writer whose lock file the sweep unlinked between its open and its
    lock holds a lock nobody else sees: it must not write. *)

@@ -177,9 +177,9 @@ fun run_in_dir_to_file dir argv output =
   handle HolbuildMachineMemory.Error msg => raise Error msg
        | HolbuildActionSandbox.Error msg => raise Error msg
 
-(* As run_in_dir_to_file, killing the child once it has run for LIMIT.  The
-   clock starts once the memory reservation is granted. *)
-fun run_in_dir_to_file_until dir argv output limit =
+(* As run_in_dir_to_file, killing the child at the time DEADLINE () gives
+   once the memory reservation is granted. *)
+fun run_in_dir_to_file_by dir argv output deadline =
   let
     val timed_out = ref false
     val status =
@@ -190,7 +190,7 @@ fun run_in_dir_to_file_until dir argv output limit =
                   let
                     val result =
                       HolbuildActionSandbox.launch argv (fn confined =>
-                        HolbuildProcessGroup.run_shell_inheriting_until lease (Time.+ (Time.now (), limit))
+                        HolbuildProcessGroup.run_shell_inheriting_until lease (deadline ())
                           ("cd " ^ quote dir ^ " && " ^
                            (if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
                            command confined ^ " > " ^ quote output ^ " 2>&1"))
@@ -203,6 +203,11 @@ fun run_in_dir_to_file_until dir argv output limit =
   in
     {status = status, timed_out = !timed_out}
   end
+
+(* As run_in_dir_to_file, killing the child once it has run for LIMIT.  The
+   clock starts once the memory reservation is granted. *)
+fun run_in_dir_to_file_until dir argv output limit =
+  run_in_dir_to_file_by dir argv output (fn () => Time.+ (Time.now (), limit))
 
 fun ensure_dir path =
   if path = "" orelse path = "." then ()

@@ -330,15 +330,17 @@ fun checkpoint_grants checkpoints =
 
 (* The theory action: its private roots are what the worker harvests.
    Under with_output_dirs (the worker's module writer), the child writes
-   only those directories and reads the roots. *)
+   only those directories and reads the action root; it runs after the
+   action's checkpoints are gone. *)
 fun action_grants (root, checkpoints) : grants =
-  let val {writable = saves, readable = stored} = checkpoint_grants checkpoints
-  in
-    case !output_dirs of
-        NONE => {writable = getOpt (!action_write_dirs, [root]) @ saves,
-                 readable = [root, checkpoints] @ stored, toolchain = false}
-      | SOME dirs => {writable = dirs, readable = [root, checkpoints] @ stored, toolchain = false}
-  end
+  case !output_dirs of
+      NONE =>
+        let val {writable = saves, readable = stored} = checkpoint_grants checkpoints
+        in
+          {writable = getOpt (!action_write_dirs, [root]) @ saves,
+           readable = [root, checkpoints] @ stored, toolchain = false}
+        end
+    | SOME dirs => {writable = dirs, readable = [root], toolchain = false}
 
 fun launch argv execute =
   case !private_roots of
