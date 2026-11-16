@@ -142,6 +142,7 @@ class Server:
     claim_started: threading.Event = field(default_factory=threading.Event)
     hold_claim: threading.Event | None = None
     protection_reply: dict[str, object] = field(default_factory=dict)
+    protection_status: int = 200
 
 
 @pytest.fixture
@@ -201,7 +202,7 @@ def server() -> Iterator[Server]:
 
         def do_PUT(self) -> None:
             state.protection.append(json.loads(self.body()))
-            self.reply(200, json.dumps(state.protection_reply))
+            self.reply(state.protection_status, json.dumps(state.protection_reply))
 
         def log_message(self, format: str, *args: object) -> None:
             pass
@@ -592,26 +593,12 @@ def test_ecs_protection_rejection_in_a_success_response_is_logged(
     assert "DEPLOYMENT_BLOCKED" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(
-    ("reason", "enabled", "drains"),
-    [
-        ("DRAINING", True, True),
-        # ECS refuses protection so on healthy instances too, in a scale-in or a rolling deployment.
-        ("DEPLOYMENT_BLOCKED", True, False),
-        ("TASK_STOPPING_OR_STOPPED", True, False),
-        ("DRAINING", False, False),
-    ],
-)
-def test_protection_refused_on_a_draining_container_instance_drains_the_worker(
-    server: Server, reason: str, enabled: bool, drains: bool
+def test_ecs_protection_refused_with_an_http_error_is_logged(
+    server: Server, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    server.protection_reply = {"failure": {"Reason": reason}}
-    drain = worker.Drain()
-    drain.interrupt = True  # the main thread is in an interruptible call, which only its own SIGTERM handler ends
-    thread = threading.Thread(target=Protection(None, server.url, drain).set, kwargs={"enabled": enabled})
-    thread.start()
-    thread.join()
-    assert (drain.stop.is_set(), drain.interrupt) == (drains, True)
+    server.protection_status = 400
+    Protection(None, server.url).set(enabled=True)
+    assert "HTTP Error 400" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("text", ["-1", "nan", "inf"])
@@ -1625,10 +1612,11 @@ def test_cpu_counters_going_backwards_give_no_idle_share(telemetry: tuple[HostTe
     assert reporter.report().cpu_idle_pct is None
 
 
-def test_no_report_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
+def test_only_the_host_id_and_rank_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
     host: Host, telemetry: tuple[HostTelemetry, Path], server: Server
 ) -> None:
     reporter, stat = telemetry
+    reporter.rank = 1
     host.lease(3 * GIB)
     coordinator = Coordinator(server.url, "w", reporter)
     with open(host.dir / "lock") as lock:
@@ -1640,7 +1628,8 @@ def test_no_report_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
     assert coordinator.heartbeat("t")
 
     reports = [beat["host"] for beat in server.heartbeats]
-    assert reports[0] is None and reports[2] is None
+    # The coordinator quarantines and packs hosts by id and rank, which need no reading.
+    assert reports[0] == reports[2] == {"id": "b0a7", "rank": 1}
     assert isinstance(reports[1], dict) and reports[1]["leases"] == 1
 
 

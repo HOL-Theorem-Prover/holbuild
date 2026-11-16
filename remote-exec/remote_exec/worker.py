@@ -138,9 +138,7 @@ class Drain:
         self.deadline = time.monotonic() + self.seconds
         self.stop.set()
         self.wake.set()
-        # Only the SIGTERM handler, which runs on the main thread, interrupts the main thread's blocking call; a
-        # request from another thread (Protection's, on the lease thread) leaves the call to see ``stop`` after.
-        if self.interrupt and threading.current_thread() is threading.main_thread():
+        if self.interrupt:
             self.interrupt = False
             raise DrainStopped
 
@@ -253,9 +251,12 @@ class Coordinator:
             return response.status, json.loads(payload) if payload else None
 
     def post_reporting(self, path: str, body: dict[str, Any], timeout: float = 30) -> tuple[int, Any]:
-        """``post`` a JSON body with the host's report in it, or none when there is none."""
-        report = None if self.host is None else self.host.report()
-        host = None if report is None else asdict(report)
+        """``post`` a JSON body with the host's report in it, or only the host's id and rank when it can't be read
+        now, since the coordinator quarantines and packs by them; or no host when the worker reports none."""
+        host = None
+        if self.host is not None:
+            report = self.host.report()
+            host = {"id": self.host.id, "rank": self.host.rank} if report is None else asdict(report)
         return self.post(path, json.dumps({**body, "host": host}).encode(), "application/json", timeout)
 
     def claim(self, tiers: list[str], worker: str, wait_s: float, phases: dict[str, float]) -> dict[str, Any] | None:
@@ -322,15 +323,12 @@ class Coordinator:
 
 class Protection:
     """Scale-in protection while the worker holds an action: ``--protection-cmd on|off``, or the ECS agent's
-    task-protection endpoint when ``ECS_AGENT_URI`` is set, or nothing. Failures are logged, never raised; one that
-    names the container instance DRAINING drains ``drain``, since ECS won't stop a worker that keeps protecting
-    itself there. ECS also refuses protection with DEPLOYMENT_BLOCKED on a healthy instance, in a scale-in or a
-    rolling deployment, so that reason alone doesn't drain."""
+    task-protection endpoint when ``ECS_AGENT_URI`` is set, or nothing. Failures, such as ECS refusing protection
+    with DEPLOYMENT_BLOCKED in a scale-in or a rolling deployment, are logged, never raised."""
 
-    def __init__(self, command: str | None, ecs_agent_uri: str | None, drain: Drain | None = None) -> None:
+    def __init__(self, command: str | None, ecs_agent_uri: str | None) -> None:
         self.command = command
         self.ecs_agent_uri = ecs_agent_uri
-        self.drain = drain
 
     def set(self, *, enabled: bool, timeout: float = 30) -> None:
         try:
@@ -352,9 +350,6 @@ class Protection:
                     raise RuntimeError(str(failure))
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
-            if enabled and self.drain is not None and "DRAINING" in str(error):
-                print("the container instance is draining; draining the worker", file=sys.stderr)
-                self.drain.request()
 
 
 @dataclass(frozen=True)
@@ -779,7 +774,7 @@ class HostTelemetry:
     def report(self) -> HostReport | None:
         """The host now, or None when it can't be read now. It doesn't wait for the cooperate dir's lock, which
         would hold up the heartbeat that renews a running action's lease: while an admission holds it, there is no
-        report."""
+        reading."""
         try:
             memory = HostMemory.read(self.cooperate_dir, wait=False)
             with open(PROC_STAT) as file:
@@ -1383,7 +1378,7 @@ def main() -> None:
         baked_root=args.baked_releases,
         drain=drain,
     )
-    protection = Protection(args.protection_cmd, os.environ.get("ECS_AGENT_URI"), drain)
+    protection = Protection(args.protection_cmd, os.environ.get("ECS_AGENT_URI"))
     tiers = list(dict.fromkeys([args.tier, *args.also_claim]))
     phases = Phases()
     discovery_url = os.environ.get("HOLBUILD_REMOTE_CACHE_DISCOVERY_URL")
