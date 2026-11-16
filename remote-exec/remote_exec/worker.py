@@ -369,18 +369,18 @@ class Releases:
 
     def spec_version(self, spec_sha256: str) -> str:
         """The ``holbuild-version`` of the action spec stored in the remote cache: zstd-compressed under ``/ac/``,
-        or as written by releases before 0.15.0, under ``/cas/``."""
+        or as releases before 0.15.0 wrote it, under ``/cas/``."""
         compressed = self._fetch_spec(spec_sha256, f"ac/{blob_key(spec_sha256)}", blob_key(spec_sha256))
         if compressed is None:
             spec = self._fetch_spec(spec_sha256, f"cas/{spec_sha256}", spec_sha256)
+            if spec is None:
+                raise RuntimeError(f"spec {spec_sha256} is missing from the remote cache: HTTP 404")
         else:
             # zstd checks the frame's checksum; exec-action checks the spec's digest when it fetches it.
             decoded = subprocess.run(["zstd", "-dcq"], input=compressed, check=False, capture_output=True)
             if decoded.returncode != 0:
                 raise RuntimeError(f"spec {spec_sha256} in the remote cache is corrupt: {decoded.stderr.decode().strip()}")
             spec = decoded.stdout
-        if spec is None:
-            raise RuntimeError(f"spec {spec_sha256} is missing from the remote cache: HTTP 404")
         versions = [
             line.removeprefix("holbuild-version=")
             for line in spec.decode(errors="replace").splitlines()

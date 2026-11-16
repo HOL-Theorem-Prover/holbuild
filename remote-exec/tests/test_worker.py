@@ -126,11 +126,11 @@ def release_tarball(path: Path, version: str, makefile: str = FAKE_MAKEFILE) -> 
 
 @dataclass
 class Server:
-    """The coordinator's worker endpoints, the remote cache's specs, and the ECS agent's task protection."""
+    """The coordinator's worker endpoints, the remote cache's ``/cas/``, and the ECS agent's task protection."""
 
     url: str = ""
-    specs: dict[str, str] = field(default_factory=dict)  # zstd-compressed under /ac/<blob key>
-    legacy_specs: dict[str, str] = field(default_factory=dict)  # as releases before 0.15.0 wrote them, under /cas/
+    specs: dict[str, str] = field(default_factory=dict)  # under /cas/
+    zstd_specs: dict[str, str] = field(default_factory=dict)  # as 0.15.0 and later write them, compressed under /ac/
     completed: list[str] = field(default_factory=list)
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
@@ -171,7 +171,7 @@ def server() -> Iterator[Server]:
                 self.wfile.write(b"holbuild-action-spec-v1\n")
                 self.close_connection = True
                 return
-            compressed = {f"/ac/{blob_key(digest)}": spec for digest, spec in state.specs.items()}
+            compressed = {f"/ac/{blob_key(digest)}": spec for digest, spec in state.zstd_specs.items()}
             if self.path in compressed:
                 body = subprocess.run(["zstd", "-qc"], input=compressed[self.path].encode(), capture_output=True,
                                       check=True).stdout
@@ -180,7 +180,7 @@ def server() -> Iterator[Server]:
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            spec = state.legacy_specs.get(self.path.removeprefix("/cas/"))
+            spec = state.specs.get(self.path.removeprefix("/cas/"))
             self.reply(404) if spec is None else self.reply(200, spec)
 
         def do_POST(self) -> None:
@@ -1973,7 +1973,7 @@ def test_bootstrap_spec_uses_second_node_when_primary_is_unreachable(tmp_path: P
         key for i in range(100)
         if ranked_nodes(nodes, blob_key(key := hashlib.sha256(str(i).encode()).hexdigest()))[0] == nodes[0]
     )
-    server.specs[digest] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.zstd_specs[digest] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     ring = Releases(str(tmp_path), "unused", ",".join(nodes), None)
     assert ring.spec_version(digest) == "1.2.3"
 
@@ -2016,7 +2016,7 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
     asked: list[str] = []
 
     def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        # /ac/ answers as given; the /cas/ fallback, asked only after 404s from every node, misses.
+        # /ac/ answers as given; /cas/, asked only after 404s from every node, misses.
         status = statuses[len(asked)] if len(asked) < len(statuses) else 404
         asked.append(command[-1])
         return subprocess.CompletedProcess(command, 22, f"\n{status}".encode(), f"HTTP {status}".encode())
@@ -2032,12 +2032,12 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
     assert len(asked) == (4 if statuses == (404, 404) else len(statuses))
 
 
-def test_bootstrap_spec_reads_one_an_older_release_wrote_under_cas(tmp_path: Path, server: Server) -> None:
-    server.legacy_specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=0.14.60\n"
-    assert Releases(str(tmp_path), "unused", server.url, None).spec_version(SPEC) == "0.14.60"
+def test_bootstrap_spec_reads_one_written_compressed_under_ac(tmp_path: Path, server: Server) -> None:
+    server.zstd_specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=0.15.0\n"
+    assert Releases(str(tmp_path), "unused", server.url, None).spec_version(SPEC) == "0.15.0"
 
 
-def test_bootstrap_spec_that_does_not_decompress_is_corrupt(
+def test_bootstrap_spec_under_ac_that_does_not_decompress_is_corrupt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run = subprocess.run
