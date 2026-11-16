@@ -1750,12 +1750,14 @@ class Coordinator:
 
         Raises ResultMismatch when the record is for another action than the lease's.
         """
-        host_id = self.lease_hosts.pop(token, None)
+        # Forgotten only once the result is applied or dropped: a worker retries a completion that failed.
+        host_id = self.lease_hosts.get(token)
         async with self.engine.begin() as conn:
             batch_id = await conn.scalar(
                 sa.text("SELECT batch_id FROM leases WHERE attempt_token = :token"), {"token": token}
             )
             if batch_id is None:
+                self.lease_hosts.pop(token, None)
                 return False
             await self._lock_batch(conn, batch_id)
             lease = (
@@ -1767,6 +1769,7 @@ class Coordinator:
                 )
             ).first()
             if lease is None:
+                self.lease_hosts.pop(token, None)
                 return False
             action = (
                 await conn.execute(
@@ -1868,6 +1871,7 @@ class Coordinator:
                 await self._fail(
                     conn, batch_id, action.input_key, action.action_class, f"{action.theory}: {result.failure}{detail}"
                 )
+        self.lease_hosts.pop(token, None)
         if host_id is not None:
             self._record_result(host_id, result)
         self._batch_changed(batch_id)

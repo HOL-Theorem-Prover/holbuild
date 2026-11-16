@@ -1165,6 +1165,31 @@ async def test_a_host_whose_last_five_results_were_infrastructure_failures_gets_
     assert coordinator._quarantine("host-a") is None
 
 
+async def test_a_completion_retried_after_a_failed_attempt_still_counts_for_its_host(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator.infra_streak["host-a"] = coordinator_module.QUARANTINE_FAILURES
+    await submit(http, ["a"])
+    coordinator.probe_at["host-a"] = coordinator.clock() - timedelta(seconds=coordinator_module.PROBE_SECONDS)
+    claimed = await coordinator.claim(["standard"], "w", host_id="host-a")
+    assert claimed is not None
+    lock_batch = coordinator._lock_batch
+    calls = 0
+
+    async def flaky(*args: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("pool timeout")
+        await lock_batch(*args)
+
+    monkeypatch.setattr(coordinator, "_lock_batch", flaky)
+    with pytest.raises(TimeoutError):
+        await coordinator.complete(claimed.attempt_token, parse_result(result("a", "built")))
+    assert await coordinator.complete(claimed.attempt_token, parse_result(result("a", "built")))
+    assert coordinator._quarantine("host-a") is None and coordinator.lease_hosts == {}
+
+
 async def test_a_host_reporting_too_little_disk_gets_no_work_until_it_reports_room(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
