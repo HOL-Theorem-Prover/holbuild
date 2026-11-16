@@ -136,6 +136,7 @@ class Server:
     claim_started: threading.Event = field(default_factory=threading.Event)
     hold_claim: threading.Event | None = None
     protection_reply: dict[str, object] = field(default_factory=dict)
+    protection_status: int = 200
 
 
 @pytest.fixture
@@ -195,7 +196,7 @@ def server() -> Iterator[Server]:
 
         def do_PUT(self) -> None:
             state.protection.append(json.loads(self.body()))
-            self.reply(200, json.dumps(state.protection_reply))
+            self.reply(state.protection_status, json.dumps(state.protection_reply))
 
         def log_message(self, format: str, *args: object) -> None:
             pass
@@ -581,6 +582,14 @@ def test_ecs_protection_rejection_in_a_success_response_is_logged(
     server.protection_reply = {field: {"Reason": "DEPLOYMENT_BLOCKED"}}
     Protection(None, server.url).set(enabled=True)
     assert "DEPLOYMENT_BLOCKED" in capsys.readouterr().err
+
+
+def test_ecs_protection_refused_with_an_http_error_is_logged(
+    server: Server, capsys: pytest.CaptureFixture[str]
+) -> None:
+    server.protection_status = 400
+    Protection(None, server.url).set(enabled=True)
+    assert "HTTP Error 400" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("text", ["-1", "nan", "inf"])
