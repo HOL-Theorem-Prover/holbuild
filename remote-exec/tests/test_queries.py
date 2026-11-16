@@ -435,8 +435,8 @@ STATEMENTS = [
     ),
     Statement("SELECT ahead_cap, max_heap_mb FROM batches", lambda f: {"id": f.fresh}, 100),
     Statement(
-        "UPDATE actions SET state = 'done', log_sha256 = :log",
-        lambda f: {"log": "log", "batch_id": f.steady, "input_key": f.steady_arrival.keys("ready")[0]},
+        cm.FINISH_PEERS,
+        lambda f: {"logs": ["log"], "batch_id": f.steady, "keys": f.steady_arrival.keys("ready")[:1]},
         11_000,
     ),
     Statement("UPDATE leases SET expires_at = now() + make_interval", lambda f: {"lease": 120, "token": f.token}, 100),
@@ -483,7 +483,7 @@ STATEMENTS = [
         11_000,
     ),
     # expiry
-    Statement("SELECT l.attempt_token, l.batch_id FROM leases l JOIN batches b", lambda f: {"lease": 120}, 1_500),
+    Statement("SELECT l.attempt_token, l.batch_id FROM leases l WHERE", lambda f: {"lease": 120}, 1_500),
     Statement(
         "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now()", lambda f: {"token": f.expired}, 100
     ),
