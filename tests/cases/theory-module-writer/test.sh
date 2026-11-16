@@ -4,9 +4,11 @@
 # modules, nor when a store with its base theories lacks fewer than 16 of
 # the modules the action wants, nor while another process holds the
 # store's writer lock.  A fake HOL stands in for the writer: it counts its
-# runs and leaves the files named in $tmpdir/writes in its output
-# directory.  Where /dev/shm is another file system, a store there stands
-# for one a worker's containers share on a mount of its own.
+# runs, records its output directory's file system and leaves the files
+# named in $tmpdir/writes there.  The worker cache cap's sweep leaves a
+# store alone while its writer runs.  Where /dev/shm is another file
+# system, a store there stands for one a worker's containers share on a
+# mount of its own: the writer writes on that file system.
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 source "$ROOT/tests/lib.sh"
@@ -25,7 +27,8 @@ for hol in hol1 hol2 hol3; do
 #!/usr/bin/env bash
 echo run >> "$tmpdir/$hol.runs"
 cp "\${@: -1}" "$tmpdir/$hol.script"
-out=\$(echo "$tmpdir"/cache/theory-modules-writer/*)
+out=\$(dirname "\$(grep -o 'openOut "[^"]*/unsupported"' "\${@: -1}" | cut -d'"' -f2)")
+stat -L -c %d "\$out" > "$tmpdir/$hol.output-device"
 while read -r file; do : > "\$out/\$file"; done < "$tmpdir/writes"
 SH
   chmod +x "$tmpdir/$hol/bin/hol"
@@ -132,6 +135,30 @@ val _ = fill "hol2";
 val _ = check "the unsupported marker was not stored" (runs "hol2" = 1 andalso stored "hol2" "unsupported");
 val _ = fill "hol2";
 val _ = check "a writer ran for an unsupported toolchain" (runs "hol2" = 1);
+
+(* The cache cap's sweep skips a store while its writer holds the lock. *)
+fun lock_store hol =
+  case Posix.Process.fork () of
+      NONE => (ignore (HolbuildFileLock.try_acquire_path
+                         {path = OS.Path.concat (store hol, "writer.lock"), obsolete_kind = NONE});
+               E.write_text ("$tmpdir/locked-" ^ hol) "";
+               OS.Process.sleep (Time.fromSeconds 60);
+               Posix.Process.exit 0w0)
+    | SOME pid =>
+        let fun await () = if exists ("$tmpdir/locked-" ^ hol) then ()
+                           else (OS.Process.sleep (Time.fromMilliseconds 50); await ())
+        in await (); pid end;
+fun unlock pid =
+  (Posix.Process.kill (Posix.Process.K_PROC pid, Posix.Signal.kill);
+   ignore (Posix.Process.waitpid (Posix.Process.W_CHILD pid, [])));
+fun sweep () = List.app (fn {evict, ...} => ignore (evict ())) (E.module_cache_families "$tmpdir/cache");
+val writer = lock_store "hol1";
+val _ = sweep ();
+val _ = check "the sweep evicted a store its writer was filling" (stored "hol1" b);
+val _ = check "the sweep kept an idle store" (not (exists (store "hol2")));
+val _ = unlock writer;
+val _ = sweep ();
+val _ = check "the sweep kept an idle store once its writer finished" (not (exists (store "hol1")));
 SML
 if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmpdir") ]]; then
   other_fs=$(mktemp -d /dev/shm/holbuild-module-writer.XXXXXX)
@@ -143,6 +170,10 @@ val _ = writes [a, b, "base-theories"];
 val _ = fill "hol3";
 val _ = check "modules were not stored on another file system"
           (runs "hol3" = 1 andalso List.all (stored "hol3") [a, b, "base-theories"]);
+val _ = check "the writer wrote off the store's file system"
+          (E.read_text "$tmpdir/hol3.output-device" =
+           Int.toString (SysWord.toInt (Posix.FileSys.devToWord (Posix.FileSys.ST.dev
+             (Posix.FileSys.stat "$other_fs")))) ^ "\n");
 SML
 else
   echo "skipping the store on another file system: no /dev/shm on another file system"
