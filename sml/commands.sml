@@ -311,7 +311,7 @@ fun exec_action_help () = print
   \                     the cache root holds at most N GB minus the reserve.\n\
   \--cache-reserve-gb N Room to keep free under the limit (default: a tenth).\n\
   \--cache-min-free-gb N Also evict while the cache's disk has under N GB\n\
-  \                     free, to N GB plus a buffer (default: 0, off).\n\
+  \                     free, to N GB plus 8 GB (default: 0, off).\n\
   \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
   \                     other workers published, and publish this run's. The\n\
   \                     host store CACHE/checkpoint-store keeps their files.\n\

@@ -1084,7 +1084,7 @@ def busy(host_id: str, leases: int) -> HostReport:
 
 
 def short_of_disk(host_id: str, free: int = 1 << 30) -> HostReport:
-    return replace(busy(host_id, 0), disk_free=free, disk_total=200 << 30)
+    return replace(busy(host_id, 0), disk_free=free)
 
 
 async def fail_on(http: httpx.AsyncClient, coordinator: Coordinator, host_id: str, failure: str | None) -> None:

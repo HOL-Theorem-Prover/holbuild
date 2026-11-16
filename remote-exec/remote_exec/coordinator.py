@@ -262,8 +262,7 @@ class HostReport:
     leases: Amount
     memory_short: bool
     rank: Annotated[int, Field(ge=0, le=MAX_HOST_RANK)] = 0
-    disk_free: Amount | None = None  # bytes free and in all on the host disk the worker's claims depend on
-    disk_total: Amount | None = None
+    disk_free: Amount | None = None  # bytes free on the host disk the worker's claims depend on
 
 
 # Seconds of a worker's time in one phase since its last report. No upper bound: a worker that couldn't report

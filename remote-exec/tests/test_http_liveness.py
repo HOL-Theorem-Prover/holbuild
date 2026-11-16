@@ -149,7 +149,7 @@ async def herd(http: httpx.AsyncClient) -> None:
 
     full_host = {"id": "full-host", "cpu_idle_pct": 90.0, "mem_total": 64 << 30, "mem_available": 60 << 30,
                  "budget": 52 << 30, "reserved": 0, "leases": 0, "memory_short": False, "rank": 0,
-                 "disk_free": 1 << 30, "disk_total": 200 << 30}
+                 "disk_free": 1 << 30, "disk_total": 200 << 30}  # as 0.14.57's workers still send it
 
     async def quarantined(index: int) -> None:
         """A worker on a host reporting too little disk: it waits apart from the herd and gets nothing."""

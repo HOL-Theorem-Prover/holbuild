@@ -92,7 +92,7 @@ local
   val word32 = Word32.toLargeInt
 in
 (* The bytes and inodes statvfs says unprivileged users may still take on
-   the filesystem holding dir, and its size in bytes, or NONE where it fails.  Glibc's struct
+   the filesystem holding dir, or NONE where it fails.  Glibc's struct
    statvfs on 64-bit Linux has 64-bit fields; Darwin's counts are 32-bit,
    after two 64-bit sizes.  A filesystem with no fixed inode count (btrfs)
    reports 0 inodes in all, and has no inode limit. *)
@@ -103,12 +103,10 @@ fun disk_free dir =
       if statvfs (dir, buf) <> 0 then NONE
       else if darwin () then
         SOME {bytes = word (Memory.get64 (buf, 0w1)) * word32 (Memory.get32 (buf, 0w6)),
-              size = word (Memory.get64 (buf, 0w1)) * word32 (Memory.get32 (buf, 0w4)),
               inodes = if Memory.get32 (buf, 0w7) = 0w0 then NONE
                        else SOME (word32 (Memory.get32 (buf, 0w9)))}
       else
         SOME {bytes = word (Memory.get64 (buf, 0w1)) * word (Memory.get64 (buf, 0w4)),
-              size = word (Memory.get64 (buf, 0w1)) * word (Memory.get64 (buf, 0w2)),
               inodes = if Memory.get64 (buf, 0w5) = 0w0 then NONE
                        else SOME (word (Memory.get64 (buf, 0w7)))}
   in
@@ -133,7 +131,7 @@ fun disk_floor () =
 (* Whether the filesystem holding dir is below the floor. *)
 fun below_disk_floor dir =
   case disk_free dir of
-      SOME {bytes, inodes, ...} =>
+      SOME {bytes, inodes} =>
         let val floor = disk_floor ()
         in
           bytes < #bytes floor orelse

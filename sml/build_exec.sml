@@ -10482,17 +10482,17 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
        worker-cache-cap.state, so a host running both doesn't thrash either. *)
     val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap-v3.state")
     val state_header = "holbuild-worker-cache-cap-v3"
-    (* Bytes to evict to bring the disk back over the floor with a buffer of
-       max(8 GiB, 4% of it), or 0 when it is over. *)
+    (* Bytes to evict to bring the disk back over the floor with an 8 GiB
+       buffer, or 0 when it is over. *)
     fun floor_deficit () =
       if min_free_bytes <= 0 then 0
       else
         case HolbuildCacheTransfer.disk_free cache of
             NONE => 0
-          | SOME {bytes = free, inodes, size} =>
+          | SOME {bytes = free, inodes} =>
               if free >= min_free_bytes andalso (case inodes of SOME n => n >= 65536 | NONE => true) then 0
               else
-                let val buffer = LargeInt.max (gb_to_bytes 8, size div 25)
+                let val buffer = gb_to_bytes 8
                 in LargeInt.max (buffer, min_free_bytes + buffer - free) end
     fun parse_sizes [] = SOME []
       | parse_sizes (id :: bytes :: rest) =

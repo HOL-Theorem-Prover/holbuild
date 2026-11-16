@@ -663,8 +663,8 @@ disk() {
 import os, sys
 s = os.statvfs(sys.argv[1])
 gib = 1024 ** 3
-free, size = s.f_bavail * s.f_frsize, s.f_blocks * s.f_frsize
-buffer = max(8 * gib, size // 25)
+free = s.f_bavail * s.f_frsize
+buffer = 8 * gib
 # A floor 32 GiB over what's free, and families each larger than what the
 # sweep must evict for it, with 64 GiB to spare for other writers on the disk.
 floor = free // gib + 32
