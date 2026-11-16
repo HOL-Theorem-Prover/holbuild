@@ -396,7 +396,7 @@ expect b 0 "status=built"
 cmp "$tmpdir/dep.dat" "$tmpdir/worker-b/blobs/$dep_dat"
 # Its record times the action and its phases.
 require_grep '^wall-ms=[0-9][0-9]*$' "$tmpdir/b.result"
-for phase in hydrate hydfiles hyddeps hydstale hydmisfit modules analyse hol check; do
+for phase in hydrate hydfiles hyddeps hydstale hydmisfit analyse hol check; do
   grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/b.result" || {
     echo "b's record lacks phase $phase:" >&2; cat "$tmpdir/b.result" >&2; exit 1; }
 done
@@ -416,8 +416,8 @@ printf 'corrupt dependency\n' > "$tmpdir/worker-c/blobs/$dep_dat"
 worker c "$spec_c"
 expect c 0 "status=built"
 cmp "$tmpdir/dep.dat" "$tmpdir/worker-c/blobs/$dep_dat"
-# Before C's child ran, the worker wrote the modules of the theories it
-# loads into the host's store, which the child itself only reads.
+# After C's result, the worker wrote the modules of the theories C loads
+# into the host's store, which theory children only read.
 if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   for theory in A B; do
     compgen -G "$tmpdir/worker-c/theory-modules/*/*-$theory-*.pmo" > /dev/null || {
@@ -447,6 +447,29 @@ SML
   worker c "$(spec_for "$tmpdir/batch-d.txt" worker:DTheory)"
   expect c 0 "status=built"
   rm "$project/src/DScript.sml"
+  # A failed action fills the store too: a theory's failing attempts are
+  # what most often run again on the host.
+  cat > "$project/src/FScript.sml" <<'SML'
+Theory F
+Ancestors B
+
+Theorem f_thm:
+  F
+Proof
+  ACCEPT_TAC b_thm
+QED
+SML
+  hb action-spec --upload FTheory > "$tmpdir/batch-f.txt"
+  worker f "$(spec_for "$tmpdir/batch-f.txt" worker:FTheory)"
+  expect f 1 "status=failed" "failure=proof"
+  for theory in A B; do
+    compgen -G "$tmpdir/worker-f/theory-modules/*/*-$theory-*.pmo" > /dev/null || {
+      echo "worker f wrote no module for $theory after a failed action" >&2
+      cat "$tmpdir/f.log" >&2
+      exit 1
+    }
+  done
+  rm "$project/src/FScript.sml"
 elif [[ ! -e "$HOLDIR/tools-poly/poly/theory_modules.ML" ]]; then
   # A HOL without the module helper starts no writer, which alone makes
   # the store.
