@@ -1347,7 +1347,7 @@ key. Cache hits materialise validated artefacts into the local `.holbuild/`
 tree. Standard cache entries do not require a trace blob.
 
 Source, action and toolchain keys and cache blobs are SHA-256 digests, the
-digest Bazel-style remote caches use for `/cas/`. holbuild 0.13.0 switched
+digest Bazel-style remote caches use. holbuild 0.13.0 switched
 them from SHA-1, so it reads none of the local cache entries, remote cache
 entries or HOL toolchains that earlier releases wrote: its first build of a
 project builds the toolchain and every theory again (or restores what other
@@ -1386,7 +1386,7 @@ so inline credentials and curl-config credentials give the same ranking;
 the HTTP request retains its full URL. Every client and worker must use the same normalized URL spellings
 and node set; different public/private hostnames give different rankings.
 
-For each `/ac/<digest>` or `/cas/<digest>` request, nodes rank by descending
+For each `/ac/<digest>` request, nodes rank by descending
 SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie).
 `HOLBUILD_REMOTE_CACHE_PREFERRED_URLS`, a comma-separated list of ring nodes,
 moves those nodes to the front, each group keeping that order: a client in
@@ -1451,10 +1451,16 @@ published it meanwhile; an archive that is missing its blob or fails to extract
 or validate is replaced by the local build (a failed download is not). Local and remote hits are not re-uploaded, and publication
 failure is only a warning.
 
-The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
-cache metadata under `/ac/<sha256>`; a blob's CAS digest is the same one
-holbuild uses locally. CAS transfers use zstd compression when
-supported by the server; action metadata stays small and is sent uncompressed.
+The remote endpoint stores holbuild cache metadata under `/ac/<sha256>`, and
+each content blob, compressed with zstd by its writer, under `/ac/<blob key>`,
+where `blob key = sha256("holbuild-zstd-blob-v1\n" ^ digest ^ "\n")` and the
+digest is the SHA-256 holbuild uses for the blob locally. The server keeps
+these bodies as they are, so it spends no CPU on compression, and a reader
+decompresses a blob and checks its digest. holbuild 0.15.0 moved blobs there
+from `/cas/<sha256>`, which costs a Bazel-style server a decompression, a hash
+and a recompression per upload; it reads no remote entry earlier releases
+wrote. The server must accept any `/ac/` body (bazel-remote:
+`--disable_http_ac_validation`), and blob transfers need the `zstd` command.
 This is a live accelerator, not remote execution and not an immutable release
 registry. Remote cache contents are trusted build inputs: cache hits can load
 Poly/ML objects, and restored toolchains execute cached binaries. Use an
@@ -1559,7 +1565,7 @@ with everything another machine needs to build that one theory from the remote
 cache alone. A theory counts as satisfied only if its remote entry would
 restore for this build: a usable manifest whose timeout contract is at least
 as strict as the one requested, and every blob it names still in the cache
-(`HEAD /cas/<sha256>` answering anything but 404), since a cache may expire
+(`HEAD /ac/<blob key>` answering anything but 404), since a cache may expire
 an entry's blobs before the entry. The command takes `build`'s cache and proof
 options (`--tactic-timeout`, `--skip-proof-steps`, ...) and needs a remote
 cache:
@@ -1570,7 +1576,7 @@ holbuild --remote-cache https://cache.example.org action-spec --upload MyTheory
 
 Each spec is written to `.holbuild/action-specs/<sha256>`, named by its
 SHA-256. With `--upload`, the specs and every source file they name are also
-uploaded to the remote cache's `/cas/`. `build --remote-exec` writes and uploads
+uploaded to the remote cache as blobs. `build --remote-exec` writes and uploads
 the same specs, then removes its local copies, since workers fetch them from
 the remote cache. The command prints the batch, the
 uncached theories with the uncached theories each waits for:
@@ -1583,7 +1589,7 @@ edge <input_key> <parent input_key>
 
 A theory is ready to build once all its `edge` parents' results are in the
 remote cache, that is once `/ac/<ac-key>` exists for each;
-`ac-key = sha256("holbuild-remote-ac-v1\n" ^ input_key ^ "\n")` is where
+`ac-key = sha256("holbuild-remote-ac-v2\n" ^ input_key ^ "\n")` is where
 holbuild stores a theory's entry. An edge names the nearest uncached theories
 a theory depends on, looking through libraries and cached theories.
 
@@ -1691,8 +1697,8 @@ timing, and prints one line per exported target:
 <context> <run_key> <spec-sha256>
 ```
 
-The spec is written to `.holbuild/run-specs/<spec-sha256>` and uploaded to
-`/cas/` with every file it names. `run-action --remote-exec` writes and uploads
+The spec is written to `.holbuild/run-specs/<spec-sha256>` and uploaded as a
+blob with every file it names. `run-action --remote-exec` writes and uploads
 the same specs, then removes its local copies. The run key is the SHA-256 of the run text:
 
 ```text
@@ -1712,7 +1718,7 @@ key of their own. Options such as the timeout stay out of the key: a longer
 timeout doesn't make a new run. The input-layout marker distinguishes runs
 with staged declared inputs from earlier runs that could not read those files.
 Input-free and HOL context run keys are unchanged. A run's result is stored, like a theory's,
-under `ac-key = sha256("holbuild-remote-ac-v1\n" ^ run_key ^ "\n")`.
+under `ac-key = sha256("holbuild-remote-ac-v2\n" ^ run_key ^ "\n")`.
 
 A run spec names no path on the exporting machine:
 
@@ -1902,7 +1908,7 @@ theory itself, and is given:
 
 Its support files are beside it, under the names they were exported with.
 If HOL exits 0 having written every declared output as a file, the worker
-uploads the outputs to `/cas/` and puts the run's entry at its key:
+uploads the outputs as blobs and puts the run's entry at its key:
 
 ```text
 holbuild-cache-action-v4
@@ -1951,7 +1957,7 @@ checkpoints), `toolpublish` (the tool cache), `check` (the publication
 checks) and `log`; stderr ends with the same times and `wall`.
 `peak-rss-mb` is the HOL process's peak resident memory, reported once the
 theory has been exported.
-`log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
+`log` is the build log, or the run's HOL output, uploaded as a blob. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during
 a failed run, whether the OOM killer took the HOL process or a process it
 started (a nested HOL whose failure it caught, say); `disk` means the disk
@@ -2233,14 +2239,15 @@ The coordinator's protocol, in what holbuild uses of it:
   `{"type": "action", "input_key", "theory", "state", "last_failure",
   "log_sha256", "failure_detail", ...}` when an action changes, and last
   `{"type": "batch", "state": "done"|"failed"|"cancelled", "failure"}`. A
-  failed action's log is at `/cas/<log_sha256>` in the remote cache. The log
+  failed action's log is the blob `<log_sha256>` in the remote cache. The log
   includes the action's failure diagnostic even when it failed before starting
   HOL, provided the worker can write and upload the log; a failure with no
   log, such as a spec the worker rejects, says why in `failure_detail`, which
   holbuild prints with the failure. A failure without a log, such as an
   interrupted attempt, keeps the log an earlier attempt uploaded. An action
   retried after a failure is printed as
-  `waiting (<failure>), attempts <n>, tier <tier>, log /cas/<sha>`, and
+  `waiting (<failure>), attempts <n>, tier <tier>, log /cas/<sha>` (`<sha>`
+  names the log blob; the `/cas/` prefix predates the blob layout), and
   likewise when ready and running. A stream may start over: it
   sends every action's current state first.
   A skipped dependent uses the existing action state `cancelled` with
@@ -2355,7 +2362,7 @@ output names, so the same run is done once. The command:
 1. Plans the targets and computes each run's key; it reads no build output
    and builds nothing.
 2. Checks the remote cache for each run's entry (`/ac/<ac-key>`, `kind=run`,
-   with every declared output in `/cas/`); a run that has one is `cached`.
+   with every declared output in the cache); a run that has one is `cached`.
 3. Exports the others' specs, publishing first the theories they need that
    only the local cache holds, and refusing a run that needs one neither
    cache holds with `build it first`.
