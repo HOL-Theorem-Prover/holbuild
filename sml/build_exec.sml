@@ -399,6 +399,10 @@ fun module_store holdir =
   Path.concat (module_stores (),
                HolbuildHash.string_sha256 (Path.mkAbsolute {path = holdir, relativeTo = FS.getDir ()}))
 
+(* Held by the worker process whose writer is filling a store
+   (write_missing_modules); the cache cap's sweep leaves that store alone. *)
+val module_store_writer_lock = "writer.lock"
+
 (* Older HOL installations keep their source loader.  Compile [code] only
    after checking that Meta has the optional [values]. *)
 fun if_meta_has values code =
@@ -437,10 +441,14 @@ fun trace_line call =
    so nothing it compiles is published there. *)
 fun write_child_policy_with {module_cache = use_module_cache} tc path =
   let
+    val store = module_store (#holdir tc)
     val module_cache =
-      module_policy {sandboxed = HolbuildActionSandbox.active (), store = module_store (#holdir tc),
+      module_policy {sandboxed = HolbuildActionSandbox.active (), store = store,
                      base_state = HolbuildToolchain.base_state tc}
   in
+    (* The cache sweeps evict the stores used least recently, and reading
+       modules leaves a store's time alone. *)
+    if use_module_cache then HolbuildCache.touch store else ();
     write_text path
       ("(* HOL discovers sibling stages at startup; they can disappear during a load. *)\n" ^
        "val _ = Meta.loadPath := List.filter (fn dir => not " ^
@@ -10394,16 +10402,26 @@ fun auto_project_gc project threshold =
        | e => warn ("automatic gc failed: " ^ General.exnMessage e)
 
 (* Factory modules have no on-disk module parents.  Once loaded their code
-   is resident, so concurrent eviction only makes a later load use source. *)
+   is resident, so concurrent eviction only makes a later load use source.
+   A store whose writer is filling it is skipped. *)
 fun module_cache_families cache =
   List.map
     (fn path =>
        {mtime = modified_time path,
         evict = fn () =>
-          let val bytes = tree_bytes path
+          let
+            fun remove () =
+              let val bytes = tree_bytes path
+              in
+                remove_tree path;
+                if path_exists path then NONE else SOME bytes
+              end
           in
-            remove_tree path;
-            if path_exists path then NONE else SOME bytes
+            case HolbuildFileLock.try_acquire_path
+                   {path = Path.concat (path, module_store_writer_lock), obsolete_kind = NONE} of
+                NONE => NONE
+              | SOME lock => (remove () before HolbuildFileLock.release lock)
+                             handle e => (HolbuildFileLock.release lock; raise e)
           end})
     (HolbuildCache.children (HolbuildCache.theory_modules_dir cache))
 
@@ -11880,16 +11898,14 @@ val module_writer_limit = 64
 val module_writer_min_missing = 16
 
 (* Files the module writer leaves in a toolchain's store beside its
-   modules.  [module_store_unsupported]: the toolchain has HOL's module
-   helper but its runtime or Meta cannot write modules, so no writer runs
-   again for it (the store, named by the HOL directory, is per Poly/ML
-   runtime).  [module_store_base_theories]: the theories of the toolchain's
-   base state, one per line; they are in the state, so HOL writes no
-   module for them.  [module_store_writer_lock]: held by the worker
-   process whose writer is writing for the store. *)
+   modules and its lock.  [module_store_unsupported]: the toolchain has
+   HOL's module helper but its runtime or Meta cannot write modules, so no
+   writer runs again for it (the store, named by the HOL directory, is per
+   Poly/ML runtime).  [module_store_base_theories]: the theories of the
+   toolchain's base state, one per line; they are in the state, so HOL
+   writes no module for them. *)
 val module_store_unsupported = "unsupported"
 val module_store_base_theories = "base-theories"
-val module_store_writer_lock = "writer.lock"
 
 (* The writer script: records whether the toolchain can write modules,
    the base state's theories when [base_theories], and then writes the
@@ -11932,7 +11948,7 @@ fun module_writer_script {output, base_theories, call} =
    has its base theories and lacks fewer than module_writer_min_missing of
    the modules wanted, or while another process writes to the store.  A
    failure leaves the action to load from .dat files. *)
-fun write_missing_modules cache root tc {deps, loads} =
+fun write_missing_modules root tc {deps, loads} =
   let
     val store = module_store (#holdir tc)
     val base_theories_file = Path.concat (store, module_store_base_theories)
@@ -11993,9 +12009,10 @@ fun write_missing_modules cache root tc {deps, loads} =
         then Path.concat (Path.dir (Path.dir dir), Path.file b)
         else b
       end
-    (* The worker's actions share its cache; the store's lock keeps this
-       directory to one writer. *)
-    val output = Path.concat (Path.concat (cache, "theory-modules-writer"), Path.file store)
+    (* Inside the store, so that the moves below are renames on its file
+       system, however a worker's containers mount the stores.  The writer
+       may write only here, and the store's lock keeps it to one writer. *)
+    val output = Path.concat (store, ".writer")
     val script = in_root root ".holbuild/theory-module-writer.sml"
     val log = in_root root ".holbuild/theory-module-writer.log"
     val call =
@@ -12005,17 +12022,11 @@ fun write_missing_modules cache root tc {deps, loads} =
       ", base_state = " ^ HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^
       ", output = " ^ HolbuildToolchain.sml_string output ^
       ", limit = " ^ Int.toString module_writer_limit ^ "};"
-    (* A worker's containers can share the store on a mount of its own,
-       which rename cannot cross. *)
-    fun install old new =
-      FS.rename {old = old, new = new}
-      handle e as OS.SysErr (_, SOME err) =>
-        if err = Posix.Error.xdev then copy_binary old new else raise e
     fun move file =
       if module_file_wanted expected file orelse
          file = module_store_unsupported orelse
          (file = module_store_base_theories andalso not (isSome base_theories))
-      then install (Path.concat (output, file)) (Path.concat (store, file))
+      then FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)}
       else ()
     fun write () =
       (HolbuildRemoveTree.remove_untrusted output;
@@ -12042,12 +12053,12 @@ fun write_missing_modules cache root tc {deps, loads} =
             handle e => (HolbuildFileLock.release lock; raise e)
   end
 
-fun fill_module_store cache root tc wanted =
+fun fill_module_store root tc wanted =
   let val holdir = #holdir tc
   in
     if file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
        not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
-    then write_missing_modules cache root tc wanted
+    then write_missing_modules root tc wanted
     else ()
   end
   handle e => warn ("theory modules not written: " ^ General.exnMessage e)
@@ -12592,7 +12603,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
       let
         val _ =
           case ahead of
-              NONE => phase "modules" (fn () => fill_module_store cache root tc {deps = #deps spec, loads = #loads spec})
+              NONE => phase "modules" (fn () => fill_module_store root tc {deps = #deps spec, loads = #loads spec})
             | SOME _ => ()
         val action =
           spec_theory_action root spec (cutoff_context spec cutoff)
@@ -12760,7 +12771,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               SOME hash => hash
             | NONE => raise Error ("no hash recorded for " ^ path)
         val source_text = read_text (in_root root (action_source_path package (#path (#source spec))))
-        val _ = phase "modules" (fn () => fill_module_store cache root tc {deps = present, loads = #loads spec})
+        val _ = phase "modules" (fn () => fill_module_store root tc {deps = present, loads = #loads spec})
         val tool_cache = setup_tool_cache spec
         (* The stage's names don't depend on the deps context. *)
         val action = spec_theory_action root spec (cutoff_context spec NONE)

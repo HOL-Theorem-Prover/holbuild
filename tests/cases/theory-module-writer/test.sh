@@ -60,7 +60,7 @@ val wanted = {deps = [dep "A", dep "B"] @ List.tabulate (16, fn i => dep ("P" ^ 
               loads = [E.LoadTheory "boolTheory"]};
 fun tc hol = {holdir = "$tmpdir/" ^ hol, maxheap = NONE,
               kernel_variant = HolbuildToolchain.StandardKernel};
-fun fill hol = E.fill_module_store "$tmpdir/cache" "$tmpdir/root" (tc hol) wanted;
+fun fill hol = E.fill_module_store "$tmpdir/root" (tc hol) wanted;
 fun store hol = E.module_store ("$tmpdir/" ^ hol);
 fun stored hol file = exists (OS.Path.concat (store hol, file));
 val a = "ab12-A-$a_sha.pmo";
