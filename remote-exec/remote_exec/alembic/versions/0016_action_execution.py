@@ -1,13 +1,13 @@
 """Retain the latest action claim's worker and completion time.
 
-Revision ID: 0018
-Revises: 0017
+Revision ID: 0016
+Revises: 0015
 """
 
 from alembic import op
 
-revision = "0018"
-down_revision = "0017"
+revision = "0016"
+down_revision = "0015"
 branch_labels = None
 depends_on = None
 

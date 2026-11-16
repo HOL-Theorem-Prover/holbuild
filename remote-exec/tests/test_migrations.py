@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from conftest import REMOTE_EXEC_DIR, FakeCache
 from test_coordinator import batch, build, submit
 
-NEW_COLUMNS = {"latest_attempt_token", "interrupted_output", "log_zstd", "log_error", "finished_at", "worker"}
+NEW_COLUMNS = {"finished_at", "worker"}
 
 
 def migrate(engine: AsyncEngine, revision: str, *, downgrade: bool = False) -> None:
@@ -40,13 +40,11 @@ async def test_action_column_baseline_preserves_existing_actions_and_downgrades(
         batch_id = await submit(http, ["a"])
         await asyncio.to_thread(migrate, remote_exec_engine, "head")
         await asyncio.to_thread(migrate, remote_exec_engine, "head")
-        assert await version(remote_exec_engine) == "0018"
+        assert await version(remote_exec_engine) == "0016"
         assert NEW_COLUMNS <= await actions_columns(remote_exec_engine)
         async with remote_exec_engine.connect() as connection:
-            row = (await connection.execute(sa.text(
-                "SELECT latest_attempt_token, interrupted_output, log_zstd, log_error, finished_at, worker FROM actions"
-            ))).one()
-        assert tuple(row) == (None,) * 6
+            row = (await connection.execute(sa.text("SELECT finished_at, worker FROM actions"))).one()
+        assert tuple(row) == (None, None)
 
         # The runtime never reads the new columns, but still claims and completes rows that predate them.
         await build(http, cache, "a")
