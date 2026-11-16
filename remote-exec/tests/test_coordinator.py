@@ -1207,6 +1207,25 @@ async def test_a_claim_reporting_only_its_host_id_is_quarantined_and_freshens_no
     assert coordinator.hosts["host-a"] == reported
 
 
+async def test_a_failing_host_whose_workers_send_only_its_id_stays_quarantined(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    now = coordinator.clock()
+    coordinator.clock = lambda: now
+    coordinator.report_host(busy("host-a", 0))
+    for _ in range(coordinator_module.QUARANTINE_FAILURES):
+        await fail_on(http, coordinator, "host-a", "internal")
+    await submit(http, ["a"])
+    body = {"tier": "standard", "worker": "w", "host": {"id": "host-a", "rank": 0}}
+    for _ in range(3):
+        now += timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS / 2)
+        coordinator.probe_at["host-a"] = now  # no probe due: only the quarantine decides
+        response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+        assert response.status_code == 204, response.text
+        await coordinator.queue()
+    assert coordinator._quarantine("host-a") == "failures"
+
+
 async def test_a_disk_report_too_old_to_trust_quarantines_nothing(coordinator: Coordinator) -> None:
     coordinator.report_host(short_of_disk("host-a"))
     reported = coordinator.clock()

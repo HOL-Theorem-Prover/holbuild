@@ -2145,19 +2145,20 @@ class Coordinator:
         )
 
     def _forget_silent_hosts(self, now: datetime) -> None:
-        """Drop the hosts no worker reported for in the last ``HOST_REPORT_SECONDS``, making room for new ones, with
-        what the quarantine knows of them, and the workers that didn't report in that time."""
-        self.hosts = {
-            host: (at, report)
-            for host, (at, report) in self.hosts.items()
-            if (now - at).total_seconds() < HOST_REPORT_SECONDS
-        }
+        """Drop the workers that didn't claim, report or heartbeat in the last ``HOST_REPORT_SECONDS``, and the hosts
+        with neither a report of readings nor such a worker in that time, making room for new ones, with what the
+        quarantine knows of them. A host whose workers can't read it stays known, its readings ageing."""
         self.host_workers = {
             host: fresh
             for host, workers in self.host_workers.items()
-            if host in self.hosts and (fresh := {
+            if (fresh := {
                 worker: seen for worker, seen in workers.items() if (now - seen[0]).total_seconds() < HOST_REPORT_SECONDS
             })
+        }
+        self.hosts = {
+            host: (at, report)
+            for host, (at, report) in self.hosts.items()
+            if (now - at).total_seconds() < HOST_REPORT_SECONDS or host in self.host_workers
         }
         self.infra_streak = {host: n for host, n in self.infra_streak.items() if host in self.hosts}
         self.probe_at = {host: at for host, at in self.probe_at.items() if host in self.hosts}
