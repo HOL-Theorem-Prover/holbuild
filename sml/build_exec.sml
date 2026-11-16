@@ -28,7 +28,9 @@ fun has_suffix suffix s =
 fun ensure_dir path =
   if path = "" orelse path = "." then ()
   else if FS.access(path, []) handle OS.SysErr _ => false then ()
-  else (ensure_dir (Path.dir path); FS.mkDir path handle OS.SysErr _ => ())
+  else
+    (ensure_dir (Path.dir path);
+     FS.mkDir path handle e as OS.SysErr _ => if FS.isDir path handle OS.SysErr _ => false then () else raise e)
 
 fun ensure_parent path = ensure_dir (Path.dir path)
 
@@ -4045,6 +4047,11 @@ fun prepare_theory_stage speculative tc root (action : theory_action) =
   in
     remove_tree stage_root;
     ensure_dir stage;
+    (* HOL exports the theory into .hol/objs and reports any failure to
+       create that directory, a full disk included, as a path that "already
+       exists but is not a directory"; created here, a full disk fails the
+       export's own writes, which name it. *)
+    ensure_dir (Path.concat(stage, ".hol/objs"));
     (* Extra inputs go in first, so holbuild's own files (the instrumented
        script above all) overwrite any input staged at the same path. *)
     List.app stage_input (#inputs action);
@@ -12612,7 +12619,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                a later step failed. *)
             (peak := peak_rss_mb stage;
              if not (!HolbuildActionSandbox.outputs_validated) then
-               raise ActionFailed (InternalFailure, msg)
+               raise action_failed InternalFailure msg
              else
              let
                val log_text = read_text (build_log ()) handle _ => ""
