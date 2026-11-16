@@ -180,8 +180,10 @@ slashes and duplicate nodes are removed. Inline credentials are excluded from
 node identity, so they agree with curl-config authentication. Use the same
 node hostnames and paths as the clients:
 coordinator reads and worker bootstrap spec downloads use holbuild's digest
-ranking and second-node fallback, including a read's 404 during handoff.
-See the top-level README's remote-cache configuration for the routing contract.
+ranking and second-node fallback, including a read's 404 during handoff; both
+look up entries that must exist, so a 404 beside a node's failure is
+unavailable rather than missing. See the top-level README's remote-cache
+configuration for the routing contract.
 
 Before enabling multiple cache nodes, upgrade the coordinator, workers and
 submitting clients to a release that supports cache rings, and drain batches
