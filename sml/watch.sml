@@ -97,6 +97,19 @@ fun sleep_debounce () = OS.Process.sleep (Time.fromReal 0.25)
 
 fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
+(* The watched files with their content hashes.  inotifywait only starts after
+   a build, so an edit made during the build fires no event; comparing this
+   from before the build with after it finds such an edit. *)
+fun snapshot ({paths, ...} : {paths : string list, manifest_dirs : string list}) =
+  let
+    fun file_hash path =
+      if is_dir path then NONE
+      else SOME (path, HolbuildHash.file_sha256 path)
+           handle IO.Io _ => NONE | OS.SysErr _ => NONE
+  in
+    List.mapPartial file_hash paths
+  end
+
 fun regex_escape text =
   String.translate
     (fn c => if Char.contains ".[]()*+?{}|^$\\" c then "\\" ^ str c else str c)
