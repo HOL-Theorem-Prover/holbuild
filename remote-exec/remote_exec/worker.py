@@ -1308,6 +1308,14 @@ def drain_seconds(text: str) -> float:
     return seconds
 
 
+def worker_name(image: str | None) -> str:
+    """The default worker name: ``host:pid``, then ``@`` and the first 12 hex digits of the digest when ``image``
+    (``REMOTE_EXEC_IMAGE``) names one as ``<repository>@sha256:<digest>``, so a lease says which image ran an action."""
+    name = f"{socket.gethostname()}:{os.getpid()}"
+    _, found, digest = (image or "").partition("@sha256:")
+    return f"{name}@{digest[:12]}" if found and digest else name
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--coordinator", required=True, help="coordinator base URL")
@@ -1359,7 +1367,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="command run with 'on' when the worker takes an action and on each heartbeat, and 'off' when it "
         "finishes, to keep a scaler from stopping a busy worker",
     )
-    parser.add_argument("--name", default=f"{socket.gethostname()}:{os.getpid()}", help="worker name in leases")
+    parser.add_argument(
+        "--name", default=worker_name(os.environ.get("REMOTE_EXEC_IMAGE")),
+        help="worker name in leases (default: host:pid, then @ and the image digest's first 12 hex digits when "
+        "REMOTE_EXEC_IMAGE names the image as <repository>@sha256:<digest>)",
+    )
     parser.add_argument(
         "--drain-seconds", type=drain_seconds, default=20.0,
         help="time for a running action to finish after SIGTERM (default: %(default)s); leave at least 10s "
