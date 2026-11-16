@@ -925,8 +925,8 @@ class Lease:
         self.token = token
         self.lease_s = lease_s
         self.interval = max(1.0, lease_s / 3)
-        # The coordinator expires the lease lease_s after it answered the claim, which arrived at ``claimed`` (by
-        # default now), or after the last heartbeat that renewed it, which arrived after it was sent.
+        # The coordinator expires the lease lease_s after it took the claim or after the last heartbeat that renewed
+        # it, each after its request was sent: ``claimed``, by default now, is when the claim's was.
         self.expires = (time.monotonic() if claimed is None else claimed) + lease_s
         self.protection = protection
         self.lost = threading.Event()
@@ -1028,7 +1028,7 @@ def run_one(
     """Run one claimed action to its end, or until its lease is lost, and report it, adding its phases' time to
     ``phases``. An error in the worker is reported for a retry and then raised, so that ``main`` waits before it
     claims again. True when exec-action reported the remote cache ``unavailable``, after which ``main`` waits too.
-    ``claimed`` is when the claim's answer arrived (``time.monotonic()``), by default now."""
+    ``claimed`` is when the claim's request was sent (``time.monotonic()``), by default now."""
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
     drain = coordinator.drain
@@ -1402,7 +1402,6 @@ def main() -> None:
                 break
             started = time.monotonic()
             claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
-            claimed = time.monotonic()
             if claim is None:
                 # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
                 with phases.timed("idle"):
@@ -1413,7 +1412,7 @@ def main() -> None:
                 nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
                 releases = replace(releases, remote_cache=",".join(nodes))
             try:
-                unavailable = run_one(coordinator, args, releases, protection, claim, phases, claimed=claimed)
+                unavailable = run_one(coordinator, args, releases, protection, claim, phases, claimed=started)
             except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
                 # Else the lease expires and the coordinator retries; a rerun finds a published result cached. Waiting
                 # keeps a worker from failing ready action after ready action while the cache or the coordinator is down.

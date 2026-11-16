@@ -863,6 +863,36 @@ def test_worker_waits_before_claiming_again_after_the_cache_was_unavailable(
     assert events == ["claim", f"wait {worker.CLAIM_RETRY_SECONDS}", "claim", "claim", "claim"]
 
 
+def test_the_lease_runs_from_when_the_claim_was_sent(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The coordinator starts the lease before its answer travels back, so a slow answer mustn't move the worker's
+    deadline later than the coordinator's."""
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
+    sent: list[float] = []
+
+    def slow_claim(*_: object) -> dict[str, object]:
+        sent.append(time.monotonic())
+        time.sleep(0.3)
+        return claim()
+
+    monkeypatch.setattr(worker, "claim_reporting", slow_claim)
+    claim_sent: list[float] = []
+
+    def run(*_: object, claimed: float) -> bool:
+        claim_sent.append(claimed)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker, "run_one", run)
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.main()
+
+    assert claim_sent[0] <= sent[0]
+
+
 def test_action_that_ends_without_a_record_is_reported_for_a_retry(
     tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1693,7 +1723,7 @@ def test_a_blocked_heartbeat_does_not_hold_the_action_past_its_lease() -> None:
         coordinator.release.set()
 
 
-def test_the_lease_runs_from_when_the_claim_was_answered() -> None:
+def test_a_lease_runs_from_the_claim_time_it_is_given() -> None:
     coordinator = StuckCoordinator()
     try:
         claimed = time.monotonic() - 2
