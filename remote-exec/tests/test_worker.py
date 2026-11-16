@@ -2047,6 +2047,11 @@ def test_bootstrap_spec_under_cas_is_read_while_an_ac_node_is_down(
     assert ring.spec_version(SPEC) == "0.14.60"
 
 
+def test_blob_key_is_the_clients() -> None:
+    # The value holbuild's SML blob_key gives, pinned so neither side drifts alone.
+    assert blob_key("0" * 64) == "f88baeae5f54f92e61dcaf2cc69cd2577dd9d5891059c52ee988f0bf3391c9e9"
+
+
 def test_bootstrap_spec_reads_one_written_compressed_under_ac(tmp_path: Path, server: Server) -> None:
     server.zstd_specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=0.15.0\n"
     assert Releases(str(tmp_path), "unused", server.url, None).spec_version(SPEC) == "0.15.0"

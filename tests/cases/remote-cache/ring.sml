@@ -65,6 +65,9 @@ val _ = List.app check_vector vectors;
 val text = "ring payload";
 val digest = HolbuildHash.string_sha256 text;
 val blob_key = RC.blob_key digest;
+val _ = assert "blob key formula, pinned as the worker's test pins it"
+  (RC.blob_key (CharVector.tabulate (64, fn _ => #"0")) =
+   "f88baeae5f54f92e61dcaf2cc69cd2577dd9d5891059c52ee988f0bf3391c9e9");
 val [primary, backup] = RC.ranked_urls cache blob_key;
 val _ = RC.write_text src text;
 val _ = RC.ensure_parent (stored backup "ac" blob_key);
