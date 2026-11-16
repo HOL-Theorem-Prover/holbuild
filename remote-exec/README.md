@@ -156,19 +156,21 @@ deadline it stops HOL and reports `unavailable`, so
 the coordinator retries immediately without counting the interrupted attempt.
 Waiting for work or preparing a release stops immediately. Repeated `SIGTERM`
 does not extend the deadline; interactive Ctrl-C retains its usual behavior.
-With `--share-heaps`, the driver gets up to 8 additional seconds after the
-natural-finish drain window to publish completed checkpoints. Lease loss gives
-it up to 15 seconds, also bounded by the drain deadline plus 8 seconds if a
-drain starts meanwhile. Only the driver receives the initial termination signal:
-it stops HOL, waits for sandbox cleanup and output validation, and publishes
-committed checkpoints. Repeated signals do not interrupt publication. The worker
+The driver gets up to 8 additional seconds after the natural-finish drain
+window to publish completed checkpoints (with `--share-heaps`) and upload the
+build log so far. Lease loss gives it up to 15 seconds, also bounded by the
+drain deadline plus 8 seconds if a drain starts meanwhile. Only the driver
+receives the initial termination signal: it stops HOL, waits for sandbox cleanup
+and output validation, publishes committed checkpoints, then uploads the log and
+writes its result. Repeated signals do not interrupt publication. The worker
 then terminates the remaining process group, escalating to SIGKILL after 2 seconds.
-Interrupted actions never report `built`; a lost lease reports no result.
-Without `--share-heaps`, the worker stops the process group immediately.
+Interrupted actions never report `built`. A drained action reports `unavailable`
+with the log the driver uploaded; after a lost lease the worker reports the
+driver's result, whose log the coordinator keeps if its batch revoked the lease.
 Leave at least 20 seconds between the drain window and the container's stop
-timeout when sharing heaps (10 otherwise), for publication, process cleanup,
-result reporting and release of task protection. For example, a 120-second
-container stop timeout allows `--drain-seconds 100` with shared heaps. An unreachable coordinator
+timeout, for publication, process cleanup, result reporting and release of task
+protection. For example, a 120-second container stop timeout allows
+`--drain-seconds 100`. An unreachable coordinator
 can still prevent reporting before the container is forcibly killed; its lease
 then expires normally. ECS protection is best effort, and a rejection in an
 HTTP-success response is logged along with transport failures.
@@ -180,8 +182,10 @@ slashes and duplicate nodes are removed. Inline credentials are excluded from
 node identity, so they agree with curl-config authentication. Use the same
 node hostnames and paths as the clients:
 coordinator reads and worker bootstrap spec downloads use holbuild's digest
-ranking and second-node fallback, including a read's 404 during handoff.
-See the top-level README's remote-cache configuration for the routing contract.
+ranking and second-node fallback, including a read's 404 during handoff; both
+look up entries that must exist, so a 404 beside a node's failure is
+unavailable rather than missing. See the top-level README's remote-cache
+configuration for the routing contract.
 
 Before enabling multiple cache nodes, upgrade the coordinator, workers and
 submitting clients to a release that supports cache rings, and drain batches
@@ -203,8 +207,10 @@ the theory-modules store is a shared root like the others. Eviction still goes
 down to the target, after an action's result or once the measurement expires,
 so the reserve holds what arrives in between. For holbuild 0.14.57 and later
 the worker also passes `--cache-min-free-gb 16`: while the disk has less free
-than that, a sweep evicts below the target until it has freed the floor plus
-8 GB, and when files outside the
+than that, a sweep evicts below the target until the bytes it evicted cover
+the floor plus 8 GB and statvfs says the disk is back over the floor (a heap a
+checkpoint tree still links, or a sparse file, frees fewer blocks than its
+size), and when files outside the
 cache keep the disk short after it evicted all it could, its measurement says
 so, and actions skip further sweeps until it expires. A sweep publishes its walk before evicting, so actions keep
 reusing a fresh measurement while eviction runs. A cached directory must match the recorded device
@@ -231,8 +237,11 @@ for a worker on another host. Likewise a worker claims only while its temp
 dir and its `HOLBUILD_CACHE` root each have 4 GiB free, so a host whose disk
 is full doesn't take actions it would only fail. A worker short of disk first
 empties the `action` and `tmp` directories of its `HOLBUILD_CACHE` root, which
-its own finished actions left behind, and while it still waits it reports its
-host to the coordinator with `POST /v1/work/report` each poll.
+its own finished actions left behind, and drops `action-resident`, the record of
+what `action` held. While it still waits, each poll it runs the cache sweep an
+action would start with, `exec-action --sweep-only` with its cap and the 16 GB
+floor, using the newest release it has that takes it (0.14.60 and later), and
+reports its host to the coordinator with `POST /v1/work/report`.
 
 Each claim and heartbeat also reports the worker's host: its id (the kernel's
 `boot_id`, the same in every container on the host), the share of CPU time
@@ -240,19 +249,22 @@ idle since the worker's previous CPU sample (iowait counts as busy), its
 memory as holbuild's admission sees it, whether that admission would
 hold a child back now or held the worker back since its last report, and
 its `--host-rank`, and the bytes free and in all on whichever of the temp
-dir, `TMPDIR` and the `HOLBUILD_CACHE` root has the least free. A
-report is left out when the host can't be read at once, as while an
-admission holds the cooperate dir's lock. `GET /v1/queue` lists them, so a
+dir, `TMPDIR` and the `HOLBUILD_CACHE` root has the least free. When the
+host can't be read at once, as while an admission holds the cooperate dir's
+lock, the report has only the id and rank, and the coordinator keeps the
+host's previous readings and their age. `GET /v1/queue` lists them, so a
 reader can tell whether hosts have CPU to spare or are short of memory.
 
-The coordinator quarantines a host while its latest report has less than
-4 GiB free, or while its last five results were all infrastructure failures
-(`internal`, `disk`, `toolchain`, `publish` or `unavailable`) with no success
-since. A quarantined host's claims get no work and don't wait among the other
-claims, so they neither take wakes nor hold back worse-ranked hosts; the
-autoscaler doesn't count its workers as capacity. One quarantined for its
-failures gets one probe claim a minute, and a success ends the quarantine;
-any failed probe keeps it. Both rules live in each coordinator process's
+The coordinator quarantines a host while its latest report has less than 4 GiB
+free, or while its last five results were all infrastructure failures
+(`internal`, `disk`, `toolchain`, `publish` or `unavailable`) of more than one
+batch, since a broken batch fails on healthy hosts too. A quarantined host's
+claims get no work and don't wait among the other claims, so they neither take
+wakes nor hold back worse-ranked hosts; the autoscaler doesn't count its idle
+workers as capacity. One quarantined for its failures gets one probe claim a
+minute, and a result showing the host ran the action (a success, or a `proof`,
+`timeout`, `tactic-timeout` or `memory` failure) ends the quarantine; any
+other failed probe keeps it. Both rules live in each coordinator process's
 memory, as host reports do: a replica goes by the reports, claims and results
 that reach it, and starts empty on a restart.
 
@@ -515,8 +527,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   are claimable again and waiting claims are woken. A build claim locks its key
   until it commits and rechecks for a live lease, so two batches claiming one
   key at the same moment lease it once.
-  A heartbeat or completion with an expired or revoked token is refused, and
-  the completion is dropped. Since a worker may run an action twice after a
+  A heartbeat or completion with an expired token is refused, and the
+  completion is dropped. A batch that ends (cancelled, or failed for good)
+  revokes its leases: their heartbeats are refused at once, and for a lease's
+  length a completion still records the log of the action its worker stopped,
+  on the cancelled action, and changes nothing else. Since a worker may run an action twice after a
   network partition, nothing depends on exactly-once execution: a second run
   finds the result cached.
 - **Loading ahead**, for a batch submitted with `speculative_loading=<cap>`:
@@ -599,7 +614,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
 - **Deadline.** A batch still running `BATCH_DEADLINE_HOURS` after its
   submission fails with `deadline: …`, so one that can't finish (a high-tier
   action with no high-tier worker, a parent check the cache keeps refusing,
-  a client that went away) neither runs nor keeps workers busy forever.
+  a client that went away) neither runs nor keeps workers busy forever. One
+  with running actions first takes the failure, cancels its actions (the
+  running ones with `last_failure` `deadline`) and revokes their leases; it
+  stays running until its workers have reported their logs or the leases
+  ran out, so a client following it gets the logs.
 - **Retention.** The sweep deletes finished batches older than
   `RETENTION_HOURS`, at most 100 per statement, never a running one, and peak
   hints not used for `HINT_TTL_DAYS`.
@@ -698,9 +717,7 @@ scale-in protection through the agent's `task-protection/v1/state` endpoint,
 for 180 minutes at a time. ECS refuses to renew protection with
 `DEPLOYMENT_BLOCKED` while a scale-in or rolling deployment wants the task
 gone, so the window set when the action is claimed has to outlast the longest
-action. A refusal that names the container instance `DRAINING` drains the
-worker, since ECS doesn't stop a protected task there; `DEPLOYMENT_BLOCKED`
-alone doesn't, since ECS also gives it to healthy instances. The worker clears protection when the action ends or loses its lease,
+action. The worker clears protection when the action ends or loses its lease,
 and a worker that dies takes its task down with it. Failures are logged and
 the action carries on.
 
@@ -840,8 +857,8 @@ when that is under a second old)
 `POST /v1/work/<attempt_token>/heartbeat`, with no body or `{"host": <report>}`
 
 - 200 `{"lease_s": 120}`: the lease now runs `lease_s` seconds from now
-- 409 when the lease expired or was revoked (the batch was cancelled or
-  failed); the worker stops the action
+- 409 when the lease expired or was revoked (the batch was cancelled,
+  failed or passed its deadline); the worker stops the action
 
 `POST /v1/work/report` with `{"tier": …, "also_claim": […], "worker": "<name>", "host": <report>}`,
 the fields as for a claim, from a worker that isn't claiming, as while it waits for disk
@@ -851,7 +868,8 @@ the fields as for a claim, from a worker that isn't claiming, as while it waits 
 `POST /v1/work/<attempt_token>/complete` with the `holbuild-action-result-v1`
 record `exec-action --result` wrote as the body (`text/plain`)
 
-- 200 `{"accepted": true}`
+- 200 `{"accepted": true}`; for a lease its batch revoked, only the record's
+  log is kept
 - 400 when the record is malformed or is for another action than the lease's
   (a record with an empty `input-key`, which `exec-action` writes when it
   couldn't read the spec, is matched by its spec alone)

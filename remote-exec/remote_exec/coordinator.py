@@ -58,10 +58,12 @@ HOST_REPORT_SECONDS = 120
 MAX_HOSTS = 1000
 # A host is quarantined (see Coordinator._quarantine) while its latest report has less disk free than this, the floor
 # under which its workers don't claim (worker.py DISK_FLOOR), or while its last QUARANTINE_FAILURES results were
-# INFRA_FAILURES; such a host gets one probe claim each PROBE_SECONDS.
+# INFRA_FAILURES of more than one batch; such a host gets one probe claim each PROBE_SECONDS, and one that ends in
+# success or in RAN_FAILURES, which say the host ran the action, ends the quarantine.
 DISK_FLOOR = 4 * 2**30
 QUARANTINE_FAILURES = 5
 INFRA_FAILURES = frozenset({"internal", "disk", "toolchain", "publish", "unavailable"})
+RAN_FAILURES = frozenset({"proof", "timeout", "tactic-timeout", "memory"})
 PROBE_SECONDS = 60
 # Leases whose host the coordinator remembers at most, the oldest forgotten first.
 MAX_LEASE_HOSTS = 10_000
@@ -254,13 +256,14 @@ class HostReport:
     lower ``rank`` first (the worker's ``--host-rank``)."""
 
     id: Annotated[str, Field(max_length=64)]  # the host's boot_id
-    cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None
-    mem_total: Amount | None
-    mem_available: Amount | None
-    budget: Amount | None
-    reserved: Amount
-    leases: Amount
-    memory_short: bool
+    # The readings, all None when the worker couldn't read its host and sent only its id and rank.
+    cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None = None
+    mem_total: Amount | None = None
+    mem_available: Amount | None = None
+    budget: Amount | None = None
+    reserved: Amount | None = None
+    leases: Amount | None = None
+    memory_short: bool | None = None
     rank: Annotated[int, Field(ge=0, le=MAX_HOST_RANK)] = 0
     disk_free: Amount | None = None  # bytes free on the host disk the worker's claims depend on
 
@@ -775,14 +778,14 @@ class _Claimed:
 # completion, so the check is one entry of actions_batch_unfinished however many actions the batch finished. It looks
 # for the batch's first unfinished action in the index's order rather than for any: with no order asked for, the
 # database scans the table for one whenever unfinished actions look common, and reads every row a batch near its end
-# finished.
+# finished. A batch the deadline failed (``fail_overdue``) waits for its workers' logs, not for this.
 FINISH_IF_DONE = sa.text(
     "UPDATE batches SET (state, failure) = (SELECT "
     "CASE WHEN count(*) = 0 THEN 'done' ELSE 'failed' END, "
     "string_agg(theory || ': ' || COALESCE(last_failure, 'internal') || "
     "COALESCE(': ' || failure_detail, ''), '; ' ORDER BY theory, input_key) "
     "FROM actions WHERE batch_id = :id AND class = 'build' AND state = 'failed') "
-    "WHERE id = :id AND state = 'running' AND (SELECT input_key FROM actions "
+    "WHERE id = :id AND state = 'running' AND failure IS NULL AND (SELECT input_key FROM actions "
     "WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running') ORDER BY input_key LIMIT 1) IS NULL"
 )
 
@@ -868,10 +871,11 @@ class Coordinator:
         # knows the hosts whose workers' requests reached it.
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
         # For the quarantine, also in memory: the host, worker and tiers of each lease, oldest first; each host's
-        # infrastructure failures in a row and its last probe claim; and the workers that last claimed, reported or
-        # heartbeat from each host, when, and whether they are burst workers. See _quarantine.
+        # infrastructure failures in a row, with their batch (None once they span more than one), and its last probe
+        # claim; and the workers that last claimed, reported or heartbeat from each host, when, and whether they are
+        # burst workers. See _quarantine.
         self.lease_hosts: dict[UUID, tuple[str, str, list[str]]] = {}
-        self.infra_streak: dict[str, int] = {}
+        self.infra_streak: dict[str, tuple[int, UUID | None]] = {}
         self.probe_at: dict[str, datetime] = {}
         self.host_workers: dict[str, dict[str, tuple[datetime, bool]]] = {}
         # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
@@ -1041,7 +1045,8 @@ class Coordinator:
             event.set()
 
     async def cancel(self, batch_id: UUID) -> str | None:
-        """Cancel a running batch; its leases go, so its workers' heartbeats and completions are refused."""
+        """Cancel a running batch; its leases are revoked, so its workers' heartbeats are refused and their
+        completions keep only the logs of the actions they stop."""
         async with self.engine.begin() as conn:
             state = await self._lock_batch(conn, batch_id)
             if state != "running":
@@ -1631,7 +1636,10 @@ class Coordinator:
             self._ahead_changed()  # its children may now be claimed ahead
 
     def report_host(self, report: HostReport) -> None:
-        """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one."""
+        """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one, and one
+        without readings changes nothing, so the host's last readings keep their age."""
+        if report.memory_short is None:
+            return
         previous = self.hosts.get(report.id)
         if previous is None and len(self.hosts) >= MAX_HOSTS:
             return
@@ -1639,10 +1647,15 @@ class Coordinator:
             report = replace(report, cpu_idle_pct=previous[1].cpu_idle_pct)
         self.hosts[report.id] = (self.clock(), report)
 
-    def report_worker(self, host_id: str, worker: str, tiers: list[str]) -> None:
+    def report_worker(self, host_id: str, worker: str, tiers: list[str], *, idle: bool = False) -> None:
         """Note that ``worker``, claiming ``tiers``, runs on reported host ``host_id``, for the autoscaler's count of
-        the workers quarantined hosts hold."""
-        if host_id in self.hosts:
+        the workers quarantined hosts hold, also before the host sent readings. An ``idle`` worker, claiming or
+        waiting to claim, runs no action: the leases still noted for it ended without its result, as when their batch
+        was cancelled, and are forgotten."""
+        if idle:
+            for token in [t for t, (h, w, _) in self.lease_hosts.items() if h == host_id and w == worker]:
+                del self.lease_hosts[token]
+        if host_id in self.host_workers or len(self.host_workers) < MAX_HOSTS:
             self.host_workers.setdefault(host_id, {})[worker] = (self.clock(), "high" in tiers)
 
     def _lease_host(self, token: UUID, host_id: str, worker: str, tiers: list[str]) -> None:
@@ -1659,37 +1672,45 @@ class Coordinator:
             free = entry[1].disk_free
             if free is not None and free < DISK_FLOOR:
                 return "disk"
-        if self.infra_streak.get(host_id, 0) >= QUARANTINE_FAILURES:
+        if self._failing(host_id):
             return "failures"
         return None
 
-    def _record_result(self, host_id: str, result: Result) -> None:
-        """Count ``result`` from host ``host_id`` towards its quarantine. Only a success ends a quarantine for
-        failures, so a failed probe, of whatever class, restarts its PROBE_SECONDS; a failure that says nothing
-        about the host, as loading ahead given up, leaves the count as it is."""
-        streak = self.infra_streak.get(host_id, 0)
-        if result.status != "failed":
+    def _failing(self, host_id: str) -> bool:
+        count, batch = self.infra_streak.get(host_id, (0, None))
+        return count >= QUARANTINE_FAILURES and batch is None
+
+    def _record_result(self, host_id: str, batch_id: UUID, result: Result) -> None:
+        """Count ``result`` of batch ``batch_id`` from host ``host_id`` towards its quarantine. Only a result showing
+        the host ran the action ends a quarantine for failures, so another failed probe restarts its PROBE_SECONDS;
+        a failure that says nothing about the host, as loading ahead given up, leaves the count as it is."""
+        failing = self._failing(host_id)
+        if result.status != "failed" or result.failure in RAN_FAILURES:
             self.infra_streak.pop(host_id, None)
             self.probe_at.pop(host_id, None)
         elif result.failure in INFRA_FAILURES:
-            self.infra_streak[host_id] = streak + 1
-            if streak + 1 >= QUARANTINE_FAILURES:
+            count, batch = self.infra_streak.get(host_id, (0, batch_id))
+            self.infra_streak[host_id] = (count + 1, batch if batch == batch_id else None)
+            if self._failing(host_id):
                 self.probe_at[host_id] = self.clock()
         elif result.failure == "ahead-abandoned":
             pass
-        elif streak < QUARANTINE_FAILURES:
+        elif not failing:
             self.infra_streak.pop(host_id, None)
         else:
             self.probe_at[host_id] = self.clock()
 
     def _quarantined_workers(self) -> tuple[int, int]:
-        """The warm and burst workers on quarantined hosts."""
+        """The warm and burst workers on quarantined hosts that hold no lease. One running an action stays
+        capacity for that action, which the queue counts as running, until it ends."""
+        busy = {(host_id, worker) for host_id, worker, _ in self.lease_hosts.values()}
         warm = burst = 0
         for host_id, workers in self.host_workers.items():
             if self._quarantine(host_id) is not None:
-                for _, is_burst in workers.values():
-                    burst += is_burst
-                    warm += not is_burst
+                for worker, (_, is_burst) in workers.items():
+                    if (host_id, worker) not in busy:
+                        burst += is_burst
+                        warm += not is_burst
         return warm, burst
 
     def _burst_demand(self, counts: QueueCounts) -> int:
@@ -1744,7 +1765,36 @@ class Coordinator:
             if batch_id is None:
                 self.lease_hosts.pop(token, None)
                 return False
-            await self._lock_batch(conn, batch_id)
+            if await self._lock_batch(conn, batch_id) != "running" or await conn.scalar(
+                sa.text("SELECT failure IS NOT NULL FROM batches WHERE id = :id"), {"id": batch_id}
+            ):
+                # Revoked with its batch (a cancel, a final failure, the deadline): the worker stopped the action, and
+                # only the log it left is kept, for the client to show how far it got.
+                revoked = (
+                    await conn.execute(
+                        sa.text("DELETE FROM leases WHERE attempt_token = :token RETURNING input_key"),
+                        {"token": token},
+                    )
+                ).first()
+                if revoked is None:
+                    self.lease_hosts.pop(token, None)
+                    return False
+                # A record for another action rolls the lease's deletion back, as on a live lease.
+                kept = await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET log_sha256 = COALESCE(:log, log_sha256) "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key AND spec_sha256 = :spec"
+                    ),
+                    {"log": result.log_sha256, "batch_id": batch_id, "input_key": revoked.input_key,
+                     "spec": result.spec_sha256},
+                )
+                if kept.rowcount != 1 or result.input_key not in (None, revoked.input_key):
+                    raise ResultMismatch(
+                        f"result for {result.input_key} (spec {result.spec_sha256}) does not match the lease's "
+                        f"action {revoked.input_key}"
+                    )
+                self.lease_hosts.pop(token, None)
+                return True
             lease = (
                 await conn.execute(
                     sa.text(
@@ -1858,7 +1908,7 @@ class Coordinator:
                 )
         self.lease_hosts.pop(token, None)
         if leased is not None:
-            self._record_result(leased[0], result)
+            self._record_result(leased[0], batch_id, result)
         self._batch_changed(batch_id)
         self.request_release(batch_id)
         if unblocked:
@@ -1978,11 +2028,19 @@ class Coordinator:
     async def expire_leases(self) -> None:
         """Send the actions of expired leases back to waiting, or fail them once they used up their attempts.
 
-        ``sweep`` asks for their release afterwards.
+        A lease its batch revoked (``_end_batch``, ``fail_overdue``) is kept ``lease_seconds`` longer, for its worker to
+        report the log of the action it stopped. ``sweep`` asks for their release afterwards.
         """
         async with self.engine.connect() as conn:
             expired = list(
-                await conn.execute(sa.text("SELECT attempt_token, batch_id FROM leases WHERE expires_at <= now()"))
+                await conn.execute(
+                    sa.text(
+                        "SELECT l.attempt_token, l.batch_id FROM leases l JOIN batches b ON b.id = l.batch_id "
+                        "WHERE l.expires_at <= now() - CASE WHEN b.state = 'running' AND b.failure IS NULL "
+                        "THEN interval '0' ELSE make_interval(secs => :lease) END"
+                    ),
+                    {"lease": self.settings.lease_seconds},
+                )
             )
         for token, batch_id in expired:
             ahead_freed = False
@@ -2072,10 +2130,30 @@ class Coordinator:
                     {"secs": hours * 3600},
                 )
             )
+        failure = f"deadline: still running after {hours:g} h"
         for batch_id in overdue:
             async with self.engine.begin() as conn:
-                if await self._lock_batch(conn, batch_id) == "running":
-                    await self._end_batch(conn, batch_id, "failed", f"deadline: still running after {hours:g} h")
+                if await self._lock_batch(conn, batch_id) != "running":
+                    continue
+                if not await conn.scalar(
+                    sa.text("SELECT EXISTS (SELECT 1 FROM leases WHERE batch_id = :id)"), {"id": batch_id}
+                ):
+                    await self._end_batch(conn, batch_id, "failed", failure)
+                elif await conn.scalar(sa.text("SELECT failure IS NULL FROM batches WHERE id = :id"), {"id": batch_id}):
+                    # The batch stays running until its workers report the logs of the actions they stop, or their
+                    # leases go, so the client following it gets those logs.
+                    await conn.execute(
+                        sa.text("UPDATE batches SET failure = :failure WHERE id = :id"),
+                        {"id": batch_id, "failure": failure},
+                    )
+                    await conn.execute(
+                        sa.text(
+                            "UPDATE actions SET last_failure = 'deadline', failure_detail = :detail "
+                            "WHERE batch_id = :id AND state = 'running'"
+                        ),
+                        {"id": batch_id, "detail": f"still running after {hours:g} h"},
+                    )
+                    await self._cancel_unfinished(conn, batch_id)
             self._batch_changed(batch_id)
 
     async def delete_expired(self) -> None:
@@ -2126,22 +2204,24 @@ class Coordinator:
         )
 
     def _forget_silent_hosts(self, now: datetime) -> None:
-        """Drop the hosts no worker reported for in the last ``HOST_REPORT_SECONDS``, making room for new ones, with
-        what the quarantine knows of them, and the workers that didn't report in that time."""
-        self.hosts = {
-            host: (at, report)
-            for host, (at, report) in self.hosts.items()
-            if (now - at).total_seconds() < HOST_REPORT_SECONDS
-        }
+        """Drop the workers that didn't claim, report or heartbeat in the last ``HOST_REPORT_SECONDS``, and the hosts
+        with neither a report of readings nor such a worker in that time, making room for new ones, with what the
+        quarantine knows of them. A host whose workers can't read it stays known, its readings ageing."""
         self.host_workers = {
             host: fresh
             for host, workers in self.host_workers.items()
-            if host in self.hosts and (fresh := {
+            if (fresh := {
                 worker: seen for worker, seen in workers.items() if (now - seen[0]).total_seconds() < HOST_REPORT_SECONDS
             })
         }
-        self.infra_streak = {host: n for host, n in self.infra_streak.items() if host in self.hosts}
-        self.probe_at = {host: at for host, at in self.probe_at.items() if host in self.hosts}
+        self.hosts = {
+            host: (at, report)
+            for host, (at, report) in self.hosts.items()
+            if (now - at).total_seconds() < HOST_REPORT_SECONDS or host in self.host_workers
+        }
+        known = self.hosts.keys() | self.host_workers.keys()
+        self.infra_streak = {host: n for host, n in self.infra_streak.items() if host in known}
+        self.probe_at = {host: at for host, at in self.probe_at.items() if host in known}
 
     @staticmethod
     async def _counts(conn: AsyncConnection, statement: sa.TextClause) -> QueueCounts:
@@ -2343,14 +2423,17 @@ class Coordinator:
     async def _check_cache(self, ac_key: str, limit: asyncio.Semaphore) -> bool | None:
         forgotten = self.cache_forgotten
         missing = False
+        failed = False
         failure: httpx.Response | None = None
         # Every node is asked before a miss: a worker writes to the node nearest to it, and until that node has
-        # written the entry through to the shared store, no other node holds it.
+        # written the entry through to the shared store, no other node holds it.  The entry is a done parent's, so
+        # a node that failed may be the one holding it: only 404s from every node it asked say it's gone.
         for node in await self.cache_read_nodes(ac_key):
             try:
                 async with limit:
                     response = await self.cache.get(f"{node}/ac/{ac_key}")
             except httpx.HTTPError:
+                failed = True
                 continue
             if response.status_code == 200:
                 if self.cache_forgotten == forgotten:  # else an input went missing since this check began
@@ -2359,11 +2442,11 @@ class Coordinator:
             if response.status_code == 404:
                 missing = True
                 continue
+            failed = True
             failure = response
             if response.status_code != 429 and not 500 <= response.status_code < 600:
-                missing = False
                 break
-        if missing:
+        if missing and not failed:
             return False
         if failure is not None:
             request = failure.request
@@ -2579,6 +2662,11 @@ class Coordinator:
             sa.text("UPDATE batches SET state = :state, failure = :failure WHERE id = :id"),
             {"id": batch_id, "state": state, "failure": failure},
         )
+        await self._cancel_unfinished(conn, batch_id)
+
+    async def _cancel_unfinished(self, conn: AsyncConnection, batch_id: UUID) -> None:
+        """Cancel the batch's unfinished actions and revoke their leases: expired, they free the key for another
+        batch and stop the heartbeats, and ``complete`` takes only the log of the action stopped."""
         await conn.execute(
             sa.text(
                 "UPDATE actions SET state = 'cancelled' "
@@ -2586,7 +2674,10 @@ class Coordinator:
             ),
             {"id": batch_id},
         )
-        await conn.execute(sa.text("DELETE FROM leases WHERE batch_id = :id"), {"id": batch_id})
+        await conn.execute(
+            sa.text("UPDATE leases SET expires_at = now() WHERE batch_id = :id AND expires_at > now()"),
+            {"id": batch_id},
+        )
 
     async def _record_peak(self, conn: AsyncConnection, package: str, theory: str, profile: str, peak: int) -> None:
         """Raise the theory's peak hint to ``peak``; a run that took less, perhaps with a quieter neighbour, keeps it."""

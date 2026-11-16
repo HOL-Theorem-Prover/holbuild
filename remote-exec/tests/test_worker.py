@@ -50,6 +50,9 @@ from remote_exec.worker import (
 
 SPEC = "5" * 64
 RECORD = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=built\n"
+# What exec-action writes once it has stopped an interrupted action: the log it uploaded so far.
+LOG = f"log={'7' * 64} 12"
+INTERRUPTED = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nstatus=failed\nfailure=unavailable\n{LOG}\n"
 
 # A stand-in holbuild source tree: `make bin/holbuild` installs a script that logs its arguments and environment and
 # writes RECORD (or HOLBUILD_FAKE_RECORD) to its --result file, or ends without one when HOLBUILD_FAKE_CRASH is set:
@@ -65,10 +68,13 @@ if [ -n "$HOLBUILD_FAKE_HANG" ]; then
 fi
 echo "$@" >> "$HOLBUILD_FAKE_LOG"
 env > "$HOLBUILD_FAKE_LOG.env"
+# HOLBUILD_FAKE_PUBLISH: on TERM, publish for 3 s, then write INTERRUPTED, as exec-action does when interrupted
 if [ -n "$HOLBUILD_FAKE_PUBLISH" ]; then
+  result=; previous=
+  for arg in "$@"; do [ "$previous" != --result ] || result=$arg; previous=$arg; done
   sleep 120 &
   child=$!
-  trap 'sleep 0.1; kill -0 "$child" || exit 1; kill "$child"; wait "$child" || true; sleep 3; echo published > "$HOLBUILD_FAKE_LOG.published"; exit 1' TERM
+  trap 'sleep 0.1; kill -0 "$child" || exit 1; kill "$child"; wait "$child" || true; sleep 3; echo published > "$HOLBUILD_FAKE_LOG.published"; printf "%s" "{INTERRUPTED}" > "$result.tmp"; mv "$result.tmp" "$result"; exit 1' TERM
   echo ready > "$HOLBUILD_FAKE_LOG.ready"
   wait
 fi
@@ -137,6 +143,7 @@ class Server:
     claim_started: threading.Event = field(default_factory=threading.Event)
     hold_claim: threading.Event | None = None
     protection_reply: dict[str, object] = field(default_factory=dict)
+    protection_status: int = 200
 
 
 @pytest.fixture
@@ -198,7 +205,7 @@ def server() -> Iterator[Server]:
 
         def do_PUT(self) -> None:
             state.protection.append(json.loads(self.body()))
-            self.reply(200, json.dumps(state.protection_reply))
+            self.reply(state.protection_status, json.dumps(state.protection_reply))
 
         def log_message(self, format: str, *args: object) -> None:
             pass
@@ -423,7 +430,7 @@ def test_sigterm_kills_descendants_that_ignore_term_and_repeated_signals_do_not_
             process.send_signal(signal.SIGTERM)
             time.sleep(0.2)
             process.send_signal(signal.SIGTERM)
-            assert process.wait(timeout=15 if share_heaps else 8) == 0, (tmp_path / "worker.log").read_text()
+            assert process.wait(timeout=15) == 0, (tmp_path / "worker.log").read_text()
             child = Path(f"/proc/{int(child_file.read_text())}/stat")
             assert not child.exists() or child.read_text().split()[2] == "Z"
         finally:
@@ -433,15 +440,17 @@ def test_sigterm_kills_descendants_that_ignore_term_and_repeated_signals_do_not_
     assert len(server.claims) == 1
 
 
+@pytest.mark.parametrize("share_heaps", [False, True])
 @pytest.mark.parametrize("stop", ["drain", "lease-loss"])
-def test_interruption_allows_checkpoint_publication_before_teardown(
+def test_an_interrupted_action_publishes_its_checkpoints_and_reports_its_log(
     tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, stop: str,
+    share_heaps: bool,
 ) -> None:
     release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
     server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
     server.next_claim = claim()
     monkeypatch.setenv("HOLBUILD_FAKE_PUBLISH", "1")
-    with running_worker(tmp_path, server, "0", "--share-heaps") as process:
+    with running_worker(tmp_path, server, "0", *(["--share-heaps"] if share_heaps else [])) as process:
         wait_for_file(Path(f"{logs[1]}.ready"))
         if stop == "drain":
             process.send_signal(signal.SIGTERM)
@@ -451,7 +460,8 @@ def test_interruption_allows_checkpoint_publication_before_teardown(
         if stop == "lease-loss":
             process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
-    assert server.completed == ([DRAINED] if stop == "drain" else [])
+    # A drained action is retried at once, keeping the log; a lost lease's report gives the coordinator the log.
+    assert server.completed == ([f"{DRAINED}{LOG}\n"] if stop == "drain" else [INTERRUPTED])
 
 
 def test_the_result_is_reported_before_exec_action_exits_and_a_lost_lease_then_stops_nothing(
@@ -586,26 +596,12 @@ def test_ecs_protection_rejection_in_a_success_response_is_logged(
     assert "DEPLOYMENT_BLOCKED" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(
-    ("reason", "enabled", "drains"),
-    [
-        ("DRAINING", True, True),
-        # ECS refuses protection so on healthy instances too, in a scale-in or a rolling deployment.
-        ("DEPLOYMENT_BLOCKED", True, False),
-        ("TASK_STOPPING_OR_STOPPED", True, False),
-        ("DRAINING", False, False),
-    ],
-)
-def test_protection_refused_on_a_draining_container_instance_drains_the_worker(
-    server: Server, reason: str, enabled: bool, drains: bool
+def test_ecs_protection_refused_with_an_http_error_is_logged(
+    server: Server, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    server.protection_reply = {"failure": {"Reason": reason}}
-    drain = worker.Drain()
-    drain.interrupt = True  # the main thread is in an interruptible call, which only its own SIGTERM handler ends
-    thread = threading.Thread(target=Protection(None, server.url, drain).set, kwargs={"enabled": enabled})
-    thread.start()
-    thread.join()
-    assert (drain.stop.is_set(), drain.interrupt) == (drains, True)
+    server.protection_status = 400
+    Protection(None, server.url).set(enabled=True)
+    assert "HTTP Error 400" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("text", ["-1", "nan", "inf"])
@@ -1048,7 +1044,7 @@ def test_a_worker_short_of_disk_cleans_its_own_action_and_temp_dirs_then_waits_r
     monkeypatch.setattr(worker, "disk_shortfall", shortfall)
     monkeypatch.setattr(drain.stop, "wait", wait)
 
-    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["high", "standard"], "w1")
+    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["high", "standard"], "w1", lambda: None)
 
     assert sorted(p.name for p in cache.rglob("*")) == [
         "action", "kept", "store", "tmp"
@@ -1065,9 +1061,113 @@ def test_a_worker_whose_cleaning_makes_room_waits_for_nothing(
     drain = worker.Drain()
     monkeypatch.setattr(drain.stop, "wait", lambda _: pytest.fail("waited"))
 
-    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["standard"], "w1")
+    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["standard"], "w1", lambda: None)
 
     assert server.reports == []
+
+
+def test_an_idle_worker_short_of_disk_sweeps_the_cache_until_there_is_room_without_claiming(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Emptying its own scratch can't make room the shared cache and the checkpoints hold: the worker runs their
+    eviction each poll while short, and the record of its action root goes before the root does."""
+    (tmp_path / "action" / "a1").mkdir(parents=True)
+    (tmp_path / "action-resident").write_text("holbuild-action-resident-v1\n")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path))
+    sweeps = 0
+
+    def sweep() -> None:
+        nonlocal sweeps
+        assert not (tmp_path / "action-resident").exists(), "the sweep ran before the action root's record went"
+        sweeps += 1
+
+    monkeypatch.setattr(worker, "disk_shortfall", lambda: "short" if sweeps < 3 else None)
+    drain = worker.Drain()
+    waits = 0
+
+    def wait(_: float) -> bool:
+        nonlocal waits
+        waits += 1
+        return waits > 10
+
+    monkeypatch.setattr(drain.stop, "wait", wait)
+
+    worker.wait_for_disk(drain, Coordinator(server.url, "w"), ["standard"], "w1", sweep)
+
+    assert (sweeps, waits, len(server.reports)) == (3, 2, 2)
+    assert not (tmp_path / "action-resident").exists()
+
+
+@pytest.mark.parametrize("mode", [0o000, 0o300])
+def test_cleaning_removes_directories_it_cannot_read(tmp_path: Path, mode: int) -> None:
+    (tmp_path / "a1" / "locked" / "deeper").mkdir(parents=True)
+    (tmp_path / "a1" / "locked" / "deeper" / "theory.dat").write_text("x")
+    (tmp_path / "a1" / "locked" / "theory.uo").write_text("x")
+    (tmp_path / "a1" / "locked").chmod(mode)
+    (tmp_path / "top").mkdir()
+    (tmp_path / "top").chmod(mode)
+
+    worker.remove_children(str(tmp_path))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_cache_sweep_runs_the_newest_release_that_has_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = tmp_path / "argv"
+
+    def release(root: Path, version: str, *, built: bool = True) -> None:
+        executable = root / f"v{version}" / "bin" / "holbuild"
+        executable.parent.mkdir(parents=True)
+        executable.write_text(f"#!/bin/sh\necho {version} \"$@\" >> {log}\n")
+        executable.chmod(0o755)
+        if built:
+            (root / f"v{version}" / worker.COMPLETE).touch()
+
+    baked, built = tmp_path / "baked", tmp_path / "built"
+    release(baked, "0.14.58")
+    release(baked, "0.15.0")
+    release(built, "0.15.1", built=False)  # a build that didn't finish
+    release(built, "0.15.0")
+    release(built, "0.14.60")
+    releases = Releases(str(built), "unused", "http://cache.test", None, baked_root=str(baked))
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+
+    worker.sweep_cache(releases, 200)
+
+    assert log.read_text() == "0.15.0 exec-action --sweep-only --cache-limit-gb 200 --cache-min-free-gb 16\n"
+    old = tmp_path / "old"
+    release(old, "0.14.59")  # released before --sweep-only
+    assert Releases(str(tmp_path / "none"), "unused", "", None, baked_root=str(old)).newest(
+        worker.MIN_SWEEP_ONLY_RELEASE
+    ) is None
+
+
+def test_a_drain_stops_the_cache_sweep_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    executable = tmp_path / "baked" / "v0.15.0" / "bin" / "holbuild"
+    executable.parent.mkdir(parents=True)
+    executable.write_text(f"#!/bin/sh\necho $$ > {tmp_path}/pid\nexec sleep 60\n")
+    executable.chmod(0o755)
+    drain = worker.Drain()
+    releases = Releases(str(tmp_path / "built"), "unused", "http://cache.test", None,
+                        baked_root=str(tmp_path / "baked"), drain=drain)
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+
+    def stop() -> None:
+        while not (tmp_path / "pid").exists():
+            time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=stop, daemon=True).start()
+    started = time.monotonic()
+    with drain.installed():
+        worker.sweep_cache(releases, 200)
+
+    assert drain.stop.is_set()
+    assert time.monotonic() - started < 10, "the sweep outlived the drain"
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((tmp_path / "pid").read_text()), 0)
 
 
 def test_the_host_report_gives_the_disk_with_the_least_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1545,10 +1645,11 @@ def test_cpu_counters_going_backwards_give_no_idle_share(telemetry: tuple[HostTe
     assert reporter.report().cpu_idle_pct is None
 
 
-def test_no_report_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
+def test_only_the_host_id_and_rank_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
     host: Host, telemetry: tuple[HostTelemetry, Path], server: Server
 ) -> None:
     reporter, stat = telemetry
+    reporter.rank = 1
     host.lease(3 * GIB)
     coordinator = Coordinator(server.url, "w", reporter)
     with open(host.dir / "lock") as lock:
@@ -1560,7 +1661,8 @@ def test_no_report_while_an_admission_holds_the_lock_or_the_host_cannot_be_read(
     assert coordinator.heartbeat("t")
 
     reports = [beat["host"] for beat in server.heartbeats]
-    assert reports[0] is None and reports[2] is None
+    # The coordinator quarantines and packs hosts by id and rank, which need no reading.
+    assert reports[0] == reports[2] == {"id": "b0a7", "rank": 1}
     assert isinstance(reports[1], dict) and reports[1]["leases"] == 1
 
 
@@ -1905,8 +2007,9 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
 
     monkeypatch.setattr(subprocess, "run", fetch)
     ring = Releases(str(tmp_path), "unused", "http://one.test,http://two.test", None)
-    error = CacheUnavailable if statuses == (503, 429) else RuntimeError
-    message = "HTTP 403" if 403 in statuses else "HTTP 429" if error is CacheUnavailable else "HTTP 404"
+    # A spec must be there: a node that fails leaves it unavailable, even beside a 404.
+    error = RuntimeError if 403 in statuses or statuses == (404, 404) else CacheUnavailable
+    message = "HTTP 403" if 403 in statuses else "HTTP 404" if error is RuntimeError else "HTTP 429|HTTP 503"
     with pytest.raises(error, match=message) as caught:
         ring.spec_version(SPEC)
     assert type(caught.value) is error

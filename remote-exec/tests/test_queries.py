@@ -439,9 +439,16 @@ STATEMENTS = [
         lambda f: {"log": "log", "batch_id": f.steady, "input_key": f.steady_arrival.keys("ready")[0]},
         11_000,
     ),
-    Statement("UPDATE leases SET expires_at", lambda f: {"lease": 120, "token": f.token}, 100),
+    Statement("UPDATE leases SET expires_at = now() + make_interval", lambda f: {"lease": 120, "token": f.token}, 100),
     # complete
     Statement("SELECT batch_id FROM leases WHERE attempt_token = :token", lambda f: {"token": f.token}, 100),
+    Statement("SELECT failure IS NOT NULL FROM batches WHERE id = :id", lambda f: {"id": f.fresh}, 100),
+    Statement("DELETE FROM leases WHERE attempt_token = :token RETURNING input_key", lambda f: {"token": f.token}, 100),
+    Statement(
+        "UPDATE actions SET log_sha256 = COALESCE(:log, log_sha256) WHERE",
+        lambda f: {**lease(f), "log": "b" * 64, "spec": "s"},
+        10_000,
+    ),
     Statement(
         "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now()", lambda f: {"token": f.token}, 100
     ),
@@ -461,7 +468,7 @@ STATEMENTS = [
         11_000,
     ),
     # expiry
-    Statement("SELECT attempt_token, batch_id FROM leases WHERE expires_at <= now()", lambda f: {}, 1_100),
+    Statement("SELECT l.attempt_token, l.batch_id FROM leases l JOIN batches b", lambda f: {"lease": 120}, 1_500),
     Statement(
         "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now()", lambda f: {"token": f.expired}, 100
     ),
@@ -528,7 +535,14 @@ STATEMENTS = [
         100,
     ),
     Statement("UPDATE actions SET state = 'cancelled' WHERE batch_id = :id", lambda f: {"id": f.fresh}, 10_000),
-    Statement("DELETE FROM leases WHERE batch_id = :id", lambda f: {"id": f.fresh}, 1_700),
+    Statement("UPDATE leases SET expires_at = now() WHERE batch_id = :id", lambda f: {"id": f.fresh}, 1_700),
+    # deadline
+    Statement("SELECT EXISTS (SELECT 1 FROM leases WHERE batch_id = :id)", lambda f: {"id": f.fresh}, 100),
+    Statement("SELECT failure IS NULL FROM batches WHERE id = :id", lambda f: {"id": f.fresh}, 100),
+    Statement("UPDATE batches SET failure = :failure WHERE id = :id", lambda f: {"id": f.fresh, "failure": "d"}, 100),
+    Statement(
+        "UPDATE actions SET last_failure = 'deadline'", lambda f: {"id": f.fresh, "detail": "still running"}, 1_000
+    ),
     Statement(
         "INSERT INTO peak_hints", lambda f: {"package": "pkg", "theory": "t0", "profile": "default", "peak": 2000}, 100
     ),

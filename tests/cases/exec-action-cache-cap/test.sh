@@ -215,6 +215,30 @@ evicted "$cache2/blobs/$own" "a blob only an evicted entry named"
 kept "$cache2/actions/newer" "an entry once the cache fits"
 kept "$cache2/blobs/$shared" "a blob a surviving entry names"
 
+# --sweep-only runs the same sweep without an action or a remote cache, for a
+# worker waiting for disk space, and exits 0.
+cache_sweep=$tmpdir/cache-sweep
+sparse "$cache_sweep/blobs/$own" 1
+sparse "$cache_sweep/checkpoints/OldScript.deps/key/deps_loaded.save" 1
+mkdir -p "$cache_sweep/actions/older" "$cache_sweep/actions/newer"
+printf 'blob dat %s\n' "$own" > "$cache_sweep/actions/older/manifest"
+printf 'blob sig %s\n' "$shared" > "$cache_sweep/actions/newer/manifest"
+at 2001 "$cache_sweep/actions/older/manifest"
+at 2002 "$cache_sweep/checkpoints/OldScript.deps/key/deps_loaded.save"
+at 2003 "$cache_sweep/actions/newer/manifest"
+HOLBUILD_CACHE=$cache_sweep "$HOLBUILD_BIN" exec-action --sweep-only --cache-limit-gb 1 --cache-reserve-gb 0 \
+  > "$tmpdir/sweep-only.log" 2>&1 || { cat "$tmpdir/sweep-only.log" >&2; exit 1; }
+evicted "$cache_sweep/actions/older" "the least recently used entry over the cap"
+evicted "$cache_sweep/blobs/$own" "a blob only an evicted entry named"
+evicted "$cache_sweep/checkpoints/OldScript.deps" "an old checkpoint family"
+kept "$cache_sweep/actions/newer" "an entry once the cache fits"
+if HOLBUILD_CACHE=$cache_sweep "$HOLBUILD_BIN" exec-action --sweep-only "$absent" --cache-limit-gb 1 \
+     > "$tmpdir/sweep-only-spec.log" 2>&1; then
+  echo "--sweep-only ran with a SPEC" >&2; exit 1
+fi
+grep -q 'takes no SPEC-SHA256' "$tmpdir/sweep-only-spec.log" ||
+  { cat "$tmpdir/sweep-only-spec.log" >&2; exit 1; }
+
 # Young unpublished blobs are last even when a newer manifest can free space.
 cache3=$tmpdir/cache3
 young=$(printf young | sha256sum | cut -d' ' -f1)
@@ -670,7 +694,20 @@ assert len(entries) == 10, f"the stamp has {len(entries) // 2} roots, not 5"
 assert int(entries[-1]) >= 2 * 1024 ** 3, "the stamp leaves out the theory-modules store"
 MODULES
 
-# Free-space floor. The disk the cache is on, read as the sweep reads it.
+# Free-space floor. A family whose bytes stay allocated after it goes (a
+# heap a checkpoint tree still links, here a sparse file) doesn't count
+# toward it: statvfs says when the disk is back over the floor. The real
+# family takes 2 GiB of the disk the cache is on; the floor is under 1 GiB
+# over what's free with it, so evicting it is enough, with the rest as room
+# for other writers on the disk.
+rm -rf "$cache10/theory-modules"
+mkdir -p "$cache10/blobs"
+python3 - "$cache10/blobs/2002" <<'REAL'
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT, 0o644)
+os.posix_fallocate(fd, 0, 2 * 1024 ** 3)
+os.close(fd)
+REAL
 disk() {
   python3 - "$cache10" <<'DISK'
 import os, sys
@@ -678,35 +715,36 @@ s = os.statvfs(sys.argv[1])
 gib = 1024 ** 3
 free = s.f_bavail * s.f_frsize
 buffer = 8 * gib
-# A floor 32 GiB over what's free, and families each larger than what the
-# sweep must evict for it, with 64 GiB to spare for other writers on the disk.
-floor = free // gib + 32
+# Sparse families each larger than what the sweep must evict for the floor
+# plus its buffer, with 64 GiB to spare.
+floor = free // gib + 1
 print(floor, (floor * gib + buffer - free) // gib + 64)
 DISK
 }
 read -r floor family <<< "$(disk)"
-rm -rf "$cache10/theory-modules"
-for year in 2001 2002 2003; do
+for year in 2001 2003; do
   sparse "$cache10/blobs/$year" "$family"
-  at "$year" "$cache10/blobs/$year"
 done
-limit=$((family * 3 + 100))
+at 2001 "$cache10/blobs/2001"
+at 2002 "$cache10/blobs/2002"
+at 2003 "$cache10/blobs/2003"
+limit=$((family * 2 + 100))
 # A fresh stamp without the floor is no reason to skip a sweep below it.
 sweep10 "$limit"
 cp "$cache10/locks/worker-cache-cap-v3.state" "$tmpdir/floor-ok-state"
 sweep10 "$limit" --cache-min-free-gb "$floor"
 ! cmp -s "$cache10/locks/worker-cache-cap-v3.state" "$tmpdir/floor-ok-state" ||
   { echo "a stamp without the floor was reused below it" >&2; exit 1; }
-# Evicting to the floor plus its buffer goes by the bytes evicted.
 evicted "$cache10/blobs/2001" "the oldest family below the free-space floor"
-kept "$cache10/blobs/2002" "a family once the floor was met"
-kept "$cache10/blobs/2003" "the newest family once the floor was met"
+evicted "$cache10/blobs/2002" "the family that frees the disk when the evicted bytes freed none"
+kept "$cache10/blobs/2003" "a family once statvfs said the floor was met"
+! grep -q 'free-space floor' "$tmpdir/floor.log" ||
+  { echo "a warning that a floor the sweep met stays unmet" >&2; cat "$tmpdir/floor.log" >&2; exit 1; }
 
 # A disk that evicting everything can't bring over the floor: the sweep says
 # so in its stamp, and siblings neither sweep again nor wait on gc.lock for it
 # while the stamp is fresh.
 sweep10 "$limit" --cache-min-free-gb 1000000
-evicted "$cache10/blobs/2002" "an evictable family below an unreachable floor"
 evicted "$cache10/blobs/2003" "an evictable family below an unreachable floor"
 grep -q 'stays under the 1000000.0 GB free-space floor' "$tmpdir/floor.log" ||
   { echo "no warning that the floor stays unmet" >&2; cat "$tmpdir/floor.log" >&2; exit 1; }

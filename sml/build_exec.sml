@@ -9570,12 +9570,13 @@ fun action_failed failure msg = ActionFailed (classify_failure failure msg)
 (* A worker keeps the spec's sources and libraries in its local blob store,
    so it fetches each once rather than once per action.  One no cache entry
    names is evicted on its own when least recently used
-   (local_cache_families). *)
+   (local_cache_families).  The spec names each blob, so its read is
+   required (HolbuildRemoteCache.required). *)
 fun fetch_spec_blob remote {hash, dst} =
   let
     val cache = cache_root ()
     fun fetch_remote () =
-      case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst} of
+      case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = dst}) of
           HolbuildCacheBackend.Hit =>
             (case HolbuildCache.publish_blob cache {hash = hash, src = dst} of
                  HolbuildCacheBackend.Conflict msg => warn ("could not keep blob " ^ hash ^ ": " ^ msg)
@@ -9804,8 +9805,10 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                             hashes = hashes})
       end
     fun restorable f (dep as {target, key, ...}) =
-      f dep
+      HolbuildRemoteCache.required (fn () => f dep)
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
+           | e as ActionFailed (DiskFailure, _) => raise e
+           | e as ActionFailed (InternalFailure, _) => raise e
            | e => raise action_failed (InputMissing ("theory " ^ key))
                           ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                            General.exnMessage e)
@@ -10209,17 +10212,27 @@ fun lost_restored_file resident root text =
           in
             if Substring.isEmpty found then []
             else
-              let val (path, rest) = Substring.splitl (not o Char.isSpace) (Substring.triml (size what) found)
+              let
+                val (path, rest) = Substring.splitl (not o Char.isSpace) (Substring.triml (size what) found)
+                (* What the message wraps the path in: an exception's
+                   quotes, a following colon. *)
+                val path = Substring.dropr (fn c => c = #"\"" orelse c = #"'" orelse c = #":") path
               in Substring.string path :: from rest end
           end
       in
         from (Substring.full text)
       end
+    (* HOL names the path it was asked for, or the .hol/objs copy it reads
+       a .ui or .uo at; the records name the path beside the source. *)
+    fun unmapped path =
+      if Path.file (Path.dir path) = "objs" andalso Path.file (Path.dir (Path.dir path)) = ".hol" then
+        SOME (Path.concat(Path.dir (Path.dir (Path.dir path)), Path.file path))
+      else NONE
+    fun lost path =
+      restored path orelse restored (hfs_remapped_path path) orelse
+      (case unmapped path of SOME path => restored path | NONE => false)
   in
-    (* HOL names the path it was asked for, and reads a .ui or .uo at its
-       .hol/objs copy. *)
-    List.exists (fn path => restored path orelse restored (hfs_remapped_path path))
-      (List.concat (map paths ["Cannot find file ", "non-existent file "]))
+    List.exists lost (List.concat (map paths ["Cannot find file ", "non-existent file "]))
   end
 
 (* The worker cache cap covers everything a worker keeps between
@@ -10541,8 +10554,12 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
         steps := !steps @ [(name, Time.toMilliseconds (Time.-(Time.now (), start)))];
         result
       end
-    fun sweep goal total remaining =
-      if total <= goal then total
+    (* The bytes a family held can stay in use after it goes: a heap a
+       checkpoint tree still links, or a sparse file's unallocated bytes. So
+       once they cover a floor deficit, statvfs says whether the disk is back
+       over the floor, and eviction goes on while it isn't. *)
+    fun sweep floor_short goal total remaining =
+      if total <= goal andalso not (floor_short ()) then total
       else
         case remaining of
             [] => total
@@ -10551,7 +10568,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                 val freed =
                   evict () handle e => (warn ("worker cache eviction failed: " ^ General.exnMessage e); NONE)
               in
-                sweep goal (total - Option.getOpt (freed, 0)) rest
+                sweep floor_short goal (total - Option.getOpt (freed, 0)) rest
               end
     fun measure_shared () =
       let
@@ -10598,15 +10615,17 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                               store_cache_families cache @ module_cache_families cache @
                               local_families) @ by_age young_orphans
                     end)
-                val after = timed "evict" (fn () => sweep goal total families)
+                fun floor_short () = deficit > 0 andalso floor_deficit () > 0
+                val after = timed "evict" (fn () => sweep floor_short goal total families)
+                val unmet = after > goal orelse floor_short ()
               in
                 (* Measure again rather than publish an estimate derived from
                    the mixed private and shared freed total, so a waiter on
                    gc.lock reuses the result rather than repeating the scan.
                    Until then siblings keep reusing the pre-eviction walk. *)
                 if after <= target then
-                  (publish (after > goal) (timed "rewalk" measure_shared);
-                   if after > goal then
+                  (publish unmet (timed "rewalk" measure_shared);
+                   if unmet then
                      warn ("the disk stays under the " ^ gb_decimal_text min_free_bytes ^
                            " GB free-space floor with the worker cache down to " ^ gb_decimal_text after ^
                            " GB of entries in use")
@@ -10658,6 +10677,17 @@ fun with_action_root_lock cache f =
   in
     (f () before HolbuildFileLock.release lock)
     handle e => (HolbuildFileLock.release lock; raise e)
+  end
+
+(* exec-action --sweep-only: the sweep an action starts with, for a worker
+   short of disk space that has no action to start. *)
+fun sweep_worker_cache {limit_bytes, reserve_bytes, min_free_bytes} =
+  let val cache = cache_root ()
+  in
+    with_action_root_lock cache (fn () =>
+      enforce_worker_cache_cap
+        {cache = cache, checkpoint_root = Path.concat(cache, "checkpoints"), limit_bytes = limit_bytes,
+         reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false})
   end
 
 fun phases_text sep unit phases =
@@ -12439,7 +12469,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           SOME path => path
         | NONE => current_build_log (current_log_dir root (#1 (!target)) (#2 (!target)))
     fun upload_log () =
-      if !cancelled orelse not (!HolbuildActionSandbox.outputs_validated) then NONE else
+      if not (!HolbuildActionSandbox.outputs_validated) then NONE else
       let val path = build_log ()
       in
         if not (file_exists path) then NONE
@@ -12906,9 +12936,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val staged = in_root staging stem
             val _ =
               (ensure_parent staged;
-               restore_spec_theory_in remote {files = staging, named = root} resolver
-                 {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE})
+               HolbuildRemoteCache.required (fn () =>
+                 restore_spec_theory_in remote {files = staging, named = root} resolver
+                   {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE}))
               handle e as HolbuildRemoteCache.Unavailable _ => raise e
+                   | e as ActionFailed (DiskFailure, _) => raise e
+                   | e as ActionFailed (InternalFailure, _) => raise e
                    | e => raise action_failed (InputMissing ("theory " ^ key))
                                   ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                                    General.exnMessage e)
@@ -13056,6 +13089,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                          TextIO.closeOut out
                        end
                        handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e))
+              (* An interrupted action has a few seconds to stop in: its
+                 saved checkpoints, which a retry resumes from, go before
+                 its log. *)
+              val _ =
+                if !cancelled then
+                  (!deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
+                   deferred := (fn () => ()))
+                else ()
               val log = phase "log" upload_log
               (* A final failure's log is its only diagnostic and nothing
                  retries the action to recover it. *)
