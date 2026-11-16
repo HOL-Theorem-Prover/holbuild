@@ -36,6 +36,7 @@ from remote_exec.worker import (
     Protection,
     Releases,
     Unreleased,
+    cache_min_free_gb,
     child_charge,
     claim_reporting,
     cpu_times,
@@ -215,8 +216,11 @@ def logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
 
 @pytest.fixture(autouse=True)
 def roomy_disk(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Whatever the test machine's disk has free, the worker sees room for actions, unless a test says otherwise."""
+    """Whatever the test machine's disk has free, the worker sees room for actions, unless a test says otherwise,
+    and passes exec-action a free-space floor of 16 GiB."""
     monkeypatch.setattr(worker, "free_bytes", lambda _path: 100 * GIB)
+    monkeypatch.setattr(worker, "cache_min_free_gb", lambda _path: 16)
+    monkeypatch.setenv("HOLBUILD_CACHE", "/unused")
 
 
 def releases(tmp_path: Path, server: Server) -> Releases:
@@ -637,13 +641,46 @@ def test_worker_runs_the_action_on_the_release_that_exported_it(
         SPEC,
         "--cache-limit-gb",
         "50",
+        "--cache-min-free-gb",
+        "16",
         "--result",
-        logs[1].read_text().split()[9],
+        logs[1].read_text().split()[11],
         "--share-heaps",
     ]
     *held, released = (tmp_path / "protection").read_text().split()
     assert (set(held), released) == ({"on"}, "off")
     assert len(held) >= 2  # renewed on a heartbeat
+
+
+@pytest.mark.parametrize(("version", "floor"), [("0.14.54", False), ("0.14.55", True)])
+def test_worker_passes_the_free_space_floor_only_to_releases_that_take_it(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], version: str, floor: bool
+) -> None:
+    release_tarball(tmp_path / f"holbuild-{version}.tar.gz", version)
+    server.specs[SPEC] = f"holbuild-action-spec-v1\nholbuild-version={version}\n"
+
+    run_one(
+        Coordinator(server.url, "w"), worker_args(tmp_path, server), releases(tmp_path, server),
+        Protection(None, None), claim(), Phases(),
+    )
+
+    assert server.completed == [RECORD]
+    assert ("--cache-min-free-gb" in logs[1].read_text().split()) == floor
+
+
+@pytest.mark.parametrize(("size_gib", "floor_gib"), [(100, 16), (320, 16), (1000, 50), (1679, 84)])
+def test_the_free_space_floor_is_5_percent_of_the_cache_disk_and_at_least_16_gib(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size_gib: int, floor_gib: int
+) -> None:
+    seen = []
+
+    def statvfs(path: str) -> SimpleNamespace:
+        seen.append(path)
+        return SimpleNamespace(f_blocks=size_gib * GIB // 4096, f_frsize=4096)
+
+    monkeypatch.setattr(worker.os, "statvfs", statvfs)
+    assert cache_min_free_gb(str(tmp_path / "cache" / "not-made-yet")) == floor_gib
+    assert seen == [str(tmp_path)]
 
 
 AHEAD_PARENTS = [{"input_key": "7" * 64, "spec_sha256": "8" * 64}, {"input_key": "9" * 64, "spec_sha256": "a" * 64}]

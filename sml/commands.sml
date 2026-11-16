@@ -295,7 +295,8 @@ fun action_spec_help () = print
 fun exec_action_help () = print
   "Usage:\n\
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
-  \      --cache-limit-gb N [--cache-reserve-gb N] [--share-heaps] [--result FILE]\n\
+  \      --cache-limit-gb N [--cache-reserve-gb N] [--cache-min-free-gb N]\n\
+  \      [--share-heaps] [--result FILE]\n\
   \      [--ahead-parent INPUT_KEY:SPEC-SHA256 ... [--ahead-wait-seconds N]]\n\n\
   \Run the ActionSpec stored in the remote cache as SPEC-SHA256 (see\n\
   \action-spec), or the run spec (see run-action), and publish its result to\n\
@@ -309,6 +310,8 @@ fun exec_action_help () = print
   \                     checkpoints, toolchains and local cache entries until\n\
   \                     the cache root holds at most N GB minus the reserve.\n\
   \--cache-reserve-gb N Room to keep free under the limit (default: a tenth).\n\
+  \--cache-min-free-gb N Also evict while the cache's disk has under N GB\n\
+  \                     free, to N GB plus a buffer (default: 0, off).\n\
   \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
   \                     other workers published, and publish this run's. The\n\
   \                     host store CACHE/checkpoint-store keeps their files.\n\
@@ -3910,23 +3913,33 @@ fun exec_action_command maxheap jobs args =
           SOME n => if n >= 0 then IntInf.fromInt n * 1073741824
                     else raise Error (label ^ " must be a non-negative integer")
         | NONE => raise Error (label ^ " must be a non-negative integer")
-    fun parse (opts as {spec, result, limit, reserve, share}) rest =
+    fun parse (opts as {spec, result, limit, reserve, floor, share}) rest =
       case rest of
           [] => opts
-        | "--result" :: file :: xs => parse {spec = spec, result = SOME file, limit = limit, reserve = reserve, share = share} xs
+        | "--result" :: file :: xs =>
+            parse {spec = spec, result = SOME file, limit = limit, reserve = reserve, floor = floor, share = share} xs
         | "--cache-limit-gb" :: n :: xs =>
-            parse {spec = spec, result = result, limit = SOME (gb "--cache-limit-gb" n), reserve = reserve, share = share} xs
+            parse {spec = spec, result = result, limit = SOME (gb "--cache-limit-gb" n), reserve = reserve,
+                   floor = floor, share = share} xs
         | "--cache-reserve-gb" :: n :: xs =>
-            parse {spec = spec, result = result, limit = limit, reserve = SOME (gb "--cache-reserve-gb" n), share = share} xs
-        | "--share-heaps" :: xs => parse {spec = spec, result = result, limit = limit, reserve = reserve, share = true} xs
+            parse {spec = spec, result = result, limit = limit, reserve = SOME (gb "--cache-reserve-gb" n),
+                   floor = floor, share = share} xs
+        | "--cache-min-free-gb" :: n :: xs =>
+            parse {spec = spec, result = result, limit = limit, reserve = reserve,
+                   floor = gb "--cache-min-free-gb" n, share = share} xs
+        | "--share-heaps" :: xs =>
+            parse {spec = spec, result = result, limit = limit, reserve = reserve, floor = floor, share = true} xs
         | ["--result"] => raise Error "--result requires FILE"
         | ["--cache-limit-gb"] => raise Error "--cache-limit-gb requires N"
         | ["--cache-reserve-gb"] => raise Error "--cache-reserve-gb requires N"
+        | ["--cache-min-free-gb"] => raise Error "--cache-min-free-gb requires N"
         | arg :: xs =>
             if String.isPrefix "-" arg then raise Error ("unknown exec-action option: " ^ arg)
             else
               case spec of
-                  NONE => parse {spec = SOME arg, result = result, limit = limit, reserve = reserve, share = share} xs
+                  NONE =>
+                    parse {spec = SOME arg, result = result, limit = limit, reserve = reserve, floor = floor,
+                           share = share} xs
                 | SOME _ => raise Error "exec-action takes one SPEC-SHA256"
     val ahead_parents = ref []
     fun ahead_parent text =
@@ -3953,12 +3966,13 @@ fun exec_action_command maxheap jobs args =
       | take_ahead ["--ahead-parent"] = raise Error "--ahead-parent requires INPUT_KEY:SPEC-SHA256"
       | take_ahead ["--ahead-wait-seconds"] = raise Error "--ahead-wait-seconds requires N"
       | take_ahead (x :: xs) = x :: take_ahead xs
-    val {spec, result, limit, reserve, share} =
-      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, share = false} (take_ahead args)
+    val {spec, result, limit, reserve, floor, share} =
+      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, floor = 0, share = false} (take_ahead args)
     val spec = case spec of SOME s => s | NONE => raise Error "exec-action requires SPEC-SHA256"
     val cache_cap =
       case limit of
-          SOME limit => {limit_bytes = limit, reserve_bytes = Option.getOpt (reserve, limit div 10)}
+          SOME limit =>
+            {limit_bytes = limit, reserve_bytes = Option.getOpt (reserve, limit div 10), min_free_bytes = floor}
         | NONE => raise Error "exec-action requires --cache-limit-gb N"
     fun toolchain {git, rev, kernel = _} =
       let

@@ -47,6 +47,7 @@ COMPLETE = ".complete"  # stamp file of a finished release build
 MIN_SANDBOX_RELEASE = (0, 13, 58)
 MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
+MIN_FREE_FLOOR_RELEASE = (0, 14, 55)  # the first whose exec-action takes --cache-min-free-gb
 
 
 @functools.cache
@@ -566,13 +567,25 @@ def wait_for_memory(directory: str, charge: int, drain: Drain | None = None) -> 
     return logged
 
 
-def free_bytes(path: str) -> int:
-    """Bytes an unprivileged writer has free on the file system ``path`` is on, or would be created on."""
+def file_system(path: str) -> os.statvfs_result:
+    """The file system ``path`` is on, or would be created on."""
     path = os.path.abspath(path)
     while not os.path.exists(path):
         path = os.path.dirname(path)
-    stat = os.statvfs(path)
+    return os.statvfs(path)
+
+
+def free_bytes(path: str) -> int:
+    """Bytes an unprivileged writer has free on the file system ``path`` is on, or would be created on."""
+    stat = file_system(path)
     return stat.f_bavail * stat.f_frsize
+
+
+def cache_min_free_gb(path: str) -> int:
+    """exec-action's --cache-min-free-gb for the cache root ``path``: 5% of its file system, at least 16 GiB, so
+    that files outside the cache (other stores, container layers, tmp) don't fill the disk the cache cap sizes."""
+    stat = file_system(path)
+    return max(16, math.ceil(stat.f_blocks * stat.f_frsize * 0.05 / GIB))
 
 
 def disk_shortfall() -> str | None:
@@ -822,14 +835,17 @@ def exec_action_env(*, version: str, discovery_config: str | None = None) -> dic
 
 
 def exec_action_command(
-    args: argparse.Namespace, holbuild: str, spec: str, result: str, max_heap_mb: int | None,
+    args: argparse.Namespace, holbuild: str, version: str, spec: str, result: str, max_heap_mb: int | None,
     ahead_parents: list[dict[str, str]],
 ) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
     command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
     if args.cooperate_dir is not None:
         command += ["--cooperate-dir", args.cooperate_dir]
-    command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb), "--result", result]
+    command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb)]
+    if tuple(map(int, version.split("."))) >= MIN_FREE_FLOOR_RELEASE:
+        command += ["--cache-min-free-gb", str(cache_min_free_gb(os.environ["HOLBUILD_CACHE"]))]
+    command += ["--result", result]
     if args.share_heaps:
         command.append("--share-heaps")
     for parent in ahead_parents:
@@ -1001,7 +1017,7 @@ def execute(
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, spec, result, claim.get("max_heap_mb"), ahead_parents),
+            exec_action_command(args, holbuild, version, spec, result, claim.get("max_heap_mb"), ahead_parents),
             env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )

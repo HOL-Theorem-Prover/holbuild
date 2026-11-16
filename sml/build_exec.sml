@@ -10113,6 +10113,35 @@ in
       handle _ => NONE
 end
 
+(* The file system PATH is on, as statvfs(3) sees it: the bytes and inodes an
+   unprivileged writer has free, and its size in bytes. NONE off Linux or if
+   the call fails, so that the worker cache cap keeps to its byte limit. Only
+   exec-action's cap calls it, from one thread, as children_peak_rss_mb. *)
+local
+  open Foreign
+  val statvfs = buildCall2 (getSymbol (loadExecutable ()) "statvfs", (cString, cPointer), cInt)
+  (* glibc's struct statvfs on LP64 Linux: unsigned longs f_bsize, f_frsize,
+     f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail, ... *)
+  val statvfs_bytes = 0w112
+in
+  fun disk_space path =
+    if not (file_exists "/proc/self/status") then NONE
+    else
+      let
+        val buffer = Memory.malloc statvfs_bytes
+        fun field i = SysWord.toLargeInt (Memory.get64 (buffer, i))
+        val space =
+          (if statvfs (path, buffer) = 0 then
+             SOME {free = field 0w4 * field 0w1, inodes = field 0w7, size = field 0w2 * field 0w1}
+           else NONE)
+          handle e => (Memory.free buffer; raise e)
+      in
+        Memory.free buffer;
+        space
+      end
+      handle _ => NONE
+end
+
 fun peak_rss_mb stage =
   (case String.tokens Char.isSpace (read_text (Path.concat(stage, peak_rss_report_name))) of
       ["VmHWM:", kb, "kB"] => Option.map (fn n => n div 1024) (Int.fromString kb)
@@ -10435,27 +10464,47 @@ fun worker_cache_roots cache =
                    (0 : Position.int) (HolbuildHolSharedCache.toolchain_keys ())
   in
     [tree (share_store cache), {id = toolchain_id, measure = toolchain_bytes},
-     tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache)]
+     tree (HolbuildCache.actions_dir cache), tree (HolbuildCache.blobs_dir cache),
+     tree (HolbuildCache.theory_modules_dir cache)]
   end
 
 (* Evict least recently used families until the cache leaves reserve_bytes of
    room under limit_bytes. An action reuses a recent shared scan while the
    cache stays within limit_bytes, so the reserve absorbs growth between
-   evictions instead of every action waiting on one; private checkpoints and
-   modules are always measured locally. Small caps
+   evictions instead of every action waiting on one; private checkpoints are
+   always measured locally. Small caps
    and zero reserves scan live.  With refresh, as after an action's result,
    scan only when the stamp is past half its life and no other process holds
    gc.lock, so that busy hosts keep the stamp fresh and actions seldom wait
-   on a scan. *)
-fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes, refresh} =
+   on a scan.
+   With min_free_bytes > 0, files outside the cache count too: when the disk
+   has less free (or under 65536 free inodes), the sweep evicts to the floor
+   plus a buffer. A sweep that took that on marks its stamp floor-handled, so
+   that siblings don't queue behind it, nor sweep again for the floor while
+   the stamp is fresh when files the cap can't evict hold the disk below it. *)
+fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes, min_free_bytes, refresh} =
   let
-    fun private_bytes () =
-      cache_root_bytes checkpoint_root + cache_root_bytes (HolbuildCache.theory_modules_dir cache)
+    fun private_bytes () = cache_root_bytes checkpoint_root
     val roots = worker_cache_roots cache
     fun root_ids () = map (fn {id, ...} => id ()) roots
     fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
     val target = limit_bytes - reserve_bytes
-    val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap.state")
+    (* Releases before the theory-modules root keep their four-root stamp in
+       worker-cache-cap.state, so a host running both doesn't thrash either. *)
+    val state_path = Path.concat(HolbuildCache.locks_dir cache, "worker-cache-cap-v3.state")
+    val state_header = "holbuild-worker-cache-cap-v3"
+    (* Bytes to evict to bring the disk back over the floor with a buffer of
+       max(8 GiB, 4% of it), or 0 when it is over. *)
+    fun floor_deficit () =
+      if min_free_bytes <= 0 then 0
+      else
+        case disk_space cache of
+            NONE => 0
+          | SOME {free, inodes, size} =>
+              if free >= min_free_bytes andalso inodes >= 65536 then 0
+              else
+                let val buffer = LargeInt.max (gb_to_bytes 8, size div 25)
+                in LargeInt.max (buffer, min_free_bytes + buffer - free) end
     fun parse_sizes [] = SOME []
       | parse_sizes (id :: bytes :: rest) =
           (case (IntInf.fromString bytes, parse_sizes rest) of
@@ -10465,7 +10514,8 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     val stamp_life = 60000000000 : LargeInt.int
     fun stamp_age () =
       (case String.tokens Char.isSpace (read_text state_path) of
-           "holbuild-worker-cache-cap-v2" :: measured :: _ =>
+           header :: measured :: _ =>
+             if header <> state_header then NONE else
              Option.map (fn measured => Time.toNanoseconds (Time.now ()) - measured) (LargeInt.fromString measured)
          | _ => NONE)
       handle IO.Io _ => NONE
@@ -10473,9 +10523,9 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
     fun recent_scan_fits private_bytes =
       target >= gb_to_bytes 64 andalso reserve_bytes > 0 andalso
       (case String.tokens Char.isSpace (read_text state_path) of
-           "holbuild-worker-cache-cap-v2" :: measured :: entries =>
-             (case (LargeInt.fromString measured, parse_sizes entries) of
-                  (SOME measured, SOME entries) =>
+           header :: measured :: floor_state :: entries =>
+             (case (header = state_header, LargeInt.fromString measured, parse_sizes entries) of
+                  (true, SOME measured, SOME entries) =>
                     let val age = Time.toNanoseconds (Time.now ()) - measured
                     in
                       age >= 0 andalso age < stamp_life andalso length entries = length roots andalso
@@ -10484,7 +10534,8 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                                 are shared. Keep their hits without stamp churn. *)
                              (fn (({id = identify, measure}), (id, bytes)) =>
                                  if identify () = id then bytes else measure ())
-                             (roots, entries)) + private_bytes () <= limit_bytes
+                             (roots, entries)) + private_bytes () <= limit_bytes andalso
+                      (floor_state = "floor-handled" orelse (floor_state = "floor-ok" andalso floor_deficit () = 0))
                     end
                 | _ => false)
          | _ => false)
@@ -10502,8 +10553,8 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
         steps := !steps @ [(name, Time.toMilliseconds (Time.-(Time.now (), start)))];
         result
       end
-    fun sweep total remaining =
-      if total <= target then total
+    fun sweep goal total remaining =
+      if total <= goal then total
       else
         case remaining of
             [] => total
@@ -10512,7 +10563,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                 val freed =
                   evict () handle e => (warn ("worker cache eviction failed: " ^ General.exnMessage e); NONE)
               in
-                sweep (total - Option.getOpt (freed, 0)) rest
+                sweep goal (total - Option.getOpt (freed, 0)) rest
               end
     fun measure_shared () =
       let
@@ -10521,10 +10572,11 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
       in
         {measured = measured, ids = ids, sizes = map (fn {measure, ...} => measure ()) roots}
       end
-    fun publish {measured, ids, sizes} =
+    fun publish floor_handled {measured, ids, sizes} =
       if ids <> root_ids () then remove_file state_path
       else write_text state_path
-        ("holbuild-worker-cache-cap-v2\n" ^ LargeInt.toString measured ^ "\n" ^
+        (state_header ^ "\n" ^ LargeInt.toString measured ^ "\n" ^
+         (if floor_handled then "floor-handled\n" else "floor-ok\n") ^
          String.concat (ListPair.map (fn (id, bytes) => id ^ " " ^ IntInf.toString bytes ^ "\n")
                                     (ids, sizes)))
     fun scan reuse =
@@ -10535,8 +10587,10 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
           let
             val shared = timed "walk" measure_shared
             val total = sum (#sizes shared) + private_size
+            val deficit = floor_deficit ()
+            val goal = LargeInt.min (target, total - deficit)
           in
-            if total <= target then publish shared
+            if total <= goal then publish false shared
             else
               let
                 (* Eviction can outlast the stamp's life. The fresh walk
@@ -10544,7 +10598,7 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                    limit reuse it instead of waiting on gc.lock. Stamped
                    when the walk ends, so eviction gets the stamp's whole
                    life. *)
-                val _ = publish {measured = Time.toNanoseconds (Time.now ()), ids = #ids shared,
+                val _ = publish (deficit > 0) {measured = Time.toNanoseconds (Time.now ()), ids = #ids shared,
                                  sizes = #sizes shared}
                 val families =
                   timed "families" (fn () =>
@@ -10556,13 +10610,19 @@ fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes
                               store_cache_families cache @ module_cache_families cache @
                               local_families) @ by_age young_orphans
                     end)
-                val after = timed "evict" (fn () => sweep total families)
+                val after = timed "evict" (fn () => sweep goal total families)
               in
                 (* Measure again rather than publish an estimate derived from
                    the mixed private and shared freed total, so a waiter on
                    gc.lock reuses the result rather than repeating the scan.
                    Until then siblings keep reusing the pre-eviction walk. *)
-                if after <= target then publish (timed "rewalk" measure_shared)
+                if after <= target then
+                  (publish (after > goal) (timed "rewalk" measure_shared);
+                   if after > goal then
+                     warn ("the disk stays under the " ^ gb_decimal_text min_free_bytes ^
+                           " GB free-space floor with the worker cache down to " ^ gb_decimal_text after ^
+                           " GB of entries in use")
+                   else ())
                 else (remove_file state_path;
                       warn ("worker cache holds " ^ gb_decimal_text after ^ " GB of entries in use, over the " ^
                            gb_decimal_text target ^ " GB left under the cap after its reserve"))
@@ -12986,12 +13046,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         (fn () =>
             let
               val _ =
-                let val {limit_bytes, reserve_bytes} = cache_cap
+                let val {limit_bytes, reserve_bytes, min_free_bytes} = cache_cap
                 in
                   phase "cap" (fn () =>
                     enforce_worker_cache_cap
-                      {cache = cache, checkpoint_root = checkpoint_root,
-                       limit_bytes = limit_bytes, reserve_bytes = reserve_bytes, refresh = false})
+                      {cache = cache, checkpoint_root = checkpoint_root, limit_bytes = limit_bytes,
+                       reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false})
                 end
               val (status, failure) = attempt ()
               val _ =
@@ -13054,11 +13114,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                 (* A worker draining after the result has a few seconds left
                    for the publish, not for a cache scan. *)
                 if !cancelled then () else
-                  let val {limit_bytes, reserve_bytes} = cache_cap
+                  let val {limit_bytes, reserve_bytes, min_free_bytes} = cache_cap
                   in
                     enforce_worker_cache_cap
-                      {cache = cache, checkpoint_root = checkpoint_root,
-                       limit_bytes = limit_bytes, reserve_bytes = reserve_bytes, refresh = true}
+                      {cache = cache, checkpoint_root = checkpoint_root, limit_bytes = limit_bytes,
+                       reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = true}
                   end;
                 HolbuildStatus.message_stderr
                   ("holbuild: exec-action after the result (ms): " ^
