@@ -61,10 +61,10 @@ async def test_passing_a_wake_preserves_its_kind_and_normal_generation(
         (["standard"], rank, second, True),
     ]
     coordinator._wake_claim("standard", ahead=ahead)
-    assert first.result() == ("standard", ahead, None)
+    assert first.result() == ("standard", ahead)
     assert not second.done()
     coordinator._pass_wake(first)
-    assert second.result() == ("standard", ahead, None)
+    assert second.result() == ("standard", ahead)
     assert coordinator.made_ready == (0 if ahead else 1)
 
 
