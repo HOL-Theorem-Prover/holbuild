@@ -22,6 +22,7 @@ import pytest
 
 from remote_exec import worker
 from remote_exec.auth import cache_discovery_token
+from remote_exec.cache import blob_key
 from remote_exec.formats import parse_result
 from remote_exec.worker import (
     DISK_FLOOR,
@@ -128,7 +129,8 @@ class Server:
     """The coordinator's worker endpoints, the remote cache's ``/cas/``, and the ECS agent's task protection."""
 
     url: str = ""
-    specs: dict[str, str] = field(default_factory=dict)
+    specs: dict[str, str] = field(default_factory=dict)  # under /cas/
+    zstd_specs: dict[str, str] = field(default_factory=dict)  # as 0.15.0 and later write them, compressed under /ac/
     completed: list[str] = field(default_factory=list)
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
@@ -168,6 +170,15 @@ def server() -> Iterator[Server]:
                 self.end_headers()
                 self.wfile.write(b"holbuild-action-spec-v1\n")
                 self.close_connection = True
+                return
+            compressed = {f"/ac/{blob_key(digest)}": spec for digest, spec in state.zstd_specs.items()}
+            if self.path in compressed:
+                body = subprocess.run(["zstd", "-qc"], input=compressed[self.path].encode(), capture_output=True,
+                                      check=True).stdout
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             spec = state.specs.get(self.path.removeprefix("/cas/"))
             self.reply(404) if spec is None else self.reply(200, spec)
@@ -1976,12 +1987,12 @@ def test_bootstrap_spec_falls_back_before_parsing(
     nodes = ["http://one.test", "http://two.test"]
     asked: list[str] = []
 
-    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
         asked.append(command[-1])
         assert "--retry" not in command
         if len(asked) == 1:
-            return subprocess.CompletedProcess(command, 22, f"\n{status}", "HTTP error")
-        return subprocess.CompletedProcess(command, 0, "holbuild-version=1.2.3\n\n200", "")
+            return subprocess.CompletedProcess(command, 22, f"\n{status}".encode(), b"HTTP error")
+        return subprocess.CompletedProcess(command, 0, b"holbuild-version=1.2.3\n\n200", b"")
 
     monkeypatch.setattr(subprocess, "run", fetch)
     assert Releases(str(tmp_path), "unused", ",".join(nodes), None).spec_version(SPEC) == "1.2.3"
@@ -2000,10 +2011,11 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
 ) -> None:
     asked: list[str] = []
 
-    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        status = statuses[len(asked)]
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        # /cas/ answers as given; /ac/, asked only after 404s from every node, misses.
+        status = statuses[len(asked)] if len(asked) < len(statuses) else 404
         asked.append(command[-1])
-        return subprocess.CompletedProcess(command, 22, f"\n{status}", f"HTTP {status}")
+        return subprocess.CompletedProcess(command, 22, f"\n{status}".encode(), f"HTTP {status}".encode())
 
     monkeypatch.setattr(subprocess, "run", fetch)
     ring = Releases(str(tmp_path), "unused", "http://one.test,http://two.test", None)
@@ -2013,7 +2025,29 @@ def test_bootstrap_spec_distinguishes_miss_from_outage(
     with pytest.raises(error, match=message) as caught:
         ring.spec_version(SPEC)
     assert type(caught.value) is error
-    assert len(asked) == len(statuses)
+    assert len(asked) == (4 if statuses == (404, 404) else len(statuses))
+
+
+def test_bootstrap_spec_reads_one_written_compressed_under_ac(tmp_path: Path, server: Server) -> None:
+    server.zstd_specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=0.15.0\n"
+    assert Releases(str(tmp_path), "unused", server.url, None).spec_version(SPEC) == "0.15.0"
+
+
+def test_bootstrap_spec_under_ac_that_does_not_decompress_is_corrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = subprocess.run
+
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if command[0] == "zstd":
+            return run(command, **kwargs)
+        if "/cas/" in command[-1]:
+            return subprocess.CompletedProcess(command, 22, b"\n404", b"HTTP 404")
+        return subprocess.CompletedProcess(command, 0, b"holbuild-version=1.2.3\n\n200", b"")
+
+    monkeypatch.setattr(subprocess, "run", fetch)
+    with pytest.raises(RuntimeError, match="corrupt"):
+        Releases(str(tmp_path), "unused", "http://one.test", None).spec_version(SPEC)
 
 
 def test_worker_discovery_exposes_only_a_scoped_token_to_the_action_and_cleans_it_on_exit(
