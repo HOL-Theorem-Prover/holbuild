@@ -42,18 +42,36 @@ fun package_paths (package, paths) =
                (HolbuildProject.package_generators package)
   end
 
+(* The path to watch for an extra-input declaration DECL relative to BASE: the
+   file or directory it names or, for a glob, the directory of its literal
+   prefix, since a glob is matched against every file below BASE. *)
+fun extra_input_watch_path base decl =
+  let
+    val literal = Substring.takel (fn c => c <> #"*" andalso c <> #"?") (Substring.full decl)
+    val path =
+      if Substring.size literal = size decl then decl
+      else Substring.string (Substring.dropr (fn c => c <> #"/") literal)
+  in
+    Path.mkCanonical (if Path.isAbsolute path then path else Path.concat(base, path))
+  end
+
+(* Adds a source and the extra inputs its action policy and its own
+   holbuild_extra_deps declare. *)
 fun source_paths (source : HolbuildSourceIndex.source, paths) =
   let
-    val paths = add_readable (#source_path source) paths
-    val extras = HolbuildProject.action_extra_inputs (#policy source)
+    val source_path = #source_path source
+    val manifest_decls =
+      map (fn extra => (#package_root source, HolbuildProject.extra_input_path extra))
+          (HolbuildProject.action_extra_inputs (#policy source))
+    val source_decls =
+      if readable source_path then
+        map (fn decl => (Path.dir source_path, decl))
+            (#extra_deps (HolbuildDependencies.extract_textual source_path))
+      else []
   in
-    List.foldl
-      (fn (extra, acc) =>
-        add_existing
-          (Path.concat(#package_root source, HolbuildProject.extra_input_path extra))
-          acc)
-      paths
-      extras
+    List.foldl (fn ((base, decl), acc) => add_existing (extra_input_watch_path base decl) acc)
+               (add_readable source_path paths)
+               (manifest_decls @ source_decls)
   end
 
 (* The directories whose manifests are in use. A manifest that takes
