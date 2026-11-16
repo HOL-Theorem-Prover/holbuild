@@ -65,15 +65,18 @@ val [primary, backup] = RC.ranked_urls cache digest;
 val _ = RC.write_text src text;
 val _ = RC.write_text (stored backup "cas" digest) text;
 val _ = put backup "authorization" "Basic dXNlcjpwYXNz";
-val _ = assert "request keeps inline credentials" (fetch auth_cache digest = CB.Hit);
+val _ = assert "request keeps inline credentials" (RC.required (fn () => fetch auth_cache digest) = CB.Hit);
 val _ = clear backup "authorization";
-val _ = assert "GET 404 handoff" (fetch cache digest = CB.Hit andalso RC.read_text dst = text);
-val _ = assert "HEAD 404 handoff" (RC.blob_present cache digest andalso RC.blob_confirmed_present cache digest);
+val _ = assert "an optional GET ends at the primary's 404" (fetch cache digest = CB.Miss);
+val _ = assert "an optional HEAD ends at the primary's 404" (not (RC.blob_present cache digest));
+val _ = assert "GET 404 handoff" (RC.required (fn () => fetch cache digest) = CB.Hit andalso RC.read_text dst = text);
+val _ = assert "HEAD 404 handoff"
+  (RC.required (fn () => RC.blob_present cache digest andalso RC.blob_confirmed_present cache digest));
 val key = "handoff-action";
 val ac = RC.remote_action_key key;
 val [ac_primary, ac_backup] = RC.ranked_urls cache ac;
 val _ = RC.write_text (stored ac_backup "ac" ac) (RC.metadata_text text []);
-val _ = assert "AC GET 404 handoff" (RC.get_action cache key = SOME text);
+val _ = assert "AC GET 404 handoff" (RC.required (fn () => RC.get_action cache key) = SOME text);
 fun transient_case code =
   (put primary "get-status" code;
    put primary "head-status" code;
@@ -110,8 +113,9 @@ val _ = assert "missing plus transient is a miss" (fetch cache digest = CB.Miss)
 val _ = assert "a required read of missing plus transient is unavailable"
   (unavailable (fn () => RC.required (fn () => fetch cache digest)));
 val _ = put backup "get-status" "403";
+val _ = assert "an optional read never asks the backup after a 404" (fetch auth_cache digest = CB.Miss);
 val _ = assert "backup authorization failure overrides miss and names backup"
-  (case fetch auth_cache digest of
+  (case RC.required (fn () => fetch auth_cache digest) of
        CB.Corrupt message => String.isSubstring (RC.redact_userinfo (authenticated backup) ^ "/cas/" ^ digest) message andalso
                              not (String.isSubstring "user:pass" message)
      | _ => false);
@@ -157,7 +161,9 @@ val _ = assert "two weak replicas do not hide a strict third"
   (RC.get_action_using timed replicas theory_key = SOME (theory_manifest "10.0"));
 val _ = RC.remove_file (stored first "ac" theory_ac);
 val _ = RC.remove_file (stored second "ac" theory_ac);
-val _ = assert "a miss walks the whole ring" (RC.get_action replicas theory_key = SOME (theory_manifest "10.0"));
+val _ = assert "an optional miss ends at the first node" (RC.get_action replicas theory_key = NONE);
+val _ = assert "a required miss walks the whole ring"
+  (RC.required (fn () => RC.get_action replicas theory_key) = SOME (theory_manifest "10.0"));
 val _ = RC.remove_file (stored third "ac" theory_ac);
 val _ = assert "missing everywhere is a miss" (RC.get_action replicas theory_key = NONE);
 
@@ -178,24 +184,52 @@ fun asked_during f =
                                      | _ => NONE)
                        (List.drop (requests node, n))) (nodes, before))
   end;
-val [_, _, q3, q4] = RC.ranked_urls quad theory_ac;
-val _ = seed q3 (theory_manifest "none");
+val [q1, _, q3, q4] = RC.ranked_urls quad theory_ac;
+fun required f = RC.required f;
+(* An optional read ends at the first plain 404: every node serves what the
+   shared backing store holds, so it misses only an entry another node took
+   moments ago.  A required read still walks the ring. *)
 val _ = seed q4 (theory_manifest "10.0");
+val _ = assert "an optional miss asks one node"
+  (asked_during (fn () => RC.get_action quad theory_key) = (NONE, [["GET"], [], [], []]));
+val _ = assert "a required read finds an entry only the last node holds"
+  (asked_during (fn () => required (fn () => RC.get_action quad theory_key)) =
+   (SOME (theory_manifest "10.0"), [["GET"], ["GET"], ["HEAD"], ["HEAD", "GET"]]));
+val _ = seed q3 (theory_manifest "none");
 val _ = assert "probes pass a weaker copy over for a stronger later one"
-  (asked_during (fn () => RC.get_action_using timed quad theory_key) =
+  (asked_during (fn () => required (fn () => RC.get_action_using timed quad theory_key)) =
    (SOME (theory_manifest "10.0"), [["GET"], ["GET"], ["HEAD", "GET"], ["HEAD", "GET"]]));
 val _ = RC.remove_file (stored q3 "ac" theory_ac);
+val _ = seed q1 (theory_manifest "none");
+val _ = assert "an optional read past a weaker copy looks on for a stronger one"
+  (asked_during (fn () => RC.get_action_using timed quad theory_key) =
+   (SOME (theory_manifest "10.0"), [["GET"], ["GET"], ["GET"], ["HEAD", "GET"]]));
+val _ = RC.remove_file (stored q1 "ac" theory_ac);
+(* A client restoring what a remote batch reported done reads it as
+   required, on whichever thread copies it. *)
+val local_root = dir ^ "/local-cache";
+val _ = List.app (fn node => RC.write_text (stored node "cas" digest) text) (RC.ranked_urls quad digest);
+fun copy () = HolbuildBuildExec.copy_remote_cache_entry local_root (RC.base_url quad) theory_key;
+val _ = assert "a client reads a key no batch reported done as optional"
+  (asked_during copy = (false, [["GET"], [], [], []]));
+val _ = HolbuildBuildExec.expect_remote_entry theory_key;
+val _ = assert "a client reads a key a batch reported done as required"
+  (#1 (asked_during copy) andalso
+   HolbuildCache.get_action local_root theory_key = SOME (theory_manifest "10.0"));
 val _ = RC.remove_file (stored q4 "ac" theory_ac);
-val _ = assert "a miss asks two nodes, then probes the rest"
-  (asked_during (fn () => RC.get_action quad theory_key) = (NONE, [["GET"], ["GET"], ["HEAD"], ["HEAD"]]));
+val _ = assert "a required miss asks two nodes, then probes the rest"
+  (asked_during (fn () => required (fn () => RC.get_action quad theory_key)) =
+   (NONE, [["GET"], ["GET"], ["HEAD"], ["HEAD"]]));
+val _ = put q1 "get-status" "503";
+val _ = assert "an optional read goes past a failed node to the next one's 404"
+  (asked_during (fn () => RC.get_action quad theory_key) = (NONE, [["GET"], ["GET"], [], []]));
+val _ = clear q1 "get-status";
 val _ = put q3 "head-status" "503";
-val _ = assert "a probe's 503 beside 404s is a miss"
-  (asked_during (fn () => RC.get_action quad theory_key) = (NONE, [["GET"], ["GET"], ["HEAD"], ["HEAD"]]));
 val _ = assert "a required read with a probe's 503 beside 404s is unavailable"
-  (unavailable (fn () => RC.required (fn () => RC.get_action quad theory_key)));
+  (unavailable (fn () => required (fn () => RC.get_action quad theory_key)));
 val _ = seed q4 (theory_manifest "10.0");
 val _ = assert "a probe's 503 does not hide a later hit"
-  (#1 (asked_during (fn () => RC.get_action quad theory_key)) = SOME (theory_manifest "10.0"));
+  (#1 (asked_during (fn () => required (fn () => RC.get_action quad theory_key))) = SOME (theory_manifest "10.0"));
 val _ = clear q3 "head-status";
 val _ = RC.remove_file (stored q4 "ac" theory_ac);
 
@@ -212,8 +246,10 @@ val _ = assert "PUT goes to the preferred node"
    not (RC.path_exists (stored first "cas" preferred_hash)) andalso
    not (RC.path_exists (stored second "cas" preferred_hash)));
 val _ = HolbuildRemoteCacheConfig.set_preferred_urls (authenticated first ^ "," ^ authenticated second);
-val _ = assert "a reader preferring other nodes still finds it"
-  (fetch replicas preferred_hash = CB.Hit andalso RC.read_text dst = preferred_text);
+val _ = assert "an optional reader preferring other nodes misses a fresh write"
+  (fetch replicas preferred_hash = CB.Miss);
+val _ = assert "a required reader preferring other nodes still finds it"
+  (RC.required (fn () => fetch replicas preferred_hash) = CB.Hit andalso RC.read_text dst = preferred_text);
 val _ = HolbuildRemoteCacheConfig.set_preferred_urls "";
 val _ = assert "no preference keeps rendezvous order"
   (RC.ranked_urls replicas theory_ac = [first, second, third]);

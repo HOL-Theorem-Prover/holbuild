@@ -2359,8 +2359,9 @@ fun publish_theory_action_seen seen remote (request as {key, text}) =
         fun retry detail =
           if attempts > 1 then attempt (attempts - 1) (read ())
           else conflict detail
+        (* After a write, which may have gone to a later node. *)
         fun verify result =
-          case read () of
+          case HolbuildRemoteCache.required read of
               NONE => retry "action missing after publication"
             | SOME observed_text =>
                 let val observed = compatible_contract observed_text
@@ -2452,6 +2453,24 @@ fun copied_from_remote key =
    Redblackset.member (!remote_copied_keys, key)
    before Mutex.unlock remote_copied_mutex)
 
+(* The keys of the actions a remote batch this process follows reported
+   done: their entries must be in the remote cache, maybe on the finishing
+   worker's node only, so they are read as required (HolbuildRemoteCache.
+   required).  Kept here, as the threads that restore or prefetch them don't
+   carry the caller's intent. *)
+val expected_remote_keys = ref (Redblackset.empty String.compare)
+val expected_remote_mutex = Mutex.mutex ()
+
+fun expect_remote_entry key =
+  (Mutex.lock expected_remote_mutex;
+   expected_remote_keys := Redblackset.add (!expected_remote_keys, key);
+   Mutex.unlock expected_remote_mutex)
+
+fun remote_entry_expected key =
+  (Mutex.lock expected_remote_mutex;
+   Redblackset.member (!expected_remote_keys, key)
+   before Mutex.unlock expected_remote_mutex)
+
 (* Copies the remote entry for key into the local cache, from the first node
    whose manifest passes `usable`.  Returns false on a remote miss and raises
    if the entry is unusable. *)
@@ -2459,20 +2478,22 @@ fun copy_remote_cache_entry_using usable root url key =
   let
     val remote = HolbuildRemoteCache.remote url
     val local_cache = HolbuildFSCacheBackend.filesystem root
+    fun copy () =
+      case HolbuildRemoteCache.get_action_using usable remote key of
+          NONE => false
+        | SOME manifest =>
+            (HolbuildFSCacheBackend.ensure_layout local_cache;
+             (* Before the copy, which a build worker may restore as soon as
+                its manifest lands. *)
+             note_remote_copy key;
+             HolbuildCacheTransfer.copy_entry
+               {source = remote_cache_source_with_action remote key manifest,
+                destination = fs_cache_destination local_cache,
+                stage_dir = HolbuildFSCacheBackend.blobs_dir local_cache}
+               key;
+             true)
   in
-    case HolbuildRemoteCache.get_action_using usable remote key of
-        NONE => false
-      | SOME manifest =>
-          (HolbuildFSCacheBackend.ensure_layout local_cache;
-           (* Before the copy, which a build worker may restore as soon as
-              its manifest lands. *)
-           note_remote_copy key;
-           HolbuildCacheTransfer.copy_entry
-             {source = remote_cache_source_with_action remote key manifest,
-              destination = fs_cache_destination local_cache,
-              stage_dir = HolbuildFSCacheBackend.blobs_dir local_cache}
-             key;
-           true)
+    if remote_entry_expected key then HolbuildRemoteCache.required copy else copy ()
   end
 
 fun copy_remote_cache_entry root url key = copy_remote_cache_entry_using (fn _ => true) root url key
@@ -7660,7 +7681,8 @@ fun node_with_input_key (options : build_options) tc project plan toolchain_key 
               (HolbuildBuildPlan.selected_nodes plan)
   end
 
-(* Fetch a worker's log to the same location as a local theory build. *)
+(* Fetch a worker's log to the same location as a local theory build.  The
+   worker reported it, so it is read as required. *)
 fun fetch_remote_build_log project node log_sha256 =
   let
     val log = current_build_log (current_log_dir (project_artifact_root project) (package node) (logical_name node))
@@ -7670,8 +7692,9 @@ fun fetch_remote_build_log project node log_sha256 =
     (case HolbuildRemoteCacheConfig.url () of
          NONE => NONE
        | SOME url =>
-           case HolbuildRemoteCache.fetch_unlisted_blob (HolbuildRemoteCache.remote url)
-                  {hash = log_sha256, dst = log} of
+           case HolbuildRemoteCache.required (fn () =>
+                  HolbuildRemoteCache.fetch_unlisted_blob (HolbuildRemoteCache.remote url)
+                    {hash = log_sha256, dst = log}) of
                HolbuildCacheBackend.Hit => SOME log
              | _ => (remove_file log; NONE))
     handle e => (remove_file log; raise e)
@@ -9123,7 +9146,8 @@ fun fetch_failed_run remote dir ({name, context, run_key} : run) log_sha256 =
       case log_sha256 of
           NONE => ()
         | SOME hash =>
-            if (HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = log} =
+            if (HolbuildRemoteCache.required (fn () =>
+                  HolbuildRemoteCache.fetch_unlisted_blob remote {hash = hash, dst = log}) =
                 HolbuildCacheBackend.Hit
                 handle HolbuildRemoteCache.Unavailable _ => false) then ()
             else (remove_tree log; warn ("could not fetch the log of failed run " ^ name))
@@ -9642,8 +9666,10 @@ fun records_parent recorded ({target, ...} : {target : string, stem : string, ke
 fun drop_stale_dep_copies remote (spec : spec_deps) wanted =
   let val checks = map (fn dep => (dep, ref false)) (List.filter wanted (#deps spec))
   in
-    parallel_all remote_probe_width (fn (dep, dropped) => dropped := drop_local_copy_if_stale remote (#key dep))
-                 checks;
+    parallel_all remote_probe_width
+      (fn (dep, dropped) =>
+          dropped := HolbuildRemoteCache.required (fn () => drop_local_copy_if_stale remote (#key dep)))
+      checks;
     List.exists (fn (_, dropped) => !dropped) checks
   end
 
@@ -10034,7 +10060,7 @@ fun publish_action_entry remote root (spec : action_spec) =
                    fun replace why =
                      (warn ("replacing remote cache entry " ^ key ^ ": " ^ why);
                       ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest});
-                      HolbuildRemoteCache.get_action remote key)
+                      HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key))
                  in
                    if (cache_manifest_outputs_equal key resident manifest handle _ => false) then SOME resident
                    else if resident_misfits_parents remote root spec resident then
@@ -10057,7 +10083,7 @@ fun check_remote_publication remote root (spec : action_spec) =
     val local_manifest = HolbuildCache.get_action (cache_root ()) key
     val remote_manifest =
       case published of
-          NONE => HolbuildRemoteCache.get_action remote key
+          NONE => HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key)
         | SOME _ => published
     fun fail msg = raise ActionFailed (PublishFailure, msg)
   in
@@ -11192,7 +11218,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             in ignore (HolbuildRemoteCache.publish_action remote {key = claim_key, text = text}); text end
           fun claim_new () =
             let val text = write_claim (now ())
-            in OS.Process.sleep shared_heap_claim_settle; read_claim () = SOME text end
+            in OS.Process.sleep shared_heap_claim_settle; HolbuildRemoteCache.required read_claim = SOME text end
           fun claim () =
             case read_claim () of
                 SOME text => not (shared_heap_claim_active owner (now ()) text) andalso claim_new ()
@@ -11208,7 +11234,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               val _ = if needs_upload sha then raise Error ("could not upload " ^ deps_loaded) else ()
               val _ = HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
             in
-              if HolbuildRemoteCache.get_action remote heap_key = SOME manifest then
+              if HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote heap_key) = SOME manifest then
                 (store_add store sha {sha = sha, src = deps_loaded, save = true}; SOME sha)
               else NONE
             end
@@ -11873,7 +11899,7 @@ fun exec_run (hol_phase, publish_phase) check_cancelled remote root tc (spec : r
           HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame
             {key = #run_key spec, text = manifest}
       in
-        case remote_run_entry remote (#run_key spec) (#outputs spec) of
+        case HolbuildRemoteCache.required (fn () => remote_run_entry remote (#run_key spec) (#outputs spec)) of
             NONE => raise ActionFailed (PublishFailure, "the remote cache holds no entry for the run after publishing")
           | SOME (resident, _) =>
               if cache_manifest_outputs_equal (#run_key spec) manifest resident then ()
@@ -12508,7 +12534,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         val _ =
           phase "spec" (fn () =>
           (ensure_parent spec_path;
-           case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = spec_sha256, dst = spec_path} of
+           case HolbuildRemoteCache.required (fn () =>
+                  HolbuildRemoteCache.fetch_unlisted_blob remote {hash = spec_sha256, dst = spec_path}) of
                HolbuildCacheBackend.Hit => ()
              | HolbuildCacheBackend.Miss => reject_spec ("the cache has no spec " ^ spec_sha256)
              | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch the spec: " ^ msg)))
@@ -12805,7 +12832,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val name = Path.file stem
             val parent_spec = Path.concat (staging, name ^ ".spec")
           in
-            case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = parent_sha, dst = parent_spec} of
+            case HolbuildRemoteCache.required (fn () =>
+                   HolbuildRemoteCache.fetch_unlisted_blob remote {hash = parent_sha, dst = parent_spec}) of
                 HolbuildCacheBackend.Hit => ()
               | _ => abandon ("the cache has no spec " ^ parent_sha ^ " for " ^ name);
             (dep, parse_action_spec (read_text parent_spec))
