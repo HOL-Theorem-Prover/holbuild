@@ -28,9 +28,7 @@ fun has_suffix suffix s =
 fun ensure_dir path =
   if path = "" orelse path = "." then ()
   else if FS.access(path, []) handle OS.SysErr _ => false then ()
-  else
-    (ensure_dir (Path.dir path);
-     FS.mkDir path handle e as OS.SysErr _ => if FS.isDir path handle OS.SysErr _ => false then () else raise e)
+  else (ensure_dir (Path.dir path); FS.mkDir path handle OS.SysErr _ => ())
 
 fun ensure_parent path = ensure_dir (Path.dir path)
 
@@ -4050,8 +4048,10 @@ fun prepare_theory_stage speculative tc root (action : theory_action) =
     (* HOL exports the theory into .hol/objs and reports any failure to
        create that directory, a full disk included, as a path that "already
        exists but is not a directory"; created here, a full disk fails the
-       export's own writes, which name it. *)
-    ensure_dir (Path.concat(stage, ".hol/objs"));
+       export's own writes, which name it.  Unlike ensure_dir, mkDir raises
+       what stops it, and the stage was just emptied. *)
+    FS.mkDir (Path.concat(stage, ".hol"));
+    FS.mkDir (Path.concat(stage, ".hol/objs"));
     (* Extra inputs go in first, so holbuild's own files (the instrumented
        script above all) overwrite any input staged at the same path. *)
     List.app stage_input (#inputs action);
