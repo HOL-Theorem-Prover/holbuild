@@ -3,6 +3,7 @@
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -65,6 +66,7 @@ def read_batches(paths: list[Path], cache_url: str, curl_config: Path | None) ->
     results = []
     with tempfile.TemporaryDirectory(prefix="holbuild-step-logs-") as tmp:
         log_path = Path(tmp) / "build.log"
+        compressed = Path(tmp) / "build.log.zst"
         for (name, key), sha in logs.items():
             if sha is None:
                 results.append(Execution(f"{name}@{key}", False, []))
@@ -74,11 +76,19 @@ def read_batches(paths: list[Path], cache_url: str, curl_config: Path | None) ->
             command = ["curl", "--fail", "--silent", "--show-error", "--max-time", "60"]
             if curl_config is not None:
                 command += ["--config", str(curl_config)]
-            command += ["--output", str(log_path), cache_url.rstrip("/") + "/cas/" + sha]
+            # holbuild stores a blob zstd-compressed under /ac/, keyed by its SHA-256.
+            blob_key = hashlib.sha256(f"holbuild-zstd-blob-v1\n{sha}\n".encode()).hexdigest()
+            command += ["--output", str(compressed), cache_url.rstrip("/") + "/ac/" + blob_key]
             fetched = subprocess.run(command, capture_output=True, text=True)
             if fetched.returncode:
                 results.append(Execution(f"{name}@{key}", False, [],
                                          f"curl exited {fetched.returncode}: {fetched.stderr.strip()}"))
+                continue
+            decoded = subprocess.run(["zstd", "-d", "-q", "-f", "-o", str(log_path), str(compressed)],
+                                     capture_output=True, text=True)
+            if decoded.returncode:
+                results.append(Execution(f"{name}@{key}", False, [],
+                                         f"zstd exited {decoded.returncode}: {decoded.stderr.strip()}"))
             else:
                 results.append(read_log(f"{name}@{key}", log_path))
     return results

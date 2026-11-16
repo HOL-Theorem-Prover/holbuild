@@ -135,9 +135,6 @@ fun zstd_compress url src dst =
   else
     HolbuildSpawn.succeeded (run "zstd" ["-1", "-q", "-f", "-T1", "-o", dst, src])
 
-fun zstd_content_headers size =
-  ["Content-Encoding: zstd", "X-Digest-SizeBytes: " ^ size]
-
 val restore_warning_emitted = ref false
 val restore_warning_mutex = Mutex.mutex ()
 
@@ -516,15 +513,14 @@ fun curl_put_with_headers headers {url, src} = curl_put_urls headers {urls = [ur
 
 fun curl_put request = curl_put_with_headers [] request
 
-fun curl_put_zstd {urls, src, size} =
+fun curl_put_compressed {urls, src} =
   let
     val compressed = temp_path "zstd-put"
     fun put () =
       if zstd_compress (hd urls) src compressed then
-        curl_put_urls (zstd_content_headers size)
-          {urls = urls, src = compressed}
+        curl_put_urls [] {urls = urls, src = compressed}
       else
-        curl_put_urls [] {urls = urls, src = src}
+        HolbuildCacheBackend.Conflict ("zstd could not compress " ^ src ^ " for the remote cache")
   in
     if disabled () then HolbuildCacheBackend.Skipped
     else
@@ -535,10 +531,32 @@ fun curl_put_zstd {urls, src, size} =
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 fun remote_action_key key =
-  HolbuildHash.string_sha256 ("holbuild-remote-ac-v1\n" ^ key ^ "\n")
+  HolbuildHash.string_sha256 ("holbuild-remote-ac-v2\n" ^ key ^ "\n")
 
 fun action_urls cache key = request_urls cache "ac" (remote_action_key key)
-fun cas_urls cache sha256 = request_urls cache "cas" sha256
+
+(* A blob is stored compressed by its writer, as an opaque /ac/ entry: the
+   server keeps those bytes as they are, where a /cas/ upload costs it a
+   decompression, a hash and a recompression.  The key comes from the blob's
+   SHA-256, so everything that names a blob still names its content. *)
+fun blob_key sha256 =
+  HolbuildHash.string_sha256 ("holbuild-zstd-blob-v1\n" ^ sha256 ^ "\n")
+
+fun blob_urls cache sha256 = request_urls cache "ac" (blob_key sha256)
+
+(* The compressed copy is staged beside dst, on the file system dst is on. *)
+fun curl_get_compressed {urls, dst} =
+  let val compressed = HolbuildTempPath.near dst ".zst"
+  in
+    (case curl_get_urls {urls = urls, dst = compressed} of
+         HolbuildCacheBackend.Hit =>
+           if HolbuildSpawn.succeeded (run "zstd" ["-d", "-q", "-f", "-o", dst, compressed]) then
+             HolbuildCacheBackend.Hit
+           else HolbuildCacheBackend.Corrupt ("zstd could not decompress the remote blob at " ^ redact_userinfo (hd urls))
+       | other => other)
+    before remove_file compressed
+    handle e => (remove_file compressed; raise e)
+  end
 
 fun lookup_blob cache sha256 =
   Redblackmap.peek (!(blob_map cache), sha256)
@@ -765,7 +783,7 @@ fun has_blob cache sha256 = Option.isSome (lookup_blob cache sha256)
    an entry whose blobs are gone isn't usable.  Only a 404 says the blob is
    gone; no answer, or another status, says nothing about it. *)
 fun blob_present cache sha256 =
-  let val urls = cas_urls cache sha256
+  let val urls = blob_urls cache sha256
   in
     case send_urls "HEAD" urls "" head_status of
         SOME (_, HolbuildHttp.Response 404) => false
@@ -779,7 +797,7 @@ fun blob_present cache sha256 =
 fun blob_confirmed_present cache sha256 =
   if tripped () then false
   else
-    let val urls = cas_urls cache sha256
+    let val urls = blob_urls cache sha256
     in #2 (routed_status "HEAD" urls "" head_status) = HolbuildHttp.Response 200 end
     handle _ => false
 
@@ -797,7 +815,7 @@ fun fetch_blob cache {hash, dst} =
     | SOME entry =>
         let
           val {sha256, ...} = entry
-          val result = curl_get_urls {urls = cas_urls cache sha256, dst = dst}
+          val result = curl_get_compressed {urls = blob_urls cache sha256, dst = dst}
         in
           case result of
               HolbuildCacheBackend.Hit => verify_downloaded_blob dst entry
@@ -811,7 +829,7 @@ fun fetch_blob cache {hash, dst} =
 (* Fetches a blob by its SHA-256 alone, without an action entry that lists
    it, as a remote worker fetches its spec and sources. *)
 fun fetch_unlisted_blob cache {hash, dst} =
-  (case curl_get_urls {urls = cas_urls cache hash, dst = dst} of
+  (case curl_get_compressed {urls = blob_urls cache hash, dst = dst} of
        HolbuildCacheBackend.Hit =>
          if HolbuildHash.file_sha256 dst = hash then HolbuildCacheBackend.Hit
          else HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ hash)
@@ -823,7 +841,7 @@ fun put_blob cache {hash, src} =
   let
     val size = Position.toString (FS.fileSize src)
     val result =
-      curl_put_zstd {urls = cas_urls cache hash, src = src, size = size}
+      curl_put_compressed {urls = blob_urls cache hash, src = src}
   in
     case result of
         HolbuildCacheBackend.Published => (remember_blob cache {sha256 = hash, size = size}; result)
