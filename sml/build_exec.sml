@@ -425,6 +425,14 @@ fun module_policy {sandboxed, store, base_state} =
     else if_meta_has ["configureTheoryModuleCache"] ("val _ = " ^ configure ^ ";")
   end
 
+(* Runs [call] on HOL's trace structure, ignoring an unknown trace.  The
+   traces moved from Feedback to HOLFlags; naming the structure at run time
+   keeps either HOL from compiling a name it lacks. *)
+fun trace_line call =
+  "val _ = CompilerSpecific.quietbind (\"val _ = (\" ^ " ^
+  "(if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HOLFlags\") then \"HOLFlags\" else \"Feedback\") ^ " ^
+  HolbuildToolchain.sml_string ("." ^ call ^ " handle _ => ());") ^ ");"
+
 (* A speculative child (pipelined builds) configures no theory module cache,
    so nothing it compiles is published there. *)
 fun write_child_policy_with {module_cache = use_module_cache} tc path =
@@ -438,8 +446,7 @@ fun write_child_policy_with {module_cache = use_module_cache} tc path =
        "val _ = Meta.loadPath := List.filter (fn dir => not " ^
        "(String.isSubstring \"/.holbuild/stage/\" (dir ^ \"/\"))) (!Meta.loadPath);\n" ^
        String.concat
-         (map (fn trace => "val _ = (Feedback.set_trace " ^ HolbuildToolchain.sml_string trace ^
-                           " 0 handle _ => ());\n")
+         (map (fn trace => trace_line ("set_trace " ^ HolbuildToolchain.sml_string trace ^ " 0") ^ "\n")
               child_policy_traces) ^ (if use_module_cache then module_cache else "") ^ "\n")
   end
 
@@ -448,8 +455,7 @@ fun write_child_policy tc path = write_child_policy_with {module_cache = true} t
 (* Checkpoints are saved with the child policy in effect.  A `run --from`
    session loads these lines so it exports theories as a plain run does. *)
 val child_policy_reset_lines =
-  map (fn trace => "val _ = (Feedback.reset_trace " ^ HolbuildToolchain.sml_string trace ^
-                   " handle _ => ());")
+  map (fn trace => trace_line ("reset_trace " ^ HolbuildToolchain.sml_string trace))
       child_policy_traces
 
 fun generated_metadata_report_lines {parents_report, mldeps_report} =

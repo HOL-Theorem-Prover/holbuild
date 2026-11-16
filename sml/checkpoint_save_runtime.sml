@@ -26,6 +26,25 @@ val _ =
       PolyML.compiler (fn () => TextIO.input1 stream, []) ()
     end;
 
+(* HOL's traces and flags moved from Feedback and refs into HOLFlags, where
+   report_thy_times is named Theory.report_thy_times.  Each HOL compiles only
+   the version that names what it has. *)
+val _ =
+  let
+    val text =
+      if Option.isSome (#lookupStruct PolyML.globalNameSpace "HOLFlags") then
+        "structure HolbuildHolFlags = struct \
+        \fun report_thy_times () = HOLFlags.current_trace \"Theory.report_thy_times\" > 0 \
+        \fun quiet_goalstack f = HOLFlags.with_bflags [(goalStack.chatting, false)] f () end;"
+      else
+        "structure HolbuildHolFlags = struct \
+        \fun report_thy_times () = Feedback.current_trace \"report_thy_times\" > 0 \
+        \fun quiet_goalstack f = Lib.with_flag (goalStack.chatting, false) f () end;"
+    val stream = TextIO.openString text
+  in
+    PolyML.compiler (fn () => TextIO.input1 stream, []) ()
+  end;
+
 structure HolbuildCheckpointSaveRuntime =
 struct
 
@@ -154,8 +173,8 @@ fun report_resumed_theory_cpu thyname carried =
       if String.isPrefix report text then (Feedback.MESG_outstream := out; out line)
       else out text
   in
-    if Feedback.get_tracefn "report_thy_times" () = 0 then ()
-    else Feedback.MESG_outstream := replace
+    if HolbuildHolFlags.report_thy_times () then Feedback.MESG_outstream := replace
+    else ()
   end
 
 fun theory_cpu_hook (TheoryDelta.NewTheory _) =

@@ -806,8 +806,7 @@ fun init_history g limit =
    history_step_count_ref := 0)
 
 fun apply_history f =
-  Lib.with_flag (goalStack.chatting, false)
-    (fn () => History.apply f (current_history())) ()
+  HolbuildHolFlags.quiet_goalstack (fn () => History.apply f (current_history()))
 
 fun ensure_history_limit limit =
   set_history (History.set_limit (current_history()) (Int.max(15, limit)))
