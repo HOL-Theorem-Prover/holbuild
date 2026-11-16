@@ -47,20 +47,12 @@ fun ensure_dir path =
 
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 
-val temp_blob_counter = ref 0
-val temp_blob_mutex = Mutex.mutex ()
-
-fun next_temp_blob_id () =
-  (Mutex.lock temp_blob_mutex;
-   (temp_blob_counter := !temp_blob_counter + 1; !temp_blob_counter)
-   before Mutex.unlock temp_blob_mutex)
-
-(* Unique per copy: concurrent copies of one blob (parallel build workers,
-   prefetch, other holbuild processes) share tmp_dir. *)
-fun temp_blob_path tmp_dir hash =
-  Path.concat(tmp_dir, String.concat ["holbuild-cache-transfer-", hash, "-",
-                                      HolbuildFileLock.current_pid_text (), "-",
-                                      Int.toString (next_temp_blob_id ()), ".blob"])
+(* Beside the blob it becomes, so publishing is a rename: from another
+   filesystem (a fleet worker's tmp/ is in its container, blobs/ on the host)
+   the publisher must copy and re-hash it.  Unique per copy: concurrent copies
+   of one blob share stage_dir. *)
+fun temp_blob_path stage_dir hash =
+  HolbuildTempPath.near (Path.concat(stage_dir, hash)) ".tmp"
 
 fun fetch_blob_or_raise (source : source) hash path =
   case #fetch_blob source {hash = hash, dst = path} of
@@ -160,11 +152,11 @@ fun out_of_space dir =
 (* A download that filled the disk need not say so (curl reports only a
    failed write, or leaves a short file), and removing it frees the space:
    probe while it is still there. *)
-fun copy_blob source (destination : destination) tmp_dir hash (uploaded, reused) =
+fun copy_blob source (destination : destination) stage_dir hash (uploaded, reused) =
   if #has_blob destination hash then (uploaded, reused + 1)
   else
   let
-    val path = temp_blob_path tmp_dir hash
+    val path = temp_blob_path stage_dir hash
     val (uploaded', reused') =
       (fetch_blob_or_raise source hash path;
        publish_blob_or_raise destination hash path)
@@ -188,16 +180,16 @@ fun put_action_or_raise (destination : destination) key text =
     | result as HolbuildCacheBackend.Skipped => result
     | HolbuildCacheBackend.Conflict detail => raise Error ("destination cache action conflict: " ^ key ^ " (" ^ detail ^ ")")
 
-fun copy_entry {source, destination, tmp_dir} key =
+fun copy_entry {source, destination, stage_dir} key =
   let
     val manifest_text =
       case #get_action source key of
           SOME text => text
         | NONE => raise Error ("source cache action missing: " ^ key)
     val blobs = unique_blobs manifest_text
-    val _ = ensure_dir tmp_dir
+    val _ = ensure_dir stage_dir
     val (uploaded, reused) =
-      List.foldl (fn (hash, counts) => copy_blob source destination tmp_dir hash counts)
+      List.foldl (fn (hash, counts) => copy_blob source destination stage_dir hash counts)
                  (0, 0)
                  blobs
     val action = put_action_or_raise destination key manifest_text

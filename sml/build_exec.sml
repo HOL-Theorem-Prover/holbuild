@@ -2464,7 +2464,7 @@ fun copy_remote_cache_entry_using usable root url key =
            HolbuildCacheTransfer.copy_entry
              {source = remote_cache_source_with_action remote key manifest,
               destination = fs_cache_destination local_cache,
-              tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache}
+              stage_dir = HolbuildFSCacheBackend.blobs_dir local_cache}
              key;
            true)
   end
@@ -2516,7 +2516,7 @@ fun publish_remote_cache_key root key =
           val _ = HolbuildCacheTransfer.copy_entry
                     {source = fs_cache_source local_cache,
                      destination = remote_cache_destination remote,
-                     tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache}
+                     stage_dir = HolbuildFSCacheBackend.blobs_dir local_cache}
                     key
         in
           cache_trace ("remote cache published: " ^ key)
@@ -10007,14 +10007,14 @@ fun publish_action_entry remote root (spec : action_spec) =
     val local_cache = HolbuildFSCacheBackend.filesystem (cache_root ())
     val source = fs_cache_source local_cache
     val destination = remote_cache_destination remote
-    val tmp_dir = HolbuildFSCacheBackend.tmp_dir local_cache
+    val stage_dir = HolbuildFSCacheBackend.blobs_dir local_cache
     val manifest =
       case #get_action source key of
           SOME text => text
         | NONE => raise ActionFailed (PublishFailure, "the build published no local cache entry")
   in
-    ensure_dir tmp_dir;
-    (transfer_all (fn hash => ignore (HolbuildCacheTransfer.copy_blob source destination tmp_dir hash (0, 0)))
+    ensure_dir stage_dir;
+    (transfer_all (fn hash => ignore (HolbuildCacheTransfer.copy_blob source destination stage_dir hash (0, 0)))
        (HolbuildCacheTransfer.unique_blobs manifest)
      handle e as HolbuildRemoteCache.Unavailable _ => raise e
           | e => raise action_failed PublishFailure ("could not publish the entry: " ^ General.exnMessage e));

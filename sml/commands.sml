@@ -2894,7 +2894,7 @@ fun import_archive args =
               val results = HolbuildCacheTransfer.copy_entries
                               {source = source,
                                destination = fs_cache_destination destination,
-                               tmp_dir = HolbuildFSCacheBackend.tmp_dir destination}
+                               stage_dir = HolbuildFSCacheBackend.blobs_dir destination}
                               keys
             in
               result_count := length results
