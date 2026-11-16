@@ -36,6 +36,8 @@ from remote_exec import coordinator as coordinator_module
 # The shape of a gate batch: its actions, the first ROOTS of which have no parents, and each later one up to FAN
 # parents among those before it (about 85,000 edges).
 ACTIONS, ROOTS, FAN = 5000, 1500, 48
+# Finished batches of the last few days, without actions: a busy fleet finishes thousands an hour.
+FINISHED_BATCHES = 50_000
 
 
 def key(i: int, build: str = "") -> str:
@@ -200,6 +202,15 @@ async def seed(engine: AsyncEngine) -> Fleet:
         await insert(connection, old, [[]] * 10, Arrival(["done"] * 10, ["no"] * 10, [0] * 10), state="done")
         await connection.execute(
             sa.text("UPDATE batches SET created_at = now() - interval '30 days' WHERE id = :id"), {"id": old}
+        )
+        # The finished batches retention keeps, among which statements find the running ones.
+        await connection.execute(
+            sa.text(
+                "INSERT INTO batches (id, state, profile, created_at) "
+                "SELECT gen_random_uuid(), (ARRAY['done', 'failed', 'cancelled'])[1 + i % 3], 'default', "
+                "now() - make_interval(secs => i * 10) FROM generate_series(1, :n) i"
+            ),
+            {"n": FINISHED_BATCHES},
         )
         await connection.execute(
             sa.text(
@@ -435,8 +446,8 @@ STATEMENTS = [
     ),
     Statement("SELECT ahead_cap, max_heap_mb FROM batches", lambda f: {"id": f.fresh}, 100),
     Statement(
-        "UPDATE actions SET state = 'done', log_sha256 = :log",
-        lambda f: {"log": "log", "batch_id": f.steady, "input_key": f.steady_arrival.keys("ready")[0]},
+        cm.FINISH_PEERS,
+        lambda f: {"logs": ["log"], "batch_id": f.steady, "keys": f.steady_arrival.keys("ready")[:1]},
         11_000,
     ),
     Statement("UPDATE leases SET expires_at = now() + make_interval", lambda f: {"lease": 120, "token": f.token}, 100),
@@ -450,7 +461,9 @@ STATEMENTS = [
         10_000,
     ),
     Statement(
-        "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now()", lambda f: {"token": f.token}, 100
+        "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now() RETURNING input_key",
+        lambda f: {"token": f.token},
+        100,
     ),
     Statement("SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions", lease, 11_000),
     Statement(
@@ -460,7 +473,20 @@ STATEMENTS = [
     ),
     Statement("UPDATE actions SET tier = 'high'", lease, 10_000),
     Statement("UPDATE actions SET attempts = attempts - 1, ahead = 'abandoned'", lease, 10_000),
-    Statement("UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1", lease, 10_000),
+    Statement("UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1 WHERE", lease, 10_000),
+    # leases a worker never got
+    # No index on the worker: it reads the leases, one per running action.
+    Statement(cm.UNHELD_LEASES, lambda f: {"worker": "w9", "held": None, "before": datetime.now(UTC)}, 1_200),
+    Statement(
+        "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now() RETURNING input_key, worker",
+        lambda f: {"token": f.token},
+        100,
+    ),
+    Statement(
+        "UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1, last_failure",
+        lambda f: {**lease(f), "detail": "w went on without this lease: its claim's answer or its result was lost"},
+        10_000,
+    ),
     # releases
     Statement(
         "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id",
@@ -468,7 +494,7 @@ STATEMENTS = [
         11_000,
     ),
     # expiry
-    Statement("SELECT l.attempt_token, l.batch_id FROM leases l JOIN batches b", lambda f: {"lease": 120}, 1_500),
+    Statement("SELECT l.attempt_token, l.batch_id FROM leases l WHERE", lambda f: {"lease": 120}, 1_500),
     Statement(
         "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now()", lambda f: {"token": f.expired}, 100
     ),

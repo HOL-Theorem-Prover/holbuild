@@ -206,11 +206,13 @@ fun report_action line =
     val state = if raw_state = "cancelled" andalso
                    String.isPrefix "skipped because of " (Option.getOpt (field "last_failure", ""))
                 then "skipped" else raw_state
+    (* A done action's detail says why it has no log. *)
     val failure =
       case (field "last_failure", field "failure_detail") of
           (SOME f, SOME detail) => " (" ^ f ^ ": " ^ detail ^ ")"
         | (SOME f, NONE) => " (" ^ f ^ ")"
-        | (NONE, _) => ""
+        | (NONE, SOME detail) => " (" ^ detail ^ ")"
+        | (NONE, NONE) => ""
     (* An action back to waiting, ready or running after a failure is
        being retried: the attempts it has used, its tier, and the log a
        failed attempt left tell a retry loop from a slow proof. *)

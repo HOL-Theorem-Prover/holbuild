@@ -310,11 +310,12 @@ fun transient (HolbuildHttp.Failed _) = true
   | transient (HolbuildHttp.Response code) = code = 429 orelse (code >= 500 andalso code < 600)
 
 (* Reads made inside `required f`, on its thread, are for entries that must be
-   there, such as an action's inputs: a node that failed may be the one
-   holding the entry, so a read that found it nowhere but saw a node fail
-   gives that failure, not a 404.  Any other read takes a 404 beside a
-   failure as a miss, so that a lookup before building or publishing doesn't
-   stop on one dead node.  Per thread, as the hydrate path between the
+   there, such as an action's inputs or what a write just put: they ask every
+   node before a miss, as the entry may be on another node only, and a node
+   that failed may be the one holding it, so a read that found it nowhere but
+   saw a node fail gives that failure, not a 404.  Any other read ends at the
+   first 404 and takes a 404 beside a failure as a miss, so that a lookup
+   before building or publishing doesn't stop on one dead node.  Per thread, as the hydrate path between the
    caller and the read doesn't carry the caller's intent. *)
 val required_tag : bool Universal.tag = Universal.tag ()
 
@@ -384,17 +385,21 @@ fun probe_all probe urls =
 (* The breaker observes the whole request: a dead primary must not disable a healthy backup.
    A write goes past the first two nodes only while none of them answered at all
    (a member whose name doesn't resolve yet, say), and stops at the first answer.
-   A read must reach every node before a miss: a node writes to the shared backing
-   store after it answers the PUT, so until then only the writer's node holds a
-   blob, and a reader that prefers another node must still find it.  It asks
-   its nodes in turn until two of them answer 404, which finds what a writer
-   ranking the nodes the same way wrote, then probes all the rest at once and
-   goes on through their answers in rank order; a GET asks a node whose probe
-   found the entry for its body.
+   Every node serves what the shared backing store holds, and a node writes an
+   entry there shortly after it answers the PUT, so until then only the
+   writer's node holds it.  A read goes past a node that failed and ends at
+   the first 404: it misses only an entry another node took moments ago, which
+   a build or a submission then makes again.  A required read (`required`),
+   of an entry that must be there, and a read that passed over a weaker copy
+   below, which looks on for a stronger one, instead reach every node before a
+   miss: they ask their nodes in turn until two of them answer 404, which finds
+   what a writer ranking the nodes the same way wrote, then probe all the rest
+   at once and go on through their answers in rank order; a GET asks a node
+   whose probe found the entry for its body.
    A read whose 200 body fails `usable` counts as that node's 404, so a replica
-   holding a weaker copy does not hide a better one on the next node.
-   A required read (`required`) that saw a node fail ends with that failure
-   rather than a 404.
+   holding a weaker copy does not hide a better one on another node.
+   A required read that saw a node fail ends with that failure rather than a
+   404.
    A cache of one node gets the second attempt on that node: a 429 or 5xx
    answer to its first request is asked again once.  No answer at all is not,
    so an unreachable cache still costs one attempt per request until the
@@ -418,8 +423,8 @@ fun routed_status_using usable method probe urls path request =
       case (missing, failed) of
           (SOME found, SOME failure) => if required then failure else found
         | _ => Option.getOpt (missing, last)
-    fun loop [] _ _ _ missing failed last = outcome missing failed last
-      | loop ((node, answer) :: rest) count misses silent missing failed last =
+    fun loop [] _ _ _ _ missing failed last = outcome missing failed last
+      | loop ((node, answer) :: rest) count misses silent passed missing failed last =
           if not read andalso count >= 2 andalso not silent then
             outcome missing failed last
           else
@@ -432,6 +437,7 @@ fun routed_status_using usable method probe urls path request =
                                               ": entry passed over")
                 else ()
               val miss = read andalso result = HolbuildHttp.Response 404
+              val passed = passed orelse rejected
               val result = if rejected then HolbuildHttp.Response 404 else result
               val misses = if miss then misses + 1 else misses
               val missing = if read andalso result = HolbuildHttp.Response 404 then SOME (node, result) else missing
@@ -441,13 +447,15 @@ fun routed_status_using usable method probe urls path request =
                 else rest
               val failed = if transient result then SOME (node, result) else failed
             in
-              if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
+              if miss andalso not required andalso not passed then outcome missing failed (node, result)
+              else if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
                 loop (if miss andalso misses = 2 andalso not (null rest) then probe_rest rest else rest)
-                     (count + 1) misses (silent andalso unanswered result) missing failed (node, result)
+                     (count + 1) misses (silent andalso unanswered result) passed missing failed (node, result)
               else (node, result)
             end
   in
-    loop (map (fn node => (node, ask node)) urls) 0 0 true NONE NONE (hd urls, HolbuildHttp.Failed "no cache response")
+    loop (map (fn node => (node, ask node)) urls) 0 0 true false NONE NONE
+         (hd urls, HolbuildHttp.Failed "no cache response")
   end
 
 fun routed_status method urls path request = routed_status_using (fn _ => true) method request urls path request

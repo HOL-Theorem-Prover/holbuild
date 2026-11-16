@@ -25,7 +25,11 @@ a container image with both.
   loses batch status and costs rebuilds, never a wrong build.
 - **Worker loop** (`remote_exec/worker.py`): claims an action, runs `holbuild
   exec-action` on it with the holbuild release that exported it, heartbeats
-  while it runs, and reports the result record.
+  while it runs, and reports the result record. It runs one action at a time,
+  under a name no other worker shares (`--name`, by default `host:pid`), so a
+  lease of that name it isn't running, one whose claim's answer never reached
+  it, ends as soon as it claims or heartbeats again, without counting as an
+  attempt.
 
 ## Running
 
@@ -149,6 +153,11 @@ docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_
 `--host-rank` (0 to 1000, 0 by default) orders hosts for packing: claims go
 to hosts of lower rank first, so hosts of higher rank (an interruptible spot
 pool, say) empty first and scale in.
+
+A worker's name in its leases is `--name`, by default `host:pid`. When
+`REMOTE_EXEC_IMAGE` names the image the worker runs as
+`<repository>@sha256:<digest>`, the default name ends in `@` and the digest's
+first 12 hex digits, so a lease says which image ran the action.
 
 On `SIGTERM`, a worker stops claiming and gives its running action up to
 `--drain-seconds` (20 by default) to finish and report its result. At the
@@ -911,13 +920,17 @@ image to run `alembic downgrade 0014`, then start the older image. Actions
 running ahead then look like any running action to the older image.
 
 Migration `0016` adds nullable `actions.finished_at` and `actions.worker`,
-which the coordinator writes on each claim and accepted result. Deploy and
-qualify an image carrying only the migration before one whose coordinator uses
-the columns, so that its previous-image rollback already knows revision `0016`. An older
+which the coordinator writes on each claim and accepted result, and the index
+`batches_running`, built concurrently, so that statements that look for the
+running batches read only those rather than every finished batch kept for
+retention. Deploy and qualify an image carrying only the migration before one
+whose coordinator uses the columns, so that its previous-image rollback already
+knows revision `0016`. An older
 coordinator still serves the upgraded schema, but its `migrate` command does
 not know the revision: to start an image predating `0016`, stop the
 coordinator and use this image to run `alembic downgrade 0015` first. This
-drops only diagnostic columns; result and scheduling state are kept.
+drops only the diagnostic columns and the index; result and scheduling state
+are kept.
 
 ## Tests
 
