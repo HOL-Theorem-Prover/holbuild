@@ -179,28 +179,34 @@ val _ = writes [a, b];
 val _ = check "a writer started with 3 s left" (#installed (fill_by "hol4" 3) = 0 andalso runs "hol4" = 0);
 val _ = E.write_text "$tmpdir/hang" "";
 val t0 = Time.now ();
-val {installed, missing, ...} = fill_by "hol4" 6;
+val {installed, missing, published, ...} = fill_by "hol4" 6;
 val _ = OS.FileSys.remove "$tmpdir/hang";
 val _ = check "the writer was not stopped at its deadline"
           (runs "hol4" = 1 andalso Time.< (Time.- (Time.now (), t0), Time.fromSeconds 15));
 val _ = check "a stopped writer's modules were not stored"
           (installed = 2 andalso missing > 2 andalso List.all (stored "hol4") [a, b]);
+val _ = check "a module was published without the time for a stalled request"
+          (published = 0);
 val _ = check "a stopped writer left its output" (not (exists (OS.Path.concat (store "hol4", ".writer"))));
 val _ = check "a stopped writer left its script or log"
           (not (exists "$tmpdir/root/.holbuild/theory-module-writer.sml") andalso
            not (exists "$tmpdir/root/.holbuild/theory-module-writer.log"));
 
-(* The writer published the modules it stored.  A store of the same
-   toolchain on another host fetches them instead of writing them. *)
+(* A writer with the time publishes the modules it stored.  A store of
+   the same toolchain on another host fetches them instead of writing
+   them. *)
 fun remove_store hol =
   (List.app OS.FileSys.remove (HolbuildCache.children (store hol));
    OS.FileSys.rmDir (store hol));
+val _ = remove_store "hol4";
+val {installed, published, ...} = fill_by "hol4" 100;
+val _ = check "the writer did not publish the modules it stored" (installed = 2 andalso published = 2);
 val _ = remove_store "hol4";
 val _ = writes [];
 val {installed, fetched, published, ...} = fill_by "hol4" 100;
 val _ = check "published modules were not fetched"
           (fetched = 2 andalso installed = 0 andalso published = 0 andalso List.all (stored "hol4") [a, b]);
-val _ = check "the writer did not run for the modules still missing" (runs "hol4" = 2);
+val _ = check "the writer did not run for the modules still missing" (runs "hol4" = 3);
 
 (* A writer whose lock file the sweep unlinked between its open and its
    lock holds a lock nobody else sees: it must not write. *)
