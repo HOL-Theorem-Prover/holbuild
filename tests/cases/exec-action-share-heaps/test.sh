@@ -204,9 +204,16 @@ write_t "T \\/ F" "simp[]"
 export_t v2
 cold v2 0
 forget_local
-worker v2 "$shared_url" "$shared" "$spec_t" --share-heaps
+HOLBUILD_CACHE_TRACE=1 worker v2 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v2 0 "status=built"
 resumed v2 "deps-loaded checkpoint" "deps-loaded heap"
+# The restore took its blobs zstd-encoded and decoded them itself.
+require_grep "remote cache decode .* zstd threads=4" "$tmpdir/v2.log"
+if grep -q "remote cache decode .* \(identity\|fallback\)" "$tmpdir/v2.log"; then
+  echo "v2 fetched a blob without decoding it in parallel:" >&2
+  grep "remote cache decode" "$tmpdir/v2.log" >&2
+  exit 1
+fi
 # None of the published checkpoints is on the edited script's prefix, and
 # the index says so without a probe of each.
 require_grep "shared checkpoint index lists 0 of" "$tmpdir/v2.log"

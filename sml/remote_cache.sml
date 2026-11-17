@@ -182,15 +182,19 @@ fun get_status {url, dst} =
 (* Blob downloads take the body still zstd-encoded and decode it here on
    several threads (HolbuildZstd), since libcurl decodes on the one thread
    running its transfers.  Without libcurl or libzstd, or with a body
-   HolbuildZstd can't decode, the blob is fetched as get_status does. *)
+   HolbuildZstd can't decode, the blob is fetched as get_status does.  Under
+   HOLBUILD_CACHE_TRACE, a line says which way each blob was decoded. *)
 val decode_threads = 4
+
+fun trace_decode url how =
+  HolbuildStatus.cache_trace ("remote cache decode " ^ redact_userinfo url ^ " " ^ how)
 
 fun get_status_parallel_decode {url, dst} =
   if not (HolbuildRemoteCacheConfig.uses_libcurl () andalso HolbuildZstd.available ()) then
     get_status {url = url, dst = dst}
   else
     let
-      val encoded = dst ^ ".zstd-get"
+      val encoded = HolbuildTempPath.near dst ".zstd-get"
       fun remove () = FS.remove encoded handle OS.SysErr _ => ()
       val (result, encoding) =
         HolbuildHttp.get_zstd {url = url, dst = encoded, timeout = stall_timeout_seconds}
@@ -200,13 +204,17 @@ fun get_status_parallel_decode {url, dst} =
           (HolbuildHttp.Response 200, HolbuildHttp.Zstd) =>
             ((HolbuildZstd.decode_file {src = encoded, dst = dst, threads = decode_threads};
               remove ();
+              trace_decode url ("zstd threads=" ^ Int.toString decode_threads);
               result)
-             handle HolbuildZstd.Error _ => (remove (); get_status {url = url, dst = dst})
+             handle HolbuildZstd.Error message =>
+                      (remove (); trace_decode url ("fallback: " ^ message);
+                       get_status {url = url, dst = dst})
                   | e => (remove (); raise e))
         | (HolbuildHttp.Response 200, HolbuildHttp.Identity) =>
-            (FS.rename {old = encoded, new = dst}; result)
+            (FS.rename {old = encoded, new = dst}; trace_decode url "identity"; result)
         | (HolbuildHttp.Response 200, HolbuildHttp.OtherEncoding) =>
-            (remove (); get_status {url = url, dst = dst})
+            (remove (); trace_decode url "fallback: another encoding";
+             get_status {url = url, dst = dst})
         | _ => (remove (); result)
     end
 
