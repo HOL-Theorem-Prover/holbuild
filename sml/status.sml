@@ -6,6 +6,8 @@ struct
 datatype outcome = Built | UpToDate | Restored | RestoredRemote | Inspected
 
 val command_outcome = ref (fn (_ : outcome) => ())
+(* Told each failed node's label and diagnostic as the build finds it. *)
+val command_failure = ref (fn (_ : string, _ : string) => ())
 
 (* thread is the worker building the node; waiting is set while that worker
    waits for machine memory before launching the node's child. *)
@@ -266,6 +268,37 @@ fun json_failure_fields source_override message =
     json_optional_int_field "input_goal_count" (input_goal_count_from_lines lines) @
     json_optional_bool_field "top_goal_truncated" (top_goal_truncated message) @
     json_evidence_limit_fields message
+  end
+
+(* The error a diagnostic MESSAGE reports, on one line of at most 300
+   characters: its child failure, else its first line naming an error (a
+   static error in a child log's tail), else its first line. *)
+fun failure_error message =
+  let
+    val lines = String.fields (fn c => c = #"\n") message
+    fun until_blank [] = []
+      | until_blank (line :: rest) = if line = "" then [] else line :: until_blank rest
+    fun child_failure [] = []
+      | child_failure (line :: rest) = if line = "child failure:" then until_blank rest else child_failure rest
+    val text =
+      case child_failure lines of
+          [] => Option.getOpt (List.find (String.isSubstring "error:") lines, hd lines)
+        | excerpt => String.concatWith " " excerpt
+  in
+    if size text > 300 then String.substring (text, 0, 297) ^ "..." else text
+  end
+
+(* A diagnostic MESSAGE, printed in full already, in one line: its first
+   line, the theorem it names and its error. *)
+fun failure_brief message =
+  let
+    val lines = String.fields (fn c => c = #"\n") message
+    val error = failure_error message
+  in
+    hd lines ^
+    (case first_line_after "theorem: " lines of SOME theorem => ": theorem " ^ theorem | NONE => "") ^
+    (if error = hd lines then "" else ": " ^ error) ^
+    " (full diagnostic above)"
   end
 
 fun json_failure_field message = [json_object_field "failure" (json_failure_fields NONE message)]
@@ -644,17 +677,19 @@ fun fail_with_debug_artifacts status key label msg artifacts =
                  TextIO.flushOut TextIO.stdOut)
               else ())
          end);
+   if finished_only () then () else !command_failure (label, msg);
    if json_mode () orelse finished_only () then () else message_stderr (label ^ " failed: " ^ msg ^ "\n"))
 
 (* A node that failed outside any build's status: a theory that failed on a
    remote worker.  Text mode reports it in the build's error. *)
 fun report_remote_failure key label msg artifacts =
-  if json_mode () then
-    emit_json "node_failed"
-      (json_node_fields key label @
-       json_failure_field_for_node key msg @
-       json_debug_artifacts_fields artifacts)
-  else ()
+  (!command_failure (label, msg);
+   if json_mode () then
+     emit_json "node_failed"
+       (json_node_fields key label @
+        json_failure_field_for_node key msg @
+        json_debug_artifacts_fields artifacts)
+   else ())
 
 fun fail status key label msg =
   fail_with_debug_artifacts status key label msg no_debug_artifacts

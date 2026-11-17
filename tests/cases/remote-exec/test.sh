@@ -1221,6 +1221,10 @@ require_grep "proof failed on a remote worker while building BTheory" "$tmpdir/p
 require_grep "^theorem: b_thm (line 4)$" "$tmpdir/proof.log"
 require_grep "^> 7 |   simp\[\] (\* one \*)$" "$tmpdir/proof.log"
 require_grep 'Failed to prove theorem "b_thm"' "$tmpdir/proof.log"
+# The diagnostic prints once, as the failure arrives; the error at exit names it.
+[[ $(grep -c "^theorem: b_thm (line 4)$" "$tmpdir/proof.log") -eq 1 ]] || { cat "$tmpdir/proof.log" >&2; exit 1; }
+require_grep "^holbuild: proof failed on a remote worker while building BTheory: theorem b_thm (line 4): .*(full diagnostic above)$" \
+  "$tmpdir/proof.log"
 require_grep "instrumented log: .*/.holbuild/logs/current/rxp/BTheory/build.log" "$tmpdir/proof.log"
 refute_grep "Theory built\|building locally" "$tmpdir/proof.log"
 [[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$log_sha" ]] ||
@@ -1311,6 +1315,36 @@ require_grep "could not fetch the failed theory's build log; building BTheory lo
 require_grep "^holbuild: theorem: b_thm (line 4)$" "$tmpdir/proof-nolog.log"
 refute_grep "on a remote worker\|CTheory built" "$tmpdir/proof-nolog.log"
 [[ $(local_hol_runs "$tmpdir/proof-nolog.timing") -gt 0 ]] || { cat "$tmpdir/proof-nolog.timing" >&2; exit 1; }
+
+# B's diagnostic prints as soon as the batch reports B failed, while the rest
+# of the batch runs (the stub holds the stream after B, before C), and a build
+# stopped then still records the failure and when it was seen.  It runs the
+# binary itself, not the suite's timing wrapper, for its own PID's record.
+sed -i 's/(\* two \*)/(* early *)/' "$project/src/BScript.sml"
+touch "$state/hold"
+(cd "$project" && HOLBUILD_COMMAND_RECORD=$tmpdir/early.json exec env HOLBUILD_COMMAND_RECORD_PID=$BASHPID \
+   "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" --remote-cache "$remote_url" build --remote-exec "$coordinator" BTheory CTheory) \
+  > "$tmpdir/early.log" 2>&1 &
+early_pid=$!
+for _ in {1..600}; do
+  grep -q "^theorem: b_thm (line 4)$" "$tmpdir/early.log" && break
+  sleep 0.1
+done
+require_grep "^holbuild: proof failed on a remote worker while building BTheory$" "$tmpdir/early.log"
+require_grep "^theorem: b_thm (line 4)$" "$tmpdir/early.log"
+refute_grep "remote rxp:CTheory\|remote failure summary" "$tmpdir/early.log"
+kill -TERM "$early_pid"
+rm "$state/hold"
+if wait "$early_pid"; then echo "the interrupted build passed" >&2; cat "$tmpdir/early.log" >&2; exit 1; fi
+python3 - "$tmpdir/early.json" <<'PY'
+import json,sys
+record=json.load(open(sys.argv[1]))
+assert record['exit_code']==1, record
+failure, = record['failures']
+assert failure['theory']=='BTheory' and failure['kind']=='proof_failure' and failure['theorem']=='b_thm', failure
+assert failure['line']==7 and failure['error'], failure
+assert record['started_at_ms']<=record['first_failure_at_ms']<=record['ended_at_ms'], record
+PY
 
 # --json reports a remote build's targets as a local build's: the theories
 # restored as finished, and a theory that failed on a worker as failed, once,

@@ -81,6 +81,11 @@ assert leaf[0]['affected_theories_in_plan']==1
 assert records[4]['exit_code']==1 and records[5]['exit_code']==1
 assert records[4]['plans'][0]['changed_sources']
 assert not records[5]['plans'][0]['changed_sources']
+# Failed attempts record what failed, and when.
+assert records[3]['failures']==[] and 'first_failure_at_ms' not in records[3], records[3]
+for r in records[4:]:
+    assert [f['theory'] for f in r['failures']]==['CTheory'] and 'this_is_not_declared' in r['failures'][0]['error'], r['failures']
+    assert r['started_at_ms']<=r['first_failure_at_ms']<=r['ended_at_ms'], r
 PY
 
 # The CLI treats a closed non-JSON output pipe as success; its record must agree.

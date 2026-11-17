@@ -69,3 +69,36 @@ val _ = reset ();
 val _ = HolbuildCommandSummary.batches := Binaryset.add (!HolbuildCommandSummary.batches, "submitted");
 val _ = assert (not (HolbuildCommandSummary.fleet_history_complete ()))
   "claimed complete history for an unobserved batch";
+
+(* A theory's failure is recorded once, when first seen: replayed failed
+   snapshots don't repeat it, and its diagnostic replaces the fleet's kind. *)
+fun failed theory = "{\"input_key\":\"k-" ^ theory ^ "\",\"theory\":\"pkg:" ^ theory ^
+                    "\",\"state\":\"failed\",\"attempts\":1,\"last_failure\":\"proof\",\"log_sha256\":\"log\"}";
+fun failures () = map #3 (!HolbuildCommandSummary.failures);
+val _ = assert (not (Option.isSome (!HolbuildCommandSummary.first_failure))) "a failure before any failed";
+val _ = observe (event "running" 1 "");
+val _ = assert (null (failures ())) "recorded a running action as failed";
+val _ = observe (failed "BTheory");
+val first_seen = !HolbuildCommandSummary.first_failure;
+val _ = observe (failed "BTheory");
+val _ = assert (failures () = ["{\"theory\":\"BTheory\",\"kind\":\"proof\"}"] andalso
+                Option.isSome first_seen)
+  "fleet failure not recorded once under its logical name";
+val diagnostic =
+  "proof failed on a remote worker while building BTheory\ntheorem: b_thm (line 4)\n" ^
+  "source: /p/src/BScript.sml:7:3-9\n  7 | simp[]\nchild failure:\nException raised at boolLib.store_thm_at:\n" ^
+  "no solution found\n\ninstrumented log: /p/build.log\n";
+val _ = HolbuildCommandSummary.observe_failure ("BTheory", diagnostic);
+val _ = HolbuildCommandSummary.observe_failure ("BTheory", "later report");
+val _ = observe (failed "BTheory");
+val _ = assert (failures () =
+                  ["{\"theory\":\"BTheory\",\"kind\":\"proof_failure\",\"theorem\":\"b_thm\",\"line\":7," ^
+                   "\"error\":\"Exception raised at boolLib.store_thm_at: no solution found\"}"] andalso
+                !HolbuildCommandSummary.first_failure = first_seen)
+  "diagnostic did not replace the fleet's failure once, or moved the first failure";
+val _ = assert (HolbuildStatus.failure_brief diagnostic =
+                "proof failed on a remote worker while building BTheory: theorem b_thm (line 4): " ^
+                "Exception raised at boolLib.store_thm_at: no solution found (full diagnostic above)")
+  "brief failure line";
+val _ = List.app (fn i => observe (failed ("T" ^ Int.toString i ^ "Theory"))) (List.tabulate (30, fn i => i));
+val _ = assert (length (failures ()) = HolbuildCommandSummary.max_failures) "failures not capped";
