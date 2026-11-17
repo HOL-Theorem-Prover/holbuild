@@ -163,6 +163,4 @@ fun scan_with_proof_ir_plans source_path _ =
        termination_plans = map (plan "t") (numbered (List.drop (plans, nb)))}
   end
 
-fun scan_terminations source_path source_text = scan_terminations_strict source_path source_text
-
 end

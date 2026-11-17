@@ -72,11 +72,6 @@ fun tar_create {stage_dir, archive_tmp, members} =
        excludes = [],
        hard_dereference = false})
 
-fun tar_extract {archive_path, stage_dir} =
-  tar_operation
-    (fn () => HolbuildTar.extract
-      {archive_path = archive_path, destination = stage_dir})
-
 fun rename_new {old, new} =
   FS.rename {old = old, new = new}
   handle OS.SysErr (msg, _) => raise Error ("could not install archive " ^ new ^ ": " ^ msg)
@@ -407,10 +402,6 @@ fun with_entries {archive_path, stage_parent, f} =
      end)
     handle e => (cleanup (); raise e)
   end
-
-fun with_reader {archive_path, stage_parent, f} =
-  with_entries {archive_path = archive_path, stage_parent = stage_parent,
-                f = fn {source, ...} => f source}
 
 type capsule_identity =
   {name : string,

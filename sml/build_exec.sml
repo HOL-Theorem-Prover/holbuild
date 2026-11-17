@@ -181,16 +181,9 @@ fun write_object_manifest path lines =
   (write_manifest path lines;
    write_manifest (hfs_remapped_path path) lines)
 
-fun dependency_sml dep = one_with_suffix ".sml" (#generated (source_artifacts dep))
-fun dependency_sig dep = one_with_suffix ".sig" (#generated (source_artifacts dep))
-
 val runtime_line = HolbuildToolchain.runtime_line
 
 fun load_theory_line name = "HolbuildRuntime.load " ^ HolbuildToolchain.sml_string name ^ ";"
-
-fun use_generated_lines dep =
-  ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (dependency_sig dep) ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (dependency_sml dep) ^ ";"]
 
 fun drop_suffix suffix path =
   if has_suffix suffix path then String.substring(path, 0, size path - size suffix)
@@ -226,14 +219,6 @@ fun unique_by key values =
   end
 
 fun unique_strings values = unique_by (fn value => value) values
-
-fun theory_project_dep dep =
-  #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript
-
-fun project_theory_load_stems deps =
-  unique_strings (map load_stem (List.filter theory_project_dep deps))
-
-fun fakeload_line name = "Meta.fakeload " ^ HolbuildToolchain.sml_string name ^ ";"
 
 fun load_project_line dep = "HolbuildRuntime.load " ^ HolbuildToolchain.sml_string dep ^ ";"
 
@@ -286,8 +271,6 @@ fun theory_load_line _ (LoadTheory name) = load_theory_line name
 fun checkpoint_ok_path path = HolbuildCheckpointStore.ok_path path
 
 fun remove_checkpoint path = HolbuildCheckpointStore.remove_checkpoint path
-
-fun checkpoint_ok_v1 () = HolbuildCheckpointStore.ok_v1 ()
 
 fun checkpoint_ok_text kind fields = HolbuildCheckpointStore.ok_text kind fields
 
@@ -1002,8 +985,6 @@ fun evict_store_family dir = evict_store_family_if (fn () => true) dir
 fun try_evict_store_family_if eligible dir =
   evict_store_family_if eligible dir
   handle e => (warn ("could not remove store family " ^ dir ^ ": " ^ General.exnMessage e); NONE)
-
-fun try_evict_store_family dir = try_evict_store_family_if (fn () => true) dir
 
 fun store_families store =
   List.filter (fn path => FS.isDir path handle OS.SysErr _ => false) (HolbuildCache.children store)
@@ -2224,11 +2205,6 @@ fun transient_cache_manifest_error root input_key manifest manifest_text dep =
     raise Error ("cache manifest contains transient stage mldep: " ^ dep ^ action)
   end
 
-fun cache_manifest_blobs root input_key =
-  case HolbuildCache.get_action root input_key of
-      SOME manifest_text => cache_manifest_blobs_from_lines input_key (cache_manifest_lines manifest_text)
-    | NONE => raise Error ("cache manifest missing: " ^ input_key)
-
 fun cache_manifest_proof_timeout lines =
   HolbuildTheoryCacheManifest.cache_manifest_proof_timeout lines
   handle HolbuildTheoryCacheManifest.Error msg => raise Error msg
@@ -2524,8 +2500,6 @@ fun hydrate_remote_cache_key_using usable root key =
           else
             (warn ("remote cache entry unusable for " ^ key ^ ": " ^ General.exnMessage e);
              false)
-
-fun hydrate_remote_cache_key root key = hydrate_remote_cache_key_using (fn _ => true) root key
 
 fun prefetch_remote_cache_key root url key =
   if Option.isSome (HolbuildCache.get_action root key) then ()
@@ -3082,9 +3056,6 @@ fun metadata_value key lines =
   end
 
 fun checkpoint_ok_matches path fields = HolbuildCheckpointStore.ok_matches warn path fields
-
-fun checkpoint_ok_text_matches path expected_text =
-  HolbuildCheckpointStore.ok_text_matches warn path expected_text
 
 fun deps_checkpoint_ok_text deps_key =
   checkpoint_ok_text "deps_loaded" [("deps_key", deps_key)]
@@ -4559,10 +4530,6 @@ fun metadata_text emit_output_hashes checkpoint_policy proof_timeout project pla
   lines_text
     (metadata_core_lines checkpoint_policy proof_timeout project plan keys input_key toolchain_key node @
      (if emit_output_hashes then output_hash_lines checkpoint_policy plan node else []))
-
-fun semantic_metadata_text text =
-  lines_text (List.filter (fn line => not (String.isPrefix "output-sha256=" line))
-                          (metadata_lines text))
 
 (* Reject installed outputs left by the removed unchecked proof-reuse mode. *)
 fun metadata_serves text = metadata_value "proofs" (metadata_lines text) <> SOME "cached"

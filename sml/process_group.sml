@@ -65,8 +65,6 @@ fun register_child_group_checked token launch =
           {id = id, process = process, reaped = reaped}
         end)
 
-fun register_child_group launch = register_child_group_checked NONE launch
-
 fun unregister_child_group id =
   with_active_child_lock
     (fn () => active_child_groups := List.filter (fn {id = active_id, ...} => active_id <> id)

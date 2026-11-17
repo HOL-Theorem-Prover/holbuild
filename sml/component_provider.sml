@@ -305,7 +305,5 @@ fun instances ({instances, ...} : project_components) = instances
 fun graph ({graph, ...} : project_components) = graph
 fun resolution_context_id ({resolution_context_id, ...} : project_components) =
   resolution_context_id
-fun canonical_resolution_context ({graph, instances, ...} : project_components) =
-  resolution_context_text graph instances
 
 end

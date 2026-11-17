@@ -370,8 +370,4 @@ fun run_selected package requested =
 
 fun validate_package package = ignore (topo_sort (HolbuildProject.package_generators package))
 
-fun run_package package =
-  run_selected package
-    (map HolbuildProject.generator_name (HolbuildProject.package_generators package))
-
 end

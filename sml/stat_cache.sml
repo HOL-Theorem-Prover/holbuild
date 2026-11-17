@@ -35,7 +35,6 @@ fun current_instance () =
       SOME instance => instance
     | NONE => no_op_instance
 
-fun set_current_instance instance = global_instance := SOME instance
 fun clear_current_instance () = global_instance := NONE
 
 fun with_lock (instance : instance) f =
@@ -49,10 +48,6 @@ fun with_lock (instance : instance) f =
 fun stats (instance : instance) =
   with_lock instance
     (fn () => {hits = !(#hits instance), recomputes = !(#recomputes instance)})
-
-fun reset_counters (instance : instance) =
-  with_lock instance
-    (fn () => (#hits instance := 0; #recomputes instance := 0))
 
 fun stat_ident path =
   SOME (let val st = Posix.FileSys.stat path

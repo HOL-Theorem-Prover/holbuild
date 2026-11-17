@@ -41,8 +41,6 @@ fun remove_checkpoint path =
        ["", ".ok", ".meta", ".prefix"];
    remove_file path)
 
-fun ok_v1 () = "holbuild-checkpoint-ok-v1\n"
-
 fun ok_text kind fields =
   String.concatWith "\n" (["holbuild-checkpoint-ok-v2", "kind=" ^ kind] @
                           map (fn (key, value) => key ^ "=" ^ value) fields) ^ "\n"
@@ -92,17 +90,11 @@ fun checkpoint_matches warn path metadata_matches =
   (remove_incomplete_residue warn path;
    current_matches path metadata_matches)
 
-fun ok_text_matches warn path expected_text =
-  checkpoint_matches warn path (fn text => text = expected_text)
-
 fun ok_matches warn path fields =
   checkpoint_matches warn path (metadata_matches_fields fields)
 
 (* Read-only counterparts for callers that hold no project lock: incomplete
    residue belongs to a build that may still be running, so leave it alone. *)
-fun ok_text_current path expected_text =
-  current_matches path (fn text => text = expected_text)
-
 fun ok_current path fields =
   current_matches path (metadata_matches_fields fields)
 

@@ -80,10 +80,6 @@ fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
 fun absolute_path path = Path.isAbsolute path handle Path.InvalidArc => false
 
-fun normalize_dep_path source_path dep =
-  normalize_path
-    (if absolute_path dep then dep else Path.concat(Path.dir source_path, dep))
-
 fun read_all path =
   let
     val input = TextIO.openIn path
@@ -662,11 +658,6 @@ fun prefetch_cached_with_hash requests =
   in
     map (fn (id, _) => Binarymap.peek(by_id, id)) (enumerate 1 requests)
   end
-
-fun extract_cached {cache_path, source_path} =
-  extract_cached_with_hash {cache_path = cache_path,
-                            source_path = source_path,
-                            source_hash = HolbuildHash.file_sha256 source_path}
 
 fun extract path = extract_uncached path
 
