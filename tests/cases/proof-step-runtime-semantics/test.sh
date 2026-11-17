@@ -174,6 +174,19 @@ Proof
   \\ FIRST [ACCEPT_TAC TRUTH, DISCH_TAC \\ FIRST_ASSUM ACCEPT_TAC]
 QED
 
+(* Plain THENL does nothing on no goals; cases must not demand a match. *)
+Theorem cases_on_no_goals:
+  T
+Proof
+  simp[] >| [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH]
+QED
+
+Theorem repeat_on_no_goals:
+  T
+Proof
+  simp[] >> rpt strip_tac
+QED
+
 Theorem chained_then1_plain:
   T /\ T /\ T
 Proof
@@ -289,3 +302,63 @@ if (cd "$map_first_empty_project" && "$HOLBUILD_BIN" build --skip-checkpoints --
   exit 1
 fi
 require_grep 'MAP_FIRST' "$tmpdir/map_first_empty_then.out"
+
+# Plain HOL evaluates a proof's whole tactic expression before applying it,
+# so a broken leaf fails the proof even where it never runs on a goal: after
+# the goal closes, or inside TRY. Both modes must fail each of these.
+eager_project=$tmpdir/eager-evaluation
+make_project "$eager_project" eager-evaluation
+eager_theory() {
+  printf 'open HolKernel Parse boolLib bossLib;\nval _ = new_theory "%s";\n%s\nval _ = export_theory();\n' \
+    "$1" "$2" > "$eager_project/src/$1Script.sml"
+}
+eager_theory AfterClose 'Theorem after_close: T
+Proof
+  simp[] >> mp_tac (SPEC ``0:num`` TRUTH)
+QED'
+eager_theory InTry 'Theorem in_try: T
+Proof
+  TRY (mp_tac (SPEC ``0:num`` TRUTH)) >> simp[]
+QED'
+eager_theory InBranch 'Theorem in_branch: T /\ T
+Proof
+  CONJ_TAC >- (simp[] >> mp_tac (SPEC ``0:num`` TRUTH)) >> simp[]
+QED'
+eager_theory InTermination 'Definition count_down_def:
+  count_down (n:num) = if n = 0 then 0 else count_down (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[] >> mp_tac (SPEC ``0:num`` TRUTH)
+End'
+eager_theory HeadOfNone 'Theorem head_of_none: T
+Proof
+  simp[] >>> HEADGOAL (ACCEPT_TAC TRUTH)
+QED'
+eager_theory Control 'Theorem control: T /\ T
+Proof
+  CONJ_TAC >> simp[] >> mp_tac TRUTH
+QED'
+for mode in steps plain; do
+  flags=(--skip-checkpoints --tactic-timeout 60)
+  [[ $mode == plain ]] && flags=(--skip-checkpoints --skip-proof-steps)
+  rm -rf "$eager_project/.holbuild"
+  if (cd "$eager_project" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" build "${flags[@]}") > "$tmpdir/eager-$mode.out" 2>&1; then
+    echo "expected eager-evaluation build to fail with $mode" >&2
+    cat "$tmpdir/eager-$mode.out" >&2
+    exit 1
+  fi
+  require_grep '5 build failures:' "$tmpdir/eager-$mode.out"
+  require_grep 'Term.dest_comb' "$tmpdir/eager-$mode.out"
+  require_grep 'NTH_GOAL' "$tmpdir/eager-$mode.out"
+  if grep -q 'static error' "$tmpdir/eager-$mode.out"; then
+    echo "eager-evaluation theories must fail when run, not to compile" >&2
+    cat "$tmpdir/eager-$mode.out" >&2
+    exit 1
+  fi
+  require_file "$eager_project/.holbuild/obj/src/ControlTheory.dat"
+  for name in AfterClose InTry InBranch InTermination HeadOfNone; do
+    if [[ -e "$eager_project/.holbuild/obj/src/${name}Theory.dat" ]]; then
+      echo "$name built with $mode but must fail" >&2
+      exit 1
+    fi
+  done
+done

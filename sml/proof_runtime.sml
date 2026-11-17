@@ -1019,7 +1019,13 @@ fun apply_focus_list_tactic label program make_list_tactic =
       end
   in
     (if generated_count = 0 then
-       (if total_count = 0 then ()
+       (* Plain HOL applies a list tactic to an empty goal list too: ALLGOALS
+          does nothing there, NTH_GOAL raises. *)
+       (with_tactic_timeout label program (fn () =>
+          case HolbuildTacticCompat.run_list_tactic (current_proof_context ()) (make_list_tactic ()) [] of
+              ([], _) => ()
+            | _ => raise Fail ("list tactic produced goals from no goals: " ^ label)) ();
+        if total_count = 0 then ()
         else append_history (HolbuildTacticCompat.expand_listf (current_proof_context ()) Tactical.ALL_LT))
      else
        append_history_with_timeout label program expand)
@@ -1503,7 +1509,8 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
         val count = focused_goal_count "cases"
         val case_count = length cases
         val resume_frame = if !resume_reached_ref then NONE else resume_case_frame()
-        val _ = if Option.isSome resume_frame orelse case_count = count then ()
+        (* Like plain THENL (NULL_OK_LT), cases on no goals do nothing. *)
+        val _ = if Option.isSome resume_frame orelse count = 0 orelse case_count = count then ()
                 else raise Fail (String.concat ["case count mismatch: ", Int.toString case_count,
                                                 " cases for ", Int.toString count, " focused goals"])
         fun run_one_case body_display n remaining prior body =
@@ -1544,7 +1551,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
       in (case resume_frame of
               SOME (CaseFrame (_, n, remaining, prior)) =>
                 restore_focused_group_order "cases" (loop n remaining (case_line_index n) (drop_cases n cases) (rev prior))
-            | _ => restore_focused_group_order "cases" (loop 1 count (d + 1) cases []));
+            | _ => if count = 0 then () else restore_focused_group_order "cases" (loop 1 count (d + 1) cases []));
          d + HolbuildProofIr.display_line_count proof_step end)
     and run_choice d path proof_step label alternatives =
       skip_or_enter_structural d path proof_step (fn () =>
@@ -1736,18 +1743,26 @@ fun with_proof_ir_execution ctxt f =
     case result of TraceOk value => value | TraceError e => raise e
   end
 
+(* Plain HOL evaluates a proof's whole tactic expression before it applies
+   any of it.  The step runner constructs each leaf only when the leaf runs,
+   so without this a leaf after the goal closes, or one whose construction
+   error a TRY or ORELSE step catches, would build here and fail in a
+   --skip-proof-steps build.  Leaves are still constructed again as they run. *)
+fun evaluate_tactic_expression make_tactic = ignore (make_tactic ())
+
 fun proof_ir_prove name g original_tac tactic_text =
   let
     val _ = active_tactic_text_ref := tactic_text
     val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
     val _ = trace_plan name plan
     val _ = stop_after_plan_if_requested ()
-    fun run factories ctxt goal =
+    fun run make_tactic factories ctxt goal =
       let
         val old_factories = !proof_factories_ref
         val _ = proof_factories_ref := factories
         val result = TraceOk (with_proof_ir_execution ctxt (fn () =>
         let
+          val _ = evaluate_tactic_expression make_tactic
           val _ = init_history goal (HolbuildProofIr.display_step_count plan + 1)
           val _ = run_steps plan
                   handle e =>
@@ -1771,7 +1786,7 @@ fun proof_ir_prove name g original_tac tactic_text =
     th
   end
 
-fun termination_tactic name tactic_text plan original_tac =
+fun termination_tactic name tactic_text plan make_tactic =
   HolbuildTacticCompat.lift_context_tactic (fn ctxt => fn g =>
   let
     val depth = length (PolyML.SaveState.showHierarchy())
@@ -1787,6 +1802,7 @@ fun termination_tactic name tactic_text plan original_tac =
         val _ = active_plan_ref := SOME plan
         val _ = trace_plan name plan
         val _ = stop_after_plan_if_requested ()
+        val _ = evaluate_tactic_expression make_tactic
         val _ = init_history g (HolbuildProofIr.display_step_count plan + 1)
         val _ = run_steps plan
                 handle e =>
@@ -2078,6 +2094,8 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
         with_theorem_trace name (fn () =>
         let
           val _ = active_tactic_text_ref := tactic_text
+          (* The replay script drops the original proof text: compile it. *)
+          val _ = evaluate_tactic_expression (compile_tactic name tactic_text)
           val plan = case !active_plan_ref of SOME p => p | NONE => raise Fail "internal error: proof-IR plan is not installed"
           val metadata =
             case parse_failed_prefix_metadata metadata_text of

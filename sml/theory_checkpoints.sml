@@ -129,7 +129,7 @@ fun termination_tactic_prefix ({name, definition_start, tactic_text, proof_ir_pl
              ["(HolbuildProofRuntime.termination_tactic ",
               HolbuildToolchain.sml_string name, " ",
               HolbuildToolchain.sml_string tactic_text, " (", plan, ") (",
-              "HolbuildTacticCompat.delay_tactic (fn () => ("]]
+              "(fn () => ("]]
 
 fun termination_tactic_suffix ({proof_ir_plan, ...} : termination) =
   case proof_ir_plan of NONE => "))" | SOME _ => "))))))"
