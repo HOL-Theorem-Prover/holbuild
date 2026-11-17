@@ -2,9 +2,10 @@ structure HolbuildHttp =
 struct
 
 (* HTTP GET and PUT for the remote cache, through libcurl bound with Foreign.
-   Handles are pooled and keep their connection open between requests, so
-   only a handle's first request pays for the TCP connect, TLS handshake and
-   CA bundle load. *)
+   Requests share one multi handle, which keeps connections open between
+   requests and the CA bundle it parsed, so only a connection's first request
+   pays for the TCP connect and TLS handshake, and only the first connection
+   for the CA bundle load. *)
 
 exception Error of string
 
@@ -61,6 +62,7 @@ in
   val multi_poll =
     buildCall5 (curl "curl_multi_poll", (cPointer, cPointer, cUint, cInt, cStar cInt), cInt)
   val multi_info_read = buildCall2 (curl "curl_multi_info_read", (cPointer, cStar cInt), cPointer)
+  val multi_wakeup = buildCall1 (curl "curl_multi_wakeup", cPointer, cInt)
   val fopen = buildCall2 (libc "fopen", (cString, cString), cPointer)
   val fclose = buildCall1 (libc "fclose", cPointer, cInt)
 
@@ -177,8 +179,8 @@ fun setup {user} =
       then Word32.andb (features, Word32.notb CURL_VERSION_ASYNCHDNS)
       else features
   in
-    if number < 0x074200 then
-      raise Error ("libcurl " ^ version_text number ^ " is older than 7.66")
+    if number < 0x074400 then
+      raise Error ("libcurl " ^ version_text number ^ " is older than 7.68")
     else if Word32.andb (features, CURL_VERSION_ASYNCHDNS) = 0w0 then
       raise Error ("libcurl " ^ version_text number ^ " has no asynchronous DNS resolver")
     else
@@ -211,29 +213,20 @@ fun connection_ca_options no_ca_directory =
   (if no_ca_directory then [("CAPATH", CURLOPT_CAPATH, NONE)] else []) @
   map (fn (name, option, value) => (name, option, SOME value)) (ca_options ())
 
-type connection = {easy : Foreign.Memory.voidStar, multi : Foreign.Memory.voidStar,
-               errors : Foreign.Memory.voidStar, no_ca_directory : bool}
+type request_handle = {easy : Foreign.Memory.voidStar, errors : Foreign.Memory.voidStar,
+                       no_ca_directory : bool}
 
-fun close ({easy, multi, errors, ...} : connection) =
+fun close ({easy, errors, ...} : request_handle) =
   (if easy = Foreign.Memory.null then () else easy_cleanup easy;
-   if multi = Foreign.Memory.null then () else ignore (multi_cleanup multi);
    Foreign.Memory.free errors)
 
-fun new_connection () : connection =
+fun new_handle () : request_handle =
   let
-    val connection as {easy, multi, errors, no_ca_directory} =
-      {easy = easy_init (), multi = multi_init (), errors = Foreign.Memory.malloc CURL_ERROR_SIZE,
+    val handle_ as {easy, errors, no_ca_directory} =
+      {easy = easy_init (), errors = Foreign.Memory.malloc CURL_ERROR_SIZE,
        no_ca_directory = !clear_ca_directory}
   in
-    (if easy = Foreign.Memory.null orelse multi = Foreign.Memory.null then
-       raise Error "could not create a libcurl handle"
-     else ();
-     (* The multi handle keeps the connection cache, by default capped at 4
-        connections per easy handle it drives.  A handle keeps one: the pool
-        hands it to requests for the origin it last talked to, so a walk over
-        a cache ring reuses a connection per node without every handle
-        holding a socket to every node. *)
-     mcheck "curl_multi_setopt MAXCONNECTS" (multi_setopt_long (multi, CURLMOPT_MAXCONNECTS, 1));
+    (if easy = Foreign.Memory.null then raise Error "could not create a libcurl handle" else ();
      check "NOSIGNAL" (setopt_long (easy, CURLOPT_NOSIGNAL, 1));
      check "CONNECTTIMEOUT" (setopt_long (easy, CURLOPT_CONNECTTIMEOUT, connect_timeout_seconds));
      check "FOLLOWLOCATION" (setopt_long (easy, CURLOPT_FOLLOWLOCATION, 1));
@@ -247,39 +240,57 @@ fun new_connection () : connection =
      List.app (fn (_, option, NONE) => ignore (setopt_ptr (easy, option, Foreign.Memory.null))
                 | (name, option, SOME value) => check name (setopt_str (easy, option, value)))
               (connection_ca_options no_ca_directory);
-     connection)
-    handle e => (close connection; raise e)
+     handle_)
+    handle e => (close handle_; raise e)
   end
 
 val pool_mutex = Mutex.mutex ()
 
-(* The most connections the pool keeps open, in use or idle.  Each holds
-   its multi handle's wakeup pipe, a socket (two while it moves to another
-   origin) and its request's files.  Poly/ML waits on streams with select(),
-   which aborts the process at a descriptor of 1024 or more, so the pool
-   stays well below that however many threads make requests at once. *)
-val max_connections = 64
+(* The most requests in flight at once, and the most idle connections the
+   multi handle keeps.  A request holds a socket (two while it reconnects)
+   and its files, an idle connection a socket.  Poly/ML waits on streams
+   with select(), which aborts the process at a descriptor of 1024 or more,
+   so these stay well below that however many threads make requests at
+   once. *)
+val max_requests = 64
 
-(* The pooled connections no request is using, the most recently returned
-   first, each with the origin of its last request and the time it was
-   returned. *)
-val idle : (connection * string * Time.time) list ref = ref []
+(* The process's one multi handle, while the pump runs.  libcurl keeps the
+   parsed CA bundle, DNS answers and idle connections per multi handle, so
+   every request shares them: a burst of requests parses the bundle once,
+   not once per connection. *)
+val multi = ref Foreign.Memory.null
 
-(* The connections open, in use or idle. *)
-val open_connections = ref 0
+(* The pump thread, while one runs; it is the only thread that calls
+   curl_multi_* other than curl_multi_wakeup, since a multi handle isn't
+   thread-safe. *)
+val pump_thread : Thread.thread option ref = ref NONE
 
-(* Signalled when a connection is returned or closed, for a request waiting
-   on a full pool. *)
+(* Easy handles waiting for the pump to add them. *)
+val queued : Foreign.Memory.voidStar list ref = ref []
+
+datatype outcome = Code of int  (* CURLcode *)
+                 | Raised of exn
+
+(* Transfers the pump has finished and removed, not yet collected by their
+   requests. *)
+val finished : (Foreign.Memory.voidStar * outcome) list ref = ref []
+
+(* The requests in flight: queued, running or finished. *)
+val in_flight = ref 0
+
+(* Broadcast when a transfer finishes or a request leaves. *)
 val pool_changed = ConditionVar.conditionVar ()
 
-(* The reaper thread, while one runs; one runs while idle is non-empty. *)
-val reaper_thread : Thread.thread option ref = ref NONE
+(* Signalled when a handle is queued.  An idle pump waits on it rather than
+   sleeping: the process exits only once every thread has stopped, and a
+   sleeping thread stops only when its sleep ends. *)
+val pump_wake = ConditionVar.conditionVar ()
 
-(* How long a connection stays pooled unused before it is closed: well
-   below the cache server's own idle timeout, so the pool never holds a
-   connection the server has closed (left in CLOSE-WAIT until the process
-   exits), and the pool empties in quiet stretches, such as a long local
-   build, while a burst of requests reuses its connections. *)
+(* How long the pump keeps the multi handle with no request: well below the
+   cache server's own idle timeout, so it never holds a connection the
+   server has closed (left in CLOSE-WAIT until the process exits), and the
+   connections close in quiet stretches, such as a long local build, while
+   a burst of requests reuses them. *)
 fun idle_timeout () =
   Time.fromMilliseconds
     (case Option.mapPartial LargeInt.fromString (OS.Process.getEnv "HOLBUILD_TEST_HTTP_IDLE_MS") of
@@ -294,100 +305,118 @@ fun with_pool_lock f =
   end
   handle e => (Mutex.unlock pool_mutex; raise e)
 
-(* Nothing signals it.  The reaper waits on it rather than sleeping: the
-   process exits only once every thread has stopped, and a sleeping thread
-   stops only when its sleep (up to a second) ends. *)
-val reaper_wake = ConditionVar.conditionVar ()
-
-(* Frees the places of count connections closed or never opened. *)
-fun release count =
-  with_pool_lock (fn () =>
-    (open_connections := !open_connections - count; ConditionVar.broadcast pool_changed))
-
-(* Closes pooled connections taken out of the pool. *)
-fun discard connections = (List.app close connections; release (length connections))
-
-(* Closes the connections idle for the timeout, then waits until the
-   oldest left reaches it; ends once the pool is empty. *)
-fun reaper () =
+(* Drives the transfers on m: adds queued handles, runs them, and hands
+   each finished one back to its request.  A foreign call keeps the ML
+   heap, so a GC waits for every thread inside one; the poll returns at
+   least every 20 ms, and at once when a request queues a handle.  DNS
+   can't block here: setup requires an asynchronous resolver.  With no
+   transfer for the idle timeout it closes m, and with it the connections,
+   and ends. *)
+fun pump m =
   let
-    val (expired, wake) = with_pool_lock (fn () =>
-      let
-        val now = Time.now ()
-        val timeout = idle_timeout ()
-        val (kept, expired) =
-          List.partition (fn (_, _, since) => Time.< (Time.- (now, since), timeout)) (!idle)
+    val running = ref [] : Foreign.Memory.voidStar list ref
+    fun hand_back outcomes =
+      with_pool_lock (fn () =>
+        (finished := outcomes @ !finished; ConditionVar.broadcast pool_changed))
+    fun read_done () =
+      let val message = multi_info_read (m, ref 0)
       in
-        idle := kept;
-        case rev kept of
-            [] => (reaper_thread := NONE; (expired, NONE))
-          | (_, _, oldest) :: _ => (expired, SOME (Time.- (Time.+ (oldest, timeout), now)))
-      end)
+        if message = Foreign.Memory.null then ()
+        else
+          let
+            (* CURLMsg's easy_handle, at byte 8, and data.result, at byte
+               16, on 64-bit platforms. *)
+            val easy = Foreign.Memory.getAddress (message, 0w1)
+            val code = Word32.toInt (Foreign.Memory.get32 (message, 0w4))
+          in
+            mcheck "curl_multi_remove_handle" (multi_remove_handle (m, easy));
+            running := List.filter (fn e => e <> easy) (!running);
+            hand_back [(easy, Code code)];
+            read_done ()
+          end
+      end
+    fun wait_for_work deadline =
+      if not (null (!queued)) then true
+      else if Time.>= (Time.now (), deadline) then (multi := Foreign.Memory.null; pump_thread := NONE; false)
+      else (ignore (ConditionVar.waitUntil (pump_wake, pool_mutex, deadline)); wait_for_work deadline)
+    fun take_queued () =
+      with_pool_lock (fn () =>
+        if not (null (!running)) orelse wait_for_work (Time.+ (Time.now (), idle_timeout ()))
+        then SOME (!queued before queued := [])
+        else NONE)
+    fun loop () =
+      case take_queued () of
+          NONE => ignore (multi_cleanup m)
+        | SOME added =>
+            (List.app (fn easy =>
+               (mcheck "curl_multi_add_handle" (multi_add_handle (m, easy));
+                running := easy :: !running))
+               added;
+             mcheck "curl_multi_perform" (multi_perform (m, ref 0));
+             read_done ();
+             if null (!running) then ()
+             else mcheck "curl_multi_poll" (multi_poll (m, Foreign.Memory.null, 0, 20, ref 0));
+             loop ())
   in
-    discard (map #1 expired);
-    case wake of
-        NONE => ()
-      | SOME wait =>
-          (with_pool_lock (fn () =>
-             ignore (ConditionVar.waitUntil (reaper_wake, pool_mutex, Time.+ (Time.now (), wait))));
-           reaper ())
+    loop ()
+    handle e as Error _ =>
+      (* The requests in flight fail with the error, and the next one starts
+         a new multi handle. *)
+      let
+        val failed = with_pool_lock (fn () =>
+          (multi := Foreign.Memory.null; pump_thread := NONE; !queued before queued := []))
+      in
+        List.app (fn easy => ignore (multi_remove_handle (m, easy))) (!running);
+        ignore (multi_cleanup m);
+        hand_back (map (fn easy => (easy, Raised e)) (!running @ failed))
+      end
   end
 
-datatype taken = Pooled of connection | Opened
-
-(* An idle connection last used for origin, else a new one while the pool
-   has room, else the longest idle, which reconnects; with none idle, waits
-   for one.  Each request holds one connection at a time, so the wait ends. *)
-fun take origin =
-  let
-    fun split _ [] = NONE
-      | split newer ((entry as (connection, last, _)) :: older) =
-          if last = origin then (idle := List.revAppend (newer, older); SOME connection)
-          else split (entry :: newer) older
-    fun pick () =
-      case split [] (!idle) of
-          SOME connection => Pooled connection
-        | NONE =>
-            if !open_connections < max_connections then
-              (open_connections := !open_connections + 1; Opened)
-            else
-              case rev (!idle) of
-                  (connection, _, _) :: newer => (idle := rev newer; Pooled connection)
-                | [] => (ConditionVar.wait (pool_changed, pool_mutex); pick ())
-  in
-    case with_pool_lock pick of
-        Pooled connection =>
-          if #no_ca_directory connection andalso not (!clear_ca_directory)
-          then (discard [connection]; take origin)
-          else connection
-      | Opened => new_connection () handle e => (release 1; raise e)
-  end
-
-fun give connection origin =
+(* Waits for a place among the requests in flight. *)
+fun enter () =
   with_pool_lock (fn () =>
-    (idle := (connection, origin, Time.now ()) :: !idle;
-     ConditionVar.signal pool_changed;
-     if isSome (!reaper_thread) then () else reaper_thread := SOME (Thread.fork (reaper, []))))
-  handle e => (discard (map #1 (with_pool_lock (fn () => !idle before idle := []))); raise e)
+    let
+      fun wait () =
+        if !in_flight < max_requests then in_flight := !in_flight + 1
+        else (ConditionVar.wait (pool_changed, pool_mutex); wait ())
+    in
+      wait ()
+    end)
 
-(* The scheme, host and port of url: what a connection is for. *)
-fun origin url =
-  let val (scheme, rest) = Substring.position "://" (Substring.full url)
-  in
-    Substring.string scheme ^ "://" ^
-    Substring.string (Substring.takel (fn c => c <> #"/") (Substring.triml 3 rest))
-  end
+fun leave () =
+  with_pool_lock (fn () => (in_flight := !in_flight - 1; ConditionVar.broadcast pool_changed))
 
-(* A connection whose request raised may be left mid-transfer, so it is
-   closed rather than pooled. *)
-fun with_handle url f =
-  let
-    val origin = origin url
-    val connection = take origin
-    val result = f connection handle e => (discard [connection]; raise e)
-  in
-    give connection origin; result
-  end
+(* The multi handle, starting it and its pump if none runs. *)
+fun current_multi () =
+  if !multi <> Foreign.Memory.null then !multi
+  else
+    let
+      val m = multi_init ()
+    in
+      if m = Foreign.Memory.null then raise Error "could not create a libcurl multi handle" else ();
+      (mcheck "curl_multi_setopt MAXCONNECTS" (multi_setopt_long (m, CURLMOPT_MAXCONNECTS, max_requests))
+       handle e => (ignore (multi_cleanup m); raise e));
+      multi := m;
+      pump_thread := SOME (Thread.fork (fn () => pump m, []));
+      m
+    end
+
+(* Runs easy's transfer on the shared multi handle and waits for it to
+   finish. *)
+fun run_transfer easy =
+  with_pool_lock (fn () =>
+    let
+      val m = current_multi ()
+      fun collect () =
+        case List.partition (fn (e, _) => e = easy) (!finished) of
+            ([(_, outcome)], others) => (finished := others; outcome)
+          | _ => (ConditionVar.wait (pool_changed, pool_mutex); collect ())
+    in
+      queued := easy :: !queued;
+      ConditionVar.signal pump_wake;
+      mcheck "curl_multi_wakeup" (multi_wakeup m);
+      collect ()
+    end)
 
 fun c_string_at p =
   let
@@ -396,42 +425,19 @@ fun c_string_at p =
     CharVector.tabulate (len 0, fn i => Byte.byteToChar (Foreign.Memory.get8 (p, Word.fromInt i)))
   end
 
-(* A foreign call keeps the ML heap, so a GC waits for every thread inside
-   one.  The transfer is driven through the handle's multi handle, whose
-   poll returns at least every 20 ms, rather than by a blocking
-   curl_easy_perform.  DNS can't block here: setup requires an asynchronous
-   resolver. *)
-fun transfer ({easy, multi, errors, no_ca_directory} : connection) =
-  let
-    val _ = HolbuildOffline.require_online "send an HTTP request"
-    val running = ref 0
-    val code = ref 0
-    fun read_done () =
-      let val message = multi_info_read (multi, ref 0)
-      in
-        if message = Foreign.Memory.null then ()
-        (* CURLMsg's data.result, at byte 16 on 64-bit platforms. *)
-        else (code := Word32.toInt (Foreign.Memory.get32 (message, 0w4)); read_done ())
-      end
-    fun loop () =
-      (mcheck "curl_multi_perform" (multi_perform (multi, running));
-       read_done ();
-       if !running = 0 then ()
-       else (mcheck "curl_multi_poll" (multi_poll (multi, Foreign.Memory.null, 0, 20, ref 0));
-             loop ()))
-    val _ = mcheck "curl_multi_add_handle" (multi_add_handle (multi, easy))
-    val _ = loop () handle e => (ignore (multi_remove_handle (multi, easy)); raise e)
-    val _ = mcheck "curl_multi_remove_handle" (multi_remove_handle (multi, easy))
-  in
-    if !code = CURLE_PEER_FAILED_VERIFICATION andalso no_ca_directory then raise CaDirectoryNeeded
-    else if !code <> 0 then
-      Failed (easy_strerror (!code) ^
-              (case c_string_at errors of "" => "" | detail => ": " ^ detail))
-    else
-      Foreign.Memory.alloca (0w8, fn status =>
-        (check "RESPONSE_CODE" (getinfo_ptr (easy, CURLINFO_RESPONSE_CODE, status));
-         Response (SysWord.toInt (Foreign.Memory.get64 (status, 0w0)))))
-  end
+(* The result of a finished transfer. *)
+fun transfer_result ({easy, errors, no_ca_directory} : request_handle) outcome =
+  case outcome of
+      Raised e => raise e
+    | Code code =>
+        if code = CURLE_PEER_FAILED_VERIFICATION andalso no_ca_directory then raise CaDirectoryNeeded
+        else if code <> 0 then
+          Failed (easy_strerror code ^
+                  (case c_string_at errors of "" => "" | detail => ": " ^ detail))
+        else
+          Foreign.Memory.alloca (0w8, fn status =>
+            (check "RESPONSE_CODE" (getinfo_ptr (easy, CURLINFO_RESPONSE_CODE, status));
+             Response (SysWord.toInt (Foreign.Memory.get64 (status, 0w0)))))
 
 fun with_file path mode f =
   let val file = fopen (path, mode)
@@ -440,32 +446,37 @@ fun with_file path mode f =
     else f file before ignore (fclose file) handle e => (ignore (fclose file); raise e)
   end
 
-(* Runs one request on a pooled connection, writing the response body to
+(* Runs one request on a new easy handle, writing the response body to
    output.  It fails once it has moved no data for timeout seconds, or after
    max_transfer_seconds: a slow transfer that keeps moving, as a large upload
    to a busy server, isn't cut off.  files opens the request's files, then
    runs the transfer with the output and set_options, which sets the
-   request's own options.  It opens them only once the request has a
-   connection, so requests waiting on a full pool hold no descriptors.  The
-   data pointers are cleared afterwards, so the pooled handle keeps none of
-   them. *)
+   request's own options.  It opens them only once the request has a place
+   in flight, so requests waiting for one hold no descriptors.  A handle
+   still with the pump, when waiting for it is interrupted, is left to it. *)
 fun request_once {url, timeout, files} =
   (HolbuildOffline.require_online "send an HTTP request";
-  with_handle url (fn connection as {easy, ...} =>
-    files (fn {output, set_options} =>
-      (check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, max_transfer_seconds));
-       check "LOW_SPEED_LIMIT" (setopt_long (easy, CURLOPT_LOW_SPEED_LIMIT, 1));
-       check "LOW_SPEED_TIME" (setopt_long (easy, CURLOPT_LOW_SPEED_TIME, timeout));
-       check "URL" (setopt_str (easy, CURLOPT_URL, url));
-       check "WRITEDATA" (setopt_ptr (easy, CURLOPT_WRITEDATA, output));
-       check "IGNORE_CONTENT_LENGTH" (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 0));
-       set_options easy;
-       transfer connection
-       before List.app (fn option => ignore (setopt_ptr (easy, option, Foreign.Memory.null)))
-                [CURLOPT_WRITEDATA, CURLOPT_READDATA, CURLOPT_HTTPHEADER]))))
+   enter ();
+   (files (fn {output, set_options} =>
+      let
+        val handle_ as {easy, ...} = new_handle ()
+        val _ =
+          (check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, max_transfer_seconds));
+           check "LOW_SPEED_LIMIT" (setopt_long (easy, CURLOPT_LOW_SPEED_LIMIT, 1));
+           check "LOW_SPEED_TIME" (setopt_long (easy, CURLOPT_LOW_SPEED_TIME, timeout));
+           check "URL" (setopt_str (easy, CURLOPT_URL, url));
+           check "WRITEDATA" (setopt_ptr (easy, CURLOPT_WRITEDATA, output));
+           check "IGNORE_CONTENT_LENGTH" (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 0));
+           set_options easy)
+          handle e => (close handle_; raise e)
+        val outcome = run_transfer easy
+      in
+        (transfer_result handle_ outcome before close handle_)
+        handle e => (close handle_; raise e)
+      end)
+    before leave ())
+   handle e => (leave (); raise e))
 
-(* Verification fails in the TLS handshake, before any data moves, so the
-   request can start again on a handle with libcurl's default CA directory. *)
 fun request args =
   request_once args
   handle CaDirectoryNeeded => (clear_ca_directory := false; request_once args)

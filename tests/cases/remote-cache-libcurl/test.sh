@@ -132,7 +132,7 @@ for fd in os.listdir(fd_dir):
     try:
         links.append(os.readlink(os.path.join(fd_dir, fd)))
     except FileNotFoundError:
-        pass  # closed since listed: the pool's reaper closes connections at any time
+        pass  # closed since listed: the idle pump closes connections at any time
 print(sum(link.startswith("socket:[") and link[8:-1] in inodes for link in links))
 PY
 python3 "$tmpdir/server.py" "$tmpdir/port" "$tmpdir" &
@@ -576,19 +576,19 @@ val _ = assert "a later request fails without a retry"
                (case tls_get () of HolbuildHttp.Failed _ => true | _ => false)
 val _ = assert "a later request connects once" (tls_accepted () = accepted_before + 1)
 
-(* A request leaves its connection pooled and the reaper waiting for the idle
+(* A request leaves its connection open and the pump waiting for the idle
    timeout.  Exiting asks every thread to stop, as Thread.kill does, and waits
-   for them: a reaper waiting on its condition variable stops at once, but a
-   sleeping one only once its one-second sleep ends.  Timing the kill rather
-   than the whole exit leaves out Poly/ML freeing its heap, which takes
-   hundreds of milliseconds on a busy machine. *)
+   for them: a pump waiting on its condition variable stops at once, but a
+   sleeping one only once its sleep ends.  Timing the kill rather than the
+   whole exit leaves out Poly/ML freeing its heap, which takes hundreds of
+   milliseconds on a busy machine. *)
 val _ = wait_for_empty_pool ()
-val _ = assert "a request leaves the reaper running"
+val _ = assert "a request leaves the pump running"
                (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/fast.out", timeout = 30} = HolbuildHttp.Response 200)
-val reaper = valOf (!HolbuildHttp.reaper_thread)
+val pump = valOf (!HolbuildHttp.pump_thread)
 val deadline = Time.+ (Time.now (), Time.fromMilliseconds 500)
-val _ = Thread.kill reaper
-val _ = wait_for "the reaper to stop" (fn () => not (Thread.isActive reaper)) deadline
+val _ = Thread.kill pump
+val _ = wait_for "the pump to stop" (fn () => not (Thread.isActive pump)) deadline
 
 val _ = print "http tests passed\n"
 SML
