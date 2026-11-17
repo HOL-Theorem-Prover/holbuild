@@ -48,8 +48,9 @@ their usual source-loading behavior. Older toolchains and missing or
 incompatible module files load from the `.dat` file automatically.
 
 These module files belong to one exact HOL saved state. They stay in the local
-cache, including on remote workers, and do not change portable theory artifacts
-or remote cache keys. Checkpoint-free builds also produce and use them. Cache
+cache and do not change portable theory artifacts or action keys. Remote
+workers also share them through the remote cache, keyed by that exact
+toolchain, so a fresh worker fetches the modules another one wrote. Checkpoint-free builds also produce and use them. Cache
 garbage collection and worker cache limits include the module files; deleting
 them only causes source loading and regeneration.
 

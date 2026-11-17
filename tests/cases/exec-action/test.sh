@@ -431,6 +431,8 @@ if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   # The writer ran after the action root was emptied, and left nothing in it.
   require_grep 'exec-action after the result (ms): [0-9]* modules_ms=[0-9]* modules_installed=[1-9][0-9]*/[1-9]' \
     "$tmpdir/c.log"
+  # ... and published them to the remote cache.
+  require_grep 'modules_published=[1-9]' "$tmpdir/c.log"
   [[ -z $(find "$tmpdir/worker-c/action" -name 'theory-module-writer*') ]] || {
     echo "worker c's writer left its files in the action root" >&2; exit 1; }
   [[ ! -e "$tmpdir/worker-c/checkpoints" ]] || {
@@ -476,7 +478,33 @@ SML
       exit 1
     }
   done
+  # Another host with worker c's paths, and so its toolchain, fetches
+  # the modules worker c published instead of writing them...
+  mv "$tmpdir/worker-c" "$tmpdir/worker-c.first"
+  worker c "$(spec_for "$tmpdir/batch-f.txt" worker:FTheory)"
+  expect c 1 "status=failed" "failure=proof"
   rm "$project/src/FScript.sml"
+  require_grep 'modules_installed=0/[1-9][0-9]* modules_fetched=[1-9]' "$tmpdir/c.log"
+  # ... and its next child loads A and B from them.
+  cat > "$project/src/GScript.sml" <<'SML'
+Theory G
+Ancestors B
+
+val _ = if length (PolyML.SaveState.showLoadedModules ()) >= 2 then ()
+        else raise Fail "G's child loaded no theory modules"
+
+Theorem g_thm:
+  T
+Proof
+  ACCEPT_TAC b_thm
+QED
+SML
+  hb action-spec --upload GTheory > "$tmpdir/batch-g.txt"
+  worker c "$(spec_for "$tmpdir/batch-g.txt" worker:GTheory)"
+  expect c 0 "status=built"
+  rm "$project/src/GScript.sml"
+  rm -rf "$tmpdir/worker-c"
+  mv "$tmpdir/worker-c.first" "$tmpdir/worker-c"
 elif [[ ! -e "$HOLDIR/tools-poly/poly/theory_modules.ML" ]]; then
   # A HOL without the module helper starts no writer, which alone makes
   # the store.

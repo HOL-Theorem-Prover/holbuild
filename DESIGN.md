@@ -192,15 +192,19 @@ few per process, since each save costs more the more is loaded), and later
 loads use it, still registering the theory and running its load hooks in the
 usual order. Missing or incompatible modules fall back to the `.dat` file.
 Modules depend on the host's base saved state, so they stay outside portable
-theory artifacts, action keys and the remote cache; cache GC and
-remote-worker byte limits account for them separately.
+theory artifacts and action keys; cache GC and remote-worker byte limits
+account for them separately.
 
 On a remote worker an action only reads the store, so that no action can
 plant a module another one loads. After a theory action's result, built
-or failed, the worker has a sandboxed child that runs no project code write
-the missing modules of the theories the action loads, from their restored
-`.dat` files alone, and moves into the store only the files named for those
-theories' `.dat` files. The action itself loads what the store lacks from
+or failed, the worker first fetches from the remote cache the missing
+modules of the theories the action loads that another worker published, then
+has a sandboxed child that runs no project code write those still missing,
+from their restored `.dat` files alone, moves into the store only the files
+named for those theories' `.dat` files, and publishes them. A published
+module's key names the toolchain's exact identity (its HOL state, so the base
+state the module is saved against), the store and the theory's `.dat`
+contents; a fetched one is stored only under the file name it is listed for. The action itself loads what the store lacks from
 `.dat` files, so it never waits for the writer. The writer goes last after
 the result, once the action's directory is emptied, and stops 100 s after
 the result, before the worker's kill at 120 s; HOL writes each module whole,

@@ -15,8 +15,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 source "$ROOT/tests/lib.sh"
 tmpdir=$(make_temp_dir)
 other_fs=
-trap 'cleanup_temp_dir "$tmpdir"; [[ -z $other_fs ]] || rm -rf "$other_fs"' EXIT
+server_pid=
+trap '[[ -z $server_pid ]] || kill "$server_pid" 2>/dev/null; cleanup_temp_dir "$tmpdir"; [[ -z $other_fs ]] || rm -rf "$other_fs"' EXIT
 mkdir -p "$tmpdir/cache" "$tmpdir/root/src" "$tmpdir/root/.holbuild"
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 
 sha() { sha1sum "$1" | cut -d' ' -f1; }
 for hol in hol1 hol2 hol3 hol4; do
@@ -62,8 +64,9 @@ val wanted = {deps = [dep "A", dep "B"] @ List.tabulate (16, fn i => dep ("P" ^ 
               loads = [E.LoadTheory "boolTheory"]};
 fun tc hol = {holdir = "$tmpdir/" ^ hol, maxheap = NONE,
               kernel_variant = HolbuildToolchain.StandardKernel};
+val remote = HolbuildRemoteCache.remote "$remote_url";
 fun fill_by hol seconds =
-  E.fill_module_store "$tmpdir/root" (tc hol) wanted (Time.+ (Time.now (), Time.fromSeconds seconds));
+  E.fill_module_store remote "$tmpdir/root" (tc hol) wanted (Time.+ (Time.now (), Time.fromSeconds seconds));
 fun fill hol = ignore (fill_by hol 100);
 fun store hol = E.module_store ("$tmpdir/" ^ hol);
 fun stored hol file = exists (OS.Path.concat (store hol, file));
@@ -122,11 +125,14 @@ val _ = check "a writer ran while another held the store's lock" (runs "hol1" = 
 val _ = Posix.Process.kill (Posix.Process.K_PROC (valOf holder), Posix.Signal.kill);
 val _ = Posix.Process.waitpid (Posix.Process.W_CHILD (valOf holder), []);
 
-(* 16 missing: the writer runs, without asking for the base theories again. *)
-val _ = writes (b :: List.take (ps, 15) @ ["base-theories"]);
+(* 16 missing once B, which the first writer published, is fetched: the
+   writer runs, without asking for the base theories again. *)
+val _ = remove [List.nth (ps, 15)];
+val _ = writes (ps @ ["base-theories"]);
 val _ = E.write_text (OS.Path.concat (store "hol1", "base-theories")) "bool\n";
-val _ = fill "hol1";
-val _ = check "no writer ran for 16 missing modules" (runs "hol1" = 2);
+val {installed, fetched, ...} = fill_by "hol1" 100;
+val _ = check "B was not fetched" (fetched = 1);
+val _ = check "no writer ran for 16 missing modules" (runs "hol1" = 2 andalso installed = 16);
 val _ = check "the missing modules were not stored" (List.all (stored "hol1") (b :: ps));
 val _ = check "the base theories were asked for again" (not (script_has "hol1" "TheoryReader.is_canonical"));
 val _ = check "the base theories were replaced"
@@ -183,6 +189,18 @@ val _ = check "a stopped writer left its output" (not (exists (OS.Path.concat (s
 val _ = check "a stopped writer left its script or log"
           (not (exists "$tmpdir/root/.holbuild/theory-module-writer.sml") andalso
            not (exists "$tmpdir/root/.holbuild/theory-module-writer.log"));
+
+(* The writer published the modules it stored.  A store of the same
+   toolchain on another host fetches them instead of writing them. *)
+fun remove_store hol =
+  (List.app OS.FileSys.remove (HolbuildCache.children (store hol));
+   OS.FileSys.rmDir (store hol));
+val _ = remove_store "hol4";
+val _ = writes [];
+val {installed, fetched, published, ...} = fill_by "hol4" 100;
+val _ = check "published modules were not fetched"
+          (fetched = 2 andalso installed = 0 andalso published = 0 andalso List.all (stored "hol4") [a, b]);
+val _ = check "the writer did not run for the modules still missing" (runs "hol4" = 2);
 
 (* A writer whose lock file the sweep unlinked between its open and its
    lock holds a lock nobody else sees: it must not write. *)
