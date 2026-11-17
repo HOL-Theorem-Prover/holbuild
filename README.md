@@ -1460,6 +1460,11 @@ The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
 cache metadata under `/ac/<sha256>`; a blob's CAS digest is the same one
 holbuild uses locally. CAS transfers use zstd compression when
 supported by the server; action metadata stays small and is sent uncompressed.
+A blob fetched by digest alone (a remote worker's spec, sources and checkpoint
+chain) is downloaded still zstd-encoded and decoded on 4 threads through
+libzstd (`libzstd.so.1`; Homebrew's on macOS) when the body is a series of
+frames that each give their content size, as bazel-remote's zstd storage serves
+it; otherwise, or without libzstd, libcurl decodes it as for other transfers.
 This is a live accelerator, not remote execution and not an immutable release
 registry. Remote cache contents are trusted build inputs: cache hits can load
 Poly/ML objects, and restored toolchains execute cached binaries. Use an
