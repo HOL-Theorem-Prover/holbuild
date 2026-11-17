@@ -984,7 +984,11 @@ fun compile_list_tactic label program =
    inside a TRY.  So the runner constructs every leaf of the plan, and every
    matching selector's RENAME_TAC, once before the first step
    (construct_plan_leaves) and applies those values, keyed by the leaf's
-   source span and program. *)
+   source span and program.  A failed-prefix resume keeps the leaves its
+   checkpoint heap holds, as the failed run left them, and constructs only
+   those it lacks: a leaf can carry state (`REWRITE_RULE [Once th]` spends
+   its bound when applied), so constructing it again would let the resumed
+   steps pass where a fresh run fails. *)
 datatype built_leaf = BuiltTactic of Tactical.tactic | BuiltListTactic of Tactical.list_tactic
 
 fun no_built_leaves () = Binarymap.mkDict String.compare : (string, built_leaf) Binarymap.dict
@@ -1374,14 +1378,19 @@ fun run_maybe_traced_step index display_index proof_step =
 (* Display indices follow run_structural_steps_with_resume's numbering, so a
    leaf whose construction fails is reported at its plan position.
    Compilation is outside the step budget, construction inside it: rule
-   arguments can do arbitrary work before returning a tactic. *)
+   arguments can do arbitrary work before returning a tactic.  Leaves already
+   in built_leaves_ref are kept. *)
 fun construct_plan_leaves display_index steps =
   let
     fun build d proof_step start_pos end_pos label program make =
-      with_plan_position d (HolbuildProofIr.step_kind proof_step) label (start_pos, end_pos) (fn () =>
-        built_leaves_ref :=
-          Binarymap.insert (!built_leaves_ref, leaf_key start_pos end_pos program,
-                            with_tactic_timeout label program make ()))
+      let val key = leaf_key start_pos end_pos program
+      in
+        if Option.isSome (Binarymap.peek (!built_leaves_ref, key)) then ()
+        else
+          with_plan_position d (HolbuildProofIr.step_kind proof_step) label (start_pos, end_pos) (fn () =>
+            built_leaves_ref :=
+              Binarymap.insert (!built_leaves_ref, key, with_tactic_timeout label program make ()))
+      end
     fun walk_list _ [] = ()
       | walk_list d (proof_step :: rest) =
           (walk d proof_step; walk_list (d + HolbuildProofIr.display_line_count proof_step) rest)
@@ -1413,7 +1422,6 @@ fun construct_plan_leaves display_index steps =
         | HolbuildProofIr.StepCases {cases, ...} => walk_headed_bodies (d + 1) cases
         | HolbuildProofIr.StepChoice {alternatives, ...} => walk_headed_bodies (d + 1) alternatives
   in
-    built_leaves_ref := no_built_leaves ();
     walk_list display_index steps
   end
 
@@ -1748,7 +1756,10 @@ fun run_built_steps resume_after_path display_index steps =
   end
 
 fun run_structural_steps_with_resume resume_after_path display_index steps =
-  (construct_plan_leaves display_index steps;
+  ((case resume_after_path of
+        NONE => built_leaves_ref := no_built_leaves ()
+      | SOME _ => ());
+   construct_plan_leaves display_index steps;
    run_built_steps resume_after_path display_index steps;
    built_leaves_ref := no_built_leaves ())
   handle e => (built_leaves_ref := no_built_leaves (); raise e)
