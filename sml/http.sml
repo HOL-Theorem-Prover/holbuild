@@ -481,9 +481,10 @@ fun request_once {url, timeout, files} =
            check "IGNORE_CONTENT_LENGTH" (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 0));
            set_options easy)
           handle e => (close handle_; raise e)
-        val outcome = run_transfer easy
       in
-        (transfer_result handle_ outcome before close handle_)
+        (* run_transfer raises only before the handle is queued or after the
+           pump is done with it, so closing it then is safe. *)
+        (transfer_result handle_ (run_transfer easy) before close handle_)
         handle e => (close handle_; raise e)
       end)
     before leave ())
