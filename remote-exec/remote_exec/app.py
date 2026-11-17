@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -69,7 +69,7 @@ def exit_on_auth_failure(error: BaseException) -> None:
         os._exit(1)
 
 
-def bearer(token: SecretStr) -> Callable[[str | None], None]:
+def bearer(token: SecretStr) -> Callable[[str | None], Awaitable[None]]:
     expected = f"Bearer {token.get_secret_value()}".encode()
 
     # Async, as is cache_reader: FastAPI runs a plain function dependency in a thread, a hop on every request.

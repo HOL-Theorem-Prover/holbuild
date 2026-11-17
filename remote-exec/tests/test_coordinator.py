@@ -3091,6 +3091,31 @@ async def test_run_claims_reuse_a_recent_none_until_a_run_is_made_ready(
         sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
 
 
+async def test_run_claims_keep_no_none_read_across_a_run_made_ready(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    # A run made ready while the read is in flight, after its snapshot: that "none" is already stale.
+    coordinator.settings.run_floor = 4
+    coordinator.settings.claim_ranking_seconds = 3600
+    asked = 0
+
+    def after_execute(_: object, __: object, statement: str, *args: object) -> None:
+        nonlocal asked
+        if "WHERE state = 'ready' AND class = 'run'" in statement:
+            asked += 1
+            if asked == 1:
+                coordinator._runs_changed()
+
+    await submit(http, ["build-a", "build-b"])
+    sa.event.listen(coordinator.engine.sync_engine, "after_cursor_execute", after_execute)
+    try:
+        await claim_named(http, "build-a")
+        await claim_named(http, "build-b")
+        assert asked == 2
+    finally:
+        sa.event.remove(coordinator.engine.sync_engine, "after_cursor_execute", after_execute)
+
+
 async def test_run_claims_go_past_the_floor_to_the_cap_and_take_a_freed_slot(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:

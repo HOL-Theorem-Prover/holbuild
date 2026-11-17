@@ -930,8 +930,9 @@ class Coordinator:
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
         # When a run claim of (tiers, slots) last found none to take: every claim asks, so a "no" is reused for as
-        # long as a ranking read is, until a run is made ready or a run lease ends.
+        # long as a ranking read is, until a run is made ready or a run lease ends (_runs_changed).
         self.no_runs: dict[tuple[tuple[str, ...], int], float] = {}
+        self.runs_changed = 0  # how many times _runs_changed ran, so a "no" read across one isn't kept
         self.rankings_forgotten = 0  # how many times _forget_rankings dropped one, so reads begun before keep none
         # The claims ahead's shared read, the lock its readers take, and how many times _ahead_changed outdated it.
         self.ahead_read: _AheadRead | None = None
@@ -1331,9 +1332,11 @@ class Coordinator:
         key, now = (tuple(tiers), slots), asyncio.get_running_loop().time()
         if (found := self.no_runs.get(key)) is not None and now - found < self.settings.claim_ranking_seconds:
             return None, False
+        changed = self.runs_changed
         async with self.engine.connect() as conn:
             if not await conn.scalar(available, params):
-                self.no_runs[key] = now
+                if changed == self.runs_changed:
+                    self.no_runs[key] = now
                 return None, False
         # Only one connection per process may wait for cross-replica run admission. Builds bypass this gate.
         async with self.run_admission, self.engine.begin() as conn:
@@ -1768,6 +1771,11 @@ class Coordinator:
         if ranking.forgotten == self.rankings_forgotten:
             self.rankings[key] = ranking
 
+    def _runs_changed(self) -> None:
+        """Drop the run claims' cached "no": a run was made ready or a run slot came free."""
+        self.no_runs.clear()
+        self.runs_changed += 1
+
     def _forget_rankings(self, batch_id: UUID, tiers: set[str]) -> None:
         """Drop the rankings that would pass over actions of ``tiers`` made ready in ``batch_id``: those that didn't
         have it with a ready action of one of them, or have since found it without one. Rankings being read then,
@@ -2153,6 +2161,8 @@ class Coordinator:
                 await self._fail(
                     conn, batch_id, action.input_key, action.action_class, f"{action.theory}: {result.failure}{detail}"
                 )
+        if action.action_class == "run":
+            self._runs_changed()  # a run slot came free, or the run is ready again
         for peak in peaks:
             await self._record_peak(*peak)
         if built:
@@ -2161,8 +2171,6 @@ class Coordinator:
         if leased is not None:
             self._record_result(leased[0], batch_id, result)
             self._learn_locality(leased[0], action.theory, result)
-        if action.action_class == "run":
-            self.no_runs.clear()  # a run slot came free, or the run is ready again
         self._batch_changed(batch_id)
         self.request_release(batch_id)
         if unblocked:
@@ -2288,7 +2296,7 @@ class Coordinator:
             self._batch_changed(batch_id)
             self._forget_rankings(batch_id, {row.tier for row in made_ready})
             if any(row.action_class == "run" for row in made_ready):
-                self.no_runs.clear()
+                self._runs_changed()
             for row in made_ready:
                 self._wake_claim(row.tier, theory=row.theory)
         requeued = False
@@ -2423,11 +2431,11 @@ class Coordinator:
                     await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
                 ahead_freed = action.ahead_batch  # the retry revokes what was claimed ahead of it
         # After the commit, so the claims woken see the slots of the cap this freed.
+        if action.action_class == "run":
+            self._runs_changed()
         if ahead_freed:
             self._ahead_changed()
         self._wake_peers(await self._peers(batch_id, action))
-        if action.action_class == "run":
-            self.no_runs.clear()
         self._batch_changed(batch_id)
 
     async def fail_overdue(self) -> None:
