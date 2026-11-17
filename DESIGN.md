@@ -115,6 +115,29 @@ For a root project, all dependency source checkouts are materialized once under:
 <root>/.holbuild/src/<package>
 ```
 
+Each is a symbolic link to a read-only checkout shared by every project using
+the cache, one per dependency URL and commit:
+
+```text
+$HOLBUILD_CACHE/git/checkouts/<sha1 of URL>-<commit>
+```
+
+It holds the commit's tree without git metadata, written from the mirror below
+with a private index, its files made read-only (directories stay writable, so
+`rm -rf` still removes a cache), and renamed into place under
+`git/checkouts/.locks/<key>.lock`, so a checkout directory that exists is
+complete. Nothing writes into it: builds write to `.holbuild/packages`, and a
+dependency whose package (or a `from` shim in its tree) declares generators,
+which write into their package's sources, gets a private clone at
+`.holbuild/src/<package>` instead. A private clone already at the pinned commit
+is used as it is, so clones made before shared checkouts stay until the pin
+changes. When the shared checkout cannot be made, holbuild warns and clones.
+Every process that uses a shared checkout holds a shared usage lease,
+`git/checkouts/.locks/<key>.usage`, until it exits, and rewrites its
+`<key>.last-used` marker; cache GC removes checkouts unused for the retention
+period that no process leases, and a link left pointing at a removed checkout
+gets it made again on the project's next build.
+
 Dependency package build artifacts live separately under:
 
 ```text
@@ -132,13 +155,14 @@ the commit is fetched into a bare mirror under `$HOLBUILD_CACHE/git/remotes`,
 shared by every project using that cache; creating a mirror and fetching into it
 are serialized by a per-mirror lock, and a new mirror is cloned to a temporary
 directory and renamed into place. Publishing a checkout is serialized by
-`.holbuild/locks/src/<package>.lock`, and HEAD is checked again under that lock.
+`.holbuild/locks/src/<package>.lock`, and the link (or a clone's HEAD) is
+checked again under that lock.
 Temporary clones left by killed processes are removed under the lock that
 guards them, and a process waiting on either lock names the pid holding it.
 Every process that uses a checkout holds a shared lease,
 `.holbuild/locks/src/<package>.lease`, until it exits; replacing a checkout at
 another commit takes the lease exclusively and fails while another process holds
-it, so no process removes a tree another one is reading.
+it, so no process replaces a tree another one is reading.
 
 The reserved `hol` package is the project HOL toolchain. It is
 materialized and built at a canonical shared cache path

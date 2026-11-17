@@ -455,8 +455,9 @@ holbuild build MyTheory
 holbuild --offline build MyTheory
 ```
 
-A missing or wrong-revision dependency checkout fails before clone or fetch,
-even if its commit is in a local bare mirror. A missing or invalid HOL
+A dependency whose shared checkout is missing fails before checkout or fetch,
+even if its commit is in a local bare mirror; one already in the cache is
+linked as usual. A missing or invalid HOL
 toolchain also fails before restore or replacement. The error names what needs
 preparing; rerun without `--offline` and with `HOLBUILD_OFFLINE` unset. Valid
 local toolchains can regenerate analyser and source metadata offline.
@@ -1269,10 +1270,11 @@ summary of failures.
 Important paths:
 
 ```text
-.holbuild/src/<package>               # dependency source checkouts
+.holbuild/src/<package>               # dependency source checkouts (links into git/checkouts)
 .holbuild/packages/<package>          # package build artefacts
 .holbuild/plan/<fingerprint>          # plan records
 $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
+$HOLBUILD_CACHE/git/checkouts/        # read-only dependency source checkouts
 $HOLBUILD_CACHE/analysis/             # sources' dependency analyses
 ```
 
@@ -2319,6 +2321,13 @@ removed toolchain are discarded and rebuilt automatically, but heaps exported
 with `holbuild heap` or `holbuild executable` must be re-exported before they
 are used outside holbuild.
 
+Cache GC also removes the read-only dependency source checkouts under
+`git/checkouts/` that no holbuild command has used within the retention period,
+skipping those a running holbuild process uses. A project whose
+`.holbuild/src/<package>` links to a removed checkout gets it checked out
+again from the cache's git mirror on its next build. The mirrors under
+`git/remotes/` are kept.
+
 `gc --toolchains-only` removes only such stale toolchains, skipping project
 cleanup and the action/blob scan, which can take minutes on a large cache. Like
 `--cache-only`, it needs no project or HOL toolchain. `--clean-only`,
@@ -2466,6 +2475,9 @@ supplied from disk. Overridden dependencies still need a matching `project.name`
 in their manifest; `dependencies.hol` cannot be overridden this way.
 A `from/path/manifest` shim cannot be overridden directly; override the direct
 source dependency named by `from` instead.
+The checkout at `.holbuild/src/NAME` is read-only and shared with other
+projects, so to build against edited dependency sources, point a `path`
+override at your own checkout.
 
 Unknown fields in recognised manifest and `.holconfig.toml` tables are
 errors.
