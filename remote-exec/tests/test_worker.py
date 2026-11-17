@@ -1824,32 +1824,37 @@ def test_a_lease_that_cannot_be_renewed_is_lost_when_it_expires(monkeypatch: pyt
     assert len(coordinator.beats) >= 3  # retried before the lease ran out
 
 
+class ScriptedCoordinator(FlakyCoordinator):
+    """A coordinator whose heartbeats fail where ``failures`` says, in order, and then succeed."""
+
+    def __init__(self, failures: list[bool]) -> None:
+        super().__init__(errors=0)
+        self.failures = failures
+
+    def heartbeat(self, token: str) -> bool:
+        self.beats.append(time.monotonic())
+        if len(self.beats) <= len(self.failures) and self.failures[len(self.beats) - 1]:
+            raise OSError("unreachable")
+        return True
+
+
 def test_failed_heartbeats_back_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each failure in a row doubles the wait before the next heartbeat, up to the heartbeat interval, so workers
-    facing an overloaded coordinator don't keep adding to its load; a renewal starts the waits over."""
-    monkeypatch.setattr(worker, "HEARTBEAT_RETRY_SECONDS", 0.2, raising=False)
-    monkeypatch.setattr(worker.random, "uniform", lambda low, high: high)
-    coordinator = FlakyCoordinator(errors=4)
+    facing an overloaded coordinator don't keep adding to its load; each wait is jittered down to half, and a renewal
+    starts the waits over."""
+    monkeypatch.setattr(worker, "HEARTBEAT_RETRY_SECONDS", 0.6, raising=False)
+    monkeypatch.setattr(worker.random, "uniform", lambda low, high: low)
+    coordinator = ScriptedCoordinator([True, True, True, False, True, False])
     # Renewed every 2 s.
     with Lease(coordinator, "t1", 6, Protection(None, None)).held(Phases()) as lease:  # type: ignore[arg-type]
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 12
         while len(coordinator.beats) < 6 and time.monotonic() < deadline:
             time.sleep(0.05)
     gaps = [later - earlier for earlier, later in itertools.pairwise(coordinator.beats)]
     assert not lease.lost.is_set()
-    assert [round(gap, 1) for gap in gaps[:4]] == [0.2, 0.4, 0.8, 1.6], gaps
-    assert 1.9 <= gaps[4] < 2.2, gaps  # renewed: the next heartbeat comes a full interval later
-
-
-def test_heartbeat_retries_are_jittered(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(worker, "HEARTBEAT_RETRY_SECONDS", 0.4, raising=False)
-    monkeypatch.setattr(worker.random, "uniform", lambda low, high: low)
-    coordinator = FlakyCoordinator(errors=1)
-    with Lease(coordinator, "t1", 3, Protection(None, None)).held(Phases()):  # type: ignore[arg-type]
-        deadline = time.monotonic() + 5
-        while len(coordinator.beats) < 2 and time.monotonic() < deadline:
-            time.sleep(0.05)
-    assert round(coordinator.beats[1] - coordinator.beats[0], 1) == 0.2
+    # Half of 0.6, 1.2, then 2.4 capped at the 2 s interval; a renewal, then a failure waits half the base again.
+    expected = [0.3, 0.6, 1.0, 2.0, 0.3]
+    assert len(gaps) == len(expected) and all(abs(gap - want) < 0.1 for gap, want in zip(gaps, expected)), gaps
 
 
 class StuckCoordinator:
