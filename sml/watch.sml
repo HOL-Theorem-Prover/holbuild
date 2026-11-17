@@ -176,22 +176,34 @@ fun drop_trailing_slashes path =
   then drop_trailing_slashes (String.substring(path, 0, size path - 1))
   else path
 
+(* A directory below another watched one adds nothing to the exclusion, and
+   the pattern is one argument, which Linux caps at 128 KiB. *)
+fun outermost_dirs dirs =
+  let
+    fun below parent dir = String.isPrefix (parent ^ "/") dir
+  in
+    List.filter (fn dir => not (List.exists (fn other => below other dir) dirs)) dirs
+  end
+
 (* Changes in holbuild's own .holbuild/, in .git/ and in _build/ don't
    matter.  inotifywait matches --exclude against each event's full path, so
    those names are anchored below the watched directories: an ancestor with
    such a name must not hide every event under it. *)
 fun exclude_option paths =
-  case map drop_trailing_slashes (List.filter is_dir paths) of
+  case outermost_dirs (map drop_trailing_slashes (List.filter is_dir paths)) of
       [] => ""
     | dirs =>
         " --exclude " ^
         quote ("^(" ^ String.concatWith "|" (map regex_escape dirs) ^
                ")/(.*/)?(\\.holbuild|\\.git|_build)/")
 
-fun inotify_tree_command paths =
+(* The watched paths are read from PATHS_FILE, one per line: all of them on
+   the command line would exceed the 128 KiB cap on one argument for a big
+   project.  A path starting with @ would read as an exclusion there. *)
+fun inotify_tree_command paths_file paths =
   "inotifywait -q -r" ^ exclude_option paths ^
-  " -e close_write,move,create,delete,attrib -- " ^
-  String.concatWith " " (map quote paths) ^ " >/dev/null 2>&1"
+  " -e close_write,move,create,delete,attrib --fromfile " ^ quote paths_file ^
+  " >/dev/null 2>&1"
 
 fun inotify_dirs_command dirs =
   "inotifywait -q -e close_write,move,create,delete,attrib -- " ^
@@ -200,9 +212,9 @@ fun inotify_dirs_command dirs =
 (* Two inotifywait processes, since one invocation is either recursive or not:
    the tree watch on the inputs, and a flat watch on the manifest directories.
    The first to exit decides; its status is the command's status. *)
-fun inotify_command ({paths, manifest_dirs, ...} : watch_set) =
+fun inotify_command paths_file ({paths, manifest_dirs, ...} : watch_set) =
   String.concatWith "\n"
-    [inotify_tree_command paths ^ " &",
+    [inotify_tree_command paths_file paths ^ " &",
      "tree=$!",
      inotify_dirs_command manifest_dirs ^ " &",
      "dirs=$!",
@@ -212,12 +224,27 @@ fun inotify_command ({paths, manifest_dirs, ...} : watch_set) =
      "wait \"$other\" 2>/dev/null",
      "wait \"$first\""]
 
+fun write_paths_file file paths =
+  let
+    val out = TextIO.openOut file
+    fun write_line path = TextIO.output (out, path ^ "\n")
+  in
+    (List.app write_line paths; TextIO.closeOut out)
+    handle e => (TextIO.closeOut out handle IO.Io _ => (); raise e)
+  end
+
 fun wait_for_change (watch_set as {paths, ...}) =
   case paths of
       [] => raise Error "build --watch has no files or directories to watch"
     | _ =>
         let
-          val status = HolbuildToolchain.run ["sh", "-c", inotify_command watch_set]
+          val paths_file = HolbuildTempPath.temporary "watch-paths"
+          fun remove_paths_file () = FS.remove paths_file handle OS.SysErr _ => ()
+          val status =
+            (write_paths_file paths_file paths;
+             HolbuildToolchain.run ["sh", "-c", inotify_command paths_file watch_set])
+            handle e => (remove_paths_file (); raise e)
+          val _ = remove_paths_file ()
         in
           if HolbuildToolchain.success status then sleep_debounce ()
           else raise Error "inotifywait failed while watching project inputs"
