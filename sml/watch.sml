@@ -187,27 +187,48 @@ fun outermost_dirs dirs =
 val skipped_names = [".holbuild", ".git", "_build"]
 val skipped_pattern = "(\\.holbuild|\\.git|_build)"
 
+fun skipped_component part = List.exists (fn name => part = name) skipped_names
+
 fun has_skipped_component path =
-  List.exists (fn part => List.exists (fn name => part = name) skipped_names)
-              (String.fields (fn c => c = #"/") path)
+  List.exists skipped_component (String.fields (fn c => c = #"/") path)
+
+(* DIR up to and including its last skipped component, or DIR itself without
+   one: below it no component of a path is skipped, so the names can be
+   matched anywhere after it. *)
+fun anchor dir =
+  let
+    val parts = String.fields (fn c => c = #"/") dir
+    fun last_skipped (_, [], found) = found
+      | last_skipped (i, part :: rest, found) =
+          last_skipped (i + 1, rest, if skipped_component part then SOME i else found)
+  in
+    case last_skipped (1, parts, NONE) of
+        NONE => dir
+      | SOME n => String.concatWith "/" (List.take (parts, n))
+  end
 
 (* Changes in holbuild's own .holbuild/, in .git/ and in _build/ don't
    matter.  inotifywait matches --exclude against each event's full path, so
    a path with such a name above a watched directory would hide every event
-   under it.  Without one, the plain pattern is right and its size doesn't
-   grow with the project.  With one, the names are anchored below the watched
-   directories, which makes the pattern grow with them; it is one argument,
-   and Linux caps one argument at 128 KiB. *)
+   under it.  Without one, the plain pattern is right.  With one, the names
+   are anchored below the watched directories' skipped ancestors, or the
+   directories themselves.  Either way the pattern is one argument, which
+   Linux caps at 128 KiB, so it is kept to what the projects' paths need. *)
 fun exclude_option paths =
   if not (List.exists has_skipped_component paths)
   then " --exclude " ^ quote ("/" ^ skipped_pattern ^ "/")
   else
-    case outermost_dirs (map drop_trailing_slashes (List.filter is_dir paths)) of
-        [] => ""
-      | dirs =>
-          " --exclude " ^
-          quote ("^(" ^ String.concatWith "|" (map regex_escape dirs) ^
-                 ")/(.*/)?" ^ skipped_pattern ^ "/")
+    let
+      val dirs = map drop_trailing_slashes (List.filter is_dir paths)
+      val anchors = List.foldl (fn (dir, acc) => add_unique (anchor dir) acc) [] dirs
+    in
+      case outermost_dirs anchors of
+          [] => ""
+        | roots =>
+            " --exclude " ^
+            quote ("^(" ^ String.concatWith "|" (map regex_escape roots) ^
+                   ")/(.*/)?" ^ skipped_pattern ^ "/")
+    end
 
 (* The watched paths are read from PATHS_FILE, one per line: all of them on
    the command line would exceed the 128 KiB cap on one argument for a big

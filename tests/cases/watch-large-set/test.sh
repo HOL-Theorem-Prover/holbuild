@@ -23,14 +23,16 @@ command -v inotifywait >/dev/null || {
   exit 1
 }
 
+pad=$(printf 'x%.0s' $(seq 1 150))
+
 # An extra input file and an (empty) member directory per name make a watch set
 # whose paths, and whose directories alone, are each longer than the 128 KiB
 # Linux allows for one command-line argument.
-project=$tmpdir/project
-mkdir -p "$project/src" "$project/data"
-pad=$(printf 'x%.0s' $(seq 1 150))
-{
-  cat <<TOML
+setup_project() {
+  local project=$1
+  mkdir -p "$project/src" "$project/data"
+  {
+    cat <<TOML
 $(write_schema2_prelude)
 [project]
 name = "watch-large-set"
@@ -39,35 +41,37 @@ name = "watch-large-set"
 members = [
   "src",
 TOML
-  for i in $(seq 1 1000); do
-    printf '  "m%s-%04d",\n' "$pad" "$i"
-    mkdir "$project/m$pad-$(printf %04d "$i")"
-  done
-  cat <<TOML
+    for i in $(seq 1 1000); do
+      printf '  "m%s-%04d",\n' "$pad" "$i"
+      mkdir "$project/m$pad-$(printf %04d "$i")"
+    done
+    cat <<TOML
 ]
 
 [actions.ATheory]
 extra_deps = [
 TOML
-  for i in $(seq 1 1000); do
-    printf '  "data/%s-%04d.txt",\n' "$pad" "$i"
-    echo v1 > "$project/data/$pad-$(printf %04d "$i").txt"
-  done
-  echo "]"
-} > "$project/holproject.toml"
-cat > "$project/src/AScript.sml" <<'SML'
+    for i in $(seq 1 1000); do
+      printf '  "data/%s-%04d.txt",\n' "$pad" "$i"
+      echo v1 > "$project/data/$pad-$(printf %04d "$i").txt"
+    done
+    echo "]"
+  } > "$project/holproject.toml"
+  cat > "$project/src/AScript.sml" <<'SML'
 open HolKernel boolLib bossLib;
 val _ = new_theory "A";
 val trivial = Q.store_thm ("trivial", `T`, rw []);
 val _ = export_theory ();
 SML
 
-file_bytes=$(find "$project/data" -type f | wc -c)
-dir_bytes=$(find "$project" -mindepth 1 -maxdepth 1 -type d -name 'm*' | wc -c)
-if (( file_bytes <= 131072 || dir_bytes <= 131072 )); then
-  echo "test setup: watched files are $file_bytes bytes, directories $dir_bytes" >&2
-  exit 1
-fi
+  local file_bytes dir_bytes
+  file_bytes=$(find "$project/data" -type f | wc -c)
+  dir_bytes=$(find "$project" -mindepth 1 -maxdepth 1 -type d -name 'm*' | wc -c)
+  if (( file_bytes <= 131072 || dir_bytes <= 131072 )); then
+    echo "test setup: watched files are $file_bytes bytes, directories $dir_bytes" >&2
+    exit 1
+  fi
+}
 
 wait_for_count() {
   local pattern=$1
@@ -93,31 +97,43 @@ wait_for_count() {
   exit 1
 }
 
-# holbuild's own directories below a watched one: writes there must not
-# trigger a rebuild.
-mkdir -p "$project/src/.holbuild" "$project/src/_build"
+run_variant() {
+  local project=$1
+  local watch_log=$project.log
+  setup_project "$project"
+  # holbuild's own directories below a watched one: writes there must not
+  # trigger a rebuild.
+  mkdir -p "$project/src/.holbuild" "$project/src/_build"
 
-watch_log=$tmpdir/watch.log
-(cd "$project" && exec "$WATCH_HOLBUILD_BIN" build --watch ATheory) >"$watch_log" 2>&1 &
-watch_pid=$!
+  (cd "$project" && exec "$WATCH_HOLBUILD_BIN" build --watch ATheory) >"$watch_log" 2>&1 &
+  watch_pid=$!
 
-wait_for_count "waiting for changes" "$watch_log" 1 90
-sleep 1
+  wait_for_count "waiting for changes" "$watch_log" 1 90
+  sleep 1
 
-echo noise > "$project/src/.holbuild/noise"
-echo noise > "$project/src/_build/noise"
-sleep 2
-if [[ $(grep -c -- "waiting for changes" "$watch_log") -ne 1 ]]; then
-  echo "watch mode rebuilt after writes in skipped directories" >&2
-  cat "$watch_log" >&2
-  exit 1
-fi
+  echo noise > "$project/src/.holbuild/noise"
+  echo noise > "$project/src/_build/noise"
+  sleep 2
+  if [[ $(grep -c -- "waiting for changes" "$watch_log") -ne 1 ]]; then
+    echo "watch mode rebuilt after writes in skipped directories" >&2
+    cat "$watch_log" >&2
+    exit 1
+  fi
 
-echo v2 > "$project/data/$pad-0001.txt"
-wait_for_count "waiting for changes" "$watch_log" 2 45
-sleep 1
+  echo v2 > "$project/data/$pad-0001.txt"
+  wait_for_count "waiting for changes" "$watch_log" 2 45
+  sleep 1
 
-echo v2 > "$project/data/$pad-1000.txt"
-wait_for_count "waiting for changes" "$watch_log" 3 45
+  echo v2 > "$project/data/$pad-1000.txt"
+  wait_for_count "waiting for changes" "$watch_log" 3 45
 
-! grep -q "inotifywait failed" "$watch_log" || { cat "$watch_log" >&2; exit 1; }
+  ! grep -q "inotifywait failed" "$watch_log" || { cat "$watch_log" >&2; exit 1; }
+  kill -TERM "$watch_pid"
+  wait "$watch_pid" 2>/dev/null || true
+  watch_pid=""
+}
+
+# With no skipped name in any watched path, and below a _build ancestor, which
+# the exclusion handles differently.
+run_variant "$tmpdir/plain/project"
+run_variant "$tmpdir/_build/project"
