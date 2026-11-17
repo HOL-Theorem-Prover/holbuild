@@ -92,6 +92,7 @@ use "sml/hol_source_manifest.sml";
 use "sml/cache_config.sml";
 use "sml/offline.sml";
 use "sml/http.sml";
+use "sml/zstd.sml";
 use "sml/remote_cache_config.sml";
 use "sml/cache_discovery.sml";
 use "sml/file_lock.sml";

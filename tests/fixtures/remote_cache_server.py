@@ -8,6 +8,8 @@ import sys
 import time
 import urllib.parse
 
+from zstd_frames import zstd_encode
+
 
 root = pathlib.Path(sys.argv[1]).resolve()
 port_file = pathlib.Path(sys.argv[2])
@@ -140,7 +142,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "Accept-Encoding", ""
         )
         if compressed:
-            data = subprocess.check_output(["zstd", "-q", "-c"], input=data)
+            data = zstd_encode(data)
         self.send_response(200)
         if compressed:
             self.send_header("Content-Encoding", "zstd")

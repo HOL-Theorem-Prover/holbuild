@@ -50,6 +50,7 @@ in
   val setopt_ptr = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cPointer, cInt))
   val setopt_str = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cString, cInt))
   val setopt_fn = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cFunction, cInt))
+  val setopt_header_fn = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cFunction, cInt))
   val getinfo_ptr = variadic (buildCall9 (curl "curl_easy_getinfo", variadic_conv cPointer, cInt))
   val slist_append = buildCall2 (curl "curl_slist_append", (cPointer, cString), cPointer)
   val slist_free_all = buildCall1 (curl "curl_slist_free_all", cPointer, cVoid)
@@ -89,6 +90,32 @@ in
     buildCallback3 ((cPointer, cInt, cInt), cInt)
       (fn (_, fd, _) =>
         (Posix.IO.setfd (Posix.FileSys.wordToFD (SysWord.fromInt fd), Posix.IO.FD.cloexec); 0))
+
+  (* Keeps in the byte at data the Content-Encoding of the latest response:
+     0 for none (or identity), 1 for zstd, 2 for any other.  Each response,
+     a redirect's included, starts with its status line. *)
+  val header_encoding =
+    buildCallback4 ((cPointer, cSize, cSize, cPointer), cSize)
+      (fn (line, item_size, items, data) =>
+        let
+          val n = item_size * items
+          val text = String.map Char.toLower
+            (CharVector.tabulate (n, fn i => Byte.byteToChar (Memory.get8 (line, Word.fromInt i))))
+          val name = "content-encoding:"
+          fun set code = Memory.set8 (data, 0w0, code)
+        in
+          (if String.isPrefix "http/" text then set 0w0
+           else if String.isPrefix name text then
+             (case String.tokens (fn c => Char.isSpace c orelse c = #",")
+                                 (String.extract (text, size name, NONE)) of
+                  [] => set 0w0
+                | ["identity"] => set 0w0
+                | ["zstd"] => set 0w1
+                | _ => set 0w2)
+           else ();
+           n)
+        end
+        handle _ => 0)
 end
 
 val CURLOPT_WRITEDATA = 10001
@@ -112,6 +139,8 @@ val CURLOPT_CAINFO = 10065
 val CURLOPT_CAPATH = 10097
 val CURLOPT_INFILESIZE_LARGE = 30115
 val CURLOPT_SOCKOPTFUNCTION = 20148
+val CURLOPT_HEADERFUNCTION = 20079
+val CURLOPT_HEADERDATA = 10029
 val CURLINFO_RESPONSE_CODE = 0x200002
 val CURLMOPT_MAXCONNECTS = 6
 val CURLE_PEER_FAILED_VERIFICATION = 60
@@ -500,6 +529,35 @@ fun get {url, dst, timeout} =
     with_file dst "wb" (fn output =>
       run {output = output,
            set_options = fn easy => check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1))})}
+
+datatype encoding = Identity | Zstd | OtherEncoding
+
+(* Downloads url into dst as the server sends it, asking for zstd, and says
+   how the body is encoded: libcurl decodes nothing. *)
+fun get_zstd {url, dst, timeout} =
+  Foreign.Memory.alloca (0w1, fn encoding =>
+    let
+      val header_list = slist_append (Foreign.Memory.null, "Accept-Encoding: zstd")
+      fun set_options easy =
+        (check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1));
+         check "ACCEPT_ENCODING" (setopt_ptr (easy, CURLOPT_ACCEPT_ENCODING, Foreign.Memory.null));
+         check "HTTPHEADER" (setopt_ptr (easy, CURLOPT_HTTPHEADER, header_list));
+         check "HEADERFUNCTION" (setopt_header_fn (easy, CURLOPT_HEADERFUNCTION, header_encoding));
+         check "HEADERDATA" (setopt_ptr (easy, CURLOPT_HEADERDATA, encoding)))
+      val _ = Foreign.Memory.set8 (encoding, 0w0, 0w0)
+      (* The handle is closed before this frees the list. *)
+      val result =
+        request {url = url, timeout = timeout, files = fn run =>
+          with_file dst "wb" (fn output => run {output = output, set_options = set_options})}
+        handle e => (slist_free_all header_list; raise e)
+    in
+      slist_free_all header_list;
+      (result,
+       case Foreign.Memory.get8 (encoding, 0w0) of
+           0w0 => Identity
+         | 0w1 => Zstd
+         | _ => OtherEncoding)
+    end)
 
 (* Asks for url with HEAD.  HTTPGET first clears a pooled handle's upload
    from an earlier put, which NOBODY alone leaves in place before libcurl
