@@ -412,9 +412,11 @@ fun run_transfer easy =
             ([(_, outcome)], others) => (finished := others; outcome)
           | _ => (ConditionVar.wait (pool_changed, pool_mutex); collect ())
     in
+      (* Woken first, so a failed wakeup leaves nothing queued; the pump
+         takes the queue under this lock, so it can't miss the handle. *)
+      mcheck "curl_multi_wakeup" (multi_wakeup m);
       queued := easy :: !queued;
       ConditionVar.signal pump_wake;
-      mcheck "curl_multi_wakeup" (multi_wakeup m);
       collect ()
     end)
 
@@ -452,8 +454,9 @@ fun with_file path mode f =
    to a busy server, isn't cut off.  files opens the request's files, then
    runs the transfer with the output and set_options, which sets the
    request's own options.  It opens them only once the request has a place
-   in flight, so requests waiting for one hold no descriptors.  A handle
-   still with the pump, when waiting for it is interrupted, is left to it. *)
+   in flight, so requests waiting for one hold no descriptors.  Waiting for
+   the pump must not be interrupted: the pump may still be using the
+   request's files and handle. *)
 fun request_once {url, timeout, files} =
   (HolbuildOffline.require_online "send an HTTP request";
    enter ();
