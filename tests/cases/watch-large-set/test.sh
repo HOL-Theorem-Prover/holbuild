@@ -30,6 +30,7 @@ pad=$(printf 'x%.0s' $(seq 1 150))
 # Linux allows for one command-line argument.
 setup_project() {
   local project=$1
+  local mixed=$2
   mkdir -p "$project/src" "$project/data"
   {
     cat <<TOML
@@ -41,6 +42,10 @@ name = "watch-large-set"
 members = [
   "src",
 TOML
+    if [[ -n $mixed ]]; then
+      mkdir -p "$project/vendor/_build/pkg"
+      echo '  "vendor/_build/pkg",'
+    fi
     for i in $(seq 1 1000); do
       printf '  "m%s-%04d",\n' "$pad" "$i"
       mkdir "$project/m$pad-$(printf %04d "$i")"
@@ -99,8 +104,9 @@ wait_for_count() {
 
 run_variant() {
   local project=$1
+  local mixed=${2:-}
   local watch_log=$project.log
-  setup_project "$project"
+  setup_project "$project" "$mixed"
   # holbuild's own directories below a watched one: writes there must not
   # trigger a rebuild.
   mkdir -p "$project/src/.holbuild" "$project/src/_build"
@@ -126,6 +132,12 @@ run_variant() {
 
   echo v2 > "$project/data/$pad-1000.txt"
   wait_for_count "waiting for changes" "$watch_log" 3 45
+  sleep 1
+
+  if [[ -n $mixed ]]; then
+    echo v2 > "$project/vendor/_build/pkg/file"
+    wait_for_count "waiting for changes" "$watch_log" 4 45
+  fi
 
   ! grep -q "inotifywait failed" "$watch_log" || { cat "$watch_log" >&2; exit 1; }
   kill -TERM "$watch_pid"
@@ -133,7 +145,8 @@ run_variant() {
   watch_pid=""
 }
 
-# With no skipped name in any watched path, and below a _build ancestor, which
-# the exclusion handles differently.
+# With no skipped name in any watched path, below a _build ancestor, and with
+# both kinds of path watched together: the exclusion differs between them.
 run_variant "$tmpdir/plain/project"
 run_variant "$tmpdir/_build/project"
+run_variant "$tmpdir/mixed/project" mixed
