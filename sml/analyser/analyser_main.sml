@@ -202,18 +202,42 @@ fun emit_proof_plan_with_id id ({name, tactic_start, tactic_end, steps} : PI.the
   emit_steps steps @
   [P.join ["end-proof-ir", id]]
 
+(* With the want proof-ir-plans, each boundary's and termination's proof-IR
+   plan follows them, with ids b0, b1, ... and t0, t1, ... in their order,
+   as a proof-ir-plan request for them would answer: the build needs both,
+   and one analyser process costs less than two. *)
 fun span_lines path wants =
   let
     val text = read_all_file path
+    fun plan_lines prefix inputs =
+      if not (member "proof-ir-plans" wants) then []
+      else
+        List.concat
+          (ListPair.map (fn (i, input) => emit_proof_plan_with_id (prefix ^ Int.toString i) (PI.plan_text input))
+             (List.tabulate (length inputs, fn i => i), inputs))
+    fun boundary_lines boundaries =
+      map emit_boundary boundaries @
+      plan_lines "b"
+        (map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : S.boundary) =>
+                 {name = name, tactic_start = tactic_start, tactic_end = tactic_end, tactic_text = tactic_text})
+             boundaries)
     val boundary_lines =
       if member "boundaries-recovering" wants then
         let val {boundaries, errors} = S.scan_recovering path text
-        in map emit_boundary boundaries @ map (fn e => P.join ["parse-error", e]) errors end
-      else if member "boundaries-strict" wants then map emit_boundary (S.scan_strict path text)
-      else if member "boundaries" wants then map emit_boundary (S.scan path text)
+        in boundary_lines boundaries @ map (fn e => P.join ["parse-error", e]) errors end
+      else if member "boundaries-strict" wants then boundary_lines (S.scan_strict path text)
+      else if member "boundaries" wants then boundary_lines (S.scan path text)
       else []
     val termination_lines =
-      if member "terminations-strict" wants then map emit_termination (S.scan_terminations_strict path text)
+      if member "terminations-strict" wants then
+        let val terminations = S.scan_terminations_strict path text
+        in
+          map emit_termination terminations @
+          plan_lines "t"
+            (map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : S.termination) =>
+                     {name = name, tactic_start = tactic_start, tactic_end = tactic_end, tactic_text = tactic_text})
+                 terminations)
+        end
       else []
   in
     boundary_lines @ termination_lines

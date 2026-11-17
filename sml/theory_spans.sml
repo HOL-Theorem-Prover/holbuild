@@ -132,6 +132,37 @@ fun scan_boundaries_and_terminations_recovering_strict source_path _ =
      terminations = map parse_termination (List.filter termination_record records)}
   end
 
+(* As scan_boundaries_and_terminations_recovering_strict, with each
+   boundary's and termination's proof-IR plan expression and factories, in
+   their order, from the same analyser process. *)
+fun scan_with_proof_ir_plans source_path _ =
+  let
+    val (records, errors) =
+      response_records ["boundaries-recovering", "terminations-strict", "proof-ir-plans"] source_path
+    val boundaries = map parse_boundary (List.filter boundary_record records)
+    val terminations = map parse_termination (List.filter termination_record records)
+    val plans = List.mapPartial (fn "begin-proof-ir" :: fields => SOME fields | _ => NONE) records
+    fun plan prefix (i, fields) =
+      case fields of
+          [id, _, _, _, expr, factories] =>
+            if id = prefix ^ Int.toString i then SOME (expr, factories)
+            else raise HolbuildTheoryCheckpoints.Error ("bad proof-IR response id: " ^ id ^ ", expected " ^
+                                                        prefix ^ Int.toString i)
+        | _ => raise HolbuildTheoryCheckpoints.Error "bad analyser proof-IR record"
+    fun numbered xs = ListPair.zip (List.tabulate (length xs, fn i => i), xs)
+    val nb = length boundaries
+  in
+    if length plans <> nb + length terminations then
+      raise HolbuildTheoryCheckpoints.Error
+        ("incomplete analyser response for " ^ source_path ^ ": " ^ Int.toString (length plans) ^
+         " proof-IR plans for " ^ Int.toString nb ^ " boundaries and " ^
+         Int.toString (length terminations) ^ " terminations")
+    else
+      {boundaries = boundaries, errors = errors, terminations = terminations,
+       boundary_plans = map (plan "b") (numbered (List.take (plans, nb))),
+       termination_plans = map (plan "t") (numbered (List.drop (plans, nb)))}
+  end
+
 fun scan_terminations source_path source_text = scan_terminations_strict source_path source_text
 
 end
