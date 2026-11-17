@@ -4302,15 +4302,38 @@ fun write_empty_ui_if_needed plan node =
   if has_signature_companion plan node then ()
   else write_object_manifest (one_with_suffix ".ui" (#objects (source_artifacts node))) []
 
+(* The lines of the load manifest of an ML library or signature, naming each
+   project dependency by STEM of its load stem. *)
+fun sml_like_manifest_lines plan node stem =
+  map load_name (ordered_loads plan node (stem o load_stem) (HolbuildBuildPlan.direct_project_deps plan node)) @
+  [source_file node]
+
 (* The load manifest of an ML library or signature, at PLACE of its path,
    naming each project dependency by STEM of its load stem. *)
 fun write_sml_like_manifest plan node output_suffix place stem =
+  write_object_manifest (place (one_with_suffix output_suffix (#objects (source_artifacts node))))
+    (sml_like_manifest_lines plan node stem)
+
+(* Whether ML node NODE's installed load manifests are what build_sml_like
+   would write now.  They name absolute paths (the source, which for HOL's own
+   libraries lies in the toolchain's directory, and project objects) that the
+   input key doesn't cover, so a toolchain or project that moved leaves them
+   naming the old paths under a matching key. *)
+fun sml_like_manifests_current plan node =
   let
-    val output = one_with_suffix output_suffix (#objects (source_artifacts node))
+    fun current output_suffix =
+      let
+        val path = one_with_suffix output_suffix (#objects (source_artifacts node))
+        val text = manifest_text (sml_like_manifest_lines plan node (fn stem => stem))
+      in
+        List.all (fn path => read_text path = text handle IO.Io _ => false)
+                 [path, hfs_remapped_path path]
+      end
   in
-    write_object_manifest (place output)
-      (map load_name (ordered_loads plan node (stem o load_stem) (HolbuildBuildPlan.direct_project_deps plan node)) @
-       [source_file node])
+    case #kind (HolbuildBuildPlan.source_of node) of
+        HolbuildSourceIndex.Sml => current ".uo"
+      | HolbuildSourceIndex.Sig => current ".ui"
+      | HolbuildSourceIndex.TheoryScript => true
   end
 
 fun build_sml_like plan node output_suffix =
@@ -4682,7 +4705,8 @@ fun theory_parent_hashes_match dat_hash_cache plan node metadata_text =
    when its outputs are up to date. *)
 fun up_to_date_metadata dat_hash_cache allow_timeout_discrepancy checkpoint_policy project plan input_key node =
   if List.all (output_exists_for_node node) (output_paths checkpoint_policy plan node) andalso
-     List.all file_exists (source_extra_output_paths plan node) then
+     List.all file_exists (source_extra_output_paths plan node) andalso
+     sml_like_manifests_current plan node then
     case current_metadata (metadata_path project node) of
         SOME text =>
           if metadata_input_key_matches input_key text andalso
