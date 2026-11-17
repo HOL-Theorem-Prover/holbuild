@@ -176,8 +176,10 @@ for pid in "${import_pids[@]}"; do
 done
 assert_strong_timeout "$concurrent_cache"
 
-# Offline, from the imported archive alone: the dependency checkout stays, as
-# `--offline` cannot fetch it; every build output goes.
+# Offline, from the imported archive alone: every build output goes. The
+# dependency's shared checkout lives in the cache, and `--offline` cannot make
+# it, so it is prepared there first.
+(cd "$project" && HOLBUILD_CACHE="$import_cache" "$HOLBUILD_BIN" context) > "$tmpdir/import-context.log" 2>&1
 find "$project/.holbuild" -mindepth 1 -maxdepth 1 ! -name src -exec rm -rf {} +
 restore_log=$tmpdir/restore.log
 (cd "$project" && HOLBUILD_CACHE="$import_cache" HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" --offline build \

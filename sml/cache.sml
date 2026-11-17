@@ -324,6 +324,21 @@ fun gc_toolchains cutoff =
      {removed = 0, busy = 0})
   handle HolbuildHolSharedCache.Error msg => raise Error msg
 
+(* Shared dependency checkouts, collected like toolchains: unused for the
+   retention period and leased by no running holbuild process. *)
+fun gc_checkouts cutoff =
+  (gc_stage "checkout-trash" (HolbuildGitCache.checkout_trash ())
+     (fn (path, ()) => (HolbuildGitCache.remove_tree path; ((), true)))
+     ();
+   gc_stage "checkouts" (HolbuildGitCache.checkout_keys ())
+     (fn (k, {removed, busy}) =>
+         case HolbuildGitCache.gc_checkout cutoff k of
+             HolbuildGitCache.GcRemoved => ({removed = removed + 1, busy = busy}, true)
+           | HolbuildGitCache.GcBusy => ({removed = removed, busy = busy + 1}, false)
+           | HolbuildGitCache.GcKept => ({removed = removed, busy = busy}, false))
+     {removed = 0, busy = 0})
+  handle HolbuildGitCache.Error msg => raise Error msg
+
 fun gc_lock_path root = Path.concat(locks_dir root, "gc.lock")
 fun gc_lock_owner_path lock = lock ^ ".owner"
 
@@ -400,7 +415,7 @@ fun growth_since_gc root = HolbuildFSCacheBackend.growth_since_gc (filesystem_ca
 
 type gc_counts =
   {tmp : int, locks : int, actions : int, blobs : int, modules : int, analysis : int,
-   toolchains : int, toolchains_busy : int}
+   toolchains : int, toolchains_busy : int, checkouts : int, checkouts_busy : int}
 
 (* One full collection; the caller holds the GC lock. Writes made while it runs
    count towards the next automatic GC. *)
@@ -417,15 +432,18 @@ fun collect_root root days : gc_counts =
     val (candidates, actions) = collect_live_actions cutoff root candidates
     val blobs = sweep_blobs cutoff candidates blob_paths
     val {removed = toolchains, busy = toolchains_busy} = gc_toolchains cutoff
+    val {removed = checkouts, busy = checkouts_busy} = gc_checkouts cutoff
   in
     {tmp = tmp, locks = locks, actions = actions, blobs = blobs, modules = modules,
-     analysis = analysis, toolchains = toolchains, toolchains_busy = toolchains_busy}
+     analysis = analysis, toolchains = toolchains, toolchains_busy = toolchains_busy,
+     checkouts = checkouts, checkouts_busy = checkouts_busy}
   end
 
-fun gc_counts_removed ({tmp, locks, actions, blobs, modules, analysis, toolchains, ...} : gc_counts) =
-  tmp + locks + actions + blobs + modules + analysis + toolchains > 0
+fun gc_counts_removed ({tmp, locks, actions, blobs, modules, analysis, toolchains, checkouts, ...} : gc_counts) =
+  tmp + locks + actions + blobs + modules + analysis + toolchains + checkouts > 0
 
-fun gc_counts_text ({tmp, locks, actions, blobs, modules, analysis, toolchains, toolchains_busy} : gc_counts) =
+fun gc_counts_text ({tmp, locks, actions, blobs, modules, analysis, toolchains, toolchains_busy,
+                     checkouts, checkouts_busy} : gc_counts) =
   "removed tmp=" ^ Int.toString tmp ^
   " locks=" ^ Int.toString locks ^
   " actions=" ^ Int.toString actions ^
@@ -433,7 +451,9 @@ fun gc_counts_text ({tmp, locks, actions, blobs, modules, analysis, toolchains, 
   " modules=" ^ Int.toString modules ^
   " analysis=" ^ Int.toString analysis ^
   " toolchains=" ^ Int.toString toolchains ^
-  " toolchains-busy=" ^ Int.toString toolchains_busy
+  " toolchains-busy=" ^ Int.toString toolchains_busy ^
+  " checkouts=" ^ Int.toString checkouts ^
+  " checkouts-busy=" ^ Int.toString checkouts_busy
 
 fun gc_root root days =
   if not (path_exists root) then

@@ -464,14 +464,15 @@ fun project_package ({root, artifact_root, graph_artifact_root, manifest, defini
 
 fun root_package_name project = package_name (project_package project)
 
-fun materialize_dependency (project : t) (dep as Dependency {name, source, ...}) =
+fun materialize_dependency shared (project : t) (dep as Dependency {name, source, ...}) =
   case source of
       GitSource {git, rev} =>
         if hol_toolchain_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
         else
           let val effective_git = Option.getOpt(override_git (#overrides project) name, git)
           in ignore (HolbuildGitCache.materialize {name = name, git = effective_git, rev = rev,
-                                                   artifact_root = #graph_artifact_root project}) end
+                                                   artifact_root = #graph_artifact_root project,
+                                                   shared = shared}) end
     | _ => ()
 
 (* The dependency's project as its local path holds it now, without
@@ -509,9 +510,28 @@ fun local_dependency_project_with resolution (project : t) (dep as Dependency {n
     dep_project
   end
 
+(* The dependency whose checkout holds dep's sources: dep itself, or for a
+   shim the dependency it is from. *)
+fun checkout_dependency (project : t) (dep as Dependency {source, ...}) =
+  case source of
+      FromSource {from, ...} =>
+        (case List.find (fn Dependency {name, ...} => name = from) (#dependencies project) of
+             SOME from_dep => checkout_dependency project from_dep
+           | NONE => die ("validated from dependency disappeared: " ^ from))
+    | _ => dep
+
+(* Generators write their outputs into their package's sources, which a shared
+   checkout keeps read-only, so the checkout holding a package that declares
+   any is replaced by a private clone at the same path. *)
 fun dependency_project_with resolution project dep =
-  (materialize_dependency project dep;
-   local_dependency_project_with resolution project dep)
+  let
+    val _ = materialize_dependency true project dep
+    val dep_project = local_dependency_project_with resolution project dep
+  in
+    if null (#generators dep_project) then ()
+    else materialize_dependency false project (checkout_dependency project dep);
+    dep_project
+  end
 
 fun dependency_project project dep = dependency_project_with standard_resolution project dep
 

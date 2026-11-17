@@ -469,6 +469,8 @@ rev = \"$rev\""
   expect_plan "from record (" "$p"
   require_grep "files rehashed, 0 keys changed" "$tmpdir/plan.log"
   expect_plan "from record (0 files rehashed, 0 keys changed)" "$p"
+  # The shared checkout's files are read-only; this stands in for its change.
+  chmod u+w "$p/.holbuild/src/gitleaf/src/GitLeaf.sml"
   printf '\n(* edited by hand *)\n' >> "$p/.holbuild/src/gitleaf/src/GitLeaf.sml"
   expect_plan "from record (1 files rehashed, 2 keys changed)" "$p"
 }

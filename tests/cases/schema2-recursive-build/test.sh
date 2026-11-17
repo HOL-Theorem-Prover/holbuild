@@ -692,7 +692,7 @@ if remote_only_foo > "$tmpdir/dirty-remote-only-analyser.log" 2>&1; then
 fi
 require_grep 'dirty HOL toolchain cache entry' "$tmpdir/dirty-remote-only-analyser.log"
 
-[ -d "$root/.holbuild/src/b/.git" ]
+[ -L "$root/.holbuild/src/b" ]
 [ ! -d "$root/.holbuild/src/b/.holbuild" ]
 [ ! -d "$root/.holbuild/packages/a/.holbuild" ]
 [ ! -d "$root/.holbuild/packages/a/.holbuild/src/b" ]

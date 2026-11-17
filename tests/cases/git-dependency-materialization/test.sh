@@ -23,6 +23,14 @@ release_lease_holder() { timeout 10 sh -c ': > "$1"' sh "$tmpdir/blocker.fifo" |
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
+# dep_rev PROJECT NAME: the commit PROJECT's .holbuild/src/NAME holds. It is a
+# link to the cache's shared checkout <URL hash>-<commit>.
+dep_rev() {
+  local link
+  link=$(readlink "$1/.holbuild/src/$2") || { echo "$1/.holbuild/src/$2 is not a link" >&2; return 1; }
+  printf '%s\n' "${link##*-}"
+}
+
 git_identity() {
   git -C "$1" config user.email test@example.com
   git -C "$1" config user.name 'Holbuild Test'
@@ -116,17 +124,17 @@ require_grep 'dependency: dep \[git=' "$tmpdir/context1.log"
 require_grep "package: dep \[root=$project/.holbuild/src/dep, manifest=$project/.holbuild/src/dep/holproject.toml, artifact-root=$project/.holbuild/packages/dep\]" "$tmpdir/context1.log"
 require_grep "package: subdep \[root=$project/.holbuild/src/dep/subdir, manifest=$project/sub.manifest.toml, artifact-root=$project/.holbuild/packages/subdep\]" "$tmpdir/context1.log"
 require_grep "dependency: subdep \[from=dep, path=subdir, manifest=sub.manifest.toml, local=$project/.holbuild/src/dep/subdir, resolved-manifest=$project/sub.manifest.toml" "$tmpdir/context1.log"
-[ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
+[ "$(dep_rev "$project" dep)" = "$rev1" ]
 require_grep '^one$' "$project/.holbuild/src/dep/value.txt"
 
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context2.log"
-[ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
+[ "$(dep_rev "$project" dep)" = "$rev1" ]
 
 # A materialized immutable revision must remain usable without its remote.
 mv "$repo" "$tmpdir/dep-repo-offline"
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context-offline.log"
 mv "$tmpdir/dep-repo-offline" "$repo"
-[ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
+[ "$(dep_rev "$project" dep)" = "$rev1" ]
 
 # The shared bare cache already exists, so a commit subsequently advertised only
 # by a non-default branch must be fetched explicitly rather than through HEAD.
@@ -143,7 +151,7 @@ text = open(path).read().replace(old, new)
 open(path, 'w').write(text)
 PY
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context-side.log"
-[ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$side_rev" ]
+[ "$(dep_rev "$project" dep)" = "$side_rev" ]
 require_grep '^side$' "$project/.holbuild/src/dep/value.txt"
 
 python3 - "$project/holproject.toml" "$side_rev" "$rev2" <<'PY'
@@ -153,7 +161,7 @@ text = open(path).read().replace(old, new)
 open(path, 'w').write(text)
 PY
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context3.log"
-[ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev2" ]
+[ "$(dep_rev "$project" dep)" = "$rev2" ]
 require_grep '^two$' "$project/.holbuild/src/dep/value.txt"
 
 bad_short=$tmpdir/bad-short
@@ -370,8 +378,9 @@ if (cd "$missing" && "$HOLBUILD_BIN" context) > "$tmpdir/missing.log" 2>&1; then
 fi
 require_grep "fetch origin '$missing_rev'" "$tmpdir/missing.log"
 
-# Concurrent materialization: a git shim that stalls every clone keeps racing
-# processes inside the clone-and-publish window together. Two project roots
+# Concurrent materialization: a git shim that stalls every clone and shared
+# checkout keeps racing processes inside the checkout-and-publish window
+# together. Two project roots
 # share a fresh cache, so their first runs also race to create the mirror.
 use_case_cache "$tmpdir/race-cache"
 slow_git=$tmpdir/slow-git
@@ -380,7 +389,7 @@ real_git=$(command -v git)
 cat > "$slow_git/git" <<SH
 #!/bin/sh
 for arg in "\$@"; do
-  if [ "\$arg" = clone ]; then sleep 1; break; fi
+  if [ "\$arg" = clone ] || [ "\$arg" = read-tree ]; then sleep 1; break; fi
 done
 exec "$real_git" "\$@"
 SH
@@ -435,7 +444,7 @@ race_context() {
   done
   [ "$failed" = 0 ]
   for project in "$@"; do
-    [ "$(git -C "$project/.holbuild/src/dep" rev-parse HEAD)" = "$rev" ]
+    [ "$(dep_rev "$project" dep)" = "$rev" ]
     require_no_checkout_temp "$project"
   done
 }
@@ -460,14 +469,19 @@ rm -rf "$tmpdir/race1/.holbuild/src" "$tmpdir/race2/.holbuild/src"
 race_context warm-mirror "$rev1" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
 
 # rev3 is not yet in the mirror, so both roots also race to fetch it. A
-# checkout clone killed mid-way leaves a temp dir that the next publish removes.
+# checkout or link killed mid-way leaves a temp entry that the next one removes.
 echo three > "$repo/value.txt"
 git -C "$repo" commit -q -am three
 rev3=$(git -C "$repo" rev-parse HEAD)
 mkdir "$tmpdir/race1/.holbuild/src/.tmp-dep-999999999"
+mkdir "$HOLBUILD_CACHE/git/checkouts/$(printf %s "$repo" | sha1sum | cut -d' ' -f1)-$rev3.tmp-999999999"
 set_dep_rev "$tmpdir/race1" "$rev3"
 set_dep_rev "$tmpdir/race2" "$rev3"
 race_context repin "$rev3" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"
+if compgen -G "$HOLBUILD_CACHE/git/checkouts/*.tmp-*" > /dev/null; then
+  echo "shared checkout temp dir left in $HOLBUILD_CACHE/git/checkouts" >&2
+  exit 1
+fi
 
 # A holbuild process that has materialized dep keeps its lease while it runs:
 # another process at the same rev still proceeds, but none may replace the tree
@@ -532,10 +546,11 @@ if (cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/leased-replace.log
   exit 1
 fi
 require_grep "another holbuild process is using it (pid [0-9][0-9]*)" "$tmpdir/leased-replace.log"
-[ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev3" ]
+[ "$(dep_rev "$tmpdir/race1" dep)" = "$rev3" ]
 require_no_checkout_temp "$tmpdir/race1"
-# The holder is blocked inside the blocker mirror clone, so it also holds that
-# mirror's lock; a run that needs the mirror names the pid it waits for.
+# The holder is blocked inside the blocker mirror clone, so it also holds the
+# lock on making blocker's shared checkout; a run that needs it names the pid
+# it waits for.
 cat >> "$tmpdir/race2/holproject.toml" <<TOML
 
 [dependencies.blocker]
@@ -548,7 +563,7 @@ for _ in {1..600}; do
   grep -q "waiting for another holbuild process" "$tmpdir/waiter.log" && break
   sleep 0.05
 done
-require_grep "waiting for another holbuild process (pid [0-9][0-9]*) to release .*[.]git[.]lock" "$tmpdir/waiter.log"
+require_grep "waiting for another holbuild process (pid [0-9][0-9]*) to release .*/git/checkouts/[.]locks/.*[.]lock" "$tmpdir/waiter.log"
 release_lease_holder
 holder=$lease_holder waiter=$lock_waiter
 lease_holder= lock_waiter=
@@ -558,9 +573,9 @@ for pid in "$holder" "$waiter"; do
     exit 1
   fi
 done
-[ "$(git -C "$tmpdir/race2/.holbuild/src/blocker" rev-parse HEAD)" = "$blocker_rev" ]
+[ "$(dep_rev "$tmpdir/race2" blocker)" = "$blocker_rev" ]
 (cd "$tmpdir/race1" && "$HOLBUILD_BIN" context) > "$tmpdir/released-replace.log"
-[ "$(git -C "$tmpdir/race1/.holbuild/src/dep" rev-parse HEAD)" = "$rev1" ]
+[ "$(dep_rev "$tmpdir/race1" dep)" = "$rev1" ]
 
 # Waiting for checkout locks and shared leases must remain interruptible. The
 # holder keeps its lock through the child's exit, so releasing it cannot make
