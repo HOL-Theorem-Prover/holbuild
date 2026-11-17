@@ -101,7 +101,6 @@ async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_re
 async def test_a_claim_ahead_comes_after_ready_builds_of_its_priority_and_before_those_of_lower_priorities(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    coordinator.settings.default_priority_floor = 0  # strict priority
     await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4", priority="2")
     await claim_named(http, "a")
     await submit(http, ["x"], priority="2")
@@ -605,7 +604,6 @@ async def test_a_claim_ahead_of_several_tiers_takes_its_first_tier_before_a_lowe
     http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
 ) -> None:
     coordinator.settings.claim_ranking_seconds = 3600
-    coordinator.settings.default_priority_floor = 0  # strict priority
     await submit(http, ["a", "x"], [("x", "a")], speculative_loading="4", priority="1")
     await submit(http, ["b", "h", "s"], [("h", "b"), ("s", "b")], speculative_loading="4")
     async with remote_exec_engine.begin() as conn:
@@ -623,18 +621,29 @@ async def test_a_claim_ahead_of_several_tiers_takes_its_first_tier_before_a_lowe
     assert claimed is not None and claimed["theory"] == "pkg:x"
 
 
-@pytest.mark.parametrize(("ahead_tier", "first"), [("standard", "n"), ("high", "x")])
-async def test_below_the_priority_zero_floor_only_a_claim_ahead_of_an_earlier_tier_goes_first(
-    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine, ahead_tier: str, first: str
+@pytest.mark.parametrize(("cap", "first"), [(1, "n"), (2, "x")])
+async def test_past_the_priority_cap_a_claim_ahead_no_longer_outranks_a_ready_build(
+    http: httpx.AsyncClient, coordinator: Coordinator, cap: int, first: str
 ) -> None:
-    coordinator.settings.default_priority_floor = 1
+    coordinator.settings.priority_cap = cap
     await submit(http, ["a", "x"], [("x", "a")], speculative_loading="4", priority="1")
-    async with remote_exec_engine.begin() as conn:
-        await conn.execute(sa.text("UPDATE actions SET tier = :tier"), {"tier": ahead_tier})
-    await claim_named(http, "a", tier=ahead_tier)
+    await claim_named(http, "a")
     await submit(http, ["n"])
-    claimed = await claim_ahead(http, "high", also_claim=["standard"])
+    claimed = await claim_ahead(http)
     assert claimed is not None and claimed["theory"] == f"pkg:{first}"
+
+
+async def test_concurrent_claims_ahead_take_the_last_priority_cap_slot_once(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.priority_cap = 2
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "x1", "x2"], [("x1", "a"), ("x2", "a")], speculative_loading="4", priority="1")
+    await claim_named(http, "a")
+    await submit(http, ["n1", "n2"])
+    claimed = await asyncio.gather(claim_ahead(http), claim_ahead(http))
+    theories = sorted(c["theory"].removeprefix("pkg:") for c in claimed if c is not None)
+    assert len(theories) == 2 and theories[1].startswith("x") and theories[0] == "n1"
 
 
 async def test_a_parent_evicted_before_a_release_revokes_the_child_claimed_ahead(

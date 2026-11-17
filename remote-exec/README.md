@@ -129,7 +129,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_AHEAD_DEPTH` | how many generations of running ancestors an action may be claimed ahead of, 0 for no limit (see "Loading ahead") | 1 |
 | `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
-| `REMOTE_EXEC_DEFAULT_PRIORITY_FLOOR` | running builds of priority-0 batches allowed ahead of higher priorities (see Claims); 0 for strict priority | 32 |
+| `REMOTE_EXEC_PRIORITY_CAP` | running builds of positive-priority batches past which their builds rank like priority-0 ones (see Claims); at least the fleet's worker count for strict priority | 128 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
 | `REMOTE_EXEC_LOCALITY` | let claims and wakes on hosts below the scale-in line prefer work whose dependency context the host holds (see Claims); `false` for the plain order | true |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
@@ -527,18 +527,20 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   a stale completed task must not keep callers spinning while its cleanup waits.
   Ahead-only notifications wake capable claims without making ordinary idle
   workers retry, and peer batches invalidate ahead reads only when they opted in.
-  Set the floor back to 0 and restart the coordinator
-  to restore strict build priority. Claims select with `FOR UPDATE SKIP LOCKED`,
+  Claims select with `FOR UPDATE SKIP LOCKED`,
   write a lease with an expiry and commit; no transaction stays open while
   the worker builds. Among running batches of the selected class and tier,
   the claim picks the highest scheduling priority first, then the fewest running actions among
   equal priorities, then the one that least recently had an action
   claimed (one that never had goes first), then the oldest: a new batch gets
   the next free worker among equal-priority batches even while a wide one holds
-  the rest, and those batches take turns when there are more of them than workers. One exception: while
-  fewer than `REMOTE_EXEC_DEFAULT_PRIORITY_FLOOR` builds of priority-0 batches are running, the
-  priority-0 batches go first in their tiers, so a wave of higher priorities never takes every worker;
-  0 restores strict priority. Within the batch, it
+  the rest, and those batches take turns when there are more of them than workers. Priority is capped:
+  once batches of a positive priority run `REMOTE_EXEC_PRIORITY_CAP` builds together, their builds
+  rank like priority-0 ones (fewest running first) and their claims ahead no longer go before ready
+  builds: priority work loses its precedence, though it still takes workers no other build is ready for.
+  Each shared ranking counts its own claims until its next read, so claims from different tier lists
+  may pass the cap by a few builds briefly. A cap at least the fleet's worker count, and a
+  coordinator restart, restores strict priority. Within the batch, it
   picks the action with the longest chain of dependents in the batch, then
   the one with the most dependents, then by theory name, so the critical
   path starts first and the ready frontier widens fastest. An expired lease returns the
@@ -934,12 +936,10 @@ to run `alembic downgrade 0013`, then start the older image. This removes only
 scheduling metadata; action inputs, outputs and leases are unchanged.
 
 `GET /v1/queue` includes `ready_priority` and `running_priority`: subsets of
-the tier counts for actions whose batch has a positive priority. Do not add
-these subsets to the tier totals. Priority does not change burst demand.
-Priority has no aging; the only reserved normal share is
-`REMOTE_EXEC_DEFAULT_PRIORITY_FLOOR` (see Claims), and with it at 0 priority is
-strict, which suits occasional finite batches. Normal work can use workers for which no priority action is ready,
-including while a priority batch waits on dependencies.
+the tier counts for build actions whose batch has a positive priority, and
+`priority_cap`, which `running_priority` is counted against (see Claims). Do not add these subsets to the tier totals. Priority does not change
+burst demand. Priority has no aging. Normal work can use workers for which no
+priority action is ready, including while a priority batch waits on dependencies.
 
 Migration `0015` adds `batches.ahead_cap` and `actions.ahead`. Before rolling
 back to a coordinator image predating it, stop the coordinator and use the new

@@ -270,6 +270,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             **{k: v for k, v in asdict(status.counts).items() if k not in ("high_run", "ready_high_run")},
             "run_slots": settings.run_slots,
             "run_floor": min(settings.run_floor, settings.run_slots),
+            "priority_cap": settings.priority_cap,
             "desired_burst_workers": status.desired_burst_workers,
             "max_burst_workers": settings.max_burst_workers,
             "hosts": [
