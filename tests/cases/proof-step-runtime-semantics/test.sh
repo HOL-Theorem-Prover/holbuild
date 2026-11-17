@@ -362,3 +362,42 @@ for mode in steps plain; do
     fi
   done
 done
+
+# A failed-prefix resume replays only the plan, not the proof text, so it
+# compiles that text to evaluate it: an edit that adds a broken leaf after
+# the goal closes must still fail the resumed proof.
+resume_project=$tmpdir/eager-resume
+make_project "$resume_project" eager-resume
+cat > "$resume_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem resumed:
+  T /\ T
+Proof
+  CONJ_TAC
+  >- ACCEPT_TAC TRUTH
+  >- FAIL_TAC "seed failure"
+QED
+val _ = export_theory();
+SML
+if (cd "$resume_project" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" build --tactic-timeout 60) > "$tmpdir/eager-resume-seed.out" 2>&1; then
+  echo "expected the seed build to fail" >&2
+  exit 1
+fi
+require_grep 'seed failure' "$tmpdir/eager-resume-seed.out"
+python3 - "$resume_project/src/AScript.sml" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+text = path.read_text()
+old = 'FAIL_TAC "seed failure"'
+assert text.count(old) == 1
+path.write_text(text.replace(old, '(simp[] >> mp_tac (SPEC ``0:num`` TRUTH))'))
+PY
+if (cd "$resume_project" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" build --tactic-timeout 60) > "$tmpdir/eager-resume.out" 2>&1; then
+  echo "expected the resumed build to fail" >&2
+  cat "$tmpdir/eager-resume.out" >&2
+  exit 1
+fi
+require_grep 'from: failed-prefix checkpoint in resumed' "$tmpdir/eager-resume.out"
+require_grep 'not a comb' "$tmpdir/eager-resume.out"
