@@ -370,6 +370,12 @@ STATEMENTS = [
     Statement(cm.REVOKE_AHEAD, lambda f: {"batch_id": f.fresh, "keys": [f.parent_of_ahead()]}, 12_000),
     Statement(cm.PEERS, lambda f: {"batch_id": f.fresh, "input_key": f.steady_arrival.keys("waiting")[0]}, 13_000),
     Statement(cm.FINISH_IF_DONE, lambda f: {"id": f.fresh}, 14_000),
+    Statement(cm.LOCK_BUILT, lambda f: {"batch_id": f.fresh, "key": f.arrival.keys("running")[0]}, 400),
+    Statement(cm.FIRST_UNFINISHED, lambda f: {"id": f.fresh}, 14_000),
+    Statement(cm.FINISHED_RUNNING, lambda f: {}, 27_000),
+    Statement(
+        cm.PEAK_COVERED, lambda f: {"package": "pkg", "theory": "t0", "profile": "default", "peak": 2000}, 100
+    ),
     Statement(cm.COUNT_UNFINISHED, lambda f: {}, 93_000),
     Statement(cm.COUNT_ACTIVE, lambda f: {}, 18_000),
     Statement(cm.HELD_TARGET, lambda f: {"now": now(), "hold": 900.0, "cap": 100}, 1_800),
@@ -548,6 +554,7 @@ STATEMENTS = [
         10_000,
     ),
     Statement("SELECT state FROM batches WHERE id = :id FOR UPDATE", lambda f: {"id": f.fresh}, 100),
+    Statement("SELECT state FROM batches WHERE id = :id FOR SHARE", lambda f: {"id": f.fresh}, 100),
     Statement("UPDATE actions SET state = :state", lambda f: {**lease(f), "state": "failed"}, 10_000),
     Statement("SELECT fail_fast FROM batches", lambda f: {"id": f.fresh}, 100),
     Statement(

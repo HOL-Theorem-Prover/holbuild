@@ -1291,12 +1291,12 @@ async def test_a_completion_retried_after_a_failed_attempt_still_counts_for_its_
     lock_batch = coordinator._lock_batch
     calls = 0
 
-    async def flaky(*args: Any) -> str | None:
+    async def flaky(*args: Any, **kwargs: Any) -> str | None:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise TimeoutError("pool timeout")
-        return await lock_batch(*args)
+        return await lock_batch(*args, **kwargs)
 
     monkeypatch.setattr(coordinator, "_lock_batch", flaky)
     with pytest.raises(TimeoutError):
@@ -1677,6 +1677,165 @@ async def test_the_finished_check_reads_no_finished_actions(
             {"id": batch_id},
         )
     assert await pages_read() < before + 20
+
+
+async def waiting_on_locks(engine: Any, count: int) -> None:
+    """Wait until ``count`` sessions of the test database wait for a lock."""
+    async with asyncio.timeout(5), engine.connect() as observer:
+        # Each read in its own transaction: a transaction sees the sessions as they were when it first read them.
+        while await observer.scalar(sa.text(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'"
+        )) < count:
+            await observer.rollback()
+            await asyncio.sleep(0.01)
+
+
+async def test_a_build_finishes_while_another_result_holds_its_batch_and_a_cancel_waits_for_them(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    batch_id = await submit(http, ["a", "b"])
+    tokens = await claim_all(http, 2)
+    cache.keys.add(ac_key("a"))
+    async with remote_exec_engine.connect() as holder:
+        # What another build's result holds while it is applied.
+        await holder.execute(sa.text("SELECT 1 FROM batches WHERE id = :id FOR SHARE"), {"id": UUID(batch_id)})
+        response = await asyncio.wait_for(complete(http, tokens["a"], result("a", "built")), 5)
+        assert response.status_code == 200
+        cancel = asyncio.create_task(coordinator.cancel(UUID(batch_id)))
+        await waiting_on_locks(remote_exec_engine, 1)
+        assert not cancel.done()
+        await holder.rollback()
+    assert await asyncio.wait_for(cancel, 5) == "cancelled"
+    assert await states(http, batch_id) == {"a": "done", "b": "cancelled"}
+
+
+async def test_parents_of_one_child_finishing_at_once_both_count_for_it(
+    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: Any
+) -> None:
+    batch_id = await submit(http, ["p", "q", "c"], [("c", "p"), ("c", "q")])
+    tokens = await claim_all(http, 2)
+    cache.keys.update({ac_key("p"), ac_key("q")})
+    async with remote_exec_engine.connect() as holder:
+        # Both results wait for the child at once, then go on together.
+        await holder.execute(
+            sa.text("SELECT 1 FROM actions WHERE batch_id = :id AND input_key = :key FOR UPDATE"),
+            {"id": UUID(batch_id), "key": input_key("c")},
+        )
+        completions = [
+            asyncio.create_task(complete(http, tokens[name], result(name, "built"))) for name in ("p", "q")
+        ]
+        await waiting_on_locks(remote_exec_engine, 2)
+        await holder.rollback()
+    assert [r.status_code for r in await asyncio.wait_for(asyncio.gather(*completions), 5)] == [200, 200]
+    assert await states(http, batch_id) == {"p": "done", "q": "done", "c": "ready"}
+    await build(http, cache, "c")
+    assert (await batch(http, batch_id))["state"] == "done"
+
+
+async def test_a_parent_and_its_child_claimed_ahead_finishing_at_once_do_not_deadlock(
+    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: Any
+) -> None:
+    # p's results write x and c, x's write c: each takes them in one order.
+    batch_id = await submit(http, ["p", "x", "c"], [("x", "p"), ("c", "x"), ("c", "p")], speculative_loading="4")
+    p = await claim_named(http, "p")
+    body = {"tier": "standard", "worker": f"w-{uuid4().hex[:8]}", "ahead": True}
+    claimed = (await http.post("/v1/work/claim", json=body, headers=WORKER)).json()
+    assert claimed["theory"] == "pkg:x"
+    cache.keys.update({ac_key("p"), ac_key("x")})
+    async with remote_exec_engine.connect() as holder:
+        await holder.execute(
+            sa.text("SELECT 1 FROM actions WHERE batch_id = :id AND input_key = :key FOR UPDATE"),
+            {"id": UUID(batch_id), "key": input_key("c")},
+        )
+        completions = [
+            asyncio.create_task(complete(http, p, result("p", "built"))),
+            asyncio.create_task(complete(http, claimed["attempt_token"], result("x", "built"))),
+        ]
+        await waiting_on_locks(remote_exec_engine, 2)
+        await holder.rollback()
+    assert [r.status_code for r in await asyncio.wait_for(asyncio.gather(*completions), 5)] == [200, 200]
+    assert await states(http, batch_id) == {"p": "done", "x": "done", "c": "ready"}
+
+
+async def test_builds_finishing_at_once_with_a_cancel_neither_deadlock_nor_outlive_it(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    roots = [f"r{i}" for i in range(10)]
+    batch_id = await submit(http, [*roots, "c"], [("c", root) for root in roots])
+    tokens = await claim_all(http, len(roots))
+    cache.keys.update(ac_key(root) for root in roots)
+    *responses, cancelled = await asyncio.wait_for(
+        asyncio.gather(
+            *(complete(http, tokens[root], result(root, "built")) for root in roots),
+            coordinator.cancel(UUID(batch_id)),
+        ),
+        10,
+    )
+    assert [r.status_code for r in responses] == [200] * len(roots) and cancelled == "cancelled"
+    final = await states(http, batch_id)
+    assert final["c"] == "cancelled" and {final[root] for root in roots} <= {"done", "cancelled"}
+    assert (await batch(http, batch_id))["state"] == "cancelled"
+
+
+async def test_the_last_builds_of_a_batch_finishing_at_once_end_it(http: httpx.AsyncClient, cache: FakeCache) -> None:
+    names = [f"r{i}" for i in range(10)]
+    batch_id = await submit(http, names)
+    tokens = await claim_all(http, len(names))
+    cache.keys.update(ac_key(name) for name in names)
+    responses = await asyncio.wait_for(
+        asyncio.gather(*(complete(http, tokens[name], result(name, "built")) for name in names)), 10
+    )
+    assert [r.status_code for r in responses] == [200] * len(names)
+    assert (await batch(http, batch_id))["state"] == "done"
+
+
+async def test_a_batch_left_running_with_nothing_unfinished_is_ended_by_the_sweep(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    # As a build's result leaves it when the coordinator stops before ending its batch.
+    batch_id = await submit(http, ["a"])
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE actions SET state = 'done' WHERE batch_id = :id"), {"id": UUID(batch_id)})
+    assert (await batch(http, batch_id))["state"] == "running"
+
+    await coordinator.sweep()
+
+    assert (await batch(http, batch_id))["state"] == "done"
+
+
+async def test_a_batch_whose_last_build_committed_past_its_deadline_is_done_not_overdue(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    batch_id = await submit(http, ["a"])
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE actions SET state = 'done' WHERE batch_id = :id"), {"id": UUID(batch_id)})
+        await connection.execute(
+            sa.text("UPDATE batches SET created_at = now() - interval '13 hours' WHERE id = :id"), {"id": UUID(batch_id)}
+        )
+
+    await coordinator.sweep()
+
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("done", None)
+
+
+async def test_a_peak_below_the_hint_writes_nothing(
+    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: Any
+) -> None:
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text(
+            "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb, updated_at) "
+            "VALUES ('pkg', 'a', 'default', 500, now() - interval '2 days')"
+        ))
+    await submit(http, ["a"])
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE peak_hints SET updated_at = now() - interval '2 days'"))
+    await build(http, cache, "a")  # peak 100
+    async with remote_exec_engine.connect() as connection:
+        hint = (await connection.execute(sa.text(
+            "SELECT peak_rss_mb, updated_at < now() - interval '1 day' FROM peak_hints"
+        ))).one()
+    assert tuple(hint) == (500, True)
 
 
 async def test_releasing_reads_each_selected_actions_edges_by_key(
