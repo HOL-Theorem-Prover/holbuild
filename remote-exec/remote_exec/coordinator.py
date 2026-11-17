@@ -821,6 +821,35 @@ class _Claimed:
     max_heap_mb: int | None
 
 
+# Lock a built action :key of batch :batch_id and its children, in key order, returning nothing. A build's result holds
+# its batch only shared (see Coordinator.complete), so builds of one batch finish at once: each takes every action
+# row it writes in this one statement and in one order, so no two wait on each other, a child claimed ahead included.
+# Its parents' recount then runs once the child's other parents that finished meanwhile committed, and sees them done.
+# Keys read by edges_parent; each row probed by primary key, the batch hidden from the planner as in
+# CLAIM_AHEAD_ACTION, since a batch inserted since the last statistics would have it read the whole batch.
+LOCK_BUILT = sa.text("""
+SELECT 1 FROM unnest(ARRAY[CAST(:key AS text)] || ARRAY(
+    SELECT input_key FROM edges WHERE batch_id = :batch_id AND parent_key = :key
+)) AS k(input_key)
+JOIN actions a ON a.batch_id = (SELECT CAST(:batch_id AS uuid)) AND a.input_key = k.input_key
+ORDER BY a.input_key FOR UPDATE OF a
+""")
+
+# A batch's first unfinished action, in the order of actions_batch_unfinished; see FINISH_IF_DONE.
+FIRST_UNFINISHED = sa.text(
+    "SELECT input_key FROM actions WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running') "
+    "ORDER BY input_key LIMIT 1"
+)
+# The running batches FINISH_IF_DONE would end, which a build's result left running when the coordinator stopped
+# between the result's commit and the finish that follows it.
+FINISHED_RUNNING = sa.text(
+    "SELECT id FROM batches b WHERE state = 'running' AND failure IS NULL AND (SELECT input_key FROM actions "
+    "WHERE batch_id = b.id AND state IN ('waiting', 'ready', 'running') ORDER BY input_key LIMIT 1) IS NULL"
+)
+PEAK_COVERED = sa.text(
+    "SELECT peak_rss_mb >= :peak FROM peak_hints WHERE package = :package AND theory = :theory AND profile = :profile"
+)
+
 # End a running batch that has no unfinished action left: done, or failed with its failed builds. Run after every
 # completion, so the check is one entry of actions_batch_unfinished however many actions the batch finished. It looks
 # for the batch's first unfinished action in the index's order rather than for any: with no order asked for, the
@@ -1962,6 +1991,12 @@ class Coordinator:
         """
         # Forgotten only once the result is applied or dropped: a worker retries a completion that failed.
         leased = self.lease_hosts.get(token)
+        # A build holds its batch shared, so the builds of a batch finish at once, while a cancel, the deadline or
+        # the batch's end waits for them; a failure, which may retry, skip descendants or end the batch, holds it
+        # alone. Peak hints are raised once the result committed, outside its locks: many copies of one theory
+        # finishing together raise the same hint.
+        built = result.status != "failed"
+        peaks: list[tuple[str, str, str, int]] = []
         async with self.engine.begin() as conn:
             batch_id = await conn.scalar(
                 sa.text("SELECT batch_id FROM leases WHERE attempt_token = :token"), {"token": token}
@@ -1969,7 +2004,7 @@ class Coordinator:
             if batch_id is None:
                 self.lease_hosts.pop(token, None)
                 return False
-            if await self._lock_batch(conn, batch_id) != "running" or await conn.scalar(
+            if await self._lock_batch(conn, batch_id, shared=built) != "running" or await conn.scalar(
                 sa.text("SELECT failure IS NOT NULL FROM batches WHERE id = :id"), {"id": batch_id}
             ):
                 # Revoked with its batch (a cancel, a final failure, the deadline): the worker stopped the action, and
@@ -2010,6 +2045,8 @@ class Coordinator:
             if lease is None:
                 self.lease_hosts.pop(token, None)
                 return False
+            if built:
+                await conn.execute(LOCK_BUILT, {"batch_id": batch_id, "key": lease.input_key})
             action = (
                 await conn.execute(
                     sa.text(
@@ -2052,15 +2089,15 @@ class Coordinator:
             unblocked = action.ahead_batch and result.status == "failed"
             if result.failure == "memory" and action.tier == "standard":
                 # The tier it failed on is the hint: future batches place this theory on the high tier.
-                await self._record_peak(conn, package, theory, action.profile, self.settings.standard_tier_mb)
+                peaks.append((package, theory, action.profile, self.settings.standard_tier_mb))
                 await conn.execute(
                     sa.text("UPDATE actions SET tier = 'high' WHERE batch_id = :batch_id AND input_key = :input_key"),
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
-            if result.status != "failed":
+            if built:
                 await self._set_state(conn, batch_id, action.input_key, "done")
                 if result.peak_rss_mb is not None:
-                    await self._record_peak(conn, package, theory, action.profile, result.peak_rss_mb)
+                    peaks.append((package, theory, action.profile, result.peak_rss_mb))
                 await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [action.input_key]})
                 if action.ahead_batch:
                     refreshed = (
@@ -2072,7 +2109,6 @@ class Coordinator:
                         # claimed ahead now; and an action claimed ahead that finished before its parents' results
                         # came frees its slot of the cap.
                         unblocked = bool(refreshed) or (action.ahead == "ahead" and action.remaining_deps > 0)
-                await self._finish_if_done(conn, batch_id)
             elif result.failure == "ahead-abandoned" and action.ahead == "ahead":
                 # Loading ahead gave up; the action is built once its parents are done, and the try costs no attempt.
                 await conn.execute(
@@ -2110,6 +2146,10 @@ class Coordinator:
                 await self._fail(
                     conn, batch_id, action.input_key, action.action_class, f"{action.theory}: {result.failure}{detail}"
                 )
+        for peak in peaks:
+            await self._record_peak(*peak)
+        if built:
+            await self._finish_when_done(batch_id)
         self.lease_hosts.pop(token, None)
         if leased is not None:
             self._record_result(leased[0], batch_id, result)
@@ -2533,7 +2573,7 @@ class Coordinator:
         )
 
     async def sweep(self) -> None:
-        """The periodic pass: expired leases, a release of every batch in the background (for actions those
+        """The periodic pass: expired leases, overdue and finished batches, a release of every batch in the background (for actions those
         leases or a failed HEAD left waiting), retention, then the burst worker target, which the scale command gets
         whenever it changes.
 
@@ -2544,6 +2584,7 @@ class Coordinator:
         self.found_in_cache = {key: at for key, at in self.found_in_cache.items() if at > trusted_since}
         await self.expire_leases()
         await self.fail_overdue()
+        await self.finish_done()
         self.request_release()
         await self.delete_expired()
         await self.scale()
@@ -2894,8 +2935,15 @@ class Coordinator:
             )
         await self._set_state(conn, batch_id, input_key, "waiting")
 
-    async def _lock_batch(self, conn: AsyncConnection, batch_id: UUID) -> str | None:
-        return await conn.scalar(sa.text("SELECT state FROM batches WHERE id = :id FOR UPDATE"), {"id": batch_id})
+    async def _lock_batch(self, conn: AsyncConnection, batch_id: UUID, *, shared: bool = False) -> str | None:
+        """The batch's state, its row locked to the end of the transaction; ``shared`` lets other shared holders in,
+        and only them."""
+        statement = (
+            sa.text("SELECT state FROM batches WHERE id = :id FOR SHARE")
+            if shared
+            else sa.text("SELECT state FROM batches WHERE id = :id FOR UPDATE")
+        )
+        return await conn.scalar(statement, {"id": batch_id})
 
     async def _set_state(self, conn: AsyncConnection, batch_id: UUID, input_key: str, state: str) -> None:
         await conn.execute(
@@ -2905,6 +2953,29 @@ class Coordinator:
 
     async def _finish_if_done(self, conn: AsyncConnection, batch_id: UUID) -> None:
         await conn.execute(FINISH_IF_DONE, {"id": batch_id})
+
+    async def _finish_when_done(self, batch_id: UUID) -> None:
+        """End ``batch_id`` once a build's result committed, if nothing is left unfinished. The builds of a batch
+        finish at once, each holding the batch shared and seeing the others unfinished, so the batch is ended after
+        their commits, under its lock alone: the last to commit sees every other done."""
+        async with self.engine.connect() as conn:
+            if await conn.scalar(FIRST_UNFINISHED, {"id": batch_id}) is not None:
+                return
+        async with self.engine.begin() as conn:
+            if await self._lock_batch(conn, batch_id) == "running":
+                await self._finish_if_done(conn, batch_id)
+        self._batch_changed(batch_id)
+
+    async def finish_done(self) -> None:
+        """End the running batches with nothing left unfinished: those whose last build's result committed before
+        the coordinator stopped and ended it (see _finish_when_done)."""
+        async with self.engine.connect() as conn:
+            finished = list(await conn.scalars(FINISHED_RUNNING))
+        for batch_id in finished:
+            async with self.engine.begin() as conn:
+                if await self._lock_batch(conn, batch_id) == "running":
+                    await self._finish_if_done(conn, batch_id)
+            self._batch_changed(batch_id)
 
     async def _fail(
         self, conn: AsyncConnection, batch_id: UUID, input_key: str, action_class: str, failure: str
@@ -2951,14 +3022,19 @@ class Coordinator:
             {"id": batch_id},
         )
 
-    async def _record_peak(self, conn: AsyncConnection, package: str, theory: str, profile: str, peak: int) -> None:
-        """Raise the theory's peak hint to ``peak``; a run that took less, perhaps with a quieter neighbour, keeps it."""
-        await conn.execute(
-            sa.text(
-                "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb) "
-                "VALUES (:package, :theory, :profile, :peak) "
-                "ON CONFLICT (package, theory, profile) DO UPDATE "
-                "SET peak_rss_mb = GREATEST(peak_hints.peak_rss_mb, :peak), updated_at = now()"
-            ),
-            {"package": package, "theory": theory, "profile": profile, "peak": peak},
-        )
+    async def _record_peak(self, package: str, theory: str, profile: str, peak: int) -> None:
+        """Raise the theory's peak hint to ``peak``; a run that took less, perhaps with a quieter neighbour, keeps it.
+        A hint already as high is left unlocked and unwritten: submissions keep the hints they use fresh."""
+        hint = {"package": package, "theory": theory, "profile": profile, "peak": peak}
+        async with self.engine.begin() as conn:
+            if await conn.scalar(PEAK_COVERED, hint):
+                return
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb) "
+                    "VALUES (:package, :theory, :profile, :peak) "
+                    "ON CONFLICT (package, theory, profile) DO UPDATE "
+                    "SET peak_rss_mb = GREATEST(peak_hints.peak_rss_mb, :peak), updated_at = now()"
+                ),
+                hint,
+            )
