@@ -929,6 +929,9 @@ class Coordinator:
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
+        # When a run claim of (tiers, slots) last found none to take: every claim asks, so a "no" is reused for as
+        # long as a ranking read is, until a run is made ready or a run lease ends.
+        self.no_runs: dict[tuple[tuple[str, ...], int], float] = {}
         self.rankings_forgotten = 0  # how many times _forget_rankings dropped one, so reads begun before keep none
         # The claims ahead's shared read, the lock its readers take, and how many times _ahead_changed outdated it.
         self.ahead_read: _AheadRead | None = None
@@ -1325,8 +1328,12 @@ class Coordinator:
             "(SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run') < :run_slots"
         )
         params = {"tiers": tiers, "classes": ["run"], "run_slots": slots}
+        key, now = (tuple(tiers), slots), asyncio.get_running_loop().time()
+        if (found := self.no_runs.get(key)) is not None and now - found < self.settings.claim_ranking_seconds:
+            return None, False
         async with self.engine.connect() as conn:
             if not await conn.scalar(available, params):
+                self.no_runs[key] = now
                 return None, False
         # Only one connection per process may wait for cross-replica run admission. Builds bypass this gate.
         async with self.run_admission, self.engine.begin() as conn:
@@ -2154,6 +2161,8 @@ class Coordinator:
         if leased is not None:
             self._record_result(leased[0], batch_id, result)
             self._learn_locality(leased[0], action.theory, result)
+        if action.action_class == "run":
+            self.no_runs.clear()  # a run slot came free, or the run is ready again
         self._batch_changed(batch_id)
         self.request_release(batch_id)
         if unblocked:
@@ -2271,13 +2280,15 @@ class Coordinator:
                         sa.text(
                             "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
                             "AND input_key = ANY(:keys) AND state = 'waiting' AND remaining_deps = 0 "
-                            "RETURNING tier, theory"
+                            "RETURNING tier, theory, class AS action_class"
                         ),
                         {"batch_id": batch_id, "keys": ready},
                     )
                 )
             self._batch_changed(batch_id)
             self._forget_rankings(batch_id, {row.tier for row in made_ready})
+            if any(row.action_class == "run" for row in made_ready):
+                self.no_runs.clear()
             for row in made_ready:
                 self._wake_claim(row.tier, theory=row.theory)
         requeued = False
@@ -2415,6 +2426,8 @@ class Coordinator:
         if ahead_freed:
             self._ahead_changed()
         self._wake_peers(await self._peers(batch_id, action))
+        if action.action_class == "run":
+            self.no_runs.clear()
         self._batch_changed(batch_id)
 
     async def fail_overdue(self) -> None:
