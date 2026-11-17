@@ -873,17 +873,20 @@ fun fetch_blob cache {hash, dst} =
              | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
 
 (* Fetches a blob by its SHA-256 alone, without needing an action entry that
-   lists it, as a remote worker fetches its spec and sources. *)
-fun fetch_unlisted_blob cache {hash, dst} =
+   lists it, as a remote worker fetches its spec and sources; a GET fails
+   once it has moved no data for TIMEOUT seconds. *)
+fun fetch_unlisted_blob_within timeout cache {hash, dst} =
   (case curl_get_urls_by get_status_parallel_decode (fn _ => true)
-                         {urls = cas_urls cache hash, dst = dst,
-                          timeout = blob_stall_timeout cache hash} of
+                         {urls = cas_urls cache hash, dst = dst, timeout = timeout} of
        HolbuildCacheBackend.Hit =>
          if HolbuildHash.file_sha256 dst = hash then HolbuildCacheBackend.Hit
          else HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ hash)
      | other => other)
   handle e as Unavailable _ => raise e
        | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
+
+fun fetch_unlisted_blob cache (request as {hash, ...}) =
+  fetch_unlisted_blob_within (blob_stall_timeout cache hash) cache request
 
 fun put_blob cache {hash, src} =
   let

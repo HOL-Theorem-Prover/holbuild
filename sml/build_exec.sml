@@ -12137,13 +12137,10 @@ fun module_remote_key {toolchain, store, wanted, dat_sha256} =
 val module_publish_grace = Time.fromSeconds 10
 
 (* Whether a remote request started now ends by DEADLINE even if it
-   stalls: a request fails once it has moved no data for STALL seconds,
-   HolbuildRemoteCache.stall_timeout_seconds or, for a blob GET, the
-   blob's HolbuildRemoteCache.blob_stall_timeout. *)
-fun module_request_fits stall deadline =
-  Time.<= (Time.+ (Time.now (), Time.fromSeconds (Int.toLarge stall)), deadline)
-
-val request_fits = module_request_fits HolbuildRemoteCache.stall_timeout_seconds
+   stalls: a request fails once it has moved no data for
+   stall_timeout_seconds. *)
+fun module_request_fits deadline =
+  Time.<= (Time.+ (Time.now (), Time.fromSeconds (Int.toLarge HolbuildRemoteCache.stall_timeout_seconds)), deadline)
 
 (* Fetches into STORE, by way of STAGING, the published ones of the
    WANTED modules, each a (`<theory>-<.dat SHA-1>.pmo`, remote key) pair,
@@ -12156,7 +12153,7 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
     val probes = ref 0
     val mutex = Mutex.mutex ()
     fun fetch (name, key) =
-      if not (request_fits deadline) then ()
+      if not (module_request_fits deadline) then ()
       else
         (Mutex.lock mutex; probes := !probes + 1; Mutex.unlock mutex;
          case HolbuildRemoteCache.get_action remote key of
@@ -12166,11 +12163,14 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
                    [("file", sha, file)] =>
                      if not (plain_file_name file andalso module_file_theory_part file = SOME name) then
                        warn ("ignoring the published theory module " ^ HolbuildHash.quote file ^ " for " ^ name)
-                     else if not (module_request_fits (HolbuildRemoteCache.blob_stall_timeout remote sha) deadline) then ()
+                     else if not (module_request_fits deadline) then ()
                      else
                        let val tmp = Path.concat (staging, file)
                        in
-                         case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = sha, dst = tmp} of
+                         (* The usual stall budget, which module_request_fits allows for,
+                            whatever the module's size. *)
+                         case HolbuildRemoteCache.fetch_unlisted_blob_within
+                                HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp} of
                              HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = Path.concat (store, file)}
                            | _ => remove_file tmp
                        end
@@ -12191,7 +12191,7 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
 fun publish_modules remote {store, modules, deadline} =
   let
     fun publish (file, key) =
-      if not (request_fits deadline) then false
+      if not (module_request_fits deadline) then false
       else
         let
           val path = Path.concat (store, file)
@@ -12201,7 +12201,7 @@ fun publish_modules remote {store, modules, deadline} =
               HolbuildCacheBackend.Published => ()
             | HolbuildCacheBackend.AlreadyPresent => ()
             | _ => raise Error ("could not upload " ^ file);
-          request_fits deadline andalso
+          module_request_fits deadline andalso
           (case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsent
                   {key = key, text = shared_manifest module_remote_header NONE [("file", sha, file)]} of
                HolbuildCacheBackend.Published => true
