@@ -12112,45 +12112,59 @@ fun module_remote_key {toolchain, store, wanted, dat_sha256} =
    kills exec-action 20 s after module_writer_budget. *)
 val module_publish_grace = Time.fromSeconds 10
 
+(* Whether a remote request started now ends by DEADLINE even if it
+   stalls: a request fails once it has moved no data for
+   stall_timeout_seconds. *)
+fun module_request_fits deadline =
+  Time.<= (Time.+ (Time.now (), Time.fromSeconds (Int.toLarge HolbuildRemoteCache.stall_timeout_seconds)), deadline)
+
 (* Fetches into STORE, by way of STAGING, the published ones of the
    WANTED modules, each a (`<theory>-<.dat SHA-1>.pmo`, remote key) pair,
-   until DEADLINE.  A module is installed only from an entry that lists
-   one plain file named for it.  A miss or a failed fetch leaves the
-   module to the writer. *)
+   starting only requests that end by DEADLINE.  A module is installed
+   only from an entry that lists one plain file named for it.  A miss or
+   a failed fetch leaves the module to the writer.  The result: how many
+   entries were looked up. *)
 fun fetch_published_modules remote {store, staging, wanted, deadline} =
   let
+    val probes = ref 0
+    val mutex = Mutex.mutex ()
     fun fetch (name, key) =
-      if Time.< (deadline, Time.now ()) then ()
+      if not (module_request_fits deadline) then ()
       else
-        case HolbuildRemoteCache.get_action remote key of
-            NONE => ()
-          | SOME text =>
-              case shared_manifest_entries text of
-                  [("file", sha, file)] =>
-                    if plain_file_name file andalso module_file_theory_part file = SOME name then
-                      let val tmp = Path.concat (staging, file)
-                      in
-                        case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = sha, dst = tmp} of
-                            HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = Path.concat (store, file)}
-                          | _ => remove_file tmp
-                      end
-                    else warn ("ignoring the published theory module " ^ HolbuildHash.quote file ^ " for " ^ name)
-                | _ => warn ("ignoring a malformed published theory module entry for " ^ name)
+        (Mutex.lock mutex; probes := !probes + 1; Mutex.unlock mutex;
+         case HolbuildRemoteCache.get_action remote key of
+             NONE => ()
+           | SOME text =>
+               case shared_manifest_entries text of
+                   [("file", sha, file)] =>
+                     if not (plain_file_name file andalso module_file_theory_part file = SOME name) then
+                       warn ("ignoring the published theory module " ^ HolbuildHash.quote file ^ " for " ^ name)
+                     else if not (module_request_fits deadline) then ()
+                     else
+                       let val tmp = Path.concat (staging, file)
+                       in
+                         case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = sha, dst = tmp} of
+                             HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = Path.concat (store, file)}
+                           | _ => remove_file tmp
+                       end
+                 | _ => warn ("ignoring a malformed published theory module entry for " ^ name))
     fun try item = fetch item handle e => warn ("theory module not fetched: " ^ General.exnMessage e)
   in
     HolbuildRemoveTree.remove_untrusted staging;
     ensure_dir staging;
     parallel_all remote_probe_width try wanted;
-    HolbuildRemoveTree.remove_untrusted staging
+    HolbuildRemoveTree.remove_untrusted staging;
+    !probes
   end
 
 (* Publishes the module files in STORE, each a (file, remote key) pair,
-   until DEADLINE.  Another writer may have published the same module
-   first, with other bytes: either is valid, so its entry stays. *)
+   starting only requests that end by DEADLINE.  Another writer may have
+   published the same module first, with other bytes: either is valid, so
+   its entry stays. *)
 fun publish_modules remote {store, modules, deadline} =
   let
     fun publish (file, key) =
-      if Time.< (deadline, Time.now ()) then false
+      if not (module_request_fits deadline) then false
       else
         let
           val path = Path.concat (store, file)
@@ -12160,10 +12174,11 @@ fun publish_modules remote {store, modules, deadline} =
               HolbuildCacheBackend.Published => ()
             | HolbuildCacheBackend.AlreadyPresent => ()
             | _ => raise Error ("could not upload " ^ file);
-          case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsent
-                 {key = key, text = shared_manifest module_remote_header NONE [("file", sha, file)]} of
-              HolbuildCacheBackend.Published => true
-            | _ => false
+          module_request_fits deadline andalso
+          (case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsent
+                  {key = key, text = shared_manifest module_remote_header NONE [("file", sha, file)]} of
+               HolbuildCacheBackend.Published => true
+             | _ => false)
         end
         handle e => (warn ("theory module not published: " ^ General.exnMessage e); false)
     val published = ref 0
@@ -12195,7 +12210,8 @@ fun publish_modules remote {store, modules, deadline} =
    then renamed), so the modules it finished are stored all the same.  A
    failure leaves later actions to load from .dat files.  The result: how
    many modules were stored by the writer, of how many missing, and how
-   many were fetched and published. *)
+   many entries were looked up in the remote cache, and how many modules
+   were fetched and published. *)
 fun write_missing_modules remote root tc {deps, loads} deadline =
   let
     val store = module_store (#holdir tc)
@@ -12333,6 +12349,7 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
           (missing, shas)
       end
     val missing = missing_modules ()
+    val probed = ref 0
     val fetched = ref 0
     val published = ref 0
     (* Fetch what another host published, write what is still missing,
@@ -12341,9 +12358,10 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
       let
         val keys = remote_keys missing handle e => (warn ("theory modules not fetched: " ^ General.exnMessage e); [])
         val _ =
-          fetch_published_modules remote
-            {store = store, staging = output, wanted = keys,
-             deadline = Time.- (deadline, module_writer_min_time)}
+          probed :=
+            fetch_published_modules remote
+              {store = store, staging = output, wanted = keys,
+               deadline = Time.- (deadline, module_writer_min_time)}
           handle e => warn ("theory modules not fetched: " ^ General.exnMessage e)
         val still = missing_modules ()
         val _ = fetched := length missing - length still
@@ -12373,18 +12391,20 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
              ((if HolbuildFileLock.at_path lock then fill () else ()) before HolbuildFileLock.release lock)
              handle e => (HolbuildFileLock.release lock; raise e))
       handle e => warn ("theory modules not written: " ^ General.exnMessage e);
-    {installed = length (!installed), missing = length missing, fetched = !fetched, published = !published}
+    {installed = length (!installed), missing = length missing, probed = !probed, fetched = !fetched,
+     published = !published}
   end
 
 (* The writer for an action's theories, given until DEADLINE: how long it
-   took, and how many modules it stored of how many missing, fetched and
+   took, how many modules it stored of how many missing, how many entries it
+   looked up in the remote cache, and how many modules it fetched and
    published. *)
 fun fill_module_store remote root tc wanted deadline =
   let
     val t0 = Time.now ()
     val holdir = #holdir tc
-    val none = {installed = 0, missing = 0, fetched = 0, published = 0}
-    val {installed, missing, fetched, published} =
+    val none = {installed = 0, missing = 0, probed = 0, fetched = 0, published = 0}
+    val {installed, missing, probed, fetched, published} =
       (if file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
           not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
        then write_missing_modules remote root tc wanted deadline
@@ -12392,7 +12412,7 @@ fun fill_module_store remote root tc wanted deadline =
       handle e => (warn ("theory modules not written: " ^ General.exnMessage e); none)
   in
     {ms = Time.toMilliseconds (Time.- (Time.now (), t0)), installed = installed, missing = missing,
-     fetched = fetched, published = published}
+     probed = probed, fetched = fetched, published = published}
   end
 
 (* Tool caches (build --tool-cache NAME).  A theory child may keep files in
@@ -12688,7 +12708,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     (* The theory-module writer, which runs last after the result, given
        until a deadline: see fill_module_store. *)
     val write_modules =
-      ref (fn (_ : Time.time) => {ms = LargeInt.fromInt 0, installed = 0, missing = 0, fetched = 0, published = 0})
+      ref (fn (_ : Time.time) => {ms = LargeInt.fromInt 0, installed = 0, missing = 0, probed = 0, fetched = 0,
+                       published = 0})
     fun cancel _ =
       if !cancelled then () else
       (cancelled := true;
@@ -13493,8 +13514,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                    for the publish, not for a cache scan or the writer.  The
                    writer goes last: it only saves later actions loading
                    time, and stops before the worker's kill. *)
-                val none = {ms = LargeInt.fromInt 0, installed = 0, missing = 0, fetched = 0, published = 0}
-                val {ms, installed, missing, fetched, published} =
+                val none = {ms = LargeInt.fromInt 0, installed = 0, missing = 0, probed = 0, fetched = 0,
+                       published = 0}
+                val {ms, installed, missing, probed, fetched, published} =
                   if !cancelled then none else
                   let val {limit_bytes, reserve_bytes, min_free_bytes} = cache_cap
                   in
@@ -13510,7 +13532,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                    LargeInt.toString (Time.toMilliseconds (Time.-(Time.now (), t0))) ^
                    " modules_ms=" ^ LargeInt.toString ms ^
                    " modules_installed=" ^ Int.toString installed ^ "/" ^ Int.toString missing ^
-                   " modules_fetched=" ^ Int.toString fetched ^ " modules_published=" ^ Int.toString published ^ "\n")
+                   " modules_probed=" ^ Int.toString probed ^ " modules_fetched=" ^ Int.toString fetched ^
+                   " modules_published=" ^ Int.toString published ^ "\n")
               end;
               (status, failure, log)
             end)
