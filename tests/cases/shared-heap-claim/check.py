@@ -143,8 +143,10 @@ def restore_waits_for_claimed_upload() -> None:
     uploader = Publisher("uploader", "four")
     uploader.wait_until(lambda: uploads.exists() and uploads.read_text() == "1")
     # Claimed and mid-upload: a restore waits no longer than its deadline.
+    started = time.monotonic()
     bounded = Publisher("bounded", "four", restore_script, WAIT_SECONDS="1")
     assert bounded.result() == "none", "the wait outlived an upload that never ends"
+    assert time.monotonic() - started < 30, "the wait ignored its deadline"
     claim_reads = claim_gets("four")
     waiting = Publisher("waiting", "four", restore_script, BASE_STATE=str(uploader.dir / "base.save"))
     waiting.wait_until(lambda: claim_gets("four") >= claim_reads + 2)

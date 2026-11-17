@@ -10970,25 +10970,31 @@ fun shared_heap_claim_text owner seconds =
   String.concat ["holbuild-shared-heap-claim-v1\nowner=", owner,
                  "\ntime=", LargeInt.toString seconds, "\n"]
 
-(* Whether a claim in the cache holds the heap for a worker other than
-   `owner` at time `now`. A time over a minute ahead of ours is a broken
-   clock or entry, so it holds nothing; nor does an entry that doesn't parse. *)
-fun shared_heap_claim_active owner now text =
+(* Whether a claim in the cache, if under `lapse` seconds old, holds the
+   heap for a worker other than `owner` at time `now`. A time over a minute
+   ahead of ours is a broken clock or entry, so it holds nothing; nor does
+   an entry that doesn't parse. *)
+fun shared_heap_claim_holds lapse owner now text =
   case String.tokens (fn c => c = #"\n") text of
       ["holbuild-shared-heap-claim-v1", owner_line, time_line] =>
         String.isPrefix "owner=" owner_line andalso
         String.extract (owner_line, 6, NONE) <> owner andalso
         String.isPrefix "time=" time_line andalso
         (case LargeInt.fromString (String.extract (time_line, 5, NONE)) of
-             SOME time => time <= now + 60 andalso now - time < LargeInt.fromInt shared_heap_claim_seconds
+             SOME time => time <= now + 60 andalso now - time < LargeInt.fromInt lapse
            | NONE => false)
     | _ => false
 
+fun shared_heap_claim_active owner now text = shared_heap_claim_holds shared_heap_claim_seconds owner now text
+
 (* How long a restore waits for a heap another worker claimed and is
-   uploading. A 784 MB heap uploads in seconds; the cold load it saves takes
-   tens of seconds to minutes; the worker kills an upload two minutes after
-   its action's result. *)
+   uploading. A 466 MB heap PUT took about 2 s, so a 784 MB one should take
+   a few; the cold load it saves takes tens of seconds to minutes. *)
 val shared_heap_wait = Time.fromSeconds 60
+(* The worker kills exec-action two minutes after its result (worker.py's
+   POST_RESULT_SECONDS), and the claim is written after the result, so an
+   older claim is an upload that was killed before it released it. *)
+val shared_heap_upload_seconds = 125
 val shared_heap_poll = Time.fromMilliseconds 500
 
 (* The heap under HEAP_KEY once the worker whose claim holds it has
@@ -11003,7 +11009,8 @@ fun await_shared_heap remote heap_key deadline =
     (* A restore holds no claim, so any claim is another worker's. *)
     fun claimed () =
       case HolbuildRemoteCache.fetch_action remote claim_key of
-          SOME {manifest, ...} => shared_heap_claim_active "" (Time.toSeconds (Time.now ())) manifest
+          SOME {manifest, ...} =>
+            shared_heap_claim_holds shared_heap_upload_seconds "" (Time.toSeconds (Time.now ())) manifest
         | NONE => false
     (* The claimant publishes the heap before releasing its claim. *)
     fun wait () =
