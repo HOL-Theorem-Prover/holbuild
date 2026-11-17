@@ -131,8 +131,9 @@ class Settings(BaseSettings):
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
     run_floor: int = Field(default=0, ge=0)
-    # Running builds of priority-0 batches allowed ahead of higher priorities; see Coordinator._claim_build.
-    default_priority_floor: int = Field(default=32, ge=0)
+    # Running builds of priority batches past which their builds rank like priority-0 ones; see
+    # Coordinator._claim_build.
+    priority_cap: int = Field(default=128, ge=0)
     # Claims and wakes on hosts below the scale-in line prefer actions whose dependency context the host holds; see
     # Coordinator._local_entry. False claims and wakes as without it.
     locality: bool = True
@@ -503,7 +504,7 @@ SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb, b.prior
     (SELECT max(l.last_claimed_at) FROM actions l WHERE l.batch_id = b.id) AS last_claimed_at,
     b.created_at,
     (SELECT count(*) FROM actions r WHERE r.state = 'running' AND r.class = 'build'
-     AND (SELECT priority FROM batches WHERE id = r.batch_id) = 0) AS running_default
+     AND (SELECT priority FROM batches WHERE id = r.batch_id) > 0) AS running_priority
 FROM batches b
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:classes AS text[]))) c (class)
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:tiers AS text[]))) t (tier)
@@ -802,9 +803,10 @@ class _Ranking:
     heap: list[tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]]
     ranked: set[tuple[UUID, str]]  # the batches and tiers it ranked
     exhausted: set[tuple[UUID, str]]
-    running_default: int  # running builds of priority-0 batches, and the claims of them since the read
+    running_priority: int  # running builds of batches of a positive priority, and the claims of them since the read
     # The theory of each batch and tier's first ready build, until a claim from it makes that unknown.
     theories: dict[tuple[UUID, str], str]
+    capped: bool = False  # see Coordinator._cap_priorities
 
 
 _NEVER = datetime.min.replace(tzinfo=UTC)  # the last claim of a batch never claimed from, for ordering
@@ -1297,7 +1299,9 @@ class Coordinator:
                 assert outranked is not None
                 _, priority, *_, tier, _ = ranking.heap[0]
                 claimed = await self._claim_ahead(outranked(tier, -priority), worker, above=-priority)
-                if claimed is not None:
+                if claimed is not None:  # of a batch of a positive priority, above the build's
+                    ranking.running_priority += 1
+                    self._cap_priorities(ranking)
                     return claimed
                 outranked = None
                 continue
@@ -1532,36 +1536,19 @@ class Coordinator:
         batches as fresh rankings would. Exhausted batch/tier pairs are skipped until the next shared read. Stop
         at a candidate ``outranked`` says ranks after a claim ahead, leaving it first in the ranking.
 
-        While fewer than ``default_priority_floor`` builds of priority-0 batches run, the best priority-0
-        candidate in the best candidate's tier goes first, ahead of claims ahead of that tier too, so a wave of
-        higher priorities never takes every worker. A priority-0 claim counts against the floor before it awaits its
-        lock, so concurrent claims sharing the ranking don't all take the floor's last slot.
+        Once batches of a positive priority run ``priority_cap`` builds, the ranking is capped (_cap_priorities):
+        their builds rank like priority-0 ones, and claims ahead no longer outrank them, so priority work never
+        takes every worker. Their claims count towards the cap before they await their lock, so concurrent claims
+        sharing the ranking don't all take its last slot.
 
         A claim from ``host_id`` may then take another candidate of the chosen one's band; see _local_entry.
         """
-        floor = self.settings.default_priority_floor
         while ranking.heap:
             entry = heapq.heappop(ranking.heap)
             if (entry[6], entry[7]) in ranking.exhausted:
                 continue
-            below_floor = False
-            if ranking.running_default < floor:
-                default = entry if entry[1] == 0 else min(
-                    (e for e in ranking.heap
-                     if e[1] == 0 and e[0] == entry[0] and (e[6], e[7]) not in ranking.exhausted),
-                    default=None,
-                )
-                # Claims ahead of an earlier tier still go first, as ready builds of one do.
-                if default is not None and (
-                    outranked is None or all(t == default[7] for t in outranked(default[7], 0))
-                ):
-                    below_floor = True
-                    if default is not entry:
-                        ranking.heap[ranking.heap.index(default)] = entry
-                        heapq.heapify(ranking.heap)
-                        entry = default
             tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
-            if not below_floor and outranked is not None and outranked(tier, -priority):
+            if not ranking.capped and outranked is not None and outranked(tier, -priority):
                 heapq.heappush(ranking.heap, entry)
                 return None
             passed = None  # the candidate passed over for one this host is warm for
@@ -1576,9 +1563,10 @@ class Coordinator:
             )
             # The batch's next ready build is another one, whose theory the ranking doesn't know.
             ranking.theories.pop((batch_id, tier), None)
-            if priority == 0:
-                ranking.running_default += 1
-            if passed is not None:  # counted before the lock's await, as the floor is, so concurrent claims see it
+            if priority != 0:
+                ranking.running_priority += 1
+                self._cap_priorities(ranking)
+            if passed is not None:  # counted before the lock's await, as the cap is, so concurrent claims see it
                 self.passed_over[passed] = self.passed_over.get(passed, 0) + 1
                 if len(self.passed_over) > MAX_LEASE_HOSTS:  # those of batches that ended unclaimed
                     del self.passed_over[next(iter(self.passed_over))]
@@ -1593,10 +1581,20 @@ class Coordinator:
                     self.passed_over[passed] = count - 1
                 else:
                     del self.passed_over[passed]
-            if priority == 0:
-                ranking.running_default -= 1
+            if priority != 0:
+                ranking.running_priority -= 1
             ranking.exhausted.add((batch_id, tier))
         return None
+
+    def _cap_priorities(self, ranking: "_Ranking") -> None:
+        """Cap ``ranking`` once batches of a positive priority run ``priority_cap`` builds: rank their builds like
+        priority-0 ones until the next read. A cap stays for the ranking's life, so claims that fail to lock
+        don't flip the order back and forth."""
+        if ranking.capped or ranking.running_priority < self.settings.priority_cap:
+            return
+        ranking.capped = True
+        ranking.heap[:] = [(e[0], 0, *e[2:]) for e in ranking.heap]
+        heapq.heapify(ranking.heap)
 
     def _local_entry(
         self, ranking: "_Ranking", entry: tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None],
@@ -1749,11 +1747,12 @@ class Coordinator:
             for row in rows
         ]
         heapq.heapify(heap)
-        running_default = rows[0].running_default if rows else 0
-        return _Ranking(
-            at, forgotten, heap, {(row.batch_id, row.tier) for row in rows}, set(), running_default,
-            {(row.batch_id, row.tier): row.theory for row in rows},
+        ranking = _Ranking(
+            at, forgotten, heap, {(row.batch_id, row.tier) for row in rows}, set(),
+            rows[0].running_priority if rows else 0, {(row.batch_id, row.tier): row.theory for row in rows},
         )
+        self._cap_priorities(ranking)
+        return ranking
 
     def _keep_ranking(self, key: tuple[str, ...], ranking: "_Ranking") -> None:
         """Share ``ranking`` with later claims, unless a release dropped a ranking while it was read, since its

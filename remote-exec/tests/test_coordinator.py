@@ -207,7 +207,6 @@ async def test_a_priority_batch_submitted_while_a_ranking_is_shared_is_claimed_n
     """Making a batch the shared ranking lacks ready drops the ranking at once, so a priority batch submitted while
     claims share one goes first on the next claim, not once the ranking expires."""
     coordinator.settings.claim_ranking_seconds = 3600
-    coordinator.settings.default_priority_floor = 0  # strict priority
     rankings = 0
     rank = coordinator._rank
 
@@ -256,7 +255,6 @@ async def test_a_claim_after_a_release_waits_for_a_fresh_shared_ranking(
 ) -> None:
     """A release preserves single-flight reads; later claims wait for a post-release snapshot."""
     coordinator.settings.claim_ranking_seconds = 3600
-    coordinator.settings.default_priority_floor = 0  # strict priority
     entered, go = asyncio.Event(), asyncio.Event()
     calls = 0
     rank = coordinator._rank
@@ -3533,7 +3531,6 @@ async def test_submit_rejects_invalid_heap_limit(http: httpx.AsyncClient, value:
 async def test_priority_precedes_batch_fair_share_and_preserves_equal_priority_turns(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    coordinator.settings.default_priority_floor = 0  # strict priority
     await submit(http, ["normal"])
     await submit(http, ["p11", "p12", "p13"], priority="1")
     await submit(http, ["p21", "p22"], priority="1")
@@ -3549,7 +3546,6 @@ async def test_priority_precedes_batch_fair_share_and_preserves_equal_priority_t
 async def test_normal_build_progresses_while_priority_chain_waits_for_its_parent(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    coordinator.settings.default_priority_floor = 0  # strict priority
     await submit(http, ["normal1", "normal2"])
     await submit(http, ["parent", "child"], [("child", "parent")], priority="1")
     await claim_named(http, "parent")
@@ -3593,50 +3589,35 @@ async def test_invalid_priority_is_rejected(http: httpx.AsyncClient, value: str)
 
 
 @pytest.mark.parametrize("ranking_seconds", [0, 3600])
-async def test_priority_zero_builds_keep_a_floor_during_a_priority_wave(
+async def test_priority_builds_rank_like_priority_zero_ones_past_the_cap(
     http: httpx.AsyncClient, coordinator: Coordinator, ranking_seconds: float
 ) -> None:
-    """Below the floor priority 0 goes first, counted by fresh rankings and by claims sharing one; at the floor,
-    higher priorities take everything else."""
-    coordinator.settings.default_priority_floor = 2
+    """Below the cap priority goes first, counted by fresh rankings and by claims sharing one; at the cap, batches
+    take turns by their running builds whatever their priority."""
+    coordinator.settings.priority_cap = 2
     coordinator.settings.claim_ranking_seconds = ranking_seconds
     await submit(http, ["n1", "n2", "n3"])
-    await submit(http, ["p1", "p2", "p3"], priority="1")
-    for name in ["n1", "n2", "p1", "p2", "p3", "n3"]:
+    await submit(http, ["p1", "p2", "p3", "p4"], priority="1")
+    for name in ["p1", "p2", "n1", "n2", "p3", "n3", "p4"]:
         await claim_named(http, name)
 
 
-async def test_a_priority_zero_build_ending_frees_its_floor_slot(
-    http: httpx.AsyncClient, coordinator: Coordinator
-) -> None:
-    coordinator.settings.default_priority_floor = 1
+async def test_a_priority_build_ending_frees_its_cap_slot(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    coordinator.settings.priority_cap = 1
     coordinator.settings.claim_ranking_seconds = 0
     await submit(http, ["n1", "n2"])
     await submit(http, ["p1", "p2"], priority="1")
-    token = await claim_named(http, "n1")
-    await claim_named(http, "p1")
-    assert (await complete(http, token, result("n1", "built"))).status_code == 200
-    await claim_named(http, "n2")
+    token = await claim_named(http, "p1")
+    await claim_named(http, "n1")
+    assert (await complete(http, token, result("p1", "built"))).status_code == 200
     await claim_named(http, "p2")
+    await claim_named(http, "n2")
 
 
-async def test_priority_zero_turns_carry_over_from_the_floor_to_the_ranking_above_it(
+async def test_concurrent_claims_sharing_a_ranking_take_the_last_cap_slot_once(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    """A batch claimed from below the floor has its turn counted once the floor is full, in the same ranking."""
-    coordinator.settings.default_priority_floor = 1
-    coordinator.settings.claim_ranking_seconds = 3600
-    await submit(http, ["a1", "a2"])
-    await submit(http, ["b1"])
-    await submit(http, ["p1"], priority="1")
-    for name in ["a1", "p1", "b1", "a2"]:
-        await claim_named(http, name)
-
-
-async def test_concurrent_claims_sharing_a_ranking_take_the_last_floor_slot_once(
-    http: httpx.AsyncClient, coordinator: Coordinator
-) -> None:
-    coordinator.settings.default_priority_floor = 1
+    coordinator.settings.priority_cap = 1
     coordinator.settings.claim_ranking_seconds = 3600
     await submit(http, ["n1", "n2"])
     await submit(http, ["p1", "p2"], priority="1")
@@ -3652,7 +3633,7 @@ async def test_concurrent_claims_sharing_a_ranking_take_the_last_floor_slot_once
 async def test_priority_work_takes_every_slot_when_no_priority_zero_build_is_ready(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    coordinator.settings.default_priority_floor = 2
+    coordinator.settings.priority_cap = 1
     await submit(http, ["parent", "child"], [("child", "parent")])
     await claim_named(http, "parent")
     await submit(http, ["p1", "p2", "p3"], priority="1")
@@ -3661,10 +3642,10 @@ async def test_priority_work_takes_every_slot_when_no_priority_zero_build_is_rea
     assert await claim(http) is None
 
 
-async def test_the_priority_zero_floor_does_not_override_the_memory_tier(
+async def test_the_priority_cap_does_not_override_the_memory_tier(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    coordinator.settings.default_priority_floor = 2
+    coordinator.settings.priority_cap = 0
     await submit(http, ["normal"])
     await submit(http, ["priority"], priority="1")
     async with coordinator.engine.begin() as conn:
@@ -3677,10 +3658,10 @@ async def test_the_priority_zero_floor_does_not_override_the_memory_tier(
 async def test_queue_reports_priority_subsets_without_double_counting(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    coordinator.settings.default_priority_floor = 0  # strict priority
     await submit(http, ["normal"])
     await submit(http, ["p1", "p2", "child"], [("child", "p1")], priority="1")
     await claim_named(http, "p1")
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
     assert (queue["ready_priority"], queue["running_priority"]) == (1, 1)
+    assert queue["priority_cap"] == coordinator.settings.priority_cap
     assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (2, 1, 1)
