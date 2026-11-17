@@ -576,24 +576,29 @@ fun write_record path text =
   (HolbuildDependencies.ensure_dir (OS.Path.dir path);
    SC.write_text_atomically path text)
 
+(* The records in DIR, newest first. *)
+fun records_newest_first dir =
+  let
+    val stream = OS.FileSys.openDir dir
+    fun loop acc =
+      case OS.FileSys.readDir stream of
+          NONE => acc
+        | SOME name =>
+            if String.isSuffix ".tmp" name orelse String.isPrefix "." name then loop acc
+            else loop (OS.Path.concat (dir, name) :: acc)
+    val paths = loop [] before OS.FileSys.closeDir stream
+    val dated = List.mapPartial (fn path => SOME (OS.FileSys.modTime path, path) handle OS.SysErr _ => NONE) paths
+  in
+    map #2 (HolbuildBuildPlan.sort_pairs (fn ((a, _), (b, _)) => Time.compare(b, a)) dated)
+  end
+  handle OS.SysErr _ => []
+
 fun prune_records dir =
   let
-    fun records () =
-      let val stream = OS.FileSys.openDir dir
-          fun loop acc =
-            case OS.FileSys.readDir stream of
-                NONE => acc
-              | SOME name =>
-                  if String.isSuffix ".tmp" name orelse String.isPrefix "." name then loop acc
-                  else loop (OS.Path.concat(dir, name) :: acc)
-      in loop [] before OS.FileSys.closeDir stream end
-    val dated = List.mapPartial (fn path => SOME (OS.FileSys.modTime path, path) handle OS.SysErr _ => NONE) (records ())
-    val newest_first = HolbuildBuildPlan.sort_pairs (fn ((a, _), (b, _)) => Time.compare(b, a)) dated
     fun drop (n, entries) = if n <= 0 then entries else case entries of [] => [] | _ :: rest => drop (n - 1, rest)
   in
-    List.app (fn (_, path) => OS.FileSys.remove path handle OS.SysErr _ => ()) (drop (kept_records, newest_first))
+    List.app (fn path => OS.FileSys.remove path handle OS.SysErr _ => ()) (drop (kept_records, records_newest_first dir))
   end
-  handle OS.SysErr _ => ()
 
 datatype write_outcome = Written | NotWritten of string
 
@@ -1037,21 +1042,11 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
    newest first. *)
 fun other_records dir fingerprint =
   let
-    val prefix = inputs_part fingerprint ^ "-"
-    val stream = OS.FileSys.openDir dir
-    fun loop acc =
-      case OS.FileSys.readDir stream of
-          NONE => acc
-        | SOME name =>
-            if String.isPrefix prefix name andalso name <> fingerprint andalso not (String.isSuffix ".tmp" name)
-            then loop (OS.Path.concat (dir, name) :: acc)
-            else loop acc
-    val paths = loop [] before OS.FileSys.closeDir stream
-    val dated = List.mapPartial (fn path => SOME (OS.FileSys.modTime path, path) handle OS.SysErr _ => NONE) paths
+    val prefix = OS.Path.concat (dir, inputs_part fingerprint ^ "-")
+    val exact = OS.Path.concat (dir, fingerprint)
   in
-    map #2 (BP.sort_pairs (fn ((a, _), (b, _)) => Time.compare(b, a)) dated)
+    List.filter (fn path => String.isPrefix prefix path andalso path <> exact) (records_newest_first dir)
   end
-  handle OS.SysErr _ => []
 
 (* The plan from the record of FINGERPRINT, or else, given TARGETS_OF, from
    the newest record of other targets whose plan holds these. *)
