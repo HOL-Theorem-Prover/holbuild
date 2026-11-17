@@ -7,13 +7,21 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../lib.sh
 source "$SCRIPT_DIR/../../lib.sh"
 
-# A failed-prefix resume applies the leaves the failed run constructed, so it
-# fails where a fresh run fails.  `REWRITE_RULE [Once th]` allocates its use
-# counter when it is constructed, so one closure applied to two goals rewrites
-# only the first; plain HOL fails on the second goal.  The body holds a `by`,
-# so it runs goal by goal and the failed prefix holds the first goal's steps.  A resume that
-# constructed the leaf again would give the second goal a fresh counter and
-# pass.
+# A failed-prefix resume must see each leaf as a fresh run would at the
+# restored point.  `REWRITE_RULE [Once th]` allocates its use counter when it
+# is constructed, so one closure applied twice rewrites only the first time.
+#
+# shared_once applies such a closure to two goals; plain HOL fails on the
+# second.  The body holds a `by`, so it runs goal by goal and the failed
+# prefix holds the first goal's steps.  A resume that constructed the leaf
+# again would give the second goal a fresh counter and pass.
+#
+# retried's leaf fails the first time it is applied and passes after.  A
+# resume that kept the leaf the failed step changed would pass.
+#
+# rewound applies the closure once, after the step an edit then changes, so
+# the resume rewinds past that application.  A resume that kept the spent
+# closure would fail where a fresh run of the edited proof passes.
 
 tmpdir=$(make_temp_dir)
 cleanup() { cleanup_temp_dir "$tmpdir"; }
@@ -75,3 +83,68 @@ require_file "$(find "$project/.holbuild/checkpoints" -name 'shared_once_failed_
 
 expect_failure "$tmpdir/resume.log"
 require_grep "from: failed-prefix checkpoint in shared_once" "$tmpdir/resume.log"
+
+cat > "$project/src/CScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "C";
+
+Theorem retried:
+  T
+Proof
+  ALL_TAC >>
+  (let val seen = ref false
+   in fn g => if !seen then ACCEPT_TAC TRUTH g else (seen := true; NO_TAC g) end)
+QED
+
+val _ = export_theory();
+SML
+
+for run in fresh resume; do
+  if (cd "$project" && "$HOLBUILD_BIN" build CTheory) >"$tmpdir/c-$run.log" 2>&1; then
+    cat "$tmpdir/c-$run.log" >&2
+    echo "expected retried to fail on the $run build" >&2
+    exit 1
+  fi
+  require_grep "fragment: let val seen" "$tmpdir/c-$run.log"
+done
+require_grep "from: failed-prefix checkpoint in retried" "$tmpdir/c-resume.log"
+
+write_b() {
+  cat > "$project/src/BScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "B";
+
+Definition duo_def:
+  duo a b <=> a /\ b
+End
+
+Theorem rewound:
+  duo a b ==> a /\ a
+Proof
+  strip_tac >> $1 >>
+  qpat_assum \`duo a b\` (mp_tac o CONJUNCT1 o REWRITE_RULE [Once duo_def]) >>
+  disch_then ACCEPT_TAC
+QED
+
+val _ = export_theory();
+SML
+}
+
+# ALL_TAC leaves the goal a /\ a, which the final step can't close; simp []
+# (the same length, so later leaves keep their keys) reduces it to a.
+write_b "ALL_TAC"
+if (cd "$project" && "$HOLBUILD_BIN" build BTheory) >"$tmpdir/b-fresh.log" 2>&1; then
+  cat "$tmpdir/b-fresh.log" >&2
+  echo "expected rewound to fail before the edit" >&2
+  exit 1
+fi
+require_grep "fragment: disch_then ACCEPT_TAC" "$tmpdir/b-fresh.log"
+require_file "$(find "$project/.holbuild/checkpoints" -name 'rewound_failed_prefix.save' -print -quit)"
+
+write_b "simp []"
+if ! (cd "$project" && "$HOLBUILD_BIN" build BTheory) >"$tmpdir/b-resume.log" 2>&1; then
+  cat "$tmpdir/b-resume.log" >&2
+  echo "expected the edited proof to pass on resume, as it does fresh" >&2
+  exit 1
+fi
+require_grep "from: failed-prefix checkpoint in rewound" "$tmpdir/b-resume.log"
