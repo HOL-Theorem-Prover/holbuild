@@ -151,3 +151,6 @@ run_variant "$tmpdir/plain/project"
 run_variant "$tmpdir/_build/project"
 run_variant "$tmpdir/mixed/project" mixed
 run_variant "$tmpdir/_build/mixed/project" mixed
+# A newline in a watched path doesn't split it in the list of paths.
+run_variant "$tmpdir/new
+line/project"
