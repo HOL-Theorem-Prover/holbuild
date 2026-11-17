@@ -46,7 +46,6 @@ val clear_to_eol = "\027[0K"
 fun set_json_mode enabled = json_mode_ref := enabled
 fun json_mode () = !json_mode_ref
 fun set_verbosity verbosity = verbosity_ref := verbosity
-fun set_verbose_mode enabled = set_verbosity (if enabled then Verbose else Normal)
 fun verbosity () = !verbosity_ref
 fun verbose_mode () = verbosity () = Verbose
 fun quiet_mode () = verbosity () = Quiet

@@ -537,8 +537,6 @@ fun summarize_goal_state_with_log_reference log_available path =
   Option.map (goal_state_summary log_available) (read_goal_state path)
   handle _ => NONE
 
-fun summarize_goal_state path = summarize_goal_state_with_log_reference true path
-
 fun plan_position_summary path =
   Option.map (fn position => "plan position: " ^ position ^ "\n")
              (plan_position_from_text (read_prefix path 65536))

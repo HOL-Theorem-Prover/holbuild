@@ -8,7 +8,6 @@ exception Error of string
 
 val format_version = "holbuild-hol-toolchain-v2"
 val theory_toolchain_format = "holbuild-theory-toolchain-v1"
-val standard_kernel = HolbuildHolToolchainConfig.StandardKernel
 
 fun toolchain_config kernel_variant = HolbuildHolToolchainConfig.config kernel_variant
 val analyser_format_version = "holbuild-hol-analyser-v2"
@@ -152,7 +151,6 @@ fun key_material {git = _, rev, kernel_variant} =
      HolbuildHolToolchainConfig.key_material_fields (toolchain_config kernel_variant))
 
 fun key req = HolbuildHash.string_sha256 (key_material req)
-fun standard_request {git, rev} = {git = git, rev = rev, kernel_variant = standard_kernel}
 fun lexical_absolute path =
   Path.mkCanonical
     (if Path.isAbsolute path then path
@@ -212,7 +210,6 @@ fun lock_owner_path lock = lock ^ ".owner"
 datatype toolchain_lock = ToolchainLock of HolbuildFileLock.t
 
 fun holdir_for_with_kernel req = holdir_for_key (key req)
-fun holdir_for req = holdir_for_with_kernel (standard_request req)
 fun hol_source_manifest_for_holdir holdir = Path.concat(Path.dir holdir, "hol-source.manifest.toml")
 fun theory_toolchain_for_holdir holdir = Path.concat(Path.dir holdir, "theory-toolchain")
 
@@ -916,8 +913,6 @@ fun ensure_built_with_kernel jobs req =
     touch_last_used k;
     holdir
   end
-
-fun ensure_built jobs req = ensure_built_with_kernel jobs (standard_request req)
 
 (* Toolchain GC: installed toolchains are rebuildable cache entries, removed
    when unused for the retention period. An entry being built, restored or

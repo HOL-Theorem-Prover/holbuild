@@ -247,7 +247,6 @@ fun abs_under root "." = root
   | abs_under root path =
       if Path.isAbsolute path then path else Path.concat(root, path)
 
-fun abs_member ({root, ...} : t) member = abs_under root member
 fun abs_run_heap ({root, run_heap, ...} : t) = Option.map (abs_under root) run_heap
 
 fun override_path overrides name =
@@ -291,8 +290,6 @@ fun package_identity package =
        metadata_id = HolbuildPackageDefinition.metadata_id definition,
        content_id = package_content_identity package}
   end
-fun package_source_root package =
-  HolbuildPackageProvenance.source_root (package_provenance package)
 fun package_members (Package {members, ...}) = members
 fun package_excludes (Package {excludes, ...}) = excludes
 fun package_exclude_globs (Package {exclude_globs, ...}) = exclude_globs
@@ -330,16 +327,6 @@ fun hol_holdir ({kernel_variant} : resolution) {git, rev} =
   HolbuildHolSharedCache.holdir_for_with_kernel
     {git = git, rev = rev, kernel_variant = kernel_variant}
 
-fun project_hol_dir_with resolution project =
-  case hol_dependency project of
-      SOME (Dependency {source = GitSource request, ...}) =>
-        SOME (hol_holdir resolution request)
-    | _ => NONE
-
-fun project_hol_dir project = project_hol_dir_with standard_resolution project
-fun build_roots ({roots, ...} : t) = roots
-fun build_root_groups ({root_groups, ...} : t) = root_groups
-fun build_groups ({groups, ...} : t) = groups
 fun checkpoint_limit_gb ({checkpoint_limit_gb, ...} : t) = checkpoint_limit_gb
 fun remote_cache_url ({remote_cache_url, ...} : t) = remote_cache_url
 fun remote_cache_curl_config ({remote_cache_curl_config, ...} : t) = remote_cache_curl_config
@@ -377,9 +364,6 @@ fun action_policy_for policies logical =
   case List.find (fn policy => action_policy_logical policy = logical) policies of
       SOME policy => policy
     | NONE => default_action_policy logical
-
-fun dependency_path_context name = "dependencies." ^ name ^ ".path"
-fun dependency_manifest_context name = "dependencies." ^ name ^ ".manifest"
 
 fun dependency_local_path_with resolution (project as {graph_artifact_root, ...} : t) (Dependency {name, source, role}) =
   case override_path (#overrides project) name of

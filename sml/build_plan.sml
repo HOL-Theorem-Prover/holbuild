@@ -1072,9 +1072,6 @@ fun restore {holdir, sources, roots, selected, analysis, edges,
               resolved_plan_id = resolved_plan_id, holdir = holdir}
   end
 
-fun plan_all components holdir sources =
-  plan_selection components holdir sources AllTargets
-
 fun plan_targets components holdir sources targets =
   plan_selection components holdir sources (SelectedTargets targets)
 

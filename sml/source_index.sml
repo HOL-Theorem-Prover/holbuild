@@ -732,20 +732,6 @@ fun describe_source ({package, kind, logical_name, relative_path,
 
 fun describe sources = List.app describe_source sources
 
-fun select_targets sources targets =
-  case targets of
-      [] => sources
-    | _ =>
-      let
-        fun source_named target (source : source) = #logical_name source = target
-        fun find target =
-          case List.filter (source_named target) sources of
-              [] => raise Error ("unknown build target: " ^ target)
-            | matches => matches
-      in
-        List.concat (map find targets)
-      end
-
 fun root_candidate_paths source_root root =
   let
     val exact = HolbuildProject.abs_under source_root root
@@ -885,9 +871,6 @@ fun default_targets_with resolution sources project =
               (HolbuildProjectGraph.packages
                 (HolbuildProjectGraph.resolve
                   {project = project, resolution = resolution})))))
-
-fun default_targets sources project =
-  default_targets_with HolbuildProject.standard_resolution sources project
 
 fun root_package_targets sources project =
   let val root_name = HolbuildProject.root_package_name project

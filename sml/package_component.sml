@@ -116,7 +116,6 @@ fun make {package, inventory, requires_live_preparation} =
   end
 
 fun id ({id, ...} : t) = id
-fun inventory_id_of ({inventory_id, ...} : t) = inventory_id
 fun inventory ({inventory, ...} : t) = inventory
 fun symbolic_facts ({symbolic_facts, ...} : t) = symbolic_facts
 fun validation ({validation, ...} : t) = validation

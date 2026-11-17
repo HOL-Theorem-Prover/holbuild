@@ -520,10 +520,6 @@ fun curl_put_urls headers {urls, src} =
   handle e as Unavailable _ => raise e
        | e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
 
-fun curl_put_with_headers headers {url, src} = curl_put_urls headers {urls = [url], src = src}
-
-fun curl_put request = curl_put_with_headers [] request
-
 fun curl_put_zstd {urls, src, size} =
   let
     val compressed = temp_path "zstd-put"
