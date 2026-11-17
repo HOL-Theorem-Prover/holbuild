@@ -3132,6 +3132,21 @@ async def test_run_claims_go_past_the_floor_to_the_cap_and_take_a_freed_slot(
     await claim_named(http, "run-d")
 
 
+async def test_run_claims_take_the_slot_an_expired_run_lease_freed(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_floor = 1
+    coordinator.settings.run_slots = 1
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["run-a", "run-b"], **{"class": "run"})
+    await claim_named(http, "run-a")
+    assert await claim(http) is None
+    async with coordinator.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
+    await coordinator.expire_leases()
+    assert await claim(http) is not None
+
+
 @pytest.mark.parametrize("floor", [0, 4])
 async def test_run_admission_waiters_leave_connections_for_heartbeats_and_completions(
     http: httpx.AsyncClient, coordinator: Coordinator, floor: int
