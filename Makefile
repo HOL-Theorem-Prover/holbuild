@@ -60,6 +60,8 @@ endif
 	install -m 755 bin/holbuild "$(DESTDIR)$(BINDIR)/holbuild"
 	install -m 644 man/holbuild.1 "$(DESTDIR)$(MANDIR)/holbuild.1"
 	install -m 644 vendor/hol/copyrights/smlnj.txt "$(DESTDIR)$(DATADIR)/copyrights/smlnj.txt"
+	install -m 644 vendor/hol/copyrights/sml-toml "$(DESTDIR)$(DATADIR)/copyrights/sml-toml"
+	install -m 644 vendor/hol/COPYRIGHT "$(DESTDIR)$(DATADIR)/copyrights/hol4.txt"
 	install -m 644 LICENSE "$(DESTDIR)$(DATADIR)/LICENSE"
 	@for file in $(RUNTIME_SOURCES); do \
 		install -d "$(DESTDIR)$(DATADIR)/$$(dirname "$$file")"; \
@@ -71,7 +73,8 @@ endif
 	install -m 644 completions/holbuild.fish "$(DESTDIR)$(FISHCOMPDIR)/holbuild.fish"
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/holbuild" "$(DESTDIR)$(MANDIR)/holbuild.1" "$(DESTDIR)$(DATADIR)/copyrights/smlnj.txt" "$(DESTDIR)$(DATADIR)/LICENSE"
+	rm -f "$(DESTDIR)$(BINDIR)/holbuild" "$(DESTDIR)$(MANDIR)/holbuild.1" "$(DESTDIR)$(DATADIR)/copyrights/smlnj.txt" \
+		"$(DESTDIR)$(DATADIR)/copyrights/sml-toml" "$(DESTDIR)$(DATADIR)/copyrights/hol4.txt" "$(DESTDIR)$(DATADIR)/LICENSE"
 	@for file in $(RUNTIME_SOURCES); do rm -f "$(DESTDIR)$(DATADIR)/$$file"; done
 	rm -f "$(DESTDIR)$(BASHCOMPDIR)/holbuild" "$(DESTDIR)$(ZSHCOMPDIR)/_holbuild" "$(DESTDIR)$(FISHCOMPDIR)/holbuild.fish"
 

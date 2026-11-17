@@ -247,23 +247,25 @@ def test_worker_spec_read_asks_every_node_before_a_miss_and_its_preferred_node_f
         asked.append(url)
         status = 404 if other_status[0] == 503 and url == ranked[2] else other_status[0]
         return subprocess.CompletedProcess(command, 0 if url == former else 22,
-                                           stdout='holbuild-version=1.2.3\n200' if url == former else f'\n{status}', stderr='')
+                                           stdout=b'holbuild-version=1.2.3\n200' if url == former else f'\n{status}'.encode(),
+                                           stderr=b'')
 
     monkeypatch.setattr(subprocess, 'run', curl)
     releases = Releases('unused', 'unused', ','.join(nodes), None)
-    assert releases.spec_version(key) == '1.2.3'
+    assert releases.read_spec(key).version == '1.2.3'
     assert len(asked) == 6
     asked.clear()
+    # A spec found nowhere under /cas/ is looked for compressed under /ac/, where 0.15.0 and later write it.
     with pytest.raises(RuntimeError):
-        releases.spec_version('missing-spec')
-    assert len(asked) == 6
+        releases.read_spec('missing-spec')
+    assert len(asked) == 12
     other_status[0] = 503
     asked.clear()
-    assert releases.spec_version(key) == '1.2.3'
+    assert releases.read_spec(key).version == '1.2.3'
     assert len(asked) == 6
     asked.clear()
     monkeypatch.setenv('HOLBUILD_REMOTE_CACHE_PREFERRED_URLS', former)
-    assert releases.spec_version(key) == '1.2.3'
+    assert releases.read_spec(key).version == '1.2.3'
     assert asked == [former]
 
 

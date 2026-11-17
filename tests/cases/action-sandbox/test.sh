@@ -25,7 +25,8 @@ val _ = if contains home orelse contains (home ^ "/bin") then
 val _ = if contains (home ^ "/bin/poly") andalso contains (home ^ "/lib") then ()
         else raise Fail "Poly executable or shared library was not granted";
 (* The host's theory-module store: every child reads it, none writes it;
-   the worker's module writer writes only its own output directory. *)
+   the worker's module writer writes only its own output directory and,
+   running once the action's checkpoints are removed, reads none. *)
 fun writes ("--write" :: path :: rest) = path :: writes rest
   | writes (_ :: rest) = writes rest
   | writes [] = [];
@@ -34,7 +35,9 @@ fun launched () =
   HolbuildActionSandbox.grant_options
     (HolbuildActionSandbox.action_grants (root ^ "/action", root ^ "/checkpoints"));
 val action = launched ();
+val _ = OS.FileSys.rmDir (root ^ "/checkpoints");
 val writer = HolbuildActionSandbox.with_output_dirs [root ^ "/out"] launched;
+val _ = OS.FileSys.mkDir (root ^ "/checkpoints");
 fun has path paths = List.exists (fn p => p = path) paths;
 val _ = if writes action = [root ^ "/action", root ^ "/checkpoints"] then ()
         else raise Fail "an action writes more than its roots";
@@ -42,9 +45,10 @@ val _ = if has (root ^ "/store") (reads action) then ()
         else raise Fail "an action cannot read the module store";
 val _ = if writes writer = [root ^ "/out"] then ()
         else raise Fail "the module writer writes more than its output directory";
-val _ = if List.all (fn p => has p (reads writer))
-             [root ^ "/action", root ^ "/checkpoints", root ^ "/store"] then ()
+val _ = if List.all (fn p => has p (reads writer)) [root ^ "/action", root ^ "/store"] then ()
         else raise Fail "the module writer cannot read the action root or the store";
+val _ = if has (root ^ "/checkpoints") (reads writer) then
+          raise Fail "the module writer reads the action's checkpoints" else ();
 val _ = if writes (launched ()) = writes action then ()
         else raise Fail "the writer's grants outlived it";
 SML

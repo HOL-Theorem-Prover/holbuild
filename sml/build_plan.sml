@@ -774,6 +774,14 @@ fun build_resolved_dependency_graph components analysis lookup selected =
               | ExtractedLoad =>
                   if theory_name name orelse external_load_available node name then []
                   else [{from_node = from_node, name = name, reason = reason}]
+              (* Naming a theory nothing provides can only fail to compile.
+                 A script's own theory has no candidate, as candidates skip
+                 the node itself. *)
+              | ExtractedHoldepMention =>
+                  if theory_name name andalso name <> logical_name node andalso
+                     not (external_load_available node name)
+                  then [{from_node = from_node, name = name, reason = reason}]
+                  else []
               | _ => []
       in List.concat (map one (symbolic_for node)) end
     val symbolic = dependency_pairs selected symbolic_for
@@ -871,6 +879,10 @@ fun reject_graph_unresolved (graph : resolved_dependency_graph) selected =
         | {name, reason = DeclaredActionDependency, ...} :: _ =>
             raise Error ("unresolved action dependency " ^ name ^ " in " ^
                          package node ^ ":" ^ relative_path node)
+        | {name, reason = ExtractedHoldepMention, ...} :: _ =>
+            raise Error ("unknown theory " ^ name ^ " in " ^
+                         package node ^ ":" ^ relative_path node ^
+                         ": no source in the project, its packages or HOL provides it")
         | {name, ...} :: _ =>
             raise Error ("unresolved load " ^ name ^ " in " ^
                          package node ^ ":" ^ relative_path node)

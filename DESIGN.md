@@ -172,10 +172,15 @@ theory artifacts, action keys and the remote cache; cache GC and
 remote-worker byte limits account for them separately.
 
 On a remote worker an action only reads the store, so that no action can
-plant a module another one loads. Before an action runs, the worker has a
-sandboxed child that runs no project code write the missing modules of the
-theories the action loads, from their restored `.dat` files alone, and moves
-into the store only the files named for those theories' `.dat` files.
+plant a module another one loads. After a theory action's result, built
+or failed, the worker has a sandboxed child that runs no project code write
+the missing modules of the theories the action loads, from their restored
+`.dat` files alone, and moves into the store only the files named for those
+theories' `.dat` files. The action itself loads what the store lacks from
+`.dat` files, so it never waits for the writer. The writer goes last after
+the result, once the action's directory is emptied, and stops 100 s after
+the result, before the worker's kill at 120 s; HOL writes each module whole,
+so the modules a stopped writer finished are stored.
 Each HOL toolchain has its own directory in the store, named by its HOL
 directory (on a worker, by the toolchain's repository, commit and kernel).
 A worker may trust any HOL repository and the writer runs the toolchain's

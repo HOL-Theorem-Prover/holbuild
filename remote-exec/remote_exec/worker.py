@@ -37,8 +37,8 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from remote_exec.auth import cache_discovery_token
-from remote_exec.cache import cache_nodes, preferred_identities, ranked_nodes
-from remote_exec.formats import sanitize_detail
+from remote_exec.cache import blob_key, cache_nodes, preferred_identities, ranked_nodes
+from remote_exec.formats import SHA256, sanitize_detail
 from remote_exec.membership import REFRESH_SECONDS, Membership, check_plain_http
 
 DEFAULT_SOURCE_URL = "https://github.com/HOL-Theorem-Prover/holbuild/archive/refs/tags/v{version}.tar.gz"
@@ -355,6 +355,15 @@ class Protection:
 
 
 @dataclass(frozen=True)
+class SpecHead:
+    """What the worker reads of an action spec: the holbuild release that runs it, and its dependency context's key,
+    which the worker reports with the result for the coordinator's placement (Coordinator._learn_locality)."""
+
+    version: str
+    deps_key: str | None
+
+
+@dataclass(frozen=True)
 class Releases:
     """Preinstalled releases from ``baked_root``, falling back to builds in ``<root>/v<version>`` from
     ``source_url`` with ``{version}`` filled in. Workers sharing ``root`` wait for one build per release."""
@@ -367,8 +376,33 @@ class Releases:
     discovery_config: str | None = field(default=None, kw_only=True)
     drain: Drain = field(default_factory=Drain, kw_only=True, compare=False)
 
-    def spec_version(self, spec_sha256: str) -> str:
-        """The ``holbuild-version`` of the action spec stored in the remote cache's ``/cas/``."""
+    def read_spec(self, spec_sha256: str) -> SpecHead:
+        """The ``holbuild-version`` and ``deps-key`` of the action spec stored in the remote cache: under ``/cas/``,
+        or as releases from 0.15.0 write it, zstd-compressed under ``/ac/``."""
+        # Until clients move to 0.15.0, nearly every spec is under /cas/: asking /ac/ first would cost a miss on
+        # every node.
+        spec = self._fetch_spec(spec_sha256, f"cas/{spec_sha256}", spec_sha256)
+        if spec is None:
+            compressed = self._fetch_spec(spec_sha256, f"ac/{blob_key(spec_sha256)}", blob_key(spec_sha256))
+            if compressed is None:
+                raise RuntimeError(f"spec {spec_sha256} is missing from the remote cache: HTTP 404")
+            # zstd checks the frame's checksum; exec-action checks the spec's digest when it fetches it.
+            decoded = subprocess.run(["zstd", "-dcq"], input=compressed, check=False, capture_output=True)
+            if decoded.returncode != 0:
+                raise RuntimeError(f"spec {spec_sha256} in the remote cache is corrupt: {decoded.stderr.decode().strip()}")
+            spec = decoded.stdout
+        lines = spec.decode(errors="replace").splitlines()
+        versions = [line.removeprefix("holbuild-version=") for line in lines if line.startswith("holbuild-version=")]
+        if len(versions) != 1:
+            raise RuntimeError(f"spec {spec_sha256} has {len(versions)} holbuild-version lines, expected 1")
+        # exec-action checks the spec itself; a deps-key that isn't one line of a SHA-256 is only left unreported.
+        deps_keys = [line.removeprefix("deps-key=") for line in lines if line.startswith("deps-key=")]
+        deps_key = deps_keys[0] if len(deps_keys) == 1 and SHA256.fullmatch(deps_keys[0]) else None
+        return SpecHead(versions[0], deps_key)
+
+    def _fetch_spec(self, spec_sha256: str, path: str, digest: str) -> bytes | None:
+        """The body at ``path`` on the first node ranked by ``digest`` that has it; None when every node answers
+        404."""
         # -g: no URL globbing, whose errors print the URL with any credentials in it.
         # The status follows the body on its own line: 000 when there was no answer.
         nodes = cache_nodes(self.remote_cache)
@@ -380,42 +414,32 @@ class Releases:
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
         unavailable: str | None = None
-        missing: str | None = None
-        failure = f"spec {spec_sha256} is missing from the remote cache"
         preferred = preferred_identities(os.environ.get("HOLBUILD_REMOTE_CACHE_PREFERRED_URLS"))
         # Every node is asked before a miss: until a node has written a new spec through to the shared store, only
         # that node holds it.  A spec the client sent must be there, so a node that failed leaves it unavailable even
         # when another answered 404.
-        for node in ranked_nodes(nodes, spec_sha256, preferred):
+        for node in ranked_nodes(nodes, digest, preferred):
             # Not check=True: its error would print credentials in the command line.
             try:
                 with self.drain.interruptible():
                     fetched = subprocess.run(
-                        [*command, f"{node}/cas/{spec_sha256}"], check=False, capture_output=True, text=True, timeout=120
+                        [*command, f"{node}/{path}"], check=False, capture_output=True, timeout=120
                     )
             except subprocess.TimeoutExpired:
                 unavailable = f"fetching spec {spec_sha256} from the remote cache timed out"
                 continue
-            spec, _, status = fetched.stdout.rpartition("\n")
+            body, _, status = fetched.stdout.rpartition(b"\n")
             if fetched.returncode == 0:
-                break
-            failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.strip()}"
-            if fetched.returncode == 22 and status.startswith("4") and status != "429":
-                if status == "404":
-                    missing = failure
+                return body
+            failure = f"fetching spec {spec_sha256} from the remote cache failed: {fetched.stderr.decode(errors='replace').strip()}"
+            if fetched.returncode == 22 and status.startswith(b"4") and status != b"429":
+                if status == b"404":
                     continue
                 raise RuntimeError(failure)
             unavailable = failure
-        else:
-            if unavailable is not None:
-                raise CacheUnavailable(unavailable)
-            raise RuntimeError(missing or failure)
-        versions = [
-            line.removeprefix("holbuild-version=") for line in spec.splitlines() if line.startswith("holbuild-version=")
-        ]
-        if len(versions) != 1:
-            raise RuntimeError(f"spec {spec_sha256} has {len(versions)} holbuild-version lines, expected 1")
-        return versions[0]
+        if unavailable is not None:
+            raise CacheUnavailable(unavailable)
+        return None
 
     def holbuild(self, version: str) -> str:
         """The holbuild executable of release ``version``, built first if this host doesn't have it yet.
@@ -894,6 +918,14 @@ def runs_hol(pid: int, cooperate_dir: str) -> bool:
 DRAINING = "the worker is draining"
 
 
+def with_deps_key(record: str, deps_key: str | None) -> str:
+    """``record`` with the spec's ``deps-key`` added, when the worker read one."""
+    if deps_key is None:
+        return record
+    separator = "" if record.endswith("\n") else "\n"
+    return f"{record}{separator}deps-key={deps_key}\n"
+
+
 def failed_record(spec_sha256: str, failure: str, detail: str | None = None) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
@@ -1100,7 +1132,7 @@ def run_one(
             lease.completing.set()
             try:
                 with phases.timed("complete"):
-                    coordinator.complete(token, record, claim["lease_s"])
+                    coordinator.complete(token, with_deps_key(record, claim.get("deps_key")), claim["lease_s"])
             finally:
                 lease.done.set()
 
@@ -1154,7 +1186,9 @@ def execute(
     ahead_parents = claim.get("ahead_parents", [])
     try:
         with phases.timed("release"):
-            version = releases.spec_version(spec)
+            head = releases.read_spec(spec)
+            version = head.version
+            claim["deps_key"] = head.deps_key
             if drain.stop.is_set():
                 return failed_record(spec, "unavailable", DRAINING)
             if ahead_parents and RELEASE.fullmatch(version) and tuple(map(int, version.split("."))) < MIN_AHEAD_RELEASE:

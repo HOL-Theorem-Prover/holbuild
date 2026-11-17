@@ -36,3 +36,8 @@ def ranked_nodes(nodes: list[str], digest: str, preferred: frozenset[str] = froz
                                                              .hexdigest(), 16), node_identity(url), url)
               for url in nodes]
     return [url for *_, url in sorted(scored)]
+
+
+def blob_key(sha256: str) -> str:
+    """The ``/ac/`` key holbuild stores a blob's zstd-compressed bytes under, as ``blob_key`` in SML."""
+    return hashlib.sha256(f"holbuild-zstd-blob-v1\n{sha256}\n".encode()).hexdigest()
