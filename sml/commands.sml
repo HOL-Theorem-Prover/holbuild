@@ -1356,7 +1356,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             | _ =>
               if after_owners then HolbuildPlanRecord.Fallback "theories that write SML sources ran"
               else timed_phase "plan.record" (fn () =>
-                     HolbuildPlanRecord.restore {dir = record_dir, graph = graph, tc = tc, fingerprint = fingerprint, start_ns = start_ns})
+                     HolbuildPlanRecord.restore
+                       {dir = record_dir, graph = graph, tc = tc, fingerprint = fingerprint, start_ns = start_ns,
+                        targets_of = if null targets then NONE
+                                     else SOME (fn index => default_build_targets resolution project index targets)})
         fun context {members, dirs, stamps, index, targets, toolchain_key} : HolbuildPlanRecord.context =
           {fingerprint = fingerprint, start_ns = start_ns,
            toolchain = {hol = HolbuildToolchain.hol tc, state = HolbuildToolchain.base_state tc, key = toolchain_key},
@@ -1394,7 +1397,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           in
             planned
           end
-        fun restored {index, targets, plan, toolchain_key, changed, reresolved, record, stamps, rehashed} =
+        fun restored {index, targets, plan, toolchain_key, changed, reresolved, sliced, record, stamps, rehashed} =
           let
             (* With every root that has its own tactic timeout selected, the
                plan holds each such root's closure, which is all the entry
@@ -1423,15 +1426,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             val changed_keys = HolbuildPlanRecord.changed_keys record index plan keys
             val _ = say ("from record (" ^ Int.toString rehashed ^ " files rehashed, " ^
                          Int.toString changed_keys ^ " keys changed" ^
-                         (if reresolved then ", dependencies re-resolved)" else ")"))
+                         (if reresolved then ", dependencies re-resolved" else "") ^
+                         (if sliced then ", sliced from other targets' plan)" else ")"))
             val _ =
-              if changed orelse changed_keys > 0 then
+              if changed orelse changed_keys > 0 orelse sliced then
                 write (context {members = #members record,
                                 dirs = map (fn {path, entries, ...} =>
                                               (path, Binarymap.peek(stamps, path), entries)) (#dirs record),
                                 stamps = stamps, index = index, targets = targets,
                                 toolchain_key = toolchain_key})
-                  (if reresolved then NONE else SOME record) plan keys
+                  (if reresolved orelse sliced then NONE else SOME record) plan keys
               else ()
           in
             (* Check mode builds from the record too, once full planning agrees. *)

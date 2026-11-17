@@ -333,18 +333,38 @@ holbuild_env_var() {
 targets_on_argv() {
   local p=$tmpdir/targets
   recorded_project "$p"
-  expect_plan "full (no plan record for these inputs)" "$p" BTheory
+  # The record of every theory holds B's plan.
+  expect_plan "from record (0 files rehashed, 0 keys changed, sliced from other targets' plan)" "$p" BTheory
   expect_plan "from record (0 files rehashed, 0 keys changed)" "$p" BTheory
   expect_plan "from record (0 files rehashed, 0 keys changed)" "$p"
   # A path target names the file its links lead to: once the link leads
   # elsewhere, full planning decides (here, that it names no source).
   mkdir "$p/aliases"
   ln -s ../src/AScript.sml "$p/aliases/AScript.sml"
-  expect_plan "full (no plan record for these inputs)" "$p" aliases/AScript.sml
+  expect_plan "from record (0 files rehashed, 0 keys changed, sliced from other targets' plan)" "$p" aliases/AScript.sml
   expect_plan "from record (0 files rehashed, 0 keys changed)" "$p" aliases/AScript.sml
   ln -sfn ../src/BScript.sml "$p/aliases/AScript.sml"
   (cd "$p" && "$HOLBUILD_BIN" --verbose build --dry-run aliases/AScript.sml) > "$tmpdir/retarget.log" 2>&1 || true
   require_grep "holbuild: plan: full (no plan record for these inputs)" "$tmpdir/retarget.log"
+}
+
+# A build of other targets takes its plan from a record whose plan holds
+# them, and records it; a target outside every record plans in full.
+target_switch() {
+  local p=$tmpdir/switch
+  make_project "$p"
+  expect_plan "full (no plan record for these inputs)" "$p" BTheory
+  expect_plan "full (no plan record for these inputs)" "$p" DTheory
+  expect_plan "from record (0 files rehashed, 0 keys changed, sliced from other targets' plan)" "$p" CTheory
+  expect_plan "from record (0 files rehashed, 0 keys changed)" "$p" CTheory
+  # The other options must match.
+  expect_plan "full (no plan record for these inputs)" "$p" --skip-proof-steps ATheory
+  # The record's files are checked as for its own targets.
+  printf '\n(* comment *)\n' >> "$p/src/AScript.sml"
+  expect_plan "from record (1 files rehashed, 1 keys changed, sliced from other targets' plan)" "$p" ATheory
+  # A new theory is in no record's plan.
+  theory "$p/src/EScript.sml" E D
+  expect_plan "full (no plan record for these inputs)" "$p" ETheory
 }
 
 deep_downstream_edit() {
@@ -378,7 +398,7 @@ corrupt_records() {
   # A record that cannot be written leaves the build as it was.
   chmod 555 "$p/.holbuild/plan"
   if [[ ! -w "$p/.holbuild/plan" ]]; then
-    expect_plan "full (no plan record for these inputs)" "$p" CTheory
+    expect_plan "from record (0 files rehashed, 0 keys changed, sliced from other targets' plan)" "$p" CTheory
     require_grep "plan record not written: cannot write" "$tmpdir/plan.log"
   fi
   chmod 755 "$p/.holbuild/plan"
@@ -547,7 +567,10 @@ entry_kinds() {
   if [[ ! -r "$p/src/Hidden.sml" ]]; then
     chmod 644 "$p/src/Hidden.sml"
     expect_plan "full (an unreadable entry became readable in $p/src)" "$p"
-    expect_plan "full (no plan record for these inputs)" "$p" ATheory
+    # The mode change was recorded within a second: whether it is rehashed
+    # depends on the time.
+    expect_plan "from record (" "$p" ATheory
+    require_grep "sliced from other targets' plan" "$tmpdir/plan.log"
     chmod 000 "$p/src/DScript.sml"
     expect_plan "full (a source became unreadable in $p/src)" "$p" ATheory
     chmod 644 "$p/src/DScript.sml"
@@ -758,6 +781,7 @@ manifest_edit
 holconfig_edit
 holbuild_env_var
 targets_on_argv
+target_switch
 deep_downstream_edit
 corrupt_records
 record_off
