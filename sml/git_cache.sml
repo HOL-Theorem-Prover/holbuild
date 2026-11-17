@@ -375,14 +375,26 @@ fun materialize {name, git, rev, artifact_root, shared} =
     val locks = Path.concat(Path.concat(holbuild_dir, "locks"), "src")
     val lease = Path.concat(locks, name ^ ".lease")
     val tmp_prefix = ".tmp-" ^ name ^ "-"
-    val target =
-      if not shared then NONE
-      else SOME (shared_checkout name git rev)
-           handle Error msg => (warn_fallback msg; NONE)
-                | OS.SysErr (msg, _) => (warn_fallback msg; NONE)
+    (* The shared checkout is made and leased only once a link needs it, so a
+       private clone already at rev is used as it is, offline too. *)
+    val target_memo = ref NONE
+    fun target () =
+      case !target_memo of
+          SOME t => t
+        | NONE =>
+            let
+              val t =
+                if not shared then NONE
+                else SOME (shared_checkout name git rev)
+                     handle Error msg => (warn_fallback msg; NONE)
+                          | OS.SysErr (msg, _) => (warn_fallback msg; NONE)
+            in
+              target_memo := SOME t;
+              t
+            end
     fun pinned () =
       case link_target dest of
-          SOME link => SOME link = target
+          SOME link => SOME link = target ()
         | NONE => materialized_head dest = SOME rev
     fun publish make =
       let val tmp = Path.concat(src_root, tmp_prefix ^ HolbuildFileLock.current_pid_text ())
@@ -401,8 +413,11 @@ fun materialize {name, git, rev, artifact_root, shared} =
       end
     (* Runs under the checkout lock. *)
     fun checkout () =
-      case target of
-          SOME checkout => publish (fn tmp => Posix.FileSys.symlink {old = checkout, new = tmp})
+      case target () of
+          SOME checkout =>
+            publish (fn tmp =>
+                        Posix.FileSys.symlink {old = checkout, new = tmp}
+                        handle OS.SysErr (msg, _) => (warn_fallback msg; clone tmp))
         | NONE => publish clone
   in
     ensure_dir src_root;

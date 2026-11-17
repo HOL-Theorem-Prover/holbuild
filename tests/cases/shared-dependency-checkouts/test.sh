@@ -187,13 +187,18 @@ gc
 [[ ! -e $leftover ]] || fail "GC left checkout trash"
 
 # A private clone already at the pinned commit, as earlier versions made, is
-# used as it is until the pin changes.
+# used as it is until the pin changes, offline too, without making the shared
+# checkout.
 upgrade=$tmpdir/upgrade
 write_manifest "$upgrade" upgrade lib
 mkdir -p "$upgrade/.holbuild/src"
 git clone -q "$tmpdir/lib" "$upgrade/.holbuild/src/lib"
+rm -rf "$lib_checkout"
+(cd "$upgrade" && "$HOLBUILD_BIN" --offline context) > "$tmpdir/context.log" 2>&1 ||
+  { cat "$tmpdir/context.log" >&2; fail "offline context failed on a clone at the pin"; }
 context "$upgrade"
 [[ -d $upgrade/.holbuild/src/lib/.git && ! -L $upgrade/.holbuild/src/lib ]] || fail "existing clone at the pin was replaced"
+[[ ! -e $lib_checkout ]] || fail "made a shared checkout that a clone at the pin made unnecessary"
 echo two > "$tmpdir/lib/value.txt"
 git -C "$tmpdir/lib" add value.txt
 git -C "$tmpdir/lib" commit -q -m two
