@@ -3603,14 +3603,17 @@ async def test_priority_builds_rank_like_priority_zero_ones_past_the_cap(
 
 
 async def test_a_priority_build_ending_frees_its_cap_slot(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
-    coordinator.settings.priority_cap = 1
+    """Below the cap again, priority goes first though its batch runs more builds than the normal one."""
+    coordinator.settings.priority_cap = 2
     coordinator.settings.claim_ranking_seconds = 0
     await submit(http, ["n1", "n2"])
-    await submit(http, ["p1", "p2"], priority="1")
-    token = await claim_named(http, "p1")
-    await claim_named(http, "n1")
-    assert (await complete(http, token, result("p1", "built"))).status_code == 200
+    await submit(http, ["p1", "p2", "p3"], priority="1")
+    p1 = await claim_named(http, "p1")
     await claim_named(http, "p2")
+    n1 = await claim_named(http, "n1")
+    assert (await complete(http, n1, result("n1", "built"))).status_code == 200
+    assert (await complete(http, p1, result("p1", "built"))).status_code == 200
+    await claim_named(http, "p3")
     await claim_named(http, "n2")
 
 
