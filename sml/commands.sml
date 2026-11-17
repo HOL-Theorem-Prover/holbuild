@@ -1359,7 +1359,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                      HolbuildPlanRecord.restore
                        {dir = record_dir, graph = graph, tc = tc, fingerprint = fingerprint, start_ns = start_ns,
                         targets_of = if null targets then NONE
-                                     else SOME (fn index => default_build_targets resolution project index targets)})
+                                     else SOME (fn index =>
+                                                  let val expanded = default_build_targets resolution project index targets
+                                                  in reject_object_targets expanded; expanded end)})
         fun context {members, dirs, stamps, index, targets, toolchain_key} : HolbuildPlanRecord.context =
           {fingerprint = fingerprint, start_ns = start_ns,
            toolchain = {hol = HolbuildToolchain.hol tc, state = HolbuildToolchain.base_state tc, key = toolchain_key},
