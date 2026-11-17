@@ -10984,6 +10984,39 @@ fun shared_heap_claim_active owner now text =
            | NONE => false)
     | _ => false
 
+(* How long a restore waits for a heap another worker claimed and is
+   uploading. A 784 MB heap uploads in seconds; the cold load it saves takes
+   tens of seconds to minutes; the worker kills an upload two minutes after
+   its action's result. *)
+val shared_heap_wait = Time.fromSeconds 60
+val shared_heap_poll = Time.fromMilliseconds 500
+
+(* The heap under HEAP_KEY once the worker whose claim holds it has
+   published it, polled until DEADLINE; NONE if no claim holds it, it is
+   released without the heap, or the deadline passes. The worker that built
+   the heap reports its result before uploading it, so the next action on
+   the same ancestors would otherwise load them all itself. *)
+fun await_shared_heap remote heap_key deadline =
+  let
+    val claim_key = shared_heap_claim_key heap_key
+    fun heap () = HolbuildRemoteCache.get_action remote heap_key
+    (* A restore holds no claim, so any claim is another worker's. *)
+    fun claimed () =
+      case HolbuildRemoteCache.fetch_action remote claim_key of
+          SOME {manifest, ...} => shared_heap_claim_active "" (Time.toSeconds (Time.now ())) manifest
+        | NONE => false
+    (* The claimant publishes the heap before releasing its claim. *)
+    fun wait () =
+      if not (claimed ()) then heap ()
+      else if Time.>= (Time.now (), deadline) then NONE
+      else (OS.Process.sleep shared_heap_poll;
+            case heap () of
+                NONE => wait ()
+              | found => found)
+  in
+    wait ()
+  end
+
 (* A checkpoint a build can resume from, under its key in the shared cache. *)
 type shared_candidate =
   {kind : string, key : string, boundary : int, path : string, sidecars : string list,
@@ -11269,7 +11302,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* No checkpoint is published without its heap, so without one there is
        nothing to look for. *)
     val {heap, files} =
-      case restore_step "rstprobe" (fn () => HolbuildRemoteCache.get_action remote heap_key) of
+      case (case restore_step "rstprobe" (fn () => HolbuildRemoteCache.get_action remote heap_key) of
+                NONE => restore_step "rstwait" (fn () =>
+                          await_shared_heap remote heap_key (Time.+ (Time.now (), shared_heap_wait)))
+              | found => found) of
           NONE => no_files
         | SOME text =>
             case (SOME (#1 (single "heap" (shared_manifest_entries text)))

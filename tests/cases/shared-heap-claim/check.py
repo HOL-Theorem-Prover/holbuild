@@ -12,7 +12,8 @@ directory = Path(os.environ["CLAIM_DIR"])
 control = directory / "control"
 remote = directory / "remote"
 requests = directory / "server/requests.log"
-script = Path(__file__).with_name("publish.sml")
+publish_script = Path(__file__).with_name("publish.sml")
+restore_script = Path(__file__).with_name("restore.sml")
 
 
 def action_key(key: str) -> str:
@@ -36,16 +37,21 @@ def heap_uploads() -> int:
     return sum(line.startswith("PUT /cas/") for line in requests.read_text().splitlines())
 
 
+def claim_gets(heap_key: str) -> int:
+    get = f"GET /ac/{claim_path(heap_key).name}"
+    return sum(line.startswith(get) for line in requests.read_text().splitlines())
+
+
 def action_writes() -> int:
     return sum(line.startswith("PUT /ac/") for line in requests.read_text().splitlines())
 
 
 class Publisher:
-    def __init__(self, name: str, heap_key: str) -> None:
+    def __init__(self, name: str, heap_key: str, script: Path = publish_script, **extra_env: str) -> None:
         self.dir = directory / name
         self.dir.mkdir()
         self.log = self.dir / "poly.log"
-        env = dict(os.environ, PUBLISH_DIR=str(self.dir), PUBLISHER=name, HEAP_KEY=heap_key)
+        env = dict(os.environ, PUBLISH_DIR=str(self.dir), PUBLISHER=name, HEAP_KEY=heap_key, **extra_env)
         with self.log.open("wb") as log:
             self.process = subprocess.Popen(
                 ["poly", "--gcthreads=1", "--error-exit", "--script", str(script)],
@@ -66,6 +72,10 @@ class Publisher:
 
     def heap(self) -> str:
         return (self.dir / "heap.sha").read_text()
+
+    def result(self) -> str:
+        self.finish()
+        return (self.dir / "result").read_text()
 
 
 def concurrent_publishers_upload_once() -> None:
@@ -125,11 +135,37 @@ def failed_upload_releases_claim() -> None:
     assert published_heap("two") == retry.heap(), "the released heap was not published at once"
 
 
+def restore_waits_for_claimed_upload() -> None:
+    """An action right after the one that built its heap waits for that
+    heap's upload instead of loading every ancestor itself."""
+    (control / "cas-put-enable").touch()
+    uploads = control / "cas-put-count"
+    uploader = Publisher("uploader", "four")
+    uploader.wait_until(lambda: uploads.exists() and uploads.read_text() == "1")
+    # Claimed and mid-upload: a restore waits no longer than its deadline.
+    bounded = Publisher("bounded", "four", restore_script, WAIT_SECONDS="1")
+    assert bounded.result() == "none", "the wait outlived an upload that never ends"
+    claim_reads = claim_gets("four")
+    waiting = Publisher("waiting", "four", restore_script, BASE_STATE=str(uploader.dir / "base.save"))
+    waiting.wait_until(lambda: claim_gets("four") >= claim_reads + 2)
+    (control / "cas-put-release").touch()
+    uploader.finish()
+    assert waiting.result() == f"{uploader.heap()} waited", "the restore missed the uploaded heap"
+    # Nothing claims an unbuilt heap: a restore goes on at once.
+    started = time.monotonic()
+    unclaimed = Publisher("unclaimed", "five", restore_script, WAIT_SECONDS="60")
+    assert unclaimed.result() == "none"
+    assert time.monotonic() - started < 30, "the restore waited for an unclaimed heap"
+    for name in ("cas-put-enable", "cas-put-release", "cas-put-count"):
+        (control / name).unlink()
+
+
 if __name__ == "__main__":
     try:
         concurrent_publishers_upload_once()
         late_claim_write_also_uploads()
         failed_upload_releases_claim()
+        restore_waits_for_claimed_upload()
     except BaseException:
         for log in sorted(directory.glob("*/poly.log")):
             print(f"== {log.parent.name}\n{log.read_text()}")
