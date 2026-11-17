@@ -1464,7 +1464,7 @@ Poly/ML objects, and restored toolchains execute cached binaries. Use an
 authenticated HTTPS endpoint with trusted writers. Content hashes detect
 corruption but do not authenticate the cache publisher.
 
-holbuild talks to the remote cache through libcurl (7.66 or later, with an
+holbuild talks to the remote cache through libcurl (7.68 or later, with an
 asynchronous DNS resolver), loaded at run time: `libcurl.so.4` on Linux, the
 system `/usr/lib/libcurl.4.dylib` on macOS. If it can't be loaded or lacks
 those, holbuild says why once and runs the `curl` command for each request
@@ -1472,8 +1472,8 @@ instead, as it did before it used libcurl. As with the curl command,
 `CURL_CA_BUNDLE`, `SSL_CERT_FILE` and `SSL_CERT_DIR` select the CA certificates
 that HTTPS connections trust. With libcurl 7.87 or later, holbuild drops
 libcurl's built-in default CA directory (not one `SSL_CERT_DIR` names), so that
-libcurl parses the CA bundle once per connection handle instead of on every
-new connection; if a server's certificate then fails to verify, holbuild goes
+libcurl parses the CA bundle once per process instead of on every new
+connection; if a server's certificate then fails to verify, holbuild goes
 back to libcurl's default for the rest of the run and retries the request.
 
 For private caches, put credentials in local/CI configuration, not in

@@ -4934,19 +4934,23 @@ fun fallback_theory_checkpoints (action : theory_action) msg =
          "; building without proof steps/checkpoints for this theory\n" ^ msg);
    [])
 
-fun theory_checkpoints_for_action policy checkpoint_root (action : theory_action) source_text boundaries errors =
+(* PLANS is the boundaries' proof-IR plans, if the analyser already gave them. *)
+fun theory_checkpoints_for_action policy checkpoint_root (action : theory_action) source_text boundaries errors plans =
   if not (proof_steps_enabled policy) andalso not (checkpoint_enabled policy) then []
   else
     let
       val proof_ir_plans =
         if null boundaries then []
         else if proof_ir_enabled policy then
-          detail_time_phase "build.exec.node.proof_ir_plan"
-            (fn () => analyser_proof_ir_plan_sml
-              (map (fn {name, tactic_start, tactic_end, tactic_text, ...} =>
-                       {name = name, tactic_start = tactic_start,
-                        tactic_end = tactic_end, tactic_text = tactic_text})
-                   boundaries))
+          case plans of
+              SOME plans => plans
+            | NONE =>
+                detail_time_phase "build.exec.node.proof_ir_plan"
+                  (fn () => analyser_proof_ir_plan_sml
+                    (map (fn {name, tactic_start, tactic_end, tactic_text, ...} =>
+                             {name = name, tactic_start = tactic_start,
+                              tactic_end = tactic_end, tactic_text = tactic_text})
+                         boundaries))
         else map (fn _ => NONE) boundaries
       val _ =
         case errors of
@@ -4965,16 +4969,21 @@ fun theory_checkpoints_for_action policy checkpoint_root (action : theory_action
        if proof_ir_enabled policy then raise Error msg
        else fallback_theory_checkpoints action msg)
 
-fun termination_proof_plans_for_action policy (action : theory_action) terminations =
+(* PLANS is the terminations' proof-IR plans, if the analyser already gave them. *)
+fun termination_proof_plans_for_action policy (action : theory_action) plans terminations =
   if null terminations orelse not (proof_ir_enabled policy) then terminations
   else
     let
-      val plans = detail_time_phase "build.exec.node.proof_ir_plan_terminations"
-        (fn () => analyser_proof_ir_plan_sml
-          (map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.termination) =>
-                   {name = name, tactic_start = tactic_start,
-                    tactic_end = tactic_end, tactic_text = tactic_text})
-               terminations))
+      val plans =
+        case plans of
+            SOME plans => plans
+          | NONE =>
+              detail_time_phase "build.exec.node.proof_ir_plan_terminations"
+                (fn () => analyser_proof_ir_plan_sml
+                  (map (fn ({name, tactic_start, tactic_end, tactic_text, ...} : HolbuildTheoryCheckpoints.termination) =>
+                           {name = name, tactic_start = tactic_start,
+                            tactic_end = tactic_end, tactic_text = tactic_text})
+                       terminations))
       fun attach (termination, plan) =
         let
           val {name, safe_name, definition_start, definition_stop, boundary,
@@ -5039,14 +5048,34 @@ fun declaration_checkpoints_for_action policy checkpoint_root (action : theory_a
 (* The theory's proof-step and checkpoint plan, from its script. *)
 fun action_checkpoints policy checkpoint_root (action : theory_action) source_text =
   let
-    val source_spans = source_spans_for_action policy action source_text
+    (* One analyser process finds the spans and plans their proofs, rather
+       than one for each.  If it fails, the separate requests below give
+       the diagnostics they always have. *)
+    val scanned =
+      if proof_steps_enabled policy andalso proof_ir_enabled policy then
+        SOME (detail_time_phase "build.exec.node.analyse_boundaries"
+                (fn () =>
+                    detail_time_phase "build.exec.node.analyse_terminations"
+                      (fn () =>
+                          detail_time_phase "build.exec.node.proof_ir_plan"
+                            (fn () => HolbuildTheorySpans.scan_with_proof_ir_plans (#source_file action) source_text))))
+        handle HolbuildTheoryCheckpoints.Error _ => NONE
+      else NONE
+    val source_spans =
+      case scanned of
+          SOME {boundaries, errors, terminations, ...} =>
+            {source_boundaries = SOME {boundaries = boundaries, errors = errors},
+             termination_diagnostics = terminations}
+        | NONE => source_spans_for_action policy action source_text
     val theorem_checkpoints =
       case #source_boundaries source_spans of
           NONE => []
         | SOME {boundaries, errors} =>
             theory_checkpoints_for_action policy checkpoint_root action source_text boundaries errors
+              (Option.map #boundary_plans scanned)
     val termination_diagnostics =
-      termination_proof_plans_for_action policy action (#termination_diagnostics source_spans)
+      termination_proof_plans_for_action policy action (Option.map #termination_plans scanned)
+        (#termination_diagnostics source_spans)
     val declaration_checkpoints =
       declaration_checkpoints_for_action policy checkpoint_root action source_text termination_diagnostics
   in
