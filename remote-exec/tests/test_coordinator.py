@@ -3661,8 +3661,11 @@ async def test_queue_reports_priority_subsets_without_double_counting(
     await submit(http, ["normal"])
     await submit(http, ["p1", "p2", "child"], [("child", "p1")], priority="1")
     await claim_named(http, "p1")
-    await submit(http, ["run"], **{"class": "run", "priority": "1"})  # counted in the tiers, not as a priority build
+    # Priority run actions count in the tiers, not as priority builds.
+    await submit(http, ["run1", "run2"], **{"class": "run", "priority": "1"})
+    coordinator.settings.run_floor = 1  # so the next claim takes a run ahead of the ready builds
+    await claim_named(http, "run1")
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
     assert (queue["ready_priority"], queue["running_priority"]) == (1, 1)
     assert queue["priority_cap"] == coordinator.settings.priority_cap
-    assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (3, 1, 1)
+    assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (3, 2, 1)
