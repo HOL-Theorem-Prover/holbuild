@@ -2178,7 +2178,10 @@ reattached stream that breaks again before any action changes state counts
 as unavailable too, since it only repeats what the build already knows. When the build stops following
 a batch that may still run (the stream was given up on, or the coordinator
 won't stream it), it cancels the batch before building locally; one
-interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too. With
+interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too,
+unless `HOLBUILD_KEEP_BATCH_ON_INTERRUPT=1` is set: then it leaves the batch
+running and prints how to reattach, so a caller that stops a build at a time
+limit finds what the workers finished in the remote cache next time. With
 `--remote-only` it cancels a batch the coordinator won't stream, or an
 interrupted build's, the same way but then fails instead of building locally,
 and it never builds HOL or a theory

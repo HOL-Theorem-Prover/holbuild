@@ -72,6 +72,10 @@ check_interrupt() {
   if [[ $cancel == yes ]]; then
     require_grep "^POST /v1/batches/$batch/cancel " "$state/requests.log"
     require_grep "^holbuild: cancelled remote batch $batch$" "$tmpdir/$name.log"
+  elif [[ $cancel == kept ]]; then
+    [[ $code -eq 1 ]] || { cat "$tmpdir/$name.log" >&2; exit 1; }
+    ! grep -q "^POST /v1/batches/$batch/cancel " "$state/requests.log" || exit 1
+    require_grep "^holbuild: left remote batch $batch running; reattach with --attach $batch$" "$tmpdir/$name.log"
   else
     ! grep -q "^POST /v1/batches/$batch/cancel " "$state/requests.log" || exit 1
   fi
@@ -86,4 +90,5 @@ failed=0
 (check_interrupt run yes run-action --remote-exec "$coordinator" \
   --script "$tmpdir/run.sml" --output result --outputs-dir "$tmpdir/out" hol:bool) || failed=1
 (check_interrupt detached no build --remote-exec "$coordinator" --detach ATheory) || failed=1
+(HOLBUILD_KEEP_BATCH_ON_INTERRUPT=1 check_interrupt kept kept build --remote-exec "$coordinator" --remote-only ATheory) || failed=1
 exit "$failed"
