@@ -305,7 +305,9 @@ run_check "${shared_selectors[0]}" 1 "${shared_selectors[@]:1}"
 grep -E '^(User[AB]|SharedBypass|Clean)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
 diff -u "$expected" "$log.reports"
 [[ $(grep -c '^consumer:src/SharedBypassScript.sml:2: kernel bypass: disk_thm$' "$log.reports") -eq 4 ]]
-[[ $(grep -c $'^phase\tname=dependency.toposort\t' "$timing") -eq "$single_plans" ]]
+# No more planning than one check: that check may have run the planner over
+# the record of the checks before it, which the batch's own record spares.
+[[ $(grep -c $'^phase\tname=dependency.toposort\t' "$timing") -le "$single_plans" ]]
 run_check --with-fingerprints 1 "${shared_selectors[@]}"
 grep -E '^(User[AB]|SharedBypass|Clean)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
 diff -u "$expected" "$log.reports"
