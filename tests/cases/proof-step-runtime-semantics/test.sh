@@ -174,6 +174,19 @@ Proof
   \\ FIRST [ACCEPT_TAC TRUTH, DISCH_TAC \\ FIRST_ASSUM ACCEPT_TAC]
 QED
 
+(* Plain THENL does nothing on no goals; cases must not demand a match. *)
+Theorem cases_on_no_goals:
+  T
+Proof
+  simp[] >| [ACCEPT_TAC TRUTH, ACCEPT_TAC TRUTH]
+QED
+
+Theorem repeat_on_no_goals:
+  T
+Proof
+  simp[] >> rpt strip_tac
+QED
+
 Theorem chained_then1_plain:
   T /\ T /\ T
 Proof
@@ -289,3 +302,108 @@ if (cd "$map_first_empty_project" && "$HOLBUILD_BIN" build --skip-checkpoints --
   exit 1
 fi
 require_grep 'MAP_FIRST' "$tmpdir/map_first_empty_then.out"
+
+# Plain HOL evaluates a proof's whole tactic expression before applying it,
+# so a broken leaf fails the proof even where it never runs on a goal: after
+# the goal closes, or inside TRY. Both modes must fail each of these.
+eager_project=$tmpdir/eager-evaluation
+make_project "$eager_project" eager-evaluation
+eager_theory() {
+  printf 'open HolKernel Parse boolLib bossLib;\nval _ = new_theory "%s";\n%s\nval _ = export_theory();\n' \
+    "$1" "$2" > "$eager_project/src/$1Script.sml"
+}
+eager_theory AfterClose 'Theorem after_close: T
+Proof
+  simp[] >> mp_tac (SPEC ``0:num`` TRUTH)
+QED'
+eager_theory InTry 'Theorem in_try: T
+Proof
+  TRY (mp_tac (SPEC ``0:num`` TRUTH)) >> simp[]
+QED'
+eager_theory InBranch 'Theorem in_branch: T /\ T
+Proof
+  CONJ_TAC >- (simp[] >> mp_tac (SPEC ``0:num`` TRUTH)) >> simp[]
+QED'
+eager_theory InTermination 'Definition count_down_def:
+  count_down (n:num) = if n = 0 then 0 else count_down (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[] >> mp_tac (SPEC ``0:num`` TRUTH)
+End'
+eager_theory HeadOfNone 'Theorem head_of_none: T
+Proof
+  simp[] >>> HEADGOAL (ACCEPT_TAC TRUTH)
+QED'
+eager_theory InSelector 'fun bad_pat () : term quotation = raise Fail "bad selector pattern";
+Theorem in_selector: T
+Proof
+  TRY (ALL_TAC >~ [bad_pat ()]) >> simp[]
+QED'
+eager_theory Control 'Theorem control: T /\ T
+Proof
+  CONJ_TAC >> simp[] >> mp_tac TRUTH
+QED'
+for mode in steps plain; do
+  flags=(--skip-checkpoints --tactic-timeout 60)
+  [[ $mode == plain ]] && flags=(--skip-checkpoints --skip-proof-steps)
+  rm -rf "$eager_project/.holbuild"
+  if (cd "$eager_project" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" build "${flags[@]}") > "$tmpdir/eager-$mode.out" 2>&1; then
+    echo "expected eager-evaluation build to fail with $mode" >&2
+    cat "$tmpdir/eager-$mode.out" >&2
+    exit 1
+  fi
+  require_grep '6 build failures:' "$tmpdir/eager-$mode.out"
+  require_grep 'Term.dest_comb' "$tmpdir/eager-$mode.out"
+  require_grep 'NTH_GOAL' "$tmpdir/eager-$mode.out"
+  require_grep 'bad selector pattern' "$tmpdir/eager-$mode.out"
+  if grep -q 'static error' "$tmpdir/eager-$mode.out"; then
+    echo "eager-evaluation theories must fail when run, not to compile" >&2
+    cat "$tmpdir/eager-$mode.out" >&2
+    exit 1
+  fi
+  require_file "$eager_project/.holbuild/obj/src/ControlTheory.dat"
+  for name in AfterClose InTry InBranch InTermination HeadOfNone InSelector; do
+    if [[ -e "$eager_project/.holbuild/obj/src/${name}Theory.dat" ]]; then
+      echo "$name built with $mode but must fail" >&2
+      exit 1
+    fi
+  done
+done
+
+# A failed-prefix resume replays only the plan, not the proof text, so it
+# compiles that text to evaluate it: an edit that adds a broken leaf after
+# the goal closes must still fail the resumed proof.
+resume_project=$tmpdir/eager-resume
+make_project "$resume_project" eager-resume
+cat > "$resume_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem resumed:
+  T /\ T
+Proof
+  CONJ_TAC
+  >- ACCEPT_TAC TRUTH
+  >- FAIL_TAC "seed failure"
+QED
+val _ = export_theory();
+SML
+if (cd "$resume_project" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" build --tactic-timeout 60) > "$tmpdir/eager-resume-seed.out" 2>&1; then
+  echo "expected the seed build to fail" >&2
+  exit 1
+fi
+require_grep 'seed failure' "$tmpdir/eager-resume-seed.out"
+python3 - "$resume_project/src/AScript.sml" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+text = path.read_text()
+old = 'FAIL_TAC "seed failure"'
+assert text.count(old) == 1
+path.write_text(text.replace(old, '(simp[] >> mp_tac (SPEC ``0:num`` TRUTH))'))
+PY
+if (cd "$resume_project" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" build --tactic-timeout 60) > "$tmpdir/eager-resume.out" 2>&1; then
+  echo "expected the resumed build to fail" >&2
+  cat "$tmpdir/eager-resume.out" >&2
+  exit 1
+fi
+require_grep 'from: failed-prefix checkpoint in resumed' "$tmpdir/eager-resume.out"
+require_grep 'not a comb' "$tmpdir/eager-resume.out"
