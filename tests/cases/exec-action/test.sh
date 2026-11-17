@@ -484,7 +484,7 @@ SML
   worker c "$(spec_for "$tmpdir/batch-f.txt" worker:FTheory)"
   expect c 1 "status=failed" "failure=proof"
   rm "$project/src/FScript.sml"
-  require_grep 'modules_installed=0/[1-9][0-9]* modules_fetched=[1-9]' "$tmpdir/c.log"
+  require_grep 'modules_installed=0/[1-9][0-9]* modules_probed=[1-9][0-9]* modules_fetched=[1-9]' "$tmpdir/c.log"
   # ... and its next child loads A and B from them.
   cat > "$project/src/GScript.sml" <<'SML'
 Theory G
