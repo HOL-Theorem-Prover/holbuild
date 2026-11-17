@@ -65,6 +65,9 @@ for proof in "  CONJ_TAC >> broadcast_tac >> simp[]"; do
     exit 1
   fi
   require_grep "holbuild tactic interrupted by Poly/ML (stack overflow or out of memory): broadcast_tac" "$tmpdir/build.log"
+  # Only kill stops a thread that swallows interrupts.
+  require_grep "HolbuildProofRuntime.interruptkill: thread killed" \
+    "$project/.holbuild/logs/current/tactic-interrupt-waiter/ATheory/build.log"
   if grep -q "timed out" "$tmpdir/build.log"; then
     echo "interrupted step was reported as a timeout: $proof" >&2
     cat "$tmpdir/build.log" >&2
