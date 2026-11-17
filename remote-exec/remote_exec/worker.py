@@ -19,6 +19,7 @@ import itertools
 import json
 import math
 import os
+import random
 import re
 import shlex
 import shutil
@@ -113,7 +114,9 @@ DISK_POLL_SECONDS = 10  # between two looks at the disk while waiting to claim
 
 # What a request to the coordinator raises when it or the network fails; ValueError covers a reply that isn't JSON.
 COORDINATOR_ERRORS = (OSError, RuntimeError, http.client.HTTPException, ValueError)
-# Wait before retrying a heartbeat that failed, while the lease still holds (at most a third of the lease).
+# Wait before retrying a heartbeat that failed, while the lease still holds; it doubles with each failure in a row, up
+# to the heartbeat interval, and each wait is jittered, so a fleet facing an overloaded coordinator doesn't add to its
+# load with retries in step.
 HEARTBEAT_RETRY_SECONDS = 5.0
 # Waits before each retry of a result report the coordinator couldn't take, as while it restarts; then 8 s apart.
 COMPLETE_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
@@ -1050,6 +1053,7 @@ class Lease:
 
     def _beat(self) -> None:
         wait = self.interval
+        retry = HEARTBEAT_RETRY_SECONDS
         while not self.check():
             left = self.expires - time.monotonic()
             if self.done.wait(wait if left <= 0 or self.completing.is_set() else min(wait, left)):
@@ -1060,8 +1064,9 @@ class Lease:
             try:
                 alive = self.coordinator.heartbeat(self.token)
             except COORDINATOR_ERRORS as error:
-                wait = min(HEARTBEAT_RETRY_SECONDS, self.interval)
-                print(f"heartbeat failed, retrying in {wait:g} s: {error}", file=sys.stderr)
+                wait = min(retry, self.interval) * random.uniform(0.5, 1.0)
+                retry *= 2
+                print(f"heartbeat failed, retrying in {wait:.1f} s: {error}", file=sys.stderr)
                 continue
             if not alive:
                 # A heartbeat that crossed the posted result finds its token spent: the lease ended as it should.
@@ -1074,6 +1079,7 @@ class Lease:
                     return
                 self.expires = sent + self.lease_s
             wait = self.interval
+            retry = HEARTBEAT_RETRY_SECONDS
             if not self.done.is_set() and not self.coordinator.drain.stop.is_set():
                 self.protection.set(enabled=True, timeout=5)
 

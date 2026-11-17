@@ -3,6 +3,7 @@ import contextlib
 import errno
 import fcntl
 import io
+import itertools
 import json
 import os
 import signal
@@ -1820,7 +1821,35 @@ def test_a_lease_that_cannot_be_renewed_is_lost_when_it_expires(monkeypatch: pyt
         lost_after = time.monotonic() - started
     assert lost and coordinator.drain.wake.is_set()
     assert 2.9 <= lost_after < 4, lost_after
-    assert len(coordinator.beats) >= 5  # retried every 0.2 s
+    assert len(coordinator.beats) >= 3  # retried before the lease ran out
+
+
+def test_failed_heartbeats_back_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each failure in a row doubles the wait before the next heartbeat, up to the heartbeat interval, so workers
+    facing an overloaded coordinator don't keep adding to its load; a renewal starts the waits over."""
+    monkeypatch.setattr(worker, "HEARTBEAT_RETRY_SECONDS", 0.2, raising=False)
+    monkeypatch.setattr(worker.random, "uniform", lambda low, high: high)
+    coordinator = FlakyCoordinator(errors=4)
+    # Renewed every 2 s.
+    with Lease(coordinator, "t1", 6, Protection(None, None)).held(Phases()) as lease:  # type: ignore[arg-type]
+        deadline = time.monotonic() + 10
+        while len(coordinator.beats) < 6 and time.monotonic() < deadline:
+            time.sleep(0.05)
+    gaps = [later - earlier for earlier, later in itertools.pairwise(coordinator.beats)]
+    assert not lease.lost.is_set()
+    assert [round(gap, 1) for gap in gaps[:4]] == [0.2, 0.4, 0.8, 1.6], gaps
+    assert 1.9 <= gaps[4] < 2.2, gaps  # renewed: the next heartbeat comes a full interval later
+
+
+def test_heartbeat_retries_are_jittered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "HEARTBEAT_RETRY_SECONDS", 0.4, raising=False)
+    monkeypatch.setattr(worker.random, "uniform", lambda low, high: low)
+    coordinator = FlakyCoordinator(errors=1)
+    with Lease(coordinator, "t1", 3, Protection(None, None)).held(Phases()):  # type: ignore[arg-type]
+        deadline = time.monotonic() + 5
+        while len(coordinator.beats) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+    assert round(coordinator.beats[1] - coordinator.beats[0], 1) == 0.2
 
 
 class StuckCoordinator:
