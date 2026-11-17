@@ -179,6 +179,45 @@ fun get_status {url, dst} =
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
     cli_status ["--compressed", "-o", dst] url
 
+(* Blob downloads take the body still zstd-encoded and decode it here on
+   several threads (HolbuildZstd), since libcurl decodes on the one thread
+   running its transfers.  Without libcurl or libzstd, or with a body
+   HolbuildZstd can't decode, the blob is fetched as get_status does.  Under
+   HOLBUILD_CACHE_TRACE, a line says which way each blob was decoded. *)
+val decode_threads = 4
+
+fun trace_decode url how =
+  HolbuildStatus.cache_trace ("remote cache decode " ^ redact_userinfo url ^ " " ^ how)
+
+fun get_status_parallel_decode {url, dst} =
+  if not (HolbuildRemoteCacheConfig.uses_libcurl () andalso HolbuildZstd.available ()) then
+    get_status {url = url, dst = dst}
+  else
+    let
+      val encoded = HolbuildTempPath.near dst ".zstd-get"
+      fun remove () = FS.remove encoded handle OS.SysErr _ => ()
+      val (result, encoding) =
+        HolbuildHttp.get_zstd {url = url, dst = encoded, timeout = stall_timeout_seconds}
+        handle e => (remove (); raise e)
+    in
+      case (result, encoding) of
+          (HolbuildHttp.Response 200, HolbuildHttp.Zstd) =>
+            ((HolbuildZstd.decode_file {src = encoded, dst = dst, threads = decode_threads};
+              remove ();
+              trace_decode url ("zstd threads=" ^ Int.toString decode_threads);
+              result)
+             handle HolbuildZstd.Error message =>
+                      (remove (); trace_decode url ("fallback: " ^ message);
+                       get_status {url = url, dst = dst})
+                  | e => (remove (); raise e))
+        | (HolbuildHttp.Response 200, HolbuildHttp.Identity) =>
+            (FS.rename {old = encoded, new = dst}; trace_decode url "identity"; result)
+        | (HolbuildHttp.Response 200, HolbuildHttp.OtherEncoding) =>
+            (remove (); trace_decode url "fallback: another encoding";
+             get_status {url = url, dst = dst})
+        | _ => (remove (); result)
+    end
+
 fun head_status url =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
     HolbuildHttp.head {url = url, timeout = stall_timeout_seconds}
@@ -490,8 +529,8 @@ fun send_urls_using usable method urls path request =
 
 fun send_urls method urls path request = send_urls_using (fn _ => true) method urls path request
 
-fun curl_get_urls_using usable {urls, dst} =
-  (case send_urls_using usable "GET" urls dst (fn url => get_status {url = url, dst = dst}) of
+fun curl_get_urls_by get usable {urls, dst} =
+  (case send_urls_using usable "GET" urls dst (fn url => get {url = url, dst = dst}) of
         NONE => HolbuildCacheBackend.Miss
       | SOME (url, HolbuildHttp.Failed message) =>
           HolbuildCacheBackend.Corrupt ("GET " ^ redact_userinfo url ^ " failed: " ^ message)
@@ -501,6 +540,8 @@ fun curl_get_urls_using usable {urls, dst} =
           HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ redact_userinfo url))
   handle e as Unavailable _ => raise e
        | e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
+
+fun curl_get_urls_using usable request = curl_get_urls_by get_status usable request
 
 fun curl_get_urls request = curl_get_urls_using (fn _ => true) request
 
@@ -815,7 +856,8 @@ fun fetch_blob cache {hash, dst} =
 (* Fetches a blob by its SHA-256 alone, without an action entry that lists
    it, as a remote worker fetches its spec and sources. *)
 fun fetch_unlisted_blob cache {hash, dst} =
-  (case curl_get_urls {urls = cas_urls cache hash, dst = dst} of
+  (case curl_get_urls_by get_status_parallel_decode (fn _ => true)
+                         {urls = cas_urls cache hash, dst = dst} of
        HolbuildCacheBackend.Hit =>
          if HolbuildHash.file_sha256 dst = hash then HolbuildCacheBackend.Hit
          else HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ hash)
