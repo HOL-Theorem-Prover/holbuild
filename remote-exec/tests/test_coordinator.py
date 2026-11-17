@@ -1803,6 +1803,22 @@ async def test_a_batch_left_running_with_nothing_unfinished_is_ended_by_the_swee
     assert (await batch(http, batch_id))["state"] == "done"
 
 
+async def test_a_batch_whose_last_build_committed_past_its_deadline_is_done_not_overdue(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    batch_id = await submit(http, ["a"])
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE actions SET state = 'done' WHERE batch_id = :id"), {"id": UUID(batch_id)})
+        await connection.execute(
+            sa.text("UPDATE batches SET created_at = now() - interval '13 hours' WHERE id = :id"), {"id": UUID(batch_id)}
+        )
+
+    await coordinator.sweep()
+
+    status = await batch(http, batch_id)
+    assert (status["state"], status["failure"]) == ("done", None)
+
+
 async def test_a_peak_below_the_hint_writes_nothing(
     http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: Any
 ) -> None:

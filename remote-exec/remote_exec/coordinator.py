@@ -2437,7 +2437,9 @@ class Coordinator:
             async with self.engine.begin() as conn:
                 if await self._lock_batch(conn, batch_id) != "running":
                     continue
-                if not await conn.scalar(
+                if (await conn.execute(FINISH_IF_DONE, {"id": batch_id})).rowcount:
+                    pass  # Its last build committed but it wasn't ended yet (see _finish_when_done): done, not overdue.
+                elif not await conn.scalar(
                     sa.text("SELECT EXISTS (SELECT 1 FROM leases WHERE batch_id = :id)"), {"id": batch_id}
                 ):
                     await self._end_batch(conn, batch_id, "failed", failure)
