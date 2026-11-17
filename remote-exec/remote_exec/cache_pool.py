@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 # One controller across replicas. Its dedicated session lock survives the short state transactions.
 POOL_LOCK = 719483206
 ADAPTER_TIMEOUT_SECONDS = 20
+# An unchanged capacity target is sent again this often, to undo a change made outside the controller.
+CAPACITY_RESEND_SECONDS = 60
 
 Phase = Literal["boot", "dns", "ready", "admit", "serving", "drain", "flush", "stop", "withdraw", "terminate"]
 
@@ -163,6 +165,8 @@ class CachePool:
         self.workers_per_node = workers_per_node
         self.max_workers = max_workers
         self.launch_timeout_seconds = launch_timeout_seconds
+        # Each adapter call is a process; on the coordinator's host those took more CPU than the coordinator.
+        self.capacity_sent: tuple[int, datetime] | None = None  # the last target the adapter accepted, and when
 
     async def ready_urls(self) -> list[str]:
         async with self.engine.connect() as conn:
@@ -215,10 +219,14 @@ class CachePool:
         cpu = await conn.scalar(sa.text("SELECT coalesce(max(target),0) FROM cache_cpu_demand"))
         floor = cache_target(workers, self.workers_per_node, len(self.slots))
         target = min(len(self.slots), max(floor, cpu)) if self.workers_per_node > 0 else 0
-        try:
-            await self.adapter.call(AdapterRequest(op="capacity", target=target))
-        except (AdapterError, OSError, TimeoutError) as error:
-            logger.warning("cache capacity request failed; continuing lifecycle hooks: %s", error)
+        sent = self.capacity_sent
+        if sent is None or sent[0] != target or (now - sent[1]).total_seconds() >= CAPACITY_RESEND_SECONDS:
+            try:
+                await self.adapter.call(AdapterRequest(op="capacity", target=target))
+            except (AdapterError, OSError, TimeoutError) as error:
+                logger.warning("cache capacity request failed; continuing lifecycle hooks: %s", error)
+            else:
+                self.capacity_sent = (target, now)
         for member in members:
             try:
                 await self._reconcile_member(conn, member, instances.get(member.owner), now)
@@ -260,7 +268,9 @@ class CachePool:
             else:
                 await self._save(conn, member, "withdraw", token=result.token, error=result.error)
             return
-        await self.adapter.call(AdapterRequest(op="heartbeat", instance=member.owner))
+        # Only an instance a lifecycle hook holds needs its heartbeat.
+        if instance.state in ("launching", "terminating"):
+            await self.adapter.call(AdapterRequest(op="heartbeat", instance=member.owner))
         if instance.state == "terminating" and member.phase not in {
             "drain", "flush", "stop", "withdraw", "terminate"
         }:
