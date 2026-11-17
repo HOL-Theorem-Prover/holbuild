@@ -2200,7 +2200,7 @@ async def test_cancel_revokes_leases_and_stops_claims(http: httpx.AsyncClient) -
 
 async def test_a_worker_stopped_by_a_cancel_reports_the_log_of_the_action(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a"])
-    token = await claim_named(http, "a")
+    token = await claim_named(http, "a", worker="w1")
     await http.post(f"/v1/batches/{batch_id}/cancel", headers=CLIENT)
 
     record = result("a", "failed", "unavailable").replace("log=" + "a" * 64, "log=" + "b" * 64)
@@ -2208,6 +2208,7 @@ async def test_a_worker_stopped_by_a_cancel_reports_the_log_of_the_action(http: 
     assert (await complete(http, token, record)).status_code == 409
     action = (await batch(http, batch_id))["actions"][0]
     assert (action["state"], action["log_sha256"]) == ("cancelled", "b" * 64)
+    assert (action["finished_at"], action["worker"]) == (None, "w1")
     assert (await batch(http, batch_id))["state"] == "cancelled"
 
 
@@ -2235,6 +2236,65 @@ async def test_events_stream_action_states_then_the_batch(http: httpx.AsyncClien
 
     assert [(e["type"], e["state"]) for e in events] == [("action", "done"), ("batch", "done")]
     assert events[0]["log_sha256"] == "a" * 64
+
+
+@pytest.mark.parametrize("status", ["built", "cached", "failed"])
+async def test_batch_status_and_events_retain_execution_times_and_worker(
+    http: httpx.AsyncClient, status: str
+) -> None:
+    batch_id = await submit(http, ["a"])
+    action = (await batch(http, batch_id))["actions"][0]
+    assert {field: action[field] for field in ("last_claimed_at", "finished_at", "worker")} == {
+        "last_claimed_at": None, "finished_at": None, "worker": None,
+    }
+
+    before_claim = datetime.now(UTC)
+    token = await claim_named(http, "a", worker="w1")
+    action = (await batch(http, batch_id))["actions"][0]
+    claimed_at = action["last_claimed_at"]
+    assert before_claim <= datetime.fromisoformat(claimed_at) <= datetime.now(UTC)
+    assert action["worker"] == "w1"
+    assert action["finished_at"] is None
+
+    record = result("a", status, "proof" if status == "failed" else None)
+    before_complete = datetime.now(UTC)
+    assert (await complete(http, token, record)).status_code == 200
+    action = (await batch(http, batch_id))["actions"][0]
+    assert before_complete <= datetime.fromisoformat(action["finished_at"]) <= datetime.now(UTC)
+    assert action["last_claimed_at"] == claimed_at
+    assert action["worker"] == "w1"
+
+    assert (await complete(http, token, record)).status_code == 409
+    assert (await batch(http, batch_id))["actions"][0] == action
+    response = await http.get(f"/v1/batches/{batch_id}/events", headers=CLIENT)
+    events = [json.loads(line) for line in response.text.splitlines() if line]
+    for field in ("last_claimed_at", "finished_at"):
+        assert datetime.fromisoformat(events[0][field]) == datetime.fromisoformat(action[field])
+        events[0][field] = action[field]
+    assert events[0] == {"type": "action", **action}
+    assert events[-1]["type"] == "batch"
+
+
+async def test_reclaim_replaces_worker_and_clears_previous_finish_time(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a"])
+    first_token = await claim_named(http, "a")
+    assert (await complete(http, first_token, result("a", "failed", "publish"))).status_code == 200
+    previous = (await batch(http, batch_id))["actions"][0]
+    assert previous["finished_at"] is not None
+
+    response = await http.post("/v1/work/claim", json={"tier": "standard", "worker": "w2"}, headers=WORKER)
+    assert response.status_code == 200
+    action = (await batch(http, batch_id))["actions"][0]
+    assert datetime.fromisoformat(action["last_claimed_at"]) > datetime.fromisoformat(previous["finished_at"])
+    assert action["worker"] == "w2"
+    assert action["finished_at"] is None
+    assert (await complete(http, first_token, result("a", "built"))).status_code == 409
+    assert (await batch(http, batch_id))["actions"][0] == action
+
+    assert (await complete(http, response.json()["attempt_token"], result("a", "built"))).status_code == 200
+    action = (await batch(http, batch_id))["actions"][0]
+    assert action["worker"] == "w2"
+    assert datetime.fromisoformat(action["finished_at"]) >= datetime.fromisoformat(action["last_claimed_at"])
 
 
 async def test_batch_status_shows_each_actions_phase_timings(http: httpx.AsyncClient) -> None:

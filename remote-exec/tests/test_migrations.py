@@ -55,13 +55,17 @@ async def test_action_column_baseline_preserves_existing_actions_and_downgrades(
             row = (await connection.execute(sa.text("SELECT finished_at, worker FROM actions"))).one()
         assert tuple(row) == (None, None)
 
-        # The runtime never reads the new columns, but still claims and completes rows that predate them.
+        # Rows that predate the columns are claimed and completed as any other.
         await build(http, cache, "a")
-        assert (await batch(http, batch_id))["state"] == "done"
+        action = (await batch(http, batch_id))["actions"][0]
+        assert action["state"] == "done" and action["worker"] is not None
+        assert action["finished_at"] is not None
         await asyncio.to_thread(migrate, remote_exec_engine, "0015", downgrade=True)
         assert await version(remote_exec_engine) == "0015"
         assert not NEW_COLUMNS & await actions_columns(remote_exec_engine)
         assert await running_index_valid(remote_exec_engine) is None
-        assert (await batch(http, batch_id))["state"] == "done"
+        # This coordinator reads the dropped columns, so the older one's view is checked in the database.
+        async with remote_exec_engine.connect() as connection:
+            assert await connection.scalar(sa.text("SELECT state FROM actions")) == "done"
     finally:
         await asyncio.to_thread(migrate, remote_exec_engine, "head")
