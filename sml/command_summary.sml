@@ -13,6 +13,11 @@ val follows = ref ([] : string list)
 val batches = ref (Binaryset.empty String.compare)
 val actions = ref (Binarymap.mkDict String.compare : (string, string) Binarymap.dict)
 val counts = Array.array (4, 0)
+(* The failed theories, in the order they failed, at most max_failures:
+   each one's label, whether its diagnostic was seen, and its record. *)
+val failures = ref ([] : (string * bool * string) list)
+val max_failures = 20
+val first_failure = ref (NONE : Time.time option)
 val mutex = Mutex.mutex ()
 
 (* Polling cannot certify that no execution occurred between snapshots. *)
@@ -109,6 +114,32 @@ fun observe_plan project plan = best_effort (fn () =>
         LargeInt.toString (Time.toMicroseconds (!started)) ^ "-" ^ pid () ^ ".json"))
   end)
 
+(* Records theory LABEL's failure as soon as it is seen, so that a build
+   stopped after it still records it.  DETAIL holds the record's fields; a
+   record from the diagnostic (DIAGNOSED) replaces one from the fleet's
+   failure kind alone. *)
+fun record_failure label diagnosed detail = locked (fn () =>
+  let
+    val record = object (J.json_string_field "theory" label :: detail)
+    fun replace (entry as (name, seen, _)) =
+      if name = label andalso diagnosed andalso not seen then (name, true, record) else entry
+  in
+    if Option.isSome (!first_failure) then () else first_failure := SOME (Time.now ());
+    if List.exists (fn (name, _, _) => name = label) (!failures) then failures := map replace (!failures)
+    else if length (!failures) < max_failures then failures := !failures @ [(label, diagnosed, record)]
+    else ()
+  end)
+
+fun observe_failure (label, message) =
+  let val lines = String.fields (fn c => c = #"\n") message
+  in
+    record_failure label true
+      (J.json_string_field "kind" (J.failure_kind message) ::
+       J.json_optional_string_field "theorem" (J.theorem_from_lines lines) @
+       J.json_optional_int_field "line" (Option.map #line (J.source_location_from_lines lines)) @
+       [J.json_string_field "error" (J.failure_error message)])
+  end
+
 fun observe_action (batch, line) =
   let
     val field = fn name => HolbuildRemoteExec.json_string_field name line
@@ -130,7 +161,15 @@ fun observe_action (batch, line) =
     val failure_fields = List.mapPartial (fn name =>
       case field name of SOME text => if text = "" then NONE else SOME (J.json_string_field name text)
                        | NONE => NONE) ["last_failure", "failure_detail", "log_sha256"]
+    val theory = getOpt (field "theory", key)
   in
+    (* The coordinator names a theory <package>:<theory>; local failures by
+       its logical name. *)
+    if field "state" = SOME "failed" orelse
+       (field "state" = SOME "cancelled" andalso field "last_failure" = SOME "deadline") then
+      record_failure (Substring.string (#2 (Substring.splitr (fn c => c <> #":") (Substring.full theory)))) false
+        [J.json_string_field "kind" (getOpt (field "last_failure", "internal"))]
+    else ();
     (* A retry snapshot may be the only observation of the preceding result.
        Retain that payload independently, without assigning it to an attempt. *)
     (case began of
@@ -155,7 +194,7 @@ fun finish () = best_effort (fn () =>
       NONE => ()
     | SOME path =>
         PR.write_record path (object
-          [J.json_string_field "schema" "holbuild-command-v1",
+          ([J.json_string_field "schema" "holbuild-command-v1",
            J.json_string_field "version" HolbuildVersion.version,
            timestamp "started_at_ms" (!started), timestamp "ended_at_ms" (Time.now ()),
            J.json_int_field "exit_code" (!exit_code),
@@ -164,9 +203,11 @@ fun finish () = best_effort (fn () =>
            "\"fleet_batches\":" ^ array (map (fn id => "\"" ^ J.json_escape id ^ "\"") (Binaryset.listItems (!batches))),
            J.json_bool_field "fleet_history_complete" (fleet_history_complete ()),
            "\"fleet_actions\":" ^ array (map #2 (Binarymap.listItems (!actions))),
-           J.json_object_field "local_outcomes"
+           "\"failures\":" ^ array (map #3 (!failures))] @
+          (case !first_failure of SOME t => [timestamp "first_failure_at_ms" t] | NONE => []) @
+          [J.json_object_field "local_outcomes"
              (ListPair.mapEq (fn (name, i) => J.json_int_field name (Array.sub (counts, i)))
-               (["built", "restored_local", "restored_remote", "up_to_date"], [0, 1, 2, 3]))] ^ "\n"))
+               (["built", "restored_local", "restored_remote", "up_to_date"], [0, 1, 2, 3]))]) ^ "\n"))
 
 fun initialize () =
   (started := Time.now ();
@@ -174,6 +215,7 @@ fun initialize () =
        (SOME path, SOME expected) => if expected = pid () then SOME path else NONE
      | _ => NONE);
    J.command_outcome := outcome;
+   J.command_failure := observe_failure;
    HolbuildRemoteExec.command_action := observe_action;
    HolbuildRemoteExec.command_follow := observe_follow;
    HolbuildRemoteExec.command_batch := (fn batch => batches := Binaryset.add (!batches, batch));
