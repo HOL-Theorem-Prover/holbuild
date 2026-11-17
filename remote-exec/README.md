@@ -516,7 +516,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   most `REMOTE_EXEC_RUN_SLOTS` running run actions fleet-wide; 0 pauses new
   runs without stopping actions already running. An unlocked precheck
   bypasses run admission when its floor or cap is full or no compatible run
-  is ready. Within one process, run claims queue before taking a database
+  is ready. Each process reuses a precheck's "none" for the same tiers and
+  slot count for `REMOTE_EXEC_CLAIM_RANKING_SECONDS`; it drops it when it
+  makes a run ready or ends a run lease, so a run made ready or freed
+  another way (another replica, a cancel, a batch's end) can wait that
+  long. Within one process, run claims queue before taking a database
   connection, so at most one connection waits for the cross-replica
   admission lock. Capacity is checked again under that lock before ranking
   run candidates. Build claims share a ranking read per accepted tier list;
