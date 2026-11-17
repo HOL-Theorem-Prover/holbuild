@@ -176,8 +176,7 @@ fun drop_trailing_slashes path =
   then drop_trailing_slashes (String.substring(path, 0, size path - 1))
   else path
 
-(* A directory below another watched one adds nothing to the exclusion, and
-   the pattern is one argument, which Linux caps at 128 KiB. *)
+(* A directory below another watched one adds nothing to the exclusion. *)
 fun outermost_dirs dirs =
   let
     fun below parent dir = String.isPrefix (parent ^ "/") dir
@@ -185,17 +184,30 @@ fun outermost_dirs dirs =
     List.filter (fn dir => not (List.exists (fn other => below other dir) dirs)) dirs
   end
 
+val skipped_names = [".holbuild", ".git", "_build"]
+val skipped_pattern = "(\\.holbuild|\\.git|_build)"
+
+fun has_skipped_component path =
+  List.exists (fn part => List.exists (fn name => part = name) skipped_names)
+              (String.fields (fn c => c = #"/") path)
+
 (* Changes in holbuild's own .holbuild/, in .git/ and in _build/ don't
    matter.  inotifywait matches --exclude against each event's full path, so
-   those names are anchored below the watched directories: an ancestor with
-   such a name must not hide every event under it. *)
+   a path with such a name above a watched directory would hide every event
+   under it.  Without one, the plain pattern is right and its size doesn't
+   grow with the project.  With one, the names are anchored below the watched
+   directories, which makes the pattern grow with them; it is one argument,
+   and Linux caps one argument at 128 KiB. *)
 fun exclude_option paths =
-  case outermost_dirs (map drop_trailing_slashes (List.filter is_dir paths)) of
-      [] => ""
-    | dirs =>
-        " --exclude " ^
-        quote ("^(" ^ String.concatWith "|" (map regex_escape dirs) ^
-               ")/(.*/)?(\\.holbuild|\\.git|_build)/")
+  if not (List.exists has_skipped_component paths)
+  then " --exclude " ^ quote ("/" ^ skipped_pattern ^ "/")
+  else
+    case outermost_dirs (map drop_trailing_slashes (List.filter is_dir paths)) of
+        [] => ""
+      | dirs =>
+          " --exclude " ^
+          quote ("^(" ^ String.concatWith "|" (map regex_escape dirs) ^
+                 ")/(.*/)?" ^ skipped_pattern ^ "/")
 
 (* The watched paths are read from PATHS_FILE, one per line: all of them on
    the command line would exceed the 128 KiB cap on one argument for a big
