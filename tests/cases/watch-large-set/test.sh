@@ -146,7 +146,8 @@ run_variant() {
 }
 
 # With no skipped name in any watched path, below a _build ancestor, and with
-# both kinds of path watched together: the exclusion differs between them.
+# a member below a skipped name as well, itself below a _build ancestor or not.
 run_variant "$tmpdir/plain/project"
 run_variant "$tmpdir/_build/project"
 run_variant "$tmpdir/mixed/project" mixed
+run_variant "$tmpdir/_build/mixed/project" mixed

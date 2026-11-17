@@ -171,70 +171,24 @@ fun regex_escape text =
     (fn c => if Char.contains ".[]()*+?{}|^$\\" c then "\\" ^ str c else str c)
     text
 
-fun drop_trailing_slashes path =
-  if size path > 1 andalso String.isSuffix "/" path
-  then drop_trailing_slashes (String.substring(path, 0, size path - 1))
-  else path
+(* The directories are watched through symlinks, <links>/<n>, and the paths
+   are read from a file, one per line.  The paths could otherwise be too long
+   for the command line, since Linux caps one argument at 128 KiB: the paths
+   themselves, and the exclusion pattern, which would have to name every
+   watched directory.
 
-(* A directory below another watched one adds nothing to the exclusion. *)
-fun outermost_dirs dirs =
-  let
-    fun below parent dir = String.isPrefix (parent ^ "/") dir
-  in
-    List.filter (fn dir => not (List.exists (fn other => below other dir) dirs)) dirs
-  end
-
-val skipped_names = [".holbuild", ".git", "_build"]
-val skipped_pattern = "(\\.holbuild|\\.git|_build)"
-
-fun skipped_component part = List.exists (fn name => part = name) skipped_names
-
-fun has_skipped_component path =
-  List.exists skipped_component (String.fields (fn c => c = #"/") path)
-
-(* DIR up to and including its last skipped component, or DIR itself without
-   one: below it no component of a path is skipped, so the names can be
-   matched anywhere after it. *)
-fun anchor dir =
-  let
-    val parts = String.fields (fn c => c = #"/") dir
-    fun last_skipped (_, [], found) = found
-      | last_skipped (i, part :: rest, found) =
-          last_skipped (i + 1, rest, if skipped_component part then SOME i else found)
-  in
-    case last_skipped (1, parts, NONE) of
-        NONE => dir
-      | SOME n => String.concatWith "/" (List.take (parts, n))
-  end
-
-(* Changes in holbuild's own .holbuild/, in .git/ and in _build/ don't
+   Changes in holbuild's own .holbuild/, in .git/ and in _build/ don't
    matter.  inotifywait matches --exclude against each event's full path, so
-   a path with such a name above a watched directory would hide every event
-   under it.  PATHS are all plain, or all with one; with none, the plain
-   pattern is right.  With one, the names are anchored below the watched
-   directories' skipped ancestors.  The pattern is one argument, which Linux
-   caps at 128 KiB, so it is kept to what the paths need. *)
-fun exclude_option paths =
-  if not (List.exists has_skipped_component paths)
-  then " --exclude " ^ quote ("/" ^ skipped_pattern ^ "/")
-  else
-    let
-      val dirs = map drop_trailing_slashes (List.filter is_dir paths)
-      val anchors = List.foldl (fn (dir, acc) => add_unique (anchor dir) acc) [] dirs
-    in
-      case outermost_dirs anchors of
-          [] => ""
-        | roots =>
-            " --exclude " ^
-            quote ("^(" ^ String.concatWith "|" (map regex_escape roots) ^
-                   ")/(.*/)?" ^ skipped_pattern ^ "/")
-    end
+   those names are matched below the watched directories only: an ancestor
+   with such a name must not hide every event under it.  A symlink names the
+   watched directory by a path with no such ancestor, and one pattern covers
+   them all.  (A path starting with @ would read as an exclusion in the file.) *)
+fun exclude_option links =
+  " --exclude " ^
+  quote ("^" ^ regex_escape links ^ "/[0-9]+/(.*/)?(\\.holbuild|\\.git|_build)/")
 
-(* The watched paths are read from PATHS_FILE, one per line: all of them on
-   the command line would exceed the 128 KiB cap on one argument for a big
-   project.  A path starting with @ would read as an exclusion there. *)
-fun inotify_tree_command paths_file paths =
-  "inotifywait -q -r" ^ exclude_option paths ^
+fun inotify_tree_command links paths_file =
+  "inotifywait -q -r" ^ exclude_option links ^
   " -e close_write,move,create,delete,attrib --fromfile " ^ quote paths_file ^
   " >/dev/null 2>&1"
 
@@ -242,42 +196,57 @@ fun inotify_dirs_command dirs =
   "inotifywait -q -e close_write,move,create,delete,attrib -- " ^
   String.concatWith " " (map quote dirs) ^ " >/dev/null 2>&1"
 
-(* The tree watches are one per kind of path, since one --exclude pattern
-   can't be both the plain one and the anchored one, and the anchored one is
-   only as large as it needs to be for the paths it applies to. *)
-fun tree_groups paths =
-  List.filter (not o null)
-    [List.filter (not o has_skipped_component) paths,
-     List.filter has_skipped_component paths]
+(* Two inotifywait processes, since one invocation is either recursive or not:
+   the tree watch on the inputs, and a flat watch on the manifest directories.
+   The first to exit decides; its status is the command's status. *)
+fun inotify_command links paths_file manifest_dirs =
+  String.concatWith "\n"
+    [inotify_tree_command links paths_file ^ " &",
+     "tree=$!",
+     inotify_dirs_command manifest_dirs ^ " &",
+     "dirs=$!",
+     "while kill -0 \"$tree\" 2>/dev/null && kill -0 \"$dirs\" 2>/dev/null; do sleep 0.2; done",
+     "if kill -0 \"$tree\" 2>/dev/null; then first=$dirs; other=$tree; else first=$tree; other=$dirs; fi",
+     "kill \"$other\" 2>/dev/null",
+     "wait \"$other\" 2>/dev/null",
+     "wait \"$first\""]
 
-(* One inotifywait per tree group, since one invocation is either recursive or
-   not and has one --exclude, and a flat one on the manifest directories.  The
-   first to exit decides; its status is the command's status. *)
-fun inotify_command groups manifest_dirs =
-  let
-    fun start command = [command ^ " &", "pids=\"$pids $!\""]
-    val starts =
-      List.concat (map (fn (file, paths) => start (inotify_tree_command file paths)) groups) @
-      start (inotify_dirs_command manifest_dirs)
-  in
-    String.concatWith "\n"
-      (["pids="] @ starts @
-       ["first=",
-        "while [ -z \"$first\" ]; do",
-        "  for p in $pids; do if ! kill -0 \"$p\" 2>/dev/null; then first=$p; break; fi; done",
-        "  [ -n \"$first\" ] || sleep 0.2",
-        "done",
-        "for p in $pids; do if [ \"$p\" != \"$first\" ]; then kill \"$p\" 2>/dev/null; wait \"$p\" 2>/dev/null; fi; done",
-        "wait \"$first\""])
-  end
+fun absolute path =
+  if Path.isAbsolute path then path
+  else Path.mkAbsolute {path = path, relativeTo = FS.getDir ()}
 
-fun write_paths_file file paths =
+(* Makes the links directory and the paths file for PATHS, runs F on their
+   names, and removes them. *)
+fun with_watch_files paths f =
   let
-    val out = TextIO.openOut file
-    fun write_line path = TextIO.output (out, path ^ "\n")
+    val links = HolbuildTempPath.temporary "watch-links"
+    val paths_file = HolbuildTempPath.temporary "watch-paths"
+    val made = ref []
+    fun link_for (path, n) =
+      if is_dir path then
+        let val link = Path.concat (links, Int.toString n)
+        in
+          Posix.FileSys.symlink {old = absolute path, new = link};
+          made := link :: !made;
+          link
+        end
+      else path
+    fun cleanup () =
+      (List.app (fn link => FS.remove link handle OS.SysErr _ => ()) (!made);
+       FS.rmDir links handle OS.SysErr _ => ();
+       FS.remove paths_file handle OS.SysErr _ => ())
+    fun run () =
+      let
+        val _ = Posix.FileSys.mkdir (links, Posix.FileSys.S.irwxu)
+        val out = TextIO.openOut paths_file
+        fun write (path, n) = (TextIO.output (out, link_for (path, n) ^ "\n"); n + 1)
+        val _ = (List.foldl write 0 paths; TextIO.closeOut out)
+                handle e => (TextIO.closeOut out handle IO.Io _ => (); raise e)
+      in
+        f links paths_file
+      end
   in
-    (List.app write_line paths; TextIO.closeOut out)
-    handle e => (TextIO.closeOut out handle IO.Io _ => (); raise e)
+    (run () before cleanup ()) handle e => (cleanup (); raise e)
   end
 
 fun wait_for_change ({paths, manifest_dirs, ...} : watch_set) =
@@ -285,16 +254,11 @@ fun wait_for_change ({paths, manifest_dirs, ...} : watch_set) =
       [] => raise Error "build --watch has no files or directories to watch"
     | _ =>
         let
-          val groups =
-            map (fn group => (HolbuildTempPath.temporary "watch-paths", group))
-                (tree_groups paths)
-          fun remove_paths_files () =
-            List.app (fn (file, _) => FS.remove file handle OS.SysErr _ => ()) groups
           val status =
-            (List.app (fn (file, group) => write_paths_file file group) groups;
-             HolbuildToolchain.run ["sh", "-c", inotify_command groups manifest_dirs])
-            handle e => (remove_paths_files (); raise e)
-          val _ = remove_paths_files ()
+            with_watch_files paths
+              (fn links => fn paths_file =>
+                 HolbuildToolchain.run
+                   ["sh", "-c", inotify_command links paths_file manifest_dirs])
         in
           if HolbuildToolchain.success status then sleep_debounce ()
           else raise Error "inotifywait failed while watching project inputs"
