@@ -492,6 +492,17 @@ fun argument_text arg =
   let val real = OS.FileSys.realPath arg handle OS.SysErr _ => arg
   in if real = arg then arg else arg ^ "\001" ^ real end
 
+(* ARGS without the last occurrence of each of VALUES, as targets follow
+   the options that may share their spelling. *)
+fun without_last values args =
+  let
+    fun drop_last _ [] = []
+      | drop_last value (arg :: rest) =
+          if arg = value andalso not (BP.member value rest) then rest else arg :: drop_last value rest
+  in
+    List.foldl (fn (value, args) => drop_last value args) args values
+  end
+
 (* Every planning input that is not a scanned file.  Packages are named by
    their resolved roots and identities, after $VAR expansion, and by their
    manifests' text.  The fingerprint is the hash of every input but the
@@ -515,8 +526,7 @@ fun fingerprint {project : HolbuildProject.t, graph, holdir, kernel_variant, tar
         ([format, HolbuildVersion.version, OS.FileSys.getDir (), holdir,
           HolbuildHolToolchainConfig.kernel_variant_name kernel_variant,
           getOpt (read_optional (OS.Path.concat (#root project, ".holconfig.toml")), "\001")] @
-         BP.canonical_list "argv"
-           (List.filter (fn arg => not (BP.member arg target_args)) (map argument_text (CommandLine.arguments ()))) @
+         BP.canonical_list "argv" (without_last target_args (map argument_text (CommandLine.arguments ()))) @
          BP.canonical_list "env" (BP.sort_strings (List.filter recorded_env_var (Posix.ProcEnv.environ ()))) @
          List.concat (map (fn package => BP.canonical_list "package" (package_text package))
                           (HolbuildProjectGraph.packages graph))))
