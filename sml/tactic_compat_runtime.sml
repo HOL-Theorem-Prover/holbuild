@@ -56,6 +56,7 @@ local
     "  fun lift_context_tactic (run : proof_context -> Tactical.goal -> Tactical.goal list * Tactical.validation) : Tactical.tactic = run ()\n" ^
     "  fun lift_list_tactic (run : Tactical.goal list -> Tactical.goal list * Tactical.list_validation) : Tactical.list_tactic = run\n" ^
     "  fun run_tactic (_ : proof_context) (tactic : Tactical.tactic) (goal : Tactical.goal) = tactic goal\n" ^
+    "  fun run_list_tactic (_ : proof_context) (list_tactic : Tactical.list_tactic) goals = list_tactic goals\n" ^
     "  fun delay_tactic make = lift_context_tactic (fn ctxt => fn goal => run_tactic ctxt (make ()) goal)\n" ^
     "  fun tac_proof (_ : proof_context) goal_tactic = Tactical.TAC_PROOF goal_tactic\n" ^
     "  fun expand_listf (_ : proof_context) list_tactic gstk = goalStack.expand_listf list_tactic gstk\n" ^
@@ -77,6 +78,7 @@ local
     "  fun lift_context_tactic (run : proof_context -> Tactical.goal -> Tactical.goal list * Tactical.validation) : Tactical.tactic = fn goal => fn ctxt => run ctxt goal\n" ^
     "  fun lift_list_tactic (run : Tactical.goal list -> Tactical.goal list * Tactical.list_validation) : Tactical.list_tactic = fn goals => fn _ => run goals\n" ^
     "  fun run_tactic ctxt (tactic : Tactical.tactic) (goal : Tactical.goal) = tactic goal ctxt\n" ^
+    "  fun run_list_tactic ctxt (list_tactic : Tactical.list_tactic) goals = list_tactic goals ctxt\n" ^
     "  fun delay_tactic make = lift_context_tactic (fn ctxt => fn goal => run_tactic ctxt (make ()) goal)\n" ^
     "  fun tac_proof ctxt goal_tactic = Tactical.TAC_PROOF_in ctxt goal_tactic\n" ^
     contextual_expand_listf ^

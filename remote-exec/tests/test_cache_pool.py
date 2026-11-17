@@ -31,6 +31,7 @@ class Provider(CommandAdapter):
         self.entered = asyncio.Event()
         self.cpu_target = 0
         self.fail_owner: str | None = None
+        self.fail_capacity = False
 
     async def call(self, request: AdapterRequest) -> AdapterResponse:
         self.calls.append(request)
@@ -39,6 +40,8 @@ class Provider(CommandAdapter):
             if self.block is not None:
                 await self.block.wait()
             return AdapterResponse(instances=self.instances, cpu_target=self.cpu_target)
+        if request.op == "capacity" and self.fail_capacity:
+            raise AdapterError("fixture capacity error")
         if request.instance == self.fail_owner and self.fail_owner is not None:
             raise AdapterError("fixture provider error")
         if request.op == "drain":
@@ -221,6 +224,45 @@ async def test_replicas_read_shared_worker_demand_before_each_capacity_write(poo
     await pool.reconcile(p.now)
     await other.reconcile(p.now)
     assert [r.target for r in p.calls if r.op == "capacity"] == [0, 4, 4]
+
+
+async def test_unchanged_capacity_is_sent_once_a_minute(pool: CachePool) -> None:
+    p = provider(pool)
+    for seconds in (0, 5, 59):
+        await pool.reconcile(p.now + timedelta(seconds=seconds))
+    assert [r.target for r in p.calls if r.op == "capacity"] == [0]
+    await pool.reconcile(p.now + timedelta(seconds=60))
+    assert [r.target for r in p.calls if r.op == "capacity"] == [0, 0]
+    pool.workers_per_node = 15
+    async with pool.engine.begin() as conn:
+        await conn.execute(sa.text("INSERT INTO burst_demand(at,workers) VALUES (:at,45)"), {"at": p.now})
+    await pool.reconcile(p.now + timedelta(seconds=61))
+    assert [r.target for r in p.calls if r.op == "capacity"] == [0, 0, 3]
+
+
+async def test_failed_capacity_request_is_sent_again_next_pass(pool: CachePool) -> None:
+    p = provider(pool)
+    p.fail_capacity = True
+    await pool.reconcile(p.now)
+    p.fail_capacity = False
+    await pool.reconcile(p.now + timedelta(seconds=5))
+    await pool.reconcile(p.now + timedelta(seconds=10))
+    assert [r.target for r in p.calls if r.op == "capacity"] == [0, 0]
+
+
+async def test_only_instances_in_a_lifecycle_hook_get_heartbeats(pool: CachePool) -> None:
+    p = provider(pool)
+    p.instances = [Instance(id="a", state="launching")]
+    await launch(pool)
+    assert await phase(pool, "a") == "serving"
+    p.instances = [Instance(id="a", state="running")]
+    p.calls.clear()
+    for seconds in (5, 10):
+        await pool.reconcile(p.now + timedelta(seconds=seconds))
+    assert [r.op for r in p.calls if r.instance == "a"] == []
+    p.instances = [Instance(id="a", state="terminating")]
+    await pool.reconcile(p.now + timedelta(seconds=15))
+    assert [r.op for r in p.calls if r.instance == "a"] == ["heartbeat"]
 
 
 async def test_one_broken_instance_does_not_starve_other_launches_or_heartbeats(pool: CachePool) -> None:
