@@ -136,8 +136,9 @@ local
     in loop 0 0 [] end
 
   (* Runs each of works on its own thread and raises the first failure once
-     all have finished. *)
-  fun run_all works =
+     all have finished.  Interrupts are deferred meanwhile, so the caller
+     can't unwind and free the buffers and descriptor the threads still use. *)
+  fun run_all works = HolbuildHttp.uninterruptible (fn () =>
     let
       val mutex = Mutex.mutex ()
       val finished = ConditionVar.conditionVar ()
@@ -158,7 +159,7 @@ local
       List.app start works;
       Mutex.lock mutex; wait (); Mutex.unlock mutex;
       case !failure of SOME e => raise e | NONE => ()
-    end
+    end)
 
   fun decode_group src out group () =
     let val capacity = List.foldl (fn ({content, ...}, m) => Int.max (content, m)) 0 group
