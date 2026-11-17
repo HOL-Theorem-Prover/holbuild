@@ -348,10 +348,10 @@ fun pump m =
       case take_queued () of
           NONE => ignore (multi_cleanup m)
         | SOME added =>
-            (List.app (fn easy =>
-               (mcheck "curl_multi_add_handle" (multi_add_handle (m, easy));
-                running := easy :: !running))
-               added;
+            (* Running before they're added, so a failed add fails the whole
+               batch below; removing a handle never added is harmless. *)
+            (running := added @ !running;
+             List.app (fn easy => mcheck "curl_multi_add_handle" (multi_add_handle (m, easy))) added;
              mcheck "curl_multi_perform" (multi_perform (m, ref 0));
              read_done ();
              if null (!running) then ()
@@ -401,10 +401,21 @@ fun current_multi () =
       m
     end
 
+(* Runs f with interrupts deferred, so a request can't unwind and free its
+   files while the pump still uses them. *)
+fun uninterruptible f =
+  let
+    val saved = Thread.getAttributes ()
+    val () = Thread.setAttributes [Thread.InterruptState Thread.InterruptDefer]
+  in
+    (f () before Thread.setAttributes saved)
+    handle e => (Thread.setAttributes saved; raise e)
+  end
+
 (* Runs easy's transfer on the shared multi handle and waits for it to
    finish. *)
 fun run_transfer easy =
-  with_pool_lock (fn () =>
+  uninterruptible (fn () => with_pool_lock (fn () =>
     let
       val m = current_multi ()
       fun collect () =
@@ -418,7 +429,7 @@ fun run_transfer easy =
       queued := easy :: !queued;
       ConditionVar.signal pump_wake;
       collect ()
-    end)
+    end))
 
 fun c_string_at p =
   let
@@ -454,9 +465,7 @@ fun with_file path mode f =
    to a busy server, isn't cut off.  files opens the request's files, then
    runs the transfer with the output and set_options, which sets the
    request's own options.  It opens them only once the request has a place
-   in flight, so requests waiting for one hold no descriptors.  Waiting for
-   the pump must not be interrupted: the pump may still be using the
-   request's files and handle. *)
+   in flight, so requests waiting for one hold no descriptors. *)
 fun request_once {url, timeout, files} =
   (HolbuildOffline.require_online "send an HTTP request";
    enter ();
