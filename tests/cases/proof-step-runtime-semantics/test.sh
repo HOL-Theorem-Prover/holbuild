@@ -333,6 +333,11 @@ eager_theory HeadOfNone 'Theorem head_of_none: T
 Proof
   simp[] >>> HEADGOAL (ACCEPT_TAC TRUTH)
 QED'
+eager_theory InSelector 'fun bad_pat () : term quotation = raise Fail "bad selector pattern";
+Theorem in_selector: T
+Proof
+  TRY (ALL_TAC >~ [bad_pat ()]) >> simp[]
+QED'
 eager_theory Control 'Theorem control: T /\ T
 Proof
   CONJ_TAC >> simp[] >> mp_tac TRUTH
@@ -346,16 +351,17 @@ for mode in steps plain; do
     cat "$tmpdir/eager-$mode.out" >&2
     exit 1
   fi
-  require_grep '5 build failures:' "$tmpdir/eager-$mode.out"
+  require_grep '6 build failures:' "$tmpdir/eager-$mode.out"
   require_grep 'Term.dest_comb' "$tmpdir/eager-$mode.out"
   require_grep 'NTH_GOAL' "$tmpdir/eager-$mode.out"
+  require_grep 'bad selector pattern' "$tmpdir/eager-$mode.out"
   if grep -q 'static error' "$tmpdir/eager-$mode.out"; then
     echo "eager-evaluation theories must fail when run, not to compile" >&2
     cat "$tmpdir/eager-$mode.out" >&2
     exit 1
   fi
   require_file "$eager_project/.holbuild/obj/src/ControlTheory.dat"
-  for name in AfterClose InTry InBranch InTermination HeadOfNone; do
+  for name in AfterClose InTry InBranch InTermination HeadOfNone InSelector; do
     if [[ -e "$eager_project/.holbuild/obj/src/${name}Theory.dat" ]]; then
       echo "$name built with $mode but must fail" >&2
       exit 1

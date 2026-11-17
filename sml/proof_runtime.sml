@@ -981,9 +981,10 @@ fun compile_list_tactic label program =
 (* Plain HOL evaluates a proof's whole tactic expression before it applies
    any of it, so a leaf whose construction raises fails the proof wherever
    it sits: after the goal closes, in an ORELSE alternative never tried, or
-   inside a TRY.  So the runner constructs every leaf of the plan once before
-   the first step (construct_plan_leaves) and applies those values, keyed by
-   the leaf's source span and program. *)
+   inside a TRY.  So the runner constructs every leaf of the plan, and every
+   matching selector's RENAME_TAC, once before the first step
+   (construct_plan_leaves) and applies those values, keyed by the leaf's
+   source span and program. *)
 datatype built_leaf = BuiltTactic of Tactical.tactic | BuiltListTactic of Tactical.list_tactic
 
 fun no_built_leaves () = Binarymap.mkDict String.compare : (string, built_leaf) Binarymap.dict
@@ -1107,48 +1108,50 @@ fun pop_branch_tail_count label =
     | _ :: rest => branch_tail_count_ref := rest
 
 
-fun matching_selector_count label selector goals =
+(* The selector's tactic, built by construct_plan_leaves; NONE for SelectFirst. *)
+fun built_selector start_pos end_pos selector =
   case HolbuildProofIr.selector_program selector of
-      NONE => if null goals then NONE else SOME 1
+      NONE => NONE
     | SOME program =>
-        let val make = compile_tactic label program
-        in with_tactic_timeout label program (fn () =>
+        (case built_leaf start_pos end_pos program of
+             BuiltTactic tac => SOME (program, tac)
+           | BuiltListTactic _ => raise Fail ("internal error: selector built as a list tactic: " ^ program))
+
+fun matching_selector_count label selector goals =
+  case selector of
+      NONE => if null goals then NONE else SOME 1
+    | SOME (matching, (program, tac)) =>
+        with_tactic_timeout label program (fn () =>
         let
-          val tac = make ()
           val probe = HolbuildTacticCompat.run_tactic (current_proof_context ()) tac
-          fun loop [] count = SOME count
-            | loop (g :: rest) count =
-                if Option.isSome (Lib.total probe g) then
-                  (case selector of
-                       HolbuildProofIr.SelectMatchingFirst _ => SOME 1
-                     | HolbuildProofIr.SelectMatchingAll _ => loop rest (count + 1)
-                     | _ => loop rest (count + 1))
-                else loop rest count
+          fun matches g = Option.isSome (Lib.total probe g)
         in
-          case selector of
+          case matching of
               HolbuildProofIr.SelectMatchingFirst _ =>
-                if List.exists (fn g => Option.isSome (Lib.total probe g)) goals then SOME 1 else NONE
-            | HolbuildProofIr.SelectMatchingAll _ => loop goals 0
-            | _ => loop goals 0
-        end) () end
+                if List.exists matches goals then SOME 1 else NONE
+            | _ => SOME (length (List.filter matches goals))
+        end) ()
 
 
-fun push_select_focus label selector =
+fun push_select_focus label start_pos end_pos selector =
   let
     val {goals, generated_count, tail_count, ...} = active_focus_snapshot label
     val focused_goals = take_goals generated_count goals
+    val built = Option.map (fn tac => (selector, tac)) (built_selector start_pos end_pos selector)
     val selected_count =
-      case matching_selector_count label selector focused_goals of
+      case matching_selector_count label built focused_goals of
           SOME n => n
         | NONE => raise Fail ("select with no matching focused goals: " ^ label)
     val _ =
-      case HolbuildProofIr.selector_list_tactic selector of
-          NONE => ()
-        | SOME program =>
-            apply_focus_list_tactic label program (compile_list_tactic label program)
+      case (built, HolbuildProofIr.selector_list_tactic selector) of
+          (SOME (HolbuildProofIr.SelectMatchingFirst _, (_, tac)), SOME program) =>
+            apply_focus_list_tactic label program (fn () => Tactical.FIRST_LT tac)
+        | (SOME (_, (_, tac)), SOME program) =>
+            apply_focus_list_tactic label program (fn () => Tactical.SELECT_LT tac)
+        | _ => ()
   in push_branch_tail_count (tail_count + generated_count - selected_count); selected_count end
 
-fun push_first_focus label = push_select_focus label HolbuildProofIr.SelectFirst
+fun push_first_focus label = push_select_focus label 0 0 HolbuildProofIr.SelectFirst
 
 fun focused_goal_count label = #generated_count (active_focus_snapshot label)
 
@@ -1396,7 +1399,15 @@ fun construct_plan_leaves display_index steps =
             let val make = compile_list_tactic label program
             in build d proof_step start_pos end_pos label program (fn () => BuiltListTactic (make ())) end
         | HolbuildProofIr.StepEach {body, ...} => walk_list (d + 1) body
-        | HolbuildProofIr.StepSelect {body, ...} => walk_list (d + 1) body
+        | HolbuildProofIr.StepSelect {start_pos, end_pos, selector, body, ...} =>
+            ((case HolbuildProofIr.selector_program selector of
+                  NONE => ()
+                | SOME program =>
+                    let
+                      val label = HolbuildProofIr.step_label proof_step
+                      val make = compile_tactic label program
+                    in build d proof_step start_pos end_pos label program (fn () => BuiltTactic (make ())) end);
+             walk_list (d + 1) body)
         | HolbuildProofIr.StepRepeat {body, ...} => walk_list (d + 1) body
         | HolbuildProofIr.StepTry {body, ...} => walk_list (d + 1) body
         | HolbuildProofIr.StepCases {cases, ...} => walk_headed_bodies (d + 1) cases
@@ -1513,7 +1524,8 @@ fun run_built_steps resume_after_path display_index steps =
           val label = HolbuildProofIr.step_label proof_step
           val close_display = d + HolbuildProofIr.display_line_count proof_step - 1
           val entering_from_resume = not (!resume_reached_ref)
-          val selected_count = if entering_from_resume then 1 else push_select_focus label selector
+          val selected_count = if entering_from_resume then 1
+            else push_select_focus label (HolbuildProofIr.step_start proof_step) (HolbuildProofIr.step_end proof_step) selector
           val result = ((if selected_count = 0 then () else run_list (d + 1) (path @ [HolbuildProofIr.PathSelect]) 0 body); NONE) handle e => SOME e
         in
           case result of
