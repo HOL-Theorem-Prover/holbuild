@@ -633,6 +633,19 @@ async def test_past_the_priority_cap_a_claim_ahead_no_longer_outranks_a_ready_bu
     assert claimed is not None and claimed["theory"] == f"pkg:{first}"
 
 
+async def test_concurrent_claims_ahead_take_the_last_priority_cap_slot_once(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.priority_cap = 2
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "x1", "x2"], [("x1", "a"), ("x2", "a")], speculative_loading="4", priority="1")
+    await claim_named(http, "a")
+    await submit(http, ["n1", "n2"])
+    claimed = await asyncio.gather(claim_ahead(http), claim_ahead(http))
+    theories = sorted(c["theory"].removeprefix("pkg:") for c in claimed if c is not None)
+    assert len(theories) == 2 and theories[1].startswith("x") and theories[0] == "n1"
+
+
 async def test_a_parent_evicted_before_a_release_revokes_the_child_claimed_ahead(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: AsyncEngine
 ) -> None:

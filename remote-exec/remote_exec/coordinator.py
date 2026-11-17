@@ -1297,13 +1297,16 @@ class Coordinator:
                 # The next ready build ranks after an action that may be claimed ahead, by a ranking read since
                 # this claim started.
                 assert outranked is not None
+                if ranking.capped:  # by a concurrent claim, since: claims ahead no longer outrank the build
+                    outranked = None
+                    continue
                 _, priority, *_, tier, _ = ranking.heap[0]
                 # Only batches of a positive priority, above the build's, are claimed from: counted before the
                 # claim's await, as _claim_build's are.
                 ranking.running_priority += 1
+                self._cap_priorities(ranking)
                 claimed = await self._claim_ahead(outranked(tier, -priority), worker, above=-priority)
                 if claimed is not None:
-                    self._cap_priorities(ranking)
                     return claimed
                 ranking.running_priority -= 1
                 outranked = None
