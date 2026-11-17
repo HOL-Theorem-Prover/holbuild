@@ -537,7 +537,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   the rest, and those batches take turns when there are more of them than workers. Priority is capped:
   once batches of a positive priority run `REMOTE_EXEC_PRIORITY_CAP` builds together, their builds
   rank like priority-0 ones (fewest running first) and their claims ahead no longer go before ready
-  builds, so priority work never takes every worker. A cap at least the fleet's worker count, and a
+  builds: priority work loses its precedence, though it still takes workers no other build is ready for.
+  Each shared ranking counts its own claims until its next read, so claims from different tier lists
+  may pass the cap by a few builds briefly. A cap at least the fleet's worker count, and a
   coordinator restart, restores strict priority. Within the batch, it
   picks the action with the longest chain of dependents in the batch, then
   the one with the most dependents, then by theory name, so the critical
@@ -934,9 +936,8 @@ to run `alembic downgrade 0013`, then start the older image. This removes only
 scheduling metadata; action inputs, outputs and leases are unchanged.
 
 `GET /v1/queue` includes `ready_priority` and `running_priority`: subsets of
-the tier counts for actions whose batch has a positive priority, and
-`priority_cap`, which `running_priority`'s builds are counted against (see
-Claims). Do not add these subsets to the tier totals. Priority does not change
+the tier counts for build actions whose batch has a positive priority, and
+`priority_cap`, which `running_priority` is counted against (see Claims). Do not add these subsets to the tier totals. Priority does not change
 burst demand. Priority has no aging. Normal work can use workers for which no
 priority action is ready, including while a priority batch waits on dependencies.
 

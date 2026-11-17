@@ -1298,11 +1298,14 @@ class Coordinator:
                 # this claim started.
                 assert outranked is not None
                 _, priority, *_, tier, _ = ranking.heap[0]
+                # Only batches of a positive priority, above the build's, are claimed from: counted before the
+                # claim's await, as _claim_build's are.
+                ranking.running_priority += 1
                 claimed = await self._claim_ahead(outranked(tier, -priority), worker, above=-priority)
-                if claimed is not None:  # of a batch of a positive priority, above the build's
-                    ranking.running_priority += 1
+                if claimed is not None:
                     self._cap_priorities(ranking)
                     return claimed
+                ranking.running_priority -= 1
                 outranked = None
                 continue
             if not ranking.heap and (not ranking.ranked or ranking.at >= started):
@@ -1537,9 +1540,10 @@ class Coordinator:
         at a candidate ``outranked`` says ranks after a claim ahead, leaving it first in the ranking.
 
         Once batches of a positive priority run ``priority_cap`` builds, the ranking is capped (_cap_priorities):
-        their builds rank like priority-0 ones, and claims ahead no longer outrank them, so priority work never
-        takes every worker. Their claims count towards the cap before they await their lock, so concurrent claims
-        sharing the ranking don't all take its last slot.
+        their builds rank like priority-0 ones, and claims ahead no longer outrank them, so priority work loses its
+        precedence. Their claims count towards the cap before they await their lock, so concurrent claims sharing
+        the ranking don't all take its last slot. Rankings of other tier lists count only their own claims until
+        their next read, so together they may pass the cap by a few builds for up to ``claim_ranking_seconds``.
 
         A claim from ``host_id`` may then take another candidate of the chosen one's band; see _local_entry.
         """
@@ -2548,7 +2552,7 @@ class Coordinator:
             if state == "ahead":
                 count[state, tier] += n
                 continue
-            if prioritized:
+            if prioritized and action_class == "build":
                 priorities[state] += n
             count[state, tier] += n
             if action_class == "run":
