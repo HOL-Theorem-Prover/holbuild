@@ -109,9 +109,9 @@ fun build_help () = print
   \      the last such save's duration, have passed since that save; 0 saves\n\
   \      every one. Remote workers use the same value; no cache key depends on it.\n\
   \  --all-checkpoints\n\
-  \      All root-package theories save checkpoints by default, except a\n\
-  \      theory that isn't a target and that a parallel build pipelines into\n\
-  \      an idle slot. With this flag every one saves them.\n\
+  \      Build targets save checkpoints as they run; other root-package\n\
+  \      theories save one only when a proof fails or times out. With this\n\
+  \      flag every one saves them as it runs.\n\
   \  --skip-proof-steps\n\
   \  --proof-scope root|all (default: root)\n\
   \  --tactic-timeout SECONDS\n\
