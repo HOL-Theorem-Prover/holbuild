@@ -18,6 +18,7 @@ from remote_exec.cache_pool import CacheSlot
 from remote_exec.coordinator import (
     Coordinator,
     HostReport,
+    PhaseReport,
     QueueCounts,
     ScaleRun,
     Settings,
@@ -505,6 +506,22 @@ async def test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes(
 
     now += timedelta(seconds=300)
     assert (await http.get("/v1/queue", headers=CLIENT)).json()["phases"]["reports"] == 0
+
+
+async def test_phase_sums_drop_the_reports_evicted_at_the_cap_and_restart_from_zero(
+    coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "MAX_PHASE_REPORTS", 2)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    coordinator.clock = lambda: now
+    for hol in (0.1, 0.2, 0.3):
+        coordinator.report_phases(PhaseReport(hol=hol))
+    totals = coordinator._phase_totals(now)
+    assert (totals.reports, totals.seconds.hol) == (2, 0.5)
+
+    now += timedelta(seconds=600)
+    assert coordinator._phase_totals(now).reports == 0
+    assert coordinator.phase_sums == dict.fromkeys(coordinator_module.PHASE_FIELDS, 0.0)
 
 
 async def test_a_negative_phase_report_is_refused(http: httpx.AsyncClient) -> None:

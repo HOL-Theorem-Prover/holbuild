@@ -752,7 +752,13 @@ path twice: otherwise a kept item could stand for files another replaced. A hydr
 whose record matches what the spec names, whose files (with their
 `.hol/objs` copies) are all there, and, for a theory, whose local cache
 manifest is unchanged (the stale check drops a local copy, which then
-reinstalls); it rewrites a kept theory's `.uo` when this spec resolves its
+reinstalls). It tells an unchanged manifest by its stat, as git's index does,
+from `<cache root>/action-manifest-stats`: the manifest's device, inode, size,
+mtime and ctime, kept beside its hash when the stat was the same before and
+after reading it and older than the hydrate's start by more than a second, so
+a later rewrite always changes it. A manifest with no such stat, as one
+installed by this hydrate, is read and hashed. The file is a cache: losing it
+only costs the hashing. It rewrites a kept theory's `.uo` when this spec resolves its
 parents to other stems, and removes every item the spec doesn't name, so the
 root ends as a cold hydrate leaves it. The parent check and the cutoff read
 the records rather than hashing ~4 files per dependency. A kept item whose

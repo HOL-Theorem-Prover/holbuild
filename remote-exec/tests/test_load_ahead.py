@@ -203,6 +203,40 @@ async def test_claims_ahead_take_the_deepest_child_first_and_stop_at_the_cap(
     assert await claim_ahead(http) is None
 
 
+async def test_concurrent_claims_ahead_of_one_batch_wait_for_its_lock_one_connection_at_a_time(
+    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
+) -> None:
+    """Each claim ahead locks its batch's row; those waiting for it would each hold a pooled connection, which one big
+    batch's claims filled. They take turns in memory instead, and the turns after the cap filled skip the batch."""
+    children = [f"c{i}" for i in range(12)]
+    await submit(http, ["p", *children], [(c, "p") for c in children], speculative_loading="2")
+    await claim_named(http, "p")
+    holding: set[int] = set()
+    most = locks = 0
+
+    def lock(conn: Any, cursor: Any, statement: str, *_: Any) -> None:
+        nonlocal most, locks
+        if statement.startswith("SELECT ahead_cap, max_heap_mb FROM batches"):
+            holding.add(id(conn))
+            most = max(most, len(holding))
+            locks += 1
+
+    def end(conn: Any) -> None:
+        holding.discard(id(conn))
+
+    events = [("before_cursor_execute", lock), ("commit", end), ("rollback", end)]
+    for name, listener in events:
+        sa.event.listen(remote_exec_engine.sync_engine, name, listener)
+    try:
+        claims = await asyncio.gather(*(claim_ahead(http) for _ in range(12)))
+    finally:
+        for name, listener in events:
+            sa.event.remove(remote_exec_engine.sync_engine, name, listener)
+    assert len([c for c in claims if c is not None]) == 2
+    assert most == 1
+    assert locks == 2  # the claims after the second skip the full batch without a connection
+
+
 async def test_claims_ahead_go_one_generation_deep_and_follow_a_parent_finishing(
     http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
 ) -> None:

@@ -14,6 +14,7 @@ case "${1:-}" in
   coordinator)
     shift
     # Open event streams and claim long-polls would otherwise hold shutdown until the supervisor kills the process.
+    # The access log stays on: deployment health checks read answered claims from it.
     exec uvicorn --factory remote_exec.app:app --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2 "$@" ;;
   migrate)
     exec alembic upgrade head ;;

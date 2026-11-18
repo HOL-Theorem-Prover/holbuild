@@ -45,6 +45,14 @@ docker run -p 8090:8090 -e REMOTE_EXEC_DATABASE_URL=... -e REMOTE_EXEC_CLIENT_TO
   holbuild-remote-exec coordinator [uvicorn options, default --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2]
 ```
 
+Besides uvicorn's access log, which deployment health checks may read for answered claims, the coordinator logs a
+line once a minute, and once more at shutdown, that counts its responses by method, route and status, with the CPU
+seconds the process used and the CPU time per response:
+
+```text
+2203 responses in 60 s, 25.9 CPU-s, 11.8 ms each: GET /v1/cache/members 200 950, POST /v1/work/claim 200 330, ...
+```
+
 Without the image, from this directory: `uv sync`, then `uv run alembic
 upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090`.
 
