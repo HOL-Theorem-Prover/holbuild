@@ -3789,8 +3789,9 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
             ignore (HolbuildToolchain.run_interactive argv)
           end
 
-(* The theory action that builds `node` in action root `root`. *)
-fun theory_action root plan keys toolchain_key deps_key node : theory_action =
+(* The directory `node`'s script runs from in its action's stage, and the
+   extra inputs the action stages, each with its stage path and its file. *)
+fun theory_inputs plan node =
   let
     val package_root = #package_root (HolbuildBuildPlan.source_of node)
     val script_dir = Path.dir (source_file node)
@@ -3812,6 +3813,14 @@ fun theory_action root plan keys toolchain_key deps_key node : theory_action =
         (map (fn input =>
                  map (staged "") (expand_extra_dep package_root (HolbuildProject.extra_input_path input)))
              (HolbuildProject.action_extra_inputs (source_policy node)))
+  in
+    {script_dir = stage_script_dir, inputs = source_inputs @ manifest_inputs}
+  end
+
+(* The theory action that builds `node` in action root `root`. *)
+fun theory_action root plan keys toolchain_key deps_key node : theory_action =
+  let
+    val {script_dir = stage_script_dir, inputs} = theory_inputs plan node
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
   in
     {input_key = HolbuildBuildPlan.input_key_for keys node,
@@ -3823,7 +3832,7 @@ fun theory_action root plan keys toolchain_key deps_key node : theory_action =
      source_file = source_file node,
      source_name = HolbuildBuildPlan.source_name plan node,
      script_dir = stage_script_dir,
-     inputs = source_inputs @ manifest_inputs,
+     inputs = inputs,
      loads = preload_loads root plan node,
      outputs = {sig_path = root_relative root sig_path,
                 sml_path = root_relative root sml_path,
@@ -7952,26 +7961,24 @@ fun is_theory_node node = #kind (HolbuildBuildPlan.source_of node) = HolbuildSou
 
 fun escapes_root rel = Path.isAbsolute rel orelse rel = ".." orelse String.isPrefix "../" rel
 
-(* A HOL theory or library the preload names by a path on this machine
-   rather than by name; a worker has no such file. *)
-fun hol_load_by_path (LoadTheory name) = CharVector.exists (fn c => c = #"/") name
-  | hol_load_by_path (LoadLibrary name) = CharVector.exists (fn c => c = #"/") name
-  | hol_load_by_path (LoadObject _) = false
+(* Whether the preload names a HOL theory or library by a path on this
+   machine rather than by name; a worker has no such file. *)
+fun hol_load_by_path name = CharVector.exists (fn c => c = #"/") name
 
 (* Why a theory can't run remotely, if it can't. *)
-fun excluded_reason (action : theory_action) node =
+fun excluded_reason plan node =
   if always_reexecute node then SOME "it sets always_reexecute"
   else if not (cache_enabled node) then SOME "it sets cache = false"
   else if escapes_root (HolbuildBuildPlan.relative_path node) then
     SOME "its script lies outside its package root"
   else
-    case List.find (fn {path, ...} => escapes_root path) (#inputs action) of
+    case List.find (fn {path, ...} => escapes_root path) (#inputs (theory_inputs plan node)) of
         SOME {path, ...} => SOME ("its extra input " ^ path ^ " lies outside its package root")
       | NONE =>
-          case List.find hol_load_by_path (#loads action) of
-              SOME (LoadTheory name) => SOME ("it loads " ^ name ^ " by path")
-            | SOME (LoadLibrary name) => SOME ("it loads " ^ name ^ " by path")
-            | _ => NONE
+          case List.find hol_load_by_path (HolbuildBuildPlan.direct_external_theories plan node @
+                                           HolbuildBuildPlan.direct_external_libs plan node) of
+              SOME name => SOME ("it loads " ^ name ^ " by path")
+            | NONE => NONE
 
 (* Whether the remote cache holds an entry this build would restore: usable,
    and with a timeout contract at least as strict as the one requested,
@@ -8469,15 +8476,15 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
     val config_lines = build_config_lines_for_node options project
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
     val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
-    (* No deps key: nothing here reads it, and action_spec_text writes the
-       spec's own.  Computing it for every theory is quadratic in the plan. *)
+    (* Each theory with its input key: the theory action, which stages its
+       inputs and orders its loads, is built only for those exported. *)
     val actions =
       detail_time_phase "action_spec.export.actions" (fn () =>
-        map (fn node => (node, theory_action root plan keys toolchain_key "" node)) theories)
+        map (fn node => (node, {input_key = HolbuildBuildPlan.input_key_for keys node})) theories)
     val _ =
       List.app
-        (fn (node, action) =>
-            case excluded_reason action node of
+        (fn (node, _) =>
+            case excluded_reason plan node of
                 SOME reason =>
                   raise Error ("action-spec: " ^ package node ^ ":" ^ logical_name node ^
                                " can't run remotely: " ^ reason)
@@ -8615,8 +8622,11 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
     val spec_dir = Path.concat(root, ".holbuild/action-specs")
     val context = {root = root, plan = plan, keys = keys, action_toolchain_key = action_toolchain_key,
                    runtime = runtime_identity (), toolchain_line = toolchain_line}
-    fun export (node, action) =
+    (* No deps key: nothing here reads it, and action_spec_text writes the
+       spec's own.  Computing it for every theory is quadratic in the plan. *)
+    fun export (node, _) =
       let
+        val action = theory_action root plan keys toolchain_key "" node
         val action_text =
           HolbuildBuildPlan.action_text_with plan config_lines action_toolchain_key keys node
         val _ =
@@ -8969,7 +8979,7 @@ fun plan_runs tc project planned jobs {keep_specs}
                       (* Run specs need the action's staging and loads, not its deps key. *)
                       val action = theory_action root plan keys toolchain_key "" node
                       val _ =
-                        case excluded_reason action node of
+                        case excluded_reason plan node of
                             SOME reason => raise Error ("run-action: " ^ name ^ " can't run remotely: " ^ reason)
                           | NONE => ()
                       val planned_inputs = List.concat
