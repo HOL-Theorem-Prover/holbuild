@@ -11,6 +11,17 @@ val _ = HolbuildRemoteCacheConfig.set_url url;
 val _ = RC.fail_closed := true;
 val remote = RC.remote url;
 fun write result = BE.write_text (dir ^ "/result") result;
+(* GATED: compiled, wait for the test's go, so a timed step doesn't include
+   compiling holbuild. *)
+val _ =
+  case OS.Process.getEnv "GATED" of
+      SOME _ =>
+        let
+          fun await () =
+            if OS.FileSys.access (dir ^ "/go", []) then ()
+            else (OS.Process.sleep (Time.fromMilliseconds 10); await ())
+        in BE.write_text (dir ^ "/ready") ""; await () end
+    | NONE => ();
 val _ =
   case OS.Process.getEnv "WAIT_SECONDS" of
       SOME seconds =>
