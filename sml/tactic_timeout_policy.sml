@@ -70,10 +70,14 @@ fun add_entry_timeout project plan (logical, timeout) acc =
       NONE => acc
     | SOME root => List.foldl (add_root_node_timeout project timeout) acc (closure_nodes plan root)
 
+fun explicit_entries project index =
+  List.filter
+    (fn (root, _) => Option.isSome (HolbuildProject.root_tactic_timeout_for project root))
+    (declared_entries project index)
+
 (* The timeouts the roots with their own tactic timeout set on the root-package
    nodes of their closures.  Every other root would set the default timeout,
-   which plan_timeouts already sets on each such node.  Every declared root
-   is still resolved, which reports an unknown or ambiguous one. *)
+   which plan_timeouts already sets on each such node. *)
 fun entry_timeouts project index entry_plan =
   List.foldl
     (fn ((root, logical), acc) =>
@@ -81,7 +85,7 @@ fun entry_timeouts project index entry_plan =
             SOME timeout => add_entry_timeout project entry_plan (logical, timeout) acc
           | NONE => acc)
     no_timeouts
-    (declared_entries project index)
+    (explicit_entries project index)
 
 fun selected_node_for_source project plan source =
   let
@@ -141,10 +145,5 @@ fun replace_timeouts base overrides = List.foldl (add_key_timeout #2) base overr
 
 fun combine_timeouts left (right : timeouts) =
   Binarymap.foldl (fn (node_key, timeout, acc) => add_key_timeout timeout_min ((node_key, timeout), acc)) left right
-
-fun explicit_entries project index =
-  List.filter
-    (fn (root, _) => Option.isSome (HolbuildProject.root_tactic_timeout_for project root))
-    (declared_entries project index)
 
 end
