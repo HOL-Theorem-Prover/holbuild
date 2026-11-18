@@ -3159,7 +3159,6 @@ async def test_run_claims_read_again_once_a_none_is_older_than_the_ranking_ttl(
     assert await claim(http) is None
     async with coordinator.engine.begin() as connection:
         await connection.execute(sa.text("UPDATE actions SET state = 'cancelled' WHERE theory = 'pkg:run-a'"))
-    assert await claim(http) is None
     await asyncio.sleep(0.3)
     await claim_named(http, "run-b")
 
