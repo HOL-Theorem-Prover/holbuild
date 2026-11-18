@@ -873,7 +873,8 @@ projects, so a theory in a dependency package writes its extra outputs under the
 consuming project's `.holbuild/packages/<name>/extra-outputs/` instead, at the
 path the declaration gives relative to the script's directory in the package;
 SML sources a theory of the package currently declares there are discovered as
-the package's own. The action must
+the package's own, and the package's extra inputs that name its declared outputs,
+by path or through a directory or glob, read them there. The action must
 produce every declaration. Extra outputs participate in up-to-date checks and
 cache publication/restoration, and `holbuild clean TARGET` removes them. Holbuild records ownership lazily and
 rejects another action that attempts to materialize the same path. As with

@@ -38,13 +38,13 @@ PY
 # age DAYS PATH: set the modification time DAYS days back.
 age() { python3 -c 'import os, sys, time; t = time.time() - float(sys.argv[1]) * 86400; os.utime(sys.argv[2], (t, t))' "$1" "$2"; }
 
-checkout_of() { printf '%s/git/checkouts/%s-%s' "$HOLBUILD_CACHE" "$(printf %s "$1" | sha1sum | cut -d' ' -f1)" "$2"; }
+checkout_of() { printf '%s/git/checkouts/%s-%s-v2' "$HOLBUILD_CACHE" "$(printf %s "$1" | sha1sum | cut -d' ' -f1)" "$2"; }
 
 # A real build against a theory in a git dependency writes nothing into the
 # shared checkout: the dependency's declared extra outputs, an SML source among
 # them, go under each consuming project's .holbuild, whether its theory is
-# built or restored from the cache.  Another theory reads one of them as an
-# extra input.  The dependency's members overlap, so discovery reaches its
+# built or restored from the cache.  Other theories read one of them as an
+# extra input, by its path and through its directory.  The dependency's members overlap, so discovery reaches its
 # generated source twice.
 use_case_cache "$tmpdir/cache"
 dep=$tmpdir/dep
@@ -65,18 +65,24 @@ val _ = new_theory "D";
 val d_def = new_definition("d_def", ``d_const = T``);
 val _ = export_theory();
 SML
-cat > "$dep/src/EScript.sml" <<'SML'
+# write_reader NAME DECLARATION: theory NAME reads results/D.txt through
+# DECLARATION and writes what it read to out/NAME.txt.
+write_reader() {
+  cat > "$dep/src/$1Script.sml" <<SML
 fun holbuild_extra_deps (_ : string list) = ();
 fun holbuild_extra_outputs (_ : string list) = ();
-val () = holbuild_extra_deps ["results/D.txt"];
-val () = holbuild_extra_outputs ["results/E.txt"];
+val () = holbuild_extra_deps ["$2"];
+val () = holbuild_extra_outputs ["out/$1.txt"];
 val () = let val input = TextIO.openIn "results/D.txt"; val text = TextIO.inputAll input
-             val () = TextIO.closeIn input; val out = TextIO.openOut "results/E.txt"
+             val () = TextIO.closeIn input; val out = TextIO.openOut "out/$1.txt"
          in TextIO.output (out, "read " ^ text); TextIO.closeOut out end;
 open HolKernel Parse boolLib bossLib;
-val _ = new_theory "E";
+val _ = new_theory "$1";
 val _ = export_theory();
 SML
+}
+write_reader E results/D.txt
+write_reader F results
 cat > "$dep/src/DUse.sml" <<'SML'
 structure DUse = struct val y = DGenML.x + 1 end
 SML
@@ -92,7 +98,7 @@ mkdir -p "$project/src"
 cat > "$project/src/UScript.sml" <<'SML'
 fun holbuild_extra_outputs (_ : string list) = ();
 val () = holbuild_extra_outputs ["results/U.txt"];
-open HolKernel Parse boolLib bossLib DTheory ETheory;
+open HolKernel Parse boolLib bossLib DTheory ETheory FTheory;
 val () = let val out = TextIO.openOut "results/U.txt"
          in TextIO.output (out, "user result " ^ Int.toString DUse.y ^ "\n"); TextIO.closeOut out end;
 val _ = new_theory "U";
@@ -113,7 +119,8 @@ before=$(snapshot "$checkout")
 require_outputs() {
   require_grep "dep result" "$1/.holbuild/packages/dep/extra-outputs/src/results/D.txt"
   require_file "$1/.holbuild/packages/dep/extra-outputs/src/DGenML.sml"
-  require_grep "read dep result" "$1/.holbuild/packages/dep/extra-outputs/src/results/E.txt"
+  require_grep "read dep result" "$1/.holbuild/packages/dep/extra-outputs/src/out/E.txt"
+  require_grep "read dep result" "$1/.holbuild/packages/dep/extra-outputs/src/out/F.txt"
   require_grep "user result 43" "$1/src/results/U.txt"
 }
 (cd "$project" && "$HOLBUILD_BIN" build) > "$tmpdir/build.log" 2>&1 || { cat "$tmpdir/build.log" >&2; fail "build failed"; }
@@ -244,10 +251,20 @@ age 6 "$lib_checkout.last-used"
 gc
 require_grep "checkouts=0 checkouts-busy=0" "$tmpdir/gc.log"
 require_file "$lib_checkout/holproject.toml"
+# So does one that 0.14.63 or 0.14.64 made, which is never used again: those
+# could hold a dependency's extra outputs.
+legacy_checkout=${lib_checkout%-v2}
+mkdir -p "$legacy_checkout"
+touch "$legacy_checkout.last-used"
 age 8 "$lib_checkout.last-used"
 gc
 require_grep "checkouts=1 checkouts-busy=0" "$tmpdir/gc.log"
 [[ ! -e $lib_checkout && ! -e $lib_checkout.last-used ]] || fail "GC left the stale checkout"
+[[ -d $legacy_checkout ]] || fail "GC removed a recently used legacy checkout"
+age 8 "$legacy_checkout.last-used"
+gc
+require_grep "checkouts=1 checkouts-busy=0" "$tmpdir/gc.log"
+[[ ! -e $legacy_checkout && ! -e $legacy_checkout.last-used ]] || fail "GC left the legacy checkout"
 [[ -L $gc_project/.holbuild/src/lib && ! -e $gc_project/.holbuild/src/lib ]] || fail "expected a dangling link"
 [[ -d $HOLBUILD_CACHE/git/remotes/$(printf %s "$tmpdir/lib" | sha1sum | cut -d' ' -f1).git ]] || fail "GC removed the mirror"
 
