@@ -544,6 +544,17 @@ worker c "$spec_a2"
 expect c 0
 [[ $(stat -c %i "$stem_a.dat") == "$inode_a" ]] || { echo "worker c installed A again" >&2; exit 1; }
 [[ ! -e "$stem_b.dat" && -z $(resident_stem 'BTheory$') ]] || { echo "worker c kept B, which A2 doesn't name" >&2; exit 1; }
+# A kept dependency's manifest hash is recorded by the manifest's stat once
+# the manifest is more than a second older than the hydrate, and trusted
+# while the stat is unchanged; a change to the manifest still shows.
+sleep 1.1
+worker c "$spec_a2"
+expect c 0
+grep -qF "$tmpdir/worker-c/actions/$key_a/manifest" "$tmpdir/worker-c/action-manifest-stats" || {
+  echo "worker c recorded no stat of A's manifest" >&2; cat "$tmpdir/worker-c/action-manifest-stats" >&2; exit 1; }
+worker c "$spec_a2"
+expect c 0
+[[ $(stat -c %i "$stem_a.dat") == "$inode_a" ]] || { echo "worker c installed A again on its recorded stat" >&2; exit 1; }
 printf '\n' >> "$tmpdir/worker-c/actions/$key_a/manifest"
 worker c "$spec_a2"
 expect c 0

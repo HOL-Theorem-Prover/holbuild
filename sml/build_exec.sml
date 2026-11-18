@@ -9775,6 +9775,11 @@ fun hydrate_step name f =
     (f () before record ()) handle e => (record (); raise e)
   end
 
+(* Adds N to the count NAME among the hydrate's steps. *)
+fun hydrate_count name n =
+  let val earlier = case List.find (fn (m, _) => m = name) (!hydrate_steps) of SOME (_, e) => e | NONE => 0
+  in hydrate_steps := (name, earlier + LargeInt.fromInt n) :: List.filter (fn (m, _) => m <> name) (!hydrate_steps) end
+
 structure Resident = HolbuildActionResident
 
 val theory_suffixes = [".sig", ".sml", ".dat", ".tr.gz", ".ui", ".uo"]
@@ -9848,7 +9853,45 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
     val resolver = spec_resolver spec
     fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
     fun uo_lines stem metadata = generated_theory_loads resolve metadata @ [in_root root stem ^ ".sml"]
-    fun source_sha key = Option.map HolbuildHash.string_sha256 (HolbuildCache.get_action cache key)
+    (* The hashes of the cache manifests the kept dependencies came from, by
+       the manifests' stat: holbuild's stat cache never returns a source's
+       hash from its stat, as a same-size write in one timestamp tick can
+       keep it; git's index scheme makes it safe for these files, which only
+       exec-action writes in its own cache: a stat is kept only when taken
+       before the read, equal after it, and older than the scan by more than
+       a second, so any later replacement shows in the stat. *)
+    val manifest_stats_file = Path.concat (cache, "action-manifest-stats")
+    val scan_ns = Time.toNanoseconds (Time.now ())
+    val known = #entries (HolbuildStatCache.load {path = manifest_stats_file})
+    val seen = HolbuildStatCache.new_instance true (SOME manifest_stats_file) (HolbuildStatCache.empty_entries ())
+    fun see path entry =
+      HolbuildStatCache.with_lock seen (fn () => #entries seen := Binarymap.insert (!(#entries seen), path, entry))
+    fun source_sha key =
+      let val path = HolbuildCache.action_manifest cache key
+      in
+        case HolbuildStatCache.stat_ident path of
+            NONE => NONE
+          | SOME ident =>
+              case Binarymap.peek (!known, path) of
+                  SOME (entry as (recorded, hash)) =>
+                    if HolbuildStatCache.same_ident (recorded, ident) then (see path entry; SOME hash)
+                    else hash_manifest key path ident
+                | NONE => hash_manifest key path ident
+      end
+    and hash_manifest key path ident =
+      Option.map
+        (fn text =>
+            let val hash = HolbuildHash.string_sha256 text
+            in
+              case HolbuildStatCache.stat_ident path of
+                  SOME after =>
+                    if HolbuildStatCache.same_ident (ident, after) andalso not (HolbuildPlanRecord.racy_at scan_ns ident)
+                    then see path (ident, hash)
+                    else ()
+                | NONE => ();
+              hash
+            end)
+        (HolbuildCache.get_action cache key)
     (* A dependency installed from the local cache's current entry for its
        key, with the .uo this spec would write, stays. *)
     fun kept {target, stem, key} =
@@ -9901,11 +9944,14 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
     fun restore_deps_now () =
       let
         val checks = map (fn dep => (dep, ref false)) (#deps spec)
-        val _ = transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks
+        val _ = hydrate_step "hydcheck" (fn () =>
+                  transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks)
         val stale = map #1 (List.filter (! o #2) checks)
       in
-        List.app (restorable remove_old) stale;
-        transfer_all (restorable install) stale
+        hydrate_count "hydinstn" (length stale);
+        hydrate_step "hydinst" (fn () =>
+          (List.app (restorable remove_old) stale;
+           transfer_all (restorable install) stale))
       end
     (* Each dependency's .dat against its parents', from the records. *)
     fun misfit () =
@@ -9974,7 +10020,9 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             | SOME {target, key, ...} =>
                 raise ActionFailed (InputMissing ("theory " ^ key),
                                     "dependency " ^ target ^ " does not match its parents in the cache");
-    Resident.save resident
+    Resident.save resident;
+    (* A stale or missing record only means a manifest is hashed again. *)
+    HolbuildStatCache.flush seen handle _ => ()
   end
 
 (* The stems of the project objects the build loads: the ones its preload
