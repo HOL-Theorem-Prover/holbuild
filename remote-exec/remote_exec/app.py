@@ -92,8 +92,8 @@ async def text_body(request: Request) -> str:
         raise HTTPException(400, f"body is not UTF-8: {error}") from error
 
 
-# Requests by method, route and status since the last summary line; they replace uvicorn's access log, whose line per
-# request cost the event loop more than the counting does.
+# Requests by method, route and status since the last summary line, which totals what uvicorn's access log lists line by
+# line.
 type ResponseCounts = Counter[tuple[str, str, int]]
 
 
