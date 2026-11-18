@@ -282,12 +282,12 @@ fun checkpoint_save_runtime_line () =
 
 (* PolyML child heaps remember their parent-chain filenames. The shared runtime
    helper saves checkpoints directly to the final .save path and publishes .ok
-   metadata last via an atomic .ok.tmp rename. *)
-fun save_heap_expr {label, share_common_data, output, ok_text} =
+   metadata last via an atomic .ok.tmp rename.  SHARE is an SML expression. *)
+fun save_heap_expr {label, share, output, ok_text} =
   String.concat
     ["HolbuildCheckpointSaveRuntime.save_checkpoint {label = ",
      HolbuildToolchain.sml_string label,
-     ", default_share = ", if share_common_data then "true" else "false",
+     ", default_share = ", share,
      ", path = ", HolbuildToolchain.sml_string output,
      ", ok_text = ", HolbuildToolchain.sml_string ok_text,
      ", depth = HolbuildRuntime.save_hierarchy_depth ()}"]
@@ -344,10 +344,14 @@ fun manifest_loads plan node =
   map load_name (ordered_loads plan node load_stem (HolbuildBuildPlan.direct_project_deps plan node))
 
 (* The deps heap keeps only the toolchain's load path, not the project's
-   directories HOL put there: other trees of the project resume from it. *)
-fun write_preload load_lines deps_loaded deps_ok path =
+   directories HOL put there: other trees of the project resume from it.  A
+   child that loaded ahead may have saved AHEAD_LOADED with its common data
+   shared; the deps heap is then its child, saved without sharing again. *)
+fun write_preload load_lines ahead_loaded deps_loaded deps_ok path =
   let
-    val save = save_heap_expr {label = "deps_loaded", share_common_data = true,
+    val share = "not (List.exists (fn f => f = " ^ HolbuildToolchain.sml_string ahead_loaded ^
+                ") (PolyML.SaveState.showHierarchy ()))"
+    val save = save_heap_expr {label = "deps_loaded", share = share,
                                output = deps_loaded, ok_text = deps_ok}
     val lines = runtime_line () ::
                 (load_lines @
@@ -814,6 +818,10 @@ fun deps_checkpoint_root base = base ^ ".deps"
 
 fun deps_loaded_path base deps_key =
   Path.concat(Path.concat(deps_checkpoint_root base, deps_key), "deps_loaded.save")
+
+(* Where a child loading ahead saves the heap its deps heap is a child of;
+   its deps key isn't known yet. *)
+fun ahead_loaded_path base = Path.concat(deps_checkpoint_root base, "ahead_loaded.save")
 
 fun theorem_checkpoint_root base = base ^ ".theorems"
 
@@ -3929,7 +3937,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
       fun run_from_fresh_preload () =
         (remove_deps_checkpoint_descendants base deps_key;
          ensure_source_checkpoint_parents ();
-         write_preload load_lines deps_loaded deps_ok preload;
+         write_preload load_lines (ahead_loaded_path base) deps_loaded deps_ok preload;
          write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
@@ -11142,7 +11150,7 @@ fun shared_index_keys text =
 
 type shared_context =
   {store : string, checkpoint_root : string, heap_key : string, index_key : string, base_state : string,
-   deps_key : string, deps_loaded : string, requested_timeout : real option,
+   deps_key : string, deps_loaded : string, ahead_loaded : string, requested_timeout : real option,
    candidates : shared_candidate list}
 
 fun shared_context cache checkpoint_root tc root policy (action : theory_action) checkpoints : shared_context =
@@ -11155,14 +11163,29 @@ fun shared_context cache checkpoint_root tc root policy (action : theory_action)
      base_state = FS.fullPath (HolbuildToolchain.base_state tc),
      deps_key = #deps_key action,
      deps_loaded = deps_loaded_path base (#deps_key action),
+     ahead_loaded = ahead_loaded_path base,
      requested_timeout = tactic_timeout policy,
      candidates = shared_candidates policy base checkpoints}
   end
 
-fun shared_heap_parent_ok ({deps_loaded, base_state, ...} : shared_context) =
-  case saved_parent deps_loaded of
-      SOME parent => (FS.fullPath parent = base_state handle OS.SysErr _ => false)
-    | NONE => false
+(* The deps heap is a child of the base state, or of the ahead heap a child
+   loading ahead saved, which is. *)
+fun shared_heap_parent_ok ({deps_loaded, ahead_loaded, base_state, ...} : shared_context) =
+  let
+    fun on_base path =
+      case saved_parent path of
+          SOME parent => (FS.fullPath parent = base_state handle OS.SysErr _ => false)
+        | NONE => false
+  in
+    on_base deps_loaded orelse saved_parent deps_loaded = SOME ahead_loaded andalso on_base ahead_loaded
+  end
+
+(* The heap manifest's ahead heap, if the deps heap is a child of one. *)
+fun shared_heap_parent entries =
+  case List.filter (fn (role, _, _) => role = "parent") entries of
+      [] => NONE
+    | [(_, sha, _)] => SOME sha
+    | _ => raise Error "shared heap manifest names more than one parent"
 
 fun tree_relative root path =
   if String.isPrefix (root ^ "/") path then SOME (String.extract(path, size root + 1, NONE)) else NONE
@@ -11184,7 +11207,8 @@ val nothing_restored : shared_restore = {heap = NONE, files = [], stale = [], mi
 (* With RESUMES false the run saves every boundary itself, so only the heap
    is restored: a linked checkpoint would sit where it saves. *)
 fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, deps_key, deps_loaded,
-                                              requested_timeout, candidates, ...} : shared_context) resumes =
+                                              ahead_loaded, requested_timeout, candidates, ...} : shared_context)
+                               resumes =
   let
     val stale = ref ([] : string list)
     val missing = ref ([] : string list)
@@ -11203,7 +11227,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun heap_placed heap =
       (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
        touch_dir (Path.concat(store, heap)))
-    fun place_heap heap = (place heap (heap, deps_loaded); heap_placed heap)
+    (* The published heap: the deps heap's blob, and its ahead heap's. *)
+    fun heap_files (heap, parent) =
+      (heap, deps_loaded) :: (case parent of SOME sha => [(sha, ahead_loaded)] | NONE => [])
+    fun place_heap (published as (heap, _)) = (List.app (place heap) (heap_files published); heap_placed heap)
     fun single role entries =
       case List.filter (fn (r, _, _) => r = role) entries of
           [(_, sha, arg)] => (sha, arg)
@@ -11217,7 +11244,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* A checkpoint is chained to the heap its manifest names, so only those
        on the heap now published under heap_key are restored. *)
     fun candidate_key (c : shared_candidate) = shared_checkpoint_key heap_key (#kind c) (#key c)
-    fun try_candidate published_heap (c : shared_candidate, fetched) =
+    fun try_candidate (published as (published_heap, _)) (c : shared_candidate, fetched) =
       let val key = candidate_key c
       in
         case fetched of
@@ -11254,7 +11281,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                            else raise Error ("unexpected shared checkpoint sidecar " ^ suffix)
                        | _ => NONE)
                      entries
-                 val restored = (heap, deps_loaded) :: spine @ spine_sidecars @ ((leaf, #path c) :: sidecars)
+                 val restored = heap_files published @ spine @ spine_sidecars @ ((leaf, #path c) :: sidecars)
                in
                  if heap <> published_heap then NONE else
                  (* The small .ok first: a checkpoint with a laxer timeout than
@@ -11264,7 +11291,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                  else
                    (restore_step "rstplace" (fn () =>
                       (transfer_all (fn (placer, file) => placer heap file)
-                         ((place, (heap, deps_loaded)) :: map place_state_file spine @
+                         (map (fn f => (place, f)) (heap_files published) @ map place_state_file spine @
                           map (fn f => (place_sidecar, f)) spine_sidecars @
                           [place_state_file (leaf, #path c)]);
                        heap_placed heap));
@@ -11282,7 +11309,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* Fetch a window of manifests at once, then try them in order. Every
        fetch has ended before a window is tried, and only a manifest that is
        tried records its blobs as present. *)
-    fun first_window heap candidates =
+    fun first_window published candidates =
       case candidates of
           [] => NONE
         | _ =>
@@ -11294,9 +11321,9 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                                           fetched := HolbuildRemoteCache.fetch_action remote (candidate_key c))
                                        window)
             in
-              case first_some (try_candidate heap) (map (fn (c, fetched) => (c, !fetched)) window) of
+              case first_some (try_candidate published) (map (fn (c, fetched) => (c, !fetched)) window) of
                   SOME restored => SOME restored
-                | NONE => first_window heap (List.drop (candidates, n))
+                | NONE => first_window published (List.drop (candidates, n))
             end
     (* Without an index (a heap published before there were any) every
        candidate is probed. *)
@@ -11321,11 +11348,11 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                     kept
                   end
           end
-    fun try_heap heap =
-      (restore_step "rstplace" (fn () => place_heap heap);
+    fun try_heap (published as (heap, _)) =
+      (restore_step "rstplace" (fn () => place_heap published);
        if shared_heap_parent_ok ctx andalso deps_checkpoint_exists deps_loaded deps_key then
          (HolbuildStatus.message_stdout "restored shared deps-loaded heap\n";
-          {heap = SOME heap, files = [(deps_loaded, heap)]})
+          {heap = SOME heap, files = map (fn (sha, path) => (path, sha)) (heap_files published)})
        else (warn "shared deps-loaded heap failed validation"; wipe (); no_files))
       handle MissingSharedBlob sha => (missing_blob heap_key sha; wipe (); no_files)
            | e => (warn ("could not restore the shared heap: " ^ General.exnMessage e);
@@ -11339,13 +11366,14 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               | found => found) of
           NONE => no_files
         | SOME text =>
-            case (SOME (#1 (single "heap" (shared_manifest_entries text)))
+            case (let val entries = shared_manifest_entries text
+                  in SOME (#1 (single "heap" entries), shared_heap_parent entries) end
                   handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
                 NONE => no_files
-              | SOME heap =>
-                  case first_window heap (if resumes then listed candidates else []) of
+              | SOME published =>
+                  case first_window published (if resumes then listed candidates else []) of
                       SOME restored => restored
-                    | NONE => try_heap heap
+                    | NONE => try_heap published
   in
     {heap = heap, files = files, stale = !stale, missing = !missing}
   end
@@ -11355,7 +11383,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
 (* After the run, successful or not: the heap if this run saved it, then,
    if the heap under them is the published one, the new checkpoints. *)
 fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, deps_key, deps_loaded,
-                                              candidates, ...} : shared_context)
+                                              ahead_loaded, candidates, ...} : shared_context)
                                ({heap = restored_heap, files = restored, stale, missing} : shared_restore) =
   let
     fun member x xs = List.exists (fn y => y = x) xs
@@ -11431,15 +11459,22 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
              this upload failed, and for a repair if the cache later loses
              the heap's blob. *)
           fun release () = ignore (write_claim 0) handle HolbuildRemoteCache.Unavailable _ => ()
+          (* A deps heap saved as the ahead heap's child is published with it. *)
+          val files =
+            (deps_loaded, sha) ::
+            (if saved_parent deps_loaded = SOME ahead_loaded then [(ahead_loaded, hash ahead_loaded)] else [])
           fun upload () =
             let
-              val manifest = shared_manifest "holbuild-shared-heap-v1" NONE [("heap", sha, "")]
-              val _ = upload_all [(deps_loaded, sha)]
-              val _ = if needs_upload sha then raise Error ("could not upload " ^ deps_loaded) else ()
+              val manifest =
+                shared_manifest "holbuild-shared-heap-v1" NONE
+                  (("heap", sha, "") :: map (fn (_, parent) => ("parent", parent, "")) (tl files))
+              val _ = upload_all files
+              val _ = List.app (fn (path, blob) => if needs_upload blob then raise Error ("could not upload " ^ path) else ())
+                               files
               val _ = HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
             in
               if HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote heap_key) = SOME manifest then
-                (store_add store sha {sha = sha, src = deps_loaded, save = true}; SOME sha)
+                (List.app (fn (path, blob) => store_add store sha {sha = blob, src = path, save = true}) files; SOME sha)
               else NONE
             end
         in
@@ -12762,7 +12797,7 @@ fun read_base_report path =
 (* The file the child evaluates first: the runtime, the recording loader and
    LOAD_LINES under it, which pass through the stand-ins, and a last step
    that waits for exec-action to write the files the child evaluates next. *)
-fun write_ahead_preload {load_lines, dir, share, path} =
+fun write_ahead_preload {load_lines, dir, ahead_loaded, path} =
   let
     val no_loader = HolbuildToolchain.sml_string "this toolchain's HOL has no Meta.loadPlan"
     val lines =
@@ -12777,7 +12812,8 @@ fun write_ahead_preload {load_lines, dir, share, path} =
          "Meta.moduleSourceLoader := (fn use => fn file => (HolbuildAheadLoad.record file; loader use file)); " ^
          "HolbuildAheadLoad.loader := Meta.load; " ^
          "HolbuildAheadLoad.restore := (fn () => Meta.moduleSourceLoader := loader) end;") ::
-      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^ Bool.toString share ^ ";" ::
+      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^
+        HolbuildToolchain.sml_string ahead_loaded ^ ";" ::
       "structure HolbuildAheadPlainRuntime = HolbuildRuntime;" ::
       "structure HolbuildRuntime = struct open HolbuildRuntime val load = HolbuildAheadLoad.load end;" ::
       (load_lines @
@@ -13284,12 +13320,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             (List.tabulate (length late, fn n => List.filter (fn parent => length (late_ancestors parent) = n) late))
         fun marker name = Path.concat (dir, name)
         fun drop name = write_text (marker name) ""
+        (* As the plain preload's heap save: none without checkpoints. *)
+        val ahead_loaded =
+          if checkpoint_enabled (spec_policy spec) andalso env_bool "HOLBUILD_SHARE_COMMON_DATA" true
+          then ahead_loaded_path (action_checkpoint_base checkpoint_root action)
+          else ""
+        val _ = if ahead_loaded = "" then () else ensure_parent ahead_loaded
         val _ =
           write_ahead_preload
             {load_lines = map (theory_load_line root) (#loads spec), dir = dir,
-             (* As the plain preload's heap save: none without checkpoints. *)
-             share = checkpoint_enabled (spec_policy spec) andalso env_bool "HOLBUILD_SHARE_COMMON_DATA" true,
-             path = Path.concat (stage, "holbuild-ahead-preload.sml")}
+             ahead_loaded = ahead_loaded, path = Path.concat (stage, "holbuild-ahead-preload.sml")}
         val files =
           map (fn name => Path.concat (stage, name))
             ["holbuild-child-policy.sml", "holbuild-ahead-preload.sml", "holbuild-preload.sml",

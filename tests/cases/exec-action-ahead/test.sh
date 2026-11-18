@@ -423,3 +423,60 @@ worker share-y "$spec_Y"
 expect share-y 0 "status=built"
 worker_wait share
 expect share 0 "status=built"
+
+# A child that has to wait saves the heap it loaded ahead, and its deps heap
+# as that heap's child.  Shared, both are published, and a plain run on the
+# same worker, its store emptied, restores them and resumes the failed proof
+# from its failed prefix.
+cat > "$project/src/PScript.sml" <<'SML'
+Theory P
+Ancestors bool
+
+Theorem p_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+cat > "$project/src/QScript.sml" <<'SML'
+Theory Q
+Ancestors P
+
+Theorem q1:
+  T
+Proof
+  ACCEPT_TAC p_thm
+QED
+
+Theorem q2:
+  T /\ T
+Proof
+  CONJ_TAC >- ACCEPT_TAC TRUTH >> FAIL_TAC "seeded failure"
+QED
+SML
+hb action-spec --upload QTheory > "$tmpdir/batch-q.txt"
+spec_P=$(spec_for "$tmpdir/batch-q.txt" ahead:PTheory)
+key_P=$(key_for "$tmpdir/batch-q.txt" ahead:PTheory)
+spec_Q=$(spec_for "$tmpdir/batch-q.txt" ahead:QTheory)
+worker_start two-level "$spec_Q" --share-heaps --ahead-parent "$key_P:$spec_P"
+await_marker two-level waiting-PTheory
+worker p "$spec_P"
+expect p 0 "status=built"
+worker_wait two-level
+expect two-level 1 "status=failed" "failure=proof"
+require_grep "seeded failure" "$tmpdir/two-level.log"
+heaps=$(grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote2/ac/* | xargs grep -l ' parent$' | wc -l)
+[[ "$heaps" == 1 ]] || { echo "$heaps shared heaps name an ahead heap, wanted 1" >&2; exit 1; }
+# The heap's key names the worker's paths, which every fleet worker shares.
+mv "$tmpdir/two-level.log" "$tmpdir/two-level-ahead.log"
+rm -rf "$tmpdir/worker-two-level/checkpoint-store"
+worker two-level "$spec_Q" --share-heaps
+expect two-level 1 "status=failed" "failure=proof"
+require_grep "seeded failure" "$tmpdir/two-level.log"
+require_grep "restored shared failed_prefix checkpoint" "$tmpdir/two-level.log"
+require_grep "from: failed-prefix checkpoint in q2" "$tmpdir/two-level.log"
+if grep -q "discarding" "$tmpdir/two-level.log"; then
+  echo "the plain run discarded the restored two-level state" >&2
+  cat "$tmpdir/two-level.log" >&2
+  exit 1
+fi

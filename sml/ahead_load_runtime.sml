@@ -26,14 +26,15 @@
    parent whose wait step shared the heap) and abandoned (written here,
    its reason; the child then exits with failure).
 
-   The plain preload shares the heap's common data before it saves the heap,
-   which on a large load costs minutes after the last parent has arrived.  So
-   the first wait step that has to wait shares it while the child is idle,
-   with most of its ancestors loaded, and the save's own share then has
-   little left to do.  Later waits don't share again: on a chain of late
-   parents they last only as long as one parent's own hand-off.  A full GC
-   follows the share: the share frees the duplicates but leaves them in the
-   heap, and the GC hands that space back while the child waits. *)
+   The plain preload saves the heap the theory's checkpoints are children
+   of, after the last parent has arrived.  So the first wait step that has to
+   wait shares the heap's common data while the child is idle, with most of
+   its ancestors loaded, and saves it as the ahead heap; the plain preload
+   then saves only what was loaded since, as the ahead heap's child, without
+   sharing again.  Later waits don't save again: on a chain of late parents
+   they last only as long as one parent's own hand-off.  A full GC follows
+   the share: the share frees the duplicates but leaves them in the heap,
+   and the GC hands that space back while the child waits. *)
 structure HolbuildAheadLoad =
 struct
   val dir = ref ""
@@ -45,8 +46,9 @@ struct
   val entries : (string * string list * int) list ref = ref []
   (* The parents whose wait steps let the load go on. *)
   val completed : string list ref = ref []
-  (* Whether a wait step that has to wait still shares the heap. *)
-  val share = ref false
+  (* Where a wait step that has to wait still shares and saves the heap;
+     "" once one has, or when the child saves no checkpoints. *)
+  val ahead_heap = ref ""
 
   (* Paths as the loader evaluates them, with HOL's path variables expanded;
      the steps' own files, in the marker directory, are left out. *)
@@ -78,9 +80,9 @@ struct
      TextIO.output (TextIO.stdErr, "holbuild: loading ahead abandoned: " ^ reason ^ "\n");
      OS.Process.exit OS.Process.failure)
 
-  fun start directory share_heap =
+  fun start directory ahead_heap_path =
     (dir := directory;
-     share := share_heap;
+     ahead_heap := ahead_heap_path;
      write "base-loaded"
        (String.concat (map (fn m => "loaded " ^ m ^ "\n") (Meta.loaded ()) @
                        map (fn d => "path " ^ d ^ "\n") (!Meta.loadPath)));
@@ -92,8 +94,27 @@ struct
     (write "finishing" "";
      await "ready";
      !restore ();
-     dir := ""; recorded := []; count := 0; entries := []; completed := []; share := false;
+     dir := ""; recorded := []; count := 0; entries := []; completed := []; ahead_heap := "";
      loader := (fn _ => ()); restore := (fn () => ()))
+
+  (* The plain preload's save sees the ahead heap in the hierarchy and saves
+     its child.  It is removed first: the path may be a link to a state other
+     actions use.  A failed save leaves the hierarchy as it was, so the plain
+     preload saves the whole heap. *)
+  fun save_ahead_heap path =
+    let
+      fun dropped e =
+        ((OS.FileSys.remove path handle OS.SysErr _ => ());
+         TextIO.output (TextIO.stdErr, "holbuild: warning: could not save the ahead heap " ^ path ^ ": " ^
+                                       General.exnMessage e ^ "\n"))
+    in
+      PolyML.shareCommonData PolyML.rootFunction;
+      PolyML.fullGC ();
+      ((OS.FileSys.remove path handle OS.SysErr _ => ());
+       PolyML.SaveState.saveChild (path, List.length (PolyML.SaveState.showHierarchy ())))
+      handle e as IO.Io _ => dropped e
+           | e as OS.SysErr _ => dropped e
+    end
 
   fun enter parent = entries := (parent, Meta.loaded (), !count) :: !entries
 
@@ -167,11 +188,10 @@ struct
             SOME (_, loaded, position) => (loaded, position)
           | NONE => abandon ("the stand-in of " ^ parent ^ " was not entered")
       val since = List.drop (rev (!recorded), position)
-      (* Before waiting-P, so the timings count the share as loading. *)
+      (* Before waiting-P, so the timings count the save as loading. *)
       val _ =
-        if !share andalso not (exists ("arrived-" ^ parent)) then
-          (share := false; PolyML.shareCommonData PolyML.rootFunction; PolyML.fullGC ();
-           write "shared" parent)
+        if !ahead_heap <> "" andalso not (exists ("arrived-" ^ parent)) then
+          (save_ahead_heap (!ahead_heap); ahead_heap := ""; write "shared" parent)
         else ()
       val _ = write ("waiting-" ^ parent) ""
       val _ = await ("arrived-" ^ parent)
