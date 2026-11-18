@@ -1746,7 +1746,9 @@ class Coordinator:
             passed = None  # the candidate passed over for one this host is warm for
             local = hinted if tier in hint_only else hinted or self._local_entry(ranking, entry, host_id, kept)
             # Only the held build is taken for its hold: another of the batch is another claim's to take.
-            only_held = tier in hint_only or hinted is not None and fits
+            only_held = tier in hint_only or (
+                local is not None and self._held_here(ranking, (local[6], local[7]), host_id, kept)
+            )
             if local is not None:
                 ranking.heap[ranking.heap.index(local)] = entry
                 heapq.heapify(ranking.heap)

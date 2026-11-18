@@ -869,6 +869,31 @@ async def test_a_claim_swapping_past_a_held_build_wakes_a_holder_that_began_wait
     assert wake.result() == ("standard", False, held, "pkg:b")
 
 
+async def test_a_claim_swapping_within_its_band_to_a_build_held_for_its_host_takes_no_other_build_of_its_batch(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``a1`` is held for host-4, whose claim, woken for another tier, swaps to it past ``b1``, the head; another
+    process's claim took ``a1`` since the ranking was read, so the lock finds a build of another theory: host-4's claim
+    leaves it and takes ``b1``."""
+    await run_on(http, cache, "host-4", "a0", "a", D2)
+    await submit_as(http, "b1", "b")
+    held = await submit_as(http, "a1", "a")
+    coordinator.settings.warm_workers = 5
+    now = asyncio.get_running_loop().time()
+    coordinator.holds[(held, "standard")] = (now, now + 60, "pkg:a")
+    lock = coordinator._lock_unleased
+
+    async def next_build(*args: Any) -> Any:
+        row = await lock(*args)
+        return row if row is None or row.theory == "pkg:b" else SimpleNamespace(**{**row._mapping, "theory": "pkg:z"})
+
+    monkeypatch.setattr(coordinator, "_lock_unleased", next_build)
+
+    claimed, _ = await coordinator._claim(["standard"], "host-4-w", host_id="host-4", hint=(uuid4(), "high", "pkg:h"))
+
+    assert claimed is not None and claimed.theory == "pkg:b"
+
+
 async def test_a_hold_of_another_theory_counts_no_held_wait(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
     """The hold left after another process's claim took the held build isn't the claimed build's."""
     key = (await submit_as(http, "b1", "b"), "standard")
