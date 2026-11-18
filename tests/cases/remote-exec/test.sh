@@ -1584,11 +1584,11 @@ require_file "$remote_root/ac/$m_ac"
 # PScript.sml's blob, which the ledger wrongly says the remote cache holds,
 # then MTheory, which doesn't fit the remote's NTheory as above.
 copy_nondet twice-remote rxnt
-in_copy twice-remote --remote-cache "$remote_url" build MTheory > "$tmpdir/twice-remote.log" 2>&1 ||
-  { cat "$tmpdir/twice-remote.log" >&2; exit 1; }
 n_ac=$(in_copy twice-remote --remote-cache "$remote_url" action-spec MTheory |
   awk '$1 == "action" && $5 == "rxnt:NTheory" { print $3 }')
 [[ -n $n_ac ]] || { echo "no action for NTheory" >&2; exit 1; }
+in_copy twice-remote --remote-cache "$remote_url" build MTheory > "$tmpdir/twice-remote.log" 2>&1 ||
+  { cat "$tmpdir/twice-remote.log" >&2; exit 1; }
 rm "$remote_root/ac/$n_ac"
 copy_nondet twice-again rxnt
 in_copy twice-again --remote-cache "$remote_url" build NTheory > "$tmpdir/twice-again.log" 2>&1 ||

@@ -244,7 +244,9 @@ hb --prefetch-concurrency 1 action-spec --upload CTheory > "$tmpdir/batch-retrie
 diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-retried.txt"
 [[ ! -e "$tmpdir/control/cas-put-fail-once" ]] || { echo "the upload was not refused once" >&2; exit 1; }
 cmp "$project/.holbuild/action-specs/$missing_spec" "$remote_root/cas/$missing_spec"
-[[ $(grep -c "^PUT /cas/$missing_spec\$" "$request_log") -eq 2 ]] || {
+# Every blob is uploaded, so the refused upload is the first one.
+first_put=$(grep -m 1 '^PUT /cas/' "$request_log")
+[[ $(grep -cxF "$first_put" "$request_log") -eq 2 ]] || {
   echo "expected the refused upload and its retry:" >&2
   grep '^PUT /cas/' "$request_log" >&2
   exit 1
