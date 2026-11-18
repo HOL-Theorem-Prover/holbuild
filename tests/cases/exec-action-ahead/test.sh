@@ -349,6 +349,25 @@ require_grep 'stopped before the end of its preload' "$tmpdir/ahead-fails.log"
 worker again "$spec_B" --ahead-parent "$key_A:$spec_A"
 expect again 3 "status=failed" "failure=ahead-abandoned"
 
+# A load ahead that finds the action built by the time its parent arrives
+# builds plain, hydrating a second time; its result names each phase once.
+ac_A=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_A" | sha256sum | cut -d' ' -f1)
+ac_B=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_B" | sha256sum | cut -d' ' -f1)
+mv "$tmpdir/remote/ac/$ac_A" "$tmpdir/ac-A"
+mv "$tmpdir/remote/ac/$ac_B" "$tmpdir/ac-B"
+worker_start reuse "$spec_B" --ahead-parent "$key_A:$spec_A"
+await_marker reuse waiting-ATheory
+mv "$tmpdir/ac-B" "$tmpdir/remote/ac/$ac_B"
+mv "$tmpdir/ac-A" "$tmpdir/remote/ac/$ac_A"
+worker_wait reuse
+expect reuse 0
+require_grep 'loading ahead found a build to reuse' "$tmpdir/reuse.log"
+grep -qE '^phase-ms=(.*,)?hydrate:[0-9]+,' "$tmpdir/reuse.result" || {
+  echo "no hydrate phase:" >&2; cat "$tmpdir/reuse.result" >&2; exit 1
+}
+repeated=$(sed -n 's/^phase-ms=//p' "$tmpdir/reuse.result" | tr , '\n' | cut -d: -f1 | sort | uniq -d)
+[[ -z "$repeated" ]] || { echo "phase-ms repeats $repeated:" >&2; cat "$tmpdir/reuse.result" >&2; exit 1; }
+
 # A parent published by the time the run starts is no reason to load ahead.
 worker late "$spec_C" --ahead-parent "$key_B:$spec_B"
 expect late 0 "status=built"

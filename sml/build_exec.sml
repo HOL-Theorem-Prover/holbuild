@@ -10799,6 +10799,24 @@ fun sweep_worker_cache {limit_bytes, reserve_bytes, min_free_bytes} =
 fun phases_text sep unit phases =
   String.concatWith sep (map (fn (name, ms) => name ^ unit ^ LargeInt.toString ms) phases)
 
+(* One entry per phase name, where it first ran: a phase run again (the
+   hydrate of a load ahead that builds plain after all) adds its time, and
+   a span keeps its earliest start and latest end.  The coordinator refuses
+   a result naming a phase twice. *)
+fun merge_phases phases =
+  let
+    fun combine name (a, b) =
+      if String.isSuffix "start" name then LargeInt.min (a, b)
+      else if String.isSuffix "end" name then LargeInt.max (a, b)
+      else a + b
+    fun add ((name, ms), merged) =
+      if List.exists (fn (n, _) => n = name) merged then
+        map (fn (n, e) => if n = name then (n, combine name (e, ms)) else (n, e)) merged
+      else merged @ [(name, ms)]
+  in
+    List.foldl add [] phases
+  end
+
 (* A failure message as one line of a result record: printable ASCII, every
    other character a space, at most 500 characters. *)
 fun result_detail msg =
@@ -13581,7 +13599,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                   | _ => failure
               val status = if Option.isSome failure then "failed" else status
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
-              val phases = rev (!phases) @
+              val phases = merge_phases (rev (!phases)) @
                 [("started", Time.toMilliseconds start),
                  ("finished", Time.toMilliseconds (Time.now ()))] @
                 (if !theory_action then [("rebuilt", if status = "built" then 1 else 0)] else [])
