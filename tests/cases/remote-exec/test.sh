@@ -2536,6 +2536,6 @@ HOLBUILD_PLAN_RECORD=on run swap 0 --verbose build --remote-exec "$coordinator" 
 rm "$state/on-submit"
 [[ $(readlink "$project/data/in.txt") == ../two.txt ]] || { echo "the input was not swapped at the POST" >&2; exit 1; }
 [[ $(plan_digest) != absent ]] || { cat "$tmpdir/swap.log" >&2; echo "the swap build wrote no plan record" >&2; exit 1; }
-run swap-check 0 --verbose build --remote-exec "$coordinator" --detach ATheory
+HOLBUILD_PLAN_RECORD=check run swap-check 0 --verbose build --remote-exec "$coordinator" --detach ATheory
 rm "$state/skip"
 require_grep "plan: from record (1 files rehashed" "$tmpdir/swap-check.log"
