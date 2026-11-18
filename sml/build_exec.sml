@@ -4651,24 +4651,27 @@ fun metadata_parent_hashes lines =
     (Binarymap.mkDict String.compare)
     lines
 
-fun theory_parent_hash_recorded parent_hashes dep =
-  Binarymap.peek (parent_hashes, theory_name_from_logical (logical_name dep)) <> NONE
+fun is_theory_named parent_name node =
+  #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript andalso
+  theory_name_from_logical (logical_name node) = parent_name
 
-(* Action dependencies also express build ordering.  A theory dependency is a
-   parent only when the exported .dat records it, so do not make an ordering-only
-   edge invalidate an otherwise valid artifact. *)
-fun project_theory_parent_deps parent_hashes theory_deps =
-  List.filter (theory_parent_hash_recorded parent_hashes) theory_deps
-
-fun same_theory_parent_deps left right =
-  let
-    fun contains node nodes =
-      List.exists (fn candidate => logical_name candidate = logical_name node)
-                  nodes
-  in
-    List.all (fn node => contains node right) left andalso
-    List.all (fn node => contains node left) right
-  end
+(* The parent names in PARENT_HASHES, in order, that name a theory of the
+   plan, each with those theories.  Action dependencies also express build
+   ordering: a theory dependency is a parent only when the exported .dat
+   records it, so an ordering-only edge must not invalidate an otherwise
+   valid artifact.  Looking the names up, rather than filtering the child's
+   dependency closure, avoids computing a closure per node; it also checks a
+   named plan theory outside the closure, which only a stale table names. *)
+fun project_theory_parents plan parent_hashes =
+  List.mapPartial
+    (fn (parent_name, _) =>
+        case List.filter (fn node => is_theory_named parent_name node andalso
+                                     HolbuildBuildPlan.is_selected plan node)
+                         (HolbuildBuildPlan.lookup plan (parent_name ^ "Theory") @
+                          HolbuildBuildPlan.lookup plan parent_name) of
+            [] => NONE
+          | nodes => SOME (parent_name, nodes))
+    (Binarymap.listItems parent_hashes)
 
 fun theory_parent_hash_matches dat_hash_cache parent_hashes dep =
   let
@@ -4689,7 +4692,7 @@ fun dat_parent_hashes_match dat_hash_cache plan node dat_path =
   let
     val parent_hashes = parse_dat_parent_hashes (read_dat_header dat_path)
   in List.all (theory_parent_hash_matches dat_hash_cache parent_hashes)
-              (project_theory_parent_deps parent_hashes (project_theory_deps plan node))
+              (List.concat (map #2 (project_theory_parents plan parent_hashes)))
   end
 
 fun child_dat_parent_hashes_match dat_hash_cache plan node =
@@ -4699,20 +4702,18 @@ fun metadata_parent_hashes_match dat_hash_cache plan node text =
   let
     val lines = metadata_lines text
     val child_parent_hashes = parse_dat_parent_hashes (read_dat_header (#data_path (theory_outputs node)))
-    val theory_deps = project_theory_deps plan node
-    val child_parent_deps = project_theory_parent_deps child_parent_hashes theory_deps
+    val child_parents = project_theory_parents plan child_parent_hashes
+    val child_parent_deps = List.concat (map #2 child_parents)
   in
     if metadata_has_parent_hashes lines then
       let
         val recorded_parent_hashes = metadata_parent_hashes lines
-        val recorded_parent_deps = project_theory_parent_deps recorded_parent_hashes theory_deps
       in
         (* Metadata is a cache for this check, not an authority on the current
            child artifact.  The two parent tables must name the same project
            theories: otherwise either metadata or the child .dat was truncated.
-           Filtering through each table still admits ordering-only action deps,
-           which appear in neither table. *)
-        same_theory_parent_deps child_parent_deps recorded_parent_deps andalso
+           Both name lists come sorted from the tables. *)
+        map #1 child_parents = map #1 (project_theory_parents plan recorded_parent_hashes) andalso
         List.all (theory_parent_hash_matches dat_hash_cache recorded_parent_hashes)
                  child_parent_deps andalso
         List.all (theory_parent_hash_matches dat_hash_cache child_parent_hashes)
