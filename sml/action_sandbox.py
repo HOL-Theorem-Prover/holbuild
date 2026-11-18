@@ -31,7 +31,11 @@ class Ruleset(ctypes.Structure):
 
 
 class PathRule(ctypes.Structure):
+    # Landlock's landlock_path_beneath_attr: packed, 12 bytes.  Python 3.14
+    # deprecates _pack_ without an explicit _layout_ (an error in 3.19); older
+    # Pythons ignore _layout_.
     _pack_ = 1
+    _layout_ = "ms"
     _fields_ = [("access", ctypes.c_uint64), ("parent", ctypes.c_int32)]
 
 

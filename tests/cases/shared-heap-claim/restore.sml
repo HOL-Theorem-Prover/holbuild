@@ -11,6 +11,20 @@ val _ = HolbuildRemoteCacheConfig.set_url url;
 val _ = RC.fail_closed := true;
 val remote = RC.remote url;
 fun write result = BE.write_text (dir ^ "/result") result;
+(* GATED: compiled, wait for the test's go, so a timed step doesn't include
+   compiling holbuild.  A test that ends without a go leaves no process
+   behind: the wait gives up after the test's own 300 s deadline. *)
+val _ =
+  case OS.Process.getEnv "GATED" of
+      SOME _ =>
+        let
+          val deadline = Time.+ (Time.now (), Time.fromSeconds 300)
+          fun await () =
+            if OS.FileSys.access (dir ^ "/go", []) then ()
+            else if Time.>= (Time.now (), deadline) then OS.Process.exit OS.Process.failure
+            else (OS.Process.sleep (Time.fromMilliseconds 10); await ())
+        in BE.write_text (dir ^ "/ready") ""; await () end
+    | NONE => ();
 val _ =
   case OS.Process.getEnv "WAIT_SECONDS" of
       SOME seconds =>
@@ -24,7 +38,7 @@ val _ =
           val tree = dir ^ "/checkpoints"
           val _ = BE.ensure_dir tree
           val ctx : BE.shared_context =
-            {store = dir ^ "/store", checkpoint_root = tree, heap_key = heap_key, index_key = "index",
+            {store = dir ^ "/store", checkpoint_root = tree, heap_key = heap_key, index_key = "index", standalone_key = "standalone",
              base_state = OS.FileSys.fullPath (env "BASE_STATE"), deps_key = "deps",
              deps_loaded = tree ^ "/deps.save", requested_timeout = NONE, candidates = []}
           val _ = BE.restore_steps := []

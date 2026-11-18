@@ -1,7 +1,14 @@
 structure HolbuildProofRuntime =
 struct
 
+(* context_checkpoints: save a context after each theorem (the build's
+   targets do; other theories save only failed prefixes).
+   share_failed_prefix: the process started from the toolchain's base state
+   with no deps heap, so a failed prefix carries every ancestor and is
+   compacted before it is saved. *)
 type config = {checkpoint_enabled : bool,
+               context_checkpoints : bool,
+               share_failed_prefix : bool,
                checkpoint_seconds : real,
                tactic_timeout : real option,
                timeout_marker : string option,
@@ -10,6 +17,8 @@ type config = {checkpoint_enabled : bool,
                plan_only_marker : string option}
 
 val checkpoint_enabled_ref = ref false
+val context_checkpoints_ref = ref false
+val share_failed_prefix_ref = ref false
 val tactic_timeout_ref = ref (NONE : real option)
 val tactic_timeout_marker_ref = ref (NONE : string option)
 val plan_theorem_ref = ref (NONE : string option)
@@ -708,7 +717,10 @@ fun save_failed_prefix_checkpoint () =
         else
           let
             val (meta_text, prefix_text) = failed_prefix_texts ()
-            val _ = save_checkpoint "failed_prefix" false failed_prefix_path failed_prefix_ok depth
+            (* Once compacted, the heap stays so for a later save here. *)
+            val share = !share_failed_prefix_ref
+            val _ = share_failed_prefix_ref := false
+            val _ = save_checkpoint "failed_prefix" share failed_prefix_path failed_prefix_ok depth
             val _ = write_text_file (failed_prefix_path ^ ".meta") meta_text
             val _ = write_text_file (failed_prefix_path ^ ".prefix") prefix_text
           in () end
@@ -736,7 +748,7 @@ fun save_theorem_context () =
       NONE => ()
     | SOME (context_path, context_ok, depth) =>
         (context_info_ref := NONE;
-         if not (!checkpoint_enabled_ref) then ()
+         if not (!checkpoint_enabled_ref andalso !context_checkpoints_ref) then ()
          else
            HolbuildCheckpointSaveRuntime.save_context_checkpoint
              {label = "theorem_context", default_share = false, path = context_path,
@@ -2355,8 +2367,10 @@ fun proof_ir_prover ctxt (g, tac) =
              drop_all();
              raise e)
 
-fun install ({checkpoint_enabled, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
+fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
   (checkpoint_enabled_ref := checkpoint_enabled;
+   context_checkpoints_ref := context_checkpoints;
+   share_failed_prefix_ref := share_failed_prefix;
    tactic_timeout_ref := tactic_timeout;
    tactic_timeout_marker_ref := timeout_marker;
    plan_theorem_ref := plan_theorem;
