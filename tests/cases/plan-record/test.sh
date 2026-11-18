@@ -367,6 +367,17 @@ target_switch() {
   expect_plan "full (no plan record for these inputs)" "$p" ETheory
 }
 
+# A record's sources name the targets a group expands to; a stale one
+# naming an object file falls back to full planning instead of failing.
+stale_group_member() {
+  local p=$tmpdir/stale-group
+  make_project "$p" $'[build.groups.libs]\ninclude_globs = ["src/L*.sml"]'
+  echo 'structure Lx = struct val x = 1 end' > "$p/src/Lx.uo.sml"
+  expect_plan "full (no plan record for these inputs)" "$p"
+  rm "$p/src/Lx.uo.sml"
+  expect_plan "full (" "$p" @libs
+}
+
 deep_downstream_edit() {
   local p=$tmpdir/deep
   recorded_project "$p"
@@ -782,6 +793,7 @@ holconfig_edit
 holbuild_env_var
 targets_on_argv
 target_switch
+stale_group_member
 deep_downstream_edit
 corrupt_records
 record_off

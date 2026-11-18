@@ -1337,9 +1337,14 @@ no record is kept; `--watch` always plans in full. With theories that write
 SML sources, the record keeps the plan made once they are up to date, with
 the sources they wrote, and a later build uses it only while every such
 theory is still up to date and its sources are unchanged; then it builds
-without running those theories first or planning again. The four newest records are kept.
+without running those theories first or planning again. A build of other
+targets with no record of its own starts from the newest record of the same
+other inputs whose plan holds all its targets: after the same checks, it
+plans again over that record's sources from the new targets and writes the
+result as its own record. The four newest records are kept.
 
-`--verbose` prints which way a build planned and why, and the timing log has
+`--verbose` prints which way a build planned and why (`sliced from other
+targets' plan` for a build that started from another targets' record), and the timing log has
 a `plan.record` phase. `HOLBUILD_PLAN_RECORD=off` turns the record off;
 `HOLBUILD_PLAN_RECORD=check` plans in full as well, and fails the build if
 the two plans differ in any source, dependency edge, fact or key.
