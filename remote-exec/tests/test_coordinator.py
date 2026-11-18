@@ -775,20 +775,25 @@ async def test_a_claim_that_gets_an_action_ends_the_leases_its_worker_got_no_ans
     assert (await http.post(f"/v1/work/{held['attempt_token']}/heartbeat", headers=WORKER)).status_code == 200
 
 
+@pytest.mark.parametrize("quarantined", [False, True])
 async def test_a_claim_whose_worker_has_gone_gives_its_action_back(
-    http: httpx.AsyncClient, coordinator: Coordinator
+    http: httpx.AsyncClient, coordinator: Coordinator, quarantined: bool
 ) -> None:
     """A worker stopped while its claim waited gets no answer: the action goes back at once, not when the lease
-    expires."""
+    expires, and its host isn't taken to run it. A quarantined host's probe claim gives it back too."""
+    if quarantined:
+        coordinator.infra_streak["host-a"] = (coordinator_module.QUARANTINE_FAILURES, None)
+        coordinator.probe_at["host-a"] = coordinator.clock() - timedelta(seconds=coordinator_module.PROBE_SECONDS)
     batch_id = await submit(http, ["a"])
 
     async def gone() -> bool:
         return True
 
-    assert await coordinator.claim(["standard"], "w9", 0, gone) is None
+    assert await coordinator.claim(["standard"], "w9", 0, gone, "host-a") is None
     await coordinator.released()
     (action,) = (await batch(http, batch_id))["actions"]
     assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+    assert not coordinator.lease_hosts and not coordinator.host_keys.get("host-a")
     claimed = await coordinator.claim(["standard"], "w10")
     assert claimed is not None and claimed.theory == "pkg:a"
 
