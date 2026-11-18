@@ -991,6 +991,49 @@ coordinator and use this image to run `alembic downgrade 0015` first. This
 drops only the diagnostic columns and the index; result and scheduling state
 are kept.
 
+## Local test fleet
+
+`local-fleet` runs a command against a private fleet built from one holbuild
+checkout, to try an unreleased coordinator, worker or `exec-action` on real
+builds before it lands:
+
+```bash
+make bin/holbuild    # in the checkout to try
+remote-exec/local-fleet --workers 8 ~/holbuild-branch -- \
+  sh -c 'cd ~/project && holbuild build FooTheory --remote-exec "$LOCAL_FLEET_URL" --remote-only'
+```
+
+It starts a fresh Postgres database (`initdb`, `pg_ctl`, `createdb` and `psql`
+on `PATH`), that checkout's coordinator, the test suite's cache server
+(`tests/fixtures/remote_cache_server.py`) and N workers whose baked-releases
+root holds the checkout under its own version, so every action runs its
+holbuild. The command runs with `LOCAL_FLEET_URL`, `HOLBUILD_REMOTE_CACHE_URL`,
+`HOLBUILD_REMOTE_EXEC_CURL_CONFIG` and `HOLBUILD_CACHE` pointing at the fleet,
+every other `HOLBUILD_REMOTE_CACHE_*` and `HOLBUILD_REMOTE_EXEC_*` variable
+unset, and the checkout's `bin/` first on `PATH`. Don't pass `--remote-cache`
+to it: a command-line cache wins over the environment. Theory cache keys don't
+include the holbuild version, so a development build's outputs must never
+reach a shared cache.
+
+The fleet starts with no HOL toolchain. `--toolchain <cache>/hol-toolchains/<key>`
+(repeatable) uses one already built in another holbuild cache: its `hol/` tree
+is read in place, since HOL bakes in its absolute paths, and granted to
+actions through `HOLBUILD_ACTION_READ_DIRS`; its locks, `last-used` marker and
+analysers stay private to the run, so the run holds no lease on it: seed from
+an entry in current use, which that cache's garbage collection won't retire
+mid-run. `holbuild buildhol` in the project prints the path of the one it
+uses.
+
+`REMOTE_EXEC_*` variables in the environment configure the coordinator. Inside
+a Slurm allocation, its memory is the workers' admission budget. The run
+directory may not lie under `/tmp`, and the workers' `TMPDIR` is inside it: as
+in the image, the action sandbox lets HOL write `/tmp` only when no worker
+state is there. On exit,
+interrupt or termination the fleet stops; the run directory (`--dir`, else a
+new one in `~/.cache/holbuild-local-fleet`) keeps the logs and CSV copies of the `batches`, `actions`
+and `leases` tables, and `--keep` also keeps the database and caches. Master
+and a branch both report the next version, so compare them in two runs.
+
 ## Tests
 
 The tests need a Postgres role that may create databases:
