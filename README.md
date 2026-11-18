@@ -1655,6 +1655,7 @@ option checkpoint-target=true      (only for a theory that saves checkpoints as 
 option skip-checkpoints=true      (when checkpoint reuse is disabled)
 option force=true                 (only for a forced theory)
 option trace-steps=true            (only for a traced theory)
+option pipeline=true               (only for a theory that may build pipelined)
 action-text
 <the action text, verbatim to the end of the blob>
 ```
@@ -1686,7 +1687,11 @@ action-text
   default to false. `force` or `trace-steps` disables whole-action cache reuse
   and early cutoff on the worker; `trace-steps` also enables proof-step tracing
   and requires `proof-steps=true`. `skip-checkpoints` disables checkpoint reuse
-  and saving, including shared heaps.
+  and saving, including shared heaps. `pipeline` defaults to false; with it, a
+  worker whose claim asks it to (`exec-action --pipeline`) builds the theory
+  pipelined, unless the spec shows the theory can't be (extra outputs, proof
+  steps without the proof IR, a forced or traced run) or its HOL lacks the
+  context-taking tactics; otherwise it builds plain.
 
 ### Exporting script runs for remote execution
 
@@ -2095,6 +2100,18 @@ built. That covers a parent that fails, a predicted parent manifest that
 doesn't match, or a parent that is late. The option costs worker time when a
 parent fails, and changes no cache keys. Like `--priority`, it applies to
 replacement batches with `--attach`, and the recovery hint includes it.
+
+Workers also build such a batch's theories pipelined, the way a local build
+does (unless `HOLBUILD_PIPELINE=off` or the coordinator turns it off): a
+theory the build doesn't name as a target publishes its outline before
+proving, and a theory waiting ahead of it starts on that outline. It keeps
+nothing built on an outline until the parent's own outputs pass the gate
+against the outline it loaded; otherwise it is built normally again. A
+theory that itself builds pipelined, within the coordinator's generation
+limit (`REMOTE_EXEC_AHEAD_DEPTH`), and whose unbuilt parents have all
+published their outlines can start at once, so it no longer waits behind
+shallower theories ready to build, and an outlined parent no longer counts
+against N.
 
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with

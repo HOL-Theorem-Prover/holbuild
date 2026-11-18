@@ -2,6 +2,7 @@
 (deps-key) the host holds; see Coordinator._local_entry."""
 
 import asyncio
+from collections.abc import Callable
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -9,12 +10,12 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-
 from conftest import FakeCache
+from test_coordinator import CLIENT, WORKER, ac_key, complete, input_key, result, spec, submit
+
 from remote_exec import coordinator as coordinator_module
 from remote_exec.coordinator import Coordinator, HostReport, _claim_rank
 from remote_exec.formats import FormatError, parse_result
-from test_coordinator import CLIENT, WORKER, ac_key, complete, input_key, result, spec, submit
 
 D1 = "d" * 64
 D2 = "e" * 64
@@ -83,6 +84,21 @@ async def test_a_claim_takes_the_batch_whose_dependency_context_its_host_holds(
     assert (first["theory"], second["theory"]) == (("pkg:b", "pkg:a") if locality else ("pkg:a", "pkg:b"))
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
     assert queue["locality"]["claims"] == (1 if locality else 0)
+
+
+async def test_a_claim_doesn_t_swap_to_a_warm_batch_whose_deeper_claim_ahead_on_outlines_goes_first(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    """host-1 ran ``b``, but ``b``'s batch has a claim ahead on outlines deeper than its ready build, which goes
+    first: host-1 takes ``a``, the head of the ranking, instead."""
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await submit_as(http, "a1", "a")
+    deep = await submit_as(http, "b1", "b")
+    outranked = SimpleNamespace(above=lambda *_: [], deepest={}, deeper=lambda batch, *_: batch == deep)
+
+    claimed, _ = await coordinator._claim(["standard"], "w", outranked, "host-1", None, frozenset(), frozenset())
+
+    assert claimed is not None and claimed.theory == "pkg:a"
 
 
 async def test_a_batch_is_passed_over_for_locality_at_most_the_window(
@@ -732,6 +748,11 @@ async def test_a_hold_of_a_theory_the_batch_no_longer_builds_next_is_replaced(
     assert coordinator.holds[key][1] < now + 60
 
 
+def outranking(above: Callable[[str, int], list[str]]) -> Any:
+    """Claims ahead that rank before ready builds of other batches by ``above``, and none of a build's own."""
+    return SimpleNamespace(above=above, deepest={}, deeper=lambda *_: False)
+
+
 async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_stopped_it(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -748,7 +769,7 @@ async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_sto
     monkeypatch.setattr(coordinator, "_claim_ahead", claim_ahead)
 
     claimed, _ = await coordinator._claim(
-        ["high", "standard"], "w", lambda tier, priority: [tier] if tier == "standard" else [], "host-1",
+        ["high", "standard"], "w", outranking(lambda tier, priority: [tier] if tier == "standard" else []), "host-1",
         None, frozenset({"high"}), frozenset({"high"}),
     )
 
@@ -775,7 +796,7 @@ async def test_a_held_build_of_a_hint_only_tier_that_a_claim_ahead_outranks_is_c
     monkeypatch.setattr(coordinator, "_claim_ahead", claim_ahead)
 
     await coordinator._claim(
-        ["high", "standard"], "w", lambda tier, priority: ["high"] if tier == "high" and priority < 1 else [],
+        ["high", "standard"], "w", outranking(lambda tier, priority: ["high"] if tier == "high" and priority < 1 else []),
         "host-1", None, frozenset({"high"}), frozenset({"high"}),
     )
 
