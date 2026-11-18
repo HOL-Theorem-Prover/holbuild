@@ -396,7 +396,7 @@ expect b 0 "status=built"
 cmp "$tmpdir/dep.dat" "$tmpdir/worker-b/blobs/$dep_dat"
 # Its record times the action and its phases.
 require_grep '^wall-ms=[0-9][0-9]*$' "$tmpdir/b.result"
-for phase in hydrate hydfiles hyddeps hydstale hydmisfit analyse hol check; do
+for phase in hydrate hydfiles hyddeps hydcheck hydinst hydstale hydmisfit analyse hol check; do
   grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/b.result" || {
     echo "b's record lacks phase $phase:" >&2; cat "$tmpdir/b.result" >&2; exit 1; }
 done
@@ -544,9 +544,24 @@ worker c "$spec_a2"
 expect c 0
 [[ $(stat -c %i "$stem_a.dat") == "$inode_a" ]] || { echo "worker c installed A again" >&2; exit 1; }
 [[ ! -e "$stem_b.dat" && -z $(resident_stem 'BTheory$') ]] || { echo "worker c kept B, which A2 doesn't name" >&2; exit 1; }
+# A kept dependency's manifest hash is recorded by the manifest's stat once
+# the manifest is more than a second older than the hydrate, and trusted
+# while the stat is unchanged; a change to the manifest still shows.
+sleep 1.1
+worker c "$spec_a2"
+expect c 0
+grep -qF "$tmpdir/worker-c/actions/$key_a/manifest" "$tmpdir/worker-c/action-manifest-stats" || {
+  echo "worker c recorded no stat of A's manifest" >&2; cat "$tmpdir/worker-c/action-manifest-stats" >&2; exit 1; }
+worker c "$spec_a2"
+expect c 0
+[[ $(stat -c %i "$stem_a.dat") == "$inode_a" ]] || { echo "worker c installed A again on its recorded stat" >&2; exit 1; }
+grep -qE "^phase-ms=(.*,)?hydstatn:[1-9][0-9]*(,|\$)" "$tmpdir/c.result" || {
+  echo "worker c hashed every manifest again despite its recorded stats:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
 printf '\n' >> "$tmpdir/worker-c/actions/$key_a/manifest"
 worker c "$spec_a2"
 expect c 0
+grep -qE "^phase-ms=(.*,)?hydinstn:[1-9][0-9]*(,|\$)" "$tmpdir/c.result" || {
+  echo "worker c counted no install:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
 [[ $(stat -c %i "$stem_a.dat") != "$inode_a" ]] || { echo "worker c kept A after its entry changed" >&2; exit 1; }
 touch "$tmpdir/worker-c/action/.holbuild/obj/stray"
 rm "$tmpdir/worker-c/action-resident"

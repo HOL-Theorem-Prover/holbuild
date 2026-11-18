@@ -1969,9 +1969,14 @@ For a run, `input-key` is its run key and `built` means it ran.
 `phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
 cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
 dependencies; its steps follow it, and are part of it: `hydfiles` the
-sources and libraries, `hyddeps` restoring the dependencies, `hydstale`
-probing the remote cache for stale dependency copies, `hydmisfit` checking
-the dependencies against their parents), `cutoff` (whether an earlier build stands), `analyse`
+sources and libraries, `hyddeps` restoring the dependencies, `hydcheck`
+checking the dependencies already in the action root (with loading and
+saving the record of their cache manifests' stats), `hydinst` removing and
+installing the ones that fail the check, `hydstale` probing the remote cache
+for stale dependency copies, `hydmisfit` checking the dependencies against
+their parents; two of them are counts, not times: `hydstatn` the cache
+manifests trusted on their recorded stat, `hydinstn` the dependencies the
+check sent to `hydinst`), `cutoff` (whether an earlier build stands), `analyse`
 (the script's proof steps and checkpoints), `restore` (shared
 checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
