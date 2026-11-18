@@ -14,6 +14,7 @@ import httpx
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from starlette.requests import Request
 
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
@@ -773,6 +774,83 @@ async def test_a_claim_that_gets_an_action_ends_the_leases_its_worker_got_no_ans
     assert (actions[lost["theory"]]["attempts"], actions[lost["theory"]]["last_failure"]) == (0, "unavailable")
     assert (actions[held["theory"]]["state"], actions[held["theory"]]["attempts"]) == ("running", 1)
     assert (await http.post(f"/v1/work/{held['attempt_token']}/heartbeat", headers=WORKER)).status_code == 200
+
+
+@pytest.mark.parametrize("quarantined", [False, True])
+async def test_a_claim_whose_worker_has_gone_gives_its_action_back(
+    http: httpx.AsyncClient, coordinator: Coordinator, quarantined: bool
+) -> None:
+    """A worker stopped while its claim waited gets no answer: the action goes back at once, not when the lease
+    expires, and its host isn't taken to run it. A quarantined host's probe claim gives it back too."""
+    if quarantined:
+        coordinator.infra_streak["host-a"] = (coordinator_module.QUARANTINE_FAILURES, None)
+        coordinator.probe_at["host-a"] = coordinator.clock() - timedelta(seconds=coordinator_module.PROBE_SECONDS)
+    batch_id = await submit(http, ["a"])
+
+    async def gone() -> bool:
+        return True
+
+    assert await coordinator.claim(["standard"], "w9", 0, gone, "host-a") is None
+    await coordinator.released()
+    (action,) = (await batch(http, batch_id))["actions"]
+    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+    assert not coordinator.lease_hosts and not coordinator.host_keys.get("host-a")
+    claimed = await coordinator.claim(["standard"], "w10")
+    assert claimed is not None and claimed.theory == "pkg:a"
+
+
+async def test_a_woken_claim_whose_worker_left_while_it_took_the_action_gives_it_back(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker is there while its claim waits and when a release wakes it, and goes while the claim takes the
+    action: only the check after taking it can see that."""
+    left = False
+    claim_once = coordinator._claim
+
+    async def leaving(*args: Any) -> Any:
+        nonlocal left
+        claimed, held_until = await claim_once(*args)
+        left = claimed is not None
+        return claimed, held_until
+
+    async def gone() -> bool:
+        return left
+
+    monkeypatch.setattr(coordinator, "_claim", leaving)
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "w9", 10, gone))
+    while not coordinator.claim_waiters:
+        await asyncio.sleep(0.01)
+    batch_id = await submit(http, ["a"])
+    assert await waiting is None and left
+    await coordinator.released()
+    (action,) = (await batch(http, batch_id))["actions"]
+    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+
+
+async def test_a_claim_whose_worker_left_as_the_endpoint_answered_gives_its_action_back(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker is there through the coordinator's checks and leaves while the endpoint ends its unheld leases:
+    the endpoint's last check gives the claim back and answers 204."""
+    left = False
+    release_unheld = coordinator.release_unheld
+
+    async def leaving(*args: Any) -> None:
+        nonlocal left
+        await release_unheld(*args)
+        left = True
+
+    async def gone(_: Request) -> bool:
+        return left
+
+    monkeypatch.setattr(coordinator, "release_unheld", leaving)
+    monkeypatch.setattr(Request, "is_disconnected", gone)
+    batch_id = await submit(http, ["a"])
+    response = await http.post("/v1/work/claim", json={"tier": "standard", "worker": "w9"}, headers=WORKER)
+    assert response.status_code == 204 and left
+    await coordinator.released()
+    (action,) = (await batch(http, batch_id))["actions"]
+    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
 
 
 async def test_a_late_claim_leaves_the_leases_its_worker_claimed_since(
