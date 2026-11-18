@@ -588,21 +588,26 @@ fun transitive_project_deps
           end
   end
 
-(* Whether DEP is in NODE's dependency closure.  The search stops at DEP and
-   keeps nothing, for the rare check that needs one answer, not the closure. *)
+(* Whether DEP is in NODE's dependency closure.  A direct dependency is
+   answered from NODE's edges; otherwise the search stops at DEP and keeps
+   nothing, so one answer costs no closure. *)
 fun depends_on ({selected_key_index, selected_adjacency, ...} : t) node dep =
   case (find_key_id selected_key_index (key node), find_key_id selected_key_index (key dep)) of
       (SOME from, SOME target) =>
-        let
-          val seen = Array.array (Vector.length selected_adjacency, false)
-          fun reach [] = false
-            | reach (id :: rest) =
-                id = target orelse
-                (if Array.sub (seen, id) then reach rest
-                 else (Array.update (seen, id, true);
-                       reach (List.revAppend (Vector.sub (selected_adjacency, id), rest))))
+        let val direct = Vector.sub (selected_adjacency, from)
         in
-          reach (Vector.sub (selected_adjacency, from))
+          List.exists (fn id => id = target) direct orelse
+          let
+            val seen = Array.array (Vector.length selected_adjacency, false)
+            fun reach [] = false
+              | reach (id :: rest) =
+                  id = target orelse
+                  (if Array.sub (seen, id) then reach rest
+                   else (Array.update (seen, id, true);
+                         reach (List.revAppend (Vector.sub (selected_adjacency, id), rest))))
+          in
+            reach direct
+          end
         end
     | _ => false
 

@@ -4664,14 +4664,15 @@ fun metadata_parent_hashes lines =
 
 (* Whether plan theory DEP, named in the parent table PARENT_HASHES of
    NODE, matches its recorded hash, or isn't NODE's dependency and so isn't
-   the parent the table names.  Only a mismatch searches NODE's closure. *)
+   the parent the table names.  A non-dependency is never hashed: it may
+   still be building, and its hash would stay in the shared cache. *)
 fun theory_parent_hash_matches dat_hash_cache plan node parent_hashes dep =
   let
     val parent_name = theory_name_from_logical (logical_name dep)
     (* Every selected exported theory parent must be represented by a valid hash.
        Treating a missing entry as a match lets truncated metadata or a
        malformed child .dat suppress a necessary rebuild. *)
-    val matches =
+    fun matches () =
       case cached_file_hash dat_hash_cache (#data_path (theory_outputs dep)) of
           NONE => false
         | SOME parent_hash =>
@@ -4679,7 +4680,7 @@ fun theory_parent_hash_matches dat_hash_cache plan node parent_hashes dep =
                  NONE => false
                | SOME recorded_hash => recorded_hash = parent_hash)
   in
-    matches orelse not (HolbuildBuildPlan.depends_on plan node dep)
+    not (HolbuildBuildPlan.depends_on plan node dep) orelse matches ()
   end
 
 fun dat_parent_hashes_match dat_hash_cache plan node dat_path =
