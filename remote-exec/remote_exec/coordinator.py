@@ -15,7 +15,7 @@ import os
 import shlex
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Self
@@ -622,6 +622,12 @@ WITH RECURSIVE walk(batch_id, root, input_key, distance) AS (
     FROM walked WHERE (p).state <> 'done'
 )
 """
+# The live leases of :outlined, the attempt tokens whose actions published their outline (Coordinator.outlined).
+# Matched through the leases, by token, a lease that ended, by any path, names nothing, nor does a late report.
+OUTLINED_LEASES = (
+    "SELECT batch_id, input_key FROM leases WHERE attempt_token = ANY(CAST(:outlined AS uuid[])) AND expires_at > now()"
+)
+
 # The actions that may be claimed ahead, best first: the children of running actions of generation below
 # ``ahead_depth`` of running batches below their ``ahead_cap``. See Coordinator._claim_ahead. Read from the running
 # parents down (edges_parent) rather than per waiting action, since a gate's batch has thousands of those: a child is
@@ -632,13 +638,13 @@ WITH RECURSIVE walk(batch_id, root, input_key, distance) AS (
 # matched against; each running parent's children are read from its edges; and each child's row is read alone. A
 # join of the children with actions was once planned per waiting action of every batch, rereading all the children
 # for each: seconds per read when a large batch arrived.
-AHEAD_CANDIDATES = sa.text("""
-WITH RECURSIVE ahead_batches AS MATERIALIZED (
+AHEAD_CANDIDATES = sa.text(f"""
+WITH RECURSIVE outlined AS MATERIALIZED ({OUTLINED_LEASES}), ahead_batches AS MATERIALIZED (
     SELECT b.id, b.priority FROM batches b
     WHERE b.state = 'running' AND b.ahead_cap IS NOT NULL AND (
         SELECT count(*) FROM actions w
         WHERE w.batch_id = b.id AND w.state = 'running' AND w.ahead = 'ahead' AND w.remaining_deps > 0
-        AND w.input_key <> ALL(CAST(:outlined AS text[]))
+        AND (w.batch_id, w.input_key) NOT IN (SELECT batch_id, input_key FROM outlined)
     ) < b.ahead_cap
 ), waiting_ahead AS MATERIALIZED (
     SELECT w.batch_id, w.input_key, ARRAY(
@@ -658,7 +664,7 @@ WITH RECURSIVE ahead_batches AS MATERIALIZED (
     HAVING CAST(:depth AS integer) IS NULL OR max(generation) < :depth
 ), children AS MATERIALIZED (
     SELECT r.batch_id, count(*) AS running_parents,
-    count(*) FILTER (WHERE r.input_key = ANY(CAST(:outlined AS text[]))) AS outlined_parents, (
+    count(*) FILTER (WHERE (r.batch_id, r.input_key) IN (SELECT batch_id, input_key FROM outlined)) AS outlined_parents, (
         SELECT a FROM actions a WHERE a.batch_id = r.batch_id AND a.input_key = e.input_key
     ) AS a
     FROM running r CROSS JOIN LATERAL unnest(ARRAY(
@@ -715,7 +721,7 @@ AHEAD_CLAIM_KEYS = 32
 COUNT_WAITING_AHEAD = sa.text(
     "SELECT count(*) FROM actions "
     "WHERE batch_id = :batch_id AND state = 'running' AND ahead = 'ahead' AND remaining_deps > 0 "
-    "AND input_key <> ALL(CAST(:outlined AS text[]))"
+    f"AND (batch_id, input_key) NOT IN ({OUTLINED_LEASES})"
 )
 # Recount the parents not done of the running actions claimed ahead of :key that waited for one, returning the new
 # counts. REFRESH leaves running actions alone. :key's children are read once, by key, rather than per running
@@ -775,6 +781,7 @@ WITH RECURSIVE ahead_running AS MATERIALIZED (
     WHERE batch_id = :batch_id AND input_key = ANY(ARRAY(SELECT input_key FROM revoked)) RETURNING input_key
 )
 DELETE FROM leases WHERE batch_id = :batch_id AND input_key = ANY(ARRAY(SELECT input_key FROM unleased))
+RETURNING attempt_token
 """)
 # Cancel :key of batch :id and its unfinished descendants, with their leases. Each step reads one action's children
 # by key (edges_parent), and the actions and leases are matched by key: a join with edges was planned, for a batch
@@ -793,6 +800,7 @@ WITH RECURSIVE blocked(input_key) AS (
     AND state IN ('waiting', 'ready', 'running') RETURNING input_key
 )
 DELETE FROM leases WHERE batch_id = :id AND input_key = ANY(ARRAY(SELECT input_key FROM skipped))
+RETURNING attempt_token
 """)
 
 
@@ -949,7 +957,8 @@ FINISH_IF_DONE = sa.text(
 # are all burst demand needs: the scale check runs every sweep, and waiting actions can outnumber the others many
 # times over. Literal states, so the partial index actions_unfinished serves both.
 # Both also count the running actions claimed ahead that wait for a parent, as state ``ahead``, for burst_demand:
-# they hold a worker but no burst worker should start for them alone.
+# they hold a worker but no burst worker should start for them alone. Not those that published their outline
+# (:outlined): they prove while their parents finish.
 COUNT_UNFINISHED = sa.text(
     "SELECT a.state, a.tier, a.class, b.priority > 0, count(*) FROM actions a "
     "JOIN batches b ON b.id = a.batch_id "
@@ -958,13 +967,15 @@ COUNT_UNFINISHED = sa.text(
     "UNION ALL SELECT 'ahead', a.tier, a.class, b.priority > 0, count(*) FROM actions a "
     "JOIN batches b ON b.id = a.batch_id "
     "WHERE a.state = 'running' AND a.ahead = 'ahead' AND a.remaining_deps > 0 "
+    f"AND (a.batch_id, a.input_key) NOT IN ({OUTLINED_LEASES}) "
     "GROUP BY a.tier, a.class, b.priority > 0"
 )
 COUNT_ACTIVE = sa.text(
     "SELECT state, tier, class, false, count(*) FROM actions "
     "WHERE state IN ('ready', 'running') GROUP BY state, tier, class "
     "UNION ALL SELECT 'ahead', tier, class, false, count(*) FROM actions "
-    "WHERE state = 'running' AND ahead = 'ahead' AND remaining_deps > 0 GROUP BY tier, class"
+    "WHERE state = 'running' AND ahead = 'ahead' AND remaining_deps > 0 "
+    f"AND (batch_id, input_key) NOT IN ({OUTLINED_LEASES}) GROUP BY tier, class"
 )
 
 
@@ -1048,8 +1059,8 @@ class Coordinator:
         # claim; and the workers that last claimed, reported or heartbeat from each host, when, and whether they are
         # burst workers. See _quarantine.
         self.lease_hosts: dict[UUID, tuple[str, str, list[str]]] = {}
-        # The input key of each live lease whose action published its outline (see outlined), by attempt token.
-        self.outlined_keys: dict[UUID, str] = {}
+        # The attempt tokens of the leases whose action published its outline (see outlined), oldest first.
+        self.outlined_tokens: dict[UUID, None] = {}
         self.infra_streak: dict[str, tuple[int, UUID | None]] = {}
         self.probe_at: dict[str, datetime] = {}
         self.host_workers: dict[str, dict[str, tuple[datetime, bool]]] = {}
@@ -1576,14 +1587,16 @@ class Coordinator:
         children, which may now be claimed ahead, are left to the claims ahead's next read (see _ahead_candidates):
         a large batch's plain claims would otherwise have every claim of a worker that loads ahead read again."""
         token = uuid4()
-        # Whether the batch loads ahead, read by primary key in the same statement.
-        ahead_batch = await conn.scalar(
+        # Whether it builds pipelined: a build of a batch that loads ahead, read by primary key in the same statement,
+        # unless it's a plain claim of a leaf, whose outline nothing would start on.
+        pipelined = await conn.scalar(
             sa.text(
                 "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now(), "
                 "finished_at = NULL, worker = :worker, "
                 "ahead = CASE WHEN :ahead THEN 'ahead' WHEN ahead = 'abandoned' THEN ahead ELSE 'no' END "
                 "WHERE batch_id = :batch_id AND input_key = :input_key "
-                "RETURNING class = 'build' AND (SELECT ahead_cap IS NOT NULL FROM batches WHERE id = actions.batch_id)"
+                "RETURNING class = 'build' AND (critical_depth > 0 OR :ahead) "
+                "AND (SELECT ahead_cap IS NOT NULL FROM batches WHERE id = actions.batch_id)"
             ),
             {"batch_id": row.batch_id, "input_key": row.input_key, "ahead": bool(ahead_parents), "worker": worker},
         )
@@ -1600,12 +1613,9 @@ class Coordinator:
                 "lease": self.settings.lease_seconds,
             },
         )
-        # An earlier lease's outline is no longer this run's.
-        for earlier in [t for t, key in self.outlined_keys.items() if key == row.input_key]:
-            del self.outlined_keys[earlier]
         return Claim(
             token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb,
-            ahead_parents, self.settings.pipeline and bool(ahead_batch),
+            ahead_parents, self.settings.pipeline and bool(pipelined),
         )
 
     async def _claim_ahead(self, tiers: list[str], worker: str, *, above: int | None = None) -> Claim | None:
@@ -1669,7 +1679,7 @@ class Coordinator:
                 if batch is not None:
                     # Counted after the lock, in a snapshot that sees every claim ahead committed before it.
                     waiting = await conn.scalar(
-                        COUNT_WAITING_AHEAD, {"batch_id": batch_id, "outlined": list(self.outlined_keys.values())}
+                        COUNT_WAITING_AHEAD, {"batch_id": batch_id, "outlined": list(self.outlined_tokens)}
                     )
                     if waiting < batch.ahead_cap:
                         row = await self._lock_unleased(
@@ -1735,7 +1745,7 @@ class Coordinator:
             async with self.engine.connect() as conn:
                 rows = (await conn.execute(
                     AHEAD_CANDIDATES,
-                    {"depth": self.settings.ahead_depth_limit, "outlined": list(self.outlined_keys.values())},
+                    {"depth": self.settings.ahead_depth_limit, "outlined": list(self.outlined_tokens)},
                 )).all()
             self.ahead_read = _AheadRead(
                 at, changes,
@@ -2449,6 +2459,7 @@ class Coordinator:
         if idle:
             for token in [t for t, (h, w, _) in self.lease_hosts.items() if h == host_id and w == worker]:
                 del self.lease_hosts[token]
+                self.outlined_tokens.pop(token, None)
         if host_id in self.host_workers or len(self.host_workers) < MAX_HOSTS:
             self.host_workers.setdefault(host_id, {})[worker] = (self.clock(), "high" in tiers)
 
@@ -2567,20 +2578,22 @@ class Coordinator:
         against its batch's ``ahead_cap`` then, so that its children may be claimed ahead too. Kept in memory, as
         ``lease_hosts`` is: a restart forgets it, and the action counts against the cap again until it ends. A stale
         token records nothing: its heartbeat stops the action."""
-        # Taken first, so that a lease ending while it's read, which drops the token, isn't recorded after.
-        self.outlined_keys[token] = ""
         async with self.engine.connect() as conn:
-            key = await conn.scalar(
-                sa.text("SELECT input_key FROM leases WHERE attempt_token = :token AND expires_at > now()"),
+            live = await conn.scalar(
+                sa.text("SELECT true FROM leases WHERE attempt_token = :token AND expires_at > now()"),
                 {"token": token},
             )
-        if key is None or token not in self.outlined_keys:
-            self.outlined_keys.pop(token, None)
+        if not live:
             return
-        self.outlined_keys[token] = key
-        if len(self.outlined_keys) > MAX_LEASE_HOSTS:
-            del self.outlined_keys[next(iter(self.outlined_keys))]
+        self.outlined_tokens[token] = None
+        if len(self.outlined_tokens) > MAX_LEASE_HOSTS:
+            del self.outlined_tokens[next(iter(self.outlined_tokens))]
         self._ahead_changed()
+
+    def _forget_outlined(self, tokens: Iterable[UUID]) -> None:
+        """Drop the outline records of the leases with ``tokens``, which a statement ended."""
+        for token in tokens:
+            self.outlined_tokens.pop(token, None)
 
     async def complete(self, token: UUID, result: Result) -> bool:
         """Apply a worker's result record; False when its lease is stale, and the record is dropped.
@@ -2601,6 +2614,7 @@ class Coordinator:
             )
             if batch_id is None:
                 self.lease_hosts.pop(token, None)
+                self.outlined_tokens.pop(token, None)
                 return False
             if await self._lock_batch(conn, batch_id, shared=built) != "running" or await conn.scalar(
                 sa.text("SELECT failure IS NOT NULL FROM batches WHERE id = :id"), {"id": batch_id}
@@ -2615,6 +2629,7 @@ class Coordinator:
                 ).first()
                 if revoked is None:
                     self.lease_hosts.pop(token, None)
+                    self.outlined_tokens.pop(token, None)
                     return False
                 # A record for another action rolls the lease's deletion back, as on a live lease.
                 kept = await conn.execute(
@@ -2631,6 +2646,7 @@ class Coordinator:
                         f"action {revoked.input_key}"
                     )
                 self.lease_hosts.pop(token, None)
+                self.outlined_tokens.pop(token, None)
                 return True
             lease = (
                 await conn.execute(
@@ -2642,6 +2658,7 @@ class Coordinator:
             ).first()
             if lease is None:
                 self.lease_hosts.pop(token, None)
+                self.outlined_tokens.pop(token, None)
                 return False
             if built:
                 await conn.execute(LOCK_BUILT, {"batch_id": batch_id, "key": lease.input_key})
@@ -2751,7 +2768,7 @@ class Coordinator:
         if built:
             await self._finish_when_done(batch_id)
         self.lease_hosts.pop(token, None)
-        self.outlined_keys.pop(token, None)
+        self.outlined_tokens.pop(token, None)
         if leased is not None:
             self._record_result(leased[0], batch_id, result)
             self._learn_locality(leased[0], action.theory, result)
@@ -2951,7 +2968,7 @@ class Coordinator:
             if lease is None:
                 return
             self.lease_hosts.pop(token, None)
-            self.outlined_keys.pop(token, None)
+            self.outlined_tokens.pop(token, None)
             action = (
                 await conn.execute(
                     sa.text(
@@ -3153,15 +3170,16 @@ class Coordinator:
         self.infra_streak = {host: n for host, n in self.infra_streak.items() if host in known}
         self.probe_at = {host: at for host, at in self.probe_at.items() if host in known}
 
-    @staticmethod
-    async def _counts(conn: AsyncConnection, statement: sa.TextClause) -> QueueCounts:
+    async def _counts(self, conn: AsyncConnection, statement: sa.TextClause) -> QueueCounts:
         """The actions ``statement`` counts, by state and tier; see COUNT_UNFINISHED."""
         count: defaultdict[tuple[str, str], int] = defaultdict(int)
         runs: defaultdict[str, int] = defaultdict(int)
         high_run = 0
         ready_high_run = 0
         priorities: defaultdict[str, int] = defaultdict(int)
-        for state, tier, action_class, prioritized, n in await conn.execute(statement):
+        for state, tier, action_class, prioritized, n in await conn.execute(
+            statement, {"outlined": list(self.outlined_tokens)}
+        ):
             if state == "ahead":
                 count[state, tier] += n
                 continue
@@ -3523,9 +3541,7 @@ class Coordinator:
             {"batch_id": batch_id, "input_key": input_key},
         )
         if ahead_batch and requeued.rowcount:
-            await conn.execute(
-                REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]}
-            )
+            self._forget_outlined(await conn.scalars(REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]}))
         await conn.execute(REFRESH_KEYS, {"batch_id": batch_id, "keys": [input_key]})
         await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [input_key]})
 
@@ -3543,9 +3559,7 @@ class Coordinator:
         waits for a running parent, so it is revoked (REVOKE_AHEAD), and the action, if it was claimed
         ahead itself, is no longer one ahead (an abandoned one stays abandoned)."""
         if ahead_batch:
-            await conn.execute(
-                REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]}
-            )
+            self._forget_outlined(await conn.scalars(REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]}))
             await conn.execute(
                 sa.text(
                     "UPDATE actions SET ahead = 'no' "
@@ -3612,7 +3626,9 @@ class Coordinator:
 
     async def _skip(self, conn: AsyncConnection, batch_id: UUID, input_key: str, reason: str) -> None:
         """Skip a blocked action and its descendants, revoking any leases left by a requeued parent."""
-        await conn.execute(SKIP_DESCENDANTS, {"id": batch_id, "key": input_key, "reason": reason})
+        self._forget_outlined(
+            await conn.scalars(SKIP_DESCENDANTS, {"id": batch_id, "key": input_key, "reason": reason})
+        )
 
     async def _fail_batch(self, conn: AsyncConnection, batch_id: UUID, input_key: str, failure: str) -> None:
         """Fail ``input_key`` finally and with it the batch; its other unfinished actions are cancelled."""

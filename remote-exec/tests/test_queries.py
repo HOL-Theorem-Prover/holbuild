@@ -97,7 +97,8 @@ class Arrival:
 class Fleet:
     """The seeded database: ``fresh`` and ``steady`` were inserted after the last ANALYZE, ``old`` is a
     finished batch past retention. ``token`` is a live lease of ``fresh``, ``expired`` an expired one of
-    ``steady``. ``since`` numbers the transaction that changed a few of ``fresh``'s actions last."""
+    ``steady``. ``since`` numbers the transaction that changed a few of ``fresh``'s actions last.
+    ``running_tokens`` are the leases of ``fresh``'s running actions."""
 
     engine: AsyncEngine
     parents: list[list[int]]
@@ -109,17 +110,18 @@ class Fleet:
     token: UUID
     expired: UUID
     since: int
+    running_tokens: list[UUID]
 
     def parent_of_ahead(self) -> str:
         """A running action of ``fresh`` with children claimed ahead."""
         child = self.arrival.ahead.index("ahead")
         return key(next(p for p in self.parents[child] if self.arrival.state[p] == "running"))
 
-    def outlined(self) -> list[str]:
-        """Every running action of ``fresh``, those claimed ahead included, as if each had published its outline:
-        the largest array of outlined keys a statement is given, which the counts of actions waiting ahead
-        exclude."""
-        return self.arrival.keys("running") + self.arrival.keys("running", "ahead")
+    def outlined(self) -> list[UUID]:
+        """The leases of every running action of ``fresh``, those claimed ahead included, as if each had published
+        its outline: the largest array of outlined tokens a statement is given, whose actions the counts of actions
+        waiting ahead exclude."""
+        return self.running_tokens
 
     def ahead_candidates(self) -> list[str]:
         """Waiting actions of ``fresh`` whose unfinished parents all run, which may be claimed ahead."""
@@ -252,13 +254,16 @@ async def seed(engine: AsyncEngine) -> Fleet:
             sa.text("SELECT attempt_token FROM leases WHERE batch_id = :id AND input_key = :key"),
             {"id": fresh, "key": arrival.keys("running")[0]},
         )
+        running_tokens = list(
+            await connection.scalars(sa.text("SELECT attempt_token FROM leases WHERE batch_id = :id"), {"id": fresh})
+        )
     async with engine.begin() as connection:
         since = int(await connection.scalar(sa.text("SELECT CAST(pg_current_xact_id() AS text)")))
         await connection.execute(
             sa.text("UPDATE actions SET log_sha256 = 'log' WHERE batch_id = :id AND input_key = ANY(:keys)"),
             {"id": fresh, "keys": arrival.keys("ready")[:20]},
         )
-    return Fleet(engine, parents, fresh, steady, old, arrival, steady_arrival, token, expired, since)
+    return Fleet(engine, parents, fresh, steady, old, arrival, steady_arrival, token, expired, since, running_tokens)
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -374,7 +379,7 @@ STATEMENTS = [
     ),
     Statement(cm.COUNT_WAITING_AHEAD, lambda f: {"batch_id": f.fresh, "outlined": f.outlined()}, 1_100),
     Statement(
-        "SELECT input_key FROM leases WHERE attempt_token = :token AND expires_at > now()",
+        "SELECT true FROM leases WHERE attempt_token = :token AND expires_at > now()",
         lambda f: {"token": f.token},
         100,
     ),
@@ -388,8 +393,8 @@ STATEMENTS = [
     Statement(
         cm.PEAK_COVERED, lambda f: {"package": "pkg", "theory": "t0", "profile": "default", "peak": 2000}, 100
     ),
-    Statement(cm.COUNT_UNFINISHED, lambda f: {}, 93_000),
-    Statement(cm.COUNT_ACTIVE, lambda f: {}, 18_000),
+    Statement(cm.COUNT_UNFINISHED, lambda f: {"outlined": f.outlined()}, 93_000),
+    Statement(cm.COUNT_ACTIVE, lambda f: {"outlined": f.outlined()}, 18_000),
     Statement(cm.HELD_TARGET, lambda f: {"now": now(), "hold": 900.0, "cap": 100}, 1_800),
     # submit
     Statement(

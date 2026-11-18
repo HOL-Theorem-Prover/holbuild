@@ -88,6 +88,11 @@ async def test_builds_of_a_batch_that_loads_ahead_are_claimed_pipelined_unless_t
     claimed = await claim_ahead(http)
     assert claimed is not None and claimed["theory"] == "pkg:b" and claimed["pipeline"] is True
 
+    # Nothing would start on the outline of a leaf claimed plain.
+    await submit(http, ["l"], speculative_loading="4")
+    claimed = await claim(http)
+    assert claimed is not None and claimed["theory"] == "pkg:l" and claimed["pipeline"] is False
+
     await submit(http, ["x"])
     claimed = await claim(http)
     assert claimed is not None and claimed["theory"] == "pkg:x" and claimed["pipeline"] is False
@@ -117,14 +122,17 @@ async def test_an_action_that_published_its_outline_frees_its_slot_of_the_cap_fo
     assert response.status_code == 204
     c = await claim_ahead(http)
     assert c is not None and (c["theory"], c["ahead_parents"]) == ("pkg:c", parents("a") + parents("b"))
-    assert list(coordinator.outlined_keys.values()) == [input_key("b")]
+    assert list(coordinator.outlined_tokens) == [UUID(b["attempt_token"])]
 
     # Its result forgets it.
     cache.keys.add(ac_key("a"))
     assert (await complete(http, a, result("a", "built"))).status_code == 200
     cache.keys.add(ac_key("b"))
     assert (await complete(http, b["attempt_token"], result("b", "built"))).status_code == 200
-    assert coordinator.outlined_keys == {}
+    assert coordinator.outlined_tokens == {}
+    # A report arriving after the result marks nothing.
+    assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204
+    assert coordinator.outlined_tokens == {}
 
 
 async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_ready(
@@ -410,7 +418,8 @@ async def test_actions_waiting_ahead_ask_for_no_burst_worker_until_their_parents
 ) -> None:
     await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
     a = await claim_named(http, "a")
-    assert await claim_ahead(http) is not None
+    b = await claim_ahead(http)
+    assert b is not None
 
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
     assert (queue["running_standard"], queue["waiting_ahead_standard"]) == (2, 1)
@@ -418,6 +427,14 @@ async def test_actions_waiting_ahead_ask_for_no_burst_worker_until_their_parents
         active = await coordinator._counts(conn, coordinator_module.COUNT_ACTIVE)
     assert (active.running_standard, active.waiting_ahead_standard) == (2, 1)
     assert coordinator_module.burst_demand(active, warm_workers=1, max_burst_workers=16) == 0
+
+    # One that published its outline proves while its parent finishes: it waits no more.
+    assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204
+    queue = (await http.get("/v1/queue", headers=CLIENT)).json()
+    assert (queue["running_standard"], queue["waiting_ahead_standard"]) == (2, 0)
+    async with coordinator.engine.connect() as conn:
+        active = await coordinator._counts(conn, coordinator_module.COUNT_ACTIVE)
+    assert active.waiting_ahead_standard == 0
 
     cache.keys.add(ac_key("a"))
     assert (await complete(http, a, result("a", "built"))).status_code == 200
@@ -459,7 +476,7 @@ async def test_claims_of_workers_that_load_ahead_share_reads_of_the_candidates(
 
     def count(conn: Any, cursor: Any, statement: str, *_: Any) -> None:
         nonlocal reads
-        reads += "WITH RECURSIVE ahead_batches AS" in statement  # AHEAD_CANDIDATES
+        reads += "WITH RECURSIVE outlined AS" in statement  # AHEAD_CANDIDATES
 
     sa.event.listen(remote_exec_engine.sync_engine, "before_cursor_execute", count)
     try:
@@ -596,7 +613,7 @@ async def test_a_parent_lease_expired_wakes_a_claim_waiting_for_the_slot_its_rev
 
 
 async def test_a_parent_back_to_waiting_revokes_what_was_claimed_ahead_of_it_and_of_that(
-    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, remote_exec_engine: AsyncEngine
 ) -> None:
     await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "b")], speculative_loading="4")
     a = await claim_named(http, "a")
@@ -606,11 +623,14 @@ async def test_a_parent_back_to_waiting_revokes_what_was_claimed_ahead_of_it_and
     assert (await complete(http, a, result("a", "built"))).status_code == 200
     c = await claim_ahead(http)
     assert c is not None and c["theory"] == "pkg:c"
+    assert (await http.post(f"/v1/work/{c['attempt_token']}/outlined", headers=WORKER)).status_code == 204
 
     # "b" gives up loading ahead; "c" can't get its parent's outputs before "b" is claimed again.
     assert (await complete(http, b["attempt_token"], result("b", "failed", "ahead-abandoned"))).status_code == 200
     assert await ahead_state(remote_exec_engine, "c") == ("waiting", "no", 0, 1)
     assert (await http.post(f"/v1/work/{c['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
+    # Nor does its outline count any more.
+    assert coordinator.outlined_tokens == {}
 
 
 async def test_a_chain_revoked_by_its_root_s_retry_is_claimed_ahead_again_once_the_root_runs_again(

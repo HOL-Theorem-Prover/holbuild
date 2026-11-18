@@ -566,7 +566,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   the rest, and those batches take turns when there are more of them than workers. Priority is capped:
   once batches of a positive priority run `REMOTE_EXEC_PRIORITY_CAP` builds together, their builds
   rank like priority-0 ones (fewest running first) and their claims ahead no longer go before ready
-  builds: priority work loses its precedence, though it still takes workers no other build is ready for.
+  builds of other batches (a claim ahead on outlines alone still ranks among its own batch's ready
+  builds; see "Pipelining"): priority work loses its precedence, though it still takes workers no other build is ready for.
   Each shared ranking counts its own claims until its next read, so claims from different tier lists
   may pass the cap by a few builds briefly. A cap at least the fleet's worker count, and a
   coordinator restart, restores strict priority. Within the batch, it
@@ -623,7 +624,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   release. An older one may abandon such a claim (`ahead-abandoned`), which is
   then built plain.
 - **Pipelining**: a claim of a build action of a batch that loads ahead
-  carries `"pipeline": true` unless `REMOTE_EXEC_PIPELINE=0`, and the worker
+  carries `"pipeline": true` unless `REMOTE_EXEC_PIPELINE=0` or it is a plain
+  claim of an action nothing in its batch depends on, and the worker
   runs it with `exec-action --pipeline` (releases 0.14.75 and later). Such an
   action, when its spec allows it, publishes its theory's outline (its
   statements, with the proofs still to check) under a key of its own before
@@ -636,7 +638,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   (`critical_depth`, then `descendant_count`, a ready build first on a tie)
   instead of waiting for them; other candidates come after the ready builds
   of their priority, since their workers would wait. The record is kept in
-  memory: a restarted coordinator counts such actions against the cap again
+  memory, by attempt token, and names an action only while that lease is
+  live: a restarted coordinator counts such actions against the cap again
   until they end. Rolling back: `REMOTE_EXEC_PIPELINE=0`, which stops new
   pipelined claims; actions already running finish as they started.
 - **Retries** by the result's failure class:

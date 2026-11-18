@@ -1655,6 +1655,7 @@ option checkpoint-target=true      (only for a theory that saves checkpoints as 
 option skip-checkpoints=true      (when checkpoint reuse is disabled)
 option force=true                 (only for a forced theory)
 option trace-steps=true            (only for a traced theory)
+option pipeline=true               (only for a theory that may build pipelined)
 action-text
 <the action text, verbatim to the end of the blob>
 ```
@@ -1686,7 +1687,11 @@ action-text
   default to false. `force` or `trace-steps` disables whole-action cache reuse
   and early cutoff on the worker; `trace-steps` also enables proof-step tracing
   and requires `proof-steps=true`. `skip-checkpoints` disables checkpoint reuse
-  and saving, including shared heaps.
+  and saving, including shared heaps. `pipeline` defaults to false; with it, a
+  worker whose claim asks it to (`exec-action --pipeline`) builds the theory
+  pipelined, unless the spec shows the theory can't be (extra outputs, proof
+  steps without the proof IR, a forced or traced run) or its HOL lacks the
+  context-taking tactics; otherwise it builds plain.
 
 ### Exporting script runs for remote execution
 

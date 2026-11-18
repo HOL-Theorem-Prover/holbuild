@@ -13413,7 +13413,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           if HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key =
              action_text_value spec "toolchain" then ()
           else raise ActionFailed (ToolchainFailure, "the toolchain's identity does not match the action text")
-        val pipelined = pipeline andalso #pipeline spec andalso not forced andalso has_context_tactics tc
+        (* The client marks what only it knows (targets, --all-checkpoints);
+           what the spec shows is checked here too, so an ineligible spec builds plain. *)
+        val pipelined =
+          pipeline andalso #pipeline spec andalso not forced andalso null (#extra_outputs spec) andalso
+          (not (#proof_steps spec) orelse #new_ir spec) andalso has_context_tactics tc
       in
         if forced orelse null ahead_parents then run_plain spec tc forced pipelined else run_ahead spec tc pipelined
       end
@@ -13931,13 +13935,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             arrivals := (name, Time.now ()) :: !arrivals
           end
         fun arrive (dep as {target, key, ...}, _) =
-          (if restore_late staging dep key then arrive_from staging dep
-           else abandon ("dependency " ^ target ^ " does not match its parents"))
-          handle e as ActionFailed (InputMissing _, _) =>
-            (* Built on an outline, the action is given up, as any failure
-               after loading one. *)
-            if null (!outlined) then raise e
-            else abandon ("dependency " ^ target ^ " is missing from the remote cache: " ^ General.exnMessage e)
+          if restore_late staging dep key then arrive_from staging dep
+          else abandon ("dependency " ^ target ^ " does not match its parents")
         (* An outline that can't be restored or doesn't match the parents
            in the root is ignored: the child waits for the entry. *)
         fun arrive_outline (dep as {key, ...}, _) =
@@ -14083,8 +14082,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           end
       in
         (* The child never outlives the run, whatever stops it before the
-           build joins the child; after that, stopping it does nothing. *)
-        continue_ahead () handle e => (stop_child (); raise e)
+           build joins the child; after that, stopping it does nothing.  Any
+           failure once an outline is loaded gives the action up. *)
+        continue_ahead ()
+        handle e =>
+          (stop_child ();
+           case e of
+               ActionFailed (AheadAbandoned, _) => raise e
+             | ActionFailed (_, msg) => if null (!outlined) then raise e else abandon ("built on an outline: " ^ msg)
+             | _ => if null (!outlined) then raise e else abandon ("built on an outline: " ^ General.exnMessage e))
       end
     fun attempt () =
       let

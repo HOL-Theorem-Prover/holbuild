@@ -100,10 +100,36 @@ Proof
 QED
 val _ = r := r_thm;
 SML
+# Q loads ahead of O and R, for a cache failure once O's outline is in.
+cat > "$project/src/QScript.sml" <<'SML'
+Theory Q
+Ancestors O R
+
+Theorem q_thm:
+  T
+Proof
+  ACCEPT_TAC o_thm
+QED
+SML
+# E declares an extra output, which a pipelined build doesn't install.
+cat > "$project/src/EScript.sml" <<'SML'
+Theory E
+Ancestors bool
+
+fun holbuild_extra_outputs (_ : string list) = ()
+val _ = holbuild_extra_outputs ["E.nsv"]
+val _ = let val out = TextIO.openOut "E.nsv" in TextIO.output (out, "E\n"); TextIO.closeOut out end
+
+Theorem e_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+SML
 # The build's target, which isn't pipelined: a target saves checkpoints.
 cat > "$project/src/ZScript.sml" <<'SML'
 Theory Z
-Ancestors B P R
+Ancestors B E P Q R
 
 Theorem z_thm:
   T
@@ -184,17 +210,19 @@ key_for() { awk -v want="$2" '$1 == "action" && $5 == want { print $2 }' "$1"; }
 ac_of() { printf 'holbuild-remote-ac-v1\n%s\n' "$1" | sha256sum | cut -d' ' -f1; }
 outline_ac_of() { ac_of "$(printf 'holbuild-outline-v1\n%s\n' "$1" | sha256sum | cut -d' ' -f1)"; }
 
-start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 hb action-spec --upload ZTheory > "$tmpdir/batch.txt"
-for theory in A B O P R Z; do
+for theory in A B E O P Q R Z; do
   declare "spec_$theory=$(spec_for "$tmpdir/batch.txt" "pipe:${theory}Theory")"
   declare "key_$theory=$(key_for "$tmpdir/batch.txt" "pipe:${theory}Theory")"
 done
 # The client lets each theory but the target pipeline.
-for spec in "$spec_A" "$spec_B" "$spec_O" "$spec_P" "$spec_R"; do
+for spec in "$spec_A" "$spec_B" "$spec_O" "$spec_P" "$spec_Q" "$spec_R"; do
   require_grep '^option pipeline=true$' "$tmpdir/remote/cas/$spec"
 done
-require_no_grep '^option pipeline=true$' "$tmpdir/remote/cas/$spec_Z"
+for spec in "$spec_E" "$spec_Z"; do
+  require_no_grep '^option pipeline=true$' "$tmpdir/remote/cas/$spec"
+done
 
 # B starts on A's outline while A proves, and commits once A's final entry
 # passes the gate.
@@ -221,10 +249,20 @@ grep -qE '^phase-ms=(.*,)?outlined:1(,|$)' "$tmpdir/b.result" || {
 }
 
 # P starts on O's outline, which lacks the oracle O's proof makes: P is
-# given up and publishes nothing.
+# given up and publishes nothing.  Q, also on O's outline, is given up when
+# the cache fails while it waits for R.
 worker_start p "$spec_P" --ahead-parent "$key_O:$spec_O" --pipeline
+worker_start q "$spec_Q" --ahead-parent "$key_O:$spec_O" --ahead-parent "$key_R:$spec_R" --pipeline
 await_marker p waiting-OTheory
-worker o "$spec_O" --pipeline
+await_marker q waiting-OTheory
+worker_start o "$spec_O" --pipeline
+await_marker q arrived-OTheory
+echo 500 > "$tmpdir/control/ac-get-status-$(ac_of "$key_R")"
+worker_wait q
+expect q 3 "status=failed" "failure=ahead-abandoned"
+require_grep 'built on an outline' "$tmpdir/q.log"
+rm "$tmpdir/control/ac-get-status-$(ac_of "$key_R")"
+worker_wait o
 expect o 0 "status=built"
 worker_wait p
 expect p 3 "status=failed" "failure=ahead-abandoned"
@@ -267,3 +305,22 @@ echo 403 > "$tmpdir/control3/ac-put-status"
 worker refused "$spec_A" --pipeline
 require_grep 'not publishing the outline: .*the remote cache refused its entry' "$tmpdir/refused.log"
 [[ ! -e "$tmpdir/refused.result.outline" ]] || { echo "a refused outline was marked" >&2; exit 1; }
+
+# A spec asking to pipeline a theory it shows can't be (one with an extra
+# output) builds plain, publishing no outline.
+kill "$server_pid"; wait "$server_pid" 2>/dev/null || true
+start_remote_cache_server "$tmpdir/remote4" "$tmpdir/server4"
+hb action-spec --upload ZTheory > /dev/null
+python3 - "$tmpdir/remote4/cas/$spec_E" "$tmpdir/extra-spec" <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+open(sys.argv[2], "wb").write(data.replace(b"\naction-text\n", b"\noption pipeline=true\naction-text\n", 1))
+PY
+require_grep '^option pipeline=true$' "$tmpdir/extra-spec"
+extra_spec=$(sha256sum "$tmpdir/extra-spec" | cut -d' ' -f1)
+cp "$tmpdir/extra-spec" "$tmpdir/remote4/cas/$extra_spec"
+worker extra "$extra_spec" --pipeline
+expect extra 0 "status=built"
+require_no_grep 'published the outline' "$tmpdir/extra.log"
+[[ ! -e "$tmpdir/extra.result.outline" ]] || { echo "an ineligible spec marked an outline" >&2; exit 1; }
+[[ ! -e "$tmpdir/remote4/ac/$(outline_ac_of "$key_E")" ]] || { echo "an ineligible spec published an outline" >&2; exit 1; }
