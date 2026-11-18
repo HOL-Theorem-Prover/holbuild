@@ -995,20 +995,91 @@ fun compile_list_tactic label program =
    inside a TRY.  So the runner constructs every leaf of the plan, and every
    matching selector's RENAME_TAC, once before the first step
    (construct_plan_leaves) and applies those values, keyed by the leaf's
-   source span and program. *)
+   source span and program.  A leaf can carry state (`REWRITE_RULE [Once th]`
+   spends its bound when applied), so a failed-prefix resume must see each
+   leaf as a fresh run would at its resume point (leaf_rewind_count). *)
 datatype built_leaf = BuiltTactic of Tactical.tactic | BuiltListTactic of Tactical.list_tactic
 
 fun no_built_leaves () = Binarymap.mkDict String.compare : (string, built_leaf) Binarymap.dict
 
 val built_leaves_ref = ref (no_built_leaves ())
 
+(* Leaf applications are numbered in order; a TRY, ORELSE or REPEAT that
+   rolls the proof back doesn't reuse the numbers, since it doesn't undo what
+   the applications did to their leaves.  leaf_uses_ref holds, for each
+   applied leaf, the numbers of its first and its last application;
+   leaf_boundaries_ref, for each successful-leaf count, how many applications
+   came before the success that reached it (the latest one: earlier ones were
+   rolled back). *)
+fun no_leaf_uses () = Binarymap.mkDict String.compare : (string, int * int) Binarymap.dict
+fun no_leaf_boundaries () = Binarymap.mkDict Int.compare : (int, int) Binarymap.dict
+
+val leaf_applications_ref = ref 0
+val leaf_uses_ref = ref (no_leaf_uses ())
+val leaf_boundaries_ref = ref (no_leaf_boundaries ())
+
+fun reset_built_leaves () =
+  (built_leaves_ref := no_built_leaves ();
+   leaf_applications_ref := 0;
+   leaf_uses_ref := no_leaf_uses ();
+   leaf_boundaries_ref := no_leaf_boundaries ())
+
+fun record_leaf_boundary count =
+  leaf_boundaries_ref := Binarymap.insert (!leaf_boundaries_ref, count, !leaf_applications_ref)
+
 fun leaf_key start_pos end_pos program =
   String.concat [Int.toString start_pos, ":", Int.toString end_pos, ":", program]
 
 fun built_leaf start_pos end_pos program =
-  case Binarymap.peek (!built_leaves_ref, leaf_key start_pos end_pos program) of
-      SOME leaf => leaf
-    | NONE => raise Fail ("internal error: proof-ir leaf was not constructed: " ^ program)
+  let
+    val key = leaf_key start_pos end_pos program
+    val n = !leaf_applications_ref
+  in
+    case Binarymap.peek (!built_leaves_ref, key) of
+        SOME leaf =>
+          (leaf_applications_ref := n + 1;
+           leaf_uses_ref :=
+             Binarymap.insert (!leaf_uses_ref, key,
+                               case Binarymap.peek (!leaf_uses_ref, key) of
+                                   SOME (first, _) => (first, n)
+                                 | NONE => (n, n));
+           leaf)
+      | NONE => raise Fail ("internal error: proof-ir leaf was not constructed: " ^ program)
+  end
+
+fun leaf_boundary 0 = 0
+  | leaf_boundary count =
+      case Binarymap.peek (!leaf_boundaries_ref, count) of
+          SOME applications => applications
+        | NONE => raise Fail ("internal error: no leaf boundary for successful leaf " ^ Int.toString count)
+
+(* A failed-prefix resume restores the heap the failed run saved, after the
+   failed step ran, so a leaf there has the state of every application up to
+   the failure.  The resume point, after the count-th successful leaf, can
+   only keep leaves applied wholly before it.  This is the latest count no
+   leaf was applied on both sides of; the failed step and steps an edit
+   rewound count as after. *)
+fun leaf_rewind_count count =
+  let val boundary = leaf_boundary count
+  in
+    case List.find (fn (_, (first, last)) => first < boundary andalso last >= boundary)
+                   (Binarymap.listItems (!leaf_uses_ref)) of
+        NONE => count
+      | SOME (_, (first, _)) =>
+          let fun back k = if leaf_boundary k <= first then k else back (k - 1)
+          in leaf_rewind_count (back (count - 1)) end
+  end
+
+(* Leaves first applied at or after the resume point are constructed again. *)
+fun drop_leaves_from count =
+  let val boundary = leaf_boundary count
+  in
+    List.app (fn (key, (first, _)) =>
+                if first < boundary then ()
+                else (built_leaves_ref := #1 (Binarymap.remove (!built_leaves_ref, key));
+                      leaf_uses_ref := #1 (Binarymap.remove (!leaf_uses_ref, key))))
+             (Binarymap.listItems (!leaf_uses_ref))
+  end
 
 fun history_is_proved () =
   ((project_history goalStack.extract_thm; true) handle _ => false)
@@ -1385,14 +1456,19 @@ fun run_maybe_traced_step index display_index proof_step =
 (* Display indices follow run_structural_steps_with_resume's numbering, so a
    leaf whose construction fails is reported at its plan position.
    Compilation is outside the step budget, construction inside it: rule
-   arguments can do arbitrary work before returning a tactic. *)
+   arguments can do arbitrary work before returning a tactic.  Leaves already
+   in built_leaves_ref are kept. *)
 fun construct_plan_leaves display_index steps =
   let
     fun build d proof_step start_pos end_pos label program make =
-      with_plan_position d (HolbuildProofIr.step_kind proof_step) label (start_pos, end_pos) (fn () =>
-        built_leaves_ref :=
-          Binarymap.insert (!built_leaves_ref, leaf_key start_pos end_pos program,
-                            with_tactic_timeout label program make ()))
+      let val key = leaf_key start_pos end_pos program
+      in
+        if Option.isSome (Binarymap.peek (!built_leaves_ref, key)) then ()
+        else
+          with_plan_position d (HolbuildProofIr.step_kind proof_step) label (start_pos, end_pos) (fn () =>
+            built_leaves_ref :=
+              Binarymap.insert (!built_leaves_ref, key, with_tactic_timeout label program make ()))
+      end
     fun walk_list _ [] = ()
       | walk_list d (proof_step :: rest) =
           (walk d proof_step; walk_list (d + HolbuildProofIr.display_line_count proof_step) rest)
@@ -1424,7 +1500,6 @@ fun construct_plan_leaves display_index steps =
         | HolbuildProofIr.StepCases {cases, ...} => walk_headed_bodies (d + 1) cases
         | HolbuildProofIr.StepChoice {alternatives, ...} => walk_headed_bodies (d + 1) alternatives
   in
-    built_leaves_ref := no_built_leaves ();
     walk_list display_index steps
   end
 
@@ -1491,6 +1566,7 @@ fun run_built_steps resume_after_path display_index steps =
             (HolbuildProofIr.canonical_dependency_prefix steps path)
       in
         successful_step_count_ref := count;
+        record_leaf_boundary count;
         successful_prefix_end_ref := prefix_end;
         successful_path_ref := path;
         successful_frames_ref := !current_frames_ref;
@@ -1759,10 +1835,13 @@ fun run_built_steps resume_after_path display_index steps =
   end
 
 fun run_structural_steps_with_resume resume_after_path display_index steps =
-  (construct_plan_leaves display_index steps;
+  ((case resume_after_path of
+        NONE => reset_built_leaves ()
+      | SOME _ => ());
+   construct_plan_leaves display_index steps;
    run_built_steps resume_after_path display_index steps;
-   built_leaves_ref := no_built_leaves ())
-  handle e => (built_leaves_ref := no_built_leaves (); raise e)
+   reset_built_leaves ())
+  handle e => (reset_built_leaves (); raise e)
 
 fun run_structural_steps display_index steps = run_structural_steps_with_resume NONE display_index steps
 
@@ -2109,7 +2188,7 @@ fun take_at_most 0 _ = []
   | take_at_most _ [] = []
   | take_at_most n (x :: xs) = if n > 0 then x :: take_at_most (n - 1) xs else []
 
-fun salvage_failed_prefix_metadata plan metadata =
+fun salvage_failed_prefix_leaves plan leaves =
   let
     fun current_signature path =
       case step_at_path plan path of
@@ -2131,7 +2210,6 @@ fun salvage_failed_prefix_metadata plan metadata =
       | loop expected (leaf :: rest) last =
           if valid_leaf leaf expected then loop (expected + 1) rest (SOME leaf)
           else last
-    val leaves = #leaves metadata
   in
     case loop 1 leaves NONE of
         NONE => {step_count = 0, prefix_end = 0, path = [], focus = [], leaf_signature = NONE,
@@ -2153,11 +2231,23 @@ fun resumable_failed_prefix_metadata plan metadata =
   (validate_failed_prefix_metadata plan metadata; metadata)
   handle _ =>
     let
-      val salvaged = salvage_failed_prefix_metadata plan metadata
+      val salvaged = salvage_failed_prefix_leaves plan (#leaves metadata)
     in
       validate_failed_prefix_metadata plan salvaged;
       salvaged
     end
+
+fun rewind_past_shared_leaves plan metadata =
+  let val count = leaf_rewind_count (#step_count metadata)
+  in
+    if count = #step_count metadata then metadata
+    else
+      let val rewound = salvage_failed_prefix_leaves plan (take_at_most count (#leaves metadata))
+      in
+        validate_failed_prefix_metadata plan rewound;
+        rewind_past_shared_leaves plan rewound
+      end
+  end
 
 fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok =
   let
@@ -2185,7 +2275,9 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
             else raise Fail (String.concat ["failed-prefix checkpoint history does not match metadata: heap=",
                                             Int.toString (!history_step_count_ref),
                                             " metadata=", Int.toString (#history_count metadata)])
-          val resume_metadata = resumable_failed_prefix_metadata plan metadata
+          val resume_metadata =
+            rewind_past_shared_leaves plan (resumable_failed_prefix_metadata plan metadata)
+          val _ = drop_leaves_from (#step_count resume_metadata)
           val backup_count = #history_count metadata - #history_count resume_metadata
           val _ =
             if backup_count >= 0 then ()
