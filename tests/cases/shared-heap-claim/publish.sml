@@ -36,4 +36,4 @@ val _ = HolbuildRemoteCacheConfig.set_url url;
 val _ = RC.fail_closed := true;
 val _ = BE.write_text (dir ^ "/heap.sha") (HolbuildHash.file_sha256 deps);
 val _ = BE.publish_shared_checkpoints (RC.remote url) ctx
-  {heap = NONE, files = [], stale = [], missing = []};
+  {heap = NONE, files = [], stale = [], missing = []} true;

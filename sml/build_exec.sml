@@ -8168,9 +8168,14 @@ fun dependency_spec_lines hash_file root plan keys token deps =
 (* A worker saves theorem checkpoints unless the spec says otherwise: a
    spec without the line, as older clients write, means true.  Likewise a
    spec without a checkpoint-seconds line means the default, so a default
-   build's spec is the same as before the option existed. *)
+   build's spec is the same as before the option existed.  A worker
+   sharing heaps publishes the theorem and definition checkpoints of a
+   theory that built only if the spec says publish-checkpoints=true, which
+   the client writes for the build's targets; those of a failed or
+   interrupted action it always publishes, for the retry. *)
 fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
-                     {theorem_checkpoints, forced, skip_checkpoints} (action : theory_action) node action_text =
+                     {theorem_checkpoints, publish_checkpoints, forced, skip_checkpoints} (action : theory_action) node
+                     action_text =
   let
     val context = #package action ^ ":" ^ #logical action
     val token = spec_token context
@@ -8205,6 +8210,7 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
        "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
        bool_option "new-ir" (proof_ir_enabled policy)] @
       (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
+      (if publish_checkpoints then [bool_option "publish-checkpoints" true] else []) @
       (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
       (if Real.== (checkpoint_seconds policy, default_checkpoint_seconds) then []
        else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
@@ -8647,6 +8653,8 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
         val {text, files} =
           action_spec_text hash_file context (checkpoint_policy_for_node options project node)
             {theorem_checkpoints = true,
+             publish_checkpoints =
+               #all_checkpoints options orelse force_target_node (#force_targets options) node,
              forced = force_node options project node, skip_checkpoints = #skip_checkpoints options}
             action node action_text
         val spec_sha256 = HolbuildHash.string_sha256 text
@@ -9280,8 +9288,8 @@ type action_spec =
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list,
    proof_steps : bool, tactic_timeout : real option, new_ir : bool,
-   theorem_checkpoints : bool, skip_checkpoints : bool, checkpoint_seconds : real, force : bool, trace_steps : bool,
-   tool_cache : string option, action_text : string}
+   theorem_checkpoints : bool, publish_checkpoints : bool, skip_checkpoints : bool, checkpoint_seconds : real,
+   force : bool, trace_steps : bool, tool_cache : string option, action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
 fun split_spec_text section text =
@@ -9410,6 +9418,10 @@ fun parse_action_spec text : action_spec =
        (case List.find (fn (k, _) => k = "option theorem-checkpoints") (!values) of
             SOME (_, v) => spec_bool "theorem-checkpoints" v
           | NONE => true),
+     publish_checkpoints =
+       (case List.find (fn (k, _) => k = "option publish-checkpoints") (!values) of
+            SOME (_, v) => spec_bool "publish-checkpoints" v
+          | NONE => false),
      skip_checkpoints =
        (case List.find (fn (k, _) => k = "option skip-checkpoints") (!values) of
             SOME (_, v) => spec_bool "skip-checkpoints" v
@@ -11353,10 +11365,12 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                remove_tree (#checkpoint_root ctx); nothing_restored)
 
 (* After the run, successful or not: the heap if this run saved it, then,
-   if the heap under them is the published one, the new checkpoints. *)
+   if the heap under them is the published one and CHECKPOINTS holds, the
+   new checkpoints. *)
 fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, deps_key, deps_loaded,
                                               candidates, ...} : shared_context)
-                               ({heap = restored_heap, files = restored, stale, missing} : shared_restore) =
+                               ({heap = restored_heap, files = restored, stale, missing} : shared_restore)
+                               checkpoints =
   let
     fun member x xs = List.exists (fn y => y = x) xs
     (* An entry naming a blob the cache lost is replaced, as if absent. *)
@@ -11555,7 +11569,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       handle e => (warning c e; NONE)
     fun publish_candidates heap =
       let
-        val eligible = List.mapPartial eligible candidates
+        val eligible = if checkpoints then List.mapPartial eligible candidates else []
         val (_, unique) = List.foldl
           (fn (item as (_, key, _), (seen, kept)) =>
             if Redblackset.member (seen, key) then (seen, kept)
@@ -11583,15 +11597,20 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             (stored := Redblackset.add (!stored, path);
              store_add store heap {sha = sha, src = path, save = save})
           handle e => warn ("could not store shared checkpoint " ^ path ^ ": " ^ General.exnMessage e)
+        val used =
+          List.mapPartial (fn (c : shared_candidate) =>
+                              if was_restored (#path c) then SOME (shared_checkpoint_key heap_key (#kind c) (#key c))
+                              else NONE)
+                          candidates @
+          List.mapPartial (fn (_, key, absent) => if !absent then NONE else SOME key) probes @
+          map (fn (_, key, _, _) => key) complete
       in
         List.app (fn (_, _, _, blobs) => List.app add blobs) complete;
-        update_index heap
-          (List.mapPartial (fn (c : shared_candidate) =>
-                               if was_restored (#path c) then SOME (shared_checkpoint_key heap_key (#kind c) (#key c))
-                               else NONE)
-                           candidates @
-           List.mapPartial (fn (_, key, absent) => if !absent then NONE else SOME key) probes @
-           map (fn (_, key, _, _) => key) complete)
+        (* A run that publishes no checkpoint and used none on a heap it
+           restored has nothing to add to that heap's index, which it
+           would otherwise rewrite empty if absent. *)
+        if not checkpoints andalso null used andalso SOME heap = restored_heap then ()
+        else update_index heap used
       end
   in
     case heap of
@@ -12799,6 +12818,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
        It runs after the result is written, since the client fetches
        neither. *)
     val deferred = ref (fn () => ())
+    (* Whether the action built: a failed or interrupted one publishes the
+       checkpoints a retry resumes from even when its spec doesn't ask. *)
+    val built = ref false
     (* The theory-module writer, which runs last after the result, given
        until a deadline: see fill_module_store. *)
     val write_modules =
@@ -13117,7 +13139,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               case shared of
                   SOME ctx =>
                     (publishing_checkpoints := true;
-                     (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
+                     (phase "publish" (fn () =>
+                        publish_shared_checkpoints remote ctx restored
+                          (#publish_checkpoints spec orelse not (!built)))
                       before publishing_checkpoints := false)
                      handle e => (publishing_checkpoints := false; raise e))
                 | NONE => ()
@@ -13580,6 +13604,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                       else NONE
                   | _ => failure
               val status = if Option.isSome failure then "failed" else status
+              val _ = built := (status = "built")
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
               val phases = rev (!phases) @
                 [("started", Time.toMilliseconds start),

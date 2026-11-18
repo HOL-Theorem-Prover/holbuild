@@ -181,7 +181,7 @@ resumed() {
 
 write_t "T" "simp[]"
 export_t v1
-# The dependency shares its checkpoints by default, before the target runs.
+# The dependency shares its heap, before the target runs.
 [[ -d "$shared/checkpoint-store" ]] || { echo "the dependency A shared no heap" >&2; exit 1; }
 requests=$tmpdir/server/requests.log
 before_v1=$(wc -l < "$requests")
@@ -616,6 +616,64 @@ if grep -q "dropping checkpoint\|restored shared theorem_context" "$tmpdir/x2.lo
   cat "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log" >&2
   exit 1
 fi
+
+# A theory the build doesn't name as a target shares its checkpoints only
+# when it fails: N, built for its dependent M.
+cat > "$project/src/MScript.sml" <<'SML'
+Theory M
+Ancestors N
+
+Theorem m1:
+  T
+Proof
+  simp[]
+QED
+SML
+write_n() {
+  cat > "$project/src/NScript.sml" <<SML
+Theory N
+Ancestors A
+
+Theorem n1:
+  T
+Proof
+  simp[]
+QED
+
+Theorem n2:
+  T /\\ (1 = 1)
+Proof
+  CONJ_TAC >- ACCEPT_TAC TRUTH >> $1
+QED
+SML
+}
+# run_n NAME TACTIC: export N's spec as M's dependency and run it.
+run_n() {
+  write_n "$2"
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload MTheory) > "$tmpdir/$1.batch"
+  spec_n=$(field "$tmpdir/$1.batch" share:NTheory 4)
+  [[ -n "$spec_n" ]] || { cat "$tmpdir/$1.batch" >&2; exit 1; }
+  if grep -q "publish-checkpoints" "$project/.holbuild/action-specs/$spec_n"; then
+    echo "$1: the spec of a dependency asks to publish its checkpoints" >&2
+    exit 1
+  fi
+  forget_local
+  worker "$1" "$shared_url" "$shared" "$spec_n" --share-heaps
+}
+n1_shared() { grep -lq "^blob=[0-9a-f]* leaf .*/n1_context\.save$" "$tmpdir"/remote/ac/*; }
+run_n n-built "simp[]"
+expect n-built 0 "status=built"
+if n1_shared; then
+  echo "a dependency that built shared its theorem checkpoints" >&2
+  exit 1
+fi
+run_n n-failed "FAIL_TAC \"dependency failure\""
+expect n-failed 1 "status=failed" "failure=proof"
+resumed n-failed "deps-loaded checkpoint" "deps-loaded heap"
+n1_shared || { echo "a dependency that failed shared no theorem checkpoint" >&2; exit 1; }
+run_n n-fixed "rw[]"
+expect n-fixed 0 "status=built"
+resumed n-fixed "failed-prefix checkpoint in n2" "failed_prefix checkpoint"
 
 # A holbuild whose runtime changed only in what a theory loads after its
 # dependency heap still restores the heap an earlier release shared; a change

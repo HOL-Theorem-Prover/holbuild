@@ -1635,6 +1635,7 @@ option proof-steps=<bool>
 option tactic-timeout=<seconds|none>
 option new-ir=<bool>
 option theorem-checkpoints=false   (only for a theory that saves none)
+option publish-checkpoints=true    (only for a build target)
 option skip-checkpoints=true      (when checkpoint reuse is disabled)
 option force=true                 (only for a forced theory)
 option trace-steps=true            (only for a traced theory)
@@ -2014,7 +2015,11 @@ unchanged, or a failed proof's prefix, with a timeout at least as strict as
 the spec's. If there's none, it restores the dependency heap; if there's no
 heap either, it loads the dependencies cold. After the build, successful or
 not, it publishes its heap if no other worker's is, and then, when the heap
-under them is the published one, the checkpoints it saved. A heap is shared
+under them is the published one, the checkpoints it saved. A theory that
+built publishes its checkpoints only if it is one of the build's targets
+(every theory under `build --all-checkpoints`); a theory that failed, timed
+out or was interrupted always publishes them, so a retry or the next build
+resumes where it stopped. A heap is shared
 only between workers with the same toolchain bytes, cache root, action root,
 platform and holbuild runtime sources compiled into the heap, which is why
 every worker should use the same cache root.
