@@ -551,7 +551,9 @@ val _ =
   end;
 val _ = export_theory();
 SML
-if ! (cd "$dependency_project" && "$HOLBUILD_BIN" build --force=project --no-cache) > "$tmpdir/evict-completed-dependency.log" 2>&1; then
+# Dependency must build plainly: a pipelined Dependency is still committing,
+# so not yet completed, while SlowDependent runs on its outline.
+if ! (cd "$dependency_project" && HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" build --force=project --no-cache) > "$tmpdir/evict-completed-dependency.log" 2>&1; then
   echo "completed dependency checkpoint family was retained while its dependent was active" >&2
   cat "$tmpdir/evict-completed-dependency.log" >&2
   exit 1
