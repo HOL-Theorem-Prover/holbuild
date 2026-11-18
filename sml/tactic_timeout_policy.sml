@@ -7,18 +7,21 @@ fun timeout_min (NONE, timeout) = timeout
   | timeout_min (timeout, NONE) = timeout
   | timeout_min (SOME a, SOME b) = SOME (Real.min(a, b))
 
+(* Each node's tactic timeout, by node key: one lookup per node per pass, so
+   a map rather than a list, which made plan-wide passes quadratic. *)
+type timeouts = (string, real option) Binarymap.dict
+
+val no_timeouts : timeouts = Binarymap.mkDict String.compare
+
+fun timeout_of (timeouts : timeouts) node_key = Option.join (Binarymap.peek (timeouts, node_key))
+
+fun add_key_timeout combine ((node_key, timeout), acc : timeouts) =
+  case Binarymap.peek (acc, node_key) of
+      NONE => Binarymap.insert (acc, node_key, timeout)
+    | SOME old_timeout => Binarymap.insert (acc, node_key, combine (old_timeout, timeout))
+
 fun add_node_timeout node timeout acc =
-  let
-    val node_key = HolbuildBuildPlan.key node
-    fun insert entries =
-      case entries of
-          [] => [(node_key, timeout)]
-        | (key, old_timeout) :: rest =>
-            if key = node_key then (key, timeout_min (old_timeout, timeout)) :: rest
-            else (key, old_timeout) :: insert rest
-  in
-    insert acc
-  end
+  add_key_timeout timeout_min ((HolbuildBuildPlan.key node, timeout), acc)
 
 fun root_package_name project = HolbuildProject.package_name (HolbuildProject.project_package project)
 
@@ -33,7 +36,7 @@ fun add_root_node_timeout project timeout (node, acc) =
 fun plan_timeouts scope project plan timeout =
   List.foldl
     (fn (node, acc) => if includes_node scope project node then add_node_timeout node timeout acc else acc)
-    [] (HolbuildBuildPlan.selected_nodes plan)
+    no_timeouts (HolbuildBuildPlan.selected_nodes plan)
 
 fun source_entry source = (#relative_path source, #logical_name source)
 
@@ -54,11 +57,6 @@ fun declared_entries project index =
     else HolbuildSourceIndex.declared_root_entries index package
   end
 
-fun entry_timeout project default_timeout root =
-  case HolbuildProject.root_tactic_timeout_for project root of
-      SOME timeout => timeout
-    | NONE => default_timeout
-
 fun node_named plan logical =
   case List.filter (fn node => HolbuildBuildPlan.logical_name node = logical) (HolbuildBuildPlan.selected_nodes plan) of
       [] => NONE
@@ -72,10 +70,16 @@ fun add_entry_timeout project plan (logical, timeout) acc =
       NONE => acc
     | SOME root => List.foldl (add_root_node_timeout project timeout) acc (closure_nodes plan root)
 
-fun entry_timeouts project index entry_plan default_timeout =
+(* The timeouts the roots with their own tactic timeout set on the root-package
+   nodes of their closures.  Every other root would set the default timeout,
+   which plan_timeouts already sets on each such node. *)
+fun entry_timeouts project index entry_plan =
   List.foldl
-    (fn ((root, logical), acc) => add_entry_timeout project entry_plan (logical, entry_timeout project default_timeout root) acc)
-    []
+    (fn ((root, logical), acc) =>
+        case HolbuildProject.root_tactic_timeout_for project root of
+            SOME timeout => add_entry_timeout project entry_plan (logical, timeout) acc
+          | NONE => acc)
+    no_timeouts
     (declared_entries project index)
 
 fun selected_node_for_source project plan source =
@@ -132,40 +136,10 @@ fun theory_timeouts project index plan =
     #2 (List.foldl one ([], []) (HolbuildProject.theory_tactic_timeouts project))
   end
 
-fun replace_timeouts base overrides =
-  let
-    fun replace ((node_key, timeout), entries) =
-      let
-        fun insert values =
-          case values of
-              [] => [(node_key, timeout)]
-            | (key, old_timeout) :: rest =>
-                if key = node_key then (key, timeout) :: rest
-                else (key, old_timeout) :: insert rest
-      in
-        insert entries
-      end
-  in
-    List.foldl replace base overrides
-  end
+fun replace_timeouts base overrides = List.foldl (add_key_timeout #2) base overrides
 
-fun combine_timeouts left right =
-  let
-    fun add ((node_key, timeout), entries) =
-      let
-        fun insert values =
-          case values of
-              [] => [(node_key, timeout)]
-            | (key, old_timeout) :: rest =>
-                if key = node_key then
-                  (key, timeout_min (old_timeout, timeout)) :: rest
-                else (key, old_timeout) :: insert rest
-      in
-        insert entries
-      end
-  in
-    List.foldl add left right
-  end
+fun combine_timeouts left (right : timeouts) =
+  Binarymap.foldl (fn (node_key, timeout, acc) => add_key_timeout timeout_min ((node_key, timeout), acc)) left right
 
 fun explicit_entries project index =
   List.filter

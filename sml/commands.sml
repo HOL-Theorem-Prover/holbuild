@@ -1249,7 +1249,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               configuration is never hidden by an invocation override. *)
            val node_local = HolbuildTacticTimeoutPolicy.theory_timeouts project index plan
          in
-           if not proof_steps then []
+           if not proof_steps then HolbuildTacticTimeoutPolicy.no_timeouts
            else if tactic_timeout_set then
              HolbuildTacticTimeoutPolicy.plan_timeouts proof_scope project plan tactic_timeout
            else
@@ -1258,14 +1258,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                  HolbuildTacticTimeoutPolicy.combine_timeouts
                    (HolbuildTacticTimeoutPolicy.plan_timeouts proof_scope project plan
                       (default_tactic_timeout ()))
-                   (HolbuildTacticTimeoutPolicy.entry_timeouts project index plan
-                      (default_tactic_timeout ()))
+                   (HolbuildTacticTimeoutPolicy.entry_timeouts project index plan)
                val explicit =
                  case entry_plan of
-                     NONE => []
+                     NONE => HolbuildTacticTimeoutPolicy.no_timeouts
                    | SOME explicit_plan =>
                        HolbuildTacticTimeoutPolicy.entry_timeouts project index explicit_plan
-                         (default_tactic_timeout ())
              in
                HolbuildTacticTimeoutPolicy.replace_timeouts
                  (HolbuildTacticTimeoutPolicy.combine_timeouts selected explicit)
@@ -1307,15 +1305,25 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
          toolchain_key = toolchain_key, components = SOME components}
       end
     fun action_toolchain_key toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
-    fun with_options (planned as {index, targets, entry_plan, plan, ...}) =
-      (planned,
-       build_options_for index entry_plan plan targets)
     (* The input keys of a plan, which the plan keeps for execution.  Only
        for plans whose theories that write SML sources are up to date: until
        those run, an extra input naming such a source may not exist. *)
-    fun input_keys ({plan, toolchain_key, ...} : planned, options) =
+    fun input_keys ({plan, toolchain_key, ...} : planned) options =
       HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node options project)
         (action_toolchain_key toolchain_key) plan
+    (* The plan, its build options, and its input keys, computed once on
+       first use: every pass over the plan takes the same keys. *)
+    fun with_options (planned as {index, targets, entry_plan, plan, ...}) =
+      let
+        val options = timed_phase "build.options" (fn () => build_options_for index entry_plan plan targets)
+        val known = ref NONE
+        fun keys () =
+          case !known of
+              SOME keys => keys
+            | NONE => let val keys = input_keys planned options in known := SOME keys; keys end
+      in
+        (planned, options, keys)
+      end
     fun warn_unreachable_for ({index, plan, ...} : planned) =
       if warn_unreachable andalso null targets then
         warn_unreachable_root_scripts resolution project index plan
@@ -1324,7 +1332,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        sources a plan cannot yet hold as they will be.  KEYS are computed
        only once every such theory's outputs exist, since an extra input
        may name one. *)
-    fun stale_source_owner ({plan, toolchain_key, ...} : planned, options) keys =
+    fun stale_source_owner ({plan, toolchain_key, ...} : planned, options, keys) =
       let
         val owners = HolbuildBuildPlan.generated_source_owner_nodes plan
         fun outputs_exist owner =
@@ -1380,10 +1388,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           let
             val _ = say ("full (" ^ reason ^ ")")
             val members = HolbuildPlanRecord.member_kinds graph
-            val planned as ({index, targets, plan, toolchain_key, ...}, _) =
+            val planned as ({index, targets, plan, toolchain_key, ...}, _, keys) =
               with_options (prepare_plan (prepare_source_index "build" resolution project))
             fun record_plan () =
-              case stale_source_owner planned (fn () => input_keys planned) of
+              case stale_source_owner planned of
                   SOME owner =>
                     say ("plan record not written: " ^ HolbuildBuildPlan.logical_name owner ^
                          " writes SML sources and is not up to date")
@@ -1392,7 +1400,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                   dirs = HolbuildPlanRecord.watched_dirs graph (rev (!HolbuildSourceIndex.observed_dirs)),
                                   stamps = Binarymap.mkDict String.compare, index = index,
                                   targets = targets, toolchain_key = toolchain_key})
-                    NONE plan (input_keys planned)
+                    NONE plan (keys ())
             val _ =
               if not record then ()
               else if List.exists (not o null o HolbuildProject.package_generators) (HolbuildProjectGraph.packages graph)
@@ -1418,11 +1426,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             val planned =
               with_options {index = index, targets = targets, entry_plan = entry_plan, plan = plan,
                             toolchain_key = toolchain_key, components = NONE}
-            val keys = input_keys planned
+            val keys = #3 planned ()
             (* The record's generated sources hold only while their writers
                would not run again. *)
             val _ =
-              case stale_source_owner planned (fn () => keys) of
+              case stale_source_owner planned of
                   SOME owner =>
                     raise HolbuildPlanRecord.Fall (HolbuildBuildPlan.logical_name owner ^
                                                    " writes SML sources and is not up to date")
@@ -1446,7 +1454,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             case record_mode of
                 HolbuildPlanRecord.Check =>
                   let val from_full = full {reason = "checking the plan record", record = false}
-                  in HolbuildPlanRecord.compare ((#1 planned, keys), (#1 from_full, input_keys from_full)) end
+                  in HolbuildPlanRecord.compare ((#1 planned, keys), (#1 from_full, #3 from_full ())) end
               | _ => ();
             planned
           end
@@ -1460,7 +1468,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
     (* Plans the build, from the plan record when it applies. *)
     fun plan_build () =
       let
-        val planned as (sources, _) =
+        val planned as (sources, _, _) =
           case prepared of
               SOME _ => with_options (prepare_plan (prepared_sources ()))
             | NONE => if watch then with_options (prepare_plan (prepared_sources ())) else plan_with_record false
@@ -1469,7 +1477,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         planned
       end
     fun describe_dry_run () =
-      let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
+      let val ({plan, toolchain_key, ...}, build_options, _) = plan_build ()
       in
         timed_phase "dry_run.describe"
           (fn () => HolbuildBuildPlan.describe (HolbuildBuildExec.build_config_lines_for_node build_options project)
@@ -1480,7 +1488,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun execute (options, plan, toolchain_key) =
           timed_phase "build.execute"
             (fn () => HolbuildBuildExec.build options tc project plan toolchain_key jobs)
-        val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
+        val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, _, _) = plan_build ()
         fun build_owners owner_plan =
           execute (build_options_for index entry_plan owner_plan [], owner_plan, toolchain_key)
         fun replan () =
@@ -1493,20 +1501,20 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               NONE => initial
             | SOME components =>
                 if build_generated_source_owners build_owners components (#holdir tc) index plan then
-                  let val replanned as (planned, _) = replan ()
+                  let val replanned as (planned, _, _) = replan ()
                   in warn_unreachable_for planned; replanned end
                 else initial
-        val ({plan = actual, toolchain_key = actual_key, ...}, actual_options) =
+        val ({plan = actual, toolchain_key = actual_key, ...}, actual_options, _) =
           prepare_requested () handle e => (HolbuildCommandSummary.observe_plan project plan; raise e)
         val _ = HolbuildCommandSummary.observe_plan project actual
       in
         execute (actual_options, actual, actual_key)
       end
     fun export_action_specs upload () =
-      let val ({plan, toolchain_key, ...}, build_options) = plan_build ()
+      let val ({plan, toolchain_key, ...}, build_options, keys) = plan_build ()
       in
         timed_phase "action_spec.export"
-          (fn () => print (#batch (HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
+          (fn () => print (#batch (HolbuildBuildExec.export_action_specs build_options tc project plan (keys ()) toolchain_key jobs
                              {upload = upload, keep_specs = true, local_resumable = false, forced = [], skip = [], defer = false,
                               publish = [], ledger = false})))
       end
@@ -1517,7 +1525,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
     fun planned_runs () =
       if null targets then NONE
       else
-        let val ({plan, toolchain_key, ...}, options) = plan_build ()
+        let val ({plan, toolchain_key, ...}, options, _) = plan_build ()
         in SOME {options = options, plan = plan, toolchain_key = toolchain_key} end
     fun export_run_specs request () =
       let
@@ -1670,8 +1678,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val _ =
           if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
           else raise Error "--remote-exec needs a remote cache: pass --remote-cache URL"
-        val ({index, entry_plan, plan, toolchain_key, components, ...}, build_options) = plan_build ()
-        fun remote_build_plan (build_options, plan, toolchain_key) attach =
+        val ({index, entry_plan, plan, toolchain_key, components, ...}, build_options, keys) = plan_build ()
+        fun remote_build_plan (build_options, plan, keys, toolchain_key) attach =
           let
             (* The theories the last export deferred: they wait for their
                dependencies' batch, then for early cutoff to settle them. *)
@@ -1689,7 +1697,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               let
                 val {batch, deferred = held, record, prefetch} =
                   timed_phase "action_spec.export"
-                    (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan toolchain_key jobs
+                    (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan keys toolchain_key jobs
                                 {upload = true, keep_specs = false, local_resumable = not detach, forced = forced, skip = skip,
                                  defer = defer, publish = !held_back, ledger = true})
               in
@@ -1748,7 +1756,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val _ = HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n")
                 val needs_local = ref false
                 fun diagnose ({input_key, kind, log_sha256} : HolbuildRemoteExec.action_failure) =
-                  case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
+                  case HolbuildBuildExec.node_with_input_key build_options tc project plan keys toolchain_key input_key of
                       NONE => (NONE, input_key, HolbuildBuildExec.Error ("failed remote action " ^ input_key ^ ": " ^ kind), false)
                     | SOME node =>
                         let
@@ -1764,7 +1772,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                               | SOME sha =>
                                   if shown then early (input_key, sha)
                                   else if is_proof then
-                                    HolbuildBuildExec.remote_proof_failure build_options tc project plan toolchain_key node
+                                    HolbuildBuildExec.remote_proof_failure build_options tc project plan keys toolchain_key node
                                       (spans node) {kind = kind, log_sha256 = sha}
                                   else
                                     Option.map (fn path => HolbuildBuildExec.error_with_captured_output
@@ -1837,11 +1845,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                        SOME batch_keys =>
                          SOME (HolbuildBuildExec.start_settled_check
                                  (HolbuildBuildExec.remote_restore_options true build_options) tc project plan
-                                 toolchain_key jobs batch_keys (!deferred))
+                                 keys toolchain_key jobs batch_keys (!deferred))
                      | NONE => NONE)
                   handle e => (stop (); raise e)
                 val failure_spans =
-                  HolbuildBuildExec.start_remote_failure_spans build_options tc project plan toolchain_key
+                  HolbuildBuildExec.start_remote_failure_spans build_options tc project plan keys toolchain_key
                     (Option.getOpt (in_batch, []))
                   handle e => (stop (); Option.app (fn {settled, ...} => ignore (settled ())) settled; raise e)
                 (* A proof that fails is diagnosed as soon as the batch says so,
@@ -1851,10 +1859,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val early_diagnoses = ref (Redblackmap.mkDict String.compare)
                 val early_mutex = Mutex.mutex ()
                 fun diagnose_early (key, kind, sha) =
-                  case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key key of
+                  case HolbuildBuildExec.node_with_input_key build_options tc project plan keys toolchain_key key of
                       NONE => ()
                     | SOME node =>
-                        case HolbuildBuildExec.remote_proof_failure build_options tc project plan toolchain_key node
+                        case HolbuildBuildExec.remote_proof_failure build_options tc project plan keys toolchain_key node
                                (#spans failure_spans node) {kind = kind, log_sha256 = sha} of
                             NONE => ()
                           | SOME e =>
@@ -1913,7 +1921,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         HolbuildBuildExec.warn ("remote execution: could not fetch the failed theory's build log: " ^
                           input_key ^ ": " ^ reason)
                     in
-                      (case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
+                      (case HolbuildBuildExec.node_with_input_key build_options tc project plan keys toolchain_key input_key of
                            NONE => warn_log "the action is not in the current plan"
                          | SOME node =>
                              case HolbuildBuildExec.fetch_remote_build_log project node sha of
@@ -1929,7 +1937,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (* A theory that failed on a worker other than in a proof, which
                under --remote-only no local build reports. *)
             fun report_failed_theory ({input_key, kind, ...} : HolbuildRemoteExec.action_failure) =
-              case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
+              case HolbuildBuildExec.node_with_input_key build_options tc project plan keys toolchain_key input_key of
                   NONE => ()
                 | SOME node =>
                     let val name = HolbuildBuildPlan.logical_name node
@@ -1946,7 +1954,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               (timed_phase "build.execute" (fn () =>
                  HolbuildStatus.reporting_finished_only (fn () =>
                    HolbuildBuildExec.build_checked settled failed (HolbuildBuildExec.remote_restore_options true build_options)
-                     tc project plan toolchain_key jobs))
+                     tc project plan keys toolchain_key jobs))
                handle HolbuildBuildExec.Error _ => ()
                     | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
                HolbuildHolSharedCache.local_build_needed := false)
@@ -1970,7 +1978,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   (HolbuildRemoteExec.Done, progress) =>
                     let
                       val log_error =
-                        (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan toolchain_key logs; NONE)
+                        (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key logs; NONE)
                         handle HolbuildBuildExec.Error reason => SOME reason
                              | HolbuildRemoteCache.Unavailable reason => SOME reason
                     in
@@ -1984,7 +1992,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                timed_phase "build.execute"
                                  (fn () => HolbuildBuildExec.build_checked settled []
                                    (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
-                                   tc project plan toolchain_key jobs))
+                                   tc project plan keys toolchain_key jobs))
                     end
                 | (HolbuildRemoteExec.Failed (reason, failures), progress) =>
                   let
@@ -1993,7 +2001,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     val forced =
                       case (resubmit andalso not proof_failure, HolbuildRemoteExec.resubmit_theory_key reason) of
                           (true, SOME missing) =>
-                            HolbuildBuildExec.theory_keys_depending_on build_options tc project plan toolchain_key missing
+                            HolbuildBuildExec.theory_keys_depending_on build_options tc project plan keys toolchain_key missing
                         | _ => []
                     val missing_blob = resubmit andalso not proof_failure andalso
                                        HolbuildRemoteExec.resubmit_missing_blob reason
@@ -2001,7 +2009,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     (* Last, after the required restores and failure logs. *)
                     fun restore_finished_logs () =
                       if final then
-                        HolbuildBuildExec.restore_finished_build_logs build_options tc project plan toolchain_key logs
+                        HolbuildBuildExec.restore_finished_build_logs build_options tc project plan keys toolchain_key logs
                       else ()
                     (* With keep-going, the deferred theories that don't depend
                        on a failed one still go to the workers, after which the
@@ -2073,7 +2081,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                           timed_phase "build.execute"
                             (fn () => HolbuildBuildExec.build_checked settled []
                                         (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
-                                        tc project plan toolchain_key jobs)))
+                                        tc project plan keys toolchain_key jobs)))
               else
                 case HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
                        (case (if fail_fast then ["fail_fast=true"] else []) @
@@ -2106,7 +2114,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val _ = (deferred := []; held_back := held)
                 val (reused, settled) =
                   timed_phase "early_cutoff.settle"
-                    (fn () => HolbuildBuildExec.settle_deferred settled build_options tc project plan toolchain_key held)
+                    (fn () => HolbuildBuildExec.settle_deferred settled build_options tc project plan keys toolchain_key held)
               in
                 HolbuildStatus.message_stderr
                   ("holbuild: remote execution: early cutoff reused " ^ Int.toString reused ^ " of " ^
@@ -2124,10 +2132,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               | NONE => export_and_submit true (not detach) NONE [] []
           end
         fun build_owners owner_plan =
-          remote_build_plan
-            (build_options_for index entry_plan owner_plan [],
-             owner_plan, toolchain_key)
-            NONE
+          let val owner_options = build_options_for index entry_plan owner_plan []
+          in
+            remote_build_plan
+              (owner_options, owner_plan,
+               HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node owner_options project)
+                 (action_toolchain_key toolchain_key) owner_plan,
+               toolchain_key)
+              NONE
+          end
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
@@ -2148,13 +2161,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           let
             fun prepare_requested () =
               case components of
-                  NONE => ((build_options, plan, toolchain_key), attach)
+                  NONE => ((build_options, plan, keys (), toolchain_key), attach)
                 | SOME components =>
                     if build_generated_source_owners build_owners components (#holdir tc) index plan then
-                      let val (planned as {plan, toolchain_key, ...}, options) = replan ()
-                      in warn_unreachable_for planned; ((options, plan, toolchain_key), NONE) end
-                    else ((build_options, plan, toolchain_key), attach)
-            val (arguments as (_, actual, _), attached) =
+                      let val (planned as {plan, toolchain_key, ...}, options, keys) = replan ()
+                      in warn_unreachable_for planned; ((options, plan, keys (), toolchain_key), NONE) end
+                    else ((build_options, plan, keys (), toolchain_key), attach)
+            val (arguments as (_, actual, _, _), attached) =
               prepare_requested () handle e => (HolbuildCommandSummary.observe_plan project plan; raise e)
             val _ = HolbuildCommandSummary.observe_plan project actual
           in remote_build_plan arguments attached end
@@ -2651,13 +2664,11 @@ fun default_build_options trknl project index entry_plan plan =
             (HolbuildTacticTimeoutPolicy.combine_timeouts
                (HolbuildTacticTimeoutPolicy.plan_timeouts HolbuildTacticTimeoutPolicy.ProofRoot project plan
                   (default_tactic_timeout ()))
-               (HolbuildTacticTimeoutPolicy.entry_timeouts project index plan
-                  (default_tactic_timeout ())))
+               (HolbuildTacticTimeoutPolicy.entry_timeouts project index plan))
             (case entry_plan of
-                 NONE => []
+                 NONE => HolbuildTacticTimeoutPolicy.no_timeouts
                | SOME explicit_plan =>
-                   HolbuildTacticTimeoutPolicy.entry_timeouts project index explicit_plan
-                     (default_tactic_timeout ())))
+                   HolbuildTacticTimeoutPolicy.entry_timeouts project index explicit_plan))
          (HolbuildTacticTimeoutPolicy.theory_timeouts project index plan),
      execution_plan = NONE,
      trace_steps = false,
@@ -2696,7 +2707,7 @@ fun heap_build_options trknl =
    proof_steps = false,
    new_ir = false,
    proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
-   node_tactic_timeouts = [],
+   node_tactic_timeouts = HolbuildTacticTimeoutPolicy.no_timeouts,
    execution_plan = NONE,
    trace_steps = false,
    repl_on_failure = false,
