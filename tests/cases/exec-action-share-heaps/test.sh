@@ -625,20 +625,51 @@ patched=$tmpdir/patched-runtime
 mkdir -p "$patched/bin" "$patched/share/holbuild"
 cp "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" "$patched/bin/holbuild"
 cp -R "$SCRIPT_DIR/../../../sml" "$patched/share/holbuild/"
+# Checkpoints above the heap hold the runtime, so a change to it misses
+# them.  A fresh theory P, whose only failed prefix is the one seeded here
+# under the old runtime, shows it for failed prefixes; T's edit of t5, which
+# resumed after t4 under the old runtime (v9), for theorem contexts.
+write_p() {
+  cat > "$project/src/PScript.sml" <<SML
+Theory P
+Ancestors A
+Theorem p1:
+  T
+Proof
+  simp[]
+QED
+Theorem p2:
+  T /\\ (1 = 1)
+Proof
+  CONJ_TAC >- ACCEPT_TAC TRUTH >> $1
+QED
+SML
+}
+# run_p BIN NAME TACTIC: export P's spec with BIN and run it, after
+# forgetting the local checkpoints.
+run_p() {
+  local bin=$1 name=$2
+  write_p "$3"
+  (cd "$project" && "$bin" --remote-cache "$shared_url" action-spec --upload PTheory) > "$tmpdir/$name.batch"
+  spec_p=$(field "$tmpdir/$name.batch" share:PTheory 4)
+  forget_local
+  HOLBUILD_BIN=$bin worker "$name" "$shared_url" "$shared" "$spec_p" --share-heaps
+}
+run_p "$HOLBUILD_BIN" p-seed "FAIL_TAC \"before the runtime change\""
+expect p-seed 1 "status=failed" "failure=proof"
+run_p "$HOLBUILD_BIN" p-seed2 "ALL_TAC >> FAIL_TAC \"still before the runtime change\""
+expect p-seed2 1 "status=failed" "failure=proof"
+resumed p-seed2 "failed-prefix checkpoint in p2" "failed_prefix checkpoint"
 printf '\n(* changed after the heap *)\n' >> "$patched/share/holbuild/sml/proof_runtime.sml"
-# The checkpoints above the heap hold the changed runtime: an edit of t5,
-# which resumed after t4 under the old runtime (v9), now resumes from the heap.
+run_p "$patched/bin/holbuild" p-runtime "ALL_TAC >> rw[]"
+expect p-runtime 0 "status=built"
+resumed p-runtime "deps-loaded checkpoint" "deps-loaded heap"
 write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "ASM_REWRITE_TAC []"
 HOLBUILD_BIN=$patched/bin/holbuild export_t t-runtime
 forget_local
 HOLBUILD_BIN=$patched/bin/holbuild worker t-runtime "$shared_url" "$shared" "$spec_t" --share-heaps
 expect t-runtime 0 "status=built"
 resumed t-runtime "deps-loaded checkpoint" "deps-loaded heap"
-if grep -q "restored shared \(theorem_context\|failed_prefix\)" "$tmpdir/t-runtime.log"; then
-  echo "a changed proof runtime restored a checkpoint saved under the old one" >&2
-  cat "$tmpdir/t-runtime.log" >&2
-  exit 1
-fi
 write_x "REWRITE_TAC []"
 HOLBUILD_BIN=$patched/bin/holbuild export_x 3
 forget_local
