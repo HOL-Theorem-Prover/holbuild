@@ -588,35 +588,9 @@ fun transitive_project_deps
           end
   end
 
-(* Whether DEP is in NODE's dependency closure.  A direct dependency is
-   answered from NODE's edges; otherwise the search stops at DEP and keeps
-   nothing, so one answer costs no closure. *)
-fun depends_on ({selected_key_index, selected_adjacency, ...} : t) node dep =
-  case (find_key_id selected_key_index (key node), find_key_id selected_key_index (key dep)) of
-      (SOME from, SOME target) =>
-        let val direct = Vector.sub (selected_adjacency, from)
-        in
-          List.exists (fn id => id = target) direct orelse
-          let
-            val seen = Array.array (Vector.length selected_adjacency, false)
-            fun reach [] = false
-              | reach (id :: rest) =
-                  id = target orelse
-                  (if Array.sub (seen, id) then reach rest
-                   else (Array.update (seen, id, true);
-                         reach (List.revAppend (Vector.sub (selected_adjacency, id), rest))))
-          in
-            reach direct
-          end
-        end
-    | _ => false
-
 (* A selected node's position, which indexes the plan's per-node caches. *)
 fun plan_node_id ({selected_key_index, ...} : t) node =
   indexed_key_id selected_key_index (key node)
-
-fun is_selected ({selected_key_index, ...} : t) node =
-  Option.isSome (find_key_id selected_key_index (key node))
 
 fun cached_dependency_context_key
       (plan as {dependency_context_key_cache, ...} : t) node context_id =

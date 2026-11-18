@@ -1908,7 +1908,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   (following := false; stop (); Option.map (fn {settled, ...} => settled ()) settled)
                 (* The ledger and plan record writes wait for the work above
                    to start: none of it reads what they write. *)
-                val _ = record_pending () handle e => (ignore (stop_all ()); raise e)
+                val _ = record_pending () handle e => (ignore (stop_all ()); #stop early_pool (); #stop failure_spans (); raise e)
                 val logs = ref []
                 fun on_change (key, state, failure, log) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);

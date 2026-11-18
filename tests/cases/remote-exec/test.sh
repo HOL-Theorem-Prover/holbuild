@@ -217,10 +217,13 @@ PY
 
 [[ $(plan_digest) != absent ]] || { echo "follow wrote no plan record" >&2; exit 1; }
 
-# With everything cached there is nothing to submit.
-run cached 0 build --remote-exec "$coordinator" BTheory
+# With everything cached there is nothing to submit, and the deferred plan
+# record is still written.
+rm "$project"/.holbuild/plan/*
+HOLBUILD_PLAN_RECORD=on run cached 0 build --remote-exec "$coordinator" BTheory
 refute_grep "remote batch" "$tmpdir/cached.log"
 require_grep "remote execution: nothing to build remotely" "$tmpdir/cached.log"
+[[ $(plan_digest) != absent ]] || { echo "an empty batch wrote no plan record" >&2; exit 1; }
 
 # Detach and reattach.
 write_theories two
