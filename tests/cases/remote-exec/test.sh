@@ -172,9 +172,8 @@ refute_grep() {
 
 # The plan record's digest, as the stub's `watch` computes it.
 plan_digest() {
-  local files
-  files=$(find "$project/.holbuild/plan" -maxdepth 1 -type f 2>/dev/null | LC_ALL=C sort)
-  if [[ -z "$files" ]]; then echo absent; else cat $files | sha256sum | cut -c1-64; fi
+  if [[ -z $(find "$project/.holbuild/plan" -maxdepth 1 -type f 2>/dev/null) ]]; then echo absent; return; fi
+  find "$project/.holbuild/plan" -maxdepth 1 -type f -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256sum | cut -c1-64
 }
 
 # Submit and follow: the workers build both theories, and the client restores

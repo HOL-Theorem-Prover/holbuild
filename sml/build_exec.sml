@@ -7726,11 +7726,26 @@ fun settle_deferred (settled : settled option) (options : build_options) tc proj
   end
 
 (* The plan's node whose action has input key `input_key`. *)
-fun node_with_input_key (options : build_options) tc project plan keys toolchain_key input_key =
+(* A lookup of PLAN's selected node with an input key, its index built on
+   first use.  Where two nodes share a key, the first selected one wins. *)
+fun node_with_input_key plan keys =
   let
+    val index = ref NONE
+    fun build () =
+      List.foldl
+        (fn (node, dict) =>
+            let val key = HolbuildBuildPlan.input_key_for keys node
+            in if Option.isSome (Binarymap.peek (dict, key)) then dict
+               else Binarymap.insert (dict, key, node)
+            end)
+        (Binarymap.mkDict String.compare) (HolbuildBuildPlan.selected_nodes plan)
   in
-    List.find (fn node => HolbuildBuildPlan.input_key_for keys node = input_key)
-              (HolbuildBuildPlan.selected_nodes plan)
+    fn input_key =>
+      let
+        val dict = case !index of
+                       SOME dict => dict
+                     | NONE => let val dict = build () in index := SOME dict; dict end
+      in Binarymap.peek (dict, input_key) end
   end
 
 (* Fetch a worker's log to the same location as a local theory build.  The

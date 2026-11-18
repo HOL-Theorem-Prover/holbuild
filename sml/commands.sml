@@ -1710,6 +1710,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             val pending_record = ref (fn () => ())
             (* The keys of the last export's theories that may be restored but aren't here. *)
             val prefetch_keys = ref []
+            val node_with_input_key = HolbuildBuildExec.node_with_input_key plan keys
             fun record_pending () =
               ((!pending_record ()) before pending_record := (fn () => ());
                write_pending_plan ())
@@ -1776,7 +1777,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val _ = HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n")
                 val needs_local = ref false
                 fun diagnose ({input_key, kind, log_sha256} : HolbuildRemoteExec.action_failure) =
-                  case HolbuildBuildExec.node_with_input_key build_options tc project plan keys toolchain_key input_key of
+                  case node_with_input_key input_key of
                       NONE => (NONE, input_key, HolbuildBuildExec.Error ("failed remote action " ^ input_key ^ ": " ^ kind), false)
                     | SOME node =>
                         let
@@ -1873,7 +1874,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val early_diagnoses = ref (Redblackmap.mkDict String.compare)
                 val early_mutex = Mutex.mutex ()
                 fun diagnose_early (key, kind, sha) =
-                  case HolbuildBuildExec.node_with_input_key build_options tc project plan keys toolchain_key key of
+                  case node_with_input_key key of
                       NONE => ()
                     | SOME node =>
                         case HolbuildBuildExec.remote_proof_failure build_options tc project plan keys toolchain_key node
@@ -1943,7 +1944,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         HolbuildBuildExec.warn ("remote execution: could not fetch the failed theory's build log: " ^
                           input_key ^ ": " ^ reason)
                     in
-                      (case HolbuildBuildExec.node_with_input_key build_options tc project plan keys toolchain_key input_key of
+                      (case node_with_input_key input_key of
                            NONE => warn_log "the action is not in the current plan"
                          | SOME node =>
                              case HolbuildBuildExec.fetch_remote_build_log project node sha of
@@ -1959,7 +1960,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (* A theory that failed on a worker other than in a proof, which
                under --remote-only no local build reports. *)
             fun report_failed_theory ({input_key, kind, ...} : HolbuildRemoteExec.action_failure) =
-              case HolbuildBuildExec.node_with_input_key build_options tc project plan keys toolchain_key input_key of
+              case node_with_input_key input_key of
                   NONE => ()
                 | SOME node =>
                     let val name = HolbuildBuildPlan.logical_name node
