@@ -798,6 +798,34 @@ async def test_a_claim_whose_worker_has_gone_gives_its_action_back(
     assert claimed is not None and claimed.theory == "pkg:a"
 
 
+async def test_a_woken_claim_whose_worker_left_while_it_took_the_action_gives_it_back(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker is there while its claim waits and when a release wakes it, and goes while the claim takes the
+    action: only the check after taking it can see that."""
+    left = False
+    claim_once = coordinator._claim
+
+    async def leaving(*args: Any) -> Any:
+        nonlocal left
+        claimed = await claim_once(*args)
+        left = claimed is not None
+        return claimed
+
+    async def gone() -> bool:
+        return left
+
+    monkeypatch.setattr(coordinator, "_claim", leaving)
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "w9", 10, gone))
+    while not coordinator.claim_waiters:
+        await asyncio.sleep(0.01)
+    batch_id = await submit(http, ["a"])
+    assert await waiting is None and left
+    await coordinator.released()
+    (action,) = (await batch(http, batch_id))["actions"]
+    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+
+
 async def test_a_late_claim_leaves_the_leases_its_worker_claimed_since(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:

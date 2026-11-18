@@ -1260,13 +1260,17 @@ class Coordinator:
         without counting the attempt, as ``release_unheld`` ends a lease."""
         if claimed is None or disconnected is None or not await disconnected():
             return claimed
+        await self.give_back(claimed)
+        return None
+
+    async def give_back(self, claimed: Claim) -> None:
+        """End the lease of ``claimed``, whose worker never got it, as ``release_unheld`` ends one."""
         async with self.engine.connect() as conn:
             batch_id = await conn.scalar(
                 sa.text("SELECT batch_id FROM leases WHERE attempt_token = :token"), {"token": claimed.attempt_token}
             )
         if batch_id is not None:
             await self._end_unheld([(claimed.attempt_token, batch_id)])
-        return None
 
     async def _outranked_by_ahead(
         self, tiers: list[str], ahead_tiers: list[str]
