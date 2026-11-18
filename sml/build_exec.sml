@@ -729,26 +729,30 @@ fun drop_extra_output_records project packages =
                  "owner" :: package :: _ => SOME package
                | _ => NONE)
         | _ => NONE
+    (* A directory that can't be read, or a record, fails the reset, which
+       the next locked command then redoes. *)
     fun drop_in dir =
-      let
-        val stream = FS.openDir dir
-        fun names acc =
-          case FS.readDir stream of
-              NONE => acc
-            | SOME name => names (Path.concat(dir, name) :: acc)
-        val paths = names [] before FS.closeDir stream
-        fun drop path =
-          case record_package path handle IO.Io _ => NONE of
-              SOME package =>
-                if member_string package packages then
-                  FS.remove path
-                  handle OS.SysErr (msg, _) => raise Error ("could not remove " ^ path ^ ": " ^ msg)
-                else ()
-            | NONE => ()
-      in
-        List.app drop paths
-      end
-      handle OS.SysErr _ => ()
+      if not (extra_output_registry_path_exists dir) then ()
+      else
+        let
+          val stream = FS.openDir dir
+          fun names acc =
+            case FS.readDir stream of
+                NONE => acc
+              | SOME name => names (Path.concat(dir, name) :: acc)
+          val paths = (names [] before FS.closeDir stream)
+                      handle e => (FS.closeDir stream handle _ => (); raise e)
+          fun drop path =
+            case record_package path of
+                SOME package =>
+                  if member_string package packages then FS.remove path else ()
+              | NONE => ()
+        in
+          List.app drop paths
+        end
+        handle OS.SysErr (msg, _) => raise Error ("could not drop the extra-output records in " ^ dir ^ ": " ^ msg)
+             | IO.Io {name, cause, ...} =>
+                 raise Error ("could not read " ^ name ^ ": " ^ General.exnMessage cause)
     val root = extra_output_registry_root project
   in
     drop_in (Path.concat(root, "owners"));

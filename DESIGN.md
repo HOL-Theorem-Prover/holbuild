@@ -122,7 +122,7 @@ the cache, one per dependency URL and commit:
 $HOLBUILD_CACHE/git/checkouts/<sha1 of URL>-<commit>-v2
 ```
 
-(Releases before 0.14.74 named them without `-v2` and could write a
+(Releases before 0.14.75 named them without `-v2` and could write a
 dependency's extra outputs into them, so those are never used again; checkout GC
 still collects them.)
 

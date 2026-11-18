@@ -812,9 +812,12 @@ fun discover_package scans package =
               else
                 let val (admitted, scripts) = admit (length found, admissions tree_sources)
                 in
-                  (* A plan record must notice a change to what they declare. *)
-                  List.app (fn (script : source) => observe_declarations name (#source_path script))
-                    (List.filter relevant scripts);
+                  (* A plan record must notice a change to what they declare,
+                     the tree's theories included: admission starts from
+                     them, even where an admitted copy replaces one. *)
+                  List.app (observe_declarations name) (sort_unique_strings
+                    (map (fn (script : source) => #source_path script)
+                       (List.filter relevant (tree_sources @ scripts))));
                   map (with_package_root source_root) admitted
                 end
             end
