@@ -9862,11 +9862,13 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
        a second, so any later replacement shows in the stat. *)
     val manifest_stats_file = Path.concat (cache, "action-manifest-stats")
     val scan_ns = Time.toNanoseconds (Time.now ())
-    (* A damaged record only means the manifests are hashed again. *)
-    val known =
-      hydrate_step "hydcheck" (fn () =>
-        !(#entries (HolbuildStatCache.load {path = manifest_stats_file}))
-        handle _ => HolbuildStatCache.empty_entries ())
+    val known = ref NONE
+    (* Read when the first check starts; a damaged record only means the
+       manifests are hashed again. *)
+    fun load_known () =
+      if Option.isSome (!known) then ()
+      else known := SOME (!(#entries (HolbuildStatCache.load {path = manifest_stats_file}))
+                          handle _ => HolbuildStatCache.empty_entries ())
     val seen = HolbuildStatCache.new_instance true (SOME manifest_stats_file) (HolbuildStatCache.empty_entries ())
     fun see path entry =
       HolbuildStatCache.with_lock seen (fn () => #entries seen := Binarymap.insert (!(#entries seen), path, entry))
@@ -9880,7 +9882,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
         case HolbuildStatCache.stat_ident path of
             NONE => NONE
           | SOME ident =>
-              case Binarymap.peek (known, path) of
+              case Option.mapPartial (fn entries => Binarymap.peek (entries, path)) (!known) of
                   SOME (entry as (recorded, hash)) =>
                     if HolbuildStatCache.same_ident (recorded, ident) then (trusted path entry; SOME hash)
                     else hash_manifest key path ident
@@ -9953,7 +9955,8 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       let
         val checks = map (fn dep => (dep, ref false)) (#deps spec)
         val _ = hydrate_step "hydcheck" (fn () =>
-                  transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks)
+                  (load_known ();
+                   transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks))
         val stale = map #1 (List.filter (! o #2) checks)
       in
         hydrate_count "hydstatn" (HolbuildStatCache.with_lock seen (fn () => !(#hits seen) before #hits seen := 0));
