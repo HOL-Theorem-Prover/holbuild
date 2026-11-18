@@ -657,14 +657,16 @@ async def test_a_holder_claiming_unwoken_takes_a_ready_build_of_an_earlier_tier_
     assert claimed is not None and claimed.theory == "pkg:h"
 
 
-async def test_a_claim_passing_over_a_held_build_wakes_only_the_hosts_it_is_held_for(
+async def test_a_claim_passing_over_a_held_build_holds_it_for_the_kept_hosts_holding_the_most_of_it_now(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    """host-0 came to hold the theory after the hold began, so its claim would find the build held for host-1."""
+    """host-0, kept, and host-9, above the scale-in line, came to hold the theory after the hold began: the next claim
+    passing the build over holds it for host-0 too, which ranks first, and not for host-9."""
     batch_id, theory = await held_in_a_busier_batch(http, coordinator)
     coordinator.host_keys["host-0"] = {theory: None}
+    coordinator.host_keys["host-9"] = {theory: None}
     loop = asyncio.get_running_loop()
-    waiters = {host: loop.create_future() for host in ["host-0", "host-1"]}
+    waiters = {host: loop.create_future() for host in ["host-0", "host-1", "host-9"]}
     coordinator.claim_waiters = [
         (["standard"], _claim_rank(["standard"], host), wake, False) for host, wake in waiters.items()
     ]
@@ -672,22 +674,46 @@ async def test_a_claim_passing_over_a_held_build_wakes_only_the_hosts_it_is_held
 
     assert await claim_on(http, "a") is None
 
-    assert waiters["host-1"].result() == ("standard", False, UUID(batch_id), theory)
-    assert not waiters["host-0"].done()
+    assert waiters["host-0"].result() == ("standard", False, UUID(batch_id), theory)
+    assert not waiters["host-1"].done() and not waiters["host-9"].done()
+    assert coordinator._held_for(["standard"], "host-0") == (UUID(batch_id), "standard", theory)
+    assert coordinator._held_for(["standard"], "host-9") is None
 
 
-async def test_a_claim_passing_over_a_held_build_wakes_its_holders_at_the_level_they_held_it(
+async def test_a_claim_passing_over_a_held_build_leaves_it_to_a_host_that_has_come_to_hold_more_of_it(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    """host-1 held only the context when the hold began; host-2 has run the theory since."""
+    """host-1 held only the context when the hold began; host-2 has run the theory since, so the build is no longer
+    held for host-1: its claims are neither woken for it nor hinted with it."""
     batch_id, theory = await held_in_a_busier_batch(http, coordinator, context_only=True)
     coordinator.host_keys["host-2"] = {theory: None}
-    wake = asyncio.get_running_loop().create_future()
-    coordinator.claim_waiters = [(["standard"], _claim_rank(["standard"], "host-1"), wake, False)]
+    loop = asyncio.get_running_loop()
+    waiters = {host: loop.create_future() for host in ["host-1", "host-2"]}
+    coordinator.claim_waiters = [
+        (["standard"], _claim_rank(["standard"], host), wake, False) for host, wake in waiters.items()
+    ]
 
     assert await claim_on(http, "a") is None
 
-    assert wake.result() == ("standard", False, UUID(batch_id), theory)
+    assert waiters["host-2"].result() == ("standard", False, UUID(batch_id), theory)
+    assert not waiters["host-1"].done()
+    assert coordinator._held_for(["standard"], "host-1") is None
+
+
+async def test_a_hold_of_a_theory_the_batch_no_longer_builds_next_is_replaced(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """Another coordinator process leased the held build, so this one still has its hold when the ranking shows the
+    batch's next build: a claim passing that over holds it anew, for its own theory."""
+    batch_id, theory = await held_in_a_busier_batch(http, coordinator)
+    key = (UUID(batch_id), "standard")
+    now = asyncio.get_running_loop().time()
+    coordinator.holds[key] = (now, now + 60, "pkg:gone", frozenset({"host-1"}), 2)
+
+    assert await claim_on(http, "a") is None
+
+    assert coordinator.holds[key][2:] == (theory, frozenset({"host-1"}), 2)
+    assert coordinator.holds[key][1] < now + 60
 
 
 async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_stopped_it(
@@ -746,9 +772,11 @@ async def test_a_hold_taken_by_a_claim_that_fails_to_lease_its_build_is_put_back
     monkeypatch: pytest.MonkeyPatch,
     failing: str,
 ) -> None:
-    """``b1`` is held for host-1; host-1's claim fails while locking or leasing it, so ``b1`` stays ready and held."""
+    """``b1`` is held for host-1; host-1's claim fails while locking or leasing it, so ``b1`` stays ready and held,
+    in the ranking the claims share too."""
     await run_on(http, cache, "host-1", "b0", "b", D1)
     held = await submit_as(http, "b1", "b")
+    coordinator.settings.claim_ranking_seconds = 3600
     assert await claim_on(http, "host-3") is None
     hold = coordinator.holds[(held, "standard")]
 
@@ -761,5 +789,7 @@ async def test_a_hold_taken_by_a_claim_that_fails_to_lease_its_build_is_put_back
             await coordinator.claim(["standard"], "w", 0, host_id="host-1")
 
     assert coordinator.holds[(held, "standard")] == hold
+    claimed = await claim_on(http, "host-3")
+    assert claimed is None
     claimed = await claim_on(http, "host-1")
     assert claimed is not None and claimed["theory"] == "pkg:b"

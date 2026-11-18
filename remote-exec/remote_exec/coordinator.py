@@ -925,7 +925,7 @@ Wake = tuple[str, bool, UUID | None, str | None]
 # The batch, tier and theory of a build a claim was woken for.
 Hint = tuple[UUID, str, str]
 # A build's hold for its holders (see Coordinator._held): when it began and ends, its theory, the hosts it is held for
-# and the level (Coordinator._level) they held of it then.
+# and the level (Coordinator._level) they hold of it, as of the last claim that left it.
 Hold = tuple[float, float, str, frozenset[str], int]
 # A shared ranking's entry; see _Ranking.
 RankEntry = tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]
@@ -1396,6 +1396,7 @@ class Coordinator:
                         claimed = await self._lease(conn, row, worker)
             except BaseException:
                 if row is not None and row.hold is not None:  # the build stays ready
+                    ranking.theories.setdefault(row.hold[0], row.theory)
                     self._put_back_hold(*row.hold)
                 raise
             if row is not None:
@@ -1753,7 +1754,7 @@ class Coordinator:
                 (tier_position, priority, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),
             )
             # The batch's next ready build is another one, whose theory the ranking doesn't know.
-            ranking.theories.pop((batch_id, tier), None)
+            theory = ranking.theories.pop((batch_id, tier), None)
             if priority != 0:
                 ranking.running_priority += 1
                 self._cap_priorities(ranking)
@@ -1767,7 +1768,9 @@ class Coordinator:
                 row = await self._lock_unleased(
                     conn, CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier}
                 )
-            except BaseException:
+            except BaseException:  # the build stays ready
+                if theory is not None:
+                    ranking.theories.setdefault((batch_id, tier), theory)
                 if hold is not None:
                     self._put_back_hold((batch_id, tier), hold)
                 raise
@@ -1879,8 +1882,8 @@ class Coordinator:
 
         A build is left for a host below the scale-in line (``kept``) that takes its tier and holds more of its
         theory than ``host_id`` (_level), for LOCALITY_HOLD_SECONDS from the first claim it was left by. It is held
-        for the kept hosts holding the most of it then; each claim leaving it wakes a claim waiting on one of them,
-        if one waits, and its end wakes the best-ranked waiting claim (_wake_at_hold_end), after which no claim
+        for the kept hosts holding the most of it as of the last claim leaving it, which wakes a claim waiting on one
+        of them, if one waits, and its end wakes the best-ranked waiting claim (_wake_at_hold_end), after which no claim
         passes it over (_hold_ended). The hold ends with that time only, so no build waits longer, and needs a known
         theory: a batch's next build after a claim from it has none until the next ranking read."""
         head = (entry[6], entry[7])
@@ -1891,14 +1894,17 @@ class Coordinator:
             return None
         loop = asyncio.get_running_loop()
         now = loop.time()
-        if (hold := self.holds.get(head)) is None:
-            holders = frozenset(h for h in kept(entry[7]) if h != host_id and self._level(h, theory) == best)
+        holders = frozenset(h for h in kept(entry[7]) if h != host_id and self._level(h, theory) == best)
+        # A hold another process's claim ended leaves the batch's next build, of another theory, a hold of its own.
+        if (hold := self.holds.get(head)) is None or hold[2] != theory:
             hold = self.holds[head] = (now, now + LOCALITY_HOLD_SECONDS, theory, holders, best)
             if len(self.holds) > MAX_LEASE_HOSTS:  # those of batches that ended unclaimed
                 del self.holds[next(iter(self.holds))]
             loop.call_later(LOCALITY_HOLD_SECONDS, self._wake_at_hold_end, head, hold)
         if now >= hold[1]:
             return None
+        # The scale-in line and what hosts hold move during a hold.
+        hold = self.holds[head] = (*hold[:3], holders, best)
         # A holder may have started waiting since the hold began.
         self._wake_holder(entry[7], head[0], theory, hold[4], hold[3])
         return hold[1]
@@ -1935,7 +1941,7 @@ class Coordinator:
         """Wake the best-ranked compatible claim waiting, if one is, for the build of ``head`` whose hold just ended,
         unless a claim took it: the claim that left it may have taken another build, and nothing else would come
         for it until work is next made ready. It makes no new work ready, so made_ready stays."""
-        if self.holds.get(head) != hold:
+        if (current := self.holds.get(head)) is None or current[:3] != hold[:3]:
             return
         batch_id, tier = head
         waiter = min(
@@ -1959,8 +1965,8 @@ class Coordinator:
 
     def _wake_holder(self, tier: str, batch_id: UUID, theory: str, level: int, kept: set[str]) -> None:
         """Wake the best-ranked claim waiting on a host of ``kept``, the hosts the build of ``batch_id`` and ``tier``
-        is held for, that holds at least ``level`` of ``theory``, what they held when its hold began, if one waits.
-        It makes no new work ready, so made_ready stays."""
+        is held for, that holds at least ``level`` of ``theory``, the most they hold, if one waits. It makes no new
+        work ready, so made_ready stays."""
         waiter = min(
             (
                 w for w in self.claim_waiters
