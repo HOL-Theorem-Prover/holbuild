@@ -4,14 +4,14 @@
 import asyncio
 from datetime import timedelta
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 
 from conftest import FakeCache
 from remote_exec import coordinator as coordinator_module
-from remote_exec.coordinator import Coordinator, _claim_rank
+from remote_exec.coordinator import Coordinator, HostReport, _claim_rank
 from remote_exec.formats import FormatError, parse_result
 from test_coordinator import CLIENT, WORKER, ac_key, complete, input_key, result, spec
 
@@ -25,11 +25,12 @@ def fresh_rankings(coordinator: Coordinator) -> None:
     coordinator.settings.claim_ranking_seconds = 0
 
 
-async def submit_as(http: httpx.AsyncClient, name: str, theory: str, priority: int = 0) -> None:
+async def submit_as(http: httpx.AsyncClient, name: str, theory: str, priority: int = 0) -> UUID:
     """A batch of one action, ``name``, building ``pkg:<theory>``."""
     text = f"holbuild-action-batch-v1\naction {input_key(name)} {ac_key(name)} {spec(name)} pkg:{theory}\n"
     response = await http.post("/v1/batches", content=text, headers=CLIENT, params={"priority": priority})
     assert response.status_code == 201, response.text
+    return UUID(response.json()["batch_id"])
 
 
 async def claim_on(http: httpx.AsyncClient, host: str, rank: int = 0) -> dict[str, Any] | None:
@@ -158,8 +159,8 @@ async def test_a_wake_goes_to_a_waiter_below_the_scale_in_line_that_holds_the_co
     coordinator._wake_claim("standard", theory="pkg:b")
     coordinator._wake_claim("standard", theory="pkg:c")  # held only above the line: the canonical waiter
 
-    assert waiters["host-1"].result() == ("standard", False, "pkg:b")
-    assert waiters["host-0"].result() == ("standard", False, "pkg:c")
+    assert waiters["host-1"].result() == ("standard", False, None, "pkg:b")
+    assert waiters["host-0"].result() == ("standard", False, None, "pkg:c")
     assert not waiters["host-9"].done()
     assert coordinator.locality.wakes == 1
 
@@ -168,7 +169,7 @@ async def test_a_wake_passed_on_keeps_its_theory(coordinator: Coordinator) -> No
     coordinator.settings.warm_workers = 2
     loop = asyncio.get_running_loop()
     left, cold, warm = loop.create_future(), loop.create_future(), loop.create_future()
-    left.set_result(("standard", False, "pkg:b"))
+    left.set_result(("standard", False, None, "pkg:b"))
     coordinator.made_ready = 1
     coordinator.claim_waiters = [
         (["standard"], _claim_rank(["standard"], "host-0"), cold, False),
@@ -180,7 +181,7 @@ async def test_a_wake_passed_on_keeps_its_theory(coordinator: Coordinator) -> No
 
     coordinator._pass_wake(left)
 
-    assert warm.result() == ("standard", False, "pkg:b") and not cold.done()
+    assert warm.result() == ("standard", False, None, "pkg:b") and not cold.done()
 
 
 async def test_hosts_learn_contexts_and_forget_those_of_their_infrastructure_failures(
@@ -191,16 +192,18 @@ async def test_hosts_learn_contexts_and_forget_those_of_their_infrastructure_fai
     await run_on(http, cache, "host-1", "z", "z", None, failure="proof")
 
     assert coordinator.theory_deps == {"pkg:x": D1, "pkg:y": D2}
-    assert list(coordinator.host_keys["host-1"]) == [D1, "pkg:z"]
+    assert list(coordinator.host_keys["host-1"]) == [D1, "pkg:x", "pkg:z"]
 
     await run_on(http, cache, "host-1", "x2", "x", None, failure="internal")  # a worker that reports no deps-key
 
     assert list(coordinator.host_keys["host-1"]) == ["pkg:z"]
 
 
-async def test_hosts_that_leave_count_the_contexts_no_kept_host_holds(
+async def test_hosts_keep_their_contexts_through_a_quiet_spell_and_count_those_no_kept_host_holds_once_gone(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
+    """host-9's workers went quiet: it is no longer kept, but its contexts stay, as when its workers are replaced,
+    until HOST_KEYS_SECONDS after its last worker was seen."""
     coordinator.settings.warm_workers = 1  # host-0 is kept
     for host in ["host-0", "host-9"]:
         coordinator.report_worker(host, f"{host}-w", ["standard"])
@@ -210,7 +213,14 @@ async def test_hosts_that_leave_count_the_contexts_no_kept_host_holds(
 
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
 
-    assert queue["locality"] == {"claims": 0, "wakes": 0, "hosts_left": 1, "keys_left": 2, "keys_lost": 1}
+    assert queue["locality"]["hosts_left"] == 0 and "host-9" in coordinator.host_keys
+    coordinator.keys_seen["host-9"] = coordinator.clock() - timedelta(seconds=coordinator_module.HOST_KEYS_SECONDS)
+
+    queue = (await http.get("/v1/queue", headers=CLIENT)).json()
+
+    assert {k: queue["locality"][k] for k in ["hosts_left", "keys_left", "keys_lost"]} == {
+        "hosts_left": 1, "keys_left": 2, "keys_lost": 1
+    }
     assert "host-9" not in coordinator.host_keys
 
 
@@ -219,3 +229,153 @@ def test_result_records_carry_an_optional_deps_key() -> None:
     assert parse_result(result("a", "built")).deps_key is None
     with pytest.raises(FormatError, match="deps-key"):
         parse_result(result("a", "built", deps_key="nope"))
+
+
+def counts(coordinator: Coordinator, *names: str) -> dict[str, int]:
+    return {name: getattr(coordinator.locality, name) for name in names}
+
+
+async def test_claims_count_what_their_host_held_of_the_theory(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "LOCALITY_HOLD_SECONDS", 0)  # no build is left for its holder here
+    coordinator.theory_deps.update({"pkg:t": D1, "pkg:u": D1})
+    coordinator.host_keys = {"host-1": {"pkg:t": None}, "host-2": {D1: None}}
+    for host in ["host-1", "host-2", "host-3"]:
+        coordinator.report_worker(host, f"{host}-w", ["standard"])
+
+    for name, theory, host in [("t1", "t", "host-1"), ("u1", "u", "host-2"), ("t2", "t", "host-3"), ("v1", "v", "host-3")]:
+        await submit_as(http, name, theory)
+        claimed = await claim_on(http, host)
+        assert claimed is not None and claimed["theory"] == f"pkg:{theory}"
+
+    queue = (await http.get("/v1/queue", headers=CLIENT)).json()
+    assert {k: queue["locality"][k] for k in ["hit_theory", "hit_deps", "missed_held", "unheld"]} == {
+        "hit_theory": 1, "hit_deps": 1, "missed_held": 1, "unheld": 1
+    }
+
+
+@pytest.mark.parametrize("locality", [True, False])
+async def test_a_cold_host_leaves_a_build_its_kept_holder_holds_and_takes_the_next(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, locality: bool
+) -> None:
+    """``b`` ran on host-1, so a claim from cold host-3 leaves ``b1``, the head, to host-1 and takes ``a1``, which no
+    host holds."""
+    coordinator.settings.locality = locality
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await submit_as(http, "b1", "b")
+    await submit_as(http, "a1", "a")
+
+    cold = await claim_on(http, "host-3")
+    warm = await claim_on(http, "host-1")
+
+    assert cold is not None and warm is not None
+    assert (cold["theory"], warm["theory"]) == (("pkg:a", "pkg:b") if locality else ("pkg:b", "pkg:a"))
+    assert counts(coordinator, "hit_theory", "missed_held", "unheld", "held_waits") == (
+        {"hit_theory": 1, "missed_held": 0, "unheld": 2, "held_waits": 1} if locality
+        else {"hit_theory": 0, "missed_held": 1, "unheld": 2, "held_waits": 0}
+    )
+
+
+async def test_a_claim_finding_only_held_builds_takes_one_once_its_hold_ends(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only the hold's end ends the wait in time
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await submit_as(http, "b1", "b")
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    claimed = await coordinator.claim(["standard"], "cold", 10, host_id="host-3")
+
+    waited = loop.time() - started
+    assert claimed is not None and claimed.theory == "pkg:b"
+    assert coordinator_module.LOCALITY_HOLD_SECONDS <= waited < 5
+    assert counts(coordinator, "missed_held", "held_waits") == {"missed_held": 1, "held_waits": 1}
+    assert coordinator.locality.held_ms_total >= 1000 * coordinator_module.LOCALITY_HOLD_SECONDS
+
+
+async def test_a_hold_wakes_a_claim_waiting_on_the_holder(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    """A claim from cold host ``a`` leaves ``b1`` to host ``c``, which ran ``b``, and wakes the claim waiting there
+    for it, not the better-ranked one on cold host ``b``; nothing new was made ready."""
+    coordinator.settings.warm_workers = 3
+    await run_on(http, cache, "c", "b0", "b", D1)
+    batch_id = await submit_as(http, "b1", "b")
+    loop = asyncio.get_running_loop()
+    waiters = {host: loop.create_future() for host in ["b", "c"]}
+    coordinator.claim_waiters = [
+        (["standard"], _claim_rank(["standard"], host), wake, False) for host, wake in waiters.items()
+    ]
+    coordinator.report_worker("b", "b-w", ["standard"])
+    made_ready = coordinator.made_ready
+
+    assert await claim_on(http, "a") is None
+
+    assert waiters["c"].result() == ("standard", False, batch_id, "pkg:b")
+    assert not waiters["b"].done() and coordinator.made_ready == made_ready
+
+
+@pytest.mark.parametrize("locality", [True, False])
+async def test_a_woken_claim_takes_the_batch_it_was_woken_for(
+    http: httpx.AsyncClient, coordinator: Coordinator, locality: bool
+) -> None:
+    coordinator.settings.locality = locality
+    await submit_as(http, "a1", "a")
+    woken_for = await submit_as(http, "b1", "b")
+
+    claimed, _ = await coordinator._claim(["standard"], "w", host_id="host-5", hint=(woken_for, "standard"))
+
+    assert claimed is not None and claimed.theory == ("pkg:b" if locality else "pkg:a")
+
+
+async def test_a_host_holding_only_the_context_leaves_the_build_to_a_host_that_ran_its_theory(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    coordinator.settings.warm_workers = 3
+    await run_on(http, cache, "host-2", "b0", "b", D1)
+    coordinator.host_keys["host-1"] = {D1: None}
+    await submit_as(http, "b1", "b")
+    await submit_as(http, "a1", "a")
+
+    first = await claim_on(http, "host-1")
+    second = await claim_on(http, "host-2")
+
+    assert first is not None and second is not None
+    assert (first["theory"], second["theory"]) == ("pkg:a", "pkg:b")
+
+
+async def test_a_wake_prefers_a_waiter_that_ran_the_theory_to_one_holding_only_its_context(
+    coordinator: Coordinator,
+) -> None:
+    coordinator.settings.warm_workers = 3
+    loop = asyncio.get_running_loop()
+    waiters = {host: loop.create_future() for host in ["host-0", "host-1", "host-2"]}
+    coordinator.claim_waiters = [
+        (["standard"], _claim_rank(["standard"], host), wake, False) for host, wake in waiters.items()
+    ]
+    for host in waiters:
+        coordinator.report_worker(host, f"{host}-w", ["standard"])
+    coordinator.theory_deps["pkg:b"] = D1
+    coordinator.host_keys = {"host-1": {D1: None}, "host-2": {"pkg:b": None, D1: None}}
+
+    coordinator._wake_claim("standard", theory="pkg:b")
+
+    assert waiters["host-2"].done() and not waiters["host-0"].done() and not waiters["host-1"].done()
+
+
+@pytest.mark.parametrize(("short", "ready", "kept"), [(False, 1, False), (True, 1, True), (False, 5, True)])
+def test_the_scale_in_line_counts_ready_builds_and_not_workers_waiting_for_memory(
+    coordinator: Coordinator, short: bool, ready: int, kept: bool
+) -> None:
+    """host-0 runs one lease and has 5 workers: with one more build ready, they cover the line unless host-0 is
+    short of memory, so its idle workers wait for memory rather than claim; with 5 ready, host-1 is needed too."""
+    for i in range(5):
+        coordinator.report_worker("host-0", f"host-0-w{i}", ["standard"])
+    coordinator.report_worker("host-1", "host-1-w", ["standard"])
+    coordinator.report_host(HostReport(id="host-0", memory_short=short, leases=1))
+    coordinator.lease_hosts[uuid4()] = ("host-0", "host-0-w0", ["standard"])
+    coordinator.ready_builds = ready
+
+    assert ("host-1" in coordinator._kept_hosts()) == kept

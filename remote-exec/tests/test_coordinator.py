@@ -1142,7 +1142,7 @@ async def test_wakes_pack_compatible_hosts_with_fifo_ties(
     coordinator.claim_waiters.insert(0, ([tier], _claim_rank([tier], "host-0"), cancelled, False))
     for index in order:
         coordinator._wake_claim(tier)
-        assert wakes[index].result() == (tier, False, None)
+        assert wakes[index].result() == (tier, False, None, None)
         assert all(wake.done() == (i in order[:order.index(index) + 1]) for i, wake in enumerate(wakes))
     coordinator._wake_claim(tier)
     assert coordinator.made_ready == len(order) + 1
@@ -1517,7 +1517,7 @@ async def test_explicitly_woken_claim_is_not_blocked_by_a_new_better_waiter(
     async def missed(tiers: list[str], worker: str, *rest: Any) -> Any:
         nonlocal attempts
         attempts += 1
-        return None if attempts == 1 else await claim_once(tiers, worker, *rest)
+        return (None, None) if attempts == 1 else await claim_once(tiers, worker, *rest)
 
     monkeypatch.setattr(coordinator, "_claim", missed)
     waiting = asyncio.create_task(coordinator.claim(["standard"], "tail", 10, host_id="host-b"))
@@ -3727,7 +3727,7 @@ async def test_concurrent_claims_sharing_a_ranking_take_the_last_cap_slot_once(
         claimed = await asyncio.gather(
             coordinator._claim_build(first, ranking), coordinator._claim_build(second, ranking)
         )
-        assert sorted(c.theory for c in claimed if c is not None) == ["pkg:n1", "pkg:p1"]
+        assert sorted(c.theory for c, _ in claimed if c is not None) == ["pkg:n1", "pkg:p1"]
 
 
 async def test_priority_work_takes_every_slot_when_no_priority_zero_build_is_ready(
