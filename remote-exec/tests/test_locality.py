@@ -583,15 +583,19 @@ async def test_a_build_that_waited_out_its_hold_is_not_passed_over_again(
     assert theory == "pkg:b"
 
 
-async def held_in_a_busier_batch(http: httpx.AsyncClient, coordinator: Coordinator) -> tuple[str, str]:
+async def held_in_a_busier_batch(
+    http: httpx.AsyncClient, coordinator: Coordinator, *, context_only: bool = False
+) -> tuple[str, str]:
     """A batch of ``x`` and ``y`` with one of them leased, whose other build, returned with the batch, is held for
-    host-1, which alone ran its theory, after a cold claim from host-3 found it."""
+    host-1, which alone ran its theory (or holds its context), after a cold claim from host-3 found it."""
     coordinator.settings.warm_workers = 3
     batch_id = await submit(http, ["x", "y"])
     leased = await claim_on(http, "host-2")
     assert leased is not None
     theory = "pkg:y" if leased["theory"] == "pkg:x" else "pkg:x"
-    coordinator.host_keys["host-1"] = {theory: None}
+    if context_only:
+        coordinator.theory_deps[theory] = D1
+    coordinator.host_keys["host-1"] = {D1 if context_only else theory: None}
     coordinator.report_worker("host-1", "host-1-w", ["standard"])
     assert await claim_on(http, "host-3") is None
     return batch_id, theory
@@ -665,3 +669,45 @@ async def test_a_claim_passing_over_a_held_build_wakes_only_the_hosts_it_is_held
 
     assert waiters["host-1"].result() == ("standard", False, UUID(batch_id), theory)
     assert not waiters["host-0"].done()
+
+
+async def test_a_claim_passing_over_a_held_build_wakes_its_holders_at_the_level_they_held_it(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """host-1 held only the context when the hold began; host-2 has run the theory since."""
+    batch_id, theory = await held_in_a_busier_batch(http, coordinator, context_only=True)
+    coordinator.host_keys["host-2"] = {theory: None}
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters = [(["standard"], _claim_rank(["standard"], "host-1"), wake, False)]
+
+    assert await claim_on(http, "a") is None
+
+    assert wake.result() == ("standard", False, UUID(batch_id), theory)
+
+
+async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_stopped_it(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ready high build ``h`` isn't the hint's, so the claim, deferring high, passes it; the standard build
+    ``s`` ranks after an action claimed ahead, so the claim ahead is for ``s``'s tier and priority."""
+    await submit(http, ["h"])
+    first = await claim_on(http, "host-9")
+    assert first is not None
+    cache.keys.add(ac_key("h"))
+    assert (await complete(http, first["attempt_token"], result("h", "built", peak_rss_mb="5000"))).status_code == 200
+    await submit(http, ["h"])
+    await submit(http, ["s"])
+    asked: list[list[str]] = []
+
+    async def claim_ahead(tiers: list[str], worker: str, **_: object) -> None:
+        asked.append(tiers)
+
+    monkeypatch.setattr(coordinator, "_claim_ahead", claim_ahead)
+
+    claimed, _ = await coordinator._claim(
+        ["high", "standard"], "w", lambda tier, priority: [tier] if tier == "standard" else [], "host-1",
+        (uuid4(), "high", "pkg:x"), "high",
+    )
+
+    assert asked == [["standard"]]
+    assert claimed is not None and claimed.theory == "pkg:s"

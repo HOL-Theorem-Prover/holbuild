@@ -922,8 +922,9 @@ ClaimRank = tuple[bool, bool, int, str]
 Wake = tuple[str, bool, UUID | None, str | None]
 # The batch, tier and theory of a build a claim was woken for.
 Hint = tuple[UUID, str, str]
-# A build's hold for its holders (see Coordinator._held): when it began and ends, its theory, the hosts it is held for.
-Hold = tuple[float, float, str, frozenset[str]]
+# A build's hold for its holders (see Coordinator._held): when it began and ends, its theory, the hosts it is held for
+# and the level (Coordinator._level) they held of it then.
+Hold = tuple[float, float, str, frozenset[str], int]
 # A shared ranking's entry; see _Ranking.
 RankEntry = tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]
 
@@ -1401,7 +1402,7 @@ class Coordinator:
                 if ranking.capped:  # by a concurrent claim, since: claims ahead no longer outrank the build
                     outranked = None
                     continue
-                _, priority, *_, tier, _ = ranking.heap[0]
+                _, priority, *_, tier, _ = min(e for e in ranking.heap if e[7] != hint_only)  # the outranked build
                 # Only batches of a positive priority, above the build's, are claimed from: counted before the
                 # claim's await, as _claim_build's are.
                 ranking.running_priority += 1
@@ -1722,7 +1723,7 @@ class Coordinator:
             hinted, fits = None, False
             if tier == hint_tier:
                 hinted = self._hinted_entry(ranking, entry, host_id, hint, kept)
-                fits = hinted is not None or self._held_here(ranking, (batch_id, tier), host_id)
+                fits = self._held_here(ranking, (hinted[6], hinted[7]) if hinted else (batch_id, tier), host_id)
                 hint = hint_tier = None
             if tier != hint_only:
                 local = hinted or self._local_entry(ranking, entry, host_id, kept)
@@ -1757,6 +1758,8 @@ class Coordinator:
             # Taken before the await, so a concurrent claim that misses the build doesn't drop it first.
             hold = self.holds.pop((batch_id, tier), None)
             row = await self._lock_unleased(conn, CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
+            if row is not None and tier == hint_only and (hold is None or row.theory != hold[2]):
+                row = None  # another build of the batch, which this claim defers; the lock ends with the transaction
             self.passed_over.pop((batch_id, tier), None)
             if row is not None:
                 if passed is not None:
@@ -1878,14 +1881,14 @@ class Coordinator:
         now = loop.time()
         if (hold := self.holds.get(head)) is None:
             holders = frozenset(h for h in kept(entry[7]) if h != host_id and self._level(h, theory) == best)
-            hold = self.holds[head] = (now, now + LOCALITY_HOLD_SECONDS, theory, holders)
+            hold = self.holds[head] = (now, now + LOCALITY_HOLD_SECONDS, theory, holders, best)
             if len(self.holds) > MAX_LEASE_HOSTS:  # those of batches that ended unclaimed
                 del self.holds[next(iter(self.holds))]
             loop.call_later(LOCALITY_HOLD_SECONDS, self._wake_at_hold_end, head, hold)
         if now >= hold[1]:
             return None
         # A holder may have started waiting since the hold began.
-        self._wake_holder(entry[7], head[0], theory, best, hold[3])
+        self._wake_holder(entry[7], head[0], theory, hold[4], hold[3])
         return hold[1]
 
     def _hold_ended(self, head: tuple[UUID, str]) -> bool:
@@ -1910,7 +1913,7 @@ class Coordinator:
             return None
         now = asyncio.get_running_loop().time()
         best: tuple[int, Hint] | None = None
-        for (batch_id, tier), (_, until, theory, holders) in self.holds.items():
+        for (batch_id, tier), (_, until, theory, holders, _) in self.holds.items():
             if now < until and tier in tiers and host_id in holders:
                 level = self._level(host_id, theory)
                 if best is None or level > best[0]:
