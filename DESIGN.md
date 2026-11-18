@@ -119,8 +119,12 @@ Each is a symbolic link to a read-only checkout shared by every project using
 the cache, one per dependency URL and commit:
 
 ```text
-$HOLBUILD_CACHE/git/checkouts/<sha1 of URL>-<commit>
+$HOLBUILD_CACHE/git/checkouts/<sha1 of URL>-<commit>-v2
 ```
+
+(Releases before 0.14.75 named them without `-v2` and could write a
+dependency's extra outputs into them, so those are never used again; checkout GC
+still collects them.)
 
 It holds the commit's tree without git metadata, written from the mirror below
 with a private index, its files made read-only (directories stay writable, so
@@ -427,6 +431,19 @@ from overwriting one another and lets cleaning or a changed declaration remove
 previously owned files without eagerly analysing unrelated sources.
 Absolute paths, `.`/`..` components, directories, and globs are deliberately not
 part of the initial contract.
+A dependency's theories write theirs under the consuming project's
+`.holbuild/packages/<name>/extra-outputs/`, at the same package-relative path,
+never into the dependency's sources, which other projects may share. Discovery
+takes an SML source there that a theory of the package declares as the
+package's, in place of any copy in its source tree, and the package's extra
+inputs that name its declared outputs read them there. Beside that directory,
+`extra-outputs.source` records the package source its files came from (snapshot,
+retrieval, and the real paths of its source and package roots). A command that
+takes the project lock first empties a directory whose record doesn't match, as
+after a repin or an override; commands outside the lock, such as `--watch`
+computing what to watch, take such a directory as empty. A theory's
+declarations that a build would reject declare nothing to discovery, so one in
+an unselected theory doesn't stop the build.
 `cache = false` disables global-cache restore/publish for the action.
 `always_reexecute = true` disables local up-to-date skipping; checkpoint replay stays
 available, since replay is keyed by the script prefix and dependencies. `impure = true`

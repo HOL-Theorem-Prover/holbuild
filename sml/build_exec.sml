@@ -150,10 +150,8 @@ fun source_artifacts node = #artifacts (HolbuildBuildPlan.source_of node)
 fun source_policy node = #policy (HolbuildBuildPlan.source_of node)
 fun source_deps plan node = HolbuildBuildPlan.dependencies plan node
 fun source_extra_output_declarations plan node = #extra_outputs (source_deps plan node)
-fun source_extra_output_path node declaration =
-  normalize_path (Path.concat(Path.dir (source_file node), declaration))
 fun source_extra_output_paths plan node =
-  map (source_extra_output_path node) (source_extra_output_declarations plan node)
+  map (HolbuildBuildPlan.extra_output_path node) (source_extra_output_declarations plan node)
 fun staged_extra_output_path stage declaration = normalize_path (Path.concat(stage, declaration))
 fun logical_name node = HolbuildBuildPlan.logical_name node
 fun package node = HolbuildBuildPlan.package node
@@ -676,19 +674,32 @@ fun claim_extra_outputs project node outputs =
     handle e => (List.app remove_file (!created); raise e)
   end
 
+(* Whether OWNER is a dependency's theory and OUTPUT is outside the project's
+   .holbuild/packages, so in the dependency's own sources (a checkout other
+   projects may share, an override path, HOL's tree), where 0.14.63 and
+   0.14.64 put its extra outputs.  Such a file is not this project's to
+   remove: the tree there may since track a file at that path. *)
+fun legacy_dependency_output project (ExtraOutputOwner {package, ...}) output =
+  package <> HolbuildProject.package_name (HolbuildProject.project_package project) andalso
+  not (String.isPrefix
+         (Path.concat(Path.concat(project_artifact_root project, ".holbuild/packages"), package ^ "/extra-outputs") ^ "/")
+         output)
+
 fun release_extra_output project owner strict output =
   let val claim_path = extra_output_claim_path project output
   in
     case read_extra_output_claim project output of
         SOME existing =>
           if same_extra_output_owner (owner, existing) then
-            (remove_file output; remove_file claim_path)
+            ((if legacy_dependency_output project owner output then () else remove_file output);
+             remove_file claim_path)
           else if strict then
             raise Error ("refusing to remove extra output owned by " ^
                          extra_output_owner_text existing ^ ": " ^ output)
           else ()
       | NONE =>
-          if strict andalso extra_output_registry_path_exists output then
+          if strict andalso not (legacy_dependency_output project owner output) andalso
+             extra_output_registry_path_exists output then
             raise Error ("extra output has no ownership record; refusing to remove: " ^ output)
           else ()
   end
@@ -704,6 +715,76 @@ fun record_materialized_extra_outputs project node outputs =
     if null outputs then remove_file action_path
     else write_text action_path (extra_output_action_text owner outputs)
   end
+
+(* Drops the ownership claims and action records of the theories of
+   PACKAGES, whose extra-output roots were just emptied
+   (reset_extra_output_roots): they are about files from another source of
+   the package. *)
+fun drop_extra_output_records project packages =
+  let
+    fun record_package path =
+      case String.tokens (fn c => c = #"\n") (read_text path) of
+          _ :: owner_line :: _ =>
+            (case HolbuildAnalysisProtocol.split owner_line of
+                 "owner" :: package :: _ => SOME package
+               | _ => NONE)
+        | _ => NONE
+    (* A directory that can't be read, or a record, fails the reset, which
+       the next locked command then redoes. *)
+    fun drop_in dir =
+      if not (extra_output_registry_path_exists dir) then ()
+      else
+        let
+          val stream = FS.openDir dir
+          fun names acc =
+            case FS.readDir stream of
+                NONE => acc
+              | SOME name => names (Path.concat(dir, name) :: acc)
+          val paths = (names [] before FS.closeDir stream)
+                      handle e => (FS.closeDir stream handle _ => (); raise e)
+          fun drop path =
+            case record_package path of
+                SOME package =>
+                  if member_string package packages then FS.remove path else ()
+              | NONE => ()
+        in
+          List.app drop paths
+        end
+        handle OS.SysErr (msg, _) => raise Error ("could not drop the extra-output records in " ^ dir ^ ": " ^ msg)
+             | IO.Io {name, cause, ...} =>
+                 raise Error ("could not read " ^ name ^ ": " ^ General.exnMessage cause)
+    val root = extra_output_registry_root project
+  in
+    drop_in (Path.concat(root, "owners"));
+    drop_in (Path.concat(root, "actions"))
+  end
+
+(* Under the project lock, before planning: empties each dependency's
+   extra-output root that isn't current (HolbuildSourceIndex.extra_output_root_current)
+   and drops its theories' ownership records, then records the identity of
+   its source, last, so a reset cut short is redone.  The names of the
+   packages whose roots it emptied. *)
+fun reset_extra_output_roots project graph =
+  List.mapPartial
+    (fn package =>
+       case HolbuildProject.package_extra_output_root package of
+           NONE => NONE
+         | SOME root =>
+             if HolbuildSourceIndex.extra_output_root_current package root then NONE
+             else
+               let val name = HolbuildProject.package_name package
+               in
+                 HolbuildRemoveTree.remove root;
+                 if extra_output_registry_path_exists root then
+                   raise Error ("could not empty the extra-output directory " ^ root)
+                 else ();
+                 drop_extra_output_records project [name];
+                 HolbuildGenerators.ensure_dir root;
+                 write_text (HolbuildSourceIndex.extra_output_root_marker root)
+                   (HolbuildSourceIndex.extra_output_root_identity package);
+                 SOME name
+               end)
+    (HolbuildProjectGraph.packages graph)
 
 fun clean_registered_extra_outputs project plan node =
   let
@@ -1722,14 +1803,13 @@ fun expand_extra_dep base decl =
   HolbuildBuildPlan.expand_extra_dep base decl
   handle HolbuildBuildPlan.Error msg => raise Error msg
 
-fun extra_dep_lines label base decls =
-  let
-    fun line decl =
-      let val expanded = sort_strings (map (fn (rel, abs) => rel ^ "@" ^ file_hash abs) (expand_extra_dep base decl))
-      in (label ^ "_decl=" ^ decl) :: map (fn s => label ^ "=" ^ s) expanded end
-  in
-    List.concat (map line decls)
-  end
+fun expand_input plan node decl =
+  #files (HolbuildBuildPlan.expand_input plan node decl)
+  handle HolbuildBuildPlan.Error msg => raise Error msg
+
+fun extra_dep_lines plan node (decl as (label, _, name)) =
+  let val expanded = sort_strings (map (fn (rel, abs) => rel ^ "@" ^ file_hash abs) (expand_input plan node decl))
+  in (label ^ "_decl=" ^ name) :: map (fn s => label ^ "=" ^ s) expanded end
 
 fun current_metadata path = SOME (read_text path) handle IO.Io _ => NONE
 
@@ -2768,7 +2848,7 @@ fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan
     CacheRestored
       (install_cache_entry (copy_blob verify_cache root) root input_key subject entry
          {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
-          extra_destination = source_extra_output_path node,
+          extra_destination = HolbuildBuildPlan.extra_output_path node,
           write_manifests = write_manifests})
   end
   handle Error "cache entry not found" => CacheMiss
@@ -3794,7 +3874,14 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
 fun theory_inputs plan node =
   let
     val package_root = #package_root (HolbuildBuildPlan.source_of node)
-    val script_dir = Path.dir (source_file node)
+    (* Where the script is in its package: a script a dependency generates is
+       read from the extra-output root, but runs where the package has it. *)
+    val relative = HolbuildBuildPlan.relative_path node
+    val script_dir =
+      if String.isPrefix (normalize_path package_root ^ "/") (normalize_path (source_file node)) orelse
+         Path.isAbsolute relative orelse String.isPrefix ".." relative
+      then Path.dir (source_file node)
+      else Path.dir (Path.concat(package_root, relative))
     val script_rel_dir =
       Path.mkRelative {path = normalize_path script_dir, relativeTo = normalize_path package_root}
     (* The stage mirrors the package layout, and the script runs from its own
@@ -3804,15 +3891,13 @@ fun theory_inputs plan node =
       {path = if Path.isAbsolute rel then rel
               else normalize_path (if base = "" then rel else Path.concat(base, rel)),
        from = abs}
-    val source_inputs =
-      List.concat
-        (map (fn decl => map (staged stage_script_dir) (expand_extra_dep script_dir decl))
-             (#extra_deps (source_deps plan node)))
-    val manifest_inputs =
-      List.concat
-        (map (fn input =>
-                 map (staged "") (expand_extra_dep package_root (HolbuildProject.extra_input_path input)))
-             (HolbuildProject.action_extra_inputs (source_policy node)))
+    (* Manifest inputs are relative to the package root, source ones to the
+       script's directory. *)
+    fun stage_inputs (decl as (label, _, _)) =
+      map (staged (if label = "extra_dep" then "" else stage_script_dir)) (expand_input plan node decl)
+    val decls = HolbuildBuildPlan.extra_input_decls plan node
+    val manifest_inputs = List.concat (map stage_inputs (List.filter (fn (label, _, _) => label = "extra_dep") decls))
+    val source_inputs = List.concat (map stage_inputs (List.filter (fn (label, _, _) => label <> "extra_dep") decls))
   in
     {script_dir = stage_script_dir, inputs = source_inputs @ manifest_inputs}
   end
@@ -4535,14 +4620,8 @@ fun action_policy_lines plan node =
       map (fn dep => "declared_dep=" ^ dep) (HolbuildProject.action_deps policy)
     val declared_load_lines =
       map (fn dep => "declared_load=" ^ dep) (HolbuildProject.action_loads policy)
-    val extra_inputs = HolbuildProject.action_extra_inputs policy
-    val extra_lines =
-      List.concat (map (fn input =>
-        extra_dep_lines "extra_dep"
-          (#package_root (HolbuildBuildPlan.source_of node))
-          [HolbuildProject.extra_input_path input]) extra_inputs)
-    val source_extra_lines =
-      extra_dep_lines "source_extra_dep" (Path.dir (source_file node)) (#extra_deps (source_deps plan node))
+    val extra_input_lines =
+      List.concat (map (extra_dep_lines plan node) (HolbuildBuildPlan.extra_input_decls plan node))
     val source_extra_output_lines =
       map (fn output => "source_extra_output=" ^ output)
           (source_extra_output_declarations plan node)
@@ -4551,8 +4630,7 @@ fun action_policy_lines plan node =
      "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
     declared_dep_lines @
     declared_load_lines @
-    extra_lines @
-    source_extra_lines @
+    extra_input_lines @
     source_extra_output_lines
   end
 
@@ -5333,7 +5411,7 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
     claim_extra_outputs project node extra_output_paths;
     List.app
       (fn declaration =>
-          let val destination = source_extra_output_path node declaration
+          let val destination = HolbuildBuildPlan.extra_output_path node declaration
           in ensure_parent destination;
              copy_binary (staged_extra_output_path stage declaration) destination
           end)
@@ -8998,8 +9076,7 @@ fun plan_runs tc project planned jobs {keep_specs}
                             SOME reason => raise Error ("run-action: " ^ name ^ " can't run remotely: " ^ reason)
                           | NONE => ()
                       val planned_inputs = List.concat
-                        (map (fn (_, base, decl) =>
-                                map #2 (#files (HolbuildBuildPlan.input_expansion plan base decl)))
+                        (map (fn decl => map #2 (#files (HolbuildBuildPlan.planned_input_expansion plan node decl)))
                              (HolbuildBuildPlan.extra_input_decls plan node))
                       val _ =
                         if sort_strings (unique_strings planned_inputs) =

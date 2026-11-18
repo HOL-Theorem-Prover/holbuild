@@ -38,20 +38,81 @@ PY
 # age DAYS PATH: set the modification time DAYS days back.
 age() { python3 -c 'import os, sys, time; t = time.time() - float(sys.argv[1]) * 86400; os.utime(sys.argv[2], (t, t))' "$1" "$2"; }
 
-checkout_of() { printf '%s/git/checkouts/%s-%s' "$HOLBUILD_CACHE" "$(printf %s "$1" | sha1sum | cut -d' ' -f1)" "$2"; }
+checkout_of() { printf '%s/git/checkouts/%s-%s-v2' "$HOLBUILD_CACHE" "$(printf %s "$1" | sha1sum | cut -d' ' -f1)" "$2"; }
 
 # A real build against a theory in a git dependency writes nothing into the
-# shared checkout.
+# shared checkout: the dependency's declared extra outputs, an SML source among
+# them, go under each consuming project's .holbuild, whether its theory is
+# built or restored from the cache.  Other theories read one of them as an
+# extra input, by its path and through its directory.  The dependency's members overlap, so discovery reaches its
+# generated source twice.
 use_case_cache "$tmpdir/cache"
 dep=$tmpdir/dep
 mkdir -p "$dep/src"
-{ write_schema2_prelude; printf '[project]\nname = "dep"\n\n[build]\nmembers = ["src"]\n'; } > "$dep/holproject.toml"
+{
+  write_schema2_prelude
+  printf '[project]\nname = "dep"\n\n[build]\nmembers = [".", "src"]\n\n'
+  printf '[actions.DUse]\ndeps = ["DTheory"]\n'
+} > "$dep/holproject.toml"
 cat > "$dep/src/DScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["results/D.txt", "DGenML.sml"];
+fun write path text = let val out = TextIO.openOut path in TextIO.output (out, text); TextIO.closeOut out end;
+val () = write "results/D.txt" "dep result\n";
+val () = write "DGenML.sml" "structure DGenML = struct val x = 42 end\n";
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "D";
 val d_def = new_definition("d_def", ``d_const = T``);
 val _ = export_theory();
 SML
+# write_reader NAME DECLARATION: theory NAME reads results/D.txt through
+# DECLARATION and writes what it read, and the files it saw in results, to
+# out/NAME.txt.
+write_reader() {
+  cat > "$dep/src/$1Script.sml" <<SML
+fun holbuild_extra_deps (_ : string list) = ();
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_deps ["$2"];
+val () = holbuild_extra_outputs ["out/$1.txt"];
+val () = let val input = TextIO.openIn "results/D.txt"; val text = TextIO.inputAll input
+             val () = TextIO.closeIn input
+             val dir = OS.FileSys.openDir "results"
+             fun names acc = case OS.FileSys.readDir dir of NONE => acc | SOME name => names (name :: acc)
+             val seen = names [] before OS.FileSys.closeDir dir
+             val out = TextIO.openOut "out/$1.txt"
+         in TextIO.output (out, "read " ^ text ^ "saw " ^ String.concatWith " " seen ^ "\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$1";
+val _ = export_theory();
+SML
+}
+write_reader E results/D.txt
+write_reader F results
+# PScript declares an output that no build here makes.
+cat > "$dep/src/PScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["results/P.txt"];
+val () = let val out = TextIO.openOut "results/P.txt" in TextIO.output (out, "p\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "P";
+val _ = export_theory();
+SML
+cat > "$dep/src/DUse.sml" <<'SML'
+structure DUse = struct val y = DGenML.x + 1 end
+SML
+# GScript generates GenML.sml, which the dependency also tracks; nothing
+# depends on GTheory, so a build of GUse alone reads the tracked copy.
+echo 'structure GenML = struct val x = 1 end' > "$dep/src/GenML.sml"
+cat > "$dep/src/GScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["GenML.sml"];
+val () = let val out = TextIO.openOut "GenML.sml"
+         in TextIO.output (out, "structure GenML = struct val x = 2 end\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "G";
+val _ = export_theory();
+SML
+echo 'structure GUse = struct val y = GenML.x end' > "$dep/src/GUse.sml"
 dep_rev=$(init_git_repo "$dep")
 
 project=$tmpdir/project
@@ -62,12 +123,17 @@ mkdir -p "$project/src"
   printf '[dependencies.dep]\ngit = "%s"\nrev = "%s"\n' "$dep" "$dep_rev"
 } > "$project/holproject.toml"
 cat > "$project/src/UScript.sml" <<'SML'
-open HolKernel Parse boolLib bossLib DTheory;
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["results/U.txt"];
+open HolKernel Parse boolLib bossLib DTheory ETheory FTheory;
+val () = let val out = TextIO.openOut "results/U.txt"
+         in TextIO.output (out, "user result " ^ Int.toString DUse.y ^ "\n"); TextIO.closeOut out end;
 val _ = new_theory "U";
 val u_thm = store_thm("u_thm", ``d_const``, REWRITE_TAC [d_def]);
 val _ = export_theory();
 SML
 cp -R "$project" "$tmpdir/copy"
+cp -R "$project" "$tmpdir/over"
 
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context.log"
 checkout=$(checkout_of "$dep" "$dep_rev")
@@ -77,14 +143,246 @@ require_file "$checkout/src/DScript.sml"
 [[ -z $(find "$checkout" -type f -perm -u=w) ]] || fail "shared checkout has writable files"
 if (echo edit >> "$project/.holbuild/src/dep/src/DScript.sml") 2> /dev/null; then fail "edited a shared checkout file in place"; fi
 before=$(snapshot "$checkout")
+# require_outputs PROJECT: the dependency's and the project's extra outputs.
+require_outputs() {
+  require_grep "dep result" "$1/.holbuild/packages/dep/extra-outputs/src/results/D.txt"
+  require_file "$1/.holbuild/packages/dep/extra-outputs/src/DGenML.sml"
+  require_grep "read dep result" "$1/.holbuild/packages/dep/extra-outputs/src/out/E.txt"
+  require_grep "read dep result" "$1/.holbuild/packages/dep/extra-outputs/src/out/F.txt"
+  require_grep "user result 43" "$1/src/results/U.txt"
+}
 (cd "$project" && "$HOLBUILD_BIN" build) > "$tmpdir/build.log" 2>&1 || { cat "$tmpdir/build.log" >&2; fail "build failed"; }
+require_outputs "$project"
 [[ $(snapshot "$checkout") == "$before" ]] || fail "build wrote into the shared checkout"
+(cd "$project" && "$HOLBUILD_BIN" --verbose build) > "$tmpdir/rebuild.log" 2>&1 || { cat "$tmpdir/rebuild.log" >&2; fail "rebuild failed"; }
+require_grep "UTheory is up to date" "$tmpdir/rebuild.log"
 
-# A second project directory links to the same checkout instead of cloning.
-(cd "$tmpdir/copy" && "$HOLBUILD_BIN" context) > /dev/null
+# A second project directory links to the same checkout instead of cloning,
+# and restores the dependency's theory and its outputs from the cache.  An
+# output of its own that it never claimed is still refused.  Its record from
+# 0.14.64 of outputs in the dependency's sources, here files the checkout
+# tracks, is dropped without removing them, whether or not their claims
+# survived.
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" clean DTheory) > /dev/null
+require_file "$tmpdir/copy/.holbuild/packages/dep/extra-outputs.source"
+record=$(grep -l 'results/D.txt' "$project"/.holbuild/extra-outputs/actions/*.outputs)
+output=$(grep -m1 '^path .*results/D.txt$' "$record")
+output=${output#path }
+legacy=${output%%/.holbuild/*}
+legacy=${legacy%/project}/copy/.holbuild/src/dep
+legacy_unclaimed=$legacy/holproject.toml
+legacy=$legacy/src/DScript.sml
+legacy_claim=$tmpdir/copy/.holbuild/extra-outputs/owners/$(printf %s "$legacy" | sha256sum | cut -d' ' -f1).owner
+mkdir -p "$tmpdir/copy/.holbuild/extra-outputs/actions" "$tmpdir/copy/.holbuild/extra-outputs/owners"
+printf 'holbuild-extra-output-action-v1\n%s\npath %s\npath %s\n' "$(sed -n 2p "$record")" "$legacy" "$legacy_unclaimed" \
+  > "$tmpdir/copy/.holbuild/extra-outputs/actions/${record##*/}"
+printf 'holbuild-extra-output-owner-v1\n%s\npath %s\n' "$(sed -n 2p "$record")" "$legacy" > "$legacy_claim"
 [[ $(readlink "$tmpdir/copy/.holbuild/src/dep") == "$checkout" ]] || fail "second project did not link the shared checkout"
 [[ $(find "$HOLBUILD_CACHE/git/checkouts" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l) == 1 ]] ||
   fail "second project made another checkout"
+mkdir -p "$tmpdir/copy/src/results"
+echo stray > "$tmpdir/copy/src/results/U.txt"
+if (cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-unowned.log" 2>&1; then
+  fail "build overwrote an unowned extra output"
+fi
+require_grep "extra output already exists without an ownership record: .*src/results/U.txt" "$tmpdir/copy-unowned.log"
+require_grep "DTheory restored from cache" "$tmpdir/copy-unowned.log"
+rm "$tmpdir/copy/src/results/U.txt"
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-build.log" 2>&1 || { cat "$tmpdir/copy-build.log" >&2; fail "second build failed"; }
+require_grep "UTheory restored from cache" "$tmpdir/copy-build.log"
+require_outputs "$tmpdir/copy"
+[[ $(snapshot "$checkout") == "$before" ]] || fail "second build wrote into the shared checkout"
+[[ ! -e $legacy_claim ]] || fail "second build kept its claim on an output in the dependency's sources"
+
+# A source in the extra-output directory that no theory of the dependency
+# declares, say from an older pin, is not the dependency's.
+echo 'structure DUse = struct val y = 0 end' > "$tmpdir/copy/.holbuild/packages/dep/extra-outputs/src/DUse.sml"
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" --verbose build) > "$tmpdir/copy-stale.log" 2>&1 || { cat "$tmpdir/copy-stale.log" >&2; fail "build with a stale output failed"; }
+require_grep "UTheory is up to date" "$tmpdir/copy-stale.log"
+
+# A plan record notices a generated source appearing in the extra-output
+# directory, though the dependency's checkout never changes.
+cat > "$tmpdir/copy/src/TScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["T.txt"];
+val () = let val out = TextIO.openOut "T.txt" in TextIO.output (out, "y=" ^ Int.toString GUse.y ^ "\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "T";
+val _ = export_theory();
+SML
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-t.log" 2>&1 || { cat "$tmpdir/copy-t.log" >&2; fail "build of T failed"; }
+require_grep "TTheory built" "$tmpdir/copy-t.log"
+require_grep "y=1" "$tmpdir/copy/src/T.txt"
+echo 'structure GenML = struct val x = 2 end' > "$tmpdir/copy/.holbuild/packages/dep/extra-outputs/src/GenML.sml"
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-t2.log" 2>&1 || { cat "$tmpdir/copy-t2.log" >&2; fail "rebuild of T failed"; }
+require_grep "GUse built" "$tmpdir/copy-t2.log"
+require_grep "y=2" "$tmpdir/copy/src/T.txt"
+
+# A new pin of the dependency starts its extra-output directory empty: a
+# generated source there from the old pin is not the new one's, though its
+# theory, never built here, still declares it.
+echo more > "$dep/src/more.txt"
+git -C "$dep" add src/more.txt
+git -C "$dep" commit -q --no-gpg-sign -m more
+dep_rev2=$(git -C "$dep" rev-parse HEAD)
+sed -i "s/$dep_rev/$dep_rev2/" "$tmpdir/copy/holproject.toml"
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-repin.log" 2>&1 || { cat "$tmpdir/copy-repin.log" >&2; fail "build after a repin failed"; }
+require_grep "y=1" "$tmpdir/copy/src/T.txt"
+require_outputs "$tmpdir/copy"
+
+# A dependency taken from a path that 0.14.63 or 0.14.64 wrote declared
+# outputs into: those copies are never inputs, even through a directory.
+cp -R "$dep" "$tmpdir/dep-override"
+mkdir -p "$tmpdir/dep-override/src/results"
+echo "stray result" > "$tmpdir/dep-override/src/results/D.txt"
+echo stray > "$tmpdir/dep-override/src/results/P.txt"
+printf '[overrides.dep]\npath = "../dep-override"\n' > "$tmpdir/over/.holconfig.toml"
+(cd "$tmpdir/over" && "$HOLBUILD_BIN" build) > "$tmpdir/over.log" 2>&1 || { cat "$tmpdir/over.log" >&2; fail "build with an overridden dependency failed"; }
+require_outputs "$tmpdir/over"
+for reader in E F; do
+  if grep -q P.txt "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/out/$reader.txt"; then
+    fail "$reader read a stray declared output from the dependency's sources"
+  fi
+done
+
+# In a dependency, a theory that another theory generates in the extra-output
+# directory reads its checked-in inputs from the dependency's sources, and the
+# sources it generates belong to the dependency.  A directory input with
+# nothing under the extra-output directory leaves the plan record usable.
+override=$tmpdir/dep-override/src
+mkdir -p "$override/gen" "$override/data"
+echo "checked in" > "$override/gen/data.txt"
+echo data > "$override/data/x.txt"
+cat > "$override/RScript.in" <<'SML'
+fun holbuild_extra_deps (_ : string list) = ();
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_deps ["data.txt"];
+val () = holbuild_extra_outputs ["RLib.sml"];
+val () = let val input = TextIO.openIn "data.txt"; val text = TextIO.inputAll input
+             val () = TextIO.closeIn input
+             val out = TextIO.openOut "RLib.sml"
+         in TextIO.output (out, "structure RLib = struct val z = " ^ Int.toString (size text) ^ " end\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "R";
+val _ = export_theory();
+SML
+cat > "$override/MScript.sml" <<'SML'
+fun holbuild_extra_deps (_ : string list) = ();
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_deps ["data", "RScript.in"];
+val () = holbuild_extra_outputs ["gen/RScript.sml"];
+val () = let val input = TextIO.openIn "RScript.in"; val text = TextIO.inputAll input
+             val () = TextIO.closeIn input
+             val out = TextIO.openOut "gen/RScript.sml"
+         in TextIO.output (out, text); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "M";
+val _ = export_theory();
+SML
+over_build() {
+  (cd "$tmpdir/over" && "$HOLBUILD_BIN" --verbose build "$@") > "$tmpdir/over-step.log" 2>&1 ||
+    { cat "$tmpdir/over-step.log" >&2; fail "build $* with an overridden dependency failed"; }
+}
+over_build MTheory
+require_file "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/gen/RScript.sml"
+for _ in 1 2; do
+  sleep 1.1
+  (cd "$tmpdir/over" && "$HOLBUILD_BIN" --verbose build --dry-run MTheory) > "$tmpdir/over-plan.log" 2>&1 ||
+    { cat "$tmpdir/over-plan.log" >&2; fail "dry run failed"; }
+done
+require_grep "^holbuild: plan: from record" "$tmpdir/over-plan.log"
+over_build RTheory
+require_grep "structure RLib = struct val z = 11 end" "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/gen/RLib.sml"
+cat > "$tmpdir/over/src/VScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "V";
+val _ = if RLib.z = 11 then () else raise Fail "RLib.z";
+val _ = export_theory();
+SML
+over_build VTheory
+
+# A dependency's file that a theory stops declaring as an output becomes an
+# input like any other, though only that theory's file changed.
+over_build
+sleep 1.1
+cat > "$override/PScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "P";
+val _ = export_theory();
+SML
+over_build
+require_grep "saw .*P.txt" "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/out/F.txt"
+
+# Nor does a plan record keep a generated source in the extra-output directory
+# once its theory, never built here, stops declaring it: the tracked copy
+# takes its place.
+echo 'structure GenML = struct val x = 2 end' > "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/GenML.sml"
+cat > "$tmpdir/over/src/WScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["W.txt"];
+val () = let val out = TextIO.openOut "W.txt" in TextIO.output (out, "y=" ^ Int.toString GUse.y ^ "\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "W";
+val _ = export_theory();
+SML
+over_build WTheory
+require_grep "y=2" "$tmpdir/over/src/W.txt"
+over_build WTheory
+require_grep "WTheory is up to date" "$tmpdir/over-step.log"
+sleep 1.1
+cat > "$override/GScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "G";
+val _ = export_theory();
+SML
+over_build WTheory
+require_grep "GUse built" "$tmpdir/over-step.log"
+require_grep "y=1" "$tmpdir/over/src/W.txt"
+
+# A declaration a build would reject, in a dependency theory not built,
+# doesn't stop the build, though discovery reads that theory's declarations.
+cat > "$override/BadScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["/tmp/bad.txt", "../bad.txt", "bad/", "*.txt"];
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Bad";
+val _ = export_theory();
+SML
+over_build WTheory
+if (cd "$tmpdir/over" && "$HOLBUILD_BIN" build BadTheory) > "$tmpdir/over-bad.log" 2>&1; then
+  fail "a dependency theory with invalid extra outputs built"
+fi
+require_grep "holbuild_extra_outputs in .*/BadScript.sml path must" "$tmpdir/over-bad.log"
+rm "$override/BadScript.sml"
+
+# Another copy of the dependency at the same path starts the extra-output
+# directory afresh, as its files came from the old copy, and so do the
+# claims on them: there, another theory declares an output of a theory the
+# copy no longer has.
+moved_script() {
+  cat > "$2/$1Script.sml" <<SML
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["moved.txt"];
+val () = let val out = TextIO.openOut "moved.txt" in TextIO.output (out, "$1\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$1";
+val _ = export_theory();
+SML
+}
+moved_script A "$override"
+over_build ATheory
+echo stale > "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/stale.txt"
+cp -R "$tmpdir/dep-override" "$tmpdir/dep-override2"
+rm "$tmpdir/dep-override2/src/AScript.sml"
+moved_script B "$tmpdir/dep-override2/src"
+mv "$tmpdir/dep-override" "$tmpdir/dep-override1"
+ln -s dep-override2 "$tmpdir/dep-override"
+over_build WTheory
+[[ ! -e $tmpdir/over/.holbuild/packages/dep/extra-outputs/src/stale.txt ]] ||
+  fail "a switch to another copy of the dependency kept its extra outputs"
+require_grep "y=1" "$tmpdir/over/src/W.txt"
+over_build BTheory
+require_grep "^B$" "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/moved.txt"
 
 # GC runs on a cache of its own, which links no shared toolchains, with a HOL
 # dependency that is never built.
@@ -166,10 +464,20 @@ age 6 "$lib_checkout.last-used"
 gc
 require_grep "checkouts=0 checkouts-busy=0" "$tmpdir/gc.log"
 require_file "$lib_checkout/holproject.toml"
+# So does one that 0.14.63 or 0.14.64 made, which is never used again: those
+# could hold a dependency's extra outputs.
+legacy_checkout=${lib_checkout%-v2}
+mkdir -p "$legacy_checkout"
+touch "$legacy_checkout.last-used"
 age 8 "$lib_checkout.last-used"
 gc
 require_grep "checkouts=1 checkouts-busy=0" "$tmpdir/gc.log"
 [[ ! -e $lib_checkout && ! -e $lib_checkout.last-used ]] || fail "GC left the stale checkout"
+[[ -d $legacy_checkout ]] || fail "GC removed a recently used legacy checkout"
+age 8 "$legacy_checkout.last-used"
+gc
+require_grep "checkouts=1 checkouts-busy=0" "$tmpdir/gc.log"
+[[ ! -e $legacy_checkout && ! -e $legacy_checkout.last-used ]] || fail "GC left the legacy checkout"
 [[ -L $gc_project/.holbuild/src/lib && ! -e $gc_project/.holbuild/src/lib ]] || fail "expected a dangling link"
 [[ -d $HOLBUILD_CACHE/git/remotes/$(printf %s "$tmpdir/lib" | sha1sum | cut -d' ' -f1).git ]] || fail "GC removed the mirror"
 

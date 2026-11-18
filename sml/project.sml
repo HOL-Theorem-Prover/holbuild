@@ -297,6 +297,14 @@ fun package_roots (Package {roots, ...}) = roots
 fun package_root_groups (Package {root_groups, ...}) = root_groups
 fun package_groups (Package {groups, ...}) = groups
 fun package_artifact_root (Package {artifact_root, ...}) = artifact_root
+(* Where a dependency's theories write their declared extra outputs: under the
+   package's artifact root in the consuming project, mirroring the package
+   layout, since its source tree may be a checkout other projects share.  NONE
+   for the root package, whose outputs go next to its sources. *)
+fun package_extra_output_root (package as Package {provenance, ...}) =
+  case HolbuildPackageProvenance.origin provenance of
+      HolbuildPackageProvenance.RootOrigin => NONE
+    | _ => SOME (Path.concat(package_artifact_root package, "extra-outputs"))
 fun root_tactic_timeouts ({root_tactic_timeouts, ...} : t) = root_tactic_timeouts
 fun root_tactic_timeout_for ({root_tactic_timeouts, ...} : t) root =
   Option.map #timeout (List.find (fn entry => #root entry = root) root_tactic_timeouts)

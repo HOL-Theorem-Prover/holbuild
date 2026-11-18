@@ -458,7 +458,9 @@ holbuild --offline build MyTheory
 
 A dependency whose shared checkout is missing fails before checkout or fetch,
 even if its commit is in a local bare mirror; one already in the cache is
-linked as usual. A missing or invalid HOL
+linked as usual. Holbuild 0.14.75 names shared checkouts differently from
+earlier releases, so a project prepared with one of those needs one more run
+with offline mode unset. A missing or invalid HOL
 toolchain also fails before restore or replacement. The error names what needs
 preparing; rerun without `--offline` and with `HOLBUILD_OFFLINE` unset. Valid
 local toolchains can regenerate analyser and source metadata offline.
@@ -868,9 +870,15 @@ val () = holbuild_extra_outputs ["results/test.nsv"];
 
 Each path is relative to the declaring source file and must be a fixed file path
 inside the package: absolute paths, `.`/`..` components, trailing slashes, and
-glob syntax are rejected. The action must produce every declaration. Extra
-outputs participate in up-to-date checks and cache publication/restoration, and
-`holbuild clean TARGET` removes them. Holbuild records ownership lazily and
+glob syntax are rejected. A dependency's sources may be shared with other
+projects, so a theory in a dependency package writes its extra outputs under the
+consuming project's `.holbuild/packages/<name>/extra-outputs/` instead, at the
+path the declaration gives relative to the script's directory in the package;
+SML sources a theory of the package currently declares there are discovered as
+the package's own, and the package's extra inputs that name its declared outputs,
+by path or through a directory or glob, read them there. The action must
+produce every declaration. Extra outputs participate in up-to-date checks and
+cache publication/restoration, and `holbuild clean TARGET` removes them. Holbuild records ownership lazily and
 rejects another action that attempts to materialize the same path. As with
 ordinary outputs, cleaning followed
 by a normal build may restore them from cache; use existing no-cache or impure /

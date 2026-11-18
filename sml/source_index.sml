@@ -392,6 +392,45 @@ val observed_dirs : (string * string * HolbuildStatCache.ident option * string l
 fun observe_dir package path stamp entries =
   observed_dirs := (package, path, stamp, entries) :: !observed_dirs
 
+(* Why PATH can't be a holbuild_extra_outputs declaration, if it can't: it
+   names a fixed file under the declaring script's directory. *)
+fun extra_output_decl_problem path =
+  let
+    val components = String.tokens (fn c => c = #"/" orelse c = #"\\") path
+    fun bad problem = SOME (problem ^ ": " ^ path)
+  in
+    if path = "" then SOME "contains an empty path"
+    else if Path.isAbsolute path then bad "path must be relative to the declaring source"
+    else if List.exists (fn component => component = "." orelse component = "..") components then
+      bad "path must not contain . or .. components"
+    else if String.isSuffix "/" path orelse String.isSuffix "\\" path then
+      bad "path must name a file, not a directory"
+    else if CharVector.exists (fn c => c = #"*" orelse c = #"?" orelse c = #"[" orelse c = #"]") path then
+      bad "path must be a fixed file path, not a glob"
+    else if List.null components then bad "contains an invalid path"
+    else NONE
+  end
+
+(* Declarations a build would refuse declare nothing to the lookups here. *)
+fun valid_extra_output_decl path = not (Option.isSome (extra_output_decl_problem path))
+
+(* The extra outputs the theory file at PATH declares, as entries "o<declaration>". *)
+fun declaration_entries path =
+  sort_unique_strings (map (fn output => "o" ^ output)
+    (List.filter valid_extra_output_decl (#extra_outputs (HolbuildDependencies.extract_textual path))))
+  handle IO.Io _ => raise Error ("cannot read " ^ path)
+       | HolbuildDependencies.Error _ => []
+
+(* What discovery saw at an observed PATH: a directory's classified entries,
+   or the extra outputs a theory file declares, which decide whether its
+   package's extra-output sources are the package's. *)
+fun observed_entries path = if is_dir path then classified_entries path else declaration_entries path
+
+fun observe_declarations package path =
+  let val stamp = HolbuildStatCache.stat_ident path
+  in observe_dir package path stamp (declaration_entries path) end
+  handle Error _ => ()
+
 fun observe_boundary_dir package path =
   let val stamp = HolbuildStatCache.stat_ident path
   in observe_dir package path stamp (classified_entries path) end
@@ -525,6 +564,35 @@ fun member_contains member path =
 
 fun scan_key name source_root = name ^ "\000" ^ source_root
 
+(* A dependency's extra-output root holds what its theories wrote from one
+   source of the package, whose identity is recorded beside it: its snapshot
+   and retrieval, and where its sources are.  Once that changes, as with a
+   new pin or an override, those files may be stale even where a theory
+   still declares their paths. *)
+fun extra_output_root_identity package =
+  let
+    val provenance = HolbuildProject.package_provenance package
+    fun location path = OS.FileSys.realPath path handle OS.SysErr _ => normalize_path path
+  in
+    String.concatWith "\n"
+      [HolbuildPackageProvenance.snapshot_text (HolbuildPackageProvenance.snapshot provenance),
+       HolbuildPackageProvenance.retrieval_text (HolbuildPackageProvenance.retrieval provenance),
+       location (HolbuildPackageProvenance.source_root provenance),
+       location (HolbuildPackageProvenance.package_root provenance)]
+  end
+
+fun extra_output_root_marker root = root ^ ".source"
+
+(* Whether ROOT, the package's extra-output root, holds outputs from its
+   current source.  Commands holding the project lock empty one that doesn't
+   (HolbuildBuildExec.reset_extra_output_roots); readers outside the lock take
+   it as empty. *)
+fun extra_output_root_current package root =
+  is_dir root andalso
+  (SOME (let val input = TextIO.openIn (extra_output_root_marker root)
+         in TextIO.inputAll input before TextIO.closeIn input end)
+   handle IO.Io _ => NONE) = SOME (extra_output_root_identity package)
+
 fun prevalidate_package package =
   let
     val name = HolbuildProject.package_name package
@@ -559,7 +627,12 @@ fun prevalidate_package package =
       end
     val existing = List.foldl scan_existing [] members
     val candidates = List.foldl declared_output existing generated_paths
-    val _ = validate_action_policies name policies candidates
+    (* A dependency's targets may also be under its extra-output root, which
+       discovery creates and scans, and checks its policies against. *)
+    val _ =
+      case HolbuildProject.package_extra_output_root package of
+          NONE => validate_action_policies name policies candidates
+        | SOME _ => ()
   in
     (* Without generators nothing can change the tree before discovery, so
        discovery reuses this scan instead of walking the tree again. *)
@@ -573,6 +646,11 @@ fun prevalidate_graph graph =
   (observed_dirs := [];
    List.mapPartial prevalidate_package (HolbuildProjectGraph.packages graph))
 
+fun with_package_root package_root
+      ({node, package, kind, logical_name, source_path, relative_path, artifacts, policy, ...} : source) : source =
+  {node = node, package = package, package_root = package_root, kind = kind, logical_name = logical_name,
+   source_path = source_path, relative_path = relative_path, artifacts = artifacts, policy = policy}
+
 fun deduplicate_sources sources =
   let
     fun add (source : source, (seen, kept)) =
@@ -584,6 +662,34 @@ fun deduplicate_sources sources =
     val (_, kept) = List.foldr add (Redblackset.empty String.compare, []) sources
   in
     kept
+  end
+
+(* The package-relative paths a theory script declares as extra outputs; []
+   for other sources. *)
+fun script_extra_outputs (script : source) =
+  let val dir = Path.dir (normalize_path (#relative_path script))
+  in
+    if #kind script <> TheoryScript then []
+    else
+      map (fn output => normalize_path (if dir = "" then output else Path.concat(dir, output)))
+          (List.filter valid_extra_output_decl
+             (#extra_outputs (HolbuildDependencies.extract_textual (#source_path script))))
+      (* One the analyser can't read declares nothing here; it fails when
+         a build selects it. *)
+      handle IO.Io _ => [] | HolbuildDependencies.Error _ => []
+  end
+
+(* The package-relative paths the theories among SCRIPTS declare as extra
+   outputs, reading only those whose directory holds one of RELS:
+   declarations have no .. components, so a theory writes only under its own
+   directory. *)
+fun declared_extra_outputs (scripts : source list) rels =
+  let
+    fun under dir path = dir = "" orelse String.isPrefix (dir ^ "/") path
+    fun relevant (script : source) =
+      List.exists (under (Path.dir (normalize_path (#relative_path script)))) rels
+  in
+    List.concat (map script_extra_outputs (List.filter relevant scripts))
   end
 
 fun discover_package scans package =
@@ -629,8 +735,95 @@ fun discover_package scans package =
       case (generated_paths, List.find (fn (k, _) => k = scan_key name source_root) scans) of
           ([], SOME (_, scanned)) => scanned
         | _ => List.foldl scan_existing [] members
-    val sources =
+    val tree_sources =
       deduplicate_sources (List.foldl declared_output existing generated_paths)
+    (* A dependency's theories write their extra outputs under its extra-output
+       root, which mirrors the package layout (see
+       HolbuildProject.package_extra_output_root).  The SML sources there are
+       the package's own, at the same relative paths, in place of any copy in
+       its source tree. *)
+    val overlay =
+      case HolbuildProject.package_extra_output_root package of
+          NONE => []
+        | SOME root =>
+            (* Under the project lock the root is current
+               (HolbuildBuildExec.reset_extra_output_roots); outside it,
+               one that isn't is as good as empty. *)
+            if not (extra_output_root_current package root) then []
+            else
+            let
+              fun scan (member, acc) =
+                let val path = HolbuildProject.abs_under root member
+                in
+                  if is_dir path orelse is_readable path then
+                    scan_member name package_id root artifact_root policies generated_paths
+                      excludes exclude_globs (path, acc)
+                  else (observe_existing_ancestor path; acc)
+                end
+              (* A producer may make the member's directory later, which a
+                 plan record must notice.  The walk ends at the root, never
+                 above, where entries change with every build. *)
+              and observe_existing_ancestor path =
+                let val parent = Path.dir path
+                in
+                  if is_dir parent then observe_boundary_dir name parent
+                  else if parent = root orelse parent = path orelse parent = "" then ()
+                  else observe_existing_ancestor parent
+                end
+              val found =
+                deduplicate_sources (List.foldl scan [] (HolbuildProject.package_members package))
+              val rels = map (fn (output : source) => normalize_path (#relative_path output)) found
+              fun rel_of (source : source) = normalize_path (#relative_path source)
+              (* The root outlives pin and override changes, so only what a
+                 theory of the package declares now counts, including a theory
+                 another theory generated there, in place of its tree copy. *)
+              (* The theories that decide admissions: the tree's, each in
+                 place of its admitted overlay copy.  An admitted theory may
+                 admit more, and a replaced one may admit less, so the
+                 admissions are recomputed until they settle, at most once
+                 per candidate, or it is an error. *)
+              fun scripts_with admitted =
+                let val generated = List.filter (fn (output : source) => #kind output = TheoryScript) admitted
+                in
+                  List.filter (fn script => not (List.exists (fn output => rel_of output = rel_of script) generated))
+                    tree_sources @ generated
+                end
+              fun admissions scripts =
+                let val declarations = declared_extra_outputs scripts rels
+                in List.filter (fn output => List.exists (fn path => path = rel_of output) declarations) found end
+              fun paths sources = map (fn (source : source) => #source_path source) sources
+              fun admit (rounds, admitted) =
+                let
+                  val scripts = scripts_with admitted
+                  val next = admissions scripts
+                in
+                  if paths next = paths admitted then (next, scripts)
+                  else if rounds = 0 then
+                    raise Error ("the extra-output sources of " ^ name ^
+                                 " that its theories declare depend on one another without settling, under " ^ root)
+                  else admit (rounds - 1, next)
+                end
+              fun under dir path = dir = "" orelse String.isPrefix (dir ^ "/") path
+              fun relevant (script : source) =
+                #kind script = TheoryScript andalso
+                List.exists (under (Path.dir (rel_of script))) rels
+            in
+              if null found then []
+              else
+                let val (admitted, scripts) = admit (length found, admissions tree_sources)
+                in
+                  (* A plan record must notice a change to what they declare,
+                     the tree's theories included: admission starts from
+                     them, even where an admitted copy replaces one. *)
+                  List.app (observe_declarations name) (sort_unique_strings
+                    (map (fn (script : source) => #source_path script)
+                       (List.filter relevant (tree_sources @ scripts))));
+                  map (with_package_root source_root) admitted
+                end
+            end
+    fun shadowed (source : source) =
+      List.exists (fn (output : source) => #relative_path output = #relative_path source) overlay
+    val sources = List.filter (not o shadowed) tree_sources @ overlay
     val _ = validate_action_policies name policies sources
   in
     sources
