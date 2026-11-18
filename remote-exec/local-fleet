@@ -75,6 +75,8 @@ while read -r name; do unset "$name"; done < <(compgen -e | grep -E '^HOLBUILD_R
 unset HOLBUILD_CACHE HOLBUILD_COOPERATE_DIR
 # Nor may the coordinator call a deployment's scaler or cache pool (its settings ignore case).
 while read -r name; do unset "$name"; done < <(compgen -e | grep -iE '^REMOTE_EXEC_(SCALE_CMD|CACHE_POOL_CMD|CACHE_SLOTS)$' || true)
+# Every endpoint is on loopback: keep an inherited proxy out of the way.
+export no_proxy=${no_proxy:+$no_proxy,}127.0.0.1 NO_PROXY=${NO_PROXY:+$NO_PROXY,}127.0.0.1
 
 if [[ -z $dir ]]; then
   mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/holbuild-local-fleet"
@@ -92,7 +94,8 @@ if [[ -n $(ls -A "$dir") ]] || ! mkdir "$dir/logs" 2>/dev/null; then
   echo "local-fleet: the run directory $dir is not empty; give a new or empty one" >&2
   exit 2
 fi
-mkdir -p "$dir"/{remote,baked,releases,cooperate,worker-cache,client-cache,hol-toolchains,tables,tmp}
+chmod 700 "$dir"
+mkdir -p "$dir"/{remote,baked,releases,cooperate,client-cache,hol-toolchains,tables,tmp}
 ln -sfn "$tree" "$dir/baked/v$version"
 read_dirs=${HOLBUILD_ACTION_READ_DIRS:-}
 for t in "${toolchains[@]}"; do
@@ -104,7 +107,11 @@ for t in "${toolchains[@]}"; do
   ln -sfn "$t/hol" "$entry/hol"
   read_dirs=${read_dirs:+$read_dirs:}$t/hol
 done
-for c in worker-cache client-cache; do ln -sfn "$dir/hol-toolchains" "$dir/$c/hol-toolchains"; done
+# Each worker needs a cache of its own: exec-action locks it for the whole action.
+for c in client-cache $(seq -f worker-cache-%g "$workers"); do
+  mkdir -p "$dir/$c"
+  ln -sfn "$dir/hol-toolchains" "$dir/$c/hol-toolchains"
+done
 if [[ -n $budget_mb ]]; then echo $((budget_mb * 1024 * 1024)) > "$dir/cooperate/budget"; fi
 
 command_pid= worker_pids=() service_pids=() pg_started=0
@@ -114,14 +121,18 @@ terminate() {
   for pid in "$@"; do wait "$pid" 2>/dev/null || true; done
 }
 # TERM to COMMAND's whole process group (a shell's children too), KILL after 10 s.
+# Bash reaps COMMAND while it waits on sleep, so the group's leader doesn't linger as a zombie.
+group_gone_within() {
+  local _
+  for _ in $(seq "$1"); do kill -0 -- "-$command_pid" 2>/dev/null || return 0; sleep 0.1; done
+  return 1
+}
 stop_command() {
-  local watchdog
-  if ! kill -TERM -- "-$command_pid" 2>/dev/null; then wait "$command_pid" 2>/dev/null || true; return 0; fi
-  (sleep 10 && kill -KILL -- "-$command_pid" 2>/dev/null) &
-  watchdog=$!
-  wait "$command_pid" 2>/dev/null || true
-  while kill -0 -- "-$command_pid" 2>/dev/null; do sleep 0.1; done
-  kill "$watchdog" 2>/dev/null || true
+  kill -TERM -- "-$command_pid" 2>/dev/null || return 0
+  group_gone_within 100 && return 0
+  kill -KILL -- "-$command_pid" 2>/dev/null || return 0
+  group_gone_within 50 && return 0
+  echo "local-fleet: COMMAND's process group $command_pid outlived SIGKILL; going on without it" >&2
 }
 stop() {
   local status=$?
@@ -137,7 +148,7 @@ stop() {
     done
     pg_ctl -s -D "$dir/pg" stop -m fast || true
   fi
-  if ((!keep)); then rm -rf "$dir"/{pg,remote,worker-cache,client-cache,hol-toolchains,releases,tmp}; fi
+  if ((!keep)); then rm -rf "$dir"/{pg,remote,worker-cache-*,client-cache,hol-toolchains,releases,tmp}; fi
   echo "local-fleet: logs and tables in $dir" >&2
   exit "$status"
 }
@@ -154,9 +165,10 @@ PGPASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 pgport=$(free_port)
 initdb -A scram-sha-256 -U postgres --pwfile "$dir/pg.password" -D "$dir/pg" > "$dir/logs/initdb.log"
 rm -f "$dir/pg.password"
+# Set first: an interrupt or a failed wait can leave a server running once pg_ctl has launched it.
+pg_started=1
 pg_ctl -s -D "$dir/pg" -l "$dir/logs/postgres.log" \
   -o "-p $pgport -k $dir -c listen_addresses=127.0.0.1 -c max_connections=$((workers * 4 + 100))" start
-pg_started=1
 createdb -h "$dir" -p "$pgport" -U postgres fleet
 database_url=postgresql+asyncpg://postgres:$PGPASSWORD@127.0.0.1:$pgport/fleet
 
@@ -168,8 +180,10 @@ python=$tree/remote-exec/.venv/bin/python
 cache_user=local-fleet:$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 (umask 077 && mkdir "$dir/cache-control" && printf 'Basic %s\n' "$(printf %s "$cache_user" | base64 -w0)" > "$dir/cache-control/authorization" &&
   printf 'user = "%s"\n' "$cache_user" > "$dir/cache.curl")
-"$python" "$tree/tests/fixtures/remote_cache_server.py" "$dir/remote" "$dir/cache.port" "$dir/logs/cache-requests.log" \
-  "$dir/cache-control" > "$dir/logs/cache.log" 2>&1 &
+# Services and workers run in sessions of their own, so a terminal's Ctrl-C reaches only this script,
+# which stops them in order; their secrets go in their environment, not on a command line others can read.
+(exec setsid "$python" "$tree/tests/fixtures/remote_cache_server.py" "$dir/remote" "$dir/cache.port" \
+  "$dir/logs/cache-requests.log" "$dir/cache-control") > "$dir/logs/cache.log" 2>&1 &
 service_pids+=($!)
 for _ in $(seq 100); do [[ -s $dir/cache.port ]] && break; sleep 0.1; done
 [[ -s $dir/cache.port ]] || { echo "local-fleet: the cache server didn't start; see $dir/logs/cache.log" >&2; exit 1; }
@@ -180,26 +194,42 @@ worker_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 (umask 077 && printf 'header = "Authorization: Bearer %s"\n' "$client_token" > "$dir/client.curl")
 
 port=$(free_port)
-(cd "$tree/remote-exec" && exec env REMOTE_EXEC_DATABASE_URL="$database_url" REMOTE_EXEC_CLIENT_TOKEN="$client_token" \
-  REMOTE_EXEC_WORKER_TOKEN="$worker_token" REMOTE_EXEC_CACHE_URL="http://$cache_user@${cache_url#http://}" REMOTE_EXEC_WARM_WORKERS="$workers" \
-  .venv/bin/uvicorn --factory remote_exec.app:app --host 127.0.0.1 --port "$port" --timeout-graceful-shutdown 2) \
-  > "$dir/logs/coordinator.log" 2>&1 &
+(
+  cd "$tree/remote-exec"
+  unset PGPASSWORD
+  export REMOTE_EXEC_DATABASE_URL=$database_url REMOTE_EXEC_CLIENT_TOKEN=$client_token REMOTE_EXEC_WORKER_TOKEN=$worker_token \
+    REMOTE_EXEC_CACHE_URL=http://$cache_user@${cache_url#http://} REMOTE_EXEC_WARM_WORKERS=$workers
+  exec setsid .venv/bin/uvicorn --factory remote_exec.app:app --host 127.0.0.1 --port "$port" --timeout-graceful-shutdown 2
+) > "$dir/logs/coordinator.log" 2>&1 &
 service_pids+=($!)
 url=http://127.0.0.1:$port
-coordinator_up() { curl -sf -K "$dir/client.curl" -o /dev/null "$url/v1/queue"; }
-for _ in $(seq 300); do coordinator_up && break; sleep 0.2; done
-coordinator_up || { echo "local-fleet: the coordinator didn't answer; see $dir/logs/coordinator.log" >&2; exit 1; }
+queue() { curl -sf -K "$dir/client.curl" "$url/v1/queue"; }
+for _ in $(seq 300); do queue > /dev/null && break; sleep 0.2; done
+queue > /dev/null || { echo "local-fleet: the coordinator didn't answer; see $dir/logs/coordinator.log" >&2; exit 1; }
 
 for i in $(seq "$workers"); do
-  (cd "$dir" && exec env -u PGPASSWORD -u ECS_AGENT_URI HOLBUILD_CACHE="$dir/worker-cache" TMPDIR="$dir/tmp" \
-    HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$dir/cache.curl" \
-    HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' HOLBUILD_ACTION_READ_DIRS="$read_dirs" \
-    REMOTE_EXEC_WORKER_TOKEN="$worker_token" PYTHONPATH="$tree/remote-exec" "$python" -m remote_exec.worker \
-    --coordinator "$url" --remote-cache "$cache_url" --tier high --also-claim standard --load-ahead \
-    --max-heap 12000 --drain-seconds 20 --share-heaps --cooperate-dir "$dir/cooperate" --cache-limit-gb 100 \
-    --baked-releases "$dir/baked" --holbuild-releases-dir "$dir/releases" --name "local-$i") \
-    > "$dir/logs/worker-$i.log" 2>&1 &
+  (
+    cd "$dir"
+    unset PGPASSWORD ECS_AGENT_URI
+    export HOLBUILD_CACHE=$dir/worker-cache-$i TMPDIR=$dir/tmp HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$dir/cache.curl \
+      HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' HOLBUILD_ACTION_READ_DIRS=$read_dirs \
+      REMOTE_EXEC_WORKER_TOKEN=$worker_token PYTHONPATH=$tree/remote-exec
+    exec setsid "$python" -m remote_exec.worker \
+      --coordinator "$url" --remote-cache "$cache_url" --tier high --also-claim standard --load-ahead \
+      --max-heap 12000 --drain-seconds 20 --share-heaps --cooperate-dir "$dir/cooperate" --cache-limit-gb 100 \
+      --baked-releases "$dir/baked" --holbuild-releases-dir "$dir/releases" --name "local-$i"
+  ) > "$dir/logs/worker-$i.log" 2>&1 &
   worker_pids+=($!)
+done
+# A worker that fails at startup would leave COMMAND's work unclaimed: wait for the workers to report, then
+# check they're all still up.
+for _ in $(seq 60); do
+  queue | python3 -c 'import json, sys; sys.exit(0 if json.load(sys.stdin)["hosts"] else 1)' && break
+  sleep 0.5
+done
+for i in $(seq "$workers"); do
+  kill -0 "${worker_pids[i - 1]}" 2>/dev/null ||
+    { echo "local-fleet: worker $i exited at startup; see $dir/logs/worker-$i.log" >&2; exit 1; }
 done
 
 echo "local-fleet: $workers workers of holbuild $version from $tree at $url, run dir $dir" >&2
