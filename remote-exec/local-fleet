@@ -68,15 +68,21 @@ elif [[ -n ${SLURM_MEM_PER_GPU:-} ]]; then
   echo "local-fleet: memory booked per GPU; book it with --mem or --mem-per-cpu so the workers' budget is known" >&2
   exit 2
 fi
+# --mem=0 books the whole node: leave the budget to holbuild's own reading of the machine.
+if [[ $budget_mb == 0 ]]; then budget_mb=; fi
 
 # Nothing the command or the workers do may reach a shared cache or fleet:
 # a branch's theory outputs share their cache keys with released holbuild.
 while read -r name; do unset "$name"; done < <(compgen -e | grep -E '^HOLBUILD_REMOTE_(CACHE|EXEC)_' || true)
 unset HOLBUILD_CACHE HOLBUILD_COOPERATE_DIR
-# Nor may the coordinator call a deployment's scaler or cache pool (its settings ignore case).
-while read -r name; do unset "$name"; done < <(compgen -e | grep -iE '^REMOTE_EXEC_(SCALE_CMD|CACHE_POOL_CMD|CACHE_SLOTS)$' || true)
+# Nor may the coordinator call a deployment's scaler or cache pool, or reach its database or cache through a
+# variant of a name set below: its settings ignore case.
+while read -r name; do unset "$name"; done < <(compgen -e |
+  grep -iE '^REMOTE_EXEC_(SCALE_CMD|CACHE_POOL_CMD|CACHE_SLOTS|DATABASE_URL|CACHE_URL|CLIENT_TOKEN|WORKER_TOKEN|WARM_WORKERS)$' || true)
 # Every endpoint is on loopback: keep an inherited proxy out of the way.
 export no_proxy=${no_proxy:+$no_proxy,}127.0.0.1 NO_PROXY=${NO_PROXY:+$NO_PROXY,}127.0.0.1
+# holbuild checks a seeded toolchain's HOL checkout with git status, which mustn't refresh its index.
+export GIT_OPTIONAL_LOCKS=0
 
 if [[ -z $dir ]]; then
   mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/holbuild-local-fleet"
@@ -89,12 +95,13 @@ dir=$(realpath -m "$dir")
 # It goes unquoted into Postgres's options and quoted into psql's commands.
 [[ $dir =~ ^[A-Za-z0-9/._+-]+$ ]] || { echo "local-fleet: the run directory $dir must be a plain path (letters, digits, / . _ + -)" >&2; exit 2; }
 mkdir -p -m 700 "$dir"
+[[ -O $dir ]] || { echo "local-fleet: the run directory $dir isn't yours" >&2; exit 2; }
+chmod 700 "$dir"
 # Creating logs/ claims the directory: of two runs given the same one, only the first gets it.
 if [[ -n $(ls -A "$dir") ]] || ! mkdir "$dir/logs" 2>/dev/null; then
   echo "local-fleet: the run directory $dir is not empty; give a new or empty one" >&2
   exit 2
 fi
-chmod 700 "$dir"
 mkdir -p "$dir"/{remote,baked,releases,cooperate,client-cache,hol-toolchains,tables,tmp}
 ln -sfn "$tree" "$dir/baked/v$version"
 read_dirs=${HOLBUILD_ACTION_READ_DIRS:-}
@@ -122,21 +129,25 @@ terminate() {
 }
 # TERM to COMMAND's whole process group (a shell's children too), KILL after 10 s.
 # Bash reaps COMMAND while it waits on sleep, so the group's leader doesn't linger as a zombie.
+# Until the child has exec'd setsid it has no group of its own: signal it by its PID then.
+signal_command() { kill "-$1" -- "-$command_pid" 2>/dev/null || kill "-$1" "$command_pid" 2>/dev/null; }
 group_gone_within() {
   local _
-  for _ in $(seq "$1"); do kill -0 -- "-$command_pid" 2>/dev/null || return 0; sleep 0.1; done
+  for _ in $(seq "$1"); do signal_command 0 || return 0; sleep 0.1; done
   return 1
 }
 stop_command() {
-  kill -TERM -- "-$command_pid" 2>/dev/null || return 0
+  signal_command TERM || return 0
   group_gone_within 100 && return 0
-  kill -KILL -- "-$command_pid" 2>/dev/null || return 0
+  signal_command KILL || return 0
   group_gone_within 50 && return 0
   echo "local-fleet: COMMAND's process group $command_pid outlived SIGKILL; going on without it" >&2
 }
 stop() {
   local status=$?
-  trap - EXIT INT TERM
+  # A second interrupt mustn't cut the teardown short: what it stops runs in sessions of its own.
+  trap - EXIT
+  trap '' INT TERM
   # Workers drain while the coordinator and cache still take their results and logs.
   if [[ -n $command_pid ]]; then stop_command; fi
   terminate "${worker_pids[@]}"
@@ -203,7 +214,7 @@ port=$(free_port)
 ) > "$dir/logs/coordinator.log" 2>&1 &
 service_pids+=($!)
 url=http://127.0.0.1:$port
-queue() { curl -sf -K "$dir/client.curl" "$url/v1/queue"; }
+queue() { curl -sf --max-time 10 -K "$dir/client.curl" "$url/v1/queue"; }
 for _ in $(seq 300); do queue > /dev/null && break; sleep 0.2; done
 queue > /dev/null || { echo "local-fleet: the coordinator didn't answer; see $dir/logs/coordinator.log" >&2; exit 1; }
 
@@ -221,12 +232,12 @@ for i in $(seq "$workers"); do
   ) > "$dir/logs/worker-$i.log" 2>&1 &
   worker_pids+=($!)
 done
-# A worker that fails at startup would leave COMMAND's work unclaimed: wait for the workers to report, then
-# check they're all still up.
-for _ in $(seq 60); do
-  queue | python3 -c 'import json, sys; sys.exit(0 if json.load(sys.stdin)["hosts"] else 1)' && break
-  sleep 0.5
-done
+# A worker that fails at startup would leave COMMAND's work unclaimed: wait for the workers to report their
+# host (all of them share it, and the coordinator counts hosts, not workers), then check they're all still up.
+reported() { queue | python3 -c 'import json, sys; sys.exit(0 if json.load(sys.stdin)["hosts"] else 1)'; }
+for _ in $(seq 60); do reported && break; sleep 0.5; done
+reported || { echo "local-fleet: no worker reported to the coordinator in 30 s; see $dir/logs/worker-*.log" >&2; exit 1; }
+sleep 2
 for i in $(seq "$workers"); do
   kill -0 "${worker_pids[i - 1]}" 2>/dev/null ||
     { echo "local-fleet: worker $i exited at startup; see $dir/logs/worker-$i.log" >&2; exit 1; }
