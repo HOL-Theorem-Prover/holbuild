@@ -131,6 +131,33 @@ fi
 [[ "$(stat -c %d:%i "$(deps_heap "$own" B)")" == "$stored_id" ]] \
   || { echo "the own-module tree's deps heap is not the stored one" >&2; exit 1; }
 
+# The stored heap's key covers only the holbuild runtime compiled into it:
+# a holbuild whose other runtime sources differ (here proof_runtime.sml,
+# which theory scripts load after the heap) resumes from it, and one whose
+# heap runtime differs (checkpoint_save_runtime.sml) doesn't.
+patched=$tmpdir/patched-runtime
+mkdir -p "$patched/bin" "$patched/share/holbuild"
+cp "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" "$patched/bin/holbuild"
+cp -R "$SCRIPT_DIR/../../../sml" "$patched/share/holbuild/"
+patched_build() {
+  local tree=$1
+  make_tree "$tree"
+  (cd "$tree" && rm -rf "$HOLBUILD_CACHE/actions" "$HOLBUILD_CACHE/blobs" && "$patched/bin/holbuild" build BTheory) \
+    > "$tree.log" 2>&1 || { cat "$tree.log" >&2; exit 1; }
+}
+printf '\n(* changed after the heap *)\n' >> "$patched/share/holbuild/sml/proof_runtime.sml"
+patched_build "$tmpdir/script-runtime"
+grep -A1 '^resuming BTheory' "$tmpdir/script-runtime.log" | grep -q 'from: deps-loaded checkpoint' \
+  || { echo "a changed script runtime missed the stored deps heap" >&2; cat "$tmpdir/script-runtime.log" >&2; exit 1; }
+[[ "$(stat -c %d:%i "$(deps_heap "$tmpdir/script-runtime" B)")" == "$stored_id" ]] \
+  || { echo "the changed script runtime's deps heap is not the stored one" >&2; exit 1; }
+printf '\n(* changed in the heap *)\n' >> "$patched/share/holbuild/sml/checkpoint_save_runtime.sml"
+patched_build "$tmpdir/heap-runtime"
+if grep -A1 '^resuming BTheory' "$tmpdir/heap-runtime.log" | grep -q 'from: deps-loaded checkpoint'; then
+  echo "a changed heap runtime resumed from the stored deps heap" >&2
+  exit 1
+fi
+
 # A build with --no-cache neither resumes from the store nor adds to it.
 nocache=$tmpdir/nocache
 make_tree "$nocache"

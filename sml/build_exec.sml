@@ -2834,6 +2834,55 @@ fun discover_boundaries_and_terminations source_path source_text =
    staged scripts carried location pragmas are not resumed. *)
 val theorem_location_schema = "source_pragmas_v1"
 
+(* The holbuild sources compiled into a deps_loaded heap: those its preload
+   uses before the save (write_preload), with ahead_load_runtime.sml for a
+   child that loads ahead (write_ahead_preload).  A resume from the heap
+   doesn't compile them again, so its key covers them and only them, and a
+   release that changes only other runtime sources keeps every deps heap.
+   The preload's and child policy's generated text isn't in a hashed file:
+   changing what it leaves in the heap needs a version bump of the
+   dependency context keys and of shared_heap_key, whose deps-key a worker
+   with early cutoff takes from the remote dependency context. *)
+val heap_runtime_source_files =
+  HolbuildToolchain.runtime_files @ ["sml/checkpoint_save_runtime.sml", "sml/ahead_load_runtime.sml"]
+
+(* The holbuild sources a theory child loads, directly or through the HOL
+   analyser that instruments its script.  Checkpoints above the deps heap
+   hold them, so their keys include them, and a worker runs only specs
+   exported by holbuild with the same sources. *)
+val runtime_source_files =
+  heap_runtime_source_files @
+  ["sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml", "sml/deferred_proofs_runtime.sml"] @
+  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
+      HolbuildHolSharedCache.analyser_source_files
+
+fun runtime_files_identity header files =
+  let
+    fun line rel =
+      rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.runtime_root (), rel))
+  in
+    HolbuildToolchain.hash_text
+      (String.concatWith "\n" (header :: map line (sort_strings (unique_strings files))) ^ "\n")
+  end
+
+val runtime_identity_memo : string option ref = ref NONE
+
+fun runtime_identity () =
+  case !runtime_identity_memo of
+      SOME identity => identity
+    | NONE =>
+        let val identity = runtime_files_identity "holbuild-runtime-v1" runtime_source_files
+        in runtime_identity_memo := SOME identity; identity end
+
+val heap_runtime_identity_memo : string option ref = ref NONE
+
+fun heap_runtime_identity () =
+  case !heap_runtime_identity_memo of
+      SOME identity => identity
+    | NONE =>
+        let val identity = runtime_files_identity "holbuild-heap-runtime-v1" heap_runtime_source_files
+        in heap_runtime_identity_memo := SOME identity; identity end
+
 (* Context checkpoints also hold the theorem numbering HOL assigned so far.
    States saved while termination goals were derived by a second Hol_defn
    carry advanced numbering, so they are not resumed. *)
@@ -2851,7 +2900,8 @@ fun theorem_checkpoint_key {kind, name, safe_name, boundary, deps_key, proof_eng
         "proof_engine=" ^ proof_engine,
         "prefix_key=" ^ prefix_hash,
         "theorem_locations=" ^ theorem_location_schema,
-        "termination_goals=" ^ termination_goal_schema] ^ "\n")
+        "termination_goals=" ^ termination_goal_schema,
+        "runtime=" ^ runtime_identity ()] ^ "\n")
 
 fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engine, prefix_hash} =
   HolbuildToolchain.hash_text
@@ -2864,7 +2914,8 @@ fun declaration_checkpoint_key {name, safe_name, boundary, deps_key, proof_engin
         "proof_engine=" ^ proof_engine,
         "prefix_key=" ^ prefix_hash,
         "theorem_locations=" ^ theorem_location_schema,
-        "termination_goals=" ^ termination_goal_schema] ^ "\n")
+        "termination_goals=" ^ termination_goal_schema,
+        "runtime=" ^ runtime_identity ()] ^ "\n")
 
 fun proof_timeout_field proof_timeout = ("proof_timeout", timeout_text proof_timeout)
 
@@ -2913,7 +2964,8 @@ fun failed_prefix_ok proof_engine proof_timeout deps_key safe_name pre_hash head
      ("failure_diagnostic_key", failed_prefix_diagnostic_key proof_engine),
      ("resume_schema_key", failed_prefix_resume_schema_key proof_engine),
      ("theorem_locations", theorem_location_schema),
-     ("termination_goals", termination_goal_schema)]
+     ("termination_goals", termination_goal_schema),
+     ("runtime", runtime_identity ())]
 
 fun nondefault_source_name (action : theory_action) =
   if #source_name action = HolbuildBuildPlan.default_source_name (#package action) (#relative_path action)
@@ -2973,34 +3025,6 @@ fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs
           end)
       terminations
 
-(* The holbuild sources a theory child loads, directly or through the HOL
-   analyser that instruments its script.  They end up in saved heaps, so local
-   dependency heaps are keyed on them and a worker runs only specs exported by
-   holbuild with the same sources. *)
-val runtime_source_files =
-  HolbuildToolchain.runtime_files @
-  ["sml/checkpoint_save_runtime.sml", "sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml", "sml/deferred_proofs_runtime.sml"] @
-  map (fn file => normalize_path (Path.concat("sml/analyser", file)))
-      HolbuildHolSharedCache.analyser_source_files
-
-val runtime_identity_memo : string option ref = ref NONE
-
-fun runtime_identity () =
-  case !runtime_identity_memo of
-      SOME identity => identity
-    | NONE =>
-        let
-          fun line rel =
-            rel ^ " " ^ HolbuildHash.file_sha256 (Path.concat(HolbuildRuntimePaths.runtime_root (), rel))
-          val identity =
-            HolbuildToolchain.hash_text
-              (String.concatWith "\n"
-                 ("holbuild-runtime-v1" :: map line (sort_strings (unique_strings runtime_source_files))) ^ "\n")
-        in
-          runtime_identity_memo := SOME identity;
-          identity
-        end
-
 (* What a theory's preload loads, in order, named the same wherever the
    project is checked out. *)
 fun preload_order_lines plan node =
@@ -3032,11 +3056,11 @@ fun dependency_input_context_key toolchain_key plan keys node =
             val key =
               HolbuildToolchain.hash_text
                 (String.concatWith "\n"
-                   (* Local heaps contain the runtime, so they are keyed on it.
-                      Artifact action keys don't depend on it. *)
+                   (* Deps heaps contain the heap runtime, so they are keyed
+                      on it.  Artifact action keys don't depend on it. *)
                    (["holbuild-dependency-context-v4",
                      "toolchain_key=" ^ toolchain_key,
-                     "runtime=" ^ runtime_identity ()] @ project_lines @ preload_order_lines plan node) ^ "\n")
+                     "runtime=" ^ heap_runtime_identity ()] @ project_lines @ preload_order_lines plan node) ^ "\n")
           in
             HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
             key
@@ -3487,7 +3511,7 @@ fun dependency_context_key toolchain_key plan keys node =
                       (String.concatWith "\n"
                          (["holbuild-dependency-context-v5",
                            "toolchain_key=" ^ toolchain_key,
-                           "runtime=" ^ runtime_identity (),
+                           "runtime=" ^ heap_runtime_identity (),
                            "deps_output_key=" ^ outputs_key] @ preload_order_lines plan node) ^ "\n")
                 in
                   HolbuildBuildPlan.remember_dependency_context_key plan node context_id key;
@@ -5149,7 +5173,7 @@ fun local_heap_key tc heap_context (action : theory_action) =
           "loads=" ^ HolbuildHash.string_sha256 (String.concatWith "\n" (map load_line (#loads action)) ^ "\n"),
           "toolchain-exact=" ^ HolbuildToolchain.toolchain_key tc,
           "holdir=" ^ FS.fullPath (#holdir tc),
-          "runtime=" ^ runtime_identity ()] ^ "\n")
+          "runtime=" ^ heap_runtime_identity ()] ^ "\n")
   end
 
 fun local_heap_location tc heap_context action =
@@ -10945,7 +10969,7 @@ fun shared_heap_key tc root (action : theory_action) =
         "platform=" ^ String.concatWith " "
                         (map HolbuildHolSharedCache.platform_value
                              ["uname -s", "uname -m", "getconf GNU_LIBC_VERSION"]),
-        "runtime=" ^ runtime_identity ()] ^ "\n")
+        "runtime=" ^ heap_runtime_identity ()] ^ "\n")
 
 fun shared_checkpoint_key heap_key kind checkpoint_key =
   HolbuildHash.string_sha256

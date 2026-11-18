@@ -1156,7 +1156,9 @@ A theory's `deps_loaded` checkpoint, its dependencies loaded into the
 toolchain's base state, is also kept once per host in
 `$HOLBUILD_CACHE/checkpoint-store/`, keyed by the dependencies' input keys
 and their theories' `.dat` and generated `.sml` files, the theory's loads (by path relative to the project), the toolchain and the
-holbuild runtime. The project's directory isn't part of the key, so every
+holbuild runtime sources compiled into the heap (not those the theory's script
+loads after it, so a release that changes only those keeps every stored heap).
+The project's directory isn't part of the key, so every
 worktree or copy of a project that uses the cache (not with `--no-cache`,
 nor for a theory with `cache = false`) shares one heap per
 dependency set: a theory with no valid `deps_loaded` hard-links the stored
@@ -2013,8 +2015,9 @@ the spec's. If there's none, it restores the dependency heap; if there's no
 heap either, it loads the dependencies cold. After the build, successful or
 not, it publishes its heap if no other worker's is, and then, when the heap
 under them is the published one, the checkpoints it saved. A heap is shared
-only between workers with the same toolchain bytes, cache root, action root
-and platform, which is why every worker should use the same cache root.
+only between workers with the same toolchain bytes, cache root, action root,
+platform and holbuild runtime sources compiled into the heap, which is why
+every worker should use the same cache root.
 
 The checkpoint tree is then the action's own, emptied before and after it;
 the host store `<cache root>/checkpoint-store` keeps the shared files, one
