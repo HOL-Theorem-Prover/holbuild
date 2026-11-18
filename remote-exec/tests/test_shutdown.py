@@ -67,6 +67,6 @@ async def test_sigterm_exits_promptly_with_open_events_stream_and_claim(coordina
     # uvicorn re-raises the SIGTERM it handled once shutdown is done, whether or not lifespan shutdown succeeded.
     assert process.returncode == -signal.SIGTERM, process.returncode
     assert b"Application shutdown complete" in output, output.decode()
-    # Deployment health checks read answered requests from the access log; the summary line counts them too.
-    assert b'"GET /v1/queue HTTP/1.1" 200' in output, output.decode()
+    # Deployment health checks read answered claims from the access log; the summary line counts them too.
+    assert b'"POST /v1/work/claim HTTP/1.1" 200' in output, output.decode()
     assert b"POST /v1/batches 201 1" in output, output.decode()
