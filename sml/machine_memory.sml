@@ -484,13 +484,6 @@ fun cgroup_shortfall dir charge starting =
                    ", below the charge")
     | _ => NONE
 
-(* How many of this process's children wait for a reservation now. *)
-val waiting_mutex = Mutex.mutex ()
-val waiting_count = ref 0
-fun change_waiting n =
-  (Mutex.lock waiting_mutex; waiting_count := !waiting_count + n; Mutex.unlock waiting_mutex)
-fun waiting_children () = !waiting_count
-
 fun acquire {dir, budget_mb, charge_mb} =
   let
     val charge = charge_mb * mib
@@ -523,8 +516,6 @@ fun acquire {dir, budget_mb, charge_mb} =
                           | SOME why => Wait why
             end
         end)
-    val counted = ref false
-    fun uncount () = if !counted then (counted := false; change_waiting ~1) else ()
     fun loop waiting =
       case try () of
           Admitted lease =>
@@ -534,15 +525,23 @@ fun acquire {dir, budget_mb, charge_mb} =
         | Wait why =>
             (check_not_stopped ();
              (if waiting then ()
-              else (counted := true;
-                    change_waiting 1;
-                    HolbuildStatus.set_waiting_for_memory
-                      (SOME ("needs " ^ mib_text charge ^ ", " ^ why))));
+              else HolbuildStatus.set_waiting_for_memory
+                     (SOME ("needs " ^ mib_text charge ^ ", " ^ why)));
              OS.Process.sleep (retry_delay ());
              loop true)
   in
-    (loop false before uncount ()) handle e => (uncount (); raise e)
+    loop false
   end
+
+(* The threads running a child on a reservation now. *)
+val holders_mutex = Mutex.mutex ()
+val holders = ref ([] : Thread.thread list)
+fun change_holders f = (Mutex.lock holders_mutex; holders := f (!holders); Mutex.unlock holders_mutex)
+
+(* Whether THREAD runs a child on a reservation now; always, with
+   cooperation off. *)
+fun holds_reservation thread =
+  not (Option.isSome (!settings)) orelse List.exists (fn t => Thread.equal (t, thread)) (!holders)
 
 (* Runs launch with a reserved lease descriptor that the child must inherit,
    or with NONE when cooperation is off. *)
@@ -550,10 +549,14 @@ fun with_reservation launch =
   case !settings of
       NONE => launch NONE
     | SOME s =>
-        let val lease = acquire s
+        let
+          val lease = acquire s
+          val self = Thread.self ()
+          fun done () = (change_holders (List.filter (fn t => not (Thread.equal (t, self)))); release lease)
         in
-          (launch (SOME (#fd lease)) before release lease)
-          handle e => (release lease; raise e)
+          change_holders (fn ts => self :: ts);
+          (launch (SOME (#fd lease)) before done ())
+          handle e => (done (); raise e)
         end
 
 end

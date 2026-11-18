@@ -6501,6 +6501,25 @@ fun read_base_report path =
 (* The file the child evaluates first: the runtime, the recording loader and
    LOAD_LINES under it, which pass through the stand-ins, and a last step
    that waits for exec-action to write the files the child evaluates next. *)
+(* Writes the stand-in for late parent NAME at load stem STEM: its .uo
+   loads PREDICTED, its predicted manifest, between the runtime's enter and
+   wait steps, which keep their files in DIR. *)
+fun write_stand_in {dir, name, stem, predicted} =
+  let
+    fun marker file = Path.concat (dir, file)
+    val enter = marker (name ^ "-enter.sml")
+    val wait = marker (name ^ "-wait.sml")
+  in
+    write_text enter ("val _ = HolbuildAheadLoad.enter " ^ HolbuildToolchain.sml_string name ^ ";\n");
+    write_text wait
+      ("val _ = HolbuildAheadLoad.wait {parent = " ^ HolbuildToolchain.sml_string name ^
+       ", ui = " ^ HolbuildToolchain.sml_string (marker (name ^ ".ui")) ^
+       ", uo = " ^ HolbuildToolchain.sml_string (marker (name ^ ".uo")) ^ "};\n");
+    ensure_dir (Path.dir (hfs_remapped_path stem));
+    write_object_manifest (stem ^ ".ui") [];
+    write_object_manifest (stem ^ ".uo") (enter :: predicted @ [wait])
+  end
+
 fun write_ahead_preload {load_lines, dir, share, path} =
   let
     val no_loader = HolbuildToolchain.sml_string "this toolchain's HOL has no Meta.loadPlan"
@@ -6632,8 +6651,6 @@ fun with_outline_watch stage on_outline f =
 
 exception AheadAbandoned of string
 
-val memory_yield_seconds = 2
-
 (* Starts the theory child of a pipelined build in STAGE ahead of LATE, its
    parents still being built, as exec-action --ahead-parent does: the child
    loads its other ancestors at once, and in each late parent's place its
@@ -6680,12 +6697,9 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
     fun resolve name = Option.map (fn (stem, order) => (view_stem view stem, order)) (plan_load_stem plan name)
     fun load (LoadObject stem) = LoadObject (view_stem view (in_root root stem))
       | load other = other
-    fun write_stand_in base parents_memo parent =
+    fun write_parent_stand_in base parents_memo parent =
       let
         val stem = stand_in parent
-        val name = Path.file stem
-        val enter = marker (name ^ "-enter.sml")
-        val wait = marker (name ^ "-wait.sml")
         val predicted =
           predicted_theory_loads
             {root = root, cwd = FS.fullPath stage, holdir = FS.fullPath (#holdir tc), base = base,
@@ -6694,14 +6708,7 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
                        lib_manifests = []},
              source_text = read_text (source_file parent)}
       in
-        write_text enter ("val _ = HolbuildAheadLoad.enter " ^ HolbuildToolchain.sml_string name ^ ";\n");
-        write_text wait
-          ("val _ = HolbuildAheadLoad.wait {parent = " ^ HolbuildToolchain.sml_string name ^
-           ", ui = " ^ HolbuildToolchain.sml_string (marker (name ^ ".ui")) ^
-           ", uo = " ^ HolbuildToolchain.sml_string (marker (name ^ ".uo")) ^ "};\n");
-        ensure_dir (Path.dir (hfs_remapped_path stem));
-        write_object_manifest (stem ^ ".ui") [];
-        write_object_manifest (stem ^ ".uo") (enter :: predicted @ [wait])
+        write_stand_in {dir = dir, name = Path.file stem, stem = stem, predicted = predicted}
       end
       handle e as AheadAbandoned _ => raise e
            | e => raise AheadAbandoned ("cannot predict the load manifest of " ^ logical_name parent ^ ": " ^
@@ -6713,19 +6720,15 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
         copy_binary (from ^ ".uo") (marker (name ^ ".uo"));
         drop ("arrived-" ^ name)
       end
-    (* The child holds its memory reservation while it waits, so it gives
-       way to a child of this build kept waiting for one (a late parent's,
-       say) longer than memory_yield_seconds. *)
-    val memory_wait_since = ref NONE
-    fun check_memory () =
-      if HolbuildMachineMemory.waiting_children () = 0 then memory_wait_since := NONE
-      else
-        case !memory_wait_since of
-            NONE => memory_wait_since := SOME (Time.now ())
-          | SOME since =>
-              if Time.> (Time.- (Time.now (), since), Time.fromSeconds memory_yield_seconds) then
-                raise AheadAbandoned "another child is waiting for machine memory"
-              else ()
+    (* A late parent's child has reached its stand-in's wait step. *)
+    val seen_waiting = ref ([] : string list)
+    fun note_waiting parent =
+      let val name = Path.file (stand_in parent)
+      in
+        if List.exists (fn n => n = name) (!seen_waiting) orelse not (file_exists (marker ("waiting-" ^ name))) then ()
+        else (seen_waiting := name :: !seen_waiting;
+              pipeline_trace ("ahead waiting: " ^ #logical action ^ " for " ^ logical_name parent))
+      end
     fun poll [] = ()
       | poll pending =
           let
@@ -6735,7 +6738,7 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
             List.app arrive came;
             if not (null came) then ()
             else if child_done () then abandon_stopped "before its parents arrived"
-            else (check_memory (); pause ());
+            else (List.app note_waiting pending; pause ());
             poll (List.filter (not o has_come) pending)
           end
     (* The late parents' own manifests in place of their stand-ins, for a
@@ -6760,8 +6763,7 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
          | _ => ())
     fun ahead () =
       (wait_until (fn () => file_exists (marker "base-loaded"));
-       pipeline_trace ("ahead loaded: " ^ #logical action);
-       List.app (write_stand_in (read_base_report (marker "base-loaded")) (ref (Binarymap.mkDict String.compare))) late;
+       List.app (write_parent_stand_in (read_base_report (marker "base-loaded")) (ref (Binarymap.mkDict String.compare))) late;
        drop "stand-ins";
        poll late;
        set_attached_child (SOME join);
@@ -6966,6 +6968,8 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     val attempt = Array.array (node_count, ANone)
     val outline_owner = Array.array (node_count, NONE : (int * Thread.thread) option)
     val attempt_owner = Array.array (node_count, NONE : (int * Thread.thread) option)
+    (* The worker that took each node's plain build. *)
+    val plain_owner = Array.array (node_count, NONE : Thread.thread option)
     val cold = Array.array (node_count, NONE : bool option)
     (* Whether a theory's ready outline exports what its outputs on disk do. *)
     val outline_unchanged = Array.array (node_count, false)
@@ -7240,10 +7244,25 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     fun producer id =
       case Array.sub (attempt, id) of ARunning (gen, _) => SOME gen | ADone (gen, _, _) => SOME gen | _ => NONE
 
-    (* A parent an attempt can start ahead of: a theory being built on
-       parents that are all available. *)
+    (* Whether the build of node ID runs on its memory reservation
+       (HolbuildMachineMemory), or needs none any more: an attempt started
+       ahead of it holds one while it waits, which must not keep ID's own
+       child from starting. *)
+    fun reserved id =
+      case (Array.sub (attempt, id), Array.sub (attempt_owner, id)) of
+          (ARunning (gen, _), SOME (g, thread)) => g = gen andalso HolbuildMachineMemory.holds_reservation thread
+        | (ARunning _, _) => false
+        | (ADone _, _) => true
+        | _ =>
+            case Array.sub (plain_owner, id) of
+                SOME thread => HolbuildMachineMemory.holds_reservation thread
+              | NONE => false
+
+    (* A parent an attempt can start ahead of: a theory being built, on its
+       reservation, on parents that are all available. *)
     fun late_parent id =
-      not (available id) andalso is_theory id andalso producing id andalso List.all available (Array.sub (deps_of, id))
+      not (available id) andalso is_theory id andalso producing id andalso reserved id andalso
+      List.all available (Array.sub (deps_of, id))
 
     (* Whether a dependent of ID could start on its outline. *)
     fun has_eligible_child id =
@@ -7365,10 +7384,12 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
           if pipelined then
             (Array.update (plain_started, id, false);
              start_attempt id (new_gen ()) (Binaryset.empty int_compare) [])
-          else (mark_active_node id; dispatched id; SOME (PlainWork id))
+          else (mark_active_node id; Array.update (plain_owner, id, SOME (Thread.self ())); dispatched id;
+                SOME (PlainWork id))
         end
       else
         (mark_active_node id;
+         Array.update (plain_owner, id, SOME (Thread.self ()));
          dispatched id;
          if priority then priority_running := !priority_running + 1 else ();
          SOME (PlainWork id))
@@ -14280,18 +14301,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                                                   (in_root root stem ^ suffix, map lib_load loads))
                                                (#libs parent)},
                  source_text = read_text parent_source}
-            val enter = marker (name ^ "-enter.sml")
-            val wait = marker (name ^ "-wait.sml")
-            val stem_path = in_root root stem
           in
-            write_text enter ("val _ = HolbuildAheadLoad.enter " ^ HolbuildToolchain.sml_string name ^ ";\n");
-            write_text wait
-              ("val _ = HolbuildAheadLoad.wait {parent = " ^ HolbuildToolchain.sml_string name ^
-               ", ui = " ^ HolbuildToolchain.sml_string (marker (name ^ ".ui")) ^
-               ", uo = " ^ HolbuildToolchain.sml_string (marker (name ^ ".uo")) ^ "};\n");
-            ensure_dir (Path.dir (hfs_remapped_path stem_path));
-            write_object_manifest (stem_path ^ ".ui") [];
-            write_object_manifest (stem_path ^ ".uo") (enter :: predicted @ [wait])
+            write_stand_in {dir = dir, name = name, stem = in_root root stem, predicted = predicted}
           end
           handle e as ActionFailed _ => raise e
                | e as HolbuildRemoteCache.Unavailable _ => raise e

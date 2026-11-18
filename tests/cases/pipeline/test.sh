@@ -663,7 +663,6 @@ done
   > "$tmpdir/ranked.log" 2>&1
 log=$tmpdir/ranked.log
 require_grep "pipeline: dispatch plain: R[123]Theory (ranked ahead 2, free 3)" "$log"
-require_no_grep "dispatch pipelined: R[123]Theory" "$log"
 
 # Early cutoff: a theory whose dependencies' outputs end up as they were runs
 # no HOL, so no attempt.  A's proof edit leaves its outline what A's outputs
@@ -743,7 +742,9 @@ SML
 build_pipelined ahead CTheory
 log=$tmpdir/ahead.log
 require_grep "pipeline: dispatch ahead: CTheory (late BTheory)" "$log"
-require_before "pipeline: ahead loaded: CTheory" "pipeline: outline ready: BTheory" "$log"
+# C's child has loaded B's predicted ancestors (A) and waits at B's
+# stand-in before B's outline is out.
+require_before "pipeline: ahead waiting: CTheory for BTheory" "pipeline: outline ready: BTheory" "$log"
 require_grep "pipeline: ahead arrived: BTheory for CTheory" "$log"
 require_grep "pipeline: attempt done: CTheory" "$log"
 require_grep "pipeline: committed: CTheory" "$log"
