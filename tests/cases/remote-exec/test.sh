@@ -1322,8 +1322,19 @@ refute_grep "on a remote worker\|CTheory built" "$tmpdir/proof-nolog.log"
 [[ $(local_hol_runs "$tmpdir/proof-nolog.timing") -gt 0 ]] || { cat "$tmpdir/proof-nolog.timing" >&2; exit 1; }
 
 # The same, but the local build of B succeeds (the failure was the workers'
-# alone): the build still fails, since B failed remotely and C wasn't built.
+# alone): the build still fails, since B failed remotely and its child C
+# wasn't built.
 write_broken two
+cat > "$project/src/CScript.sml" <<SML
+Theory C
+Ancestors B
+
+Theorem c_thm:
+  T
+Proof
+  ACCEPT_TAC b_thm
+QED
+SML
 cat > "$state/heal" <<SML
 Theory B
 Ancestors A
@@ -1343,6 +1354,16 @@ require_grep "BTheory built" "$tmpdir/proof-nolog-healed.log"
 require_grep "BTheory failed remotely: proof" "$tmpdir/proof-nolog-healed.log"
 refute_grep "CTheory built" "$tmpdir/proof-nolog-healed.log"
 write_broken two
+cat > "$project/src/CScript.sml" <<SML
+Theory C
+Ancestors bool
+
+Theorem c_thm:
+  T
+Proof
+  simp[]
+QED
+SML
 
 # B's diagnostic prints as soon as the batch reports B failed, while the rest
 # of the batch runs (the stub holds the stream after B, before C), and a build
