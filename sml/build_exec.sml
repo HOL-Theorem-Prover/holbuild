@@ -150,10 +150,8 @@ fun source_artifacts node = #artifacts (HolbuildBuildPlan.source_of node)
 fun source_policy node = #policy (HolbuildBuildPlan.source_of node)
 fun source_deps plan node = HolbuildBuildPlan.dependencies plan node
 fun source_extra_output_declarations plan node = #extra_outputs (source_deps plan node)
-fun source_extra_output_path node declaration =
-  normalize_path (Path.concat(Path.dir (source_file node), declaration))
 fun source_extra_output_paths plan node =
-  map (source_extra_output_path node) (source_extra_output_declarations plan node)
+  map (HolbuildBuildPlan.extra_output_path node) (source_extra_output_declarations plan node)
 fun staged_extra_output_path stage declaration = normalize_path (Path.concat(stage, declaration))
 fun logical_name node = HolbuildBuildPlan.logical_name node
 fun package node = HolbuildBuildPlan.package node
@@ -677,19 +675,32 @@ fun claim_extra_outputs project node outputs =
     handle e => (List.app remove_file (!created); raise e)
   end
 
+(* Whether OWNER is a dependency's theory and OUTPUT is outside the project's
+   .holbuild/packages, so in the dependency's own sources (a checkout other
+   projects may share, an override path, HOL's tree), where 0.14.63 and
+   0.14.64 put its extra outputs.  Such a file is not this project's to
+   remove: the tree there may since track a file at that path. *)
+fun legacy_dependency_output project (ExtraOutputOwner {package, ...}) output =
+  package <> HolbuildProject.package_name (HolbuildProject.project_package project) andalso
+  not (String.isPrefix
+         (Path.concat(Path.concat(project_artifact_root project, ".holbuild/packages"), package ^ "/extra-outputs") ^ "/")
+         output)
+
 fun release_extra_output project owner strict output =
   let val claim_path = extra_output_claim_path project output
   in
     case read_extra_output_claim project output of
         SOME existing =>
           if same_extra_output_owner (owner, existing) then
-            (remove_file output; remove_file claim_path)
+            ((if legacy_dependency_output project owner output then () else remove_file output);
+             remove_file claim_path)
           else if strict then
             raise Error ("refusing to remove extra output owned by " ^
                          extra_output_owner_text existing ^ ": " ^ output)
           else ()
       | NONE =>
-          if strict andalso extra_output_registry_path_exists output then
+          if strict andalso not (legacy_dependency_output project owner output) andalso
+             extra_output_registry_path_exists output then
             raise Error ("extra output has no ownership record; refusing to remove: " ^ output)
           else ()
   end
@@ -705,6 +716,76 @@ fun record_materialized_extra_outputs project node outputs =
     if null outputs then remove_file action_path
     else write_text action_path (extra_output_action_text owner outputs)
   end
+
+(* Drops the ownership claims and action records of the theories of
+   PACKAGES, whose extra-output roots were just emptied
+   (reset_extra_output_roots): they are about files from another source of
+   the package. *)
+fun drop_extra_output_records project packages =
+  let
+    fun record_package path =
+      case String.tokens (fn c => c = #"\n") (read_text path) of
+          _ :: owner_line :: _ =>
+            (case HolbuildAnalysisProtocol.split owner_line of
+                 "owner" :: package :: _ => SOME package
+               | _ => NONE)
+        | _ => NONE
+    (* A directory that can't be read, or a record, fails the reset, which
+       the next locked command then redoes. *)
+    fun drop_in dir =
+      if not (extra_output_registry_path_exists dir) then ()
+      else
+        let
+          val stream = FS.openDir dir
+          fun names acc =
+            case FS.readDir stream of
+                NONE => acc
+              | SOME name => names (Path.concat(dir, name) :: acc)
+          val paths = (names [] before FS.closeDir stream)
+                      handle e => (FS.closeDir stream handle _ => (); raise e)
+          fun drop path =
+            case record_package path of
+                SOME package =>
+                  if member_string package packages then FS.remove path else ()
+              | NONE => ()
+        in
+          List.app drop paths
+        end
+        handle OS.SysErr (msg, _) => raise Error ("could not drop the extra-output records in " ^ dir ^ ": " ^ msg)
+             | IO.Io {name, cause, ...} =>
+                 raise Error ("could not read " ^ name ^ ": " ^ General.exnMessage cause)
+    val root = extra_output_registry_root project
+  in
+    drop_in (Path.concat(root, "owners"));
+    drop_in (Path.concat(root, "actions"))
+  end
+
+(* Under the project lock, before planning: empties each dependency's
+   extra-output root that isn't current (HolbuildSourceIndex.extra_output_root_current)
+   and drops its theories' ownership records, then records the identity of
+   its source, last, so a reset cut short is redone.  The names of the
+   packages whose roots it emptied. *)
+fun reset_extra_output_roots project graph =
+  List.mapPartial
+    (fn package =>
+       case HolbuildProject.package_extra_output_root package of
+           NONE => NONE
+         | SOME root =>
+             if HolbuildSourceIndex.extra_output_root_current package root then NONE
+             else
+               let val name = HolbuildProject.package_name package
+               in
+                 HolbuildRemoveTree.remove root;
+                 if extra_output_registry_path_exists root then
+                   raise Error ("could not empty the extra-output directory " ^ root)
+                 else ();
+                 drop_extra_output_records project [name];
+                 HolbuildGenerators.ensure_dir root;
+                 write_text (HolbuildSourceIndex.extra_output_root_marker root)
+                   (HolbuildSourceIndex.extra_output_root_identity package);
+                 SOME name
+               end)
+    (HolbuildProjectGraph.packages graph)
 
 fun clean_registered_extra_outputs project plan node =
   let
@@ -1723,14 +1804,13 @@ fun expand_extra_dep base decl =
   HolbuildBuildPlan.expand_extra_dep base decl
   handle HolbuildBuildPlan.Error msg => raise Error msg
 
-fun extra_dep_lines label base decls =
-  let
-    fun line decl =
-      let val expanded = sort_strings (map (fn (rel, abs) => rel ^ "@" ^ file_hash abs) (expand_extra_dep base decl))
-      in (label ^ "_decl=" ^ decl) :: map (fn s => label ^ "=" ^ s) expanded end
-  in
-    List.concat (map line decls)
-  end
+fun expand_input plan node decl =
+  #files (HolbuildBuildPlan.expand_input plan node decl)
+  handle HolbuildBuildPlan.Error msg => raise Error msg
+
+fun extra_dep_lines plan node (decl as (label, _, name)) =
+  let val expanded = sort_strings (map (fn (rel, abs) => rel ^ "@" ^ file_hash abs) (expand_input plan node decl))
+  in (label ^ "_decl=" ^ name) :: map (fn s => label ^ "=" ^ s) expanded end
 
 fun current_metadata path = SOME (read_text path) handle IO.Io _ => NONE
 
@@ -2769,7 +2849,7 @@ fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan
     CacheRestored
       (install_cache_entry (copy_blob verify_cache root) root input_key subject entry
          {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
-          extra_destination = source_extra_output_path node,
+          extra_destination = HolbuildBuildPlan.extra_output_path node,
           write_manifests = write_manifests})
   end
   handle Error "cache entry not found" => CacheMiss
@@ -3219,22 +3299,31 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool}
 
-(* checkpoint: the theory saves checkpoints at all, its deps_loaded state
-   included.  theorem_checkpoints: it also saves them per theorem and
-   definition, and on a failed proof.  checkpoint_seconds: build's
+(* checkpoint: the theory restores checkpoints and saves them at all.
+   theorem_checkpoints: it also saves them per theorem and definition, and
+   on a failed proof.  checkpoint_target: it is one of the build's targets
+   (any theory under --all-checkpoints or --repl-on-failure), which saves
+   its deps_loaded state and its theorem and definition contexts as it
+   runs; any other theory saves only a failed proof's prefix, so a passing
+   dependency pays for no checkpoint.  checkpoint_seconds: build's
    --checkpoint-seconds, the least time between two context saves. *)
 datatype checkpoint_policy =
-  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool}
+  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool}
 
 val default_checkpoint_seconds = 2.0
 
 val no_checkpoint_policy =
-  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false}
+  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false}
 
 fun checkpoint_enabled (CheckpointPolicy {checkpoint, ...}) = checkpoint
 fun theorem_checkpoints_enabled (CheckpointPolicy {theorem_checkpoints, ...}) = theorem_checkpoints
+(* Whether the theory saves its deps_loaded state, and its theorem and
+   definition contexts, as it runs. *)
+fun checkpoint_target_enabled (CheckpointPolicy {checkpoint_target, ...}) = checkpoint_target
+fun saves_progress policy = checkpoint_enabled policy andalso checkpoint_target_enabled policy
+fun context_checkpoints_enabled policy = theorem_checkpoints_enabled policy andalso saves_progress policy
 fun checkpoint_seconds (CheckpointPolicy {checkpoint_seconds, ...}) = checkpoint_seconds
 fun proof_steps_enabled (CheckpointPolicy {proof_steps, ...}) = proof_steps
 fun proof_ir_enabled (CheckpointPolicy {new_ir, ...}) = new_ir
@@ -3608,13 +3697,17 @@ fun deferrable_checkpoint source_text (checkpoints : HolbuildTheoryCheckpoints.c
 
 (* DEFER_PROOFS: the script is a pipelined build's, which defers what
    proofs it can. *)
-fun instrumented_source defer_proofs policy timeout_marker plan_only_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
+(* SHARE_FAILED_PREFIX: the script runs from the toolchain's base state with
+   no deps heap (proof_runtime.sml). *)
+fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker plan_only_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
   if proof_steps_enabled policy then
     HolbuildTheoryCheckpoints.instrument
       {source = source_text, source_name = source_name, start_offset = start_offset, checkpoints = checkpoints,
-       declaration_checkpoints = if theorem_checkpoints_enabled policy then declaration_checkpoints else [],
+       declaration_checkpoints = if context_checkpoints_enabled policy then declaration_checkpoints else [],
        terminations = terminations,
        save_checkpoints = theorem_checkpoints_enabled policy,
+       context_checkpoints = context_checkpoints_enabled policy,
+       share_failed_prefix = share_failed_prefix,
        checkpoint_seconds = checkpoint_seconds policy,
        tactic_timeout = tactic_timeout policy,
        timeout_marker = timeout_marker,
@@ -3654,10 +3747,15 @@ fun failed_prefix_resume_message logical checkpoint step_count =
     ["from: failed-prefix checkpoint in " ^ #safe_name checkpoint,
      "restoring proof-ir prefix with " ^ Int.toString step_count ^ " successful leaf steps"]
 
-fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
+(* CONTEXTS: whether the resumed run saves theorem and definition contexts:
+   not on a failed prefix with no deps_loaded under it, since a context is
+   reused only on a current deps_loaded. *)
+fun failed_prefix_resume_source policy contexts timeout_marker plan_only_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
   let
     val runtime_config =
       {checkpoint_enabled = theorem_checkpoints_enabled policy,
+       context_checkpoints = (contexts andalso context_checkpoints_enabled policy),
+       share_failed_prefix = false,
        checkpoint_seconds = checkpoint_seconds policy,
        tactic_timeout = tactic_timeout policy,
        timeout_marker = SOME timeout_marker,
@@ -3716,9 +3814,11 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_na
          source_name = source_name,
          start_offset = #boundary checkpoint,
          checkpoints = checkpoints,
-         declaration_checkpoints = if theorem_checkpoints_enabled policy then declaration_checkpoints else [],
+         declaration_checkpoints = if (contexts andalso context_checkpoints_enabled policy) then declaration_checkpoints else [],
          terminations = terminations,
          save_checkpoints = theorem_checkpoints_enabled policy,
+         context_checkpoints = (contexts andalso context_checkpoints_enabled policy),
+         share_failed_prefix = false,
          checkpoint_seconds = checkpoint_seconds policy,
          tactic_timeout = tactic_timeout policy,
          timeout_marker = SOME timeout_marker,
@@ -3795,7 +3895,14 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
 fun theory_inputs plan node =
   let
     val package_root = #package_root (HolbuildBuildPlan.source_of node)
-    val script_dir = Path.dir (source_file node)
+    (* Where the script is in its package: a script a dependency generates is
+       read from the extra-output root, but runs where the package has it. *)
+    val relative = HolbuildBuildPlan.relative_path node
+    val script_dir =
+      if String.isPrefix (normalize_path package_root ^ "/") (normalize_path (source_file node)) orelse
+         Path.isAbsolute relative orelse String.isPrefix ".." relative
+      then Path.dir (source_file node)
+      else Path.dir (Path.concat(package_root, relative))
     val script_rel_dir =
       Path.mkRelative {path = normalize_path script_dir, relativeTo = normalize_path package_root}
     (* The stage mirrors the package layout, and the script runs from its own
@@ -3805,15 +3912,13 @@ fun theory_inputs plan node =
       {path = if Path.isAbsolute rel then rel
               else normalize_path (if base = "" then rel else Path.concat(base, rel)),
        from = abs}
-    val source_inputs =
-      List.concat
-        (map (fn decl => map (staged stage_script_dir) (expand_extra_dep script_dir decl))
-             (#extra_deps (source_deps plan node)))
-    val manifest_inputs =
-      List.concat
-        (map (fn input =>
-                 map (staged "") (expand_extra_dep package_root (HolbuildProject.extra_input_path input)))
-             (HolbuildProject.action_extra_inputs (source_policy node)))
+    (* Manifest inputs are relative to the package root, source ones to the
+       script's directory. *)
+    fun stage_inputs (decl as (label, _, _)) =
+      map (staged (if label = "extra_dep" then "" else stage_script_dir)) (expand_input plan node decl)
+    val decls = HolbuildBuildPlan.extra_input_decls plan node
+    val manifest_inputs = List.concat (map stage_inputs (List.filter (fn (label, _, _) => label = "extra_dep") decls))
+    val source_inputs = List.concat (map stage_inputs (List.filter (fn (label, _, _) => label <> "extra_dep") decls))
   in
     {script_dir = stage_script_dir, inputs = source_inputs @ manifest_inputs}
   end
@@ -3916,7 +4021,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
   in
   if not (checkpoint_enabled policy) then
     (write_plain_preload load_lines preload;
-     write_text staged_script (instrumented_source defer_proofs policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
+     write_text staged_script (instrumented_source defer_proofs policy false (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
      {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
   else
     let
@@ -3933,20 +4038,24 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
            List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints)
       fun run_from_deps_checkpoint () =
         (ensure_source_checkpoint_parents ();
-         write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source false policy false (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          deps_loaded_resume_message logical;
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
+      (* A theory that isn't a target saves no deps heap: its failed
+         prefix, if any, is then a child of the base state. *)
       fun run_from_fresh_preload () =
         (remove_deps_checkpoint_descendants base deps_key;
          ensure_source_checkpoint_parents ();
-         write_preload load_lines deps_loaded deps_ok preload;
-         write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         if saves_progress policy then write_preload load_lines deps_loaded deps_ok preload
+         else write_plain_preload load_lines preload;
+         write_text staged_script (instrumented_source false policy (not (saves_progress policy)) (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
         let
           val path = #failed_prefix_path checkpoint
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
+          val contexts = deps_checkpoint_exists deps_loaded deps_key
+          val _ = write_text staged_script (failed_prefix_resume_source policy contexts timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
           val _ = failed_prefix_resume_message logical checkpoint step_count
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME (path, step_count)}
@@ -3954,7 +4063,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
       fun run_from_replay {boundary, path, safe_name, kind, failure_checkpoints} =
         let
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
+          val _ = write_text staged_script (instrumented_source false policy false (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
           val _ = source_context_resume_message logical (#source_file action) source_text kind safe_name boundary
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = failure_checkpoints @ [deps_loaded], failed_prefix_context = NONE}
@@ -4537,14 +4646,8 @@ fun action_policy_lines plan node =
       map (fn dep => "declared_dep=" ^ dep) (HolbuildProject.action_deps policy)
     val declared_load_lines =
       map (fn dep => "declared_load=" ^ dep) (HolbuildProject.action_loads policy)
-    val extra_inputs = HolbuildProject.action_extra_inputs policy
-    val extra_lines =
-      List.concat (map (fn input =>
-        extra_dep_lines "extra_dep"
-          (#package_root (HolbuildBuildPlan.source_of node))
-          [HolbuildProject.extra_input_path input]) extra_inputs)
-    val source_extra_lines =
-      extra_dep_lines "source_extra_dep" (Path.dir (source_file node)) (#extra_deps (source_deps plan node))
+    val extra_input_lines =
+      List.concat (map (extra_dep_lines plan node) (HolbuildBuildPlan.extra_input_decls plan node))
     val source_extra_output_lines =
       map (fn output => "source_extra_output=" ^ output)
           (source_extra_output_declarations plan node)
@@ -4553,8 +4656,7 @@ fun action_policy_lines plan node =
      "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
     declared_dep_lines @
     declared_load_lines @
-    extra_lines @
-    source_extra_lines @
+    extra_input_lines @
     source_extra_output_lines
   end
 
@@ -4791,13 +4893,21 @@ fun force_node ({force, force_targets, ...} : build_options) project node =
 fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
+(* Whether NODE saves checkpoints as it runs (checkpoint_policy): it is one
+   of the build's checkpoint targets (its targets, or every root-package
+   theory when it has none), or every theory is under --all-checkpoints, or
+   under --repl-on-failure, whose REPL starts from wherever a build fails. *)
+fun checkpoint_target_node ({all_checkpoints, repl_on_failure, checkpoint_targets, ...} : build_options) node =
+  all_checkpoints orelse repl_on_failure orelse force_target_node checkpoint_targets node
+
 (* An impure action never replays checkpoints: its script may compute
    different values on each run (a timestamp, a version string), and
    resuming past that code would restore the values of an earlier run. *)
-fun checkpoint_policy_for_node ({skip_checkpoints, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
+fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
   if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
     CheckpointPolicy {checkpoint = not skip_checkpoints andalso not (impure node),
                       theorem_checkpoints = not skip_checkpoints andalso not (impure node),
+                      checkpoint_target = checkpoint_target_node options node,
                       checkpoint_seconds = checkpoint_seconds,
                       proof_steps = proof_steps,
                       new_ir = new_ir,
@@ -4810,6 +4920,7 @@ fun checkpoint_policy_for_node ({skip_checkpoints, checkpoint_seconds, proof_ste
   else
     CheckpointPolicy {checkpoint = false,
                       theorem_checkpoints = false,
+                      checkpoint_target = checkpoint_target_node options node,
                       checkpoint_seconds = default_checkpoint_seconds,
                       proof_steps = false,
                       new_ir = false,
@@ -5294,7 +5405,11 @@ fun restore_local_heap tc heap_context base_context checkpoint_root (action : th
          warn ("could not restore a deps heap from the host store: " ^ General.exnMessage e);
          NONE)
   in
-    if deps_checkpoint_exists deps_loaded deps_key then NONE
+    (* Placing a heap removes the theorem checkpoints on this deps_key, among
+       them a failed prefix the theory saved with no deps_loaded (while not
+       a target), which resumes later than the heap would. *)
+    if deps_checkpoint_exists deps_loaded deps_key orelse
+       contains_failed_prefix_ok (theorem_checkpoints_for_deps_root base deps_key) then NONE
     else
       case (SOME (local_heap_location tc heap_context action)
             handle e => (warn ("could not find the host store's deps heap: " ^ General.exnMessage e); NONE)) of
@@ -5335,7 +5450,7 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
     claim_extra_outputs project node extra_output_paths;
     List.app
       (fn declaration =>
-          let val destination = source_extra_output_path node declaration
+          let val destination = HolbuildBuildPlan.extra_output_path node declaration
           in ensure_parent destination;
              copy_binary (staged_extra_output_path stage declaration) destination
           end)
@@ -6245,7 +6360,7 @@ fun speculative_action root plan keys toolchain_key view key node : theory_actio
   end
 
 fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, ...}) =
-  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false,
+  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false,
                     checkpoint_seconds = default_checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout, execution_plan = NONE,
                     trace_steps = false, repl_on_failure = false, trknl = false}
@@ -7671,12 +7786,12 @@ fun build options tc project plan toolchain_key jobs =
     toolchain_key jobs
 
 (* After remote execution, force and tracing have already been fulfilled. *)
-fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
+fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, checkpoint_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
                            new_ir, proof_scope, node_tactic_timeouts, execution_plan, repl_on_failure,
                            emit_output_hashes, allow_cache_timeout_discrepancy, trknl, fail_fast, all_checkpoints, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = ForceNone, force_targets = force_targets,
-   skip_checkpoints = skip_checkpoints, checkpoint_seconds = checkpoint_seconds,
+   checkpoint_targets = checkpoint_targets, skip_checkpoints = skip_checkpoints, checkpoint_seconds = checkpoint_seconds,
    proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
    node_tactic_timeouts = node_tactic_timeouts, execution_plan = execution_plan,
    trace_steps = false, repl_on_failure = repl_on_failure,
@@ -8190,9 +8305,11 @@ fun dependency_spec_lines hash_file root plan keys token deps =
 (* A worker saves theorem checkpoints unless the spec says otherwise: a
    spec without the line, as older clients write, means true.  Likewise a
    spec without a checkpoint-seconds line means the default, so a default
-   build's spec is the same as before the option existed.  PIPELINE: the
-   client's options let the theory build pipelined (pipelinable); a worker
-   told to pipeline then does, where its HOL can. *)
+   build's spec is the same as before the option existed.  A spec says
+   checkpoint-target=true for a target (checkpoint_target_node), which
+   saves checkpoints as it runs; without it a theory saves only a failed
+   prefix.  PIPELINE: the client's options let the theory build pipelined
+   (pipelinable); a worker told to pipeline then does, where its HOL can. *)
 fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
                      {theorem_checkpoints, forced, skip_checkpoints, pipeline} (action : theory_action) node action_text =
   let
@@ -8229,6 +8346,7 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
        "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
        bool_option "new-ir" (proof_ir_enabled policy)] @
       (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
+      (if checkpoint_target_enabled policy then [bool_option "checkpoint-target" true] else []) @
       (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
       (if Real.== (checkpoint_seconds policy, default_checkpoint_seconds) then []
        else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
@@ -9022,8 +9140,7 @@ fun plan_runs tc project planned jobs {keep_specs}
                             SOME reason => raise Error ("run-action: " ^ name ^ " can't run remotely: " ^ reason)
                           | NONE => ()
                       val planned_inputs = List.concat
-                        (map (fn (_, base, decl) =>
-                                map #2 (#files (HolbuildBuildPlan.input_expansion plan base decl)))
+                        (map (fn decl => map #2 (#files (HolbuildBuildPlan.planned_input_expansion plan node decl)))
                              (HolbuildBuildPlan.extra_input_decls plan node))
                       val _ =
                         if sort_strings (unique_strings planned_inputs) =
@@ -9307,7 +9424,8 @@ type action_spec =
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list,
    proof_steps : bool, tactic_timeout : real option, new_ir : bool,
-   theorem_checkpoints : bool, skip_checkpoints : bool, checkpoint_seconds : real, force : bool, trace_steps : bool,
+   theorem_checkpoints : bool, checkpoint_target : bool, skip_checkpoints : bool, checkpoint_seconds : real,
+   force : bool, trace_steps : bool,
    pipeline : bool, tool_cache : string option, action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
@@ -9437,6 +9555,10 @@ fun parse_action_spec text : action_spec =
        (case List.find (fn (k, _) => k = "option theorem-checkpoints") (!values) of
             SOME (_, v) => spec_bool "theorem-checkpoints" v
           | NONE => true),
+     checkpoint_target =
+       (case List.find (fn (k, _) => k = "option checkpoint-target") (!values) of
+            SOME (_, v) => spec_bool "checkpoint-target" v
+          | NONE => false),
      skip_checkpoints =
        (case List.find (fn (k, _) => k = "option skip-checkpoints") (!values) of
             SOME (_, v) => spec_bool "skip-checkpoints" v
@@ -9651,6 +9773,7 @@ fun spec_theory_action root (spec : action_spec) {deps_key, loads} : theory_acti
 fun spec_policy (spec : action_spec) =
   CheckpointPolicy {checkpoint = not (#skip_checkpoints spec),
                     theorem_checkpoints = not (#skip_checkpoints spec) andalso #theorem_checkpoints spec,
+                    checkpoint_target = #checkpoint_target spec,
                     checkpoint_seconds = #checkpoint_seconds spec,
                     proof_steps = #proof_steps spec,
                     new_ir = #new_ir spec,
@@ -11258,9 +11381,20 @@ fun shared_index_keys text =
                                    lines)
     | [] => NONE
 
+(* A failed prefix saved with no deps heap under it, by a theory that saves
+   none (checkpoint_policy), is a chain of states ending at the toolchain's
+   base state.  It is published once per theory, the theory's latest, and
+   looked for only when no deps heap is published: then nothing else is. *)
+val shared_standalone_header = "holbuild-shared-failed-prefix-v1"
+
+fun shared_standalone_key heap_key (action : theory_action) =
+  HolbuildHash.string_sha256
+    (String.concat [shared_standalone_header, "\nheap=", heap_key, "\npackage=", #package action,
+                    "\npath=", #relative_path action, "\n"])
+
 type shared_context =
-  {store : string, checkpoint_root : string, heap_key : string, index_key : string, base_state : string,
-   deps_key : string, deps_loaded : string, requested_timeout : real option,
+  {store : string, checkpoint_root : string, heap_key : string, index_key : string, standalone_key : string,
+   base_state : string, deps_key : string, deps_loaded : string, requested_timeout : real option,
    candidates : shared_candidate list}
 
 fun shared_context cache checkpoint_root tc root policy (action : theory_action) checkpoints : shared_context =
@@ -11270,6 +11404,7 @@ fun shared_context cache checkpoint_root tc root policy (action : theory_action)
   in
     {store = share_store cache, checkpoint_root = checkpoint_root,
      heap_key = heap_key, index_key = shared_index_key heap_key action,
+     standalone_key = shared_standalone_key heap_key action,
      base_state = FS.fullPath (HolbuildToolchain.base_state tc),
      deps_key = #deps_key action,
      deps_loaded = deps_loaded_path base (#deps_key action),
@@ -11301,7 +11436,8 @@ val nothing_restored : shared_restore = {heap = NONE, files = [], stale = [], mi
    else the heap, placed in the action's checkpoint tree, which is empty. *)
 (* With RESUMES false the run saves every boundary itself, so only the heap
    is restored: a linked checkpoint would sit where it saves. *)
-fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, deps_key, deps_loaded,
+fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
+                                              deps_key, deps_loaded,
                                               requested_timeout, candidates, ...} : shared_context) resumes =
   let
     val stale = ref ([] : string list)
@@ -11326,77 +11462,117 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       case List.filter (fn (r, _, _) => r = role) entries of
           [(_, sha, arg)] => (sha, arg)
         | _ => raise Error ("shared checkpoint manifest needs one " ^ role)
-    (* Each file's recorded parent is the next one down the chain. *)
-    fun chain_ok paths =
+    fun is_base_state path = (FS.fullPath path = base_state handle OS.SysErr _ => false)
+    (* Each file's recorded parent is the next one down the chain, to the
+       deps heap, or with no heap to the base state. *)
+    fun chain_ok heap paths =
       case paths of
           [] => true
-        | [last] => saved_parent last = SOME deps_loaded
-        | p :: (rest as q :: _) => saved_parent p = SOME q andalso chain_ok rest
+        | [last] =>
+            (case (heap, saved_parent last) of
+                 (SOME _, parent) => parent = SOME deps_loaded
+               | (NONE, SOME parent) => is_base_state parent
+               | (NONE, NONE) => false)
+        | p :: (rest as q :: _) => saved_parent p = SOME q andalso chain_ok heap rest
     (* A checkpoint is chained to the heap its manifest names, so only those
        on the heap now published under heap_key are restored. *)
     fun candidate_key (c : shared_candidate) = shared_checkpoint_key heap_key (#kind c) (#key c)
-    fun try_candidate published_heap (c : shared_candidate, fetched) =
-      let val key = candidate_key c
+    (* Places checkpoint C and the chain its manifest ENTRIES name under it:
+       on HEAP, or with none on the base state, the chain's lowest file then
+       naming its store family. *)
+    fun restore_chain heap (c : shared_candidate) entries =
+      let
+        val (leaf, leaf_rel) = single "leaf" entries
+        val _ = if tree_path checkpoint_root leaf_rel = #path c then ()
+                else raise Error "shared checkpoint manifest names another checkpoint"
+        val spine =
+          List.mapPartial (fn ("spine", sha, rel) => SOME (sha, tree_path checkpoint_root rel) | _ => NONE)
+                          entries
+        (* The spine's own records, so that a retry after HOL rejects
+           the leaf resumes from the checkpoint under it. *)
+        val spine_sidecars =
+          List.mapPartial
+            (fn ("spine-sidecar", sha, rel) =>
+                  let val path = tree_path checkpoint_root rel
+                  in
+                    if List.exists (fn (_, p) => List.exists (fn suffix => path = p ^ suffix)
+                                                             shared_sidecar_suffixes)
+                                   spine
+                    then SOME (sha, path)
+                    else raise Error ("unexpected shared checkpoint sidecar " ^ rel)
+                  end
+              | _ => NONE)
+            entries
+        val sidecars =
+          List.mapPartial
+            (fn ("sidecar", sha, suffix) =>
+                  if List.exists (fn s => s = suffix) (#sidecars c) then SOME (sha, #path c ^ suffix)
+                  else raise Error ("unexpected shared checkpoint sidecar " ^ suffix)
+              | _ => NONE)
+            entries
+        val family = case (heap, spine) of
+                         (SOME heap, _) => heap
+                       | (NONE, (bottom, _) :: _) => bottom
+                       | (NONE, []) => leaf
+        val heap_files = case heap of SOME heap => [(heap, deps_loaded)] | NONE => []
+        val restored = heap_files @ spine @ spine_sidecars @ ((leaf, #path c) :: sidecars)
       in
-        case fetched of
-            NONE => NONE
-          | SOME action =>
-              (let
-                 val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
-                 val (heap, _) = single "heap" entries
-                 val (leaf, leaf_rel) = single "leaf" entries
-                 val _ = if tree_path checkpoint_root leaf_rel = #path c then ()
-                         else raise Error "shared checkpoint manifest names another checkpoint"
-                 val spine =
-                   List.mapPartial (fn ("spine", sha, rel) => SOME (sha, tree_path checkpoint_root rel) | _ => NONE)
-                                   entries
-                 (* The spine's own records, so that a retry after HOL rejects
-                    the leaf resumes from the checkpoint under it. *)
-                 val spine_sidecars =
-                   List.mapPartial
-                     (fn ("spine-sidecar", sha, rel) =>
-                           let val path = tree_path checkpoint_root rel
-                           in
-                             if List.exists (fn (_, p) => List.exists (fn suffix => path = p ^ suffix)
-                                                                      shared_sidecar_suffixes)
-                                            spine
-                             then SOME (sha, path)
-                             else raise Error ("unexpected shared checkpoint sidecar " ^ rel)
-                           end
-                       | _ => NONE)
-                     entries
-                 val sidecars =
-                   List.mapPartial
-                     (fn ("sidecar", sha, suffix) =>
-                           if List.exists (fn s => s = suffix) (#sidecars c) then SOME (sha, #path c ^ suffix)
-                           else raise Error ("unexpected shared checkpoint sidecar " ^ suffix)
-                       | _ => NONE)
-                     entries
-                 val restored = (heap, deps_loaded) :: spine @ spine_sidecars @ ((leaf, #path c) :: sidecars)
-               in
-                 if heap <> published_heap then NONE else
-                 (* The small .ok first: a checkpoint with a laxer timeout than
-                    requested is skipped before its chain is fetched. *)
-                 (restore_step "rstplace" (fn () => List.app (place_sidecar heap) sidecars);
-                 if not (checkpoint_timeout_satisfies requested_timeout (#path c)) then (wipe (); NONE)
-                 else
-                   (restore_step "rstplace" (fn () =>
-                      (transfer_all (fn (placer, file) => placer heap file)
-                         ((place, (heap, deps_loaded)) :: map place_state_file spine @
-                          map (fn f => (place_sidecar, f)) spine_sidecars @
-                          [place_state_file (leaf, #path c)]);
-                       heap_placed heap));
-                    if shared_heap_parent_ok ctx andalso chain_ok (#path c :: rev (map #2 spine)) andalso
-                       #accepts c () then
-                      (HolbuildStatus.message_stdout
-                         ("restored shared " ^ #kind c ^ " checkpoint " ^ leaf_rel ^ "\n");
-                       SOME {heap = SOME heap, files = map (fn (sha, path) => (path, sha)) restored})
-                    else (warn ("shared checkpoint failed validation: " ^ leaf_rel); wipe (); NONE)))
-               end
-               handle MissingSharedBlob sha => (missing_blob key sha; wipe (); NONE)
-                    | e => (warn ("could not restore shared checkpoint: " ^ General.exnMessage e);
-                            wipe (); NONE))
+        (* The small .ok first: a checkpoint with a laxer timeout than
+           requested is skipped before its chain is fetched. *)
+        (restore_step "rstplace" (fn () => List.app (place_sidecar family) sidecars);
+        if not (checkpoint_timeout_satisfies requested_timeout (#path c)) then (wipe (); NONE)
+        else
+          (restore_step "rstplace" (fn () =>
+             (transfer_all (fn (placer, file) => placer family file)
+                (map (fn file => (place, file)) heap_files @ map place_state_file spine @
+                 map (fn f => (place_sidecar, f)) spine_sidecars @
+                 [place_state_file (leaf, #path c)]);
+              Option.app heap_placed heap));
+           if (not (Option.isSome heap) orelse shared_heap_parent_ok ctx) andalso
+              chain_ok heap (#path c :: rev (map #2 spine)) andalso #accepts c () then
+             (HolbuildStatus.message_stdout
+                ("restored shared " ^ (if Option.isSome heap then "" else "standalone ") ^ #kind c ^
+                 " checkpoint " ^ leaf_rel ^ "\n");
+              SOME {heap = heap, files = map (fn (sha, path) => (path, sha)) restored})
+           else (warn ("shared checkpoint failed validation: " ^ leaf_rel); wipe (); NONE)))
       end
+    fun restore_entry key restore =
+      restore ()
+      handle MissingSharedBlob sha => (missing_blob key sha; wipe (); NONE)
+           | e => (warn ("could not restore shared checkpoint: " ^ General.exnMessage e);
+                   wipe (); NONE)
+    fun try_candidate published_heap (c : shared_candidate, fetched) =
+      case fetched of
+          NONE => NONE
+        | SOME action =>
+            restore_entry (candidate_key c) (fn () =>
+              let
+                val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
+                val (heap, _) = single "heap" entries
+              in
+                if heap <> published_heap then NONE else restore_chain (SOME heap) c entries
+              end)
+    (* The theory's standalone failed prefix: the failed-prefix candidate at
+       the path its manifest names. *)
+    fun try_standalone () =
+      case restore_step "rstprobe" (fn () => HolbuildRemoteCache.fetch_action remote standalone_key) of
+          NONE => NONE
+        | SOME action =>
+            restore_entry standalone_key (fn () =>
+              let
+                (* Only the manifest of a candidate it tries records its blobs
+                   as present, as in first_window. *)
+                val text = #manifest action
+                val entries = shared_manifest_entries text
+                val path = tree_path checkpoint_root (#2 (single "leaf" entries))
+                val key = metadata_value "key" (metadata_lines text)
+              in
+                case List.find (fn c => #kind c = "failed_prefix" andalso #path c = path andalso key = SOME (#key c))
+                               candidates of
+                    SOME c => (ignore (HolbuildRemoteCache.remember_action remote action);
+                               restore_chain NONE c entries)
+                  | NONE => NONE
+              end)
     (* Fetch a window of manifests at once, then try them in order. Every
        fetch has ended before a window is tried, and only a manifest that is
        tried records its blobs as present. *)
@@ -11448,22 +11624,29 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       handle MissingSharedBlob sha => (missing_blob heap_key sha; wipe (); no_files)
            | e => (warn ("could not restore the shared heap: " ^ General.exnMessage e);
                    wipe (); no_files)
-    (* No checkpoint is published without its heap, so without one there is
-       nothing to look for. *)
+    (* Without a usable heap, a theory that saves none (not a target) may
+       have published a failed prefix of its own. *)
+    fun or_standalone (restored as {files = [], ...}) =
+          (case (if resumes then try_standalone () else NONE) of
+               SOME standalone => standalone
+             | NONE => restored)
+      | or_standalone restored = restored
+    (* No other checkpoint is published without its heap. *)
     val {heap, files} =
-      case (case restore_step "rstprobe" (fn () => HolbuildRemoteCache.get_action remote heap_key) of
-                NONE => restore_step "rstwait" (fn () =>
-                          await_shared_heap remote heap_key (Time.+ (Time.now (), shared_heap_wait)))
-              | found => found) of
-          NONE => no_files
-        | SOME text =>
-            case (SOME (#1 (single "heap" (shared_manifest_entries text)))
-                  handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
-                NONE => no_files
-              | SOME heap =>
-                  case first_window heap (if resumes then listed candidates else []) of
-                      SOME restored => restored
-                    | NONE => try_heap heap
+      or_standalone
+        (case (case restore_step "rstprobe" (fn () => HolbuildRemoteCache.get_action remote heap_key) of
+                  NONE => restore_step "rstwait" (fn () =>
+                            await_shared_heap remote heap_key (Time.+ (Time.now (), shared_heap_wait)))
+                | found => found) of
+            NONE => no_files
+          | SOME text =>
+              case (SOME (#1 (single "heap" (shared_manifest_entries text)))
+                    handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
+                  NONE => no_files
+                | SOME heap =>
+                    case first_window heap (if resumes then listed candidates else []) of
+                        SOME restored => restored
+                      | NONE => try_heap heap)
   in
     {heap = heap, files = files, stale = !stale, missing = !missing}
   end
@@ -11472,8 +11655,8 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
 
 (* After the run, successful or not: the heap if this run saved it, then,
    if the heap under them is the published one, the new checkpoints. *)
-fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, deps_key, deps_loaded,
-                                              candidates, ...} : shared_context)
+fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
+                                              deps_key, deps_loaded, candidates, ...} : shared_context)
                                ({heap = restored_heap, files = restored, stale, missing} : shared_restore) =
   let
     fun member x xs = List.exists (fn y => y = x) xs
@@ -11596,9 +11779,12 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       end
       handle e => warn ("could not update the shared checkpoint index: " ^ General.exnMessage e)
     val spines = ref (Redblackmap.mkDict String.compare)
-    (* Shared tails make parent walking linear across valid candidates;
+    (* The chain under PATH down to the deps heap, or with ON_BASE down to
+       the base state, nearest first.  A run walks only one of the two (the
+       base state's only without a deps heap), so the memo serves both.
+       Shared tails make parent walking linear across valid candidates;
        each manifest still encodes its whole spine in the existing order. *)
-    fun ancestors path =
+    fun ancestors on_base path =
       let
         fun loop p n =
           case Redblackmap.peek (!spines, p) of
@@ -11611,7 +11797,9 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                       case saved_parent p of
                           NONE => NONE
                         | SOME q =>
-                            if q = deps_loaded then SOME (0, [])
+                            if q = deps_loaded then (if on_base then NONE else SOME (0, []))
+                            else if on_base andalso (FS.fullPath q = base_state handle OS.SysErr _ => false) then
+                              SOME (0, [])
                             else if Option.isSome (tree_relative checkpoint_root q) then
                               Option.map (fn (depth, paths) => (depth + 1, q :: paths)) (loop q (n + 1))
                             else NONE
@@ -11643,10 +11831,10 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   not (Option.isSome (HolbuildRemoteCache.fetch_action remote key)) orelse
                   (#kind c = "failed_prefix" andalso replaces_restored (#path c))))
       handle e => warning c e
-    fun prepare (c : shared_candidate, key, absent) =
+    fun prepare on_base (c : shared_candidate, key, absent) =
       if not (!absent) then NONE
       else
-        case ancestors (#path c) of
+        case ancestors on_base (#path c) of
             NONE => (warn ("shared checkpoint chain is not on the heap: " ^ #path c); NONE)
           | SOME nearest_first =>
               let
@@ -11681,7 +11869,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           (Redblackset.empty String.compare, []) eligible
         val probes = rev unique
         val _ = parallel_all remote_probe_width probe probes
-        val prepared = List.mapPartial prepare probes
+        val prepared = List.mapPartial (prepare false) probes
         val _ = upload_all (List.concat (map (fn (_, _, _, blobs) =>
                                   map (fn (path, sha, _) => (path, sha)) blobs) prepared))
         val complete = List.filter
@@ -11711,9 +11899,38 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
            List.mapPartial (fn (_, key, absent) => if !absent then NONE else SOME key) probes @
            map (fn (_, key, _, _) => key) complete)
       end
+    (* With no deps heap, the theory's latest failed prefix, chained to the
+       base state, unless it is the one restored. *)
+    fun latest_failed_prefix () =
+      List.find (fn c => #kind c = "failed_prefix" andalso checkpoint_exists (#path c) andalso #accepts c ())
+                candidates
+    fun publish_standalone () =
+      case latest_failed_prefix () of
+          NONE => ()
+        | SOME c =>
+            case (if was_restored (#path c) then NONE else prepare true (c, standalone_key, ref true)) of
+                NONE => ()
+              | SOME (_, _, entries, blobs) =>
+                  let
+                    val _ = upload_all (map (fn (path, sha, _) => (path, sha)) blobs)
+                  in
+                    if List.exists (fn (_, sha, _) => needs_upload sha) blobs then ()
+                    else
+                      let
+                        (* The store family is the chain's lowest file. *)
+                        val family = #2 (hd blobs)
+                      in
+                        ignore (HolbuildRemoteCache.replace_action_unconditionally remote
+                                  {key = standalone_key,
+                                   text = shared_manifest shared_standalone_header (SOME (#kind c)) entries ^
+                                          "key=" ^ #key c ^ "\n"});
+                        List.app (fn (path, sha, save) => store_add store family {sha = sha, src = path, save = save})
+                                 blobs
+                      end
+                  end
   in
     case heap of
-        NONE => ()
+        NONE => if deps_checkpoint_exists deps_loaded deps_key then () else publish_standalone ()
       | SOME heap => publish_candidates heap
   end
   handle e => warn ("shared checkpoint publish failed: " ^ General.exnMessage e)
@@ -13368,7 +13585,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           in
             deferred :=
               (fn () =>
-                 (publish_shared ();
+                 ((* A passing non-target has no checkpoint to share. *)
+                  if checkpoint_target_enabled policy then publish_shared () else ();
                   if !cancelled then () else
                   (publish_tools ();
                    (* After the publish: the checkpoints saved after
@@ -13525,8 +13743,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         val _ =
           write_ahead_preload
             {load_lines = map (theory_load_line root) (#loads spec), dir = dir,
-             (* As the plain preload's heap save: none without checkpoints. *)
-             share = not pipelined andalso checkpoint_enabled (spec_policy spec) andalso
+             (* As the plain preload's heap save: none unless it saves one. *)
+             share = not pipelined andalso saves_progress (spec_policy spec) andalso
                      env_bool "HOLBUILD_SHARE_COMMON_DATA" true,
              path = Path.concat (stage, "holbuild-ahead-preload.sml")}
         val files =
@@ -13777,14 +13995,20 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val built_action =
               spec_theory_action root spec (cutoff_context spec cutoff)
             (* What a plain build would take instead of running the script:
-               the action's own entry, an earlier build's, or a shared heap
-               (whose checkpoints may resume inside the script).  A plain run
-               starts over from an empty root. *)
+               the action's own entry, an earlier build's, a shared heap
+               (whose checkpoints may resume inside the script), or a failed
+               prefix a theory with no heap shared.  A plain run starts over
+               from an empty root. *)
+            val shared_key = shared_heap_key tc root built_action
             val hit =
               cached (#input_key spec) orelse
               (case cutoff of SOME {pair_key, ...} => cached pair_key | NONE => false) orelse
               (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
-               cached (shared_heap_key tc root built_action))
+               (cached shared_key orelse
+                resumes_from_checkpoints (spec_policy spec) built_action andalso
+                (* Only a restore that checks its key= line records its blobs. *)
+                Option.isSome (HolbuildRemoteCache.fetch_action remote
+                                 (shared_standalone_key shared_key built_action))))
             (* The root's records still hold: the child wrote none of it,
                and the stems written here are the hydrate's scratch. *)
             fun restart () =

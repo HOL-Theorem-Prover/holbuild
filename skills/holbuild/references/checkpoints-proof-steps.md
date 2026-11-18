@@ -64,7 +64,7 @@ Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `
 
 ## Default checkpoints and `--all-checkpoints`
 
-By default, every root-package theory saves `deps_loaded`, theorem-context, declaration and failed-prefix checkpoints, including dependencies of the requested targets. Proof steps and step timeouts apply throughout the root package. `--skip-checkpoints` disables checkpoint saving; `--all-checkpoints` remains an accepted compatibility alias with no effect. Theory outputs and keys are unchanged. Remote action specs use the same default. Workers also share `deps_loaded` for older specs containing `option theorem-checkpoints=false`, while respecting their opt-out from theorem checkpoints.
+By default, the build's targets (the default targets when none are named, or every root-package theory when there are none of those) save `deps_loaded`, theorem-context and declaration checkpoints as they run. Other root-package theories, such as the targets' dependencies, save nothing while their proofs pass; when a proof fails or times out they save its failed prefix, which the next build (and, with `--share-heaps`, another worker) resumes from. Editing such a dependency later loads its ancestors once before it saves a `deps_loaded` of its own as a target. `--all-checkpoints` (and `--repl-on-failure`) make every root-package theory save checkpoints as it runs. Proof steps and step timeouts apply throughout the root package. `--skip-checkpoints` disables checkpoint saving. Theory outputs and keys are unchanged. Remote action specs carry the policy as `option checkpoint-target=true` on targets.
 
 ## Host deps heaps
 

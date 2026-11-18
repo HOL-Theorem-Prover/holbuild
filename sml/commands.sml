@@ -109,9 +109,9 @@ fun build_help () = print
   \      the last such save's duration, have passed since that save; 0 saves\n\
   \      every one. Remote workers use the same value; no cache key depends on it.\n\
   \  --all-checkpoints\n\
-  \      All root-package theories save checkpoints by default, except a\n\
-  \      theory that isn't a target and that a parallel build pipelines into\n\
-  \      an idle slot. With this flag every one saves them.\n\
+  \      Build targets save checkpoints as they run; other root-package\n\
+  \      theories save one only when a proof fails or times out. With this\n\
+  \      flag every one saves them as it runs.\n\
   \  --skip-proof-steps\n\
   \  --proof-scope root|all (default: root)\n\
   \  --tactic-timeout SECONDS\n\
@@ -1160,6 +1160,14 @@ fun prepare_source_index phase_prefix resolution project =
      components = components}
   end
 
+(* Under the project lock, before planning: empties the extra-output roots of
+   dependencies whose source changed (HolbuildBuildExec.reset_extra_output_roots).
+   Whether any was, which makes a source index prepared before stale. *)
+fun reset_extra_output_roots resolution project =
+  timed_phase "extra_outputs.reset"
+    (fn () => not (null (HolbuildBuildExec.reset_extra_output_roots project
+                           (HolbuildProjectGraph.resolve {project = project, resolution = resolution}))))
+
 (* A theory script may write SML sources as extra outputs, as EmitML code does.
    A plan made before the theory runs has no node for such a source while it is
    missing, so the sources that use it build without it, and it hashes a stale
@@ -1237,11 +1245,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       case #build_tactic_timeout project of
           NONE => SOME 2.5
         | SOME timeout => timeout
-    fun build_options_for index entry_plan plan force_targets =
+    (* CHECKPOINT_TARGETS: the theories that save checkpoints as they run
+       (checkpoint_targets_for), whatever FORCE_TARGETS this pass forces. *)
+    fun build_options_for index entry_plan plan force_targets checkpoint_targets =
       {use_cache = use_cache,
        verify_cache = verify_cache,
        force = force,
        force_targets = force_targets,
+       checkpoint_targets = checkpoint_targets,
        fail_fast = fail_fast,
        all_checkpoints = all_checkpoints,
        skip_checkpoints = skip_checkpoints,
@@ -1283,10 +1294,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
        trknl = trknl,
        restore_only = (case mode of RemoteExec {remote_only, ...} => remote_only | _ => false)}
+    (* Whether the locked reset emptied an extra-output root that PREPARED,
+       made outside the lock, had read. *)
+    val prepared_stale = ref false
+    fun with_lock label f =
+      HolbuildBuildExec.with_project_lock project label
+        (fn () => (if reset_extra_output_roots resolution project then prepared_stale := true else ();
+                   f ()))
     fun prepared_sources () =
-      case prepared of
-          SOME {index, components, ...} => {index = index, components = components}
-        | NONE => prepare_source_index "build" resolution project
+      case (prepared, !prepared_stale) of
+          (SOME {index, components, ...}, false) => {index = index, components = components}
+        | _ => prepare_source_index "build" resolution project
     type planned =
       {index : HolbuildSourceIndex.t, targets : string list, entry_plan : HolbuildBuildPlan.t option,
        plan : HolbuildBuildPlan.t, toolchain_key : string,
@@ -1311,6 +1329,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
          toolchain_key = toolchain_key, components = SOME components}
       end
     fun action_toolchain_key toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
+    (* The build's targets, or every root-package theory when it has none. *)
+    fun checkpoint_targets_for index targets =
+      if null targets then HolbuildSourceIndex.root_package_targets index project else targets
     (* The input keys of a plan, which the plan keeps for execution.  Only
        for plans whose theories that write SML sources are up to date: until
        those run, an extra input naming such a source may not exist. *)
@@ -1321,7 +1342,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        first use: every pass over the plan takes the same keys. *)
     fun with_options (planned as {index, targets, entry_plan, plan, ...}) =
       let
-        val options = timed_phase "build.options" (fn () => build_options_for index entry_plan plan targets)
+        val options = timed_phase "build.options" (fn () => build_options_for index entry_plan plan targets (checkpoint_targets_for index targets))
         val known = ref NONE
         fun keys () =
           case !known of
@@ -1512,9 +1533,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun execute (options, plan, toolchain_key) =
           timed_phase "build.execute"
             (fn () => HolbuildBuildExec.build options tc project plan toolchain_key jobs)
-        val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, _, _) = plan_build ()
+        val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, initial_options, _) = plan_build ()
         fun build_owners owner_plan =
-          execute (build_options_for index entry_plan owner_plan [], owner_plan, toolchain_key)
+          execute (build_options_for index entry_plan owner_plan [] (#checkpoint_targets initial_options), owner_plan, toolchain_key)
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
@@ -1572,7 +1593,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         (* Why the runs didn't all end, and whether a later try may succeed. *)
         val stopped : (string * bool) option ref = ref NONE
         val (remote, runs, uncached, {exported, refused}) =
-          HolbuildBuildExec.with_project_lock project "run-action"
+          with_lock "run-action"
             (fn () => run_with_stat_cache (fn () =>
               let
                 val {remote, runs, export} =
@@ -1771,7 +1792,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     | entry_targets => SOME (HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
               in
                 timed_phase "build.execute"
-                  (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets)
+                  (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets (#checkpoint_targets build_options))
                               tc project theory_plan toolchain_key jobs)
               end
             (* Diagnose every final failure. A missing proof log retains the
@@ -2164,7 +2185,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            requested batch: a replan, if the owners rebuilt, queues its own. *)
         fun build_owners owner_plan =
           let
-            val owner_options = build_options_for index entry_plan owner_plan []
+            val owner_options = build_options_for index entry_plan owner_plan [] (#checkpoint_targets build_options)
             val requested_write = !pending_plan_write
             fun restore () = pending_plan_write := requested_write
           in
@@ -2213,17 +2234,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
   in
     case mode of
         ExportActionSpecs {upload} =>
-          HolbuildBuildExec.with_project_lock project "action-spec"
+          with_lock "action-spec"
             (fn () => run_with_stat_cache (export_action_specs upload))
       | ExportRunSpecs request =>
-          HolbuildBuildExec.with_project_lock project "run-action"
+          with_lock "run-action"
             (fn () => run_with_stat_cache (export_run_specs request))
       | RemoteRun run => remote_run run ()
       | BuildTargets =>
-          HolbuildBuildExec.with_project_lock project (if dry_run then "dry-run" else "build")
+          with_lock (if dry_run then "dry-run" else "build")
             (fn () => run_with_stat_cache (if dry_run then describe_dry_run else execute_build))
       | RemoteExec remote =>
-          HolbuildBuildExec.with_project_lock project "build"
+          with_lock "build"
             (fn () => run_with_stat_cache (fn () =>
                         (remote_build remote handle e => (write_pending_plan (); raise e))
                         before write_pending_plan ()))
@@ -2693,7 +2714,7 @@ fun default_build_options trknl project index entry_plan plan =
     {use_cache = true,
      verify_cache = true,
      force = HolbuildBuildExec.ForceNone,
-     force_targets = [],
+     force_targets = [], checkpoint_targets = [],
      skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
      proof_steps = true,
      new_ir = true,
@@ -2742,7 +2763,7 @@ fun heap_build_options trknl =
   {use_cache = true,
    verify_cache = true,
    force = HolbuildBuildExec.ForceNone,
-   force_targets = [],
+   force_targets = [], checkpoint_targets = [],
    skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
    proof_steps = false,
    new_ir = false,
@@ -3040,6 +3061,7 @@ fun clean_targets args =
     val _ = reject_object_targets args
     fun execute_clean () =
       let
+        val _ = reset_extra_output_roots HolbuildProject.standard_resolution project
         val {index, components} = prepare_source_index "clean"
                                   HolbuildProject.standard_resolution project
         val args = HolbuildSourceIndex.resolve_path_targets index args
@@ -3125,6 +3147,7 @@ fun build_heap_kind tc cli_jobs command args =
           in
             {index = index, components = components, plan = plan}
           end
+        val _ = reset_extra_output_roots (resolution_for_toolchain tc) project
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
         fun build_plan plan =
