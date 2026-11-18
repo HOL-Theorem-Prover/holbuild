@@ -450,6 +450,16 @@ batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/ledger-seed.log")
 for spec in $(awk '$1 == "action" { print $4 }' "$state/$batch.batch"); do
   refute_grep "^blob $spec$" "$ledger_file"
 done
+# --remote-only builds nothing locally, but its workers build pipelined
+# whatever the local rule would pipeline: ATheory, not the target BTheory.
+[[ $(awk '$1 == "action" && $5 ~ /ATheory$/' "$state/$batch.batch" | wc -l) -eq 1 ]] ||
+  { cat "$state/$batch.batch" >&2; exit 1; }
+while read -r spec theory; do
+  case $theory in
+    *ATheory) require_grep '^option pipeline=true$' "$remote_root/cas/$spec" ;;
+    *) refute_grep '^option pipeline=true$' "$remote_root/cas/$spec" ;;
+  esac
+done < <(awk '$1 == "action" { print $4, $5 }' "$state/$batch.batch")
 # A build with nothing to do doesn't read the ledger: a FIFO in its place
 # would block the read.
 cp "$ledger_file" "$tmpdir/ledger.seed"

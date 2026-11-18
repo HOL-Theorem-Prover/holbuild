@@ -1482,11 +1482,21 @@ class Coordinator:
                         if row is not None:
                             ready = ranking.depths[(batch_id, tier)] = (row.critical_depth, row.descendant_count)
                     if ready is not None and outranked.deeper(batch_id, tier, ready):
+                        # Counted in the ranking as a build of the batch is (_claim_build), before the claim's
+                        # await, so concurrent claims spread over batches and keep to the priority cap.
+                        counted = (*stopped[:2], stopped[2] + 1, True, self.clock(), *stopped[5:])
+                        self._replace_entry(ranking, stopped, counted)
+                        if priority != 0:
+                            ranking.running_priority += 1
+                            self._cap_priorities(ranking)
                         claimed = await self._claim_ahead_in(
                             outranked.read, batch_id, tier, worker, deeper_than=ready
                         )
                         if claimed is not None:
                             return claimed, None
+                        self._replace_entry(ranking, counted, stopped)
+                        if priority != 0:
+                            ranking.running_priority -= 1
                 outranked = None
                 continue
             # Builds of tiers hint_only not held for this host are no candidates.
@@ -1503,6 +1513,13 @@ class Coordinator:
             if self.rankings.get(key) is ranking:
                 self.rankings.pop(key)
             ranking = await self._current_ranking(key, after=started)
+
+    @staticmethod
+    def _replace_entry(ranking: "_Ranking", entry: "RankEntry", by: "RankEntry") -> None:
+        """Put ``by`` in ``entry``'s place in ``ranking``, if a concurrent claim hasn't taken it out."""
+        with contextlib.suppress(ValueError):
+            ranking.heap[ranking.heap.index(entry)] = by
+            heapq.heapify(ranking.heap)
 
     async def _claim_run(
         self, tiers: list[str], worker: str, slots: int, *, builds_first: bool = False
@@ -2550,12 +2567,15 @@ class Coordinator:
         against its batch's ``ahead_cap`` then, so that its children may be claimed ahead too. Kept in memory, as
         ``lease_hosts`` is: a restart forgets it, and the action counts against the cap again until it ends. A stale
         token records nothing: its heartbeat stops the action."""
+        # Taken first, so that a lease ending while it's read, which drops the token, isn't recorded after.
+        self.outlined_keys[token] = ""
         async with self.engine.connect() as conn:
             key = await conn.scalar(
                 sa.text("SELECT input_key FROM leases WHERE attempt_token = :token AND expires_at > now()"),
                 {"token": token},
             )
-        if key is None:
+        if key is None or token not in self.outlined_keys:
+            self.outlined_keys.pop(token, None)
             return
         self.outlined_keys[token] = key
         if len(self.outlined_keys) > MAX_LEASE_HOSTS:

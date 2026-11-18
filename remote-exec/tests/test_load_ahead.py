@@ -181,6 +181,25 @@ async def test_a_claim_ahead_on_outlines_alone_with_a_deeper_chain_than_its_batc
     assert claimed[:3] == order
 
 
+async def test_a_claim_ahead_on_outlines_alone_counts_as_a_build_of_its_batch_in_the_ranking_claims_share(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a", "b", "c", "l"], [("b", "a"), ("c", "b")], speculative_loading="4")
+    a = await claim_named(http, "a")
+    assert (await http.post(f"/v1/work/{a}/outlined", headers=WORKER)).status_code == 204
+    await submit(http, ["y1", "y2"])
+    coordinator.settings.claim_ranking_seconds = 3600
+
+    # Batches take turns by their running builds: "b", claimed ahead, is the second of its batch, so the other
+    # batch's "y2" comes before "l".
+    claimed = []
+    for _ in range(4):
+        action = await claim_ahead(http)
+        assert action is not None
+        claimed.append(action["theory"].removeprefix("pkg:"))
+    assert claimed == ["y1", "b", "y2", "l"]
+
+
 async def test_a_ready_build_waits_only_for_a_claim_ahead_of_its_tier_or_an_earlier_one(
     http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
 ) -> None:

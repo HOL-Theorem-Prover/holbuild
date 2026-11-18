@@ -115,6 +115,12 @@ class Fleet:
         child = self.arrival.ahead.index("ahead")
         return key(next(p for p in self.parents[child] if self.arrival.state[p] == "running"))
 
+    def outlined(self) -> list[str]:
+        """Every running action of ``fresh``, those claimed ahead included, as if each had published its outline:
+        the largest array of outlined keys a statement is given, which the counts of actions waiting ahead
+        exclude."""
+        return self.arrival.keys("running") + self.arrival.keys("running", "ahead")
+
     def ahead_candidates(self) -> list[str]:
         """Waiting actions of ``fresh`` whose unfinished parents all run, which may be claimed ahead."""
         state, parents = self.arrival.state, self.parents
@@ -355,7 +361,7 @@ STATEMENTS = [
     Statement(cm.FIRST_READY_PLACE, lambda f: {"batch_id": f.fresh, "tier": "standard"}, 2_900),
     Statement(cm.LOCK_KEY, lambda f: {"key": f.arrival.keys("ready")[0]}, 100),
     Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("ready")[0]}, 2_100),
-    Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2, "outlined": [f.parent_of_ahead()]}, 120_000),
+    Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2, "outlined": f.outlined()}, 120_000),
     Statement(
         cm.CLAIM_AHEAD_ACTION,
         lambda f: {"batch_id": f.fresh, "keys": f.ahead_candidates(), "tier": "standard", "depth": 2, "taken": []},
@@ -366,7 +372,7 @@ STATEMENTS = [
         lambda f: {"batch_id": f.fresh, "keys": f.arrival.keys("running", "ahead")[-1:], "depth": 2},
         100,
     ),
-    Statement(cm.COUNT_WAITING_AHEAD, lambda f: {"batch_id": f.fresh, "outlined": [f.parent_of_ahead()]}, 1_100),
+    Statement(cm.COUNT_WAITING_AHEAD, lambda f: {"batch_id": f.fresh, "outlined": f.outlined()}, 1_100),
     Statement(
         "SELECT input_key FROM leases WHERE attempt_token = :token AND expires_at > now()",
         lambda f: {"token": f.token},

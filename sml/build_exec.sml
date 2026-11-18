@@ -6069,8 +6069,10 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
 
 fun pipeline_trace line = cache_trace ("pipeline: " ^ line)
 
+fun pipeline_switched_on () = OS.Process.getEnv "HOLBUILD_PIPELINE" <> SOME "off"
+
 fun pipeline_enabled (options : build_options) =
-  OS.Process.getEnv "HOLBUILD_PIPELINE" <> SOME "off" andalso
+  pipeline_switched_on () andalso
   not (#restore_only options) andalso not (#trknl options) andalso not (#trace_steps options) andalso
   not (Option.isSome (#execution_plan options)) andalso not (#repl_on_failure options)
 
@@ -8777,7 +8779,9 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
     val spec_dir = Path.concat(root, ".holbuild/action-specs")
     val context = {root = root, plan = plan, keys = keys, action_toolchain_key = action_toolchain_key,
                    runtime = runtime_identity (), toolchain_line = toolchain_line}
-    val pipelining = pipeline_enabled options
+    (* Not pipeline_enabled: --remote-only builds nothing locally (restore_only)
+       but has the workers build, and pipelinable checks the rest per theory. *)
+    val pipelining = pipeline_switched_on ()
     (* No deps key: nothing here reads it, and action_spec_text writes the
        spec's own.  Computing it for every theory is quadratic in the plan. *)
     fun export (node, _) =
@@ -13137,11 +13141,16 @@ fun write_ahead_preload {load_lines, dir, share, path} =
    plain build might not builds again plain in the same action. *)
 fun outline_action_key input_key = HolbuildHash.string_sha256 ("holbuild-outline-v1\n" ^ input_key ^ "\n")
 
+(* How long the outline's copy may take: the child may swap a file for one
+   whose read blocks, such as a FIFO, after the copy checked it. *)
+val outline_copy_seconds = 120
+
 (* Copies into SNAPSHOT the outline that the theory child in STAGE, under
    action root ROOT, published, and its load metadata, while the child may
    still write the stage.  The copy runs confined like the child, so it
    reads only what the child could, whatever the child put in place of the
-   files. *)
+   files; it takes only regular files, from the outline's own directory,
+   and is killed if it outlasts outline_copy_seconds. *)
 fun snapshot_outline root stage logical snapshot =
   let
     val names = [logical ^ ".dat", logical ^ ".sig", logical ^ ".sml",
@@ -13149,8 +13158,12 @@ fun snapshot_outline root stage logical snapshot =
     val sources =
       map (fn name => Path.concat (stage_outline_dir stage, name)) (List.take (names, 3)) @
       map (fn name => Path.concat (stage, name)) (List.drop (names, 3))
+    val q = HolbuildActionSandbox.quote
+    fun is kind path = "test " ^ kind ^ " " ^ q path ^ " -a ! -h " ^ q path ^ " || exit 1; "
     fun script work =
-      String.concatWith " " ("cp --" :: map HolbuildActionSandbox.quote sources @ [HolbuildActionSandbox.quote work])
+      is "-d" (stage_outline_dir stage) ^ String.concat (map (is "-f") sources) ^
+      String.concatWith " "
+        (["exec timeout -s KILL", Int.toString outline_copy_seconds, "cp --"] @ map q sources @ [q work])
     fun keep (work, status) =
       if OS.Process.isSuccess status then
         (HolbuildRemoveTree.remove_untrusted_strict snapshot;
@@ -13476,7 +13489,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         HolbuildCache.remove_action cache key;
         publish_theory_cache (cache_warning_subject logical (#source_file action)) key (tactic_timeout policy)
           (file (logical ^ ".sig")) published_sml (file (logical ^ ".dat")) NONE [] metadata;
-        ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = upload_entry_blobs remote key});
+        (case HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = upload_entry_blobs remote key} of
+             HolbuildCacheBackend.Published => ()
+           | HolbuildCacheBackend.AlreadyPresent => ()
+           | _ => raise Error "the remote cache refused its entry");
         HolbuildStatus.message_stderr "holbuild: pipeline: published the outline\n";
         (* The worker tells the coordinator, which then lets the theory's
            children be claimed ahead beyond the batch's cap. *)
@@ -13915,8 +13931,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             arrivals := (name, Time.now ()) :: !arrivals
           end
         fun arrive (dep as {target, key, ...}, _) =
-          if restore_late staging dep key then arrive_from staging dep
-          else abandon ("dependency " ^ target ^ " does not match its parents")
+          (if restore_late staging dep key then arrive_from staging dep
+           else abandon ("dependency " ^ target ^ " does not match its parents"))
+          handle e as ActionFailed (InputMissing _, _) =>
+            (* Built on an outline, the action is given up, as any failure
+               after loading one. *)
+            if null (!outlined) then raise e
+            else abandon ("dependency " ^ target ^ " is missing from the remote cache: " ^ General.exnMessage e)
         (* An outline that can't be restored or doesn't match the parents
            in the root is ignored: the child waits for the entry. *)
         fun arrive_outline (dep as {key, ...}, _) =

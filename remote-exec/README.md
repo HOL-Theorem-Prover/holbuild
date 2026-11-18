@@ -135,6 +135,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_EVENTS_FALLBACK_SECONDS` | most time between an event stream's reads, for other coordinator processes' writes | 10 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
 | `REMOTE_EXEC_AHEAD_DEPTH` | how many generations of running ancestors an action may be claimed ahead of, 0 for no limit (see "Loading ahead") | 1 |
+| `REMOTE_EXEC_PIPELINE` | 0 to stop asking workers to build pipelined: claims of new build actions of batches that load ahead then carry `"pipeline": false` (see "Loading ahead") | 1 |
 | `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
 | `REMOTE_EXEC_PRIORITY_CAP` | running builds of positive-priority batches past which their builds rank like priority-0 ones (see Claims); at least the fleet's worker count for strict priority | 128 |
@@ -591,8 +592,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   finds the result cached.
 - **Loading ahead**, for a batch submitted with `speculative_loading=<cap>`:
   a worker that says it can (`"ahead": true`) and finds nothing ready of the
-  batch's priority or higher (in the same tier or an earlier one) may claim a
-  waiting build action of the batch whose parents that
+  batch's priority or higher (in the same tier or an earlier one), or a
+  candidate on outlines alone that ranks before them (see "Pipelining"), may
+  claim a waiting build action of the batch whose parents that
   aren't done are all running, at most `REMOTE_EXEC_AHEAD_DEPTH` generations
   ahead (with 0, any number): a running action that waits for no parent is generation 0, and one
   claimed ahead is a generation after its latest running parent. Its worker
@@ -620,6 +622,23 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   once the clients that submit `speculative_loading` batches run such a
   release. An older one may abandon such a claim (`ahead-abandoned`), which is
   then built plain.
+- **Pipelining**: a claim of a build action of a batch that loads ahead
+  carries `"pipeline": true` unless `REMOTE_EXEC_PIPELINE=0`, and the worker
+  runs it with `exec-action --pipeline` (releases 0.14.75 and later). Such an
+  action, when its spec allows it, publishes its theory's outline (its
+  statements, with the proofs still to check) under a key of its own before
+  proving, and a child claimed ahead of it may start on that outline; the
+  child commits nothing until the parent's own entry passes its gate. Once the
+  outline is out, the worker posts `outlined` (below), and until its lease
+  ends the action no longer counts against its batch's `<cap>`. A candidate
+  whose unfinished parents have all posted `outlined` can start at once, so
+  it ranks among its batch's ready builds by its chain of dependents
+  (`critical_depth`, then `descendant_count`, a ready build first on a tie)
+  instead of waiting for them; other candidates come after the ready builds
+  of their priority, since their workers would wait. The record is kept in
+  memory: a restarted coordinator counts such actions against the cap again
+  until they end. Rolling back: `REMOTE_EXEC_PIPELINE=0`, which stops new
+  pipelined claims; actions already running finish as they started.
 - **Retries** by the result's failure class:
 
   | `failure` | What happens |
@@ -930,9 +949,10 @@ the worker's report of its host, a host of `GET /v1/queue` without `age_s`,
 with `cpu_idle_pct` measured since the worker's previous CPU sample, or null
 when that is under a second old)
 
-- 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120, "max_heap_mb": null, "ahead_parents": [{"input_key": "<sha256>", "spec_sha256": "<sha256>"}, …]}`:
+- 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120, "max_heap_mb": null, "ahead_parents": [{"input_key": "<sha256>", "spec_sha256": "<sha256>"}, …], "pipeline": false}`:
   `ahead_parents` lists the ancestors still building when the action was claimed ahead of them, each after its
-  own such ancestors, and is empty for any other claim
+  own such ancestors, and is empty for any other claim; `pipeline` asks the worker to build the action
+  pipelined (see "Pipelining")
 - 204 when nothing became ready for the tier within `wait_s`
 
 `POST /v1/work/<attempt_token>/heartbeat`, with no body or `{"host": <report>}`
@@ -940,6 +960,12 @@ when that is under a second old)
 - 200 `{"lease_s": 120}`: the lease now runs `lease_s` seconds from now
 - 409 when the lease expired or was revoked (the batch was cancelled,
   failed or passed its deadline); the worker stops the action
+
+`POST /v1/work/<attempt_token>/outlined`, with no body, once `exec-action
+--pipeline` has published the action's outline (it then creates
+`<result>.outline` beside its result file)
+
+- 204, also for a token that is no longer live, which records nothing
 
 `POST /v1/work/report` with `{"tier": …, "also_claim": […], "worker": "<name>", "host": <report>}`,
 the fields as for a claim, from a worker that isn't claiming, as while it waits for disk

@@ -186,7 +186,7 @@ outline_ac_of() { ac_of "$(printf 'holbuild-outline-v1\n%s\n' "$1" | sha256sum |
 
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 hb action-spec --upload ZTheory > "$tmpdir/batch.txt"
-for theory in A B O P R; do
+for theory in A B O P R Z; do
   declare "spec_$theory=$(spec_for "$tmpdir/batch.txt" "pipe:${theory}Theory")"
   declare "key_$theory=$(key_for "$tmpdir/batch.txt" "pipe:${theory}Theory")"
 done
@@ -194,17 +194,26 @@ done
 for spec in "$spec_A" "$spec_B" "$spec_O" "$spec_P" "$spec_R"; do
   require_grep '^option pipeline=true$' "$tmpdir/remote/cas/$spec"
 done
+require_no_grep '^option pipeline=true$' "$tmpdir/remote/cas/$spec_Z"
 
 # B starts on A's outline while A proves, and commits once A's final entry
 # passes the gate.
 worker_start b "$spec_B" --ahead-parent "$key_A:$spec_A" --pipeline
 await_marker b waiting-ATheory
-worker a "$spec_A" --pipeline
+worker_start a "$spec_A" --pipeline
+# The worker learns of the outline from a file beside the result, once the
+# outline is in the cache under its own key, while A still proves.
+for _ in {1..600}; do
+  [[ -e "$tmpdir/a.result.outline" ]] && break
+  kill -0 "${worker_pid[a]}" 2>/dev/null || break
+  sleep 0.05
+done
+require_file "$tmpdir/a.result.outline"
+require_file "$tmpdir/remote/ac/$(outline_ac_of "$key_A")"
+[[ ! -e "$tmpdir/remote/ac/$(ac_of "$key_A")" ]] || { echo "A published its entry before proving" >&2; exit 1; }
+worker_wait a
 expect a 0 "status=built"
 require_grep 'pipeline: published the outline' "$tmpdir/a.log"
-require_file "$tmpdir/remote/ac/$(outline_ac_of "$key_A")"
-# The worker learns of the outline from a file beside the result.
-require_file "$tmpdir/a.result.outline"
 worker_wait b
 expect b 0 "status=built"
 grep -qE '^phase-ms=(.*,)?outlined:1(,|$)' "$tmpdir/b.result" || {
@@ -248,3 +257,13 @@ for key in "$key_A" "$key_B" "$key_O" "$key_R"; do
   cmp "$first_remote/ac/$(ac_of "$key")" "$tmpdir/remote2/ac/$(ac_of "$key")"
 done
 [[ ! -e "$tmpdir/remote2/ac/$(outline_ac_of "$key_A")" ]] || { echo "a plain build published an outline" >&2; exit 1; }
+
+# An outline the remote cache refuses its entry is no outline: the worker
+# isn't told of one.
+kill "$server_pid"; wait "$server_pid" 2>/dev/null || true
+start_remote_cache_server "$tmpdir/remote3" "$tmpdir/server3" "$tmpdir/control3"
+hb action-spec --upload ZTheory > /dev/null
+echo 403 > "$tmpdir/control3/ac-put-status"
+worker refused "$spec_A" --pipeline
+require_grep 'not publishing the outline: .*the remote cache refused its entry' "$tmpdir/refused.log"
+[[ ! -e "$tmpdir/refused.result.outline" ]] || { echo "a refused outline was marked" >&2; exit 1; }

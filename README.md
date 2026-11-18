@@ -2096,6 +2096,16 @@ doesn't match, or a parent that is late. The option costs worker time when a
 parent fails, and changes no cache keys. Like `--priority`, it applies to
 replacement batches with `--attach`, and the recovery hint includes it.
 
+Workers also build such a batch's theories pipelined, the way a local build
+does (unless `HOLBUILD_PIPELINE=off` or the coordinator turns it off): a
+theory the build doesn't name as a target publishes its outline before
+proving, and a theory waiting ahead of it starts on that outline. It keeps
+nothing built on an outline until the parent's own outputs pass the gate
+against the outline it loaded; otherwise it is built normally again. A
+theory whose unbuilt parents have all published their outlines can start at
+once, so it no longer waits behind shallower theories ready to build, and an
+outlined parent no longer counts against N.
+
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with
 `exec-action`, then restores them as an ordinary build would:
