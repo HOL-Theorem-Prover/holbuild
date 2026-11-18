@@ -1674,6 +1674,23 @@ fun hol_dat_hash path =
     case literal of SOME hash => hash | NONE => hol_file_sha1 path
   end
 
+(* HOL maps <dir>/xTheory.sml to <dir>/.hol/objs/xTheory.sml itself, so a
+   theory under .hol/objs goes by its unmapped name. *)
+fun hol_name b =
+  let val dir = Path.dir b
+  in
+    if Path.file dir = "objs" andalso Path.file (Path.dir dir) = ".hol"
+    then Path.concat (Path.dir (Path.dir dir), Path.file b)
+    else b
+  end
+
+(* A toolchain theory's files' path without suffix, beside its objects. *)
+fun toolchain_theory_base (tc : HolbuildToolchain.t) name =
+  let val uo = Path.concat (Path.concat (#holdir tc, "sigobj"), name ^ "Theory.uo")
+  in SOME (Path.concat (Path.dir (FS.realPath uo), name ^ "Theory"))
+  end
+  handle OS.SysErr _ => NONE
+
 type file_hash_cache = {entries : (string, string) Binarymap.dict ref, mutex : Mutex.mutex}
 
 fun new_file_hash_cache () =
@@ -1702,12 +1719,118 @@ fun cached_file_hash (cache : file_hash_cache) path =
                            (#entries cache := Binarymap.insert (!(#entries cache), path, hash);
                             SOME hash)))
 
+(* A .dat's SHA-1 as a file (what HOL's theory modules are named by),
+   memoized beside its hol_dat_hash under a key no path has. *)
+fun dat_sha1_entry path = "\000sha1 " ^ path
+
+fun cached_dat_sha1 (cache : file_hash_cache) path =
+  case with_file_hash_cache_lock cache
+         (fn () => Binarymap.peek (!(#entries cache), dat_sha1_entry path)) of
+      SOME hash => SOME hash
+    | NONE =>
+        (case (SOME (hol_file_sha1 path) handle _ => NONE) of
+             NONE => NONE
+           | SOME hash =>
+               (with_file_hash_cache_lock cache
+                  (fn () => #entries cache := Binarymap.insert (!(#entries cache), dat_sha1_entry path, hash));
+                SOME hash))
+
 fun invalidate_cached_file_hash (cache : file_hash_cache) path =
   with_file_hash_cache_lock cache
     (fn () =>
-        case Binarymap.peek (!(#entries cache), path) of
-            NONE => ()
-          | SOME _ => #entries cache := #1 (Binarymap.remove (!(#entries cache), path)))
+        List.app
+          (fn key =>
+              case Binarymap.peek (!(#entries cache), key) of
+                  NONE => ()
+                | SOME _ => #entries cache := #1 (Binarymap.remove (!(#entries cache), key)))
+          [path, dat_sha1_entry path])
+
+(* The digests of the toolchain's theories' .dat files, by the path HOL's
+   load names each (beside its .sig, unmapped), for HOL's theory module
+   cache.  Kept in the toolchain's module store with each file's identity,
+   and taken from there only as git's index does: the size, inode, change
+   and modification times as recorded, and modified over a second before it
+   was hashed; any other file is hashed again.  None for a HOL without
+   theory modules. *)
+val toolchain_dat_digests_file = "dat-digests"
+
+fun toolchain_dat_digests (tc : HolbuildToolchain.t) =
+  if not (file_exists (Path.concat (#holdir tc, "tools-poly/poly/theory_modules.ML"))) then []
+  else
+  let
+    val store = module_store (#holdir tc)
+    val file = Path.concat (store, toolchain_dat_digests_file)
+    val header = "holbuild-dat-digests-v1"
+    fun parse line =
+      case String.fields (fn c => c = #"\t") line of
+          [key, dat, sha1, dev, ino, size, mtime, ctime, hashed] =>
+            (case (Int.fromString size, LargeInt.fromString mtime, LargeInt.fromString ctime,
+                   LargeInt.fromString hashed) of
+                 (SOME size, SOME mtime_ns, SOME ctime_ns, SOME hashed) =>
+                   SOME (dat, {key = key, sha1 = sha1, hashed = hashed,
+                               ident = {dev = dev, ino = ino, size = size, mtime_ns = mtime_ns, ctime_ns = ctime_ns}})
+               | _ => NONE)
+        | _ => NONE
+    val recorded =
+      case String.tokens (fn c => c = #"\n") (read_text file) handle _ => [] of
+          first :: lines =>
+            if first = header then
+              List.foldl (fn (line, dict) => case parse line of
+                                                SOME (dat, entry) => Binarymap.insert (dict, dat, entry)
+                                              | NONE => dict)
+                         (Binarymap.mkDict String.compare) lines
+            else Binarymap.mkDict String.compare
+        | [] => Binarymap.mkDict String.compare
+    fun current dat =
+      case (Binarymap.peek (recorded, dat), HolbuildStatCache.stat_ident dat) of
+          (SOME (entry as {ident, hashed, ...}), SOME now) =>
+            if HolbuildStatCache.same_ident (ident, now) andalso
+               #mtime_ns now + 1000000000 < hashed
+            then SOME entry else NONE
+        | _ => NONE
+    val names =
+      List.mapPartial (fn f => if has_suffix "Theory.uo" f then SOME (drop_suffix "Theory.uo" f) else NONE)
+        (HolbuildBuildPlan.list_dir (Path.concat (#holdir tc, "sigobj")))
+    val theories =
+      List.mapPartial
+        (fn name => Option.mapPartial
+                      (fn b => if file_exists (b ^ ".dat") then SOME (hol_name b ^ ".dat", b ^ ".dat") else NONE)
+                      (toolchain_theory_base tc name))
+        names
+    val stale = List.filter (fn (_, dat) => not (isSome (current dat))) theories
+    val fresh =
+      if null stale then []
+      else
+        let
+          val hashed = Time.toNanoseconds (Time.now ())
+          val idents = map (fn (_, dat) => HolbuildStatCache.stat_ident dat) stale
+          val sha1s = hol_files_sha1 (map #2 stale)
+        in
+          (* A file that changed while it was hashed isn't kept. *)
+          ListPair.mapEq
+            (fn (((key, dat), ident), sha1) =>
+                case (ident, HolbuildStatCache.stat_ident dat) of
+                    (SOME was, SOME now) =>
+                      if HolbuildStatCache.same_ident (was, now)
+                      then (dat, SOME {key = key, sha1 = sha1, hashed = hashed, ident = now})
+                      else (dat, NONE)
+                  | _ => (dat, NONE))
+            (ListPair.zipEq (stale, idents), sha1s)
+        end
+    val entries =
+      List.mapPartial (fn (_, dat) => Option.map (fn e => (dat, e)) (current dat)) theories @
+      List.mapPartial (fn (dat, e) => Option.map (fn e => (dat, e)) e) fresh
+    fun line (dat, {key, sha1, hashed, ident = {dev, ino, size, mtime_ns, ctime_ns}}) =
+      String.concatWith "\t"
+        [key, dat, sha1, dev, ino, Int.toString size, LargeInt.toString mtime_ns,
+         LargeInt.toString ctime_ns, LargeInt.toString hashed] ^ "\n"
+    val _ =
+      if null stale then ()
+      else (ensure_dir store;
+            HolbuildStatCache.write_text_atomically file (String.concat (header ^ "\n" :: map line entries)))
+  in
+    map (fn (_, {key, sha1, ...}) => (key, sha1)) entries
+  end
 
 fun sort_strings xs =
   let
@@ -3898,14 +4021,33 @@ fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
 fun resumes_from_checkpoints policy (action : theory_action) =
   null (#extra_outputs action) andalso not (trace_steps policy)
 
-fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
+(* A fresh preload's load lines, given the dependencies' .dat digests
+   (DAT_DIGESTS, by the paths HOL's load names): HOL's theory module cache
+   takes them instead of reading and hashing those files.  They hold for the
+   loads only, so no heap saved after them carries them; HOL hashes any file
+   they miss, and one too old to take them loads as before. *)
+fun dat_digest_load_lines dat_digests preload load_lines =
+  case (dat_digests () handle e => (warn ("theory .dat digests not passed: " ^ General.exnMessage e); [])) of
+      [] => load_lines
+    | digests =>
+        let
+          val file = Path.mkAbsolute {path = Path.concat (Path.dir preload, "holbuild-theory-dat-digests"),
+                                      relativeTo = FS.getDir ()}
+        in
+          write_text file (String.concat (map (fn (path, sha1) => sha1 ^ "  " ^ path ^ "\n") digests));
+          if_meta_has ["readTheoryDatDigests", "theoryDatDigests"]
+            ("val _ = Meta.readTheoryDatDigests " ^ HolbuildToolchain.sml_string file ^ ";") ::
+          load_lines @ [if_meta_has ["theoryDatDigests"] "val _ = Meta.theoryDatDigests := [];"]
+        end
+
+fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker dat_digests =
   let
     val source_name = #source_name action
     val logical = #logical action
     val load_lines = map (theory_load_line root) (#loads action)
   in
   if not (checkpoint_enabled policy) then
-    (write_plain_preload load_lines preload;
+    (write_plain_preload (dat_digest_load_lines dat_digests preload load_lines) preload;
      write_text staged_script (instrumented_source defer_proofs policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
      {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
   else
@@ -3929,7 +4071,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
       fun run_from_fresh_preload () =
         (remove_deps_checkpoint_descendants base deps_key;
          ensure_source_checkpoint_parents ();
-         write_preload load_lines deps_loaded deps_ok preload;
+         write_preload (dat_digest_load_lines dat_digests preload load_lines) deps_loaded deps_ok preload;
          write_text staged_script (instrumented_source false policy (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
@@ -4106,7 +4248,7 @@ val attached_child : (unit -> unit) option ref = ref NONE
    outline, or a proof on outlined parents), which logs there, produces no
    theory module, and leaves its outputs in the stage for the caller to
    install or drop. *)
-fun run_theory_action check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text theorem_checkpoints declaration_checkpoints termination_diagnostics =
+fun run_theory_action check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text theorem_checkpoints declaration_checkpoints termination_diagnostics dat_digests =
   let
     val _ = check_cancelled ()
     val speculative = Option.isSome speculative_log
@@ -4147,6 +4289,8 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val run_spec = write_theory_script (speculative andalso proof_steps_enabled policy) policy root checkpoint_root base_context action source_text
                                     theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
                                     (if execution_plan_only policy then SOME plan_only_marker else NONE)
+                                    (* A speculative child has no module cache; a child loading ahead has its preload. *)
+                                    (if speculative orelse Option.isSome attached then (fn () => []) else dat_digests)
     (* A speculative child runs no checkpoints, so it starts from the
        preload, which then also loads the runtime its deferred proofs use. *)
     val _ =
@@ -5107,11 +5251,11 @@ fun action_checkpoints policy checkpoint_root (action : theory_action) source_te
    made obsolete too: checkpoints saved after resuming from one are its
    children. *)
 fun run_theory_action_checkpoints check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text
-      {theorem_checkpoints, declaration_checkpoints, termination_diagnostics} =
+      {theorem_checkpoints, declaration_checkpoints, termination_diagnostics} dat_digests =
   let
     fun run retries_left =
       run_theory_action check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context action source_text
-                        theorem_checkpoints declaration_checkpoints termination_diagnostics
+                        theorem_checkpoints declaration_checkpoints termination_diagnostics dat_digests
       handle RetryInvalidCheckpoint =>
         if retries_left <= 0 then raise RetryInvalidCheckpoint
         else run (retries_left - 1)
@@ -5119,13 +5263,13 @@ fun run_theory_action_checkpoints check_cancelled speculative_log cache_allowed 
     run (length theorem_checkpoints + length declaration_checkpoints + 1)
   end
 
-fun build_theory_action cache_allowed policy tc root checkpoint_root base_context (action : theory_action) =
+fun build_theory_action cache_allowed policy tc root checkpoint_root base_context (action : theory_action) dat_digests =
   let
     val source_text = read_text (#source_file action)
     val checkpoints = action_checkpoints policy checkpoint_root action source_text
     val generated_metadata =
       run_theory_action_checkpoints (fn () => ()) NONE cache_allowed policy tc root checkpoint_root base_context action source_text
-        checkpoints
+        checkpoints dat_digests
   in
     remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints);
     generated_metadata
@@ -5301,6 +5445,25 @@ fun restore_local_heap tc heap_context base_context checkpoint_root (action : th
 (* Builds a theory from its source in the project: runs its theory action with
    the project's artifact root as action root, then puts the extra outputs in
    the source tree and writes the theory's local load manifests. *)
+(* The .dat digests of a theory's dependencies for its preload
+   (dat_digest_load_lines): the toolchain's, and its project dependencies'
+   hashed once in a build, by the path its .sig has in their load manifests. *)
+fun local_dat_digests dat_hash_cache tc plan node () =
+  let
+    fun is_theory dep = #kind (HolbuildBuildPlan.source_of dep) = HolbuildSourceIndex.TheoryScript
+    fun digest dep =
+      let
+        val {sig_path, data_path, ...} = theory_outputs dep
+        val key = Path.base sig_path ^ ".dat"
+      in
+        if hol_name (Path.base sig_path) <> hol_name (Path.base data_path) then NONE
+        else Option.map (fn sha1 => (key, sha1)) (cached_dat_sha1 dat_hash_cache data_path)
+      end
+  in
+    toolchain_dat_digests tc @
+    List.mapPartial digest (List.filter is_theory (HolbuildBuildPlan.transitive_project_deps plan node))
+  end
+
 fun build_theory dat_hash_cache cache_allowed policy tc project base_context plan keys toolchain_key node =
   let
     val root = project_artifact_root project
@@ -5323,6 +5486,7 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
                  heap_context
     val generated_metadata =
       build_theory_action cache_allowed policy tc root checkpoint_root base_context action
+        (local_dat_digests dat_hash_cache tc plan node)
       handle e => (publish_heap (); raise e)
     val _ = publish_heap ()
     val stage = action_stage root action
@@ -6318,7 +6482,7 @@ fun build_speculative options tc project base_context plan keys toolchain_key ru
       with_outline_watch stage (fn () => on_outline stage)
         (fn () =>
             run_theory_action_checkpoints (fn () => ()) (SOME log_dir) false policy tc root checkpoint_root base_context
-              action deferred (action_checkpoints policy checkpoint_root action deferred))
+              action deferred (action_checkpoints policy checkpoint_root action deferred) (fn () => []))
       handle e => (remove_tree (stage_root_at root key); raise e)
     val _ =
       if path_exists (stage_finalized_marker stage) then ()
@@ -9885,7 +10049,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
           (Resident.Theory {target = target, key = key, source = HolbuildHash.string_sha256 source_text,
                             parents = parents, mldeps = mldeps, dat_hash = hol_dat_hash (path ^ ".dat"),
                             dat_parents = Binarymap.listItems (parse_dat_parent_hashes (read_dat_header (path ^ ".dat"))),
-                            hashes = hashes})
+                            dat_sha1 = hol_file_sha1 (path ^ ".dat"), hashes = hashes})
       end
     fun restorable f (dep as {target, key, ...}) =
       HolbuildRemoteCache.required (fn () => f dep)
@@ -12306,7 +12470,7 @@ fun publish_modules remote {store, modules, deadline} =
    many modules were stored by the writer, of how many missing, and how
    many entries were looked up in the remote cache, and how many modules
    were fetched and published. *)
-fun write_missing_modules remote root tc {deps, loads} deadline =
+fun write_missing_modules remote root tc {deps, loads} known deadline =
   let
     val store = module_store (#holdir tc)
     val base_theories_file = Path.concat (store, module_store_base_theories)
@@ -12314,15 +12478,10 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
       map (fn {target, stem, ...} =>
               (theory_name_from_logical (#2 (target_name target)), in_root root stem))
           deps
-    fun toolchain_base name =
-      let val uo = Path.concat (Path.concat (#holdir tc, "sigobj"), name ^ "Theory.uo")
-      in SOME (Path.concat (Path.dir (FS.realPath uo), name ^ "Theory"))
-      end
-      handle OS.SysErr _ => NONE
     fun base name =
       case List.find (fn (n, _) => n = name) project of
           SOME (_, stem) => SOME stem
-        | NONE => toolchain_base name
+        | NONE => toolchain_theory_base tc name
     (* The base state's theories have no modules, so they count as seen. *)
     val base_theories =
       if file_exists base_theories_file
@@ -12351,9 +12510,19 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
         loads @ map #1 project
     val seen0 = Binaryset.addList (Binaryset.empty String.compare, getOpt (base_theories, []))
     val theories = rev (#2 (List.foldl visit (seen0, []) roots))
+    (* The .dat digests KNOWN (by the path HOL's load names), hashing only
+       the rest. *)
+    fun key b = hol_name b ^ ".dat"
+    val known_digests =
+      List.foldl (fn ((path, sha1), t) => Binarymap.insert (t, path, sha1)) (Binarymap.mkDict String.compare) known
+    val unknown = List.filter (fn (_, b) => not (isSome (Binarymap.peek (known_digests, key b)))) theories
+    val digests =
+      if null unknown then known_digests
+      else
+        ListPair.foldlEq (fn ((_, b), sha1, t) => Binarymap.insert (t, key b, sha1)) known_digests
+          (unknown, hol_files_sha1 (map (fn (_, b) => b ^ ".dat") unknown))
     val expected =
-      ListPair.mapEq (fn ((name, b), sha1) => (name ^ "-" ^ sha1 ^ ".pmo", b ^ ".dat"))
-        (theories, hol_files_sha1 (map (fn (_, b) => b ^ ".dat") theories))
+      map (fn (name, b) => (name ^ "-" ^ Binarymap.find (digests, key b) ^ ".pmo", b ^ ".dat")) theories
     fun missing_modules () =
       let
         val stored =
@@ -12366,15 +12535,6 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
     fun worth_writing missing =
       not (null missing) andalso
       not (isSome base_theories andalso length missing < module_writer_min_missing)
-    (* HOL maps <dir>/xTheory.sml to <dir>/.hol/objs/xTheory.sml itself,
-       so it is given the unmapped name of a toolchain theory. *)
-    fun hol_name b =
-      let val dir = Path.dir b
-      in
-        if Path.file dir = "objs" andalso Path.file (Path.dir dir) = ".hol"
-        then Path.concat (Path.dir (Path.dir dir), Path.file b)
-        else b
-      end
     (* Inside the store, so that the moves below are renames on its file
        system, however a worker's containers mount the stores.  The writer
        may write only here, and the store's lock keeps it to one writer. *)
@@ -12493,7 +12653,7 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
    took, how many modules it stored of how many missing, how many entries it
    looked up in the remote cache, and how many modules it fetched and
    published. *)
-fun fill_module_store remote root tc wanted deadline =
+fun fill_module_store remote root tc wanted known deadline =
   let
     val t0 = Time.now ()
     val holdir = #holdir tc
@@ -12501,7 +12661,7 @@ fun fill_module_store remote root tc wanted deadline =
     val {installed, missing, probed, fetched, published} =
       (if file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
           not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
-       then write_missing_modules remote root tc wanted deadline
+       then write_missing_modules remote root tc wanted known deadline
        else none)
       handle e => (warn ("theory modules not written: " ^ General.exnMessage e); none)
   in
@@ -13072,9 +13232,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
            one loads from .dat files what the store lacks, and later ones
            on the host find the modules.  By now a load ahead has its late
            parents in the root too. *)
+        (* The .dat digests of the theories the action loads: the
+           toolchain's, and those of the dependencies the hydrate installed. *)
+        fun dat_digests () =
+          toolchain_dat_digests tc @
+          map (fn (path, {dat_sha1, ...} : Resident.theory) => (path ^ ".dat", dat_sha1))
+              (Resident.theories (!resident))
         fun set_write_modules () =
           if not (!HolbuildActionSandbox.outputs_validated) then ()
           else write_modules := fill_module_store remote root tc {deps = #deps spec, loads = #loads spec}
+                                  (dat_digests () handle e => (warn ("theory .dat digests not reused: " ^ General.exnMessage e); []))
         val action =
           spec_theory_action root spec (cutoff_context spec cutoff)
         (* A local entry that didn't restore must not stand in for this
@@ -13132,7 +13299,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           in
             (ignore (phase "hol" (fn () =>
                        run_theory_action_checkpoints check_cancelled NONE true policy tc root checkpoint_root
-                         (toolchain_base_context tc) action source_text checkpoints))
+                         (toolchain_base_context tc) action source_text checkpoints dat_digests))
              handle e =>
                (attached_child := NONE;
                 deferred :=

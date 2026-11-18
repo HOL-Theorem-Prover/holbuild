@@ -66,7 +66,7 @@ fun tc hol = {holdir = "$tmpdir/" ^ hol, maxheap = NONE,
               kernel_variant = HolbuildToolchain.StandardKernel};
 val remote = HolbuildRemoteCache.remote "$remote_url";
 fun fill_by hol seconds =
-  E.fill_module_store remote "$tmpdir/root" (tc hol) wanted (Time.+ (Time.now (), Time.fromSeconds seconds));
+  E.fill_module_store remote "$tmpdir/root" (tc hol) wanted [] (Time.+ (Time.now (), Time.fromSeconds seconds));
 fun fill hol = ignore (fill_by hol 100);
 fun store hol = E.module_store ("$tmpdir/" ^ hol);
 fun stored hol file = exists (OS.Path.concat (store hol, file));

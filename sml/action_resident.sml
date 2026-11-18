@@ -19,6 +19,8 @@ type theory =
    parents : string list, mldeps : string list,
    (* The .dat by the hash its children record, and the parents' it records. *)
    dat_hash : string, dat_parents : (string * string) list,
+   (* The .dat's SHA-1 as a file, which HOL's theory modules are named by. *)
+   dat_sha1 : string,
    (* SHA-256 of each of hashed_suffixes. *)
    hashes : string list}
 
@@ -37,7 +39,7 @@ type t =
   {file : string option, entries : (string, entry) Binarymap.dict ref,
    wanted : string Binaryset.set ref, lock : Mutex.mutex}
 
-val header = "holbuild-action-resident-v1"
+val header = "holbuild-action-resident-v2"
 
 fun new file entries =
   {file = file, entries = ref entries, wanted = ref (Binaryset.empty String.compare), lock = Mutex.mutex ()}
@@ -57,9 +59,9 @@ fun uncommas "-" = []
 fun line (path, entry) =
   String.concatWith "\t"
     (case entry of
-         Theory {target, key, source, parents, mldeps, dat_hash, dat_parents, hashes} =>
+         Theory {target, key, source, parents, mldeps, dat_hash, dat_parents, dat_sha1, hashes} =>
            ["theory", path, target, key, source, commas parents, commas mldeps, dat_hash,
-            commas (map (fn (name, hash) => name ^ "=" ^ hash) dat_parents), commas hashes]
+            commas (map (fn (name, hash) => name ^ "=" ^ hash) dat_parents), commas hashes, dat_sha1]
        | File sha => ["file", path, sha]
        | Manifest sha => ["manifest", path, sha]
        | Scratch key => ["scratch", path, key]) ^ "\n"
@@ -68,7 +70,7 @@ exception Malformed
 
 fun parse_line text =
   case String.fields (fn c => c = #"\t") text of
-      ["theory", path, target, key, source, parents, mldeps, dat_hash, dat_parents, hashes] =>
+      ["theory", path, target, key, source, parents, mldeps, dat_hash, dat_parents, hashes, dat_sha1] =>
         (path,
          Theory {target = target, key = key, source = source, parents = uncommas parents, mldeps = uncommas mldeps,
                  dat_hash = dat_hash,
@@ -77,7 +79,7 @@ fun parse_line text =
                                        [name, hash] => (name, hash)
                                      | _ => raise Malformed)
                        (uncommas dat_parents),
-                 hashes = uncommas hashes})
+                 dat_sha1 = dat_sha1, hashes = uncommas hashes})
     | ["file", path, sha] => (path, File sha)
     | ["manifest", path, sha] => (path, Manifest sha)
     | ["scratch", path, key] => (path, Scratch key)
@@ -136,6 +138,10 @@ fun put (t as {entries, wanted, ...} : t) path entry =
   locked t (fn () => (entries := Binarymap.insert (!entries, path, entry); wanted := Binaryset.add (!wanted, path)))
 
 fun theory t path = case find t path of SOME (Theory theory) => SOME theory | _ => NONE
+
+fun theories (t as {entries, ...} : t) =
+  locked t (fn () => List.mapPartial (fn (path, Theory theory) => SOME (path, theory) | _ => NONE)
+                                     (Binarymap.listItems (!entries)))
 
 (* The keys of the recorded theories and scratch stems. *)
 fun keys (t as {entries, ...} : t) =

@@ -20,7 +20,7 @@ val root = "/w/action";
 val resident : Resident.t = Resident.empty ();
 val _ = Resident.put resident "/w/action/src/fooTheory"
           (Resident.Theory {target = "src/fooTheory", key = "k", source = "s", parents = [], mldeps = [],
-                            dat_hash = "d", dat_parents = [], hashes = []});
+                            dat_hash = "d", dat_parents = [], dat_sha1 = "s1", hashes = []});
 val _ = Resident.put resident "/w/action/lib/barLib.sml" (Resident.File "h");
 fun check (text, expected) =
   if HolbuildBuildExec.lost_restored_file resident root text = expected then ()
