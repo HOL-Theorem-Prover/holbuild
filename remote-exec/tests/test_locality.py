@@ -736,3 +736,30 @@ async def test_a_held_build_of_a_hint_only_tier_that_a_claim_ahead_outranks_is_c
     )
 
     assert asked == [["high"]]
+
+
+@pytest.mark.parametrize("failing", ["_lock_unleased", "_lease"])
+async def test_a_hold_taken_by_a_claim_that_fails_to_lease_its_build_is_put_back(
+    http: httpx.AsyncClient,
+    cache: FakeCache,
+    coordinator: Coordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str,
+) -> None:
+    """``b1`` is held for host-1; host-1's claim fails while locking or leasing it, so ``b1`` stays ready and held."""
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    held = await submit_as(http, "b1", "b")
+    assert await claim_on(http, "host-3") is None
+    hold = coordinator.holds[(held, "standard")]
+
+    async def fail(*_: object, **__: object) -> None:
+        raise RuntimeError("database gone")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(coordinator, failing, fail)
+        with pytest.raises(RuntimeError):
+            await coordinator.claim(["standard"], "w", 0, host_id="host-1")
+
+    assert coordinator.holds[(held, "standard")] == hold
+    claimed = await claim_on(http, "host-1")
+    assert claimed is not None and claimed["theory"] == "pkg:b"

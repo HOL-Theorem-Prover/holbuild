@@ -847,6 +847,8 @@ class _Claimed:
     spec_sha256: str
     theory: str
     max_heap_mb: int | None
+    # The hold the claim took for the build, by its (batch, tier), put back if its lease fails.
+    hold: "tuple[tuple[UUID, str], Hold] | None" = None
 
 
 # Lock a built action :key of batch :batch_id and its children, in key order, returning nothing. A build's result holds
@@ -1383,13 +1385,19 @@ class Coordinator:
             if claimed is not None:
                 return claimed, None
         while True:
-            async with self.engine.begin() as conn:
-                # Never lock a batch after an action: batch writers take those locks in the opposite order.
-                row, held_until, stopped = await self._claim_build(
-                    conn, ranking, outranked, host_id, hint, hint_only=hint_only
-                )
-                if row is not None:
-                    claimed = await self._lease(conn, row, worker)
+            row = None
+            try:
+                async with self.engine.begin() as conn:
+                    # Never lock a batch after an action: batch writers take those locks in the opposite order.
+                    row, held_until, stopped = await self._claim_build(
+                        conn, ranking, outranked, host_id, hint, hint_only=hint_only
+                    )
+                    if row is not None:
+                        claimed = await self._lease(conn, row, worker)
+            except BaseException:
+                if row is not None and row.hold is not None:  # the build stays ready
+                    self._put_back_hold(*row.hold)
+                raise
             if row is not None:
                 self._batch_changed(row.batch_id)
                 return claimed, None
@@ -1755,7 +1763,14 @@ class Coordinator:
                     del self.passed_over[next(iter(self.passed_over))]
             # Taken before the await, so a concurrent claim that misses the build doesn't drop it first.
             hold = self.holds.pop((batch_id, tier), None)
-            row = await self._lock_unleased(conn, CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
+            try:
+                row = await self._lock_unleased(
+                    conn, CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier}
+                )
+            except BaseException:
+                if hold is not None:
+                    self._put_back_hold((batch_id, tier), hold)
+                raise
             if row is not None and tier == hint_only and (hold is None or row.theory != hold[2]):
                 row = None  # another build of the batch, which this claim defers; the lock ends with the transaction
             self.passed_over.pop((batch_id, tier), None)
@@ -1767,7 +1782,8 @@ class Coordinator:
                     self.locality.held_ms_total += round((asyncio.get_running_loop().time() - hold[0]) * 1000)
                 if host_id is not None:
                     self._count_claim(row.theory, tier, host_id, kept)
-                return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb), None, None
+                taken = None if hold is None else ((batch_id, tier), hold)
+                return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb, taken), None, None
             if passed is not None and (count := self.passed_over.get(passed)) is not None:
                 if count > 1:
                     self.passed_over[passed] = count - 1
@@ -1775,10 +1791,8 @@ class Coordinator:
                     del self.passed_over[passed]
             if priority != 0:
                 ranking.running_priority -= 1
-            if hold is not None:  # for a concurrent claim leasing it
-                self.holds.setdefault((batch_id, tier), hold)
-                if asyncio.get_running_loop().time() >= hold[1]:  # its end's wake found no hold
-                    self._wake_at_hold_end((batch_id, tier), hold)
+            if hold is not None:
+                self._put_back_hold((batch_id, tier), hold)
             ranking.exhausted.add((batch_id, tier))
         put_back_held()
         return None, held_until, None
@@ -1935,6 +1949,13 @@ class Coordinator:
         if waiter is not None:
             waiter[2].set_result((tier, False, batch_id, hold[2]))
             self.claim_waiters.remove(waiter)
+
+    def _put_back_hold(self, key: tuple[UUID, str], hold: Hold) -> None:
+        """Put back the hold a claim took for the build of ``key`` it didn't lease, for a concurrent claim leasing
+        it; if the hold ended meanwhile, its end's wake found none, so wake a claim now."""
+        self.holds.setdefault(key, hold)
+        if asyncio.get_running_loop().time() >= hold[1]:
+            self._wake_at_hold_end(key, hold)
 
     def _wake_holder(self, tier: str, batch_id: UUID, theory: str, level: int, kept: set[str]) -> None:
         """Wake the best-ranked claim waiting on a host of ``kept``, the hosts the build of ``batch_id`` and ``tier``
