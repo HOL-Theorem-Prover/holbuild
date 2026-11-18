@@ -591,7 +591,7 @@ write_b_and_c idle
 (cd "$tmpdir/idle" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j2 build --no-cache --skip-checkpoints --skip-proof-steps CTheory) \
   > "$tmpdir/idle.log" 2>&1
 log=$tmpdir/idle.log
-require_grep "pipeline: dispatch pipelined: ATheory (pending 1, free 2)" "$log"
+require_grep "pipeline: dispatch pipelined: ATheory (ranked ahead 0, free 2)" "$log"
 require_grep "pipeline: attempt done: BTheory" "$log"
 require_grep "pipeline: attempt done: CTheory" "$log"
 require_grep "pipeline: committed: CTheory" "$log"
@@ -600,8 +600,7 @@ require_no_grep "dispatch pipelined: [BC]Theory" "$log"
 require_same_as_unpipelined idle CTheory A B C
 
 # Under a backlog nothing is pipelined: six independent theories at -j2.
-# Each worker that takes one leaves at least as many ready as free, so each
-# builds plain, but for the last if both workers are free then.
+# None has a child that could start on its outline, so each builds plain.
 new_project backlog
 for t in R1 R2 R3 R4 R5 R6; do
   cat > "$tmpdir/backlog/src/${t}Script.sml" <<SML
@@ -620,8 +619,8 @@ done
 log=$tmpdir/backlog.log
 plain=$(grep -c "pipeline: dispatch plain: R" "$log" || true)
 pipelined=$(grep -c "pipeline: dispatch pipelined: R" "$log" || true)
-if (( plain < 5 || plain + pipelined != 6 )); then
-  echo "expected at least 5 of the 6 theories dispatched plain, got $plain plain and $pipelined pipelined" >&2
+if (( plain != 6 || pipelined != 0 )); then
+  echo "expected the 6 theories dispatched plain, got $plain plain and $pipelined pipelined" >&2
   cat "$log" >&2
   exit 1
 fi
@@ -669,3 +668,48 @@ require_grep "pipeline: gate failed: ATheory (digest differs)" "$log"
 require_no_grep "early cutoff: [BC]Theory " "$log"
 require_grep "BTheory built" "$log"
 require_grep "CTheory built" "$log"
+
+# Loading ahead: C starts its attempt while B's still runs its script, B's
+# outline not yet published, and loads everything else meanwhile, then B's
+# outline once it comes.  Its outputs are those of a plain build.
+new_project ahead
+cat > "$tmpdir/ahead/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem a_thm:
+  T
+Proof
+  $slow_truth
+QED
+val _ = export_theory();
+SML
+cat > "$tmpdir/ahead/src/BScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib ATheory;
+val _ = new_theory "B";
+val _ = OS.Process.sleep (Time.fromSeconds 6);
+Theorem b_thm:
+  T /\ T
+Proof
+  CONJ_TAC >> ACCEPT_TAC ATheory.a_thm
+QED
+val _ = export_theory();
+SML
+cat > "$tmpdir/ahead/src/CScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib BTheory;
+val _ = new_theory "C";
+Theorem c_thm:
+  T /\ T
+Proof
+  ACCEPT_TAC BTheory.b_thm
+QED
+val _ = export_theory();
+SML
+build_pipelined ahead CTheory
+log=$tmpdir/ahead.log
+require_grep "pipeline: dispatch ahead: CTheory (late BTheory)" "$log"
+require_before "pipeline: dispatch ahead: CTheory" "pipeline: outline ready: BTheory" "$log"
+require_grep "pipeline: ahead arrived: BTheory for CTheory" "$log"
+require_grep "pipeline: attempt done: CTheory" "$log"
+require_grep "pipeline: committed: CTheory" "$log"
+require_no_grep "ahead abandoned" "$log"
+require_same_as_unpipelined ahead CTheory A B C
