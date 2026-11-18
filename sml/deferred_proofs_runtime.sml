@@ -464,7 +464,10 @@ struct
       if null (!queue) then (HolbuildRuntime.normalize_theory_export sig_path; publish ())
       else
         let
-          val data = valOf (HOLsexp.fromString (read_text (stem ^ ".dat")))
+          (* Not HOLsexp.fromString: its time grows faster than the text
+             (98 s for a 1.9 MB .dat that fromStream parses in 0.1 s). *)
+          val data = let val input = TextIO.openIn (stem ^ ".dat")
+                     in HOLsexp.fromStream input before TextIO.closeIn input end
           val _ = marker_data := SOME data
           val (outline, oracle) = oracle_in_scope data
         in
