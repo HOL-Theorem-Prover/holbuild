@@ -495,23 +495,23 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   primary tier. Polling claims defer each tier to better-ranked waiters;
   a waiting standard-only worker still leaves high work available to burst
   workers. This packs work so excess tail hosts can drain for scale-in.
-  With `REMOTE_EXEC_LOCALITY` on, each process also remembers, per host, the
-  last 2048 theories its actions ran and their dependency contexts (the
-  `deps-key` its workers report), for 30 minutes after the host's last
-  worker went quiet; a host loses those of an action that failed for an
-  infrastructure reason. A host holds a theory's checkpoints if the theory
-  ran there, else possibly its context, whose heap a cold host fetches from
-  the cache. Only hosts below the scale-in line count as holders: where the
-  hosts, in packing order and counting each host's workers or leases (only
-  leases and waiting claims on a host short of memory), can run the live
-  leases and the ready builds, and at least `REMOTE_EXEC_WARM_WORKERS` (for
-  high work, counting only hosts with a burst worker); hosts above it get no
-  preference, so they still empty when demand falls.
-  A claim from such a host that holds less of the head batch's next build
-  takes, of the next 8 batches with the same tier, priority and running
-  count, the first it holds the most of (checkpoints before context) where
-  no other kept host taking its tier holds more; each batch is passed over
-  that way at most 8 times in a row. A claim from any host that holds less
+  Each process also remembers, per host, its last 2048 keys, the theories
+  its actions ran and their dependency contexts (the `deps-key` its workers
+  report) together, for 30 minutes after the host's last worker went quiet;
+  a host loses those of an action that failed for an infrastructure reason.
+  A host holds a theory's checkpoints if the theory ran there, else possibly
+  its context, whose heap a cold host fetches from the cache. Only hosts
+  below the scale-in line count as holders: where the hosts, in packing
+  order and counting each host's workers or leases (only leases and waiting
+  claims on a host short of memory), can run the live leases and the ready
+  builds, and at least `REMOTE_EXEC_WARM_WORKERS`; for high work, where the
+  hosts with a burst worker can run their leases and the ready high work.
+  Hosts above it get no preference, so they still empty when demand falls.
+  With `REMOTE_EXEC_LOCALITY` on, a claim from a kept host that holds less
+  of the head batch's next build takes, of the next 8 batches with the same
+  tier, priority and running count, the first it holds the most of
+  (checkpoints before context) where no other kept host taking its tier
+  holds more; each batch is passed over that way at most 8 times in a row. A claim from any host that holds less
   of the head's build than a kept host taking its tier leaves it to such
   hosts for 0.5 s from the first time a claim did, waking a claim waiting on
   one, and takes the next batch instead; with only such builds left, it

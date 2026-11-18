@@ -996,6 +996,7 @@ class Coordinator:
         self.passed_over: dict[tuple[UUID, str], int] = {}
         self.holds: dict[tuple[UUID, str], tuple[float, float]] = {}
         self.ready_builds = 0
+        self.ready_high = 0  # high-tier actions ready at that count
         self.locality = LocalityCounts()
         # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
         self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque(maxlen=MAX_PHASE_REPORTS)
@@ -1607,7 +1608,11 @@ class Coordinator:
         a candidate held for another host (_held) for the next one. When only such candidates are left, it returns
         no build and when the first of their holds ends.
         """
-        kept = functools.cache(lambda tier: self._kept_hosts(len(ranking.heap) + 1, tier))
+        kept = functools.cache(
+            lambda tier: self._kept_hosts(
+                (len(ranking.heap) if tier != "high" else sum(e[7] == "high" for e in ranking.heap)) + 1, tier
+            )
+        )
         held: list[RankEntry] = []  # taken out of the heap only until this claim awaits or returns
         held_until: float | None = None
 
@@ -1858,10 +1863,10 @@ class Coordinator:
     def _kept_hosts(self, ready: int = 0, tier: str = "standard") -> set[str]:
         """The hosts below the scale-in line for work of ``tier``: in the order claims pack onto them (warm hosts,
         then by rank and id), the hosts not quarantined whose workers seen lately could run the live leases and the
-        ready builds (the last count's, or ``ready`` if more), and at least the warm workers. For high work, which
-        only burst workers take, the line is drawn over the hosts with one alone. A host short of memory counts only
-        the workers it runs or that wait for a claim, as the others wait for memory. A host above the line is to
-        empty, so locality never sends it work."""
+        ready builds (the last count's, or ``ready`` if more), and at least the warm workers. High work, which only
+        burst workers take, has a line of its own over the hosts with one: their leases and the ready high work. A
+        host short of memory counts only the workers it runs or that wait for a claim, as the others wait for
+        memory. A host above the line is to empty, so locality never sends it work."""
         now = self.clock()
         leases = Counter(host for host, _, _ in self.lease_hosts.values())
         waiting = Counter(w_rank[3] for _, w_rank, w_woken, _ in self.claim_waiters if not w_woken.done())
@@ -1879,7 +1884,10 @@ class Coordinator:
             short = report is not None and bool(report[1].memory_short)
             slots = max(reported, busy, 1) if short else max(len(fresh), reported, busy, 1)
             hosts.append(((all(fresh), rank, host_id), slots))
-        budget = max(self.settings.warm_workers, len(self.lease_hosts) + max(ready, self.ready_builds))
+        if tier == "high":
+            budget = sum(leases[host_id] for (_, _, host_id), _ in hosts) + max(ready, self.ready_high)
+        else:
+            budget = max(self.settings.warm_workers, len(self.lease_hosts) + max(ready, self.ready_builds))
         kept: set[str] = set()
         before = 0
         for (_, _, host_id), slots in sorted(hosts):
@@ -2706,6 +2714,7 @@ class Coordinator:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
             counts = await self._counts(conn, COUNT_UNFINISHED)
         self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
+        self.ready_high = counts.ready_high
         now = self.clock()
         self._forget_silent_hosts(now)
         demand = self._burst_demand(counts)
@@ -2835,6 +2844,7 @@ class Coordinator:
             async with self.engine.connect() as conn:
                 counts = await self._counts(conn, COUNT_ACTIVE)
             self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
+            self.ready_high = counts.ready_high
             now = self.clock()
             self._forget_silent_hosts(now)
             demand = self._burst_demand(counts)

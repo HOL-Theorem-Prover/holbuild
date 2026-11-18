@@ -488,3 +488,12 @@ def test_high_work_draws_its_scale_in_line_over_the_hosts_with_burst_workers(coo
     coordinator.report_worker("host-9", "host-9-w", ["high", "standard"])
 
     assert (coordinator._kept_hosts(1), coordinator._kept_hosts(1, "high")) == ({"host-0"}, {"host-9"})
+
+
+def test_the_high_line_counts_high_work_and_not_the_warm_workers(coordinator: Coordinator) -> None:
+    """One ready high build needs one burst host, whatever the warm workers wanted."""
+    coordinator.settings.warm_workers = 5
+    for host in ["host-8", "host-9"]:
+        coordinator.report_worker(host, f"{host}-w", ["high", "standard"])
+
+    assert coordinator._kept_hosts(1, "high") == {"host-8"}
