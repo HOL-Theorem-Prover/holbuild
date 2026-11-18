@@ -86,6 +86,13 @@ compacted_failed_prefix() {
        grep -q "checkpoint kind=failed_prefix share=true"; then
     echo "build $1 saved no compacted failed prefix" >&2
     ls -R "$project/.holbuild/logs/current" >&2 || true
+    saves A >&2
+    for log in "$project"/.holbuild/logs/current/nontarget/ATheory/*.log; do
+      echo "== $log" >&2
+      tail -n 40 "$log" >&2 || true
+    done
+    echo "== $tmpdir/$1.log" >&2
+    cat "$tmpdir/$1.log" >&2 || true
     exit 1
   fi
 }
