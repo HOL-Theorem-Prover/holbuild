@@ -85,29 +85,15 @@ fun path_components path = String.tokens (fn c => c = #"/" orelse c = #"\\") pat
 fun path_has_suffix suffix path =
   size path >= size suffix andalso
   String.substring(path, size path - size suffix, size suffix) = suffix
-fun has_glob_char path =
-  CharVector.exists (fn c => c = #"*" orelse c = #"?" orelse c = #"[" orelse c = #"]") path
 
 fun validate_extra_output_decl node path =
   let
     val source = source_of node
     val context = "holbuild_extra_outputs in " ^ #source_path source
-    val components = path_components path
-    val invalid_component =
-      List.exists (fn component => component = "." orelse component = "..") components
   in
-    if path = "" then raise Error (context ^ " contains an empty path")
-    else if Path.isAbsolute path then
-      raise Error (context ^ " path must be relative to the declaring source: " ^ path)
-    else if invalid_component then
-      raise Error (context ^ " path must not contain . or .. components: " ^ path)
-    else if path_has_suffix "/" path orelse path_has_suffix "\\" path then
-      raise Error (context ^ " path must name a file, not a directory: " ^ path)
-    else if has_glob_char path then
-      raise Error (context ^ " path must be a fixed file path, not a glob: " ^ path)
-    else if List.null components then
-      raise Error (context ^ " contains an invalid path: " ^ path)
-    else
+    case HolbuildSourceIndex.extra_output_decl_problem path of
+        SOME problem => raise Error (context ^ " " ^ problem)
+      | NONE =>
       case #kind source of
           HolbuildSourceIndex.TheoryScript => ()
         | _ => raise Error (context ^ " is only supported for theory-script actions")
@@ -1349,13 +1335,20 @@ fun expand_input plan node (label, base, decl) : input_expansion =
           else
             let
               val root = valOf (input_overlay plan node "")
-              val _ = HolbuildGenerators.ensure_dir root
+              (* Planning under the project lock finds the root current;
+                 outside it, one that isn't is as good as empty. *)
+              val current =
+                case List.find (fn package => HolbuildProject.package_name package = #package (source_of node))
+                       (analysis_packages (analysis_state plan)) of
+                    SOME package => HolbuildSourceIndex.extra_output_root_current package root
+                  | NONE => false
               fun existing path =
                 if path = root orelse is_dir path then path else existing (Path.dir path)
               val glob = path_has_glob decl
               val start = normalize_path (Path.concat(overlay, decl))
               val found =
-                if glob then
+                if not current then {files = [], dirs = []}
+                else if glob then
                   if is_dir overlay then
                     let val {files, dirs} = walked_files_under overlay ""
                     in {files = List.filter (fn (rel, _) => HolbuildSourceIndex.glob_match decl rel) files, dirs = dirs} end

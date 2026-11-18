@@ -64,10 +64,16 @@ fun extra_input_watch_path root base decl =
   end
 
 (* The extra-output root of the source's package, where a dependency's
-   theories write their extra outputs (HolbuildProject.package_extra_output_root). *)
+   theories write their extra outputs (HolbuildProject.package_extra_output_root),
+   while it holds outputs from the package's current source; the next build
+   empties one that doesn't. *)
 fun extra_output_root packages (source : HolbuildSourceIndex.source) =
   case List.find (fn package => HolbuildProject.package_name package = #package source) packages of
-      SOME package => HolbuildProject.package_extra_output_root package
+      SOME package =>
+        (case HolbuildProject.package_extra_output_root package of
+             SOME root =>
+               if HolbuildSourceIndex.extra_output_root_current package root then SOME root else NONE
+           | NONE => NONE)
     | NONE => NONE
 
 (* The extra-input declarations of a source, each with the directory it is

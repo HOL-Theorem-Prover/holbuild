@@ -392,9 +392,32 @@ val observed_dirs : (string * string * HolbuildStatCache.ident option * string l
 fun observe_dir package path stamp entries =
   observed_dirs := (package, path, stamp, entries) :: !observed_dirs
 
+(* Why PATH can't be a holbuild_extra_outputs declaration, if it can't: it
+   names a fixed file under the declaring script's directory. *)
+fun extra_output_decl_problem path =
+  let
+    val components = String.tokens (fn c => c = #"/" orelse c = #"\\") path
+    fun bad problem = SOME (problem ^ ": " ^ path)
+  in
+    if path = "" then SOME "contains an empty path"
+    else if Path.isAbsolute path then bad "path must be relative to the declaring source"
+    else if List.exists (fn component => component = "." orelse component = "..") components then
+      bad "path must not contain . or .. components"
+    else if String.isSuffix "/" path orelse String.isSuffix "\\" path then
+      bad "path must name a file, not a directory"
+    else if CharVector.exists (fn c => c = #"*" orelse c = #"?" orelse c = #"[" orelse c = #"]") path then
+      bad "path must be a fixed file path, not a glob"
+    else if List.null components then bad "contains an invalid path"
+    else NONE
+  end
+
+(* Declarations a build would refuse declare nothing to the lookups here. *)
+fun valid_extra_output_decl path = not (Option.isSome (extra_output_decl_problem path))
+
 (* The extra outputs the theory file at PATH declares, as entries "o<declaration>". *)
 fun declaration_entries path =
-  sort_unique_strings (map (fn output => "o" ^ output) (#extra_outputs (HolbuildDependencies.extract_textual path)))
+  sort_unique_strings (map (fn output => "o" ^ output)
+    (List.filter valid_extra_output_decl (#extra_outputs (HolbuildDependencies.extract_textual path))))
   handle IO.Io _ => raise Error ("cannot read " ^ path)
        | HolbuildDependencies.Error _ => []
 
@@ -542,27 +565,49 @@ fun member_contains member path =
 fun scan_key name source_root = name ^ "\000" ^ source_root
 
 (* A dependency's extra-output root holds what its theories wrote from one
-   snapshot of its sources, recorded beside it.  Once the package's snapshot
-   changes, as with a new pin, those files may be stale even where a theory
-   still declares their paths, so the root starts empty. *)
-fun prepare_extra_output_root package root =
+   source of the package, whose identity is recorded beside it: its snapshot
+   and retrieval, and where its sources are.  Once that changes, as with a
+   new pin or an override, those files may be stale even where a theory
+   still declares their paths. *)
+fun extra_output_root_identity package =
   let
-    val marker = root ^ ".source"
-    val identity =
-      HolbuildPackageProvenance.snapshot_text
-        (HolbuildPackageProvenance.snapshot (HolbuildProject.package_provenance package))
-    val recorded =
-      SOME (let val input = TextIO.openIn marker
-            in TextIO.inputAll input before TextIO.closeIn input end)
-      handle IO.Io _ => NONE
+    val provenance = HolbuildProject.package_provenance package
+    fun location path = OS.FileSys.realPath path handle OS.SysErr _ => normalize_path path
   in
-    if recorded = SOME identity andalso is_dir root then ()
-    else
-      (HolbuildRemoveTree.remove root;
-       HolbuildGenerators.ensure_dir root;
-       let val out = TextIO.openOut marker
-       in TextIO.output (out, identity); TextIO.closeOut out end)
+    String.concatWith "\n"
+      [HolbuildPackageProvenance.snapshot_text (HolbuildPackageProvenance.snapshot provenance),
+       HolbuildPackageProvenance.retrieval_text (HolbuildPackageProvenance.retrieval provenance),
+       location (HolbuildPackageProvenance.source_root provenance),
+       location (HolbuildPackageProvenance.package_root provenance)]
   end
+
+fun extra_output_root_marker root = root ^ ".source"
+
+(* Whether ROOT, the package's extra-output root, holds outputs from its
+   current source.  Readers outside the project lock take one that doesn't as
+   empty. *)
+fun extra_output_root_current package root =
+  is_dir root andalso
+  (SOME (let val input = TextIO.openIn (extra_output_root_marker root)
+         in TextIO.inputAll input before TextIO.closeIn input end)
+   handle IO.Io _ => NONE) = SOME (extra_output_root_identity package)
+
+(* Under the project lock: empties each dependency's extra-output root that
+   isn't current, recording the identity of its source.  Whether any was. *)
+fun reset_extra_output_roots graph =
+  List.foldl
+    (fn (package, reset) =>
+       case HolbuildProject.package_extra_output_root package of
+           NONE => reset
+         | SOME root =>
+             if extra_output_root_current package root then reset
+             else
+               (HolbuildRemoveTree.remove root;
+                HolbuildGenerators.ensure_dir root;
+                let val out = TextIO.openOut (extra_output_root_marker root)
+                in TextIO.output (out, extra_output_root_identity package); TextIO.closeOut out end;
+                true))
+    false (HolbuildProjectGraph.packages graph)
 
 fun prevalidate_package package =
   let
@@ -603,7 +648,7 @@ fun prevalidate_package package =
     val _ =
       case HolbuildProject.package_extra_output_root package of
           NONE => validate_action_policies name policies candidates
-        | SOME root => prepare_extra_output_root package root
+        | SOME _ => ()
   in
     (* Without generators nothing can change the tree before discovery, so
        discovery reuses this scan instead of walking the tree again. *)
@@ -643,7 +688,8 @@ fun script_extra_outputs (script : source) =
     if #kind script <> TheoryScript then []
     else
       map (fn output => normalize_path (if dir = "" then output else Path.concat(dir, output)))
-          (#extra_outputs (HolbuildDependencies.extract_textual (#source_path script)))
+          (List.filter valid_extra_output_decl
+             (#extra_outputs (HolbuildDependencies.extract_textual (#source_path script))))
       (* One the analyser can't read declares nothing here; it fails when
          a build selects it. *)
       handle IO.Io _ => [] | HolbuildDependencies.Error _ => []
@@ -716,6 +762,11 @@ fun discover_package scans package =
       case HolbuildProject.package_extra_output_root package of
           NONE => []
         | SOME root =>
+            (* Under the project lock the root is current
+               (reset_extra_output_roots); outside it, one that isn't is as
+               good as empty. *)
+            if not (extra_output_root_current package root) then []
+            else
             let
               fun scan (member, acc) =
                 let val path = HolbuildProject.abs_under root member
@@ -727,8 +778,7 @@ fun discover_package scans package =
                 end
               (* A producer may make the member's directory later, which a
                  plan record must notice.  The walk ends at the root, never
-                 above, where entries change with every build; planning
-                 creates the root (prevalidate_package). *)
+                 above, where entries change with every build. *)
               and observe_existing_ancestor path =
                 let val parent = Path.dir path
                 in

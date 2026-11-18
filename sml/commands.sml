@@ -1154,6 +1154,14 @@ fun prepare_source_index phase_prefix resolution project =
      components = components}
   end
 
+(* Under the project lock, before planning: empties the extra-output roots of
+   dependencies whose source changed (HolbuildSourceIndex.reset_extra_output_roots).
+   Whether any was, which makes a source index prepared before stale. *)
+fun reset_extra_output_roots resolution project =
+  timed_phase "extra_outputs.reset"
+    (fn () => HolbuildSourceIndex.reset_extra_output_roots
+                (HolbuildProjectGraph.resolve {project = project, resolution = resolution}))
+
 (* A theory script may write SML sources as extra outputs, as EmitML code does.
    A plan made before the theory runs has no node for such a source while it is
    missing, so the sources that use it build without it, and it hashes a stale
@@ -1279,10 +1287,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
        trknl = trknl,
        restore_only = (case mode of RemoteExec {remote_only, ...} => remote_only | _ => false)}
+    (* Whether the locked reset emptied an extra-output root that PREPARED,
+       made outside the lock, had read. *)
+    val prepared_stale = ref false
+    fun with_lock label f =
+      HolbuildBuildExec.with_project_lock project label
+        (fn () => (if reset_extra_output_roots resolution project then prepared_stale := true else ();
+                   f ()))
     fun prepared_sources () =
-      case prepared of
-          SOME {index, components, ...} => {index = index, components = components}
-        | NONE => prepare_source_index "build" resolution project
+      case (prepared, !prepared_stale) of
+          (SOME {index, components, ...}, false) => {index = index, components = components}
+        | _ => prepare_source_index "build" resolution project
     type planned =
       {index : HolbuildSourceIndex.t, targets : string list, entry_plan : HolbuildBuildPlan.t option,
        plan : HolbuildBuildPlan.t, toolchain_key : string,
@@ -1540,7 +1555,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         (* Why the runs didn't all end, and whether a later try may succeed. *)
         val stopped : (string * bool) option ref = ref NONE
         val (remote, runs, uncached, {exported, refused}) =
-          HolbuildBuildExec.with_project_lock project "run-action"
+          with_lock "run-action"
             (fn () => run_with_stat_cache (fn () =>
               let
                 val {remote, runs, export} =
@@ -2162,17 +2177,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
   in
     case mode of
         ExportActionSpecs {upload} =>
-          HolbuildBuildExec.with_project_lock project "action-spec"
+          with_lock "action-spec"
             (fn () => run_with_stat_cache (export_action_specs upload))
       | ExportRunSpecs request =>
-          HolbuildBuildExec.with_project_lock project "run-action"
+          with_lock "run-action"
             (fn () => run_with_stat_cache (export_run_specs request))
       | RemoteRun run => remote_run run ()
       | BuildTargets =>
-          HolbuildBuildExec.with_project_lock project (if dry_run then "dry-run" else "build")
+          with_lock (if dry_run then "dry-run" else "build")
             (fn () => run_with_stat_cache (if dry_run then describe_dry_run else execute_build))
       | RemoteExec remote =>
-          HolbuildBuildExec.with_project_lock project "build"
+          with_lock "build"
             (fn () => run_with_stat_cache (fn () => remote_build remote))
   end
 
@@ -2989,6 +3004,7 @@ fun clean_targets args =
     val _ = reject_object_targets args
     fun execute_clean () =
       let
+        val _ = reset_extra_output_roots HolbuildProject.standard_resolution project
         val {index, components} = prepare_source_index "clean"
                                   HolbuildProject.standard_resolution project
         val args = HolbuildSourceIndex.resolve_path_targets index args
@@ -3074,6 +3090,7 @@ fun build_heap_kind tc cli_jobs command args =
           in
             {index = index, components = components, plan = plan}
           end
+        val _ = reset_extra_output_roots (resolution_for_toolchain tc) project
         val toolchain_key = timed_phase "toolchain.key" (fn () => HolbuildToolchain.toolchain_key tc)
         val output_path = HolbuildProject.abs_under (#root project) output
         fun build_plan plan =

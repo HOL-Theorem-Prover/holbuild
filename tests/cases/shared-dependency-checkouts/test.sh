@@ -338,6 +338,33 @@ over_build WTheory
 require_grep "GUse built" "$tmpdir/over-step.log"
 require_grep "y=1" "$tmpdir/over/src/W.txt"
 
+# A declaration a build would reject, in a dependency theory not built,
+# doesn't stop the build, though discovery reads that theory's declarations.
+cat > "$override/BadScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["/tmp/bad.txt", "../bad.txt", "bad/", "*.txt"];
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Bad";
+val _ = export_theory();
+SML
+over_build WTheory
+if (cd "$tmpdir/over" && "$HOLBUILD_BIN" build BadTheory) > "$tmpdir/over-bad.log" 2>&1; then
+  fail "a dependency theory with invalid extra outputs built"
+fi
+require_grep "holbuild_extra_outputs in .*/BadScript.sml path must" "$tmpdir/over-bad.log"
+rm "$override/BadScript.sml"
+
+# Another copy of the dependency at the same path starts the extra-output
+# directory afresh, as its files came from the old copy.
+echo stale > "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/stale.txt"
+cp -R "$tmpdir/dep-override" "$tmpdir/dep-override2"
+mv "$tmpdir/dep-override" "$tmpdir/dep-override1"
+ln -s dep-override2 "$tmpdir/dep-override"
+over_build WTheory
+[[ ! -e $tmpdir/over/.holbuild/packages/dep/extra-outputs/src/stale.txt ]] ||
+  fail "a switch to another copy of the dependency kept its extra outputs"
+require_grep "y=1" "$tmpdir/over/src/W.txt"
+
 # GC runs on a cache of its own, which links no shared toolchains, with a HOL
 # dependency that is never built.
 export HOLBUILD_CACHE=$tmpdir/gc-cache
