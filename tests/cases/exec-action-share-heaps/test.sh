@@ -626,6 +626,19 @@ mkdir -p "$patched/bin" "$patched/share/holbuild"
 cp "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" "$patched/bin/holbuild"
 cp -R "$SCRIPT_DIR/../../../sml" "$patched/share/holbuild/"
 printf '\n(* changed after the heap *)\n' >> "$patched/share/holbuild/sml/proof_runtime.sml"
+# The checkpoints above the heap hold the changed runtime: an edit of t5,
+# which resumed after t4 under the old runtime (v9), now resumes from the heap.
+write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "ASM_REWRITE_TAC []"
+HOLBUILD_BIN=$patched/bin/holbuild export_t t-runtime
+forget_local
+HOLBUILD_BIN=$patched/bin/holbuild worker t-runtime "$shared_url" "$shared" "$spec_t" --share-heaps
+expect t-runtime 0 "status=built"
+resumed t-runtime "deps-loaded checkpoint" "deps-loaded heap"
+if grep -q "restored shared \(theorem_context\|failed_prefix\)" "$tmpdir/t-runtime.log"; then
+  echo "a changed proof runtime restored a checkpoint saved under the old one" >&2
+  cat "$tmpdir/t-runtime.log" >&2
+  exit 1
+fi
 write_x "REWRITE_TAC []"
 HOLBUILD_BIN=$patched/bin/holbuild export_x 3
 forget_local

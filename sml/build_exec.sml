@@ -2840,8 +2840,9 @@ val theorem_location_schema = "source_pragmas_v1"
    doesn't compile them again, so its key covers them and only them, and a
    release that changes only other runtime sources keeps every deps heap.
    The preload's and child policy's generated text isn't in a hashed file:
-   changing what it leaves in the heap needs a dependency-context version
-   bump. *)
+   changing what it leaves in the heap needs a version bump of the
+   dependency context keys and of shared_heap_key, whose deps-key a worker
+   with early cutoff takes from the remote dependency context. *)
 val heap_runtime_source_files =
   HolbuildToolchain.runtime_files @ ["sml/checkpoint_save_runtime.sml", "sml/ahead_load_runtime.sml"]
 
