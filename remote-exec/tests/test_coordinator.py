@@ -775,6 +775,23 @@ async def test_a_claim_that_gets_an_action_ends_the_leases_its_worker_got_no_ans
     assert (await http.post(f"/v1/work/{held['attempt_token']}/heartbeat", headers=WORKER)).status_code == 200
 
 
+async def test_a_claim_whose_worker_has_gone_gives_its_action_back(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """A worker stopped while its claim waited gets no answer: the action goes back at once, not when the lease
+    expires."""
+    batch_id = await submit(http, ["a"])
+
+    async def gone() -> bool:
+        return True
+
+    assert await coordinator.claim(["standard"], "w9", 0, gone) is None
+    (action,) = (await batch(http, batch_id))["actions"]
+    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+    claimed = await coordinator.claim(["standard"], "w10")
+    assert claimed is not None and claimed.theory == "pkg:a"
+
+
 async def test_a_late_claim_leaves_the_leases_its_worker_claimed_since(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:

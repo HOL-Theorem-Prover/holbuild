@@ -1163,7 +1163,8 @@ class Coordinator:
         that least recently had one claimed, then the oldest; within it, the action with the deepest chain of
         dependents, then the most dependents.
 
-        A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. Each
+        A wait ends early once ``disconnected`` says the worker has gone, and a claim it has gone from by the time
+        it took an action gives that action back, so no action is leased to nobody. Each
         action this process's ``release`` makes ready wakes one compatible claim, preferring warm workers, then
         hosts of lower ``host_rank``, then hosts in canonical order, with FIFO ties. Unwoken claims defer each tier to
         better-ranked waiters, so polling workers don't spread work back onto tail hosts. Waits recheck every
@@ -1208,7 +1209,7 @@ class Coordinator:
                         if claimed is not None:
                             self._lease_host(claimed.attempt_token, host_id, worker, tiers)
                             self._ran_on(host_id, claimed.theory)
-                        return claimed
+                        return await self._answered(claimed, disconnected)
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         return None
@@ -1232,7 +1233,7 @@ class Coordinator:
                     self._lease_host(claimed.attempt_token, host_id, worker, tiers)
                     self._ran_on(host_id, claimed.theory)
                 if claimed is not None or remaining <= 0:
-                    return claimed
+                    return await self._answered(claimed, disconnected)
                 woken = loop.create_future()
                 if (self.made_ready, self.ahead_changes if ahead else 0) == seen:
                     waiter = (tiers, rank, woken, ahead)
@@ -1249,6 +1250,22 @@ class Coordinator:
         except asyncio.CancelledError:
             self._pass_wake(woken)
             raise
+
+    async def _answered(
+        self, claimed: Claim | None, disconnected: Callable[[], Awaitable[bool]] | None
+    ) -> Claim | None:
+        """``claimed``, or None once its lease is ended when its worker has gone by now, as one ECS stopped while
+        it waited does: no answer would reach it, so the action would wait out the lease. It goes back at once
+        without counting the attempt, as ``release_unheld`` ends a lease."""
+        if claimed is None or disconnected is None or not await disconnected():
+            return claimed
+        async with self.engine.connect() as conn:
+            batch_id = await conn.scalar(
+                sa.text("SELECT batch_id FROM leases WHERE attempt_token = :token"), {"token": claimed.attempt_token}
+            )
+        if batch_id is not None:
+            await self._end_unheld([(claimed.attempt_token, batch_id)])
+        return None
 
     async def _outranked_by_ahead(
         self, tiers: list[str], ahead_tiers: list[str]
