@@ -504,8 +504,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   the cache. Only hosts below the scale-in line count as holders: where the
   hosts, in packing order and counting each host's workers or leases (only
   leases and waiting claims on a host short of memory), can run the live
-  leases and the ready builds, and at least `REMOTE_EXEC_WARM_WORKERS`;
-  hosts above it get no preference, so they still empty when demand falls.
+  leases and the ready builds, and at least `REMOTE_EXEC_WARM_WORKERS` (for
+  high work, counting only hosts with a burst worker); hosts above it get no
+  preference, so they still empty when demand falls.
   A claim from such a host that holds less of the head batch's next build
   takes, of the next 8 batches with the same tier, priority and running
   count, the first it holds the most of (checkpoints before context) where
@@ -517,9 +518,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   waits until the first hold ends, claiming nothing ahead meanwhile. A wake
   for newly ready work goes to a waiting claim on a kept host holding the
   most of it, if more than the first in line, and a woken claim takes that
-  batch while it is still in the head's band and not left for another host,
-  or while it is left for this one. `GET /v1/queue`'s `locality` counts what
-  it did.
+  build while it is still in the head's band and no other kept host holds
+  more of it, or while it is left for this host. `GET /v1/queue`'s
+  `locality` counts what it did.
   Packing is best effort among that process's waiting claims; it neither
   moves running actions nor coordinates host preference across replicas.
   Run admission is serialized across coordinator replicas and permits at

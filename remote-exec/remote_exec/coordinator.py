@@ -910,6 +910,8 @@ ClaimRank = tuple[bool, bool, int, str]
 # if it was for one.
 Wake = tuple[str, bool, UUID | None, str | None]
 # A shared ranking's entry; see _Ranking.
+# The batch, tier and theory of a build a claim was woken for.
+Hint = tuple[UUID, str, str]
 RankEntry = tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]
 
 
@@ -1250,8 +1252,8 @@ class Coordinator:
                 )
                 # A claim woken for a batch made ready prefers it; see _claim_build.
                 hint = None
-                if woken.done() and (wake := woken.result())[2] is not None and not wake[1]:
-                    hint = (wake[2], wake[0])
+                if woken.done() and (wake := woken.result())[2] is not None and wake[3] is not None and not wake[1]:
+                    hint = (wake[2], wake[0], wake[3])
                 claimed, held_until = (
                     await self._claim(eligible_tiers, worker, outranked, host_id, hint) if eligible_tiers else (None, None)
                 )
@@ -1310,7 +1312,7 @@ class Coordinator:
         worker: str,
         outranked: Callable[[str, int], list[str]] | None = None,
         host_id: str | None = None,
-        hint: tuple[UUID, str] | None = None,
+        hint: Hint | None = None,
     ) -> tuple[Claim | None, float | None]:
         """Lease a ready build of ``tiers`` from the shared ranking, else a run action. Before a ready build that
         ranks after an action that may be claimed ahead, claim one of the tiers ``outranked`` gives for it, of a
@@ -1586,7 +1588,7 @@ class Coordinator:
         ranking: "_Ranking",
         outranked: Callable[[str, int], list[str]] | None = None,
         host_id: str | None = None,
-        hint: tuple[UUID, str] | None = None,
+        hint: Hint | None = None,
     ) -> tuple[_Claimed | None, float | None]:
         """Lock a ready build from the shared ranking, without refreshing it inside the transaction.
 
@@ -1605,7 +1607,7 @@ class Coordinator:
         a candidate held for another host (_held) for the next one. When only such candidates are left, it returns
         no build and when the first of their holds ends.
         """
-        kept = functools.cache(lambda: self._kept_hosts(len(ranking.heap) + 1))
+        kept = functools.cache(lambda tier: self._kept_hosts(len(ranking.heap) + 1, tier))
         held: list[RankEntry] = []  # taken out of the heap only until this claim awaits or returns
         held_until: float | None = None
 
@@ -1690,30 +1692,35 @@ class Coordinator:
         ranking: "_Ranking",
         entry: RankEntry,
         host_id: str | None,
-        hint: tuple[UUID, str] | None,
-        kept: Callable[[], dict[str, bool]],
+        hint: Hint | None,
+        kept: Callable[[str], set[str]],
     ) -> RankEntry | None:
-        """The candidate of the batch and tier ``hint`` a claim from ``host_id`` was woken for, to take instead of
-        ``entry``, popped from ``ranking``, or None: while it is in ``entry``'s band and not held for another host,
-        or of its tier and priority and held for this host (see _held). As in _local_entry, ``entry`` is passed
+        """The candidate of the build ``hint`` a claim from ``host_id`` was woken for, to take instead of ``entry``,
+        popped from ``ranking``, or None: while it is held for this host (see _held) and of ``entry``'s tier and
+        priority, or else while it is in ``entry``'s band and no other kept host holds more of its theory, which
+        _held would leave it to. Not once another claim took that build. As in _local_entry, ``entry`` is passed
         over at most LOCALITY_WINDOW times in a row."""
         head = (entry[6], entry[7])
+        if not self.settings.locality or host_id is None or hint is None:
+            return None
+        key, theory = hint[:2], hint[2]
         if (
-            not self.settings.locality or host_id is None or hint is None or hint == head or hint in ranking.exhausted
+            key == head or key in ranking.exhausted or ranking.theories.get(key) != theory
             or self.passed_over.get(head, 0) >= LOCALITY_WINDOW
         ):
             return None
-        hinted = next((e for e in ranking.heap if (e[6], e[7]) == hint), None)
+        hinted = next((e for e in ranking.heap if (e[6], e[7]) == key), None)
         if hinted is None or hinted[:2] != entry[:2]:
             return None
-        hold = self.holds.get(hint)
-        if hold is None or asyncio.get_running_loop().time() >= hold[1]:
-            return hinted if hinted[:3] == entry[:3] else None
-        theory = ranking.theories.get(hint)
-        return hinted if theory is not None and self._holds_most(host_id, theory, hint[1], kept) else None
+        hold = self.holds.get(key)
+        if hold is not None and asyncio.get_running_loop().time() < hold[1]:
+            return hinted if self._holds_most(host_id, theory, key[1], kept) else None
+        if self._best_level(theory, key[1], host_id, kept) > self._level(host_id, theory):
+            return None
+        return hinted if hinted[:3] == entry[:3] else None
 
     def _local_entry(
-        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[], dict[str, bool]]
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
     ) -> RankEntry | None:
         """The candidate a claim from ``host_id`` takes instead of ``entry``, popped from ``ranking``, or None.
 
@@ -1745,7 +1752,7 @@ class Coordinator:
         return local
 
     def _held(
-        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[], dict[str, bool]]
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
     ) -> float | None:
         """When the hold of candidate ``entry`` for a host other than ``host_id`` ends, or None if a claim from
         ``host_id`` may take it now.
@@ -1765,18 +1772,17 @@ class Coordinator:
             hold = self.holds[head] = (now, now + LOCALITY_HOLD_SECONDS)
             if len(self.holds) > MAX_LEASE_HOSTS:  # those of batches that ended unclaimed
                 del self.holds[next(iter(self.holds))]
-            self._wake_holder(entry[7], head[0], theory, best, kept())
+            self._wake_holder(entry[7], head[0], theory, best, kept(entry[7]))
         return hold[1] if now < hold[1] else None
 
-    def _wake_holder(self, tier: str, batch_id: UUID, theory: str, level: int, kept: dict[str, bool]) -> None:
+    def _wake_holder(self, tier: str, batch_id: UUID, theory: str, level: int, kept: set[str]) -> None:
         """Wake the best-ranked claim waiting on a host of ``kept`` that holds ``level`` of ``theory``, the most a
         kept host does, for the build of ``batch_id`` and ``tier`` just held for such hosts, if one waits. It makes
         no new work ready, so made_ready stays."""
         waiter = min(
             (
                 w for w in self.claim_waiters
-                if tier in w[0] and not w[2].done() and w[1][3] in kept and (tier != "high" or kept[w[1][3]])
-                and self._level(w[1][3], theory) == level
+                if tier in w[0] and not w[2].done() and w[1][3] in kept and self._level(w[1][3], theory) == level
             ),
             key=lambda w: w[1],
             default=None,
@@ -1797,24 +1803,20 @@ class Coordinator:
         deps = self.theory_deps.get(theory)
         return 1 if deps is not None and deps in keys else 0
 
-    def _best_level(self, theory: str, tier: str, host_id: str, kept: Callable[[], dict[str, bool]]) -> int:
+    def _best_level(self, theory: str, tier: str, host_id: str, kept: Callable[[str], set[str]]) -> int:
         """The most of ``theory`` (_level) a host below the scale-in line other than ``host_id`` that takes ``tier``
         holds. The line is computed only if some host holds any of it."""
         if not any(self._level(h, theory) for h in self.host_keys if h != host_id):
             return 0
-        hosts = kept()
-        return max(
-            (self._level(h, theory) for h, high in hosts.items() if h != host_id and (high or tier != "high")),
-            default=0,
-        )
+        return max((self._level(h, theory) for h in kept(tier) if h != host_id), default=0)
 
-    def _holds_most(self, host_id: str, theory: str, tier: str, kept: Callable[[], dict[str, bool]]) -> bool:
+    def _holds_most(self, host_id: str, theory: str, tier: str, kept: Callable[[str], set[str]]) -> bool:
         """Whether ``host_id`` is below the scale-in line and holds some of ``theory`` and no less of it than any
         other kept host that takes ``tier``, so a build of it isn't left for another host."""
         mine = self._level(host_id, theory)
-        return mine > 0 and host_id in kept() and mine >= self._best_level(theory, tier, host_id, kept)
+        return mine > 0 and host_id in kept(tier) and mine >= self._best_level(theory, tier, host_id, kept)
 
-    def _count_claim(self, theory: str, tier: str, host_id: str, kept: Callable[[], dict[str, bool]]) -> None:
+    def _count_claim(self, theory: str, tier: str, host_id: str, kept: Callable[[str], set[str]]) -> None:
         """Count a build of ``theory`` and ``tier`` claimed from ``host_id`` by what its host held of it."""
         mine = self._level(host_id, theory)
         if mine == 2:
@@ -1853,21 +1855,22 @@ class Coordinator:
         elif result.status != "failed" or result.failure in RAN_FAILURES:
             self._ran_on(host_id, theory)
 
-    def _kept_hosts(self, ready: int = 0) -> dict[str, bool]:
-        """The hosts below the scale-in line, each with whether it takes high work: in the order claims pack onto
-        them (warm hosts, then by rank and id), the hosts not quarantined whose workers seen lately could run the
-        live leases and the ready builds (the last count's, or ``ready`` if more), and at least the warm workers. A
-        host short of memory counts only the workers it runs or that wait for a claim, as the others wait for
-        memory. A host above the line is to empty, so locality never sends it work."""
+    def _kept_hosts(self, ready: int = 0, tier: str = "standard") -> set[str]:
+        """The hosts below the scale-in line for work of ``tier``: in the order claims pack onto them (warm hosts,
+        then by rank and id), the hosts not quarantined whose workers seen lately could run the live leases and the
+        ready builds (the last count's, or ``ready`` if more), and at least the warm workers. For high work, which
+        only burst workers take, the line is drawn over the hosts with one alone. A host short of memory counts only
+        the workers it runs or that wait for a claim, as the others wait for memory. A host above the line is to
+        empty, so locality never sends it work."""
         now = self.clock()
         leases = Counter(host for host, _, _ in self.lease_hosts.values())
         waiting = Counter(w_rank[3] for _, w_rank, w_woken, _ in self.claim_waiters if not w_woken.done())
-        hosts: list[tuple[tuple[bool, int, str], int, bool]] = []
+        hosts: list[tuple[tuple[bool, int, str], int]] = []
         for host_id, workers in self.host_workers.items():
             fresh = [
                 is_burst for seen, is_burst in workers.values() if (now - seen).total_seconds() < HOST_REPORT_SECONDS
             ]
-            if not fresh or self._quarantine(host_id) is not None:
+            if not fresh or self._quarantine(host_id) is not None or (tier == "high" and not any(fresh)):
                 continue
             report = self.hosts.get(host_id)
             rank = 0 if report is None else report[1].rank
@@ -1875,14 +1878,14 @@ class Coordinator:
             busy = leases[host_id] + waiting[host_id]
             short = report is not None and bool(report[1].memory_short)
             slots = max(reported, busy, 1) if short else max(len(fresh), reported, busy, 1)
-            hosts.append(((all(fresh), rank, host_id), slots, any(fresh)))
+            hosts.append(((all(fresh), rank, host_id), slots))
         budget = max(self.settings.warm_workers, len(self.lease_hosts) + max(ready, self.ready_builds))
-        kept: dict[str, bool] = {}
+        kept: set[str] = set()
         before = 0
-        for (_, _, host_id), slots, high in sorted(hosts):
+        for (_, _, host_id), slots in sorted(hosts):
             if before >= budget:
                 break
-            kept[host_id] = high
+            kept.add(host_id)
             before += slots
         return kept
 
@@ -1997,8 +2000,8 @@ class Coordinator:
         if waiter is not None and theory is not None and self.settings.locality:
             level = self._level(waiter[1][3], theory)
             holders = [w for w in compatible if self._level(w[1][3], theory) > level]
-            kept = self._kept_hosts(1) if holders else {}  # with the build made ready
-            holders = [w for w in holders if w[1][3] in kept and (tier != "high" or kept[w[1][3]])]
+            kept = self._kept_hosts(1, tier) if holders else set()  # with the build made ready
+            holders = [w for w in holders if w[1][3] in kept]
             best = max((self._level(w[1][3], theory) for w in holders), default=0)
             local = min((w for w in holders if self._level(w[1][3], theory) == best), key=lambda w: w[1], default=None)
             if local is not None:

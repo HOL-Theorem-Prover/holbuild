@@ -317,17 +317,32 @@ async def test_a_hold_wakes_a_claim_waiting_on_the_holder(
     assert not waiters["b"].done() and coordinator.made_ready == made_ready
 
 
-@pytest.mark.parametrize("locality", [True, False])
-async def test_a_woken_claim_takes_the_batch_it_was_woken_for(
-    http: httpx.AsyncClient, coordinator: Coordinator, locality: bool
+@pytest.mark.parametrize(
+    ("locality", "theory", "expected"), [(True, "pkg:b", "pkg:b"), (False, "pkg:b", "pkg:a"), (True, "pkg:c", "pkg:a")]
+)
+async def test_a_woken_claim_takes_the_build_it_was_woken_for_unless_another_claim_took_it(
+    http: httpx.AsyncClient, coordinator: Coordinator, locality: bool, theory: str, expected: str
 ) -> None:
+    """Woken for ``pkg:c``, a build of ``b1``'s batch another claim took, a claim takes the head."""
     coordinator.settings.locality = locality
     await submit_as(http, "a1", "a")
     woken_for = await submit_as(http, "b1", "b")
 
-    claimed, _ = await coordinator._claim(["standard"], "w", host_id="host-5", hint=(woken_for, "standard"))
+    claimed, _ = await coordinator._claim(["standard"], "w", host_id="host-5", hint=(woken_for, "standard", theory))
 
-    assert claimed is not None and claimed.theory == ("pkg:b" if locality else "pkg:a")
+    assert claimed is not None and claimed.theory == expected
+
+
+async def test_a_woken_claim_leaves_the_build_it_was_woken_for_to_a_kept_host_holding_more_of_it(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await submit_as(http, "a1", "a")
+    woken_for = await submit_as(http, "b1", "b")
+
+    claimed, _ = await coordinator._claim(["standard"], "w", host_id="host-5", hint=(woken_for, "standard", "pkg:b"))
+
+    assert claimed is not None and claimed.theory == "pkg:a"
 
 
 @pytest.mark.parametrize("head", ["b", "a"])
@@ -443,12 +458,12 @@ async def test_a_release_wake_counts_the_build_it_made_ready_in_the_scale_in_lin
 async def test_a_release_hands_the_claim_it_wakes_the_batch_it_made_ready(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    hints: list[tuple[UUID, str] | None] = []
+    hints: list[tuple[UUID, str, str] | None] = []
     claim = coordinator._claim
 
     async def recording(
         tiers: list[str], worker: str, outranked: Any = None, host_id: str | None = None,
-        hint: tuple[UUID, str] | None = None,
+        hint: tuple[UUID, str, str] | None = None,
     ) -> Any:
         hints.append(hint)
         return await claim(tiers, worker, outranked, host_id, hint)
@@ -462,4 +477,14 @@ async def test_a_release_hands_the_claim_it_wakes_the_batch_it_made_ready(
     claimed = await waiting
 
     assert claimed is not None and claimed.theory == "pkg:a"
-    assert hints[-1] == (batch_id, "standard")
+    assert hints[-1] == (batch_id, "standard", "pkg:a")
+
+
+def test_high_work_draws_its_scale_in_line_over_the_hosts_with_burst_workers(coordinator: Coordinator) -> None:
+    """Warm host-0's standard workers cover the warm workers, but can't take high work."""
+    coordinator.settings.warm_workers = 2
+    for i in range(2):
+        coordinator.report_worker("host-0", f"host-0-w{i}", ["standard"])
+    coordinator.report_worker("host-9", "host-9-w", ["high", "standard"])
+
+    assert (coordinator._kept_hosts(1), coordinator._kept_hosts(1, "high")) == ({"host-0"}, {"host-9"})
