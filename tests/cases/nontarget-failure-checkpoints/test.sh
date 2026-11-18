@@ -172,11 +172,12 @@ require_grep "from: failed-prefix checkpoint in a2" "$tmpdir/after-timeout.log"
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 url=$remote_url
 worker_cache=$tmpdir/worker
-# worker NAME: exec-action of A's current spec on a worker that holds
-# nothing from an earlier run.
+# worker NAME [TARGET]: exec-action of A's current spec, in a batch for
+# TARGET (T, where A is a dependency), on a worker that holds nothing from
+# an earlier run.
 worker() {
-  local name=$1 spec
-  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" action-spec --upload TTheory) > "$tmpdir/$name.batch"
+  local name=$1 target=${2:-TTheory} spec
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" action-spec --upload "$target") > "$tmpdir/$name.batch"
   spec=$(awk '$1 == "action" && $5 == "nontarget:ATheory" { print $4 }' "$tmpdir/$name.batch")
   [[ -n "$spec" ]] || { cat "$tmpdir/$name.batch" >&2; exit 1; }
   rm -rf "$worker_cache"
@@ -231,3 +232,21 @@ worker share-fixed
 expect_worker share-fixed 0 "status=built"
 require_grep "restored shared standalone failed_prefix checkpoint" "$tmpdir/share-fixed.log"
 require_grep "from: failed-prefix checkpoint in a3" "$tmpdir/share-fixed.log"
+
+# A passing dependency that restores a deps heap a target build of A shared
+# publishes nothing, not even the heap's checkpoint index.
+write_a "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH"
+worker share-target ATheory
+expect_worker share-target 0 "status=built"
+[[ -n "$(published holbuild-shared-heap-v1)" ]] || {
+  echo "the target A shared no deps heap" >&2; cat "$tmpdir/share-target.log" >&2; exit 1; }
+indexes() { for f in $(grep -lx holbuild-shared-checkpoint-index-v1 "$tmpdir"/remote/ac/* 2>/dev/null); do md5sum "$f"; done; }
+before=$(indexes)
+# A new proof, so A isn't already in the cache; its deps heap is the same.
+write_a "ALL_TAC >> ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH"
+worker share-dep-pass
+expect_worker share-dep-pass 0 "status=built"
+require_grep "restored shared" "$tmpdir/share-dep-pass.log"
+if [[ "$(indexes)" != "$before" ]]; then
+  echo "the passing dependency A published a checkpoint index:" >&2; indexes >&2; exit 1
+fi

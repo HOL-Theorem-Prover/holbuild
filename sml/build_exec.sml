@@ -13369,7 +13369,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                 raise e));
             deferred :=
               (fn () =>
-                 (publish_shared ();
+                 ((* A passing non-target has no checkpoint to share. *)
+                  if checkpoint_target_enabled policy then publish_shared () else ();
                   if !cancelled then () else
                   (publish_tools ();
                    (* After the publish: the checkpoints saved after
@@ -13701,7 +13702,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
                (cached shared_key orelse
                 resumes_from_checkpoints (spec_policy spec) built_action andalso
-                cached (shared_standalone_key shared_key built_action)))
+                (* Only a restore that checks its key= line records its blobs. *)
+                Option.isSome (HolbuildRemoteCache.fetch_action remote
+                                 (shared_standalone_key shared_key built_action))))
           in
             if hit then
               (stop_child ();
