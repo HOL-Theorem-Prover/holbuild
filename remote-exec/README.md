@@ -42,18 +42,19 @@ what building holbuild and HOL takes. Its entrypoint takes `migrate`,
 docker run -e REMOTE_EXEC_DATABASE_URL=postgresql+asyncpg://user:pass@host/remote_exec holbuild-remote-exec migrate
 docker run -p 8090:8090 -e REMOTE_EXEC_DATABASE_URL=... -e REMOTE_EXEC_CLIENT_TOKEN=... \
   -e REMOTE_EXEC_WORKER_TOKEN=... -e REMOTE_EXEC_CACHE_URL=https://user:pass@cache.example.org \
-  holbuild-remote-exec coordinator [uvicorn options, default --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2 --no-access-log]
+  holbuild-remote-exec coordinator [uvicorn options, default --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2]
 ```
 
-The coordinator writes no line per request. Once a minute, and once more at shutdown, it logs a line that counts its
-responses by method, route and status, with the CPU seconds the process used and the CPU time per response:
+Besides uvicorn's access log, which deployment health checks may read for answered claims, the coordinator logs a
+line once a minute, and once more at shutdown, that counts its responses by method, route and status, with the CPU
+seconds the process used and the CPU time per response:
 
 ```text
 2203 responses in 60 s, 25.9 CPU-s, 11.8 ms each: GET /v1/cache/members 200 950, POST /v1/work/claim 200 330, ...
 ```
 
 Without the image, from this directory: `uv sync`, then `uv run alembic
-upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090 --no-access-log`.
+upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090`.
 
 Migration `0005` adds the action class and its indexes; run migrations with
 the coordinator stopped. To roll back to an image predating `0005`, first
