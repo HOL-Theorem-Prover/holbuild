@@ -70,6 +70,11 @@ class Publisher:
             raise AssertionError(f"{self.dir.name} failed:\n{self.log.read_text()}")
         return self.log.read_text()
 
+    def go(self) -> None:
+        """Start a GATED script's timed part once it has compiled."""
+        self.wait_until(lambda: (self.dir / "ready").exists())
+        (self.dir / "go").touch()
+
     def heap(self) -> str:
         return (self.dir / "heap.sha").read_text()
 
@@ -138,17 +143,24 @@ def failed_upload_releases_claim() -> None:
 def restore_waits_for_claimed_upload() -> None:
     """An action right after the one that built its heap waits for that
     heap's upload instead of loading every ancestor itself."""
+    # Both restores compile before the upload starts: the held upload gives
+    # up after curl's 30 s low-speed limit, which compiling twice can pass.
+    bounded = Publisher("bounded", "four", restore_script, WAIT_SECONDS="1", GATED="1")
+    waiting = Publisher("waiting", "four", restore_script,
+                        BASE_STATE=str(directory / "uploader" / "base.save"), GATED="1")
+    for restore in (bounded, waiting):
+        restore.wait_until(lambda: (restore.dir / "ready").exists())
     (control / "cas-put-enable").touch()
     uploads = control / "cas-put-count"
     uploader = Publisher("uploader", "four")
     uploader.wait_until(lambda: uploads.exists() and uploads.read_text() == "1")
     # Claimed and mid-upload: a restore waits no longer than its deadline.
     started = time.monotonic()
-    bounded = Publisher("bounded", "four", restore_script, WAIT_SECONDS="1")
+    bounded.go()
     assert bounded.result() == "none", "the wait outlived an upload that never ends"
     assert time.monotonic() - started < 30, "the wait ignored its deadline"
     claim_reads = claim_gets("four")
-    waiting = Publisher("waiting", "four", restore_script, BASE_STATE=str(uploader.dir / "base.save"))
+    waiting.go()
     waiting.wait_until(lambda: claim_gets("four") >= claim_reads + 2)
     (control / "cas-put-release").touch()
     uploader.finish()
