@@ -484,6 +484,13 @@ fun cgroup_shortfall dir charge starting =
                    ", below the charge")
     | _ => NONE
 
+(* How many of this process's children wait for a reservation now. *)
+val waiting_mutex = Mutex.mutex ()
+val waiting_count = ref 0
+fun change_waiting n =
+  (Mutex.lock waiting_mutex; waiting_count := !waiting_count + n; Mutex.unlock waiting_mutex)
+fun waiting_children () = !waiting_count
+
 fun acquire {dir, budget_mb, charge_mb} =
   let
     val charge = charge_mb * mib
@@ -516,6 +523,8 @@ fun acquire {dir, budget_mb, charge_mb} =
                           | SOME why => Wait why
             end
         end)
+    val counted = ref false
+    fun uncount () = if !counted then (counted := false; change_waiting ~1) else ()
     fun loop waiting =
       case try () of
           Admitted lease =>
@@ -525,12 +534,14 @@ fun acquire {dir, budget_mb, charge_mb} =
         | Wait why =>
             (check_not_stopped ();
              (if waiting then ()
-              else HolbuildStatus.set_waiting_for_memory
-                     (SOME ("needs " ^ mib_text charge ^ ", " ^ why)));
+              else (counted := true;
+                    change_waiting 1;
+                    HolbuildStatus.set_waiting_for_memory
+                      (SOME ("needs " ^ mib_text charge ^ ", " ^ why))));
              OS.Process.sleep (retry_delay ());
              loop true)
   in
-    loop false
+    (loop false before uncount ()) handle e => (uncount (); raise e)
   end
 
 (* Runs launch with a reserved lease descriptor that the child must inherit,

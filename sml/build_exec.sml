@@ -6632,6 +6632,8 @@ fun with_outline_watch stage on_outline f =
 
 exception AheadAbandoned of string
 
+val memory_yield_seconds = 2
+
 (* Starts the theory child of a pipelined build in STAGE ahead of LATE, its
    parents still being built, as exec-action --ahead-parent does: the child
    loads its other ancestors at once, and in each late parent's place its
@@ -6711,6 +6713,19 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
         copy_binary (from ^ ".uo") (marker (name ^ ".uo"));
         drop ("arrived-" ^ name)
       end
+    (* The child holds its memory reservation while it waits, so it gives
+       way to a child of this build kept waiting for one (a late parent's,
+       say) longer than memory_yield_seconds. *)
+    val memory_wait_since = ref NONE
+    fun check_memory () =
+      if HolbuildMachineMemory.waiting_children () = 0 then memory_wait_since := NONE
+      else
+        case !memory_wait_since of
+            NONE => memory_wait_since := SOME (Time.now ())
+          | SOME since =>
+              if Time.> (Time.- (Time.now (), since), Time.fromSeconds memory_yield_seconds) then
+                raise AheadAbandoned "another child is waiting for machine memory"
+              else ()
     fun poll [] = ()
       | poll pending =
           let
@@ -6720,7 +6735,7 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
             List.app arrive came;
             if not (null came) then ()
             else if child_done () then abandon_stopped "before its parents arrived"
-            else pause ();
+            else (check_memory (); pause ());
             poll (List.filter (not o has_come) pending)
           end
     (* The late parents' own manifests in place of their stand-ins, for a
@@ -6745,6 +6760,7 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
          | _ => ())
     fun ahead () =
       (wait_until (fn () => file_exists (marker "base-loaded"));
+       pipeline_trace ("ahead loaded: " ^ #logical action);
        List.app (write_stand_in (read_base_report (marker "base-loaded")) (ref (Binarymap.mkDict String.compare))) late;
        drop "stand-ins";
        poll late;
@@ -6938,7 +6954,10 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
         PlainWork of int
       | CommitWork of int * speculative_result
       | OutlineWork of int * int * (HolbuildBuildPlan.node * string) list
-      | AttemptWork of int * int * (HolbuildBuildPlan.node * string) list * int list
+      (* An attempt's late parents, each with its producer when the
+         attempt started: the generation of its attempt, or NONE for its
+         plain build. *)
+      | AttemptWork of int * int * (HolbuildBuildPlan.node * string) list * (int * int option) list
     datatype 'a speculation = Succeeded of 'a | NotCold | Failed of string | Abandoned of string
     val deps_of = Array.array (node_count, [] : int list)
     val committed = Array.array (node_count, false)
@@ -7209,11 +7228,17 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                    | _ => acc)
         (Binaryset.empty int_compare) deps
 
-    (* Whether node ID is being built: a worker has its build, its commit
-       or its attempt, or its attempt is done and waits to commit. *)
+    (* Whether node ID is being built: a worker has its build, its commit,
+       its attempt or its outline, or its attempt is done and waits to
+       commit. *)
     fun producing id =
-      Array.sub (active_nodes, id) orelse
+      Array.sub (active_nodes, id) orelse Option.isSome (Array.sub (outline_owner, id)) orelse
       (case Array.sub (attempt, id) of ARunning _ => true | ADone _ => true | _ => false)
+
+    (* Which build of a late parent ID an attempt waits for: its attempt's
+       generation, or NONE for its plain build. *)
+    fun producer id =
+      case Array.sub (attempt, id) of ARunning (gen, _) => SOME gen | ADone (gen, _, _) => SOME gen | _ => NONE
 
     (* A parent an attempt can start ahead of: a theory being built on
        parents that are all available. *)
@@ -7320,7 +7345,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
               waiting_ahead := (gen, length late) :: !waiting_ahead;
               pipeline_trace ("dispatch ahead: " ^ node_name id ^ " (late " ^
                               String.concatWith ", " (map node_name late) ^ ")");
-              start_attempt id gen consumed late
+              start_attempt id gen consumed (map (fn p => (p, producer p)) late)
             end
 
     (* A ready node, pipelined if a child could start on its outline and a
@@ -7814,16 +7839,21 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                                        (case outcome of Failed msg => "\n" ^ msg | _ => ""))))
       end
 
-    (* For attempt GEN of theory ID, started ahead of its late parent P:
-       P's load stem once P is outlined or built, after which the attempt
-       has loaded it.  Raises AheadAbandoned once the attempt is dropped or
-       P is no longer coming. *)
-    fun arrived id gen p =
+    (* For attempt GEN of theory ID, started ahead of its late parent P
+       while P's build PRODUCER (producer) ran: P's load stem once that
+       build has outlined P or P is built, after which the attempt has
+       loaded it.  Raises AheadAbandoned once the attempt is dropped or
+       that build of P is no longer running. *)
+    fun arrived id gen (p, p_producer) =
       with_lock
         (fn () =>
             let
               fun gone why = raise AheadAbandoned why
               val stem = load_stem (Vector.sub (nodes, p))
+              val same_build =
+                case p_producer of
+                    SOME _ => producer p = p_producer
+                  | NONE => Array.sub (active_nodes, p) andalso producer p = NONE
               fun note consumed =
                 (Array.update (attempt, id, ARunning (gen, consumed));
                  (case Array.sub (outline, id) of
@@ -7834,6 +7864,10 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                      (!waiting_ahead);
                  pipeline_trace ("ahead arrived: " ^ node_name p ^ " for " ^ node_name id);
                  signal ())
+              fun other consumed =
+                if Array.sub (committed, p) then (note consumed; SOME stem)
+                else if same_build then NONE
+                else gone ("the build of " ^ node_name p ^ " it started ahead of stopped")
             in
               case Array.sub (attempt, id) of
                   ARunning (current, consumed) =>
@@ -7843,13 +7877,12 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                       (* An outline is what the attempt predicted P's
                          manifest from; a built P comes only without one. *)
                       (case Array.sub (outline, p) of
-                           OReady (_, base, outlined) =>
-                             (note (Binaryset.add (Binaryset.union (consumed, outlined), p));
-                              SOME (outline_path root base stem))
-                         | _ =>
-                             if Array.sub (committed, p) then (note consumed; SOME stem)
-                             else if producing p then NONE
-                             else gone (node_name p ^ " is no longer being built ahead of it"))
+                           OReady (g, base, outlined) =>
+                             if p_producer = SOME g then
+                               (note (Binaryset.add (Binaryset.union (consumed, outlined), p));
+                                SOME (outline_path root base stem))
+                             else other consumed
+                         | _ => other consumed)
                 | _ => gone "the attempt was dropped"
             end)
 
@@ -7859,7 +7892,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
         val outlines = outline_view root view
         val dir = Path.concat(run_dir, "ahead-" ^ Int.toString gen)
         fun stand_in parent = outline_path root dir (load_stem parent)
-        val late_nodes = map (fn p => Vector.sub (nodes, p)) late
+        val late_nodes = map (fn (p, _) => Vector.sub (nodes, p)) late
         val ahead_view =
           fn stem => case List.find (fn parent => load_stem parent = stem) late_nodes of
                          SOME parent => SOME (stand_in parent)
@@ -7869,7 +7902,8 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
           else
             SOME (load_ahead_locally
                     {tc = tc, root = root, plan = plan, base_context = base_context, view = ahead_view, dir = dir,
-                     late = late_nodes, stand_in = stand_in, arrived = fn parent => arrived id gen (node_id parent)})
+                     late = late_nodes, stand_in = stand_in, arrived = fn parent =>
+                       arrived id gen (valOf (List.find (fn (p, _) => p = node_id parent) late))})
         val outcome =
           speculate
             (fn () =>

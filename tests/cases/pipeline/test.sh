@@ -632,6 +632,39 @@ for t in $(sed -n 's/.*pipeline: dispatch plain: \([A-Za-z0-9]*\)Theory .*/\1/p'
   require_no_grep "attempt done: ${t}Theory" "$log"
 done
 
+# A worker is left over for a pipelined build only once every ready theory
+# ranked as high has one: three equally deep roots at -j3, each with a
+# child that could start on its outline.  The first dispatched sees two
+# more ranked as high with three workers free, so it builds plain.
+new_project ranked
+for t in R1 R2 R3; do
+  cat > "$tmpdir/ranked/src/${t}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$t";
+Theorem ${t}_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+  cat > "$tmpdir/ranked/src/${t}ChildScript.sml" <<SML
+open HolKernel Parse boolLib bossLib ${t}Theory;
+val _ = new_theory "${t}Child";
+Theorem ${t}Child_thm:
+  T
+Proof
+  ACCEPT_TAC ${t}Theory.${t}_thm
+QED
+val _ = export_theory();
+SML
+done
+(cd "$tmpdir/ranked" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j3 build --no-cache --skip-checkpoints --skip-proof-steps) \
+  > "$tmpdir/ranked.log" 2>&1
+log=$tmpdir/ranked.log
+require_grep "pipeline: dispatch plain: R[123]Theory (ranked ahead 2, free 3)" "$log"
+require_no_grep "dispatch pipelined: R[123]Theory" "$log"
+
 # Early cutoff: a theory whose dependencies' outputs end up as they were runs
 # no HOL, so no attempt.  A's proof edit leaves its outline what A's outputs
 # on disk export, so B, which cuts off on those, isn't attempted while A
@@ -689,7 +722,7 @@ SML
 cat > "$tmpdir/ahead/src/BScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib ATheory;
 val _ = new_theory "B";
-val _ = OS.Process.sleep (Time.fromSeconds 6);
+val _ = OS.Process.sleep (Time.fromSeconds 10);
 Theorem b_thm:
   T /\ T
 Proof
@@ -710,7 +743,7 @@ SML
 build_pipelined ahead CTheory
 log=$tmpdir/ahead.log
 require_grep "pipeline: dispatch ahead: CTheory (late BTheory)" "$log"
-require_before "pipeline: dispatch ahead: CTheory" "pipeline: outline ready: BTheory" "$log"
+require_before "pipeline: ahead loaded: CTheory" "pipeline: outline ready: BTheory" "$log"
 require_grep "pipeline: ahead arrived: BTheory for CTheory" "$log"
 require_grep "pipeline: attempt done: CTheory" "$log"
 require_grep "pipeline: committed: CTheory" "$log"
