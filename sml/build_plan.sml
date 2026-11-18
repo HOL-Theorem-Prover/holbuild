@@ -253,7 +253,7 @@ type t =
    extra_inputs_key_cache : string option option array,
    input_expansions : (string, input_expansion) Binarymap.dict ref,
    input_hashes : (string, string) Binarymap.dict ref,
-   declared_outputs : (string, string list) Binarymap.dict ref,
+   declared_outputs : (string, (string * string list) list) Binarymap.dict ref,
    known_input_keys : known_input_key option array,
    package_tiers : (string * int) list,
    holdir : string}
@@ -1229,26 +1229,29 @@ fun lookup_key keys dep =
       SOME input_key => input_key
     | NONE => raise Error ("missing action key for dependency: " ^ logical_name dep)
 
-(* The package-relative extra outputs the theories in directory DIR of
-   PACKAGE declare, read once per plan. *)
-fun declared_outputs_in (plan as {declared_outputs, ...} : t) package dir =
+(* The theories in directory DIR of PACKAGE, each as its file and the
+   package-relative extra outputs it declares, read once per plan. *)
+fun declaring_scripts_in (plan as {declared_outputs, ...} : t) package dir =
   let val memo_key = package ^ "\000" ^ dir
   in
     case Binarymap.peek(!declared_outputs, memo_key) of
-        SOME outputs => outputs
+        SOME scripts => scripts
       | NONE =>
           let
             val scripts =
-              List.filter
-                (fn script => #package script = package andalso
-                              Path.dir (normalize_path (#relative_path script)) = dir)
-                (map source_of (universe_nodes plan))
-            val outputs = List.concat (map HolbuildSourceIndex.script_extra_outputs scripts)
+              map (fn script => (#source_path script, HolbuildSourceIndex.script_extra_outputs script))
+                (List.filter
+                   (fn script => #package script = package andalso #kind script = HolbuildSourceIndex.TheoryScript andalso
+                                 Path.dir (normalize_path (#relative_path script)) = dir)
+                   (map source_of (universe_nodes plan)))
           in
-            declared_outputs := Binarymap.insert(!declared_outputs, memo_key, outputs);
-            outputs
+            declared_outputs := Binarymap.insert(!declared_outputs, memo_key, scripts);
+            scripts
           end
   end
+
+fun declared_outputs_in plan package dir =
+  List.concat (map #2 (declaring_scripts_in plan package dir))
 
 (* The directories a theory declaring REL as an output may be in: REL's own
    and its ancestors, as declarations have no .. components. *)
@@ -1269,6 +1272,13 @@ fun declared_outputs_among plan node rels =
          (output_dirs rel))
     rels
 
+(* The files of the theories whose declarations decide whether RELS, paths in
+   NODE's package, are declared extra outputs. *)
+fun declaring_script_files plan node rels =
+  HolbuildSourceIndex.sort_unique_strings (List.concat
+    (map (fn dir => map #1 (declaring_scripts_in plan (package node) dir))
+       (HolbuildSourceIndex.sort_unique_strings (List.concat (map output_dirs rels)))))
+
 (* A dependency's declared extra outputs are written under its extra-output
    root (extra_output_dir_of), not next to its sources.  For an extra-input
    declaration of NODE relative to package directory DIR: SOME of the
@@ -1287,10 +1297,17 @@ fun input_dir node label = if label = "extra_dep" then "" else Path.dir (relativ
    (label, base directory, declaration).  In a dependency, a declaration that
    names an extra output a theory of the package declares is based under the
    package's extra-output root, where that output is written, whether or not
-   it exists yet. *)
+   it exists yet; the others are based in the package's source tree, even for
+   a theory another theory generated under that root. *)
 fun extra_input_decls plan node =
   let
     val source = source_of node
+    val script_base =
+      case input_overlay plan node "" of
+          NONE => Path.dir (#source_path source)
+        | SOME _ =>
+            let val dir = input_dir node "source_extra_dep"
+            in if dir = "" then #package_root source else package_path (#package_root source) dir end
     fun base_of base label decl =
       let val dir = input_dir node label
       in
@@ -1310,7 +1327,7 @@ fun extra_input_decls plan node =
     val declared =
       map (fn decl =>
              ("source_extra_dep",
-              base_of (Path.dir (#source_path source)) "source_extra_dep" decl, decl))
+              base_of script_base "source_extra_dep" decl, decl))
         (#extra_deps (dependencies plan node))
   in
     manifest @ declared
@@ -1318,7 +1335,10 @@ fun extra_input_decls plan node =
 
 (* What an extra-input declaration of NODE (see extra_input_decls) names.  A
    directory or glob in a dependency also takes in the package's declared
-   extra outputs under it, which are written under the extra-output root. *)
+   extra outputs under it, which are written under the extra-output root.
+   Its directories to watch include, where a directory under that root
+   doesn't exist yet, the nearest one that does, and the theories whose
+   declarations decide which files count as outputs. *)
 fun expand_input plan node (label, base, decl) : input_expansion =
   let val dir = input_dir node label
   in
@@ -1328,14 +1348,20 @@ fun expand_input plan node (label, base, decl) : input_expansion =
           if Path.isAbsolute decl orelse base = overlay then expand_extra_dep_walk base decl
           else
             let
+              val root = valOf (input_overlay plan node "")
+              val _ = HolbuildGenerators.ensure_dir root
+              fun existing path =
+                if path = root orelse is_dir path then path else existing (Path.dir path)
               val glob = path_has_glob decl
               val start = normalize_path (Path.concat(overlay, decl))
               val found =
                 if glob then
-                  let val {files, dirs} = walked_files_under overlay ""
-                  in {files = List.filter (fn (rel, _) => HolbuildSourceIndex.glob_match decl rel) files, dirs = dirs} end
+                  if is_dir overlay then
+                    let val {files, dirs} = walked_files_under overlay ""
+                    in {files = List.filter (fn (rel, _) => HolbuildSourceIndex.glob_match decl rel) files, dirs = dirs} end
+                  else {files = [], dirs = [existing overlay]}
                 else if is_dir start then walked_files_under start decl
-                else if is_dir (normalize_path (Path.concat(base, decl))) then {files = [], dirs = [start]}
+                else if is_dir (normalize_path (Path.concat(base, decl))) then {files = [], dirs = [existing start]}
                 else {files = [], dirs = []}
               val declared = declared_outputs_among plan node (map (fn (rel, _) => package_path dir rel) (#files found))
               val outputs =
@@ -1349,8 +1375,12 @@ fun expand_input plan node (label, base, decl) : input_expansion =
               val strays =
                 declared_outputs_among plan node (map (fn (rel, _) => package_path dir rel) (#files tree))
               fun stray (rel, _) = List.exists (fn output => output = package_path dir rel) strays
+              val scripts =
+                declaring_script_files plan node
+                  (map (fn (rel, _) => package_path dir rel) (#files tree @ #files found))
             in
-              {files = List.filter (not o stray) (#files tree) @ outputs, dirs = #dirs tree @ #dirs found}
+              {files = List.filter (not o stray) (#files tree) @ outputs,
+               dirs = #dirs tree @ #dirs found @ scripts}
             end
   end
 

@@ -692,16 +692,30 @@ fun discover_package scans package =
               val _ = HolbuildGenerators.ensure_dir root
               val found =
                 deduplicate_sources (List.foldl scan [] (HolbuildProject.package_members package))
+              val rels = map (fn (output : source) => normalize_path (#relative_path output)) found
+              fun rel_of (source : source) = normalize_path (#relative_path source)
               (* The root outlives pin and override changes, so only what a
-                 theory of the package declares now counts. *)
-              val declarations =
-                if null found then []
-                else declared_extra_outputs tree_sources
-                       (map (fn (output : source) => normalize_path (#relative_path output)) found)
-              fun is_declared (output : source) =
-                List.exists (fn path => path = normalize_path (#relative_path output)) declarations
+                 theory of the package declares now counts, including a theory
+                 another theory generated there, in place of its tree copy. *)
+              fun admit scripts =
+                let
+                  val declarations = declared_extra_outputs scripts rels
+                  val admitted =
+                    List.filter (fn output => List.exists (fn path => path = rel_of output) declarations) found
+                  val new_scripts =
+                    List.filter
+                      (fn (output : source) =>
+                         #kind output = TheoryScript andalso
+                         not (List.exists (fn (script : source) => #source_path script = #source_path output) scripts))
+                      admitted
+                in
+                  if null new_scripts then admitted
+                  else
+                    admit (List.filter (fn script => not (List.exists (fn output => rel_of output = rel_of script) new_scripts)) scripts
+                           @ new_scripts)
+                end
             in
-              map (with_package_root source_root) (List.filter is_declared found)
+              if null found then [] else map (with_package_root source_root) (admit tree_sources)
             end
     fun shadowed (source : source) =
       List.exists (fn (output : source) => #relative_path output = #relative_path source) overlay

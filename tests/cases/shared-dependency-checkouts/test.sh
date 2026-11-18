@@ -228,6 +228,74 @@ for reader in E F; do
   fi
 done
 
+# In a dependency, a theory that another theory generates in the extra-output
+# directory reads its checked-in inputs from the dependency's sources, and the
+# sources it generates belong to the dependency.  A directory input with
+# nothing under the extra-output directory leaves the plan record usable.
+override=$tmpdir/dep-override/src
+mkdir -p "$override/gen" "$override/data"
+echo "checked in" > "$override/gen/data.txt"
+echo data > "$override/data/x.txt"
+cat > "$override/RScript.in" <<'SML'
+fun holbuild_extra_deps (_ : string list) = ();
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_deps ["data.txt"];
+val () = holbuild_extra_outputs ["RLib.sml"];
+val () = let val input = TextIO.openIn "data.txt"; val text = TextIO.inputAll input
+             val () = TextIO.closeIn input
+             val out = TextIO.openOut "RLib.sml"
+         in TextIO.output (out, "structure RLib = struct val z = " ^ Int.toString (size text) ^ " end\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "R";
+val _ = export_theory();
+SML
+cat > "$override/MScript.sml" <<'SML'
+fun holbuild_extra_deps (_ : string list) = ();
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_deps ["data", "RScript.in"];
+val () = holbuild_extra_outputs ["gen/RScript.sml"];
+val () = let val input = TextIO.openIn "RScript.in"; val text = TextIO.inputAll input
+             val () = TextIO.closeIn input
+             val out = TextIO.openOut "gen/RScript.sml"
+         in TextIO.output (out, text); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "M";
+val _ = export_theory();
+SML
+over_build() {
+  (cd "$tmpdir/over" && "$HOLBUILD_BIN" --verbose build "$@") > "$tmpdir/over-step.log" 2>&1 ||
+    { cat "$tmpdir/over-step.log" >&2; fail "build $* with an overridden dependency failed"; }
+}
+over_build MTheory
+require_file "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/gen/RScript.sml"
+for _ in 1 2; do
+  sleep 1.1
+  (cd "$tmpdir/over" && "$HOLBUILD_BIN" --verbose build --dry-run MTheory) > "$tmpdir/over-plan.log" 2>&1 ||
+    { cat "$tmpdir/over-plan.log" >&2; fail "dry run failed"; }
+done
+require_grep "^holbuild: plan: from record" "$tmpdir/over-plan.log"
+over_build RTheory
+require_grep "structure RLib = struct val z = 11 end" "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/gen/RLib.sml"
+cat > "$tmpdir/over/src/VScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "V";
+val _ = if RLib.z = 11 then () else raise Fail "RLib.z";
+val _ = export_theory();
+SML
+over_build VTheory
+
+# A dependency's file that a theory stops declaring as an output becomes an
+# input like any other, though only that theory's file changed.
+over_build
+sleep 1.1
+cat > "$override/PScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "P";
+val _ = export_theory();
+SML
+over_build
+require_grep "saw .*P.txt" "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/out/F.txt"
+
 # GC runs on a cache of its own, which links no shared toolchains, with a HOL
 # dependency that is never built.
 export HOLBUILD_CACHE=$tmpdir/gc-cache

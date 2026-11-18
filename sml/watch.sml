@@ -63,30 +63,56 @@ fun extra_input_watch_path root base decl =
     existing (Path.mkCanonical (if Path.isAbsolute path then path else Path.concat(base, path)))
   end
 
+(* The extra-output root of the source's package, where a dependency's
+   theories write their extra outputs (HolbuildProject.package_extra_output_root). *)
+fun extra_output_root packages (source : HolbuildSourceIndex.source) =
+  case List.find (fn package => HolbuildProject.package_name package = #package source) packages of
+      SOME package => HolbuildProject.package_extra_output_root package
+    | NONE => NONE
+
 (* The extra-input declarations of a source, each with the directory it is
-   relative to: those of its action policy and of its own holbuild_extra_deps. *)
-fun extra_input_decls (source : HolbuildSourceIndex.source) =
+   relative to and the root bounding that directory: those of its action
+   policy and of its own holbuild_extra_deps.  In a dependency, each relative
+   declaration is relative both to a directory of the package's source tree
+   and to the matching one under its extra-output root, as the build reads
+   the package's declared outputs from there. *)
+fun extra_input_decls packages (source : HolbuildSourceIndex.source) =
   let
     val source_path = #source_path source
+    val package_root = Path.mkCanonical (#package_root source)
+    val output_root = extra_output_root packages source
+    fun under root dir = if dir = "" then root else Path.concat(root, dir)
+    fun bases dir decl =
+      case output_root of
+          NONE => [(package_root, under package_root dir, decl)]
+        | SOME root =>
+            if Path.isAbsolute decl then [(package_root, under package_root dir, decl)]
+            else [(package_root, under package_root dir, decl),
+                  (Path.mkCanonical root, under (Path.mkCanonical root) dir, decl)]
     val manifest_decls =
-      map (fn extra => (#package_root source, HolbuildProject.extra_input_path extra))
-          (HolbuildProject.action_extra_inputs (#policy source))
+      List.concat (map (fn extra => bases "" (HolbuildProject.extra_input_path extra))
+                       (HolbuildProject.action_extra_inputs (#policy source)))
+    val script_dir = Path.dir (HolbuildSourceIndex.normalize_path (#relative_path source))
     val source_decls =
       if readable source_path then
-        map (fn decl => (Path.dir source_path, decl))
-            (#extra_deps (HolbuildDependencies.extract_textual source_path))
+        List.concat
+          (map (fn decl =>
+                  case output_root of
+                      NONE => [(package_root, Path.dir source_path, decl)]
+                    | SOME _ => bases script_dir decl)
+               (#extra_deps (HolbuildDependencies.extract_textual source_path)))
       else []
   in
     manifest_decls @ source_decls
   end
 
 (* Adds a source and the paths to watch for its extra inputs. *)
-fun source_paths (source : HolbuildSourceIndex.source, paths) =
+fun source_paths packages (source : HolbuildSourceIndex.source, paths) =
   List.foldl
-    (fn ((base, decl), acc) =>
-      add_existing (extra_input_watch_path (Path.mkCanonical (#package_root source)) base decl) acc)
+    (fn ((root, base, decl), acc) =>
+      add_existing (extra_input_watch_path root base decl) acc)
     (add_readable (#source_path source) paths)
-    (extra_input_decls source)
+    (extra_input_decls packages source)
 
 (* The files a declaration names, as the build expands it into action inputs;
    none while it names nothing, which the build reports. *)
@@ -105,7 +131,7 @@ fun input_files packages index =
                                 (HolbuildProject.generator_inputs generator)))
              (HolbuildProject.package_generators package))
     fun source_files source =
-      List.concat (map (fn (base, decl) => expand_input base decl) (extra_input_decls source))
+      List.concat (map (fn (_, base, decl) => expand_input base decl) (extra_input_decls packages source))
   in
     List.concat (map source_files index @ map generator_files packages)
   end
@@ -135,7 +161,7 @@ fun watch_paths_with resolution project index =
                   {project = project, resolution = resolution}
     val packages = HolbuildProjectGraph.packages graph
     val paths = List.foldl package_paths paths packages
-    val paths = List.foldl source_paths paths index
+    val paths = List.foldl (source_paths packages) paths index
   in
     {paths = rev paths, manifest_dirs = rev (manifest_dirs project packages),
      input_files = input_files packages index}
