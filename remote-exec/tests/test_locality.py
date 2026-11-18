@@ -114,7 +114,6 @@ async def test_concurrent_claims_pass_a_batch_over_at_most_the_window(
 async def test_a_batch_of_a_higher_priority_is_never_passed_over(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
 ) -> None:
-    coordinator.settings.default_priority_floor = 0  # else the floor's swap, not locality, takes ``b``
     await run_on(http, cache, "host-1", "b0", "b", D1)
     await submit_as(http, "a1", "a", priority=1)
     await submit_as(http, "b1", "b")

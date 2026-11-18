@@ -918,6 +918,12 @@ setting.
 .B HOLBUILD_REMOTE_EXEC_CURL_CONFIG
 A curl configuration file for requests to the remote-execution coordinator.
 .TP
+.B HOLBUILD_KEEP_BATCH_ON_INTERRUPT
+.B 1
+leaves a followed remote-execution batch running when the build is
+interrupted (SIGINT or SIGTERM) instead of cancelling it, and prints how to
+reattach.
+.TP
 .B HOLBUILD_COOPERATE_DIR
 As
 .BR \-\-cooperate\-dir .

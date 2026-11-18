@@ -239,6 +239,7 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "waiting_ahead_high": 0,
         "run_slots": 30,
         "run_floor": 0,
+        "priority_cap": 128,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
         "max_burst_workers": 0,
         "hosts": [],

@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -69,10 +69,11 @@ def exit_on_auth_failure(error: BaseException) -> None:
         os._exit(1)
 
 
-def bearer(token: SecretStr) -> Callable[[str | None], None]:
+def bearer(token: SecretStr) -> Callable[[str | None], Awaitable[None]]:
     expected = f"Bearer {token.get_secret_value()}".encode()
 
-    def check(authorization: str | None = Header(default=None)) -> None:
+    # Async, as is cache_reader: FastAPI runs a plain function dependency in a thread, a hop on every request.
+    async def check(authorization: str | None = Header(default=None)) -> None:
         if not hmac.compare_digest((authorization or "").encode(), expected):
             raise HTTPException(401, "bad or missing bearer token")
 
@@ -129,7 +130,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
     worker = [Depends(bearer(settings.worker_token))]
     discovery_token = cache_discovery_token(settings.worker_token.get_secret_value())
 
-    def cache_reader(authorization: str | None = Header(default=None)) -> None:
+    async def cache_reader(authorization: str | None = Header(default=None)) -> None:
         supplied = (authorization or "").encode()
         valid = [hmac.compare_digest(supplied, f"Bearer {token}".encode())
                  for token in (settings.client_token.get_secret_value(), settings.worker_token.get_secret_value(),
@@ -270,6 +271,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             **{k: v for k, v in asdict(status.counts).items() if k not in ("high_run", "ready_high_run")},
             "run_slots": settings.run_slots,
             "run_floor": min(settings.run_floor, settings.run_slots),
+            "priority_cap": settings.priority_cap,
             "desired_burst_workers": status.desired_burst_workers,
             "max_burst_workers": settings.max_burst_workers,
             "hosts": [

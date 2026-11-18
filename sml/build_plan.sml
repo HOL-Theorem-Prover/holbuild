@@ -1075,6 +1075,16 @@ fun restore {holdir, sources, roots, selected, analysis, edges,
 fun plan_targets components holdir sources targets =
   plan_selection components holdir sources (SelectedTargets targets)
 
+(* The positions in SOURCES of the roots plan_targets picks for TARGETS. *)
+fun target_positions sources targets =
+  let
+    val nodes = map (make_node []) sources
+    val positions = build_key_index nodes
+    val roots = target_roots (indexed_nodes_named (build_name_index nodes)) nodes (SelectedTargets targets)
+  in
+    map (fn node => indexed_key_id positions (key node)) roots
+  end
+
 fun kind_name source = HolbuildSourceIndex.kind_string (#kind source)
 
 fun readable path = OS.FileSys.access(path, [OS.FileSys.A_READ]) handle OS.SysErr _ => false

@@ -1356,7 +1356,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             | _ =>
               if after_owners then HolbuildPlanRecord.Fallback "theories that write SML sources ran"
               else timed_phase "plan.record" (fn () =>
-                     HolbuildPlanRecord.restore {dir = record_dir, graph = graph, tc = tc, fingerprint = fingerprint, start_ns = start_ns})
+                     HolbuildPlanRecord.restore
+                       {dir = record_dir, graph = graph, tc = tc, fingerprint = fingerprint, start_ns = start_ns,
+                        targets_of = if null targets then NONE
+                                     else SOME (fn index =>
+                                                  let val expanded = default_build_targets resolution project index targets
+                                                  in reject_object_targets expanded handle Error msg => raise HolbuildSourceIndex.Error msg;
+                                                     expanded
+                                                  end)})
         fun context {members, dirs, stamps, index, targets, toolchain_key} : HolbuildPlanRecord.context =
           {fingerprint = fingerprint, start_ns = start_ns,
            toolchain = {hol = HolbuildToolchain.hol tc, state = HolbuildToolchain.base_state tc, key = toolchain_key},
@@ -1394,7 +1401,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           in
             planned
           end
-        fun restored {index, targets, plan, toolchain_key, changed, reresolved, record, stamps, rehashed} =
+        fun restored {index, targets, plan, toolchain_key, changed, reresolved, sliced, record, stamps, rehashed} =
           let
             (* With every root that has its own tactic timeout selected, the
                plan holds each such root's closure, which is all the entry
@@ -1423,15 +1430,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             val changed_keys = HolbuildPlanRecord.changed_keys record index plan keys
             val _ = say ("from record (" ^ Int.toString rehashed ^ " files rehashed, " ^
                          Int.toString changed_keys ^ " keys changed" ^
-                         (if reresolved then ", dependencies re-resolved)" else ")"))
+                         (if reresolved then ", dependencies re-resolved" else "") ^
+                         (if sliced then ", sliced from other targets' plan)" else ")"))
             val _ =
-              if changed orelse changed_keys > 0 then
+              if changed orelse changed_keys > 0 orelse sliced then
                 write (context {members = #members record,
                                 dirs = map (fn {path, entries, ...} =>
                                               (path, Binarymap.peek(stamps, path), entries)) (#dirs record),
                                 stamps = stamps, index = index, targets = targets,
                                 toolchain_key = toolchain_key})
-                  (if reresolved then NONE else SOME record) plan keys
+                  (if reresolved orelse sliced then NONE else SOME record) plan keys
               else ()
           in
             (* Check mode builds from the record too, once full planning agrees. *)
@@ -1731,23 +1739,31 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                               tc project theory_plan toolchain_key jobs)
               end
             (* Diagnose every final failure. A missing proof log retains the
-               single-theory diagnostic fallback. *)
-            fun proof_failed reason (failures : HolbuildRemoteExec.action_failure list) spans restore_finished_logs later =
+               single-theory diagnostic fallback.  EARLY gives the diagnostic
+               of a proof that follow diagnosed as it failed, given its input
+               key and log; text mode printed it then, so the error here only
+               names it. *)
+            fun proof_failed reason (failures : HolbuildRemoteExec.action_failure list) spans early restore_finished_logs later =
               let
                 val _ = HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n")
                 val needs_local = ref false
                 fun diagnose ({input_key, kind, log_sha256} : HolbuildRemoteExec.action_failure) =
                   case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key input_key of
-                      NONE => (NONE, input_key, HolbuildBuildExec.Error ("failed remote action " ^ input_key ^ ": " ^ kind))
+                      NONE => (NONE, input_key, HolbuildBuildExec.Error ("failed remote action " ^ input_key ^ ": " ^ kind), false)
                     | SOME node =>
                         let
                           val name = HolbuildBuildPlan.logical_name node
                           val is_proof = kind = "proof" orelse kind = "tactic-timeout"
+                          val shown =
+                            case log_sha256 of
+                                SOME sha => is_proof andalso Option.isSome (early (input_key, sha))
+                              | NONE => false
                           val error =
                             case log_sha256 of
                                 NONE => NONE
                               | SOME sha =>
-                                  if is_proof then
+                                  if shown then early (input_key, sha)
+                                  else if is_proof then
                                     HolbuildBuildExec.remote_proof_failure build_options tc project plan toolchain_key node
                                       (spans node) {kind = kind, log_sha256 = sha}
                                   else
@@ -1771,20 +1787,24 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                       handle Thread.Interrupt => raise Thread.Interrupt
                                            | e => e)
                                    else HolbuildBuildExec.Error msg
-                                 end)
+                                 end,
+                           shown andalso not (HolbuildStatus.json_mode ()))
                         end
                 val diagnosed = map diagnose failures
                 val later_errors = later ()
                 val _ = restore_finished_logs ()
-                fun report (SOME key, name, e) =
+                fun report (SOME key, name, e, _) =
                       HolbuildStatus.report_remote_failure key name (HolbuildBuildExec.build_error_message e)
                         (HolbuildBuildExec.build_error_debug_artifacts e)
-                  | report (NONE, _, _) = ()
+                  | report (NONE, _, _, _) = ()
+                fun final_error (_, name, e, printed) =
+                  (name, if printed then HolbuildBuildExec.Error (HolbuildStatus.failure_brief (HolbuildBuildExec.build_error_message e))
+                         else e)
               in
                 List.app report diagnosed;
                 HolbuildHolSharedCache.local_build_needed :=
                   (!needs_local orelse !HolbuildHolSharedCache.local_build_needed);
-                HolbuildBuildExec.raise_build_failures (map (fn (_, name, e) => (name, e)) diagnosed @ later_errors)
+                HolbuildBuildExec.raise_build_failures (map final_error diagnosed @ later_errors)
               end
             (* A batch that abandon would cancel is cancelled on an interrupt too.
                While it runs, the entries of the theories it finishes, and of a
@@ -1824,6 +1844,35 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   HolbuildBuildExec.start_remote_failure_spans build_options tc project plan toolchain_key
                     (Option.getOpt (in_batch, []))
                   handle e => (stop (); Option.app (fn {settled, ...} => ignore (settled ())) settled; raise e)
+                (* A proof that fails is diagnosed as soon as the batch says so,
+                   while the rest of it runs: printed at once in text mode, so
+                   that whoever watches the build can start on it, and recorded
+                   for the command summary.  proof_failed reuses it. *)
+                val early_diagnoses = ref (Redblackmap.mkDict String.compare)
+                val early_mutex = Mutex.mutex ()
+                fun diagnose_early (key, kind, sha) =
+                  case HolbuildBuildExec.node_with_input_key build_options tc project plan toolchain_key key of
+                      NONE => ()
+                    | SOME node =>
+                        case HolbuildBuildExec.remote_proof_failure build_options tc project plan toolchain_key node
+                               (#spans failure_spans node) {kind = kind, log_sha256 = sha} of
+                            NONE => ()
+                          | SOME e =>
+                              let val msg = HolbuildBuildExec.build_error_message e
+                              in
+                                Mutex.lock early_mutex;
+                                early_diagnoses := Redblackmap.insert (!early_diagnoses, key, (sha, e));
+                                Mutex.unlock early_mutex;
+                                !HolbuildStatus.command_failure (HolbuildBuildPlan.logical_name node, msg);
+                                if HolbuildStatus.json_mode () then ()
+                                else HolbuildStatus.message_stderr ("holbuild: " ^ msg ^ "\n")
+                              end
+                val early_pool = HolbuildBuildExec.start_background_pool 2 diagnose_early
+                val early_queued = ref (Redblackset.empty String.compare)
+                fun early (key, sha) =
+                  case Redblackmap.peek (!early_diagnoses, key) of
+                      SOME (diagnosed_sha, e) => if diagnosed_sha = sha then SOME e else NONE
+                    | NONE => NONE
                 val following = ref true
                 val _ = Thread.fork (fn () =>
                   (drain (); Option.app (fn {drain, ...} => drain ()) settled; #drain failure_spans ();
@@ -1831,19 +1880,27 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 fun stop_all () =
                   (following := false; stop (); Option.map (fn {settled, ...} => settled ()) settled)
                 val logs = ref []
-                fun on_change (key, state, _, log) =
+                fun on_change (key, state, failure, log) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
                    if state = "done" then
                      (HolbuildBuildExec.expect_remote_entry key; add key; logs := (key, log) :: !logs)
-                   else ())
+                   else ();
+                   case (state, failure, log) of
+                       ("failed", SOME kind, SOME sha) =>
+                         if (kind = "proof" orelse kind = "tactic-timeout") andalso
+                            not (Redblackset.member (!early_queued, key))
+                         then (early_queued := Redblackset.add (!early_queued, key); #add early_pool (key, kind, sha))
+                         else ()
+                     | _ => ())
                 fun follow_batch () =
                   let
                     val result = HolbuildRemoteExec.follow url batch_id on_change
                     val settled = stop_all ()
+                    val _ = #drain early_pool ()
                   in
-                    (result, rev (!logs), settled, failure_spans)
+                    (result, rev (!logs), settled, failure_spans, early)
                   end
-                  handle e => (stop_all (); #stop failure_spans (); raise e)
+                  handle e => (stop_all (); #stop early_pool (); #stop failure_spans (); raise e)
               in
                 follow_batch ()
               end)
@@ -1904,7 +1961,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                resubmitted once, for the export to upload it again. *)
             fun finish resubmit skip in_batch batch_id =
               let
-                val (outcome, logs, settled, failure_spans) = follow in_batch batch_id
+                val (outcome, logs, settled, failure_spans, early) = follow in_batch batch_id
                 (* Whatever follows (a restore, a resubmission, a local build)
                    doesn't overlap the span analysis; its results stay readable. *)
                 val _ = #stop failure_spans ()
@@ -1962,7 +2019,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                              | e => [("theories deferred for early cutoff", e)]
                   in
                     if proof_failure then
-                      proof_failed reason failures (#spans failure_spans) restore_finished_logs deferred_errors
+                      proof_failed reason failures (#spans failure_spans) early restore_finished_logs deferred_errors
                     else
                       if final then
                         (List.app report_failed_log failures;

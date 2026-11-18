@@ -396,12 +396,22 @@ fun while_followed url batch_id f =
 (* Whoever interrupts a build may kill it soon after, so this waits briefly. *)
 val interrupt_cancel_seconds = 5
 
+(* With HOLBUILD_KEEP_BATCH_ON_INTERRUPT=1 an interrupt leaves the batch
+   running, so a caller that stops the build at a time limit keeps what the
+   workers finish in the remote cache for its next build. *)
+fun keep_batch_on_interrupt () =
+  OS.Process.getEnv "HOLBUILD_KEEP_BATCH_ON_INTERRUPT" = SOME "1"
+
 fun cancel_followed () =
   case !followed of
       NONE => ()
     | SOME (url, batch_id) =>
         (followed := NONE;
-         if cancel_within interrupt_cancel_seconds url batch_id
+         if keep_batch_on_interrupt () then
+           HolbuildStatus.message_stderr
+             ("holbuild: left remote batch " ^ batch_id ^ " running; reattach with --attach " ^
+              batch_id ^ "\n")
+         else if cancel_within interrupt_cancel_seconds url batch_id
          then HolbuildStatus.message_stderr ("holbuild: cancelled remote batch " ^ batch_id ^ "\n")
          else ())
 

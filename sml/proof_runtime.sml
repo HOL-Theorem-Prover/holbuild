@@ -183,7 +183,18 @@ fun timeout seconds f x =
        Thread.setAttributes timeout_attrib_sync;
        Mutex.lock m; ConditionVar.signal c; Mutex.unlock m)
     val worker = Thread.fork (worker_fun, timeout_attrib_async)
+    (* A broadcast Interrupt (heap exhausted) also reaches this waiter, whose
+       wait reacquires m before raising.  Stop the worker and report the step
+       as interrupted, like an Interrupt raised in the worker itself.
+       Interrupts are deferred meanwhile so another broadcast can't cut
+       interruptkill short. *)
     val completed = ConditionVar.waitUntil (c, m, Time.now () + Time.fromReal seconds)
+      handle Interrupt =>
+        (Mutex.unlock m;
+         Thread.setAttributes [Thread.InterruptState Thread.InterruptDefer];
+         interruptkill worker;
+         Thread.setAttributes curattrib;
+         raise FunctionInterrupted)
     val _ = Mutex.unlock m
     val _ = Thread.setAttributes curattrib
     val _ = if completed then () else interruptkill worker

@@ -48,8 +48,9 @@ their usual source-loading behavior. Older toolchains and missing or
 incompatible module files load from the `.dat` file automatically.
 
 These module files belong to one exact HOL saved state. They stay in the local
-cache, including on remote workers, and do not change portable theory artifacts
-or remote cache keys. Checkpoint-free builds also produce and use them. Cache
+cache and do not change portable theory artifacts or action keys. Remote
+workers also share them through the remote cache, keyed by that exact
+toolchain, so a fresh worker fetches the modules another one wrote. Checkpoint-free builds also produce and use them. Cache
 garbage collection and worker cache limits include the module files; deleting
 them only causes source loading and regeneration.
 
@@ -1155,7 +1156,9 @@ A theory's `deps_loaded` checkpoint, its dependencies loaded into the
 toolchain's base state, is also kept once per host in
 `$HOLBUILD_CACHE/checkpoint-store/`, keyed by the dependencies' input keys
 and their theories' `.dat` and generated `.sml` files, the theory's loads (by path relative to the project), the toolchain and the
-holbuild runtime. The project's directory isn't part of the key, so every
+holbuild runtime sources compiled into the heap (not those the theory's script
+loads after it, so a release that changes only those keeps every stored heap).
+The project's directory isn't part of the key, so every
 worktree or copy of a project that uses the cache (not with `--no-cache`,
 nor for a theory with `cache = false`) shares one heap per
 dependency set: a theory with no valid `deps_loaded` hard-links the stored
@@ -1336,9 +1339,14 @@ no record is kept; `--watch` always plans in full. With theories that write
 SML sources, the record keeps the plan made once they are up to date, with
 the sources they wrote, and a later build uses it only while every such
 theory is still up to date and its sources are unchanged; then it builds
-without running those theories first or planning again. The four newest records are kept.
+without running those theories first or planning again. A build of other
+targets with no record of its own starts from the newest record of the same
+other inputs whose plan holds all its targets: after the same checks, it
+plans again over that record's sources from the new targets and writes the
+result as its own record. The four newest records are kept.
 
-`--verbose` prints which way a build planned and why, and the timing log has
+`--verbose` prints which way a build planned and why (`sliced from other
+targets' plan` for a build that started from another targets' record), and the timing log has
 a `plan.record` phase. `HOLBUILD_PLAN_RECORD=off` turns the record off;
 `HOLBUILD_PLAN_RECORD=check` plans in full as well, and fails the build if
 the two plans differ in any source, dependency edge, fact or key.
@@ -1460,6 +1468,11 @@ The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
 cache metadata under `/ac/<sha256>`; a blob's CAS digest is the same one
 holbuild uses locally. CAS transfers use zstd compression when
 supported by the server; action metadata stays small and is sent uncompressed.
+A blob fetched by digest alone (a remote worker's spec, sources and checkpoint
+chain) is downloaded still zstd-encoded and decoded on 4 threads through
+libzstd (`libzstd.so.1`; Homebrew's on macOS) when the body is a series of
+frames that each give their content size, as bazel-remote's zstd storage serves
+it; otherwise, or without libzstd, libcurl decodes it as for other transfers.
 This is a live accelerator, not remote execution and not an immutable release
 registry. Remote cache contents are trusted build inputs: cache hits can load
 Poly/ML objects, and restored toolchains execute cached binaries. Use an
@@ -2002,8 +2015,9 @@ the spec's. If there's none, it restores the dependency heap; if there's no
 heap either, it loads the dependencies cold. After the build, successful or
 not, it publishes its heap if no other worker's is, and then, when the heap
 under them is the published one, the checkpoints it saved. A heap is shared
-only between workers with the same toolchain bytes, cache root, action root
-and platform, which is why every worker should use the same cache root.
+only between workers with the same toolchain bytes, cache root, action root,
+platform and holbuild runtime sources compiled into the heap, which is why
+every worker should use the same cache root.
 
 The checkpoint tree is then the action's own, emptied before and after it;
 the host store `<cache root>/checkpoint-store` keeps the shared files, one
@@ -2173,7 +2187,10 @@ reattached stream that breaks again before any action changes state counts
 as unavailable too, since it only repeats what the build already knows. When the build stops following
 a batch that may still run (the stream was given up on, or the coordinator
 won't stream it), it cancels the batch before building locally; one
-interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too. With
+interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too,
+unless `HOLBUILD_KEEP_BATCH_ON_INTERRUPT=1` is set: then it leaves the batch
+running and prints how to reattach, so a caller that stops a build at a time
+limit finds what the workers finished in the remote cache next time. With
 `--remote-only` it cancels a batch the coordinator won't stream, or an
 interrupted build's, the same way but then fails instead of building locally,
 and it never builds HOL or a theory

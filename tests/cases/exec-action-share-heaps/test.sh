@@ -204,9 +204,16 @@ write_t "T \\/ F" "simp[]"
 export_t v2
 cold v2 0
 forget_local
-worker v2 "$shared_url" "$shared" "$spec_t" --share-heaps
+HOLBUILD_CACHE_TRACE=1 worker v2 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v2 0 "status=built"
 resumed v2 "deps-loaded checkpoint" "deps-loaded heap"
+# The restore took its blobs zstd-encoded and decoded them itself.
+require_grep "remote cache decode .* zstd threads=4" "$tmpdir/v2.log"
+if grep -q "remote cache decode .* \(identity\|fallback\)" "$tmpdir/v2.log"; then
+  echo "v2 fetched a blob without decoding it in parallel:" >&2
+  grep "remote cache decode" "$tmpdir/v2.log" >&2
+  exit 1
+fi
 # None of the published checkpoints is on the edited script's prefix, and
 # the index says so without a probe of each.
 require_grep "shared checkpoint index lists 0 of" "$tmpdir/v2.log"
@@ -607,5 +614,77 @@ x2_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/x2.result")
 if grep -q "dropping checkpoint\|restored shared theorem_context" "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log"; then
   echo "the extra-output theory resumed into restored contexts" >&2
   cat "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log" >&2
+  exit 1
+fi
+
+# A holbuild whose runtime changed only in what a theory loads after its
+# dependency heap still restores the heap an earlier release shared; a change
+# to what is compiled into the heap misses it.  Spec and worker both come from
+# a copy of the binary with its own runtime tree.
+patched=$tmpdir/patched-runtime
+mkdir -p "$patched/bin" "$patched/share/holbuild"
+cp "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" "$patched/bin/holbuild"
+cp -R "$SCRIPT_DIR/../../../sml" "$patched/share/holbuild/"
+# Checkpoints above the heap hold the runtime, so a change to it misses
+# them.  A fresh theory P, whose only failed prefix is the one seeded here
+# under the old runtime, shows it for failed prefixes; T's edit of t5, which
+# resumed after t4 under the old runtime (v9), for theorem contexts.
+write_p() {
+  cat > "$project/src/PScript.sml" <<SML
+Theory P
+Ancestors A
+Theorem p1:
+  T
+Proof
+  simp[]
+QED
+Theorem p2:
+  T /\\ (1 = 1)
+Proof
+  CONJ_TAC >- ACCEPT_TAC TRUTH >> $1
+QED
+SML
+}
+# run_p BIN NAME TACTIC: export P's spec with BIN and run it, after
+# forgetting the local checkpoints.
+run_p() {
+  local bin=$1 name=$2
+  write_p "$3"
+  (cd "$project" && "$bin" --remote-cache "$shared_url" action-spec --upload PTheory) > "$tmpdir/$name.batch"
+  spec_p=$(field "$tmpdir/$name.batch" share:PTheory 4)
+  forget_local
+  HOLBUILD_BIN=$bin worker "$name" "$shared_url" "$shared" "$spec_p" --share-heaps
+}
+run_p "$HOLBUILD_BIN" p-seed "FAIL_TAC \"before the runtime change\""
+expect p-seed 1 "status=failed" "failure=proof"
+run_p "$HOLBUILD_BIN" p-seed2 "ALL_TAC >> FAIL_TAC \"still before the runtime change\""
+expect p-seed2 1 "status=failed" "failure=proof"
+resumed p-seed2 "failed-prefix checkpoint in p2" "failed_prefix checkpoint"
+printf '\n(* changed after the heap *)\n' >> "$patched/share/holbuild/sml/proof_runtime.sml"
+run_p "$patched/bin/holbuild" p-runtime "ALL_TAC >> rw[]"
+expect p-runtime 0 "status=built"
+resumed p-runtime "deps-loaded checkpoint" "deps-loaded heap"
+write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "ASM_REWRITE_TAC []"
+HOLBUILD_BIN=$patched/bin/holbuild export_t t-runtime
+forget_local
+HOLBUILD_BIN=$patched/bin/holbuild worker t-runtime "$shared_url" "$shared" "$spec_t" --share-heaps
+expect t-runtime 0 "status=built"
+resumed t-runtime "deps-loaded checkpoint" "deps-loaded heap"
+write_x "REWRITE_TAC []"
+HOLBUILD_BIN=$patched/bin/holbuild export_x 3
+forget_local
+HOLBUILD_BIN=$patched/bin/holbuild worker x3 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x3 0 "status=built"
+require_grep "restored shared deps-loaded heap" "$tmpdir/x3.log"
+require_grep "from: deps-loaded checkpoint" "$tmpdir/x3.log"
+printf '\n(* changed in the heap *)\n' >> "$patched/share/holbuild/sml/checkpoint_save_runtime.sml"
+write_x "MATCH_ACCEPT_TAC TRUTH"
+HOLBUILD_BIN=$patched/bin/holbuild export_x 4
+forget_local
+HOLBUILD_BIN=$patched/bin/holbuild worker x4 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x4 0 "status=built"
+if grep -q "restored shared deps-loaded heap" "$tmpdir/x4.log"; then
+  echo "a changed heap runtime restored the old shared deps heap" >&2
+  cat "$tmpdir/x4.log" >&2
   exit 1
 fi
