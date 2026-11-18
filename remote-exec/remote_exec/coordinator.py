@@ -132,6 +132,9 @@ class Settings(BaseSettings):
     # How many generations of unfinished parents an action may be claimed ahead of, 0 for no limit; see
     # AHEAD_CANDIDATES.
     ahead_depth: int = Field(default=1, ge=0)
+    # Build actions of batches that load ahead build pipelined where their spec allows it (exec-action --pipeline):
+    # each publishes its outline early, which its children claimed ahead start on. False builds them plain.
+    pipeline: bool = True
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
     run_floor: int = Field(default=0, ge=0)
@@ -217,6 +220,7 @@ class Claim:
     lease_s: int
     max_heap_mb: int | None
     ahead_parents: tuple[AheadParent, ...] = ()  # empty unless the action was claimed ahead of these parents
+    pipeline: bool = False  # build pipelined where the spec allows it; see Settings.pipeline
 
 
 @dataclass(frozen=True)
@@ -1493,12 +1497,14 @@ class Coordinator:
         children, which may now be claimed ahead, are left to the claims ahead's next read (see _ahead_candidates):
         a large batch's plain claims would otherwise have every claim of a worker that loads ahead read again."""
         token = uuid4()
-        await conn.execute(
+        # Whether the batch loads ahead, read by primary key in the same statement.
+        ahead_batch = await conn.scalar(
             sa.text(
                 "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now(), "
                 "finished_at = NULL, worker = :worker, "
                 "ahead = CASE WHEN :ahead THEN 'ahead' WHEN ahead = 'abandoned' THEN ahead ELSE 'no' END "
-                "WHERE batch_id = :batch_id AND input_key = :input_key"
+                "WHERE batch_id = :batch_id AND input_key = :input_key "
+                "RETURNING class = 'build' AND (SELECT ahead_cap IS NOT NULL FROM batches WHERE id = actions.batch_id)"
             ),
             {"batch_id": row.batch_id, "input_key": row.input_key, "ahead": bool(ahead_parents), "worker": worker},
         )
@@ -1517,7 +1523,7 @@ class Coordinator:
         )
         return Claim(
             token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb,
-            ahead_parents,
+            ahead_parents, self.settings.pipeline and bool(ahead_batch),
         )
 
     async def _claim_ahead(self, tiers: list[str], worker: str, *, above: int | None = None) -> Claim | None:

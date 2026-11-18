@@ -50,6 +50,7 @@ MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
 MIN_FREE_FLOOR_RELEASE = (0, 14, 57)  # the first whose exec-action takes --cache-min-free-gb
 MIN_SWEEP_ONLY_RELEASE = (0, 14, 60)  # the first whose exec-action takes --sweep-only
+MIN_PIPELINE_RELEASE = (0, 14, 75)  # the first whose exec-action takes --pipeline
 CACHE_MIN_FREE_GB = 16  # the free space the cache cap keeps on the cache's disk for writers it doesn't count
 
 
@@ -984,7 +985,7 @@ def exec_action_env(*, version: str, discovery_config: str | None = None) -> dic
 
 def exec_action_command(
     args: argparse.Namespace, holbuild: str, version: str, spec: str, result: str, max_heap_mb: int | None,
-    ahead_parents: list[dict[str, str]],
+    ahead_parents: list[dict[str, str]], *, pipeline: bool = False,
 ) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
     command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
@@ -996,6 +997,8 @@ def exec_action_command(
     command += ["--result", result]
     if args.share_heaps:
         command.append("--share-heaps")
+    if pipeline and tuple(map(int, version.split("."))) >= MIN_PIPELINE_RELEASE:
+        command.append("--pipeline")
     for parent in ahead_parents:
         command += ["--ahead-parent", f"{parent['input_key']}:{parent['spec_sha256']}"]
     return command
@@ -1216,7 +1219,10 @@ def execute(
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, version, spec, result, claim.get("max_heap_mb"), ahead_parents),
+            exec_action_command(
+                args, holbuild, version, spec, result, claim.get("max_heap_mb"), ahead_parents,
+                pipeline=claim.get("pipeline", False),
+            ),
             env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )

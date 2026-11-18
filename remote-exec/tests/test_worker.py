@@ -745,6 +745,26 @@ def test_worker_passes_an_ahead_claims_late_parents_to_exec_action(
     ]
 
 
+@pytest.mark.parametrize(("version", "passed"), [("0.14.74", False), ("0.14.75", True)])
+def test_worker_asks_a_release_that_can_to_build_a_pipelined_claim_pipelined(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], version: str, passed: bool
+) -> None:
+    release_tarball(tmp_path / f"holbuild-{version}.tar.gz", version)
+    server.specs[SPEC] = f"holbuild-action-spec-v1\nholbuild-version={version}\n"
+
+    run_one(
+        Coordinator(server.url, "w"),
+        worker_args(tmp_path, server),
+        releases(tmp_path, server),
+        Protection(None, None),
+        {**claim(), "pipeline": True},
+        Phases(),
+    )
+
+    assert server.completed == [RECORD]
+    assert ("--pipeline" in logs[1].read_text().split()) == passed
+
+
 def test_an_ahead_claim_for_a_release_without_ahead_mode_is_abandoned_unrun(
     tmp_path: Path, server: Server, logs: tuple[Path, Path]
 ) -> None:

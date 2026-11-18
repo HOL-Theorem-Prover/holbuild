@@ -79,6 +79,25 @@ async def test_a_batch_without_speculative_loading_is_never_claimed_ahead(http: 
     assert await claim_ahead(http) is None
 
 
+async def test_builds_of_a_batch_that_loads_ahead_are_claimed_pipelined_unless_the_setting_is_off(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    claimed = await claim(http)
+    assert claimed is not None and claimed["pipeline"] is True
+    claimed = await claim_ahead(http)
+    assert claimed is not None and claimed["theory"] == "pkg:b" and claimed["pipeline"] is True
+
+    await submit(http, ["x"])
+    claimed = await claim(http)
+    assert claimed is not None and claimed["theory"] == "pkg:x" and claimed["pipeline"] is False
+
+    coordinator.settings.pipeline = False
+    await submit(http, ["y"], speculative_loading="4")
+    claimed = await claim(http)
+    assert claimed is not None and claimed["theory"] == "pkg:y" and claimed["pipeline"] is False
+
+
 async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_ready(
     http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
 ) -> None:
