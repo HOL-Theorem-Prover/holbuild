@@ -9780,6 +9780,11 @@ fun hydrate_step name f =
     (f () before record ()) handle e => (record (); raise e)
   end
 
+(* Adds N to the count NAME among the hydrate's steps. *)
+fun hydrate_count name n =
+  let val earlier = case List.find (fn (m, _) => m = name) (!hydrate_steps) of SOME (_, e) => e | NONE => 0
+  in hydrate_steps := (name, earlier + LargeInt.fromInt n) :: List.filter (fn (m, _) => m <> name) (!hydrate_steps) end
+
 structure Resident = HolbuildActionResident
 
 val theory_suffixes = [".sig", ".sml", ".dat", ".tr.gz", ".ui", ".uo"]
@@ -9853,7 +9858,55 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
     val resolver = spec_resolver spec
     fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
     fun uo_lines stem metadata = generated_theory_loads resolve metadata @ [in_root root stem ^ ".sml"]
-    fun source_sha key = Option.map HolbuildHash.string_sha256 (HolbuildCache.get_action cache key)
+    (* The hashes of the cache manifests the kept dependencies came from, by
+       the manifests' stat: holbuild's stat cache never returns a source's
+       hash from its stat, as a same-size write in one timestamp tick can
+       keep it; git's index scheme makes it safe for these files, which only
+       exec-action writes in its own cache: a stat is kept only when taken
+       before the read, equal after it, and older than the scan by more than
+       a second, so any later replacement shows in the stat. *)
+    val manifest_stats_file = Path.concat (cache, "action-manifest-stats")
+    val scan_ns = Time.toNanoseconds (Time.now ())
+    val known = ref NONE
+    (* Read when the first check starts; a damaged record only means the
+       manifests are hashed again. *)
+    fun load_known () =
+      if Option.isSome (!known) then ()
+      else known := SOME (!(#entries (HolbuildStatCache.load {path = manifest_stats_file}))
+                          handle _ => HolbuildStatCache.empty_entries ())
+    val seen = HolbuildStatCache.new_instance true (SOME manifest_stats_file) (HolbuildStatCache.empty_entries ())
+    fun see path entry =
+      HolbuildStatCache.with_lock seen (fn () => #entries seen := Binarymap.insert (!(#entries seen), path, entry))
+    fun trusted path entry =
+      HolbuildStatCache.with_lock seen (fn () =>
+        (#entries seen := Binarymap.insert (!(#entries seen), path, entry);
+         #hits seen := !(#hits seen) + 1))
+    fun source_sha key =
+      let val path = HolbuildCache.action_manifest cache key
+      in
+        case HolbuildStatCache.stat_ident path of
+            NONE => NONE
+          | SOME ident =>
+              case Option.mapPartial (fn entries => Binarymap.peek (entries, path)) (!known) of
+                  SOME (entry as (recorded, hash)) =>
+                    if HolbuildStatCache.same_ident (recorded, ident) then (trusted path entry; SOME hash)
+                    else hash_manifest key path ident
+                | NONE => hash_manifest key path ident
+      end
+    and hash_manifest key path ident =
+      Option.map
+        (fn text =>
+            let val hash = HolbuildHash.string_sha256 text
+            in
+              case HolbuildStatCache.stat_ident path of
+                  SOME after =>
+                    if HolbuildStatCache.same_ident (ident, after) andalso not (HolbuildPlanRecord.racy_at scan_ns ident)
+                    then see path (ident, hash)
+                    else ()
+                | NONE => ();
+              hash
+            end)
+        (HolbuildCache.get_action cache key)
     (* A dependency installed from the local cache's current entry for its
        key, with the .uo this spec would write, stays. *)
     fun kept {target, stem, key} =
@@ -9906,11 +9959,16 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
     fun restore_deps_now () =
       let
         val checks = map (fn dep => (dep, ref false)) (#deps spec)
-        val _ = transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks
+        val _ = hydrate_step "hydcheck" (fn () =>
+                  (load_known ();
+                   transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks))
         val stale = map #1 (List.filter (! o #2) checks)
       in
-        List.app (restorable remove_old) stale;
-        transfer_all (restorable install) stale
+        hydrate_count "hydstatn" (HolbuildStatCache.with_lock seen (fn () => !(#hits seen) before #hits seen := 0));
+        hydrate_count "hydinstn" (length stale);
+        hydrate_step "hydinst" (fn () =>
+          (List.app (restorable remove_old) stale;
+           transfer_all (restorable install) stale))
       end
     (* Each dependency's .dat against its parents', from the records. *)
     fun misfit () =
@@ -9979,7 +10037,9 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             | SOME {target, key, ...} =>
                 raise ActionFailed (InputMissing ("theory " ^ key),
                                     "dependency " ^ target ^ " does not match its parents in the cache");
-    Resident.save resident
+    Resident.save resident;
+    (* A stale or missing record only means a manifest is hashed again. *)
+    hydrate_step "hydcheck" (fn () => HolbuildStatCache.flush seen handle _ => ())
   end
 
 (* The stems of the project objects the build loads: the ones its preload
@@ -10803,6 +10863,24 @@ fun sweep_worker_cache {limit_bytes, reserve_bytes, min_free_bytes} =
 
 fun phases_text sep unit phases =
   String.concatWith sep (map (fn (name, ms) => name ^ unit ^ LargeInt.toString ms) phases)
+
+(* One entry per phase name, where it first ran: a phase run again (the
+   hydrate of a load ahead that builds plain after all) adds its time, and
+   a span keeps its earliest start and latest end.  The coordinator refuses
+   a result naming a phase twice. *)
+fun merge_phases phases =
+  let
+    fun combine name (a, b) =
+      if String.isSuffix "start" name then LargeInt.min (a, b)
+      else if String.isSuffix "end" name then LargeInt.max (a, b)
+      else a + b
+    fun add ((name, ms), merged) =
+      if List.exists (fn (n, _) => n = name) merged then
+        map (fn (n, e) => if n = name then (n, combine name (e, ms)) else (n, e)) merged
+      else merged @ [(name, ms)]
+  in
+    List.foldl add [] phases
+  end
 
 (* A failure message as one line of a result record: printable ASCII, every
    other character a space, at most 500 characters. *)
@@ -13586,7 +13664,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                   | _ => failure
               val status = if Option.isSome failure then "failed" else status
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
-              val phases = rev (!phases) @
+              val phases = merge_phases (rev (!phases)) @
                 [("started", Time.toMilliseconds start),
                  ("finished", Time.toMilliseconds (Time.now ()))] @
                 (if !theory_action then [("rebuilt", if status = "built" then 1 else 0)] else [])
