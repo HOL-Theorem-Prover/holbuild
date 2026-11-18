@@ -296,7 +296,7 @@ fun exec_action_help () = print
   "Usage:\n\
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
   \      --cache-limit-gb N [--cache-reserve-gb N] [--cache-min-free-gb N]\n\
-  \      [--share-heaps] [--result FILE]\n\
+  \      [--share-heaps] [--pipeline] [--result FILE]\n\
   \      [--ahead-parent INPUT_KEY:SPEC-SHA256 ... [--ahead-wait-seconds N]]\n\
   \  holbuild [GLOBAL OPTIONS] exec-action --sweep-only\n\
   \      --cache-limit-gb N [--cache-reserve-gb N] [--cache-min-free-gb N]\n\n\
@@ -319,6 +319,13 @@ fun exec_action_help () = print
   \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
   \                     other workers published, and publish this run's. The\n\
   \                     host store CACHE/checkpoint-store keeps their files.\n\
+  \--pipeline           Build a theory whose spec allows it pipelined: publish\n\
+  \                     its outline to the remote cache once its script has\n\
+  \                     run, under a key of its own, then prove its deferred\n\
+  \                     proofs. With --ahead-parent, also start on a late\n\
+  \                     parent's outline, and install nothing until the\n\
+  \                     parent's entry is in and matches it. With --result\n\
+  \                     FILE, create FILE.outline once the outline is out.\n\
   \--ahead-parent INPUT_KEY:SPEC-SHA256\n\
   \                     Load ahead of this parent, a dependency of the theory\n\
   \                     that another worker is still building from SPEC-SHA256:\n\
@@ -4054,7 +4061,8 @@ fun exec_action_command maxheap jobs args =
                     else raise Error (label ^ " must be a non-negative integer")
         | NONE => raise Error (label ^ " must be a non-negative integer")
     val sweep_only = List.exists (fn arg => arg = "--sweep-only") args
-    val args = List.filter (fn arg => arg <> "--sweep-only") args
+    val pipeline = List.exists (fn arg => arg = "--pipeline") args
+    val args = List.filter (fn arg => arg <> "--sweep-only" andalso arg <> "--pipeline") args
     fun parse (opts as {spec, result, limit, reserve, floor, share}) rest =
       case rest of
           [] => opts
@@ -4148,7 +4156,7 @@ fun exec_action_command maxheap jobs args =
        HolbuildRemoteCacheConfig.setup_client ();
        HolbuildBuildExec.exec_action
          {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, share_heaps = share,
-          toolchain = toolchain, ahead_parents = rev (!ahead_parents)})
+          toolchain = toolchain, ahead_parents = rev (!ahead_parents), pipeline = pipeline})
       handle e =>
         (HolbuildStatus.message_stderr
            ("holbuild: exec-action failed: " ^

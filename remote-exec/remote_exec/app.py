@@ -396,6 +396,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             raise HTTPException(409, "lease expired or revoked; stop the action")
         return {"lease_s": settings.lease_seconds}
 
+    @app.post("/v1/work/{attempt_token}/outlined", status_code=204, dependencies=worker)
+    async def outlined(attempt_token: UUID) -> None:
+        await coordinator.outlined(attempt_token)
+
     @app.post("/v1/work/{attempt_token}/complete", dependencies=worker)
     async def complete(attempt_token: UUID, request: Request) -> dict[str, bool]:
         try:
