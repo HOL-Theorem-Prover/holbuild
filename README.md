@@ -1236,7 +1236,9 @@ below a theory first, then its number of descendants. A pipelined theory:
    come, checking that they load exactly what was predicted, so the load
    order is a plain build's. At most `-j` / 3 (up to 6) children wait like
    this at once; one whose parent's build stops, or whose prediction was
-   wrong, is abandoned and builds later without starting early.
+   wrong, is abandoned and builds later without starting early. With
+   `--cooperate-dir`, children don't start early: one waiting would hold a
+   memory reservation its parent's build may need.
 3. Meanwhile the deferred proofs run on up to 4 threads (at most `-j`;
    `HOLBUILD_PROOF_THREADS` overrides), each in the context its goal was
    stated in. The theory's data is then written with their dependencies and

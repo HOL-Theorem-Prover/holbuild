@@ -6415,12 +6415,15 @@ fun predicted_theory_loads {root, cwd, holdir, base = {loaded, path}, resolve, p
     (* HOL's loader reads <dir>/x.ui from <dir>/.hol/objs/x.ui (HOL's
        HFS_NameMunge); a toolchain built by recent HOL has it only there. *)
     fun find module ext =
-      List.find file_exists
-        (List.concat
-           (map (fn dir =>
-                   let val file = Path.mkAbsolute {path = module ^ ext, relativeTo = Path.mkAbsolute {path = dir, relativeTo = cwd}}
-                   in [file, hfs_remapped_path file] end)
-                ("." :: path)))
+      let
+        fun at dir =
+          let val file = Path.mkAbsolute {path = module ^ ext, relativeTo = Path.mkAbsolute {path = dir, relativeTo = cwd}}
+          in List.find file_exists [file, hfs_remapped_path file] end
+        fun first [] = NONE
+          | first (dir :: dirs) = case at dir of SOME file => SOME file | NONE => first dirs
+      in
+        if Path.isAbsolute module then at "." else first ("." :: path)
+      end
     fun manifest module ext =
       case List.find (fn (file, _) => file = module ^ ext) lib_manifests of
           SOME (_, lines) => lines
@@ -6535,6 +6538,11 @@ fun write_ahead_preload {load_lines, dir, share, path} =
          "Meta.moduleSourceLoader := (fn use => fn file => (HolbuildAheadLoad.record file; loader use file)); " ^
          "HolbuildAheadLoad.loader := Meta.load; " ^
          "HolbuildAheadLoad.restore := (fn () => Meta.moduleSourceLoader := loader) end;") ::
+      (* HOL put every directory of the project on the load path, the
+         thousands under holbuild's checkpoints and logs too; none holds a
+         module, and predicting a load manifest searches the path. *)
+      "val _ = Meta.loadPath := List.filter (fn dir => not (String.isSubstring \"/.holbuild/checkpoints/\" (dir ^ \"/\") " ^
+        "orelse String.isSubstring \"/.holbuild/logs/\" (dir ^ \"/\"))) (!Meta.loadPath);" ::
       "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^ Bool.toString share ^ ";" ::
       "structure HolbuildAheadPlainRuntime = HolbuildRuntime;" ::
       "structure HolbuildRuntime = struct open HolbuildRuntime val load = HolbuildAheadLoad.load end;" ::
@@ -6969,7 +6977,6 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     val outline_owner = Array.array (node_count, NONE : (int * Thread.thread) option)
     val attempt_owner = Array.array (node_count, NONE : (int * Thread.thread) option)
     (* The worker that took each node's plain build. *)
-    val plain_owner = Array.array (node_count, NONE : Thread.thread option)
     val cold = Array.array (node_count, NONE : bool option)
     (* Whether a theory's ready outline exports what its outputs on disk do. *)
     val outline_unchanged = Array.array (node_count, false)
@@ -7245,25 +7252,12 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     fun producer id =
       case Array.sub (attempt, id) of ARunning (gen, _) => SOME gen | ADone (gen, _, _) => SOME gen | _ => NONE
 
-    (* Whether the build of node ID runs on its memory reservation
-       (HolbuildMachineMemory), or needs none any more: an attempt started
-       ahead of it holds one while it waits, which must not keep ID's own
-       child from starting. *)
-    fun reserved id =
-      case (Array.sub (attempt, id), Array.sub (attempt_owner, id)) of
-          (ARunning (gen, _), SOME (g, thread)) => g = gen andalso HolbuildMachineMemory.holds_reservation thread
-        | (ARunning _, _) => false
-        (* Done, it needs no child unless a parent still has to build. *)
-        | (ADone _, _) => Array.sub (plain_started, id)
-        | _ =>
-            case Array.sub (plain_owner, id) of
-                SOME thread => HolbuildMachineMemory.holds_reservation thread
-              | NONE => false
-
-    (* A parent an attempt can start ahead of: a theory being built, on its
-       reservation, on parents that are all available. *)
+    (* A parent an attempt can start ahead of: a theory being built on
+       parents that are all available, and not itself still waiting for
+       late parents of its own, whose outlines it hasn't loaded yet. *)
     fun late_parent id =
-      not (available id) andalso is_theory id andalso producing id andalso reserved id andalso
+      not (available id) andalso is_theory id andalso producing id andalso
+      not (case producer id of SOME g => List.exists (fn (w, _) => w = g) (!waiting_ahead) | NONE => false) andalso
       List.all available (Array.sub (deps_of, id))
 
     (* Whether a dependent of ID could start on its outline. *)
@@ -7333,7 +7327,10 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     (* The best-ranked theory that can start its attempt ahead of its late
        parents, if one may start. *)
     fun best_ahead () =
-      if not pipelining orelse length (!waiting_ahead) >= ahead_cap orelse jobs - !running <= 1 then NONE
+      (* Under machine memory admission a child waiting ahead would hold a
+         lease its late parent's build may need. *)
+      if not pipelining orelse Option.isSome (!HolbuildMachineMemory.settings) orelse
+         length (!waiting_ahead) >= ahead_cap orelse jobs - !running <= 1 then NONE
       else
         let
           fun waits id =
@@ -7387,12 +7384,11 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
           if pipelined then
             (Array.update (plain_started, id, false);
              start_attempt id (new_gen ()) (Binaryset.empty int_compare) [])
-          else (mark_active_node id; Array.update (plain_owner, id, SOME (Thread.self ())); dispatched id;
+          else (mark_active_node id; dispatched id;
                 SOME (PlainWork id))
         end
       else
         (mark_active_node id;
-         Array.update (plain_owner, id, SOME (Thread.self ()));
          dispatched id;
          if priority then priority_running := !priority_running + 1 else ();
          SOME (PlainWork id))
@@ -7448,10 +7444,6 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
 
     fun next_work () = with_lock next_work_locked
 
-    (* A late parent's child holding its reservation lets an attempt start
-       ahead of it (reserved). *)
-    val _ = HolbuildMachineMemory.on_reserved := (fn () => with_lock signal)
-
     fun stop_owner owners id gen =
       case Array.sub (owners, id) of
           SOME (owner_gen, thread) =>
@@ -7478,6 +7470,8 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
       if Array.sub (committed, id) orelse Array.sub (skipped, id) then ()
       else
         let
+          (* A parent's outline or commit can change whether it cuts off. *)
+          val _ = Array.update (ahead_cuts_off, id, NONE)
           val deps = Array.sub (deps_of, id)
           val all_available = pipelining andalso List.all available deps
           val _ =
@@ -7944,6 +7938,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                     (build_speculative options tc project base_context plan keys toolchain_key run_dir
                        (if null late then outlines else ahead_view) (Int.toString gen)
                        (publish_theory_outline id gen) ahead node))
+        val _ = if null late then () else remove_tree dir
       in
         with_lock (fn () => finish_attempt_locked id gen outcome)
       end

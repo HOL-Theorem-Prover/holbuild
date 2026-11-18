@@ -533,34 +533,16 @@ fun acquire {dir, budget_mb, charge_mb} =
     loop false
   end
 
-(* The threads running a child on a reservation now. *)
-val holders_mutex = Mutex.mutex ()
-val holders = ref ([] : Thread.thread list)
-fun change_holders f = (Mutex.lock holders_mutex; holders := f (!holders); Mutex.unlock holders_mutex)
-
-(* Called once a thread holds a reservation for its child. *)
-val on_reserved = ref (fn () => ())
-
-(* Whether THREAD runs a child on a reservation now; always, with
-   cooperation off. *)
-fun holds_reservation thread =
-  not (Option.isSome (!settings)) orelse List.exists (fn t => Thread.equal (t, thread)) (!holders)
-
 (* Runs launch with a reserved lease descriptor that the child must inherit,
    or with NONE when cooperation is off. *)
 fun with_reservation launch =
   case !settings of
       NONE => launch NONE
     | SOME s =>
-        let
-          val lease = acquire s
-          val self = Thread.self ()
-          fun done () = (change_holders (List.filter (fn t => not (Thread.equal (t, self)))); release lease)
+        let val lease = acquire s
         in
-          change_holders (fn ts => self :: ts);
-          (!on_reserved) ();
-          (launch (SOME (#fd lease)) before done ())
-          handle e => (done (); raise e)
+          (launch (SOME (#fd lease)) before release lease)
+          handle e => (release lease; raise e)
         end
 
 end

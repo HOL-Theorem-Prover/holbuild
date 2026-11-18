@@ -798,8 +798,44 @@ require_grep "pipeline: committed: CTheory" "$log"
 require_no_grep "ahead abandoned" "$log"
 require_same_as_unpipelined ahead CTheory A B C
 
-# The same under machine memory cooperation: C starts ahead of B only once
-# B's child holds its reservation, which wakes the idle workers.
+# Chained: D starts ahead of C only once C, itself started ahead of B, has
+# loaded B's outline, so D predicts C's loads from what C really loaded.
+rm -rf "$tmpdir/ahead-chain"
+cp -r "$tmpdir/ahead" "$tmpdir/ahead-chain"
+rm -rf "$tmpdir/ahead-chain/.holbuild"
+cat > "$tmpdir/ahead-chain/src/CScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib BTheory;
+val _ = new_theory "C";
+val _ = OS.Process.sleep (Time.fromSeconds 10);
+Theorem c_thm:
+  T /\ T
+Proof
+  ACCEPT_TAC BTheory.b_thm
+QED
+val _ = export_theory();
+SML
+cat > "$tmpdir/ahead-chain/src/DScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib CTheory;
+val _ = new_theory "D";
+Theorem d_thm:
+  T /\ T
+Proof
+  ACCEPT_TAC CTheory.c_thm
+QED
+val _ = export_theory();
+SML
+# -j6, so two children may wait ahead at once and only the rule holds D back.
+(cd "$tmpdir/ahead-chain" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j6 build --no-cache --skip-checkpoints --skip-proof-steps DTheory) \
+  > "$tmpdir/ahead-chain.log" 2>&1
+log=$tmpdir/ahead-chain.log
+require_before "pipeline: ahead arrived: BTheory for CTheory" "pipeline: dispatch ahead: DTheory (late CTheory)" "$log"
+require_grep "pipeline: committed: DTheory" "$log"
+require_no_grep "ahead abandoned" "$log"
+require_same_as_unpipelined ahead-chain DTheory A B C D
+
+# Under machine memory cooperation nothing starts ahead, since a child
+# waiting ahead would hold a lease its late parent may need; C still
+# pipelines on B's outline.
 rm -rf "$tmpdir/ahead-coop"
 cp -r "$tmpdir/ahead" "$tmpdir/ahead-coop"
 rm -rf "$tmpdir/ahead-coop/.holbuild"
@@ -810,10 +846,10 @@ printf 'MemTotal:        67108864 kB\nMemAvailable:    67108864 kB\n' > "$tmpdir
    HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --no-cache --skip-checkpoints --skip-proof-steps \
    --cooperate-dir "$tmpdir/ahead-coop-dir" --child-charge 256 CTheory) > "$tmpdir/ahead-coop.log" 2>&1
 log=$tmpdir/ahead-coop.log
-require_grep "pipeline: dispatch ahead: CTheory (late BTheory)" "$log"
-require_before "pipeline: ahead waiting: CTheory for BTheory" "pipeline: outline ready: BTheory" "$log"
+require_no_grep "pipeline: dispatch ahead" "$log"
+require_grep "pipeline: outline ready: BTheory" "$log"
+require_grep "pipeline: attempt done: CTheory" "$log"
 require_grep "pipeline: committed: CTheory" "$log"
-require_no_grep "ahead abandoned" "$log"
 
 # Abandoning: B loads a theory its source doesn't name, so C's child, which
 # loaded B's predicted manifest and waits at its stand-in, finds B's real
