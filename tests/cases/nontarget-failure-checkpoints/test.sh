@@ -81,9 +81,11 @@ checkpoints=$project/.holbuild/checkpoints
 saves() { find "$checkpoints" -path "*/$1Script.sml*" -name '*.save' 2>/dev/null | sort; }
 # build NAME [TARGET]: build TARGET (default TTheory).
 # A failed build echoes no child log; A's are kept under .holbuild/logs.
+# grep reads the logs itself: piped from cat, a match makes grep exit while
+# cat still writes, and under pipefail cat's SIGPIPE reads as no match.
 compacted_failed_prefix() {
-  if ! cat "$project"/.holbuild/logs/current/nontarget/ATheory/*.log 2>/dev/null |
-       grep -q "checkpoint kind=failed_prefix share=true"; then
+  if ! grep -qs "checkpoint kind=failed_prefix share=true" \
+       "$project"/.holbuild/logs/current/nontarget/ATheory/*.log; then
     echo "build $1 saved no compacted failed prefix" >&2
     ls -R "$project/.holbuild/logs/current" >&2 || true
     saves A >&2
@@ -130,7 +132,7 @@ if [[ -n "$(saves A)" ]]; then
   saves A >&2
   exit 1
 fi
-saves T | grep -q '/deps_loaded.save$' || { echo "the target T saved no deps heap" >&2; saves T >&2; exit 1; }
+grep -q '/deps_loaded.save$' <<< "$(saves T)" || { echo "the target T saved no deps heap" >&2; saves T >&2; exit 1; }
 
 # A failing proof saves its prefix, and the fixed proof resumes from it.
 write_a 'FAIL_TAC "seeded failure"'
