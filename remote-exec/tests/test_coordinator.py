@@ -14,6 +14,7 @@ import httpx
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from starlette.requests import Request
 
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import create_app
@@ -821,6 +822,32 @@ async def test_a_woken_claim_whose_worker_left_while_it_took_the_action_gives_it
         await asyncio.sleep(0.01)
     batch_id = await submit(http, ["a"])
     assert await waiting is None and left
+    await coordinator.released()
+    (action,) = (await batch(http, batch_id))["actions"]
+    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+
+
+async def test_a_claim_whose_worker_left_as_the_endpoint_answered_gives_its_action_back(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker is there through the coordinator's checks and leaves while the endpoint ends its unheld leases:
+    the endpoint's last check gives the claim back and answers 204."""
+    left = False
+    release_unheld = coordinator.release_unheld
+
+    async def leaving(*args: Any) -> None:
+        nonlocal left
+        await release_unheld(*args)
+        left = True
+
+    async def gone(_: Request) -> bool:
+        return left
+
+    monkeypatch.setattr(coordinator, "release_unheld", leaving)
+    monkeypatch.setattr(Request, "is_disconnected", gone)
+    batch_id = await submit(http, ["a"])
+    response = await http.post("/v1/work/claim", json={"tier": "standard", "worker": "w9"}, headers=WORKER)
+    assert response.status_code == 204 and left
     await coordinator.released()
     (action,) = (await batch(http, batch_id))["actions"]
     assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
