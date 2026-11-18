@@ -28,6 +28,13 @@ val manifest_marker = "manifest-text-v1\n"
    HolbuildHttp.max_transfer_seconds. *)
 val stall_timeout_seconds = 30
 
+(* A node whose disk lacks a blob fetches it from the shared store, checks it
+   and stores it before it sends a byte; for a heap of hundreds of MB that
+   can take over a minute, and giving up meanwhile only starts the same work
+   on the next node.  So a GET of a blob this large waits longer for data. *)
+val large_blob_bytes = 64 * 1024 * 1024
+val large_blob_stall_timeout_seconds = 120
+
 fun empty_blob_map () = Redblackmap.mkDict String.compare
 
 fun remote url =
@@ -157,12 +164,12 @@ fun warn_restore_once message =
 (* Requests go through libcurl when HolbuildRemoteCacheConfig could set it
    up, and otherwise through the curl command, which prints its own error
    message. *)
-fun cli_status options url =
+fun cli_status timeout options url =
   let
     val _ = HolbuildOffline.require_online "contact the remote cache"
     val result =
       run "curl" (["-q", "-sS", "-L", "--connect-timeout", Int.toString HolbuildHttp.connect_timeout_seconds,
-                   "--speed-limit", "1", "--speed-time", Int.toString stall_timeout_seconds,
+                   "--speed-limit", "1", "--speed-time", Int.toString timeout,
                    "--max-time", Int.toString HolbuildHttp.max_transfer_seconds] @
                   curl_config_args () @ options @ ["-w", "%{http_code}", url])
   in
@@ -171,13 +178,13 @@ fun cli_status options url =
       | _ => HolbuildHttp.Failed "the curl command failed"
   end
 
-fun get_status {url, dst} =
+fun get_status {url, dst, timeout} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
-    HolbuildHttp.get {url = url, dst = dst, timeout = stall_timeout_seconds}
+    HolbuildHttp.get {url = url, dst = dst, timeout = timeout}
   else
     (* --compressed advertises curl-supported response encodings, including zstd
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
-    cli_status ["--compressed", "-o", dst] url
+    cli_status timeout ["--compressed", "-o", dst] url
 
 (* Blob downloads take the body still zstd-encoded and decode it here on
    several threads (HolbuildZstd), since libcurl decodes on the one thread
@@ -189,15 +196,15 @@ val decode_threads = 4
 fun trace_decode url how =
   HolbuildStatus.cache_trace ("remote cache decode " ^ redact_userinfo url ^ " " ^ how)
 
-fun get_status_parallel_decode {url, dst} =
+fun get_status_parallel_decode (request as {url, dst, timeout}) =
   if not (HolbuildRemoteCacheConfig.uses_libcurl () andalso HolbuildZstd.available ()) then
-    get_status {url = url, dst = dst}
+    get_status request
   else
     let
       val encoded = HolbuildTempPath.near dst ".zstd-get"
       fun remove () = FS.remove encoded handle OS.SysErr _ => ()
       val (result, encoding) =
-        HolbuildHttp.get_zstd {url = url, dst = encoded, timeout = stall_timeout_seconds}
+        HolbuildHttp.get_zstd {url = url, dst = encoded, timeout = timeout}
         handle e => (remove (); raise e)
     in
       case (result, encoding) of
@@ -208,13 +215,13 @@ fun get_status_parallel_decode {url, dst} =
               result)
              handle HolbuildZstd.Error message =>
                       (remove (); trace_decode url ("fallback: " ^ message);
-                       get_status {url = url, dst = dst})
+                       get_status request)
                   | e => (remove (); raise e))
         | (HolbuildHttp.Response 200, HolbuildHttp.Identity) =>
             (FS.rename {old = encoded, new = dst}; trace_decode url "identity"; result)
         | (HolbuildHttp.Response 200, HolbuildHttp.OtherEncoding) =>
             (remove (); trace_decode url "fallback: another encoding";
-             get_status {url = url, dst = dst})
+             get_status request)
         | _ => (remove (); result)
     end
 
@@ -222,13 +229,13 @@ fun head_status url =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
     HolbuildHttp.head {url = url, timeout = stall_timeout_seconds}
   else
-    cli_status ["-I", "--ignore-content-length", "-o", "/dev/null"] url
+    cli_status stall_timeout_seconds ["-I", "--ignore-content-length", "-o", "/dev/null"] url
 
 fun put_status headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
     HolbuildHttp.put {url = url, src = src, headers = headers, timeout = stall_timeout_seconds}
   else
-    cli_status (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
+    cli_status stall_timeout_seconds (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
 
 (* No HTTP response counts as a transport failure; any HTTP status resets
    the count. After tripping, only one request probes each cooldown. *)
@@ -529,8 +536,8 @@ fun send_urls_using usable method urls path request =
 
 fun send_urls method urls path request = send_urls_using (fn _ => true) method urls path request
 
-fun curl_get_urls_by get usable {urls, dst} =
-  (case send_urls_using usable "GET" urls dst (fn url => get {url = url, dst = dst}) of
+fun curl_get_urls_by get usable {urls, dst, timeout} =
+  (case send_urls_using usable "GET" urls dst (fn url => get {url = url, dst = dst, timeout = timeout}) of
         NONE => HolbuildCacheBackend.Miss
       | SOME (url, HolbuildHttp.Failed message) =>
           HolbuildCacheBackend.Corrupt ("GET " ^ redact_userinfo url ^ " failed: " ^ message)
@@ -541,7 +548,8 @@ fun curl_get_urls_by get usable {urls, dst} =
   handle e as Unavailable _ => raise e
        | e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
 
-fun curl_get_urls_using usable request = curl_get_urls_by get_status usable request
+fun curl_get_urls_using usable {urls, dst} =
+  curl_get_urls_by get_status usable {urls = urls, dst = dst, timeout = stall_timeout_seconds}
 
 fun curl_get_urls request = curl_get_urls_using (fn _ => true) request
 
@@ -587,6 +595,15 @@ fun cas_urls cache sha256 = request_urls cache "cas" sha256
 
 fun lookup_blob cache sha256 =
   Redblackmap.peek (!(blob_map cache), sha256)
+
+(* The stall budget of a GET of a blob, by the size an action entry that
+   lists it gave; a blob no entry read here lists gets the usual one. *)
+fun blob_stall_timeout cache sha256 =
+  case Option.mapPartial (Position.fromString o #size) (lookup_blob cache sha256) of
+      SOME size =>
+        if size >= Position.fromInt large_blob_bytes then large_blob_stall_timeout_seconds
+        else stall_timeout_seconds
+    | NONE => stall_timeout_seconds
 
 (* A worker's transfer threads share one handle. *)
 val blobs_mutex = Mutex.mutex ()
@@ -728,7 +745,7 @@ fun repair_action_replicas cache {key, text, attempts, should_replace} =
             warn_restore_once ("could not reconcile cache replica " ^ redact_userinfo url ^ ": " ^ detail)
           fun request method path call = traced method url path call
           fun loop remaining =
-            case request "GET" download (fn () => get_status {url = url, dst = download}) of
+            case request "GET" download (fn () => get_status {url = url, dst = download, timeout = stall_timeout_seconds}) of
                 HolbuildHttp.Response 404 => ()
               | HolbuildHttp.Response 200 =>
                   if not (should_replace (#manifest (metadata_manifest (read_text download)))) then ()
@@ -842,7 +859,9 @@ fun fetch_blob cache {hash, dst} =
     | SOME entry =>
         let
           val {sha256, ...} = entry
-          val result = curl_get_urls {urls = cas_urls cache sha256, dst = dst}
+          val result = curl_get_urls_by get_status (fn _ => true)
+                         {urls = cas_urls cache sha256, dst = dst,
+                          timeout = blob_stall_timeout cache sha256}
         in
           case result of
               HolbuildCacheBackend.Hit => verify_downloaded_blob dst entry
@@ -853,17 +872,21 @@ fun fetch_blob cache {hash, dst} =
         handle e as Unavailable _ => raise e
              | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
 
-(* Fetches a blob by its SHA-256 alone, without an action entry that lists
-   it, as a remote worker fetches its spec and sources. *)
-fun fetch_unlisted_blob cache {hash, dst} =
+(* Fetches a blob by its SHA-256 alone, without needing an action entry that
+   lists it, as a remote worker fetches its spec and sources; a GET fails
+   once it has moved no data for TIMEOUT seconds. *)
+fun fetch_unlisted_blob_within timeout cache {hash, dst} =
   (case curl_get_urls_by get_status_parallel_decode (fn _ => true)
-                         {urls = cas_urls cache hash, dst = dst} of
+                         {urls = cas_urls cache hash, dst = dst, timeout = timeout} of
        HolbuildCacheBackend.Hit =>
          if HolbuildHash.file_sha256 dst = hash then HolbuildCacheBackend.Hit
          else HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ hash)
      | other => other)
   handle e as Unavailable _ => raise e
        | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
+
+fun fetch_unlisted_blob cache (request as {hash, ...}) =
+  fetch_unlisted_blob_within (blob_stall_timeout cache hash) cache request
 
 fun put_blob cache {hash, src} =
   let

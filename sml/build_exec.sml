@@ -12210,7 +12210,10 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
                      else
                        let val tmp = Path.concat (staging, file)
                        in
-                         case HolbuildRemoteCache.fetch_unlisted_blob remote {hash = sha, dst = tmp} of
+                         (* The usual stall budget, which module_request_fits allows for,
+                            whatever the module's size. *)
+                         case HolbuildRemoteCache.fetch_unlisted_blob_within
+                                HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp} of
                              HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = Path.concat (store, file)}
                            | _ => remove_file tmp
                        end
