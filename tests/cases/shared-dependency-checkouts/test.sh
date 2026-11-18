@@ -43,13 +43,14 @@ checkout_of() { printf '%s/git/checkouts/%s-%s' "$HOLBUILD_CACHE" "$(printf %s "
 # A real build against a theory in a git dependency writes nothing into the
 # shared checkout: the dependency's declared extra outputs, an SML source among
 # them, go under each consuming project's .holbuild, whether its theory is
-# built or restored from the cache.
+# built or restored from the cache.  The dependency's members overlap, so
+# discovery reaches its generated source twice.
 use_case_cache "$tmpdir/cache"
 dep=$tmpdir/dep
 mkdir -p "$dep/src"
 {
   write_schema2_prelude
-  printf '[project]\nname = "dep"\n\n[build]\nmembers = ["src"]\n\n'
+  printf '[project]\nname = "dep"\n\n[build]\nmembers = [".", "src"]\n\n'
   printf '[actions.DUse]\ndeps = ["DTheory"]\n'
 } > "$dep/holproject.toml"
 cat > "$dep/src/DScript.sml" <<'SML'
@@ -109,8 +110,20 @@ require_grep "UTheory is up to date" "$tmpdir/rebuild.log"
 
 # A second project directory links to the same checkout instead of cloning,
 # and restores the dependency's theory and its outputs from the cache.  An
-# output of its own that it never claimed is still refused.
+# output of its own that it never claimed is still refused.  Its claim from
+# 0.14.64 on an output in the dependency's sources, here a file the checkout
+# tracks, is dropped without removing the file.
 (cd "$tmpdir/copy" && "$HOLBUILD_BIN" context) > /dev/null
+record=$(grep -l 'results/D.txt' "$project"/.holbuild/extra-outputs/actions/*.outputs)
+output=$(grep -m1 '^path .*results/D.txt$' "$record")
+output=${output#path }
+legacy=${output%%/.holbuild/*}
+legacy=${legacy%/project}/copy/.holbuild/src/dep/src/DScript.sml
+legacy_claim=$tmpdir/copy/.holbuild/extra-outputs/owners/$(printf %s "$legacy" | sha256sum | cut -d' ' -f1).owner
+mkdir -p "$tmpdir/copy/.holbuild/extra-outputs/actions" "$tmpdir/copy/.holbuild/extra-outputs/owners"
+printf 'holbuild-extra-output-action-v1\n%s\npath %s\n' "$(sed -n 2p "$record")" "$legacy" \
+  > "$tmpdir/copy/.holbuild/extra-outputs/actions/${record##*/}"
+printf 'holbuild-extra-output-owner-v1\n%s\npath %s\n' "$(sed -n 2p "$record")" "$legacy" > "$legacy_claim"
 [[ $(readlink "$tmpdir/copy/.holbuild/src/dep") == "$checkout" ]] || fail "second project did not link the shared checkout"
 [[ $(find "$HOLBUILD_CACHE/git/checkouts" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l) == 1 ]] ||
   fail "second project made another checkout"
@@ -126,6 +139,13 @@ rm "$tmpdir/copy/src/results/U.txt"
 require_grep "UTheory restored from cache" "$tmpdir/copy-build.log"
 require_outputs "$tmpdir/copy"
 [[ $(snapshot "$checkout") == "$before" ]] || fail "second build wrote into the shared checkout"
+[[ ! -e $legacy_claim ]] || fail "second build kept its claim on an output in the dependency's sources"
+
+# A source in the extra-output directory that no theory of the dependency
+# declares, say from an older pin, is not the dependency's.
+echo 'structure DUse = struct val y = 0 end' > "$tmpdir/copy/.holbuild/packages/dep/extra-outputs/src/DUse.sml"
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" --verbose build) > "$tmpdir/copy-stale.log" 2>&1 || { cat "$tmpdir/copy-stale.log" >&2; fail "build with a stale output failed"; }
+require_grep "UTheory is up to date" "$tmpdir/copy-stale.log"
 
 # GC runs on a cache of its own, which links no shared toolchains, with a HOL
 # dependency that is never built.

@@ -654,9 +654,29 @@ fun discover_package scans package =
                       excludes exclude_globs (path, acc)
                   else acc
                 end
+              val found =
+                deduplicate_sources (List.foldl scan [] (HolbuildProject.package_members package))
+              (* The root outlives pin and override changes, so only what a
+                 theory of the package declares now counts.  Declarations
+                 have no .. components, so a theory writes only under its own
+                 directory. *)
+              fun under dir path = dir = "" orelse String.isPrefix (dir ^ "/") path
+              fun declared (script : source) =
+                let val dir = Path.dir (normalize_path (#relative_path script))
+                in
+                  if #kind script <> TheoryScript orelse
+                     not (List.exists (fn (output : source) => under dir (#relative_path output)) found)
+                  then []
+                  else
+                    map (fn output => normalize_path (if dir = "" then output else Path.concat(dir, output)))
+                        (#extra_outputs (HolbuildDependencies.extract_textual (#source_path script)))
+                    handle IO.Io _ => []
+                end
+              val declarations = if null found then [] else List.concat (map declared tree_sources)
+              fun is_declared (output : source) =
+                List.exists (fn path => path = normalize_path (#relative_path output)) declarations
             in
-              map (with_package_root source_root)
-                  (List.foldl scan [] (HolbuildProject.package_members package))
+              map (with_package_root source_root) (List.filter is_declared found)
             end
     fun shadowed (source : source) =
       List.exists (fn (output : source) => #relative_path output = #relative_path source) overlay

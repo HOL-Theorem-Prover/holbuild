@@ -674,13 +674,20 @@ fun claim_extra_outputs project node outputs =
     handle e => (List.app remove_file (!created); raise e)
   end
 
+(* Whether OUTPUT is in a dependency's sources, where 0.14.63 and 0.14.64 put
+   its extra outputs.  `.holbuild/src/<name>` may link to a checkout other
+   projects share, possibly of a revision that tracks a file at that path. *)
+fun in_dependency_sources project output =
+  String.isPrefix (Path.concat(project_artifact_root project, ".holbuild/src") ^ "/") output
+
 fun release_extra_output project owner strict output =
   let val claim_path = extra_output_claim_path project output
   in
     case read_extra_output_claim project output of
         SOME existing =>
           if same_extra_output_owner (owner, existing) then
-            (remove_file output; remove_file claim_path)
+            ((if in_dependency_sources project output then () else remove_file output);
+             remove_file claim_path)
           else if strict then
             raise Error ("refusing to remove extra output owned by " ^
                          extra_output_owner_text existing ^ ": " ^ output)
