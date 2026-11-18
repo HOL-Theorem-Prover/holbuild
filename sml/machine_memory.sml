@@ -538,6 +538,9 @@ val holders_mutex = Mutex.mutex ()
 val holders = ref ([] : Thread.thread list)
 fun change_holders f = (Mutex.lock holders_mutex; holders := f (!holders); Mutex.unlock holders_mutex)
 
+(* Called once a thread holds a reservation for its child. *)
+val on_reserved = ref (fn () => ())
+
 (* Whether THREAD runs a child on a reservation now; always, with
    cooperation off. *)
 fun holds_reservation thread =
@@ -555,6 +558,7 @@ fun with_reservation launch =
           fun done () = (change_holders (List.filter (fn t => not (Thread.equal (t, self)))); release lease)
         in
           change_holders (fn ts => self :: ts);
+          (!on_reserved) ();
           (launch (SOME (#fd lease)) before done ())
           handle e => (done (); raise e)
         end

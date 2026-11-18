@@ -664,6 +664,44 @@ done
 log=$tmpdir/ranked.log
 require_grep "pipeline: dispatch plain: R[123]Theory (ranked ahead 2, free 3)" "$log"
 
+# Ranking: at -j3, Deep heads a chain two links long, Wide and Narrow one
+# link each (Wide with two children, Narrow with one), and Leaf has none.
+# Workers take Deep, then Wide, then Narrow; Deep is pipelined, since the
+# shallower ready roots don't count against its spare worker.
+new_project order
+write_root() {
+  local name=$1
+  shift
+  local opens=""
+  for dep in "$@"; do opens="$opens ${dep}Theory"; done
+  cat > "$tmpdir/order/src/${name}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib$opens;
+val _ = new_theory "$name";
+Theorem ${name}_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+}
+write_root Deep
+write_root Deep2 Deep
+write_root Deep3 Deep2
+write_root Wide
+write_root Wide1 Wide
+write_root Wide2 Wide
+write_root Narrow
+write_root Narrow1 Narrow
+write_root Leaf
+(cd "$tmpdir/order" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j3 build --no-cache --skip-checkpoints --skip-proof-steps) \
+  > "$tmpdir/order.log" 2>&1
+log=$tmpdir/order.log
+require_grep "pipeline: dispatch pipelined: DeepTheory (ranked ahead 0, free 3)" "$log"
+require_before "pipeline: dispatch [a-z]*: DeepTheory" "pipeline: dispatch [a-z]*: WideTheory" "$log"
+require_before "pipeline: dispatch [a-z]*: WideTheory" "pipeline: dispatch [a-z]*: NarrowTheory" "$log"
+require_before "pipeline: dispatch [a-z]*: NarrowTheory" "pipeline: dispatch [a-z]*: LeafTheory" "$log"
+
 # Early cutoff: a theory whose dependencies' outputs end up as they were runs
 # no HOL, so no attempt.  A's proof edit leaves its outline what A's outputs
 # on disk export, so B, which cuts off on those, isn't attempted while A
@@ -750,3 +788,16 @@ require_grep "pipeline: attempt done: CTheory" "$log"
 require_grep "pipeline: committed: CTheory" "$log"
 require_no_grep "ahead abandoned" "$log"
 require_same_as_unpipelined ahead CTheory A B C
+
+# The same under machine memory cooperation: C starts ahead of B only once
+# B's child holds its reservation, which wakes the idle workers.
+rm -rf "$tmpdir/ahead-coop"
+cp -r "$tmpdir/ahead" "$tmpdir/ahead-coop"
+rm -rf "$tmpdir/ahead-coop/.holbuild"
+(cd "$tmpdir/ahead-coop" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --skip-checkpoints --skip-proof-steps \
+   --cooperate-dir "$tmpdir/ahead-coop-dir" --child-charge 256 CTheory) > "$tmpdir/ahead-coop.log" 2>&1
+log=$tmpdir/ahead-coop.log
+require_grep "pipeline: dispatch ahead: CTheory (late BTheory)" "$log"
+require_before "pipeline: ahead waiting: CTheory for BTheory" "pipeline: outline ready: BTheory" "$log"
+require_grep "pipeline: committed: CTheory" "$log"
+require_no_grep "ahead abandoned" "$log"

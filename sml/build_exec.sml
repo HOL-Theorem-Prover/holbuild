@@ -6977,6 +6977,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
        how many of its late parents have yet to arrive; and the theories
        whose attempt ahead was abandoned. *)
     val waiting_ahead = ref ([] : (int * int) list)
+    val started_ahead = Array.array (node_count, false)
     val no_ahead = Array.array (node_count, false)
     (* Whether a theory would cut off on its dependencies' outputs on disk
        when first considered to start ahead: a late parent's outline can't
@@ -7362,6 +7363,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                   (consumed_by (Array.sub (deps_of, id))) late
             in
               waiting_ahead := (gen, length late) :: !waiting_ahead;
+              Array.update (started_ahead, id, true);
               pipeline_trace ("dispatch ahead: " ^ node_name id ^ " (late " ^
                               String.concatWith ", " (map node_name late) ^ ")");
               start_attempt id gen consumed (map (fn p => (p, producer p)) late)
@@ -7444,6 +7446,10 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
       handle e => (unlock (); raise e)
 
     fun next_work () = with_lock next_work_locked
+
+    (* A late parent's child holding its reservation lets an attempt start
+       ahead of it (reserved). *)
+    val _ = HolbuildMachineMemory.on_reserved := (fn () => with_lock signal)
 
     fun stop_owner owners id gen =
       case Array.sub (owners, id) of
@@ -7552,7 +7558,10 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
               (Array.update (outline, id, ONone); pipeline_trace ("dropped outline: " ^ node_name id))
             else ();
             if attempt_hit then
-              (Array.update (attempt, id, ANone); pipeline_trace ("dropped attempt: " ^ node_name id))
+              (Array.update (attempt, id, ANone);
+               (* An attempt started ahead doesn't start ahead again. *)
+               if Array.sub (started_ahead, id) then Array.update (no_ahead, id, true) else ();
+               pipeline_trace ("dropped attempt: " ^ node_name id))
             else ();
             outline_hit orelse attempt_hit
           end
