@@ -75,6 +75,11 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   if [[ -e "$state/optional-log-outage" && \$theory == *:ATheory ]]; then
     echo 500 > "$tmpdir/cache-control/cas-get-status-\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
   fi
+  # A remote failure the local source doesn't share: the source heals.
+  if [[ \$status -ne 0 && -e "$state/heal" ]]; then
+    cp "$state/heal" "\$(cat "$state/heal-to")"
+    rm "$state/heal"
+  fi
   # A failed action fails the batch, naming the theory or blob it found
   # missing.
   if [[ \$status -ne 0 ]]; then
@@ -1315,6 +1320,29 @@ require_grep "could not fetch the failed theory's build log; building BTheory lo
 require_grep "^holbuild: theorem: b_thm (line 4)$" "$tmpdir/proof-nolog.log"
 refute_grep "on a remote worker\|CTheory built" "$tmpdir/proof-nolog.log"
 [[ $(local_hol_runs "$tmpdir/proof-nolog.timing") -gt 0 ]] || { cat "$tmpdir/proof-nolog.timing" >&2; exit 1; }
+
+# The same, but the local build of B succeeds (the failure was the workers'
+# alone): the build still fails, since B failed remotely and C wasn't built.
+write_broken two
+cat > "$state/heal" <<SML
+Theory B
+Ancestors A
+
+Theorem b_thm:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+SML
+echo "$project/src/BScript.sml" > "$state/heal-to"
+touch "$state/drop-log"
+run proof-nolog-healed 1 build --remote-exec "$coordinator" BTheory CTheory
+rm "$state/drop-log"
+require_grep "could not fetch the failed theory's build log; building BTheory locally" "$tmpdir/proof-nolog-healed.log"
+require_grep "BTheory built" "$tmpdir/proof-nolog-healed.log"
+require_grep "BTheory failed remotely: proof" "$tmpdir/proof-nolog-healed.log"
+refute_grep "CTheory built" "$tmpdir/proof-nolog-healed.log"
+write_broken two
 
 # B's diagnostic prints as soon as the batch reports B failed, while the rest
 # of the batch runs (the stub holds the stream after B, before C), and a build
