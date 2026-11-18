@@ -623,16 +623,18 @@ fun forget_output_digests ({output_digest_cache, ...} : t) =
 (* The script's own directory in the root package; in a dependency, its
    directory under the package's extra-output root, so that no project writes
    into a dependency's sources. *)
-fun extra_output_dir_of packages (source : HolbuildSourceIndex.source) =
+fun extra_output_root_of packages (source : HolbuildSourceIndex.source) =
   case List.find (fn package => HolbuildProject.package_name package = #package source) packages of
       NONE => raise Error ("no package " ^ #package source ^ " for " ^ #source_path source)
-    | SOME package =>
-        case HolbuildProject.package_extra_output_root package of
-            NONE => Path.dir (#source_path source)
-          | SOME root =>
-              case Path.dir (#relative_path source) of
-                  "" => root
-                | dir => Path.concat(root, dir)
+    | SOME package => HolbuildProject.package_extra_output_root package
+
+fun extra_output_dir_of packages (source : HolbuildSourceIndex.source) =
+  case extra_output_root_of packages source of
+      NONE => Path.dir (#source_path source)
+    | SOME root =>
+        case Path.dir (#relative_path source) of
+            "" => root
+          | dir => Path.concat(root, dir)
 
 fun analysis_packages (analysis : HolbuildComponentProvider.analysis_state) =
   HolbuildProjectGraph.packages (HolbuildPackagePrepare.graph (#preparation analysis))
@@ -1226,15 +1228,46 @@ fun lookup_key keys dep =
     | NONE => raise Error ("missing action key for dependency: " ^ logical_name dep)
 
 (* The node's extra-input declarations, manifest-declared first, as
-   (label, base directory, declaration). *)
+   (label, base directory, declaration).  In a dependency, a declaration that
+   names an extra output a theory of the package declares is based in the
+   package's extra-output root, where that output is written. *)
 fun extra_input_decls plan node =
   let
     val source = source_of node
+    val overlay_root = extra_output_root_of (analysis_packages (analysis_state plan)) source
+    (* BASE for a declaration relative to DIR in the package, or the matching
+       directory under the extra-output root when the output is there. *)
+    fun base_of base dir decl =
+      case overlay_root of
+          NONE => base
+        | SOME root =>
+            let
+              val overlay = if dir = "" then root else Path.concat(root, dir)
+              val target = normalize_path (if dir = "" then decl else Path.concat(dir, decl))
+              fun declared () =
+                let
+                  val scripts =
+                    List.filter (fn script => #package script = #package source)
+                      (map source_of (universe_nodes plan))
+                in
+                  List.exists (fn output => output = target)
+                    (HolbuildSourceIndex.declared_extra_outputs scripts [target])
+                end
+            in
+              if not (path_has_glob decl) andalso not (Path.isAbsolute decl) andalso
+                 readable (normalize_path (Path.concat(overlay, decl))) andalso declared ()
+              then overlay
+              else base
+            end
     val manifest =
-      map (fn input => ("extra_dep", #package_root source, HolbuildProject.extra_input_path input))
+      map (fn input =>
+             let val decl = HolbuildProject.extra_input_path input
+             in ("extra_dep", base_of (#package_root source) "" decl, decl) end)
         (HolbuildProject.action_extra_inputs (#policy source))
     val declared =
-      map (fn decl => ("source_extra_dep", Path.dir (#source_path source), decl))
+      map (fn decl =>
+             ("source_extra_dep",
+              base_of (Path.dir (#source_path source)) (Path.dir (#relative_path source)) decl, decl))
         (#extra_deps (dependencies plan node))
   in
     manifest @ declared

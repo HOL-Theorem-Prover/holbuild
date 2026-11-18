@@ -591,6 +591,26 @@ fun deduplicate_sources sources =
     kept
   end
 
+(* The package-relative paths the theories among SCRIPTS declare as extra
+   outputs, reading only those whose directory holds one of RELS:
+   declarations have no .. components, so a theory writes only under its own
+   directory. *)
+fun declared_extra_outputs (scripts : source list) rels =
+  let
+    fun under dir path = dir = "" orelse String.isPrefix (dir ^ "/") path
+    fun declared (script : source) =
+      let val dir = Path.dir (normalize_path (#relative_path script))
+      in
+        if #kind script <> TheoryScript orelse not (List.exists (under dir) rels) then []
+        else
+          map (fn output => normalize_path (if dir = "" then output else Path.concat(dir, output)))
+              (#extra_outputs (HolbuildDependencies.extract_textual (#source_path script)))
+          handle IO.Io _ => []
+      end
+  in
+    List.concat (map declared scripts)
+  end
+
 fun discover_package scans package =
   let
     val name = HolbuildProject.package_name package
@@ -657,22 +677,11 @@ fun discover_package scans package =
               val found =
                 deduplicate_sources (List.foldl scan [] (HolbuildProject.package_members package))
               (* The root outlives pin and override changes, so only what a
-                 theory of the package declares now counts.  Declarations
-                 have no .. components, so a theory writes only under its own
-                 directory. *)
-              fun under dir path = dir = "" orelse String.isPrefix (dir ^ "/") path
-              fun declared (script : source) =
-                let val dir = Path.dir (normalize_path (#relative_path script))
-                in
-                  if #kind script <> TheoryScript orelse
-                     not (List.exists (fn (output : source) => under dir (#relative_path output)) found)
-                  then []
-                  else
-                    map (fn output => normalize_path (if dir = "" then output else Path.concat(dir, output)))
-                        (#extra_outputs (HolbuildDependencies.extract_textual (#source_path script)))
-                    handle IO.Io _ => []
-                end
-              val declarations = if null found then [] else List.concat (map declared tree_sources)
+                 theory of the package declares now counts. *)
+              val declarations =
+                if null found then []
+                else declared_extra_outputs tree_sources
+                       (map (fn (output : source) => normalize_path (#relative_path output)) found)
               fun is_declared (output : source) =
                 List.exists (fn path => path = normalize_path (#relative_path output)) declarations
             in

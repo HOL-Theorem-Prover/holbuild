@@ -43,8 +43,9 @@ checkout_of() { printf '%s/git/checkouts/%s-%s' "$HOLBUILD_CACHE" "$(printf %s "
 # A real build against a theory in a git dependency writes nothing into the
 # shared checkout: the dependency's declared extra outputs, an SML source among
 # them, go under each consuming project's .holbuild, whether its theory is
-# built or restored from the cache.  The dependency's members overlap, so
-# discovery reaches its generated source twice.
+# built or restored from the cache.  Another theory reads one of them as an
+# extra input.  The dependency's members overlap, so discovery reaches its
+# generated source twice.
 use_case_cache "$tmpdir/cache"
 dep=$tmpdir/dep
 mkdir -p "$dep/src"
@@ -64,6 +65,18 @@ val _ = new_theory "D";
 val d_def = new_definition("d_def", ``d_const = T``);
 val _ = export_theory();
 SML
+cat > "$dep/src/EScript.sml" <<'SML'
+fun holbuild_extra_deps (_ : string list) = ();
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_deps ["results/D.txt"];
+val () = holbuild_extra_outputs ["results/E.txt"];
+val () = let val input = TextIO.openIn "results/D.txt"; val text = TextIO.inputAll input
+             val () = TextIO.closeIn input; val out = TextIO.openOut "results/E.txt"
+         in TextIO.output (out, "read " ^ text); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "E";
+val _ = export_theory();
+SML
 cat > "$dep/src/DUse.sml" <<'SML'
 structure DUse = struct val y = DGenML.x + 1 end
 SML
@@ -79,7 +92,7 @@ mkdir -p "$project/src"
 cat > "$project/src/UScript.sml" <<'SML'
 fun holbuild_extra_outputs (_ : string list) = ();
 val () = holbuild_extra_outputs ["results/U.txt"];
-open HolKernel Parse boolLib bossLib DTheory;
+open HolKernel Parse boolLib bossLib DTheory ETheory;
 val () = let val out = TextIO.openOut "results/U.txt"
          in TextIO.output (out, "user result " ^ Int.toString DUse.y ^ "\n"); TextIO.closeOut out end;
 val _ = new_theory "U";
@@ -100,6 +113,7 @@ before=$(snapshot "$checkout")
 require_outputs() {
   require_grep "dep result" "$1/.holbuild/packages/dep/extra-outputs/src/results/D.txt"
   require_file "$1/.holbuild/packages/dep/extra-outputs/src/DGenML.sml"
+  require_grep "read dep result" "$1/.holbuild/packages/dep/extra-outputs/src/results/E.txt"
   require_grep "user result 43" "$1/src/results/U.txt"
 }
 (cd "$project" && "$HOLBUILD_BIN" build) > "$tmpdir/build.log" 2>&1 || { cat "$tmpdir/build.log" >&2; fail "build failed"; }
@@ -110,18 +124,21 @@ require_grep "UTheory is up to date" "$tmpdir/rebuild.log"
 
 # A second project directory links to the same checkout instead of cloning,
 # and restores the dependency's theory and its outputs from the cache.  An
-# output of its own that it never claimed is still refused.  Its claim from
-# 0.14.64 on an output in the dependency's sources, here a file the checkout
-# tracks, is dropped without removing the file.
+# output of its own that it never claimed is still refused.  Its record from
+# 0.14.64 of outputs in the dependency's sources, here files the checkout
+# tracks, is dropped without removing them, whether or not their claims
+# survived.
 (cd "$tmpdir/copy" && "$HOLBUILD_BIN" context) > /dev/null
 record=$(grep -l 'results/D.txt' "$project"/.holbuild/extra-outputs/actions/*.outputs)
 output=$(grep -m1 '^path .*results/D.txt$' "$record")
 output=${output#path }
 legacy=${output%%/.holbuild/*}
-legacy=${legacy%/project}/copy/.holbuild/src/dep/src/DScript.sml
+legacy=${legacy%/project}/copy/.holbuild/src/dep
+legacy_unclaimed=$legacy/holproject.toml
+legacy=$legacy/src/DScript.sml
 legacy_claim=$tmpdir/copy/.holbuild/extra-outputs/owners/$(printf %s "$legacy" | sha256sum | cut -d' ' -f1).owner
 mkdir -p "$tmpdir/copy/.holbuild/extra-outputs/actions" "$tmpdir/copy/.holbuild/extra-outputs/owners"
-printf 'holbuild-extra-output-action-v1\n%s\npath %s\n' "$(sed -n 2p "$record")" "$legacy" \
+printf 'holbuild-extra-output-action-v1\n%s\npath %s\npath %s\n' "$(sed -n 2p "$record")" "$legacy" "$legacy_unclaimed" \
   > "$tmpdir/copy/.holbuild/extra-outputs/actions/${record##*/}"
 printf 'holbuild-extra-output-owner-v1\n%s\npath %s\n' "$(sed -n 2p "$record")" "$legacy" > "$legacy_claim"
 [[ $(readlink "$tmpdir/copy/.holbuild/src/dep") == "$checkout" ]] || fail "second project did not link the shared checkout"

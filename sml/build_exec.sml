@@ -693,7 +693,8 @@ fun release_extra_output project owner strict output =
                          extra_output_owner_text existing ^ ": " ^ output)
           else ()
       | NONE =>
-          if strict andalso extra_output_registry_path_exists output then
+          if strict andalso not (in_dependency_sources project output) andalso
+             extra_output_registry_path_exists output then
             raise Error ("extra output has no ownership record; refusing to remove: " ^ output)
           else ()
   end
@@ -3808,15 +3809,13 @@ fun theory_action root plan keys toolchain_key deps_key node : theory_action =
       {path = if Path.isAbsolute rel then rel
               else normalize_path (if base = "" then rel else Path.concat(base, rel)),
        from = abs}
-    val source_inputs =
-      List.concat
-        (map (fn decl => map (staged stage_script_dir) (expand_extra_dep script_dir decl))
-             (#extra_deps (source_deps plan node)))
-    val manifest_inputs =
-      List.concat
-        (map (fn input =>
-                 map (staged "") (expand_extra_dep package_root (HolbuildProject.extra_input_path input)))
-             (HolbuildProject.action_extra_inputs (source_policy node)))
+    (* Manifest inputs are relative to the package root, source ones to the
+       script's directory. *)
+    fun stage_inputs (label, base, decl) =
+      map (staged (if label = "extra_dep" then "" else stage_script_dir)) (expand_extra_dep base decl)
+    val decls = HolbuildBuildPlan.extra_input_decls plan node
+    val manifest_inputs = List.concat (map stage_inputs (List.filter (fn (label, _, _) => label = "extra_dep") decls))
+    val source_inputs = List.concat (map stage_inputs (List.filter (fn (label, _, _) => label <> "extra_dep") decls))
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
   in
     {input_key = HolbuildBuildPlan.input_key_for keys node,
@@ -4531,14 +4530,9 @@ fun action_policy_lines plan node =
       map (fn dep => "declared_dep=" ^ dep) (HolbuildProject.action_deps policy)
     val declared_load_lines =
       map (fn dep => "declared_load=" ^ dep) (HolbuildProject.action_loads policy)
-    val extra_inputs = HolbuildProject.action_extra_inputs policy
-    val extra_lines =
-      List.concat (map (fn input =>
-        extra_dep_lines "extra_dep"
-          (#package_root (HolbuildBuildPlan.source_of node))
-          [HolbuildProject.extra_input_path input]) extra_inputs)
-    val source_extra_lines =
-      extra_dep_lines "source_extra_dep" (Path.dir (source_file node)) (#extra_deps (source_deps plan node))
+    val extra_input_lines =
+      List.concat (map (fn (label, base, decl) => extra_dep_lines label base [decl])
+                       (HolbuildBuildPlan.extra_input_decls plan node))
     val source_extra_output_lines =
       map (fn output => "source_extra_output=" ^ output)
           (source_extra_output_declarations plan node)
@@ -4547,8 +4541,7 @@ fun action_policy_lines plan node =
      "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
     declared_dep_lines @
     declared_load_lines @
-    extra_lines @
-    source_extra_lines @
+    extra_input_lines @
     source_extra_output_lines
   end
 
