@@ -999,12 +999,13 @@ builds before it lands:
 
 ```bash
 make bin/holbuild    # in the checkout to try
-remote-exec/local-fleet --workers 8 ~/holbuild-branch -- \
+remote-exec/local-fleet --workers 8 --toolchain ~/.cache/holbuild/hol-toolchains/<key> ~/holbuild-branch -- \
   sh -c 'cd ~/project && holbuild build FooTheory --remote-exec "$LOCAL_FLEET_URL" --remote-only'
 ```
 
 It starts a fresh Postgres database (`initdb`, `pg_ctl`, `createdb` and `psql`
-on `PATH`), that checkout's coordinator, the test suite's cache server
+on `PATH`; password authentication, since other accounts can reach its port),
+that checkout's coordinator, the test suite's cache server
 (`tests/fixtures/remote_cache_server.py`) and N workers whose baked-releases
 root holds the checkout under its own version, so every action runs its
 holbuild. The command runs with `LOCAL_FLEET_URL`, `HOLBUILD_REMOTE_CACHE_URL`,
@@ -1013,26 +1014,33 @@ every other `HOLBUILD_REMOTE_CACHE_*` and `HOLBUILD_REMOTE_EXEC_*` variable
 unset, and the checkout's `bin/` first on `PATH`. Don't pass `--remote-cache`
 to it: a command-line cache wins over the environment. Theory cache keys don't
 include the holbuild version, so a development build's outputs must never
-reach a shared cache.
+reach a shared cache. A project whose outputs are already up to date builds
+nothing, so the fleet sees no work: start from a tree without them.
 
-The fleet starts with no HOL toolchain. `--toolchain <cache>/hol-toolchains/<key>`
-(repeatable) uses one already built in another holbuild cache: its `hol/` tree
-is read in place, since HOL bakes in its absolute paths, and granted to
-actions through `HOLBUILD_ACTION_READ_DIRS`; its locks, `last-used` marker and
-analysers stay private to the run, so the run holds no lease on it: seed from
-an entry in current use, which that cache's garbage collection won't retire
-mid-run. `holbuild buildhol` in the project prints the path of the one it
-uses.
+The fleet starts with no HOL toolchain, and `--remote-only` won't build one.
+`--toolchain <cache>/hol-toolchains/<key>` (repeatable) uses one already built
+in another holbuild cache: its `hol/` tree is read in place, since HOL bakes in
+its absolute paths, and granted to actions through `HOLBUILD_ACTION_READ_DIRS`;
+its locks, `last-used` marker and analysers stay private to the run, so the run
+holds no lease on it: seed from an entry in current use, which that cache's
+garbage collection won't retire mid-run. `holbuild buildhol` in the project
+prints the path of the one it uses.
 
-`REMOTE_EXEC_*` variables in the environment configure the coordinator. Inside
-a Slurm allocation, its memory is the workers' admission budget. The run
-directory may not lie under `/tmp`, and the workers' `TMPDIR` is inside it: as
-in the image, the action sandbox lets HOL write `/tmp` only when no worker
-state is there. On exit,
-interrupt or termination the fleet stops; the run directory (`--dir`, else a
-new one in `~/.cache/holbuild-local-fleet`) keeps the logs and CSV copies of the `batches`, `actions`
-and `leases` tables, and `--keep` also keeps the database and caches. Master
-and a branch both report the next version, so compare them in two runs.
+`REMOTE_EXEC_*` variables in the environment configure the coordinator, except
+`REMOTE_EXEC_SCALE_CMD`, `REMOTE_EXEC_CACHE_POOL_CMD` and
+`REMOTE_EXEC_CACHE_SLOTS`, which are unset because they would reach a deployed
+fleet's scaler and cache pool. Inside a Slurm allocation, its memory
+(`--mem` or `--mem-per-cpu`) is the workers' admission budget.
+
+The run directory (`--dir`, else a new one in `~/.cache/holbuild-local-fleet`)
+must be new or empty, a plain path, and not under `/tmp`; the workers' `TMPDIR`
+is inside it: as in the image, the action sandbox lets HOL write `/tmp` only
+when no worker state is there. On exit, interrupt or termination the command
+is stopped, then the workers, which drain while the coordinator and cache still
+take their results, then the coordinator and cache. The run directory keeps
+the logs and CSV copies of the `batches`, `actions` and `leases` tables, and
+`--keep` also keeps the database and caches. Master and a branch both report
+the next version, so compare them in two runs.
 
 ## Tests
 

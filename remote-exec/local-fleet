@@ -11,8 +11,8 @@ usage: local-fleet [--workers N] [--dir DIR] [--toolchain DIR]... [--keep] TREE 
 
 TREE      a holbuild checkout with bin/holbuild built
 --workers workers to start (default 4)
---dir     run directory for logs, the database and caches, not under /tmp
-          (default: a new directory in ~/.cache/holbuild-local-fleet)
+--dir     run directory for logs, the database and caches: new or empty, not under
+          /tmp, a plain path (default: a new directory in ~/.cache/holbuild-local-fleet)
 --toolchain
           a built HOL toolchain, one entry of a holbuild cache's hol-toolchains, to
           use without building it; repeatable. Its hol/ tree is used in place (HOL
@@ -24,8 +24,10 @@ COMMAND runs with LOCAL_FLEET_URL (the coordinator), HOLBUILD_REMOTE_CACHE_URL,
 HOLBUILD_REMOTE_EXEC_CURL_CONFIG and HOLBUILD_CACHE set, every other
 HOLBUILD_REMOTE_CACHE_* and HOLBUILD_REMOTE_EXEC_* variable unset, and TREE/bin
 first on PATH, e.g.
-  local-fleet ~/holbuild -- sh -c 'holbuild build FooTheory --remote-exec "$LOCAL_FLEET_URL" --remote-only'
-REMOTE_EXEC_* variables in the environment configure the coordinator.
+  local-fleet --toolchain ~/.cache/holbuild/hol-toolchains/<key> ~/holbuild -- \
+    sh -c 'holbuild build FooTheory --remote-exec "$LOCAL_FLEET_URL" --remote-only'
+REMOTE_EXEC_* variables in the environment configure the coordinator, except the
+scaler and cache-pool hooks, which would reach a deployed fleet's.
 Needs initdb, pg_ctl, createdb and psql on PATH, and uv.
 EOF
 }
@@ -55,21 +57,38 @@ for t in "${toolchains[@]}"; do
 done
 version=$(sed -n 's/^val version = "\(.*\)"$/\1/p' "$tree/sml/version.sml")
 [[ -n $version ]] || { echo "local-fleet: no version in $tree/sml/version.sml" >&2; exit 2; }
+# A Slurm booking's memory is the workers' admission budget.
+budget_mb=
+if [[ -n ${SLURM_MEM_PER_NODE:-} ]]; then
+  budget_mb=$SLURM_MEM_PER_NODE
+elif [[ -n ${SLURM_MEM_PER_CPU:-} ]]; then
+  budget_mb=$((SLURM_MEM_PER_CPU * ${SLURM_CPUS_ON_NODE:?SLURM_MEM_PER_CPU is set but SLURM_CPUS_ON_NODE is not}))
+elif [[ -n ${SLURM_MEM_PER_GPU:-} ]]; then
+  echo "local-fleet: memory booked per GPU; book it with --mem or --mem-per-cpu so the workers' budget is known" >&2
+  exit 2
+fi
 
 # Nothing the command or the workers do may reach a shared cache or fleet:
 # a branch's theory outputs share their cache keys with released holbuild.
 while read -r name; do unset "$name"; done < <(compgen -e | grep -E '^HOLBUILD_REMOTE_(CACHE|EXEC)_' || true)
 unset HOLBUILD_CACHE HOLBUILD_COOPERATE_DIR
+# Nor may the coordinator call a deployment's scaler or cache pool (its settings ignore case).
+while read -r name; do unset "$name"; done < <(compgen -e | grep -iE '^REMOTE_EXEC_(SCALE_CMD|CACHE_POOL_CMD|CACHE_SLOTS)$' || true)
 
 if [[ -z $dir ]]; then
   mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/holbuild-local-fleet"
   dir=$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/holbuild-local-fleet/run.XXXXXX")
+elif [[ -e $dir && -n $(ls -A "$dir") ]]; then
+  echo "local-fleet: the run directory $dir is not empty; give a new or empty one" >&2
+  exit 2
 fi
-mkdir -p "$dir"
+mkdir -p -m 700 "$dir"
 dir=$(realpath "$dir")
 # The action sandbox gives HOL /tmp, where Poly's temp files go (HolSat, intLib), only
 # when no worker state lies under it: the run directory and the workers' TMPDIR stay out.
 [[ $dir/ != /tmp/* ]] || { echo "local-fleet: the run directory $dir is under /tmp, which the action sandbox would then withhold from HOL" >&2; exit 2; }
+# It goes unquoted into Postgres's options and quoted into psql's commands.
+[[ $dir =~ ^[A-Za-z0-9/._+-]+$ ]] || { echo "local-fleet: the run directory $dir must be a plain path (letters, digits, / . _ + -)" >&2; exit 2; }
 mkdir -p "$dir"/{logs,remote,baked,releases,cooperate,worker-cache,client-cache,hol-toolchains,tables,tmp}
 ln -sfn "$tree" "$dir/baked/v$version"
 read_dirs=${HOLBUILD_ACTION_READ_DIRS:-}
@@ -83,19 +102,25 @@ for t in "${toolchains[@]}"; do
   read_dirs=${read_dirs:+$read_dirs:}$t/hol
 done
 for c in worker-cache client-cache; do ln -sfn "$dir/hol-toolchains" "$dir/$c/hol-toolchains"; done
-# A Slurm booking's memory is the workers' admission budget (bytes).
-if [[ -n ${SLURM_MEM_PER_NODE:-} ]]; then echo $((SLURM_MEM_PER_NODE * 1024 * 1024)) > "$dir/cooperate/budget"; fi
+if [[ -n $budget_mb ]]; then echo $((budget_mb * 1024 * 1024)) > "$dir/cooperate/budget"; fi
 
-pids=() pg_started=0
+command_pid= worker_pids=() service_pids=() pg_started=0
+terminate() {
+  local pid
+  for pid in "$@"; do kill -TERM "$pid" 2>/dev/null || true; done
+  for pid in "$@"; do wait "$pid" 2>/dev/null || true; done
+}
 stop() {
   local status=$?
   trap - EXIT INT TERM
-  for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
-  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  # Workers drain while the coordinator and cache still take their results and logs.
+  if [[ -n $command_pid ]]; then terminate "$command_pid"; fi
+  terminate "${worker_pids[@]}"
+  terminate "${service_pids[@]}"
   if ((pg_started)); then
     for table in batches actions leases; do
       psql -h "$dir" -p "$pgport" -U postgres -d fleet -qc "\\copy $table TO '$dir/tables/$table.csv' CSV HEADER" \
-        >> "$dir/logs/tables.log" 2>&1 || true
+        >> "$dir/logs/tables.log" 2>&1 || echo "local-fleet: copying the $table table failed; see $dir/logs/tables.log" >&2
     done
     pg_ctl -s -D "$dir/pg" stop -m fast || true
   fi
@@ -109,13 +134,18 @@ trap 'exit 143' TERM
 
 free_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 
+# Password authentication, since other accounts on the host can reach the TCP port.
+export PGPASSWORD
+PGPASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+(umask 077 && printf '%s\n' "$PGPASSWORD" > "$dir/pg.password")
 pgport=$(free_port)
-initdb -A trust -U postgres -D "$dir/pg" > "$dir/logs/initdb.log"
+initdb -A scram-sha-256 -U postgres --pwfile "$dir/pg.password" -D "$dir/pg" > "$dir/logs/initdb.log"
+rm -f "$dir/pg.password"
 pg_ctl -s -D "$dir/pg" -l "$dir/logs/postgres.log" \
   -o "-p $pgport -k $dir -c listen_addresses=127.0.0.1 -c max_connections=$((workers * 4 + 100))" start
 pg_started=1
 createdb -h "$dir" -p "$pgport" -U postgres fleet
-database_url=postgresql+asyncpg://postgres@127.0.0.1:$pgport/fleet
+database_url=postgresql+asyncpg://postgres:$PGPASSWORD@127.0.0.1:$pgport/fleet
 
 (cd "$tree/remote-exec" && uv sync --frozen --quiet)
 python=$tree/remote-exec/.venv/bin/python
@@ -123,37 +153,41 @@ python=$tree/remote-exec/.venv/bin/python
 
 "$python" "$tree/tests/fixtures/remote_cache_server.py" "$dir/remote" "$dir/cache.port" "$dir/logs/cache-requests.log" \
   > "$dir/logs/cache.log" 2>&1 &
-pids+=($!)
+service_pids+=($!)
 for _ in $(seq 100); do [[ -s $dir/cache.port ]] && break; sleep 0.1; done
 [[ -s $dir/cache.port ]] || { echo "local-fleet: the cache server didn't start; see $dir/logs/cache.log" >&2; exit 1; }
 cache_url=http://127.0.0.1:$(< "$dir/cache.port")
 
 client_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 worker_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
-printf 'header = "Authorization: Bearer %s"\n' "$client_token" > "$dir/client.curl"
-chmod 600 "$dir/client.curl"
+(umask 077 && printf 'header = "Authorization: Bearer %s"\n' "$client_token" > "$dir/client.curl")
 
 port=$(free_port)
 (cd "$tree/remote-exec" && exec env REMOTE_EXEC_DATABASE_URL="$database_url" REMOTE_EXEC_CLIENT_TOKEN="$client_token" \
   REMOTE_EXEC_WORKER_TOKEN="$worker_token" REMOTE_EXEC_CACHE_URL="$cache_url" REMOTE_EXEC_WARM_WORKERS="$workers" \
   .venv/bin/uvicorn --factory remote_exec.app:app --host 127.0.0.1 --port "$port" --timeout-graceful-shutdown 2) \
   > "$dir/logs/coordinator.log" 2>&1 &
-pids+=($!)
+service_pids+=($!)
 url=http://127.0.0.1:$port
-for _ in $(seq 300); do curl -so /dev/null "$url/v1/queue" && break; sleep 0.2; done
-curl -so /dev/null "$url/v1/queue" || { echo "local-fleet: the coordinator didn't answer; see $dir/logs/coordinator.log" >&2; exit 1; }
+coordinator_up() { curl -sf -K "$dir/client.curl" -o /dev/null "$url/v1/queue"; }
+for _ in $(seq 300); do coordinator_up && break; sleep 0.2; done
+coordinator_up || { echo "local-fleet: the coordinator didn't answer; see $dir/logs/coordinator.log" >&2; exit 1; }
 
 for i in $(seq "$workers"); do
-  (cd "$dir" && exec env HOLBUILD_CACHE="$dir/worker-cache" TMPDIR="$dir/tmp" HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' \
-    HOLBUILD_ACTION_READ_DIRS="$read_dirs" \
+  (cd "$dir" && exec env -u PGPASSWORD HOLBUILD_CACHE="$dir/worker-cache" TMPDIR="$dir/tmp" \
+    HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' HOLBUILD_ACTION_READ_DIRS="$read_dirs" \
     REMOTE_EXEC_WORKER_TOKEN="$worker_token" PYTHONPATH="$tree/remote-exec" "$python" -m remote_exec.worker \
     --coordinator "$url" --remote-cache "$cache_url" --tier high --also-claim standard --load-ahead \
     --max-heap 12000 --drain-seconds 20 --share-heaps --cooperate-dir "$dir/cooperate" --cache-limit-gb 100 \
     --baked-releases "$dir/baked" --holbuild-releases-dir "$dir/releases" --name "local-$i") \
     > "$dir/logs/worker-$i.log" 2>&1 &
-  pids+=($!)
+  worker_pids+=($!)
 done
 
 echo "local-fleet: $workers workers of holbuild $version from $tree at $url, run dir $dir" >&2
-LOCAL_FLEET_URL=$url HOLBUILD_REMOTE_CACHE_URL=$cache_url HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$dir/client.curl \
-  HOLBUILD_CACHE=$dir/client-cache PATH=$tree/bin:$PATH "$@"
+# In the background, so a TERM to this script runs the teardown at once.
+env -u PGPASSWORD LOCAL_FLEET_URL="$url" HOLBUILD_REMOTE_CACHE_URL="$cache_url" \
+  HOLBUILD_REMOTE_EXEC_CURL_CONFIG="$dir/client.curl" HOLBUILD_CACHE="$dir/client-cache" PATH="$tree/bin:$PATH" \
+  "$@" < /dev/stdin &
+command_pid=$!
+wait "$command_pid"
