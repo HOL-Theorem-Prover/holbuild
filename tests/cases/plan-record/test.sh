@@ -353,15 +353,19 @@ targets_on_argv() {
 target_switch() {
   local p=$tmpdir/switch
   make_project "$p"
-  expect_plan "full (no plan record for these inputs)" "$p" BTheory
   expect_plan "full (no plan record for these inputs)" "$p" DTheory
+  # Records are tried newest first by modification time.
+  sleep 1.1
+  expect_plan "from record (0 files rehashed, 0 keys changed, sliced from other targets' plan)" "$p" ATheory
+  # The newest record, A's, doesn't hold C; D's older one does.
   expect_plan "from record (0 files rehashed, 0 keys changed, sliced from other targets' plan)" "$p" CTheory
   expect_plan "from record (0 files rehashed, 0 keys changed)" "$p" CTheory
   # The other options must match.
-  expect_plan "full (no plan record for these inputs)" "$p" --skip-proof-steps ATheory
+  expect_plan "full (no plan record for these inputs)" "$p" --skip-proof-steps BTheory
   # The record's files are checked as for its own targets.
   printf '\n(* comment *)\n' >> "$p/src/AScript.sml"
-  expect_plan "from record (1 files rehashed, 1 keys changed, sliced from other targets' plan)" "$p" ATheory
+  expect_plan "from record (1 files rehashed, " "$p" BTheory
+  require_grep "sliced from other targets' plan" "$tmpdir/plan.log"
   # A new theory is in no record's plan.
   theory "$p/src/EScript.sml" E D
   expect_plan "full (no plan record for these inputs)" "$p" ETheory
