@@ -20,7 +20,8 @@ TREE      a holbuild checkout with bin/holbuild built
           last-used marker and analysers stay private to the fleet
 --keep    keep the caches and database when done (logs and tables are always kept)
 
-COMMAND runs with LOCAL_FLEET_URL (the coordinator), HOLBUILD_REMOTE_CACHE_URL,
+COMMAND runs in its own process group with LOCAL_FLEET_URL (the coordinator),
+HOLBUILD_REMOTE_CACHE_URL, HOLBUILD_REMOTE_CACHE_CURL_CONFIG,
 HOLBUILD_REMOTE_EXEC_CURL_CONFIG and HOLBUILD_CACHE set, every other
 HOLBUILD_REMOTE_CACHE_* and HOLBUILD_REMOTE_EXEC_* variable unset, and TREE/bin
 first on PATH, e.g.
@@ -78,18 +79,20 @@ while read -r name; do unset "$name"; done < <(compgen -e | grep -iE '^REMOTE_EX
 if [[ -z $dir ]]; then
   mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/holbuild-local-fleet"
   dir=$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/holbuild-local-fleet/run.XXXXXX")
-elif [[ -e $dir && -n $(ls -A "$dir") ]]; then
-  echo "local-fleet: the run directory $dir is not empty; give a new or empty one" >&2
-  exit 2
 fi
-mkdir -p -m 700 "$dir"
-dir=$(realpath "$dir")
+dir=$(realpath -m "$dir")
 # The action sandbox gives HOL /tmp, where Poly's temp files go (HolSat, intLib), only
 # when no worker state lies under it: the run directory and the workers' TMPDIR stay out.
 [[ $dir/ != /tmp/* ]] || { echo "local-fleet: the run directory $dir is under /tmp, which the action sandbox would then withhold from HOL" >&2; exit 2; }
 # It goes unquoted into Postgres's options and quoted into psql's commands.
 [[ $dir =~ ^[A-Za-z0-9/._+-]+$ ]] || { echo "local-fleet: the run directory $dir must be a plain path (letters, digits, / . _ + -)" >&2; exit 2; }
-mkdir -p "$dir"/{logs,remote,baked,releases,cooperate,worker-cache,client-cache,hol-toolchains,tables,tmp}
+mkdir -p -m 700 "$dir"
+# Creating logs/ claims the directory: of two runs given the same one, only the first gets it.
+if [[ -n $(ls -A "$dir") ]] || ! mkdir "$dir/logs" 2>/dev/null; then
+  echo "local-fleet: the run directory $dir is not empty; give a new or empty one" >&2
+  exit 2
+fi
+mkdir -p "$dir"/{remote,baked,releases,cooperate,worker-cache,client-cache,hol-toolchains,tables,tmp}
 ln -sfn "$tree" "$dir/baked/v$version"
 read_dirs=${HOLBUILD_ACTION_READ_DIRS:-}
 for t in "${toolchains[@]}"; do
@@ -110,11 +113,21 @@ terminate() {
   for pid in "$@"; do kill -TERM "$pid" 2>/dev/null || true; done
   for pid in "$@"; do wait "$pid" 2>/dev/null || true; done
 }
+# TERM to COMMAND's whole process group (a shell's children too), KILL after 10 s.
+stop_command() {
+  local watchdog
+  if ! kill -TERM -- "-$command_pid" 2>/dev/null; then wait "$command_pid" 2>/dev/null || true; return 0; fi
+  (sleep 10 && kill -KILL -- "-$command_pid" 2>/dev/null) &
+  watchdog=$!
+  wait "$command_pid" 2>/dev/null || true
+  while kill -0 -- "-$command_pid" 2>/dev/null; do sleep 0.1; done
+  kill "$watchdog" 2>/dev/null || true
+}
 stop() {
   local status=$?
   trap - EXIT INT TERM
   # Workers drain while the coordinator and cache still take their results and logs.
-  if [[ -n $command_pid ]]; then terminate "$command_pid"; fi
+  if [[ -n $command_pid ]]; then stop_command; fi
   terminate "${worker_pids[@]}"
   terminate "${service_pids[@]}"
   if ((pg_started)); then
@@ -151,8 +164,12 @@ database_url=postgresql+asyncpg://postgres:$PGPASSWORD@127.0.0.1:$pgport/fleet
 python=$tree/remote-exec/.venv/bin/python
 (cd "$tree/remote-exec" && REMOTE_EXEC_DATABASE_URL=$database_url .venv/bin/alembic upgrade head) > "$dir/logs/migrate.log" 2>&1
 
+# The cache server takes only requests with this credential, since other accounts can reach its port too.
+cache_user=local-fleet:$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+(umask 077 && mkdir "$dir/cache-control" && printf 'Basic %s\n' "$(printf %s "$cache_user" | base64 -w0)" > "$dir/cache-control/authorization" &&
+  printf 'user = "%s"\n' "$cache_user" > "$dir/cache.curl")
 "$python" "$tree/tests/fixtures/remote_cache_server.py" "$dir/remote" "$dir/cache.port" "$dir/logs/cache-requests.log" \
-  > "$dir/logs/cache.log" 2>&1 &
+  "$dir/cache-control" > "$dir/logs/cache.log" 2>&1 &
 service_pids+=($!)
 for _ in $(seq 100); do [[ -s $dir/cache.port ]] && break; sleep 0.1; done
 [[ -s $dir/cache.port ]] || { echo "local-fleet: the cache server didn't start; see $dir/logs/cache.log" >&2; exit 1; }
@@ -164,7 +181,7 @@ worker_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 
 port=$(free_port)
 (cd "$tree/remote-exec" && exec env REMOTE_EXEC_DATABASE_URL="$database_url" REMOTE_EXEC_CLIENT_TOKEN="$client_token" \
-  REMOTE_EXEC_WORKER_TOKEN="$worker_token" REMOTE_EXEC_CACHE_URL="$cache_url" REMOTE_EXEC_WARM_WORKERS="$workers" \
+  REMOTE_EXEC_WORKER_TOKEN="$worker_token" REMOTE_EXEC_CACHE_URL="http://$cache_user@${cache_url#http://}" REMOTE_EXEC_WARM_WORKERS="$workers" \
   .venv/bin/uvicorn --factory remote_exec.app:app --host 127.0.0.1 --port "$port" --timeout-graceful-shutdown 2) \
   > "$dir/logs/coordinator.log" 2>&1 &
 service_pids+=($!)
@@ -174,7 +191,8 @@ for _ in $(seq 300); do coordinator_up && break; sleep 0.2; done
 coordinator_up || { echo "local-fleet: the coordinator didn't answer; see $dir/logs/coordinator.log" >&2; exit 1; }
 
 for i in $(seq "$workers"); do
-  (cd "$dir" && exec env -u PGPASSWORD HOLBUILD_CACHE="$dir/worker-cache" TMPDIR="$dir/tmp" \
+  (cd "$dir" && exec env -u PGPASSWORD -u ECS_AGENT_URI HOLBUILD_CACHE="$dir/worker-cache" TMPDIR="$dir/tmp" \
+    HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$dir/cache.curl" \
     HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' HOLBUILD_ACTION_READ_DIRS="$read_dirs" \
     REMOTE_EXEC_WORKER_TOKEN="$worker_token" PYTHONPATH="$tree/remote-exec" "$python" -m remote_exec.worker \
     --coordinator "$url" --remote-cache "$cache_url" --tier high --also-claim standard --load-ahead \
@@ -185,9 +203,10 @@ for i in $(seq "$workers"); do
 done
 
 echo "local-fleet: $workers workers of holbuild $version from $tree at $url, run dir $dir" >&2
-# In the background, so a TERM to this script runs the teardown at once.
+# In the background, so a TERM to this script runs the teardown at once, and in a process group
+# of its own (setsid needn't fork here: a background job isn't a group leader), so it can be stopped whole.
 env -u PGPASSWORD LOCAL_FLEET_URL="$url" HOLBUILD_REMOTE_CACHE_URL="$cache_url" \
-  HOLBUILD_REMOTE_EXEC_CURL_CONFIG="$dir/client.curl" HOLBUILD_CACHE="$dir/client-cache" PATH="$tree/bin:$PATH" \
-  "$@" < /dev/stdin &
+  HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$dir/cache.curl" HOLBUILD_REMOTE_EXEC_CURL_CONFIG="$dir/client.curl" \
+  HOLBUILD_CACHE="$dir/client-cache" PATH="$tree/bin:$PATH" setsid "$@" < /dev/stdin &
 command_pid=$!
 wait "$command_pid"

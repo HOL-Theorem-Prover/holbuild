@@ -1006,9 +1006,11 @@ remote-exec/local-fleet --workers 8 --toolchain ~/.cache/holbuild/hol-toolchains
 It starts a fresh Postgres database (`initdb`, `pg_ctl`, `createdb` and `psql`
 on `PATH`; password authentication, since other accounts can reach its port),
 that checkout's coordinator, the test suite's cache server
-(`tests/fixtures/remote_cache_server.py`) and N workers whose baked-releases
+(`tests/fixtures/remote_cache_server.py`, which takes only requests carrying a
+generated credential, for the same reason) and N workers whose baked-releases
 root holds the checkout under its own version, so every action runs its
-holbuild. The command runs with `LOCAL_FLEET_URL`, `HOLBUILD_REMOTE_CACHE_URL`,
+holbuild. The command runs in a process group of its own with `LOCAL_FLEET_URL`,
+`HOLBUILD_REMOTE_CACHE_URL`, `HOLBUILD_REMOTE_CACHE_CURL_CONFIG`,
 `HOLBUILD_REMOTE_EXEC_CURL_CONFIG` and `HOLBUILD_CACHE` pointing at the fleet,
 every other `HOLBUILD_REMOTE_CACHE_*` and `HOLBUILD_REMOTE_EXEC_*` variable
 unset, and the checkout's `bin/` first on `PATH`. Don't pass `--remote-cache`
@@ -1035,8 +1037,8 @@ fleet's scaler and cache pool. Inside a Slurm allocation, its memory
 The run directory (`--dir`, else a new one in `~/.cache/holbuild-local-fleet`)
 must be new or empty, a plain path, and not under `/tmp`; the workers' `TMPDIR`
 is inside it: as in the image, the action sandbox lets HOL write `/tmp` only
-when no worker state is there. On exit, interrupt or termination the command
-is stopped, then the workers, which drain while the coordinator and cache still
+when no worker state is there. On exit, interrupt or termination the command's
+process group is stopped (TERM, then KILL after 10 s), then the workers, which drain while the coordinator and cache still
 take their results, then the coordinator and cache. The run directory keeps
 the logs and CSV copies of the `batches`, `actions` and `leases` tables, and
 `--keep` also keeps the database and caches. Master and a branch both report
