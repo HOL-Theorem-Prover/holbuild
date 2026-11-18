@@ -634,15 +634,20 @@ async def test_a_holder_claiming_unwoken_takes_nothing_but_its_held_build_ahead_
     assert await claim_on(http, "host-1") is None
 
 
-async def test_a_holder_claiming_unwoken_takes_a_ready_build_of_an_earlier_tier_before_its_held_build(
-    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
-) -> None:
-    """``h`` peaked above the standard tier, so it is ready as high work; host-1's worker takes high work first."""
+async def learn_high(http: httpx.AsyncClient, cache: FakeCache) -> None:
+    """Build ``h`` once with a peak above the standard tier, so its next batches place it high."""
     await submit(http, ["h"])
     first = await claim_on(http, "host-9")
     assert first is not None
     cache.keys.add(ac_key("h"))
     assert (await complete(http, first["attempt_token"], result("h", "built", peak_rss_mb="5000"))).status_code == 200
+
+
+async def test_a_holder_claiming_unwoken_takes_a_ready_build_of_an_earlier_tier_before_its_held_build(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    """``h`` peaked above the standard tier, so it is ready as high work; host-1's worker takes high work first."""
+    await learn_high(http, cache)
     _, theory = await held_in_a_busier_batch(http, coordinator)
     await submit(http, ["h"])
     wait_on_host_0(coordinator)
@@ -690,11 +695,7 @@ async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_sto
 ) -> None:
     """The ready high build ``h`` isn't the hint's, so the claim, deferring high, passes it; the standard build
     ``s`` ranks after an action claimed ahead, so the claim ahead is for ``s``'s tier and priority."""
-    await submit(http, ["h"])
-    first = await claim_on(http, "host-9")
-    assert first is not None
-    cache.keys.add(ac_key("h"))
-    assert (await complete(http, first["attempt_token"], result("h", "built", peak_rss_mb="5000"))).status_code == 200
+    await learn_high(http, cache)
     await submit(http, ["h"])
     await submit(http, ["s"])
     asked: list[list[str]] = []
@@ -711,3 +712,27 @@ async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_sto
 
     assert asked == [["standard"]]
     assert claimed is not None and claimed.theory == "pkg:s"
+
+
+async def test_a_held_build_of_a_hint_only_tier_that_a_claim_ahead_outranks_is_claimed_ahead_of(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``h``, high and held for host-1, ranks after a high action claimed ahead; ``s``, standard, after none."""
+    await learn_high(http, cache)
+    held = UUID(await submit(http, ["h"]))
+    await submit(http, ["s"], priority="2")
+    now = asyncio.get_running_loop().time()
+    coordinator.holds[(held, "high")] = (now, now + 60, "pkg:h", frozenset({"host-1"}), 2)
+    asked: list[list[str]] = []
+
+    async def claim_ahead(tiers: list[str], worker: str, **_: object) -> None:
+        asked.append(tiers)
+
+    monkeypatch.setattr(coordinator, "_claim_ahead", claim_ahead)
+
+    await coordinator._claim(
+        ["high", "standard"], "w", lambda tier, priority: ["high"] if tier == "high" and priority < 1 else [],
+        "host-1", (held, "high", "pkg:h"), "high",
+    )
+
+    assert asked == [["high"]]

@@ -1385,7 +1385,9 @@ class Coordinator:
         while True:
             async with self.engine.begin() as conn:
                 # Never lock a batch after an action: batch writers take those locks in the opposite order.
-                row, held_until = await self._claim_build(conn, ranking, outranked, host_id, hint, hint_only=hint_only)
+                row, held_until, stopped = await self._claim_build(
+                    conn, ranking, outranked, host_id, hint, hint_only=hint_only
+                )
                 if row is not None:
                     claimed = await self._lease(conn, row, worker)
             if row is not None:
@@ -1393,16 +1395,14 @@ class Coordinator:
                 return claimed, None
             if held_until is not None:
                 return None, held_until
-            # Builds of tier hint_only other than the hint's are no candidates.
-            candidates = any(e[7] != hint_only for e in ranking.heap)
-            if candidates and (not ranking.ranked or ranking.at >= started):
+            if stopped is not None and (not ranking.ranked or ranking.at >= started):
                 # The next ready build ranks after an action that may be claimed ahead, by a ranking read since
                 # this claim started.
                 assert outranked is not None
                 if ranking.capped:  # by a concurrent claim, since: claims ahead no longer outrank the build
                     outranked = None
                     continue
-                _, priority, *_, tier, _ = min(e for e in ranking.heap if e[7] != hint_only)  # the outranked build
+                _, priority, *_, tier, _ = stopped
                 # Only batches of a positive priority, above the build's, are claimed from: counted before the
                 # claim's await, as _claim_build's are.
                 ranking.running_priority += 1
@@ -1413,7 +1413,8 @@ class Coordinator:
                 ranking.running_priority -= 1
                 outranked = None
                 continue
-            if not candidates and (not ranking.ranked or ranking.at >= started):
+            # Builds of tier hint_only other than the hint's are no candidates.
+            if not any(e[7] != hint_only for e in ranking.heap) and (not ranking.ranked or ranking.at >= started):
                 if not run_tiers:
                     return None, None
                 claimed, retry_builds = await self._claim_run(
@@ -1675,12 +1676,12 @@ class Coordinator:
         hint: Hint | None = None,
         *,
         hint_only: str | None = None,
-    ) -> tuple[_Claimed | None, float | None]:
+    ) -> tuple[_Claimed | None, float | None, RankEntry | None]:
         """Lock a ready build from the shared ranking, without refreshing it inside the transaction.
 
         Put each candidate back with one more running action before trying it, so concurrent claims spread over
         batches as fresh rankings would. Exhausted batch/tier pairs are skipped until the next shared read. Stop
-        at a candidate ``outranked`` says ranks after a claim ahead, leaving it first in the ranking.
+        at a candidate ``outranked`` says ranks after a claim ahead, leaving it in the ranking, and return it.
 
         Once batches of a positive priority run ``priority_cap`` builds, the ranking is capped (_cap_priorities):
         their builds rank like priority-0 ones, and claims ahead no longer outrank them, so priority work loses its
@@ -1713,25 +1714,22 @@ class Coordinator:
             if (entry[6], entry[7]) in ranking.exhausted:
                 continue
             tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
-            if not ranking.capped and outranked is not None and outranked(tier, -priority):
-                heapq.heappush(ranking.heap, entry)
-                put_back_held()
-                # Held builds rank before claims ahead too, so a claim that left some waits for their holds to end.
-                return None, held_until
-            passed = None  # the candidate passed over for one this host is warm for
             # The hint is for the first candidate of its tier only, as a woken claim's, or one held for this host.
             hinted, fits = None, False
             if tier == hint_tier:
                 hinted = self._hinted_entry(ranking, entry, host_id, hint, kept)
                 fits = self._held_here(ranking, (hinted[6], hinted[7]) if hinted else (batch_id, tier), host_id)
                 hint = hint_tier = None
-            if tier != hint_only:
-                local = hinted or self._local_entry(ranking, entry, host_id, kept)
-            elif fits:
-                local = hinted
-            else:
+            if tier == hint_only and not fits:
                 held.append(entry)
                 continue
+            if not ranking.capped and outranked is not None and outranked(tier, -priority):
+                heapq.heappush(ranking.heap, entry)
+                put_back_held()
+                # Held builds rank before claims ahead too, so a claim that left some waits for their holds to end.
+                return None, held_until, entry
+            passed = None  # the candidate passed over for one this host is warm for
+            local = hinted if tier == hint_only else hinted or self._local_entry(ranking, entry, host_id, kept)
             if local is not None:
                 ranking.heap[ranking.heap.index(local)] = entry
                 heapq.heapify(ranking.heap)
@@ -1769,7 +1767,7 @@ class Coordinator:
                     self.locality.held_ms_total += round((asyncio.get_running_loop().time() - hold[0]) * 1000)
                 if host_id is not None:
                     self._count_claim(row.theory, tier, host_id, kept)
-                return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb), None
+                return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb), None, None
             if passed is not None and (count := self.passed_over.get(passed)) is not None:
                 if count > 1:
                     self.passed_over[passed] = count - 1
@@ -1783,7 +1781,7 @@ class Coordinator:
                     self._wake_at_hold_end((batch_id, tier), hold)
             ranking.exhausted.add((batch_id, tier))
         put_back_held()
-        return None, held_until
+        return None, held_until, None
 
     def _cap_priorities(self, ranking: "_Ranking") -> None:
         """Cap ``ranking`` once batches of a positive priority run ``priority_cap`` builds: rank their builds like
@@ -1914,8 +1912,7 @@ class Coordinator:
         now = asyncio.get_running_loop().time()
         best: tuple[int, Hint] | None = None
         for (batch_id, tier), (_, until, theory, holders, _) in self.holds.items():
-            if now < until and tier in tiers and host_id in holders:
-                level = self._level(host_id, theory)
+            if now < until and tier in tiers and host_id in holders and (level := self._level(host_id, theory)) > 0:
                 if best is None or level > best[0]:
                     best = level, (batch_id, tier, theory)
         return None if best is None else best[1]
@@ -1940,13 +1937,13 @@ class Coordinator:
             self.claim_waiters.remove(waiter)
 
     def _wake_holder(self, tier: str, batch_id: UUID, theory: str, level: int, kept: set[str]) -> None:
-        """Wake the best-ranked claim waiting on a host of ``kept`` that holds ``level`` of ``theory``, the most a
-        kept host does, for the build of ``batch_id`` and ``tier`` just held for such hosts, if one waits. It makes
-        no new work ready, so made_ready stays."""
+        """Wake the best-ranked claim waiting on a host of ``kept``, the hosts the build of ``batch_id`` and ``tier``
+        is held for, that holds at least ``level`` of ``theory``, what they held when its hold began, if one waits.
+        It makes no new work ready, so made_ready stays."""
         waiter = min(
             (
                 w for w in self.claim_waiters
-                if tier in w[0] and not w[2].done() and w[1][3] in kept and self._level(w[1][3], theory) == level
+                if tier in w[0] and not w[2].done() and w[1][3] in kept and self._level(w[1][3], theory) >= level
             ),
             key=lambda w: w[1],
             default=None,
