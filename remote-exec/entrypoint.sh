@@ -14,7 +14,8 @@ case "${1:-}" in
   coordinator)
     shift
     # Open event streams and claim long-polls would otherwise hold shutdown until the supervisor kills the process.
-    exec uvicorn --factory remote_exec.app:app --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2 "$@" ;;
+    # No access log: a line per request cost the event loop more than the counts the app logs once a minute.
+    exec uvicorn --factory remote_exec.app:app --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2 --no-access-log "$@" ;;
   migrate)
     exec alembic upgrade head ;;
   worker)
