@@ -3,6 +3,7 @@
 
 import asyncio
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -748,7 +749,7 @@ async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_sto
 
     claimed, _ = await coordinator._claim(
         ["high", "standard"], "w", lambda tier, priority: [tier] if tier == "standard" else [], "host-1",
-        None, "high", "high",
+        None, frozenset({"high"}), frozenset({"high"}),
     )
 
     assert asked == [["standard"]]
@@ -775,7 +776,7 @@ async def test_a_held_build_of_a_hint_only_tier_that_a_claim_ahead_outranks_is_c
 
     await coordinator._claim(
         ["high", "standard"], "w", lambda tier, priority: ["high"] if tier == "high" and priority < 1 else [],
-        "host-1", None, "high", "high",
+        "host-1", None, frozenset({"high"}), frozenset({"high"}),
     )
 
     assert asked == [["high"]]
@@ -878,3 +879,48 @@ async def test_a_hold_of_another_theory_counts_no_held_wait(http: httpx.AsyncCli
 
     assert claimed is not None and claimed["theory"] == "pkg:b"
     assert counts(coordinator, "held_waits") == {"held_waits": 0}
+
+
+async def test_a_holder_claiming_unwoken_tries_each_tier_with_a_held_build(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    """host-1 ran ``h``, held as high work, but takes no high work, so ``h`` isn't held for it; the standard build
+    held for it, whose hold began later, it takes ahead of the claim waiting on host-0, to which it defers both
+    tiers."""
+    await learn_high(http, cache)
+    held_high = UUID(await submit(http, ["h"]))
+    now = asyncio.get_running_loop().time()
+    coordinator.holds[(held_high, "high")] = (now, now + 60, "pkg:h")
+    _, theory = await held_in_a_busier_batch(http, coordinator)
+    coordinator.host_keys["host-1"]["pkg:h"] = None
+    coordinator.claim_waiters = [
+        (
+            ["high", "standard"], _claim_rank(["high", "standard"], "host-0"),
+            asyncio.get_running_loop().create_future(), False,
+        )
+    ]
+    coordinator.report_worker("host-0", "host-0-w", ["high", "standard"])
+
+    claimed = await coordinator.claim(["high", "standard"], "host-1-w", 0, host_id="host-1")
+
+    assert claimed is not None and claimed.theory == theory
+
+
+async def test_a_holder_swapping_to_its_held_build_takes_no_other_build_of_its_batch(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another process's claim took the held build since the ranking was read, so the lock finds the batch's next
+    build, of another theory: host-1's claim leaves it and takes ``a1``, the head."""
+    await held_in_a_busier_batch(http, coordinator)
+    await submit_as(http, "a1", "a")
+    lock = coordinator._lock_unleased
+
+    async def next_build(*args: Any) -> Any:
+        row = await lock(*args)
+        return row if row is None or row.theory == "pkg:a" else SimpleNamespace(**{**row._mapping, "theory": "pkg:z"})
+
+    monkeypatch.setattr(coordinator, "_lock_unleased", next_build)
+
+    claimed = await coordinator.claim(["standard"], "host-1-w", 0, host_id="host-1")
+
+    assert claimed is not None and claimed.theory == "pkg:a"
