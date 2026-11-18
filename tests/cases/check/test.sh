@@ -290,7 +290,10 @@ QED
 SML
 done
 shared_selectors=(UserATheory UserBTheory:UserB_thm CleanTheory UserATheory SharedBypassTheory)
+# Each check and the batch below plan with no record, so their planning
+# compares.
 for selector in "${shared_selectors[@]}"; do
+  rm -rf "$project/.holbuild/plan"
   if [[ $selector == CleanTheory ]]; then run_check "$selector" 0; else run_check "$selector" 1; fi
 done
 require_grep '^consumer:src/SharedBypassScript.sml:2: kernel bypass: disk_thm$' "$tmpdir/check-UserATheory.log"
@@ -301,6 +304,7 @@ for selector in "${shared_selectors[@]}"; do
   grep -E '^(User[AB]|SharedBypass|Clean)Theory[.:]|^consumer:src/' \
     "$tmpdir/check-${selector//:/-}.log" >> "$expected"
 done
+rm -rf "$project/.holbuild/plan"
 run_check "${shared_selectors[0]}" 1 "${shared_selectors[@]:1}"
 grep -E '^(User[AB]|SharedBypass|Clean)Theory[.:]|^consumer:src/' "$log" > "$log.reports"
 diff -u "$expected" "$log.reports"
