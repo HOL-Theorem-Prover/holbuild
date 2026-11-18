@@ -1147,8 +1147,10 @@ holbuild build --skip-checkpoints MyTheory
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
 - Checkpoints are restored in every theory included by `--proof-scope`
   (root-package theories by default). The build's requested targets (the
-  default targets when none are given) save them as they run: the
-  `deps_loaded` checkpoint and theorem and declaration contexts. Any other
+  default targets when none are given, or every root-package theory when
+  there are none of those either) save them as they run: the
+  `deps_loaded` checkpoint and theorem and declaration contexts, unless a
+  local parallel build pipelines one (below) that it didn't name. Any other
   theory saves a checkpoint only when one of its proofs fails or times out:
   the failed proof's prefix, which the next build resumes from. A theory that
   passes is then not slowed by saving checkpoints nobody will resume from,

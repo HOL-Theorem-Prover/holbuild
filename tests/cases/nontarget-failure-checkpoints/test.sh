@@ -37,7 +37,8 @@ members = ["src"]
 tactic_timeout = 0.2
 TOML
 
-# write_a STEP: theory A, whose second theorem's last step is STEP.
+# write_a STEP [STEP3]: theory A, whose second theorem's last step is STEP
+# and whose third theorem's is STEP3 (by default one that proves it).
 write_a() {
   cat > "$project/src/AScript.sml" <<SML
 Theory A
@@ -55,6 +56,12 @@ Theorem a2:
   T /\\ T
 Proof
   CONJ_TAC >- ACCEPT_TAC TRUTH >> $1
+QED
+
+Theorem a3:
+  T /\\ T
+Proof
+  CONJ_TAC >- ACCEPT_TAC TRUTH >> ${2:-ACCEPT_TAC TRUTH}
 QED
 SML
 }
@@ -183,8 +190,17 @@ expect_worker share-fail 1 "status=failed" "failure=proof"
   echo "the failing dependency A shared no failed prefix" >&2; cat "$tmpdir/share-fail.log" >&2; exit 1; }
 [[ -z "$(published holbuild-shared-heap-v1)" ]] || { echo "the failing dependency A shared a deps heap" >&2; exit 1; }
 
-write_a "ALL_TAC >> ACCEPT_TAC TRUTH"
+# Resumed from that prefix, a later proof fails: the new prefix is published
+# with the chain under it, and the next worker resumes at the later proof.
+write_a "ALL_TAC >> ACCEPT_TAC TRUTH" 'FAIL_TAC "later failure"'
+worker share-chain
+expect_worker share-chain 1 "status=failed" "failure=proof"
+require_grep "restored shared standalone failed_prefix checkpoint" "$tmpdir/share-chain.log"
+require_grep "from: failed-prefix checkpoint in a2" "$tmpdir/share-chain.log"
+require_grep "later failure" "$tmpdir/share-chain.log"
+
+write_a "ALL_TAC >> ACCEPT_TAC TRUTH" "ALL_TAC >> ACCEPT_TAC TRUTH"
 worker share-fixed
 expect_worker share-fixed 0 "status=built"
 require_grep "restored shared standalone failed_prefix checkpoint" "$tmpdir/share-fixed.log"
-require_grep "from: failed-prefix checkpoint in a2" "$tmpdir/share-fixed.log"
+require_grep "from: failed-prefix checkpoint in a3" "$tmpdir/share-fixed.log"

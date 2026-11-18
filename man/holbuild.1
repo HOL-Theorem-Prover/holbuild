@@ -376,6 +376,8 @@ For a worker waiting for disk space.
 .B \-\-share\-heaps
 Resume from the deps-loaded heap and theorem checkpoints other workers
 published, and publish this run's.
+A theory that saves no deps-loaded heap (not a build target) publishes only a
+failed proof's prefix, which a worker with no heap to restore resumes from.
 The host store
 .I CACHE/checkpoint\-store
 keeps their files.
@@ -704,9 +706,9 @@ that save; 0 saves every context.
 Remote workers use the same value, and no cache key depends on it.
 .TP
 .B \-\-all\-checkpoints
-All root-package theories save checkpoints by default, except a theory that
-is not a target and that a parallel build pipelines into an idle slot.
-With this flag every such theory saves them.
+Build targets save checkpoints as they run; other root-package theories save
+one only when a proof fails or times out.
+With this flag every such theory saves them as it runs, unpipelined.
 Checkpoint policy does not change theory outputs or cache keys.
 .TP
 .B \-\-skip\-proof\-steps

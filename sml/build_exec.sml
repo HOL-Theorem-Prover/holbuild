@@ -3240,7 +3240,8 @@ fun checkpoint_enabled (CheckpointPolicy {checkpoint, ...}) = checkpoint
 fun theorem_checkpoints_enabled (CheckpointPolicy {theorem_checkpoints, ...}) = theorem_checkpoints
 (* Whether the theory saves its deps_loaded state, and its theorem and
    definition contexts, as it runs. *)
-fun saves_progress (CheckpointPolicy {checkpoint, checkpoint_target, ...}) = checkpoint andalso checkpoint_target
+fun checkpoint_target_enabled (CheckpointPolicy {checkpoint_target, ...}) = checkpoint_target
+fun saves_progress policy = checkpoint_enabled policy andalso checkpoint_target_enabled policy
 fun context_checkpoints_enabled policy = theorem_checkpoints_enabled policy andalso saves_progress policy
 fun checkpoint_seconds (CheckpointPolicy {checkpoint_seconds, ...}) = checkpoint_seconds
 fun proof_steps_enabled (CheckpointPolicy {proof_steps, ...}) = proof_steps
@@ -4832,7 +4833,7 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
   else
     CheckpointPolicy {checkpoint = false,
                       theorem_checkpoints = false,
-                      checkpoint_target = false,
+                      checkpoint_target = checkpoint_target_node options project node,
                       checkpoint_seconds = default_checkpoint_seconds,
                       proof_steps = false,
                       new_ir = false,
@@ -6663,7 +6664,8 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
         val policy = checkpoint_policy_for_node options project node
       in
         context_tactics andalso is_theory id andalso not (is_settled node) andalso Array.sub (cold, id) <> SOME false andalso
-        not (context_checkpoints_enabled policy) andalso
+        (not (theorem_checkpoints_enabled policy) orelse
+         not (#all_checkpoints options orelse force_target_node (#force_targets options) node)) andalso
         (not (proof_steps_enabled policy) orelse proof_ir_enabled policy) andalso
         not (trace_steps policy) andalso not (Option.isSome (execution_plan policy)) andalso
         not (repl_on_failure policy) andalso not (trknl_enabled policy) andalso
@@ -8198,8 +8200,9 @@ fun dependency_spec_lines hash_file root plan keys token deps =
    spec without the line, as older clients write, means true.  Likewise a
    spec without a checkpoint-seconds line means the default, so a default
    build's spec is the same as before the option existed.  A spec says
-   checkpoint-target=true for a theory that saves checkpoints as it runs
-   (checkpoint_policy); without it a theory saves only a failed prefix. *)
+   checkpoint-target=true for a target (checkpoint_target_node), which
+   saves checkpoints as it runs; without it a theory saves only a failed
+   prefix. *)
 fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
                      {theorem_checkpoints, forced, skip_checkpoints} (action : theory_action) node action_text =
   let
@@ -8236,7 +8239,7 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
        "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
        bool_option "new-ir" (proof_ir_enabled policy)] @
       (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
-      (if saves_progress policy then [bool_option "checkpoint-target" true] else []) @
+      (if checkpoint_target_enabled policy then [bool_option "checkpoint-target" true] else []) @
       (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
       (if Real.== (checkpoint_seconds policy, default_checkpoint_seconds) then []
        else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
@@ -11152,6 +11155,11 @@ fun shared_manifest_entries text =
             | _ => raise Error ("malformed shared checkpoint manifest line: " ^ line))
     (String.tokens (fn c => c = #"\n") text)
 
+(* The value of a manifest's NAME= line, if it has one. *)
+fun shared_manifest_field name text =
+  Option.map (fn line => String.extract (line, size name + 1, NONE))
+    (List.find (String.isPrefix (name ^ "=")) (String.tokens (fn c => c = #"\n") text))
+
 (* Which of a theory's checkpoints are published on a heap, most recently
    used first, so that a restore probes those rather than every boundary
    of the script, most of which no build saved.  Only a hint: a listed
@@ -11357,10 +11365,13 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         | SOME action =>
             restore_entry standalone_key (fn () =>
               let
-                val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
+                val text = HolbuildRemoteCache.remember_action remote action
+                val entries = shared_manifest_entries text
                 val path = tree_path checkpoint_root (#2 (single "leaf" entries))
+                val key = shared_manifest_field "key" text
               in
-                case List.find (fn c => #kind c = "failed_prefix" andalso #path c = path) candidates of
+                case List.find (fn c => #kind c = "failed_prefix" andalso #path c = path andalso key = SOME (#key c))
+                               candidates of
                     SOME c => restore_chain NONE c entries
                   | NONE => NONE
               end)
@@ -11415,25 +11426,29 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       handle MissingSharedBlob sha => (missing_blob heap_key sha; wipe (); no_files)
            | e => (warn ("could not restore the shared heap: " ^ General.exnMessage e);
                    wipe (); no_files)
-    (* No checkpoint is published without its heap, so without one there is
-       nothing to look for. *)
+    (* Without a usable heap, a theory that saves none (not a target) may
+       have published a failed prefix of its own. *)
+    fun or_standalone (restored as {files = [], ...}) =
+          (case (if resumes then try_standalone () else NONE) of
+               SOME standalone => standalone
+             | NONE => restored)
+      | or_standalone restored = restored
+    (* No other checkpoint is published without its heap. *)
     val {heap, files} =
-      case (case restore_step "rstprobe" (fn () => HolbuildRemoteCache.get_action remote heap_key) of
-                NONE => restore_step "rstwait" (fn () =>
-                          await_shared_heap remote heap_key (Time.+ (Time.now (), shared_heap_wait)))
-              | found => found) of
-          NONE =>
-            (case (if resumes then try_standalone () else NONE) of
-                 SOME restored => restored
-               | NONE => no_files)
-        | SOME text =>
-            case (SOME (#1 (single "heap" (shared_manifest_entries text)))
-                  handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
-                NONE => no_files
-              | SOME heap =>
-                  case first_window heap (if resumes then listed candidates else []) of
-                      SOME restored => restored
-                    | NONE => try_heap heap
+      or_standalone
+        (case (case restore_step "rstprobe" (fn () => HolbuildRemoteCache.get_action remote heap_key) of
+                  NONE => restore_step "rstwait" (fn () =>
+                            await_shared_heap remote heap_key (Time.+ (Time.now (), shared_heap_wait)))
+                | found => found) of
+            NONE => no_files
+          | SOME text =>
+              case (SOME (#1 (single "heap" (shared_manifest_entries text)))
+                    handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
+                  NONE => no_files
+                | SOME heap =>
+                    case first_window heap (if resumes then listed candidates else []) of
+                        SOME restored => restored
+                      | NONE => try_heap heap)
   in
     {heap = heap, files = files, stale = !stale, missing = !missing}
   end
@@ -11709,7 +11724,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                       in
                         ignore (HolbuildRemoteCache.replace_action_unconditionally remote
                                   {key = standalone_key,
-                                   text = shared_manifest shared_standalone_header (SOME (#kind c)) entries});
+                                   text = shared_manifest shared_standalone_header (SOME (#kind c)) entries ^
+                                          "key=" ^ #key c ^ "\n"});
                         List.app (fn (path, sha, save) => store_add store family {sha = sha, src = path, save = save})
                                  blobs
                       end
@@ -13589,14 +13605,18 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val built_action =
               spec_theory_action root spec (cutoff_context spec cutoff)
             (* What a plain build would take instead of running the script:
-               the action's own entry, an earlier build's, or a shared heap
-               (whose checkpoints may resume inside the script).  A plain run
-               starts over from an empty root. *)
+               the action's own entry, an earlier build's, a shared heap
+               (whose checkpoints may resume inside the script), or a failed
+               prefix a theory with no heap shared.  A plain run starts over
+               from an empty root. *)
+            val shared_key = shared_heap_key tc root built_action
             val hit =
               cached (#input_key spec) orelse
               (case cutoff of SOME {pair_key, ...} => cached pair_key | NONE => false) orelse
               (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
-               cached (shared_heap_key tc root built_action))
+               (cached shared_key orelse
+                resumes_from_checkpoints (spec_policy spec) built_action andalso
+                cached (shared_standalone_key shared_key built_action)))
           in
             if hit then
               (stop_child ();
