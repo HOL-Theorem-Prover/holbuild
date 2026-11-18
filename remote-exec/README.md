@@ -508,16 +508,18 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   hosts above it get no preference, so they still empty when demand falls.
   A claim from such a host that holds less of the head batch's next build
   takes, of the next 8 batches with the same tier, priority and running
-  count, the first it holds the most of (checkpoints before context); each
-  batch is passed over that way at most 8 times in a row. A claim from any
-  host that holds less of the head's build than a kept host taking its tier
-  leaves it to that host for 0.5 s from the first time a claim did, waking a
-  claim waiting there, and takes the next batch instead; with only such
-  builds left, it waits until the first hold ends. A wake for newly ready
-  work goes to a waiting claim on a kept host holding the most of it, if
-  more than the first in line, and a woken claim takes that batch while it
-  is still in the head's band. `GET /v1/queue`'s `locality` counts what it
-  did.
+  count, the first it holds the most of (checkpoints before context) where
+  no other kept host taking its tier holds more; each batch is passed over
+  that way at most 8 times in a row. A claim from any host that holds less
+  of the head's build than a kept host taking its tier leaves it to such
+  hosts for 0.5 s from the first time a claim did, waking a claim waiting on
+  one, and takes the next batch instead; with only such builds left, it
+  waits until the first hold ends, claiming nothing ahead meanwhile. A wake
+  for newly ready work goes to a waiting claim on a kept host holding the
+  most of it, if more than the first in line, and a woken claim takes that
+  batch while it is still in the head's band and not left for another host,
+  or while it is left for this one. `GET /v1/queue`'s `locality` counts what
+  it did.
   Packing is best effort among that process's waiting claims; it neither
   moves running actions nor coordinates host preference across replicas.
   Run admission is serialized across coordinator replicas and permits at

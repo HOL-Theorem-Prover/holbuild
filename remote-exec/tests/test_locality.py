@@ -13,7 +13,7 @@ from conftest import FakeCache
 from remote_exec import coordinator as coordinator_module
 from remote_exec.coordinator import Coordinator, HostReport, _claim_rank
 from remote_exec.formats import FormatError, parse_result
-from test_coordinator import CLIENT, WORKER, ac_key, complete, input_key, result, spec
+from test_coordinator import CLIENT, WORKER, ac_key, complete, input_key, result, spec, submit
 
 D1 = "d" * 64
 D2 = "e" * 64
@@ -330,14 +330,16 @@ async def test_a_woken_claim_takes_the_batch_it_was_woken_for(
     assert claimed is not None and claimed.theory == ("pkg:b" if locality else "pkg:a")
 
 
+@pytest.mark.parametrize("head", ["b", "a"])
 async def test_a_host_holding_only_the_context_leaves_the_build_to_a_host_that_ran_its_theory(
-    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, head: str
 ) -> None:
+    """Whether ``b1`` heads the ranking (held) or follows ``a1`` in its band (not swapped in)."""
     coordinator.settings.warm_workers = 3
     await run_on(http, cache, "host-2", "b0", "b", D1)
     coordinator.host_keys["host-1"] = {D1: None}
-    await submit_as(http, "b1", "b")
-    await submit_as(http, "a1", "a")
+    for name in ["b", "a"] if head == "b" else ["a", "b"]:
+        await submit_as(http, f"{name}1", name)
 
     first = await claim_on(http, "host-1")
     second = await claim_on(http, "host-2")
@@ -379,3 +381,85 @@ def test_the_scale_in_line_counts_ready_builds_and_not_workers_waiting_for_memor
     coordinator.ready_builds = ready
 
     assert ("host-1" in coordinator._kept_hosts()) == kept
+
+
+@pytest.mark.parametrize("priorities", [False, True])
+async def test_a_build_held_for_another_host_still_comes_before_claims_ahead(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch,
+    priorities: bool,
+) -> None:
+    """Cold host-3 leaves ``b1`` to host-1 and waits out its hold rather than claim ``c`` ahead of its running
+    parent; with priorities, ``c``'s batch (3) outranks ``x1`` (0) but not ``b1`` (5)."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await submit(http, ["a", "c"], [("c", "a")], speculative_loading="4", priority="3" if priorities else "0")
+    leased = await claim_on(http, "host-0")
+    assert leased is not None and leased["theory"] == "pkg:a"
+    await submit_as(http, "b1", "b", priority=5 if priorities else 0)
+    if priorities:
+        await submit_as(http, "x1", "x")
+
+    claimed = await coordinator.claim(["standard"], "cold", 10, host_id="host-3", ahead=True)
+
+    assert claimed is not None and claimed.theory == "pkg:b"
+
+
+async def test_a_hold_wakes_no_waiter_holding_less_of_the_theory_than_the_host_it_is_left_for(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    """``b1`` is left for host ``c``, which ran ``b``; the claim waiting on ``b``, which holds only its context,
+    would only find it held again."""
+    coordinator.settings.warm_workers = 3
+    await run_on(http, cache, "c", "b0", "b", D1)
+    await submit_as(http, "b1", "b")
+    coordinator.host_keys["b"] = {D1: None}
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters = [(["standard"], _claim_rank(["standard"], "b"), wake, False)]
+    coordinator.report_worker("b", "b-w", ["standard"])
+
+    assert await claim_on(http, "a") is None
+
+    assert not wake.done()
+
+
+async def test_a_release_wake_counts_the_build_it_made_ready_in_the_scale_in_line(coordinator: Coordinator) -> None:
+    """host-1 runs the only lease and holds ``b``: with the build just made ready, the line keeps it after cold
+    host-0, though no sweep has counted that build yet."""
+    loop = asyncio.get_running_loop()
+    waiters = {host: loop.create_future() for host in ["host-0", "host-1"]}
+    coordinator.claim_waiters = [
+        (["standard"], _claim_rank(["standard"], host), wake, False) for host, wake in waiters.items()
+    ]
+    for host in waiters:
+        coordinator.report_worker(host, f"{host}-w", ["standard"])
+    coordinator.lease_hosts[uuid4()] = ("host-1", "host-1-w9", ["standard"])
+    coordinator.host_keys = {"host-1": {"pkg:b": None}}
+
+    coordinator._wake_claim("standard", theory="pkg:b")
+
+    assert waiters["host-1"].done() and not waiters["host-0"].done()
+
+
+async def test_a_release_hands_the_claim_it_wakes_the_batch_it_made_ready(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hints: list[tuple[UUID, str] | None] = []
+    claim = coordinator._claim
+
+    async def recording(
+        tiers: list[str], worker: str, outranked: Any = None, host_id: str | None = None,
+        hint: tuple[UUID, str] | None = None,
+    ) -> Any:
+        hints.append(hint)
+        return await claim(tiers, worker, outranked, host_id, hint)
+
+    monkeypatch.setattr(coordinator, "_claim", recording)
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "w", 10, host_id="host-5"))
+    while not coordinator.claim_waiters:
+        await asyncio.sleep(0.01)
+    batch_id = await submit_as(http, "a1", "a")
+
+    claimed = await waiting
+
+    assert claimed is not None and claimed.theory == "pkg:a"
+    assert hints[-1] == (batch_id, "standard")
