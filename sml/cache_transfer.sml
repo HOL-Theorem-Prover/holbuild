@@ -12,7 +12,10 @@ type source =
                   dst : HolbuildCacheBackend.local_path} -> HolbuildCacheBackend.fetch_result }
 
 type destination =
-  { put_action : HolbuildCacheBackend.action_publish_policy ->
+  (* has_blob must establish usable content, not just pathname existence.
+     publish_blob receives a transfer-owned file verified by fetch_blob. *)
+  { has_blob : HolbuildCacheBackend.blob_hash -> bool,
+    put_action : HolbuildCacheBackend.action_publish_policy ->
                  {key : HolbuildCacheBackend.action_key,
                   text : HolbuildCacheBackend.manifest_text} -> HolbuildCacheBackend.publish_result,
     publish_blob : {hash : HolbuildCacheBackend.blob_hash,
@@ -25,45 +28,12 @@ type entry_result =
     reused_blobs : int,
     action : HolbuildCacheBackend.publish_result }
 
-fun has_prefix prefix s =
-  size s >= size prefix andalso String.substring(s, 0, size prefix) = prefix
-
-fun trim_newline s =
-  if size s > 0 andalso String.sub(s, size s - 1) = #"\n" then
-    String.substring(s, 0, size s - 1)
-  else s
-
-fun take_token s =
-  let
-    fun loop i =
-      if i >= size s then i
-      else
-        case String.sub(s, i) of
-            #" " => i
-          | #"\t" => i
-          | #"\n" => i
-          | _ => loop (i + 1)
-    val n = loop 0
-  in
-    String.substring(s, 0, n)
-  end
-
-fun blob_ref line =
-  let val clean = trim_newline line
-  in
-    case String.tokens Char.isSpace clean of
-        ["blob", _, hash] => SOME hash
-      | _ =>
-          if has_prefix "blob=" clean then SOME (take_token (String.extract(clean, 5, NONE)))
-          else NONE
-  end
-
 fun unique_blobs manifest_text =
   let
     fun add (hash, hashes) =
       if List.exists (fn existing => existing = hash) hashes then hashes else hash :: hashes
     fun line (text, hashes) =
-      case blob_ref text of
+      case HolbuildFSCacheBackend.blob_ref text of
           SOME hash => add (hash, hashes)
         | NONE => hashes
   in
@@ -77,20 +47,12 @@ fun ensure_dir path =
 
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 
-val temp_blob_counter = ref 0
-val temp_blob_mutex = Mutex.mutex ()
-
-fun next_temp_blob_id () =
-  (Mutex.lock temp_blob_mutex;
-   (temp_blob_counter := !temp_blob_counter + 1; !temp_blob_counter)
-   before Mutex.unlock temp_blob_mutex)
-
-(* Unique per copy: concurrent copies of one blob (parallel build workers,
-   prefetch, other holbuild processes) share tmp_dir. *)
-fun temp_blob_path tmp_dir hash =
-  Path.concat(tmp_dir, String.concat ["holbuild-cache-transfer-", hash, "-",
-                                      HolbuildFileLock.current_pid_text (), "-",
-                                      Int.toString (next_temp_blob_id ()), ".blob"])
+(* Beside the blob it becomes, so publishing is a rename: from another
+   filesystem (a fleet worker's tmp/ is in its container, blobs/ on the host)
+   the publisher must copy and re-hash it.  Unique per copy: concurrent copies
+   of one blob share stage_dir. *)
+fun temp_blob_path stage_dir hash =
+  HolbuildTempPath.near (Path.concat(stage_dir, hash)) ".tmp"
 
 fun fetch_blob_or_raise (source : source) hash path =
   case #fetch_blob source {hash = hash, dst = path} of
@@ -112,6 +74,63 @@ val no_space = "No space left on device"
    large-object path, which can run a small heap out of store. *)
 val probe_chunk = Word8Vector.tabulate (65536, fn _ => 0w0)
 
+local
+  open Foreign
+  val statvfs = buildCall2 (getSymbol (loadExecutable ()) "statvfs", (cString, cPointer), cInt)
+  (* Foreign resolves a symbol on its first call without a lock. *)
+  val statvfs_mutex = Mutex.mutex ()
+  val darwin = List.exists (fn field => field = ("sysname", "Darwin")) o Posix.ProcEnv.uname
+  val word = SysWord.toLargeInt
+  val word32 = Word32.toLargeInt
+in
+(* The bytes and inodes statvfs says unprivileged users may still take on
+   the filesystem holding dir, or NONE where it fails.  Glibc's struct
+   statvfs on 64-bit Linux has 64-bit fields; Darwin's counts are 32-bit,
+   after two 64-bit sizes.  A filesystem with no fixed inode count (btrfs)
+   reports 0 inodes in all, and has no inode limit. *)
+fun disk_free dir =
+  let
+    val buf = Memory.malloc 0w128
+    fun read () =
+      if statvfs (dir, buf) <> 0 then NONE
+      else if darwin () then
+        SOME {bytes = word (Memory.get64 (buf, 0w1)) * word32 (Memory.get32 (buf, 0w6)),
+              inodes = if Memory.get32 (buf, 0w7) = 0w0 then NONE
+                       else SOME (word32 (Memory.get32 (buf, 0w9)))}
+      else
+        SOME {bytes = word (Memory.get64 (buf, 0w1)) * word (Memory.get64 (buf, 0w4)),
+              inodes = if Memory.get64 (buf, 0w5) = 0w0 then NONE
+                       else SOME (word (Memory.get64 (buf, 0w7)))}
+  in
+    (Mutex.lock statvfs_mutex;
+     (read () before (Mutex.unlock statvfs_mutex; Memory.free buf))
+     handle e => (Mutex.unlock statvfs_mutex; Memory.free buf; raise e))
+  end
+end
+
+(* Below these a worker's disk counts as full: the free space a fleet
+   worker waits for before it claims an action, and a few theories' files.  A test may
+   set others, as "BYTES INODES" in HOLBUILD_TEST_DISK_FLOOR. *)
+fun disk_floor () =
+  case Option.map (String.tokens Char.isSpace) (OS.Process.getEnv "HOLBUILD_TEST_DISK_FLOOR") of
+      SOME [bytes, inodes] =>
+        (case (IntInf.fromString bytes, IntInf.fromString inodes) of
+             (SOME b, SOME i) => {bytes = b, inodes = i}
+           | _ => raise Error "HOLBUILD_TEST_DISK_FLOOR must be \"BYTES INODES\"")
+    | SOME _ => raise Error "HOLBUILD_TEST_DISK_FLOOR must be \"BYTES INODES\""
+    | NONE => {bytes = 4 * 1024 * 1024 * 1024, inodes = 1024}
+
+(* Whether the filesystem holding dir is below the floor. *)
+fun below_disk_floor dir =
+  case disk_free dir of
+      SOME {bytes, inodes} =>
+        let val floor = disk_floor ()
+        in
+          bytes < #bytes floor orelse
+          (case inodes of SOME n => n < #inodes floor | NONE => false)
+        end
+    | NONE => false
+
 (* Whether the filesystem holding dir can't take a small write (1 MB). *)
 fun out_of_space dir =
   let val probe = Path.concat(dir, ".holbuild-space-probe")
@@ -131,9 +150,11 @@ fun out_of_space dir =
 (* A download that filled the disk need not say so (curl reports only a
    failed write, or leaves a short file), and removing it frees the space:
    probe while it is still there. *)
-fun copy_blob source destination tmp_dir hash (uploaded, reused) =
+fun copy_blob source (destination : destination) stage_dir hash (uploaded, reused) =
+  if #has_blob destination hash then (uploaded, reused + 1)
+  else
   let
-    val path = temp_blob_path tmp_dir hash
+    val path = temp_blob_path stage_dir hash
     val (uploaded', reused') =
       (fetch_blob_or_raise source hash path;
        publish_blob_or_raise destination hash path)
@@ -157,16 +178,16 @@ fun put_action_or_raise (destination : destination) key text =
     | result as HolbuildCacheBackend.Skipped => result
     | HolbuildCacheBackend.Conflict detail => raise Error ("destination cache action conflict: " ^ key ^ " (" ^ detail ^ ")")
 
-fun copy_entry {source, destination, tmp_dir} key =
+fun copy_entry {source, destination, stage_dir} key =
   let
     val manifest_text =
       case #get_action source key of
           SOME text => text
         | NONE => raise Error ("source cache action missing: " ^ key)
     val blobs = unique_blobs manifest_text
-    val _ = ensure_dir tmp_dir
+    val _ = ensure_dir stage_dir
     val (uploaded, reused) =
-      List.foldl (fn (hash, counts) => copy_blob source destination tmp_dir hash counts)
+      List.foldl (fn (hash, counts) => copy_blob source destination stage_dir hash counts)
                  (0, 0)
                  blobs
     val action = put_action_or_raise destination key manifest_text

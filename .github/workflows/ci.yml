@@ -20,8 +20,22 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 2s --health-retries 30
     steps:
       - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+      - name: Bound coordinator HTTP liveness under 400 concurrent claimers
+        working-directory: remote-exec
+        run: uv run --frozen pytest -q -s tests/test_http_liveness.py
+        env:
+          REMOTE_EXEC_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
 
       - name: Read HOL4 pin
         id: hol4-pin
@@ -145,17 +159,15 @@ jobs:
           HOLBUILD_TEST_HOL_REV: ${{ steps.legacy-hol4-pin.outputs.hol4-ref }}
         run: >-
           make HOLDIR="$HOLDIR" test
-          TESTS="proof-attributes tactic-parse-compatibility proof-step-runtime-semantics proof-ir-branch-composition-behavior failed-prefix-structural-edit checkpoint-recovery termination-diagnostics"
+          TESTS="proof-attributes tactic-parse-compatibility proof-step-runtime-semantics proof-ir-branch-composition-behavior failed-prefix-structural-edit checkpoint-recovery termination-diagnostics smt-tactic-timeout"
 
   theory-modules:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    env:
-      HOLBUILD_TEST_HOL_GIT: https://github.com/SequentAI/HOL.git
     steps:
       - uses: actions/checkout@v6
 
-      - name: Read compiled initializer HOL pin
+      - name: Read theory-module HOL pin
         id: module-hol4-pin
         run: echo "hol4-ref=$(tr -d '[:space:]' < tests/HOL_THEORY_MODULES_REV)" >> "$GITHUB_OUTPUT"
 
@@ -165,7 +177,7 @@ jobs:
       - name: Configure holbuild test cache
         run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
 
-      - name: Restore compiled initializer HOL toolchain cache
+      - name: Restore theory-module HOL toolchain cache
         id: module-hol-toolchain-cache
         uses: actions/cache/restore@v5
         with:
@@ -175,7 +187,7 @@ jobs:
       - name: Build holbuild
         run: make
 
-      - name: Run compiled initializer integration tests
+      - name: Run theory-module integration tests
         env:
           TMPDIR: ${{ runner.temp }}
           HOLBUILD_TEST_JOBS: '4'
@@ -185,7 +197,7 @@ jobs:
           tests/run.sh theory-modules basic-theory checkpoint-extra-inputs
           checkpoint-recovery exec-action exec-action-share-heaps
 
-      - name: Save compiled initializer HOL toolchain cache
+      - name: Save theory-module HOL toolchain cache
         if: steps.module-hol-toolchain-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:

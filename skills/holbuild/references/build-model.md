@@ -69,11 +69,18 @@ theory actions also produce `.tr.gz` Poly/ML exports.
 
 **Any source byte change** (including comments/proof edits) changes the action key, and the keys of all dependents. Cache keys never depend on generated outputs. Still, a dependent whose key changed is not rebuilt when its own inputs and its dependencies' outputs are unchanged (early cutoff, below), locally or on remote workers.
 
-Proof engine/checkpoint/timeout/trace flags are intentionally not final artifact action-key inputs. Switching `--skip-checkpoints`, `--all-checkpoints`, `--skip-proof-steps`, or root tactic timeout should not rebuild an otherwise up-to-date semantic artifact.
+Proof engine/checkpoint/timeout/trace flags are intentionally not final artifact action-key inputs. Switching `--skip-checkpoints`, `--all-checkpoints`, `--checkpoint-seconds`, `--skip-proof-steps`, or root tactic timeout should not rebuild an otherwise up-to-date semantic artifact.
 
-`extra_deps` are filesystem dependencies outside the normal HOL dependency graph. Manifest entries are package-root-relative; source annotations of the form `holbuild_extra_deps ["../data/table.txt"]` are source-file-relative. Entries may name files, directories, or simple globs. Expanded contents are hashed into the action key, and source-declared entries are staged so matching relative filesystem reads work during the action.
+`extra_deps` are filesystem dependencies outside the normal HOL dependency graph. Manifest entries are package-root-relative; source annotations of the form `holbuild_extra_deps ["../data/table.txt"]` are source-file-relative. As with `holbuild_extra_outputs` below, define `fun holbuild_extra_deps (_ : string list) = ();` before calling it; HOL does not provide it. Entries may name files, directories, or simple globs. Expanded contents are hashed into the action key, and source-declared entries are staged so matching relative filesystem reads work during the action.
 
-Theory scripts can declare deterministic extra output files with `holbuild_extra_outputs ["results/test.nsv"]`. Paths are source-file-relative fixed paths inside the package; absolute paths, `.`/`..` components, directories, and globs are not supported. Declared files are required after execution, included in local up-to-date checks and action-cache blobs, restored by local/remote/HBX caches, and removed by `clean TARGET`. Cleaning does not force source regeneration because the next build may restore the file from cache.
+Theory scripts can declare deterministic extra output files with a static literal annotation. Define the no-op function before calling it; HOL does not provide it, and holbuild scans the literal list in the source:
+
+```sml
+fun holbuild_extra_outputs (_ : string list) = ();
+val _ = holbuild_extra_outputs ["results/test.nsv"];
+```
+
+The script must write the declared files itself. Paths are source-file-relative fixed paths inside the package; absolute paths, `.`/`..` components, directories, and globs are not supported. Declared files are required after execution, included in local up-to-date checks and action-cache blobs, restored by local/remote/HBX caches, and removed by `clean TARGET`. Cleaning does not force source regeneration because the next build may restore the file from cache.
 
 ## Up-to-date check
 
@@ -87,7 +94,7 @@ On a key miss, a theory keeps its outputs (early cutoff) when they exist, its `.
 
 Under `--remote-exec` without `--detach`, a theory the worktree already has built for its current inputs (its `.holbuild/dep` metadata holds its current input key, under a timeout contract as strict as the one requested) stays out of the batch, even when the remote cache lacks it; when a submitted theory depends on it, holbuild publishes its local cache entry to the remote cache, and submits it only if it has no usable local entry or the publish fails. Every dependent of an edited theory is still submitted, since its spec is written before its dependencies are built. The worker hashes the dependency outputs it restored and, when an earlier build of the same action text on the same outputs left an entry, reuses it (`holbuild: early cutoff: <theory> reuses the build of <key>` in the worker's log, status `cached`) instead of running HOL. Its shared heap and checkpoints are keyed on the same hash.
 
-A proof that fails on a remote worker (`proof` or `tactic-timeout`) isn't rebuilt locally: the build restores what the cache holds, writes the worker's build log to `.holbuild/logs/current/<package>/<theory>/build.log`, prints the usual diagnostic from it (`proof failed on a remote worker while building <theory>`), and exits 1. Fix the proof and build again.
+A proof that fails on a remote worker (`proof` or `tactic-timeout`) isn't rebuilt locally: the build restores what the cache holds, writes the worker's build log to `.holbuild/logs/current/<package>/<theory>/build.log` (and the logs of the theories the batch finished to theirs), prints the usual diagnostic from it (`proof failed on a remote worker while building <theory>`), and exits 1. Fix the proof and build again.
 
 ## Cache
 

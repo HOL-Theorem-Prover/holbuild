@@ -8,8 +8,11 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
+ring_server_pids=()
 cleanup() {
   [[ -z "${server_pid:-}" ]] || kill "$server_pid" 2>/dev/null || true
+  [[ -z "${tls_server_pid:-}" ]] || kill "$tls_server_pid" 2>/dev/null || true
+  for pid in "${ring_server_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
   cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
@@ -19,8 +22,9 @@ trap cleanup EXIT
 # /trickle sends its 6-byte body a byte every 0.5 s,
 # /gated once the file gate-release exists in the test directory (writing
 # gate-event there on arrival), /missing with 404 and /error with 500, and
-# PUT /store/<name> keeps a body that GET /store/<name> returns, and
-# /connections returns how many connections the server has accepted.
+# PUT /store/<name> keeps a body that GET /store/<name> returns,
+# /connections returns how many connections the server has accepted, and
+# HEAD answers 200 with Content-Length -1.
 cat > "$tmpdir/server.py" <<'PY'
 import base64
 import http.server
@@ -88,6 +92,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.reply(200, b"ok\n")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        # What bazel-remote answers for a blob only in its S3 backend.
+        self.send_header("Content-Length", "-1")
+        self.end_headers()
+
     def do_PUT(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         if self.headers.get("Authorization") != credentials:
@@ -122,7 +132,7 @@ for fd in os.listdir(fd_dir):
     try:
         links.append(os.readlink(os.path.join(fd_dir, fd)))
     except FileNotFoundError:
-        pass  # closed since listed: the pool's reaper closes connections at any time
+        pass  # closed since listed: the idle pump closes connections at any time
 print(sum(link.startswith("socket:[") and link[8:-1] in inodes for link in links))
 PY
 python3 "$tmpdir/server.py" "$tmpdir/port" "$tmpdir" &
@@ -137,6 +147,84 @@ done
 }
 HTTP_TEST_URL="http://127.0.0.1:$(< "$tmpdir/port")"
 export HTTP_TEST_URL HTTP_TEST_DIR=$tmpdir
+
+# Eight more servers, as the nodes of a cache ring.
+HTTP_TEST_RING_URLS=
+for node in {1..8}; do
+  python3 "$tmpdir/server.py" "$tmpdir/ring-port-$node" "$tmpdir" &
+  ring_server_pids+=($!)
+done
+for node in {1..8}; do
+  for _ in {1..100}; do
+    [[ -s "$tmpdir/ring-port-$node" ]] && break
+    sleep 0.01
+  done
+  [[ -s "$tmpdir/ring-port-$node" ]] || {
+    echo "ring test HTTP server $node did not start" >&2
+    exit 1
+  }
+  HTTP_TEST_RING_URLS+=" http://127.0.0.1:$(< "$tmpdir/ring-port-$node")"
+done
+export HTTP_TEST_RING_URLS
+
+# An HTTPS server with a self-signed certificate, which writes how many
+# connections it has accepted to tls-accepted.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \
+  -addext subjectAltName=IP:127.0.0.1 -keyout "$tmpdir/key.pem" -out "$tmpdir/cert.pem" 2>/dev/null
+cat > "$tmpdir/tls-server.py" <<'PY'
+import http.server
+import pathlib
+import ssl
+import sys
+
+directory = pathlib.Path(sys.argv[2])
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(directory / "cert.pem", directory / "key.pem")
+accepted = 0
+
+class Server(http.server.ThreadingHTTPServer):
+    def get_request(self):
+        global accepted
+        sock, address = super().get_request()
+        accepted += 1
+        (directory / "tls-accepted").write_text(str(accepted))
+        # The handshake runs in the request's thread, so a failed one blocks nothing.
+        return context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), address
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "3")
+        self.end_headers()
+        self.wfile.write(b"ok\n")
+
+    def log_message(self, *args):
+        pass
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (ssl.SSLError, OSError):
+            self.close_connection = True
+
+server = Server(("127.0.0.1", 0), Handler)
+(directory / "tls-port").write_text(str(server.server_address[1]))
+server.serve_forever()
+PY
+python3 "$tmpdir/tls-server.py" "$tmpdir/tls-port" "$tmpdir" &
+tls_server_pid=$!
+for _ in {1..100}; do
+  [[ -s "$tmpdir/tls-port" ]] && break
+  sleep 0.01
+done
+[[ -s "$tmpdir/tls-port" ]] || {
+  echo "test HTTPS server did not start" >&2
+  exit 1
+}
+HTTPS_TEST_URL="https://127.0.0.1:$(< "$tmpdir/tls-port")"
+export HTTPS_TEST_URL
 
 cat > "$tmpdir/http-test.sml" <<'SML'
 val root =
@@ -168,6 +256,9 @@ val _ = assert "an unsupported option is reported by name"
 val url = valOf (OS.Process.getEnv "HTTP_TEST_URL")
 val dir = valOf (OS.Process.getEnv "HTTP_TEST_DIR")
 val _ = HolbuildRemoteCacheConfig.set_url url
+(* Until the client is set up, requests go through the curl command. *)
+val _ = assert "the curl command takes a HEAD answered with Content-Length -1"
+               (HolbuildRemoteCache.head_status (url ^ "/negative-length") = HolbuildHttp.Response 200)
 val _ = HolbuildRemoteCacheConfig.setup_client ()
 val _ = assert "libcurl is set up with the configured user" (HolbuildRemoteCacheConfig.uses_libcurl ())
 
@@ -180,6 +271,20 @@ fun wait_for what condition deadline =
   else if Time.> (Time.now (), deadline) then fail ("timed out waiting for " ^ what)
   else (OS.Process.sleep (Time.fromMilliseconds 10); wait_for what condition deadline)
 fun in_10s () = Time.+ (Time.now (), Time.fromSeconds 10)
+
+(* A GET of a blob an action entry lists as large waits longer for a node
+   that refills it from the shared store; others keep the usual budget. *)
+local
+  val cache = HolbuildRemoteCache.remote url
+  fun listed sha256 size = HolbuildRemoteCache.remember_blob cache {sha256 = sha256, size = size}
+  fun budget sha256 = HolbuildRemoteCache.blob_stall_timeout cache sha256
+  val _ = listed "large" "67108864"
+  val _ = listed "small" "67108863"
+in
+  val _ = assert "a large listed blob gets the long stall budget" (budget "large" = 120)
+  val _ = assert "a smaller listed blob keeps the usual stall budget" (budget "small" = 30)
+  val _ = assert "an unlisted blob keeps the usual stall budget" (budget "unlisted" = 30)
+end
 
 val fast = HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/fast.out", timeout = 30}
 val _ = assert "GET sends the credentials and returns the HTTP status" (fast = HolbuildHttp.Response 200)
@@ -270,11 +375,40 @@ fun burst () =
    List.app (fn thread => ignore (Thread.fork (fn () => client thread, []))) (List.tabulate (16, fn i => i));
    wait_for "the concurrent requests" (fn () => !finished = 16) (Time.+ (Time.now (), Time.fromSeconds 60));
    assert ("concurrent requests failed: " ^ String.concatWith ", " (!failures)) (null (!failures)))
-fun accepted () =
+fun accepted_at server =
   (assert "GET /connections"
-          (HolbuildHttp.get {url = url ^ "/connections", dst = dir ^ "/connections.out", timeout = 30}
+          (HolbuildHttp.get {url = server ^ "/connections", dst = dir ^ "/connections.out", timeout = 30}
            = HolbuildHttp.Response 200);
    valOf (Int.fromString (read_file (dir ^ "/connections.out"))))
+fun accepted () = accepted_at url
+
+val accepted_before = accepted ()
+val _ = assert "a HEAD answered with Content-Length -1 returns its status"
+               (HolbuildHttp.head {url = url ^ "/negative-length", timeout = 30} = HolbuildHttp.Response 200)
+val _ = assert "a GET after it on the same handle reads its body by its length"
+               (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/after-head.out", timeout = 30}
+                = HolbuildHttp.Response 200
+                andalso read_file (dir ^ "/after-head.out") = "ok\n")
+val _ = assert "the HEAD and the GET kept the connection" (accepted () = accepted_before)
+
+(* Requests from one thread, one pooled handle, to each of 8 servers in
+   turn, 3 times over, as a walk over a cache ring: the handle keeps a
+   connection to every server, more than libcurl's default of 4. *)
+val ring = String.tokens Char.isSpace (valOf (OS.Process.getEnv "HTTP_TEST_RING_URLS"))
+fun ring_accepted () = List.foldl (fn (server, total) => total + accepted_at server) 0 ring
+val ring_accepted_before = ring_accepted ()
+val _ =
+  List.app (fn _ =>
+    List.app (fn server =>
+      assert "a GET to a ring server"
+             (HolbuildHttp.get {url = server ^ "/fast", dst = dir ^ "/ring.out", timeout = 30}
+              = HolbuildHttp.Response 200))
+      ring)
+    [1, 2, 3]
+val ring_opened = ring_accepted () - ring_accepted_before
+val _ = assert ("24 requests over 8 servers opened " ^ Int.toString ring_opened ^ " connections, not 0")
+               (ring_opened = 0)
+
 val accepted_before = accepted ()
 val _ = burst ()
 val opened = accepted () - accepted_before
@@ -319,6 +453,45 @@ val _ =
      wait_for "that connection to be closed" (fn () => sockets () = 0) (in_10s ()))
   else ()
 
+(* 200 threads at once, each walking the ring twice, as a wide cache check:
+   the process's descriptors stay well below 1024, past which Poly/ML's
+   select() aborts the process.  Before the pool was bounded, each of the
+   200 handles kept a socket to every server and its wakeup pipe. *)
+fun open_fds () =
+  let
+    val fds = OS.FileSys.openDir "/proc/self/fd"
+    fun count n = case OS.FileSys.readDir fds of NONE => n | SOME _ => count (n + 1)
+  in
+    count 0 before OS.FileSys.closeDir fds
+  end
+fun walker () =
+  (List.app (fn _ =>
+     List.app (fn server =>
+       if HolbuildHttp.head {url = server ^ "/fast", timeout = 30} = HolbuildHttp.Response 200 then ()
+       else record (fn () => failures := server :: !failures))
+       ring)
+     [1, 2]
+   handle e => record (fn () => failures := General.exnMessage e :: !failures);
+   record (fn () => finished := !finished + 1))
+val _ =
+  if has_proc then
+    let
+      val _ = (finished := 0; failures := [])
+      val _ = List.app (fn _ => ignore (Thread.fork (walker, []))) (List.tabulate (200, fn i => i))
+      val deadline = Time.+ (Time.now (), Time.fromSeconds 60)
+      fun sample peak =
+        if !finished = 200 then Int.max (peak, open_fds ())
+        else if Time.> (Time.now (), deadline) then fail "the ring walkers did not finish"
+        else (OS.Process.sleep (Time.fromMilliseconds 10); sample (Int.max (peak, open_fds ())))
+      val peak = sample 0
+    in
+      print ("200 ring walkers held at most " ^ Int.toString peak ^ " descriptors\n");
+      assert ("ring walks failed: " ^ String.concatWith ", " (!failures)) (null (!failures));
+      assert ("200 threads walking the ring held " ^ Int.toString peak ^ " descriptors") (peak < 512);
+      wait_for "the ring connections to be closed" (fn () => sockets () = 0) (in_10s ())
+    end
+  else ()
+
 (* A transfer waiting on a response must not hold up another thread's GC.
    The server holds /gated until gate-release exists. *)
 val gated_done = ref false
@@ -359,6 +532,78 @@ val _ = assert "SSL_CERT_DIR and SSL_CERT_FILE"
 val _ = assert "SSL_CERT_FILE alone" (ca_options_with [("SSL_CERT_DIR", NONE)] = [("CAINFO", "/file")])
 val _ = assert "no CA settings" (ca_options_with [("SSL_CERT_FILE", NONE)] = [])
 
+(* A handle made while the default CA directory is cleared clears it before
+   applying the environment's settings; one made after the fallback doesn't. *)
+fun connection_ca_options no_ca_directory =
+  map (fn (name, _, value) => (name, value)) (HolbuildHttp.connection_ca_options no_ca_directory)
+val _ = assert "the default CA directory is cleared"
+               (connection_ca_options true = [("CAPATH", NONE)])
+val _ = assert "the default CA directory is kept" (connection_ca_options false = [])
+val _ = ca_options_with [("SSL_CERT_DIR", SOME "/dir")]
+val _ = assert "a CA directory the environment names is set after the default is cleared"
+               (connection_ca_options true = [("CAPATH", NONE), ("CAPATH", SOME "/dir")])
+val _ = assert "a CA directory the environment names is set"
+               (connection_ca_options false = [("CAPATH", SOME "/dir")])
+val _ = ca_options_with [("SSL_CERT_DIR", NONE)]
+
+(* HTTPS to a server whose self-signed certificate only CURL_CA_BUNDLE names.
+   With a libcurl that caches the parsed CA bundle, new handles start without
+   libcurl's default CA directory; the bundle alone verifies the server. *)
+val tls_url = valOf (OS.Process.getEnv "HTTPS_TEST_URL")
+fun tls_accepted () =
+  if OS.FileSys.access (dir ^ "/tls-accepted", []) then valOf (Int.fromString (read_file (dir ^ "/tls-accepted")))
+  else 0
+fun tls_get () = HolbuildHttp.get {url = tls_url ^ "/", dst = dir ^ "/tls.out", timeout = 30}
+(* A handle takes the CA settings when it is made, so let the pool close the
+   ones the requests above left. *)
+fun wait_for_empty_pool () =
+  if has_proc then wait_for "the pooled connections to be closed" (fn () => sockets () = 0) (in_10s ())
+  else OS.Process.sleep (Time.fromSeconds 5)
+val clearing = !HolbuildHttp.clear_ca_directory
+val _ = wait_for_empty_pool ()
+val _ = ca_options_with [("CURL_CA_BUNDLE", SOME (dir ^ "/cert.pem"))]
+val _ = assert "HTTPS verifies the server against the CA bundle" (tls_get () = HolbuildHttp.Response 200)
+val _ = assert "a verified server keeps the CA directory cleared" (!HolbuildHttp.clear_ca_directory = clearing)
+
+(* After the fallback, a pooled handle made without the default CA directory
+   is closed rather than reused. *)
+val accepted_before = tls_accepted ()
+val _ = HolbuildHttp.clear_ca_directory := false
+val _ = assert "a request after the fallback succeeds" (tls_get () = HolbuildHttp.Response 200)
+val _ = assert "it doesn't reuse a handle made without the default CA directory"
+               (tls_accepted () = accepted_before + (if clearing then 1 else 0))
+val _ = HolbuildHttp.clear_ca_directory := clearing
+
+(* Once the pool has closed that handle, a certificate the default CAs don't
+   verify fails, after one retry on a handle with libcurl's default CA
+   directory when the first had none, and later handles keep that default. *)
+val _ = wait_for_empty_pool ()
+val _ = ca_options_with [("CURL_CA_BUNDLE", NONE)]
+val accepted_before = tls_accepted ()
+val _ = assert "an unverified certificate is a transport failure"
+               (case tls_get () of HolbuildHttp.Failed _ => true | _ => false)
+val _ = assert "the request was retried once if the CA directory was cleared"
+               (tls_accepted () = accepted_before + (if clearing then 2 else 1))
+val _ = assert "the CA directory is no longer cleared" (not (!HolbuildHttp.clear_ca_directory))
+val accepted_before = tls_accepted ()
+val _ = assert "a later request fails without a retry"
+               (case tls_get () of HolbuildHttp.Failed _ => true | _ => false)
+val _ = assert "a later request connects once" (tls_accepted () = accepted_before + 1)
+
+(* A request leaves its connection open and the pump waiting for the idle
+   timeout.  Exiting asks every thread to stop, as Thread.kill does, and waits
+   for them: a pump waiting on its condition variable stops at once, but a
+   sleeping one only once its sleep ends.  Timing the kill rather than the
+   whole exit leaves out Poly/ML freeing its heap, which takes hundreds of
+   milliseconds on a busy machine. *)
+val _ = wait_for_empty_pool ()
+val _ = assert "a request leaves the pump running"
+               (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/fast.out", timeout = 30} = HolbuildHttp.Response 200)
+val pump = valOf (!HolbuildHttp.pump_thread)
+val deadline = Time.+ (Time.now (), Time.fromMilliseconds 500)
+val _ = Thread.kill pump
+val _ = wait_for "the pump to stop" (fn () => not (Thread.isActive pump)) deadline
+
 val _ = print "http tests passed\n"
 SML
 
@@ -373,9 +618,10 @@ grep -q "http tests passed" "$tmpdir/http-test.log" || {
   cat "$tmpdir/http-test.log" >&2
   exit 1
 }
-kill "$server_pid"
-wait "$server_pid" 2>/dev/null || true
+kill "$server_pid" "${ring_server_pids[@]}"
+wait "$server_pid" "${ring_server_pids[@]}" 2>/dev/null || true
 server_pid=
+ring_server_pids=()
 
 # When libcurl can't be used, a build says why once and makes its requests
 # with the curl command: a first build publishes to the remote cache and a

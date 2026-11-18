@@ -28,9 +28,9 @@ The same holbuild executable supports the current HOL pin in `vendor/hol/REV`
 and the legacy compatibility floor recorded in `tests/HOL_LEGACY_TACTICS_REV`
 (`e395eb6e69054ff6f7cef9d1107fd1a04dd5848f`). CI covers those two revisions;
 this is not a guarantee for every intervening or future HOL commit.
-Compiled initializer integration is also checked against the public HOL fork
-revision in `tests/HOL_THEORY_MODULES_REV`, which includes the optional loader
-API; the main and legacy jobs continue checking source-loader compatibility.
+Theory-module loading is also checked against the HOL revision in
+`tests/HOL_THEORY_MODULES_REV`, which includes the optional loader API; the
+main and legacy jobs continue checking `.dat`-loader compatibility.
 
 Compatibility boundaries select implementations by the installed HOL API,
 not branch names or revision ordering. In particular, the analyser retains its
@@ -39,18 +39,25 @@ constructor shapes, before and after HOL added combinator-token spans. Small
 adapter tests cover both shapes without adding a third HOL toolchain to CI.
 The new token annotations do not change existing proof-step labels or extents.
 
-On HOL and Poly/ML versions supporting compiled theory initializers, holbuild
-automatically caches their compiled code under `<cache root>/theory-modules`.
-Loading a cached initializer still reads the theory data, registers its types,
-constants and theorems, and runs its load hooks in the usual dependency order.
-ML libraries retain their usual source-loading behavior. Older toolchains and
-missing or incompatible module files use the source loader automatically.
+On HOL and Poly/ML versions supporting theory modules, holbuild
+automatically keeps each loaded theory's decoded data in a module under
+`<cache root>/theory-modules/<toolchain>`, so later loads skip reading its `.dat` file.
+Loading a module still registers the theory's types, constants and theorems
+and runs its load hooks in the usual dependency order. ML libraries retain
+their usual source-loading behavior. Older toolchains and missing or
+incompatible module files load from the `.dat` file automatically.
 
 These module files belong to one exact HOL saved state. They stay in the local
-cache, including on remote workers, and do not change portable theory artifacts
-or remote cache keys. Checkpoint-free builds also produce and use them. Cache
+cache and do not change portable theory artifacts or action keys. Remote
+workers also share them through the remote cache, keyed by that exact
+toolchain, so a fresh worker fetches the modules another one wrote. Checkpoint-free builds also produce and use them. Cache
 garbage collection and worker cache limits include the module files; deleting
 them only causes source loading and regeneration.
+
+Remote execution isolates submitted HOL code from worker credentials and shared
+writable caches. Worker hosts need Linux Landlock and libseccomp; see
+[action isolation](remote-exec/README.md#action-isolation) for prerequisites,
+the trust boundary and the client upgrade requirement.
 
 ## Install
 
@@ -73,13 +80,15 @@ holbuild --version
 
 Keep the extracted directory together: `bin/holbuild` loads runtime and
 analyser sources from `share/holbuild`. You can move the directory or symlink
-the executable into a directory already on `PATH`.
+the executable into a directory already on `PATH`. The manual page is
+`share/man/man1/holbuild.1`; read it with `man -l share/man/man1/holbuild.1`,
+or put `share/man` on `MANPATH` and run `man holbuild`.
 
 The executable includes the Poly/ML runtime, so running it does not require
 an installed Poly/ML. Building HOL toolchains still requires `poly` and
 `polyc`, plus HOL's other build dependencies. Archives include holbuild's
 `LICENSE`, the SML/NJ notice, and Poly/ML's license in `share/holbuild`.
-The same release also offers `polyml-v5.9.2-seq3-source.tar.gz`, the exact
+The same release also offers `polyml-v5.9.2-seq12-source.tar.gz`, the exact
 Poly/ML sources used for both binaries. Poly/ML is built with
 `--disable-shared --without-gmp`; the holbuild sources for rebuilding/relinking
 are available at the release tag.
@@ -127,15 +136,40 @@ By default this installs to:
 
 ```text
 $HOME/.local/bin/holbuild
+$HOME/.local/share/man/man1/holbuild.1
 ```
 
-You can override the destination with `PREFIX`, `BINDIR`, or `DESTDIR`.
+`man holbuild` finds the manual page when `$HOME/.local/share/man` is on the
+manpath (most systems add it when it exists). The page lists every command,
+option and environment variable.
+
+You can override the destination with `PREFIX`, `BINDIR`, `MANDIR`, or `DESTDIR`.
 Installation also places runtime sources and notices in
 `$PREFIX/share/holbuild`; keep that directory beside `$PREFIX/bin` when moving
 an installation.
 Custom `BINDIR`/`DATADIR` layouts are also supported: `make install` rebuilds
 the executable with that data path. Keep custom data at the configured path;
 use the standard layout for an installation that can move as a directory.
+
+`make install` also installs shell completion for Bash, Zsh and Fish, under
+`$PREFIX/share` (`BASHCOMPDIR`, `ZSHCOMPDIR` and `FISHCOMPDIR` override each
+directory). Bash with bash-completion, and Fish, load it from there when
+`$PREFIX` is `$HOME/.local` or `/usr/local`. Zsh needs the directory on its
+`fpath` before `compinit`, in `~/.zshrc`:
+
+```sh
+fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+autoload -Uz compinit && compinit
+```
+
+To use the completion from a checkout instead, source
+`completions/holbuild.bash` in Bash, add `completions/` to Zsh's `fpath`, or
+source `completions/holbuild.fish` in Fish. It completes commands, options,
+option values, build targets, `@group` names, theory names, heap and
+executable names, reading the project in the current directory (or the one
+`--source-dir` names) and the dependencies already on disk. It never builds,
+fetches or locks anything. Where it has nothing to offer, the shell completes
+file names.
 
 ## A minimal project
 
@@ -279,6 +313,20 @@ outputs are unaffected. An explicit debugging flag turns back on what it needs:
 
 ## Common commands
 
+Builds finish independent work after a theory or library fails. Nodes that
+depend on a failure are skipped, with the failed dependency named in the
+diagnostic. Successful outputs are cached normally; failed or skipped nodes
+publish no successful outputs. Every failure is reported as it happens and in
+the final diagnostic, and the build exits nonzero. Pass `build --fail-fast`
+to stop after the first failure and cancel unfinished work instead.
+
+Keep-going applies within a resolved build plan. Setup or dependency-planning
+errors still stop the command. A theory that generates SML sources must finish
+before those sources and their consumers can be planned: if that preliminary
+phase fails, independent actions already in its plan finish, but the later
+phase does not start. Planning from missing or stale generated sources could
+otherwise miss dependencies or compute incorrect input keys.
+
 `build` is the default command, so it can usually be omitted:
 
 ```sh
@@ -298,8 +346,9 @@ holbuild repl --from MyTheory
 holbuild context
 holbuild context --trknl
 holbuild execution-plan MyTheory:my_theorem
-holbuild check MyTheory
-holbuild check --fingerprint MyTheory
+holbuild check MyTheory OtherTheory:my_theorem
+holbuild check --fingerprint MyTheory OtherTheory
+holbuild check --with-fingerprints MyTheory:my_theorem
 holbuild buildhol
 holbuild buildhol --trknl
 holbuild build --trknl MyTheory
@@ -407,8 +456,9 @@ holbuild build MyTheory
 holbuild --offline build MyTheory
 ```
 
-A missing or wrong-revision dependency checkout fails before clone or fetch,
-even if its commit is in a local bare mirror. A missing or invalid HOL
+A dependency whose shared checkout is missing fails before checkout or fetch,
+even if its commit is in a local bare mirror; one already in the cache is
+linked as usual. A missing or invalid HOL
 toolchain also fails before restore or replacement. The error names what needs
 preparing; rerun without `--offline` and with `HOLBUILD_OFFLINE` unset. Valid
 local toolchains can regenerate analyser and source metadata offline.
@@ -447,16 +497,23 @@ child that fits the budget starts whatever `MemAvailable` says, so a build
 never waits on memory none of its children use. Where `/proc/meminfo` has no
 `MemAvailable` (outside Linux), only the reservations count, and the default
 charge is `--max-heap` + 1 GiB, what a child can reach. `/proc/meminfo` shows
-the whole machine, not a container's memory limit, so inside a
-memory-limited container set `--child-charge` to what a child can reach. A child
+the whole machine, not a container's memory limit. Where cgroup v2 limits the
+memory of holbuild's group or of a group enclosing it (a container, a systemd
+or Slurm scope), a child also starts only while the tightest of those groups
+has its charge left (`memory.max` less `memory.current`, plus its reclaimable
+`inactive_file` page cache, less the charges of children still starting),
+whether or not any reservation is held, and a charge larger than the least
+`memory.max` fails at once. Under cgroup v1, or another memory limit holbuild
+can't read, set `--child-charge` to what a child can reach. A child
 that waits shows as `(waiting for memory)` in the status line, as a
 `waiting for machine memory` line otherwise, and as a `waiting_for_memory`
 event with `--json`. A charge larger than the whole budget fails at once.
 
 This bounds admission; it does not enforce RSS: children already running can
 still grow together, up to their `--max-heap`, past what the machine has left,
-since nothing re-checks a child once it has started. It covers neither HOL
-toolchain builds nor `check`, `run` or `repl`.
+since nothing re-checks a child once it has started. The HOL session of
+fingerprint checks and `run` takes a reservation like a theory child; HOL toolchain
+builds and `repl` take none.
 
 - The budget is the byte count in `DIR/budget`, which `--machine-max-mem`
   creates on first use. Without that file, it is the default, recomputed from
@@ -488,12 +545,15 @@ manifest in use is watched as well (not recursively), so a `holbuild.toml` or
 currently requires `inotifywait` from `inotify-tools` and does not support
 `--json`, `--dry-run`, or `--repl-on-failure`.
 
-`holbuild check MyTheory` builds the theory if needed, loads it in HOL and
-checks the tags of its stored theorems. It prints one line per
+`holbuild check MyTheory` builds the theory if needed, then reads the restored
+`Theory.dat` files directly, without starting HOL or loading ancestor terms.
+It checks the tags and hypotheses of its stored theorems. It prints one line per
 theorem whose tag carries an oracle other than `DISK_THM` (for instance
 `MyTheory.my_theorem: cheat`) and one per axiom declared in the theory or its
 ancestors outside HOL itself, that is, in the root package or a dependency
-package (`DepTheory.my_axiom: axiom`). Theorems loaded from disk do not record
+package (`DepTheory.my_axiom: axiom`). Each stored theorem with undischarged
+hypotheses is also a finding (`MyTheory.my_theorem: undischarged hypotheses`),
+even when it has no oracle tag. Theorems loaded from disk do not record
 which axioms they use, so every such axiom in the ancestry is reported. It also
 scans the sources the theory is built from outside HOL (theory scripts and the
 SML libraries they load) for calls that can forge a theorem or change the
@@ -503,24 +563,40 @@ line per use (`mypkg:src/MyScript.sml:12: kernel bypass: disk_thm`). Names in
 comments and string literals don't count; the scan is a backstop, not a
 sandbox. With findings it exits non-zero; otherwise it prints
 `MyTheory: clean (N theorems)` and exits zero. `holbuild check MyTheory:my_theorem` checks one theorem.
-`check` builds the theory, and any `[run].loads`, without proof steps or
-checkpoints: it applies no step timeout (that is `build`'s check) and reuses
-theories built by `holbuild build --skip-proof-steps`. The tags are those
-recorded in the built theory, which may have been restored from a cache;
-run `holbuild build --no-cache MyTheory` first to check a fresh build. HOL
-always starts from the toolchain's base state here, not from `[run].heap`,
-which may hold an older copy of the theory.
+Pass several selectors to share one build of the distinct targets:
+`holbuild check MyTheory OtherTheory:my_theorem`. Each selector keeps
+its own findings or clean line, in argument order (including repeated selectors).
+Findings do not stop later checks; the command exits non-zero if any selector
+has findings. Invalid selectors, missing theorems and unreadable theory data abort the
+command.
 
-`holbuild check --fingerprint MyTheory` builds and loads the theory the same
-way and prints one tab-separated line per axiom, definition and theorem stored
+`check` builds the theories, and any `[run].loads`, without proof steps or
+checkpoints: it applies no step timeout (that is `build`'s check) and reuses
+theories built by `holbuild build --skip-proof-steps`. Plain checks do not execute
+`[run].loads`; fingerprint modes load them in HOL. The tags are those
+recorded in the built theory, which may have been restored from a cache;
+run `holbuild build --no-cache MyTheory` first to check a fresh build.
+
+`holbuild check --fingerprint MyTheory` builds the theory, then loads it in HOL
+and prints one tab-separated line per axiom, definition and theorem stored
 in it and in each of its ancestors, HOL's own theories included, sorted
-bytewise so that two runs diff cleanly:
+bytewise so that two runs diff cleanly. Several theories can be passed together
+(`holbuild check --fingerprint MyTheory OtherTheory`); their shared ancestors
+and repeated target theories are emitted only once:
 
 ```text
 fingerprint	DepTheory	axiom	my_axiom	9a02…(64 hex digits)	-
 fingerprint	MyTheory	theorem	my_theorem	3f1c…	-
 fingerprint	MyTheory	theorem	other_theorem	77d0…	cheat
 ```
+
+`holbuild check --with-fingerprints MyTheory:my_theorem` does both in one HOL
+session: it checks the selectors as plain `check` does and prints the
+fingerprint lines of their theories, and exits with the check's status. A
+tool that wants both pays for one theory load. Both fingerprint modes start HOL
+from a valid dependency checkpoint or the toolchain's base state, never from
+`[run].heap`, which may hold an older copy of a theory. These HOL sessions use
+one GC thread and take the same `--cooperate-dir` memory reservation as builds.
 
 Build progress and HOL's own messages share stdout, so keep the lines that
 start with `fingerprint` and a tab (`grep '^fingerprint'`). After that column
@@ -749,7 +825,9 @@ always_reexecute = true
   read as `../data/table.txt` (the stage mirrors the package layout, so such
   copies stay inside it); absolute paths and `..` components are rejected. A
   directory or glob names the files under it, skipping any `.holbuild/`
-  directory inside it.
+  directory inside it. Before hashing or staging these files, holbuild runs
+  the generators whose declared outputs match the file, directory, or glob,
+  including outputs that do not exist yet. Unrelated generators stay idle.
 - `cache = false` disables global cache restore/publish for the action.
 - `always_reexecute = true` disables local up-to-date skipping for the action.
 
@@ -772,15 +850,19 @@ child replaces the local entry, which does not change the remote cache's
 conflict checks. An entry rejected only by the requested proof policy is retained until
 a successful rebuild can publish its stronger contract.
 
-Source files may also declare source-file-relative extra dependencies:
+Source files may also declare source-file-relative extra dependencies. Define the
+no-op function before calling it; HOL does not provide it, and holbuild scans the
+literal list in the source:
 
 ```sml
+fun holbuild_extra_deps (_ : string list) = ();
 val () = holbuild_extra_deps ["../data/table.txt"];
 ```
 
-Theory scripts may declare deterministic extra output files:
+Theory scripts may declare deterministic extra output files with the same pattern:
 
 ```sml
+fun holbuild_extra_outputs (_ : string list) = ();
 val () = holbuild_extra_outputs ["results/test.nsv"];
 ```
 
@@ -798,6 +880,11 @@ When such an action needs source execution, holbuild reruns its script from the
 start: script checkpoints retain ML state, not the files the script wrote.
 The dependency-loaded checkpoint remains reusable, and proof checkpoints remain
 available for diagnostics.
+
+Extra outputs must be byte-identical for the same inputs, including during a
+forced rebuild. Put elapsed times and other execution-specific data in the
+build log instead. A remote worker rejects a conflicting publication, keeping
+the existing cache entry, and reports both sets of output hashes.
 
 A theory may write SML sources (`.sml` or `.sig`) as extra outputs, as EmitML
 code does. A plan made before the theory runs has no node for such a source, so
@@ -908,7 +995,9 @@ and they reuse theories built by `holbuild build --skip-proof-steps`; use
 (on remote workers with `--remote-exec`; see
 [Building on remote workers](#building-on-remote-workers)), create an
 invocation-private project context under `.holbuild/`, and then load the
-configured targets followed by user arguments. Two kinds of argument never
+configured targets followed by user arguments. Like heap targets, these are
+built without proof steps, so no tactic timeout applies and theories built by
+`holbuild build --skip-proof-steps` are reused. Two kinds of argument never
 reach HOL this way, wherever they appear: holbuild's global options and
 `-h`/`--help`, which holbuild takes itself, and Poly/ML runtime options
 (`--gcthreads`, `--maxheap`, `-H`, ...), which holbuild's own Poly/ML runtime
@@ -957,6 +1046,10 @@ without proof execution attributes also support failed-prefix checkpoints;
 termination proofs currently replay from the preceding clean
 definition/theorem/dependency checkpoint.
 
+A failed termination proof reports its definition, proof source and termination
+goal. Once the definition succeeds, that goal is cleared so a later error in the
+theory is not attributed to the completed termination proof.
+
 `Proof[...]` attributes such as `exclude_simps` and `exclude_frags`, including
 those on `Resume`, remain active across the entire stepped proof. They retain
 leaf diagnostics, timeouts and traces. Attributed proofs save theorem-context state
@@ -966,17 +1059,52 @@ save or restore failed-prefix checkpoints.
 Theories in dependency packages build without proof-step instrumentation or checkpoints
 by default. To audit their proofs too, select `--proof-scope=all`.
 
+Ordinary timed builds record steps taking more than half their step limit in
+`build.log`, without enabling tracing or changing theory action keys or cached
+outputs. To list the recorded steps, slowest first, give the collector the logs
+from the execution:
+
+```sh
+python3 tools/slow-proof-steps.py .holbuild/logs/current/mypackage/MyTheory/build.log
+```
+
+For a remote build, save its finished batch status and collect its original
+worker logs from the cache. Repeat `--batch` for a build that submitted several
+batches or for retries whose successful branches you want to combine:
+
+```sh
+curl --fail https://exec.example.org/v1/batches/BATCH_ID > batch.json
+python3 tools/slow-proof-steps.py --batch batch.json --cache-url https://cache.example.org
+```
+
+Use curl's `--config` for authenticated batch requests; the collector takes
+`--curl-config` for authenticated cache requests. The table gives the theory
+(with its input key in batch mode), theorem, display step index, kind, status,
+elapsed milliseconds, limit and tactic label. Indices are zero-based and match
+the failure diagnostic's display index. An atomic proof without a step index
+says `unknown`. The measured invocation includes tactic argument evaluation and
+any half-budget retry; repeated invocations of the same source step remain
+separate rows.
+
+This is a report of executed work, not a complete profile: checkpoint resumes
+omit their restored prefix, and a batch lists only actions submitted to it.
+The collector explicitly reports unavailable timings for old or untimed logs
+and for cached actions whose original log was not retained. A blob-fetch error
+names the affected theory and leaves the rest of the collection running. Such actions are
+not counted as having zero slow steps. A fully cached build may contribute no
+new timing data. Existing log files can be from an earlier invocation; pass
+only logs belonging to the execution you want, or use its saved batch records.
+
 Useful commands and options:
 
 ```sh
 holbuild execution-plan MyTheory:my_theorem
 holbuild build --tactic-timeout 10 MyTheory
 holbuild build --force=full --no-cache --proof-scope=all --tactic-timeout 5 MyTheory
-holbuild build --trace-steps --force MyTheory
+holbuild build --trace-steps MyTheory
 holbuild build --repl-on-failure MyTheory
 holbuild build --skip-proof-steps MyTheory
 holbuild build --skip-checkpoints MyTheory
-holbuild build --all-checkpoints MyTheory
 ```
 
 - `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
@@ -985,8 +1113,14 @@ holbuild build --all-checkpoints MyTheory
   select the termination proof, or `THEORY:theorem:NAME` to select only a theorem.
   Both explicit forms restrict name suggestions to the selected kind.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
-  A step that times out fails the build even inside `TRY` or an `ORELSE`
-  alternative.
+  Steps containing public `HolSmtLib` tactic names (such as `Z3_TAC`, `CVC_TAC`,
+  or `z3_tac`) are automatically untimed, including under other structure
+  qualifiers. Other work in the same step shares that exemption; separate steps
+  retain their limits.
+  A step that times out runs once more with half the timeout; if that
+  finishes, the step passes and the theory's build log says so
+  (`holbuild tactic timeout retry passed: ...`). Otherwise it fails the build,
+  even inside `TRY` or an `ORELSE` alternative.
 - `--proof-scope root|all` (also `--proof-scope=root|all`) selects which
   theories receive proof instrumentation and the invocation's timeout. `root`
   is the default. `all` includes dependency theories in the selected build
@@ -996,7 +1130,9 @@ holbuild build --all-checkpoints MyTheory
   up-to-date and cache-restored actions are not checked. Scope and timeout
   do not change action keys; existing timeout compatibility checks still apply
   when reusing outputs. `all` conflicts with `--skip-proof-steps`.
-- `--trace-steps` records proof-step traces in child logs.
+- `--trace-steps` executes and records proof-step traces for theories covered by
+  the selected proof scope, including up-to-date theories. It skips checkpoint
+  replay so their trace covers every proof step.
 - `--repl-on-failure` starts a HOL REPL from the newest useful checkpoint after a
   theory failure. It serialises the build and is not supported with `--json`.
 - `HOLBUILD_FAILED_GOALS_LIMIT` sets the byte limit for the all-input-goals
@@ -1011,23 +1147,20 @@ holbuild build --all-checkpoints MyTheory
   remote execution, the log limit uses the worker's environment.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
-- `--all-checkpoints` saves theorem checkpoints in every theory included by
-  `--proof-scope` (root-package theories by default) that
-  the build runs. By default only the requested targets save them (the default
-  targets when none are given, or every root-package theory when there are
-  none); the other theories still save their `deps_loaded` checkpoint and run
-  with proof steps and step timeouts, so a cold build writes far fewer `.save`
-  files. An edit to such a theory starts from its `deps_loaded` checkpoint, and
-  rebuilding it as a target (after an edit, or with `--force=theory`) saves its
-  theorem checkpoints. `--repl-on-failure` saves them everywhere. Theory outputs and
-  cache keys are the same either way. Under `--remote-exec`, the action specs
-  carry the choice to the workers.
+- Theorem, declaration and failed-prefix checkpoints are saved in every theory
+  included by `--proof-scope` (root-package theories by default), except one
+  that a local parallel build pipelines (below) because it isn't a requested
+  target. `--all-checkpoints` keeps every such theory unpipelined, so all of
+  them save checkpoints. Checkpoint policy does not change theory outputs or
+  cache keys. Remote action specs carry this policy to the workers.
 
 A theory's `deps_loaded` checkpoint, its dependencies loaded into the
 toolchain's base state, is also kept once per host in
 `$HOLBUILD_CACHE/checkpoint-store/`, keyed by the dependencies' input keys
 and their theories' `.dat` and generated `.sml` files, the theory's loads (by path relative to the project), the toolchain and the
-holbuild runtime. The project's directory isn't part of the key, so every
+holbuild runtime sources compiled into the heap (not those the theory's script
+loads after it, so a release that changes only those keeps every stored heap).
+The project's directory isn't part of the key, so every
 worktree or copy of a project that uses the cache (not with `--no-cache`,
 nor for a theory with `cache = false`) shares one heap per
 dependency set: a theory with no valid `deps_loaded` hard-links the stored
@@ -1071,15 +1204,82 @@ Removed legacy interfaces:
 - `--goalfrag`
 - `--goalfrag-plan`
 
+### Pipelined builds
+
+A theory's children need its declarations, not its proofs. So when a local
+build with `-j` greater than 1 would otherwise leave a job slot idle, a cold
+theory builds *pipelined*:
+
+1. Its HOL process runs the script with each `Theorem ... Proof ... QED` proof
+   deferred, and exports the theory. That export is the theory's *outline*.
+2. The theory's cold children start at once, loading the outline in place of
+   the finished theory.
+3. Meanwhile the deferred proofs run on up to 4 threads (at most `-j`;
+   `HOLBUILD_PROOF_THREADS` overrides), each in the context its goal was
+   stated in. The theory's data is then written with their dependencies and
+   oracles.
+
+Once the theory has built, a *gate* checks that its outline matches the
+real export: the same digest, theorem numbering, and save and tag indices.
+A child built on the outline is committed only after every outline it loaded
+has passed its gate. A committed theory's outputs are those of a plain build
+on its real parents, and they go to the local and remote caches as a plain
+build's do. One difference: a proof that runs after the export can record
+other dependencies than it would in place (metis's search depends on a
+global variable counter), so a theory's data can differ from a plain build's
+in the dependencies of its theorems, though not in what its digest covers.
+Any failure costs only time. A deferred proof that fails, leaves
+an extra hypothesis, changes the theory, or writes theory data makes the
+theory build again with its proofs in place. "Changes the theory" means a
+theory change HOL reports (a new constant, type or saved theorem) or a write
+to theory data of a type holbuild knows. A proof that changes some other ML
+state that a later declaration reads isn't caught, since the declaration
+already ran with the state as it was: a tactic that writes a `ref`, directly or
+through a helper, still runs deferred (Poly has no write barrier, and a
+helper's writes can't be seen), and the theory is built as if that were fine.
+A script that relies on this must build with `HOLBUILD_PIPELINE=off`, or not
+use the pattern. Likewise, until the script ends a deferred theorem's ML value
+is the stub, so top-level code that reads `Thm.tag` of its own theorem and
+branches without failing (prints, or saves a theorem conditionally, rather than
+raising) sees the `holbuild_deferred_<k>` oracle and marker dependency in the
+tag, and what it outputs goes to the caches under the ordinary key. A failed
+gate drops everything that loaded the outline. Either way the theory's input key is remembered
+in `.holbuild/plan/outline-skip`, and that input is never pipelined again.
+
+Proofs that use `cheat` or `suspend`, theorems the script `Resume`s, and
+`Resume` blocks whose header names `smlname` (the stub would give the name a
+theorem with the subgoal's assumptions as hypotheses) run in place; a label
+that only contains the word `smlname` is run in place too. A theory is not pipelined if it saves checkpoints and is a
+requested target or the build passes `--all-checkpoints`, if it declares
+extra outputs, or under `--trace-steps`, `--repl-on-failure`, a tracing
+kernel or an execution plan.
+
+A theory that would cut off early (its own inputs unchanged and its
+dependencies' outputs as at its last build) runs no HOL, so it isn't
+pipelined: not once its dependencies have built, and not while the outlines it
+would load export what those theories' outputs on disk do. If such a
+dependency's gate then fails, the theory builds once that dependency has.
+
+A pipelined theory saves no checkpoints, not even `deps_loaded`, so the first
+rebuild after editing it reloads its ancestors. Remote-exec workers never
+pipeline. `HOLBUILD_PIPELINE=off` turns pipelining off. Tools that read
+theorems' dependency lists (holyhammer's exports, say) and need a plain
+build's should rebuild with `HOLBUILD_PIPELINE=off holbuild build
+--force=full --no-cache`: a pipelined theory's data has the same input key
+as a plain build's, so it is reused from the local build and the caches.
+`HOLBUILD_CACHE_TRACE=1` prints a `pipeline:` line for each step and a
+summary of failures.
+
 ## Caches and cleanup
 
 Important paths:
 
 ```text
-.holbuild/src/<package>               # dependency source checkouts
+.holbuild/src/<package>               # dependency source checkouts (links into git/checkouts)
 .holbuild/packages/<package>          # package build artefacts
 .holbuild/plan/<fingerprint>          # plan records
 $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
+$HOLBUILD_CACHE/git/checkouts/        # read-only dependency source checkouts
 $HOLBUILD_CACHE/analysis/             # sources' dependency analyses
 ```
 
@@ -1091,20 +1291,47 @@ the analyser is built against, so another checkout of the same sources on the
 machine reads it instead of analysing again, and a different HOL pin never
 uses it.
 
+An analyser failure reports its exit status or signal and stderr. On systems
+with cgroup v2, it also reports available `memory.events` counters before and
+after the attempt. These counters cover a shared group; they do not identify
+the analyser as an OOM victim or establish why it was killed. Outside the
+action sandbox, SIGKILL or exit status 137 retries at most twice, after 100 ms
+and 200 ms, with fresh temporary files. Caller cancellation, other failures
+and sandboxed calls do not retry. Exit status 137 is compatible with a shell
+reporting SIGKILL, but can also be an explicit program exit.
+
+### Keeping a tool's files between builds
+
+A tool run from theory scripts (a proof search with an index of the
+ancestry's theorems, say) can keep files from one build to the next in a
+tool cache. `holbuild build --tool-cache NAME` gives each theory's HOL
+processes the environment variable `HOLBUILD_TOOL_CACHE_DIR`, naming a
+directory the tool may read and write. NAME is letters, digits, `.`, `_` and
+`-`. Locally the directory is `$HOLBUILD_CACHE/tool-cache/NAME`, shared by
+every build that names it and never cleaned by holbuild. A theory built on a
+remote worker (`--remote-exec`) gets a directory filled from the remote cache
+and saved back to it after the build, keyed by the theory's dependencies and
+toolchain (see "Running one theory action as a remote worker"). The flag
+doesn't change a theory's cache key: a theory built or cached without it is
+reused as is.
+
 ### The plan record
 
 Planning a build discovers every source, analyses its dependencies and
 computes every action key. After it plans, holbuild writes what it found to
 a plan record in `.holbuild/plan/`, and the next build with the same
-non-file inputs (holbuild version, working directory, command line,
+non-file inputs (holbuild version, working directory, command line, requested targets,
 `HOLBUILD_*` environment, manifests and `.holconfig.toml`, package roots)
 starts from it: it checks each recorded file and directory with `stat`,
 hashes again only the files whose size, modification time, change time or
 inode moved (and any recorded within a second of its last change), analyses
 again the sources whose content changed, and recomputes the keys of those
-nodes and everything that depends on them. A source or directory added,
-removed, renamed or made readable, or a changed dependency, sends the build
-back to full planning, except inside HOL and the git dependencies holbuild
+nodes and everything that depends on them. When a changed source's
+dependencies changed too (it mentions a module it didn't before, or no
+longer does), it plans again over the recorded sources, analysing only
+what it hasn't analysed before. A source or directory added, removed,
+renamed or made readable sends the build back to full planning, except
+inside HOL and the git dependencies holbuild
 checked out at their pinned revision: there only the files planning read are
 checked, so edits to their content are still caught, but a change made by
 hand to such a checkout's directories (an added source or `holproject.toml`,
@@ -1114,9 +1341,14 @@ no record is kept; `--watch` always plans in full. With theories that write
 SML sources, the record keeps the plan made once they are up to date, with
 the sources they wrote, and a later build uses it only while every such
 theory is still up to date and its sources are unchanged; then it builds
-without running those theories first or planning again. The four newest records are kept.
+without running those theories first or planning again. A build of other
+targets with no record of its own starts from the newest record of the same
+other inputs whose plan holds all its targets: after the same checks, it
+plans again over that record's sources from the new targets and writes the
+result as its own record. The four newest records are kept.
 
-`--verbose` prints which way a build planned and why, and the timing log has
+`--verbose` prints which way a build planned and why (`sliced from other
+targets' plan` for a build that started from another targets' record), and the timing log has
 a `plan.record` phase. `HOLBUILD_PLAN_RECORD=off` turns the record off;
 `HOLBUILD_PLAN_RECORD=check` plans in full as well, and fails the build if
 the two plans differ in any source, dependency edge, fact or key.
@@ -1133,10 +1365,12 @@ entries or HOL toolchains that earlier releases wrote: its first build of a
 project builds the toolchain and every theory again (or restores what other
 0.13.0 builds have published), and is never served an old entry. `holbuild gc`
 removes the old entries once they age out. Two uses of SHA-1 remain. A
-theory's `.dat` names each parent by the SHA-1 of the parent's `.dat` (HOL's
-format), and holbuild checks those names. Git dependency mirrors under the
-cache's `git/remotes/` keep their SHA-1-of-URL names, so existing mirrors
-stay in use.
+theory's `.dat` names each parent by a SHA-1 (HOL's format): the hash in the
+parent's `Theory.sml`, which holbuild's exporter takes over the parent's data
+without its proof-dependent parts, so a proof-only edit of the parent keeps
+it (see `DESIGN.md`, early cutoff); holbuild checks those names. Git
+dependency mirrors under the cache's `git/remotes/` keep their SHA-1-of-URL
+names, so existing mirrors stay in use.
 
 Completed theory artifacts are reused only when their recorded proof timeout
 satisfies the requested timeout. `--allow-cache-timeout-discrepancy` waives that
@@ -1165,15 +1399,42 @@ the HTTP request retains its full URL. Every client and worker must use the same
 and node set; different public/private hostnames give different rankings.
 
 For each `/ac/<digest>` or `/cas/<digest>` request, nodes rank by descending
-SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie). Only the first two
-nodes are tried. Reads try the second node after a 404, connection failure,
-timeout, 429 or 5xx; writes do so after a connection failure, timeout, 429 or
-5xx. A single-node list keeps the ordinary single-cache behavior. A successful
+SHA256 of `node identity + ":" + digest` (ascending identity breaks a tie).
+`HOLBUILD_REMOTE_CACHE_PREFERRED_URLS`, a comma-separated list of ring nodes,
+moves those nodes to the front, each group keeping that order: a client in
+one data center can name the replicas there, so it writes to them and reads
+from them first. Reads try the next node after a connection failure, timeout,
+429 or 5xx, and end at the first 404: every node serves what the shared
+backing store holds, so a miss costs one request, and only an entry another
+node took moments ago (a node writes a new entry to the backing store shortly
+after answering the PUT) is missed, which the build then makes again. Reads of
+an entry that must exist go through the whole ring instead: a remote worker's
+action inputs and spec, the outputs and logs a remote batch reported finished,
+and the read-back after a write, which may have gone to a later node. After two
+nodes answer 404, such a read asks the rest of the ring at once with HEAD (on
+up to 16 helper threads per process) and then reads the body only from a node
+that has the entry. Writes try the second node after a connection failure,
+timeout, 429 or 5xx. A theory's `/ac` read also tries the next node when the
+first one's entry was built under a weaker tactic-timeout contract than the
+build asks for, and then goes through the whole ring looking for a stronger
+one. When publishing or confirming an
+existing timed theory, workers also strengthen older compatible manifests on
+reachable replicas, so a reader with a narrower cache view can restore the
+result. This repair preserves stronger contracts, does not create missing
+replicas, and never changes manifests whose outputs differ. Secondary repair
+failures warn without failing successful primary publication; timeout checks
+still apply on every restore. A write whose nodes all failed without an HTTP response (an unresolvable
+name, no connection, a timeout) goes on down the ranking until a node answers,
+so one more healthy node takes it. A single-node list keeps the ordinary single-cache behavior. A successful
 backup keeps the ring available; the circuit breaker below counts the final
-outcome of a request. If neither node hits, a 404 from either node gives a miss, even if the
-other node failed transiently; this allows a new action to build and publish
-on the healthy node. Two transient failures remain unavailable. Replicas should share a backing store: the second
-node covers handoff while a newly added node cannot yet see a recent upload.
+outcome of a request. If no node hits, a 404 from any node gives a miss, even if
+others failed transiently; this allows a new action to build and publish on a
+healthy node. Transient failures from every node remain unavailable. Reads of an
+entry that must exist (above, and the coordinator checking that a finished
+parent is still cached) are the exception: a 404 beside a transient failure is
+unavailable, since the failed node may hold the entry. Replicas should share a
+backing store, so that any node can serve an entry another node wrote once it
+is uploaded.
 
 Remote cache misses or errors fall back to the local cache/source build path.
 A request waits at most 5 s for its connection. After three requests in a row
@@ -1209,19 +1470,28 @@ The remote endpoint stores content blobs under `/cas/<sha256>` and holbuild
 cache metadata under `/ac/<sha256>`; a blob's CAS digest is the same one
 holbuild uses locally. CAS transfers use zstd compression when
 supported by the server; action metadata stays small and is sent uncompressed.
+A blob fetched by digest alone (a remote worker's spec, sources and checkpoint
+chain) is downloaded still zstd-encoded and decoded on 4 threads through
+libzstd (`libzstd.so.1`; Homebrew's on macOS) when the body is a series of
+frames that each give their content size, as bazel-remote's zstd storage serves
+it; otherwise, or without libzstd, libcurl decodes it as for other transfers.
 This is a live accelerator, not remote execution and not an immutable release
 registry. Remote cache contents are trusted build inputs: cache hits can load
 Poly/ML objects, and restored toolchains execute cached binaries. Use an
 authenticated HTTPS endpoint with trusted writers. Content hashes detect
 corruption but do not authenticate the cache publisher.
 
-holbuild talks to the remote cache through libcurl (7.66 or later, with an
+holbuild talks to the remote cache through libcurl (7.68 or later, with an
 asynchronous DNS resolver), loaded at run time: `libcurl.so.4` on Linux, the
 system `/usr/lib/libcurl.4.dylib` on macOS. If it can't be loaded or lacks
 those, holbuild says why once and runs the `curl` command for each request
 instead, as it did before it used libcurl. As with the curl command,
 `CURL_CA_BUNDLE`, `SSL_CERT_FILE` and `SSL_CERT_DIR` select the CA certificates
-that HTTPS connections trust.
+that HTTPS connections trust. With libcurl 7.87 or later, holbuild drops
+libcurl's built-in default CA directory (not one `SSL_CERT_DIR` names), so that
+libcurl parses the CA bundle once per process instead of on every new
+connection; if a server's certificate then fails to verify, holbuild goes
+back to libcurl's default for the rest of the run and retries the request.
 
 For private caches, put credentials in local/CI configuration, not in
 the project manifest. CLI `--remote-cache` overrides `HOLBUILD_REMOTE_CACHE_URL`,
@@ -1251,7 +1521,7 @@ file form for CI and shared machines. holbuild redacts URL userinfo in its own
 remote-cache diagnostics, but it cannot hide secrets from the operating system if
 they are passed as command-line arguments.
 
-Portable build-output archives use the same cache representation:
+Portable build-output archives (`.hbx`) use the same cache representation:
 
 ```sh
 holbuild build MyTheory
@@ -1259,13 +1529,43 @@ holbuild export -o my-build.hbx MyTheory
 holbuild --cache-dir /path/to/other/cache import my-build.hbx
 ```
 
-`export` includes the selected target closure by default and does not run a
-build unless `--build` is passed. The archive stores a global deduplicated blob
-area plus `project/` and `deps/<package>/` package views for the exported action
-manifests. `import` hydrates the global cache; a later `holbuild build MyTheory`
-materialises outputs through the normal cache-restore path. Import HBX archives
-only from trusted publishers because those cached build outputs may later be
-loaded by Poly/ML.
+`export` writes the root package as a capsule, an archive of two parts. The
+package part (`holbuild-package/`) is the package's source snapshot: its
+manifest, the sources its manifest discovers (with the committed manifest's own
+`exclude` and `exclude_globs`), the extra inputs, `holbuild_extra_deps`
+files, generator inputs and shim manifests that it declares. It never holds
+`.git`, `.holbuild`, `.holconfig.toml` or generator outputs, so its bytes do
+not depend on the publisher's checkout, local configuration, or whether
+generators have run. A symlink in the snapshot, a declared file that is
+missing, or a declared path outside the package root fails the export. Beside
+the files, `holbuild-package/manifest` (`holbuild-hbx-capsule-v1`) names the
+package, its version if declared, the `toolchain_key` of the toolchain that
+exported it and the holbuild version. Dependencies are not stored beside the
+snapshot: they are the declarations in the snapshot's `holproject.toml`. The
+snapshot holds the files as committed, `holproject.toml` included, so a
+dependency URL in it must not carry credentials.
+
+The cache part (`holbuild-cache/`, format `holbuild-hbx-v2`) holds the cached
+build outputs of the root package's theories among the selected targets. Targets
+in other packages are left out, not an error, and an unbuilt dependency theory
+does not fail the export. It stores a global deduplicated blob area plus
+`project/` package views of the exported action manifests. `export` does not run
+a build unless `--build` is passed.
+
+- `--closure` writes the cache part of the whole selected target closure,
+  dependencies included (`deps/<package>/` views), and no package part.
+- `--sources-only` writes the package part alone. It takes no targets and builds
+  no theories.
+
+`import` hydrates the global cache from the cache part (a capsule without one
+imports no actions, which is not an error). It never unpacks the source
+snapshot. Before unpacking anything it lists the archive and refuses one that
+holds a member other than a regular file or directory (a symbolic or hard link,
+a device, a FIFO), a `..` component or an absolute path, naming the member. A
+later `holbuild build MyTheory` materialises outputs
+through the normal cache-restore path, offline too, when every needed output is
+in the archive (use `--closure` for that). Import HBX archives only from trusted
+publishers because those cached build outputs may later be loaded by Poly/ML.
 
 Use `holbuild export --metadata-out MyTheory.hbx.json` to write a registry
 metadata sidecar for static hosting or GitHub Releases; see
@@ -1290,7 +1590,9 @@ holbuild --remote-cache https://cache.example.org action-spec --upload MyTheory
 
 Each spec is written to `.holbuild/action-specs/<sha256>`, named by its
 SHA-256. With `--upload`, the specs and every source file they name are also
-uploaded to the remote cache's `/cas/`. The command prints the batch, the
+uploaded to the remote cache's `/cas/`. `build --remote-exec` writes and uploads
+the same specs, then removes its local copies, since workers fetch them from
+the remote cache. The command prints the batch, the
 uncached theories with the uncached theories each waits for:
 
 ```text
@@ -1306,9 +1608,8 @@ holbuild stores a theory's entry. An edge names the nearest uncached theories
 a theory depends on, looking through libraries and cached theories.
 
 `action-spec` refuses a closure containing a theory that can't run remotely,
-and says which and why: one with `cache = false` or `always_reexecute`, a
-forced one (`--force`), one whose script or extra input lies outside its
-package root, one that loads a HOL theory or library by path, one with a path
+and says which and why: one with `cache = false` or `always_reexecute`,
+one whose script or extra input lies outside its package root, one that loads a HOL theory or library by path, one with a path
 containing whitespace, and any theory with `--trknl`. Such a closure builds
 locally.
 
@@ -1328,6 +1629,7 @@ file input <relpath> <sha256> <size>
 file library <relpath> <sha256> <size>
 dep theory <package>:<logical> <stem> <input_key>
 lib <package>:<logical> <stem> <suffix> <load>...
+order <package>:<logical> <tier> <package-or-.> <dir-or-.>
 load theory|library|object <name-or-stem>
 output sig|sml|dat <relpath>
 output extra <declaration>
@@ -1335,6 +1637,9 @@ option proof-steps=<bool>
 option tactic-timeout=<seconds|none>
 option new-ir=<bool>
 option theorem-checkpoints=false   (only for a theory that saves none)
+option skip-checkpoints=true      (when checkpoint reuse is disabled)
+option force=true                 (only for a forced theory)
+option trace-steps=true            (only for a traced theory)
 action-text
 <the action text, verbatim to the end of the blob>
 ```
@@ -1353,11 +1658,20 @@ action-text
   `.holbuild/action-src/<package>/`.
 - `dep theory` lines list every theory the target depends on, directly or not,
   with the object stem its outputs restore to.
+- `order` lines give each `dep theory` and `lib` target's load-order key (see
+  "Artifacts and local materialization" in DESIGN.md); a worker sorts the `.uo`
+  manifests it writes for restored theories by them. `.` stands for an empty
+  package or directory. `load` lines and a `lib` line's loads are already in
+  that order.
 - `deps-key` identifies the target's dependency context with the toolchain's
   semantic identity, for naming a saved dependency heap.
 - The `option` lines are how the theory is run, which the action key leaves
   out; the entry built under them carries the timeout contract the exporting
-  build will ask for.
+  build will ask for. Optional `force`, `trace-steps` and `skip-checkpoints`
+  default to false. `force` or `trace-steps` disables whole-action cache reuse
+  and early cutoff on the worker; `trace-steps` also enables proof-step tracing
+  and requires `proof-steps=true`. `skip-checkpoints` disables checkpoint reuse
+  and saving, including shared heaps.
 
 ### Exporting script runs for remote execution
 
@@ -1384,25 +1698,28 @@ those the `--load` libraries need from the remote cache, so each must be
 there or in the local cache for its current inputs, from where it is
 published to the remote cache first. A target with one in neither is
 refused with `build it first`, the others are still exported, and the
-command exits 1. A fetched run's directory holds `KEY` and `CONTEXT`, so
+command exits 1. A fetched run's directory holds `KEY`, `CONTEXT` and `LOG`, so
 those aren't output names. `--support` files must lie under the
 script's directory and are named by their given path relative to it, without
 resolving symbolic links. `--load` names a library: one
 in the toolchain's `sigobj`, or a source the project plans (including the
-implicit `hol` package's libraries). The command takes `build`'s cache and
-proof options and prints one line per exported target:
+implicit `hol` package's libraries). The command takes `build`'s cache
+options, reuses timed and untimed contexts without checking proof-step
+timing, and prints one line per exported target:
 
 ```text
 <context> <run_key> <spec-sha256>
 ```
 
 The spec is written to `.holbuild/run-specs/<spec-sha256>` and uploaded to
-`/cas/` with every file it names. The run key is the SHA-256 of the run text:
+`/cas/` with every file it names. `run-action --remote-exec` writes and uploads
+the same specs, then removes its local copies. The run key is the SHA-256 of the run text:
 
 ```text
 holbuild-run-v1
 toolchain=<semantic toolchain key>
 context=<package>:<logical>@<input_key>   (or context=HOL:<logical>)
+context-input-layout=package-v1          (only contexts declaring extra inputs)
 script=<sha256>
 support=<relpath>@<sha256>                  (sorted)
 load=<package>:<logical>@<input_key>        (a project library; in order)
@@ -1412,7 +1729,9 @@ output=<name>                               (sorted)
 
 The toolchain key fixes HOL's own theories and libraries, so they carry no
 key of their own. Options such as the timeout stay out of the key: a longer
-timeout doesn't make a new run. A run's result is stored, like a theory's,
+timeout doesn't make a new run. The input-layout marker distinguishes runs
+with staged declared inputs from earlier runs that could not read those files.
+Input-free and HOL context run keys are unchanged. A run's result is stored, like a theory's,
 under `ac-key = sha256("holbuild-remote-ac-v1\n" ^ run_key ^ "\n")`.
 
 A run spec names no path on the exporting machine:
@@ -1427,8 +1746,10 @@ context <package>:<logical> <stem> <input_key>   (or context HOL:<logical>)
 file library <relpath> <sha256> <size>
 dep theory <package>:<logical> <stem> <input_key>
 lib <package>:<logical> <stem> <suffix> <load>...
+order <package>:<logical> <tier> <package-or-.> <dir-or-.>
 load theory|library|object <name-or-stem>
 file context-script <relpath> <sha256> <size>
+file input <relpath> <sha256> <size>
 script <sha256> <size>
 file support <relpath> <sha256> <size>
 run-load <package>:<logical>|HOLLIB:<name>
@@ -1442,11 +1763,19 @@ run-text
   and `load` lines are the context theory's ActionSpec lines, followed by the
   `file library`, `lib` and `dep theory` lines of what the `--load` libraries
   need beyond them. A HOL context has only the latter.
-- `context` names the theory to restore, as a `dep theory` line does.
+- `context` names the theory to restore, as a `dep theory` line does, and
+  an `order` line gives its load-order key.
 - `file context-script` lines are the scripts of the context theory and of
   every theory it depends on, under `.holbuild/action-src/<package>/`, for
   scripts that read their ancestry's sources. For a project context the
   first is the context theory's own.
+- `file input` lines carry the context theory's declared runtime files
+  (`holbuild_extra_deps` and manifest `extra_inputs`) under that same
+  package-relative source tree. A script replaying the context can run from
+  the directory of `HOLBUILD_RUN_SOURCE` so source-relative reads resolve.
+  Ancestors are restored as objects; their runtime inputs are not inherited.
+  Undeclared files are not copied, and inputs outside the package are refused.
+  These contents already contribute to the context input key and run key.
 - `run-load` lines are the libraries to load, in order: a project library by
   its `lib` line's name, a toolchain library as `HOLLIB:<name>`.
 - `output` lines are the file names the script must write.
@@ -1463,10 +1792,15 @@ HOLBUILD_CACHE=/var/cache/holbuild holbuild --remote-cache https://cache.example
   exec-action SPEC-SHA256 --result result.txt --cache-limit-gb 200 [--share-heaps]
 ```
 
-It runs in `<cache root>/action`, which it locks and empties before and after
-each action, and, without `--share-heaps` (below), keeps the theory's
-dependency heap and checkpoints in `<cache root>/checkpoints`, so a later run
-of an edited theory resumes from them as a local build does. A saved heap records the absolute paths it was
+It runs in `<cache root>/action`, which it locks. The dependencies it
+restores there stay for the next action, which keeps those it names again and
+removes the rest; HOL may read them but writes only the action's stage, logs,
+tool cache and load-ahead markers, which are emptied before and after each
+action. Without its records (`<cache root>/action-resident`), as after a
+worker stopped part way, or a release that keeps no records ran there, and
+before every script run, the action root is emptied first. Dependency heaps and checkpoints in `<cache root>/checkpoints`
+are private to the action and are also emptied before and after it; reuse
+across worker actions requires `--share-heaps` (below). A saved heap records the absolute paths it was
 built at, so every worker should use the same cache root. One `exec-action`
 runs per cache root at a time; a second waits for the first. The cache root
 is the worker's own: other holbuild commands shouldn't share it, since the
@@ -1482,23 +1816,82 @@ once), restores every dependency through the normal cache restore and its
 checks, and reports `cached` if the theory's own entry already restores, or
 if an earlier build of the same action text on byte-identical dependency
 outputs left one, which it then publishes under the action's input key (early
-cutoff, DESIGN.md). Otherwise it builds the theory as a local build would,
+cutoff, DESIGN.md). Forced and traced actions bypass both reuse checks.
+Otherwise it builds the theory as a local build would,
 with the spec's proof options, publishes it to the remote cache (a local
 build would publish it at once; the worker waits for the checks below), and
 checks that the remote cache then holds an entry for it whose outputs equal
 the build's. An entry there with other outputs is replaced only when it records parents other than the restored
 ones, each restored from an entry with the remote cache's outputs, since no
 build against them can use it. The worker's local copy of an entry goes out
-of date when the remote cache's entry changes, so when a restored dependency
-doesn't match its parents, or the theory was built against local copies of
-its parents that differ from the remote cache's, the worker drops those
-copies, for the action's retry to restore the remote cache's; such a build
-is not published but fails as a `publish` failure. A missing dependency
-fails the action; the worker never builds one. When the remote cache gives
-no answer, answers 429 or 5xx, or is in its 60-second cooldown after
-requests got no response, whatever the worker was fetching or publishing,
-the action fails as `unavailable` rather than reading that as a miss or a
-conflict: the cache failed, not the action.
+of date when the remote cache's entry changes. So before it checks for the
+theory's own entry, the worker replaces its copies that differ from the
+remote cache's entries with those: the copies of the theories the build
+loads directly or through project libraries, and, when a restored
+dependency doesn't match its parents, all of them. It does the same for the
+theory's own entry when that doesn't match the restored parents. A theory
+still built against local copies of its parents that differ from the remote
+cache's (an entry replaced during the build) is not published but fails as a
+`publish` failure, and the worker drops those copies for the action's retry.
+A missing dependency fails the action; the worker never builds one. When the
+remote cache gives no answer, answers 429 or 5xx, or is in its 60-second
+cooldown after requests got no response, whatever the worker was fetching or
+publishing, the action fails as `unavailable` rather than reading that as a
+miss or a conflict: the cache failed, not the action.
+
+A theory exported with `--tool-cache NAME` (see "Keeping a tool's files
+between builds" below) gets a tool cache: before HOL starts, the worker
+fills `.holbuild/tool-cache/NAME` under the action root from the remote
+cache's entry for the key
+
+```text
+sha256("holbuild-tool-cache-v1\nname=" ^ NAME ^ "\ndeps_key=" ^ <deps_key> ^ "\ntoolchain=" ^ <toolchain key>)
+```
+
+and gives the theory's HOL processes that directory as
+`HOLBUILD_TOOL_CACHE_DIR`. The key leaves out the theory's own source, so
+every theory with the same dependencies and toolchain shares the entry, on
+any worker. The worker keeps the entry's files in its host store
+(`<cache root>/checkpoint-store`), so it fetches each from the remote cache
+once. After HOL exits, built or failed, the worker publishes the directory
+again if its files changed: at most 16 regular files, 64 MiB in all, with
+names of letters, digits, `.`, `_` and `-`. An entry that can't be restored,
+or a directory that breaks these limits, only warns: the action goes on
+without the tool cache. The newest publication replaces the
+entry, so a tool should write each file whole (to a temporary name, then
+renamed) and treat the directory as a cache it may find empty.
+
+With `--ahead-parent INPUT_KEY:SPEC-SHA256`, given once per dependency that
+another worker is still building from that spec (a late parent), the worker
+loads ahead of those parents rather than waiting to be claimed after them. It
+restores the other dependencies and starts HOL at once. In each late parent's
+place, HOL loads a stand-in manifest that names what the parent's manifest
+will name, predicted from its spec, then waits. The worker polls the remote
+cache every 2 seconds. It restores each parent's entry outside the directories
+HOL may write, checks it against the parents it records, and moves it into
+place. HOL then checks the stand-in: loading the parent's real manifest from
+where HOL stood must load exactly the files the stand-in loaded. Once every
+parent has arrived, the worker takes a plain run's reuse checks: the theory's
+own entry, an earlier build on the same dependency outputs, or with
+`--share-heaps` a shared dependency heap. If one applies, it stops HOL and
+runs as without the option. Otherwise the parents' real manifests replace
+the stand-ins, so a parent the script loads itself is the real one, and HOL
+goes on to build the theory; everything after is as in a plain run. A forced or traced action, or one
+whose late parents are all in the remote cache by the time it starts, runs
+as without the option. The action fails as `ahead-abandoned` (exit status 3)
+when it can't go on as a plain run would:
+* its own entry is in the remote cache already;
+* a late parent's spec or source, which only the prediction reads, isn't in
+  the remote cache;
+* a stand-in doesn't match;
+* a restored dependency was built on another build of a late parent;
+* HOL stops early;
+* the parents don't all arrive within `--ahead-wait-seconds` (default 14400, counted from the start of the run).
+A retry without the option builds it. The result's `phase-ms` adds
+`aheadwait`, the time HOL spent waiting: at each stand-in from its wait to
+that parent's arrival, and at the end of the preload until every parent has
+arrived and the script is written; and `aheadload`, the rest of the time
+from HOL's start to then.
 
 A run spec (`holbuild-run-spec-v1`, see "Exporting script runs for remote
 execution") is checked the same way, its run text against its `run-key`,
@@ -1555,23 +1948,41 @@ input-key=<input_key>
 status=built|cached|failed
 failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal|unavailable
 missing=theory <input_key> | blob <sha256>
+detail=<message>
 peak-rss-mb=<n>
 wall-ms=<n>
 phase-ms=<phase>:<n>,...
 log=<sha256> <size>
 ```
 
-`failure` appears on failure, and `missing` with `input-missing`.
+`failure` appears on failure, and `missing` with `input-missing`. A failure
+with no `log` (a spec rejected before any HOL ran, say) gives its message in
+`detail`, on one line of printable ASCII of at most 500 characters.
 For a run, `input-key` is its run key and `built` means it ran.
 `phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
 cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
-dependencies), `cutoff` (whether an earlier build stands), `restore` (shared
-checkpoints), `hol`, `publish` (shared checkpoints), `check` (the
-publication checks) and `log`; stderr ends with the same times and `wall`.
-`peak-rss-mb` is the HOL process's peak resident memory on a successful build.
+dependencies; its steps follow it, and are part of it: `hydfiles` the
+sources and libraries, `hyddeps` restoring the dependencies, `hydcheck`
+checking the dependencies already in the action root (with loading and
+saving the record of their cache manifests' stats), `hydinst` removing and
+installing the ones that fail the check, `hydstale` probing the remote cache
+for stale dependency copies, `hydmisfit` checking the dependencies against
+their parents; two of them are counts, not times: `hydstatn` the cache
+manifests trusted on their recorded stat, `hydinstn` the dependencies the
+check sent to `hydinst`), `cutoff` (whether an earlier build stands), `analyse`
+(the script's proof steps and checkpoints), `restore` (shared
+checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
+checkpoints), `toolpublish` (the tool cache), `check` (the publication
+checks) and `log`; stderr ends with the same times and `wall`.
+`peak-rss-mb` is the HOL process's peak resident memory, reported once the
+theory has been exported.
 `log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
 of heap or the container's cgroup `memory.events` counted an OOM kill during
-the run; `disk` means the disk filled. The exit status summarizes the record:
+a failed run, whether the OOM killer took the HOL process or a process it
+started (a nested HOL whose failure it caught, say); `disk` means the disk
+filled. When the HOL process dies by a signal or the OOM killer's count
+rose, the log's last lines say which, and the largest resident set of any
+child process of the action so far. The exit status summarizes the record:
 
 | Exit | Meaning |
 |---|---|
@@ -1588,6 +1999,20 @@ GB minus a reserve for the action itself (`--cache-reserve-gb`, by default a
 tenth of `N`). A theory's checkpoints go together, a toolchain goes with its
 analysers, and a toolchain another holbuild process is using is kept.
 
+Workers sharing a host coordinate sweeps through `<cache root>/locks/gc.lock`;
+share `locks/` along with the cache directories. Private checkpoints and theory modules are sized
+on every action. With a positive reserve and a target of at least 64 GiB,
+shared sizes can be reused for up to 60 seconds when the last measurement plus
+current private sizes fit under the target. Smaller targets and zero-reserve
+runs are scanned live. This is a housekeeping limit: shared growth during
+that interval is accounted for at the next scan, rather than reserved on each
+write. Each cached root's device and inode must match the measurement; roots
+that differ are sized live, so partial directory sharing remains safe without
+repeatedly replacing a sibling's measurement. Eviction lists are built only
+when the measured cache exceeds its target.
+Unreferenced blobs younger than five minutes are evicted after other families,
+and are still removable if needed to reach the target.
+
 With `--share-heaps`, workers share dependency heaps and checkpoints through
 the remote cache. Before the build, the worker restores the latest checkpoint
 another worker published for the theory's source, the way a local build
@@ -1597,21 +2022,22 @@ the spec's. If there's none, it restores the dependency heap; if there's no
 heap either, it loads the dependencies cold. After the build, successful or
 not, it publishes its heap if no other worker's is, and then, when the heap
 under them is the published one, the checkpoints it saved. A heap is shared
-only between workers with the same toolchain bytes, cache root, action root
-and platform, which is why every worker should use the same cache root.
+only between workers with the same toolchain bytes, cache root, action root,
+platform and holbuild runtime sources compiled into the heap, which is why
+every worker should use the same cache root.
 
 The checkpoint tree is then the action's own, emptied before and after it;
 the host store `<cache root>/checkpoint-store` keeps the shared files, one
 directory per heap, which the cache cap and `holbuild gc` evict as a unit,
 unless an action on the host is using it. Worker containers on one host can share
 `checkpoint-store/` and `hol-toolchains/`, mounted from host directories, and
-keep the rest of the cache root to themselves. A restored Poly/ML state is
-hard-linked from the store when the store and `checkpoints/` are on one
-mount, and otherwise symbolically linked, which the action's lease on the
-heap's directory keeps valid until it exits; a bind mount counts as another
-mount even on the same filesystem. The small records beside the states are
-copied, and so are the files an action adds to the store when the store is
-on another mount, since its own tree is emptied after it.
+keep the rest of the cache root to themselves. Restored Poly/ML states are
+linked into the private checkpoint tree (symbolically, where the store is on
+another mount), and their records copied; HOL may only read the directories
+that hold a link and the store directories the links point into, so
+submitted HOL code cannot change the shared files. A restored failed proof's
+prefix, which the run replaces in place, is copied. Files published back to
+the store are also copied, after cleanup and output validation.
 
 ### Building on remote workers
 
@@ -1625,6 +2051,32 @@ upload that fails, the rest are skipped and the build falls back (below).
 Before compressing and uploading a file, it checks the CAS and skips the file
 only when the cache confirms it is already present.
 
+`build --remote-exec URL --priority N` assigns a batch scheduling priority
+between 0 and 2147483647 (default 0). Higher values are claimed before lower
+values within the same action class and worker memory tier; equal priorities
+share workers fairly. Priority does not preempt running actions or change cache
+keys. Use it for a limited number of finite builds: continuously ready higher
+priority work can delay lower priority batches. `--priority` requires
+`--remote-exec`. With `--attach`, it applies to any replacement batch needed
+for missing inputs; it does not change the batch being followed. Retain the
+same priority when reattaching; the recovery hint includes it.
+
+`build --remote-exec URL --speculative-loading[=N]` lets a theory load ahead
+of its parents. A worker with nothing ready to build at the batch's priority or
+higher (in the same tier or an earlier one) may take a theory whose
+unbuilt parents are all running on other workers, themselves at most as many
+generations ahead of built parents as the coordinator allows (by default,
+none). It loads everything else the theory needs, waits for those unbuilt
+ancestors, and then builds (`exec-action --ahead-parent`). At most N theories of
+the batch wait like this at a time (1 to 64, default 16). Only workers started
+with `--load-ahead` take such theories, and only when they have nothing ready
+of the batch's priority or higher, so the batch never adds workers for them.
+A theory whose load ahead can't go on is built normally once its parents are
+built. That covers a parent that fails, a predicted parent manifest that
+doesn't match, or a parent that is late. The option costs worker time when a
+parent fails, and changes no cache keys. Like `--priority`, it applies to
+replacement batches with `--attach`, and the recovery hint includes it.
+
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with
 `exec-action`, then restores them as an ordinary build would:
@@ -1632,6 +2084,54 @@ that aren't already built here, to a remote-execution coordinator, which runs th
 ```sh
 holbuild --remote-cache https://cache.example.org build --remote-exec https://exec.example.org MyTheory
 ```
+
+`--force`, `--force=theory`, `--force=project` and `--force=full` also run
+on the workers, including with `--remote-only`. Forced theories go into the
+batch even when their outputs are already built locally or cached remotely.
+`--force=theory` forces only the requested targets; their ancestors reuse the
+cache as usual. Valid proof checkpoints remain reusable.
+
+`--trace-steps` (also the deprecated `--goalfrag-trace`) sends every theory
+whose proof policy enables tracing to the workers even if it is cached.
+The worker executes its proof steps without theorem-checkpoint replay.
+
+Completed actions' build logs are fetched into
+`.holbuild/logs/current/<package>/<theory>/build.log`. Traced theories also
+write `proof-trace.log` there and print a trace summary and its log path.
+A forced or traced build falls back locally if its required log cannot be
+returned; with `--remote-only` it fails with status 75. It never reports
+success with an old or absent log. The client restores the
+finished outputs without forcing a second build locally. Detached builds
+return their logs when attached.
+
+Each planned build also leaves a command record in
+`.holbuild/commands/<start>-<pid>.json`. It contains the command's timestamps
+and exit status, local build/restore counts, source changes since this
+worktree's previous attempted build, and fleet batch events with worker
+timings. Source comparisons survive changes of target; newly observed
+sources are reported separately. `source_hashes_complete` reports whether the
+planner supplied every selected source hash; recording never prepares or
+generates an extra source. A changed source's affected-theory count
+includes itself and covers only the requested plan, not the full project.
+Observed worker results are retained once per action/execution start,
+independently of bare running-attempt markers. A result may first appear in
+a retry snapshot; its attempt is not inferred. Attempt markers keep coverage
+incomplete rather than claiming an exact retry history.
+`fleet_history_complete` is false whenever a remote batch or action was
+observed: polling cannot certify that no execution happened between snapshots.
+Untimed failure payloads are retained too, deduplicated by their failure fields
+without assigning an execution identity.
+These diagnostic snapshots do not participate in build or cache keys.
+
+Supervisors can set `HOLBUILD_COMMAND_RECORD` to a destination file and
+`HOLBUILD_COMMAND_RECORD_PID` to the process ID which will exec holbuild.
+The PID check keeps inherited settings from overwriting a parent's record.
+Worker phase sums overlap across actions and within nested phases; they
+are not command wall time or CPU time. Worker timestamp spans permit a
+wall-time analysis when clocks are synchronized. Deferred checkpoint
+uploads continue after the action result and are outside its client wait.
+The `rebuilt` counter describes theory-build actions only. Remote run actions
+carry execution, HOL, publication and log spans without claiming a source rebuild.
 
 It exports and uploads the batch as `action-spec --upload` does, submits it
 with `POST URL/v1/batches`, and follows `GET URL/v1/batches/<id>/events`,
@@ -1644,6 +2144,11 @@ whatever is not there yet. The coordinator's credentials go
 in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 `header = "Authorization: Bearer <token>"`, so they stay off the command line.
 
+If a local cache entry has a weaker tactic-timeout contract than requested,
+restore refreshes it from the remote cache once. This picks up a stronger
+contract published by a worker without discarding the older entry when the
+remote has no usable replacement.
+
 When the batch ends, one line says how many of its theories the remote
 workers finished, built or found cached (`holbuild: remote execution: remote
 workers finished 3 of 3 theories`), or, when the build falls back, why and
@@ -1651,7 +2156,8 @@ how many they finished.
 
 A theory built here for its current inputs (the worktree's `.holbuild/dep`
 metadata holds its current input key, under a timeout contract at least as
-strict as the one requested) needs no worker, so it isn't checked
+strict as the one requested), or with a valid entry and intact blobs in the
+local cache, needs no worker, so it isn't checked
 against the remote cache and stays out of the batch, even when the remote
 cache lacks it, as when its publish after a local build failed. The workers
 restore from the remote cache what the batch's theories depend on, so when a
@@ -1659,8 +2165,11 @@ theory in the batch depends on one, holbuild publishes its local cache entry
 there first; it goes in the batch only when it has no usable local entry or
 the publish fails. `--detach` follows no local build, so it checks and
 submits such theories like any other. What these checks and the source
-uploads find the remote cache to hold is kept in `.holbuild/remote-ledger/`,
-so a later build doesn't ask again.
+uploads find the remote cache to hold is kept in the cache root's
+`remote-ledger/`, shared by every project and worktree using that cache root,
+so a later build doesn't ask again. A build that would take it past 100000
+entries keeps only the entries it used or learned, so it grows past that only
+as far as one build's own entries.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
@@ -1677,12 +2186,18 @@ for either, the build forgets the ledger, and a batch missing a blob
 answered 5xx, as a proxy in front of the coordinator answers while it
 restarts or the coordinator itself answers while it's overloaded, or 429,
 is retried, and an event stream that breaks is reattached; either is given up on once the coordinator stays unavailable for
-about two and a half minutes (retries back off to 8 seconds apart). A
+almost six minutes (retries back off to 8 seconds apart). With
+`--remote-only` or `--detach`, which have no local build to fall back to, a
+submission that can't reach the coordinator at all is retried the same way;
+otherwise it builds locally at once. A
 reattached stream that breaks again before any action changes state counts
 as unavailable too, since it only repeats what the build already knows. When the build stops following
 a batch that may still run (the stream was given up on, or the coordinator
 won't stream it), it cancels the batch before building locally; one
-interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too. With
+interrupted (SIGINT or SIGTERM) while it follows a batch cancels it too,
+unless `HOLBUILD_KEEP_BATCH_ON_INTERRUPT=1` is set: then it leaves the batch
+running and prints how to reattach, so a caller that stops a build at a time
+limit finds what the workers finished in the remote cache next time. With
 `--remote-only` it cancels a batch the coordinator won't stream, or an
 interrupted build's, the same way but then fails instead of building locally,
 and it never builds HOL or a theory
@@ -1700,12 +2215,25 @@ only restores from the cache, and with `--detach` it fails.
 
 A batch that fails because a theory's proof failed on a worker (failure
 `proof` or `tactic-timeout`) isn't built locally, since a local build would
-fail the same way. The build restores what the cache holds, as `--remote-only`
-does, fetches the worker's build log from the remote cache into
+fail the same way. Independent theories finish first, and dependents of failed
+theories are reported as skipped. The build restores successful branches from
+the cache, as `--remote-only` does, fetches each failed worker's build log into
 `.holbuild/logs/current/<package>/<theory>/build.log`, prints the diagnostic a
 local build would, and exits with status 1, with or without `--remote-only`.
-If that log can't be fetched, the build builds just the failed theory locally,
+The logs of the theories the batch finished are fetched to the same place
+last; one that can't be fetched is skipped.
+If a log can't be fetched, the build builds just that failed theory locally,
 for its diagnostic; with `--remote-only` it fails with status 75 instead.
+The event stream reports each failure when it occurs and repeats the full list
+of failures and skips when following ends. `--fail-fast` asks the coordinator
+to stop the batch on its first final failure. Older coordinators retain their
+fail-fast behavior until upgraded; older clients can follow new coordinators
+using the existing event format, without the new client's full diagnostics.
+
+For other action failures, including `publish`, a failed batch also saves the
+worker's log at the same local path and prints its tail. If the log cannot be
+fetched, holbuild warns and preserves the batch's normal failure or fallback
+behavior. A batch being resubmitted does not fetch failure logs first.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building
@@ -1713,8 +2241,9 @@ locally. `--attach <id>` follows that batch and then builds as above. A
 `--remote-only` build that loses the event stream says how to reattach.
 
 `run` and `repl` take `--remote-exec URL` and `--remote-only` too, before the
-arguments passed to HOL, and build their `[run].loads` targets this way
-before they start HOL locally (they don't take `--detach` or `--attach`):
+arguments passed to HOL, and build their `[run].loads` targets, and any
+`--from` or inferred theory, this way (without proof steps) before they start
+HOL locally (they don't take `--detach` or `--attach`):
 
 ```sh
 holbuild --remote-cache https://cache.example.org run --remote-exec https://exec.example.org script.sml
@@ -1727,17 +2256,59 @@ The coordinator's protocol, in what holbuild uses of it:
 
 - `POST /v1/batches` with the batch text as the body answers 201 and
   `{"batch_id": "<id>"}`; any other status refuses the batch.
+  The optional query parameter `fail_fast=true` stops independent actions after
+  a final build failure. It defaults to false and does not change run batches.
 - `GET /v1/batches/<id>/events` streams one JSON object per line: an
   `{"type": "action", "input_key", "theory", "state", "last_failure",
-  "log_sha256", ...}` when an action changes, and last `{"type": "batch",
-  "state": "done"|"failed"|"cancelled", "failure"}`. A failed action's log is
-  at `/cas/<log_sha256>` in the remote cache. A stream may start over: it
+  "log_sha256", "failure_detail", ...}` when an action changes, and last
+  `{"type": "batch", "state": "done"|"failed"|"cancelled", "failure"}`. A
+  failed action's log is at `/cas/<log_sha256>` in the remote cache. The log
+  includes the action's failure diagnostic even when it failed before starting
+  HOL, provided the worker can write and upload the log; a failure with no
+  log, such as a spec the worker rejects, says why in `failure_detail`, which
+  holbuild prints with the failure. A failure without a log, such as an
+  interrupted attempt, keeps the log an earlier attempt uploaded. An action
+  retried after a failure is printed as
+  `waiting (<failure>), attempts <n>, tier <tier>, log /cas/<sha>`, and
+  likewise when ready and running. A stream may start over: it
   sends every action's current state first.
+  A skipped dependent uses the existing action state `cancelled` with
+  `last_failure` beginning `skipped because of `; its reason names the failed
+  ancestor. A build batch stays `running` while independent actions remain,
+  then ends `failed` with the failed actions listed in `failure`. Batch-wide
+  cancellation, deadlines and input-cache resubmission errors still abort the
+  batch immediately.
 - `POST /v1/batches/<id>/cancel` cancels a running batch and answers
   `{"state": "<state>"}`: `cancelled`, or the end a batch that already
   ended reached.
 
-Clean old project and cache state with:
+Builds collect old project and cache state themselves. After a successful
+`build` (including `export --build`, and `build --remote-exec` unless
+`--detach`ed), `heap`, `executable` or `import`, holbuild runs the same
+collection as `holbuild gc` in the foreground when a threshold is passed:
+
+- project GC, once 1000 theories were built, restored from a cache or exported
+  as heaps in the project since its last GC;
+- cache GC, once 10 GiB were written into the cache since its last GC (a new
+  action entry counts as 1 MiB, so entries that reuse cached files still
+  count).
+
+Every GC, automatic or `holbuild gc`, restarts its count from zero, so a
+collection that cannot free much (entries used within the retention period
+stay) does not run again until a threshold's worth of new work arrives. The
+counts are kept in `.holbuild/gc.state` and `<cache>/locks/gc-growth.journal`.
+Automatic GC keeps the default 7-day retention, skips a GC another process is
+running (or a project another holbuild is modifying), prints one line on
+stderr only when it removed something, prints nothing under `--quiet` or
+`--json`, and turns a failure into a warning without changing the command's
+exit status. `build --dry-run`, `--execution-plan`, `--watch`, `check`, `run`,
+`repl` and fleet workers never run it. Change the thresholds or turn it off in
+`.holconfig.toml`'s `[gc]` (see Local configuration), or set
+`HOLBUILD_AUTO_GC=0`.
+
+Run `holbuild gc` by hand for a different retention period
+(`--retention-days`), to remove only stale toolchains (`--toolchains-only`), or
+for a one-off cleanup now:
 
 ```sh
 holbuild gc
@@ -1755,6 +2326,10 @@ locking/discovery and does not require a HOL toolchain. Project checkpoint GC
 uses `.holconfig.toml`'s `[build].checkpoint_limit_gb` unless overridden with
 `--max-checkpoints-gb`.
 
+Project GC also removes the spec files in `.holbuild/action-specs` and
+`.holbuild/run-specs` written before the retention period, such as those
+`action-spec` and `run-action --export-only` keep.
+
 Cache GC removes the dependency analyses under `analysis/` that no build has
 read or written within the retention period. A build that finds its analyses
 in `.holbuild/obj` doesn't count as a use, so such an entry can go while a
@@ -1769,6 +2344,13 @@ Toolchains being built, restored, or used by a running holbuild process
 removed toolchain are discarded and rebuilt automatically, but heaps exported
 with `holbuild heap` or `holbuild executable` must be re-exported before they
 are used outside holbuild.
+
+Cache GC also removes the read-only dependency source checkouts under
+`git/checkouts/` that no holbuild command has used within the retention period,
+skipping those a running holbuild process uses. A project whose
+`.holbuild/src/<package>` links to a removed checkout gets it checked out
+again from the cache's git mirror on its next build. The mirrors under
+`git/remotes/` are kept.
 
 `gc --toolchains-only` removes only such stale toolchains, skipping project
 cleanup and the action/blob scan, which can take minutes on a large cache. Like
@@ -1789,6 +2371,15 @@ holbuild --remote-cache https://cache.example.org run-action \
   [--profile P] --script run.sml [--support F]... [--load L]... --output N... \
   [--option timeout=SECONDS] [--closure] TARGET...
 ```
+
+The project write lock covers planning, cache checks, and spec export. It
+is released before submitting or following the batch and fetching outputs,
+so another command can build the same project while the remote run is in flight.
+
+Contexts reuse artifacts built with any proof-step timeout, including
+`build --skip-proof-steps`, in remote, fetch-only and export-only modes.
+`run-action` consumes these artifacts without rechecking proof-step timing;
+ordinary `build` still checks its requested timeout contract.
 
 The targets, the script, its support files, `--load` libraries, outputs,
 timeout and `--closure` are those of `run-action --export-only` (see
@@ -1813,7 +2404,11 @@ output names, so the same run is done once. The command:
    `D/<package>/<theory>/` (`D/HOL/<theory>/` for a toolchain theory),
    replacing what was there: `KEY` holds the run key, `CONTEXT` the run
    text's context (`<package>:<theory>@<input_key>` or `HOL:<theory>`), and
-   each declared output its file.
+   each declared output its file. For a `failed` run, replaces the same
+   directory with `KEY`, `CONTEXT` and, when available, `LOG` containing the
+   worker's diagnostic. If a reported log cannot be fetched, warns on stderr
+   and leaves `LOG` absent; the run stays `failed` and still counts toward
+   exit status 0. Successful and cached runs have no `LOG`.
 6. Prints one line per run on stdout, in the targets' order:
 
    ```text
@@ -1872,6 +2467,11 @@ tactic_timeout = 10.0
 url = "https://cache.example.org"
 curl_config = "/path/to/holbuild-remote-cache.curl"
 
+[gc]
+auto = true
+cache_gb = 10
+project_builds = 1000
+
 [overrides.foo]
 path = "../foo"
 
@@ -1881,7 +2481,12 @@ git = "$BAR_REPO"
 
 `build.jobs` sets local default parallelism, and `build.checkpoint_limit_gb`
 sets the local checkpoint storage budget in GiB; the built-in checkpoint budget
-default is 5. Local `exclude` and `exclude_globs` apply only to the root package.
+default is 5. `[gc]` configures automatic GC (described with `holbuild gc`): `auto =
+false` turns it off, `cache_gb` is the GiB written into the cache that trigger
+a cache GC, `project_builds` the theories built, restored or exported that
+trigger a project GC; the values shown are the defaults. The cache thresholds
+come from the configuration of the project the command runs in, or the
+defaults outside a project. Local `exclude` and `exclude_globs` apply only to the root package.
 Dependency discovery is controlled by each dependency's committed manifest.
 
 `[overrides.NAME]` maps a declared dependency to local workstation source. Use
@@ -1894,6 +2499,9 @@ supplied from disk. Overridden dependencies still need a matching `project.name`
 in their manifest; `dependencies.hol` cannot be overridden this way.
 A `from/path/manifest` shim cannot be overridden directly; override the direct
 source dependency named by `from` instead.
+The checkout at `.holbuild/src/NAME` is read-only and shared with other
+projects, so to build against edited dependency sources, point a `path`
+override at your own checkout.
 
 Unknown fields in recognised manifest and `.holconfig.toml` tables are
 errors.
@@ -1943,39 +2551,127 @@ env -u HOLDIR -u HOLBUILD_HOLDIR \
   HOLBUILD_TEST_HOL_REV=<full-40-character-commit> make test
 ```
 
-The focused `theory-modules` CI job selects the public HOL fork with
-`HOLBUILD_TEST_HOL_GIT` and the commit in `tests/HOL_THEORY_MODULES_REV`.
+The focused `theory-modules` CI job tests the HOL commit in
+`tests/HOL_THEORY_MODULES_REV`.
 It sets `HOLBUILD_TEST_REQUIRE_THEORY_MODULES=1` so an unsupported toolchain
-fails this job instead of checking only the source fallback. The ordinary
-suite also runs the same case on its default HOL revision, where the source
+fails this job instead of checking only the `.dat` fallback. The ordinary
+suite also runs the same case on its default HOL revision, where the `.dat`
 fallback remains valid.
 
 ## Release process
 
-Maintainer checklist:
+Publishing a GitHub release is what makes it live: installs and deployments
+that follow the latest release pick it up, while a pushed tag or a draft
+release changes nothing for them. Every tag release is created as a draft
+and published only after the candidate passes validation against its
+consumers.
 
-1. Ensure CI is green on `master`.
-2. Bump `HolbuildVersion.version` in `sml/version.sml` if needed.
-3. Create and push an annotated tag:
+### Breaking releases
+
+A release is breaking if, compared with the latest published release:
+
+- the golden key dump (`tests/golden/key-dumps`) changed, so cache keys
+  changed and consumers on the old release share no cache entries with it;
+- a commit in it carries a `Breaking-change:` trailer, which a pull request
+  that changes a default, a command-line option or the `holproject.toml`
+  schema in a way consumers must adapt to adds to one of its commits:
+
+  ```text
+  Breaking-change: export writes a full source capsule unless given --closure
+  ```
+
+  The value says what consumers must change; it goes in the release notes.
+
+`tools/release-breaking.sh BASE TAG` applies these two checks and prints the
+reasons. Because it compares with the latest published release rather than
+the previous tag, every candidate tagged while a breaking draft is pending
+still reports the outstanding breaking changes.
+
+The golden key dump covers one small fixture project. Before tagging, run
+`tools/release-key-inventory.sh` against your consumers to catch key changes
+it misses. In a scratch checkout of each consumer's default branch, with its
+remote cache configured as for its builds:
+
+```sh
+tools/release-key-inventory.sh /path/to/published/holbuild \
+  /path/to/candidate/bin/holbuild [action-spec arguments...]
+```
+
+It plans the project with `action-spec` under both binaries and lists the
+theories the published release can restore from the
+remote cache but the candidate can't. Pass the consumer's own build flags
+and targets (`--skip-proof-steps`, say), since they select the cache entries.
+Pass `--remote-only` to prevent a local HOL toolchain build: an uncached
+toolchain then exits 75. The inventory exits 1 only for lost restorable
+theories; command errors exit at least 2, preserving exit 75.
+If it lists any theory, the release is breaking: record that with a
+`Breaking-change:` trailer on a commit of the release before tagging (the
+version bump, or an empty commit), so the release notes record the break.
+
+### Steps
+
+1. Bump `HolbuildVersion.version` in `sml/version.sml` if needed and merge
+   the change to `master`.
+2. Run the key inventory above against your consumers, with holbuild built
+   at the commit to be tagged.
+3. Ensure **CI** has passed on the exact `master` commit to be tagged.
+4. Create and push an annotated tag on that checked commit:
 
    ```sh
    version=X.Y.Z
-   git tag -a "v$version" -m "holbuild v$version"
+   commit=FULL_CHECKED_MASTER_COMMIT_SHA
+   git tag -a "v$version" "$commit" -m "holbuild v$version"
    git push origin "v$version"
    ```
 
-4. The **Release binaries** workflow builds Linux x86_64 and macOS arm64
+5. The **Release binaries** workflow builds Linux x86_64 and macOS arm64
    archives, then tests downloaded copies on fresh runners without Poly/ML.
    Only after both platforms pass does it attach the archives and
-   `SHA256SUMS`, plus the shared Poly/ML source archive, to the release. It
-   creates a release with generated notes if none exists for the tag; an existing release (including a draft) retains
-   its notes and publication state. Summarise user-visible changes in those
-   notes, and publish the draft if you prepared one.
+   `SHA256SUMS`, plus the shared Poly/ML source archive, to the release. If
+   no release exists for the tag, it creates a draft with generated notes,
+   with the reasons first in its notes if the release is breaking. An
+   existing release (including a draft) retains its notes and publication
+   state.
+6. Validate the draft candidate against its consumers before publishing it:
+   compare cache-key inventories before warming the cache, run consumer
+   builds with their usual flags, and check any affected runtime tools.
+   Publish only once these checks and packaging pass. For a non-breaking
+   candidate, publish the draft with `gh release edit vX.Y.Z --draft=false
+   --latest`; breaking candidates also need the coordinated steps below.
 
 The workflow also checks packaging on relevant pull requests without
-publishing anything. To rebuild assets, rerun the tag's workflow; uploads
-replace assets with the same names. A manual workflow run only builds and
-tests; publication requires a version-tag push.
+publishing anything. To rebuild assets, rerun the tag's
+workflow; uploads replace assets with the same names. A manual workflow run
+only builds and tests; publication requires a version-tag push.
+
+### Publishing a breaking release
+
+While the release is a draft, its tag already exists, so consumers can test
+against it:
+
+1. Warm the remote cache with the new release's keys: build each consumer's
+   default branch with it, with the flags its CI uses.
+2. In each consumer, open a pull request that moves its pinned holbuild to
+   the new tag, with whatever else the breaking change needs (a workflow
+   edit for a changed option, say), and wait for its CI to pass.
+3. Then, in one go: publish the newest draft, adding a line that starts
+   with `Consumers ready:` to its notes (`gh release edit vX.Y.Z
+   --draft=false --latest --notes-file notes.md`; publish older pending
+   drafts first the same way with `--latest=false`, or delete them), merge
+   every consumer's pull request, and update the installs and deployments
+   that follow the latest release.
+
+Publishing a release by hand runs a check of its own: a breaking release
+whose notes have no `Consumers ready:` line is turned back into a draft,
+with the reasons added to its notes, and the **Release binaries** run
+fails. It compares against the newest earlier release that was published
+more than an hour before it or carries that line, not one published
+moments ago whose own check may not have run yet. This covers drafts made
+before the tag was pushed, which the tag's run leaves as they are.
+
+If a breaking release was published by mistake anyway, turn it back into a
+draft (`gh release edit vX.Y.Z --draft=true`) so that nothing else adopts
+it, then roll back whatever already did, or finish the steps above at once.
 
 ## More detail
 

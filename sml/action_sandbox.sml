@@ -1,0 +1,381 @@
+structure HolbuildActionSandbox =
+struct
+
+exception Error of string
+exception Rejected of string
+
+val private_roots : (string * string) option ref = ref NONE
+val toolchain_root = ref ""
+val poly_executable = ref ""
+val outputs_validated = ref false
+(* exec-action's --result file: the worker's, so never exposed to the action. *)
+val result_file : string option ref = ref NONE
+
+(* Directories every sandboxed child may read, such as the host's store of
+   HOL theory modules, which no child writes. *)
+val shared_reads : string list ref = ref []
+(* While set, a child writes only these directories and may read, but not
+   write, the private roots. *)
+val output_dirs : string list option ref = ref NONE
+(* While set, the directories of the action root a theory child writes; the
+   rest of the root, its dependencies, it may only read. *)
+val action_write_dirs : string list option ref = ref NONE
+
+fun active () = Option.isSome (!private_roots)
+fun enable roots = (outputs_validated := false; private_roots := SOME roots)
+fun disable () = private_roots := NONE
+
+fun protect_process () =
+  let
+    open Foreign
+    val call = buildCall5 (getSymbol (loadExecutable ()) "prctl",
+                          (cInt, cInt, cInt, cInt, cInt), cInt)
+  in
+    if call (4, 0, 0, 0, 0) = 0 then ()
+    else raise Error "cannot protect exec-action process"
+  end
+  handle Foreign.Foreign _ => raise Error "exec-action needs Linux process protection"
+
+fun quote s = "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"
+
+fun environment_name entry = hd (String.fields (fn c => c = #"=") entry)
+
+fun trusted_repositories () =
+  let
+    fun valid_ref name =
+      size name > 0 andalso Char.isAlphaNum (String.sub(name, 0)) andalso
+      List.all (fn c => Char.ord c < 128 andalso
+                 (Char.isAlphaNum c orelse List.exists (fn x => c = x) [#".", #"_", #"/", #"-"]))
+               (String.explode name) andalso
+      not (List.exists (fn part => String.isSubstring part name) ["..", "//", "/."]) andalso
+      not (String.isPrefix "refs/" name) andalso
+      not (List.exists (fn ending => String.isSuffix ending name) ["/", ".", ".lock"])
+    fun parse "*" = ("*", [])
+      | parse entry =
+      case rev (String.fields (fn c => c = #"=") entry) of
+          refs :: rest =>
+            let
+              val url = String.concatWith "=" (rev rest)
+              val branches = String.fields (fn c => c = #",") refs
+            in
+              if (String.isPrefix "https://" url orelse String.isPrefix "/" url) andalso
+                 not (String.isSubstring "\000" url) andalso List.all valid_ref branches
+              then (url, branches)
+              else raise Error "invalid HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES entry"
+            end
+        | _ => raise Error "invalid HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES entry"
+  in
+    case OS.Process.getEnv "HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES" of
+        SOME text =>
+          if null (String.tokens Char.isSpace text) then
+            raise Error "HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES is empty"
+          else map parse (String.tokens Char.isSpace text)
+      | NONE => [("https://github.com/HOL-Theorem-Prover/HOL.git", ["develop", "master"]),
+                 ("https://github.com/HOL-Theorem-Prover/HOL", ["develop", "master"])]
+  end
+
+(* git for the worker's own fetches: no user or system configuration,
+   credentials, prompts, hooks or background maintenance, and only the named
+   protocols.  HOME is never read with a null global configuration. *)
+fun hardened_git {home, protocol} args =
+  let
+    val environment = List.filter
+      (fn entry =>
+          let val name = environment_name entry val lower = String.map Char.toLower name
+          in List.exists (fn allowed => name = allowed)
+               ["PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"] orelse
+             List.exists (fn allowed => lower = allowed) ["http_proxy", "https_proxy", "all_proxy", "no_proxy"]
+          end) (Posix.ProcEnv.environ ())
+  in
+    HolbuildSpawn.run
+      {program = "/usr/bin/env", stderr = HolbuildSpawn.Merge,
+       args = ["-i"] @ environment @
+         ["HOME=" ^ home, "GIT_CONFIG_NOSYSTEM=1",
+          "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/bin/false",
+          "GIT_NO_LAZY_FETCH=1", "GIT_ALLOW_PROTOCOL=" ^ protocol,
+          "git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0", "-c", "maintenance.auto=false"] @ args}
+  end
+
+(* A "*" entry trusts any https repository at an exact commit: every step that
+   runs its code is confined, so no branch need vouch for it. *)
+fun any_https_trusted git =
+  String.isPrefix "https://" git andalso
+  not (CharVector.exists (fn c => Char.isSpace c orelse Char.isCntrl c) git) andalso
+  List.exists (fn (url, _) => url = "*") (trusted_repositories ())
+
+fun require_trusted_branches {git, rev = revision} =
+  let
+    val branches =
+      case List.find (fn (url, _) => url = git) (trusted_repositories ()) of
+          SOME (_, refs) => refs
+        | NONE => raise Rejected ("exec-action HOL repository is not trusted by this worker: " ^ git)
+    val cache = HolbuildCacheConfig.cache_root ()
+    val _ = HolbuildGitCache.ensure_dir cache
+    val graphs = OS.Path.concat(OS.FileSys.fullPath cache, "toolchain-trust")
+    val graph = OS.Path.concat(graphs, HolbuildHash.string_sha256 git)
+    fun exists path = OS.FileSys.access(path, []) handle OS.SysErr _ => false
+    fun run protocol args = hardened_git {home = OS.Path.concat(graph, "home"), protocol = protocol} args
+    fun success (result : HolbuildSpawn.result) = #status result = Posix.Process.W_EXITED
+    fun trusted () =
+      exists (OS.Path.concat(graph, "HEAD")) andalso
+      let val kind = run "" ["-C", graph, "cat-file", "-t", revision]
+      in success kind andalso HolbuildGitCache.trim (#output kind) = "commit" andalso
+         List.exists (fn branch => success (run ""
+           ["-C", graph, "merge-base", "--is-ancestor", revision, "refs/heads/" ^ branch])) branches
+      end
+    fun refresh () =
+      if trusted () then () else
+      let
+        val _ = HolbuildOffline.require_online "verify the HOL revision against trusted branches"
+        val _ = if exists (OS.Path.concat(graph, "HEAD")) then () else
+          let
+            val tmp = graph ^ ".tmp-" ^ HolbuildFileLock.current_pid_text ()
+            val _ = HolbuildGitCache.remove_if_exists tmp
+            val initialized = run "" ["init", "--bare", "--quiet", tmp]
+          in
+            if success initialized then OS.FileSys.rename {old = tmp, new = graph}
+            else raise Error ("cannot initialize HOL trust graph: " ^ #output initialized)
+          end
+        val fetched = run "https:file"
+          (["-C", graph, "fetch", "--quiet", "--atomic", "--no-tags", "--no-recurse-submodules",
+            "--no-write-fetch-head", "--update-head-ok"] @
+           (if String.isPrefix "https://" git then ["--filter=tree:0"] else []) @ ["--", git] @
+           map (fn branch => "+refs/heads/" ^ branch ^ ":refs/heads/" ^ branch) branches)
+      in
+        if success fetched then () else raise Error ("cannot fetch trusted HOL branches: " ^ #output fetched)
+      end
+  in
+    if trusted () then () else
+      (HolbuildGitCache.ensure_dir graphs;
+       HolbuildGitCache.with_lock (graph ^ ".lock") refresh;
+       if trusted () then () else
+         raise Rejected ("HOL revision " ^ revision ^ " is not a commit on trusted branches: " ^
+                         String.concatWith ", " branches))
+  end
+
+fun require_trusted_repository {git, rev = revision} =
+  let
+    val _ = HolbuildGitCache.validate_rev revision
+            handle HolbuildGitCache.Error msg => raise Rejected msg
+  in
+    if any_https_trusted git then () else require_trusted_branches {git = git, rev = revision}
+  end
+
+fun helper () = OS.Path.concat (HolbuildRuntimePaths.runtime_root (), "sml/action_sandbox.py")
+
+(* What one confined command may write and read beyond the system paths.
+   toolchain: it builds a HOL tree, which links and chmods within itself. *)
+type grants = {writable : string list, readable : string list, toolchain : bool}
+
+(* The helper's options granting GRANTS.  confined passes them in a file:
+   one theory's checkpoint directories can exceed the kernel's limit on a
+   single argument (128 KiB), and the launch goes through one sh -c. *)
+fun grant_options ({writable, readable = extra, toolchain} : grants) =
+  let
+    fun exists path = OS.FileSys.access (path, []) handle OS.SysErr _ => false
+    fun full path = OS.FileSys.fullPath path
+    fun fields name =
+      case OS.Process.getEnv name of SOME text => String.tokens (fn c => c = #":") text | NONE => []
+    val poly_prefix = OS.Path.dir (OS.Path.dir (!poly_executable))
+    val poly_libraries = map (fn path => OS.Path.concat(poly_prefix, path))
+                          ["lib", "lib64", "bin/polyc"]
+    val readable = List.filter exists
+      ([!toolchain_root, HolbuildRuntimePaths.runtime_root (), !poly_executable,
+        "/usr", "/bin", "/sbin", "/lib", "/lib64", "/dev/urandom", "/dev/zero", "/proc/meminfo",
+        "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/localtime",
+        "/etc/ssl/certs", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf", "/etc/gai.conf"] @
+       poly_libraries @ extra @ !shared_reads @ fields "HOLBUILD_ACTION_READ_DIRS" @
+       List.mapPartial OS.Process.getEnv ["HOLBUILD_POLYC", "HOLBUILD_ANALYSER_SRC"])
+    (* As configured, not normalized: the helper also forbids each link on
+       the way, and resolves ".." after a link the way open does. *)
+    fun absolute path = if OS.Path.isAbsolute path then path else OS.FileSys.getDir () ^ "/" ^ path
+    val cache = absolute (HolbuildCacheConfig.cache_root ())
+    val protected_paths =
+      map (fn part => OS.Path.concat (cache, part))
+          ["actions", "blobs", "locks", "cooperate", "toolchain-trust", "git",
+           "hol-toolchains/.locks", "action.lock"] @
+      List.mapPartial
+        (fn entry =>
+            case String.fields (fn c => c = #"=") entry of
+                name :: rest =>
+                  if String.isSuffix "CURL_CONFIG" name orelse
+                     String.isPrefix "HOLBUILD_SHARED_" name orelse name = "HOLBUILD_COOPERATE_DIR"
+                  then SOME (String.concatWith "=" rest) else NONE
+              | [] => NONE)
+        (Posix.ProcEnv.environ ()) @
+      (case !(HolbuildMachineMemory.settings) of SOME {dir, ...} => [dir] | NONE => []) @
+      (case !result_file of SOME file => [file] | NONE => []) @
+      (* holbuild's own temporary files, which it hashes and publishes;
+         every holbuild process on the host keeps them under TMPDIR. *)
+      [HolbuildTempPath.private_temporary_dir ()]
+    val forbidden = List.mapPartial
+      (fn path => if path = "" then NONE else
+         SOME (absolute path)) protected_paths
+    fun options flag paths = List.concat (map (fn path => [flag, path]) paths)
+  in
+    (if toolchain then ["--toolchain"] else []) @
+    options "--write" (map full writable) @
+    options "--read" (map full readable) @ options "--forbid" forbidden @
+    (* Restored states link into the store, which actions read in parts. *)
+    options "--keep-read-only" [OS.Path.concat (cache, "checkpoint-store")] @
+    (* Poly/ML's OS.FileSys.tmpName always creates files in /tmp, ignoring
+       TMPDIR; HolSat and HolSmt need it.  The helper leaves it out if
+       protected worker state, holbuild's TMPDIR included, lies beneath it. *)
+    options "--scratch" (List.filter exists ["/tmp"])
+  end
+
+fun wrap {completed, options} argv =
+  ["python3", "-I", helper (), "--options", options, "--completed", completed, "--"] @ argv
+
+fun with_output_dirs dirs f =
+  (output_dirs := SOME dirs;
+   (f () before output_dirs := NONE) handle e => (output_dirs := NONE; raise e))
+
+(* Only the trusted supervisor can write this sibling of the private roots.
+   A child exit status alone cannot attest to cleanup or output validation,
+   so EXECUTE's result counts only once the supervisor says so. *)
+fun confined grants argv execute =
+  let
+    val completed = OS.Path.concat
+      (OS.FileSys.fullPath (HolbuildCacheConfig.cache_root ()), "sandbox-" ^ HolbuildTempPath.suffix ())
+    val options = completed ^ ".options"
+    fun remove () = List.app (fn path => OS.FileSys.remove path handle OS.SysErr _ => ()) [completed, options]
+    fun write path text =
+      let val output = TextIO.openOut path
+      in (TextIO.output(output, text); TextIO.closeOut output)
+         handle e => (TextIO.closeOut output; raise e)
+      end
+    fun completion () =
+      let val input = TextIO.openIn completed
+      in (TextIO.inputAll input before TextIO.closeIn input)
+         handle e => (TextIO.closeIn input; raise e)
+      end
+    val unconfirmed = "HOL sandbox did not complete cleanup and output validation"
+    (* NONE once the supervisor validated; else why the result doesn't count. *)
+    fun await_completion deadline =
+      case completion () of
+          "validated\n" => NONE
+        | text =>
+            if String.isPrefix "failed\n" text then
+              case String.tokens (fn c => c = #"\n") (String.extract (text, size "failed\n", NONE)) of
+                  [] => SOME unconfirmed
+                | lines => SOME ("HOL sandbox failed: " ^ String.concatWith "; " lines)
+            else if Time.>= (Time.now (), deadline) then SOME unconfirmed
+            else (OS.Process.sleep (Time.fromReal 0.01); await_completion deadline)
+    fun run () =
+      let
+        val _ = write completed "pending\n"
+        val _ = write options (String.concat (map (fn option => option ^ "\000") (grant_options grants)))
+        val result = execute (wrap {completed = completed, options = options} argv)
+      in
+        (* A timeout reaps the outer shell before its watcher signals the
+           supervisor. Allow the supervisor's bounded cleanup to finish. *)
+        case await_completion (Time.+ (Time.now (), Time.fromSeconds 6)) of
+            NONE => result
+          | SOME reason => raise Error reason
+      end
+  in
+    (run () before remove ()) handle e => (remove (); raise e)
+  end
+
+(* The checkpoint tree's states restored from the store are links to it:
+   hard links, or symbolic ones where the store is on another mount.  A
+   child may only read them, so the tree's writable directories are its
+   largest subtrees without a link, and the store directories symbolic
+   links point into are readable.  Each checkpoint has its own directory,
+   created before the child starts, so it can save every one it hasn't
+   restored. *)
+fun checkpoint_grants checkpoints =
+  let
+    val store = OS.Path.concat (HolbuildCacheConfig.cache_root (), "checkpoint-store")
+    val store = (OS.FileSys.fullPath store handle OS.SysErr _ => store) ^ "/"
+    fun target path =
+      let val dir = OS.FileSys.fullPath (OS.Path.dir (Posix.FileSys.readlink path))
+      in
+        (* A state's family directory, never the store itself. *)
+        if String.isPrefix store dir andalso not (CharVector.exists (fn c => c = #"/") (String.extract (dir, size store, NONE)))
+        then dir
+        else raise Error ("checkpoint link leaves its store family: " ^ path)
+      end
+    (* NONE when the subtree at DIR has no link; else what of it is
+       writable and the store directories its links point into. *)
+    fun visit dir =
+      let
+        val stream = OS.FileSys.openDir dir
+        fun entries acc =
+          case OS.FileSys.readDir stream of
+              NONE => rev acc
+            | SOME name => entries (OS.Path.concat (dir, name) :: acc)
+        val paths = (entries [] before OS.FileSys.closeDir stream) handle e => (OS.FileSys.closeDir stream; raise e)
+        fun child (path, (clean, writable, readable, linked)) =
+          let val st = Posix.FileSys.lstat path
+          in
+            if Posix.FileSys.ST.isDir st then
+              case visit path of
+                  NONE => (path :: clean, writable, readable, linked)
+                | SOME (w, r) => (clean, w @ writable, r @ readable, true)
+            else if Posix.FileSys.ST.isLink st then (clean, writable, target path :: readable, true)
+            else if Posix.FileSys.ST.nlink st > 1 then (clean, writable, readable, true)
+            else (clean, writable, readable, linked)
+          end
+        val (clean, writable, readable, linked) = List.foldl child ([], [], [], false) paths
+      in
+        if linked then SOME (clean @ writable, readable) else NONE
+      end
+  in
+    case visit checkpoints of
+        NONE => {writable = [checkpoints], readable = []}
+      | SOME (writable, readable) => {writable = writable, readable = readable}
+  end
+
+(* The theory action: its private roots are what the worker harvests.
+   Under with_output_dirs (the worker's module writer), the child writes
+   only those directories and reads the action root; it runs after the
+   action's checkpoints are gone. *)
+fun action_grants (root, checkpoints) : grants =
+  case !output_dirs of
+      NONE =>
+        let val {writable = saves, readable = stored} = checkpoint_grants checkpoints
+        in
+          {writable = getOpt (!action_write_dirs, [root]) @ saves,
+           readable = [root, checkpoints] @ stored, toolchain = false}
+        end
+    | SOME dirs => {writable = dirs, readable = [root], toolchain = false}
+
+fun launch argv execute =
+  case !private_roots of
+      NONE => execute argv
+    | SOME roots =>
+        (outputs_validated := false;
+         confined (action_grants roots) argv execute before outputs_validated := true)
+
+(* Runs the shell script SCRIPT work, with a fresh work directory WORK as its
+   first writable root (its HOME and TMPDIR), through RUN, a runner of trusted
+   shell text whose $$ stays the helper's parent.  FINISH (work, result) runs
+   only once the supervisor has reaped every descendant and validated the
+   writable roots, so it can read what the command left in WORK; the work
+   directory is removed afterwards. *)
+fun shell ({writable, readable, toolchain} : grants) script run finish =
+  let
+    val work = OS.Path.concat
+      (OS.FileSys.fullPath (HolbuildCacheConfig.cache_root ()), "sandbox-work-" ^ HolbuildTempPath.suffix ())
+    fun cleanup () = HolbuildRemoveTree.remove_untrusted_strict work
+    val _ = OS.FileSys.mkDir work
+    fun go () =
+      finish (work,
+        confined {writable = work :: writable, readable = readable, toolchain = toolchain}
+          ["/bin/sh", "-c", script work]
+          (fn argv => run ("HOLBUILD_SANDBOX_PARENT=$$ " ^ String.concatWith " " (map quote argv))))
+  in
+    (go () before cleanup ()) handle e => (cleanup () handle _ => (); raise e)
+  end
+
+(* NONE if DIR, a toolchain tree from elsewhere, is closed the way a confined
+   build leaves one: links stay inside, no hard links, special or setuid files,
+   and every directory is listable; otherwise why not. *)
+fun closed_tree dir =
+  let val result = HolbuildSpawn.run {program = "python3", args = ["-I", helper (), "--validate-tree", dir],
+                                      stderr = HolbuildSpawn.Merge}
+  in if HolbuildSpawn.succeeded result then NONE else SOME (#output result) end
+
+end

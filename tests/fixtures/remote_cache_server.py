@@ -8,6 +8,8 @@ import sys
 import time
 import urllib.parse
 
+from zstd_frames import zstd_encode
+
 
 root = pathlib.Path(sys.argv[1]).resolve()
 port_file = pathlib.Path(sys.argv[2])
@@ -92,6 +94,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         while not (control / "cas-put-release").exists():
             time.sleep(0.01)
 
+    def cas_put_fail_once(self):
+        """The status in control/cas-put-fail-once, answered to one CAS PUT."""
+        if control is None or not self.path.startswith("/cas/"):
+            return None
+        with action_put_lock:
+            status = control / "cas-put-fail-once"
+            if not status.exists():
+                return None
+            code = int(status.read_text())
+            status.unlink()
+            return code
+
     def do_GET(self):
         self.record_request()
         self.gate_action_get()
@@ -108,6 +122,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_response(int((control / name).read_text()))
                     self.end_headers()
                     return
+        if control is not None and self.path.startswith("/cas/"):
+            digest = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
+            status = control / f"cas-get-status-{digest}"
+            if status.exists():
+                self.send_response(int(status.read_text()))
+                self.end_headers()
+                return
         path = self.object_path()
         if path is None:
             return
@@ -121,7 +142,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "Accept-Encoding", ""
         )
         if compressed:
-            data = subprocess.check_output(["zstd", "-q", "-c"], input=data)
+            data = zstd_encode(data)
         self.send_response(200)
         if compressed:
             self.send_header("Content-Encoding", "zstd")
@@ -155,6 +176,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.gate_cas_put()
+        failure = self.cas_put_fail_once()
+        if failure is not None:
+            self.send_response(failure)
+            self.end_headers()
+            return
         if (
             control is not None
             and self.path.startswith("/cas/")
@@ -173,6 +199,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.headers.get("Content-Encoding") == "zstd":
             data = subprocess.check_output(["zstd", "-q", "-d", "-c"], input=data)
+        if (
+            control is not None
+            and self.path.startswith("/cas/")
+            and (control / "cas-put-reject-text").exists()
+            and (control / "cas-put-reject-text").read_bytes() in data
+        ):
+            self.send_response(500)
+            self.end_headers()
+            return
         action_sequence = (
             next_action_put()
             if urllib.parse.urlparse(self.path).path.startswith("/ac/")
@@ -189,6 +224,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class Server(http.server.ThreadingHTTPServer):
+    # The default listen backlog of 5 overflows when a burst of parallel
+    # requests arrives while a loaded machine has this process waiting for a
+    # CPU, and the client then sees its connections reset.
+    request_queue_size = 1024
+
+
+server = Server(("127.0.0.1", 0), Handler)
 port_file.write_text(str(server.server_address[1]), encoding="utf-8")
 server.serve_forever()

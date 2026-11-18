@@ -9,13 +9,29 @@ default_test_jobs() {
 }
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=lib.sh
+source "$ROOT/tests/lib.sh"
 HOLBUILD_BIN=${HOLBUILD_BIN:-"$ROOT/bin/holbuild"}
 HOLBUILD_TEST_JOBS=${HOLBUILD_TEST_JOBS:-$(default_test_jobs)}
 export HOLBUILD_ROOT="$ROOT"
 # Every build that plans from the plan record also plans in full and fails on
 # any difference.
 export HOLBUILD_PLAN_RECORD=${HOLBUILD_PLAN_RECORD:-check}
+# Builds save a context checkpoint after every theorem and definition, not only
+# once enough time has passed, so tests see the same checkpoints on every run.
+export HOLBUILD_CHECKPOINT_EVERY_CONTEXT=${HOLBUILD_CHECKPOINT_EVERY_CONTEXT:-1}
 export HOLBUILD_TEST_GLOBAL_CACHE="${HOLBUILD_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/holbuild}"
+# Machine-memory admission reads no cgroup limits unless a case points this
+# at a stand-in group: the machine running the tests may be near its own.
+export HOLBUILD_TEST_CGROUP=${HOLBUILD_TEST_CGROUP-}
+# Test builds must not read from or publish to a remote cache or exec service
+# configured in the machine's environment; cases that need a remote start their
+# own and pass it explicitly. The values stay available to remote-exec-live,
+# the one case that opts in to a real remote, as HOLBUILD_TEST_LIVE_REMOTE_*.
+for remote_var in $(compgen -e HOLBUILD_REMOTE_); do
+  export "HOLBUILD_TEST_LIVE_${remote_var#HOLBUILD_}=${!remote_var}"
+  unset "$remote_var"
+done
 
 vendor_hol_rev=$(tr -d '[:space:]' < "$ROOT/vendor/hol/REV")
 test_hol_rev=${HOLBUILD_TEST_HOL_REV:-$vendor_hol_rev}
@@ -198,6 +214,10 @@ run_case() {
   local start_ms end_ms duration_ms
 
   write_holbuild_wrapper "$wrapper"
+  # Each case runs in its own cache, sharing only the HOL toolchains, so no
+  # build in it writes to, locks or collects the machine's cache. A case may
+  # still point HOLBUILD_CACHE elsewhere.
+  use_case_cache "$log_dir/$name.cache"
   start_ms=$(now_ms)
   echo "== $name ==" > "$log"
   if REAL_HOLBUILD_BIN="$HOLBUILD_BIN" \

@@ -115,6 +115,29 @@ For a root project, all dependency source checkouts are materialized once under:
 <root>/.holbuild/src/<package>
 ```
 
+Each is a symbolic link to a read-only checkout shared by every project using
+the cache, one per dependency URL and commit:
+
+```text
+$HOLBUILD_CACHE/git/checkouts/<sha1 of URL>-<commit>
+```
+
+It holds the commit's tree without git metadata, written from the mirror below
+with a private index, its files made read-only (directories stay writable, so
+`rm -rf` still removes a cache), and renamed into place under
+`git/checkouts/.locks/<key>.lock`, so a checkout directory that exists is
+complete. Nothing writes into it: builds write to `.holbuild/packages`, and a
+dependency whose package (or a `from` shim in its tree) declares generators,
+which write into their package's sources, gets a private clone at
+`.holbuild/src/<package>` instead. A private clone already at the pinned commit
+is used as it is, so clones made before shared checkouts stay until the pin
+changes. When the shared checkout cannot be made, holbuild warns and clones.
+Every process that uses a shared checkout holds a shared usage lease,
+`git/checkouts/.locks/<key>.usage`, until it exits, and rewrites its
+`<key>.last-used` marker; cache GC removes checkouts unused for the retention
+period that no process leases, and a link left pointing at a removed checkout
+gets it made again on the project's next build.
+
 Dependency package build artifacts live separately under:
 
 ```text
@@ -132,13 +155,14 @@ the commit is fetched into a bare mirror under `$HOLBUILD_CACHE/git/remotes`,
 shared by every project using that cache; creating a mirror and fetching into it
 are serialized by a per-mirror lock, and a new mirror is cloned to a temporary
 directory and renamed into place. Publishing a checkout is serialized by
-`.holbuild/locks/src/<package>.lock`, and HEAD is checked again under that lock.
+`.holbuild/locks/src/<package>.lock`, and the link (or a clone's HEAD) is
+checked again under that lock.
 Temporary clones left by killed processes are removed under the lock that
 guards them, and a process waiting on either lock names the pid holding it.
 Every process that uses a checkout holds a shared lease,
 `.holbuild/locks/src/<package>.lease`, until it exits; replacing a checkout at
 another commit takes the lease exclusively and fails while another process holds
-it, so no process removes a tree another one is reading.
+it, so no process replaces a tree another one is reading.
 
 The reserved `hol` package is the project HOL toolchain. It is
 materialized and built at a canonical shared cache path
@@ -160,14 +184,35 @@ user removes it manually. The cache key includes the HOL revision, the Poly/ML
 runtime (release and architecture variant), the resolved `poly` executable
 path, build arguments other than `-j`, and cache format version.
 
-Compiled theory initializers are an optional local cache under
+Theory modules are an optional local cache under
 `$HOLBUILD_CACHE/theory-modules`. When the installed HOL exposes the loader
-API, each child configures it with its exact base saved state and caches the
-initializer after normalizing exported theory files. Consumers apply cached
-code in their current kernel, replaying registration and load hooks in the
-source loader's order. Missing or incompatible code uses the source loader.
-These runtime-specific files are outside portable theory artifacts and action
-keys; cache GC and remote-worker byte limits account for them separately.
+API, each child configures it with its exact base saved state. A child that
+loads a theory from its `.dat` file saves the decoded theory as a module (a
+few per process, since each save costs more the more is loaded), and later
+loads use it, still registering the theory and running its load hooks in the
+usual order. Missing or incompatible modules fall back to the `.dat` file.
+Modules depend on the host's base saved state, so they stay outside portable
+theory artifacts and action keys; cache GC and remote-worker byte limits
+account for them separately.
+
+On a remote worker an action only reads the store, so that no action can
+plant a module another one loads. After a theory action's result, built
+or failed, the worker first fetches from the remote cache the missing
+modules of the theories the action loads that another worker published, then
+has a sandboxed child that runs no project code write those still missing,
+from their restored `.dat` files alone, moves into the store only the files
+named for those theories' `.dat` files, and publishes them. A published
+module's key names the toolchain's exact identity (its HOL state, so the base
+state the module is saved against), the store and the theory's `.dat`
+contents; a fetched one is stored only under the file name it is listed for. The action itself loads what the store lacks from
+`.dat` files, so it never waits for the writer. The writer goes last after
+the result, once the action's directory is emptied, and stops 100 s after
+the result, before the worker's kill at 120 s; HOL writes each module whole,
+so the modules a stopped writer finished are stored.
+Each HOL toolchain has its own directory in the store, named by its HOL
+directory (on a worker, by the toolchain's repository, commit and kernel).
+A worker may trust any HOL repository and the writer runs the toolchain's
+own code, so a toolchain can write only the modules its own actions load.
 
 ## Main binary and project-HOL helper direction
 
@@ -363,6 +408,14 @@ extra dependencies with static literal `holbuild_extra_deps [...]` annotations.
 Entries may name files, directories, or simple globs (which skip `.holbuild/`
 directories inside them), and entries are staged so matching relative
 filesystem reads work during the action.
+
+Before loading dependencies or running a theory script, each HOL child removes
+`.holbuild/stage` and its subdirectories from `Meta.loadPath`. HOL's project
+discovery can add sibling stages at startup, but those directories disappear as
+parallel actions finish. Other project directories retain their search order,
+including built objects needed by dynamic library loads. The same policy runs
+when a child resumes from a checkpoint.
+
 Theory-script sources may declare deterministic, source-file-relative fixed
 output files with static literal `holbuild_extra_outputs [...]` annotations.
 These paths are part of the action identity and owned output set: successful
@@ -375,9 +428,11 @@ previously owned files without eagerly analysing unrelated sources.
 Absolute paths, `.`/`..` components, directories, and globs are deliberately not
 part of the initial contract.
 `cache = false` disables global-cache restore/publish for the action.
-`always_reexecute = true` disables local up-to-date skipping and any retained/debug
-checkpoint replay for the action. `impure = true`
-is a conservative shorthand for no cache and always re-execute. These fields are
+`always_reexecute = true` disables local up-to-date skipping; checkpoint replay stays
+available, since replay is keyed by the script prefix and dependencies. `impure = true`
+is a conservative shorthand for no cache and always re-execute, and also disables
+checkpoint saving and replay, because an impure script may compute different values
+on each run (a timestamp, say) that a resumed run would take from an earlier one. These fields are
 intended for audited exceptions such as generated data, root-HOL SML modules with
 explicit predecessor requirements, source-implicit external libraries, or
 tool/example side effects; they are not include paths and do not make arbitrary
@@ -509,6 +564,20 @@ their implementation. HOL's current
 need auxiliary internal load paths or rewritten non-semantic load copies while
 preserving canonical artifacts.
 
+Every load list holbuild writes (a theory's preload, a `.uo` manifest, the
+manifests a remote worker restores) is in Holmake's order. Holmake's `.uo`
+lists a target's direct dependencies sorted by directory, then file name, and
+HOL loads them depth first; the order of names in a script's header doesn't
+reach it. Load order is observable: a library that registers data as each
+theory loads (cv_compute's `cv_rep` theorems, say) keeps the last
+registration. holbuild sorts by `(tier, package, directory, file)`. Tier 0 is
+HOL's own tree: `sigobj` for HOL's theories and libraries, and the source
+directory for a package taken from HOL's repository. Each other package comes
+after, by its depth in the package graph counting only packages outside HOL's
+tree, then by its name and the directory relative to its root. That is Holmake's order when HOL and the packages are
+checked out side by side with HOL sorting first, and unlike Holmake's it
+doesn't depend on where the trees are checked out.
+
 ## Invalidation and action keys
 
 Each build action has an input key derived from resolved facts, not raw paths:
@@ -556,7 +625,21 @@ deps_output_key = hash(the output digest of every node in the transitive
 
 A theory's output digest covers what its dependents load: `Theory.dat`,
 `.sig` and `.sml`, its `.uo`/`.ui` load manifests (which carry its ML
-dependencies), its kernel trace if present, and its declared extra outputs. An
+dependencies), its kernel trace if present, and its declared extra outputs. The
+`.dat` counts by its digest rather than its bytes: the hash literal in
+`Theory.sml`, which the exporter sets to the SHA-1 of the data without the
+parts a proof edit changes (each theorem's dependency record and source
+location, and the parents' hashes), so an edit that changes only proofs leaves
+the digest, and with it every dependent, as it was. Theory data counts by
+what it says, not by the string-table indices it says it with, which the
+proofs decide: data of a `ThyDataSexp` codec and HOL's own codecs are read
+that way, and a theory carrying data of a codec holbuild doesn't know is
+hashed as written (a warning says so), since its bare integers could be
+indices or integers. Children record that
+literal as the parent's hash and HOL's `link_parents` compares it at load, so
+a kept child still loads after its parent's proof-only edit. The `.dat` bytes
+stay as HOL wrote them, since other tools read the dependency records and
+locations. An
 ML library's load manifest names only its source, so a library's digest covers
 its own `self_input_key` as well as its objects and extra outputs; what it loads
 is in the closure with its own digest. When a theory's input key misses, but
@@ -582,12 +665,14 @@ stale.
 
 A remote worker (`exec-action`) makes the same decision once it has restored
 the action's dependencies. It hashes what the action loads from them, as
-restored in its action root: each dependency theory's `.dat`, `.sig`, `.sml`
-and load manifests, and the library sources and manifests the spec ships.
+restored in its action root: each dependency theory's `.dat` (by its digest,
+as above), `.sig`, `.sml` and load manifests, and the library sources and
+manifests the spec ships.
 With the action text, dependencies named but not keyed, that hash gives a pair
 key, and the remote cache maps the pair to the input key of the last build
 on it (an action entry `holbuild-early-cutoff-v1` with one `input-key=` line).
-On a hit, the worker restores that build's entry with the checks a dependency
+The worker looks the pair up beside the action's own entry, since a miss
+asks every cache node in turn. On a hit, the worker restores that build's entry with the checks a dependency
 restore makes (the timeout contract, the extra outputs, and the parent `.dat`
 hashes its `.dat` records), copies it to the action's input key, publishes it
 there and reports `cached`. On a miss or any doubt it builds, and then points
@@ -597,6 +682,15 @@ outputs, so a theory edited after an output-neutral upstream edit resumes
 from the heap and checkpoints shared before it. These hashes cover files
 that name the action root, so they hold for one cache root, as shared heaps
 do; local builds publish no pairs.
+
+Forced and traced specs skip whole-action cache reuse and early cutoff.
+They still compute the dependency-output context key, so valid dependency
+heaps and proof checkpoints remain reusable. Tracing replays proof steps
+rather than resuming theorem checkpoints. These execution options change
+neither the action key nor its outputs; their logs belong to the batch's
+execution and return separately through the result record's CAS log hash.
+The client's final restore clears force and tracing to avoid executing the
+same work again.
 
 A build may also record output hashes for diagnostics (`--emit-output-hashes`).
 
@@ -609,7 +703,7 @@ across machines rests on a reproducibility contract: a deterministic script,
 with its sources and extra inputs declared, under the same theory toolchain key,
 produces a byte-identical `Theory.dat` in any project directory and artifact
 cache. The exporter canonicalizes the parent header by theory name, preserving
-the remaining payload, and updates the embedded data hash in `Theory.sml`.
+the remaining payload, and writes the data's digest as the hash in `Theory.sml`.
 The generated parent load metadata uses the same order. Every action key
 includes `theory_manifest_version`, which changes whenever holbuild changes what
 a theory exports, so entries from exporters with different outputs never share
@@ -634,6 +728,56 @@ conflicts still keep the first entry; remote publication and archive import
 still reject conflicts, except that a remote-exec worker replaces a remote
 entry whose recorded parents differ from the parents it restored from the
 remote cache, since no build can use it.
+
+### Persistent action root on workers
+
+A worker's action root keeps the dependencies one action restored for the
+next, at the same absolute paths, so heap and checkpoint keys, which name
+those paths, are unchanged. Only `exec-action` writes it, under the worker's
+action lock; a theory child reads it and writes only `.holbuild/stage`,
+`logs`, `tool-cache` and `ahead`. Around each action the worker removes
+everything in the root but `.holbuild/{obj,packages,action-src,action-extra}`,
+which the hydrate prunes, and its marker. The
+worker records what it installed (`<cache root>/action-resident`): each
+dependency theory with its key, the SHA-256 of the local cache manifest it
+came from, the parent names its `.uo` was generated from, and the hashes the
+parent check and the early cutoff read; each source, input and library by
+SHA-256; each library manifest by its text's SHA-256. It trusts them only
+while the root holds the marker `.holbuild/resident`, which an older release,
+removing the root around its actions, removes with it; emptying the root
+removes the records first. A spec must name each path it writes in canonical
+form, its files under `.holbuild/action-src` and its objects under
+`.holbuild/obj` or `.holbuild/packages`, its outputs as one stem's, and no
+path twice: otherwise a kept item could stand for files another replaced. A hydrate keeps an item
+whose record matches what the spec names, whose files (with their
+`.hol/objs` copies) are all there, and, for a theory, whose local cache
+manifest is unchanged (the stale check drops a local copy, which then
+reinstalls). It tells an unchanged manifest by its stat, as git's index does,
+from `<cache root>/action-manifest-stats`: the manifest's device, inode, size,
+mtime and ctime, kept beside its hash when the stat was the same before and
+after reading it and older than the hydrate's start by more than a second, so
+a later rewrite always changes it. A manifest with no such stat, as one
+installed by this hydrate, is read and hashed. The file is a cache: losing it
+only costs the hashing. It rewrites a kept theory's `.uo` when this spec resolves its
+parents to other stems, and removes every item the spec doesn't name, so the
+root ends as a cold hydrate leaves it. The parent check and the cutoff read
+the records rather than hashing ~4 files per dependency. A kept item whose
+files went missing is reinstalled with a warning naming the lost path; a HOL
+load that can't find a file the records say the hydrate put in the root fails
+as `internal`, so the coordinator retries it, and removes the records, so the
+next action starts from an empty root. Any other missing file is the script's
+own error. The stems the action
+writes besides its dependencies (its own outputs, and with loading ahead its
+late parents) are emptied and recorded as scratch, which the next hydrate
+removes or reinstalls. Extra outputs lie under their theory's key in
+`.holbuild/action-extra`; the hydrate removes those of every key it doesn't
+record, as an early cutoff restores the action's own under its earlier key.
+The hydrate deletes the record file before it changes
+the tree and writes it back once it passed, so a worker stopped part way
+starts from an empty root. Script runs put every object directory under the
+root on `loadPath`, so they start from an empty root, leave no records, and the root is removed
+after them. The
+cache cap doesn't count the root: it holds one spec's dependencies.
 
 ## Global cache
 
@@ -671,9 +815,29 @@ an interrupted fallback rebuild should not warn repeatedly about the same known-
 entry. A successful cache hit refreshes the action manifest mtime for retention;
 this avoids relying on filesystem atime policy.
 
+Large theory artifacts are read in 64 KiB pieces to avoid Poly/ML 5.9.2's
+small-heap whole-file allocation failure. Initializer path relocation keeps
+unmatched substring spans rather than allocating a list entry per character.
+
 Cache blobs are materialized by an in-process copy. Reflink clones only help on
 copy-on-write filesystems and cost a `cp` process per blob, which is slower than
 copying small theory files.
+
+Cache-to-cache transfers verify a resident filesystem blob before fetching it
+again. A missing or corrupt blob is fetched into a transfer-owned temporary
+file, verified by the source backend, and renamed into the destination cache.
+When the filesystems differ, publication falls back to a validated copy.
+Ordinary publication still validates its input; only transfer-owned, verified
+temporary files use the consuming operation.
+
+Action-spec and run-spec export share file hashes across specs and source uploads
+within that export. Reuse requires unchanged device, inode, size, mtime and ctime;
+files timestamped within a second of the export's start are rehashed. Library
+and context-script hashes must still match the plan. The table is not persisted
+between exports. Run planning computes identities first; only runs selected for
+export construct context metadata. Fetch-only calls and cache hits avoid that
+work. Run exports check remote source availability on every call rather than
+using the persistent upload ledger, since they have no missing-input resubmission.
 
 Avoid hardlinking cache blobs into project `.holbuild/`: even if cache blobs are meant
 to be immutable, project outputs are the local materialized build view and should
@@ -769,6 +933,16 @@ deps_loaded.save         after resolved ancestors are loaded in topological orde
 <thm>_context.save       after the theorem has been stored in the theory context
 ```
 
+Each context save forces a full garbage collection, so a context is saved only
+once the time since the last context save ended reaches max(N, 10 x that
+save's duration), counted from when the dependencies are loaded. N is build's
+`--checkpoint-seconds` (default 2 s; 0 saves every context). It reaches remote
+workers as a spec option and is in no key, since it changes which states are
+saved, not what a build produces. Saving costs at most about a tenth of the
+proof time, and a resume replays at most that much finished work before the
+edit. A skipped context is removed, never left from an earlier run. The test
+suite sets `HOLBUILD_CHECKPOINT_EVERY_CONTEXT=1` to save every context.
+
 Holbuild saves no state after the theory is exported. Current HOL versions seal
 a theory when it is exported, so saving one would take a second process that
 loads the generated theory, and nothing would read the result. Source execution
@@ -837,6 +1011,16 @@ rejected and holbuild falls back to an earlier valid checkpoint. Future
 incrementality work should make this opportunistic reuse fire in more structural
 contexts, especially around dynamic choices and richer structural frame/event
 snapshots, while preserving the same fallback-on-mismatch contract.
+
+A checkpoint that cannot be loaded (an unreadable or missing heap, or a heap
+without holbuild's runtime) is discarded together with the checkpoints saved
+after it, and the build retries from the next earlier context. An ML static
+error, such as an undeclared identifier, in the source run after a checkpoint
+is a source error: the build fails with it at once and keeps the checkpoint.
+holbuild does not try to detect a checkpoint that loads but holds the wrong
+state. Checkpoint paths are keyed on the dependency and source-prefix keys,
+and every passing build and every tactic failure already trusts the loaded
+state, so retrying only when a static error appears would protect nothing.
 
 The prototype currently instruments AST `HOLTheoremDecl` declarations, i.e.
 modern goal/proof forms such as `Theorem ... Proof ... QED`. It parses the HOL
@@ -938,10 +1122,9 @@ opts out of theorem instrumentation: with checkpoints still enabled, the build c
 still save and consult `deps_loaded`, but there are no
 theorem-context/failed-prefix proof-navigation checkpoints and no
 tactic timeout enforcement for that build.
-Theorem, declaration and failed-prefix checkpoints are saved only in the
-requested targets (with none given, the default targets, or every root-package
-theory when there are none); every theory keeps `deps_loaded` and proof steps.
-`--all-checkpoints` saves them in every root-package theory.
+Theorem, declaration and failed-prefix checkpoints are saved in every theory
+included by the proof scope (root-package theories by default).
+`--all-checkpoints` is a compatibility alias for this default.
 `holbuild run --from THEORY` and `repl --from THEORY` start interactive sessions
 from THEORY's `deps_loaded` while it is current, and load THEORY on top when its
 metadata matches its current input key. `run` takes no project lock, so `--from`
@@ -977,6 +1160,28 @@ property of the declared entry point graph, not of the current request, except t
 but local metadata/cache records the timeout a successful build satisfied; a success under
 60s may satisfy a later 180s request, while a success under 180s does not satisfy a later
 60s request.
+
+Steps containing a public `HolSmtLib` tactic name (`GENERIC_SMT_TAC`, `CVC_TAC`,
+`CVC_ORACLE_TAC`, `YICES_TAC`, `Z3_TAC`, `Z3_ORACLE_TAC`, `cvc_tac`, `cvco_tac`,
+`z3_tac`, or `z3o_tac`) run without the step timeout: solver execution and proof
+replay can exceed the ordinary tactic budget. Names may be unqualified or under
+any structure qualifier. Matching uses identifiers in the tactic program, ignoring
+comments and string/term quotations. If one executable step mixes an SMT call with
+other work, that entire step is untimed; other planned steps keep their limits.
+Aliases with different names are not recognized. Timeout metadata and cache key
+formats are unchanged; existing successful builds remain reusable.
+
+A step that exceeds its timeout runs once more, at once and in the same process, with
+half the timeout. Each timed call computes its result from the proof state it was given
+and commits it to the proof history only on success, so the first attempt leaves the
+proof history unchanged; side effects the tactic itself made before it was stopped (a
+reference, a memo table) remain. If the second
+attempt finishes, the step passes and the theory's build log gets one line,
+`holbuild tactic timeout retry passed: <step> (budget <s>s; retry <ms> ms wall; GC during
+first attempt <ms> ms)`. If it times out too, the step fails as a timeout, reported with
+the full timeout. The intent is that a step that stalled once (on a loaded host, say)
+passes, while one that needs about the timeout of real work still fails. A step that Poly/ML interrupts before
+the timeout is not run again.
 
 A timeout is not a tactic failure: inside `TRY`, an `ORELSE`/`FIRST` alternative or a
 structural repeat body it fails the build at that step instead of taking the combinator's

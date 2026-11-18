@@ -230,9 +230,26 @@ for cache in "$first_cache" "$second_cache" "$third_cache" "$fourth_cache" \
   link_hol_toolchain_cache "$cache"
 done
 
+# Record each zstd command line so the test can check uploads use level 1;
+# the second build hydrating from these uploads checks they round-trip.
+zstd_shim=$tmpdir/zstd-shim
+zstd_args=$tmpdir/zstd-args
+mkdir -p "$zstd_shim"
+cat > "$zstd_shim/zstd" <<SH
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$zstd_args"
+exec "$(command -v zstd)" "\$@"
+SH
+chmod +x "$zstd_shim/zstd"
+
 first_log=$tmpdir/first.log
-(cd "$first" && HOLBUILD_CACHE="$first_cache" HOLBUILD_CACHE_TRACE=1 \
+(cd "$first" && PATH="$zstd_shim:$PATH" HOLBUILD_CACHE="$first_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 ATheory) > "$first_log" 2>&1
+require_grep "^-1 -vv " "$zstd_args"
+if grep -v "^-1 " "$zstd_args"; then
+  echo "remote cache ran zstd without -1" >&2
+  exit 1
+fi
 require_grep "ATheory built" "$first_log"
 require_grep "remote cache published:" "$first_log"
 require_grep "remote cache zstd .*/cas/[0-9a-f]* Completed in" "$first_log"
@@ -280,6 +297,10 @@ tactic_timeout = 180
 url = "$remote_url"
 TOML
 third_log=$tmpdir/third.log
+# Downloads stage beside blobs/, not in tmp/: the two may be on different
+# filesystems, where publishing would copy and re-hash every blob.
+mkdir -p "$third_cache/tmp"
+chmod a-w "$third_cache/tmp"
 (cd "$third" && HOLBUILD_CACHE="$third_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" build ATheory) > "$third_log" 2>&1
 require_grep "remote cache \(hydrated\|prefetched\):" "$third_log"
@@ -567,6 +588,14 @@ background_pids+=("$server_pid")
 server_pid=
 start_remote_cache_server "$ring_dir/two/store" "$ring_dir/two/state" "$ring_dir/two/control"
 ring_two=$remote_url
+background_pids+=("$server_pid")
+server_pid=
+start_remote_cache_server "$ring_dir/three/store" "$ring_dir/three/state" "$ring_dir/three/control"
+ring_three=$remote_url
+background_pids+=("$server_pid")
+server_pid=
+start_remote_cache_server "$ring_dir/four/store" "$ring_dir/four/state" "$ring_dir/four/control"
+ring_four=$remote_url
 python3 - "$ring_dir/vectors" "$ring_one" "$ring_two" <<'PY'
 import hashlib
 import pathlib
@@ -585,8 +614,9 @@ pathlib.Path(sys.argv[1]).write_text("\n".join(vectors))
 PY
 for transport in libcurl cli; do
   # Remove only this test's objects between runs, retaining the live servers.
-  find "$ring_dir/one/store" "$ring_dir/two/store" -type f -delete
-  RING_DIR="$ring_dir" RING_ONE="$ring_one" RING_TWO="$ring_two" RING_TRANSPORT="$transport" \
+  find "$ring_dir/one/store" "$ring_dir/two/store" "$ring_dir/three/store" "$ring_dir/four/store" -type f -delete
+  RING_DIR="$ring_dir" RING_ONE="$ring_one" RING_TWO="$ring_two" RING_THREE="$ring_three" RING_FOUR="$ring_four" \
+    RING_TRANSPORT="$transport" \
     poly --script "$SCRIPT_DIR/ring.sml" > "$ring_dir/$transport.log" 2>&1 || {
       cat "$ring_dir/$transport.log" >&2
       exit 1

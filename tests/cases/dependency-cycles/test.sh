@@ -91,6 +91,16 @@ structure A = struct val x = 1 end
 SML
 expect_build_failure unresolved_load A "unresolved load Missing in cycles:src/A.sml"
 
+make_project unknown_theory
+cat > "$tmpdir/unknown_theory/src/AScript.sml" <<'SML'
+Theory A
+Ancestors
+  arithmetic missing
+
+Theorem a_thm = ATheory.a_def
+SML
+expect_build_failure unknown_theory ATheory "unknown theory missingTheory in cycles:src/AScript.sml"
+
 make_project unsupported_use
 cat > "$tmpdir/unsupported_use/src/A.sml" <<'SML'
 use "other.sml";

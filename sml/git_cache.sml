@@ -37,7 +37,7 @@ fun validate_rev rev =
 
 fun command_output command =
   let
-    val tmp = FS.tmpName ()
+    val tmp = HolbuildTempPath.temporary "git-output"
     val status = OS.Process.system (command ^ " > " ^ quote tmp ^ " 2>&1")
     val input = TextIO.openIn tmp
     val text = TextIO.inputAll input before TextIO.closeIn input
@@ -75,14 +75,15 @@ fun string_byte_reader text (offset, requested) =
 (* A mirror's name only has to be stable. It stays the SHA-1 of the URL, so
    caches keep the mirrors they have rather than cloning every dependency
    again and leaving the old mirrors behind, which gc never collects. *)
+fun url_hash git = SHA1_ML.sha1String (string_byte_reader git) 0
+
 fun cache_remote_dir git =
   let
     val root = cache_root ()
     val remotes = Path.concat(Path.concat(root, "git"), "remotes")
-    val hash = SHA1_ML.sha1String (string_byte_reader git) 0
   in
     ensure_dir remotes;
-    Path.concat(remotes, hash ^ ".git")
+    Path.concat(remotes, url_hash git ^ ".git")
   end
 
 fun holder_text path =
@@ -171,6 +172,143 @@ fun ensure_commit git rev =
     (remote, verify_commit remote rev)
   end
 
+(* Shared checkouts: one read-only tree per (dependency URL, commit) under
+   git/checkouts, made once from the mirror and linked from each project's
+   .holbuild/src/<name>.  A key directory that exists is complete: it is
+   renamed into place under the key's lock.  Every process that uses one holds
+   its usage lease until exit and rewrites its last-used marker, and cache GC
+   removes it once unused for the retention period, as for HOL toolchains.
+   Its files are read-only; its directories stay writable so that removing a
+   cache with rm -rf still works. *)
+fun lexical_absolute path =
+  Path.mkCanonical
+    (if Path.isAbsolute path then path
+     else Path.mkAbsolute {path = path, relativeTo = FS.getDir ()})
+
+fun checkouts_dir () = Path.concat(Path.concat(lexical_absolute (cache_root ()), "git"), "checkouts")
+fun checkout_locks_dir () = Path.concat(checkouts_dir (), ".locks")
+fun checkout_trash_dir () = Path.concat(checkouts_dir (), ".trash")
+fun checkout_key git rev = url_hash git ^ "-" ^ rev
+fun checkout_dir k = Path.concat(checkouts_dir (), k)
+fun last_used_path k = checkout_dir k ^ ".last-used"
+fun usage_lease_path k = Path.concat(checkout_locks_dir (), k ^ ".usage")
+fun checkout_lock_path k = Path.concat(checkout_locks_dir (), k ^ ".lock")
+
+(* fcntl locks are dropped when the process closes any descriptor for the
+   file, so each key is leased at most once per process and never released. *)
+val held_usage_leases = ref ([] : (string * HolbuildFileLock.t) list)
+
+fun holds_usage_lease k = List.exists (fn (held, _) => held = k) (!held_usage_leases)
+
+fun hold_usage_lease k =
+  if holds_usage_lease k then ()
+  else
+    let
+      val lease = HolbuildFileLock.acquire_shared_path_wait {path = usage_lease_path k}
+                  handle HolbuildFileLock.Error msg => die ("could not acquire dependency checkout usage lease: " ^ msg)
+    in
+      held_usage_leases := (k, lease) :: !held_usage_leases
+    end
+
+(* GC retention is measured from the last-used marker's mtime. *)
+fun touch_last_used k =
+  TextIO.closeOut (TextIO.openOut (last_used_path k)) handle IO.Io _ => ()
+
+(* Runs under the key's lock. *)
+fun create_checkout git rev k =
+  let
+    val dir = checkout_dir k
+    val (remote, commit) = ensure_commit git rev
+    val tmp = dir ^ ".tmp-" ^ HolbuildFileLock.current_pid_text ()
+    val index = HolbuildTempPath.temporary "checkout-index"
+    val git_tree = "GIT_INDEX_FILE=" ^ quote index ^ " " ^ HolbuildOffline.git_command () ^
+                   " --git-dir=" ^ quote remote ^ " --work-tree=" ^ quote tmp
+    fun remove_index () = FS.remove index handle OS.SysErr _ => ()
+  in
+    remove_temp_dirs {dir = checkouts_dir (), prefix = k ^ ".tmp-"};
+    (FS.mkDir tmp;
+     run (git_tree ^ " read-tree " ^ quote commit);
+     run (git_tree ^ " checkout-index --all");
+     run ("find " ^ quote tmp ^ " -type f -exec chmod a-w {} +");
+     FS.rename {old = tmp, new = dir})
+    handle e => (remove_index (); remove_if_exists tmp; raise e);
+    remove_index ()
+  end
+
+(* The shared checkout of dependency name (git at rev), made if missing (or
+   collected), leased by this process and marked used. Offline, a missing one
+   is not made, as a missing private clone is not. *)
+fun shared_checkout name git rev =
+  let
+    val k = checkout_key git rev
+    val dir = checkout_dir k
+    fun create () =
+      if path_exists dir then ()
+      else
+        (HolbuildOffline.require_online ("materialize dependency " ^ name ^ " at " ^ rev);
+         create_checkout git rev k)
+  in
+    ensure_dir (checkout_locks_dir ());
+    (* Lease before checking, so GC cannot remove the checkout in between. *)
+    hold_usage_lease k;
+    if path_exists dir then () else with_lock (checkout_lock_path k) create;
+    touch_last_used k;
+    dir
+  end
+
+datatype gc_outcome = GcKept | GcRemoved | GcBusy
+
+fun is_checkout_key name =
+  size name = 81 andalso String.sub(name, 40) = #"-" andalso
+  CharVector.all is_hex (String.substring(name, 0, 40) ^ String.extract(name, 41, NONE))
+
+fun checkout_keys () = List.filter is_checkout_key (list_dir (checkouts_dir ())) handle OS.SysErr _ => []
+
+(* Leftovers of an interrupted checkout GC; HolbuildCache removes them under
+   its GC lock before collecting checkouts. *)
+fun checkout_trash () =
+  map (fn name => Path.concat(checkout_trash_dir (), name)) (list_dir (checkout_trash_dir ()))
+  handle OS.SysErr _ => []
+
+fun last_use_time k =
+  SOME (FS.modTime (last_used_path k))
+  handle OS.SysErr _ => (SOME (FS.modTime (checkout_dir k)) handle OS.SysErr _ => NONE)
+
+fun checkout_stale cutoff k =
+  case last_use_time k of
+      SOME time => Time.<(time, cutoff)
+    | NONE => false
+
+fun with_try_lock path f =
+  case HolbuildFileLock.try_acquire_path {path = path, obsolete_kind = NONE}
+       handle HolbuildFileLock.Error msg => die msg of
+      NONE => GcBusy
+    | SOME lock =>
+        (f () before HolbuildFileLock.release lock)
+        handle e => (HolbuildFileLock.release lock; raise e)
+
+(* Removes the checkout if it is stale and no process holds its lock or usage
+   lease. It is renamed out of checkouts first, so an interrupted GC never
+   leaves a half-removed tree at the key. *)
+fun gc_checkout cutoff k =
+  (* fcntl locks never conflict within one process, so a checkout this process
+     uses must be skipped explicitly. *)
+  if holds_usage_lease k orelse not (checkout_stale cutoff k) then GcKept
+  else
+    with_try_lock (checkout_lock_path k) (fn () =>
+      with_try_lock (usage_lease_path k) (fn () =>
+        if not (checkout_stale cutoff k) then GcKept
+        else
+          let val trash = Path.concat(checkout_trash_dir (), k ^ "." ^ HolbuildFileLock.current_pid_text ())
+          in
+            ensure_dir (checkout_trash_dir ());
+            remove_if_exists trash;
+            FS.rename {old = checkout_dir k, new = trash};
+            FS.remove (last_used_path k) handle OS.SysErr _ => ();
+            remove_tree trash;
+            GcRemoved
+          end))
+
 fun materialized_head dest =
   if path_exists dest then
     let
@@ -179,6 +317,10 @@ fun materialized_head dest =
       if HolbuildSpawn.succeeded run then SOME (trim (#output run)) else NONE
     end
   else NONE
+
+fun link_target path = SOME (FS.readLink path) handle OS.SysErr _ => NONE
+
+fun entry_exists path = (ignore (Posix.FileSys.lstat path); true) handle OS.SysErr _ => false
 
 (* A process that has seen a checkout at its pinned commit holds a shared
    lease on it until exit, and replacing a checkout takes the lease
@@ -201,10 +343,10 @@ fun drop_lease path =
   let val (dropped, kept) = List.partition (fn (held, _) => held = path) (!held_leases)
   in List.app (fn (_, lease) => HolbuildFileLock.release lease) dropped; held_leases := kept end
 
-(* Moves a complete checkout to dest, replacing an existing tree only while
-   no other process holds its lease. *)
+(* Moves a complete checkout or link to dest, replacing an existing one only
+   while no other process holds its lease. *)
 fun publish_checkout {tmp, dest, lease} =
-  if not (path_exists dest) then FS.rename {old = tmp, new = dest}
+  if not (entry_exists dest) then FS.rename {old = tmp, new = dest}
   else
     case HolbuildFileLock.try_acquire_path {path = lease, obsolete_kind = NONE}
          handle HolbuildFileLock.Error msg => die msg of
@@ -215,7 +357,15 @@ fun publish_checkout {tmp, dest, lease} =
           ((remove_tree dest; FS.rename {old = tmp, new = dest}; HolbuildFileLock.release lock)
            handle e => (HolbuildFileLock.release lock; raise e))
 
-fun materialize {name, git, rev, artifact_root} =
+fun warn_fallback msg =
+  (TextIO.output(TextIO.stdErr, "holbuild: cannot use a shared dependency checkout, cloning instead: " ^ msg ^ "\n");
+   TextIO.flushOut TextIO.stdErr)
+
+(* Makes .holbuild/src/<name> hold git at rev. With shared, it links to the
+   shared checkout, or, if that cannot be made, falls back to a private clone;
+   without, it is a private clone, which a dependency writing into its own
+   tree needs. A private clone already at rev is kept either way. *)
+fun materialize {name, git, rev, artifact_root, shared} =
   let
     val _ = validate_name name
     val _ = validate_rev rev
@@ -224,25 +374,55 @@ fun materialize {name, git, rev, artifact_root} =
     val dest = Path.concat(src_root, name)
     val locks = Path.concat(Path.concat(holbuild_dir, "locks"), "src")
     val lease = Path.concat(locks, name ^ ".lease")
-    fun pinned () = materialized_head dest = SOME rev
-    (* Runs under the checkout lock. *)
-    fun checkout () =
+    val tmp_prefix = ".tmp-" ^ name ^ "-"
+    (* The shared checkout is made and leased only once a link needs it, so a
+       private clone already at rev is used as it is, offline too. *)
+    val target_memo = ref NONE
+    fun target () =
+      case !target_memo of
+          SOME t => t
+        | NONE =>
+            let
+              val t =
+                if not shared then NONE
+                else SOME (shared_checkout name git rev)
+                     handle Error msg => (warn_fallback msg; NONE)
+                          | OS.SysErr (msg, _) => (warn_fallback msg; NONE)
+            in
+              target_memo := SOME t;
+              t
+            end
+    fun pinned () =
+      case link_target dest of
+          SOME link => SOME link = target ()
+        | NONE => materialized_head dest = SOME rev
+    fun publish make =
+      let val tmp = Path.concat(src_root, tmp_prefix ^ HolbuildFileLock.current_pid_text ())
+      in
+        remove_temp_dirs {dir = src_root, prefix = tmp_prefix};
+        (make tmp; publish_checkout {tmp = tmp, dest = dest, lease = lease})
+        handle e => (if entry_exists tmp then remove_tree tmp else (); raise e)
+      end
+    fun clone tmp =
       let
         val _ = HolbuildOffline.require_online ("materialize dependency " ^ name ^ " at " ^ rev)
         val (remote, commit) = ensure_commit git rev
-        val tmp_prefix = ".tmp-" ^ name ^ "-"
-        val tmp = Path.concat(src_root, tmp_prefix ^ HolbuildFileLock.current_pid_text ())
       in
-        remove_temp_dirs {dir = src_root, prefix = tmp_prefix};
-        (run (HolbuildOffline.git_command () ^ " clone " ^ quote remote ^ " " ^ quote tmp);
-         run (HolbuildOffline.git_command () ^ " -C " ^ quote tmp ^ " checkout --detach " ^ quote commit);
-         publish_checkout {tmp = tmp, dest = dest, lease = lease})
-        handle e => (remove_if_exists tmp; raise e)
+        run (HolbuildOffline.git_command () ^ " clone " ^ quote remote ^ " " ^ quote tmp);
+        run (HolbuildOffline.git_command () ^ " -C " ^ quote tmp ^ " checkout --detach " ^ quote commit)
       end
+    (* Runs under the checkout lock. *)
+    fun checkout () =
+      case target () of
+          SOME checkout =>
+            publish (fn tmp =>
+                        Posix.FileSys.symlink {old = checkout, new = tmp}
+                        handle OS.SysErr (msg, _) => (warn_fallback msg; clone tmp))
+        | NONE => publish clone
   in
     ensure_dir src_root;
-    (* HEAD is checked again under the lease: a checkout replaced between the
-       first check and the lease is no longer at rev. *)
+    (* The link or HEAD is checked again under the lease: a checkout replaced
+       between the first check and the lease is no longer at rev. *)
     if pinned () andalso (hold_lease lease; pinned ()) then dest
     else
       (drop_lease lease;

@@ -25,12 +25,9 @@ fun poly_runtime_args ({maxheap, ...} : t) =
     | SOME n => ["--maxheap", Int.toString n]
 
 fun hol_subcommand_argv tc subcommand =
-  hol tc :: poly_runtime_args tc @ [subcommand]
+  hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ [subcommand]
 
-(* Holmake deliberately confines Poly/ML to one GC thread while playing theory
-   scripts.  Keep that build policy separate from interactive run/repl use. *)
-fun theory_run_argv tc =
-  hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ ["run"]
+fun theory_run_argv tc = hol_subcommand_argv tc "run"
 
 fun quote s =
   "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"
@@ -150,6 +147,15 @@ fun timed_shell kind argv output script =
 fun run argv =
   timed_shell "run" argv NONE (command argv)
 
+(* As run, under a machine memory reservation (--cooperate-dir), for the HOL
+   session of check and run. *)
+fun run_reserved argv =
+  HolbuildMachineMemory.with_reservation
+    (fn lease =>
+        timed_system "run" argv NONE
+          (fn () => HolbuildProcessGroup.run_shell_inheriting lease (command argv)))
+  handle HolbuildMachineMemory.Error msg => raise Error msg
+
 fun run_interactive argv =
   timed_system "run_interactive" argv NONE (fn () => OS.Process.system (command argv))
 
@@ -163,13 +169,17 @@ fun run_in_dir_to_file dir argv output =
     (fn lease =>
         timed_system "run_in_dir_to_file" argv (SOME output)
           (fn () =>
-              HolbuildProcessGroup.run_shell_inheriting lease
-                ("cd " ^ quote dir ^ " && " ^ command argv ^ " > " ^ quote output ^ " 2>&1")))
+              HolbuildActionSandbox.launch argv (fn confined =>
+                HolbuildProcessGroup.run_shell_inheriting lease
+                  ("cd " ^ quote dir ^ " && " ^
+                   (if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
+                   command confined ^ " > " ^ quote output ^ " 2>&1"))))
   handle HolbuildMachineMemory.Error msg => raise Error msg
+       | HolbuildActionSandbox.Error msg => raise Error msg
 
-(* As run_in_dir_to_file, killing the child once it has run for LIMIT.  The
-   clock starts once the memory reservation is granted. *)
-fun run_in_dir_to_file_until dir argv output limit =
+(* As run_in_dir_to_file, killing the child at the time DEADLINE () gives
+   once the memory reservation is granted. *)
+fun run_in_dir_to_file_by dir argv output deadline =
   let
     val timed_out = ref false
     val status =
@@ -179,16 +189,25 @@ fun run_in_dir_to_file_until dir argv output limit =
               (fn () =>
                   let
                     val result =
-                      HolbuildProcessGroup.run_shell_inheriting_until lease (Time.+ (Time.now (), limit))
-                        ("cd " ^ quote dir ^ " && " ^ command argv ^ " > " ^ quote output ^ " 2>&1")
+                      HolbuildActionSandbox.launch argv (fn confined =>
+                        HolbuildProcessGroup.run_shell_inheriting_until lease (deadline ())
+                          ("cd " ^ quote dir ^ " && " ^
+                           (if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
+                           command confined ^ " > " ^ quote output ^ " 2>&1"))
                   in
                     timed_out := #timed_out result;
                     #status result
                   end))
       handle HolbuildMachineMemory.Error msg => raise Error msg
+           | HolbuildActionSandbox.Error msg => raise Error msg
   in
     {status = status, timed_out = !timed_out}
   end
+
+(* As run_in_dir_to_file, killing the child once it has run for LIMIT.  The
+   clock starts once the memory reservation is granted. *)
+fun run_in_dir_to_file_until dir argv output limit =
+  run_in_dir_to_file_by dir argv output (fn () => Time.+ (Time.now (), limit))
 
 fun ensure_dir path =
   if path = "" orelse path = "." then ()

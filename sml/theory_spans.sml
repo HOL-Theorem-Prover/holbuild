@@ -3,14 +3,6 @@ struct
 
 structure P = HolbuildAnalysisProtocol
 
-fun read_all path =
-  let val input = TextIO.openIn path
-  in TextIO.inputAll input before TextIO.closeIn input end
-
-fun write_file path text =
-  let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
-
 fun int field text =
   case Int.fromString text of
       SOME n => n
@@ -23,31 +15,19 @@ fun analyser () =
 
 fun run wants source_path =
   let
-    val req = OS.FileSys.tmpName ()
-    val resp = OS.FileSys.tmpName ()
-    val err = OS.FileSys.tmpName ()
     val request = String.concatWith "\n"
       [P.join ["version", P.protocol_version],
        P.join ["command", "analyse"],
        P.join (["file", "1", source_path] @ wants),
        P.join ["end"]] ^ "\n"
-    val _ = write_file req request
-    val status = OS.Process.system (HolbuildHash.quote (analyser ()) ^ " " ^
-                                    String.concatWith " " (HolbuildDependencies.analyser_min_heap_args ()) ^
-                                    " --request " ^ HolbuildHash.quote req ^
-                                    " --response " ^ HolbuildHash.quote resp ^ " 2> " ^ HolbuildHash.quote err)
-    val stderr = read_all err handle _ => ""
-    val _ = OS.FileSys.remove req handle OS.SysErr _ => ()
-    val _ = OS.FileSys.remove err handle OS.SysErr _ => ()
+    val result as {output, response, ...} =
+      HolbuildDependencies.run_analyser {analyser = analyser (), request = request, capture_stderr = true}
   in
-    if OS.Process.isSuccess status then
-      let val lines = String.tokens (fn c => c = #"\n") (read_all resp)
-          val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
-      in lines end
-    else
-      let val _ = OS.FileSys.remove resp handle OS.SysErr _ => ()
-      in raise HolbuildTheoryCheckpoints.Error ("holbuild-hol-analyser failed for " ^ source_path ^
-                                                (if stderr = "" then "" else "\n" ^ stderr)) end
+    print output;
+    case response of
+        SOME text => String.tokens (fn c => c = #"\n") text
+      | NONE => raise HolbuildTheoryCheckpoints.Error ("holbuild-hol-analyser failed for " ^ source_path ^
+          "\n" ^ HolbuildDependencies.analyser_failure result)
   end
 
 fun parse_boundary fields =
@@ -152,6 +132,35 @@ fun scan_boundaries_and_terminations_recovering_strict source_path _ =
      terminations = map parse_termination (List.filter termination_record records)}
   end
 
-fun scan_terminations source_path source_text = scan_terminations_strict source_path source_text
+(* As scan_boundaries_and_terminations_recovering_strict, with each
+   boundary's and termination's proof-IR plan expression and factories, in
+   their order, from the same analyser process. *)
+fun scan_with_proof_ir_plans source_path _ =
+  let
+    val (records, errors) =
+      response_records ["boundaries-recovering", "terminations-strict", "proof-ir-plans"] source_path
+    val boundaries = map parse_boundary (List.filter boundary_record records)
+    val terminations = map parse_termination (List.filter termination_record records)
+    val plans = List.mapPartial (fn "begin-proof-ir" :: fields => SOME fields | _ => NONE) records
+    fun plan prefix (i, fields) =
+      case fields of
+          [id, _, _, _, expr, factories] =>
+            if id = prefix ^ Int.toString i then SOME (expr, factories)
+            else raise HolbuildTheoryCheckpoints.Error ("bad proof-IR response id: " ^ id ^ ", expected " ^
+                                                        prefix ^ Int.toString i)
+        | _ => raise HolbuildTheoryCheckpoints.Error "bad analyser proof-IR record"
+    fun numbered xs = ListPair.zip (List.tabulate (length xs, fn i => i), xs)
+    val nb = length boundaries
+  in
+    if length plans <> nb + length terminations then
+      raise HolbuildTheoryCheckpoints.Error
+        ("incomplete analyser response for " ^ source_path ^ ": " ^ Int.toString (length plans) ^
+         " proof-IR plans for " ^ Int.toString nb ^ " boundaries and " ^
+         Int.toString (length terminations) ^ " terminations")
+    else
+      {boundaries = boundaries, errors = errors, terminations = terminations,
+       boundary_plans = map (plan "b") (numbered (List.take (plans, nb))),
+       termination_plans = map (plan "t") (numbered (List.drop (plans, nb)))}
+  end
 
 end

@@ -9,13 +9,18 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 # run --remote-exec --remote-only against a real coordinator and the remote
 # cache its workers use: a run of theories no cache holds builds nothing
-# locally. Credentials come from HOLBUILD_REMOTE_EXEC_CURL_CONFIG and
-# HOLBUILD_REMOTE_CACHE_CURL_CONFIG, as for any build.
+# locally. tests/run.sh clears the HOLBUILD_REMOTE_* environment for every
+# case and keeps its values as HOLBUILD_TEST_LIVE_REMOTE_*; this case restores
+# the cache URL and the curl configs for its build.
 
-if [[ -z "${HOLBUILD_TEST_REMOTE_EXEC_URL:-}" || -z "${HOLBUILD_REMOTE_CACHE_URL:-}" ]]; then
+if [[ -z "${HOLBUILD_TEST_REMOTE_EXEC_URL:-}" || -z "${HOLBUILD_TEST_LIVE_REMOTE_CACHE_URL:-}" ]]; then
   echo "SKIP remote-exec-live: HOLBUILD_TEST_REMOTE_EXEC_URL or HOLBUILD_REMOTE_CACHE_URL is not set"
   exit 0
 fi
+for live_var in CACHE_URL CACHE_CURL_CONFIG EXEC_CURL_CONFIG; do
+  live=HOLBUILD_TEST_LIVE_REMOTE_$live_var
+  [[ -z "${!live:-}" ]] || export "HOLBUILD_REMOTE_$live_var=${!live}"
+done
 
 tmpdir=$(make_temp_dir)
 log=$tmpdir/run.log

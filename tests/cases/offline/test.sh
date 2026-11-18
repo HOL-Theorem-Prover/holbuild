@@ -104,15 +104,25 @@ no_requests
 "$HOLBUILD_BIN" context > "$tmpdir/context-online"
 HOLBUILD_OFFLINE=0 PATH="$blocked_path" "$HOLBUILD_BIN" --offline context > "$tmpdir/context-offline"
 cmp "$tmpdir/context-online" "$tmpdir/context-offline"
-mv .holbuild/src/dep "$tmpdir/saved-dep"
+# A project links the shared checkout offline, but a missing shared checkout
+# is not made from the mirror.
+shared=$HOLBUILD_CACHE/git/checkouts/$(printf %s "$tmpdir/dep" | sha1sum | cut -d' ' -f1)-$rev
+[[ $(readlink .holbuild/src/dep) == "$shared" ]]
+rm .holbuild/src/dep
+HOLBUILD_OFFLINE=1 PATH="$blocked_path" "$HOLBUILD_BIN" context > /dev/null
+[[ $(readlink .holbuild/src/dep) == "$shared" ]]
+no_requests
+rm .holbuild/src/dep
+mv "$shared" "$tmpdir/saved-dep"
 expect_failure warm-mirror 'offline: cannot materialize dependency dep at' \
   env HOLBUILD_OFFLINE=1 PATH="$blocked_path" "$HOLBUILD_BIN" context
 no_requests
-mv "$tmpdir/saved-dep" .holbuild/src/dep
+mv "$tmpdir/saved-dep" "$shared"
+ln -s "$shared" .holbuild/src/dep
 write_manifest 0000000000000000000000000000000000000000
 expect_failure wrong-rev 'offline: cannot materialize dependency dep at' \
   env PATH="$blocked_path" "$HOLBUILD_BIN" --offline context
-[[ $(git -C .holbuild/src/dep rev-parse HEAD) == "$rev" ]]
+[[ $(readlink .holbuild/src/dep) == "$shared" ]]
 write_manifest "$rev"
 no_requests
 
@@ -243,7 +253,7 @@ val _ = assert "curl CLI"
   (case HolbuildRemoteCache.curl_get {url=url, dst=tmp ^ "/cli-get"} of
        HolbuildCacheBackend.Corrupt message => String.isSubstring "offline" message
      | _ => false);
-val _ = denied "submit" (fn () => ignore (HolbuildRemoteExec.submit url NONE "batch"));
+val _ = denied "submit" (fn () => ignore (HolbuildRemoteExec.submit false url NONE "batch"));
 val _ = denied "follow" (fn () => ignore (HolbuildRemoteExec.follow url "batch" (fn _ => ())));
 val _ = denied "cancel" (fn () => ignore (HolbuildRemoteExec.cancel url "batch"));
 val _ = denied "restore" (fn () => ignore (HolbuildHolSharedCache.restore_entry "missing"));

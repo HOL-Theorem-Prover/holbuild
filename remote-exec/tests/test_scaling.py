@@ -1,7 +1,9 @@
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -12,15 +14,18 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
 from remote_exec import app as app_module
 from remote_exec import coordinator as coordinator_module
+from remote_exec.cache_pool import CacheSlot
 from remote_exec.coordinator import (
     Coordinator,
     HostReport,
+    PhaseReport,
     QueueCounts,
     ScaleRun,
     Settings,
     burst_demand,
     is_auth_failure,
 )
+from test_cache_pool import Provider
 from test_coordinator import claim, input_key, submit
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -35,6 +40,9 @@ def counts(
     ready_run: int = 0,
     running_run: int = 0,
     high_run: int = 0,
+    ready_high_run: int = 0,
+    ahead: int = 0,
+    ahead_high: int = 0,
 ) -> QueueCounts:
     return QueueCounts(
         waiting=0,
@@ -45,6 +53,9 @@ def counts(
         ready_run=ready_run,
         running_run=running_run,
         high_run=high_run,
+        ready_high_run=ready_high_run,
+        waiting_ahead_standard=ahead,
+        waiting_ahead_high=ahead_high,
     )
 
 
@@ -57,10 +68,38 @@ def counts(
         (counts(ready_high=1), 1),  # warm workers are standard-tier, so a high action needs a burst worker
         (counts(running=2, ready_high=1, running_high=1), 2),
         (counts(ready=30, running=10), 16),  # capped
+        # Running actions waiting ahead ask for no worker while no ready work needs a burst worker...
+        (counts(running=6, ahead=4), 0),
+        (counts(running_high=3, ahead_high=3), 0),
+        (counts(ready=1, running=4, ahead=3), 0),  # the warm workers take the rest
+        # ...and count once some does, since they don't take it, whatever their tier.
+        (counts(ready_high=2, running_high=6, ahead_high=4), 4 + 4),
+        (counts(ready_high=1, running=4, running_high=3, ahead=4), 4 + 4),
+        (counts(ready=2, running=4, ahead=3), 1 + 3),
     ],
 )
 def test_burst_demand(queue: QueueCounts, expected: int) -> None:
     assert burst_demand(queue, warm_workers=2, max_burst_workers=16) == expected
+
+
+def test_burst_demand_counts_the_workers_held_ahead_for_no_high_run_the_run_slots_hold_back() -> None:
+    # One run slot, taken by the running high run: the ready one waits for it, not for a burst worker.
+    queue = counts(
+        running=4, ready_high=1, running_high=1, ready_run=1, running_run=1, high_run=2, ready_high_run=1, ahead=4
+    )
+    assert burst_demand(queue, warm_workers=2, max_burst_workers=16, run_slots=1) == 1
+
+
+def test_burst_demand_counts_the_workers_held_ahead_for_no_high_run_held_back_by_standard_runs() -> None:
+    # One run slot, taken by a running standard run: the ready high run waits for it, not for a burst worker.
+    queue = counts(running=6, ready_high=1, ready_run=1, running_run=1, high_run=1, ready_high_run=1, ahead=4)
+    assert burst_demand(queue, warm_workers=2, max_burst_workers=16, run_slots=1) == 1
+
+
+def test_burst_demand_counts_the_workers_held_ahead_for_no_standard_run_the_run_slots_hold_back() -> None:
+    # One run slot, taken by the running high run: the ready standard run waits for it, not for a burst worker.
+    queue = counts(running=7, ready=1, running_high=1, ready_run=1, running_run=1, high_run=1, ahead=4)
+    assert burst_demand(queue, warm_workers=2, max_burst_workers=16, run_slots=1) == 2
 
 
 def scaled_coordinator(coordinator: Coordinator, tmp_path: Path, script: str) -> tuple[Coordinator, Path]:
@@ -114,6 +153,65 @@ async def test_sweep_runs_the_scale_command_when_the_held_target_changes_and_kee
     assert calls.read_text().split() == ["0", "2", "2", "0"]
 
 
+async def test_cache_pool_holds_its_worker_floor_past_the_shorter_worker_hold(
+    http: httpx.AsyncClient, coordinator: Coordinator, tmp_path: Path
+) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = start
+
+    def at(seconds: float) -> None:
+        nonlocal now
+        now = start + timedelta(seconds=seconds)
+
+    scaled, calls = scaled_coordinator(coordinator, tmp_path, "")
+    settings = scaled.settings.model_copy(update={
+        "scale_down_hold_s": 60.0,
+        "cache_scale_down_hold_s": 900.0,
+        "cache_pool_cmd": "unused",
+        "cache_slots": [CacheSlot(name=str(n), url=f"http://cache-{n}.test") for n in range(4)],
+        "cache_workers_per_node": 1,
+    })
+    scaled = Coordinator(scaled.engine, scaled.cache, settings)
+    scaled.clock = lambda: now
+    assert scaled.cache_pool is not None
+    provider = Provider()
+    scaled.cache_pool.adapter = provider
+
+    async def capacity() -> int:
+        assert scaled.cache_pool is not None
+        await scaled.cache_pool.reconcile(now)
+        target = [r.target for r in provider.calls if r.op == "capacity"][-1]
+        assert target is not None
+        return target
+
+    await submit(http, ["a", "b", "c"])
+    await scaled.sweep()
+    assert await capacity() == 2
+    async with scaled.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE actions SET state = 'cancelled'"))
+    at(120)
+    await scaled.sweep()  # past the worker hold: the workers go, the caches stay
+    assert calls.read_text().split() == ["2", "0"]
+    assert await capacity() == 2
+    at(901)
+    await scaled.sweep()
+    assert await capacity() == 0
+    provider.cpu_target = 3  # CPU recommendations keep the shorter hold
+    assert await capacity() == 3
+    provider.cpu_target = 0
+    at(959)
+    assert await capacity() == 3
+    at(962)
+    assert await capacity() == 0
+
+
+async def test_queue_reports_the_burst_worker_cap(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    coordinator.settings.max_burst_workers = 420
+    response = await http.get("/v1/queue", headers=CLIENT)
+    assert response.status_code == 200
+    assert response.json()["max_burst_workers"] == 420
+
+
 async def test_queue_reports_counts_and_the_desired_burst_workers(
     http: httpx.AsyncClient, coordinator: Coordinator, tmp_path: Path
 ) -> None:
@@ -136,10 +234,22 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "running_high": 1,
         "ready_run": 2,
         "running_run": 1,
+        "ready_priority": 0,
+        "running_priority": 0,
+        "waiting_ahead_standard": 0,
+        "waiting_ahead_high": 0,
+        "run_slots": 30,
+        "run_floor": 0,
+        "priority_cap": 128,
         "desired_burst_workers": 0,  # the route's coordinator has no burst workers to ask for
+        "max_burst_workers": 0,
         "hosts": [],
         "phases": None,  # see test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes
         "scaler": None,  # nor a scale command
+        "locality": {  # no host claimed
+            "claims": 0, "wakes": 0, "hosts_left": 0, "keys_left": 0, "keys_lost": 0, "hit_theory": 0, "hit_deps": 0,
+            "missed_held": 0, "unheld": 0, "held_waits": 0, "held_ms_total": 0,
+        },
     }
     assert (await scaled.queue()).desired_burst_workers == 4
 
@@ -147,6 +257,20 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
     response = await http.get("/v1/queue", headers=CLIENT)
     assert response.json()["scaler"] == {"workers": 4, "at": "2026-01-01T12:00:00+00:00", "error": "scale 4 exited 1"}
     assert (await http.get("/v1/queue", headers=WORKER)).status_code == 401
+
+
+@pytest.mark.parametrize(("slots", "floor", "effective"), [(30, 4, 4), (2, 8, 2), (0, 4, 0)])
+async def test_queue_reports_effective_run_capacity(
+    http: httpx.AsyncClient, coordinator: Coordinator, slots: int, floor: int, effective: int
+) -> None:
+    coordinator.settings.run_slots = slots
+    coordinator.settings.run_floor = floor
+
+    response = await http.get("/v1/queue", headers=CLIENT)
+
+    assert response.status_code == 200
+    assert response.json()["run_slots"] == slots
+    assert response.json()["run_floor"] == effective
 
 
 async def test_failing_scale_command_neither_stops_the_sweep_nor_counts_as_applied(
@@ -301,7 +425,7 @@ def test_settings_errors_do_not_print_credentials(monkeypatch: pytest.MonkeyPatc
     assert "secret" not in str(error.value)
 
 
-def host_report(host_id: str, cpu_idle_pct: float | None) -> dict[str, Any]:
+def host_report(host_id: str, cpu_idle_pct: float | None, rank: int = 0) -> dict[str, Any]:
     return {
         "id": host_id,
         "cpu_idle_pct": cpu_idle_pct,
@@ -311,7 +435,26 @@ def host_report(host_id: str, cpu_idle_pct: float | None) -> dict[str, Any]:
         "reserved": 6 << 30,
         "leases": 2,
         "memory_short": False,
+        "rank": rank,
+        "disk_free": 100 << 30,
     }
+
+
+@pytest.mark.parametrize(("host_id", "host_rank"), [(None, 0), ("host-a", 0), ("host-a", 1)])
+async def test_claim_forwards_optional_host_id_and_rank(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, host_id: str | None,
+    host_rank: int,
+) -> None:
+    claim = AsyncMock(return_value=None)
+    monkeypatch.setattr(coordinator, "claim", claim)
+    body: dict[str, Any] = {"tier": "high", "also_claim": ["standard"], "worker": "w1"}
+    if host_id is not None:
+        body["host"] = host_report(host_id, 30.0, host_rank)
+    response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+    assert response.status_code == 204
+    assert claim.await_args is not None
+    assert claim.await_args.args[:3] == (["high", "standard"], "w1", 0)
+    assert claim.await_args.kwargs == {"host_id": host_id, "host_rank": host_rank, "ahead": False}
 
 
 async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
@@ -336,8 +479,8 @@ async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, c
 
     hosts = (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"]
     assert hosts == [
-        {**host_report("h1", 30.0), "age_s": 5.0},  # the last idle share measured
-        {**host_report("h2", 80.0), "age_s": 5.0},
+        {**host_report("h1", 30.0), "age_s": 5.0, "quarantined": None},  # the last idle share measured
+        {**host_report("h2", 80.0), "age_s": 5.0, "quarantined": None},
     ]
 
     now += timedelta(seconds=120)
@@ -357,12 +500,28 @@ async def test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes(
         assert response.status_code == 204
         now += timedelta(seconds=300)
 
-    seconds = dict.fromkeys(["memory_wait", "claim", "idle", "lease", "release", "before_hol", "exec", "complete"], 0.0)
+    seconds = dict.fromkeys(["memory_wait", "claim", "idle", "lease", "release", "before_hol", "exec", "complete", "after_result"], 0.0)
     totals = (await http.get("/v1/queue", headers=CLIENT)).json()["phases"]
     assert totals == {"window_s": 600, "reports": 1, "seconds": {**seconds, "hol": 10.0, "after_hol": 12.0}}
 
     now += timedelta(seconds=300)
     assert (await http.get("/v1/queue", headers=CLIENT)).json()["phases"]["reports"] == 0
+
+
+async def test_phase_sums_drop_the_reports_evicted_at_the_cap_and_restart_from_zero(
+    coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "MAX_PHASE_REPORTS", 2)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    coordinator.clock = lambda: now
+    for hol in (0.1, 0.2, 0.3):
+        coordinator.report_phases(PhaseReport(hol=hol))
+    totals = coordinator._phase_totals(now)
+    assert (totals.reports, totals.seconds.hol) == (2, 0.5)
+
+    now += timedelta(seconds=600)
+    assert coordinator._phase_totals(now).reports == 0
+    assert coordinator.phase_sums == dict.fromkeys(coordinator_module.PHASE_FIELDS, 0.0)
 
 
 async def test_a_negative_phase_report_is_refused(http: httpx.AsyncClient) -> None:
@@ -433,3 +592,82 @@ def test_run_slots_defaults_to_thirty_and_rejects_negative_values(coordinator: C
     assert Settings(**settings).run_slots == 30
     with pytest.raises(ValidationError):
         Settings(**settings, run_slots=-1)
+
+
+async def test_batch_intake_scales_without_waiting_for_sweep_or_scale_command(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator.settings.scale_cmd = "unused"
+    coordinator.settings.max_burst_workers = 10
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    calls: list[int] = []
+    active = 0
+
+    async def scale(command: str, workers: int) -> None:
+        nonlocal active
+        active += 1
+        assert active == 1
+        calls.append(workers)
+        started.set()
+        try:
+            await finish.wait()
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(coordinator, "_scale", scale)
+    sweep = None
+    try:
+        await asyncio.wait_for(submit(http, ["a"]), 5)
+        await asyncio.wait_for(started.wait(), 5)
+        assert calls == [1]
+        assert coordinator.scale_task is not None and not coordinator.scale_task.done()
+        await submit(http, ["b", "c"])
+        sweep = asyncio.create_task(coordinator.sweep())
+        await asyncio.sleep(0)
+        assert calls == [1]  # intake and sweep both wait for the first command
+    finally:
+        finish.set()
+        if sweep is not None:
+            await sweep
+        if coordinator.scale_task is not None:
+            await coordinator.scale_task
+    assert calls == [1, 3]  # fresh demand is read after acquiring the lock
+
+
+async def test_intake_scale_requests_are_coalesced(coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch) -> None:
+    coordinator.settings.scale_cmd = "unused"
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def scale() -> None:
+        started.set()
+        await finish.wait()
+
+    check = AsyncMock(side_effect=scale)
+    monkeypatch.setattr(coordinator, "scale", check)
+    for _ in range(20):
+        coordinator.request_scale()
+    await asyncio.wait_for(started.wait(), 5)
+    task = coordinator.scale_task
+    try:
+        for _ in range(20):
+            coordinator.request_scale()
+        assert coordinator.scale_task is task
+        assert check.await_count == 1
+    finally:
+        finish.set()
+        assert task is not None
+        await task
+    assert check.await_count == 2
+
+
+async def test_empty_batch_does_not_request_scaling(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    check = AsyncMock()
+    monkeypatch.setattr(coordinator, "scale", check)
+    coordinator.settings.scale_cmd = "unused"
+    await submit(http, [])
+    assert coordinator.scale_task is None
+    check.assert_not_awaited()

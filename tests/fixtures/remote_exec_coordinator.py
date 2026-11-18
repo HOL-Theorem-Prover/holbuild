@@ -6,7 +6,7 @@ id.  GET /v1/batches/<id>/events runs `RUN <batch file>` (a stand-in for the
 workers), then streams one action event per action and the batch's final
 event: done when RUN exits 0, failed otherwise.  In a failed batch, an action
 RUN left a result for (STATE/result-<input key>, as exec-action writes it) is
-reported as that result says: done, or failed with its failure and log.  Each
+reported as that result says: done, or failed with its failure, log and detail.  Each
 action is reported running twice first, as a coordinator repeats unchanged
 states.  A batch submitted with `?class=run` is a run batch: each action is
 reported from its result (failed `internal` without one) and the batch ends
@@ -20,10 +20,14 @@ holding a count, makes that many event streams send the first action's running
 state and then break, without running RUN, `down`
 makes the event stream and POST /v1/batches/<id>/cancel answer 503, `ended`
 makes the event stream answer 503 and the cancel answer that the batch is
-already done, `skip` reports the batch done without running RUN, `hang` streams one
+already done, `watch`, holding a directory, makes each submitted batch <id> leave
+STATE/<id>.watched: the sha256 of that directory's files, concatenated in name
+order, or `absent` when it has none, `skip` reports the batch done without running RUN, `hang` streams one
 running event and then nothing until `hang` is removed, without running RUN, `hold`
 holds the stream after the first action's final event until `hold` is removed, and
-`cancelled` reports every action and the batch cancelled without running RUN.  When RUN
+`cancelled` reports every action and the batch cancelled without running RUN, and
+`deadline` reports a failed action as the batch deadline leaves it: cancelled, then again
+with the log its worker uploaded as it stopped, and the batch failed at the deadline.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", the batch fails for resubmission naming it,
 as the coordinator does.  Otherwise
@@ -31,6 +35,7 @@ the cancel answers that it cancelled the batch.  Every request is logged to
 STATE/requests.log.
 """
 
+import hashlib
 import json
 import pathlib
 import subprocess
@@ -81,11 +86,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(status, {"detail": "restarting"})
         batch_id = f"b{len(list(state.glob('*.batch'))) + 1}"
         (state / f"{batch_id}.batch").write_text(body)
+        watch = state / "watch"
+        if watch.exists():
+            files = sorted(p for p in pathlib.Path(watch.read_text().strip()).glob("*") if p.is_file())
+            digest = hashlib.sha256(b"".join(p.read_bytes() for p in files)).hexdigest() if files else "absent"
+            (state / f"{batch_id}.watched").write_text(digest)
         heap = parse_qs(query).get("max_heap_mb")
         if heap:
             (state / f"{batch_id}.heap").write_text(heap[0])
         if "class=run" in query.split("&"):
             (state / f"{batch_id}.run").touch()
+        # What happens elsewhere while the client submits.
+        if (state / "on-submit").exists():
+            subprocess.run(["bash", str(state / "on-submit")], check=True)
         # Whitespace around the colon is valid JSON the client must accept.
         self.answer(201, {"batch_id": batch_id}, separators=(", ", " : "))
 
@@ -140,6 +153,12 @@ class Handler(BaseHTTPRequestHandler):
         for line in batch.read_text().splitlines():
             fields = line.split()
             if fields[0] == "action":
+                if (state / "retried").exists():
+                    # A retry after a memory failure, as the coordinator reports it.
+                    retried = {"type": "action", "input_key": fields[1], "theory": fields[4], "state": "waiting",
+                               "tier": "high", "attempts": 1, "last_failure": "memory",
+                               "log_sha256": "c" * 64, "failure_detail": "killed by SIGKILL"}
+                    self.wfile.write((json.dumps(retried) + "\n").encode())
                 for _ in range(2):
                     running = {"type": "action", "input_key": fields[1], "theory": fields[4],
                                "state": "running", "tier": "standard", "attempts": 1,
@@ -158,15 +177,42 @@ class Handler(BaseHTTPRequestHandler):
                     if record["status"] == "failed":
                         event["state"], event["last_failure"] = "failed", record["failure"]
                         event["log_sha256"] = record["log"].split()[0] if "log" in record else None
+                        event["failure_detail"] = record.get("detail")
                     else:
                         event["state"], event["last_failure"] = "done", None
                 elif not ok and result.exists():
                     record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
-                    if record["status"] == "failed":
+                    if record["status"] == "skipped":
+                        event["state"], event["last_failure"] = "cancelled", record["failure"]
+                    elif record["status"] == "failed":
                         event["last_failure"] = record["failure"]
                         event["log_sha256"] = record["log"].split()[0] if "log" in record else None
+                        event["failure_detail"] = record.get("detail")
+                        if (state / "deadline").exists():
+                            # As the coordinator sends it: cancelled at the deadline, then the log its
+                            # worker reports as it stops.
+                            event["state"], event["last_failure"] = "cancelled", "deadline"
+                            event["failure_detail"] = "still running after 12 h"
+                            self.wfile.write((json.dumps(dict(event, log_sha256=None)) + "\n").encode())
                     else:
                         event["state"], event["last_failure"] = "done", None
+                elif not ok and not (state / "fail").exists():
+                    event["state"], event["last_failure"] = "cancelled", None
+                if event["state"] == "done" and result.exists() and not cancelled:
+                    record = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:])
+                    event["log_sha256"] = record["log"].split()[0] if "log" in record else None
+                if result.exists():
+                    recorded = dict(line.split("=", 1) for line in result.read_text().splitlines()[1:] if "=" in line)
+                    if "phase-ms" in recorded:
+                        event["timings"] = {name: int(ms) for name, ms in
+                                            (part.split(":") for part in recorded["phase-ms"].split(","))}
+                        event["timings"]["wall"] = int(recorded["wall-ms"])
+                if event["state"] == "done" and (state / "requeue-log").exists():
+                    # The first execution's log was evicted; only the final
+                    # execution's log is usable after the action is requeued.
+                    self.wfile.write((json.dumps(dict(event, log_sha256="0" * 64)) + "\n").encode())
+                    if not (state / "requeue-snapshot").exists():
+                        self.wfile.write((json.dumps(dict(event, state="waiting", log_sha256=None)) + "\n").encode())
                 self.wfile.write((json.dumps(event) + "\n").encode())
                 self.wfile.flush()
                 for _ in range(600):
@@ -176,14 +222,16 @@ class Handler(BaseHTTPRequestHandler):
         if (state / "drop").exists():
             (state / "drop").unlink()
             return
-        failure = None if ok else "an action failed"
+        failure = None if ok else "deadline: still running after 12 h" if (state / "deadline").exists() \
+            else "an action failed"
         missing = state / "missing"
         if not ok and missing.exists():
             what = missing.read_text().strip()
             missing.unlink()
             if what:
                 failure = f"resubmit: an action is still missing {what} after 3 attempts"
-        final = {"type": "batch", "state": final_state, "failure": failure}
+        final = {"type": "batch", "state": "cancelled" if (state / "cancel-after-actions").exists() else final_state,
+                 "failure": failure}
         self.wfile.write((json.dumps(final) + "\n").encode())
 
 

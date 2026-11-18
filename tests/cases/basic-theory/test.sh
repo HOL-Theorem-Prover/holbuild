@@ -214,10 +214,9 @@ while IFS= read -r line; do
   fi
 done < <(grep "^output-sha256=" "$metadata")
 
-# A remapped artifact is a distinct file.  Its diagnostic hash must describe
-# its own bytes even if it has been corrupted independently of the canonical
-# artifact.
+# Replacing a remapped artifact must not make its diagnostic use the canonical hash.
 remapped_sml=$project/.holbuild/obj/src/.hol/objs/ATheory.sml
+rm "$remapped_sml"
 printf 'corrupted remapped artifact\n' > "$remapped_sml"
 (cd "$project" && "$HOLBUILD_BIN" --verbose build --emit-output-hashes ATheory) > "$tmpdir/corrupt-remap-hash.log"
 expected_remapped_hash=$(sha256sum "$remapped_sml" | awk '{print $1}')

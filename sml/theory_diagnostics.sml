@@ -206,7 +206,7 @@ fun static_error_summary source_path source_text lines =
              source_context])
         end
 
-fun proof_unit_label (checkpoint : HolbuildTheoryCheckpoints.checkpoint) =
+fun proof_unit_label (checkpoint : HolbuildTheoryCheckpoints.boundary) =
   if #kind checkpoint = "resume" then "resume" else "theorem"
 
 fun source_span_text source_path source_text start_offset end_offset =
@@ -227,7 +227,7 @@ fun source_span_text source_path source_text start_offset end_offset =
                    source_context_text_span source_text {start_offset = start_offset, end_offset = end_offset}]
   end
 
-fun checkpoint_source_summary source_path source_text (checkpoint : HolbuildTheoryCheckpoints.checkpoint) label {offset, width} =
+fun checkpoint_source_summary source_path source_text (checkpoint : HolbuildTheoryCheckpoints.boundary) label {offset, width} =
   let
     val theorem_line = line_number_at source_text (#theorem_start checkpoint)
     val proof_line = line_number_at source_text (#tactic_start checkpoint)
@@ -243,6 +243,7 @@ fun checkpoint_source_summary source_path source_text (checkpoint : HolbuildTheo
 val termination_goal_prefix = "holbuild termination condition goal for "
 val termination_goal_end = "holbuild termination condition goal end"
 val termination_definition_start_prefix = "holbuild termination definition start for "
+val termination_definition_end_prefix = "holbuild termination definition end for "
 
 fun has_suffix suffix text =
   let val n = size text
@@ -280,7 +281,9 @@ fun last_termination_goal lines =
           SOME (TerminationGoal {name = name, definition_start = definition_start, lines = rev lines})
     fun loop [] current best = finish current best
       | loop (line :: rest) current best =
-          case current of
+          if String.isPrefix termination_definition_start_prefix line orelse
+             String.isPrefix termination_definition_end_prefix line then loop rest NONE NONE
+          else case current of
               SOME {name, definition_start, lines} =>
                 if line = termination_goal_end then
                   loop rest NONE (SOME (TerminationGoal {name = name, definition_start = definition_start, lines = rev lines}))
@@ -289,9 +292,7 @@ fun last_termination_goal lines =
                 case parse_termination_goal_marker line of
                     SOME {name, definition_start} =>
                       loop rest (SOME {name = name, definition_start = definition_start, lines = []}) best
-                  | NONE =>
-                      if String.isPrefix termination_definition_start_prefix line then loop rest NONE NONE
-                      else loop rest NONE best
+                  | NONE => loop rest NONE best
   in
     loop lines NONE NONE
   end
@@ -370,7 +371,7 @@ fun skip_whitespace source_text limit offset =
   else if Char.isSpace (String.sub(source_text, offset)) then skip_whitespace source_text limit (offset + 1)
   else offset
 
-fun finish_span source_text (checkpoint : HolbuildTheoryCheckpoints.checkpoint) =
+fun finish_span source_text (checkpoint : HolbuildTheoryCheckpoints.boundary) =
   let
     val finish_offset = skip_whitespace source_text (#theorem_stop checkpoint) (#tactic_end checkpoint)
   in
@@ -378,7 +379,7 @@ fun finish_span source_text (checkpoint : HolbuildTheoryCheckpoints.checkpoint) 
   end
 
 fun failed_theorem_source_summary source_path source_text checkpoints label theorem_name failed_span failed_end =
-  case List.find (fn (checkpoint : HolbuildTheoryCheckpoints.checkpoint) => #name checkpoint = theorem_name) checkpoints of
+  case List.find (fn (checkpoint : HolbuildTheoryCheckpoints.boundary) => #name checkpoint = theorem_name) checkpoints of
       NONE => NONE
     | SOME checkpoint =>
         SOME (checkpoint_source_summary source_path source_text checkpoint label
@@ -536,8 +537,6 @@ fun summarize_goal_state_with_log_reference log_available path =
   Option.map (goal_state_summary log_available) (read_goal_state path)
   handle _ => NONE
 
-fun summarize_goal_state path = summarize_goal_state_with_log_reference true path
-
 fun plan_position_summary path =
   Option.map (fn position => "plan position: " ^ position ^ "\n")
              (plan_position_from_text (read_prefix path 65536))
@@ -558,11 +557,27 @@ fun take_n n lines acc =
       | line :: rest => take_n (n - 1) rest (line :: acc)
 
 fun child_failure_excerpt lines =
-  case lines of
-      [] => NONE
-    | line :: rest =>
-        if child_failure_line line then SOME (take_n 12 (line :: rest) [])
-        else child_failure_excerpt rest
+  let
+    (* A worker appends its derived summary to the raw log.  Diagnose only
+       the raw output, and keep preceding output separate from the cause. *)
+    fun scan [] _ failure terminal = (failure, terminal)
+      | scan (remaining as line :: rest) preceding failure terminal =
+          if String.isPrefix "holbuild: exec-action failed:" line then (failure, terminal)
+          else
+            scan rest (take_n 10 (line :: preceding) [])
+              (if child_failure_line line then SOME remaining else failure)
+              (if String.isPrefix "Uncaught exception" line then SOME (line, rev preceding)
+               else terminal)
+    fun raw_excerpt [] = []
+      | raw_excerpt (line :: rest) =
+          if String.isPrefix "holbuild: exec-action failed:" line then []
+          else line :: raw_excerpt rest
+  in
+    case scan lines [] NONE NONE of
+        (_, SOME (line, [])) => SOME [line]
+      | (_, SOME (line, preceding)) => SOME (line :: "preceding HOL output:" :: preceding)
+      | (failure, NONE) => Option.map (fn rest => raw_excerpt (take_n 12 rest [])) failure
+  end
 
 fun child_failure_summary path =
   let val lines = String.fields (fn c => c = #"\n") (read_text path)

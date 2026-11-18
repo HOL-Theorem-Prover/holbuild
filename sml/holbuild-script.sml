@@ -78,9 +78,9 @@ use_hol("src/portableML/Redblackmap.sml");
 use "sml/sha256.sml";
 
 use "sml/spawn.sml";
+use "sml/temp_path.sml";
 use "sml/hash.sml";
 use "sml/process_group.sml";
-use "sml/temp_path.sml";
 use "sml/remove_tree.sml";
 use "sml/stat_cache.sml";
 use "sml/version.sml";
@@ -92,7 +92,9 @@ use "sml/hol_source_manifest.sml";
 use "sml/cache_config.sml";
 use "sml/offline.sml";
 use "sml/http.sml";
+use "sml/zstd.sml";
 use "sml/remote_cache_config.sml";
+use "sml/cache_discovery.sml";
 use "sml/file_lock.sml";
 use "sml/git_cache.sml";
 use "sml/cache_backend.sml";
@@ -104,10 +106,12 @@ use "sml/status.sml";
 use "sml/machine_memory.sml";
 use "sml/remote_cache.sml";
 use "sml/tar_archive.sml";
-use "sml/cache_archive.sml";
 use "sml/toolchain_archive.sml";
+use "sml/action_sandbox.sml";
+use "sml/action_resident.sml";
 use "sml/hol_shared_cache.sml";
 use "sml/manifest_util.sml";
+use "sml/cache_archive.sml";
 use "sml/package_definition.sml";
 use "sml/package_provenance.sml";
 use "sml/local_config.sml";
@@ -117,10 +121,12 @@ use "sml/toolchain.sml";
 use "sml/generators.sml";
 use "sml/package_prepare.sml";
 use "sml/source_index.sml";
+use "sml/names.sml";
 use "sml/package_component.sml";
 use "sml/dependencies.sml";
 use "sml/component_provider.sml";
 use "sml/build_plan.sml";
+use "sml/package_snapshot.sml";
 use "sml/plan_record.sml";
 use "sml/theory_checkpoints.sml";
 use "sml/checkpoint_store.sml";
@@ -133,6 +139,11 @@ use "sml/build_exec.sml";
 use "sml/proof_ir_types.sml";
 use "sml/watch.sml";
 use "sml/remote_exec.sml";
+use "sml/command_summary.sml";
 use "sml/commands.sml";
+use "sml/complete.sml";
 
-fun main () = HolbuildCommands.main (CommandLine.arguments())
+fun main () =
+  case CommandLine.arguments () of
+      "__complete" :: words => HolbuildComplete.main words
+    | args => HolbuildCommands.main args

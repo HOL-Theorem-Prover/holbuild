@@ -181,8 +181,8 @@ resumed() {
 
 write_t "T" "simp[]"
 export_t v1
-# A, a dependency of the target, has no theorem checkpoints: nothing to share.
-[[ ! -e "$shared/checkpoint-store" ]] || { echo "the dependency A shared a heap" >&2; exit 1; }
+# The dependency shares its checkpoints by default, before the target runs.
+[[ -d "$shared/checkpoint-store" ]] || { echo "the dependency A shared no heap" >&2; exit 1; }
 requests=$tmpdir/server/requests.log
 before_v1=$(wc -l < "$requests")
 worker v1 "$shared_url" "$shared" "$spec_t" --share-heaps
@@ -204,9 +204,19 @@ write_t "T \\/ F" "simp[]"
 export_t v2
 cold v2 0
 forget_local
-worker v2 "$shared_url" "$shared" "$spec_t" --share-heaps
+HOLBUILD_CACHE_TRACE=1 worker v2 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v2 0 "status=built"
 resumed v2 "deps-loaded checkpoint" "deps-loaded heap"
+# The restore took its blobs zstd-encoded and decoded them itself.
+require_grep "remote cache decode .* zstd threads=4" "$tmpdir/v2.log"
+if grep -q "remote cache decode .* \(identity\|fallback\)" "$tmpdir/v2.log"; then
+  echo "v2 fetched a blob without decoding it in parallel:" >&2
+  grep "remote cache decode" "$tmpdir/v2.log" >&2
+  exit 1
+fi
+# None of the published checkpoints is on the edited script's prefix, and
+# the index says so without a probe of each.
+require_grep "shared checkpoint index lists 0 of" "$tmpdir/v2.log"
 same_outputs v2
 
 # An edit of a late theorem resumes from the context after the one before.
@@ -217,7 +227,74 @@ forget_local
 worker v3 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v3 0 "status=built"
 resumed v3 "theorem-context checkpoint after t2" "theorem_context checkpoint"
+require_grep "shared checkpoint index lists [1-9][0-9]* of" "$tmpdir/v3.log"
 same_outputs v3
+# With an empty store the restore fetched the heap and its chain, and says so.
+for step in rstprobe rstplace rstfetch rstfetchn rstfetchkb rstheap rstheapkb; do
+  grep -qE "^phase-ms=(.*,)?$step:[0-9]+(,|\$)" "$tmpdir/v3.result" || {
+    echo "v3's record lacks restore step $step:" >&2; cat "$tmpdir/v3.result" >&2; exit 1; }
+done
+if grep -qE "^phase-ms=(.*,)?rsthitn:" "$tmpdir/v3.result"; then
+  echo "v3 counted store hits in an empty store:" >&2; cat "$tmpdir/v3.result" >&2; exit 1
+fi
+
+# The index of the checkpoints published on each heap: a restore probes only
+# the checkpoints it lists, and probes every candidate without one.
+index_entries() { grep -lx "holbuild-shared-checkpoint-index-v1" "$tmpdir"/remote/ac/* || true; }
+# set_index KEY...: every index lists just KEYS.
+set_index() {
+  local manifest path
+  manifest="holbuild-shared-checkpoint-index-v1"$'\n'
+  for key in "$@"; do manifest+="checkpoint=$key"$'\n'; done
+  for path in $(index_entries); do
+    printf 'holbuild-remote-cache-action-v2\nmanifest-sha256 %s\nmanifest-size %s\nmanifest-text-v1\n%s' \
+      "$(printf '%s' "$manifest" | sha256sum | cut -d' ' -f1)" "${#manifest}" "$manifest" > "$path"
+  done
+}
+# drop_checkpoint THEOREM: the cache loses every entry of THEOREM's context.
+drop_checkpoint() {
+  local path
+  for path in $(grep -l "^blob=[0-9a-f]* leaf .*/$1_context\.save$" "$tmpdir"/remote/ac/*); do rm "$path"; done
+}
+[[ -n "$(index_entries)" ]] || { echo "no shared checkpoint index was published" >&2; exit 1; }
+
+# Without an index the late edit still resumes from the latest checkpoint,
+# and its publish writes the index again.
+rm $(index_entries)
+write_t "T \\/ F" "REFL_TAC" "ACCEPT_TAC TRUTH"
+export_t v3a
+forget_local
+worker v3a "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v3a 0 "status=built"
+resumed v3a "theorem-context checkpoint after t3" "theorem_context checkpoint"
+require_grep "no shared checkpoint index: probing all" "$tmpdir/v3a.log"
+[[ -n "$(index_entries)" ]] || { echo "v3a published no shared checkpoint index" >&2; exit 1; }
+
+# A listed checkpoint whose entry is gone is passed over for the next one.
+drop_checkpoint t4
+write_t "T \\/ F" "REFL_TAC" "ACCEPT_TAC TRUTH" "ACCEPT_TAC TRUTH"
+export_t v3b
+forget_local
+worker v3b "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v3b 0 "status=built"
+resumed v3b "theorem-context checkpoint after t3" "theorem_context checkpoint"
+
+# A published checkpoint the index doesn't list isn't probed: the edit
+# resumes from the heap, and its publish lists the checkpoints again.
+set_index
+write_t "T \\/ F" "REFL_TAC" "ACCEPT_TAC TRUTH" "REWRITE_TAC []"
+export_t v3c
+forget_local
+worker v3c "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v3c 0 "status=built"
+resumed v3c "deps-loaded checkpoint" "deps-loaded heap"
+require_grep "shared checkpoint index lists 0 of" "$tmpdir/v3c.log"
+write_t "T \\/ F" "REFL_TAC" "ACCEPT_TAC TRUTH" "MATCH_ACCEPT_TAC TRUTH"
+export_t v3d
+forget_local
+worker v3d "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v3d 0 "status=built"
+resumed v3d "theorem-context checkpoint after t4" "theorem_context checkpoint"
 
 # A failed proof shares its failed prefix, and the fixed proof resumes from it.
 write_t "T \\/ F" "FAIL_TAC \"seeded failure\""
@@ -281,6 +358,21 @@ expect v7 0 "status=built"
 resumed v7 "theorem-context checkpoint after t4" "theorem_context checkpoint"
 same_outputs v7
 
+# That context's restored spine holds t3's failed prefix, yet a later
+# theorem that fails still saves its own failed prefix beside it.
+write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "FAIL_TAC \"after the context\""
+export_t v7f
+forget_local
+worker v7f "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v7f 1 "status=failed" "failure=proof"
+require_grep "after the context" "$tmpdir/v7f.log"
+resumed v7f "theorem-context checkpoint after t4" "theorem_context checkpoint"
+if grep -q "Permission denied" "$tmpdir/v7f.log"; then
+  echo "v7f could not save its failed prefix" >&2
+  cat "$tmpdir/v7f.log" >&2
+  exit 1
+fi
+
 # The cache loses the heap's blob but keeps the entries naming it: the
 # worker loads cold, replaces the entries, and the next edit resumes again.
 heap_blob=$(find "$shared/checkpoint-store" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
@@ -318,11 +410,23 @@ if tail -n +"$((before_again + 1))" "$requests" | grep -qxF "$source_get"; then
 fi
 
 # A store on another file system than the action's checkpoints, as a store
-# on its own mount is: hard links fail there, so the worker links the
-# store's states symbolically, and resumes from them.
+# on its own mount is: states are linked symbolically, the worker still
+# resumes from them, and the child can't write them.  t5's proof tries to,
+# for each link it finds in the checkpoint tree.
 if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmpdir") ]]; then
   other_fs=$(mktemp -d /dev/shm/holbuild-share-heaps.XXXXXX)
-  write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "MATCH_ACCEPT_TAC TRUTH"
+  probe_links="(fn g => let
+    fun walk dir =
+      let val s = OS.FileSys.openDir dir
+          fun loop () = case OS.FileSys.readDir s of NONE => () | SOME n => (visit (OS.Path.concat (dir, n)); loop ())
+      in loop (); OS.FileSys.closeDir s end
+    and visit p =
+      if Posix.FileSys.ST.isLink (Posix.FileSys.lstat p) then
+        ((TextIO.closeOut (TextIO.openAppend p); raise Fail (\"wrote a restored state: \" ^ p))
+         handle IO.Io _ => print \"restored state read-only\\n\")
+      else if OS.FileSys.isDir p then walk p else ()
+  in (walk \"$shared/checkpoints\" handle OS.SysErr _ => ()); MATCH_ACCEPT_TAC TRUTH g end)"
+  write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "$probe_links"
   export_t v10
   cold v10 0
   forget_local
@@ -330,9 +434,257 @@ if [[ -d /dev/shm && -w /dev/shm && $(stat -c %d /dev/shm) != $(stat -c %d "$tmp
   ln -s "$other_fs" "$shared/checkpoint-store"
   worker v10 "$shared_url" "$shared" "$spec_t" --share-heaps
   expect v10 0 "status=built"
-  require_grep "the checkpoint store is on another file system; linking its states symbolically" "$tmpdir/v10.log"
+  require_grep 'linking its states symbolically' "$tmpdir/v10.log"
   resumed v10 "theorem-context checkpoint after t4" "theorem_context checkpoint"
+  v10_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/v10.result")
+  require_grep 'restored state read-only' "$tmpdir/remote/cas/$v10_log"
+  for state in "$other_fs"/*/*; do
+    [[ $(sha256sum "$state" | cut -d' ' -f1) == "$(basename "$state")" ]] || { echo "store state changed: $state" >&2; exit 1; }
+  done
   same_outputs v10
 else
   echo "skipping the cross-file-system store: no /dev/shm on another file system"
+fi
+
+
+# Older clients can explicitly disable theorem saves. Their dependency heap
+# must still be shared and reusable after a proof edit.
+cat > "$project/src/LegacyScript.sml" <<'SML'
+Theory Legacy
+Ancestors A
+Theorem legacy_thm:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+SML
+export_legacy() {
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload LegacyTheory) > "$tmpdir/legacy.batch"
+  spec_legacy=$(field "$tmpdir/legacy.batch" share:LegacyTheory 4)
+  sed '/^action-text$/i option theorem-checkpoints=false' "$project/.holbuild/action-specs/$spec_legacy" > "$tmpdir/legacy.spec"
+  spec_legacy=$(sha256sum "$tmpdir/legacy.spec" | cut -d' ' -f1)
+  curl -fsS -X PUT --data-binary "@$tmpdir/legacy.spec" "$shared_url/cas/$spec_legacy"
+}
+legacy=$tmpdir/worker-legacy
+export_legacy
+worker legacy1 "$shared_url" "$legacy" "$spec_legacy" --share-heaps
+expect legacy1 0 "status=built"
+[[ -d "$legacy/checkpoint-store" ]] || { echo "old spec shared no dependency heap" >&2; exit 1; }
+sed -i 's/ACCEPT_TAC a_thm/MATCH_ACCEPT_TAC a_thm/' "$project/src/LegacyScript.sml"
+export_legacy
+rm -rf "$legacy/checkpoint-store"
+worker legacy2 "$shared_url" "$legacy" "$spec_legacy" --share-heaps
+expect legacy2 0 "status=built"
+resumed legacy2 "deps-loaded checkpoint" "deps-loaded heap"
+
+# Interrupt a dependency, not the requested target, after completed saves.
+# A fresh worker must resume those saves without ever caching a built result
+# for the interrupted action.
+cat > "$project/src/InterruptedScript.sml" <<'SML'
+Theory Interrupted
+Ancestors A
+Theorem completed:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+Definition completed_def:
+  completed_value = T
+End
+Theorem uncommitted:
+  T
+Proof
+  simp[]
+QED
+val _ = (print "checkpoint-cancel-ready\n"; TextIO.flushOut TextIO.stdOut;
+         OS.Process.sleep (Time.fromSeconds 120))
+Theorem unfinished:
+  completed_value
+Proof
+  simp[completed_def]
+QED
+SML
+cat > "$project/src/ConsumerScript.sml" <<'SML'
+Theory Consumer
+Ancestors Interrupted
+SML
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload ConsumerTheory) > "$tmpdir/cancel.batch"
+spec_interrupt=$(field "$tmpdir/cancel.batch" share:InterruptedTheory 4)
+key_interrupt=$(field "$tmpdir/cancel.batch" share:InterruptedTheory 3)
+interrupted=$tmpdir/worker-interrupted
+link_hol_toolchain_cache "$interrupted"
+python3 - "$HOLBUILD_BIN" "$shared_url" "$spec_interrupt" "$interrupted" "$tmpdir" <<'PYTEST'
+import hashlib
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+binary, url, spec, cache, temp = sys.argv[1:]
+# The suite timing wrapper is a shell; signal the driver itself.
+binary = os.environ.get("REAL_HOLBUILD_BIN", binary)
+root = Path(cache)
+with open(f"{temp}/interrupted.log", "w") as log:
+    process = subprocess.Popen(
+        [binary, "--remote-cache", url, "exec-action", spec, "--share-heaps",
+         "--cache-limit-gb", "1000", "--result", f"{temp}/interrupted.result"],
+        env={**os.environ, "HOLBUILD_CACHE": cache}, stdout=log, stderr=log,
+    )
+    try:
+        deadline = time.monotonic() + 90
+        while not any("checkpoint-cancel-ready" in p.read_text(errors="replace")
+                      for p in root.glob("action/.holbuild/stage/**/holbuild-build.log")):
+            if process.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError("HOL never reached the interruption point")
+            time.sleep(0.05)
+        assert list(root.glob("checkpoints/**/*_context.save.ok")), "no completed theorem save"
+        # Model a save interrupted before its atomic .ok commit. It is a
+        # real candidate, but neither its partial bytes nor .ok.tmp may publish.
+        incomplete = next(root.glob("checkpoints/**/uncommitted_context.save"))
+        ok = Path(str(incomplete) + ".ok")
+        ok.rename(str(ok) + ".tmp")
+        partial = b"interrupted-checkpoint-save"
+        incomplete.write_bytes(partial)
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=15) != 0, "interrupted action succeeded"
+        assert not (Path(temp) / "remote/cas" / hashlib.sha256(partial).hexdigest()).exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+PYTEST
+require_grep '^status=failed$' "$tmpdir/interrupted.result"
+require_grep '^failure=unavailable$' "$tmpdir/interrupted.result"
+# The log so far is uploaded, for the client to see how far the action got.
+interrupted_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/interrupted.result")
+[[ -n "$interrupted_log" ]] || { echo "interrupted action uploaded no log" >&2; cat "$tmpdir/interrupted.result" >&2; exit 1; }
+require_grep 'checkpoint-cancel-ready' "$tmpdir/remote/cas/$interrupted_log"
+require_grep 'exec-action failed: interrupted' "$tmpdir/remote/cas/$interrupted_log"
+[[ ! -e "$tmpdir/remote/ac/$key_interrupt" ]] || { echo "interrupted action published a built result" >&2; exit 1; }
+[[ ! -e "$interrupted/checkpoints" ]] || { echo "interrupted action kept private checkpoints" >&2; exit 1; }
+sed -i 's/OS.Process.sleep (Time.fromSeconds 120)/()/' "$project/src/InterruptedScript.sml"
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload ConsumerTheory) > "$tmpdir/resume.batch"
+spec_interrupt=$(field "$tmpdir/resume.batch" share:InterruptedTheory 4)
+# A replacement worker uses the same canonical paths but has no local store.
+rm -rf "$interrupted/checkpoint-store"
+worker interrupted-resume "$shared_url" "$interrupted" "$spec_interrupt" --share-heaps
+expect interrupted-resume 0 "status=built"
+require_grep 'restored shared .* checkpoint' "$tmpdir/interrupted-resume.log"
+require_grep 'checkpoint after completed' "$tmpdir/interrupted-resume.log"
+
+# A theory with declared outputs replays its whole script, so it saves every
+# theorem context again: the worker restores only the dependency heap, never a
+# context it would save over.
+write_x() {
+  cat > "$project/src/XScript.sml" <<SML
+fun holbuild_extra_outputs (_ : string list) = ()
+val _ = holbuild_extra_outputs ["results/X.out"]
+val _ = let val out = TextIO.openOut "results/X.out" in TextIO.output (out, "x\\n"); TextIO.closeOut out end
+Theory X
+Ancestors A
+Theorem x1:
+  T
+Proof
+  ACCEPT_TAC a_thm
+QED
+Theorem x2:
+  T
+Proof
+  $1
+QED
+SML
+}
+export_x() {
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload XTheory) > "$tmpdir/x-$1.batch"
+  spec_x=$(field "$tmpdir/x-$1.batch" share:XTheory 4)
+}
+write_x "simp[]"
+export_x 1
+worker x1 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x1 0 "status=built"
+write_x "ACCEPT_TAC TRUTH"
+export_x 2
+forget_local
+worker x2 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x2 0 "status=built"
+require_grep "restored shared deps-loaded heap" "$tmpdir/x2.log"
+x2_log=$(sed -n 's/^log=\([^ ]*\) .*/\1/p' "$tmpdir/x2.result")
+if grep -q "dropping checkpoint\|restored shared theorem_context" "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log"; then
+  echo "the extra-output theory resumed into restored contexts" >&2
+  cat "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log" >&2
+  exit 1
+fi
+
+# A holbuild whose runtime changed only in what a theory loads after its
+# dependency heap still restores the heap an earlier release shared; a change
+# to what is compiled into the heap misses it.  Spec and worker both come from
+# a copy of the binary with its own runtime tree.
+patched=$tmpdir/patched-runtime
+mkdir -p "$patched/bin" "$patched/share/holbuild"
+cp "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" "$patched/bin/holbuild"
+cp -R "$SCRIPT_DIR/../../../sml" "$patched/share/holbuild/"
+# Checkpoints above the heap hold the runtime, so a change to it misses
+# them.  A fresh theory P, whose only failed prefix is the one seeded here
+# under the old runtime, shows it for failed prefixes; T's edit of t5, which
+# resumed after t4 under the old runtime (v9), for theorem contexts.
+write_p() {
+  cat > "$project/src/PScript.sml" <<SML
+Theory P
+Ancestors A
+Theorem p1:
+  T
+Proof
+  simp[]
+QED
+Theorem p2:
+  T /\\ (1 = 1)
+Proof
+  CONJ_TAC >- ACCEPT_TAC TRUTH >> $1
+QED
+SML
+}
+# run_p BIN NAME TACTIC: export P's spec with BIN and run it, after
+# forgetting the local checkpoints.
+run_p() {
+  local bin=$1 name=$2
+  write_p "$3"
+  (cd "$project" && "$bin" --remote-cache "$shared_url" action-spec --upload PTheory) > "$tmpdir/$name.batch"
+  spec_p=$(field "$tmpdir/$name.batch" share:PTheory 4)
+  forget_local
+  HOLBUILD_BIN=$bin worker "$name" "$shared_url" "$shared" "$spec_p" --share-heaps
+}
+run_p "$HOLBUILD_BIN" p-seed "FAIL_TAC \"before the runtime change\""
+expect p-seed 1 "status=failed" "failure=proof"
+run_p "$HOLBUILD_BIN" p-seed2 "ALL_TAC >> FAIL_TAC \"still before the runtime change\""
+expect p-seed2 1 "status=failed" "failure=proof"
+resumed p-seed2 "failed-prefix checkpoint in p2" "failed_prefix checkpoint"
+printf '\n(* changed after the heap *)\n' >> "$patched/share/holbuild/sml/proof_runtime.sml"
+run_p "$patched/bin/holbuild" p-runtime "ALL_TAC >> rw[]"
+expect p-runtime 0 "status=built"
+resumed p-runtime "deps-loaded checkpoint" "deps-loaded heap"
+write_t "T \\/ F" "rw[]" "ACCEPT_TAC TRUTH" "ASM_REWRITE_TAC []"
+HOLBUILD_BIN=$patched/bin/holbuild export_t t-runtime
+forget_local
+HOLBUILD_BIN=$patched/bin/holbuild worker t-runtime "$shared_url" "$shared" "$spec_t" --share-heaps
+expect t-runtime 0 "status=built"
+resumed t-runtime "deps-loaded checkpoint" "deps-loaded heap"
+write_x "REWRITE_TAC []"
+HOLBUILD_BIN=$patched/bin/holbuild export_x 3
+forget_local
+HOLBUILD_BIN=$patched/bin/holbuild worker x3 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x3 0 "status=built"
+require_grep "restored shared deps-loaded heap" "$tmpdir/x3.log"
+require_grep "from: deps-loaded checkpoint" "$tmpdir/x3.log"
+printf '\n(* changed in the heap *)\n' >> "$patched/share/holbuild/sml/checkpoint_save_runtime.sml"
+write_x "MATCH_ACCEPT_TAC TRUTH"
+HOLBUILD_BIN=$patched/bin/holbuild export_x 4
+forget_local
+HOLBUILD_BIN=$patched/bin/holbuild worker x4 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x4 0 "status=built"
+if grep -q "restored shared deps-loaded heap" "$tmpdir/x4.log"; then
+  echo "a changed heap runtime restored the old shared deps heap" >&2
+  cat "$tmpdir/x4.log" >&2
+  exit 1
 fi

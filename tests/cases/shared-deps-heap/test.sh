@@ -131,6 +131,33 @@ fi
 [[ "$(stat -c %d:%i "$(deps_heap "$own" B)")" == "$stored_id" ]] \
   || { echo "the own-module tree's deps heap is not the stored one" >&2; exit 1; }
 
+# The stored heap's key covers only the holbuild runtime compiled into it:
+# a holbuild whose other runtime sources differ (here proof_runtime.sml,
+# which theory scripts load after the heap) resumes from it, and one whose
+# heap runtime differs (checkpoint_save_runtime.sml) doesn't.
+patched=$tmpdir/patched-runtime
+mkdir -p "$patched/bin" "$patched/share/holbuild"
+cp "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" "$patched/bin/holbuild"
+cp -R "$SCRIPT_DIR/../../../sml" "$patched/share/holbuild/"
+patched_build() {
+  local tree=$1
+  make_tree "$tree"
+  (cd "$tree" && rm -rf "$HOLBUILD_CACHE/actions" "$HOLBUILD_CACHE/blobs" && "$patched/bin/holbuild" build BTheory) \
+    > "$tree.log" 2>&1 || { cat "$tree.log" >&2; exit 1; }
+}
+printf '\n(* changed after the heap *)\n' >> "$patched/share/holbuild/sml/proof_runtime.sml"
+patched_build "$tmpdir/script-runtime"
+grep -A1 '^resuming BTheory' "$tmpdir/script-runtime.log" | grep -q 'from: deps-loaded checkpoint' \
+  || { echo "a changed script runtime missed the stored deps heap" >&2; cat "$tmpdir/script-runtime.log" >&2; exit 1; }
+[[ "$(stat -c %d:%i "$(deps_heap "$tmpdir/script-runtime" B)")" == "$stored_id" ]] \
+  || { echo "the changed script runtime's deps heap is not the stored one" >&2; exit 1; }
+printf '\n(* changed in the heap *)\n' >> "$patched/share/holbuild/sml/checkpoint_save_runtime.sml"
+patched_build "$tmpdir/heap-runtime"
+if grep -A1 '^resuming BTheory' "$tmpdir/heap-runtime.log" | grep -q 'from: deps-loaded checkpoint'; then
+  echo "a changed heap runtime resumed from the stored deps heap" >&2
+  exit 1
+fi
+
 # A build with --no-cache neither resumes from the store nor adds to it.
 nocache=$tmpdir/nocache
 make_tree "$nocache"
@@ -173,10 +200,13 @@ fi
 fourth=$tmpdir/fourth
 make_tree "$fourth"
 sed -i 's/ACCEPT_TAC helperLib.helper_thm/NO_TAC/' "$fourth/src/BScript.sml"
-# Poly/ML checks the parent's time stamp in the header (bytes 68-75 on
-# 64-bit hosts) when it loads the state, not when it reads the parent name.
+# Poly/ML checks the parent's time stamp in the header when it loads the
+# state, not when it reads the parent name. On 64-bit hosts that stamp is
+# bytes 68-75 in the header of runtimes with dependent modules (v5.9.2-seq4,
+# v5.9.2-seq8 to seq12) and 72-79 in the v5.9.2-seq5 to seq7 one; bytes 72-75
+# are in it for both.
 cp "$stored" "$tmpdir/stale"
-printf '\xff\xff\xff\xff' | dd of="$tmpdir/stale" bs=1 seek=68 conv=notrunc status=none
+printf '\xff\xff\xff\xff' | dd of="$tmpdir/stale" bs=1 seek=72 conv=notrunc status=none
 mv "$tmpdir/stale" "$stored"
 stale_sum=$(sha256sum < "$stored")
 if (cd "$fourth" && build_uncached BTheory) > "$tmpdir/fourth.log" 2>&1; then

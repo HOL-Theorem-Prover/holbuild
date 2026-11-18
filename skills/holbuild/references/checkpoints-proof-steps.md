@@ -42,6 +42,8 @@ During a theory build, checkpoints may be created at syntactic boundaries:
 | `<thm>_context.save` | Theorem stored in theory context | Resume before the next declaration |
 | `<thm>_failed_prefix.save` | Failed proof after a reusable prefix | Fast rebuild after editing a failing suffix |
 
+A context checkpoint (after a theorem or a definition) is saved only once at least max(N, 10 x the last context save's duration) has passed since that save, since each save forces a full GC. N is `build --checkpoint-seconds N` (default 2; 0 saves every context); it changes no cache key. A resume starts from the latest context saved before the edit and replays the declarations after it.
+
 Export seals a theory in current HOL versions, so no state is saved after it: the source process exports and exits, and dependents load the generated theory through its manifest. A generated theory that fails to load fails its first dependent.
 
 Successful source builds retain reusable deps/theorem-context checkpoints for future proof edits and clear stale failed-prefix checkpoints for that source. Failed/interrupted builds may leave failed-prefix and partial debug breadcrumbs. `holbuild gc` removes old checkpoint families and enforces the default 5GB project checkpoint budget.
@@ -60,9 +62,9 @@ Replay eligibility requires exact metadata match. Invalid selected checkpoints a
 
 Runs theorem proofs through proof steps without saving `.save`/`.ok` files. No `deps_loaded`, theorem-context or failed-prefix checkpoints are created.
 
-## Target-only theorem checkpoints and `--all-checkpoints`
+## Default checkpoints and `--all-checkpoints`
 
-By default, theorem-context, declaration and failed-prefix checkpoints are saved only in the requested targets (the default targets when none are given, or every root-package theory when there are none). Every root-package theory still saves its `deps_loaded` checkpoint and runs with proof steps and step timeouts. An edit to a non-target starts from `deps_loaded`; rebuilding it as a target (after an edit, or with `--force=theory`) saves its theorem checkpoints. `--repl-on-failure` saves them everywhere. `--all-checkpoints` saves them in every root-package theory. Theory outputs and keys don't change either way. Under `--remote-exec`, a non-target's action spec says `option theorem-checkpoints=false` and the worker skips them too.
+By default, every root-package theory saves `deps_loaded`, theorem-context, declaration and failed-prefix checkpoints, including dependencies of the requested targets. Proof steps and step timeouts apply throughout the root package. `--skip-checkpoints` disables checkpoint saving; `--all-checkpoints` remains an accepted compatibility alias with no effect. Theory outputs and keys are unchanged. Remote action specs use the same default. Workers also share `deps_loaded` for older specs containing `option theorem-checkpoints=false`, while respecting their opt-out from theorem checkpoints.
 
 ## Host deps heaps
 
@@ -80,7 +82,7 @@ A tracing-kernel build runs root-package theories as `--skip-checkpoints --skip-
 
 ## Parser recovery
 
-HOL source parse errors are build failures. When HOLSourceParser recovery occurs, holbuild may warn and keep recovered theorem/resume boundaries for best-effort instrumentation and diagnostics before HOL reports the failing script-play status. This avoids the old all-or-nothing fallback where one later parse recovery could disable proof IR/timeouts for the whole theory.
+HOL source parse errors are build failures. When HOLSourceParser recovery occurs, holbuild warns and keeps the boundaries of the theorem/resume blocks that parsed cleanly, so proof IR, timeouts and checkpoints still cover them. A block the parser reported an error in (a missing `QED` or `Proof`, an empty tactic) gets no boundary: it is neither instrumented nor resumed from a checkpoint, and HOL reports the error at its source line. This avoids the old all-or-nothing fallback where one later parse recovery could disable proof IR/timeouts for the whole theory.
 
 ## Tactic timeout flow
 
@@ -97,10 +99,13 @@ consumers. An explicit CLI `--tactic-timeout` takes precedence; `0` disables the
 timeout for the named theory.
 
 On timeout:
-1. Runtime timeout wrapper raises the timeout marker/failure
-2. Child log records tactic label/plan position, source span, and input goal evidence where available
-3. holbuild reports the timed-out tactic and **does not retry** through the plain non-instrumented fallback
-4. Build fails
+1. The step runs once more with half the timeout; if that finishes, the step passes and the build log gets a `holbuild tactic timeout retry passed: <step> (...)` line
+2. Otherwise the runtime timeout wrapper raises the timeout marker/failure, with the full timeout
+3. Child log records tactic label/plan position, source span, and input goal evidence where available
+4. holbuild reports the timed-out tactic and **does not retry** through the plain non-instrumented fallback
+5. Build fails
+
+To list the steps that passed only on their retry in the last build: `grep -h "tactic timeout retry passed" .holbuild/logs/current/*/*/build.log`.
 
 For full semantic production builds of large projects, use `--tactic-timeout 0`.
 

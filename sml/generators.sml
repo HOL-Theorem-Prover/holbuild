@@ -74,7 +74,7 @@ fun retain_debug_artifacts () =
   HolbuildStatus.json_mode () andalso HolbuildStatus.retain_debug_artifacts ()
 
 fun command_output_path package generator =
-  if HolbuildStatus.json_mode () andalso not (retain_debug_artifacts ()) then FS.tmpName ()
+  if HolbuildStatus.json_mode () andalso not (retain_debug_artifacts ()) then HolbuildTempPath.temporary "generator-output"
   else log_path package generator
 
 fun generator_output_detail output =
@@ -369,9 +369,5 @@ fun run_selected package requested =
   end
 
 fun validate_package package = ignore (topo_sort (HolbuildProject.package_generators package))
-
-fun run_package package =
-  run_selected package
-    (map HolbuildProject.generator_name (HolbuildProject.package_generators package))
 
 end

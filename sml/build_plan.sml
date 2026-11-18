@@ -11,9 +11,11 @@ exception UnknownTarget of string * string list
 fun unknown_target_message (target, candidates) =
   "unknown build target: " ^ target ^ HolbuildSuggest.did_you_mean target candidates
 
+(* KEY, the node's identity, is computed once: plans compare it constantly. *)
 type node =
   { source : HolbuildSourceIndex.source,
-    external_dirs : string list }
+    external_dirs : string list,
+    key : string }
 
 type keyed_node = {node : node, input_key : string}
 
@@ -68,7 +70,7 @@ fun external_dirs_of ({external_dirs, ...} : node) = external_dirs
 fun logical_name node = #logical_name (source_of node)
 fun package node = #package (source_of node)
 fun relative_path node = #relative_path (source_of node)
-fun key node = package node ^ "\000" ^ relative_path node ^ "\000" ^ logical_name node
+fun key ({key, ...} : node) = key
 
 fun member value values = List.exists (fn x => x = value) values
 
@@ -142,22 +144,12 @@ fun validate_extra_output_ownership analysis selected =
     ()
   end
 
-fun has_logical_name name node = logical_name node = name
-
-fun nodes_named nodes name = List.filter (has_logical_name name) nodes
-
 type name_index = (string * node list) Vector.vector
 
+(* Halving by position keeps sort_pairs stable: equal keys stay in input order. *)
 fun split_pairs xs =
-  let
-    fun loop left right rest =
-      case rest of
-          [] => (left, right)
-        | [x] => (x :: left, right)
-        | x :: y :: zs => loop (x :: left) (y :: right) zs
-  in
-    loop [] [] xs
-  end
+  let val half = length xs div 2
+  in (List.take (xs, half), List.drop (xs, half)) end
 
 fun merge_pairs compare left right =
   case (left, right) of
@@ -261,6 +253,7 @@ type t =
    input_expansions : (string, input_expansion) Binarymap.dict ref,
    input_hashes : (string, string) Binarymap.dict ref,
    known_input_keys : known_input_key option array,
+   package_tiers : (string * int) list,
    holdir : string}
 
 fun universe_nodes ({universe, ...} : t) = universe
@@ -335,7 +328,7 @@ fun target_roots lookup nodes selection =
       let
         fun find target =
           case lookup target of
-              [] => raise UnknownTarget (target, map logical_name nodes)
+              [] => raise UnknownTarget (target, HolbuildNames.target_names (map source_of nodes))
             | matches => matches
       in
         List.concat (map find targets)
@@ -406,9 +399,6 @@ fun signature_companion_deps_with lookup node =
           (lookup (logical_name node))
     | _ => []
 
-fun signature_companion_deps nodes node =
-  signature_companion_deps_with (nodes_named nodes) node
-
 fun bootstrap_project_deps components analysis lookup nodes node =
   let
     fun not_self candidate = key candidate <> key node
@@ -447,16 +437,15 @@ fun reverse_dependency_edges plan node =
   graph_values (#reverse (dependency_graph plan)) node
 
 (* Resolved edges lead from selected nodes to selected nodes: the selection
-   is closed under them. *)
+   is closed under them.  The adjacency holds those edges' targets, in edge
+   order; a node outside the selection has none. *)
 fun direct_project_deps
-      (plan as {selected_key_index, selected_node_index, ...} : t) node =
-  let
-    fun target (edge : resolved_dependency_edge) =
-      Vector.sub(selected_node_index,
-                 indexed_key_id selected_key_index (#to_node edge))
-  in
-    unique_nodes (map target (resolved_dependency_edges plan node))
-  end
+      ({selected_key_index, selected_node_index, selected_adjacency, ...} : t) node =
+  case find_key_id selected_key_index (key node) of
+      NONE => []
+    | SOME id =>
+        unique_nodes (map (fn dep => Vector.sub(selected_node_index, dep))
+                          (Vector.sub(selected_adjacency, id)))
 
 fun direct_external_theories plan node =
   unique_strings
@@ -629,18 +618,9 @@ fun forget_output_digest (plan as {output_digest_cache, ...} : t) node =
 fun forget_output_digests ({output_digest_cache, ...} : t) =
   Array.modify (fn _ => NONE) output_digest_cache
 
-fun closure_external_theories plan node =
-  unique_strings
-    (List.concat (map (direct_external_theories plan)
-       (transitive_project_deps plan node @ [node])))
-
-fun closure_external_libs plan node =
-  unique_strings
-    (List.concat (map (direct_external_libs plan)
-       (transitive_project_deps plan node @ [node])))
-
-fun make_node external_dirs source =
-  {source = source, external_dirs = external_dirs}
+fun make_node external_dirs (source : HolbuildSourceIndex.source) =
+  {source = source, external_dirs = external_dirs,
+   key = #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source}
 
 fun bootstrap_prefetch_nodes analysis nodes =
   HolbuildComponentProvider.prefetch analysis
@@ -796,6 +776,14 @@ fun build_resolved_dependency_graph components analysis lookup selected =
               | ExtractedLoad =>
                   if theory_name name orelse external_load_available node name then []
                   else [{from_node = from_node, name = name, reason = reason}]
+              (* Naming a theory nothing provides can only fail to compile.
+                 A script's own theory has no candidate, as candidates skip
+                 the node itself. *)
+              | ExtractedHoldepMention =>
+                  if theory_name name andalso name <> logical_name node andalso
+                     not (external_load_available node name)
+                  then [{from_node = from_node, name = name, reason = reason}]
+                  else []
               | _ => []
       in List.concat (map one (symbolic_for node)) end
     val symbolic = dependency_pairs selected symbolic_for
@@ -885,11 +873,6 @@ fun selected_plan_text graph_id roots selected =
 fun selected_plan_identity graph_id roots selected =
   HolbuildHash.string_sha256 (selected_plan_text graph_id roots selected)
 
-fun selected_graph_canonical_text plan =
-  selected_graph_text (selected_nodes plan) (dependency_graph plan)
-fun selected_plan_canonical_text plan =
-  selected_plan_text (selected_graph_id plan) (root_nodes plan) (selected_nodes plan)
-
 fun reject_graph_unresolved (graph : resolved_dependency_graph) selected =
   let
     fun check node =
@@ -898,6 +881,10 @@ fun reject_graph_unresolved (graph : resolved_dependency_graph) selected =
         | {name, reason = DeclaredActionDependency, ...} :: _ =>
             raise Error ("unresolved action dependency " ^ name ^ " in " ^
                          package node ^ ":" ^ relative_path node)
+        | {name, reason = ExtractedHoldepMention, ...} :: _ =>
+            raise Error ("unknown theory " ^ name ^ " in " ^
+                         package node ^ ":" ^ relative_path node ^
+                         ": no source in the project, its packages or HOL provides it")
         | {name, ...} :: _ =>
             raise Error ("unresolved load " ^ name ^ " in " ^
                          package node ^ ":" ^ relative_path node)
@@ -942,6 +929,36 @@ fun write_test_dependency_graph graph_id plan_id resolved_id (graph : resolved_d
           val _ = each_vector unresolved (#unresolved graph)
         in TextIO.closeOut output end
 
+(* Each package's load-order tier, by name: 1 for a package that depends on
+   no package but HOL, else one more than its deepest dependency.  HOL's own
+   directories, and the packages taken from them (`from = "hol"`), are tier 0,
+   so dependencies load before what depends on them, as they do under Holmake
+   when HOL and the packages sit side by side. *)
+fun package_tiers graph =
+  let
+    fun from_hol package =
+      case HolbuildPackageProvenance.snapshot (HolbuildProject.package_provenance package) of
+          HolbuildPackageProvenance.ToolchainSnapshot _ => true
+        | _ => false
+    val packages =
+      map (fn package => (HolbuildProjectGraph.package_id package, HolbuildProject.package_name package))
+          (HolbuildProjectGraph.packages graph)
+    val hol_ids =
+      map HolbuildProjectGraph.package_id (List.filter from_hol (HolbuildProjectGraph.packages graph))
+    val edges = HolbuildProjectGraph.edges graph
+    fun dependencies id =
+      List.mapPartial
+        (fn {declaring_package, dependency_package, ...} =>
+           if declaring_package = id andalso not (member dependency_package hol_ids)
+           then SOME dependency_package else NONE)
+        edges
+    fun tier visiting id =
+      if member id visiting then 1
+      else 1 + List.foldl Int.max 0 (map (tier (id :: visiting)) (dependencies id))
+  in
+    map (fn (id, name) => (name, tier [] id)) packages
+  end
+
 fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, resolution_context_id,
               selected_graph_id, selected_plan_id, resolved_plan_id, holdir} : t =
   let
@@ -964,21 +981,23 @@ fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, re
      input_expansions = ref (Binarymap.mkDict String.compare),
      input_hashes = ref (Binarymap.mkDict String.compare),
      known_input_keys = Array.array(length selected, NONE),
+     package_tiers =
+       package_tiers (HolbuildPackagePrepare.graph (#preparation (analysis : HolbuildComponentProvider.analysis_state))),
      holdir = holdir}
   end
 
-fun plan_selection components holdir sources selection =
+(* Plans over SOURCES from the roots ROOTS_OF picks, given the name lookup
+   and the nodes; ANALYSIS may already hold some sources' facts. *)
+fun plan_roots components analysis holdir sources roots_of =
   let
-    val provider = HolbuildComponentProvider.provider components
     val resolution_context_id =
       HolbuildComponentProvider.resolution_context_id components
     val _ = HolbuildDependencies.configure_analyser_for_holdir holdir
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
-    val analysis = HolbuildComponentProvider.new_analysis_state components
     val nodes = map (make_node external_dirs) sources
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
-    val roots = target_roots lookup nodes selection
+    val roots = roots_of lookup nodes
     val _ = bootstrap_reachable_frontier components analysis lookup nodes roots
     val reachable = bootstrap_topo_sort components analysis lookup nodes roots
     val dependency_graph =
@@ -1007,6 +1026,10 @@ fun plan_selection components holdir sources selection =
               selected_graph_id = selected_graph_id, selected_plan_id = selected_plan_id,
               resolved_plan_id = resolved_plan_id, holdir = holdir}
   end
+
+fun plan_selection components holdir sources selection =
+  plan_roots components (HolbuildComponentProvider.new_analysis_state components) holdir sources
+    (fn lookup => fn nodes => target_roots lookup nodes selection)
 
 (* The plan an earlier planning run made over the same discovered sources,
    from what the plan record kept: the selection, each selected node's
@@ -1051,11 +1074,18 @@ fun restore {holdir, sources, roots, selected, analysis, edges,
               resolved_plan_id = resolved_plan_id, holdir = holdir}
   end
 
-fun plan_all components holdir sources =
-  plan_selection components holdir sources AllTargets
-
 fun plan_targets components holdir sources targets =
   plan_selection components holdir sources (SelectedTargets targets)
+
+(* The positions in SOURCES of the roots plan_targets picks for TARGETS. *)
+fun target_positions sources targets =
+  let
+    val nodes = map (make_node []) sources
+    val positions = build_key_index nodes
+    val roots = target_roots (indexed_nodes_named (build_name_index nodes)) nodes (SelectedTargets targets)
+  in
+    map (fn node => indexed_key_id positions (key node)) roots
+  end
 
 fun kind_name source = HolbuildSourceIndex.kind_string (#kind source)
 
@@ -1250,6 +1280,47 @@ fun toolchain_source_name ({holdir, ...} : t) node =
     else NONE
   end
 
+(* Where an object sits in the order Holmake loads a target's dependencies:
+   sorted by directory, then file name.  HOL's directories come first, then
+   each package's, by tier and then name, so the order doesn't depend on
+   where the trees are checked out.  Equal keys keep their input order. *)
+type load_order = {tier : int, package : string, dir : string, file : string}
+
+fun compare_load_order ({tier, package, dir, file} : load_order, b : load_order) =
+  case Int.compare (tier, #tier b) of
+      EQUAL =>
+        (case String.compare (package, #package b) of
+             EQUAL =>
+               (case String.compare (dir, #dir b) of
+                    EQUAL => String.compare (file, #file b)
+                  | order => order)
+           | order => order)
+    | order => order
+
+(* A HOL theory or library named without a node: it is in $(HOLDIR)/sigobj. *)
+fun external_load_order name : load_order = {tier = 0, package = "", dir = "sigobj", file = name}
+
+(* Package hol's modules are installed in sigobj, so they sort with the
+   external ones; other packages from the HOL tree keep their directory. *)
+fun load_order (plan as {package_tiers, ...} : t) node : load_order =
+  if package node = "hol" then external_load_order (logical_name node)
+  else
+    case toolchain_source_name plan node of
+        SOME name =>
+          {tier = 0, package = "",
+           dir = HolbuildSourceIndex.dirname (String.extract (name, size "$(HOLDIR)/", NONE)),
+           file = logical_name node}
+      | NONE =>
+          {tier = case List.find (fn (name, _) => name = package node) package_tiers of
+                      SOME (_, tier) => tier
+                    | NONE => 1,
+           package = package node, dir = HolbuildSourceIndex.dirname (relative_path node),
+           file = logical_name node}
+
+fun sort_by_load_order order values =
+  map #2 (sort_pairs (fn ((a, _), (b, _)) => compare_load_order (a, b))
+                     (map (fn value => (order value, value)) values))
+
 fun source_name plan node =
   case toolchain_source_name plan node of
       SOME name => name
@@ -1262,11 +1333,14 @@ fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_li
     val source = source_of node
     val analysis = analysis_state plan
     val source_hash = source_hash_of analysis node
-    val project_deps = map dep_text (direct_project_deps plan node)
+    (* In load order, so a change of order changes the key. *)
+    val project_deps = map (fn dep => (load_order plan dep, dep_text dep)) (direct_project_deps plan node)
     (* Toolchain objects are a function of the theory toolchain identity, so
        they are named but not hashed: their files carry the install path. *)
-    val external_deps = map (fn name => "HOL:" ^ name) (direct_external_theories plan node)
-    val external_libs = map (fn name => "HOLLIB:" ^ name) (direct_external_libs plan node)
+    val external_deps =
+      map (fn name => (external_load_order name, "HOL:" ^ name)) (direct_external_theories plan node)
+    val external_libs =
+      map (fn name => (external_load_order name, "HOLLIB:" ^ name)) (direct_external_libs plan node)
     val policy = #policy source
     val declared_deps = HolbuildProject.action_deps policy
     val declared_loads = HolbuildProject.action_loads policy
@@ -1293,7 +1367,7 @@ fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_li
     declared_load_lines @
     input_lines @
     source_extra_output_lines @
-    map (fn dep => "dep=" ^ dep) (project_deps @ external_deps @ external_libs)
+    map (fn (_, dep) => "dep=" ^ dep) (sort_by_load_order #1 (project_deps @ external_deps @ external_libs))
   end
 
 fun action_text_with plan config_lines_for_node toolchain_key keys node =

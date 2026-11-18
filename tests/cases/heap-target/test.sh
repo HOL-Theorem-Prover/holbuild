@@ -67,6 +67,25 @@ require_file "$project/runtests.exe"
 "$project/runtests.exe" > "$tmpdir/runtests.out"
 require_grep "executable ok" "$tmpdir/runtests.out"
 
+printf '\n(* heap edit *)\n' >> "$project/src/AScript.sml"
+(cd "$project" && "$HOLBUILD_BIN" heap main)
+printf '\n(* executable edit *)\n' >> "$project/src/runtests.sml"
+(cd "$project" && "$HOLBUILD_BIN" executable runtests)
+(cd "$project" && "$HOLBUILD_BIN" build)
+python3 - "$project" <<'PYCODE'
+import json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+records=sorted((json.loads(p.read_text()) for p in (root/'.holbuild/commands').glob('*.json')),
+               key=lambda r:r['started_at_ms'])
+assert len(records)==5, records
+assert all(len(r['plans'])==1 for r in records), records
+assert records[0]['plans'][0]['cold_worktree']
+assert not records[1]['plans'][0]['cold_worktree']
+assert [s['name'] for s in records[2]['plans'][0]['changed_sources']]==['ATheory'], records[2]
+assert [s['name'] for s in records[3]['plans'][0]['changed_sources']]==['runtests'], records[3]
+assert not records[4]['plans'][0]['changed_sources'], records[4]
+PYCODE
+
 bad=$tmpdir/bad
 cp -R "$project" "$bad"
 python3 - "$bad/holproject.toml" <<'PY'

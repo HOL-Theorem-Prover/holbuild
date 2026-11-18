@@ -88,36 +88,55 @@ fun parse_error_text source_path source_text _ (start, _) msg =
   in String.concat ["HOL source parse error: ", msg, "\n", "source: ", source_path, ":", Int.toString line, ":", Int.toString col, "\n", source_context_text source_text line] end
 fun raise_parse_error source_path source_text loc span msg = raise Error (parse_error_text source_path source_text loc span msg)
 
-fun boundaries_from_result source result =
-  let fun boundary kind name theorem_start theorem_stop tactic_start tactic_end proof_attrs =
+(* PARSE_ERROR is called for each error the parser reports, as it parses.
+   Without KEEP_ERRORED, a theorem or resume block it reported an error in has
+   no boundary.  The build instruments the blocks it gets boundaries for, and
+   instrumenting one the parser recovered from (a missing QED or Proof, an
+   empty tactic) would hide or garble the error: replaying a failed-prefix
+   checkpoint as `Theorem name = ...;` closes a block that has no QED.  So the
+   script runs it as written and HOL reports the error.  Commands that only
+   show a theorem's plan keep such blocks. *)
+fun scan_boundaries source_path source parse_error keep_errored =
+  let val error_count = ref 0
+      fun record loc span msg = (error_count := !error_count + 1; parse_error loc span msg)
+      val result = HOLSourceParser.parseSML source_path (parser_reader source) record HOLSourceParser.initialScope
+      fun boundary kind name theorem_start theorem_stop tactic_start tactic_end proof_attrs =
         let val b = statement_boundary source theorem_stop
         in {kind = kind, name = name, safe_name = safe_name name, theorem_start = theorem_start,
             theorem_stop = theorem_stop, boundary = b, tactic_start = tactic_start, tactic_end = tactic_end,
             tactic_text = slice source tactic_start tactic_end, proof_attrs = proof_attrs,
             prefix_hash = prefix_hash source b} end
       fun loop acc =
-        case #parseDec result () of
-            NONE => rev acc
-          | SOME (HOLSourceAST.HOLTheoremDecl {theorem_, id = (_, name), proof_, tac, stop, ...}) =>
-              let val (ts, te) = HOLSourceAST.expSpan tac
-                  val proof_attrs = case proof_ of SOME {attrs, ...} => proof_kvals (attr_args attrs) | NONE => []
-              in loop (boundary "theorem" name theorem_ stop ts te proof_attrs :: acc) end
-          | SOME (HOLSourceAST.HOLResume {resume_, id = (_, id_name), attrs, tac, stop, ...}) =>
-              let val (ts, te) = HOLSourceAST.expSpan tac
-                  val {name, proof_attrs} = resume_label_and_attrs id_name attrs
-              in loop (boundary "resume" name resume_ stop ts te proof_attrs :: acc) end
-          | SOME _ => loop acc
+        let val errors_before = !error_count
+            val dec = #parseDec result ()
+            val clean = keep_errored orelse !error_count = errors_before
+        in
+          case dec of
+              NONE => rev acc
+            | SOME (HOLSourceAST.HOLTheoremDecl {theorem_, id = (_, name), proof_, tac, stop, ...}) =>
+                if not clean then loop acc
+                else
+                  let val (ts, te) = HOLSourceAST.expSpan tac
+                      val proof_attrs = case proof_ of SOME {attrs, ...} => proof_kvals (attr_args attrs) | NONE => []
+                  in loop (boundary "theorem" name theorem_ stop ts te proof_attrs :: acc) end
+            | SOME (HOLSourceAST.HOLResume {resume_, id = (_, id_name), attrs, tac, stop, ...}) =>
+                if not clean then loop acc
+                else
+                  let val (ts, te) = HOLSourceAST.expSpan tac
+                      val {name, proof_attrs} = resume_label_and_attrs id_name attrs
+                  in loop (boundary "resume" name resume_ stop ts te proof_attrs :: acc) end
+            | SOME _ => loop acc
+        end
   in loop [] end
 
-fun scan source_path source_text =
-  boundaries_from_result source_text (HOLSourceParser.parseSML source_path (parser_reader source_text) ignore_parse_error HOLSourceParser.initialScope)
+fun scan source_path source_text = scan_boundaries source_path source_text ignore_parse_error true
 fun scan_strict source_path source_text =
-  boundaries_from_result source_text (HOLSourceParser.parseSML source_path (parser_reader source_text) (raise_parse_error source_path source_text) HOLSourceParser.initialScope)
+  scan_boundaries source_path source_text (raise_parse_error source_path source_text) false
 fun scan_recovering source_path source_text =
   let val errors = ref []
       fun record loc span msg = errors := parse_error_text source_path source_text loc span msg :: !errors
-      val result = HOLSourceParser.parseSML source_path (parser_reader source_text) record HOLSourceParser.initialScope
-  in {boundaries = boundaries_from_result source_text result, errors = rev (!errors)} end
+      val boundaries = scan_boundaries source_path source_text record false
+  in {boundaries = boundaries, errors = rev (!errors)} end
 
 fun qdecl_start (HOLSourceAST.QuoteLiteral (pos, _)) = pos
   | qdecl_start (HOLSourceAST.QuoteAntiq {caret_, ...}) = caret_

@@ -5,6 +5,10 @@ struct
    cache; it counts towards from_cache as well. *)
 datatype outcome = Built | UpToDate | Restored | RestoredRemote | Inspected
 
+val command_outcome = ref (fn (_ : outcome) => ())
+(* Told each failed node's label and diagnostic as the build finds it. *)
+val command_failure = ref (fn (_ : string, _ : string) => ())
+
 (* thread is the worker building the node; waiting is set while that worker
    waits for machine memory before launching the node's child. *)
 type active_node = {key : string, label : string, started_at : Time.time,
@@ -44,12 +48,24 @@ val clear_to_eol = "\027[0K"
 fun set_json_mode enabled = json_mode_ref := enabled
 fun json_mode () = !json_mode_ref
 fun set_verbosity verbosity = verbosity_ref := verbosity
-fun set_verbose_mode enabled = set_verbosity (if enabled then Verbose else Normal)
 fun verbosity () = !verbosity_ref
 fun verbose_mode () = verbosity () = Verbose
 fun quiet_mode () = verbosity () = Quiet
 fun set_retain_debug_artifacts enabled = retain_debug_artifacts_ref := enabled
 fun retain_debug_artifacts () = !retain_debug_artifacts_ref
+
+(* While set, builds report only the nodes they finish: the restore after a
+   remote batch failed misses every theory the workers didn't finish, and
+   those misses are no failures of their own. *)
+val finished_only_ref = ref false
+fun finished_only () = !finished_only_ref
+fun reporting_finished_only f =
+  let val previous = !finished_only_ref
+  in
+    finished_only_ref := true;
+    (f () before finished_only_ref := previous)
+    handle e => (finished_only_ref := previous; raise e)
+  end
 
 fun hex_digit n =
   String.sub("0123456789abcdef", n)
@@ -178,6 +194,9 @@ fun failure_kind message =
           String.isSubstring "\ntheorem: " message orelse String.isPrefix "theorem: " message orelse
           String.isSubstring "\nplan position: " message then
     "proof_failure"
+  (* HOL's term type checker: a statement or definition that does not type-check. *)
+  else if String.isSubstring "Preterm.type-analysis" message then
+    "type_error"
   else if String.isSubstring "child failure:" message orelse
           String.isSubstring "child log:" message orelse
           String.isSubstring "Couldn't load HOL base-state" message orelse
@@ -249,6 +268,37 @@ fun json_failure_fields source_override message =
     json_optional_int_field "input_goal_count" (input_goal_count_from_lines lines) @
     json_optional_bool_field "top_goal_truncated" (top_goal_truncated message) @
     json_evidence_limit_fields message
+  end
+
+(* The error a diagnostic MESSAGE reports, on one line of at most 300
+   characters: its child failure, else its first line naming an error (a
+   static error in a child log's tail), else its first line. *)
+fun failure_error message =
+  let
+    val lines = String.fields (fn c => c = #"\n") message
+    fun until_blank [] = []
+      | until_blank (line :: rest) = if line = "" then [] else line :: until_blank rest
+    fun child_failure [] = []
+      | child_failure (line :: rest) = if line = "child failure:" then until_blank rest else child_failure rest
+    val text =
+      case child_failure lines of
+          [] => Option.getOpt (List.find (String.isSubstring "error:") lines, hd lines)
+        | excerpt => String.concatWith " " excerpt
+  in
+    if size text > 300 then String.substring (text, 0, 297) ^ "..." else text
+  end
+
+(* A diagnostic MESSAGE, printed in full already, in one line: its first
+   line, the theorem it names and its error. *)
+fun failure_brief message =
+  let
+    val lines = String.fields (fn c => c = #"\n") message
+    val error = failure_error message
+  in
+    hd lines ^
+    (case first_line_after "theorem: " lines of SOME theorem => ": theorem " ^ theorem | NONE => "") ^
+    (if error = hd lines then "" else ": " ^ error) ^
+    " (full diagnostic above)"
   end
 
 fun json_failure_field message = [json_object_field "failure" (json_failure_fields NONE message)]
@@ -350,13 +400,23 @@ fun outcome_text Built = "built"
   | outcome_text RestoredRemote = "restored from cache"
   | outcome_text Inspected = "inspected"
 
+(* Theories this process built or restored, and heaps it exported: the work
+   that leaves residue in a project, towards its next automatic GC. *)
+val project_work = ref 0
+val project_work_lock = Mutex.mutex ()
+
+fun count_project_work () =
+  (Mutex.lock project_work_lock; project_work := !project_work + 1; Mutex.unlock project_work_lock)
+
 fun count_outcome ({built, up_to_date, restored, restored_remote, ...} : t) outcome =
-  case outcome of
-      Built => built := !built + 1
+  (!command_outcome outcome;
+   case outcome of
+      Built => (built := !built + 1; count_project_work ())
     | UpToDate => up_to_date := !up_to_date + 1
-    | Restored => restored := !restored + 1
-    | RestoredRemote => (restored := !restored + 1; restored_remote := !restored_remote + 1)
-    | Inspected => ()
+    | Restored => (restored := !restored + 1; count_project_work ())
+    | RestoredRemote =>
+        (restored := !restored + 1; restored_remote := !restored_remote + 1; count_project_work ())
+    | Inspected => ())
 
 fun elapsed ({started_at, ...} : t) = Time.-(Time.now (), started_at)
 
@@ -459,7 +519,8 @@ fun start_node status key label =
           else
             (active := {key = key, label = label, started_at = Time.now (),
                         thread = Thread.self (), waiting = false} :: remove_active key (!active);
-             if json_mode () then
+             if finished_only () then ()
+             else if json_mode () then
                emit_json "node_started" (json_node_fields key label)
              else if enabled then redraw status
              else if verbose_mode () then
@@ -503,7 +564,8 @@ fun finish status =
          in
            if !ended then ()
            else
-             (if json_mode () then
+             (if finished_only () then ()
+              else if json_mode () then
                 emit_json "build_finished"
                   [json_int_field "elapsed_ms" (elapsed_ms status),
                    json_int_field "total" total,
@@ -598,12 +660,14 @@ fun cache_trace line =
 fun fail_with_debug_artifacts status key label msg artifacts =
   (with_lock status
      (fn () =>
-         let val {enabled, active, ended, ...} = status
+         let val {enabled, active, ended, finished, ...} = status
          in
            if !ended then ()
            else
              (active := remove_active key (!active);
-              if json_mode () then
+              finished := !finished + 1;
+              if finished_only () then ()
+              else if json_mode () then
                 emit_json "node_failed"
                   (json_node_fields key label @
                    json_failure_field_for_node key msg @
@@ -611,12 +675,30 @@ fun fail_with_debug_artifacts status key label msg artifacts =
               else if enabled then
                 (TextIO.output (TextIO.stdOut, "\r" ^ clear_to_eol);
                  TextIO.flushOut TextIO.stdOut)
-              else ();
-              ended := true)
+              else ())
          end);
-   current_status := NONE)
+   if finished_only () then () else !command_failure (label, msg);
+   if json_mode () orelse finished_only () then () else message_stderr (label ^ " failed: " ^ msg ^ "\n"))
+
+(* A node that failed outside any build's status: a theory that failed on a
+   remote worker.  Text mode reports it in the build's error. *)
+fun report_remote_failure key label msg artifacts =
+  (!command_failure (label, msg);
+   if json_mode () then
+     emit_json "node_failed"
+       (json_node_fields key label @
+        json_failure_field_for_node key msg @
+        json_debug_artifacts_fields artifacts)
+   else ())
 
 fun fail status key label msg =
   fail_with_debug_artifacts status key label msg no_debug_artifacts
+
+fun skip status key label reason =
+  (with_lock status (fn () => #finished status := !(#finished status) + 1);
+   if finished_only () then ()
+   else if json_mode () then
+     emit_json "node_skipped" (json_node_fields key label @ [json_string_field "reason" reason])
+   else message_stderr (label ^ " skipped because of " ^ reason ^ "\n"))
 
 end

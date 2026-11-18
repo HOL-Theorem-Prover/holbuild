@@ -28,6 +28,13 @@ val manifest_marker = "manifest-text-v1\n"
    HolbuildHttp.max_transfer_seconds. *)
 val stall_timeout_seconds = 30
 
+(* A node whose disk lacks a blob fetches it from the shared store, checks it
+   and stores it before it sends a byte; for a heap of hundreds of MB that
+   can take over a minute, and giving up meanwhile only starts the same work
+   on the next node.  So a GET of a blob this large waits longer for data. *)
+val large_blob_bytes = 64 * 1024 * 1024
+val large_blob_stall_timeout_seconds = 120
+
 fun empty_blob_map () = Redblackmap.mkDict String.compare
 
 fun remote url =
@@ -35,25 +42,32 @@ fun remote url =
 
 fun base_url (RemoteCache {urls, ...}) = String.concatWith "," urls
 
-(* Authentication does not change node identity; full URLs are kept for requests. *)
+(* Authentication does not change node identity; full URLs are kept for requests.
+   Preferred nodes come first, each group in rendezvous order. *)
 fun ranked_urls (RemoteCache {urls, ...}) digest =
   let
+    val urls = HolbuildCacheDiscovery.urls urls
     fun score url =
       let val identity = HolbuildRemoteCacheConfig.node_identity url
       in ((HolbuildHash.string_sha256 (identity ^ ":" ^ digest), identity), url) end
     fun compare (((a, u), _), ((b, v), _)) =
       case String.compare (b, a) of EQUAL => String.compare (u, v) | order => order
+    val preferred = HolbuildRemoteCacheConfig.preferred_identities ()
+    fun is_preferred url =
+      List.exists (fn identity => identity = HolbuildRemoteCacheConfig.node_identity url) preferred
   in
     case urls of
         [_] => urls
-      | _ => map #2 (Redblackset.listItems (Redblackset.fromList compare (map score urls)))
+      | _ =>
+          let
+            val ranked = map #2 (Redblackset.listItems (Redblackset.fromList compare (map score urls)))
+            val (first, rest) = List.partition is_preferred ranked
+          in first @ rest end
   end
 
 fun request_urls cache kind digest =
   let val ranked = ranked_urls cache digest
-  in map (fn url => url ^ "/" ^ kind ^ "/" ^ digest)
-       (List.take (ranked, Int.min (2, length ranked)))
-  end
+  in map (fn url => url ^ "/" ^ kind ^ "/" ^ digest) ranked end
 
 fun blob_map (RemoteCache {blobs, ...}) = blobs
 
@@ -107,12 +121,16 @@ fun completed_line text =
       SOME line => Substring.string (#2 (Substring.position "Completed in" (Substring.full line)))
     | NONE => "no zstd completion line"
 
-(* Under HOLBUILD_CACHE_TRACE, zstd runs verbosely so its wall time and CPU
-   load show how much the -T0 threads compete with the build. *)
+(* One thread per blob: the transfer pools already compress many blobs at
+   once, and -T0 would start a thread per host core in each, whatever the
+   process's CPU allowance.  Level 1 costs much less CPU than the default
+   level 3 for about the same ratio on build artifacts.  Under
+   HOLBUILD_CACHE_TRACE, zstd runs verbosely so its wall time and CPU load
+   show how it competes with the build. *)
 fun zstd_compress url src dst =
   if HolbuildStatus.cache_trace_enabled () then
     let
-      val result = HolbuildSpawn.run {program = "zstd", args = ["-vv", "-f", "-T0", "-o", dst, src],
+      val result = HolbuildSpawn.run {program = "zstd", args = ["-1", "-vv", "-f", "-T1", "-o", dst, src],
                                       stderr = HolbuildSpawn.Merge}
       val ok = HolbuildSpawn.succeeded result
     in
@@ -122,7 +140,7 @@ fun zstd_compress url src dst =
       ok
     end
   else
-    HolbuildSpawn.succeeded (run "zstd" ["-q", "-f", "-T0", "-o", dst, src])
+    HolbuildSpawn.succeeded (run "zstd" ["-1", "-q", "-f", "-T1", "-o", dst, src])
 
 fun zstd_content_headers size =
   ["Content-Encoding: zstd", "X-Digest-SizeBytes: " ^ size]
@@ -146,12 +164,12 @@ fun warn_restore_once message =
 (* Requests go through libcurl when HolbuildRemoteCacheConfig could set it
    up, and otherwise through the curl command, which prints its own error
    message. *)
-fun cli_status options url =
+fun cli_status timeout options url =
   let
     val _ = HolbuildOffline.require_online "contact the remote cache"
     val result =
       run "curl" (["-q", "-sS", "-L", "--connect-timeout", Int.toString HolbuildHttp.connect_timeout_seconds,
-                   "--speed-limit", "1", "--speed-time", Int.toString stall_timeout_seconds,
+                   "--speed-limit", "1", "--speed-time", Int.toString timeout,
                    "--max-time", Int.toString HolbuildHttp.max_transfer_seconds] @
                   curl_config_args () @ options @ ["-w", "%{http_code}", url])
   in
@@ -160,25 +178,64 @@ fun cli_status options url =
       | _ => HolbuildHttp.Failed "the curl command failed"
   end
 
-fun get_status {url, dst} =
+fun get_status {url, dst, timeout} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
-    HolbuildHttp.get {url = url, dst = dst, timeout = stall_timeout_seconds}
+    HolbuildHttp.get {url = url, dst = dst, timeout = timeout}
   else
     (* --compressed advertises curl-supported response encodings, including zstd
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
-    cli_status ["--compressed", "-o", dst] url
+    cli_status timeout ["--compressed", "-o", dst] url
+
+(* Blob downloads take the body still zstd-encoded and decode it here on
+   several threads (HolbuildZstd), since libcurl decodes on the one thread
+   running its transfers.  Without libcurl or libzstd, or with a body
+   HolbuildZstd can't decode, the blob is fetched as get_status does.  Under
+   HOLBUILD_CACHE_TRACE, a line says which way each blob was decoded. *)
+val decode_threads = 4
+
+fun trace_decode url how =
+  HolbuildStatus.cache_trace ("remote cache decode " ^ redact_userinfo url ^ " " ^ how)
+
+fun get_status_parallel_decode (request as {url, dst, timeout}) =
+  if not (HolbuildRemoteCacheConfig.uses_libcurl () andalso HolbuildZstd.available ()) then
+    get_status request
+  else
+    let
+      val encoded = HolbuildTempPath.near dst ".zstd-get"
+      fun remove () = FS.remove encoded handle OS.SysErr _ => ()
+      val (result, encoding) =
+        HolbuildHttp.get_zstd {url = url, dst = encoded, timeout = timeout}
+        handle e => (remove (); raise e)
+    in
+      case (result, encoding) of
+          (HolbuildHttp.Response 200, HolbuildHttp.Zstd) =>
+            ((HolbuildZstd.decode_file {src = encoded, dst = dst, threads = decode_threads};
+              remove ();
+              trace_decode url ("zstd threads=" ^ Int.toString decode_threads);
+              result)
+             handle HolbuildZstd.Error message =>
+                      (remove (); trace_decode url ("fallback: " ^ message);
+                       get_status request)
+                  | e => (remove (); raise e))
+        | (HolbuildHttp.Response 200, HolbuildHttp.Identity) =>
+            (FS.rename {old = encoded, new = dst}; trace_decode url "identity"; result)
+        | (HolbuildHttp.Response 200, HolbuildHttp.OtherEncoding) =>
+            (remove (); trace_decode url "fallback: another encoding";
+             get_status request)
+        | _ => (remove (); result)
+    end
 
 fun head_status url =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
     HolbuildHttp.head {url = url, timeout = stall_timeout_seconds}
   else
-    cli_status ["-I", "-o", "/dev/null"] url
+    cli_status stall_timeout_seconds ["-I", "--ignore-content-length", "-o", "/dev/null"] url
 
 fun put_status headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
     HolbuildHttp.put {url = url, src = src, headers = headers, timeout = stall_timeout_seconds}
   else
-    cli_status (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
+    cli_status stall_timeout_seconds (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
 
 (* No HTTP response counts as a transport failure; any HTTP status resets
    the count. After tripping, only one request probes each cooldown. *)
@@ -298,25 +355,156 @@ fun require_answer method url result =
 fun transient (HolbuildHttp.Failed _) = true
   | transient (HolbuildHttp.Response code) = code = 429 orelse (code >= 500 andalso code < 600)
 
-(* The breaker observes the whole request: a dead primary must not disable a healthy backup. *)
-fun routed_status method urls path request =
+(* Reads made inside `required f`, on its thread, are for entries that must be
+   there, such as an action's inputs or what a write just put: they ask every
+   node before a miss, as the entry may be on another node only, and a node
+   that failed may be the one holding it, so a read that found it nowhere but
+   saw a node fail gives that failure, not a 404.  Any other read ends at the
+   first 404 and takes a 404 beside a failure as a miss, so that a lookup
+   before building or publishing doesn't stop on one dead node.  Per thread, as the hydrate path between the
+   caller and the read doesn't carry the caller's intent. *)
+val required_tag : bool Universal.tag = Universal.tag ()
+
+fun reads_required () = Option.getOpt (Thread.getLocal required_tag, false)
+
+fun required f =
   let
-    val primary = hd urls
-    val result = traced method primary path (fn () => request primary)
-    val retry = transient result orelse
-      ((method = "GET" orelse method = "HEAD") andalso result = HolbuildHttp.Response 404)
+    val outer = reads_required ()
+    fun restore () = Thread.setLocal (required_tag, outer)
   in
-    case tl urls of
-        backup :: _ =>
-          if retry then
-            let val next = traced method backup path (fn () => request backup)
-            in
-              if result = HolbuildHttp.Response 404 andalso transient next then (primary, result)
-              else (backup, next)
-            end
-          else (primary, result)
-      | [] => (primary, result)
+    Thread.setLocal (required_tag, true);
+    (f () before restore ()) handle e => (restore (); raise e)
   end
+
+(* A read's probes past its first nodes run on the caller's thread and on
+   helper threads, at most probe_helpers of them in the whole process, so
+   callers that run many lookups at once don't multiply threads,
+   connections or curl processes. *)
+val probe_helpers = 16
+val free_helpers = ref probe_helpers
+val helpers_mutex = Mutex.mutex ()
+
+fun with_mutex mutex f =
+  (Mutex.lock mutex; f () before Mutex.unlock mutex)
+  handle e => (Mutex.unlock mutex; raise e)
+
+(* The result of probe on each of urls, in order.  The caller probes too, so
+   with every helper busy this is a plain serial walk. *)
+fun probe_all probe urls =
+  let
+    val nodes = Vector.fromList urls
+    val count = Vector.length nodes
+    val results = Array.array (count, HolbuildHttp.Failed "not probed")
+    val mutex = Mutex.mutex ()
+    val finished = ConditionVar.conditionVar ()
+    val next = ref 0
+    val running = ref 0
+    fun take () =
+      with_mutex mutex (fn () => if !next < count then SOME (!next before next := !next + 1) else NONE)
+    fun work () =
+      case take () of
+          NONE => ()
+        | SOME i =>
+            (Array.update (results, i, probe (Vector.sub (nodes, i))
+                                         handle e => HolbuildHttp.Failed (General.exnMessage e));
+             work ())
+    fun release slots = with_mutex helpers_mutex (fn () => free_helpers := !free_helpers + slots)
+    fun stopped () = with_mutex mutex (fn () => (running := !running - 1; ConditionVar.broadcast finished))
+    fun helper () = (work (); release 1; stopped ())
+    fun start 0 = ()
+      | start slots =
+          (with_mutex mutex (fn () => running := !running + 1);
+           ignore (Thread.fork (helper, []));
+           start (slots - 1))
+          handle _ => (release slots; stopped ())
+    val slots = with_mutex helpers_mutex (fn () =>
+      let val slots = Int.min (count - 1, !free_helpers)
+      in free_helpers := !free_helpers - slots; slots end)
+    fun wait () = if !running > 0 then (ConditionVar.wait (finished, mutex); wait ()) else ()
+  in
+    start slots;
+    work ();
+    with_mutex mutex wait;
+    Array.foldr (op ::) [] results
+  end
+
+(* The breaker observes the whole request: a dead primary must not disable a healthy backup.
+   A write goes past the first two nodes only while none of them answered at all
+   (a member whose name doesn't resolve yet, say), and stops at the first answer.
+   Every node serves what the shared backing store holds, and a node writes an
+   entry there shortly after it answers the PUT, so until then only the
+   writer's node holds it.  A read goes past a node that failed and ends at
+   the first 404: it misses only an entry another node took moments ago, which
+   a build or a submission then makes again.  A required read (`required`),
+   of an entry that must be there, and a read that passed over a weaker copy
+   below, which looks on for a stronger one, instead reach every node before a
+   miss: they ask their nodes in turn until two of them answer 404, which finds
+   what a writer ranking the nodes the same way wrote, then probe all the rest
+   at once and go on through their answers in rank order; a GET asks a node
+   whose probe found the entry for its body.
+   A read whose 200 body fails `usable` counts as that node's 404, so a replica
+   holding a weaker copy does not hide a better one on another node.
+   A required read that saw a node fail ends with that failure rather than a
+   404.
+   A cache of one node gets the second attempt on that node: a 429 or 5xx
+   answer to its first request is asked again once.  No answer at all is not,
+   so an unreachable cache still costs one attempt per request until the
+   breaker trips. *)
+fun routed_status_using usable method probe urls path request =
+  let
+    val read = method = "GET" orelse method = "HEAD"
+    fun unanswered (HolbuildHttp.Failed _) = true
+      | unanswered (HolbuildHttp.Response _) = false
+    fun ask node () = traced method node path (fn () => request node)
+    fun probed node result () =
+      if method = "GET" andalso result = HolbuildHttp.Response 200 then ask node () else result
+    fun probe_rest rest =
+      let val nodes = map #1 rest
+      in
+        ListPair.mapEq (fn (node, result) => (node, probed node result))
+          (nodes, probe_all (fn node => traced "HEAD" node "" (fn () => probe node)) nodes)
+      end
+    val required = read andalso reads_required ()
+    fun outcome missing failed last =
+      case (missing, failed) of
+          (SOME found, SOME failure) => if required then failure else found
+        | _ => Option.getOpt (missing, last)
+    fun loop [] _ _ _ _ missing failed last = outcome missing failed last
+      | loop ((node, answer) :: rest) count misses silent passed missing failed last =
+          if not read andalso count >= 2 andalso not silent then
+            outcome missing failed last
+          else
+            let
+              val result = answer ()
+              val rejected = read andalso result = HolbuildHttp.Response 200 andalso not (usable path)
+              val _ =
+                if rejected then
+                  HolbuildStatus.cache_trace ("remote cache " ^ method ^ " " ^ redact_userinfo node ^
+                                              ": entry passed over")
+                else ()
+              val miss = read andalso result = HolbuildHttp.Response 404
+              val passed = passed orelse rejected
+              val result = if rejected then HolbuildHttp.Response 404 else result
+              val misses = if miss then misses + 1 else misses
+              val missing = if read andalso result = HolbuildHttp.Response 404 then SOME (node, result) else missing
+              val rest =
+                if count = 0 andalso null rest andalso transient result andalso not (unanswered result) then
+                  [(node, ask node)]
+                else rest
+              val failed = if transient result then SOME (node, result) else failed
+            in
+              if miss andalso not required andalso not passed then outcome missing failed (node, result)
+              else if transient result orelse (read andalso result = HolbuildHttp.Response 404) then
+                loop (if miss andalso misses = 2 andalso not (null rest) then probe_rest rest else rest)
+                     (count + 1) misses (silent andalso unanswered result) passed missing failed (node, result)
+              else (node, result)
+            end
+  in
+    loop (map (fn node => (node, ask node)) urls) 0 0 true false NONE NONE
+         (hd urls, HolbuildHttp.Failed "no cache response")
+  end
+
+fun routed_status method urls path request = routed_status_using (fn _ => true) method request urls path request
 
 (* NONE when the remote cache is disabled, without a request.  With
    fail_closed, raises Unavailable instead, and for no answer, 429 or 5xx. *)
@@ -343,11 +531,13 @@ fun send_result method url request =
 fun send method url path request =
   Option.map #2 (send_result method url (fn () => (url, traced method url path request)))
 
-fun send_urls method urls path request =
-  send_result method (hd urls) (fn () => routed_status method urls path request)
+fun send_urls_using usable method urls path request =
+  send_result method (hd urls) (fn () => routed_status_using usable method head_status urls path request)
 
-fun curl_get_urls {urls, dst} =
-  (case send_urls "GET" urls dst (fn url => get_status {url = url, dst = dst}) of
+fun send_urls method urls path request = send_urls_using (fn _ => true) method urls path request
+
+fun curl_get_urls_by get usable {urls, dst, timeout} =
+  (case send_urls_using usable "GET" urls dst (fn url => get {url = url, dst = dst, timeout = timeout}) of
         NONE => HolbuildCacheBackend.Miss
       | SOME (url, HolbuildHttp.Failed message) =>
           HolbuildCacheBackend.Corrupt ("GET " ^ redact_userinfo url ^ " failed: " ^ message)
@@ -357,6 +547,11 @@ fun curl_get_urls {urls, dst} =
           HolbuildCacheBackend.Corrupt ("HTTP " ^ Int.toString code ^ " from " ^ redact_userinfo url))
   handle e as Unavailable _ => raise e
        | e => (HolbuildCacheBackend.Corrupt (General.exnMessage e))
+
+fun curl_get_urls_using usable {urls, dst} =
+  curl_get_urls_by get_status usable {urls = urls, dst = dst, timeout = stall_timeout_seconds}
+
+fun curl_get_urls request = curl_get_urls_using (fn _ => true) request
 
 fun curl_get {url, dst} = curl_get_urls {urls = [url], dst = dst}
 
@@ -373,10 +568,6 @@ fun curl_put_urls headers {urls, src} =
           else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ redact_userinfo url))
   handle e as Unavailable _ => raise e
        | e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
-
-fun curl_put_with_headers headers {url, src} = curl_put_urls headers {urls = [url], src = src}
-
-fun curl_put request = curl_put_with_headers [] request
 
 fun curl_put_zstd {urls, src, size} =
   let
@@ -405,12 +596,26 @@ fun cas_urls cache sha256 = request_urls cache "cas" sha256
 fun lookup_blob cache sha256 =
   Redblackmap.peek (!(blob_map cache), sha256)
 
+(* The stall budget of a GET of a blob, by the size an action entry that
+   lists it gave; a blob no entry read here lists gets the usual one. *)
+fun blob_stall_timeout cache sha256 =
+  case Option.mapPartial (Position.fromString o #size) (lookup_blob cache sha256) of
+      SOME size =>
+        if size >= Position.fromInt large_blob_bytes then large_blob_stall_timeout_seconds
+        else stall_timeout_seconds
+    | NONE => stall_timeout_seconds
+
+(* A worker's transfer threads share one handle. *)
+val blobs_mutex = Mutex.mutex ()
+
 fun remember_blob cache entry =
   let
     val blobs = blob_map cache
     val {sha256, ...} = entry
   in
-    blobs := Redblackmap.insert (!blobs, sha256, entry)
+    Mutex.lock blobs_mutex;
+    blobs := Redblackmap.insert (!blobs, sha256, entry);
+    Mutex.unlock blobs_mutex
   end
 
 fun split_at_marker text =
@@ -482,19 +687,21 @@ fun metadata_text manifest blobs =
      map (fn {sha256, size} => "blob " ^ sha256 ^ " " ^ size) blobs @
      [manifest_marker ^ manifest])
 
-fun get_action cache key =
+(* An action's metadata, without recording its blobs as present: a caller
+   that may not use the manifest records them with remember_action.  The
+   lookup passes over a node whose manifest fails `usable`, as for a 404. *)
+fun fetch_action_using usable cache key =
   let
     val tmp = temp_path "action"
     fun cleanup () = remove_file tmp
+    fun usable_body path = usable (#manifest (metadata_manifest (read_text path))) handle _ => true
   in
-    case curl_get_urls {urls = action_urls cache key, dst = tmp} of
+    case curl_get_urls_using usable_body {urls = action_urls cache key, dst = tmp} of
         HolbuildCacheBackend.Hit =>
-          let
-            val {blobs, manifest} = metadata_manifest (read_text tmp)
-            val _ = List.app (remember_blob cache) blobs
+          let val action = metadata_manifest (read_text tmp)
           in
             cleanup ();
-            SOME manifest
+            SOME action
           end
       | HolbuildCacheBackend.Miss => (cleanup (); NONE)
       | HolbuildCacheBackend.Corrupt message =>
@@ -502,6 +709,15 @@ fun get_action cache key =
   end
   handle e as Unavailable _ => raise e
        | _ => NONE
+
+fun remember_action cache {blobs, manifest} =
+  (List.app (remember_blob cache) blobs; manifest)
+
+fun fetch_action cache key = fetch_action_using (fn _ => true) cache key
+
+fun get_action_using usable cache key = Option.map (remember_action cache) (fetch_action_using usable cache key)
+
+fun get_action cache key = get_action_using (fn _ => true) cache key
 
 fun action_metadata cache key text =
   let
@@ -513,6 +729,53 @@ fun action_metadata cache key text =
   in
     metadata_text text known_blobs
   end
+
+(* Repair only resident entries the caller identifies as weaker compatible
+   copies. Optional replica maintenance must not trip the primary's breaker. *)
+fun repair_action_replicas cache {key, text, attempts, should_replace} =
+  if tripped () then ()
+  else
+    let
+      val download = temp_path "action-repair-get"
+      val upload = temp_path "action-repair-put"
+      fun cleanup () = (remove_file download; remove_file upload)
+      fun repair url =
+        let
+          fun warning detail =
+            warn_restore_once ("could not reconcile cache replica " ^ redact_userinfo url ^ ": " ^ detail)
+          fun request method path call = traced method url path call
+          fun loop remaining =
+            case request "GET" download (fn () => get_status {url = url, dst = download, timeout = stall_timeout_seconds}) of
+                HolbuildHttp.Response 404 => ()
+              | HolbuildHttp.Response 200 =>
+                  if not (should_replace (#manifest (metadata_manifest (read_text download)))) then ()
+                  else if remaining = 0 then warning "weaker timeout contract remains after repair"
+                  else
+                    (case request "PUT" upload (fn () => put_status [] {url = url, src = upload}) of
+                         HolbuildHttp.Response code =>
+                           if successful_put_code code then loop (remaining - 1)
+                           else if remaining > 1 then loop (remaining - 1)
+                           else warning ("HTTP " ^ Int.toString code ^ " during repair")
+                       | HolbuildHttp.Failed message =>
+                           if remaining > 1 then loop (remaining - 1) else warning message)
+              | result =>
+                  HolbuildStatus.cache_trace
+                    ("cache replica repair skipped: " ^ redact_userinfo url ^
+                     (case result of HolbuildHttp.Failed message => ": " ^ message
+                                   | HolbuildHttp.Response code => ": HTTP " ^ Int.toString code))
+        in
+          loop attempts handle Error detail => warning detail
+                             | IO.Io {name, function, ...} => warning (function ^ ": " ^ name)
+                             | OS.SysErr (detail, _) => warning detail
+        end
+    in
+      (write_text upload (action_metadata cache key text);
+       List.app repair (action_urls cache key);
+       cleanup ())
+      handle Error detail => (cleanup (); warn_restore_once detail)
+           | IO.Io {name, function, ...} => (cleanup (); warn_restore_once (function ^ ": " ^ name))
+           | OS.SysErr (detail, _) => (cleanup (); warn_restore_once detail)
+    end
 
 fun publish_action_metadata cache key metadata =
   let
@@ -596,7 +859,9 @@ fun fetch_blob cache {hash, dst} =
     | SOME entry =>
         let
           val {sha256, ...} = entry
-          val result = curl_get_urls {urls = cas_urls cache sha256, dst = dst}
+          val result = curl_get_urls_by get_status (fn _ => true)
+                         {urls = cas_urls cache sha256, dst = dst,
+                          timeout = blob_stall_timeout cache sha256}
         in
           case result of
               HolbuildCacheBackend.Hit => verify_downloaded_blob dst entry
@@ -607,16 +872,21 @@ fun fetch_blob cache {hash, dst} =
         handle e as Unavailable _ => raise e
              | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
 
-(* Fetches a blob by its SHA-256 alone, without an action entry that lists
-   it, as a remote worker fetches its spec and sources. *)
-fun fetch_unlisted_blob cache {hash, dst} =
-  (case curl_get_urls {urls = cas_urls cache hash, dst = dst} of
+(* Fetches a blob by its SHA-256 alone, without needing an action entry that
+   lists it, as a remote worker fetches its spec and sources; a GET fails
+   once it has moved no data for TIMEOUT seconds. *)
+fun fetch_unlisted_blob_within timeout cache {hash, dst} =
+  (case curl_get_urls_by get_status_parallel_decode (fn _ => true)
+                         {urls = cas_urls cache hash, dst = dst, timeout = timeout} of
        HolbuildCacheBackend.Hit =>
          if HolbuildHash.file_sha256 dst = hash then HolbuildCacheBackend.Hit
          else HolbuildCacheBackend.Corrupt ("downloaded blob SHA256 mismatch: " ^ hash)
      | other => other)
   handle e as Unavailable _ => raise e
        | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)
+
+fun fetch_unlisted_blob cache (request as {hash, ...}) =
+  fetch_unlisted_blob_within (blob_stall_timeout cache hash) cache request
 
 fun put_blob cache {hash, src} =
   let

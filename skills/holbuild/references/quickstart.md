@@ -60,8 +60,8 @@ holbuild build --dry-run FooTheory       # show plan
 holbuild context                         # show manifest info/cache paths
 holbuild buildhol                        # prebuild/reuse dependencies.hol
 holbuild execution-plan FooTheory:thm    # static proof-step plan
-holbuild check FooTheory[:thm]           # report oracles (cheat, ...), non-HOL axioms and kernel-bypass calls; exit 1 if any
-holbuild check --fingerprint FooTheory   # statement fingerprints and oracles of the whole ancestry, for before/after diffs
+holbuild check FooTheory[:thm] [BarTheory ...] # report oracles (cheat, ...), non-HOL axioms and kernel-bypass calls; exit 1 if any
+holbuild check --fingerprint FooTheory [BarTheory ...] # statement fingerprints and oracles of the whole ancestry, for before/after diffs
 holbuild build --force --trace-steps FooTheory
 holbuild --json build FooTheory          # bounded JSON events/errors for build output
 holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report failure logs
@@ -87,7 +87,8 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 - `--force=full` / `--force-full` / `--force` — rebuild the whole requested plan from source; forced nodes still publish cache unless `--no-cache`
 - `--no-cache` — skip global cache restore/publish; local `.holbuild/` up-to-date checks still work
 - `--skip-checkpoints` — no `.save`/`.ok` checkpoint files; theorem instrumentation still runs
-- `--all-checkpoints` — theorem checkpoints in every root theory; by default only the requested targets save them, others keep `deps_loaded` and step timeouts
+- `--all-checkpoints` — accepted compatibility alias; every root-package theory saves checkpoints by default
+- `--checkpoint-seconds N` — least time between two theorem/definition context saves (default 2; 0 saves every one); remote workers use the same value
 - `--skip-proof-steps` — no proof-step execution, hence no tactic timeout/trace-step/repl-on-failure support
 - `--trknl` — tracing kernel; root theories default to `--skip-checkpoints --skip-proof-steps`; `--trace-steps`/`--tactic-timeout` turn proof steps back on, `--repl-on-failure` proof steps and checkpoints
 - `--trace-steps` — record detailed proof-step execution logs; use with `--force` to inspect up-to-date targets
@@ -97,7 +98,7 @@ holbuild --json build --retain-debug-artifacts FooTheory  # also retain/report f
 
 **Incompatible**: `--skip-proof-steps` + `--tactic-timeout`/`--trace-steps`/`--repl-on-failure`; `--json` + dry-run/trace-steps/repl-on-failure.
 
-Parser recovery policy: HOL source parse errors are build failures. holbuild may still use HOLSourceParser recovery internally to record warnings, recover theorem/resume boundaries where possible, and produce best-effort instrumentation diagnostics before HOL reports the failing script-play status.
+Parser recovery policy: HOL source parse errors are build failures. holbuild may still use HOLSourceParser recovery internally to record warnings and keep the boundaries of the theorem/resume blocks that parsed cleanly; a block with a parse error is never instrumented or resumed, so HOL reports its error as written.
 
 ## Maintenance
 

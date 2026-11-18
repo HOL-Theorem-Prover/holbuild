@@ -139,7 +139,7 @@ fun parse_local_config root =
 
 fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, local_config} =
   let
-    val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config} = local_config
+    val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config, gc = _} = local_config
     val {definition, compatibility = _,
          tactic_timeout = manifest_timeout,
          theory_tactic_timeouts} =
@@ -247,7 +247,6 @@ fun abs_under root "." = root
   | abs_under root path =
       if Path.isAbsolute path then path else Path.concat(root, path)
 
-fun abs_member ({root, ...} : t) member = abs_under root member
 fun abs_run_heap ({root, run_heap, ...} : t) = Option.map (abs_under root) run_heap
 
 fun override_path overrides name =
@@ -291,8 +290,6 @@ fun package_identity package =
        metadata_id = HolbuildPackageDefinition.metadata_id definition,
        content_id = package_content_identity package}
   end
-fun package_source_root package =
-  HolbuildPackageProvenance.source_root (package_provenance package)
 fun package_members (Package {members, ...}) = members
 fun package_excludes (Package {excludes, ...}) = excludes
 fun package_exclude_globs (Package {exclude_globs, ...}) = exclude_globs
@@ -330,16 +327,6 @@ fun hol_holdir ({kernel_variant} : resolution) {git, rev} =
   HolbuildHolSharedCache.holdir_for_with_kernel
     {git = git, rev = rev, kernel_variant = kernel_variant}
 
-fun project_hol_dir_with resolution project =
-  case hol_dependency project of
-      SOME (Dependency {source = GitSource request, ...}) =>
-        SOME (hol_holdir resolution request)
-    | _ => NONE
-
-fun project_hol_dir project = project_hol_dir_with standard_resolution project
-fun build_roots ({roots, ...} : t) = roots
-fun build_root_groups ({root_groups, ...} : t) = root_groups
-fun build_groups ({groups, ...} : t) = groups
 fun checkpoint_limit_gb ({checkpoint_limit_gb, ...} : t) = checkpoint_limit_gb
 fun remote_cache_url ({remote_cache_url, ...} : t) = remote_cache_url
 fun remote_cache_curl_config ({remote_cache_curl_config, ...} : t) = remote_cache_curl_config
@@ -366,6 +353,7 @@ fun action_cache_enabled (ActionPolicy {impure, cache, always_reexecute, ...}) =
   cache andalso not impure andalso not always_reexecute
 fun action_always_reexecute (ActionPolicy {impure, always_reexecute, ...}) =
   impure orelse always_reexecute
+fun action_impure (ActionPolicy {impure, ...}) = impure
 fun extra_input_path (ExtraInput {path}) = path
 
 fun default_action_policy logical =
@@ -376,9 +364,6 @@ fun action_policy_for policies logical =
   case List.find (fn policy => action_policy_logical policy = logical) policies of
       SOME policy => policy
     | NONE => default_action_policy logical
-
-fun dependency_path_context name = "dependencies." ^ name ^ ".path"
-fun dependency_manifest_context name = "dependencies." ^ name ^ ".manifest"
 
 fun dependency_local_path_with resolution (project as {graph_artifact_root, ...} : t) (Dependency {name, source, role}) =
   case override_path (#overrides project) name of
@@ -463,17 +448,21 @@ fun project_package ({root, artifact_root, graph_artifact_root, manifest, defini
 
 fun root_package_name project = package_name (project_package project)
 
-fun dependency_project_with resolution (project : t) (dep as Dependency {name, source, ...}) =
+fun materialize_dependency shared (project : t) (dep as Dependency {name, source, ...}) =
+  case source of
+      GitSource {git, rev} =>
+        if hol_toolchain_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
+        else
+          let val effective_git = Option.getOpt(override_git (#overrides project) name, git)
+          in ignore (HolbuildGitCache.materialize {name = name, git = effective_git, rev = rev,
+                                                   artifact_root = #graph_artifact_root project,
+                                                   shared = shared}) end
+    | _ => ()
+
+(* The dependency's project as its local path holds it now, without
+   materializing it. *)
+fun local_dependency_project_with resolution (project : t) (dep as Dependency {name, ...}) =
   let
-    val _ =
-      case source of
-          GitSource {git, rev} =>
-            if hol_toolchain_dependency dep orelse Option.isSome (override_path (#overrides project) name) then ()
-            else
-              let val effective_git = Option.getOpt(override_git (#overrides project) name, git)
-              in ignore (HolbuildGitCache.materialize {name = name, git = effective_git, rev = rev,
-                                                       artifact_root = #graph_artifact_root project}) end
-        | _ => ()
     val dep_root =
       case dependency_local_path_with resolution project dep of
           SOME path => path
@@ -502,6 +491,29 @@ fun dependency_project_with resolution (project : t) (dep as Dependency {name, s
       else die ("dependency " ^ name ^ " manifest " ^ dep_manifest ^
                 " declares project.name = " ^ declared_name)
   in
+    dep_project
+  end
+
+(* The dependency whose checkout holds dep's sources: dep itself, or for a
+   shim the dependency it is from. *)
+fun checkout_dependency (project : t) (dep as Dependency {source, ...}) =
+  case source of
+      FromSource {from, ...} =>
+        (case List.find (fn Dependency {name, ...} => name = from) (#dependencies project) of
+             SOME from_dep => checkout_dependency project from_dep
+           | NONE => die ("validated from dependency disappeared: " ^ from))
+    | _ => dep
+
+(* Generators write their outputs into their package's sources, which a shared
+   checkout keeps read-only, so the checkout holding a package that declares
+   any is replaced by a private clone at the same path. *)
+fun dependency_project_with resolution project dep =
+  let
+    val _ = materialize_dependency true project dep
+    val dep_project = local_dependency_project_with resolution project dep
+  in
+    if null (#generators dep_project) then ()
+    else materialize_dependency false project (checkout_dependency project dep);
     dep_project
   end
 
@@ -542,10 +554,9 @@ fun resolved_hol_dependency_with (resolution as {kernel_variant} : resolution) p
 
 fun resolved_hol_dependency project = resolved_hol_dependency_with standard_resolution project
 
-fun dependency_package_with resolution artifact_parent project
-      (dep as Dependency {name, source, ...}) =
+fun package_of_dependency_project resolution artifact_parent project
+      (dep as Dependency {name, source, ...}) dep_project =
   let
-    val dep_project = dependency_project_with resolution project dep
     val dep_root =
       case dependency_local_path_with resolution project dep of
           SOME value => value
@@ -636,8 +647,18 @@ fun dependency_package_with resolution artifact_parent project
      dep_project)
   end
 
+fun dependency_package_with resolution artifact_parent project dep =
+  package_of_dependency_project resolution artifact_parent project dep
+    (dependency_project_with resolution project dep)
+
 fun dependency_package artifact_parent project dep =
   dependency_package_with standard_resolution artifact_parent project dep
+
+(* The package of a dependency already on disk, read as it is: nothing is
+   fetched, materialized or locked. *)
+fun local_dependency_package artifact_parent project dep =
+  package_of_dependency_project standard_resolution artifact_parent project dep
+    (local_dependency_project_with standard_resolution project dep)
 
 (* A commit names the same sources in every repository that has it, so two
    hol dependencies at one rev agree whatever their URLs: a HOL fork and HOL

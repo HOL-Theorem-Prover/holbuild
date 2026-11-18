@@ -11,13 +11,11 @@ struct
 (* A step that yields text (a batch, a batch id) or says why it couldn't. *)
 datatype attempt = Ok of string | Refused of string
 
-(* An action that failed for good because its proof did, and the cache
-   blob that holds its worker's build log. *)
-type proof_failure = {input_key : string, kind : string, log_sha256 : string}
+(* A final action failure and its worker log, when one was uploaded. *)
+type action_failure = {input_key : string, kind : string, log_sha256 : string option}
 
 datatype outcome = Done
-                 | Failed of string * proof_failure option
-                                          (* the batch failed, and the proof that failed it *)
+                 | Failed of string * action_failure list
                  | Cancelled              (* someone cancelled the batch *)
                  | Unfollowable of string (* the coordinator won't stream it; it may still run *)
                  | Unreachable of string  (* the coordinator couldn't be asked *)
@@ -26,18 +24,23 @@ datatype outcome = Done
    said. *)
 type progress = {built : int, total : int}
 
+val command_action = ref (fn (_ : string * string) => ())
+val command_follow = ref (fn (_ : string * Time.time * Time.time) => ())
+val command_batch = ref (fn (_ : string) => ())
+
 val connect_timeout_seconds = 10
 val request_max_time_seconds = 60
 (* Waits before each retry of a request the coordinator couldn't answer (a
    submission answered 5xx or 429, an event stream that broke without
-   delivering a state change): doubling up to 8 seconds, about two and a half
-   minutes in all, long enough to ride out a coordinator restart such as an
-   image upgrade.  Tests shorten them with HOLBUILD_TEST_RETRY_DELAYS,
-   comma-separated seconds. *)
+   delivering a state change): doubling up to 8 seconds, almost six minutes
+   in all, long enough to ride out a coordinator restart such as an image
+   upgrade (which pulls the new image first), or the move to a replacement
+   instance.  Tests shorten them
+   with HOLBUILD_TEST_RETRY_DELAYS, comma-separated seconds. *)
 fun retry_delays_seconds () =
   case OS.Process.getEnv "HOLBUILD_TEST_RETRY_DELAYS" of
       SOME text => List.mapPartial Int.fromString (String.tokens (fn c => c = #",") text)
-    | NONE => [1, 2, 4] @ List.tabulate (18, fn _ => 8)
+    | NONE => [1, 2, 4] @ List.tabulate (43, fn _ => 8)
 
 fun retry_after delay = OS.Process.sleep (Time.fromSeconds (Int.toLarge delay))
 
@@ -80,6 +83,19 @@ fun json_string_field name text =
           end
   end
 
+(* The value of an integer field in one JSON object, as the coordinator
+   writes it: NONE when the field is missing or not a number. *)
+fun json_int_field name text =
+  let val key = "\"" ^ name ^ "\""
+  in
+    case HolbuildStatus.find_substring key text of
+        NONE => NONE
+      | SOME start =>
+          case Substring.getc (Substring.dropl Char.isSpace (Substring.extract (text, start + size key, NONE))) of
+              SOME (#":", value) => LargeInt.fromString (Substring.string value)
+            | _ => NONE
+  end
+
 (* curl's output split into lines, and the HTTP status `-w` appends as the
    last line (0 when no response came). *)
 fun split_status output =
@@ -97,12 +113,14 @@ fun write_text path text =
 (* Submits a batch, with QUERY ("" or "?...") after the path; Ok carries
    its id.  A 5xx answer (a proxy's 502-504 while the coordinator restarts,
    or the coordinator's own 500 while it's overloaded) or a 429 is retried after each of retry_delays_seconds, since
-   it passes like a restart; other 4xx errors aren't, and an unreachable
-   coordinator is refused at once.  A gateway error that comes after the
+   it passes like a restart; other 4xx errors aren't.  An unreachable
+   coordinator is retried the same way when WAIT_UNREACHABLE (the caller has
+   nothing to fall back to, as under --remote-only), and refused at once
+   otherwise, so that a build that can go on locally does.  A gateway error that comes after the
    coordinator stored the batch (it was stopped between storing and
    answering) leaves a copy that nobody follows: it runs to its end or
    deadline, repeating work whose results the cache dedupes. *)
-fun submit_with_query url query maxheap batch_text : attempt =
+fun submit_with_query wait_unreachable url query maxheap batch_text : attempt =
   let
     val _ = HolbuildOffline.require_online "submit a remote batch"
     val query = query ^ (case maxheap of
@@ -122,16 +140,17 @@ fun submit_with_query url query maxheap batch_text : attempt =
              stderr = HolbuildSpawn.Merge}
         val (lines, status) = split_status (#output result)
         val text = String.concatWith "\n" lines
-        val refusal = "coordinator refused the batch (HTTP " ^ Int.toString status ^ "): " ^ text
+        val refusal =
+          if status = 0 then
+            "could not reach the coordinator at " ^ HolbuildRemoteCache.redact_userinfo url ^
+            (if text = "" then "" else ": " ^ text)
+          else "coordinator refused the batch (HTTP " ^ Int.toString status ^ "): " ^ text
       in
         if status = 201 then
           case json_string_field "batch_id" text of
-              SOME id => Ok id
+              SOME id => (!command_batch id; Ok id)
             | NONE => Refused ("coordinator answered without a batch_id: " ^ text)
-        else if status = 0 then
-          Refused ("could not reach the coordinator at " ^ HolbuildRemoteCache.redact_userinfo url ^
-                   (if text = "" then "" else ": " ^ text))
-        else if status = 429 orelse status >= 500 then
+        else if (status = 0 andalso wait_unreachable) orelse status = 429 orelse status >= 500 then
           case delays of
               [] => Refused refusal
             | delay :: rest =>
@@ -147,7 +166,8 @@ fun submit_with_query url query maxheap batch_text : attempt =
     outcome
   end
 
-fun submit url maxheap batch_text = submit_with_query url "" maxheap batch_text
+fun submit wait_unreachable url maxheap batch_text =
+  submit_with_query wait_unreachable url "" maxheap batch_text
 
 (* The input key of the theory a failed batch's workers could not use, when
    the coordinator failed it for resubmission naming the theory as
@@ -182,18 +202,42 @@ fun report_action line =
   let
     val field = fn name => json_string_field name line
     val theory = Option.getOpt (field "theory", "?")
-    val state = Option.getOpt (field "state", "?")
-    val failure = case field "last_failure" of SOME f => " (" ^ f ^ ")" | NONE => ""
-    val log = case (state, field "log_sha256") of
-                  ("failed", SOME sha) => ", log /cas/" ^ sha
-                | _ => ""
+    val raw_state = Option.getOpt (field "state", "?")
+    val state = if raw_state = "cancelled" andalso
+                   String.isPrefix "skipped because of " (Option.getOpt (field "last_failure", ""))
+                then "skipped" else raw_state
+    (* A done action's detail says why it has no log. *)
+    val failure =
+      case (field "last_failure", field "failure_detail") of
+          (SOME f, SOME detail) => " (" ^ f ^ ": " ^ detail ^ ")"
+        | (SOME f, NONE) => " (" ^ f ^ ")"
+        | (NONE, SOME detail) => " (" ^ detail ^ ")"
+        | (NONE, NONE) => ""
+    (* An action back to waiting, ready or running after a failure is
+       being retried: the attempts it has used, its tier, and the log a
+       failed attempt left tell a retry loop from a slow proof. *)
+    val retried = Option.isSome (field "last_failure") andalso
+                  List.exists (fn s => s = state) ["waiting", "ready", "running"]
+    val attempt =
+      if not retried then ""
+      else
+        (case json_int_field "attempts" line of
+             SOME n => ", attempts " ^ LargeInt.toString n
+           | NONE => "") ^
+        (case field "tier" of SOME tier => ", tier " ^ tier | NONE => "")
+    (* A cancelled action's log is the one its worker uploaded as it
+       stopped it, as at the batch deadline. *)
+    val log = case field "log_sha256" of
+                  SOME sha => if List.exists (fn s => s = state) ["failed", "cancelled"] orelse retried
+                              then ", log /cas/" ^ sha else ""
+                | NONE => ""
   in
-    HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ state ^ failure ^ log ^ "\n")
+    HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ state ^ failure ^ attempt ^ log ^ "\n")
   end
 
 (* Follows a batch's event stream until the batch finishes, printing each
    action whose state changes, and passing on_change the input key, the
-   new state and the last failure, if any, of each.  A stream that breaks (the connection drops,
+   new state, last failure and log hash, if any, of each.  A stream that breaks (the connection drops,
    or the coordinator answers 5xx while it restarts) is reattached: after a
    second when it delivered a state change, and after each of
    retry_delays_seconds in a row when it delivered none.  Every stream
@@ -203,11 +247,18 @@ fun report_action line =
    on a quiet stream, so a proxy doesn't close a healthy one for being
    idle.  The coordinator ends a batch at its deadline, so this ends too.  A failed
    batch comes with the action whose proof failed, when one did. *)
-fun follow url batch_id (on_change : string * string * string option -> unit) : outcome * progress =
+fun follow url batch_id (on_change : string * string * string option * string option -> unit) : outcome * progress =
   let
+    val followed_at = Time.now ()
     val _ = HolbuildOffline.require_online "follow a remote batch"
-    val states : (string * string) list ref = ref []
-    val proof_failure : proof_failure option ref = ref NONE
+    val states : (string * (string * string option * string option)) list ref = ref []
+    val names = ref ([] : (string * string) list)
+    (* An action the deadline stopped failed with its batch. *)
+    fun failures () =
+      List.mapPartial (fn (key, (state, kind, log)) =>
+        if state = "failed" orelse (state = "cancelled" andalso kind = SOME "deadline") then
+          SOME {input_key = key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
+        else NONE) (rev (!states))
     (* A line cut off by a dropped connection, perhaps with curl's error
        after it, is no event. *)
     fun complete line = Substring.isSuffix "}" (Substring.dropr Char.isSpace (Substring.full line))
@@ -215,20 +266,24 @@ fun follow url batch_id (on_change : string * string * string option -> unit) : 
       case (if complete line then json_string_field "type" line else NONE) of
           SOME "action" =>
             let
+              val _ = !command_action (batch_id, line)
               val key = Option.getOpt (json_string_field "input_key" line, "")
               val state = Option.getOpt (json_string_field "state" line, "")
+              val failure = json_string_field "last_failure" line
+              val log = json_string_field "log_sha256" line
+              val previous = List.find (fn (k, _) => k = key) (!states)
+              val status = (state, failure, log)
             in
-              (case (state, json_string_field "last_failure" line, json_string_field "log_sha256" line) of
-                   ("failed", SOME kind, SOME log_sha256) =>
-                     if kind = "proof" orelse kind = "tactic-timeout" then
-                       proof_failure := SOME {input_key = key, kind = kind, log_sha256 = log_sha256}
-                     else ()
-                 | _ => ());
-              if List.exists (fn entry => entry = (key, state)) (!states) then ()
-              else (states := (key, state) :: List.filter (fn (k, _) => k <> key) (!states);
-                    changed := true;
-                    report_action line;
-                    on_change (key, state, json_string_field "last_failure" line))
+              names := (key, Option.getOpt (json_string_field "theory" line, key)) ::
+                       List.filter (fn (k, _) => k <> key) (!names);
+              if previous = SOME (key, status) then ()
+              else
+                (states := (key, status) :: List.filter (fn (k, _) => k <> key) (!states);
+                 (* A new log can arrive in a repeated done snapshot after a
+                    missed requeue. Only state progress resets stream retries. *)
+                 if Option.map (fn (_, (s, _, _)) => s) previous = SOME state then ()
+                 else (changed := true; report_action line);
+                 on_change (key, state, failure, log))
             end
         | SOME "batch" =>
             outcome :=
@@ -239,8 +294,8 @@ fun follow url batch_id (on_change : string * string * string option -> unit) : 
                           Failed (state ^ (case json_string_field "failure" line of
                                                SOME failure => ": " ^ failure
                                              | NONE => ""),
-                                  !proof_failure)
-                      | NONE => Failed ("finished in an unknown state", !proof_failure))
+                                  failures ())
+                      | NONE => Failed ("finished in an unknown state", failures ()))
         | _ => others := line :: !others
     fun attach delays =
       let
@@ -277,9 +332,25 @@ fun follow url batch_id (on_change : string * string * string option -> unit) : 
                   | delay :: rest => again delay rest
       end
     val outcome = attach (retry_delays_seconds ())
+                  handle e => (!command_follow (batch_id, followed_at, Time.now ()); raise e)
+    val _ = !command_follow (batch_id, followed_at, Time.now ())
+    val skipped = List.filter (fn (_, (state, reason, _)) =>
+      state = "cancelled" andalso String.isPrefix "skipped because of " (Option.getOpt (reason, ""))) (!states)
+    fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
+    val _ =
+      if null (failures ()) andalso null skipped then ()
+      else
+        (HolbuildStatus.message_stderr ("holbuild: remote failure summary: " ^
+           Int.toString (length (failures ())) ^ " failed, " ^ Int.toString (length skipped) ^ " skipped\n");
+         List.app (fn {input_key, kind, log_sha256} =>
+           HolbuildStatus.message_stderr ("holbuild: remote " ^ name input_key ^ ": failed (" ^ kind ^ ")" ^
+             (case log_sha256 of SOME sha => ", log /cas/" ^ sha | NONE => ", no worker log") ^ "\n")) (failures ());
+         List.app (fn (key, (_, reason, _)) =>
+           HolbuildStatus.message_stderr ("holbuild: remote " ^ name key ^ ": " ^ Option.getOpt (reason, "skipped") ^ "\n"))
+           (rev skipped))
   in
     (outcome,
-     {built = length (List.filter (fn (_, state) => state = "done") (!states)),
+     {built = length (List.filter (fn (_, (state, _, _)) => state = "done") (!states)),
       total = length (!states)})
   end
 
@@ -325,12 +396,22 @@ fun while_followed url batch_id f =
 (* Whoever interrupts a build may kill it soon after, so this waits briefly. *)
 val interrupt_cancel_seconds = 5
 
+(* With HOLBUILD_KEEP_BATCH_ON_INTERRUPT=1 an interrupt leaves the batch
+   running, so a caller that stops the build at a time limit keeps what the
+   workers finish in the remote cache for its next build. *)
+fun keep_batch_on_interrupt () =
+  OS.Process.getEnv "HOLBUILD_KEEP_BATCH_ON_INTERRUPT" = SOME "1"
+
 fun cancel_followed () =
   case !followed of
       NONE => ()
     | SOME (url, batch_id) =>
         (followed := NONE;
-         if cancel_within interrupt_cancel_seconds url batch_id
+         if keep_batch_on_interrupt () then
+           HolbuildStatus.message_stderr
+             ("holbuild: left remote batch " ^ batch_id ^ " running; reattach with --attach " ^
+              batch_id ^ "\n")
+         else if cancel_within interrupt_cancel_seconds url batch_id
          then HolbuildStatus.message_stderr ("holbuild: cancelled remote batch " ^ batch_id ^ "\n")
          else ())
 

@@ -75,9 +75,10 @@ while read -r _ key _ spec target; do
   echo "$key $target" >> "$tmpdir/keys"
 done < <(grep '^action ' "$tmpdir/batch.txt")
 
-# The local build, from source in another cache root, without the remote.
+# The local build, from source in another cache root, without the remote,
+# and without pipelining: a deferred proof can record other dependencies.
 link_hol_toolchain_cache "$tmpdir/local"
-(cd "$project" && HOLBUILD_CACHE=$tmpdir/local "$HOLBUILD_BIN" build countcharsTheory) > "$tmpdir/local.log" 2>&1 ||
+(cd "$project" && HOLBUILD_CACHE=$tmpdir/local HOLBUILD_PIPELINE=off "$HOLBUILD_BIN" build countcharsTheory) > "$tmpdir/local.log" 2>&1 ||
   { cat "$tmpdir/local.log" >&2; exit 1; }
 
 while read -r key target; do

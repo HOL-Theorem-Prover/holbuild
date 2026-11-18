@@ -94,7 +94,7 @@ key_c=$(plan_key CTheory)
 # text hashes to its input key, and its source line matches that text.
 check_specs() {
   python3 - "$project/.holbuild/action-specs" "$1" <<'PY'
-import hashlib, pathlib, sys
+import hashlib, pathlib, re, sys
 spec_dir, batch = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).read_text().splitlines()
 assert batch[0] == "holbuild-action-batch-v1", batch
 for line in batch[1:]:
@@ -112,6 +112,7 @@ for line in batch[1:]:
     assert f"input-key={key}" in lines, (target, key)
     assert hashlib.sha256(action_text).hexdigest() == key, target
     assert f"action-text-sha256={key}" in lines, target
+    assert any(re.fullmatch("deps-key=[0-9a-f]{64}", l) for l in lines), target
     assert f"target {target}" in lines, target
     source = [l.split() for l in lines if l.startswith("source ")]
     assert len(source) == 1, source
@@ -125,6 +126,8 @@ PY
 # Nothing is cached: every theory is exported, each waiting for its parent.
 hb action-spec CTheory > "$tmpdir/batch1.txt"
 check_specs "$tmpdir/batch1.txt"
+hb action-spec --remote-only CTheory > "$tmpdir/batch-remote-only.txt"
+diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-remote-only.txt"
 grep '^edge' "$tmpdir/batch1.txt" | sort > "$tmpdir/edges1.txt"
 printf 'edge %s %s\nedge %s %s\n' "$key_b" "$key_a" "$key_c" "$key_b" | sort > "$tmpdir/edges1.expected"
 diff -u "$tmpdir/edges1.expected" "$tmpdir/edges1.txt"
@@ -263,8 +266,22 @@ for client in libcurl cli; do
   unset HOLBUILD_TEST_LIBCURL
 done
 
-# After the first upload fails, the rest are skipped and the export fails.
+# A cache of one node asks again after a transient answer to an upload.
 missing_spec=$(awk '$1 == "action" { print $4; exit }' "$tmpdir/batch1.txt")
+rm "$remote_root/cas/$missing_spec"
+echo 502 > "$tmpdir/control/cas-put-fail-once"
+: > "$request_log"
+hb --prefetch-concurrency 1 action-spec --upload CTheory > "$tmpdir/batch-retried.txt"
+diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-retried.txt"
+[[ ! -e "$tmpdir/control/cas-put-fail-once" ]] || { echo "the upload was not refused once" >&2; exit 1; }
+cmp "$project/.holbuild/action-specs/$missing_spec" "$remote_root/cas/$missing_spec"
+[[ $(grep -c "^PUT /cas/$missing_spec\$" "$request_log") -eq 2 ]] || {
+  echo "expected the refused upload and its retry:" >&2
+  grep '^PUT /cas/' "$request_log" >&2
+  exit 1
+}
+
+# After the first upload fails twice, the rest are skipped and the export fails.
 rm "$remote_root/cas/$missing_spec"
 echo 500 > "$tmpdir/control/cas-put-status"
 : > "$request_log"
@@ -275,7 +292,7 @@ fi
 rm "$tmpdir/control/cas-put-status"
 require_grep 'could not upload .*HTTP 500' "$tmpdir/upload-failure.log"
 require_grep 'name=action_spec.upload.*status=fail' "$tmpdir/failed-upload.timing"
-[[ $(grep -c '^PUT /cas/' "$request_log") -eq 1 ]] || {
+[[ $(grep -c '^PUT /cas/' "$request_log") -eq 2 ]] || {
   echo "uploads went on after the first failure:" >&2
   grep '^PUT /cas/' "$request_log" >&2
   exit 1
@@ -323,7 +340,10 @@ expect_refusal() {
   fi
   grep -q -- "$pattern" "$tmpdir/refused.log" || { cat "$tmpdir/refused.log" >&2; require_grep "$pattern" "$tmpdir/refused.log"; }
 }
-expect_refusal "spec:ATheory can't run remotely: it is forced" --force CTheory
+hb action-spec --force=theory CTheory > "$tmpdir/batch-forced.txt"
+require_grep '^action .* spec:CTheory$' "$tmpdir/batch-forced.txt"
+forced_spec=$(awk '$1 == "action" && $5 == "spec:CTheory" { print $4 }' "$tmpdir/batch-forced.txt")
+require_grep '^option force=true$' "$project/.holbuild/action-specs/$forced_spec"
 
 echo outside > "$tmpdir/outside.txt"
 cat > "$project/src/DScript.sml" <<'SML'
@@ -357,3 +377,32 @@ if (cd "$project" && env -u HOLBUILD_REMOTE_CACHE_URL "$HOLBUILD_BIN" action-spe
   exit 1
 fi
 require_grep "action-spec needs a remote cache" "$tmpdir/no-remote.log"
+
+# An uncached toolchain must fail without building HOL locally.
+fake_hol=$tmpdir/fake-hol
+write_fake_hol "$fake_hol"
+fake_rev=$(init_git_repo "$fake_hol")
+mkdir -p "$tmpdir/fake-project"
+cat > "$tmpdir/fake-project/holproject.toml" <<TOML
+[holbuild]
+schema = 2
+minimum_version = "0.10.0"
+
+[project]
+name = "spec-fake"
+
+[dependencies.hol]
+git = "$fake_hol"
+rev = "$fake_rev"
+TOML
+: > "$tmpdir/fake-build-count"
+status=0
+(cd "$tmpdir/fake-project" &&
+  HOLBUILD_CACHE=$tmpdir/fake-cache \
+  HOLBUILD_TEST_BUILD_COUNT=$tmpdir/fake-build-count \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --remote-only) \
+  > "$tmpdir/toolchain-only.log" 2>&1 || status=$?
+[[ $status -eq 75 ]] || { cat "$tmpdir/toolchain-only.log" >&2; echo "wanted 75, got $status" >&2; exit 1; }
+# It names what it looked for, so a failure elsewhere can be traced.
+require_grep "HOL toolchain could not be restored from a cache, and --remote-only builds nothing locally (HOL rev $fake_rev, toolchain key [0-9a-f]\{64\}, remote archive key [0-9a-f]\{64\})" "$tmpdir/toolchain-only.log"
+[[ ! -s "$tmpdir/fake-build-count" ]] || { cat "$tmpdir/fake-build-count" >&2; exit 1; }

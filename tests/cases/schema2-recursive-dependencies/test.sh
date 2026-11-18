@@ -74,7 +74,7 @@ parse_counts=$tmpdir/parse-counts.log
 require_grep "package: a \[root=$root/.holbuild/src/a" "$tmpdir/root.log"
 require_grep "package: b \[root=$root/.holbuild/src/b" "$tmpdir/root.log"
 require_grep "package: hol \[root=$HOLBUILD_CACHE/hol-toolchains/" "$tmpdir/root.log"
-[ -d "$root/.holbuild/src/b/.git" ]
+[ -L "$root/.holbuild/src/b" ]
 [ ! -d "$root/.holbuild/packages/a/.holbuild/src/b" ]
 
 # Missing hol is rejected.

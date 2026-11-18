@@ -122,9 +122,10 @@ if grep -q 'module-cache unsupported' "$log"; then
   echo 'source loader checked; compiled initializers unsupported by this toolchain'
   exit 0
 fi
-require_grep 'module-cache hits=3 misses=0' "$log"
+# B's or C's child wrote A's module; D's writes B's and C's.
+require_grep 'module-cache hits=1 misses=2' "$log"
 module_cache=$HOLBUILD_CACHE/theory-modules
-test -n "$(find "$module_cache" -name '*.ref' -print -quit)"
+test "$(find "$module_cache" -name '*.pmo' | wc -l)" -eq 3
 
 rm -rf "$module_cache"
 rebuild "$tmpdir/cold.log"

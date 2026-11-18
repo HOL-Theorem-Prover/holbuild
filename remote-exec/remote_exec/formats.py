@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 SHA256 = re.compile(r"[0-9a-f]{64}")
 THEORY = re.compile(r"[^\s:]+:\S+")
 PHASE = re.compile(r"[a-z]+")
+DETAIL_MAX = 500
 
 FAILURES = frozenset(
     {
@@ -22,6 +23,7 @@ FAILURES = frozenset(
         "script",
         "timeout",
         "unavailable",
+        "ahead-abandoned",  # an action claimed ahead of its parents gave up; it is built once they are done
     }
 )
 
@@ -59,7 +61,18 @@ class Result:
     missing: Missing | None
     peak_rss_mb: int | None
     log_sha256: str | None
-    timings: dict[str, int] | None = None  # milliseconds: each phase's, and the whole run's as "wall"
+    # Durations in ms; started/finished and hol/publish/log start/end are Unix ms.
+    # rebuilt is 1 for a source build, 0 for a cache hit or failure.
+    timings: dict[str, int] | None = None
+    detail: str | None = None  # why a failure with no log failed, as sanitize_detail leaves it
+    # The spec's deps-key, which the worker adds: the dependency context whose shared heap the action loaded.
+    deps_key: str | None = None
+
+
+def sanitize_detail(text: str) -> str:
+    """``text`` as a result record's ``detail``: one line of printable ASCII, every other character a space,
+    cut to ``DETAIL_MAX`` characters, as ``holbuild exec-action`` writes it."""
+    return "".join(c if " " <= c <= "~" else " " for c in text[:DETAIL_MAX])
 
 
 def _expect(pattern: re.Pattern[str], value: str, what: str) -> str:
@@ -162,4 +175,6 @@ def parse_result(text: str) -> Result:
         peak_rss_mb=int(peak) if peak is not None else None,
         log_sha256=_expect(SHA256, log.split(" ")[0], "log") if log else None,
         timings=timings or None,
+        detail=sanitize_detail(fields["detail"]) if fields.get("detail") else None,
+        deps_key=_expect(SHA256, fields["deps-key"], "deps-key") if fields.get("deps-key") else None,
     )

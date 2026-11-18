@@ -127,7 +127,8 @@ git_log=$tmpdir/git.log
 require_grep "override-git=$git_leaf" "$git_log"
 require_grep "local=$git_project/.holbuild/src/git_leaf" "$git_log"
 require_grep "package: git_leaf \[root=$git_project/.holbuild/src/git_leaf" "$git_log"
-[ "$(git -C "$git_project/.holbuild/src/git_leaf" rev-parse HEAD)" = "$git_leaf_rev" ]
+link=$(readlink "$git_project/.holbuild/src/git_leaf")
+[ "${link##*-}" = "$git_leaf_rev" ]
 
 transitive=$tmpdir/transitive
 make_project_dir "$transitive" transitive "
@@ -222,7 +223,8 @@ recursive_git_log=$tmpdir/recursive-git.log
 require_grep "package: mid_git \[root=$recursive_git_project/.holbuild/src/mid_git" "$recursive_git_log"
 require_grep "package: transitive_git \[root=$recursive_git_project/.holbuild/src/transitive_git" "$recursive_git_log"
 require_grep "override: transitive_git git -> $transitive_git" "$recursive_git_log"
-[ "$(git -C "$recursive_git_project/.holbuild/src/transitive_git" rev-parse HEAD)" = "$transitive_git_rev" ]
+link=$(readlink "$recursive_git_project/.holbuild/src/transitive_git")
+[ "${link##*-}" = "$transitive_git_rev" ]
 
 # A from/path/manifest shim lives inside its from dependency's checkout, so
 # overriding the from dependency must move the shim's package root with it.

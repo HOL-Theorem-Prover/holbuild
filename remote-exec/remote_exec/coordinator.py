@@ -6,28 +6,33 @@ is a batch row first, then its actions and leases, so a completion, an expiry an
 
 import asyncio
 import contextlib
+import functools
 import graphlib
+import heapq
 import json
 import logging
 import os
 import shlex
 import time
-from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable
+from collections import Counter, defaultdict, deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any, Literal, Self
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import asyncpg
 import httpx
 import sqlalchemy as sa
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
-from remote_exec.cache import cache_nodes, ranked_nodes
+from remote_exec.cache import cache_nodes, node_identity, ranked_nodes
+from remote_exec.cache_pool import HELD_TARGET, CachePool, CacheSlot, CommandAdapter
 from remote_exec.formats import Batch, Result
+from remote_exec.membership import REFRESH_SECONDS, Membership
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +42,8 @@ IN_CACHE_TRUST_SECONDS = 60
 # How many requests a release has in flight to the cache at once. At most two releases run at once (a pass over every
 # batch and one of single batches), so together they stay within the cache client's 100 connections.
 RELEASE_CACHE_CHECKS = 48
+# Transactions a release pass holds at once, so a pass over many batches leaves pooled connections to the rest.
+RELEASE_TRANSACTIONS = 8
 RELEASE_SLOW_SECONDS = 5.0  # a release pass that takes this long is logged
 
 # A statement, or a transaction left idle, that runs longer than this is ended by the database, so one stuck
@@ -50,7 +57,30 @@ SCALE_CMD_TIMEOUT_S = 60
 HOST_REPORT_SECONDS = 120
 # Hosts the coordinator remembers at most; a report from another host beyond them is dropped.
 MAX_HOSTS = 1000
+# A host is quarantined (see Coordinator._quarantine) while its latest report has less disk free than this, the floor
+# under which its workers don't claim (worker.py DISK_FLOOR), or while its last QUARANTINE_FAILURES results were
+# INFRA_FAILURES of more than one batch; such a host gets one probe claim each PROBE_SECONDS, and one that ends in
+# success or in RAN_FAILURES, which say the host ran the action, ends the quarantine.
+DISK_FLOOR = 4 * 2**30
+QUARANTINE_FAILURES = 5
+INFRA_FAILURES = frozenset({"internal", "disk", "toolchain", "publish", "unavailable"})
+RAN_FAILURES = frozenset({"proof", "timeout", "tactic-timeout", "memory"})
+PROBE_SECONDS = 60
+# Leases whose host the coordinator remembers at most, the oldest forgotten first.
+MAX_LEASE_HOSTS = 10_000
+# The highest --host-rank a worker may report (worker.py checks the same bound at start).
+MAX_HOST_RANK = 1000
 # The queue sums the phase reports of workers' last this many seconds; at most MAX_PHASE_REPORTS are kept.
+# Placement for locality (see Coordinator._local_entry): how many theories and dependency contexts the coordinator
+# remembers per host, for how long after the host's last worker went quiet, and theories' contexts in all; how many
+# entries of a claim's band it looks past the head, which is also how many times a batch may be passed over; and how
+# long a build is left for a kept host holding it once a claim from a host holding less first found it (see _held).
+HOST_LOCALITY_KEYS = 2048
+HOST_KEYS_SECONDS = 1800
+MAX_THEORY_DEPS = 10_000
+LOCALITY_WINDOW = 8
+LOCALITY_HOLD_SECONDS = 0.5
+
 PHASE_WINDOW_SECONDS = 600
 MAX_PHASE_REPORTS = 100_000
 
@@ -68,6 +98,9 @@ class Settings(BaseSettings):
 
     lease_seconds: int = 120
     max_attempts: int = 3
+    # Refunded "unavailable" results per action (a worker drained or its cache was out); past this they count as
+    # attempts, so an action that never fits a drain window can't loop forever.
+    max_interruptions: int = 5
     # A theory whose peak hint reaches this goes to the high-memory tier; set it to what a standard worker holds.
     standard_tier_mb: int = 16000
     retention_hours: int = 168
@@ -75,17 +108,51 @@ class Settings(BaseSettings):
     batch_deadline_hours: float = 12.0
     hint_ttl_days: int = 30
     sweep_seconds: float = 5.0
+    # An event stream reads its batch when a write of this process to the batch wakes it, on average at most once
+    # every events_poll_seconds, and at least every events_fallback_seconds, for the writes of other coordinator
+    # processes. Up to events_burst reads, events_burst_spacing_seconds apart, may come sooner, so that a short
+    # batch's few changes (ready, running, done) reach its client at once.
     events_poll_seconds: float = 1.0
+    events_burst: int = 3
+    events_burst_spacing_seconds: float = 0.1
+    events_fallback_seconds: float = 10.0
     # An event stream with nothing to send this long sends a blank line, shorter than proxies' idle timeouts.
     events_keepalive_seconds: float = 15.0
     # Database connections the coordinator holds at most, and how long a request waits for one before it fails.
-    database_pool_size: int = 20
-    database_pool_timeout_s: float = 10.0
+    # Kept well under the workers' request timeouts, so an overloaded coordinator answers 503 rather than doing the
+    # work of a heartbeat or completion its worker has already given up on and is retrying.
+    database_pool_size: int = 50
+    database_pool_timeout_s: float = 3.0
+    # /v1/cache/members reuses the serving slots it read for this long: workers ask about as often as they claim.
+    # Clients keep the list REFRESH_SECONDS more, which together stay under cache_drain_seconds.
+    cache_members_ttl_seconds: float = Field(default=2.0, ge=0, allow_inf_nan=False)
+    # Build claims share one ranking of the batches for this long; see Coordinator._claim_build. With 0, only claims
+    # that arrive while a ranking is being read share it.
+    claim_ranking_seconds: float = Field(default=0.5, ge=0, allow_inf_nan=False)
+    # How many generations of unfinished parents an action may be claimed ahead of, 0 for no limit; see
+    # AHEAD_CANDIDATES.
+    ahead_depth: int = Field(default=1, ge=0)
     # Burst workers: workers that a scaler starts and stops on top of `warm_workers` always-on ones.
     run_slots: int = Field(default=30, ge=0)
+    run_floor: int = Field(default=0, ge=0)
+    # Running builds of priority batches past which their builds rank like priority-0 ones; see
+    # Coordinator._claim_build.
+    priority_cap: int = Field(default=128, ge=0)
+    # Steer builds to hosts below the scale-in line that hold their theory's checkpoints or dependency context; see
+    # Coordinator._local_entry and _held. False claims and wakes as without it.
+    locality: bool = True
     warm_workers: int = 0
     max_burst_workers: int = 0
     scale_down_hold_s: float = 900.0
+    # The burst cache pool's own hold on the worker floor. Worker hosts get a further scale-in delay from their
+    # capacity provider, which lets scale_down_hold_s stay short; cache nodes get none, and each one terminated
+    # loses its warm disk.
+    cache_scale_down_hold_s: float = Field(default=900.0, ge=0, allow_inf_nan=False)
+    cache_pool_cmd: str | None = None
+    cache_slots: list[CacheSlot] = Field(default_factory=list)
+    cache_workers_per_node: int = Field(default=15, ge=0)
+    cache_drain_seconds: int = Field(default=60, ge=60)
+    cache_launch_timeout_seconds: int = Field(default=900, gt=0)
     scale_cmd: str | None = None  # run as `<scale_cmd> <desired burst workers>` when that number changes
 
     @field_validator("cache_url")
@@ -93,12 +160,52 @@ class Settings(BaseSettings):
     def normalize_cache_url(cls, value: str) -> str:
         return ",".join(cache_nodes(value))
 
+    @model_validator(mode="after")
+    def plain_http_slots(self) -> Self:
+        """Discovery hands the permanent nodes' credentials to slots, so plain-HTTP slots need a credential-free HTTP pool."""
+        urls = [*(self.cache_url.split(",") if self.cache_url else []), *(slot.url for slot in self.cache_slots)]
+        parts = [urlsplit(url) for url in urls]
+        if any(part.scheme == "http" for part in parts) and self.cache_slots:
+            if any(part.username or part.password for part in parts):
+                raise ValueError("http:// cache slots need a cache URL without credentials")
+            if len({part.scheme for part in parts}) > 1:
+                raise ValueError("cache slots and the cache URL must not mix http:// and https://")
+        return self
+
+    @model_validator(mode="after")
+    def members_kept_under_drain(self) -> Self:
+        """A slot's drain must outlast every list that still names it: the coordinator's and then a client's."""
+        if self.cache_members_ttl_seconds + REFRESH_SECONDS >= self.cache_drain_seconds:
+            raise ValueError(
+                f"cache_members_ttl_seconds plus the clients' {REFRESH_SECONDS} s refresh must stay under "
+                "cache_drain_seconds"
+            )
+        return self
+
+    @property
+    def ahead_depth_limit(self) -> int | None:
+        """``ahead_depth`` as the statements' :depth, None for no limit."""
+        return self.ahead_depth or None
+
 class ScaleCommandError(RuntimeError):
     """The scale command failed or timed out."""
 
 
+# What a read raises while the database is out of reach or overloaded: no pooled connection came free, a statement
+# timed out or lost its connection (wrapped by SQLAlchemy), or a new connection failed to open (not wrapped).
+DATABASE_UNAVAILABLE = (sa.exc.TimeoutError, sa.exc.DBAPIError, asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
+
+
 class ResultMismatch(ValueError):
     """A result record for another action than the one its attempt token leases."""
+
+
+@dataclass(frozen=True)
+class AheadParent:
+    """A parent still building when its child was claimed ahead of it."""
+
+    input_key: str
+    spec_sha256: str
 
 
 @dataclass(frozen=True)
@@ -109,6 +216,7 @@ class Claim:
     theory: str
     lease_s: int
     max_heap_mb: int | None
+    ahead_parents: tuple[AheadParent, ...] = ()  # empty unless the action was claimed ahead of these parents
 
 
 @dataclass(frozen=True)
@@ -120,6 +228,10 @@ class ActionStatus:
     attempts: int
     last_failure: str | None
     log_sha256: str | None
+    failure_detail: str | None  # the last result's detail: why it failed when it has no log
+    last_claimed_at: datetime | None
+    finished_at: datetime | None  # the latest accepted result's time; lease expiry and cancellation set none
+    worker: str | None
     timings: dict[str, int] | None  # the last result's, in milliseconds; see formats.Result
 
 
@@ -142,7 +254,12 @@ class QueueCounts:
     running_high: int
     ready_run: int = 0
     running_run: int = 0
+    ready_priority: int = 0
+    running_priority: int = 0
+    waiting_ahead_standard: int = 0  # of the running ones, claimed ahead and waiting for a parent
+    waiting_ahead_high: int = 0
     high_run: int = 0  # internal: ready or running high-tier runs, for capped burst demand
+    ready_high_run: int = 0  # internal: of those, the ready ones
 
 
 # What a host report's counts and sizes may be: JSON's exact integers.
@@ -153,16 +270,20 @@ Amount = Annotated[int, Field(ge=0, le=2**53)]
 class HostReport:
     """What a worker reports of its host with a claim or heartbeat (``HostReport`` in worker.py): the share of CPU
     time idle lately, memory in bytes as holbuild's ``--cooperate-dir`` admission sees it, and whether that
-    admission would hold a child back now or held the worker back since its last report."""
+    admission would hold a child back now or held the worker back since its last report. Claims pack onto hosts of
+    lower ``rank`` first (the worker's ``--host-rank``)."""
 
     id: Annotated[str, Field(max_length=64)]  # the host's boot_id
-    cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None
-    mem_total: Amount | None
-    mem_available: Amount | None
-    budget: Amount | None
-    reserved: Amount
-    leases: Amount
-    memory_short: bool
+    # The readings, all None when the worker couldn't read its host and sent only its id and rank.
+    cpu_idle_pct: Annotated[float, Field(ge=0, le=100)] | None = None
+    mem_total: Amount | None = None
+    mem_available: Amount | None = None
+    budget: Amount | None = None
+    reserved: Amount | None = None
+    leases: Amount | None = None
+    memory_short: bool | None = None
+    rank: Annotated[int, Field(ge=0, le=MAX_HOST_RANK)] = 0
+    disk_free: Amount | None = None  # bytes free on the host disk the worker's claims depend on
 
 
 # Seconds of a worker's time in one phase since its last report. No upper bound: a worker that couldn't report
@@ -176,7 +297,8 @@ class PhaseReport:
     before a claim, in claim requests, sleeping after a claim got nothing, taking and giving up an action's lease
     (scale-in protection, the heartbeat thread), finding the action's holbuild release,
     in exec-action before its first HOL child, from then to its last HOL child's end, after it, all of exec-action
-    when the worker can't see HOL children, and reporting the result."""
+    when the worker can't see HOL children, reporting the result, and in exec-action after its result, as it
+    publishes for later actions."""
 
     memory_wait: PhaseSeconds = 0
     claim: PhaseSeconds = 0
@@ -188,6 +310,10 @@ class PhaseReport:
     after_hol: PhaseSeconds = 0
     exec: PhaseSeconds = 0
     complete: PhaseSeconds = 0
+    after_result: PhaseSeconds = 0
+
+
+PHASE_FIELDS = tuple(field.name for field in fields(PhaseReport))
 
 
 @dataclass(frozen=True)
@@ -199,12 +325,17 @@ class PhaseTotals:
     seconds: PhaseReport
 
 
+Quarantine = Literal["disk", "failures"]
+
+
 @dataclass(frozen=True)
 class HostStatus:
-    """A host's latest report, ``age_s`` seconds old, with the latest ``cpu_idle_pct`` measured."""
+    """A host's latest report, ``age_s`` seconds old, with the latest ``cpu_idle_pct`` measured, and why it is
+    quarantined, if it is."""
 
     report: HostReport
     age_s: float
+    quarantined: Quarantine | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +347,30 @@ class ScaleRun:
     error: str | None
 
 
+@dataclass
+class LocalityCounts:
+    """What locality did in this process: claims that took another batch of the band than its head, and wakes sent
+    to another waiter than the best-ranked, for the claiming host's dependency contexts; and the hosts forgotten
+    holding contexts, those contexts, and how many of them no host below the scale-in line held then.
+
+    Each build claim from a known host, with locality off too, counts once by what its host held of the leased
+    action's theory: the theory, only its dependency context, nothing while a kept host held either, or nothing any
+    kept host held. Builds left for a holder (see Coordinator._held) count, once claimed, how many and the
+    milliseconds from their first hold to the claim."""
+
+    claims: int = 0
+    wakes: int = 0
+    hosts_left: int = 0
+    keys_left: int = 0
+    keys_lost: int = 0
+    hit_theory: int = 0
+    hit_deps: int = 0
+    missed_held: int = 0
+    unheld: int = 0
+    held_waits: int = 0
+    held_ms_total: int = 0
+
+
 @dataclass(frozen=True)
 class QueueStatus:
     counts: QueueCounts
@@ -223,18 +378,33 @@ class QueueStatus:
     hosts: list[HostStatus]
     phases: PhaseTotals
     scaler: ScaleRun | None  # the scale command's last run in this process
+    locality: LocalityCounts
 
 
 def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int, run_slots: int = 30) -> int:
     """Burst workers the queue needs now: every ready or running action beyond the warm workers, and at least
     one per high-tier action, since warm workers are standard-tier. Runs contribute at most ``run_slots``
-    in each term; the total is at most ``max_burst_workers``."""
+    in each term; the total is at most ``max_burst_workers``.
+
+    Actions waiting ahead of their parents hold burst workers (only burst workers load ahead) but ask for none
+    of their own: the demand is the other actions', plus the workers those hold once ready work needs a burst
+    worker, since they don't take it."""
     ready = counts.ready_standard + counts.ready_high
     running = counts.running_standard + counts.running_high
     runs = counts.ready_run + counts.running_run
-    active = ready + running - runs + min(run_slots, runs)
-    high = counts.ready_high + counts.running_high - counts.high_run + min(run_slots, counts.high_run)
+    ahead = counts.waiting_ahead_standard + counts.waiting_ahead_high
+    active = ready + running - ahead - runs + min(run_slots, runs)
+    high = (
+        counts.ready_high + counts.running_high - counts.waiting_ahead_high
+        - counts.high_run + min(run_slots, counts.high_run)
+    )
     demand = max(0, active - warm_workers, high)
+    # Work beyond what runs is ready work a burst worker could take; runs the run slots hold back are not.
+    running_active = running - ahead - counts.running_run + min(run_slots, counts.running_run)
+    free_run_slots = max(0, run_slots - counts.running_run)
+    ready_high = counts.ready_high - counts.ready_high_run + min(counts.ready_high_run, free_run_slots)
+    if ready_high > 0 or active > max(warm_workers, running_active):
+        demand += ahead
     return min(demand, max_burst_workers)
 
 
@@ -294,6 +464,14 @@ UPDATE actions c SET (remaining_deps, state) = (
 )
 WHERE c.batch_id = :batch_id AND c.input_key = ANY({selected}) AND c.state IN ('waiting', 'ready')
 """
+# The live leases of a worker other than the one it ``held``, claimed ``before`` a time: see
+# ``Coordinator.release_unheld``. A lease is claimed in the transaction that sets its action's ``last_claimed_at``.
+UNHELD_LEASES = sa.text(
+    "SELECT l.attempt_token, l.batch_id FROM leases l "
+    "JOIN actions a ON a.batch_id = l.batch_id AND a.input_key = l.input_key "
+    "WHERE l.worker = :worker AND l.expires_at > now() AND l.attempt_token IS DISTINCT FROM CAST(:held AS uuid) "
+    "AND a.last_claimed_at < :before"
+)
 REFRESH_KEYS = sa.text(REFRESH.format(selected="CAST(:keys AS text[])"))
 REFRESH_CHILDREN = sa.text(
     REFRESH.format(
@@ -301,9 +479,9 @@ REFRESH_CHILDREN = sa.text(
     )
 )
 
-# The waiting actions whose parents are all done, with each parent's input and action-cache keys; see
-# Coordinator.release.
-RELEASABLE = sa.text("""
+# The waiting actions whose parents are all done, with each parent's input and action-cache keys, of every batch
+# or of one; see Coordinator.release. Two statements, so the database plans the one-batch read by its batch.
+RELEASABLE = """
 SELECT a.batch_id, a.input_key, ARRAY(
     SELECT ROW(e.parent_key, (
         SELECT p.ac_key FROM actions p WHERE p.batch_id = e.batch_id AND p.input_key = e.parent_key
@@ -311,60 +489,450 @@ SELECT a.batch_id, a.input_key, ARRAY(
     FROM edges e WHERE e.batch_id = a.batch_id AND e.input_key = a.input_key
 ) AS parents
 FROM actions a JOIN batches b ON b.id = a.batch_id
-WHERE a.state = 'waiting' AND a.remaining_deps = 0 AND b.state = 'running'
-AND (CAST(:batch_id AS uuid) IS NULL OR a.batch_id = :batch_id)
-""")
+WHERE a.state = 'waiting' AND a.remaining_deps = 0 AND b.state = 'running'{batch}
+"""
+RELEASABLE_ALL = sa.text(RELEASABLE.format(batch=""))
+RELEASABLE_BATCH = sa.text(RELEASABLE.format(batch=" AND a.batch_id = :batch_id"))
 
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
 CHANGED_ACTIONS = sa.text("""
-SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, CAST(timings AS text) FROM actions
+SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, failure_detail,
+       last_claimed_at, finished_at, worker, CAST(timings AS text)
+FROM actions
 WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)
 ORDER BY theory, input_key
 """)
 
 
-# The ready action to claim next; see Coordinator.claim. Only the batches with a ready action of the tiers are
-# ranked, each from its own index entries, so a claim reads neither finished batches nor finished actions.
-CLAIM = sa.text("""
+# The ready action to claim next is found in two steps; see Coordinator.claim. CLAIM_CANDIDATES ranks the running
+# batches with a ready action of an accepted class and tier, one row per batch, class and tier, best first; each
+# batch's running count and last claim come from its own index entries, so a claim reads neither finished batches
+# nor finished actions, nor every ready action: a LIMIT 1 probe per batch, class and tier looks for a ready one. CLAIM_ACTION then locks a candidate's first ready action in the
+# order of actions_ready_order, skipping those other claims hold; the first candidate with one wins. Together they
+# take the first unlocked action in the order (class, tier, batch rank, critical depth, descendants, theory, key).
+CLAIM_CANDIDATES = sa.text("""
 WITH run_capacity AS MATERIALIZED (
-    SELECT :allow_run AND (
+    SELECT 'run' = ANY(CAST(:classes AS text[])) AND (
         SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run'
     ) < :run_slots AS available
-), ready_batches AS MATERIALIZED (
-    SELECT b.id, b.created_at, b.max_heap_mb,
-        (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running_count,
-        (SELECT max(c.last_claimed_at) FROM actions c WHERE c.batch_id = b.id) AS last_claimed_at
-    FROM batches b
-    WHERE b.state = 'running' AND b.id IN (
-        SELECT batch_id FROM actions WHERE state = 'ready' AND tier = ANY(CAST(:tiers AS text[]))
-        AND (class = 'build' OR (SELECT available FROM run_capacity))
-    )
 )
-SELECT a.batch_id, a.input_key, a.spec_sha256, a.theory, b.max_heap_mb
-FROM actions a
-JOIN ready_batches b ON b.id = a.batch_id
-WHERE a.state = 'ready' AND a.tier = ANY(CAST(:tiers AS text[]))
-AND (a.class = 'build' OR (SELECT available FROM run_capacity))
-ORDER BY
-    a.class,
-    array_position(CAST(:tiers AS text[]), a.tier),
-    b.running_count,
-    b.last_claimed_at NULLS FIRST,
+SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb, b.priority, ready.theory,
+    (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running,
+    (SELECT max(l.last_claimed_at) FROM actions l WHERE l.batch_id = b.id) AS last_claimed_at,
     b.created_at,
-    a.critical_depth DESC,
-    a.descendant_count DESC,
-    a.theory,
-    a.input_key
+    (SELECT count(*) FROM actions r WHERE r.state = 'running' AND r.class = 'build'
+     AND (SELECT priority FROM batches WHERE id = r.batch_id) > 0) AS running_priority
+FROM batches b
+CROSS JOIN (SELECT DISTINCT unnest(CAST(:classes AS text[]))) c (class)
+CROSS JOIN (SELECT DISTINCT unnest(CAST(:tiers AS text[]))) t (tier)
+CROSS JOIN LATERAL (
+    SELECT a.theory FROM actions a
+    WHERE a.batch_id = b.id AND a.state = 'ready' AND a.class = c.class AND a.tier = t.tier
+    AND (a.class = 'run' OR a.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()))
+    ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
+    LIMIT 1
+) ready
+WHERE b.state = 'running'
+AND (c.class = 'build' OR (SELECT available FROM run_capacity))
+ORDER BY
+    c.class,
+    array_position(CAST(:tiers AS text[]), t.tier),
+    b.priority DESC,
+    running,
+    last_claimed_at NULLS FIRST,
+    b.created_at,
+    b.id
+""")
+# A build action whose key another batch's live lease is building is held back (single-flight), here and in
+# CLAIM_CANDIDATES: once that build succeeds, Coordinator.complete marks the action done as well; once it fails or
+# its lease expires, the action is claimed again. An expired lease stops holding at once, before the sweep deletes it.
+# An unclaimed action has no lease in its own batch, so every live lease of its key is another batch's; uncorrelated,
+# the lease keys are read once per statement into a hash, rather than once per ready action probed. A build claim
+# then rechecks its key (Coordinator._lock_unleased), and skips the keys in :taken.
+CLAIM_ACTION = sa.text("""
+SELECT input_key, spec_sha256, theory FROM actions
+WHERE batch_id = :batch_id AND state = 'ready' AND class = :class AND tier = :tier
+AND (class = 'run' OR input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()))
+AND input_key <> ALL(CAST(:taken AS text[]))
+ORDER BY critical_depth DESC, descendant_count DESC, theory, input_key
+LIMIT 1 FOR UPDATE SKIP LOCKED
+""")
+# Two claims of one key from different batches may both pass the statement's check, each in a snapshot without the
+# other's lease. So a build claim then takes a lock on its key, which it holds until it commits, and checks for a
+# live lease again in a later statement, whose snapshot sees every lease of a claim that held the lock before; one
+# whose lock is held or whose key has a live lease skips the key. The lock never waits, so claims that tried several
+# keys can't deadlock; a lock of one 64-bit key never matches run admission's lock of two 32-bit ones.
+LOCK_KEY = sa.text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))")
+KEY_LEASED = sa.text("SELECT EXISTS (SELECT 1 FROM leases WHERE input_key = :key AND expires_at > now())")
+
+# Loading ahead: in a batch with an ``ahead_cap``, a waiting build action may be claimed before its parents are done
+# when each parent that isn't done is running, up to ``ahead_depth`` generations ahead: generation 0 is a running
+# action that waits for no parent, and an action claimed ahead is one generation after its latest unfinished parent.
+# Its worker loads what it can and waits for the unfinished ancestors' outputs. An action whose claim ahead gave up,
+# or lost its lease while it waited, is ``abandoned`` and waits for its parents from then on; one revoked because an
+# ancestor went back to waiting (REVOKE_AHEAD) may be claimed ahead again once its unfinished parents run again.
+#
+# AHEAD_WALK: the unfinished ancestors of the actions :keys of :batch_id, with the action each was reached from
+# (``root``) and each of its distances from it: their unfinished parents, and, above a running parent that was
+# itself claimed ahead and still waits for parents, its unfinished parents, up to :depth generations up. Each step
+# reads one action's edges and parents by key, and so does ``ancestors`` each ancestor's row: the lookups are
+# subqueries on the row they start from, so that the database plans them by key whatever it guesses of a batch
+# inserted since its last statistics (a join with actions was planned as a scan of every unfinished action). The
+# walk starts from the keys themselves, and :batch_id is read in a subquery: the database takes a batch it has no
+# statistics for, compared with a constant, for about one row, and reads it by batch alone, its keys as a filter
+# (every action of the batch); compared with a value it doesn't know in advance, it reads each key alone.
+AHEAD_WALK = """
+WITH RECURSIVE walk(batch_id, root, input_key, distance) AS (
+    SELECT k.batch_id, k.input_key, e.parent_key, 1
+    FROM (SELECT (SELECT CAST(:batch_id AS uuid)) AS batch_id, unnest(CAST(:keys AS text[])) AS input_key) k
+    CROSS JOIN LATERAL unnest(ARRAY(
+        SELECT e.parent_key FROM edges e WHERE e.batch_id = k.batch_id AND e.input_key = k.input_key
+    )) AS e(parent_key)
+    UNION
+    SELECT w.batch_id, w.root, e.parent_key, w.distance + 1 FROM walk w
+    CROSS JOIN LATERAL unnest(ARRAY(
+        SELECT e.parent_key FROM edges e WHERE e.batch_id = w.batch_id AND e.input_key = w.input_key
+    )) AS e(parent_key)
+    WHERE (CAST(:depth AS integer) IS NULL OR w.distance < :depth) AND (
+        SELECT p.state = 'running' AND p.remaining_deps > 0 FROM actions p
+        WHERE p.batch_id = w.batch_id AND p.input_key = w.input_key
+    )
+), walked AS MATERIALIZED (
+    SELECT w.root, w.input_key, w.distance, (
+        SELECT p FROM actions p WHERE p.batch_id = w.batch_id AND p.input_key = w.input_key
+    ) AS p
+    FROM walk w
+), ancestors AS MATERIALIZED (
+    SELECT root, input_key, distance, (p).spec_sha256, (p).state, (p).remaining_deps
+    FROM walked WHERE (p).state <> 'done'
+)
+"""
+# The actions that may be claimed ahead, best first: the children of running actions of generation below
+# ``ahead_depth`` of running batches below their ``ahead_cap``. See Coordinator._claim_ahead. Read from the running
+# parents down (edges_parent) rather than per waiting action, since a gate's batch has thousands of those: a child is
+# a candidate when such running parents are all its unfinished ones, by ``remaining_deps``. An action's generation
+# is its longest chain of running actions claimed ahead, down from one of generation 0. CLAIM_AHEAD_ACTION checks
+# the rule itself under the batch's lock. Every read is by key, whatever the planner guesses of a batch inserted since
+# its last statistics: the few actions waiting ahead are read once with their parents, which the generations are
+# matched against; each running parent's children are read from its edges; and each child's row is read alone. A
+# join of the children with actions was once planned per waiting action of every batch, rereading all the children
+# for each: seconds per read when a large batch arrived.
+AHEAD_CANDIDATES = sa.text("""
+WITH RECURSIVE ahead_batches AS MATERIALIZED (
+    SELECT b.id, b.priority FROM batches b
+    WHERE b.state = 'running' AND b.ahead_cap IS NOT NULL AND (
+        SELECT count(*) FROM actions w
+        WHERE w.batch_id = b.id AND w.state = 'running' AND w.ahead = 'ahead' AND w.remaining_deps > 0
+    ) < b.ahead_cap
+), waiting_ahead AS MATERIALIZED (
+    SELECT w.batch_id, w.input_key, ARRAY(
+        SELECT e.parent_key FROM edges e WHERE e.batch_id = w.batch_id AND e.input_key = w.input_key
+    ) AS parents
+    FROM ahead_batches b JOIN actions w ON w.batch_id = b.id
+    WHERE w.state = 'running' AND w.ahead = 'ahead' AND w.remaining_deps > 0
+), generations(batch_id, input_key, generation) AS (
+    SELECT r.batch_id, r.input_key, 0
+    FROM ahead_batches b JOIN actions r ON r.batch_id = b.id AND r.state = 'running' AND r.remaining_deps = 0
+    UNION
+    SELECT g.batch_id, w.input_key, g.generation + 1
+    FROM generations g JOIN waiting_ahead w ON w.batch_id = g.batch_id AND g.input_key = ANY(w.parents)
+    WHERE CAST(:depth AS integer) IS NULL OR g.generation < :depth
+), running AS MATERIALIZED (
+    SELECT batch_id, input_key FROM generations GROUP BY batch_id, input_key
+    HAVING CAST(:depth AS integer) IS NULL OR max(generation) < :depth
+), children AS MATERIALIZED (
+    SELECT r.batch_id, count(*) AS running_parents, (
+        SELECT a FROM actions a WHERE a.batch_id = r.batch_id AND a.input_key = e.input_key
+    ) AS a
+    FROM running r CROSS JOIN LATERAL unnest(ARRAY(
+        SELECT e.input_key FROM edges e WHERE e.batch_id = r.batch_id AND e.parent_key = r.input_key
+    )) AS e(input_key)
+    GROUP BY r.batch_id, e.input_key
+)
+SELECT (c.a).batch_id, (c.a).input_key, (c.a).tier, b.priority
+FROM children c JOIN ahead_batches b ON b.id = c.batch_id
+WHERE (c.a).state = 'waiting' AND (c.a).class = 'build' AND (c.a).ahead <> 'abandoned'
+AND (c.a).remaining_deps = c.running_parents
+AND (c.a).input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
+ORDER BY b.priority DESC, (c.a).critical_depth DESC, (c.a).descendant_count DESC, (c.a).theory, (c.a).input_key
+""")
+
+# Lock the best of a batch's candidates ``keys`` of ``tier`` that may still be claimed ahead, but not one whose key
+# another batch's live lease is building (single-flight; see CLAIM_ACTION) or in :taken: one with an unfinished
+# ancestor in its walk that isn't running, or one :depth generations up that still waits for parents. Each
+# candidate's row is read by key, as in AHEAD_WALK, and checked; the one taken is then locked through its key. The
+# checks aren't made again on the row locked, which no other transaction changes in the meantime: it waits, and
+# every writer of a waiting action holds its batch's lock first, as the caller does. Checked on the row locked, they
+# let the database read the batch's unfinished actions of the tier instead, which it takes for none on a batch it has
+# no statistics for.
+CLAIM_AHEAD_ACTION = sa.text(f"""{AHEAD_WALK}, candidates AS MATERIALIZED (
+    SELECT (
+        SELECT c FROM actions c WHERE c.batch_id = (SELECT CAST(:batch_id AS uuid)) AND c.input_key = k.input_key
+    ) AS c
+    FROM unnest(CAST(:keys AS text[])) AS k(input_key)
+)
+SELECT a.input_key, a.spec_sha256, a.theory
+FROM candidates JOIN actions a ON a.batch_id = (c).batch_id AND a.input_key = (c).input_key
+WHERE (c).tier = :tier AND (c).state = 'waiting' AND (c).class = 'build' AND (c).ahead <> 'abandoned'
+AND (c).remaining_deps > 0
+AND (c).input_key NOT IN (
+    SELECT root FROM ancestors WHERE state <> 'running' OR (distance = :depth AND remaining_deps > 0)
+)
+AND (c).input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
+AND (c).input_key <> ALL(CAST(:taken AS text[]))
+ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
 LIMIT 1 FOR UPDATE OF a SKIP LOCKED
+""")
+# The unfinished ancestors an action claimed ahead waits for, ancestors first (by their longest distance from it,
+# which for the first is the action's generation), then by key.
+AHEAD_PARENTS = sa.text(f"""{AHEAD_WALK}
+SELECT input_key, spec_sha256, max(distance) AS distance FROM ancestors
+GROUP BY input_key, spec_sha256 ORDER BY max(distance) DESC, input_key
+""")
+# The most candidates of a batch CLAIM_AHEAD_ACTION checks at once, the best of the shared read: its cost grows with
+# their edges, under the batch's lock.
+AHEAD_CLAIM_KEYS = 32
+# The actions of a batch claimed ahead and still waiting for a parent, which count against its ``ahead_cap``.
+COUNT_WAITING_AHEAD = sa.text(
+    "SELECT count(*) FROM actions "
+    "WHERE batch_id = :batch_id AND state = 'running' AND ahead = 'ahead' AND remaining_deps > 0"
+)
+# Recount the parents not done of the running actions claimed ahead of :key that waited for one, returning the new
+# counts. REFRESH leaves running actions alone. :key's children are read once, by key, rather than per running
+# action claimed ahead, of which a batch may have 64.
+REFRESH_AHEAD_CHILDREN = sa.text("""
+UPDATE actions c SET remaining_deps = (
+    SELECT count(*) FROM edges e
+    WHERE e.batch_id = c.batch_id AND e.input_key = c.input_key AND (
+        SELECT p.state FROM actions p WHERE p.batch_id = e.batch_id AND p.input_key = e.parent_key
+    ) <> 'done'
+)
+WHERE c.batch_id = :batch_id AND c.input_key = ANY(ARRAY(
+    SELECT input_key FROM edges WHERE batch_id = :batch_id AND parent_key = :key
+)) AND c.state = 'running' AND c.ahead = 'ahead' AND c.remaining_deps > 0
+RETURNING c.remaining_deps
 """)
 
 
-# The burst worker target at :now: the highest demand recorded in the hold before it, under the current cap.
-HELD_TARGET = sa.text(
-    "SELECT least(coalesce(max(workers), 0), :cap) FROM burst_demand "
-    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold)"
+# Revoke the leases of the running actions claimed ahead of one of :keys, and of those claimed ahead of them, sending
+# them back to waiting without the attempt counting. Their parents went back to waiting, so they could only wait out
+# their limit, holding a worker and a slot of the cap; when a parent is re-queued, its outputs they may have taken are
+# gone too. They gave up nothing themselves, so they aren't abandoned: once their unfinished parents run again they
+# may be claimed ahead again, or the rest of a long chain would be built one link at a time after a single retry
+# above it. Each revoke costs the ancestor that went back to waiting an attempt or an interruption, or abandons it.
+# An action claimed ahead of :keys has one as a parent, or one any number of generations up across parents that were
+# claimed ahead too, running or since done (an action keeps ``ahead`` once done): not only ``ahead_depth`` of them,
+# since parents that finish before their own parents make their children generation 0, and the children's claims
+# ahead then reach further up. The walk keeps no distance, so it reaches each ancestor once whatever the number of
+# paths to it. The batch's few running actions claimed ahead are read first and each is tested by its edges, so the
+# statement reads no more than those whatever the planner guesses of a batch inserted since its last statistics; a
+# join here would be planned over all the batch's edges.
+REVOKE_AHEAD = sa.text("""
+WITH RECURSIVE ahead_running AS MATERIALIZED (
+    SELECT a.batch_id, a.input_key, ARRAY(
+        SELECT e.parent_key FROM edges e WHERE e.batch_id = a.batch_id AND e.input_key = a.input_key
+    ) AS parents
+    FROM actions a WHERE a.batch_id = :batch_id AND a.state = 'running' AND a.ahead = 'ahead'
+), revoked(input_key) AS (
+    SELECT c.input_key FROM ahead_running c WHERE EXISTS (
+        WITH RECURSIVE up(input_key) AS (
+            SELECT parent_key FROM unnest(c.parents) AS parent_key
+            UNION
+            SELECT e.parent_key FROM up u
+            CROSS JOIN LATERAL unnest(ARRAY(
+                SELECT e.parent_key FROM edges e WHERE e.batch_id = c.batch_id AND e.input_key = u.input_key
+            )) AS e(parent_key)
+            WHERE (
+                SELECT p.ahead FROM actions p WHERE p.batch_id = c.batch_id AND p.input_key = u.input_key
+            ) = 'ahead'
+        )
+        SELECT 1 FROM up WHERE input_key = ANY(CAST(:keys AS text[]))
+    )
+    UNION
+    SELECT c.input_key FROM revoked r CROSS JOIN ahead_running c WHERE r.input_key = ANY(c.parents)
+), unleased AS (
+    UPDATE actions SET state = 'waiting', ahead = 'no', attempts = attempts - 1
+    WHERE batch_id = :batch_id AND input_key = ANY(ARRAY(SELECT input_key FROM revoked)) RETURNING input_key
 )
+DELETE FROM leases WHERE batch_id = :batch_id AND input_key = ANY(ARRAY(SELECT input_key FROM unleased))
+""")
+# Cancel :key of batch :id and its unfinished descendants, with their leases. Each step reads one action's children
+# by key (edges_parent), and the actions and leases are matched by key: a join with edges was planned, for a batch
+# inserted since the last statistics, as a scan of all of its edges per descendant, tens of seconds under the
+# batch's lock.
+SKIP_DESCENDANTS = sa.text("""
+WITH RECURSIVE blocked(input_key) AS (
+    SELECT CAST(:key AS text)
+    UNION
+    SELECT e.input_key FROM blocked p CROSS JOIN LATERAL unnest(ARRAY(
+        SELECT e.input_key FROM edges e WHERE e.batch_id = :id AND e.parent_key = p.input_key
+    )) AS e(input_key)
+), skipped AS (
+    UPDATE actions SET state = 'cancelled', last_failure = :reason, failure_detail = NULL
+    WHERE batch_id = :id AND input_key = ANY(ARRAY(SELECT input_key FROM blocked))
+    AND state IN ('waiting', 'ready', 'running') RETURNING input_key
+)
+DELETE FROM leases WHERE batch_id = :id AND input_key = ANY(ARRAY(SELECT input_key FROM skipped))
+""")
+
+
+@dataclass
+class _AheadRead:
+    """AHEAD_CANDIDATES read from ``at``, as (batch, input key, tier), best first, which the claims ahead share,
+    less those they claimed, and the batches and tiers found since with nothing left to claim ahead; with
+    Coordinator.ahead_changes when it began."""
+
+    at: float
+    changes: int
+    candidates: list[tuple[UUID, str, str, int]]
+    exhausted: set[tuple[UUID, str]]
+
+
+@dataclass
+class _AheadTurn:
+    """The lock a batch's claims ahead take in turn, and how many hold or wait for it."""
+
+    lock: asyncio.Lock
+    claims: int = 0
+
+
+# The unfinished, unclaimed build actions of other running batches with the same key as a build whose lease just ended;
+# see CLAIM_ACTION. With their spec, since a forced or traced build has the same keys as a plain one: only a copy with
+# the same spec is done with the build, the others are just no longer held. Read by primary key, a probe per running
+# batch: no index leads with input_key.
+PEERS = sa.text("""
+SELECT batch_id, tier, state, spec_sha256,
+    (SELECT ahead_cap IS NOT NULL FROM batches WHERE id = actions.batch_id) AS ahead_batch
+FROM actions
+WHERE batch_id = ANY(ARRAY(SELECT id FROM batches WHERE state = 'running' AND id <> :batch_id))
+AND input_key = :input_key AND class = 'build' AND state IN ('waiting', 'ready')
+""")
+# Mark done the copies of :keys in batch :batch_id, each with its log of :logs, that no claim took; see
+# Coordinator._finish_peers.
+FINISH_PEERS = sa.text("""
+UPDATE actions SET state = 'done', log_sha256 = u.log, last_failure = NULL, failure_detail = NULL
+FROM unnest(CAST(:keys AS text[]), CAST(:logs AS text[])) AS u(input_key, log)
+WHERE actions.batch_id = :batch_id AND actions.input_key = u.input_key AND actions.state IN ('waiting', 'ready')
+RETURNING actions.input_key
+""")
+
+
+@dataclass
+class _Ranking:
+    """The running batches with ready build actions, as CLAIM_CANDIDATES ranks them, read at ``at``: a heap of
+    (tier position, negated priority, running actions, ever claimed, last claim, created, batch, tier, heap limit),
+    the batches and tiers it ranked, and those found without an unlocked ready action since."""
+
+    at: float
+    forgotten: int  # Coordinator.rankings_forgotten when it was read
+    heap: list[tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]]
+    ranked: set[tuple[UUID, str]]  # the batches and tiers it ranked
+    exhausted: set[tuple[UUID, str]]
+    running_priority: int  # running builds of batches of a positive priority, and the claims of them since the read
+    # The theory of each batch and tier's first ready build, until a claim from it makes that unknown.
+    theories: dict[tuple[UUID, str], str]
+    capped: bool = False  # see Coordinator._cap_priorities
+
+
+_NEVER = datetime.min.replace(tzinfo=UTC)  # the last claim of a batch never claimed from, for ordering
+
+
+@dataclass(frozen=True)
+class _Claimed:
+    """The action a claim locked, and its batch's heap limit."""
+
+    batch_id: UUID
+    input_key: str
+    spec_sha256: str
+    theory: str
+    max_heap_mb: int | None
+    # The hold the claim took for the build, by its (batch, tier), put back if its lease fails.
+    hold: "tuple[tuple[UUID, str], Hold] | None" = None
+
+
+# Lock a built action :key of batch :batch_id and its children, in key order, returning nothing. A build's result holds
+# its batch only shared (see Coordinator.complete), so builds of one batch finish at once: each takes every action
+# row it writes in this one statement and in one order, so no two wait on each other, a child claimed ahead included.
+# Its parents' recount then runs once the child's other parents that finished meanwhile committed, and sees them done.
+# Keys read by edges_parent; each row probed by primary key, the batch hidden from the planner as in
+# CLAIM_AHEAD_ACTION, since a batch inserted since the last statistics would have it read the whole batch.
+LOCK_BUILT = sa.text("""
+SELECT 1 FROM unnest(ARRAY[CAST(:key AS text)] || ARRAY(
+    SELECT input_key FROM edges WHERE batch_id = :batch_id AND parent_key = :key
+)) AS k(input_key)
+JOIN actions a ON a.batch_id = (SELECT CAST(:batch_id AS uuid)) AND a.input_key = k.input_key
+ORDER BY a.input_key FOR UPDATE OF a
+""")
+
+# A batch's first unfinished action, in the order of actions_batch_unfinished; see FINISH_IF_DONE.
+FIRST_UNFINISHED = sa.text(
+    "SELECT input_key FROM actions WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running') "
+    "ORDER BY input_key LIMIT 1"
+)
+# The running batches FINISH_IF_DONE would end, which a build's result left running when the coordinator stopped
+# between the result's commit and the finish that follows it.
+FINISHED_RUNNING = sa.text(
+    "SELECT id FROM batches b WHERE state = 'running' AND failure IS NULL AND (SELECT input_key FROM actions "
+    "WHERE batch_id = b.id AND state IN ('waiting', 'ready', 'running') ORDER BY input_key LIMIT 1) IS NULL"
+)
+PEAK_COVERED = sa.text(
+    "SELECT peak_rss_mb >= :peak FROM peak_hints WHERE package = :package AND theory = :theory AND profile = :profile"
+)
+
+# End a running batch that has no unfinished action left: done, or failed with its failed builds. Run after every
+# completion, so the check is one entry of actions_batch_unfinished however many actions the batch finished. It looks
+# for the batch's first unfinished action in the index's order rather than for any: with no order asked for, the
+# database scans the table for one whenever unfinished actions look common, and reads every row a batch near its end
+# finished. A batch the deadline failed (``fail_overdue``) waits for its workers' logs, not for this.
+FINISH_IF_DONE = sa.text(
+    "UPDATE batches SET (state, failure) = (SELECT "
+    "CASE WHEN count(*) = 0 THEN 'done' ELSE 'failed' END, "
+    "string_agg(theory || ': ' || COALESCE(last_failure, 'internal') || "
+    "COALESCE(': ' || failure_detail, ''), '; ' ORDER BY theory, input_key) "
+    "FROM actions WHERE batch_id = :id AND class = 'build' AND state = 'failed') "
+    "WHERE id = :id AND state = 'running' AND failure IS NULL AND (SELECT input_key FROM actions "
+    "WHERE batch_id = :id AND state IN ('waiting', 'ready', 'running') ORDER BY input_key LIMIT 1) IS NULL"
+)
+
+# The unfinished actions by state, tier and class, for the queue counts, and only the ready and running ones, which
+# are all burst demand needs: the scale check runs every sweep, and waiting actions can outnumber the others many
+# times over. Literal states, so the partial index actions_unfinished serves both.
+# Both also count the running actions claimed ahead that wait for a parent, as state ``ahead``, for burst_demand:
+# they hold a worker but no burst worker should start for them alone.
+COUNT_UNFINISHED = sa.text(
+    "SELECT a.state, a.tier, a.class, b.priority > 0, count(*) FROM actions a "
+    "JOIN batches b ON b.id = a.batch_id "
+    "WHERE a.state IN ('waiting', 'ready', 'running') "
+    "GROUP BY a.state, a.tier, a.class, b.priority > 0 "
+    "UNION ALL SELECT 'ahead', a.tier, a.class, b.priority > 0, count(*) FROM actions a "
+    "JOIN batches b ON b.id = a.batch_id "
+    "WHERE a.state = 'running' AND a.ahead = 'ahead' AND a.remaining_deps > 0 "
+    "GROUP BY a.tier, a.class, b.priority > 0"
+)
+COUNT_ACTIVE = sa.text(
+    "SELECT state, tier, class, false, count(*) FROM actions "
+    "WHERE state IN ('ready', 'running') GROUP BY state, tier, class "
+    "UNION ALL SELECT 'ahead', tier, class, false, count(*) FROM actions "
+    "WHERE state = 'running' AND ahead = 'ahead' AND remaining_deps > 0 GROUP BY tier, class"
+)
+
+
+ClaimRank = tuple[bool, bool, int, str]
+# A wake handed to a waiting claim: its tier, whether it was for a claim ahead, and the batch and theory made ready,
+# if it was for one.
+Wake = tuple[str, bool, UUID | None, str | None]
+# The batch, tier and theory of a build a claim was woken for.
+Hint = tuple[UUID, str, str]
+# A build's hold for its holders (see Coordinator._held): when it began and ends, and its theory.
+Hold = tuple[float, float, str]
+# A shared ranking's entry; see _Ranking.
+RankEntry = tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]
+
+
+def _claim_rank(tiers: list[str], host_id: str | None, host_rank: int = 0) -> ClaimRank:
+    """Pack standard work onto warm workers first, then hosts of lower rank, then hosts in a stable order."""
+    return tiers[0] != "standard", host_id is None, host_rank, host_id or ""
 
 
 class Coordinator:
@@ -375,12 +943,41 @@ class Coordinator:
         self.cache = cache
         self.settings = settings
         self.cache_nodes = cache_nodes(settings.cache_url)
+        self.membership = Membership(self.cache_nodes, [slot.url for slot in settings.cache_slots])
+        self.membership_lock = asyncio.Lock()
+        self.serving_lock = asyncio.Lock()
+        self.serving: tuple[float, list[str]] | None = None  # when the serving slots were last read, and them
         self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+        self.cache_pool = (CachePool(engine, settings.cache_slots, CommandAdapter(settings.cache_pool_cmd),
+                                     drain_seconds=settings.cache_drain_seconds,
+                                     hold_seconds=settings.cache_scale_down_hold_s,
+                                     cpu_hold_seconds=settings.scale_down_hold_s,
+                                     workers_per_node=settings.cache_workers_per_node,
+                                     max_workers=settings.max_burst_workers,
+                                     launch_timeout_seconds=settings.cache_launch_timeout_seconds)
+                           if settings.cache_pool_cmd else None)
         self.scaler: ScaleRun | None = None  # the scale command's last run
-        # How many actions this process's release has made ready, and the claims waiting, by the tiers they take
-        # and the future that wakes them, oldest first; see claim.
+        self.scale_lock = asyncio.Lock()
+        self.scale_pending = False
+        self.scale_task: asyncio.Task[None] | None = None
+        # How many actions this process's release has made ready, and waiting claims' tiers, rank, wake (the tier
+        # and whether it was for a claim ahead) and whether they may claim ahead, oldest first (the tie-breaker
+        # within a host); see claim.
         self.made_ready = 0
-        self.claim_waiters: list[tuple[list[str], asyncio.Future[None]]] = []
+        self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[Wake], bool]] = []
+        self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
+        self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
+        self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
+        # When a run claim of (tiers, slots) last found none to take: every claim asks, so a "no" is reused for as
+        # long as a ranking read is, until a run is made ready or a run lease ends (_runs_changed).
+        self.no_runs: dict[tuple[tuple[str, ...], int], float] = {}
+        self.runs_changed = 0  # how many times _runs_changed ran, so a "no" read across one isn't kept
+        self.rankings_forgotten = 0  # how many times _forget_rankings dropped one, so reads begun before keep none
+        # The claims ahead's shared read, the lock its readers take, and how many times _ahead_changed outdated it.
+        self.ahead_read: _AheadRead | None = None
+        self.ahead_lock = asyncio.Lock()
+        self.ahead_changes = 0
+        self.ahead_turns: dict[UUID, _AheadTurn] = {}  # by batch; see _claim_ahead_in
         # When each cache entry was last found, the checks of the cache under way, and how many times
         # input-missing results forgot both; see _in_cache.
         self.found_in_cache: dict[str, float] = {}
@@ -390,11 +987,39 @@ class Coordinator:
         # run them, one for every batch's and one for single batches'; see request_release.
         self.release_pending: set[UUID | None] = set()
         self.releasers: dict[bool, asyncio.Task[None]] = {}
+        # The copies other batches' workers built that releases are to mark done, by batch and key, with the
+        # builder's log and whether the copy's batch loads ahead; see complete. Claims here pass over them meanwhile.
+        self.peers_done: dict[UUID, dict[str, tuple[str | None, bool]]] = {}
         # What workers reported of their hosts, by host id, and when. Kept in memory: each coordinator process
         # knows the hosts whose workers' requests reached it.
         self.hosts: dict[str, tuple[datetime, HostReport]] = {}
-        # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
-        self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque(maxlen=MAX_PHASE_REPORTS)
+        # For the quarantine, also in memory: the host, worker and tiers of each lease, oldest first; each host's
+        # infrastructure failures in a row, with their batch (None once they span more than one), and its last probe
+        # claim; and the workers that last claimed, reported or heartbeat from each host, when, and whether they are
+        # burst workers. See _quarantine.
+        self.lease_hosts: dict[UUID, tuple[str, str, list[str]]] = {}
+        self.infra_streak: dict[str, tuple[int, UUID | None]] = {}
+        self.probe_at: dict[str, datetime] = {}
+        self.host_workers: dict[str, dict[str, tuple[datetime, bool]]] = {}
+        # For locality, also in memory: the dependency context (deps-key) workers last reported for each theory; the
+        # theories each host last ran and their contexts, least recent first, and when the host last had a worker
+        # seen lately; the times a batch and tier was passed over for them; each batch and tier a claim left for its
+        # holders, with when, until when and for which hosts (see _held); the ready builds the last count found; and
+        # what locality did. See _local_entry.
+        self.theory_deps: dict[str, str] = {}
+        self.host_keys: dict[str, dict[str, None]] = {}
+        self.keys_seen: dict[str, datetime] = {}
+        self.passed_over: dict[tuple[UUID, str], int] = {}
+        self.holds: dict[tuple[UUID, str], Hold] = {}
+        self.ready_builds = 0
+        self.ready_high = 0  # high-tier builds ready at that count
+        self.locality = LocalityCounts()
+        # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came, with their sums by
+        # phase, kept as reports come and go: /v1/queue asks for them more often than reports expire. Also in memory.
+        self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque()
+        self.phase_sums = dict.fromkeys(PHASE_FIELDS, 0.0)
+        # The wakes of the event streams following each batch; see watch.
+        self.batch_watchers: dict[UUID, set[asyncio.Event]] = {}
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Coordinator":
@@ -412,16 +1037,19 @@ class Coordinator:
                     }
                 },
             ),
-            # Every connection stays open between requests, so bursts of them don't each open a new TLS connection.
+            # Every connection stays open between requests, so bursts of them don't each open a new TLS connection;
+            # for a minute, where httpx closes them after 5 s (the cache nodes' Caddy keeps them 5 min).
             httpx.AsyncClient(
                 timeout=30,
                 follow_redirects=True,
-                limits=httpx.Limits(max_connections=100, max_keepalive_connections=100),
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=100, keepalive_expiry=60),
             ),
             settings,
         )
 
     async def aclose(self) -> None:
+        if self.scale_task is not None:
+            await self.scale_task
         for releaser in self.releasers.values():
             releaser.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -430,37 +1058,46 @@ class Coordinator:
         await self.engine.dispose()
 
     async def submit(
-        self, batch: Batch, profile: str, action_class: str = "build", max_heap_mb: int | None = None
+        self, batch: Batch, profile: str, action_class: str = "build", max_heap_mb: int | None = None,
+        *, fail_fast: bool = False, priority: int = 0, ahead_cap: int | None = None,
     ) -> UUID:
-        """Store a batch; its actions without uncached parents become ready."""
+        """Store a batch; its actions without uncached parents become ready. With ``ahead_cap``, up to that many
+        of its actions at once may be claimed ahead of their parents; see _claim_ahead."""
         batch_id = uuid4()
         parents: defaultdict[str, int] = defaultdict(int)
         for child, _ in batch.edges:
             parents[child] += 1
-        priority = dag_priorities([a.input_key for a in batch.actions], batch.edges)
+        dag_priority = dag_priorities([a.input_key for a in batch.actions], batch.edges)
         packages = [a.theory.split(":", 1)[0] for a in batch.actions]
         names = [a.theory.split(":", 1)[1] for a in batch.actions]
         async with self.engine.begin() as conn:
+            # Retention takes the same key order: heap/index scan order can otherwise deadlock overlapping writes.
             hints = await conn.execute(
                 sa.text(
-                    "UPDATE peak_hints SET updated_at = now() WHERE profile = :profile "
+                    "WITH locked AS (SELECT package, theory, profile FROM peak_hints WHERE profile = :profile "
                     "AND (package, theory) IN "
                     "(SELECT * FROM unnest(CAST(:packages AS text[]), CAST(:names AS text[]))) "
-                    "RETURNING package || ':' || theory, peak_rss_mb"
+                    "ORDER BY package, theory, profile FOR UPDATE) "
+                    "UPDATE peak_hints h SET updated_at = now() FROM locked l "
+                    "WHERE (h.package, h.theory, h.profile) = (l.package, l.theory, l.profile) "
+                    "RETURNING h.package || ':' || h.theory, h.peak_rss_mb"
                 ),
                 {"profile": profile, "packages": packages, "names": names},
             )
             high = {theory for theory, peak in hints if peak >= self.settings.standard_tier_mb}
             await conn.execute(
                 sa.text(
-                    "INSERT INTO batches (id, state, profile, max_heap_mb) "
-                    "VALUES (:id, :state, :profile, :max_heap_mb)"
+                    "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority, ahead_cap) "
+                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority, :ahead_cap)"
                 ),
                 {
                     "id": batch_id,
                     "state": "running" if batch.actions else "done",
                     "profile": profile,
                     "max_heap_mb": max_heap_mb,
+                    "fail_fast": fail_fast,
+                    "priority": priority,
+                    "ahead_cap": ahead_cap,
                 },
             )
             if batch.actions:
@@ -481,8 +1118,8 @@ class Coordinator:
                             "theory": a.theory,
                             "remaining": parents[a.input_key],
                             "tier": "high" if a.theory in high else "standard",
-                            "depth": priority[a.input_key].critical_depth,
-                            "descendants": priority[a.input_key].descendant_count,
+                            "depth": dag_priority[a.input_key].critical_depth,
+                            "descendants": dag_priority[a.input_key].descendant_count,
                             "class": action_class,
                         }
                         for a in batch.actions
@@ -494,6 +1131,8 @@ class Coordinator:
                     [{"batch_id": batch_id, "child": child, "parent": parent} for child, parent in batch.edges],
                 )
         await self.release(batch_id)
+        if batch.actions:
+            self.request_scale()
         return batch_id
 
     async def get(self, batch_id: UUID) -> BatchStatus | None:
@@ -525,14 +1164,35 @@ class Coordinator:
             status = BatchStatus(batch_id, batch.state, batch.failure, [ActionStatus(*row[:-1], json.loads(row[-1]) if row[-1] is not None else None) for row in actions])
             return status, int(batch.xmin)
 
+    @contextlib.contextmanager
+    def watch(self, batch_id: UUID) -> Iterator[asyncio.Event]:
+        """An event, set from the start and again after each write of this process to ``batch_id``'s actions or
+        state commits, for one follower of the batch to clear before each read of its changes."""
+        event = asyncio.Event()
+        event.set()
+        watchers = self.batch_watchers.setdefault(batch_id, set())
+        watchers.add(event)
+        try:
+            yield event
+        finally:
+            watchers.discard(event)
+            if not watchers:
+                del self.batch_watchers[batch_id]
+
+    def _batch_changed(self, batch_id: UUID) -> None:
+        for event in self.batch_watchers.get(batch_id, ()):
+            event.set()
+
     async def cancel(self, batch_id: UUID) -> str | None:
-        """Cancel a running batch; its leases go, so its workers' heartbeats and completions are refused."""
+        """Cancel a running batch; its leases are revoked, so its workers' heartbeats are refused and their
+        completions keep only the logs of the actions they stop."""
         async with self.engine.begin() as conn:
             state = await self._lock_batch(conn, batch_id)
             if state != "running":
                 return state
             await self._end_batch(conn, batch_id, "cancelled", None)
-            return "cancelled"
+        self._batch_changed(batch_id)
+        return "cancelled"
 
     async def claim(
         self,
@@ -540,37 +1200,114 @@ class Coordinator:
         worker: str,
         wait_s: float = 0,
         disconnected: Callable[[], Awaitable[bool]] | None = None,
+        host_id: str | None = None,
+        host_rank: int = 0,
+        *,
+        ahead: bool = False,
     ) -> Claim | None:
         """Lease a ready action to ``worker``, waiting up to ``wait_s`` seconds for one, or None if none became
         ready: of the first of ``tiers`` that has one, the batch with the fewest running actions, then the one
         that least recently had one claimed, then the oldest; within it, the action with the deepest chain of
         dependents, then the most dependents.
 
-        A wait ends early once ``disconnected`` says the worker has gone, so no action is leased to nobody. Each
-        action this process's ``release`` makes ready wakes the longest waiting claim that takes its tier, not
-        every waiting claim, so hundreds of waiting workers don't all query for it. Waits recheck every
+        A wait ends early once ``disconnected`` says the worker has gone, and a claim it has gone from by the time
+        it took an action gives that action back, so no action is leased to nobody. Each
+        action this process's ``release`` makes ready wakes one compatible claim, preferring warm workers, then
+        hosts of lower ``host_rank``, then hosts in canonical order, with FIFO ties. Unwoken claims defer each tier to
+        better-ranked waiters, so polling workers don't spread work back onto tail hosts, but not a tier with a build
+        held for their host (_held_for), which they then prefer. Waits recheck every
         ``CLAIM_RECHECK_SECONDS``, for actions another coordinator process made ready and for an action whose
         woken claim took another one or lost it to another claim; a claim woken that leaves without trying wakes
-        the next.
+        the next. A claim that found only builds left for other hosts (see _held) waits no longer than their hold.
+
+        A claim ``ahead`` comes from a worker that can load ahead: when nothing is ready, it may get an action of a
+        batch that loads ahead whose parents still run; see _claim_ahead.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
-        woken: asyncio.Future[str] = loop.create_future()  # done once a wake was handed to this claim
+        rank = _claim_rank(tiers, host_id, host_rank)
+        # Done once a wake was handed to this claim.
+        woken: asyncio.Future[Wake] = loop.create_future()
+
+        def undeferred(*, ahead_only: bool) -> list[str]:
+            """The tiers no better-ranked unwoken waiter takes, of those that may claim ahead if ``ahead_only``."""
+            # An ahead wake bypassed better-ranked waiters that can't claim ahead, so it lifts only the ahead deferral.
+            return tiers if woken.done() and (ahead_only or not woken.result()[1]) else [
+                tier for tier in tiers
+                if not any(
+                    tier in w_tiers and not w_woken.done() and w_rank < rank and (w_ahead or not ahead_only)
+                    and self._quarantine(w_rank[3]) is None
+                    for w_tiers, w_rank, w_woken, w_ahead in self.claim_waiters
+                )
+            ]
+
         try:
             while True:
-                # Taken before the attempt, so an action made ready during it is tried at once, not waited for.
-                made_ready = self.made_ready
-                claimed = await self._claim(tiers, worker)
+                if host_id is not None and (quarantine := self._quarantine(host_id)) is not None:
+                    # A quarantined host waits apart from the other claims, so it neither gets their wakes nor
+                    # holds them back, and claims once each PROBE_SECONDS while failures quarantine it.
+                    self._pass_wake(woken)
+                    woken = loop.create_future()
+                    now = self.clock()
+                    probe = self.probe_at.get(host_id)
+                    if quarantine == "failures" and (probe is None or (now - probe).total_seconds() >= PROBE_SECONDS):
+                        self.probe_at[host_id] = now
+                        claimed, _ = await self._claim(tiers, worker)
+                        claimed = await self._answered(claimed, disconnected)
+                        if claimed is not None:
+                            self._lease_host(claimed.attempt_token, host_id, worker, tiers)
+                            self._ran_on(host_id, claimed.theory)
+                        return claimed
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        return None
+                    await asyncio.sleep(min(remaining, CLAIM_RECHECK_SECONDS))
+                    if disconnected is not None and await disconnected():
+                        return None
+                    continue
+                # Work made claimable during the attempt is retried at once, for workers that can take it.
+                seen = (self.made_ready, self.ahead_changes if ahead else 0)
+                eligible_tiers = undeferred(ahead_only=False)
+                # A better-ranked waiter that can't claim ahead leaves the actions claimed ahead to this one.
+                ahead_tiers = undeferred(ahead_only=True) if ahead else []
+                # A claim woken for a batch made ready prefers it; see _claim_build. So does one from a host a build is
+                # held for, which takes that build even where it defers to better-ranked waiters, which would
+                # otherwise take it cold, but only that build.
+                hint, held_tiers = None, frozenset[str]()
+                if woken.done() and (wake := woken.result())[2] is not None and wake[3] is not None and not wake[1]:
+                    hint = (wake[2], wake[0], wake[3])
+                elif not woken.done():
+                    held_tiers = self._held_for(tiers, host_id)
+                hint_only = held_tiers.difference(eligible_tiers)
+                claim_tiers = [t for t in tiers if t in eligible_tiers or t in hint_only]
+                outranked = (
+                    await self._outranked_by_ahead(tiers, ahead_tiers) if ahead_tiers and claim_tiers else None
+                )
+                claimed, held_until = (
+                    await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only, held_tiers)
+                    if claim_tiers else (None, None)
+                )
+                # Builds left for their holders still rank before claims ahead.
+                if claimed is None and ahead_tiers and held_until is None:
+                    claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
+                    claimed = await self._answered(claimed, disconnected)
+                    if claimed is not None and host_id is not None:
+                        self._lease_host(claimed.attempt_token, host_id, worker, tiers)
+                        self._ran_on(host_id, claimed.theory)
                     return claimed
                 woken = loop.create_future()
-                if self.made_ready == made_ready:
-                    waiter = (tiers, woken)
+                if (self.made_ready, self.ahead_changes if ahead else 0) == seen:
+                    waiter = (tiers, rank, woken, ahead)
                     self.claim_waiters.append(waiter)
                     try:
                         with contextlib.suppress(TimeoutError):
-                            await asyncio.wait_for(asyncio.shield(woken), min(remaining, CLAIM_RECHECK_SECONDS))
+                            # A build left for its holder may be claimed once its hold ends.
+                            wait = min(remaining, CLAIM_RECHECK_SECONDS)
+                            if held_until is not None:
+                                wait = min(wait, max(0.0, held_until - loop.time()))
+                            await asyncio.wait_for(asyncio.shield(woken), wait)
                     finally:
                         with contextlib.suppress(ValueError):
                             self.claim_waiters.remove(waiter)
@@ -581,70 +1318,1004 @@ class Coordinator:
             self._pass_wake(woken)
             raise
 
-    async def _claim(self, tiers: list[str], worker: str) -> Claim | None:
-        async with self.engine.begin() as conn:
-            # A batch's running count and last claim are read without locking its row, so concurrent claims see
-            # only each other's committed leases, which at worst lets workers waking together pick the same
-            # batch. Locking or updating the batch row here, after the action row, would invert the lock order.
-            params = {"tiers": tiers, "allow_run": False, "run_slots": self.settings.run_slots}
-            row = (await conn.execute(CLAIM, params)).first()
+    async def _answered(
+        self, claimed: Claim | None, disconnected: Callable[[], Awaitable[bool]] | None
+    ) -> Claim | None:
+        """``claimed``, or None once its lease is ended when its worker has gone by now, as one ECS stopped while
+        it waited does: no answer would reach it, so the action would wait out the lease. It goes back at once
+        without counting the attempt, as ``release_unheld`` ends a lease."""
+        if claimed is None or disconnected is None or not await disconnected():
+            return claimed
+        await self.give_back(claimed)
+        return None
+
+    async def give_back(self, claimed: Claim) -> None:
+        """End the lease of ``claimed``, whose worker never got it, as ``release_unheld`` ends one."""
+        async with self.engine.connect() as conn:
+            batch_id = await conn.scalar(
+                sa.text("SELECT batch_id FROM leases WHERE attempt_token = :token"), {"token": claimed.attempt_token}
+            )
+        if batch_id is not None:
+            await self._end_unheld([(claimed.attempt_token, batch_id)])
+
+    async def _outranked_by_ahead(
+        self, tiers: list[str], ahead_tiers: list[str]
+    ) -> Callable[[str, int], list[str]] | None:
+        """For a ready build of a tier and priority, the tiers of ``ahead_tiers`` no later than its tier in
+        ``tiers`` with an action that may be claimed ahead of a batch of a higher priority, which ranks before the
+        build; none when there is no such action. Ready builds of the same priority come first, so with no
+        priorities set claims ahead wait for every ready build, as they did before priorities ranked them. None
+        when nothing may be claimed ahead."""
+        read = await self._ahead_candidates()
+        best: dict[str, int] = {}  # the highest priority of a candidate of each tier
+        for batch_id, _, tier, priority in read.candidates:
+            if tier in ahead_tiers and (batch_id, tier) not in read.exhausted:
+                best[tier] = max(best.get(tier, priority), priority)
+        if not best:
+            return None
+        return lambda tier, priority: [
+            t for t in ahead_tiers if t in best and best[t] > priority and tiers.index(t) <= tiers.index(tier)
+        ]
+
+    async def _claim(
+        self,
+        tiers: list[str],
+        worker: str,
+        outranked: Callable[[str, int], list[str]] | None = None,
+        host_id: str | None = None,
+        hint: Hint | None = None,
+        hint_only: frozenset[str] = frozenset(),
+        held_tiers: frozenset[str] = frozenset(),
+    ) -> tuple[Claim | None, float | None]:
+        """Lease a ready build of ``tiers`` from the shared ranking, else a run action. Before a ready build that
+        ranks after an action that may be claimed ahead, claim one of the tiers ``outranked`` gives for it, of a
+        higher priority than the build's; failing that, the build is claimed after all. A claim from ``host_id``
+        may take a build its host is warm for, the batch and tier ``hint`` it was woken for, or a build of
+        ``held_tiers`` held for its host; see _claim_build.
+
+        Also returns, when the only ready builds left are held for other hosts (see _held), when the first hold
+        ends: those builds are ready, so no run is claimed, and the claim asks again then. Of tiers ``hint_only``,
+        it may lease only a build held for its host, and no run."""
+        started = asyncio.get_running_loop().time()
+        key = tuple(tiers)
+        ranking = await self._current_ranking(key)
+        run_tiers = [t for t in tiers if t not in hint_only]
+        floor = min(self.settings.run_floor, self.settings.run_slots)
+        if floor > 0 and run_tiers:
+            claimed, _ = await self._claim_run(run_tiers, worker, floor)
+            if claimed is not None:
+                return claimed, None
+        while True:
+            row = None
+            try:
+                async with self.engine.begin() as conn:
+                    # Never lock a batch after an action: batch writers take those locks in the opposite order.
+                    row, held_until, stopped = await self._claim_build(
+                        conn, ranking, outranked, host_id, hint, hint_only=hint_only, held_tiers=held_tiers
+                    )
+                    if row is not None:
+                        claimed = await self._lease(conn, row, worker)
+            except BaseException:
+                if row is not None and row.hold is not None:  # the build stays ready
+                    ranking.theories.setdefault(row.hold[0], row.theory)
+                    self._put_back_hold(*row.hold)
+                raise
+            if row is not None:
+                self._batch_changed(row.batch_id)
+                return claimed, None
+            if held_until is not None:
+                return None, held_until
+            if stopped is not None and (not ranking.ranked or ranking.at >= started):
+                # The next ready build ranks after an action that may be claimed ahead, by a ranking read since
+                # this claim started.
+                assert outranked is not None
+                if ranking.capped:  # by a concurrent claim, since: claims ahead no longer outrank the build
+                    outranked = None
+                    continue
+                _, priority, *_, tier, _ = stopped
+                # Only batches of a positive priority, above the build's, are claimed from: counted before the
+                # claim's await, as _claim_build's are.
+                ranking.running_priority += 1
+                self._cap_priorities(ranking)
+                claimed = await self._claim_ahead(outranked(tier, -priority), worker, above=-priority)
+                if claimed is not None:
+                    return claimed, None
+                ranking.running_priority -= 1
+                outranked = None
+                continue
+            # Builds of tiers hint_only not held for this host are no candidates.
+            if not any(e[7] not in hint_only for e in ranking.heap) and (not ranking.ranked or ranking.at >= started):
+                if not run_tiers:
+                    return None, None
+                claimed, retry_builds = await self._claim_run(
+                    run_tiers, worker, self.settings.run_slots, builds_first=True
+                )
+                if not retry_builds:
+                    return claimed, None
+                started = asyncio.get_running_loop().time()
+            # Refresh outside the transaction: waiting here with a connection could starve the shared read.
+            if self.rankings.get(key) is ranking:
+                self.rankings.pop(key)
+            ranking = await self._current_ranking(key, after=started)
+
+    async def _claim_run(
+        self, tiers: list[str], worker: str, slots: int, *, builds_first: bool = False
+    ) -> tuple[Claim | None, bool]:
+        """Return a run lease or a request to retry builds, queuing before taking a pooled connection."""
+        if slots == 0:
+            return None, False
+        available = sa.text(
+            "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'run' "
+            "AND tier = ANY(CAST(:tiers AS text[]))) AND "
+            "(SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run') < :run_slots"
+        )
+        params = {"tiers": tiers, "classes": ["run"], "run_slots": slots}
+        key, now = (tuple(tiers), slots), asyncio.get_running_loop().time()
+        if (found := self.no_runs.get(key)) is not None and now - found < self.settings.claim_ranking_seconds:
+            return None, False
+        changed = self.runs_changed
+        async with self.engine.connect() as conn:
+            if not await conn.scalar(available, params):
+                if changed == self.runs_changed:
+                    self.no_runs[key] = now
+                return None, False
+        # Only one connection per process may wait for cross-replica run admission. Builds bypass this gate.
+        async with self.run_admission, self.engine.begin() as conn:
+            await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
+            # A build made ready during the wait still precedes a fallback run. Rank it outside this transaction.
+            if builds_first and await conn.scalar(
+                sa.text(
+                    "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'build' "
+                    "AND tier = ANY(CAST(:tiers AS text[])) "
+                    "AND input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()) "
+                    "FOR UPDATE SKIP LOCKED)"
+                ),
+                params,
+            ):
+                return None, True
+            # A preceding admission may have filled the floor/cap; don't rank every batch again in that case.
+            if not await conn.scalar(available, params):
+                return None, False
+            row = await self._claim_first(conn, params)
             if row is None:
-                if self.settings.run_slots == 0 or not await conn.scalar(
-                    sa.text(
-                        "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'run' "
-                        "AND tier = ANY(CAST(:tiers AS text[])))"
-                    ),
-                    {"tiers": tiers},
-                ):
-                    return None
-                # Serialize only run admission, across replicas. The next statement gets a fresh snapshot
-                # after the preceding claimant commits, so its running run counts against the cap.
-                # This advisory key is reserved for run admission; no batch writer takes it.
-                await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
-                row = (await conn.execute(CLAIM, {**params, "allow_run": True})).first()
+                return None, False
+            claimed = await self._lease(conn, row, worker)
+        self._batch_changed(row.batch_id)
+        return claimed, False
+
+    async def _lease(
+        self, conn: AsyncConnection, row: _Claimed, worker: str, ahead_parents: tuple[AheadParent, ...] = ()
+    ) -> Claim:
+        """Record a lease for the action locked by this transaction, claimed ahead of ``ahead_parents`` when there
+        are any.
+
+        A plain claim of an action a claim ahead left waiting isn't one ahead; one abandoned stays so. Its waiting
+        children, which may now be claimed ahead, are left to the claims ahead's next read (see _ahead_candidates):
+        a large batch's plain claims would otherwise have every claim of a worker that loads ahead read again."""
+        token = uuid4()
+        await conn.execute(
+            sa.text(
+                "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now(), "
+                "finished_at = NULL, worker = :worker, "
+                "ahead = CASE WHEN :ahead THEN 'ahead' WHEN ahead = 'abandoned' THEN ahead ELSE 'no' END "
+                "WHERE batch_id = :batch_id AND input_key = :input_key"
+            ),
+            {"batch_id": row.batch_id, "input_key": row.input_key, "ahead": bool(ahead_parents), "worker": worker},
+        )
+        await conn.execute(
+            sa.text(
+                "INSERT INTO leases (attempt_token, batch_id, input_key, worker, expires_at) "
+                "VALUES (:token, :batch_id, :input_key, :worker, now() + make_interval(secs => :lease))"
+            ),
+            {
+                "token": token,
+                "batch_id": row.batch_id,
+                "input_key": row.input_key,
+                "worker": worker,
+                "lease": self.settings.lease_seconds,
+            },
+        )
+        return Claim(
+            token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb,
+            ahead_parents,
+        )
+
+    async def _claim_ahead(self, tiers: list[str], worker: str, *, above: int | None = None) -> Claim | None:
+        """Lease an action of ``tiers`` ahead of its parents: of the running batches with an ``ahead_cap`` and
+        fewer than that many actions waiting ahead, the action whose chain of dependents is deepest of those whose
+        unfinished parents all run, at most ``ahead_depth`` generations ahead (CLAIM_AHEAD_ACTION). Its claim names
+        its unfinished ancestors, ancestors first, whose outputs its worker waits for.
+
+        Candidates come from a read the claims of ``claim_ranking_seconds`` share; each batch is then locked, as
+        every writer of it does first, so its cap and the parents' states are rechecked against concurrent claims
+        and completions. A batch and tier found with nothing to claim are skipped until the next read. With
+        ``above``, only batches of a higher priority are claimed from.
+        """
+        read = await self._ahead_candidates()
+        # Tier by tier, as a plain claim takes them, then in the read's order.
+        for tier in tiers:
+            for batch_id in dict.fromkeys(
+                b for b, _, t, priority in read.candidates if t == tier and (above is None or priority > above)
+            ):
+                if (batch_id, tier) in read.exhausted:
+                    continue
+                claimed = await self._claim_ahead_in(read, batch_id, tier, worker)
+                if claimed is not None:
+                    return claimed
+        return None
+
+    async def _claim_ahead_in(self, read: _AheadRead, batch_id: UUID, tier: str, worker: str) -> Claim | None:
+        """Lease the best action of ``tier`` of ``batch_id`` that ``read`` found may be claimed ahead, if any still
+        may, or mark the batch and tier exhausted in ``read``.
+
+        This process's claims ahead of one batch take their turns in memory before the batch's row lock, which each
+        would otherwise wait for holding a pooled connection: one big batch's claims filled the pool. A claim whose
+        turn comes finds in ``read`` what the claims before it took."""
+        async with self._ahead_turn(batch_id):
+            if (batch_id, tier) in read.exhausted:
+                return None
+            keys = [key for b, key, t, _ in read.candidates if (b, t) == (batch_id, tier)][:AHEAD_CLAIM_KEYS]
+            if not keys:
+                read.exhausted.add((batch_id, tier))
+                return None
+            async with self.engine.begin() as conn:
+                batch = (
+                    await conn.execute(
+                        sa.text(
+                            "SELECT ahead_cap, max_heap_mb FROM batches WHERE id = :id AND state = 'running' FOR UPDATE"
+                        ),
+                        {"id": batch_id},
+                    )
+                ).first()
+                row = None
+                depth = self.settings.ahead_depth_limit
+                waiting = 0
+                if batch is not None:
+                    # Counted after the lock, in a snapshot that sees every claim ahead committed before it.
+                    waiting = await conn.scalar(COUNT_WAITING_AHEAD, {"batch_id": batch_id})
+                    if waiting < batch.ahead_cap:
+                        row = await self._lock_unleased(
+                            conn, CLAIM_AHEAD_ACTION, {"batch_id": batch_id, "keys": keys, "tier": tier, "depth": depth}
+                        )
                 if row is None:
+                    read.exhausted.add((batch_id, tier))
                     return None
-            token = uuid4()
-            await conn.execute(
-                sa.text(
-                    "UPDATE actions SET state = 'running', attempts = attempts + 1, last_claimed_at = now() "
-                    "WHERE batch_id = :batch_id AND input_key = :input_key"
-                ),
-                {"batch_id": row.batch_id, "input_key": row.input_key},
-            )
-            await conn.execute(
-                sa.text(
-                    "INSERT INTO leases (attempt_token, batch_id, input_key, worker, expires_at) "
-                    "VALUES (:token, :batch_id, :input_key, :worker, now() + make_interval(secs => :lease))"
-                ),
-                {
-                    "token": token,
-                    "batch_id": row.batch_id,
-                    "input_key": row.input_key,
-                    "worker": worker,
-                    "lease": self.settings.lease_seconds,
-                },
-            )
-        return Claim(token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb)
+                parents = (
+                    await conn.execute(AHEAD_PARENTS, {"batch_id": batch_id, "keys": [row.input_key], "depth": depth})
+                ).all()
+                ahead_parents = tuple(AheadParent(p.input_key, p.spec_sha256) for p in parents)
+                claimed = await self._lease(
+                    conn,
+                    _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, batch.max_heap_mb),
+                    worker,
+                    ahead_parents,
+                )
+            # Out of the shared read, so the next claim of this read orders the batches by what remains.
+            read.candidates = [c for c in read.candidates if (c[0], c[1]) != (batch_id, row.input_key)]
+            if waiting + 1 >= batch.ahead_cap:  # this claim filled the cap: the claims waiting their turn skip it
+                read.exhausted.update((batch_id, t) for t in ("standard", "high"))
+        self._batch_changed(batch_id)
+        # Below the last generation, its own waiting children may now be claimed ahead, while the cap has room.
+        if (depth is None or max(p.distance for p in parents) < depth) and waiting + 1 < batch.ahead_cap:
+            self._ahead_changed()
+        return claimed
 
-    def _wake_claim(self, tier: str) -> None:
-        """Count an action of ``tier`` made ready, and wake the longest waiting claim that takes it."""
-        self.made_ready += 1
-        for waiter in self.claim_waiters:
-            tiers, woken = waiter
-            if tier in tiers and not woken.done():
-                woken.set_result(tier)
-                self.claim_waiters.remove(waiter)
-                return
+    @contextlib.asynccontextmanager
+    async def _ahead_turn(self, batch_id: UUID) -> AsyncIterator[None]:
+        """Hold ``batch_id``'s claims ahead in this process to one at a time; see _claim_ahead_in."""
+        turn = self.ahead_turns.get(batch_id)
+        if turn is None:
+            turn = self.ahead_turns[batch_id] = _AheadTurn(asyncio.Lock())
+        turn.claims += 1
+        try:
+            async with turn.lock:
+                yield
+        finally:
+            turn.claims -= 1
+            if not turn.claims:
+                del self.ahead_turns[batch_id]
 
-    def _pass_wake(self, woken: asyncio.Future[str]) -> None:
-        """Hand the wake of a claim leaving without trying, if it got one, to the next claim that takes its tier."""
+    async def _ahead_candidates(self) -> _AheadRead:
+        """The last read of AHEAD_CANDIDATES if it began after this call, or if it is younger than
+        ``claim_ranking_seconds`` and began after the last _ahead_changed; else a new one. A read is made under
+        ``ahead_lock``, and the calls that waited for it take it: claims arriving together read once, not once each
+        in turn."""
+        loop = asyncio.get_running_loop()
+        called = loop.time()
+        async with self.ahead_lock:
+            read = self.ahead_read
+            if read is not None and (
+                read.at >= called
+                or (read.changes == self.ahead_changes and loop.time() - read.at < self.settings.claim_ranking_seconds)
+            ):
+                return read
+            at, changes = loop.time(), self.ahead_changes
+            async with self.engine.connect() as conn:
+                rows = (await conn.execute(AHEAD_CANDIDATES, {"depth": self.settings.ahead_depth_limit})).all()
+            self.ahead_read = _AheadRead(
+                at, changes, [(row.batch_id, row.input_key, row.tier, row.priority) for row in rows], set()
+            )
+            return self.ahead_read
+
+    def _ahead_changed(self) -> None:
+        """Outdate the claims ahead's shared read, since actions of a batch that loads ahead may have become
+        candidates, and wake a claim of each tier that may claim ahead: their tiers aren't known here."""
+        self.ahead_changes += 1
+        for tier in ("standard", "high"):
+            self._wake_claim(tier, ahead=True)
+
+    async def _lock_unleased(
+        self, conn: AsyncConnection, statement: sa.TextClause, params: dict[str, Any]
+    ) -> sa.Row[Any] | None:
+        """The build action ``statement`` locks with ``params``, passing over those whose key another claim is
+        leasing or leased since the statement's snapshot (see LOCK_KEY), and those a release is to mark done."""
+        taken = list(self.peers_done.get(params["batch_id"], ()))
+        while True:
+            row = (await conn.execute(statement, {**params, "taken": taken})).first()
+            if row is None or (
+                await conn.scalar(LOCK_KEY, {"key": row.input_key})
+                and not await conn.scalar(KEY_LEASED, {"key": row.input_key})
+            ):
+                return row
+            taken.append(row.input_key)
+
+    async def _claim_first(self, conn: AsyncConnection, params: dict[str, object]) -> _Claimed | None:
+        """Lock the first ready action ``params`` accept that no other claim holds; see CLAIM_CANDIDATES."""
+        for candidate in (await conn.execute(CLAIM_CANDIDATES, params)).all():
+            row = (
+                await conn.execute(
+                    CLAIM_ACTION,
+                    {
+                        "batch_id": candidate.batch_id,
+                        "class": candidate.action_class,
+                        "tier": candidate.tier,
+                        "taken": list(self.peers_done.get(candidate.batch_id, ())),
+                    },
+                )
+            ).first()
+            if row is not None:
+                return _Claimed(candidate.batch_id, row.input_key, row.spec_sha256, row.theory, candidate.max_heap_mb)
+        return None
+
+    async def _claim_build(
+        self,
+        conn: AsyncConnection,
+        ranking: "_Ranking",
+        outranked: Callable[[str, int], list[str]] | None = None,
+        host_id: str | None = None,
+        hint: Hint | None = None,
+        *,
+        hint_only: frozenset[str] = frozenset(),
+        held_tiers: frozenset[str] = frozenset(),
+    ) -> tuple[_Claimed | None, float | None, RankEntry | None]:
+        """Lock a ready build from the shared ranking, without refreshing it inside the transaction.
+
+        Put each candidate back with one more running action before trying it, so concurrent claims spread over
+        batches as fresh rankings would. Exhausted batch/tier pairs are skipped until the next shared read. Stop
+        at a candidate ``outranked`` says ranks after a claim ahead, leaving it in the ranking, and return it.
+
+        Once batches of a positive priority run ``priority_cap`` builds, the ranking is capped (_cap_priorities):
+        their builds rank like priority-0 ones, and claims ahead no longer outrank them, so priority work loses its
+        precedence. Their claims count towards the cap before they await their lock, so concurrent claims sharing
+        the ranking don't all take its last slot. Rankings of other tier lists count only their own claims until
+        their next read, so together they may pass the cap by a few builds for up to ``claim_ranking_seconds``.
+
+        A claim from ``host_id`` may then take, instead of the chosen candidate, the batch and tier ``hint`` it was
+        woken for (_hinted_entry), a build of ``held_tiers`` held for its host (_held_entry) or another candidate
+        of its band its host holds (_local_entry); else it passes over a candidate held for another host (_held) for
+        the next one, as a swap passes over the chosen one, waking a claim on a host it is held for (_wake_holders).
+        When only such candidates are left, it returns no build and when the first of their holds ends. Of tiers
+        ``hint_only``, it takes only a build held for ``host_id``: the claim defers them to better-ranked claims.
+        """
+        kept = functools.cache(
+            lambda tier: self._kept_hosts(
+                (len(ranking.heap) if tier != "high" else sum(e[7] == "high" for e in ranking.heap)) + 1, tier
+            )
+        )
+        held: list[RankEntry] = []  # taken out of the heap only until this claim awaits or returns
+        held_until: float | None = None
+        hint_tiers = set(held_tiers) if hint is None else {hint[1]}
+
+        def put_back_held() -> None:
+            for e in held:
+                heapq.heappush(ranking.heap, e)
+            held.clear()
+
+        while ranking.heap:
+            entry = heapq.heappop(ranking.heap)
+            if (entry[6], entry[7]) in ranking.exhausted:
+                continue
+            tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
+            # A hint is for the first candidate of its tier only, as a woken claim's, or one held for this host.
+            hinted, fits = None, False
+            if tier in hint_tiers:
+                hint_tiers.discard(tier)
+                if hint is not None:
+                    hinted, hint = self._hinted_entry(ranking, entry, host_id, hint, kept), None
+                else:
+                    hinted = self._held_entry(ranking, entry, host_id, kept)
+                fits = self._held_here(ranking, (hinted[6], hinted[7]) if hinted else (batch_id, tier), host_id, kept)
+            if tier in hint_only and not fits:
+                held.append(entry)
+                continue
+            if not ranking.capped and outranked is not None and outranked(tier, -priority):
+                heapq.heappush(ranking.heap, entry)
+                put_back_held()
+                # Held builds rank before claims ahead too, so a claim that left some waits for their holds to end.
+                return None, held_until, entry
+            passed = None  # the candidate passed over for one this host is warm for
+            local = hinted if tier in hint_only else hinted or self._local_entry(ranking, entry, host_id, kept)
+            # Only the held build is taken for its hold: another of the batch is another claim's to take.
+            only_held = tier in hint_only or (
+                local is not None and self._held_here(ranking, (local[6], local[7]), host_id, kept)
+            )
+            if local is not None:
+                ranking.heap[ranking.heap.index(local)] = entry
+                heapq.heapify(ranking.heap)
+                self._wake_holders(ranking, entry, host_id, kept)
+                passed, entry = (batch_id, tier), local
+                tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
+            elif (until := self._held(ranking, entry, host_id, kept)) is not None:
+                held.append(entry)
+                held_until = until if held_until is None else min(held_until, until)
+                continue
+            put_back_held()
+            heapq.heappush(
+                ranking.heap,
+                (tier_position, priority, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),
+            )
+            # The batch's next ready build is another one, whose theory the ranking doesn't know.
+            theory = ranking.theories.pop((batch_id, tier), None)
+            if priority != 0:
+                ranking.running_priority += 1
+                self._cap_priorities(ranking)
+            if passed is not None:  # counted before the lock's await, as the cap is, so concurrent claims see it
+                self.passed_over[passed] = self.passed_over.get(passed, 0) + 1
+                if len(self.passed_over) > MAX_LEASE_HOSTS:  # those of batches that ended unclaimed
+                    del self.passed_over[next(iter(self.passed_over))]
+            # Taken before the await, so a concurrent claim that misses the build doesn't drop it first.
+            hold = self.holds.pop((batch_id, tier), None)
+            try:
+                row = await self._lock_unleased(
+                    conn, CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier}
+                )
+            except BaseException:  # the build stays ready
+                if theory is not None:
+                    ranking.theories.setdefault((batch_id, tier), theory)
+                if hold is not None:
+                    self._put_back_hold((batch_id, tier), hold)
+                raise
+            if row is not None and only_held and (hold is None or row.theory != hold[2]):
+                row = None  # another build of the batch; the lock ends with the transaction
+            self.passed_over.pop((batch_id, tier), None)
+            if row is not None:
+                if passed is not None:
+                    self.locality.claims += 1
+                if hold is not None and row.theory == hold[2]:
+                    self.locality.held_waits += 1
+                    self.locality.held_ms_total += round((asyncio.get_running_loop().time() - hold[0]) * 1000)
+                if host_id is not None:
+                    self._count_claim(row.theory, tier, host_id, kept)
+                taken = None if hold is None else ((batch_id, tier), hold)
+                return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb, taken), None, None
+            if passed is not None and (count := self.passed_over.get(passed)) is not None:
+                if count > 1:
+                    self.passed_over[passed] = count - 1
+                else:
+                    del self.passed_over[passed]
+            if priority != 0:
+                ranking.running_priority -= 1
+            if hold is not None:
+                self._put_back_hold((batch_id, tier), hold)
+            ranking.exhausted.add((batch_id, tier))
+        put_back_held()
+        return None, held_until, None
+
+    def _cap_priorities(self, ranking: "_Ranking") -> None:
+        """Cap ``ranking`` once batches of a positive priority run ``priority_cap`` builds: rank their builds like
+        priority-0 ones until the next read. A cap stays for the ranking's life, so claims that fail to lock
+        don't flip the order back and forth."""
+        if ranking.capped or ranking.running_priority < self.settings.priority_cap:
+            return
+        ranking.capped = True
+        ranking.heap[:] = [(e[0], 0, *e[2:]) for e in ranking.heap]
+        heapq.heapify(ranking.heap)
+
+    def _hinted_entry(
+        self,
+        ranking: "_Ranking",
+        entry: RankEntry,
+        host_id: str | None,
+        hint: Hint | None,
+        kept: Callable[[str], set[str]],
+    ) -> RankEntry | None:
+        """The candidate of the build ``hint`` a claim from ``host_id`` was woken for, to take instead of ``entry``,
+        popped from ``ranking``, or None: while it is held for this host (see _held) and of ``entry``'s tier and
+        priority, or else while it is in ``entry``'s band and no other kept host holds more of its theory, which
+        _held would leave it to. Not once another claim took that build, nor past an ``entry`` whose hold ended
+        (_hold_ended). As in _local_entry, ``entry`` is passed over at most LOCALITY_WINDOW times in a row."""
+        head = (entry[6], entry[7])
+        if not self.settings.locality or host_id is None or hint is None:
+            return None
+        key, theory = hint[:2], hint[2]
+        if (
+            key == head or key in ranking.exhausted or ranking.theories.get(key) != theory
+            or self.passed_over.get(head, 0) >= LOCALITY_WINDOW or self._hold_ended(ranking, head)
+        ):
+            return None
+        hinted = next((e for e in ranking.heap if (e[6], e[7]) == key), None)
+        if hinted is None or hinted[:2] != entry[:2]:
+            return None
+        hold = self.holds.get(key)
+        if hold is not None and asyncio.get_running_loop().time() < hold[1] and hold[2] == theory:
+            return hinted if self._held_here(ranking, key, host_id, kept) else None
+        if self._best_level(theory, key[1], host_id, kept) > self._level(host_id, theory):
+            return None
+        return hinted if hinted[:3] == entry[:3] else None
+
+    def _local_entry(
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
+    ) -> RankEntry | None:
+        """The candidate a claim from ``host_id`` takes instead of ``entry``, popped from ``ranking``, or None.
+
+        A host keeps the checkpoints of each theory it ran, and the shared heap of each dependency context
+        (deps-key), which a cold host fetches from the cache: most of what restoring a checkpoint moves. So a claim
+        from a host that doesn't hold ``entry``'s theory takes, of the next LOCALITY_WINDOW candidates of the same
+        band (tier, priority and running actions), the first of those it holds most of (_level), if that is more
+        than it holds of ``entry``'s and no other kept host holds more of it (_holds_most). Each candidate may be
+        passed over LOCALITY_WINDOW times, so no batch waits for long. Only a host below the scale-in line (``kept``)
+        does: the others are to empty when demand falls."""
+        if not self.settings.locality or host_id is None or not self.host_keys.get(host_id):
+            return None
+        head = (entry[6], entry[7])
+        theory = ranking.theories.get(head)
+        mine = 0 if theory is None else self._level(host_id, theory)
+        if mine == 2 or self.passed_over.get(head, 0) >= LOCALITY_WINDOW or self._hold_ended(ranking, head):
+            return None
+        band = heapq.nsmallest(
+            LOCALITY_WINDOW,
+            (e for e in ranking.heap if e[:3] == entry[:3] and (e[6], e[7]) not in ranking.exhausted),
+        )
+        local = None
+        for e in band:
+            t = ranking.theories.get((e[6], e[7]))
+            if t is not None and (level := self._level(host_id, t)) > mine and self._holds_most(host_id, t, e[7], kept):
+                local, mine = e, level
+                if level == 2:
+                    break
+        return local
+
+    def _held(
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
+    ) -> float | None:
+        """When the hold of candidate ``entry`` for a host other than ``host_id`` ends, or None if a claim from
+        ``host_id`` may take it now.
+
+        A build is left for a host below the scale-in line (``kept``) that takes its tier and holds more of its
+        theory than ``host_id`` (_level), for LOCALITY_HOLD_SECONDS from the first claim it was left by. It is held
+        for the kept hosts holding the most of it (_holds_most), as they are when a claim from one comes (_held_here):
+        the scale-in line and what hosts hold move during a hold. Each claim leaving it wakes a claim waiting on one
+        of them, if one waits, and its end wakes the best-ranked waiting claim (_wake_at_hold_end), after which no claim
+        passes it over (_hold_ended). The hold ends with that time only, so no build waits longer, and needs a known
+        theory: a batch's next build after a claim from it has none until the next ranking read."""
+        head = (entry[6], entry[7])
+        if not self.settings.locality or host_id is None or (theory := ranking.theories.get(head)) is None:
+            return None
+        mine = self._level(host_id, theory)
+        if mine == 2 or self._best_level(theory, entry[7], host_id, kept) <= mine:
+            return None
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        # A hold another process's claim ended leaves the batch's next build, of another theory, a hold of its own.
+        if (hold := self.holds.get(head)) is None or hold[2] != theory:
+            hold = self.holds[head] = (now, now + LOCALITY_HOLD_SECONDS, theory)
+            if len(self.holds) > MAX_LEASE_HOSTS:  # those of batches that ended unclaimed
+                del self.holds[next(iter(self.holds))]
+            loop.call_later(LOCALITY_HOLD_SECONDS, self._wake_at_hold_end, head, hold)
+        if now >= hold[1]:
+            return None
+        self._wake_holders(ranking, entry, host_id, kept)
+        return hold[1]
+
+    def _hold_ended(self, ranking: "_Ranking", head: tuple[UUID, str]) -> bool:
+        """Whether the build of ``head`` that ``ranking`` knows was held for a holder (see _held) and its hold has
+        ended: it has waited its hold out, so no claim passes it over again."""
+        hold = self.holds.get(head)
+        return (
+            hold is not None and asyncio.get_running_loop().time() >= hold[1] and ranking.theories.get(head) == hold[2]
+        )
+
+    def _held_here(
+        self, ranking: "_Ranking", key: tuple[UUID, str], host_id: str | None, kept: Callable[[str], set[str]]
+    ) -> bool:
+        """Whether the build of ``key`` that ``ranking`` knows is held (see _held) for ``host_id``, a kept host
+        holding the most of its theory now, and its hold hasn't ended."""
+        hold = self.holds.get(key)
+        return (
+            hold is not None and asyncio.get_running_loop().time() < hold[1] and host_id is not None
+            and ranking.theories.get(key) == hold[2] and self._holds_most(host_id, hold[2], key[1], kept)
+        )
+
+    def _held_for(self, tiers: list[str], host_id: str | None) -> frozenset[str]:
+        """The tiers of ``tiers`` of builds held (see _held) whose holds haven't ended and whose theories ``host_id``
+        holds some of, for a claim from ``host_id`` that wasn't woken: it looks for a build of each held for its host
+        (_held_entry), by the scale-in line of the ranking it claims from."""
+        if not self.settings.locality or host_id is None or not self.host_keys.get(host_id):
+            return frozenset()
+        now = asyncio.get_running_loop().time()
+        return frozenset(
+            tier for (_, tier), (_, until, theory) in self.holds.items()
+            if now < until and tier in tiers and self._level(host_id, theory) > 0
+        )
+
+    def _held_entry(
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
+    ) -> RankEntry | None:
+        """The candidate of ``entry``'s tier and priority held for ``host_id`` (_held_here) to take instead of
+        ``entry``, of a theory it holds the most of if several are, or None: when ``entry`` is such a build at
+        least as good, or none is. As in _hinted_entry, not past an ``entry`` whose hold ended or that was passed
+        over LOCALITY_WINDOW times in a row."""
+        head = (entry[6], entry[7])
+        if host_id is None or self.passed_over.get(head, 0) >= LOCALITY_WINDOW or self._hold_ended(ranking, head):
+            return None
+
+        def level(e: RankEntry) -> int:
+            key = (e[6], e[7])
+            if key in ranking.exhausted or not self._held_here(ranking, key, host_id, kept):
+                return 0
+            return self._level(host_id, ranking.theories[key])
+
+        best, most = None, level(entry)
+        for e in ranking.heap:
+            if e[:2] == entry[:2] and ((n := level(e)) > most or n == most and best is not None and e < best):
+                best, most = e, n
+        return best
+
+    def _wake_at_hold_end(self, head: tuple[UUID, str], hold: Hold) -> None:
+        """Wake the best-ranked compatible claim waiting, if one is, for the build of ``head`` whose hold just ended,
+        unless a claim took it: the claim that left it may have taken another build, and nothing else would come
+        for it until work is next made ready. It makes no new work ready, so made_ready stays."""
+        if self.holds.get(head) != hold:
+            return
+        batch_id, tier = head
+        waiter = min(
+            (
+                w for w in self.claim_waiters
+                if tier in w[0] and not w[2].done() and self._quarantine(w[1][3]) is None
+            ),
+            key=lambda w: w[1],
+            default=None,
+        )
+        if waiter is not None:
+            waiter[2].set_result((tier, False, batch_id, hold[2]))
+            self.claim_waiters.remove(waiter)
+
+    def _put_back_hold(self, key: tuple[UUID, str], hold: Hold) -> None:
+        """Put back the hold a claim took for the build of ``key`` it didn't lease, for a concurrent claim leasing
+        it; if the hold ended meanwhile, its end's wake found none, so wake a claim now."""
+        self.holds.setdefault(key, hold)
+        if asyncio.get_running_loop().time() >= hold[1]:
+            self._wake_at_hold_end(key, hold)
+
+    def _wake_holders(
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
+    ) -> None:
+        """Wake a claim waiting on a host candidate ``entry`` is held for, if its hold hasn't ended, as a claim from
+        ``host_id`` passes it over: a holder may have started waiting since the hold began."""
+        head = (entry[6], entry[7])
+        hold, theory = self.holds.get(head), ranking.theories.get(head)
+        if hold is None or asyncio.get_running_loop().time() >= hold[1] or theory != hold[2]:
+            return
+        # The most any kept host holds, this one's included: a build held for this host is held for no other.
+        if (best := self._best_level(theory, entry[7], "", kept)) > 0:
+            holders = {h for h in kept(entry[7]) if h != host_id and self._level(h, theory) == best}
+            self._wake_holder(entry[7], head[0], theory, holders)
+
+    def _wake_holder(self, tier: str, batch_id: UUID, theory: str, holders: set[str]) -> None:
+        """Wake the best-ranked claim waiting on one of ``holders``, the hosts the build of ``batch_id`` and ``tier``,
+        of ``theory``, is held for, if one waits. It makes no new work ready, so made_ready stays."""
+        waiter = min(
+            (
+                w for w in self.claim_waiters
+                if tier in w[0] and not w[2].done() and w[1][3] in holders
+            ),
+            key=lambda w: w[1],
+            default=None,
+        )
+        if waiter is not None:
+            waiter[2].set_result((tier, False, batch_id, theory))
+            self.claim_waiters.remove(waiter)
+            self.locality.wakes += 1
+
+    def _level(self, host_id: str, theory: str) -> int:
+        """What ``host_id`` holds of ``theory``: 2 its checkpoints, as the theory ran there; 1 only its dependency
+        context, as a theory sharing it ran there; 0 neither (or the context isn't known yet)."""
+        keys = self.host_keys.get(host_id)
+        if not keys:
+            return 0
+        if theory in keys:
+            return 2
+        deps = self.theory_deps.get(theory)
+        return 1 if deps is not None and deps in keys else 0
+
+    def _best_level(self, theory: str, tier: str, host_id: str, kept: Callable[[str], set[str]]) -> int:
+        """The most of ``theory`` (_level) a host below the scale-in line other than ``host_id`` that takes ``tier``
+        holds. The line is computed only if some host holds any of it."""
+        if not any(self._level(h, theory) for h in self.host_keys if h != host_id):
+            return 0
+        return max((self._level(h, theory) for h in kept(tier) if h != host_id), default=0)
+
+    def _holds_most(self, host_id: str, theory: str, tier: str, kept: Callable[[str], set[str]]) -> bool:
+        """Whether ``host_id`` is below the scale-in line and holds some of ``theory`` and no less of it than any
+        other kept host that takes ``tier``, so a build of it isn't left for another host."""
+        mine = self._level(host_id, theory)
+        return mine > 0 and host_id in kept(tier) and mine >= self._best_level(theory, tier, host_id, kept)
+
+    def _count_claim(self, theory: str, tier: str, host_id: str, kept: Callable[[str], set[str]]) -> None:
+        """Count a build of ``theory`` and ``tier`` claimed from ``host_id`` by what its host held of it."""
+        mine = self._level(host_id, theory)
+        if mine == 2:
+            self.locality.hit_theory += 1
+        elif mine == 1:
+            self.locality.hit_deps += 1
+        elif self._best_level(theory, tier, host_id, kept) > 0:
+            self.locality.missed_held += 1
+        else:
+            self.locality.unheld += 1
+
+    def _ran_on(self, host_id: str, theory: str) -> None:
+        """Note that ``host_id`` runs an action of ``theory``, so holds its checkpoints and its dependency context, if
+        known, from now on."""
+        keys = self.host_keys.setdefault(host_id, {})
+        for key in (self.theory_deps.get(theory), theory):
+            if key is not None:
+                keys.pop(key, None)
+                keys[key] = None
+        while len(keys) > HOST_LOCALITY_KEYS:
+            del keys[next(iter(keys))]
+
+    def _learn_locality(self, host_id: str, theory: str, result: Result) -> None:
+        """Take the dependency context ``result`` reports for ``theory``, which ran on ``host_id``. A host that failed
+        an action for its own reasons forgets the action's theory and context, so its retry isn't sent back there."""
+        learned = self.theory_deps.get(theory)
+        if result.deps_key is not None:
+            self.theory_deps.pop(theory, None)
+            self.theory_deps[theory] = result.deps_key
+            if len(self.theory_deps) > MAX_THEORY_DEPS:
+                del self.theory_deps[next(iter(self.theory_deps))]
+        keys = self.host_keys.get(host_id, {})
+        if result.status == "failed" and result.failure in INFRA_FAILURES:
+            for key in {theory, learned, result.deps_key} - {None}:
+                keys.pop(key, None)
+        elif result.status != "failed" or result.failure in RAN_FAILURES:
+            self._ran_on(host_id, theory)
+
+    def _kept_hosts(self, ready: int = 0, tier: str = "standard") -> set[str]:
+        """The hosts below the scale-in line for work of ``tier``: in the order claims pack onto them (warm hosts,
+        then by rank and id), the hosts not quarantined whose workers seen lately could run the live leases and the
+        ready builds (the last count's, or ``ready`` if more), and at least the warm workers. High work, which only
+        burst workers take, has a line of its own counting only burst workers: their leases and the ready high
+        builds. A host short of memory counts only the workers it runs or that wait for a claim, as the others wait
+        for memory. A host above the line is to empty, so locality never sends it work."""
+        now = self.clock()
+        high = tier == "high"
+        leases = Counter(host for host, _, tiers in self.lease_hosts.values() if not high or "high" in tiers)
+        waiting = Counter(
+            w_rank[3] for w_tiers, w_rank, w_woken, _ in self.claim_waiters
+            if not w_woken.done() and (not high or "high" in w_tiers)
+        )
+        hosts: list[tuple[tuple[bool, int, str], int]] = []
+        for host_id, workers in self.host_workers.items():
+            fresh = [
+                is_burst for seen, is_burst in workers.values()
+                if (now - seen).total_seconds() < HOST_REPORT_SECONDS and (not high or is_burst)
+            ]
+            if not fresh or self._quarantine(host_id) is not None:
+                continue
+            report = self.hosts.get(host_id)
+            rank = 0 if report is None else report[1].rank
+            # A host reports its leases of all tiers.
+            reported = report[1].leases if report is not None and report[1].leases is not None and not high else 0
+            busy = leases[host_id] + waiting[host_id]
+            short = report is not None and bool(report[1].memory_short)
+            slots = max(reported, busy, 1) if short else max(len(fresh), reported, busy, 1)
+            hosts.append(((all(fresh), rank, host_id), slots))
+        if high:
+            budget = sum(leases[host_id] for (_, _, host_id), _ in hosts) + max(ready, self.ready_high)
+        else:
+            budget = max(self.settings.warm_workers, len(self.lease_hosts) + max(ready, self.ready_builds))
+        kept: set[str] = set()
+        before = 0
+        for (_, _, host_id), slots in sorted(hosts):
+            if before >= budget:
+                break
+            kept.add(host_id)
+            before += slots
+        return kept
+
+    async def _current_ranking(self, key: tuple[str, ...], *, after: float = 0) -> "_Ranking":
+        """Share one read per tier key, fresh enough for invalidations seen on entry and ``after``.
+
+        An empty ranking stays valid for the TTL, until a release invalidates it. An exhausted nonempty ranking
+        needs a new read. A release during a read leaves it shared, but callers arriving after the release wait
+        for it outside the pool and then share another read that includes the newly ready actions.
+        """
+        forgotten = self.rankings_forgotten
+        while True:
+            ranking = self.rankings.get(key)
+            if (
+                ranking is not None and ranking.forgotten >= forgotten
+                and asyncio.get_running_loop().time() - ranking.at < self.settings.claim_ranking_seconds
+                and (ranking.heap or not ranking.ranked) and ranking.at >= after
+            ):
+                return ranking
+            read = self.ranking_reads.get(key)
+            if read is None or read.done():
+
+                async def rank() -> _Ranking:
+                    try:
+                        async with self.engine.connect() as conn:
+                            ranking = await self._rank(conn, key)
+                        self._keep_ranking(key, ranking)
+                        return ranking
+                    finally:
+                        # Clear before completion: awaiting a done stale read never yields to a cleanup callback.
+                        if self.ranking_reads.get(key) is asyncio.current_task():
+                            del self.ranking_reads[key]
+
+                read = asyncio.get_running_loop().create_task(rank())
+                self.ranking_reads[key] = read
+
+                def done(task: asyncio.Task[_Ranking]) -> None:
+                    # Observe failures even when every shielded caller was cancelled.
+                    if not task.cancelled():
+                        task.exception()
+
+                read.add_done_callback(done)
+            # Cancellation belongs to the caller; the read still serves other claims.
+            ranking = await asyncio.shield(read)
+            if ranking.forgotten >= forgotten and ranking.at >= after:
+                return ranking
+
+    async def _rank(self, conn: AsyncConnection, key: tuple[str, ...]) -> "_Ranking":
+        at = asyncio.get_running_loop().time()
+        forgotten = self.rankings_forgotten
+        params = {"tiers": list(key), "classes": ["build"], "run_slots": self.settings.run_slots}
+        rows = (await conn.execute(CLAIM_CANDIDATES, params)).all()
+        heap = [
+            (
+                key.index(row.tier), -row.priority, row.running, row.last_claimed_at is not None,
+                row.last_claimed_at or _NEVER, row.created_at, row.batch_id, row.tier, row.max_heap_mb,
+            )
+            for row in rows
+        ]
+        heapq.heapify(heap)
+        ranking = _Ranking(
+            at, forgotten, heap, {(row.batch_id, row.tier) for row in rows}, set(),
+            rows[0].running_priority if rows else 0, {(row.batch_id, row.tier): row.theory for row in rows},
+        )
+        self._cap_priorities(ranking)
+        return ranking
+
+    def _keep_ranking(self, key: tuple[str, ...], ranking: "_Ranking") -> None:
+        """Share ``ranking`` with later claims, unless a release dropped a ranking while it was read, since its
+        snapshot may predate the actions that release made ready."""
+        if ranking.forgotten == self.rankings_forgotten:
+            self.rankings[key] = ranking
+
+    def _runs_changed(self) -> None:
+        """Drop the run claims' cached "no": a run was made ready or a run slot came free."""
+        self.no_runs.clear()
+        self.runs_changed += 1
+
+    def _forget_rankings(self, batch_id: UUID, tiers: set[str]) -> None:
+        """Drop the rankings that would pass over actions of ``tiers`` made ready in ``batch_id``: those that didn't
+        have it with a ready action of one of them, or have since found it without one. Rankings being read then,
+        may predate those actions. Keep the in-flight read shared; later callers require a post-release read
+        after it finishes, and _keep_ranking discards its stale result."""
+        keys = {key for key in [*self.rankings, *self.ranking_reads] if tiers.intersection(key)}
+        stale = {
+            key for key in keys
+            if key in self.ranking_reads
+            or (ranking := self.rankings.get(key)) is None or not all(
+                (batch_id, tier) in ranking.ranked and (batch_id, tier) not in ranking.exhausted
+                for tier in tiers if tier in key
+            )
+        }
+        if stale:
+            self.rankings_forgotten += 1
+            for key in stale:
+                self.rankings.pop(key, None)
+
+    def _wake_claim(
+        self, tier: str, *, ahead: bool = False, batch_id: UUID | None = None, theory: str | None = None
+    ) -> None:
+        """Wake the best-ranked compatible claim, with FIFO ties, for an action of ``batch_id`` and ``theory`` made
+        ready, if it is for one: of those on hosts below the scale-in line that take ``tier``, the best-ranked that
+        hold the most of ``theory`` (see _local_entry), if more than the best-ranked claim's host. Only normal wakes
+        count newly ready work; changes for capable claims are recorded by _ahead_changed."""
+        if not ahead:
+            self.made_ready += 1
+        compatible = [
+            w for w in self.claim_waiters
+            if tier in w[0] and not w[2].done() and (w[3] or not ahead) and self._quarantine(w[1][3]) is None
+        ]
+        waiter = min(compatible, key=lambda w: w[1], default=None)
+        if waiter is not None and theory is not None and self.settings.locality:
+            level = self._level(waiter[1][3], theory)
+            holders = [w for w in compatible if self._level(w[1][3], theory) > level]
+            kept = self._kept_hosts(1, tier) if holders else set()  # with the build made ready
+            holders = [w for w in holders if w[1][3] in kept]
+            best = max((self._level(w[1][3], theory) for w in holders), default=0)
+            local = min((w for w in holders if self._level(w[1][3], theory) == best), key=lambda w: w[1], default=None)
+            if local is not None:
+                waiter = local
+                self.locality.wakes += 1
+        if waiter is not None:
+            waiter[2].set_result((tier, ahead, batch_id, theory))
+            self.claim_waiters.remove(waiter)
+
+    def _pass_wake(self, woken: asyncio.Future[Wake]) -> None:
+        """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""
         if woken.done() and not woken.cancelled():
-            self.made_ready -= 1
-            self._wake_claim(woken.result())
+            tier, ahead, batch_id, theory = woken.result()
+            if not ahead:
+                self.made_ready -= 1
+            self._wake_claim(tier, ahead=ahead, batch_id=batch_id, theory=theory)
+
+    async def _peers(self, batch_id: UUID, action: sa.Row[Any]) -> list[sa.Row[Any]]:
+        """The waiting and ready copies of build ``action`` of ``batch_id``, whose lease just ended, in other
+        running batches, with their batch, tier, state, spec and ahead opt-in; see PEERS. Read once the lease's deletion
+        committed, so a batch submitted meanwhile is either found or was never held."""
+        if action.action_class != "build":
+            return []
+        async with self.engine.connect() as conn:
+            return list(await conn.execute(PEERS, {"batch_id": batch_id, "input_key": action.input_key}))
+
+    def _wake_peers(self, peers: list[sa.Row[Any]]) -> None:
+        """Have claims take the ``peers`` now that the lease holding them back ended: the ready ones as if just made
+        ready, the waiting ones ahead of their parents."""
+        for peer in peers:
+            if peer.state == "ready":
+                self._forget_rankings(peer.batch_id, {peer.tier})
+                self._wake_claim(peer.tier)
+        if any(peer.state == "waiting" and peer.ahead_batch for peer in peers):
+            self._ahead_changed()
+
+    async def _finish_peers(self, batch_id: UUID, transactions: asyncio.Semaphore) -> None:
+        """Mark done the copies in ``batch_id`` that other batches' workers built and published (see complete),
+        those no claim took meanwhile, in one transaction; each keeps its builder's log for the client to show. The
+        keys are passed over by claims until it commits."""
+        queued = dict(self.peers_done.get(batch_id, {}))
+        if not queued:
+            return
+        done: list[str] = []
+        async with transactions, self.engine.begin() as conn:
+            if await self._lock_batch(conn, batch_id) == "running":
+                done = list(
+                    await conn.scalars(
+                        FINISH_PEERS,
+                        {"batch_id": batch_id, "keys": list(queued), "logs": [log for log, _ in queued.values()]},
+                    )
+                )
+                if done:
+                    await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": done})
+                    await self._finish_if_done(conn, batch_id)
+        remaining = self.peers_done.get(batch_id, {})
+        for key in queued:
+            remaining.pop(key, None)
+        if not remaining:
+            self.peers_done.pop(batch_id, None)
+        if done:
+            self._batch_changed(batch_id)
+            if any(ahead for _, ahead in queued.values()):
+                self._ahead_changed()  # their children may now be claimed ahead
 
     def report_host(self, report: HostReport) -> None:
-        """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one."""
+        """Take a worker's report of its host. A report without ``cpu_idle_pct`` keeps the host's last one, and one
+        without readings changes nothing, so the host's last readings keep their age."""
+        if report.memory_short is None:
+            return
         previous = self.hosts.get(report.id)
         if previous is None and len(self.hosts) >= MAX_HOSTS:
             return
@@ -652,43 +2323,177 @@ class Coordinator:
             report = replace(report, cpu_idle_pct=previous[1].cpu_idle_pct)
         self.hosts[report.id] = (self.clock(), report)
 
+    def report_worker(self, host_id: str, worker: str, tiers: list[str], *, idle: bool = False) -> None:
+        """Note that ``worker``, claiming ``tiers``, runs on reported host ``host_id``, for the autoscaler's count of
+        the workers quarantined hosts hold, also before the host sent readings. An ``idle`` worker, claiming or
+        waiting to claim, runs no action: the leases still noted for it ended without its result, as when their batch
+        was cancelled, and are forgotten."""
+        if idle:
+            for token in [t for t, (h, w, _) in self.lease_hosts.items() if h == host_id and w == worker]:
+                del self.lease_hosts[token]
+        if host_id in self.host_workers or len(self.host_workers) < MAX_HOSTS:
+            self.host_workers.setdefault(host_id, {})[worker] = (self.clock(), "high" in tiers)
+
+    def _lease_host(self, token: UUID, host_id: str, worker: str, tiers: list[str]) -> None:
+        self.lease_hosts[token] = (host_id, worker, tiers)
+        if len(self.lease_hosts) > MAX_LEASE_HOSTS:
+            del self.lease_hosts[next(iter(self.lease_hosts))]
+
+    def _quarantine(self, host_id: str) -> Quarantine | None:
+        """Why host ``host_id`` gets no work, or None if it gets its share: its latest report, if fresh, has less
+        than DISK_FLOOR free, or its last QUARANTINE_FAILURES results were infrastructure failures. A host short
+        on disk gets out by reporting room; one that only fails, by a probe claim that succeeds."""
+        entry = self.hosts.get(host_id)
+        if entry is not None and (self.clock() - entry[0]).total_seconds() < HOST_REPORT_SECONDS:
+            free = entry[1].disk_free
+            if free is not None and free < DISK_FLOOR:
+                return "disk"
+        if self._failing(host_id):
+            return "failures"
+        return None
+
+    def _failing(self, host_id: str) -> bool:
+        count, batch = self.infra_streak.get(host_id, (0, None))
+        return count >= QUARANTINE_FAILURES and batch is None
+
+    def _record_result(self, host_id: str, batch_id: UUID, result: Result) -> None:
+        """Count ``result`` of batch ``batch_id`` from host ``host_id`` towards its quarantine. Only a result showing
+        the host ran the action ends a quarantine for failures, so another failed probe restarts its PROBE_SECONDS;
+        a failure that says nothing about the host, as loading ahead given up, leaves the count as it is."""
+        failing = self._failing(host_id)
+        if result.status != "failed" or result.failure in RAN_FAILURES:
+            self.infra_streak.pop(host_id, None)
+            self.probe_at.pop(host_id, None)
+        elif result.failure in INFRA_FAILURES:
+            count, batch = self.infra_streak.get(host_id, (0, batch_id))
+            self.infra_streak[host_id] = (count + 1, batch if batch == batch_id else None)
+            if self._failing(host_id):
+                self.probe_at[host_id] = self.clock()
+        elif result.failure == "ahead-abandoned":
+            pass
+        elif not failing:
+            self.infra_streak.pop(host_id, None)
+        else:
+            self.probe_at[host_id] = self.clock()
+
+    def _quarantined_workers(self) -> tuple[int, int]:
+        """The warm and burst workers on quarantined hosts that hold no lease. One running an action stays
+        capacity for that action, which the queue counts as running, until it ends."""
+        busy = {(host_id, worker) for host_id, worker, _ in self.lease_hosts.values()}
+        warm = burst = 0
+        for host_id, workers in self.host_workers.items():
+            if self._quarantine(host_id) is not None:
+                for worker, (_, is_burst) in workers.items():
+                    if (host_id, worker) not in busy:
+                        burst += is_burst
+                        warm += not is_burst
+        return warm, burst
+
+    def _burst_demand(self, counts: QueueCounts) -> int:
+        """``burst_demand`` with the workers of quarantined hosts left out of the capacity: their warm workers
+        don't count as warm, and while there is demand, burst workers replace theirs."""
+        warm, burst = self._quarantined_workers()
+        demand = burst_demand(
+            counts, max(0, self.settings.warm_workers - warm), self.settings.max_burst_workers, self.settings.run_slots
+        )
+        return min(self.settings.max_burst_workers, demand + burst) if demand else 0
+
     def report_phases(self, report: PhaseReport) -> None:
         """Take a worker's report of where its time went."""
+        if len(self.phase_reports) >= MAX_PHASE_REPORTS:
+            self._drop_oldest_phases()
         self.phase_reports.append((self.clock(), report))
+        for name in PHASE_FIELDS:
+            self.phase_sums[name] += getattr(report, name)
+
+    def _drop_oldest_phases(self) -> None:
+        _, report = self.phase_reports.popleft()
+        if not self.phase_reports:  # sums of none, without the rounding error the subtractions left
+            self.phase_sums = dict.fromkeys(PHASE_FIELDS, 0.0)
+            return
+        for name in PHASE_FIELDS:
+            self.phase_sums[name] -= getattr(report, name)
 
     def _phase_totals(self, now: datetime) -> PhaseTotals:
         while self.phase_reports and (now - self.phase_reports[0][0]).total_seconds() >= PHASE_WINDOW_SECONDS:
-            self.phase_reports.popleft()
-        sums = {
-            field.name: round(sum(getattr(report, field.name) for _, report in self.phase_reports), 1)
-            for field in fields(PhaseReport)
-        }
+            self._drop_oldest_phases()
+        sums = {name: round(total, 1) for name, total in self.phase_sums.items()}
         return PhaseTotals(PHASE_WINDOW_SECONDS, len(self.phase_reports), PhaseReport(**sums))
 
-    async def heartbeat(self, token: UUID) -> bool:
-        """Extend a live lease; False when it expired or was revoked, so the worker should stop."""
+    async def heartbeat(self, token: UUID, arrived: datetime | None = None) -> bool:
+        """Extend a live lease; False when it expired or was revoked, so the worker should stop. The worker runs one
+        action at a time, so it holds none of its other live leases claimed before the heartbeat ``arrived``: they end
+        as ``release_unheld`` ends them. One claimed since may be one it runs, the heartbeat having outlasted the
+        worker's wait for it and its result."""
+        arrived = arrived or datetime.now(UTC)
         async with self.engine.begin() as conn:
-            result = await conn.execute(
+            worker = await conn.scalar(
                 sa.text(
                     "UPDATE leases SET expires_at = now() + make_interval(secs => :lease) "
-                    "WHERE attempt_token = :token AND expires_at > now()"
+                    "WHERE attempt_token = :token AND expires_at > now() RETURNING worker"
                 ),
                 {"token": token, "lease": self.settings.lease_seconds},
             )
-            return result.rowcount == 1
+            unheld = [] if worker is None else list(
+                await conn.execute(UNHELD_LEASES, {"worker": worker, "held": token, "before": arrived})
+            )
+        await self._end_unheld(unheld)
+        live = worker is not None
+        # A worker running one long action claims nothing meanwhile: its heartbeats keep it counted on its host.
+        if live and (lease := self.lease_hosts.get(token)) is not None:
+            self.report_worker(*lease)
+        return live
 
     async def complete(self, token: UUID, result: Result) -> bool:
         """Apply a worker's result record; False when its lease is stale, and the record is dropped.
 
         Raises ResultMismatch when the record is for another action than the lease's.
         """
+        # Forgotten only once the result is applied or dropped: a worker retries a completion that failed.
+        leased = self.lease_hosts.get(token)
+        # A build holds its batch shared, so the builds of a batch finish at once, while a cancel, the deadline or
+        # the batch's end waits for them; a failure, which may retry, skip descendants or end the batch, holds it
+        # alone. Peak hints are raised once the result committed, outside its locks: many copies of one theory
+        # finishing together raise the same hint.
+        built = result.status != "failed"
+        peaks: list[tuple[str, str, str, int]] = []
         async with self.engine.begin() as conn:
             batch_id = await conn.scalar(
                 sa.text("SELECT batch_id FROM leases WHERE attempt_token = :token"), {"token": token}
             )
             if batch_id is None:
+                self.lease_hosts.pop(token, None)
                 return False
-            await self._lock_batch(conn, batch_id)
+            if await self._lock_batch(conn, batch_id, shared=built) != "running" or await conn.scalar(
+                sa.text("SELECT failure IS NOT NULL FROM batches WHERE id = :id"), {"id": batch_id}
+            ):
+                # Revoked with its batch (a cancel, a final failure, the deadline): the worker stopped the action, and
+                # only the log it left is kept, for the client to show how far it got.
+                revoked = (
+                    await conn.execute(
+                        sa.text("DELETE FROM leases WHERE attempt_token = :token RETURNING input_key"),
+                        {"token": token},
+                    )
+                ).first()
+                if revoked is None:
+                    self.lease_hosts.pop(token, None)
+                    return False
+                # A record for another action rolls the lease's deletion back, as on a live lease.
+                kept = await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET log_sha256 = COALESCE(:log, log_sha256) "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key AND spec_sha256 = :spec"
+                    ),
+                    {"log": result.log_sha256, "batch_id": batch_id, "input_key": revoked.input_key,
+                     "spec": result.spec_sha256},
+                )
+                if kept.rowcount != 1 or result.input_key not in (None, revoked.input_key):
+                    raise ResultMismatch(
+                        f"result for {result.input_key} (spec {result.spec_sha256}) does not match the lease's "
+                        f"action {revoked.input_key}"
+                    )
+                self.lease_hosts.pop(token, None)
+                return True
             lease = (
                 await conn.execute(
                     sa.text(
@@ -698,11 +2503,15 @@ class Coordinator:
                 )
             ).first()
             if lease is None:
+                self.lease_hosts.pop(token, None)
                 return False
+            if built:
+                await conn.execute(LOCK_BUILT, {"batch_id": batch_id, "key": lease.input_key})
             action = (
                 await conn.execute(
                     sa.text(
-                        "SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.last_failure, a.class AS action_class, b.profile "
+                        "SELECT a.input_key, a.spec_sha256, a.theory, a.tier, a.attempts, a.interruptions, a.last_failure, "
+                        "a.class AS action_class, a.ahead, a.remaining_deps, b.profile, b.ahead_cap IS NOT NULL AS ahead_batch "
                         "FROM actions a JOIN batches b ON b.id = a.batch_id "
                         "WHERE a.batch_id = :batch_id AND a.input_key = :input_key"
                     ),
@@ -714,57 +2523,111 @@ class Coordinator:
                     f"result for {result.input_key} (spec {result.spec_sha256}) does not match the lease's action "
                     f"{action.input_key} (spec {action.spec_sha256})"
                 )
+            # A failure without a log, such as an interruption, keeps the log an earlier attempt left, the only
+            # evidence of why that one failed.
             await conn.execute(
                 sa.text(
-                    "UPDATE actions SET log_sha256 = :log, last_failure = :failure, "
-                    "timings = CAST(CAST(:timings AS text) AS jsonb) "
+                    "UPDATE actions SET log_sha256 = CASE WHEN CAST(:failed AS boolean) "
+                    "THEN COALESCE(:log, log_sha256) ELSE :log END, last_failure = :failure, failure_detail = :detail, "
+                    "timings = CAST(CAST(:timings AS text) AS jsonb), finished_at = now() "
                     "WHERE batch_id = :batch_id AND input_key = :input_key"
                 ),
                 {
+                    "failed": result.status == "failed",
                     "log": result.log_sha256,
                     "failure": result.failure,
+                    "detail": result.detail,
                     "timings": json.dumps(result.timings) if result.timings is not None else None,
                     "batch_id": batch_id,
                     "input_key": lease.input_key,
                 },
             )
             package, theory = action.theory.split(":", 1)
-            if result.status != "failed":
-                await self._set_state(conn, batch_id, action.input_key, "done")
-                if result.peak_rss_mb is not None:
-                    await self._record_peak(conn, package, theory, action.profile, result.peak_rss_mb)
-                await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [action.input_key]})
-                await self._finish_if_done(conn, batch_id)
-            elif result.failure == "memory" and action.tier == "standard":
+            # Whether a slot of the batch's cap may be free, or the action's children may be claimed ahead, now: a
+            # failure frees the action's slot if it was claimed ahead, and those of the actions claimed ahead of it,
+            # which it revokes or cancels.
+            unblocked = action.ahead_batch and result.status == "failed"
+            if result.failure == "memory" and action.tier == "standard":
                 # The tier it failed on is the hint: future batches place this theory on the high tier.
-                await self._record_peak(conn, package, theory, action.profile, self.settings.standard_tier_mb)
+                peaks.append((package, theory, action.profile, self.settings.standard_tier_mb))
                 await conn.execute(
                     sa.text("UPDATE actions SET tier = 'high' WHERE batch_id = :batch_id AND input_key = :input_key"),
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
-                await self._retry(conn, batch_id, action.input_key)
-            elif result.failure == "unavailable":
-                # The worker couldn't start it, so it doesn't count as an attempt.
+            if built:
+                await self._set_state(conn, batch_id, action.input_key, "done")
+                if result.peak_rss_mb is not None:
+                    peaks.append((package, theory, action.profile, result.peak_rss_mb))
+                await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [action.input_key]})
+                if action.ahead_batch:
+                    refreshed = (
+                        await conn.execute(REFRESH_AHEAD_CHILDREN, {"batch_id": batch_id, "key": action.input_key})
+                    ).all()
+                    unblocked = any(child.remaining_deps == 0 for child in refreshed)
+                    if self.settings.ahead_depth != 1:
+                        # A child still waiting for a parent may be a generation nearer, so its own children may be
+                        # claimed ahead now; and an action claimed ahead that finished before its parents' results
+                        # came frees its slot of the cap.
+                        unblocked = bool(refreshed) or (action.ahead == "ahead" and action.remaining_deps > 0)
+            elif result.failure == "ahead-abandoned" and action.ahead == "ahead":
+                # Loading ahead gave up; the action is built once its parents are done, and the try costs no attempt.
                 await conn.execute(
                     sa.text(
-                        "UPDATE actions SET attempts = attempts - 1 WHERE batch_id = :batch_id AND input_key = :input_key"
+                        "UPDATE actions SET attempts = attempts - 1, ahead = 'abandoned' "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
                     ),
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
-                await self._retry(conn, batch_id, action.input_key)
+                await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)
+            elif result.failure == "unavailable" and action.interruptions < self.settings.max_interruptions:
+                # The worker couldn't start or finish it, so it doesn't count as an attempt.
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1 "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {"batch_id": batch_id, "input_key": action.input_key},
+                )
+                await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)
             elif action.attempts < self.settings.max_attempts and (
-                result.failure in ("publish", "toolchain", "internal", "memory")
+                # ``ahead-abandoned`` from an action not claimed ahead is an error in the worker.
+                result.failure in ("publish", "toolchain", "internal", "memory", "unavailable", "ahead-abandoned")
                 or (result.failure == "disk" and action.last_failure != "disk")
             ):
-                await self._retry(conn, batch_id, action.input_key)
+                await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)
             elif result.failure == "input-missing":
                 self._forget_cache_findings()
-                await self._input_missing(conn, batch_id, action.input_key, action.theory, action.attempts, result)
-            else:
-                await self._fail(
-                    conn, batch_id, action.input_key, action.action_class, f"{action.theory}: {result.failure}"
+                await self._input_missing(
+                    conn, batch_id, action.input_key, action.theory, action.attempts, result,
+                    ahead_batch=action.ahead_batch,
                 )
+            else:
+                detail = f": {result.detail}" if result.detail else ""
+                await self._fail(
+                    conn, batch_id, action.input_key, action.action_class, f"{action.theory}: {result.failure}{detail}"
+                )
+        if action.action_class == "run":
+            self._runs_changed()  # a run slot came free, or the run is ready again
+        for peak in peaks:
+            await self._record_peak(*peak)
+        if built:
+            await self._finish_when_done(batch_id)
+        self.lease_hosts.pop(token, None)
+        if leased is not None:
+            self._record_result(leased[0], batch_id, result)
+            self._learn_locality(leased[0], action.theory, result)
+        self._batch_changed(batch_id)
         self.request_release(batch_id)
+        if unblocked:
+            self._ahead_changed()
+        peers = await self._peers(batch_id, action)
+        done = [] if result.status == "failed" else [peer for peer in peers if peer.spec_sha256 == action.spec_sha256]
+        self._wake_peers([peer for peer in peers if peer not in done])
+        # Marked done by a release, a transaction per batch for all the keys completed meanwhile: one per copy here
+        # held the worker's request through up to a dozen batch locks, which the copies' releases also take.
+        for peer in done:
+            self.peers_done.setdefault(peer.batch_id, {})[action.input_key] = (result.log_sha256, peer.ahead_batch)
+            self.request_release(peer.batch_id)
         return True
 
     def request_release(self, batch_id: UUID | None = None) -> None:
@@ -802,18 +2665,35 @@ class Coordinator:
         A parent the cache doesn't hold is re-queued; a parent the cache can't be asked about leaves its children
         waiting for the next sweep. Each batch's actions are made ready as soon as the cache has answered for that
         batch's parents, so a slow answer holds up only its own batch. No transaction is open during the cache
-        requests. A pass that takes RELEASE_SLOW_SECONDS or more is logged.
+        requests. A pass that takes RELEASE_SLOW_SECONDS or more is logged. Each pass first marks done the copies of
+        builds other batches finished (see _finish_peers), so the children that frees are released in the same pass.
         """
+        transactions = asyncio.Semaphore(RELEASE_TRANSACTIONS)
         while True:
             started = time.monotonic()
+            finishing = list(self.peers_done) if batch_id is None else [batch_id]
+            for batch, result in zip(
+                finishing,
+                await asyncio.gather(
+                    *(self._finish_peers(batch, transactions) for batch in finishing), return_exceptions=True
+                ),
+                strict=True,
+            ):
+                if isinstance(result, BaseException):
+                    if not isinstance(result, Exception):
+                        raise result
+                    logger.error("finishing the copies in %s failed", batch, exc_info=result)
             async with self.engine.connect() as conn:
-                rows = await conn.execute(RELEASABLE, {"batch_id": batch_id})
+                if batch_id is None:
+                    rows = await conn.execute(RELEASABLE_ALL)
+                else:
+                    rows = await conn.execute(RELEASABLE_BATCH, {"batch_id": batch_id})
                 candidates: defaultdict[UUID, dict[str, list[tuple[str, str]]]] = defaultdict(dict)
                 for row in rows:
                     candidates[row.batch_id][row.input_key] = list(row.parents)
             limit = asyncio.Semaphore(RELEASE_CACHE_CHECKS)
             results = await asyncio.gather(
-                *(self._release_batch(batch, actions, limit) for batch, actions in candidates.items()),
+                *(self._release_batch(batch, actions, limit, transactions) for batch, actions in candidates.items()),
                 return_exceptions=True,  # one batch's failure doesn't cut the others' releases short
             )
             for batch, result in zip(candidates, results, strict=True):
@@ -833,85 +2713,175 @@ class Coordinator:
                 return
 
     async def _release_batch(
-        self, batch_id: UUID, candidates: dict[str, list[tuple[str, str]]], limit: asyncio.Semaphore
+        self,
+        batch_id: UUID,
+        candidates: dict[str, list[tuple[str, str]]],
+        limit: asyncio.Semaphore,
+        transactions: asyncio.Semaphore,
     ) -> bool:
-        """``release`` of the ``candidates`` of one batch, their parents' cache checks ``limit`` at a time with the
-        other batches' of the pass. Whether it re-queued a parent."""
+        """``release`` of the ``candidates`` of one batch, their parents' cache checks ``limit`` and its
+        transactions ``transactions`` at a time with the other batches' of the pass. Whether it re-queued a parent."""
         present = await self._in_cache_all({ac_key for parents in candidates.values() for _, ac_key in parents}, limit)
         ready = [key for key, parents in candidates.items() if all(present[ac_key] for _, ac_key in parents)]
         if ready:
             # Taking the batch's lock before its actions', as every other writer does.
-            async with self.engine.begin() as conn:
+            async with transactions, self.engine.begin() as conn:
                 if await self._lock_batch(conn, batch_id) != "running":
                     return False
-                tiers = await conn.scalars(
-                    sa.text(
-                        "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
-                        "AND input_key = ANY(:keys) AND state = 'waiting' AND remaining_deps = 0 RETURNING tier"
-                    ),
-                    {"batch_id": batch_id, "keys": ready},
+                made_ready = list(
+                    await conn.execute(
+                        sa.text(
+                            "UPDATE actions SET state = 'ready' WHERE batch_id = :batch_id "
+                            "AND input_key = ANY(:keys) AND state = 'waiting' AND remaining_deps = 0 "
+                            "RETURNING tier, theory, class AS action_class"
+                        ),
+                        {"batch_id": batch_id, "keys": ready},
+                    )
                 )
-                made_ready = list(tiers)
-            for tier in made_ready:
-                self._wake_claim(tier)
+            self._batch_changed(batch_id)
+            self._forget_rankings(batch_id, {row.tier for row in made_ready})
+            if any(row.action_class == "run" for row in made_ready):
+                self._runs_changed()
+            for row in made_ready:
+                self._wake_claim(row.tier, batch_id=batch_id, theory=row.theory)
         requeued = False
         for parents in candidates.values():
             for parent, ac_key in parents:
                 if present[ac_key] is False:
-                    requeued |= await self._requeue_evicted(batch_id, parent)
+                    async with transactions:
+                        requeued |= await self._requeue_evicted(batch_id, parent)
         return requeued
 
     async def expire_leases(self) -> None:
         """Send the actions of expired leases back to waiting, or fail them once they used up their attempts.
 
-        ``sweep`` asks for their release afterwards.
+        A lease its batch revoked (``_end_batch``, ``fail_overdue``) is kept ``lease_seconds`` longer, for its worker to
+        report the log of the action it stopped. ``sweep`` asks for their release afterwards.
         """
         async with self.engine.connect() as conn:
             expired = list(
-                await conn.execute(sa.text("SELECT attempt_token, batch_id FROM leases WHERE expires_at <= now()"))
+                await conn.execute(
+                    sa.text(
+                        # Only expired leases' batches, each by key: a join reads every batch retention keeps.
+                        "SELECT l.attempt_token, l.batch_id FROM leases l "
+                        "WHERE l.expires_at <= now() AND l.expires_at <= now() - CASE WHEN ("
+                        "SELECT b.state = 'running' AND b.failure IS NULL FROM batches b WHERE b.id = l.batch_id"
+                        ") THEN interval '0' ELSE make_interval(secs => :lease) END"
+                    ),
+                    {"lease": self.settings.lease_seconds},
+                )
             )
         for token, batch_id in expired:
-            async with self.engine.begin() as conn:
-                await self._lock_batch(conn, batch_id)
-                lease = (
-                    await conn.execute(
-                        sa.text(
-                            "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now() "
-                            "RETURNING input_key"
-                        ),
-                        {"token": token},
+            await self._end_lease(token, batch_id)
+
+    async def release_unheld(self, worker: str, held: str | None, before: datetime) -> None:
+        """End the live leases of ``worker`` claimed ``before`` the claim that just ``held`` one arrived: it claims
+        only while it runs nothing, so it holds none of them. The answer to the claim that took each never reached it
+        (it gave up waiting for a slow coordinator), or it gave up reporting the result. Each action goes back at once
+        and, as an ``unavailable`` result does, doesn't count the attempt. A lease claimed since may be one the worker
+        runs: it gave up on this claim and claimed again before this ran."""
+        async with self.engine.connect() as conn:
+            unheld = list(await conn.execute(UNHELD_LEASES, {"worker": worker, "held": held, "before": before}))
+        await self._end_unheld(unheld)
+
+    async def _end_unheld(self, unheld: list[sa.Row[Any]]) -> None:
+        for token, batch_id in unheld:
+            await self._end_lease(token, batch_id, unheld=True)
+            self.request_release(batch_id)
+
+    async def _end_lease(self, token: UUID, batch_id: UUID, *, unheld: bool = False) -> None:
+        """End lease ``token`` of ``batch_id`` without its worker's result: one that expired, or with ``unheld`` a
+        live one its worker never got (``release_unheld``)."""
+        ahead_freed = False
+        async with self.engine.begin() as conn:
+            await self._lock_batch(conn, batch_id)
+            lease = (
+                await conn.execute(
+                    sa.text(
+                        "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now() "
+                        "RETURNING input_key, worker"
                     )
-                ).first()
-                if lease is None:
-                    continue
-                action = (
-                    await conn.execute(
-                        sa.text(
-                            "SELECT theory, state, attempts, class AS action_class FROM actions "
-                            "WHERE batch_id = :batch_id AND input_key = :input_key FOR UPDATE"
-                        ),
-                        {"batch_id": batch_id, "input_key": lease.input_key},
-                    )
-                ).one()
-                if action.state != "running":
-                    continue
-                if action.attempts >= self.settings.max_attempts:
-                    await conn.execute(
-                        sa.text(
-                            "UPDATE actions SET last_failure = 'internal' "
-                            "WHERE batch_id = :batch_id AND input_key = :input_key AND class = 'run'"
-                        ),
-                        {"batch_id": batch_id, "input_key": lease.input_key},
-                    )
+                    if unheld
+                    else sa.text(
+                        "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now() "
+                        "RETURNING input_key, worker"
+                    ),
+                    {"token": token},
+                )
+            ).first()
+            if lease is None:
+                return
+            self.lease_hosts.pop(token, None)
+            action = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT a.input_key, a.spec_sha256, a.theory, a.state, a.attempts, a.interruptions, "
+                        "a.class AS action_class, a.ahead, a.remaining_deps, b.ahead_cap IS NOT NULL AS ahead_batch "
+                        "FROM actions a JOIN batches b ON b.id = a.batch_id "
+                        "WHERE a.batch_id = :batch_id AND a.input_key = :input_key FOR UPDATE OF a"
+                    ),
+                    {"batch_id": batch_id, "input_key": lease.input_key},
+                )
+            ).one()
+            if action.state != "running":
+                return
+            if unheld and action.interruptions < self.settings.max_interruptions:
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1, "
+                        "last_failure = 'unavailable', failure_detail = :detail "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {"batch_id": batch_id, "input_key": lease.input_key,
+                     "detail": f"{lease.worker} went on without this lease: its claim's answer or its result was lost"},
+                )
+                await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
+                ahead_freed = action.ahead_batch  # the retry revokes what was claimed ahead of it
+            elif action.ahead == "ahead" and action.remaining_deps > 0:
+                # Lost while waiting ahead (a reclaimed burst host, say): given up as loading ahead is, without
+                # the attempt counting.
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET attempts = attempts - 1, ahead = 'abandoned' "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {"batch_id": batch_id, "input_key": lease.input_key},
+                )
+                await self._retry(conn, batch_id, lease.input_key, ahead_batch=True)
+                ahead_freed = True
+            else:
+                # The worker never reported, so all there is to go on is which workers lost it: the detail lists
+                # those of the expiries in a row.
+                final = action.attempts >= self.settings.max_attempts
+                detail = await conn.scalar(
+                    sa.text(
+                        "UPDATE actions SET last_failure = CASE WHEN class = 'run' AND CAST(:final AS boolean) "
+                        "THEN 'internal' ELSE :failure END, failure_detail = CASE "
+                        "WHEN last_failure = 'lease expired' AND failure_detail IS NOT NULL "
+                        "THEN failure_detail || ', ' || :worker ELSE :worker END "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key RETURNING failure_detail"
+                    ),
+                    {"batch_id": batch_id, "input_key": lease.input_key, "worker": lease.worker, "final": final,
+                     "failure": f"lease expired {action.attempts} times" if final else "lease expired"},
+                )
+                if final:
                     await self._fail(
                         conn,
                         batch_id,
                         lease.input_key,
                         action.action_class,
-                        f"{action.theory}: lease expired {action.attempts} times",
+                        f"{action.theory}: lease expired {action.attempts} times: {detail}",
                     )
                 else:
-                    await self._retry(conn, batch_id, lease.input_key)
+                    await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
+                ahead_freed = action.ahead_batch  # the retry revokes what was claimed ahead of it
+        # After the commit, so the claims woken see the slots of the cap this freed.
+        if action.action_class == "run":
+            self._runs_changed()
+        if ahead_freed:
+            self._ahead_changed()
+        self._wake_peers(await self._peers(batch_id, action))
+        self._batch_changed(batch_id)
 
     async def fail_overdue(self) -> None:
         """Fail the batches still running ``batch_deadline_hours`` after their submission: one that can't finish,
@@ -928,10 +2898,33 @@ class Coordinator:
                     {"secs": hours * 3600},
                 )
             )
+        failure = f"deadline: still running after {hours:g} h"
         for batch_id in overdue:
             async with self.engine.begin() as conn:
-                if await self._lock_batch(conn, batch_id) == "running":
-                    await self._end_batch(conn, batch_id, "failed", f"deadline: still running after {hours:g} h")
+                if await self._lock_batch(conn, batch_id) != "running":
+                    continue
+                if (await conn.execute(FINISH_IF_DONE, {"id": batch_id})).rowcount:
+                    pass  # Its last build committed but it wasn't ended yet (see _finish_when_done): done, not overdue.
+                elif not await conn.scalar(
+                    sa.text("SELECT EXISTS (SELECT 1 FROM leases WHERE batch_id = :id)"), {"id": batch_id}
+                ):
+                    await self._end_batch(conn, batch_id, "failed", failure)
+                elif await conn.scalar(sa.text("SELECT failure IS NULL FROM batches WHERE id = :id"), {"id": batch_id}):
+                    # The batch stays running until its workers report the logs of the actions they stop, or their
+                    # leases go, so the client following it gets those logs.
+                    await conn.execute(
+                        sa.text("UPDATE batches SET failure = :failure WHERE id = :id"),
+                        {"id": batch_id, "failure": failure},
+                    )
+                    await conn.execute(
+                        sa.text(
+                            "UPDATE actions SET last_failure = 'deadline', failure_detail = :detail "
+                            "WHERE batch_id = :id AND state = 'running'"
+                        ),
+                        {"id": batch_id, "detail": f"still running after {hours:g} h"},
+                    )
+                    await self._cancel_unfinished(conn, batch_id)
+            self._batch_changed(batch_id)
 
     async def delete_expired(self) -> None:
         """Delete terminal batches past the retention period, a bounded number at a time, and stale peak hints."""
@@ -948,7 +2941,13 @@ class Coordinator:
                 break
         async with self.engine.begin() as conn:
             await conn.execute(
-                sa.text("DELETE FROM peak_hints WHERE updated_at < now() - make_interval(days => :days)"),
+                sa.text(
+                    "WITH locked AS (SELECT package, theory, profile FROM peak_hints "
+                    "WHERE updated_at < now() - make_interval(days => :days) "
+                    "ORDER BY package, theory, profile FOR UPDATE) "
+                    "DELETE FROM peak_hints h USING locked l "
+                    "WHERE (h.package, h.theory, h.profile) = (l.package, l.theory, l.profile)"
+                ),
                 {"days": self.settings.hint_ttl_days},
             )
 
@@ -958,22 +2957,84 @@ class Coordinator:
         process in the last ``HOST_REPORT_SECONDS``, by id, and this process's last run of the scale command."""
         async with self.engine.connect() as conn:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
-            rows = await conn.execute(
-                sa.text(
-                    "SELECT state, tier, class, count(*) FROM actions "
-                    "WHERE state IN ('waiting', 'ready', 'running') GROUP BY state, tier, class"
-                )
-            )
-            count: defaultdict[tuple[str, str], int] = defaultdict(int)
-            runs: defaultdict[str, int] = defaultdict(int)
-            high_run = 0
-            for state, tier, action_class, n in rows:
+            counts = await self._counts(conn, COUNT_UNFINISHED)
+        self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
+        self.ready_high = counts.ready_high - counts.ready_high_run
+        now = self.clock()
+        self._forget_silent_hosts(now)
+        demand = self._burst_demand(counts)
+        hosts = [
+            HostStatus(report, round((now - at).total_seconds(), 1), self._quarantine(host_id))
+            for host_id, (at, report) in self.hosts.items()
+        ]
+        return QueueStatus(
+            counts,
+            max(desired, demand),
+            sorted(hosts, key=lambda h: h.report.id),
+            self._phase_totals(now),
+            self.scaler,
+            replace(self.locality),
+        )
+
+    def _forget_silent_hosts(self, now: datetime) -> None:
+        """Drop the workers that didn't claim, report or heartbeat in the last ``HOST_REPORT_SECONDS``, and the hosts
+        with neither a report of readings nor such a worker in that time, making room for new ones, with what the
+        quarantine knows of them. A host whose workers can't read it stays known, its readings ageing."""
+        self.host_workers = {
+            host: fresh
+            for host, workers in self.host_workers.items()
+            if (fresh := {
+                worker: seen for worker, seen in workers.items() if (now - seen[0]).total_seconds() < HOST_REPORT_SECONDS
+            })
+        }
+        self.hosts = {
+            host: (at, report)
+            for host, (at, report) in self.hosts.items()
+            if (now - at).total_seconds() < HOST_REPORT_SECONDS or host in self.host_workers
+        }
+        known = self.hosts.keys() | self.host_workers.keys()
+        # A host's theories and contexts outlast a quiet spell of its workers, as when they are replaced on the same
+        # host, for HOST_KEYS_SECONDS; meanwhile it isn't below the scale-in line, so no work is left for it.
+        for host in self.host_workers:
+            self.keys_seen[host] = now
+        if gone := [
+            host for host in self.host_keys
+            if (now - self.keys_seen.setdefault(host, now)).total_seconds() >= HOST_KEYS_SECONDS
+        ]:
+            # Counted for the drain handoff's case: contexts that leave with their host while no host below the
+            # scale-in line holds them.
+            kept = set().union(*(self.host_keys.get(host, {}).keys() for host in self._kept_hosts()))
+            for host in gone:
+                keys = self.host_keys.pop(host)
+                self.locality.hosts_left += 1
+                self.locality.keys_left += len(keys)
+                self.locality.keys_lost += sum(key not in kept for key in keys)
+        self.keys_seen = {host: at for host, at in self.keys_seen.items() if host in self.host_keys}
+        self.infra_streak = {host: n for host, n in self.infra_streak.items() if host in known}
+        self.probe_at = {host: at for host, at in self.probe_at.items() if host in known}
+
+    @staticmethod
+    async def _counts(conn: AsyncConnection, statement: sa.TextClause) -> QueueCounts:
+        """The actions ``statement`` counts, by state and tier; see COUNT_UNFINISHED."""
+        count: defaultdict[tuple[str, str], int] = defaultdict(int)
+        runs: defaultdict[str, int] = defaultdict(int)
+        high_run = 0
+        ready_high_run = 0
+        priorities: defaultdict[str, int] = defaultdict(int)
+        for state, tier, action_class, prioritized, n in await conn.execute(statement):
+            if state == "ahead":
                 count[state, tier] += n
-                if action_class == "run":
-                    runs[state] += n
-                    if tier == "high" and state in ("ready", "running"):
-                        high_run += n
-        counts = QueueCounts(
+                continue
+            if prioritized and action_class == "build":
+                priorities[state] += n
+            count[state, tier] += n
+            if action_class == "run":
+                runs[state] += n
+                if tier == "high" and state in ("ready", "running"):
+                    high_run += n
+                if tier == "high" and state == "ready":
+                    ready_high_run += n
+        return QueueCounts(
             waiting=count["waiting", "standard"] + count["waiting", "high"],
             ready_standard=count["ready", "standard"],
             ready_high=count["ready", "high"],
@@ -982,27 +3043,15 @@ class Coordinator:
             ready_run=runs["ready"],
             running_run=runs["running"],
             high_run=high_run,
-        )
-        demand = burst_demand(
-            counts, self.settings.warm_workers, self.settings.max_burst_workers, self.settings.run_slots
-        )
-        now = self.clock()
-        self.hosts = {
-            host: (at, report)
-            for host, (at, report) in self.hosts.items()
-            if (now - at).total_seconds() < HOST_REPORT_SECONDS
-        }
-        hosts = [HostStatus(report, round((now - at).total_seconds(), 1)) for at, report in self.hosts.values()]
-        return QueueStatus(
-            counts,
-            max(desired, demand),
-            sorted(hosts, key=lambda h: h.report.id),
-            self._phase_totals(now),
-            self.scaler,
+            ready_high_run=ready_high_run,
+            ready_priority=priorities["ready"],
+            running_priority=priorities["running"],
+            waiting_ahead_standard=count["ahead", "standard"],
+            waiting_ahead_high=count["ahead", "high"],
         )
 
     async def sweep(self) -> None:
-        """The periodic pass: expired leases, a release of every batch in the background (for actions those
+        """The periodic pass: expired leases, overdue and finished batches, a release of every batch in the background (for actions those
         leases or a failed HEAD left waiting), retention, then the burst worker target, which the scale command gets
         whenever it changes.
 
@@ -1013,33 +3062,58 @@ class Coordinator:
         self.found_in_cache = {key: at for key, at in self.found_in_cache.items() if at > trusted_since}
         await self.expire_leases()
         await self.fail_overdue()
+        await self.finish_done()
         self.request_release()
         await self.delete_expired()
-        counts = (await self.queue()).counts
-        demand = burst_demand(
-            counts, self.settings.warm_workers, self.settings.max_burst_workers, self.settings.run_slots
-        )
-        now = self.clock()
-        async with self.engine.begin() as conn:
-            await conn.execute(
-                sa.text("DELETE FROM burst_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"),
-                {"now": now, "hold": self.settings.scale_down_hold_s},
-            )
-            await conn.execute(
-                sa.text("INSERT INTO burst_demand (at, workers) VALUES (:now, :workers)"),
-                {"now": now, "workers": demand},
-            )
-            desired = await conn.scalar(HELD_TARGET, self._held_target_params(now))
-        last = self.scaler
-        if self.settings.scale_cmd is None or (last is not None and last.error is None and last.workers == desired):
+        await self.scale()
+
+    def request_scale(self) -> None:
+        """Coalesce batch intake into background scale checks, without delaying the response on the scaler."""
+        if self.settings.scale_cmd is None:
             return
-        try:
-            await self._scale(self.settings.scale_cmd, desired)
-        except (OSError, ScaleCommandError) as error:
-            logger.warning("scaling to %d burst workers failed: %s", desired, error)
-            self.scaler = ScaleRun(desired, now, str(error))
-            return
-        self.scaler = ScaleRun(desired, now, None)
+        self.scale_pending = True
+        if self.scale_task is None or self.scale_task.done():
+            self.scale_task = asyncio.create_task(self._run_scales())
+
+    async def _run_scales(self) -> None:
+        while self.scale_pending:
+            self.scale_pending = False
+            try:
+                await self.scale()
+            except Exception:
+                logger.exception("background scale check failed")
+
+    async def scale(self) -> None:
+        """Sample demand and apply its held target, serialized with intake and periodic checks."""
+        async with self.scale_lock:
+            async with self.engine.connect() as conn:
+                counts = await self._counts(conn, COUNT_ACTIVE)
+            self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
+            self.ready_high = counts.ready_high - counts.ready_high_run
+            now = self.clock()
+            self._forget_silent_hosts(now)
+            demand = self._burst_demand(counts)
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    sa.text("DELETE FROM burst_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"),
+                    # The cache pool reads these samples too, over its own hold.
+                    {"now": now, "hold": max(self.settings.scale_down_hold_s, self.settings.cache_scale_down_hold_s)},
+                )
+                await conn.execute(
+                    sa.text("INSERT INTO burst_demand (at, workers) VALUES (:now, :workers)"),
+                    {"now": now, "workers": demand},
+                )
+                desired = await conn.scalar(HELD_TARGET, self._held_target_params(now))
+            last = self.scaler
+            if self.settings.scale_cmd is None or (last is not None and last.error is None and last.workers == desired):
+                return
+            try:
+                await self._scale(self.settings.scale_cmd, desired)
+            except (OSError, ScaleCommandError) as error:
+                logger.warning("scaling to %d burst workers failed: %s", desired, error)
+                self.scaler = ScaleRun(desired, now, str(error))
+                return
+            self.scaler = ScaleRun(desired, now, None)
 
     def _held_target_params(self, now: datetime) -> dict[str, object]:
         return {"now": now, "hold": self.settings.scale_down_hold_s, "cap": self.settings.max_burst_workers}
@@ -1048,6 +3122,11 @@ class Coordinator:
         process = await asyncio.create_subprocess_exec(*shlex.split(scale_cmd), str(workers))
         try:
             code = await asyncio.wait_for(process.wait(), SCALE_CMD_TIMEOUT_S)
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
         except TimeoutError:
             process.kill()
             await process.wait()
@@ -1095,15 +3174,59 @@ class Coordinator:
         self.cache_checks.clear()
         self.cache_forgotten += 1
 
+    async def cache_members(self) -> list[str]:
+        """The cache nodes for clients: the permanent ones, then the serving slots'.
+
+        The slots read are reused for ``cache_members_ttl_seconds``, and concurrent calls wait for one read. While
+        the database can't answer, the slots last read are kept, so the endpoint answers rather than failing.
+        """
+        permanent = [node_identity(url) for url in cache_nodes(self.settings.cache_url)]
+        if self.cache_pool is None:
+            return permanent
+        loop = asyncio.get_running_loop()
+        async with self.serving_lock:
+            if self.serving is None or loop.time() - self.serving[0] >= self.settings.cache_members_ttl_seconds:
+                try:
+                    serving = await self.cache_pool.ready_urls()
+                except DATABASE_UNAVAILABLE as error:
+                    logger.warning("reading the serving cache slots failed; keeping the last read: %s", error)
+                    serving = [] if self.serving is None else self.serving[1]
+                # Stamped when the read ends, failed or not, so the callers that waited for it don't each wait out
+                # the pool in turn.
+                self.serving = (loop.time(), serving)
+        return list(dict.fromkeys(permanent + self.serving[1]))
+
+    async def cache_read_nodes(self, digest: str) -> list[str]:
+        """Refresh ready slots at most once per thirty seconds, retaining the permanent fallback."""
+        if self.cache_pool is None:
+            return ranked_nodes(self.cache_nodes, digest)
+        now = asyncio.get_running_loop().time()
+        if now - self.membership.attempted >= REFRESH_SECONDS:
+            async with self.membership_lock:
+                if now - self.membership.attempted >= REFRESH_SECONDS:
+                    self.membership.attempted = now
+                    try:
+                        members = self.cache_nodes + await self.cache_pool.ready_urls()
+                        text = "holbuild-cache-members-v1\n" + "\n".join(node_identity(url) for url in members)
+                        self.membership.update(text, now)
+                    except sa.exc.SQLAlchemyError:
+                        logger.warning("cache membership query failed; retaining the permanent fallback")
+        return ranked_nodes(self.membership.current(now), digest)
+
     async def _check_cache(self, ac_key: str, limit: asyncio.Semaphore) -> bool | None:
         forgotten = self.cache_forgotten
         missing = False
+        failed = False
         failure: httpx.Response | None = None
-        for node in ranked_nodes(self.cache_nodes, ac_key)[:2]:
+        # Every node is asked before a miss: a worker writes to the node nearest to it, and until that node has
+        # written the entry through to the shared store, no other node holds it.  The entry is a done parent's, so
+        # a node that failed may be the one holding it: only 404s from every node it asked say it's gone.
+        for node in await self.cache_read_nodes(ac_key):
             try:
                 async with limit:
                     response = await self.cache.get(f"{node}/ac/{ac_key}")
             except httpx.HTTPError:
+                failed = True
                 continue
             if response.status_code == 200:
                 if self.cache_forgotten == forgotten:  # else an input went missing since this check began
@@ -1112,11 +3235,11 @@ class Coordinator:
             if response.status_code == 404:
                 missing = True
                 continue
+            failed = True
             failure = response
             if response.status_code != 429 and not 500 <= response.status_code < 600:
-                missing = False
                 break
-        if missing:
+        if missing and not failed:
             return False
         if failure is not None:
             request = failure.request
@@ -1131,7 +3254,12 @@ class Coordinator:
     async def _requeue_evicted(self, batch_id: UUID, parent: str) -> bool:
         """Re-queue a done parent whose key the cache no longer holds; True when it was."""
         async with self.engine.begin() as conn:
-            if await self._lock_batch(conn, batch_id) != "running":
+            batch = (
+                await conn.execute(
+                    sa.text("SELECT state, ahead_cap FROM batches WHERE id = :id FOR UPDATE"), {"id": batch_id}
+                )
+            ).first()
+            if batch is None or batch.state != "running":
                 return False
             action = (
                 await conn.execute(
@@ -1144,16 +3272,19 @@ class Coordinator:
             ).one()
             if action.state != "done":
                 return False
-            if action.attempts >= self.settings.max_attempts:
+            requeued = action.attempts < self.settings.max_attempts
+            if requeued:
+                await self._requeue(conn, batch_id, parent, ahead_batch=batch.ahead_cap is not None)
+            else:
                 await self._fail_batch(
                     conn, batch_id, parent, f"resubmit: {action.theory} (theory {parent}) is not in the cache after it built"
                 )
-                return False
-            await self._requeue(conn, batch_id, parent)
-            return True
+        self._batch_changed(batch_id)
+        return requeued
 
     async def _input_missing(
-        self, conn: AsyncConnection, batch_id: UUID, input_key: str, theory: str, attempts: int, result: Result
+        self, conn: AsyncConnection, batch_id: UUID, input_key: str, theory: str, attempts: int, result: Result,
+        *, ahead_batch: bool,
     ) -> None:
         """Handle ``input-missing``: re-queue a missing theory the batch builds, and retry on anything else, since a
         restore that fails on a network error reports its input missing too; once the action used up its
@@ -1169,6 +3300,14 @@ class Coordinator:
                 sa.text("SELECT theory FROM actions WHERE batch_id = :batch_id AND input_key = :input_key"),
                 {"batch_id": batch_id, "input_key": missing.key},
             )
+            parent_state = await conn.scalar(
+                sa.text("SELECT state FROM actions WHERE batch_id = :batch_id AND input_key = :key"),
+                {"batch_id": batch_id, "key": missing.key},
+            )
+            if parent_state in ("failed", "cancelled"):
+                await self._skip(conn, batch_id, input_key, f"skipped because of {rebuilt} ({missing.key})")
+                await self._finish_if_done(conn, batch_id)
+                return
         if attempts >= self.settings.max_attempts:
             what = f"{missing.kind} {missing.key}" if missing else "an input"
             if rebuilt is not None:
@@ -1179,10 +3318,10 @@ class Coordinator:
         elif (
             rebuilt is not None and missing is not None and await self._add_edge(conn, batch_id, input_key, missing.key)
         ):
-            await self._set_state(conn, batch_id, input_key, "waiting")
-            await self._requeue(conn, batch_id, missing.key)
+            await self._back_to_waiting(conn, batch_id, input_key, ahead_batch=ahead_batch)
+            await self._requeue(conn, batch_id, missing.key, ahead_batch=ahead_batch)
         else:
-            await self._retry(conn, batch_id, input_key)
+            await self._retry(conn, batch_id, input_key, ahead_batch=ahead_batch)
 
     async def _add_edge(self, conn: AsyncConnection, batch_id: UUID, child: str, parent: str) -> bool:
         """Make ``child`` depend on ``parent``, updating the priorities it changes; False, adding nothing, when the
@@ -1233,28 +3372,58 @@ class Coordinator:
             )
         return True
 
-    async def _requeue(self, conn: AsyncConnection, batch_id: UUID, input_key: str) -> None:
-        await conn.execute(
+    async def _requeue(self, conn: AsyncConnection, batch_id: UUID, input_key: str, *, ahead_batch: bool) -> None:
+        """Send a done action back to waiting, to be built again. In a batch that loads ahead, the actions claimed
+        ahead of it lose their leases and wait, without the attempt counting (REVOKE_AHEAD)."""
+        requeued = await conn.execute(
             sa.text(
                 "UPDATE actions SET state = 'waiting' WHERE batch_id = :batch_id AND input_key = :input_key "
                 "AND state = 'done'"
             ),
             {"batch_id": batch_id, "input_key": input_key},
         )
+        if ahead_batch and requeued.rowcount:
+            await conn.execute(
+                REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]}
+            )
         await conn.execute(REFRESH_KEYS, {"batch_id": batch_id, "keys": [input_key]})
         await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": [input_key]})
 
-    async def _retry(self, conn: AsyncConnection, batch_id: UUID, input_key: str) -> None:
+    async def _retry(self, conn: AsyncConnection, batch_id: UUID, input_key: str, *, ahead_batch: bool) -> None:
         """Send a failed or expired action back to waiting, so ``release`` checks its parents' keys again, or
         trusts what it found within ``IN_CACHE_TRUST_SECONDS``.
 
         A parent may have been re-queued while the action ran; going straight to ready would skip that check.
         """
-        await self._set_state(conn, batch_id, input_key, "waiting")
+        await self._back_to_waiting(conn, batch_id, input_key, ahead_batch=ahead_batch)
         await conn.execute(REFRESH_KEYS, {"batch_id": batch_id, "keys": [input_key]})
 
-    async def _lock_batch(self, conn: AsyncConnection, batch_id: UUID) -> str | None:
-        return await conn.scalar(sa.text("SELECT state FROM batches WHERE id = :id FOR UPDATE"), {"id": batch_id})
+    async def _back_to_waiting(self, conn: AsyncConnection, batch_id: UUID, input_key: str, *, ahead_batch: bool) -> None:
+        """Set a running action of ``batch_id`` waiting. In a batch that loads ahead, a claim ahead of it no longer
+        waits for a running parent, so it is revoked (REVOKE_AHEAD), and the action, if it was claimed
+        ahead itself, is no longer one ahead (an abandoned one stays abandoned)."""
+        if ahead_batch:
+            await conn.execute(
+                REVOKE_AHEAD, {"batch_id": batch_id, "keys": [input_key]}
+            )
+            await conn.execute(
+                sa.text(
+                    "UPDATE actions SET ahead = 'no' "
+                    "WHERE batch_id = :batch_id AND input_key = :input_key AND ahead = 'ahead'"
+                ),
+                {"batch_id": batch_id, "input_key": input_key},
+            )
+        await self._set_state(conn, batch_id, input_key, "waiting")
+
+    async def _lock_batch(self, conn: AsyncConnection, batch_id: UUID, *, shared: bool = False) -> str | None:
+        """The batch's state, its row locked to the end of the transaction; ``shared`` lets other shared holders in,
+        and only them."""
+        statement = (
+            sa.text("SELECT state FROM batches WHERE id = :id FOR SHARE")
+            if shared
+            else sa.text("SELECT state FROM batches WHERE id = :id FOR UPDATE")
+        )
+        return await conn.scalar(statement, {"id": batch_id})
 
     async def _set_state(self, conn: AsyncConnection, batch_id: UUID, input_key: str, state: str) -> None:
         await conn.execute(
@@ -1263,23 +3432,47 @@ class Coordinator:
         )
 
     async def _finish_if_done(self, conn: AsyncConnection, batch_id: UUID) -> None:
-        await conn.execute(
-            sa.text(
-                "UPDATE batches SET state = 'done' WHERE id = :id AND NOT EXISTS "
-                "(SELECT 1 FROM actions WHERE batch_id = :id AND state NOT IN ('done', 'failed'))"
-            ),
-            {"id": batch_id},
-        )
+        await conn.execute(FINISH_IF_DONE, {"id": batch_id})
+
+    async def _finish_when_done(self, batch_id: UUID) -> None:
+        """End ``batch_id`` once a build's result committed, if nothing is left unfinished. The builds of a batch
+        finish at once, each holding the batch shared and seeing the others unfinished, so the batch is ended after
+        their commits, under its lock alone: the last to commit sees every other done."""
+        async with self.engine.connect() as conn:
+            if await conn.scalar(FIRST_UNFINISHED, {"id": batch_id}) is not None:
+                return
+        async with self.engine.begin() as conn:
+            if await self._lock_batch(conn, batch_id) == "running":
+                await self._finish_if_done(conn, batch_id)
+        self._batch_changed(batch_id)
+
+    async def finish_done(self) -> None:
+        """End the running batches with nothing left unfinished: those whose last build's result committed before
+        the coordinator stopped and ended it (see _finish_when_done)."""
+        async with self.engine.connect() as conn:
+            finished = list(await conn.scalars(FINISHED_RUNNING))
+        for batch_id in finished:
+            async with self.engine.begin() as conn:
+                if await self._lock_batch(conn, batch_id) == "running":
+                    await self._finish_if_done(conn, batch_id)
+            self._batch_changed(batch_id)
 
     async def _fail(
         self, conn: AsyncConnection, batch_id: UUID, input_key: str, action_class: str, failure: str
     ) -> None:
-        """Keep final failures independent in a run batch; build failures still end the whole batch."""
-        if action_class == "build":
-            await self._fail_batch(conn, batch_id, input_key, failure)
-            return
+        """Fail this action, skipping its descendants while independent work finishes."""
         await self._set_state(conn, batch_id, input_key, "failed")
+        if action_class == "build":
+            fail_fast = await conn.scalar(sa.text("SELECT fail_fast FROM batches WHERE id = :id"), {"id": batch_id})
+            if fail_fast:
+                await self._fail_batch(conn, batch_id, input_key, failure)
+                return
+            await self._skip(conn, batch_id, input_key, f"skipped because of {failure} ({input_key})")
         await self._finish_if_done(conn, batch_id)
+
+    async def _skip(self, conn: AsyncConnection, batch_id: UUID, input_key: str, reason: str) -> None:
+        """Skip a blocked action and its descendants, revoking any leases left by a requeued parent."""
+        await conn.execute(SKIP_DESCENDANTS, {"id": batch_id, "key": input_key, "reason": reason})
 
     async def _fail_batch(self, conn: AsyncConnection, batch_id: UUID, input_key: str, failure: str) -> None:
         """Fail ``input_key`` finally and with it the batch; its other unfinished actions are cancelled."""
@@ -1292,6 +3485,11 @@ class Coordinator:
             sa.text("UPDATE batches SET state = :state, failure = :failure WHERE id = :id"),
             {"id": batch_id, "state": state, "failure": failure},
         )
+        await self._cancel_unfinished(conn, batch_id)
+
+    async def _cancel_unfinished(self, conn: AsyncConnection, batch_id: UUID) -> None:
+        """Cancel the batch's unfinished actions and revoke their leases: expired, they free the key for another
+        batch and stop the heartbeats, and ``complete`` takes only the log of the action stopped."""
         await conn.execute(
             sa.text(
                 "UPDATE actions SET state = 'cancelled' "
@@ -1299,16 +3497,24 @@ class Coordinator:
             ),
             {"id": batch_id},
         )
-        await conn.execute(sa.text("DELETE FROM leases WHERE batch_id = :id"), {"id": batch_id})
-
-    async def _record_peak(self, conn: AsyncConnection, package: str, theory: str, profile: str, peak: int) -> None:
-        """Raise the theory's peak hint to ``peak``; a run that took less, perhaps with a quieter neighbour, keeps it."""
         await conn.execute(
-            sa.text(
-                "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb) "
-                "VALUES (:package, :theory, :profile, :peak) "
-                "ON CONFLICT (package, theory, profile) DO UPDATE "
-                "SET peak_rss_mb = GREATEST(peak_hints.peak_rss_mb, :peak), updated_at = now()"
-            ),
-            {"package": package, "theory": theory, "profile": profile, "peak": peak},
+            sa.text("UPDATE leases SET expires_at = now() WHERE batch_id = :id AND expires_at > now()"),
+            {"id": batch_id},
         )
+
+    async def _record_peak(self, package: str, theory: str, profile: str, peak: int) -> None:
+        """Raise the theory's peak hint to ``peak``; a run that took less, perhaps with a quieter neighbour, keeps it.
+        A hint already as high is left unlocked and unwritten: submissions keep the hints they use fresh."""
+        hint = {"package": package, "theory": theory, "profile": profile, "peak": peak}
+        async with self.engine.begin() as conn:
+            if await conn.scalar(PEAK_COVERED, hint):
+                return
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb) "
+                    "VALUES (:package, :theory, :profile, :peak) "
+                    "ON CONFLICT (package, theory, profile) DO UPDATE "
+                    "SET peak_rss_mb = GREATEST(peak_hints.peak_rss_mb, :peak), updated_at = now()"
+                ),
+                hint,
+            )

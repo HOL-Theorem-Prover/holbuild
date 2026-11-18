@@ -21,7 +21,8 @@ fun path_exists path = FS.access(path, []) handle OS.SysErr _ => false
 fun is_dir path = FS.isDir path handle OS.SysErr _ => false
 
 val remove_file = HolbuildFileLock.remove_file
-val remove_tree = HolbuildFileLock.remove_tree
+(* Extracted archives are untrusted: a directory may lack owner access. *)
+fun remove_tree path = HolbuildRemoveTree.remove_untrusted path handle HolbuildRemoveTree.Error msg => raise Error msg
 val read_text = HolbuildFileLock.read_text
 val write_text = HolbuildFileLock.write_text
 
@@ -38,7 +39,9 @@ fun require_manifest identity text =
 fun validate_extracted_manifest {staging_dir, identity} =
   let val path = Path.concat(staging_dir, internal_manifest_path)
   in
-    if not (path_exists path) orelse is_dir path orelse FS.isLink path then
+    (* Only a regular file: opening a FIFO from the archive would block. *)
+    if not (path_exists path) orelse
+       not (Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false) then
       die "extracted toolchain archive manifest is missing"
     else if FS.fileSize path > Position.fromInt max_manifest_size then
       die "toolchain archive manifest is too large"
@@ -47,12 +50,7 @@ fun validate_extracted_manifest {staging_dir, identity} =
        remove_file path)
   end
 
-fun fresh_temp_name () =
-  let val placeholder = FS.tmpName ()
-  in
-    remove_file placeholder;
-    placeholder
-  end
+fun fresh_temp_name () = HolbuildTempPath.temporary "archive"
 
 fun temp_path label =
   let val unique = fresh_temp_name ()
@@ -154,8 +152,10 @@ fun restore {remote, identity, final_dir} =
           val scratch_dir = restore_scratch_path final_dir
           val archive_path = Path.concat(scratch_dir, "archive.tar")
           fun cleanup () = remove_tree scratch_dir handle _ => ()
+          (* The record names the archive, so it must be there. *)
           fun fetch () =
-            case HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = archive_path} of
+            case HolbuildRemoteCache.required (fn () =>
+                   HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = archive_path}) of
                 HolbuildCacheBackend.Hit => ()
               | HolbuildCacheBackend.Miss => reject "remote toolchain archive blob is missing"
               | HolbuildCacheBackend.Corrupt detail => die ("could not fetch remote toolchain archive blob: " ^ detail)
@@ -199,7 +199,7 @@ fun publish {remote, identity, entry_dir, replace} =
                 (* HTTP has no compare-and-swap: two builders can both see no
                    record and both put one, so only a record that still names
                    this archive counts as ours. *)
-                (case HolbuildRemoteCache.get_action remote identity of
+                (case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote identity) of
                      SOME text =>
                        if (parse_remote_record text = hash handle _ => false) then HolbuildCacheBackend.Published
                        else HolbuildCacheBackend.AlreadyPresent

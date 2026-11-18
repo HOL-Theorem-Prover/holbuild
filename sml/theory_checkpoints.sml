@@ -16,6 +16,14 @@ type checkpoint = {kind : string, name : string, safe_name : string, theorem_sta
                    deps_key : string, checkpoint_key : string,
                    proof_ir_plan : string option, proof_ir_factories : string option}
 
+(* Where a checkpoint's proof unit is in the script. *)
+fun checkpoint_boundary ({kind, name, safe_name, theorem_start, theorem_stop, boundary, tactic_start,
+                          tactic_end, tactic_text, proof_attrs, prefix_hash, ...} : checkpoint) : boundary =
+  {kind = kind, name = name, safe_name = safe_name, theorem_start = theorem_start,
+   theorem_stop = theorem_stop, boundary = boundary, tactic_start = tactic_start,
+   tactic_end = tactic_end, tactic_text = tactic_text, proof_attrs = proof_attrs,
+   prefix_hash = prefix_hash}
+
 type termination = {name : string, safe_name : string, definition_start : int,
                     definition_stop : int, boundary : int,
                     quote_start : int, quote_end : int, quote_text : string,
@@ -102,6 +110,13 @@ fun begin_termination_line ({name, definition_start, ...} : termination) =
      Int.toString definition_start,
      ";\n"]
 
+fun end_termination_line ({name, definition_start, ...} : termination) =
+  String.concat
+    ["\nval _ = HolbuildTerminationDiagnosticsRuntime.end_definition ",
+     HolbuildToolchain.sml_string name, " ",
+     Int.toString definition_start,
+     ";\n"]
+
 fun termination_tactic_prefix ({name, definition_start, tactic_text, proof_ir_plan, ...} : termination) =
   String.concat
     ["(HolbuildTerminationDiagnosticsRuntime.report_goal ",
@@ -121,7 +136,7 @@ fun termination_tactic_suffix ({proof_ir_plan, ...} : termination) =
 
 fun save_declaration_context_line ({safe_name, context_path, context_ok, ...} : declaration_checkpoint) =
   String.concat
-    ["\nval _ = HolbuildCheckpointSaveRuntime.save_checkpoint {label = ",
+    ["\nval _ = HolbuildCheckpointSaveRuntime.save_context_checkpoint {label = ",
      HolbuildToolchain.sml_string ("definition_context:" ^ safe_name),
      ", default_share = false, path = ", HolbuildToolchain.sml_string context_path,
      ", ok_text = ", HolbuildToolchain.sml_string context_ok,
@@ -136,7 +151,8 @@ val runtime_load_lines = []
    second Defn.Hol_defn would advance HOL's theorem numbering, so the theory
    would differ from an uninstrumented build.  A definition that fails before
    HOL runs its tactic prints no goal, so each definition first prints a start
-   marker; an earlier definition's goal is then not reported for it. *)
+   marker; an earlier definition's goal is then not reported for it. The end
+   marker clears the goal once the definition returns successfully. *)
 val termination_runtime_lines =
   ["structure HolbuildTerminationDiagnosticsRuntime = struct",
    "fun print_line text = (TextIO.output(TextIO.stdOut, text ^ \"\\n\"); TextIO.flushOut TextIO.stdOut)",
@@ -146,6 +162,7 @@ val termination_runtime_lines =
    "fun marker name start = String.concat [\"holbuild termination condition goal for \", name, \" at \", Int.toString start, \":\"]",
    "fun print_goal name start text = (print_line (marker name start); print_line text; print_line \"holbuild termination condition goal end\")",
    "fun begin_definition name start = print_line (String.concat [\"holbuild termination definition start for \", name, \" at \", Int.toString start])",
+   "fun end_definition name start = print_line (String.concat [\"holbuild termination definition end for \", name, \" at \", Int.toString start])",
    "fun report_goal name start tac =",
    "  HolbuildTacticCompat.lift_context_tactic (fn ctxt => fn g =>",
    "    (print_goal name start (goal_text g); HolbuildTacticCompat.run_tactic ctxt tac g))",
@@ -178,11 +195,15 @@ fun tactic_compat_runtime_helper_path () =
 fun checkpoint_save_runtime_helper_path () =
   OS.Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/checkpoint_save_runtime.sml")
 
-fun declaration_checkpoint_runtime_prelude [] = ""
-  | declaration_checkpoint_runtime_prelude _ =
-      runtime_lines ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"]
+(* For a script that doesn't install the proof runtime: the save runtime
+   alone, its context gate started at the build's checkpoint_seconds. *)
+fun checkpoint_save_runtime_prelude checkpoint_seconds =
+  runtime_lines
+    ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
+     "val _ = HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate " ^
+       Real.toString checkpoint_seconds ^ ";"]
 
-fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
+fun runtime_install_lines {checkpoint_enabled, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
   ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (source_helper_path "sml/diagnostic_limits.sml") ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (sha256_runtime_helper_path ()) ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
@@ -191,6 +212,7 @@ fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, p
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_runtime_helper_path ()) ^ ";",
    "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
      (if checkpoint_enabled then "true" else "false") ^
+     ", checkpoint_seconds = " ^ Real.toString checkpoint_seconds ^
      ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
      ", timeout_marker = " ^ option_string_sml timeout_marker ^
      ", plan_theorem = " ^ option_string_sml plan_theorem ^
@@ -200,15 +222,15 @@ fun runtime_install_lines {checkpoint_enabled, tactic_timeout, timeout_marker, p
    "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
 
 
-fun runtime_prelude _ [] = ""
-  | runtime_prelude config _ = runtime_lines (runtime_load_lines @ runtime_install_lines config)
+fun runtime_prelude config = runtime_lines (runtime_load_lines @ runtime_install_lines config)
 
-fun runtime_reinstall_prelude {checkpoint_enabled, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
+fun runtime_reinstall_prelude {checkpoint_enabled, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
   let
     val install =
       ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
        "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
          (if checkpoint_enabled then "true" else "false") ^
+         ", checkpoint_seconds = " ^ Real.toString checkpoint_seconds ^
          ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
          ", timeout_marker = " ^ option_string_sml timeout_marker ^
          ", plan_theorem = " ^ option_string_sml plan_theorem ^
@@ -268,15 +290,24 @@ datatype instrument_event =
 | DeclarationCheckpointEvent of declaration_checkpoint
 | TerminationEvent of termination
 
-fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} :
+(* DEFER: whether a pipelined build defers a theorem's proof (see
+   HolbuildDeferred).  A deferred proof keeps its precompiled steps (its
+   factories), so no step is compiled after the script has run, where
+   later bindings would shadow the theorem's; a theorem without them is
+   not deferred. *)
+fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, defer} :
                 {source : string, source_name : string, start_offset : int, checkpoints : checkpoint list,
                  declaration_checkpoints : declaration_checkpoint list,
                  terminations : termination list, save_checkpoints : bool,
+                 checkpoint_seconds : real,
                  tactic_timeout : real option, timeout_marker : string option,
                  plan_theorem : string option, trace_all : bool,
-                 plan_only_marker : string option, new_ir : bool}) =
+                 plan_only_marker : string option, new_ir : bool,
+                 defer : checkpoint -> bool}) =
   let
     val n = size source
+    val deferred = ref 0
+    fun one_line text = String.map (fn #"\n" => #" " | c => c) text
     fun source_slice i j = String.substring(source, i, j - i)
     fun active_checkpoint ({boundary, ...} : checkpoint) = boundary > start_offset
     fun active_declaration_checkpoint ({boundary, ...} : declaration_checkpoint) = boundary > start_offset
@@ -298,17 +329,20 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
          map TerminationEvent active_terminations)
     fun runtime_config () =
       {checkpoint_enabled = save_checkpoints,
+       checkpoint_seconds = checkpoint_seconds,
        tactic_timeout = tactic_timeout,
        timeout_marker = timeout_marker,
        plan_theorem = plan_theorem,
        trace_all = trace_all,
        plan_only_marker = plan_only_marker,
        new_ir = new_ir}
+    (* A resumed script loads the checkpoint runtime even with no checkpoint
+       left to save: it carries the theory's CPU time over from the checkpoint. *)
     fun prelude () =
-      runtime_prelude (runtime_config ())
-        (if null active_checkpoints andalso null active_terminations then [] else [()]) ^
-      declaration_checkpoint_runtime_prelude
-        (if null active_checkpoints andalso null active_terminations then active_declaration_checkpoints else []) ^
+      (if null active_checkpoints andalso null active_terminations then
+         if start_offset > 0 orelse not (null active_declaration_checkpoints)
+         then checkpoint_save_runtime_prelude checkpoint_seconds else ""
+       else runtime_prelude (runtime_config ())) ^
       termination_runtime_prelude active_terminations
     val position = ref start_position
     fun resume_at offset =
@@ -323,27 +357,54 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
               let
                 val theorem_pragma = resume_at theorem_start
                 val boundary_pragma = resume_at boundary
-                val factories =
-                  if null (#proof_attrs checkpoint) then "NONE"
-                  else case #proof_ir_factories checkpoint of
-                           NONE => "NONE"
-                         | SOME code => "SOME (" ^ code ^ ")"
-                val tactic_suffix = ")) (let\n" ^ generated_code_pragma source ^
-                  "in " ^ factories ^ " end)"
+                fun factories_suffix factories =
+                  ")) (let\n" ^ generated_code_pragma source ^ "in " ^ factories ^ " end)"
+                fun emit setup opening closing after =
+                  loop boundary rest
+                    (boundary_pragma ::
+                     after ::
+                     "\n" ::
+                     source_slice tactic_end boundary ::
+                     closing ::
+                     source_slice tactic_start tactic_end ::
+                     opening ::
+                     source_slice theorem_start tactic_start ::
+                     theorem_pragma ::
+                     setup ::
+                     source_slice pos theorem_start ::
+                     acc)
               in
-                loop boundary rest
-                  (boundary_pragma ::
-                   "val _ = holbuild_save_theorem_context();\n" ::
-                   "\n" ::
-                   source_slice tactic_end boundary ::
-                   tactic_suffix ::
-                   source_slice tactic_start tactic_end ::
-                   "HolbuildProofRuntime.proof_ir_tactic (fn () => (" ::
-                   source_slice theorem_start tactic_start ::
-                   theorem_pragma ::
-                   begin_theorem_line checkpoint ::
-                   source_slice pos theorem_start ::
-                   acc)
+                case (if defer checkpoint then #proof_ir_factories checkpoint else NONE) of
+                    SOME code =>
+                      let val k = !deferred
+                      in
+                        deferred := k + 1;
+                        (* The runtime learns which theorem it proves when
+                           the proof runs (`begin_theorem` inside the setup
+                           thunk), written on one line so the tactic keeps
+                           its own lines. *)
+                        emit ""
+                             (String.concat
+                                ["HolbuildDeferred.defer_steps ", Int.toString k, " ",
+                                 HolbuildToolchain.sml_string (#name checkpoint),
+                                 " (fn () => let ", one_line (begin_theorem_line checkpoint),
+                                 "in () end) (fn () => HolbuildProofRuntime.proof_ir_tactic (fn () => ("])
+                             (factories_suffix ("SOME (" ^ code ^ ")") ^ ")")
+                             ""
+                      end
+                  | NONE =>
+                      let
+                        val factories =
+                          if null (#proof_attrs checkpoint) then "NONE"
+                          else case #proof_ir_factories checkpoint of
+                                   NONE => "NONE"
+                                 | SOME code => "SOME (" ^ code ^ ")"
+                      in
+                        emit (begin_theorem_line checkpoint)
+                             "HolbuildProofRuntime.proof_ir_tactic (fn () => ("
+                             (factories_suffix factories)
+                             "val _ = holbuild_save_theorem_context();\n"
+                      end
               end
         | DeclarationCheckpointEvent (declaration_checkpoint as {boundary, ...}) :: rest =>
             if boundary <= start_offset orelse boundary < pos then loop pos rest acc
@@ -353,18 +414,26 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                  save_declaration_context_line declaration_checkpoint ::
                  source_slice pos boundary ::
                  acc)
-        | TerminationEvent (termination as {definition_start, tactic_start, tactic_end, ...}) :: rest =>
+        | TerminationEvent (termination as {definition_start, boundary, tactic_start, tactic_end, ...}) :: rest =>
             if definition_start < pos then loop pos rest acc
             else
-              loop tactic_end rest
-                (termination_tactic_suffix termination ::
+              let
+                val definition_pragma = resume_at definition_start
+                val boundary_pragma = resume_at boundary
+              in
+                loop boundary rest
+                (boundary_pragma ::
+                 end_termination_line termination ::
+                 source_slice tactic_end boundary ::
+                 termination_tactic_suffix termination ::
                  source_slice tactic_start tactic_end ::
                  termination_tactic_prefix termination ::
                  source_slice definition_start tactic_start ::
-                 resume_at definition_start ::
+                 definition_pragma ::
                  begin_termination_line termination ::
                  source_slice pos definition_start ::
                  acc)
+              end
     val prelude_text = prelude ()
     val start_pragma = resume_at start_offset
   in
