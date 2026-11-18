@@ -34,7 +34,7 @@ fun candidate i : BE.shared_candidate =
 val candidates = rev (List.tabulate (count, fn i => candidate (i + 1)));
 val ctx : BE.shared_context =
   {store = store, checkpoint_root = tree, heap_key = "heap", index_key = "index", base_state = base,
-   deps_key = "deps", deps_loaded = deps, ahead_loaded = tree ^ "/ahead.save", requested_timeout = NONE,
+   deps_key = "deps", deps_loaded = deps, deps_root = tree ^ "/deps", requested_timeout = NONE,
    candidates = candidates @ [candidate 1]};
 val heap = HolbuildHash.file_sha256 deps;
 val bad = HolbuildHash.file_sha256 (path 12 ^ ".ok");

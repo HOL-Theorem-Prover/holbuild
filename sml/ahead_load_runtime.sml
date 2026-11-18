@@ -32,9 +32,10 @@
    its ancestors loaded, and saves it as the ahead heap; the plain preload
    then saves only what was loaded since, as the ahead heap's child, without
    sharing again.  Later waits don't save again: on a chain of late parents
-   they last only as long as one parent's own hand-off.  A full GC follows
-   the share: the share frees the duplicates but leaves them in the heap,
-   and the GC hands that space back while the child waits. *)
+   they last only as long as one parent's own hand-off.  The save's full GC
+   hands back the duplicates the share freed.  The ahead heap is never a
+   start point: it was saved inside a load, and the deps heap's overwrite of
+   mutable data restores the state the load ended in. *)
 structure HolbuildAheadLoad =
 struct
   val dir = ref ""
@@ -108,8 +109,9 @@ struct
          TextIO.output (TextIO.stdErr, "holbuild: warning: could not save the ahead heap " ^ path ^ ": " ^
                                        General.exnMessage e ^ "\n"))
     in
+      (* saveChild runs a full GC first, which hands back what the share
+         freed. *)
       PolyML.shareCommonData PolyML.rootFunction;
-      PolyML.fullGC ();
       ((OS.FileSys.remove path handle OS.SysErr _ => ());
        PolyML.SaveState.saveChild (path, List.length (PolyML.SaveState.showHierarchy ())))
       handle e as IO.Io _ => dropped e

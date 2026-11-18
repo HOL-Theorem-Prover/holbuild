@@ -465,8 +465,9 @@ expect p 0 "status=built"
 worker_wait two-level
 expect two-level 1 "status=failed" "failure=proof"
 require_grep "seeded failure" "$tmpdir/two-level.log"
-heaps=$(grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote2/ac/* | xargs grep -l ' parent$' | wc -l)
-[[ "$heaps" == 1 ]] || { echo "$heaps shared heaps name an ahead heap, wanted 1" >&2; exit 1; }
+two_level=$(grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote2/ac/* | xargs grep -l ' parent ')
+[[ $(wc -l <<< "$two_level") == 1 ]] || { echo "shared heaps naming an ahead heap: $two_level" >&2; exit 1; }
+cp "$two_level" "$tmpdir/two-level-manifest"
 # The heap's key names the worker's paths, which every fleet worker shares.
 mv "$tmpdir/two-level.log" "$tmpdir/two-level-ahead.log"
 rm -rf "$tmpdir/worker-two-level/checkpoint-store"
@@ -480,3 +481,103 @@ if grep -q "discarding" "$tmpdir/two-level.log"; then
   cat "$tmpdir/two-level.log" >&2
   exit 1
 fi
+
+# A heap whose ahead heap's place is outside the deps tree, or whose blob
+# the cache lost, isn't restored: the run builds from a fresh preload.
+python3 - "$two_level" <<'PY'
+import hashlib, re, sys
+path = sys.argv[1]
+header, manifest = open(path).read().split("manifest-text-v1\n", 1)
+manifest = re.sub(r" parent .*", " parent elsewhere/ahead.save", manifest)
+header = re.sub(r"manifest-sha256 \S+", "manifest-sha256 " + hashlib.sha256(manifest.encode()).hexdigest(), header)
+header = re.sub(r"manifest-size \S+", "manifest-size %d" % len(manifest.encode()), header)
+open(path, "w").write(header + "manifest-text-v1\n" + manifest)
+PY
+mv "$tmpdir/two-level.log" "$tmpdir/two-level-resume.log"
+rm -rf "$tmpdir/worker-two-level/checkpoint-store"
+worker two-level "$spec_Q" --share-heaps
+expect two-level 1 "status=failed" "failure=proof"
+require_grep "seeded failure" "$tmpdir/two-level.log"
+require_grep "shared heap parent is outside the deps tree" "$tmpdir/two-level.log"
+if grep -q "restored shared" "$tmpdir/two-level.log"; then
+  echo "restored a heap whose ahead heap is outside the deps tree" >&2; exit 1
+fi
+cp "$tmpdir/two-level-manifest" "$two_level"
+parent_sha=$(awk '$2 == "parent" { print substr($1, 6) }' "$two_level")
+rm "$tmpdir/remote2/cas/$parent_sha"
+mv "$tmpdir/two-level.log" "$tmpdir/two-level-outside.log"
+rm -rf "$tmpdir/worker-two-level/checkpoint-store"
+worker two-level "$spec_Q" --share-heaps
+expect two-level 1 "status=failed" "failure=proof"
+require_grep "seeded failure" "$tmpdir/two-level.log"
+require_grep "the cache lost blob $parent_sha" "$tmpdir/two-level.log"
+if grep -q "restored shared" "$tmpdir/two-level.log"; then
+  echo "restored a heap whose ahead heap's blob is gone" >&2; exit 1
+fi
+
+# A local entry the remote lost is dropped with its checkpoints before the
+# child saves its ahead heap, not after: the run publishes a two-level heap
+# and checkpoints on it, which a later version of the theory resumes from.
+cat > "$project/src/SScript.sml" <<'SML'
+Theory S
+Ancestors bool
+
+Theorem s_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+write_r() {
+  cat > "$project/src/RScript.sml" <<SML
+Theory R
+Ancestors S
+
+Theorem r1:
+  T
+Proof
+  ACCEPT_TAC s_thm
+QED
+$1
+SML
+}
+write_r ""
+hb action-spec --upload RTheory > "$tmpdir/batch-r1.txt"
+spec_S=$(spec_for "$tmpdir/batch-r1.txt" ahead:STheory)
+key_S=$(key_for "$tmpdir/batch-r1.txt" ahead:STheory)
+spec_R1=$(spec_for "$tmpdir/batch-r1.txt" ahead:RTheory)
+worker s "$spec_S"
+expect s 0 "status=built"
+ls "$tmpdir/remote2/ac" | sort > "$tmpdir/ac-before-r"
+worker r "$spec_R1" --share-heaps
+expect r 0 "status=built"
+# Leave worker r its local entry while the remote misses everything it
+# published (input key, cutoff pair, heap) and S.
+ac_of() { printf 'holbuild-remote-ac-v1\n%s\n' "$1" | sha256sum | cut -d' ' -f1; }
+ls "$tmpdir/remote2/ac" | sort | comm -13 "$tmpdir/ac-before-r" - | sed "s|^|$tmpdir/remote2/ac/|" | xargs rm
+rm "$tmpdir/remote2/ac/$(ac_of "$key_S")"
+mv "$tmpdir/r.log" "$tmpdir/r-plain.log"
+worker_start r "$spec_R1" --share-heaps --ahead-parent "$key_S:$spec_S"
+await_marker r waiting-STheory
+worker s2 "$spec_S"
+expect s2 0 "status=built"
+worker_wait r
+expect r 0 "status=built"
+[[ $(grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote2/ac/* | xargs grep -l ' parent ' | wc -l) == 1 ]] || {
+  echo "the rebuild over a stale local entry published no two-level heap" >&2
+  cat "$tmpdir/r.log" >&2
+  exit 1
+}
+write_r 'Theorem r2:
+  T /\ T
+Proof
+  FAIL_TAC "seeded failure"
+QED'
+hb action-spec --upload RTheory > "$tmpdir/batch-r2.txt"
+spec_R2=$(spec_for "$tmpdir/batch-r2.txt" ahead:RTheory)
+mv "$tmpdir/r.log" "$tmpdir/r-ahead.log"
+rm -rf "$tmpdir/worker-r/checkpoint-store"
+worker r "$spec_R2" --share-heaps
+expect r 1 "status=failed" "failure=proof"
+require_grep "restored shared theorem_context checkpoint" "$tmpdir/r.log"
+require_grep "from: theorem-context checkpoint after r1" "$tmpdir/r.log"

@@ -26,7 +26,7 @@ val _ =
           val ctx : BE.shared_context =
             {store = dir ^ "/store", checkpoint_root = tree, heap_key = heap_key, index_key = "index",
              base_state = OS.FileSys.fullPath (env "BASE_STATE"), deps_key = "deps",
-             deps_loaded = tree ^ "/deps.save", ahead_loaded = tree ^ "/ahead.save", requested_timeout = NONE, candidates = []}
+             deps_loaded = tree ^ "/deps.save", deps_root = tree ^ "/deps", requested_timeout = NONE, candidates = []}
           val _ = BE.restore_steps := []
           val {heap, ...} = BE.restore_shared_checkpoints remote ctx false
           val waited = List.exists (fn (name, _) => name = "rstwait") (!BE.restore_steps)
