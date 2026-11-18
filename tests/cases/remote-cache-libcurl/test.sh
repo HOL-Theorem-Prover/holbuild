@@ -276,11 +276,10 @@ fun in_10s () = Time.+ (Time.now (), Time.fromSeconds 10)
    that refills it from the shared store; others keep the usual budget. *)
 local
   val cache = HolbuildRemoteCache.remote url
-  val large = HolbuildRemoteCache.large_blob_bytes
-  fun listed sha256 size = HolbuildRemoteCache.remember_blob cache {sha256 = sha256, size = Int.toString size}
+  fun listed sha256 size = HolbuildRemoteCache.remember_blob cache {sha256 = sha256, size = size}
   fun budget sha256 = HolbuildRemoteCache.blob_stall_timeout cache sha256
-  val _ = listed "large" large
-  val _ = listed "small" (large - 1)
+  val _ = listed "large" "67108864"
+  val _ = listed "small" "67108863"
 in
   val _ = assert "a large listed blob gets the long stall budget" (budget "large" = 120)
   val _ = assert "a smaller listed blob keeps the usual stall budget" (budget "small" = 30)
