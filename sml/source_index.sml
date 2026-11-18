@@ -396,6 +396,7 @@ fun observe_dir package path stamp entries =
 fun declaration_entries path =
   sort_unique_strings (map (fn output => "o" ^ output) (#extra_outputs (HolbuildDependencies.extract_textual path)))
   handle IO.Io _ => raise Error ("cannot read " ^ path)
+       | HolbuildDependencies.Error _ => []
 
 (* What discovery saw at an observed PATH: a directory's classified entries,
    or the extra outputs a theory file declares, which decide whether its
@@ -620,7 +621,9 @@ fun script_extra_outputs (script : source) =
     else
       map (fn output => normalize_path (if dir = "" then output else Path.concat(dir, output)))
           (#extra_outputs (HolbuildDependencies.extract_textual (#source_path script)))
-      handle IO.Io _ => []
+      (* One the analyser can't read declares nothing here; it fails when
+         a build selects it. *)
+      handle IO.Io _ => [] | HolbuildDependencies.Error _ => []
   end
 
 (* The package-relative paths the theories among SCRIPTS declare as extra

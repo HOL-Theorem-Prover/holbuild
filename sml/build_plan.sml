@@ -1370,14 +1370,15 @@ fun expand_input plan node (label, base, decl) : input_expansion =
               val tree =
                 if null outputs then expand_extra_dep_walk base decl
                 else
-                  expand_extra_dep_walk base decl
-                  handle Error _ =>
-                    let
-                      fun existing_dir path =
-                        if is_dir path orelse Path.dir path = path then path else existing_dir (Path.dir path)
-                    in
-                      {files = [], dirs = [existing_dir (normalize_path (Path.concat(base, decl)))]}
-                    end
+                  let
+                    val tree_path = if glob then base else normalize_path (Path.concat(base, decl))
+                    fun existing_dir path =
+                      if is_dir path orelse Path.dir path = path then path else existing_dir (Path.dir path)
+                  in
+                    if (OS.FileSys.access (tree_path, []) handle OS.SysErr _ => false)
+                    then expand_extra_dep_walk base decl
+                    else {files = [], dirs = [existing_dir tree_path]}
+                  end
               (* A declared output in the source tree is a stray copy, such
                  as one 0.14.63 or 0.14.64 wrote there. *)
               val strays =
@@ -1447,7 +1448,14 @@ fun default_source_name package relative_path = "$(" ^ package ^ ")/" ^ relative
    which only the planning side has.  The action text carries it to workers. *)
 fun toolchain_source_name ({holdir, ...} : t) node =
   let
-    val path = normalize_path (#source_path (source_of node))
+    val source = source_of node
+    val root = normalize_path (#package_root source)
+    val physical = normalize_path (#source_path source)
+    (* A source under a dependency's extra-output root counts as at its
+       place in the package's tree. *)
+    val path =
+      if String.isPrefix (root ^ "/") physical then physical
+      else normalize_path (Path.concat(root, #relative_path source))
     val dir = normalize_path holdir
   in
     if holdir <> "" andalso String.isPrefix (dir ^ "/") path then
