@@ -993,15 +993,28 @@ fun no_built_leaves () = Binarymap.mkDict String.compare : (string, built_leaf) 
 
 val built_leaves_ref = ref (no_built_leaves ())
 
-(* For each applied leaf, the successful-leaf count at its first and its last
-   application. *)
+(* Leaf applications are numbered in order; a TRY, ORELSE or REPEAT that
+   rolls the proof back doesn't reuse the numbers, since it doesn't undo what
+   the applications did to their leaves.  leaf_uses_ref holds, for each
+   applied leaf, the numbers of its first and its last application;
+   leaf_boundaries_ref, for each successful-leaf count, how many applications
+   came before the success that reached it (the latest one: earlier ones were
+   rolled back). *)
 fun no_leaf_uses () = Binarymap.mkDict String.compare : (string, int * int) Binarymap.dict
+fun no_leaf_boundaries () = Binarymap.mkDict Int.compare : (int, int) Binarymap.dict
 
+val leaf_applications_ref = ref 0
 val leaf_uses_ref = ref (no_leaf_uses ())
+val leaf_boundaries_ref = ref (no_leaf_boundaries ())
 
 fun reset_built_leaves () =
   (built_leaves_ref := no_built_leaves ();
-   leaf_uses_ref := no_leaf_uses ())
+   leaf_applications_ref := 0;
+   leaf_uses_ref := no_leaf_uses ();
+   leaf_boundaries_ref := no_leaf_boundaries ())
+
+fun record_leaf_boundary count =
+  leaf_boundaries_ref := Binarymap.insert (!leaf_boundaries_ref, count, !leaf_applications_ref)
 
 fun leaf_key start_pos end_pos program =
   String.concat [Int.toString start_pos, ":", Int.toString end_pos, ":", program]
@@ -1009,11 +1022,12 @@ fun leaf_key start_pos end_pos program =
 fun built_leaf start_pos end_pos program =
   let
     val key = leaf_key start_pos end_pos program
-    val n = !successful_step_count_ref
+    val n = !leaf_applications_ref
   in
     case Binarymap.peek (!built_leaves_ref, key) of
         SOME leaf =>
-          (leaf_uses_ref :=
+          (leaf_applications_ref := n + 1;
+           leaf_uses_ref :=
              Binarymap.insert (!leaf_uses_ref, key,
                                case Binarymap.peek (!leaf_uses_ref, key) of
                                    SOME (first, _) => (first, n)
@@ -1022,6 +1036,12 @@ fun built_leaf start_pos end_pos program =
       | NONE => raise Fail ("internal error: proof-ir leaf was not constructed: " ^ program)
   end
 
+fun leaf_boundary 0 = 0
+  | leaf_boundary count =
+      case Binarymap.peek (!leaf_boundaries_ref, count) of
+          SOME applications => applications
+        | NONE => raise Fail ("internal error: no leaf boundary for successful leaf " ^ Int.toString count)
+
 (* A failed-prefix resume restores the heap the failed run saved, after the
    failed step ran, so a leaf there has the state of every application up to
    the failure.  The resume point, after the count-th successful leaf, can
@@ -1029,18 +1049,26 @@ fun built_leaf start_pos end_pos program =
    leaf was applied on both sides of; the failed step and steps an edit
    rewound count as after. *)
 fun leaf_rewind_count count =
-  case List.find (fn (_, (first, last)) => first < count andalso last >= count)
-                 (Binarymap.listItems (!leaf_uses_ref)) of
-      NONE => count
-    | SOME (_, (first, _)) => leaf_rewind_count first
+  let val boundary = leaf_boundary count
+  in
+    case List.find (fn (_, (first, last)) => first < boundary andalso last >= boundary)
+                   (Binarymap.listItems (!leaf_uses_ref)) of
+        NONE => count
+      | SOME (_, (first, _)) =>
+          let fun back k = if leaf_boundary k <= first then k else back (k - 1)
+          in leaf_rewind_count (back (count - 1)) end
+  end
 
 (* Leaves first applied at or after the resume point are constructed again. *)
 fun drop_leaves_from count =
-  List.app (fn (key, (first, _)) =>
-              if first < count then ()
-              else (built_leaves_ref := #1 (Binarymap.remove (!built_leaves_ref, key));
-                    leaf_uses_ref := #1 (Binarymap.remove (!leaf_uses_ref, key))))
-           (Binarymap.listItems (!leaf_uses_ref))
+  let val boundary = leaf_boundary count
+  in
+    List.app (fn (key, (first, _)) =>
+                if first < boundary then ()
+                else (built_leaves_ref := #1 (Binarymap.remove (!built_leaves_ref, key));
+                      leaf_uses_ref := #1 (Binarymap.remove (!leaf_uses_ref, key))))
+             (Binarymap.listItems (!leaf_uses_ref))
+  end
 
 fun history_is_proved () =
   ((project_history goalStack.extract_thm; true) handle _ => false)
@@ -1527,6 +1555,7 @@ fun run_built_steps resume_after_path display_index steps =
             (HolbuildProofIr.canonical_dependency_prefix steps path)
       in
         successful_step_count_ref := count;
+        record_leaf_boundary count;
         successful_prefix_end_ref := prefix_end;
         successful_path_ref := path;
         successful_frames_ref := !current_frames_ref;

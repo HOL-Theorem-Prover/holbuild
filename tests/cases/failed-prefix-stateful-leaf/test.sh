@@ -22,6 +22,11 @@ source "$SCRIPT_DIR/../../lib.sh"
 # rewound applies the closure once, after the step an edit then changes, so
 # the resume rewinds past that application.  A resume that kept the spent
 # closure would fail where a fresh run of the edited proof passes.
+#
+# rolled_back spends the closure on the first goal inside a TRY that then
+# fails and rolls back; the second goal's TRY then can't use it.  After an
+# edit to the last step, a resume that constructed the closure again would
+# close the second goal where a fresh run of the edited proof fails.
 
 tmpdir=$(make_temp_dir)
 cleanup() { cleanup_temp_dir "$tmpdir"; }
@@ -148,3 +153,45 @@ if ! (cd "$project" && "$HOLBUILD_BIN" build BTheory) >"$tmpdir/b-resume.log" 2>
   exit 1
 fi
 require_grep "from: failed-prefix checkpoint in rewound" "$tmpdir/b-resume.log"
+
+write_d() {
+  cat > "$project/src/DScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "D";
+
+Definition duo_def:
+  duo a b <=> a /\\ b
+End
+
+Theorem rolled_back:
+  duo a b /\\ b ==> b /\\ a
+Proof
+  strip_tac >> CONJ_TAC >> (
+    TRY (ALL_TAC >>
+         qpat_assum \`duo a b\` (mp_tac o CONJUNCT1 o REWRITE_RULE [Once duo_def]) >>
+         disch_then ACCEPT_TAC) >>
+    ALL_TAC >> $1)
+QED
+
+val _ = export_theory();
+SML
+}
+
+write_d "NO_TAC"
+if (cd "$project" && "$HOLBUILD_BIN" build DTheory) >"$tmpdir/d-fresh.log" 2>&1; then
+  cat "$tmpdir/d-fresh.log" >&2
+  echo "expected rolled_back to fail before the edit" >&2
+  exit 1
+fi
+require_grep "fragment: NO_TAC" "$tmpdir/d-fresh.log"
+
+# first_assum ACCEPT_TAC closes b but not a, which only the spent closure
+# could have closed.
+write_d "first_assum ACCEPT_TAC"
+if (cd "$project" && "$HOLBUILD_BIN" build DTheory) >"$tmpdir/d-resume.log" 2>&1; then
+  cat "$tmpdir/d-resume.log" >&2
+  echo "expected the edited rolled_back to fail on the second goal, as it does fresh" >&2
+  exit 1
+fi
+require_grep "from: failed-prefix checkpoint in rolled_back" "$tmpdir/d-resume.log"
+require_grep "fragment: first_assum ACCEPT_TAC" "$tmpdir/d-resume.log"
