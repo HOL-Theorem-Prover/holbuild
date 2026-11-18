@@ -9862,19 +9862,27 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
        a second, so any later replacement shows in the stat. *)
     val manifest_stats_file = Path.concat (cache, "action-manifest-stats")
     val scan_ns = Time.toNanoseconds (Time.now ())
-    val known = #entries (HolbuildStatCache.load {path = manifest_stats_file})
+    (* A damaged record only means the manifests are hashed again. *)
+    val known =
+      hydrate_step "hydcheck" (fn () =>
+        !(#entries (HolbuildStatCache.load {path = manifest_stats_file}))
+        handle _ => HolbuildStatCache.empty_entries ())
     val seen = HolbuildStatCache.new_instance true (SOME manifest_stats_file) (HolbuildStatCache.empty_entries ())
     fun see path entry =
       HolbuildStatCache.with_lock seen (fn () => #entries seen := Binarymap.insert (!(#entries seen), path, entry))
+    fun trusted path entry =
+      HolbuildStatCache.with_lock seen (fn () =>
+        (#entries seen := Binarymap.insert (!(#entries seen), path, entry);
+         #hits seen := !(#hits seen) + 1))
     fun source_sha key =
       let val path = HolbuildCache.action_manifest cache key
       in
         case HolbuildStatCache.stat_ident path of
             NONE => NONE
           | SOME ident =>
-              case Binarymap.peek (!known, path) of
+              case Binarymap.peek (known, path) of
                   SOME (entry as (recorded, hash)) =>
-                    if HolbuildStatCache.same_ident (recorded, ident) then (see path entry; SOME hash)
+                    if HolbuildStatCache.same_ident (recorded, ident) then (trusted path entry; SOME hash)
                     else hash_manifest key path ident
                 | NONE => hash_manifest key path ident
       end
@@ -9948,6 +9956,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                   transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks)
         val stale = map #1 (List.filter (! o #2) checks)
       in
+        hydrate_count "hydstatn" (HolbuildStatCache.with_lock seen (fn () => !(#hits seen) before #hits seen := 0));
         hydrate_count "hydinstn" (length stale);
         hydrate_step "hydinst" (fn () =>
           (List.app (restorable remove_old) stale;
@@ -10022,7 +10031,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                                     "dependency " ^ target ^ " does not match its parents in the cache");
     Resident.save resident;
     (* A stale or missing record only means a manifest is hashed again. *)
-    HolbuildStatCache.flush seen handle _ => ()
+    hydrate_step "hydcheck" (fn () => HolbuildStatCache.flush seen handle _ => ())
   end
 
 (* The stems of the project objects the build loads: the ones its preload
