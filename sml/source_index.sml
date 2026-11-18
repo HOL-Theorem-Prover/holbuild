@@ -717,22 +717,28 @@ fun discover_package scans package =
               (* The root outlives pin and override changes, so only what a
                  theory of the package declares now counts, including a theory
                  another theory generated there, in place of its tree copy. *)
-              fun admit scripts =
-                let
-                  val declarations = declared_extra_outputs scripts rels
-                  val admitted =
-                    List.filter (fn output => List.exists (fn path => path = rel_of output) declarations) found
-                  val new_scripts =
-                    List.filter
-                      (fn (output : source) =>
-                         #kind output = TheoryScript andalso
-                         not (List.exists (fn (script : source) => #source_path script = #source_path output) scripts))
-                      admitted
+              (* The theories that decide admissions: the tree's, each in
+                 place of its admitted overlay copy.  An admitted theory may
+                 admit more, and a replaced one may admit less, so the
+                 admissions are recomputed until they settle, at most once
+                 per candidate. *)
+              fun scripts_with admitted =
+                let val generated = List.filter (fn (output : source) => #kind output = TheoryScript) admitted
                 in
-                  if null new_scripts then (admitted, scripts)
-                  else
-                    admit (List.filter (fn script => not (List.exists (fn output => rel_of output = rel_of script) new_scripts)) scripts
-                           @ new_scripts)
+                  List.filter (fn script => not (List.exists (fn output => rel_of output = rel_of script) generated))
+                    tree_sources @ generated
+                end
+              fun admissions scripts =
+                let val declarations = declared_extra_outputs scripts rels
+                in List.filter (fn output => List.exists (fn path => path = rel_of output) declarations) found end
+              fun paths sources = map (fn (source : source) => #source_path source) sources
+              fun admit (rounds, admitted) =
+                let
+                  val scripts = scripts_with admitted
+                  val next = admissions scripts
+                in
+                  if paths next = paths admitted orelse rounds = 0 then (next, scripts_with next)
+                  else admit (rounds - 1, next)
                 end
               fun under dir path = dir = "" orelse String.isPrefix (dir ^ "/") path
               fun relevant (script : source) =
@@ -741,7 +747,7 @@ fun discover_package scans package =
             in
               if null found then []
               else
-                let val (admitted, scripts) = admit tree_sources
+                let val (admitted, scripts) = admit (length found, admissions tree_sources)
                 in
                   (* A plan record must notice a change to what they declare. *)
                   List.app (fn (script : source) => observe_declarations name (#source_path script))

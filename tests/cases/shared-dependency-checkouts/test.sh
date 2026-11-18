@@ -202,16 +202,20 @@ require_grep "UTheory is up to date" "$tmpdir/copy-stale.log"
 # A plan record notices a generated source appearing in the extra-output
 # directory, though the dependency's checkout never changes.
 cat > "$tmpdir/copy/src/TScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["T.txt"];
+val () = let val out = TextIO.openOut "T.txt" in TextIO.output (out, "y=" ^ Int.toString GUse.y ^ "\n"); TextIO.closeOut out end;
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "T";
-val _ = if GUse.y = 1 then () else ();
 val _ = export_theory();
 SML
 (cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-t.log" 2>&1 || { cat "$tmpdir/copy-t.log" >&2; fail "build of T failed"; }
 require_grep "TTheory built" "$tmpdir/copy-t.log"
+require_grep "y=1" "$tmpdir/copy/src/T.txt"
 echo 'structure GenML = struct val x = 2 end' > "$tmpdir/copy/.holbuild/packages/dep/extra-outputs/src/GenML.sml"
 (cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-t2.log" 2>&1 || { cat "$tmpdir/copy-t2.log" >&2; fail "rebuild of T failed"; }
 require_grep "GUse built" "$tmpdir/copy-t2.log"
+require_grep "y=2" "$tmpdir/copy/src/T.txt"
 
 # A dependency taken from a path that 0.14.63 or 0.14.64 wrote declared
 # outputs into: those copies are never inputs, even through a directory.
@@ -301,12 +305,15 @@ require_grep "saw .*P.txt" "$tmpdir/over/.holbuild/packages/dep/extra-outputs/sr
 # takes its place.
 echo 'structure GenML = struct val x = 2 end' > "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/GenML.sml"
 cat > "$tmpdir/over/src/WScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["W.txt"];
+val () = let val out = TextIO.openOut "W.txt" in TextIO.output (out, "y=" ^ Int.toString GUse.y ^ "\n"); TextIO.closeOut out end;
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "W";
-val _ = if GUse.y > 0 then () else ();
 val _ = export_theory();
 SML
 over_build WTheory
+require_grep "y=2" "$tmpdir/over/src/W.txt"
 over_build WTheory
 require_grep "WTheory is up to date" "$tmpdir/over-step.log"
 sleep 1.1
@@ -317,6 +324,7 @@ val _ = export_theory();
 SML
 over_build WTheory
 require_grep "GUse built" "$tmpdir/over-step.log"
+require_grep "y=1" "$tmpdir/over/src/W.txt"
 
 # GC runs on a cache of its own, which links no shared toolchains, with a HOL
 # dependency that is never built.

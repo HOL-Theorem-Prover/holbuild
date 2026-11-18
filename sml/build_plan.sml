@@ -1369,7 +1369,15 @@ fun expand_input plan node (label, base, decl) : input_expansion =
                   (#files found)
               val tree =
                 if null outputs then expand_extra_dep_walk base decl
-                else expand_extra_dep_walk base decl handle Error _ => {files = [], dirs = []}
+                else
+                  expand_extra_dep_walk base decl
+                  handle Error _ =>
+                    let
+                      fun existing_dir path =
+                        if is_dir path orelse Path.dir path = path then path else existing_dir (Path.dir path)
+                    in
+                      {files = [], dirs = [existing_dir (normalize_path (Path.concat(base, decl)))]}
+                    end
               (* A declared output in the source tree is a stray copy, such
                  as one 0.14.63 or 0.14.64 wrote there. *)
               val strays =
