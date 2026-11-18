@@ -906,12 +906,14 @@ async def test_a_holder_claiming_unwoken_tries_each_tier_with_a_held_build(
     assert claimed is not None and claimed.theory == theory
 
 
+@pytest.mark.parametrize("woken", [False, True])
 async def test_a_holder_swapping_to_its_held_build_takes_no_other_build_of_its_batch(
-    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, woken: bool
 ) -> None:
     """Another process's claim took the held build since the ranking was read, so the lock finds the batch's next
-    build, of another theory: host-1's claim leaves it and takes ``a1``, the head."""
-    await held_in_a_busier_batch(http, coordinator)
+    build, of another theory: host-1's claim, unwoken or woken for the held build, leaves it and takes ``a1``, the
+    head."""
+    batch_id, theory = await held_in_a_busier_batch(http, coordinator)
     await submit_as(http, "a1", "a")
     lock = coordinator._lock_unleased
 
@@ -921,6 +923,10 @@ async def test_a_holder_swapping_to_its_held_build_takes_no_other_build_of_its_b
 
     monkeypatch.setattr(coordinator, "_lock_unleased", next_build)
 
-    claimed = await coordinator.claim(["standard"], "host-1-w", 0, host_id="host-1")
+    if woken:
+        hint = (UUID(batch_id), "standard", theory)
+        claimed, _ = await coordinator._claim(["standard"], "host-1-w", host_id="host-1", hint=hint)
+    else:
+        claimed = await coordinator.claim(["standard"], "host-1-w", 0, host_id="host-1")
 
     assert claimed is not None and claimed.theory == "pkg:a"

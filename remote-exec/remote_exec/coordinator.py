@@ -1727,14 +1727,13 @@ class Coordinator:
                 continue
             tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
             # A hint is for the first candidate of its tier only, as a woken claim's, or one held for this host.
-            hinted, fits, held_swap = None, False, False
+            hinted, fits = None, False
             if tier in hint_tiers:
                 hint_tiers.discard(tier)
                 if hint is not None:
                     hinted, hint = self._hinted_entry(ranking, entry, host_id, hint, kept), None
                 else:
                     hinted = self._held_entry(ranking, entry, host_id, kept)
-                    held_swap = hinted is not None
                 fits = self._held_here(ranking, (hinted[6], hinted[7]) if hinted else (batch_id, tier), host_id, kept)
             if tier in hint_only and not fits:
                 held.append(entry)
@@ -1747,7 +1746,7 @@ class Coordinator:
             passed = None  # the candidate passed over for one this host is warm for
             local = hinted if tier in hint_only else hinted or self._local_entry(ranking, entry, host_id, kept)
             # Only the held build is taken for its hold: another of the batch is another claim's to take.
-            only_held = tier in hint_only or held_swap
+            only_held = tier in hint_only or hinted is not None and fits
             if local is not None:
                 ranking.heap[ranking.heap.index(local)] = entry
                 heapq.heapify(ranking.heap)
@@ -2005,7 +2004,8 @@ class Coordinator:
         hold, theory = self.holds.get(head), ranking.theories.get(head)
         if hold is None or asyncio.get_running_loop().time() >= hold[1] or theory != hold[2]:
             return
-        if (best := self._best_level(theory, entry[7], host_id or "", kept)) > 0:
+        # The most any kept host holds, this one's included: a build held for this host is held for no other.
+        if (best := self._best_level(theory, entry[7], "", kept)) > 0:
             holders = {h for h in kept(entry[7]) if h != host_id and self._level(h, theory) == best}
             self._wake_holder(entry[7], head[0], theory, holders)
 
