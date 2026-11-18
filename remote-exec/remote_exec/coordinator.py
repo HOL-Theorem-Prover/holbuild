@@ -1877,6 +1877,12 @@ class Coordinator:
                 return None, held_until, entry
             passed = None  # the candidate passed over for one this host is warm for
             local = hinted if tier in hint_only else hinted or self._local_entry(ranking, entry, host_id, kept)
+            # Nor is a batch swapped in whose deeper claim ahead on outlines goes before its ready build.
+            if (
+                local is not None and local is not hinted and outranked is not None
+                and outranked.deeper(local[6], local[7], ranking.depths.get((local[6], local[7])))
+            ):
+                local = None
             # Only the held build is taken for its hold: another of the batch is another claim's to take.
             only_held = tier in hint_only or (
                 local is not None and self._held_here(ranking, (local[6], local[7]), host_id, kept)

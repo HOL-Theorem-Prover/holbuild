@@ -2107,9 +2107,11 @@ theory the build doesn't name as a target publishes its outline before
 proving, and a theory waiting ahead of it starts on that outline. It keeps
 nothing built on an outline until the parent's own outputs pass the gate
 against the outline it loaded; otherwise it is built normally again. A
-theory whose unbuilt parents have all published their outlines can start at
-once, so it no longer waits behind shallower theories ready to build, and an
-outlined parent no longer counts against N.
+theory that itself builds pipelined, within the coordinator's generation
+limit (`REMOTE_EXEC_AHEAD_DEPTH`), and whose unbuilt parents have all
+published their outlines can start at once, so it no longer waits behind
+shallower theories ready to build, and an outlined parent no longer counts
+against N.
 
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with

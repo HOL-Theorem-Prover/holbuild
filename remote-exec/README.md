@@ -639,7 +639,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   instead of waiting for them; other candidates come after the ready builds
   of their priority, since their workers would wait. The record is kept in
   memory, by attempt token, and names an action only while that lease is
-  live: a restarted coordinator counts such actions against the cap again
+  live; each replica keeps the reports it received, as it does host reports,
+  and a restarted coordinator counts such actions against the cap again
   until they end. Rolling back: `REMOTE_EXEC_PIPELINE=0`, which stops new
   pipelined claims; actions already running finish as they started.
 - **Retries** by the result's failure class:
