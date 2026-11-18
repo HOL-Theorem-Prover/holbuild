@@ -3801,7 +3801,14 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
 fun theory_action root plan keys toolchain_key deps_key node : theory_action =
   let
     val package_root = #package_root (HolbuildBuildPlan.source_of node)
-    val script_dir = Path.dir (source_file node)
+    (* Where the script is in its package: a script a dependency generates is
+       read from the extra-output root, but runs where the package has it. *)
+    val relative = HolbuildBuildPlan.relative_path node
+    val script_dir =
+      if String.isPrefix (normalize_path package_root ^ "/") (normalize_path (source_file node)) orelse
+         Path.isAbsolute relative orelse String.isPrefix ".." relative
+      then Path.dir (source_file node)
+      else Path.dir (Path.concat(package_root, relative))
     val script_rel_dir =
       Path.mkRelative {path = normalize_path script_dir, relativeTo = normalize_path package_root}
     (* The stage mirrors the package layout, and the script runs from its own

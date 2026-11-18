@@ -591,6 +591,18 @@ fun deduplicate_sources sources =
     kept
   end
 
+(* The package-relative paths a theory script declares as extra outputs; []
+   for other sources. *)
+fun script_extra_outputs (script : source) =
+  let val dir = Path.dir (normalize_path (#relative_path script))
+  in
+    if #kind script <> TheoryScript then []
+    else
+      map (fn output => normalize_path (if dir = "" then output else Path.concat(dir, output)))
+          (#extra_outputs (HolbuildDependencies.extract_textual (#source_path script)))
+      handle IO.Io _ => []
+  end
+
 (* The package-relative paths the theories among SCRIPTS declare as extra
    outputs, reading only those whose directory holds one of RELS:
    declarations have no .. components, so a theory writes only under its own
@@ -598,17 +610,10 @@ fun deduplicate_sources sources =
 fun declared_extra_outputs (scripts : source list) rels =
   let
     fun under dir path = dir = "" orelse String.isPrefix (dir ^ "/") path
-    fun declared (script : source) =
-      let val dir = Path.dir (normalize_path (#relative_path script))
-      in
-        if #kind script <> TheoryScript orelse not (List.exists (under dir) rels) then []
-        else
-          map (fn output => normalize_path (if dir = "" then output else Path.concat(dir, output)))
-              (#extra_outputs (HolbuildDependencies.extract_textual (#source_path script)))
-          handle IO.Io _ => []
-      end
+    fun relevant (script : source) =
+      List.exists (under (Path.dir (normalize_path (#relative_path script)))) rels
   in
-    List.concat (map declared scripts)
+    List.concat (map script_extra_outputs (List.filter relevant scripts))
   end
 
 fun discover_package scans package =
@@ -672,8 +677,19 @@ fun discover_package scans package =
                   if is_dir path orelse is_readable path then
                     scan_member name package_id root artifact_root policies generated_paths
                       excludes exclude_globs (path, acc)
-                  else acc
+                  else (observe_existing_ancestor path; acc)
                 end
+              (* A producer may make the member's directory later, which a
+                 plan record must notice.  The root exists, so the walk ends
+                 at it, never above, where entries change with every build. *)
+              and observe_existing_ancestor path =
+                let val parent = Path.dir path
+                in
+                  if is_dir parent then observe_boundary_dir name parent
+                  else if parent = root orelse parent = path orelse parent = "" then ()
+                  else observe_existing_ancestor parent
+                end
+              val _ = HolbuildGenerators.ensure_dir root
               val found =
                 deduplicate_sources (List.foldl scan [] (HolbuildProject.package_members package))
               (* The root outlives pin and override changes, so only what a

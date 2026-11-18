@@ -458,7 +458,9 @@ holbuild --offline build MyTheory
 
 A dependency whose shared checkout is missing fails before checkout or fetch,
 even if its commit is in a local bare mirror; one already in the cache is
-linked as usual. A missing or invalid HOL
+linked as usual. Holbuild 0.14.70 names shared checkouts differently from
+earlier releases, so a project prepared with one of those needs one more run
+with offline mode unset. A missing or invalid HOL
 toolchain also fails before restore or replacement. The error names what needs
 preparing; rerun without `--offline` and with `HOLBUILD_OFFLINE` unset. Valid
 local toolchains can regenerate analyser and source metadata offline.

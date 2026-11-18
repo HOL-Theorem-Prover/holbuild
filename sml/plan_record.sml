@@ -466,17 +466,20 @@ fun is_pinned_git_package package =
 
 (* The directories of OBSERVED, as discovery listed them, that the record
    watches: not those a scan of HOL or of a pinned checkout listed, whose
-   entries change only with the pin. *)
+   entries change only with the pin, except those under the package's
+   artifact root, where its theories write their extra outputs. *)
 fun watched_dirs graph observed =
   let
     val fixed =
-      map HolbuildProject.package_name
+      map (fn p => (HolbuildProject.package_name p, HolbuildProject.package_artifact_root p ^ "/"))
         (List.filter (fn p => is_hol_package p orelse is_pinned_git_package p)
            (HolbuildProjectGraph.packages graph))
+    fun is_fixed (package, path) =
+      List.exists (fn (name, artifacts) => name = package andalso not (String.isPrefix artifacts path)) fixed
   in
     List.mapPartial
       (fn (package, path, stamp, entries) =>
-         if List.exists (fn name => name = package) fixed then NONE else SOME (path, stamp, entries))
+         if is_fixed (package, path) then NONE else SOME (path, stamp, entries))
       observed
   end
 

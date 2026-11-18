@@ -66,7 +66,8 @@ val d_def = new_definition("d_def", ``d_const = T``);
 val _ = export_theory();
 SML
 # write_reader NAME DECLARATION: theory NAME reads results/D.txt through
-# DECLARATION and writes what it read to out/NAME.txt.
+# DECLARATION and writes what it read, and the files it saw in results, to
+# out/NAME.txt.
 write_reader() {
   cat > "$dep/src/$1Script.sml" <<SML
 fun holbuild_extra_deps (_ : string list) = ();
@@ -74,8 +75,12 @@ fun holbuild_extra_outputs (_ : string list) = ();
 val () = holbuild_extra_deps ["$2"];
 val () = holbuild_extra_outputs ["out/$1.txt"];
 val () = let val input = TextIO.openIn "results/D.txt"; val text = TextIO.inputAll input
-             val () = TextIO.closeIn input; val out = TextIO.openOut "out/$1.txt"
-         in TextIO.output (out, "read " ^ text); TextIO.closeOut out end;
+             val () = TextIO.closeIn input
+             val dir = OS.FileSys.openDir "results"
+             fun names acc = case OS.FileSys.readDir dir of NONE => acc | SOME name => names (name :: acc)
+             val seen = names [] before OS.FileSys.closeDir dir
+             val out = TextIO.openOut "out/$1.txt"
+         in TextIO.output (out, "read " ^ text ^ "saw " ^ String.concatWith " " seen ^ "\n"); TextIO.closeOut out end;
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "$1";
 val _ = export_theory();
@@ -83,9 +88,31 @@ SML
 }
 write_reader E results/D.txt
 write_reader F results
+# PScript declares an output that no build here makes.
+cat > "$dep/src/PScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["results/P.txt"];
+val () = let val out = TextIO.openOut "results/P.txt" in TextIO.output (out, "p\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "P";
+val _ = export_theory();
+SML
 cat > "$dep/src/DUse.sml" <<'SML'
 structure DUse = struct val y = DGenML.x + 1 end
 SML
+# GScript generates GenML.sml, which the dependency also tracks; nothing
+# depends on GTheory, so a build of GUse alone reads the tracked copy.
+echo 'structure GenML = struct val x = 1 end' > "$dep/src/GenML.sml"
+cat > "$dep/src/GScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["GenML.sml"];
+val () = let val out = TextIO.openOut "GenML.sml"
+         in TextIO.output (out, "structure GenML = struct val x = 2 end\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "G";
+val _ = export_theory();
+SML
+echo 'structure GUse = struct val y = GenML.x end' > "$dep/src/GUse.sml"
 dep_rev=$(init_git_repo "$dep")
 
 project=$tmpdir/project
@@ -106,6 +133,7 @@ val u_thm = store_thm("u_thm", ``d_const``, REWRITE_TAC [d_def]);
 val _ = export_theory();
 SML
 cp -R "$project" "$tmpdir/copy"
+cp -R "$project" "$tmpdir/over"
 
 (cd "$project" && "$HOLBUILD_BIN" context) > "$tmpdir/context.log"
 checkout=$(checkout_of "$dep" "$dep_rev")
@@ -170,6 +198,35 @@ require_outputs "$tmpdir/copy"
 echo 'structure DUse = struct val y = 0 end' > "$tmpdir/copy/.holbuild/packages/dep/extra-outputs/src/DUse.sml"
 (cd "$tmpdir/copy" && "$HOLBUILD_BIN" --verbose build) > "$tmpdir/copy-stale.log" 2>&1 || { cat "$tmpdir/copy-stale.log" >&2; fail "build with a stale output failed"; }
 require_grep "UTheory is up to date" "$tmpdir/copy-stale.log"
+
+# A plan record notices a generated source appearing in the extra-output
+# directory, though the dependency's checkout never changes.
+cat > "$tmpdir/copy/src/TScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "T";
+val _ = if GUse.y = 1 then () else ();
+val _ = export_theory();
+SML
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-t.log" 2>&1 || { cat "$tmpdir/copy-t.log" >&2; fail "build of T failed"; }
+require_grep "TTheory built" "$tmpdir/copy-t.log"
+echo 'structure GenML = struct val x = 2 end' > "$tmpdir/copy/.holbuild/packages/dep/extra-outputs/src/GenML.sml"
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-t2.log" 2>&1 || { cat "$tmpdir/copy-t2.log" >&2; fail "rebuild of T failed"; }
+require_grep "GUse built" "$tmpdir/copy-t2.log"
+
+# A dependency taken from a path that 0.14.63 or 0.14.64 wrote declared
+# outputs into: those copies are never inputs, even through a directory.
+cp -R "$dep" "$tmpdir/dep-override"
+mkdir -p "$tmpdir/dep-override/src/results"
+echo "stray result" > "$tmpdir/dep-override/src/results/D.txt"
+echo stray > "$tmpdir/dep-override/src/results/P.txt"
+printf '[overrides.dep]\npath = "../dep-override"\n' > "$tmpdir/over/.holconfig.toml"
+(cd "$tmpdir/over" && "$HOLBUILD_BIN" build) > "$tmpdir/over.log" 2>&1 || { cat "$tmpdir/over.log" >&2; fail "build with an overridden dependency failed"; }
+require_outputs "$tmpdir/over"
+for reader in E F; do
+  if grep -q P.txt "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/out/$reader.txt"; then
+    fail "$reader read a stray declared output from the dependency's sources"
+  fi
+done
 
 # GC runs on a cache of its own, which links no shared toolchains, with a HOL
 # dependency that is never built.
