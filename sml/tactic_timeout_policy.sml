@@ -72,7 +72,8 @@ fun add_entry_timeout project plan (logical, timeout) acc =
 
 (* The timeouts the roots with their own tactic timeout set on the root-package
    nodes of their closures.  Every other root would set the default timeout,
-   which plan_timeouts already sets on each such node. *)
+   which plan_timeouts already sets on each such node.  Every declared root
+   is still resolved, which reports an unknown or ambiguous one. *)
 fun entry_timeouts project index entry_plan =
   List.foldl
     (fn ((root, logical), acc) =>

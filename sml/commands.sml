@@ -1386,9 +1386,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            graph = graph, members = members, dirs = dirs, stamps = stamps, index = index, targets = targets}
         fun write context prior plan keys =
           let
+            val written =
+              timed_phase "plan.record.build" (fn () => HolbuildPlanRecord.writer record_dir context prior plan keys)
             fun write_now () =
-              case timed_phase "plan.record.write"
-                     (fn () => HolbuildPlanRecord.write record_dir context prior plan keys) of
+              case timed_phase "plan.record.write" written of
                   HolbuildPlanRecord.Written => ()
                 | HolbuildPlanRecord.NotWritten reason => say ("plan record not written: " ^ reason)
           in

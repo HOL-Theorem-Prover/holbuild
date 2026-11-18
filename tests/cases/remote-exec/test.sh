@@ -2503,3 +2503,39 @@ cp "$tmpdir/ring-weak-ac" "${ranked_roots[1]}/ac/$ring_ac"
 ring_worker ring-built-worker built
 require_grep '^proof-timeout=2.5$' "${ranked_roots[0]}/ac/$ring_ac"
 require_grep '^proof-timeout=2.5$' "${ranked_roots[1]}/ac/$ring_ac"
+
+# The plan record written after the POST keeps the stamps taken when planning
+# hashed the inputs: an input whose link moves to an older file while the
+# batch is submitted is hashed again by the next plan, which check mode
+# compares with full planning.
+project=$tmpdir/swap
+mkdir -p "$project/src" "$project/data"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxswap"
+
+[build]
+members = ["src"]
+
+[actions.ATheory]
+extra_inputs = ["data/in.txt"]
+TOML
+cat > "$project/src/AScript.sml" <<'SML'
+Theory A
+Ancestors bool
+SML
+echo one > "$project/one.txt"
+echo two > "$project/two.txt"
+ln -s ../one.txt "$project/data/in.txt"
+# Neither file's stat is recent enough for the record to distrust it.
+sleep 1.1
+echo "ln -sfn ../two.txt '$project/data/in.txt'" > "$state/on-submit"
+touch "$state/skip"
+HOLBUILD_PLAN_RECORD=on run swap 0 --verbose build --remote-exec "$coordinator" --detach ATheory
+rm "$state/on-submit"
+[[ $(readlink "$project/data/in.txt") == ../two.txt ]] || { echo "the input was not swapped at the POST" >&2; exit 1; }
+[[ $(plan_digest) != absent ]] || { cat "$tmpdir/swap.log" >&2; echo "the swap build wrote no plan record" >&2; exit 1; }
+run swap-check 0 --verbose build --remote-exec "$coordinator" --detach ATheory
+rm "$state/skip"
+require_grep "plan: from record (1 files rehashed" "$tmpdir/swap-check.log"
