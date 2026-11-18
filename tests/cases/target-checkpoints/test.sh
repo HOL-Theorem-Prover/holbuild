@@ -59,7 +59,7 @@ log=$tmpdir/build.log
   || { cat "$log" >&2; exit 1; }
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 require_file "$project/.holbuild/obj/src/BTheory.dat"
-if find "$checkpoints/AScript.sml.deps" "$checkpoints/AScript.sml.theorems" -name '*.save' -print 2>/dev/null | grep -q .; then
+if has_save AScript.sml.deps '*.save' || has_save AScript.sml.theorems '*.save'; then
   echo "the passing dependency saved checkpoints" >&2; exit 1
 fi
 has_save BScript.sml.deps deps_loaded.save || { echo "target lost its deps_loaded checkpoint" >&2; exit 1; }

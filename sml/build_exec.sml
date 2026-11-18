@@ -3666,11 +3666,14 @@ fun failed_prefix_resume_message logical checkpoint step_count =
     ["from: failed-prefix checkpoint in " ^ #safe_name checkpoint,
      "restoring proof-ir prefix with " ^ Int.toString step_count ^ " successful leaf steps"]
 
-fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
+(* CONTEXTS: whether the resumed run saves theorem and definition contexts:
+   not on a failed prefix with no deps_loaded under it, since a context is
+   reused only on a current deps_loaded. *)
+fun failed_prefix_resume_source policy contexts timeout_marker plan_only_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
   let
     val runtime_config =
       {checkpoint_enabled = theorem_checkpoints_enabled policy,
-       context_checkpoints = context_checkpoints_enabled policy,
+       context_checkpoints = (contexts andalso context_checkpoints_enabled policy),
        share_failed_prefix = false,
        checkpoint_seconds = checkpoint_seconds policy,
        tactic_timeout = tactic_timeout policy,
@@ -3730,10 +3733,10 @@ fun failed_prefix_resume_source policy timeout_marker plan_only_marker source_na
          source_name = source_name,
          start_offset = #boundary checkpoint,
          checkpoints = checkpoints,
-         declaration_checkpoints = if context_checkpoints_enabled policy then declaration_checkpoints else [],
+         declaration_checkpoints = if (contexts andalso context_checkpoints_enabled policy) then declaration_checkpoints else [],
          terminations = terminations,
          save_checkpoints = theorem_checkpoints_enabled policy,
-         context_checkpoints = context_checkpoints_enabled policy,
+         context_checkpoints = (contexts andalso context_checkpoints_enabled policy),
          share_failed_prefix = false,
          checkpoint_seconds = checkpoint_seconds policy,
          tactic_timeout = tactic_timeout policy,
@@ -3956,7 +3959,8 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
         let
           val path = #failed_prefix_path checkpoint
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (failed_prefix_resume_source policy timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
+          val contexts = deps_checkpoint_exists deps_loaded deps_key
+          val _ = write_text staged_script (failed_prefix_resume_source policy contexts timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
           val _ = failed_prefix_resume_message logical checkpoint step_count
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME (path, step_count)}
@@ -11365,14 +11369,17 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         | SOME action =>
             restore_entry standalone_key (fn () =>
               let
-                val text = HolbuildRemoteCache.remember_action remote action
+                (* Only the manifest of a candidate it tries records its blobs
+                   as present, as in first_window. *)
+                val text = #manifest action
                 val entries = shared_manifest_entries text
                 val path = tree_path checkpoint_root (#2 (single "leaf" entries))
                 val key = shared_manifest_field "key" text
               in
                 case List.find (fn c => #kind c = "failed_prefix" andalso #path c = path andalso key = SOME (#key c))
                                candidates of
-                    SOME c => restore_chain NONE c entries
+                    SOME c => (ignore (HolbuildRemoteCache.remember_action remote action);
+                               restore_chain NONE c entries)
                   | NONE => NONE
               end)
     (* Fetch a window of manifests at once, then try them in order. Every

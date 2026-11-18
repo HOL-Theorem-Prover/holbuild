@@ -79,10 +79,11 @@ SML
 checkpoints=$project/.holbuild/checkpoints
 # saves THEORY: THEORY's saved states, one per line.
 saves() { find "$checkpoints" -path "*/$1Script.sml*" -name '*.save' 2>/dev/null | sort; }
+# build NAME [TARGET]: build TARGET (default TTheory).
 build() {
-  local name=$1
+  local name=$1 target=${2:-TTheory}
   set +e
-  (cd "$project" && "$HOLBUILD_BIN" build TTheory) > "$tmpdir/$name.log" 2>&1
+  (cd "$project" && "$HOLBUILD_BIN" build "$target") > "$tmpdir/$name.log" 2>&1
   build_status=$?
   set -e
 }
@@ -127,6 +128,20 @@ expect_build fixed 0
 require_grep "from: failed-prefix checkpoint in a2" "$tmpdir/fixed.log"
 if [[ -n "$(saves A)" ]]; then
   echo "A kept checkpoints once it passed:" >&2; saves A >&2; exit 1
+fi
+
+# Rebuilt as a target, A resumes from the prefix it saved as a dependency, and
+# saves no contexts on it: with no deps heap under them none could be reused.
+write_a 'FAIL_TAC "seeded failure"'
+build fail-again
+expect_build fail-again 1
+only_failed_prefix fail-again
+write_a "ALL_TAC >> ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH"
+build as-target ATheory
+expect_build as-target 0
+require_grep "from: failed-prefix checkpoint in a2" "$tmpdir/as-target.log"
+if [[ -n "$(saves A)" ]]; then
+  echo "A saved checkpoints on a prefix with no deps heap:" >&2; saves A >&2; exit 1
 fi
 
 # A step that times out, and again on its retry at half the budget, saves

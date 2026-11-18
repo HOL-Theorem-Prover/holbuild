@@ -1014,7 +1014,7 @@ starting state is:
 | --- | --- |
 | Its `deps_loaded` checkpoint matches its current dependencies and `THEORY` is built for its current source | ancestors loaded from the checkpoint, then `THEORY` loaded |
 | Only `THEORY` changed since it was built, or the project directory moved (`THEORY`'s objects name the old directory, so loading it fails with a warning): its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
-| Otherwise: not built yet, restored from the cache without a local build, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency or the HOL toolchain changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
+| Otherwise: not built yet, built only as a dependency of other targets (build `THEORY` itself, or use `--all-checkpoints`), restored from the cache without a local build, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency or the HOL toolchain changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
 
 A usable checkpoint takes precedence over `[run].heap`. holbuild prints one
 line naming the state it chose and, on fallback, why. `--from` does not build
