@@ -996,7 +996,7 @@ class Coordinator:
         self.passed_over: dict[tuple[UUID, str], int] = {}
         self.holds: dict[tuple[UUID, str], tuple[float, float]] = {}
         self.ready_builds = 0
-        self.ready_high = 0  # high-tier actions ready at that count
+        self.ready_high = 0  # high-tier builds ready at that count
         self.locality = LocalityCounts()
         # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
         self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque(maxlen=MAX_PHASE_REPORTS)
@@ -1659,9 +1659,10 @@ class Coordinator:
                 self.passed_over[passed] = self.passed_over.get(passed, 0) + 1
                 if len(self.passed_over) > MAX_LEASE_HOSTS:  # those of batches that ended unclaimed
                     del self.passed_over[next(iter(self.passed_over))]
+            # Taken before the await, so a concurrent claim that misses the build doesn't drop it first.
+            hold = self.holds.pop((batch_id, tier), None)
             row = await self._lock_unleased(conn, CLAIM_ACTION, {"batch_id": batch_id, "class": "build", "tier": tier})
             self.passed_over.pop((batch_id, tier), None)
-            hold = self.holds.pop((batch_id, tier), None)
             if row is not None:
                 if passed is not None:
                     self.locality.claims += 1
@@ -1678,6 +1679,8 @@ class Coordinator:
                     del self.passed_over[passed]
             if priority != 0:
                 ranking.running_priority -= 1
+            if hold is not None:  # for a concurrent claim leasing it
+                self.holds.setdefault((batch_id, tier), hold)
             ranking.exhausted.add((batch_id, tier))
         put_back_held()
         return None, held_until
@@ -1864,27 +1867,33 @@ class Coordinator:
         """The hosts below the scale-in line for work of ``tier``: in the order claims pack onto them (warm hosts,
         then by rank and id), the hosts not quarantined whose workers seen lately could run the live leases and the
         ready builds (the last count's, or ``ready`` if more), and at least the warm workers. High work, which only
-        burst workers take, has a line of its own over the hosts with one: their leases and the ready high work. A
-        host short of memory counts only the workers it runs or that wait for a claim, as the others wait for
-        memory. A host above the line is to empty, so locality never sends it work."""
+        burst workers take, has a line of its own counting only burst workers: their leases and the ready high
+        builds. A host short of memory counts only the workers it runs or that wait for a claim, as the others wait
+        for memory. A host above the line is to empty, so locality never sends it work."""
         now = self.clock()
-        leases = Counter(host for host, _, _ in self.lease_hosts.values())
-        waiting = Counter(w_rank[3] for _, w_rank, w_woken, _ in self.claim_waiters if not w_woken.done())
+        high = tier == "high"
+        leases = Counter(host for host, _, tiers in self.lease_hosts.values() if not high or "high" in tiers)
+        waiting = Counter(
+            w_rank[3] for w_tiers, w_rank, w_woken, _ in self.claim_waiters
+            if not w_woken.done() and (not high or "high" in w_tiers)
+        )
         hosts: list[tuple[tuple[bool, int, str], int]] = []
         for host_id, workers in self.host_workers.items():
             fresh = [
-                is_burst for seen, is_burst in workers.values() if (now - seen).total_seconds() < HOST_REPORT_SECONDS
+                is_burst for seen, is_burst in workers.values()
+                if (now - seen).total_seconds() < HOST_REPORT_SECONDS and (not high or is_burst)
             ]
-            if not fresh or self._quarantine(host_id) is not None or (tier == "high" and not any(fresh)):
+            if not fresh or self._quarantine(host_id) is not None:
                 continue
             report = self.hosts.get(host_id)
             rank = 0 if report is None else report[1].rank
-            reported = report[1].leases if report is not None and report[1].leases is not None else 0
+            # A host reports its leases of all tiers.
+            reported = report[1].leases if report is not None and report[1].leases is not None and not high else 0
             busy = leases[host_id] + waiting[host_id]
             short = report is not None and bool(report[1].memory_short)
             slots = max(reported, busy, 1) if short else max(len(fresh), reported, busy, 1)
             hosts.append(((all(fresh), rank, host_id), slots))
-        if tier == "high":
+        if high:
             budget = sum(leases[host_id] for (_, _, host_id), _ in hosts) + max(ready, self.ready_high)
         else:
             budget = max(self.settings.warm_workers, len(self.lease_hosts) + max(ready, self.ready_builds))
@@ -2714,7 +2723,7 @@ class Coordinator:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
             counts = await self._counts(conn, COUNT_UNFINISHED)
         self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
-        self.ready_high = counts.ready_high
+        self.ready_high = counts.ready_high - counts.ready_high_run
         now = self.clock()
         self._forget_silent_hosts(now)
         demand = self._burst_demand(counts)
@@ -2844,7 +2853,7 @@ class Coordinator:
             async with self.engine.connect() as conn:
                 counts = await self._counts(conn, COUNT_ACTIVE)
             self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
-            self.ready_high = counts.ready_high
+            self.ready_high = counts.ready_high - counts.ready_high_run
             now = self.clock()
             self._forget_silent_hosts(now)
             demand = self._burst_demand(counts)
