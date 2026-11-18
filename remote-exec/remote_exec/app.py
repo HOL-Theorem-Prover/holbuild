@@ -297,14 +297,14 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             host_rank=0 if body.host is None else body.host.rank,
             ahead=body.ahead,
         )
+        # After the claim, so claims arriving together still share their reads. Its worker's next claim comes 30 s
+        # after this one arrived at the soonest, which dwarfs any skew between this clock and the database's.
+        await coordinator.release_unheld(body.worker, None if claimed is None else str(claimed.attempt_token), arrived)
         if await request.is_disconnected():
             # The worker went as the claim returned: nobody gets the answer.
             if claimed is not None:
                 await coordinator.give_back(claimed)
             return Response(status_code=204)
-        # After the claim, so claims arriving together still share their reads. Its worker's next claim comes 30 s
-        # after this one arrived at the soonest, which dwarfs any skew between this clock and the database's.
-        await coordinator.release_unheld(body.worker, None if claimed is None else str(claimed.attempt_token), arrived)
         if claimed is None:
             return Response(status_code=204)
         return asdict(claimed)
