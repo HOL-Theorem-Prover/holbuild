@@ -502,3 +502,129 @@ def test_the_high_line_counts_high_work_and_burst_workers_only(coordinator: Coor
     assert coordinator._kept_hosts(1, "high") == {"host-8"}
     coordinator.lease_hosts[uuid4()] = ("host-8", "host-8-w", ["high", "standard"])
     assert coordinator._kept_hosts(1, "high") == {"host-8", "host-9"}
+
+
+async def test_a_holder_claiming_unwoken_during_a_hold_takes_its_build_before_better_ranked_waiters(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    """``b1`` is held for host-1, which ran ``b``; a claim from host-1 that wasn't woken for it isn't deferred to the
+    claim waiting on better-ranked cold host-0, which would take it cold once the hold ends."""
+    coordinator.settings.warm_workers = 3
+    await run_on(http, cache, "host-1", "b0", "b", D1, rank=1)
+    await submit_as(http, "b1", "b")
+    assert await claim_on(http, "host-3", rank=1) is None
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters = [(["standard"], _claim_rank(["standard"], "host-0"), wake, False)]
+    coordinator.report_worker("host-0", "host-0-w", ["standard"])
+
+    claimed = await claim_on(http, "host-1", rank=1)
+
+    assert claimed is not None and claimed["theory"] == "pkg:b"
+    assert counts(coordinator, "hit_theory", "held_waits") == {"hit_theory": 1, "held_waits": 1}
+
+
+async def test_a_claim_passing_over_a_held_build_wakes_a_holder_that_began_waiting_after_the_hold(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    coordinator.settings.warm_workers = 3
+    await run_on(http, cache, "c", "b0", "b", D1)
+    batch_id = await submit_as(http, "b1", "b")
+    assert await claim_on(http, "a") is None  # the hold begins; nobody waits on c yet
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters = [(["standard"], _claim_rank(["standard"], "c"), wake, False)]
+
+    assert await claim_on(http, "a") is None
+
+    assert wake.result() == ("standard", False, batch_id, "pkg:b")
+
+
+async def test_the_end_of_a_hold_wakes_a_waiting_claim_for_the_build_left(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold host-3 leaves ``b1`` to host-1 and takes ``a1``; when the hold ends, the claim waiting on cold host-9 is
+    woken for ``b1``, though host-1 never came for it, and nothing new was made ready."""
+    monkeypatch.setattr(coordinator_module, "LOCALITY_HOLD_SECONDS", 0.05)
+    coordinator.settings.warm_workers = 3
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    batch_id = await submit_as(http, "b1", "b")
+    await submit_as(http, "a1", "a")
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters = [(["standard"], _claim_rank(["standard"], "host-9"), wake, False)]
+    made_ready = coordinator.made_ready
+    claimed = await claim_on(http, "host-3")
+    assert claimed is not None and claimed["theory"] == "pkg:a"
+
+    await asyncio.wait_for(asyncio.shield(wake), 5)
+
+    assert wake.result() == ("standard", False, batch_id, "pkg:b") and coordinator.made_ready == made_ready
+
+
+@pytest.mark.parametrize("hinted", [False, True])
+async def test_a_build_that_waited_out_its_hold_is_not_passed_over_again(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, hinted: bool
+) -> None:
+    """``b1`` waited out its hold for host-1; host-2, which ran ``a``, takes it rather than swap in ``a1``, also when
+    woken for ``a1``."""
+    monkeypatch.setattr(coordinator_module, "LOCALITY_HOLD_SECONDS", 0.05)
+    coordinator.settings.warm_workers = 3
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await run_on(http, cache, "host-2", "a0", "a", D2)
+    await submit_as(http, "b1", "b")
+    assert await claim_on(http, "host-3") is None
+    await asyncio.sleep(0.1)
+    a_batch = await submit_as(http, "a1", "a")
+
+    if hinted:
+        claimed, _ = await coordinator._claim(["standard"], "w", host_id="host-2", hint=(a_batch, "standard", "pkg:a"))
+        theory = claimed.theory if claimed is not None else None
+    else:
+        theory = (await claim_on(http, "host-2") or {}).get("theory")
+
+    assert theory == "pkg:b"
+
+
+async def held_in_a_busier_batch(http: httpx.AsyncClient, coordinator: Coordinator) -> tuple[str, str]:
+    """A batch of ``x`` and ``y`` with one of them leased, whose other build, returned with the batch, is held for
+    host-1, which alone ran its theory, after a cold claim from host-3 found it."""
+    coordinator.settings.warm_workers = 3
+    batch_id = await submit(http, ["x", "y"])
+    leased = await claim_on(http, "host-2")
+    assert leased is not None
+    theory = "pkg:y" if leased["theory"] == "pkg:x" else "pkg:x"
+    coordinator.host_keys["host-1"] = {theory: None}
+    coordinator.report_worker("host-1", "host-1-w", ["standard"])
+    assert await claim_on(http, "host-3") is None
+    return batch_id, theory
+
+
+def wait_on_host_0(coordinator: Coordinator) -> None:
+    """A claim waits on host-0, which ranks before host-1: an unwoken claim from host-1 defers to it."""
+    coordinator.claim_waiters = [
+        (["standard"], _claim_rank(["standard"], "host-0"), asyncio.get_running_loop().create_future(), False)
+    ]
+    coordinator.report_worker("host-0", "host-0-w", ["standard"])
+
+
+async def test_a_holder_claiming_unwoken_finds_its_held_build_behind_a_batch_running_less(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """``a1``'s batch runs nothing, so it heads the ranking, in another band than the held build's."""
+    _, theory = await held_in_a_busier_batch(http, coordinator)
+    await submit_as(http, "a1", "a")
+    wait_on_host_0(coordinator)
+
+    claimed = await claim_on(http, "host-1")
+
+    assert claimed is not None and claimed["theory"] == theory
+
+
+async def test_a_holder_claiming_unwoken_takes_nothing_but_its_held_build_ahead_of_better_ranked_waiters(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """``a1`` ranks first by its priority, so the held build is no candidate for the hint; host-1 leaves ``a1`` to
+    host-0's claim, which ranks better."""
+    await held_in_a_busier_batch(http, coordinator)
+    await submit_as(http, "a1", "a", priority=1)
+    wait_on_host_0(coordinator)
+
+    assert await claim_on(http, "host-1") is None

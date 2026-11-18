@@ -521,8 +521,13 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   holds more; each batch is passed over that way at most 8 times in a row. A claim from any host that holds less
   of the head's build than a kept host taking its tier leaves it to such
   hosts for 0.5 s from the first time a claim did, waking a claim waiting on
-  one, and takes the next batch instead; with only such builds left, it
-  waits until the first hold ends, claiming nothing ahead meanwhile. A wake
+  one each time a claim leaves it, and takes the next batch instead; with
+  only such builds left, it waits until the first hold ends, claiming
+  nothing ahead meanwhile. A claim from a host a build is held for takes
+  it even if not woken for it, ahead of better-ranked waiting claims, but
+  takes nothing else ahead of them. When
+  the hold ends, the best-ranked waiting claim is woken for the build, and
+  no claim passes it over again. A wake
   for newly ready work goes to a waiting claim on a kept host holding the
   most of it, if more than the first in line, and a woken claim takes that
   build while it is still in the head's band and no other kept host holds
