@@ -19,7 +19,7 @@ async def test_ahead_changes_retry_only_capable_inflight_claims(
     entered, go, retried = asyncio.Event(), asyncio.Event(), asyncio.Event()
     attempts = 0
 
-    async def empty(tiers: list[str], worker: str, *_: object) -> None:
+    async def empty(tiers: list[str], worker: str, *_: object) -> tuple[None, None]:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -27,6 +27,7 @@ async def test_ahead_changes_retry_only_capable_inflight_claims(
             await go.wait()
         else:
             retried.set()
+        return None, None
 
     async def no_ahead(tiers: list[str], worker: str, **_: object) -> None:
         return None
@@ -61,10 +62,10 @@ async def test_passing_a_wake_preserves_its_kind_and_normal_generation(
         (["standard"], rank, second, True),
     ]
     coordinator._wake_claim("standard", ahead=ahead)
-    assert first.result() == ("standard", ahead, None)
+    assert first.result() == ("standard", ahead, None, None)
     assert not second.done()
     coordinator._pass_wake(first)
-    assert second.result() == ("standard", ahead, None)
+    assert second.result() == ("standard", ahead, None, None)
     assert coordinator.made_ready == (0 if ahead else 1)
 
 
