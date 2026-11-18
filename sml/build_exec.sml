@@ -3228,7 +3228,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool}
 
 (* checkpoint: the theory saves checkpoints at all, its deps_loaded state
    included.  theorem_checkpoints: it also saves them per theorem and
@@ -3799,8 +3799,9 @@ fun run_failure_repl tc policy theorem_checkpoints failure_checkpoints deps_load
             ignore (HolbuildToolchain.run_interactive argv)
           end
 
-(* The theory action that builds `node` in action root `root`. *)
-fun theory_action root plan keys toolchain_key deps_key node : theory_action =
+(* The directory `node`'s script runs from in its action's stage, and the
+   extra inputs the action stages, each with its stage path and its file. *)
+fun theory_inputs plan node =
   let
     val package_root = #package_root (HolbuildBuildPlan.source_of node)
     (* Where the script is in its package: a script a dependency generates is
@@ -3827,6 +3828,14 @@ fun theory_action root plan keys toolchain_key deps_key node : theory_action =
     val decls = HolbuildBuildPlan.extra_input_decls plan node
     val manifest_inputs = List.concat (map stage_inputs (List.filter (fn (label, _, _) => label = "extra_dep") decls))
     val source_inputs = List.concat (map stage_inputs (List.filter (fn (label, _, _) => label <> "extra_dep") decls))
+  in
+    {script_dir = stage_script_dir, inputs = source_inputs @ manifest_inputs}
+  end
+
+(* The theory action that builds `node` in action root `root`. *)
+fun theory_action root plan keys toolchain_key deps_key node : theory_action =
+  let
+    val {script_dir = stage_script_dir, inputs} = theory_inputs plan node
     val {sig_path, sml_path, data_path, ...} = theory_outputs node
   in
     {input_key = HolbuildBuildPlan.input_key_for keys node,
@@ -3838,7 +3847,7 @@ fun theory_action root plan keys toolchain_key deps_key node : theory_action =
      source_file = source_file node,
      source_name = HolbuildBuildPlan.source_name plan node,
      script_dir = stage_script_dir,
-     inputs = source_inputs @ manifest_inputs,
+     inputs = inputs,
      loads = preload_loads root plan node,
      outputs = {sig_path = root_relative root sig_path,
                 sml_path = root_relative root sml_path,
@@ -4785,10 +4794,6 @@ fun force_node ({force, force_targets, ...} : build_options) project node =
     | ForceProject => root_package_node project node
     | ForceAll => true
 
-fun assoc_timeout _ [] = NONE
-  | assoc_timeout node_key ((key, timeout) :: rest) =
-      if key = node_key then timeout else assoc_timeout node_key rest
-
 fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
@@ -4803,7 +4808,7 @@ fun checkpoint_policy_for_node ({skip_checkpoints, checkpoint_seconds, proof_ste
                       proof_steps = proof_steps,
                       new_ir = new_ir,
                       tactic_timeout = effective_tactic_timeout proof_steps
-                                        (assoc_timeout (HolbuildBuildPlan.key node) node_tactic_timeouts),
+                                        (HolbuildTacticTimeoutPolicy.timeout_of node_tactic_timeouts (HolbuildBuildPlan.key node)),
                       execution_plan = if proof_steps then execution_plan else NONE,
                       trace_steps = proof_steps andalso trace_steps,
                       repl_on_failure = repl_on_failure,
@@ -4824,11 +4829,8 @@ fun proof_engine (CheckpointPolicy {proof_steps = false, ...}) = "plain_v1"
   | proof_engine (CheckpointPolicy {new_ir = true, ...}) = "proof_ir_v3"
   | proof_engine _ = "proof_steps_failed_fragment_span_v6"
 
-fun build_config_lines_for_node options project node =
-  case #kind (HolbuildBuildPlan.source_of node) of
-      HolbuildSourceIndex.TheoryScript => policy_config_lines (checkpoint_policy_for_node options project node)
-    | HolbuildSourceIndex.Sml => policy_config_lines no_checkpoint_policy
-    | HolbuildSourceIndex.Sig => policy_config_lines no_checkpoint_policy
+(* The same for every node: action keys carry no proof policy. *)
+fun build_config_lines_for_node _ _ _ = policy_config_lines no_checkpoint_policy
 
 (* The saved HOL state `run --from` starts from, or why there is none.
    deps_loaded has THEORY's ancestors loaded; LOAD is THEORY's generated module
@@ -7478,10 +7480,8 @@ type settled = {nodes : (string, string) Binarymap.dict, dat_hash_cache : file_h
    Returns {drain, settled}: drain waits for the checks; settled drops those
    that haven't started, waits for the others, and gives the nodes found up
    to date whose dependencies all were too. *)
-fun start_settled_check (options : build_options) tc project plan toolchain_key jobs batch_keys deferred =
+fun start_settled_check (options : build_options) tc project plan keys toolchain_key jobs batch_keys deferred =
   let
-    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     fun input_key node = HolbuildBuildPlan.input_key_for keys node
     val key = HolbuildBuildPlan.key
     val in_batch = Binaryset.addList (Binaryset.empty String.compare, batch_keys)
@@ -7583,7 +7583,7 @@ fun trace_cpu_pressure_delta start =
 (* Builds the plan; SETTLED, from start_settled_check, holds the nodes a
    check during the batch found up to date, and FAILED the input keys of the
    theories the batch's workers failed. *)
-fun build_checked (settled : settled option) failed (options : build_options) tc project plan toolchain_key jobs =
+fun build_checked (settled : settled option) failed (options : build_options) tc project plan keys toolchain_key jobs =
   let
     val cpu_pressure_start =
       if HolbuildStatus.cache_trace_enabled () then cpu_pressure_total_us () else NONE
@@ -7595,8 +7595,6 @@ fun build_checked (settled : settled option) failed (options : build_options) tc
        sweeping it to the builds that do. *)
     val _ = if #restore_only options then () else sweep_local_heap_store ()
     val base_context = toolchain_base_context tc
-    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val _ = dump_keys_if_requested (build_config_lines_for_node options project) toolchain_key plan keys
     (* Only for the input key it was checked for. *)
     fun is_settled node =
@@ -7655,7 +7653,11 @@ fun build_checked (settled : settled option) failed (options : build_options) tc
     end
   end
 
-fun build options tc project plan toolchain_key jobs = build_checked NONE [] options tc project plan toolchain_key jobs
+fun build options tc project plan toolchain_key jobs =
+  build_checked NONE [] options tc project plan
+    (HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
+       (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan)
+    toolchain_key jobs
 
 (* After remote execution, force and tracing have already been fulfilled. *)
 fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
@@ -7682,12 +7684,10 @@ fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets
    not checked again.  The entries it reuses stay local for the next export
    to publish.  Returns how many deferred theories settled, and SETTLED
    with the nodes settled here added, for the build that follows. *)
-fun settle_deferred (settled : settled option) (options : build_options) tc project plan toolchain_key deferred =
+fun settle_deferred (settled : settled option) (options : build_options) tc project plan keys toolchain_key deferred =
   let
     val options = remote_restore_options true options
     val base_context = toolchain_base_context tc
-    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val {nodes = checked, dat_hash_cache} =
       Option.getOpt (settled, {nodes = Binarymap.mkDict String.compare, dat_hash_cache = new_file_hash_cache ()})
     fun is_checked node =
@@ -7734,13 +7734,26 @@ fun settle_deferred (settled : settled option) (options : build_options) tc proj
   end
 
 (* The plan's node whose action has input key `input_key`. *)
-fun node_with_input_key (options : build_options) tc project plan toolchain_key input_key =
+(* A lookup of PLAN's selected node with an input key, its index built on
+   first use.  Where two nodes share a key, the first selected one wins. *)
+fun node_with_input_key plan keys =
   let
-    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
+    val index = ref NONE
+    fun build () =
+      List.foldl
+        (fn (node, dict) =>
+            let val key = HolbuildBuildPlan.input_key_for keys node
+            in if Option.isSome (Binarymap.peek (dict, key)) then dict
+               else Binarymap.insert (dict, key, node)
+            end)
+        (Binarymap.mkDict String.compare) (HolbuildBuildPlan.selected_nodes plan)
   in
-    List.find (fn node => HolbuildBuildPlan.input_key_for keys node = input_key)
-              (HolbuildBuildPlan.selected_nodes plan)
+    fn input_key =>
+      let
+        val dict = case !index of
+                       SOME dict => dict
+                     | NONE => let val dict = build () in index := SOME dict; dict end
+      in Binarymap.peek (dict, input_key) end
   end
 
 (* Fetch a worker's log to the same location as a local theory build.  The
@@ -7765,10 +7778,8 @@ fun fetch_remote_build_log project node log_sha256 =
 (* The logs of the theories a failed batch finished, for what they report
    (such as a proof step that passed on its retry).  They are optional: one
    that can't be fetched is skipped. *)
-fun restore_finished_build_logs (options : build_options) tc project plan toolchain_key logs =
+fun restore_finished_build_logs (options : build_options) tc project plan keys toolchain_key logs =
   let
-    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val theories = List.filter
       (fn node => #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript)
       (HolbuildBuildPlan.selected_nodes plan)
@@ -7788,10 +7799,8 @@ fun restore_finished_build_logs (options : build_options) tc project plan toolch
   end
 
 (* Logs belong to this execution, not the cached theory entry. *)
-fun restore_remote_build_logs (options : build_options) tc project plan toolchain_key logs =
+fun restore_remote_build_logs (options : build_options) tc project plan keys toolchain_key logs =
   let
-    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val log_table = List.foldl
       (fn ((key, sha), table) => Redblackmap.insert (table, key, sha))
       (Redblackmap.mkDict String.compare) logs
@@ -7893,10 +7902,8 @@ val remote_failure_spans_limit = 4
    for the HOL analyser.  Returns {spans, drain, stop}: spans waits for them
    and gives a node's, if worked out; drain waits for them; stop drops those
    not started and waits for the others. *)
-fun start_remote_failure_spans options tc project plan toolchain_key batch_keys =
+fun start_remote_failure_spans options tc project plan keys toolchain_key batch_keys =
   let
-    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val in_batch = Binaryset.addList (Binaryset.empty String.compare, batch_keys)
     val nodes =
       if length batch_keys > remote_failure_spans_limit then []
@@ -7923,10 +7930,8 @@ fun start_remote_failure_spans options tc project plan toolchain_key batch_keys 
    blob `log_sha256`, and the script's SPANS if worked out already.  The log
    goes where a local build leaves it.  NONE when the log can't be fetched.
    Runs no HOL. *)
-fun remote_proof_failure (options : build_options) tc project plan toolchain_key node spans {kind, log_sha256} =
+fun remote_proof_failure (options : build_options) tc project plan keys toolchain_key node spans {kind, log_sha256} =
   let
-    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val root = project_artifact_root project
     fun diagnose node =
       let
@@ -7979,26 +7984,24 @@ fun is_theory_node node = #kind (HolbuildBuildPlan.source_of node) = HolbuildSou
 
 fun escapes_root rel = Path.isAbsolute rel orelse rel = ".." orelse String.isPrefix "../" rel
 
-(* A HOL theory or library the preload names by a path on this machine
-   rather than by name; a worker has no such file. *)
-fun hol_load_by_path (LoadTheory name) = CharVector.exists (fn c => c = #"/") name
-  | hol_load_by_path (LoadLibrary name) = CharVector.exists (fn c => c = #"/") name
-  | hol_load_by_path (LoadObject _) = false
+(* Whether the preload names a HOL theory or library by a path on this
+   machine rather than by name; a worker has no such file. *)
+fun hol_load_by_path name = CharVector.exists (fn c => c = #"/") name
 
 (* Why a theory can't run remotely, if it can't. *)
-fun excluded_reason (action : theory_action) node =
+fun excluded_reason plan node =
   if always_reexecute node then SOME "it sets always_reexecute"
   else if not (cache_enabled node) then SOME "it sets cache = false"
   else if escapes_root (HolbuildBuildPlan.relative_path node) then
     SOME "its script lies outside its package root"
   else
-    case List.find (fn {path, ...} => escapes_root path) (#inputs action) of
+    case List.find (fn {path, ...} => escapes_root path) (#inputs (theory_inputs plan node)) of
         SOME {path, ...} => SOME ("its extra input " ^ path ^ " lies outside its package root")
       | NONE =>
-          case List.find hol_load_by_path (#loads action) of
-              SOME (LoadTheory name) => SOME ("it loads " ^ name ^ " by path")
-            | SOME (LoadLibrary name) => SOME ("it loads " ^ name ^ " by path")
-            | _ => NONE
+          case List.find hol_load_by_path (HolbuildBuildPlan.direct_external_theories plan node @
+                                           HolbuildBuildPlan.direct_external_libs plan node) of
+              SOME name => SOME ("it loads " ^ name ^ " by path")
+            | NONE => NONE
 
 (* Whether the remote cache holds an entry this build would restore: usable,
    and with a timeout contract at least as strict as the one requested,
@@ -8336,10 +8339,8 @@ fun forget_remote_ledger () =
 
 (* The input keys of the plan's theories whose input key is missing or that
    depend on that theory. *)
-fun theory_keys_depending_on (options : build_options) tc project plan toolchain_key missing =
+fun theory_keys_depending_on (options : build_options) tc project plan keys toolchain_key missing =
   let
-    val keys = HolbuildBuildPlan.input_keys (build_config_lines_for_node options project)
-                 (HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)) plan
     val key_of = HolbuildBuildPlan.input_key_for keys
     fun depends node =
       key_of node = missing orelse
@@ -8468,7 +8469,7 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
    dependencies are built, and those that depend on them; deferred holds
    their keys, for settle_deferred.  Deferring only schedules: whether a
    theory's outputs are reused is decided by early cutoff alone. *)
-fun export_action_specs (options : build_options) tc project plan toolchain_key jobs
+fun export_action_specs (options : build_options) tc project plan keys toolchain_key jobs
       {upload, keep_specs, local_resumable, forced, skip, defer, publish, ledger} =
   let
     val hash_file = export_file_hash ()
@@ -8497,17 +8498,16 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val root = project_artifact_root project
     val config_lines = build_config_lines_for_node options project
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
-    val keys = HolbuildBuildPlan.input_keys config_lines action_toolchain_key plan
     val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
-    (* No deps key: nothing here reads it, and action_spec_text writes the
-       spec's own.  Computing it for every theory is quadratic in the plan. *)
+    (* Each theory with its input key: the theory action, which stages its
+       inputs and orders its loads, is built only for those exported. *)
     val actions =
       detail_time_phase "action_spec.export.actions" (fn () =>
-        map (fn node => (node, theory_action root plan keys toolchain_key "" node)) theories)
+        map (fn node => (node, {input_key = HolbuildBuildPlan.input_key_for keys node})) theories)
     val _ =
       List.app
-        (fn (node, action) =>
-            case excluded_reason action node of
+        (fn (node, _) =>
+            case excluded_reason plan node of
                 SOME reason =>
                   raise Error ("action-spec: " ^ package node ^ ":" ^ logical_name node ^
                                " can't run remotely: " ^ reason)
@@ -8645,8 +8645,11 @@ fun export_action_specs (options : build_options) tc project plan toolchain_key 
     val spec_dir = Path.concat(root, ".holbuild/action-specs")
     val context = {root = root, plan = plan, keys = keys, action_toolchain_key = action_toolchain_key,
                    runtime = runtime_identity (), toolchain_line = toolchain_line}
-    fun export (node, action) =
+    (* No deps key: nothing here reads it, and action_spec_text writes the
+       spec's own.  Computing it for every theory is quadratic in the plan. *)
+    fun export (node, _) =
       let
+        val action = theory_action root plan keys toolchain_key "" node
         val action_text =
           HolbuildBuildPlan.action_text_with plan config_lines action_toolchain_key keys node
         val _ =
@@ -8999,7 +9002,7 @@ fun plan_runs tc project planned jobs {keep_specs}
                       (* Run specs need the action's staging and loads, not its deps key. *)
                       val action = theory_action root plan keys toolchain_key "" node
                       val _ =
-                        case excluded_reason action node of
+                        case excluded_reason plan node of
                             SOME reason => raise Error ("run-action: " ^ name ^ " can't run remotely: " ^ reason)
                           | NONE => ()
                       val planned_inputs = List.concat
