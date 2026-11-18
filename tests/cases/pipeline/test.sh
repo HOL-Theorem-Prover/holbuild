@@ -357,7 +357,9 @@ require_same_as_unpipelined cycle CTheory A B C
 
 # A cheat in scope: B's proof uses A's cheated theorem, so it carries the
 # cheat once proved, which an outline can't predict.  B publishes no outline,
-# and C builds on the committed B.
+# and C builds on the committed B: its attempt either waits for B's commit or,
+# started ahead of B on A's outline, finds the committed B loading the
+# committed A instead, is abandoned and builds plain.
 new_project withheld
 cat > "$tmpdir/withheld/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
@@ -387,7 +389,7 @@ require_grep "pipeline: gate passed: ATheory" "$log"
 require_grep "pipeline: outline withheld: BTheory (oracle cheat in theory A)" "$log"
 require_no_grep "outline ready: BTheory" "$log"
 require_no_grep "gate failed" "$log"
-require_before "committed: BTheory" "attempt done: CTheory" "$log"
+require_before "committed: BTheory" "attempt done: CTheory\\|dispatch plain: CTheory" "$log"
 require_same_as_unpipelined withheld CTheory A B C
 
 # The same from a cheat in A itself, in a [local] lemma whose proof does more
@@ -447,8 +449,9 @@ require_grep "pipeline: gate passed: ATheory" "$log"
 require_grep "pipeline: gate failed: BTheory (digest differs)" "$log"
 require_grep "pipeline: attempt done: CTheory" "$log"
 require_grep "pipeline: dropped attempt: CTheory" "$log"
-# C then builds again, on the committed B.
-require_before "dropped attempt: CTheory" "committed: CTheory" "$log"
+# C then builds again, on the committed B: plain, as it has no child to
+# start on its outline.
+require_before "dropped attempt: CTheory" "CTheory built" "$log"
 require_file "$tmpdir/digest/.holbuild/plan/outline-skip"
 require_same_as_unpipelined digest CTheory B C
 

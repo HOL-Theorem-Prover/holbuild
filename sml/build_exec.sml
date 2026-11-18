@@ -6078,7 +6078,8 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
    parents (load_ahead_locally): its child loads everything else while
    they run, and the late parents' outlines or outputs once they come.  At
    most min(6, jobs div 3) such attempts wait for parents at once, and one
-   starts only while another worker is idle.  One whose late parent stops
+   starts only while another worker is idle; none for a theory that would
+   cut off on its dependencies' outputs on disk.  One whose late parent stops
    coming (its build was dropped, or will build plain again) or whose load
    differs from what the parents' manifests name is abandoned: it is
    considered again as if it had never started, and starts no further
@@ -6917,6 +6918,10 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
        whose attempt ahead was abandoned. *)
     val waiting_ahead = ref ([] : (int * int) list)
     val no_ahead = Array.array (node_count, false)
+    (* Whether a theory would cut off on its dependencies' outputs on disk
+       when first considered to start ahead: a late parent's outline can't
+       show whether it will. *)
+    val ahead_cuts_off = Array.array (node_count, NONE : bool option)
     val ahead_cap = Int.min (6, jobs div 3)
     val ahead_candidates = ref ([] : int list)
     val ahead_listed = Array.array (node_count, false)
@@ -7245,7 +7250,17 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
         else
           case List.filter (not o available) deps of
               [] => NONE
-            | late => if speculable id then SOME late else NONE
+            | late =>
+                if not (speculable id) then NONE
+                else
+                  let
+                    val cut =
+                      case Array.sub (ahead_cuts_off, id) of
+                          SOME known => known
+                        | NONE => let val known = cuts_off id in Array.update (ahead_cuts_off, id, SOME known); known end
+                  in
+                    if cut then NONE else SOME late
+                  end
       end
 
     (* The best-ranked theory that can start its attempt ahead of its late
