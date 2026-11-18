@@ -109,9 +109,9 @@ fun build_help () = print
   \      the last such save's duration, have passed since that save; 0 saves\n\
   \      every one. Remote workers use the same value; no cache key depends on it.\n\
   \  --all-checkpoints\n\
-  \      All root-package theories save checkpoints by default, except a\n\
-  \      theory that isn't a target and that a parallel build pipelines into\n\
-  \      an idle slot. With this flag every one saves them.\n\
+  \      Build targets save checkpoints as they run; other root-package\n\
+  \      theories save one only when a proof fails or times out. With this\n\
+  \      flag every one saves them as it runs.\n\
   \  --skip-proof-steps\n\
   \  --proof-scope root|all (default: root)\n\
   \  --tactic-timeout SECONDS\n\
@@ -1239,11 +1239,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       case #build_tactic_timeout project of
           NONE => SOME 2.5
         | SOME timeout => timeout
-    fun build_options_for index entry_plan plan force_targets =
+    (* CHECKPOINT_TARGETS: the theories that save checkpoints as they run
+       (checkpoint_targets_for), whatever FORCE_TARGETS this pass forces. *)
+    fun build_options_for index entry_plan plan force_targets checkpoint_targets =
       {use_cache = use_cache,
        verify_cache = verify_cache,
        force = force,
        force_targets = force_targets,
+       checkpoint_targets = checkpoint_targets,
        fail_fast = fail_fast,
        all_checkpoints = all_checkpoints,
        skip_checkpoints = skip_checkpoints,
@@ -1320,6 +1323,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
          toolchain_key = toolchain_key, components = SOME components}
       end
     fun action_toolchain_key toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
+    (* The build's targets, or every root-package theory when it has none. *)
+    fun checkpoint_targets_for index targets =
+      if null targets then HolbuildSourceIndex.root_package_targets index project else targets
     (* The input keys of a plan, which the plan keeps for execution.  Only
        for plans whose theories that write SML sources are up to date: until
        those run, an extra input naming such a source may not exist. *)
@@ -1330,7 +1336,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        first use: every pass over the plan takes the same keys. *)
     fun with_options (planned as {index, targets, entry_plan, plan, ...}) =
       let
-        val options = timed_phase "build.options" (fn () => build_options_for index entry_plan plan targets)
+        val options = timed_phase "build.options" (fn () => build_options_for index entry_plan plan targets (checkpoint_targets_for index targets))
         val known = ref NONE
         fun keys () =
           case !known of
@@ -1521,9 +1527,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun execute (options, plan, toolchain_key) =
           timed_phase "build.execute"
             (fn () => HolbuildBuildExec.build options tc project plan toolchain_key jobs)
-        val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, _, _) = plan_build ()
+        val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, initial_options, _) = plan_build ()
         fun build_owners owner_plan =
-          execute (build_options_for index entry_plan owner_plan [], owner_plan, toolchain_key)
+          execute (build_options_for index entry_plan owner_plan [] (#checkpoint_targets initial_options), owner_plan, toolchain_key)
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
@@ -1780,7 +1786,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     | entry_targets => SOME (HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
               in
                 timed_phase "build.execute"
-                  (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets)
+                  (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets (#checkpoint_targets build_options))
                               tc project theory_plan toolchain_key jobs)
               end
             (* Diagnose every final failure. A missing proof log retains the
@@ -2173,7 +2179,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            requested batch: a replan, if the owners rebuilt, queues its own. *)
         fun build_owners owner_plan =
           let
-            val owner_options = build_options_for index entry_plan owner_plan []
+            val owner_options = build_options_for index entry_plan owner_plan [] (#checkpoint_targets build_options)
             val requested_write = !pending_plan_write
             fun restore () = pending_plan_write := requested_write
           in
@@ -2702,7 +2708,7 @@ fun default_build_options trknl project index entry_plan plan =
     {use_cache = true,
      verify_cache = true,
      force = HolbuildBuildExec.ForceNone,
-     force_targets = [],
+     force_targets = [], checkpoint_targets = [],
      skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
      proof_steps = true,
      new_ir = true,
@@ -2751,7 +2757,7 @@ fun heap_build_options trknl =
   {use_cache = true,
    verify_cache = true,
    force = HolbuildBuildExec.ForceNone,
-   force_targets = [],
+   force_targets = [], checkpoint_targets = [],
    skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
    proof_steps = false,
    new_ir = false,

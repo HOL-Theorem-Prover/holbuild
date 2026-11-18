@@ -203,7 +203,7 @@ fun checkpoint_save_runtime_prelude checkpoint_seconds =
      "val _ = HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate " ^
        Real.toString checkpoint_seconds ^ ";"]
 
-fun runtime_install_lines {checkpoint_enabled, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
+fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
   ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (source_helper_path "sml/diagnostic_limits.sml") ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (sha256_runtime_helper_path ()) ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
@@ -212,6 +212,8 @@ fun runtime_install_lines {checkpoint_enabled, checkpoint_seconds, tactic_timeou
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_runtime_helper_path ()) ^ ";",
    "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
      (if checkpoint_enabled then "true" else "false") ^
+     ", context_checkpoints = " ^ (if context_checkpoints then "true" else "false") ^
+     ", share_failed_prefix = " ^ (if share_failed_prefix then "true" else "false") ^
      ", checkpoint_seconds = " ^ Real.toString checkpoint_seconds ^
      ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
      ", timeout_marker = " ^ option_string_sml timeout_marker ^
@@ -224,12 +226,14 @@ fun runtime_install_lines {checkpoint_enabled, checkpoint_seconds, tactic_timeou
 
 fun runtime_prelude config = runtime_lines (runtime_load_lines @ runtime_install_lines config)
 
-fun runtime_reinstall_prelude {checkpoint_enabled, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
+fun runtime_reinstall_prelude {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
   let
     val install =
       ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
        "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
          (if checkpoint_enabled then "true" else "false") ^
+         ", context_checkpoints = " ^ (if context_checkpoints then "true" else "false") ^
+         ", share_failed_prefix = " ^ (if share_failed_prefix then "true" else "false") ^
          ", checkpoint_seconds = " ^ Real.toString checkpoint_seconds ^
          ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
          ", timeout_marker = " ^ option_string_sml timeout_marker ^
@@ -295,10 +299,11 @@ datatype instrument_event =
    factories), so no step is compiled after the script has run, where
    later bindings would shadow the theorem's; a theorem without them is
    not deferred. *)
-fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, defer} :
+fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, defer} :
                 {source : string, source_name : string, start_offset : int, checkpoints : checkpoint list,
                  declaration_checkpoints : declaration_checkpoint list,
                  terminations : termination list, save_checkpoints : bool,
+                 context_checkpoints : bool, share_failed_prefix : bool,
                  checkpoint_seconds : real,
                  tactic_timeout : real option, timeout_marker : string option,
                  plan_theorem : string option, trace_all : bool,
@@ -329,6 +334,8 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
          map TerminationEvent active_terminations)
     fun runtime_config () =
       {checkpoint_enabled = save_checkpoints,
+       context_checkpoints = context_checkpoints,
+       share_failed_prefix = share_failed_prefix,
        checkpoint_seconds = checkpoint_seconds,
        tactic_timeout = tactic_timeout,
        timeout_marker = timeout_marker,

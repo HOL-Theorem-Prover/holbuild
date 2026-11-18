@@ -24,7 +24,7 @@ val _ =
           val tree = dir ^ "/checkpoints"
           val _ = BE.ensure_dir tree
           val ctx : BE.shared_context =
-            {store = dir ^ "/store", checkpoint_root = tree, heap_key = heap_key, index_key = "index",
+            {store = dir ^ "/store", checkpoint_root = tree, heap_key = heap_key, index_key = "index", standalone_key = "standalone",
              base_state = OS.FileSys.fullPath (env "BASE_STATE"), deps_key = "deps",
              deps_loaded = tree ^ "/deps.save", requested_timeout = NONE, candidates = []}
           val _ = BE.restore_steps := []

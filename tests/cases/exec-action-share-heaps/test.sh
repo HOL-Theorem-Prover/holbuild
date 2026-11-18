@@ -181,8 +181,10 @@ resumed() {
 
 write_t "T" "simp[]"
 export_t v1
-# The dependency shares its checkpoints by default, before the target runs.
-[[ -d "$shared/checkpoint-store" ]] || { echo "the dependency A shared no heap" >&2; exit 1; }
+# The dependency, which isn't a target, passed and so shared nothing.
+if grep -qlx "holbuild-shared-heap-v1" "$tmpdir"/remote/ac/* 2>/dev/null; then
+  echo "the dependency A shared a heap" >&2; exit 1
+fi
 requests=$tmpdir/server/requests.log
 before_v1=$(wc -l < "$requests")
 worker v1 "$shared_url" "$shared" "$spec_t" --share-heaps
@@ -477,9 +479,9 @@ worker legacy2 "$shared_url" "$legacy" "$spec_legacy" --share-heaps
 expect legacy2 0 "status=built"
 resumed legacy2 "deps-loaded checkpoint" "deps-loaded heap"
 
-# Interrupt a dependency, not the requested target, after completed saves.
-# A fresh worker must resume those saves without ever caching a built result
-# for the interrupted action.
+# Interrupt a target after completed saves (a dependency saves none while its
+# proofs pass).  A fresh worker must resume those saves without ever caching a
+# built result for the interrupted action.
 cat > "$project/src/InterruptedScript.sml" <<'SML'
 Theory Interrupted
 Ancestors A
@@ -504,11 +506,7 @@ Proof
   simp[completed_def]
 QED
 SML
-cat > "$project/src/ConsumerScript.sml" <<'SML'
-Theory Consumer
-Ancestors Interrupted
-SML
-(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload ConsumerTheory) > "$tmpdir/cancel.batch"
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload InterruptedTheory) > "$tmpdir/cancel.batch"
 spec_interrupt=$(field "$tmpdir/cancel.batch" share:InterruptedTheory 4)
 key_interrupt=$(field "$tmpdir/cancel.batch" share:InterruptedTheory 3)
 interrupted=$tmpdir/worker-interrupted
@@ -565,7 +563,7 @@ require_grep 'exec-action failed: interrupted' "$tmpdir/remote/cas/$interrupted_
 [[ ! -e "$tmpdir/remote/ac/$key_interrupt" ]] || { echo "interrupted action published a built result" >&2; exit 1; }
 [[ ! -e "$interrupted/checkpoints" ]] || { echo "interrupted action kept private checkpoints" >&2; exit 1; }
 sed -i 's/OS.Process.sleep (Time.fromSeconds 120)/()/' "$project/src/InterruptedScript.sml"
-(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload ConsumerTheory) > "$tmpdir/resume.batch"
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload InterruptedTheory) > "$tmpdir/resume.batch"
 spec_interrupt=$(field "$tmpdir/resume.batch" share:InterruptedTheory 4)
 # A replacement worker uses the same canonical paths but has no local store.
 rm -rf "$interrupted/checkpoint-store"

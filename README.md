@@ -1022,7 +1022,7 @@ starting state is:
 | --- | --- |
 | Its `deps_loaded` checkpoint matches its current dependencies and `THEORY` is built for its current source | ancestors loaded from the checkpoint, then `THEORY` loaded |
 | Only `THEORY` changed since it was built, or the project directory moved (`THEORY`'s objects name the old directory, so loading it fails with a warning): its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
-| Otherwise: not built yet, restored from the cache without a local build, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency or the HOL toolchain changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
+| Otherwise: not built yet, built only as a dependency of other targets (build `THEORY` itself, or use `--all-checkpoints`), restored from the cache without a local build, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency or the HOL toolchain changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
 
 A usable checkpoint takes precedence over `[run].heap`. holbuild prints one
 line naming the state it chose and, on fallback, why. `--from` does not build
@@ -1153,12 +1153,20 @@ holbuild build --skip-checkpoints MyTheory
   remote execution, the log limit uses the worker's environment.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
-- Theorem, declaration and failed-prefix checkpoints are saved in every theory
-  included by `--proof-scope` (root-package theories by default), except one
-  that a local parallel build pipelines (below) because it isn't a requested
-  target. `--all-checkpoints` keeps every such theory unpipelined, so all of
-  them save checkpoints. Checkpoint policy does not change theory outputs or
-  cache keys. Remote action specs carry this policy to the workers.
+- Checkpoints are restored in every theory included by `--proof-scope`
+  (root-package theories by default). The build's requested targets (the
+  default targets when none are given, or every root-package theory when
+  there are none of those either) save them as they run: the
+  `deps_loaded` checkpoint and theorem and declaration contexts, unless a
+  local parallel build pipelines one (below) that it didn't name. Any other
+  theory saves a checkpoint only when one of its proofs fails or times out:
+  the failed proof's prefix, which the next build resumes from. A theory that
+  passes is then not slowed by saving checkpoints nobody will resume from,
+  though editing it later loads its ancestors again. `--all-checkpoints`,
+  and `--repl-on-failure`, make every such theory save them as it runs, and
+  keep it unpipelined (below). Checkpoint policy does not change theory
+  outputs or cache keys. Remote action specs carry this policy to the
+  workers.
 
 A theory's `deps_loaded` checkpoint, its dependencies loaded into the
 toolchain's base state, is also kept once per host in
@@ -1643,6 +1651,7 @@ option proof-steps=<bool>
 option tactic-timeout=<seconds|none>
 option new-ir=<bool>
 option theorem-checkpoints=false   (only for a theory that saves none)
+option checkpoint-target=true      (only for a theory that saves checkpoints as it runs)
 option skip-checkpoints=true      (when checkpoint reuse is disabled)
 option force=true                 (only for a forced theory)
 option trace-steps=true            (only for a traced theory)
@@ -2025,9 +2034,13 @@ another worker published for the theory's source, the way a local build
 picks one: the last theorem or definition context whose source prefix is
 unchanged, or a failed proof's prefix, with a timeout at least as strict as
 the spec's. If there's none, it restores the dependency heap; if there's no
-heap either, it loads the dependencies cold. After the build, successful or
-not, it publishes its heap if no other worker's is, and then, when the heap
-under them is the published one, the checkpoints it saved. A heap is shared
+heap either, it restores the theory's latest failed prefix that a theory saving
+no heap published (below), else it loads the dependencies cold. After the
+build, successful or not, it publishes its heap if no other worker's is, and
+then, when the heap under them is the published one, the checkpoints it
+saved. A theory that saves no checkpoints as it runs (not a target) and has no
+heap publishes only a failed prefix, its chain down to the toolchain's base
+state, as the theory's one failed prefix. A heap is shared
 only between workers with the same toolchain bytes, cache root, action root,
 platform and holbuild runtime sources compiled into the heap, which is why
 every worker should use the same cache root.
