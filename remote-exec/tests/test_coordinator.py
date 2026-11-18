@@ -3064,6 +3064,103 @@ async def test_run_floor_precheck_keeps_build_claims_off_the_admission_lock(
             sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
 
 
+async def test_run_claims_reuse_a_recent_none_until_a_run_is_made_ready(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_floor = 4
+    coordinator.settings.claim_ranking_seconds = 3600
+    asked = 0
+
+    def before_execute(_: object, __: object, statement: str, *args: object) -> None:
+        nonlocal asked
+        asked += "WHERE state = 'ready' AND class = 'run'" in statement
+
+    await submit(http, ["build-a", "build-b"])
+    sa.event.listen(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+    try:
+        await claim_named(http, "build-a")
+        assert asked == 1
+        await claim_named(http, "build-b")
+        assert asked == 1
+        await submit(http, ["build-c"])
+        await submit(http, ["run"], **{"class": "run"})
+        await claim_named(http, "run")
+    finally:
+        sa.event.remove(coordinator.engine.sync_engine, "before_cursor_execute", before_execute)
+
+
+async def test_run_claims_keep_no_none_read_across_a_run_made_ready(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    # A run made ready while the read is in flight, after its snapshot: that "none" is already stale.
+    coordinator.settings.run_floor = 4
+    coordinator.settings.claim_ranking_seconds = 3600
+    asked = 0
+
+    def after_execute(_: object, __: object, statement: str, *args: object) -> None:
+        nonlocal asked
+        if "WHERE state = 'ready' AND class = 'run'" in statement:
+            asked += 1
+            if asked == 1:
+                coordinator._runs_changed()
+
+    await submit(http, ["build-a", "build-b"])
+    sa.event.listen(coordinator.engine.sync_engine, "after_cursor_execute", after_execute)
+    try:
+        await claim_named(http, "build-a")
+        await claim_named(http, "build-b")
+        assert asked == 2
+    finally:
+        sa.event.remove(coordinator.engine.sync_engine, "after_cursor_execute", after_execute)
+
+
+async def test_run_claims_go_past_the_floor_to_the_cap_and_take_a_freed_slot(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    # The floor's "none" (its slot is taken) must not stand for the cap's.
+    coordinator.settings.run_floor = 1
+    coordinator.settings.run_slots = 3
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["run-a", "run-b", "run-c", "run-d"], **{"class": "run"})
+    token = await claim_named(http, "run-a")
+    await claim_named(http, "run-b")
+    await claim_named(http, "run-c")
+    assert await claim(http) is None
+    assert (await complete(http, token, result("run-a", "built"))).status_code == 200
+    await claim_named(http, "run-d")
+
+
+async def test_run_claims_take_the_slot_an_expired_run_lease_freed(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.run_floor = 1
+    coordinator.settings.run_slots = 1
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["run-a", "run-b"], **{"class": "run"})
+    await claim_named(http, "run-a")
+    assert await claim(http) is None
+    async with coordinator.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
+    await coordinator.expire_leases()
+    assert await claim(http) is not None
+
+
+async def test_run_claims_read_again_once_a_none_is_older_than_the_ranking_ttl(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    # A slot freed out of this process's sight (another replica, a cancel) is seen once the TTL passes.
+    coordinator.settings.run_floor = 1
+    coordinator.settings.run_slots = 1
+    coordinator.settings.claim_ranking_seconds = 0.2
+    await submit(http, ["run-a", "run-b"], **{"class": "run"})
+    await claim_named(http, "run-a")
+    assert await claim(http) is None
+    async with coordinator.engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE actions SET state = 'cancelled' WHERE theory = 'pkg:run-a'"))
+    await asyncio.sleep(0.3)
+    await claim_named(http, "run-b")
+
+
 @pytest.mark.parametrize("floor", [0, 4])
 async def test_run_admission_waiters_leave_connections_for_heartbeats_and_completions(
     http: httpx.AsyncClient, coordinator: Coordinator, floor: int
