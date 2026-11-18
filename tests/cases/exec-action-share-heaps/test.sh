@@ -616,3 +616,31 @@ if grep -q "dropping checkpoint\|restored shared theorem_context" "$tmpdir/x2.lo
   cat "$tmpdir/x2.log" "$tmpdir/remote/cas/$x2_log" >&2
   exit 1
 fi
+
+# A holbuild whose runtime changed only in what a theory loads after its
+# dependency heap still restores the heap an earlier release shared; a change
+# to what is compiled into the heap misses it.  Spec and worker both come from
+# a copy of the binary with its own runtime tree.
+patched=$tmpdir/patched-runtime
+mkdir -p "$patched/bin" "$patched/share/holbuild"
+cp "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" "$patched/bin/holbuild"
+cp -R "$SCRIPT_DIR/../../../sml" "$patched/share/holbuild/"
+printf '\n(* changed after the heap *)\n' >> "$patched/share/holbuild/sml/proof_runtime.sml"
+write_x "REWRITE_TAC []"
+HOLBUILD_BIN=$patched/bin/holbuild export_x 3
+forget_local
+HOLBUILD_BIN=$patched/bin/holbuild worker x3 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x3 0 "status=built"
+require_grep "restored shared deps-loaded heap" "$tmpdir/x3.log"
+require_grep "from: deps-loaded checkpoint" "$tmpdir/x3.log"
+printf '\n(* changed in the heap *)\n' >> "$patched/share/holbuild/sml/checkpoint_save_runtime.sml"
+write_x "MATCH_ACCEPT_TAC TRUTH"
+HOLBUILD_BIN=$patched/bin/holbuild export_x 4
+forget_local
+HOLBUILD_BIN=$patched/bin/holbuild worker x4 "$shared_url" "$shared" "$spec_x" --share-heaps
+expect x4 0 "status=built"
+if grep -q "restored shared deps-loaded heap" "$tmpdir/x4.log"; then
+  echo "a changed heap runtime restored the old shared deps heap" >&2
+  cat "$tmpdir/x4.log" >&2
+  exit 1
+fi
