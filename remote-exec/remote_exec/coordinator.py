@@ -1273,18 +1273,18 @@ class Coordinator:
                 # A claim woken for a batch made ready prefers it; see _claim_build. So does one from a host a build is
                 # held for, which takes that build even where it defers to better-ranked waiters, which would
                 # otherwise take it cold, but only that build.
-                hint = None
+                hint, held_tier = None, None
                 if woken.done() and (wake := woken.result())[2] is not None and wake[3] is not None and not wake[1]:
                     hint = (wake[2], wake[0], wake[3])
                 elif not woken.done():
-                    hint = self._held_for(tiers, host_id)
-                hint_only = hint[1] if hint is not None and hint[1] not in eligible_tiers else None
+                    held_tier = self._held_for(tiers, host_id)
+                hint_only = held_tier if held_tier not in eligible_tiers else None
                 claim_tiers = [t for t in tiers if t in eligible_tiers or t == hint_only]
                 outranked = (
                     await self._outranked_by_ahead(tiers, ahead_tiers) if ahead_tiers and claim_tiers else None
                 )
                 claimed, held_until = (
-                    await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only)
+                    await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only, held_tier)
                     if claim_tiers else (None, None)
                 )
                 # Builds left for their holders still rank before claims ahead.
@@ -1365,15 +1365,17 @@ class Coordinator:
         host_id: str | None = None,
         hint: Hint | None = None,
         hint_only: str | None = None,
+        held_tier: str | None = None,
     ) -> tuple[Claim | None, float | None]:
         """Lease a ready build of ``tiers`` from the shared ranking, else a run action. Before a ready build that
         ranks after an action that may be claimed ahead, claim one of the tiers ``outranked`` gives for it, of a
         higher priority than the build's; failing that, the build is claimed after all. A claim from ``host_id``
-        may take a build its host is warm for, or the batch and tier ``hint`` it was woken for; see _claim_build.
+        may take a build its host is warm for, the batch and tier ``hint`` it was woken for, or a build of
+        ``held_tier`` held for its host; see _claim_build.
 
         Also returns, when the only ready builds left are held for other hosts (see _held), when the first hold
         ends: those builds are ready, so no run is claimed, and the claim asks again then. Of tier ``hint_only``, it
-        may lease only the build of ``hint``, and no run."""
+        may lease only a build held for its host, and no run."""
         started = asyncio.get_running_loop().time()
         key = tuple(tiers)
         ranking = await self._current_ranking(key)
@@ -1389,7 +1391,7 @@ class Coordinator:
                 async with self.engine.begin() as conn:
                     # Never lock a batch after an action: batch writers take those locks in the opposite order.
                     row, held_until, stopped = await self._claim_build(
-                        conn, ranking, outranked, host_id, hint, hint_only=hint_only
+                        conn, ranking, outranked, host_id, hint, hint_only=hint_only, held_tier=held_tier
                     )
                     if row is not None:
                         claimed = await self._lease(conn, row, worker)
@@ -1421,7 +1423,7 @@ class Coordinator:
                 ranking.running_priority -= 1
                 outranked = None
                 continue
-            # Builds of tier hint_only other than the hint's are no candidates.
+            # Builds of tier hint_only not held for this host are no candidates.
             if not any(e[7] != hint_only for e in ranking.heap) and (not ranking.ranked or ranking.at >= started):
                 if not run_tiers:
                     return None, None
@@ -1684,6 +1686,7 @@ class Coordinator:
         hint: Hint | None = None,
         *,
         hint_only: str | None = None,
+        held_tier: str | None = None,
     ) -> tuple[_Claimed | None, float | None, RankEntry | None]:
         """Lock a ready build from the shared ranking, without refreshing it inside the transaction.
 
@@ -1698,10 +1701,11 @@ class Coordinator:
         their next read, so together they may pass the cap by a few builds for up to ``claim_ranking_seconds``.
 
         A claim from ``host_id`` may then take, instead of the chosen candidate, the batch and tier ``hint`` it was
-        woken for (_hinted_entry) or another candidate of its band its host holds (_local_entry); else it passes over
-        a candidate held for another host (_held) for the next one. When only such candidates are left, it returns
-        no build and when the first of their holds ends. Of tier ``hint_only``, it takes only the build of ``hint``,
-        and only while it is held for ``host_id``: the claim defers that tier to better-ranked claims.
+        woken for (_hinted_entry), a build of tier ``held_tier`` held for its host (_held_entry) or another candidate
+        of its band its host holds (_local_entry); else it passes over a candidate held for another host (_held) for
+        the next one, as a swap passes over the chosen one, waking a claim on a host it is held for (_wake_holders).
+        When only such candidates are left, it returns no build and when the first of their holds ends. Of tier
+        ``hint_only``, it takes only a build held for ``host_id``: the claim defers that tier to better-ranked claims.
         """
         kept = functools.cache(
             lambda tier: self._kept_hosts(
@@ -1710,7 +1714,7 @@ class Coordinator:
         )
         held: list[RankEntry] = []  # taken out of the heap only until this claim awaits or returns
         held_until: float | None = None
-        hint_tier = None if hint is None else hint[1]
+        hint_tier = held_tier if hint is None else hint[1]
 
         def put_back_held() -> None:
             for e in held:
@@ -1725,7 +1729,10 @@ class Coordinator:
             # The hint is for the first candidate of its tier only, as a woken claim's, or one held for this host.
             hinted, fits = None, False
             if tier == hint_tier:
-                hinted = self._hinted_entry(ranking, entry, host_id, hint, kept)
+                if hint is not None:
+                    hinted = self._hinted_entry(ranking, entry, host_id, hint, kept)
+                else:
+                    hinted = self._held_entry(ranking, entry, host_id, kept)
                 fits = self._held_here(ranking, (hinted[6], hinted[7]) if hinted else (batch_id, tier), host_id, kept)
                 hint = hint_tier = None
             if tier == hint_only and not fits:
@@ -1741,6 +1748,7 @@ class Coordinator:
             if local is not None:
                 ranking.heap[ranking.heap.index(local)] = entry
                 heapq.heapify(ranking.heap)
+                self._wake_holders(ranking, entry, host_id, kept)
                 passed, entry = (batch_id, tier), local
                 tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
             elif (until := self._held(ranking, entry, host_id, kept)) is not None:
@@ -1779,7 +1787,7 @@ class Coordinator:
             if row is not None:
                 if passed is not None:
                     self.locality.claims += 1
-                if hold is not None:
+                if hold is not None and row.theory == hold[2]:
                     self.locality.held_waits += 1
                     self.locality.held_ms_total += round((asyncio.get_running_loop().time() - hold[0]) * 1000)
                 if host_id is not None:
@@ -1835,7 +1843,7 @@ class Coordinator:
         if hinted is None or hinted[:2] != entry[:2]:
             return None
         hold = self.holds.get(key)
-        if hold is not None and asyncio.get_running_loop().time() < hold[1]:
+        if hold is not None and asyncio.get_running_loop().time() < hold[1] and hold[2] == theory:
             return hinted if self._held_here(ranking, key, host_id, kept) else None
         if self._best_level(theory, key[1], host_id, kept) > self._level(host_id, theory):
             return None
@@ -1890,7 +1898,7 @@ class Coordinator:
         if not self.settings.locality or host_id is None or (theory := ranking.theories.get(head)) is None:
             return None
         mine = self._level(host_id, theory)
-        if mine == 2 or (best := self._best_level(theory, entry[7], host_id, kept)) <= mine:
+        if mine == 2 or self._best_level(theory, entry[7], host_id, kept) <= mine:
             return None
         loop = asyncio.get_running_loop()
         now = loop.time()
@@ -1902,9 +1910,7 @@ class Coordinator:
             loop.call_later(LOCALITY_HOLD_SECONDS, self._wake_at_hold_end, head, hold)
         if now >= hold[1]:
             return None
-        # A holder may have started waiting since the hold began.
-        holders = {h for h in kept(entry[7]) if h != host_id and self._level(h, theory) == best}
-        self._wake_holder(entry[7], head[0], theory, holders)
+        self._wake_holders(ranking, entry, host_id, kept)
         return hold[1]
 
     def _hold_ended(self, ranking: "_Ranking", head: tuple[UUID, str]) -> bool:
@@ -1926,20 +1932,44 @@ class Coordinator:
             and ranking.theories.get(key) == hold[2] and self._holds_most(host_id, hold[2], key[1], kept)
         )
 
-    def _held_for(self, tiers: list[str], host_id: str | None) -> Hint | None:
-        """A build of ``tiers`` held (see _held) whose hold hasn't ended and whose theory ``host_id`` holds some of,
-        the most it holds of one if several, for a claim from ``host_id`` that wasn't woken for it, as its hint (see
-        _hinted_entry); or None. The claim takes it only if it is held for ``host_id`` (_held_here), by the scale-in
-        line of the ranking it claims from."""
+    def _held_for(self, tiers: list[str], host_id: str | None) -> str | None:
+        """The tier of ``tiers`` of a build held (see _held) whose hold hasn't ended and whose theory ``host_id``
+        holds some of, of the most it holds of one if several, for a claim from ``host_id`` that wasn't woken: it
+        looks for a build of that tier held for its host (_held_entry), by the scale-in line of the ranking it
+        claims from; or None."""
         if not self.settings.locality or host_id is None or not self.host_keys.get(host_id):
             return None
         now = asyncio.get_running_loop().time()
-        best: tuple[int, Hint] | None = None
-        for (batch_id, tier), (_, until, theory) in self.holds.items():
-            if now < until and tier in tiers and (level := self._level(host_id, theory)) > 0:
-                if best is None or level > best[0]:
-                    best = level, (batch_id, tier, theory)
+        best: tuple[int, str] | None = None
+        for (_, tier), (_, until, theory) in self.holds.items():
+            if now < until and tier in tiers and (level := self._level(host_id, theory)) > 0 and (
+                best is None or level > best[0]
+            ):
+                best = level, tier
         return None if best is None else best[1]
+
+    def _held_entry(
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
+    ) -> RankEntry | None:
+        """The candidate of ``entry``'s tier and priority held for ``host_id`` (_held_here) to take instead of
+        ``entry``, of a theory it holds the most of if several are, or None: when ``entry`` is such a build at
+        least as good, or none is. As in _hinted_entry, not past an ``entry`` whose hold ended or that was passed
+        over LOCALITY_WINDOW times in a row."""
+        head = (entry[6], entry[7])
+        if host_id is None or self.passed_over.get(head, 0) >= LOCALITY_WINDOW or self._hold_ended(ranking, head):
+            return None
+
+        def level(e: RankEntry) -> int:
+            key = (e[6], e[7])
+            if key in ranking.exhausted or not self._held_here(ranking, key, host_id, kept):
+                return 0
+            return self._level(host_id, ranking.theories[key])
+
+        best, most = None, level(entry)
+        for e in ranking.heap:
+            if e[:2] == entry[:2] and ((n := level(e)) > most or n == most and best is not None and e < best):
+                best, most = e, n
+        return best
 
     def _wake_at_hold_end(self, head: tuple[UUID, str], hold: Hold) -> None:
         """Wake the best-ranked compatible claim waiting, if one is, for the build of ``head`` whose hold just ended,
@@ -1966,6 +1996,19 @@ class Coordinator:
         self.holds.setdefault(key, hold)
         if asyncio.get_running_loop().time() >= hold[1]:
             self._wake_at_hold_end(key, hold)
+
+    def _wake_holders(
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
+    ) -> None:
+        """Wake a claim waiting on a host candidate ``entry`` is held for, if its hold hasn't ended, as a claim from
+        ``host_id`` passes it over: a holder may have started waiting since the hold began."""
+        head = (entry[6], entry[7])
+        hold, theory = self.holds.get(head), ranking.theories.get(head)
+        if hold is None or asyncio.get_running_loop().time() >= hold[1] or theory != hold[2]:
+            return
+        if (best := self._best_level(theory, entry[7], host_id or "", kept)) > 0:
+            holders = {h for h in kept(entry[7]) if h != host_id and self._level(h, theory) == best}
+            self._wake_holder(entry[7], head[0], theory, holders)
 
     def _wake_holder(self, tier: str, batch_id: UUID, theory: str, holders: set[str]) -> None:
         """Wake the best-ranked claim waiting on one of ``holders``, the hosts the build of ``batch_id`` and ``tier``,

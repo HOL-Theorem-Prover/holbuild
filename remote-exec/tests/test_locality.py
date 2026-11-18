@@ -648,7 +648,7 @@ async def test_a_holder_claiming_unwoken_takes_a_ready_build_of_an_earlier_tier_
 ) -> None:
     """``h`` peaked above the standard tier, so it is ready as high work; host-1's worker takes high work first."""
     await learn_high(http, cache)
-    _, theory = await held_in_a_busier_batch(http, coordinator)
+    await held_in_a_busier_batch(http, coordinator)
     await submit(http, ["h"])
     wait_on_host_0(coordinator)
 
@@ -748,7 +748,7 @@ async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_sto
 
     claimed, _ = await coordinator._claim(
         ["high", "standard"], "w", lambda tier, priority: [tier] if tier == "standard" else [], "host-1",
-        (uuid4(), "high", "pkg:x"), "high",
+        None, "high", "high",
     )
 
     assert asked == [["standard"]]
@@ -775,7 +775,7 @@ async def test_a_held_build_of_a_hint_only_tier_that_a_claim_ahead_outranks_is_c
 
     await coordinator._claim(
         ["high", "standard"], "w", lambda tier, priority: ["high"] if tier == "high" and priority < 1 else [],
-        "host-1", (held, "high", "pkg:h"), "high",
+        "host-1", None, "high", "high",
     )
 
     assert asked == [["high"]]
@@ -823,3 +823,58 @@ async def test_a_hold_ends_only_for_the_build_it_held(http: httpx.AsyncClient, c
     assert not coordinator._hold_ended(ranking, key)
     coordinator.holds[key] = (now - 1, now - 0.5, "pkg:b")
     assert coordinator._hold_ended(ranking, key)
+
+
+async def test_a_holder_claiming_unwoken_finds_the_build_held_for_it_among_several_held(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """host-1 holds the context of ``x`` and ``y``, and kept host-2 ran ``x``: both builds are held, ``x`` for host-2
+    and ``y`` for host-1, which takes ``y`` though the hold of ``x`` began first."""
+    coordinator.settings.warm_workers = 4
+    coordinator.theory_deps["pkg:x"] = coordinator.theory_deps["pkg:y"] = D1
+    coordinator.host_keys["host-1"] = {D1: None}
+    coordinator.host_keys["host-2"] = {"pkg:x": None}
+    coordinator.report_worker("host-1", "host-1-w", ["standard"])
+    coordinator.report_worker("host-2", "host-2-w", ["standard"])
+    await submit_as(http, "x1", "x")
+    await submit_as(http, "y1", "y")
+    assert await claim_on(http, "host-3") is None
+    assert len(coordinator.holds) == 2
+    wait_on_host_0(coordinator)
+
+    claimed = await claim_on(http, "host-1")
+
+    assert claimed is not None and claimed["theory"] == "pkg:y"
+
+
+async def test_a_claim_swapping_past_a_held_build_wakes_a_holder_that_began_waiting_after_the_hold(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    """``b1``, the head, is held for host-1 and ``a1`` for host-4, which takes ``a1`` from behind ``b1``, waking the
+    claim host-1 started waiting after the hold began."""
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await run_on(http, cache, "host-4", "a0", "a", D2)
+    held = await submit_as(http, "b1", "b")
+    await submit_as(http, "a1", "a")
+    coordinator.settings.warm_workers = 5
+    assert await claim_on(http, "host-3") is None
+    assert (held, "standard") in coordinator.holds
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters = [(["standard"], _claim_rank(["standard"], "host-1"), wake, False)]
+
+    claimed = await claim_on(http, "host-4")
+
+    assert claimed is not None and claimed["theory"] == "pkg:a"
+    assert wake.result() == ("standard", False, held, "pkg:b")
+
+
+async def test_a_hold_of_another_theory_counts_no_held_wait(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    """The hold left after another process's claim took the held build isn't the claimed build's."""
+    key = (await submit_as(http, "b1", "b"), "standard")
+    now = asyncio.get_running_loop().time()
+    coordinator.holds[key] = (now, now + 60, "pkg:gone")
+
+    claimed = await claim_on(http, "host-3")
+
+    assert claimed is not None and claimed["theory"] == "pkg:b"
+    assert counts(coordinator, "held_waits") == {"held_waits": 0}
