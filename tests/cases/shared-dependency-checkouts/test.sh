@@ -217,6 +217,18 @@ echo 'structure GenML = struct val x = 2 end' > "$tmpdir/copy/.holbuild/packages
 require_grep "GUse built" "$tmpdir/copy-t2.log"
 require_grep "y=2" "$tmpdir/copy/src/T.txt"
 
+# A new pin of the dependency starts its extra-output directory empty: a
+# generated source there from the old pin is not the new one's, though its
+# theory, never built here, still declares it.
+echo more > "$dep/src/more.txt"
+git -C "$dep" add src/more.txt
+git -C "$dep" commit -q --no-gpg-sign -m more
+dep_rev2=$(git -C "$dep" rev-parse HEAD)
+sed -i "s/$dep_rev/$dep_rev2/" "$tmpdir/copy/holproject.toml"
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-repin.log" 2>&1 || { cat "$tmpdir/copy-repin.log" >&2; fail "build after a repin failed"; }
+require_grep "y=1" "$tmpdir/copy/src/T.txt"
+require_outputs "$tmpdir/copy"
+
 # A dependency taken from a path that 0.14.63 or 0.14.64 wrote declared
 # outputs into: those copies are never inputs, even through a directory.
 cp -R "$dep" "$tmpdir/dep-override"

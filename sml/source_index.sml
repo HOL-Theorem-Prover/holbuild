@@ -541,6 +541,29 @@ fun member_contains member path =
 
 fun scan_key name source_root = name ^ "\000" ^ source_root
 
+(* A dependency's extra-output root holds what its theories wrote from one
+   snapshot of its sources, recorded beside it.  Once the package's snapshot
+   changes, as with a new pin, those files may be stale even where a theory
+   still declares their paths, so the root starts empty. *)
+fun prepare_extra_output_root package root =
+  let
+    val marker = root ^ ".source"
+    val identity =
+      HolbuildPackageProvenance.snapshot_text
+        (HolbuildPackageProvenance.snapshot (HolbuildProject.package_provenance package))
+    val recorded =
+      SOME (let val input = TextIO.openIn marker
+            in TextIO.inputAll input before TextIO.closeIn input end)
+      handle IO.Io _ => NONE
+  in
+    if recorded = SOME identity andalso is_dir root then ()
+    else
+      (HolbuildRemoveTree.remove root;
+       HolbuildGenerators.ensure_dir root;
+       let val out = TextIO.openOut marker
+       in TextIO.output (out, identity); TextIO.closeOut out end)
+  end
+
 fun prevalidate_package package =
   let
     val name = HolbuildProject.package_name package
@@ -580,7 +603,7 @@ fun prevalidate_package package =
     val _ =
       case HolbuildProject.package_extra_output_root package of
           NONE => validate_action_policies name policies candidates
-        | SOME root => HolbuildGenerators.ensure_dir root
+        | SOME root => prepare_extra_output_root package root
   in
     (* Without generators nothing can change the tree before discovery, so
        discovery reuses this scan instead of walking the tree again. *)
@@ -724,7 +747,7 @@ fun discover_package scans package =
                  place of its admitted overlay copy.  An admitted theory may
                  admit more, and a replaced one may admit less, so the
                  admissions are recomputed until they settle, at most once
-                 per candidate. *)
+                 per candidate, or it is an error. *)
               fun scripts_with admitted =
                 let val generated = List.filter (fn (output : source) => #kind output = TheoryScript) admitted
                 in
@@ -740,7 +763,10 @@ fun discover_package scans package =
                   val scripts = scripts_with admitted
                   val next = admissions scripts
                 in
-                  if paths next = paths admitted orelse rounds = 0 then (next, scripts_with next)
+                  if paths next = paths admitted then (next, scripts)
+                  else if rounds = 0 then
+                    raise Error ("the extra-output sources of " ^ name ^
+                                 " that its theories declare depend on one another without settling, under " ^ root)
                   else admit (rounds - 1, next)
                 end
               fun under dir path = dir = "" orelse String.isPrefix (dir ^ "/") path
