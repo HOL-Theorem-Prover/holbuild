@@ -3817,7 +3817,7 @@ async def test_concurrent_claims_sharing_a_ranking_take_the_last_cap_slot_once(
         claimed = await asyncio.gather(
             coordinator._claim_build(first, ranking), coordinator._claim_build(second, ranking)
         )
-        assert sorted(c.theory for c, _ in claimed if c is not None) == ["pkg:n1", "pkg:p1"]
+        assert sorted(c.theory for c, *_ in claimed if c is not None) == ["pkg:n1", "pkg:p1"]
 
 
 async def test_priority_work_takes_every_slot_when_no_priority_zero_build_is_ready(

@@ -170,10 +170,20 @@ refute_grep() {
   fi
 }
 
+# The plan record's digest, as the stub's `watch` computes it.
+plan_digest() {
+  if [[ -z $(find "$project/.holbuild/plan" -maxdepth 1 -type f 2>/dev/null) ]]; then echo absent; return; fi
+  find "$project/.holbuild/plan" -maxdepth 1 -type f -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256sum | cut -c1-64
+}
+
 # Submit and follow: the workers build both theories, and the client restores
-# them from the remote cache without building anything itself.
+# them from the remote cache without building anything itself.  The plan
+# record is written only after the batch is submitted (record mode on, as
+# outside the tests).
 write_theories one
-run follow 0 build --remote-exec "$coordinator" BTheory
+echo "$project/.holbuild/plan" > "$state/watch"
+HOLBUILD_PLAN_RECORD=on run follow 0 build --remote-exec "$coordinator" BTheory
+[[ $(< "$state/b1.watched") == absent ]] || { echo "plan record written before the POST" >&2; exit 1; }
 require_grep "holbuild: remote batch b1" "$tmpdir/follow.log"
 require_grep "holbuild: remote rx:BTheory: done" "$tmpdir/follow.log"
 [[ $(grep -c "remote rx:BTheory: running" "$tmpdir/follow.log") -eq 1 ]] || { cat "$tmpdir/follow.log" >&2; exit 1; }
@@ -204,15 +214,26 @@ assert record['local_outcomes']['built']==0
 assert record['local_outcomes']['restored_remote']==2
 PY
 
-# With everything cached there is nothing to submit.
-run cached 0 build --remote-exec "$coordinator" BTheory
+[[ $(plan_digest) != absent ]] || { echo "follow wrote no plan record" >&2; exit 1; }
+
+# With everything cached there is nothing to submit, and the deferred plan
+# record is still written.
+rm "$project"/.holbuild/plan/*
+HOLBUILD_PLAN_RECORD=on run cached 0 build --remote-exec "$coordinator" BTheory
 refute_grep "remote batch" "$tmpdir/cached.log"
 require_grep "remote execution: nothing to build remotely" "$tmpdir/cached.log"
+[[ $(plan_digest) != absent ]] || { echo "an empty batch wrote no plan record" >&2; exit 1; }
 
 # Detach and reattach.
 write_theories two
-run detach 0 build --remote-exec "$coordinator" --detach BTheory
+record_before=$(plan_digest)
+HOLBUILD_PLAN_RECORD=on run detach 0 build --remote-exec "$coordinator" --detach BTheory
 require_grep "holbuild: remote batch b2" "$tmpdir/detach.log"
+rm "$state/watch"
+# A detached build writes the record of its edited plan, after the POST.
+[[ $(< "$state/b2.watched") == "$record_before" ]] || { echo "plan record changed before the POST" >&2; exit 1; }
+record_after=$(plan_digest)
+[[ $record_after != absent && $record_after != "$record_before" ]] || { echo "detach wrote no new plan record" >&2; exit 1; }
 refute_grep "Theory built\|restored from cache" "$tmpdir/detach.log"
 run attach 0 build --remote-exec "$coordinator" --attach b2 BTheory
 require_grep "BTheory restored from cache" "$tmpdir/attach.log"
@@ -2482,3 +2503,39 @@ cp "$tmpdir/ring-weak-ac" "${ranked_roots[1]}/ac/$ring_ac"
 ring_worker ring-built-worker built
 require_grep '^proof-timeout=2.5$' "${ranked_roots[0]}/ac/$ring_ac"
 require_grep '^proof-timeout=2.5$' "${ranked_roots[1]}/ac/$ring_ac"
+
+# The plan record written after the POST keeps the stamps taken when planning
+# hashed the inputs: an input whose link moves to an older file while the
+# batch is submitted is hashed again by the next plan, which check mode
+# compares with full planning.
+project=$tmpdir/swap
+mkdir -p "$project/src" "$project/data"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxswap"
+
+[build]
+members = ["src"]
+
+[actions.ATheory]
+extra_inputs = ["data/in.txt"]
+TOML
+cat > "$project/src/AScript.sml" <<'SML'
+Theory A
+Ancestors bool
+SML
+echo one > "$project/one.txt"
+echo two > "$project/two.txt"
+ln -s ../one.txt "$project/data/in.txt"
+# Neither file's stat is recent enough for the record to distrust it.
+sleep 1.1
+echo "ln -sfn ../two.txt '$project/data/in.txt'" > "$state/on-submit"
+touch "$state/skip"
+HOLBUILD_PLAN_RECORD=on run swap 0 --verbose build --remote-exec "$coordinator" --detach ATheory
+rm "$state/on-submit"
+[[ $(readlink "$project/data/in.txt") == ../two.txt ]] || { echo "the input was not swapped at the POST" >&2; exit 1; }
+[[ $(plan_digest) != absent ]] || { cat "$tmpdir/swap.log" >&2; echo "the swap build wrote no plan record" >&2; exit 1; }
+HOLBUILD_PLAN_RECORD=check run swap-check 0 --verbose build --remote-exec "$coordinator" --detach ATheory
+rm "$state/skip"
+require_grep "plan: from record (1 files rehashed" "$tmpdir/swap-check.log"

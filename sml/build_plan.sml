@@ -11,9 +11,11 @@ exception UnknownTarget of string * string list
 fun unknown_target_message (target, candidates) =
   "unknown build target: " ^ target ^ HolbuildSuggest.did_you_mean target candidates
 
+(* KEY, the node's identity, is computed once: plans compare it constantly. *)
 type node =
   { source : HolbuildSourceIndex.source,
-    external_dirs : string list }
+    external_dirs : string list,
+    key : string }
 
 type keyed_node = {node : node, input_key : string}
 
@@ -68,7 +70,7 @@ fun external_dirs_of ({external_dirs, ...} : node) = external_dirs
 fun logical_name node = #logical_name (source_of node)
 fun package node = #package (source_of node)
 fun relative_path node = #relative_path (source_of node)
-fun key node = package node ^ "\000" ^ relative_path node ^ "\000" ^ logical_name node
+fun key ({key, ...} : node) = key
 
 fun member value values = List.exists (fn x => x = value) values
 
@@ -435,16 +437,15 @@ fun reverse_dependency_edges plan node =
   graph_values (#reverse (dependency_graph plan)) node
 
 (* Resolved edges lead from selected nodes to selected nodes: the selection
-   is closed under them. *)
+   is closed under them.  The adjacency holds those edges' targets, in edge
+   order; a node outside the selection has none. *)
 fun direct_project_deps
-      (plan as {selected_key_index, selected_node_index, ...} : t) node =
-  let
-    fun target (edge : resolved_dependency_edge) =
-      Vector.sub(selected_node_index,
-                 indexed_key_id selected_key_index (#to_node edge))
-  in
-    unique_nodes (map target (resolved_dependency_edges plan node))
-  end
+      ({selected_key_index, selected_node_index, selected_adjacency, ...} : t) node =
+  case find_key_id selected_key_index (key node) of
+      NONE => []
+    | SOME id =>
+        unique_nodes (map (fn dep => Vector.sub(selected_node_index, dep))
+                          (Vector.sub(selected_adjacency, id)))
 
 fun direct_external_theories plan node =
   unique_strings
@@ -617,8 +618,9 @@ fun forget_output_digest (plan as {output_digest_cache, ...} : t) node =
 fun forget_output_digests ({output_digest_cache, ...} : t) =
   Array.modify (fn _ => NONE) output_digest_cache
 
-fun make_node external_dirs source =
-  {source = source, external_dirs = external_dirs}
+fun make_node external_dirs (source : HolbuildSourceIndex.source) =
+  {source = source, external_dirs = external_dirs,
+   key = #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source}
 
 fun bootstrap_prefetch_nodes analysis nodes =
   HolbuildComponentProvider.prefetch analysis
