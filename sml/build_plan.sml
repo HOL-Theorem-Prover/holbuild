@@ -1307,8 +1307,11 @@ fun extra_input_decls plan node =
         case input_overlay plan node dir of
             NONE => base
           | SOME overlay =>
+              (* A declaration naming a directory there is one a build of
+                 its theory rejects, so it declares nothing. *)
               if not (path_has_glob decl) andalso not (Path.isAbsolute decl) andalso
-                 not (null (declared_outputs_among plan node [package_path dir decl]))
+                 not (null (declared_outputs_among plan node [package_path dir decl])) andalso
+                 not (is_dir (normalize_path (Path.concat(overlay, decl))))
               then overlay
               else base
       end
@@ -1338,59 +1341,65 @@ fun expand_input plan node (label, base, decl) : input_expansion =
     case input_overlay plan node dir of
         NONE => expand_extra_dep_walk base decl
       | SOME overlay =>
-          if Path.isAbsolute decl orelse base = overlay then expand_extra_dep_walk base decl
-          else
-            let
-              val root = valOf (input_overlay plan node "")
-              (* Planning under the project lock finds the root current;
-                 outside it, one that isn't is as good as empty. *)
-              val current =
-                case List.find (fn package => HolbuildProject.package_name package = #package (source_of node))
-                       (analysis_packages (analysis_state plan)) of
-                    SOME package => HolbuildSourceIndex.extra_output_root_current package root
-                  | NONE => false
-              fun existing path =
-                if path = root orelse is_dir path then path else existing (Path.dir path)
-              val glob = path_has_glob decl
-              val start = normalize_path (Path.concat(overlay, decl))
-              val found =
-                if not current then {files = [], dirs = []}
-                else if glob then
-                  if is_dir overlay then
-                    let val {files, dirs} = walked_files_under overlay ""
-                    in {files = List.filter (fn (rel, _) => HolbuildSourceIndex.glob_match decl rel) files, dirs = dirs} end
-                  else {files = [], dirs = [existing overlay]}
-                else if is_dir start then walked_files_under start decl
-                else if is_dir (normalize_path (Path.concat(base, decl))) then {files = [], dirs = [existing start]}
-                else {files = [], dirs = []}
-              val declared = declared_outputs_among plan node (map (fn (rel, _) => package_path dir rel) (#files found))
-              val outputs =
-                List.filter (fn (rel, _) => List.exists (fn output => output = package_path dir rel) declared)
-                  (#files found)
-              val tree =
-                if null outputs then expand_extra_dep_walk base decl
-                else
-                  let
-                    val tree_path = if glob then base else normalize_path (Path.concat(base, decl))
-                    fun existing_dir path =
-                      if is_dir path orelse Path.dir path = path then path else existing_dir (Path.dir path)
-                  in
-                    if (OS.FileSys.access (tree_path, []) handle OS.SysErr _ => false)
-                    then expand_extra_dep_walk base decl
-                    else {files = [], dirs = [existing_dir tree_path]}
-                  end
-              (* A declared output in the source tree is a stray copy, such
-                 as one 0.14.63 or 0.14.64 wrote there. *)
-              val strays =
-                declared_outputs_among plan node (map (fn (rel, _) => package_path dir rel) (#files tree))
-              fun stray (rel, _) = List.exists (fn output => output = package_path dir rel) strays
-              val scripts =
-                declaring_script_files plan node
-                  (map (fn (rel, _) => package_path dir rel) (#files tree @ #files found))
-            in
-              {files = List.filter (not o stray) (#files tree) @ outputs,
-               dirs = #dirs tree @ #dirs found @ scripts}
-            end
+          let
+            val root = valOf (input_overlay plan node "")
+            (* Planning under the project lock finds the root current;
+               outside it, one that isn't is as good as empty. *)
+            val current =
+              case List.find (fn package => HolbuildProject.package_name package = #package (source_of node))
+                     (analysis_packages (analysis_state plan)) of
+                  SOME package => HolbuildSourceIndex.extra_output_root_current package root
+                | NONE => false
+          in
+            if Path.isAbsolute decl then expand_extra_dep_walk base decl
+            else if base = overlay then
+              if current then expand_extra_dep_walk base decl
+              else raise Error ("extra dependency not found: " ^ normalize_path (Path.concat(base, decl)))
+            else
+              let
+                fun existing path =
+                  if path = root orelse is_dir path then path else existing (Path.dir path)
+                val glob = path_has_glob decl
+                val start = normalize_path (Path.concat(overlay, decl))
+                val found =
+                  if not current then {files = [], dirs = []}
+                  else if glob then
+                    if is_dir overlay then
+                      let val {files, dirs} = walked_files_under overlay ""
+                      in {files = List.filter (fn (rel, _) => HolbuildSourceIndex.glob_match decl rel) files, dirs = dirs} end
+                    else {files = [], dirs = [existing overlay]}
+                  else if is_dir start then walked_files_under start decl
+                  else if is_dir (normalize_path (Path.concat(base, decl))) then {files = [], dirs = [existing start]}
+                  else {files = [], dirs = []}
+                val declared = declared_outputs_among plan node (map (fn (rel, _) => package_path dir rel) (#files found))
+                val outputs =
+                  List.filter (fn (rel, _) => List.exists (fn output => output = package_path dir rel) declared)
+                    (#files found)
+                val tree =
+                  if null outputs then expand_extra_dep_walk base decl
+                  else
+                    let
+                      val tree_path = if glob then base else normalize_path (Path.concat(base, decl))
+                      fun existing_dir path =
+                        if is_dir path orelse Path.dir path = path then path else existing_dir (Path.dir path)
+                    in
+                      if (OS.FileSys.access (tree_path, []) handle OS.SysErr _ => false)
+                      then expand_extra_dep_walk base decl
+                      else {files = [], dirs = [existing_dir tree_path]}
+                    end
+                (* A declared output in the source tree is a stray copy, such
+                   as one 0.14.63 or 0.14.64 wrote there. *)
+                val strays =
+                  declared_outputs_among plan node (map (fn (rel, _) => package_path dir rel) (#files tree))
+                fun stray (rel, _) = List.exists (fn output => output = package_path dir rel) strays
+                val scripts =
+                  declaring_script_files plan node
+                    (map (fn (rel, _) => package_path dir rel) (#files tree @ #files found))
+              in
+                {files = List.filter (not o stray) (#files tree) @ outputs,
+                 dirs = #dirs tree @ #dirs found @ scripts}
+              end
+          end
   end
 
 fun planned_input_expansion plan node (decl as (_, base, rel)) =

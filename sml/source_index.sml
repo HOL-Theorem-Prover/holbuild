@@ -593,21 +593,22 @@ fun extra_output_root_current package root =
    handle IO.Io _ => NONE) = SOME (extra_output_root_identity package)
 
 (* Under the project lock: empties each dependency's extra-output root that
-   isn't current, recording the identity of its source.  Whether any was. *)
+   isn't current, recording the identity of its source.  The names of the
+   packages whose roots it emptied. *)
 fun reset_extra_output_roots graph =
-  List.foldl
-    (fn (package, reset) =>
+  List.mapPartial
+    (fn package =>
        case HolbuildProject.package_extra_output_root package of
-           NONE => reset
+           NONE => NONE
          | SOME root =>
-             if extra_output_root_current package root then reset
+             if extra_output_root_current package root then NONE
              else
                (HolbuildRemoveTree.remove root;
                 HolbuildGenerators.ensure_dir root;
                 let val out = TextIO.openOut (extra_output_root_marker root)
                 in TextIO.output (out, extra_output_root_identity package); TextIO.closeOut out end;
-                true))
-    false (HolbuildProjectGraph.packages graph)
+                SOME (HolbuildProject.package_name package)))
+    (HolbuildProjectGraph.packages graph)
 
 fun prevalidate_package package =
   let

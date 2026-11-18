@@ -1155,12 +1155,16 @@ fun prepare_source_index phase_prefix resolution project =
   end
 
 (* Under the project lock, before planning: empties the extra-output roots of
-   dependencies whose source changed (HolbuildSourceIndex.reset_extra_output_roots).
-   Whether any was, which makes a source index prepared before stale. *)
+   dependencies whose source changed (HolbuildSourceIndex.reset_extra_output_roots)
+   and drops their theories' ownership records.  Whether any was, which makes
+   a source index prepared before stale. *)
 fun reset_extra_output_roots resolution project =
   timed_phase "extra_outputs.reset"
-    (fn () => HolbuildSourceIndex.reset_extra_output_roots
-                (HolbuildProjectGraph.resolve {project = project, resolution = resolution}))
+    (fn () =>
+       case HolbuildSourceIndex.reset_extra_output_roots
+              (HolbuildProjectGraph.resolve {project = project, resolution = resolution}) of
+           [] => false
+         | packages => (HolbuildBuildExec.drop_extra_output_records project packages; true))
 
 (* A theory script may write SML sources as extra outputs, as EmitML code does.
    A plan made before the theory runs has no node for such a source while it is

@@ -716,6 +716,41 @@ fun record_materialized_extra_outputs project node outputs =
     else write_text action_path (extra_output_action_text owner outputs)
   end
 
+(* Drops the ownership claims and action records of the theories of
+   PACKAGES, whose extra-output roots were just emptied
+   (HolbuildSourceIndex.reset_extra_output_roots): they are about files from
+   another source of the package. *)
+fun drop_extra_output_records project packages =
+  let
+    fun record_package path =
+      case String.tokens (fn c => c = #"\n") (read_text path) of
+          _ :: owner_line :: _ =>
+            (case HolbuildAnalysisProtocol.split owner_line of
+                 "owner" :: package :: _ => SOME package
+               | _ => NONE)
+        | _ => NONE
+    fun drop_in dir =
+      let
+        val stream = FS.openDir dir
+        fun names acc =
+          case FS.readDir stream of
+              NONE => acc
+            | SOME name => names (Path.concat(dir, name) :: acc)
+        val paths = names [] before FS.closeDir stream
+        fun drop path =
+          case record_package path handle IO.Io _ => NONE of
+              SOME package => if member_string package packages then remove_file path else ()
+            | NONE => ()
+      in
+        List.app drop paths
+      end
+      handle OS.SysErr _ => ()
+    val root = extra_output_registry_root project
+  in
+    drop_in (Path.concat(root, "owners"));
+    drop_in (Path.concat(root, "actions"))
+  end
+
 fun clean_registered_extra_outputs project plan node =
   let
     val owner = extra_output_owner node

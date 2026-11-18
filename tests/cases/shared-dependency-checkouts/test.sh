@@ -355,15 +355,33 @@ require_grep "holbuild_extra_outputs in .*/BadScript.sml path must" "$tmpdir/ove
 rm "$override/BadScript.sml"
 
 # Another copy of the dependency at the same path starts the extra-output
-# directory afresh, as its files came from the old copy.
+# directory afresh, as its files came from the old copy, and so do the
+# claims on them: there, another theory declares an output of a theory the
+# copy no longer has.
+moved_script() {
+  cat > "$2/$1Script.sml" <<SML
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["moved.txt"];
+val () = let val out = TextIO.openOut "moved.txt" in TextIO.output (out, "$1\n"); TextIO.closeOut out end;
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$1";
+val _ = export_theory();
+SML
+}
+moved_script A "$override"
+over_build ATheory
 echo stale > "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/stale.txt"
 cp -R "$tmpdir/dep-override" "$tmpdir/dep-override2"
+rm "$tmpdir/dep-override2/src/AScript.sml"
+moved_script B "$tmpdir/dep-override2/src"
 mv "$tmpdir/dep-override" "$tmpdir/dep-override1"
 ln -s dep-override2 "$tmpdir/dep-override"
 over_build WTheory
 [[ ! -e $tmpdir/over/.holbuild/packages/dep/extra-outputs/src/stale.txt ]] ||
   fail "a switch to another copy of the dependency kept its extra outputs"
 require_grep "y=1" "$tmpdir/over/src/W.txt"
+over_build BTheory
+require_grep "^B$" "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/moved.txt"
 
 # GC runs on a cache of its own, which links no shared toolchains, with a HOL
 # dependency that is never built.
