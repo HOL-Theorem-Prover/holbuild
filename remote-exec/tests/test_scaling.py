@@ -246,7 +246,10 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
         "hosts": [],
         "phases": None,  # see test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes
         "scaler": None,  # nor a scale command
-        "locality": {"claims": 0, "wakes": 0, "hosts_left": 0, "keys_left": 0, "keys_lost": 0},  # no host claimed
+        "locality": {  # no host claimed
+            "claims": 0, "wakes": 0, "hosts_left": 0, "keys_left": 0, "keys_lost": 0, "hit_theory": 0, "hit_deps": 0,
+            "missed_held": 0, "unheld": 0, "held_waits": 0, "held_ms_total": 0,
+        },
     }
     assert (await scaled.queue()).desired_burst_workers == 4
 

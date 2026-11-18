@@ -138,7 +138,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
 | `REMOTE_EXEC_PRIORITY_CAP` | running builds of positive-priority batches past which their builds rank like priority-0 ones (see Claims); at least the fleet's worker count for strict priority | 128 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
-| `REMOTE_EXEC_LOCALITY` | let claims and wakes on hosts below the scale-in line prefer work whose dependency context the host holds (see Claims); `false` for the plain order | true |
+| `REMOTE_EXEC_LOCALITY` | steer builds to the hosts below the scale-in line that hold their checkpoints or dependency context (see Claims); `false` for the plain order | true |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
 | `REMOTE_EXEC_SCALE_DOWN_HOLD_S` | how long a higher burst worker count is kept after demand drops | 900 |
 | `REMOTE_EXEC_CACHE_SCALE_DOWN_HOLD_S` | how long the burst cache pool keeps the capacity a higher burst worker count needed (see "Temporary cache members") | 900 |
@@ -502,21 +502,32 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   primary tier. Polling claims defer each tier to better-ranked waiters;
   a waiting standard-only worker still leaves high work available to burst
   workers. This packs work so excess tail hosts can drain for scale-in.
-  With `REMOTE_EXEC_LOCALITY` on, each process also remembers, per host, the
-  last 64 dependency contexts its actions ran with (the `deps-key` its
-  workers report, or the theory name before one is reported; a host loses
-  one whose action failed for an infrastructure reason) and prefers, on the
-  hosts below the scale-in line, work whose context the host holds, since a
-  cold host fetches that context's heap from the cache. The line is
-  where the hosts, in packing order and counting each host's workers or
-  leases, can run the live leases and the ready work, and at least
-  `REMOTE_EXEC_WARM_WORKERS`; hosts above it get no preference, so they
-  still empty when demand falls. A claim from such a host whose context
-  differs from the head batch's takes, of the next 8 batches with the same
-  tier, priority and running count, the first whose context it holds; each
-  batch is passed over that way at most 8 times in a row. A wake for newly
-  ready work goes to a waiting claim on such a host that holds its context,
-  if any. `GET /v1/queue`'s `locality` counts what it did.
+  Each process also remembers, per host, its last 2048 keys, the theories
+  its actions ran and their dependency contexts (the `deps-key` its workers
+  report) together, for 30 minutes after the host's last worker went quiet;
+  a host loses those of an action that failed for an infrastructure reason.
+  A host holds a theory's checkpoints if the theory ran there, else possibly
+  its context, whose heap a cold host fetches from the cache. Only hosts
+  below the scale-in line count as holders: where the hosts, in packing
+  order and counting each host's workers or leases (only leases and waiting
+  claims on a host short of memory), can run the live leases and the ready
+  builds, and at least `REMOTE_EXEC_WARM_WORKERS`; for high work, where the
+  hosts with a burst worker can run their leases and the ready high work.
+  Hosts above it get no preference, so they still empty when demand falls.
+  With `REMOTE_EXEC_LOCALITY` on, a claim from a kept host that holds less
+  of the head batch's next build takes, of the next 8 batches with the same
+  tier, priority and running count, the first it holds the most of
+  (checkpoints before context) where no other kept host taking its tier
+  holds more; each batch is passed over that way at most 8 times in a row. A claim from any host that holds less
+  of the head's build than a kept host taking its tier leaves it to such
+  hosts for 0.5 s from the first time a claim did, waking a claim waiting on
+  one, and takes the next batch instead; with only such builds left, it
+  waits until the first hold ends, claiming nothing ahead meanwhile. A wake
+  for newly ready work goes to a waiting claim on a kept host holding the
+  most of it, if more than the first in line, and a woken claim takes that
+  build while it is still in the head's band and no other kept host holds
+  more of it, or while it is left for this host. `GET /v1/queue`'s
+  `locality` counts what it did.
   Packing is best effort among that process's waiting claims; it neither
   moves running actions nor coordinates host preference across replicas.
   Run admission is serialized across coordinator replicas and permits at
@@ -873,8 +884,12 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   and, under `locality`, what locality (see Claims) did in this process:
   claims that took another batch than the head, wakes sent to another claim
   than the first in line, and of the hosts forgotten after their workers went
-  quiet, their number, the contexts they held, and how many of those no host
-  below the scale-in line held.
+  quiet, their number, the theories and contexts they held, and how many of
+  those no host below the scale-in line held; each build claim from a known
+  host, also with locality off, by what its host held of the claimed theory
+  (`hit_theory`, `hit_deps` for only its context, `missed_held` while a kept
+  host held either, `unheld`); and builds left for a holder, once claimed
+  (`held_waits`, with `held_ms_total` from their first hold to the claim).
   The phases:
   ```json
   {"window_s": 600, "reports": 4210, "seconds": {"memory_wait": 0.0, "claim": 812.4, "idle": 0.0, "lease": 12.5, "release": 31.0, "before_hol": 40210.7, "hol": 52300.2, "after_hol": 44102.9, "exec": 0.0, "complete": 950.3, "after_result": 3020.4}}
