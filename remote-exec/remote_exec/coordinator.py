@@ -1205,11 +1205,11 @@ class Coordinator:
                     probe = self.probe_at.get(host_id)
                     if quarantine == "failures" and (probe is None or (now - probe).total_seconds() >= PROBE_SECONDS):
                         self.probe_at[host_id] = now
-                        claimed = await self._claim(tiers, worker)
+                        claimed = await self._answered(await self._claim(tiers, worker), disconnected)
                         if claimed is not None:
                             self._lease_host(claimed.attempt_token, host_id, worker, tiers)
                             self._ran_on(host_id, claimed.theory)
-                        return await self._answered(claimed, disconnected)
+                        return claimed
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         return None
@@ -1229,11 +1229,12 @@ class Coordinator:
                 if claimed is None and ahead_tiers:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
-                if claimed is not None and host_id is not None:
-                    self._lease_host(claimed.attempt_token, host_id, worker, tiers)
-                    self._ran_on(host_id, claimed.theory)
                 if claimed is not None or remaining <= 0:
-                    return await self._answered(claimed, disconnected)
+                    claimed = await self._answered(claimed, disconnected)
+                    if claimed is not None and host_id is not None:
+                        self._lease_host(claimed.attempt_token, host_id, worker, tiers)
+                        self._ran_on(host_id, claimed.theory)
+                    return claimed
                 woken = loop.create_future()
                 if (self.made_ready, self.ahead_changes if ahead else 0) == seen:
                     waiter = (tiers, rank, woken, ahead)

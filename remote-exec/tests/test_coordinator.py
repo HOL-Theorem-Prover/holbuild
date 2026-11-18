@@ -786,6 +786,7 @@ async def test_a_claim_whose_worker_has_gone_gives_its_action_back(
         return True
 
     assert await coordinator.claim(["standard"], "w9", 0, gone) is None
+    await coordinator.released()
     (action,) = (await batch(http, batch_id))["actions"]
     assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
     claimed = await coordinator.claim(["standard"], "w10")
