@@ -1117,7 +1117,9 @@ holbuild build --skip-checkpoints MyTheory
 
 - `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
   explicit termination proof. If a theorem and terminating definition have the
-  same name, the theorem takes precedence.
+  same name, the theorem takes precedence. Use `THEORY:termination:NAME` to
+  select the termination proof, or `THEORY:theorem:NAME` to select only a theorem.
+  Both explicit forms restrict name suggestions to the selected kind.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
   Steps containing public `HolSmtLib` tactic names (such as `Z3_TAC`, `CVC_TAC`,
   or `z3_tac`) are automatically untimed, including under other structure

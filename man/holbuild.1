@@ -127,11 +127,14 @@ With
 fail instead of building locally.
 .RE
 .TP
-.BI execution\-plan " THEORY" : THEOREM
-Print the proof-step execution plan for a theorem (or an explicit termination
-proof).
-If a theorem and a terminating definition have the same name, the theorem
-takes precedence.
+.B execution\-plan \fITHEORY\fR:[\fIKIND\fR:]\fINAME\fR
+Print the proof-step execution plan for a theorem or an explicit termination proof.
+Use
+.B theorem
+or
+.B termination
+to select the proof by kind.
+When the kind is omitted and both proofs have the same name, the theorem takes precedence.
 .TP
 .B check \fITHEORY\fR[:\fITHEOREM\fR] ...
 Build each theory if needed, read its restored Theory.dat metadata without
