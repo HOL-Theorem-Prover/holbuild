@@ -1345,9 +1345,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               List.find (not o HolbuildBuildExec.node_is_up_to_date options project plan (keys ()) toolchain_key)
                 owners
       end
+    (* The plan record's write when its planner deferred it: remote_build
+       runs it once its batch is submitted, off the path to the POST. *)
+    val pending_plan_write = ref (fn () => ())
+    fun write_pending_plan () =
+      let val write = !pending_plan_write
+      in pending_plan_write := (fn () => ()); write () end
     (* Plans from the record when it holds; AFTER_OWNERS plans again, in
-       full, once the theories that write SML sources have run. *)
-    fun plan_with_record after_owners =
+       full, once the theories that write SML sources have run.  With
+       DEFER_WRITE the record's write waits for write_pending_plan. *)
+    fun plan_with_record defer_write after_owners =
       let
         val start_ns = Time.toNanoseconds (Time.now ())
         val record_mode = HolbuildPlanRecord.mode ()
@@ -1378,10 +1385,18 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            action_toolchain_key = action_toolchain_key toolchain_key,
            graph = graph, members = members, dirs = dirs, stamps = stamps, index = index, targets = targets}
         fun write context prior plan keys =
-          case timed_phase "plan.record.write"
-                 (fn () => HolbuildPlanRecord.write record_dir context prior plan keys) of
-              HolbuildPlanRecord.Written => ()
-            | HolbuildPlanRecord.NotWritten reason => say ("plan record not written: " ^ reason)
+          let
+            fun write_now () =
+              case timed_phase "plan.record.write"
+                     (fn () => HolbuildPlanRecord.write record_dir context prior plan keys) of
+                  HolbuildPlanRecord.Written => ()
+                | HolbuildPlanRecord.NotWritten reason => say ("plan record not written: " ^ reason)
+          in
+            (* Check mode compares records as it goes. *)
+            if defer_write andalso record_mode <> HolbuildPlanRecord.Check
+            then pending_plan_write := write_now
+            else write_now ()
+          end
         (* Check mode plans in full only to compare, and keeps the record
            the restored plan wrote, so the suite reads such records back. *)
         fun full {reason, record} =
@@ -1465,17 +1480,19 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               restored restored_plan
               handle HolbuildPlanRecord.Fall reason => full {reason = reason, record = true}
       end
-    (* Plans the build, from the plan record when it applies. *)
-    fun plan_build () =
+    (* Plans the build, from the plan record when it applies; with
+       DEFER_WRITE the record's write waits for write_pending_plan. *)
+    fun plan_build_with defer_write =
       let
         val planned as (sources, _, _) =
           case prepared of
               SOME _ => with_options (prepare_plan (prepared_sources ()))
-            | NONE => if watch then with_options (prepare_plan (prepared_sources ())) else plan_with_record false
+            | NONE => if watch then with_options (prepare_plan (prepared_sources ())) else plan_with_record defer_write false
       in
         warn_unreachable_for sources;
         planned
       end
+    fun plan_build () = plan_build_with false
     fun describe_dry_run () =
       let val ({plan, toolchain_key, ...}, build_options, _) = plan_build ()
       in
@@ -1494,7 +1511,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
-          else plan_with_record true
+          else plan_with_record false true
         fun prepare_requested () =
           case components of
               (* A restored plan already holds the writers' current sources. *)
@@ -1678,7 +1695,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val _ =
           if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
           else raise Error "--remote-exec needs a remote cache: pass --remote-cache URL"
-        val ({index, entry_plan, plan, toolchain_key, components, ...}, build_options, keys) = plan_build ()
+        val ({index, entry_plan, plan, toolchain_key, components, ...}, build_options, keys) = plan_build_with true
         fun remote_build_plan (build_options, plan, keys, toolchain_key) attach =
           let
             (* The theories the last export deferred: they wait for their
@@ -1687,12 +1704,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (* The theories an earlier pass deferred: whatever settled them,
                a later batch makes sure the remote cache has them. *)
             val held_back = ref []
-            (* Records in the ledger what the last export learned: submit runs
-               it once the batch is submitted, or found empty. *)
+            (* Records in the ledger what the last export learned, and writes
+               the plan record: submit runs it once the batch is submitted,
+               or found empty. *)
             val pending_record = ref (fn () => ())
             (* The keys of the last export's theories that may be restored but aren't here. *)
             val prefetch_keys = ref []
-            fun record_pending () = (!pending_record ()) before pending_record := (fn () => ())
+            fun record_pending () =
+              ((!pending_record ()) before pending_record := (fn () => ());
+               write_pending_plan ())
             fun export defer skip forced =
               let
                 val {batch, deferred = held, record, prefetch} =
@@ -1825,12 +1845,6 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             fun follow in_batch batch_id =
               HolbuildRemoteExec.while_followed url batch_id (fn () =>
               let
-                (* Planning, export and early cutoff leave garbage that a
-                   major collection would only reclaim once the heap grows
-                   again; following waits on the coordinator for as long as
-                   the batch runs, so collect it now rather than hold it,
-                   and again once the work started below has finished. *)
-                val _ = PolyML.fullGC ()
                 val outside_batch =
                   case in_batch of
                       SOME batch_keys =>
@@ -1882,11 +1896,19 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                       SOME (diagnosed_sha, e) => if diagnosed_sha = sha then SOME e else NONE
                     | NONE => NONE
                 val following = ref true
+                (* Planning, export and early cutoff leave garbage that a
+                   major collection would only reclaim once the heap grows
+                   again; following waits on the coordinator for as long as
+                   the batch runs, so collect it once the work started above
+                   has finished. *)
                 val _ = Thread.fork (fn () =>
                   (drain (); Option.app (fn {drain, ...} => drain ()) settled; #drain failure_spans ();
                    if !following then PolyML.fullGC () else ()), [])
                 fun stop_all () =
                   (following := false; stop (); Option.map (fn {settled, ...} => settled ()) settled)
+                (* The ledger and plan record writes wait for the work above
+                   to start: none of it reads what they write. *)
+                val _ = record_pending () handle e => (ignore (stop_all ()); raise e)
                 val logs = ref []
                 fun on_change (key, state, failure, log) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
@@ -2097,8 +2119,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                       let
                         fun submitted () =
                           (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
-                           record_pending ();
-                           if detach then () else finish resubmit skip (SOME (batch_keys batch)) batch_id)
+                           if detach then record_pending () else finish resubmit skip (SOME (batch_keys batch)) batch_id)
                       in
                         if detach then submitted ()
                         else HolbuildRemoteExec.while_followed url batch_id submitted
@@ -2144,7 +2165,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
-          else plan_with_record true
+          else plan_with_record false true
         val writes_sources = not (null (HolbuildBuildPlan.generated_source_owners plan))
         val reason = "theories that write SML sources build before the rest is planned"
       in
@@ -2152,10 +2173,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         else if writes_sources andalso Option.isSome attach andalso remote_only then
           (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "; restoring from the cache\n");
            Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
+           write_pending_plan ();
            execute_build ())
         else if writes_sources andalso Option.isSome attach then
           (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
            Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
+           write_pending_plan ();
            execute_build ())
         else
           let
@@ -2186,7 +2209,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (fn () => run_with_stat_cache (if dry_run then describe_dry_run else execute_build))
       | RemoteExec remote =>
           HolbuildBuildExec.with_project_lock project "build"
-            (fn () => run_with_stat_cache (fn () => remote_build remote))
+            (fn () => run_with_stat_cache (fn () =>
+                        (remote_build remote handle e => (write_pending_plan (); raise e))
+                        before write_pending_plan ()))
   end
 
 fun build_once_with_prepared tc = build_once_with_prepared_mode BuildTargets tc

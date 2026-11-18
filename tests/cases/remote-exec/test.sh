@@ -199,6 +199,9 @@ assert record['local_outcomes']['built']==0
 assert record['local_outcomes']['restored_remote']==2
 PY
 
+# The plan record is written once the batch is submitted.
+ls "$project"/.holbuild/plan/* > /dev/null
+
 # With everything cached there is nothing to submit.
 run cached 0 build --remote-exec "$coordinator" BTheory
 refute_grep "remote batch" "$tmpdir/cached.log"
@@ -206,8 +209,11 @@ require_grep "remote execution: nothing to build remotely" "$tmpdir/cached.log"
 
 # Detach and reattach.
 write_theories two
+record_before=$(cat "$project"/.holbuild/plan/* | sha256sum)
 run detach 0 build --remote-exec "$coordinator" --detach BTheory
 require_grep "holbuild: remote batch b2" "$tmpdir/detach.log"
+# A detached build writes the record of its edited plan too.
+[[ $(cat "$project"/.holbuild/plan/* | sha256sum) != "$record_before" ]] || { echo "detach left the plan record unchanged" >&2; exit 1; }
 refute_grep "Theory built\|restored from cache" "$tmpdir/detach.log"
 run attach 0 build --remote-exec "$coordinator" --attach b2 BTheory
 require_grep "BTheory restored from cache" "$tmpdir/attach.log"
