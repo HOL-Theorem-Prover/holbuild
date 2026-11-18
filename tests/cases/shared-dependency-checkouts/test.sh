@@ -41,16 +41,30 @@ age() { python3 -c 'import os, sys, time; t = time.time() - float(sys.argv[1]) *
 checkout_of() { printf '%s/git/checkouts/%s-%s' "$HOLBUILD_CACHE" "$(printf %s "$1" | sha1sum | cut -d' ' -f1)" "$2"; }
 
 # A real build against a theory in a git dependency writes nothing into the
-# shared checkout.
+# shared checkout: the dependency's declared extra outputs, an SML source among
+# them, go under each consuming project's .holbuild, whether its theory is
+# built or restored from the cache.
 use_case_cache "$tmpdir/cache"
 dep=$tmpdir/dep
 mkdir -p "$dep/src"
-{ write_schema2_prelude; printf '[project]\nname = "dep"\n\n[build]\nmembers = ["src"]\n'; } > "$dep/holproject.toml"
+{
+  write_schema2_prelude
+  printf '[project]\nname = "dep"\n\n[build]\nmembers = ["src"]\n\n'
+  printf '[actions.DUse]\ndeps = ["DTheory"]\n'
+} > "$dep/holproject.toml"
 cat > "$dep/src/DScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["results/D.txt", "DGenML.sml"];
+fun write path text = let val out = TextIO.openOut path in TextIO.output (out, text); TextIO.closeOut out end;
+val () = write "results/D.txt" "dep result\n";
+val () = write "DGenML.sml" "structure DGenML = struct val x = 42 end\n";
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "D";
 val d_def = new_definition("d_def", ``d_const = T``);
 val _ = export_theory();
+SML
+cat > "$dep/src/DUse.sml" <<'SML'
+structure DUse = struct val y = DGenML.x + 1 end
 SML
 dep_rev=$(init_git_repo "$dep")
 
@@ -62,7 +76,11 @@ mkdir -p "$project/src"
   printf '[dependencies.dep]\ngit = "%s"\nrev = "%s"\n' "$dep" "$dep_rev"
 } > "$project/holproject.toml"
 cat > "$project/src/UScript.sml" <<'SML'
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["results/U.txt"];
 open HolKernel Parse boolLib bossLib DTheory;
+val () = let val out = TextIO.openOut "results/U.txt"
+         in TextIO.output (out, "user result " ^ Int.toString DUse.y ^ "\n"); TextIO.closeOut out end;
 val _ = new_theory "U";
 val u_thm = store_thm("u_thm", ``d_const``, REWRITE_TAC [d_def]);
 val _ = export_theory();
@@ -77,14 +95,37 @@ require_file "$checkout/src/DScript.sml"
 [[ -z $(find "$checkout" -type f -perm -u=w) ]] || fail "shared checkout has writable files"
 if (echo edit >> "$project/.holbuild/src/dep/src/DScript.sml") 2> /dev/null; then fail "edited a shared checkout file in place"; fi
 before=$(snapshot "$checkout")
+# require_outputs PROJECT: the dependency's and the project's extra outputs.
+require_outputs() {
+  require_grep "dep result" "$1/.holbuild/packages/dep/extra-outputs/src/results/D.txt"
+  require_file "$1/.holbuild/packages/dep/extra-outputs/src/DGenML.sml"
+  require_grep "user result 43" "$1/src/results/U.txt"
+}
 (cd "$project" && "$HOLBUILD_BIN" build) > "$tmpdir/build.log" 2>&1 || { cat "$tmpdir/build.log" >&2; fail "build failed"; }
+require_outputs "$project"
 [[ $(snapshot "$checkout") == "$before" ]] || fail "build wrote into the shared checkout"
+(cd "$project" && "$HOLBUILD_BIN" --verbose build) > "$tmpdir/rebuild.log" 2>&1 || { cat "$tmpdir/rebuild.log" >&2; fail "rebuild failed"; }
+require_grep "UTheory is up to date" "$tmpdir/rebuild.log"
 
-# A second project directory links to the same checkout instead of cloning.
+# A second project directory links to the same checkout instead of cloning,
+# and restores the dependency's theory and its outputs from the cache.  An
+# output of its own that it never claimed is still refused.
 (cd "$tmpdir/copy" && "$HOLBUILD_BIN" context) > /dev/null
 [[ $(readlink "$tmpdir/copy/.holbuild/src/dep") == "$checkout" ]] || fail "second project did not link the shared checkout"
 [[ $(find "$HOLBUILD_CACHE/git/checkouts" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l) == 1 ]] ||
   fail "second project made another checkout"
+mkdir -p "$tmpdir/copy/src/results"
+echo stray > "$tmpdir/copy/src/results/U.txt"
+if (cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-unowned.log" 2>&1; then
+  fail "build overwrote an unowned extra output"
+fi
+require_grep "extra output already exists without an ownership record: .*src/results/U.txt" "$tmpdir/copy-unowned.log"
+require_grep "DTheory restored from cache" "$tmpdir/copy-unowned.log"
+rm "$tmpdir/copy/src/results/U.txt"
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-build.log" 2>&1 || { cat "$tmpdir/copy-build.log" >&2; fail "second build failed"; }
+require_grep "UTheory restored from cache" "$tmpdir/copy-build.log"
+require_outputs "$tmpdir/copy"
+[[ $(snapshot "$checkout") == "$before" ]] || fail "second build wrote into the shared checkout"
 
 # GC runs on a cache of its own, which links no shared toolchains, with a HOL
 # dependency that is never built.

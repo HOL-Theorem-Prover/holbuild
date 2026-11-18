@@ -150,10 +150,8 @@ fun source_artifacts node = #artifacts (HolbuildBuildPlan.source_of node)
 fun source_policy node = #policy (HolbuildBuildPlan.source_of node)
 fun source_deps plan node = HolbuildBuildPlan.dependencies plan node
 fun source_extra_output_declarations plan node = #extra_outputs (source_deps plan node)
-fun source_extra_output_path node declaration =
-  normalize_path (Path.concat(Path.dir (source_file node), declaration))
 fun source_extra_output_paths plan node =
-  map (source_extra_output_path node) (source_extra_output_declarations plan node)
+  map (HolbuildBuildPlan.extra_output_path node) (source_extra_output_declarations plan node)
 fun staged_extra_output_path stage declaration = normalize_path (Path.concat(stage, declaration))
 fun logical_name node = HolbuildBuildPlan.logical_name node
 fun package node = HolbuildBuildPlan.package node
@@ -2768,7 +2766,7 @@ fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan
     CacheRestored
       (install_cache_entry (copy_blob verify_cache root) root input_key subject entry
          {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
-          extra_destination = source_extra_output_path node,
+          extra_destination = HolbuildBuildPlan.extra_output_path node,
           write_manifests = write_manifests})
   end
   handle Error "cache entry not found" => CacheMiss
@@ -5331,7 +5329,7 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
     claim_extra_outputs project node extra_output_paths;
     List.app
       (fn declaration =>
-          let val destination = source_extra_output_path node declaration
+          let val destination = HolbuildBuildPlan.extra_output_path node declaration
           in ensure_parent destination;
              copy_binary (staged_extra_output_path stage declaration) destination
           end)

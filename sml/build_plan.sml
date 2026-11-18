@@ -11,9 +11,12 @@ exception UnknownTarget of string * string list
 fun unknown_target_message (target, candidates) =
   "unknown build target: " ^ target ^ HolbuildSuggest.did_you_mean target candidates
 
+(* `extra_output_dir` is the directory a theory's declared extra outputs are
+   relative to: see extra_output_dir_of. *)
 type node =
   { source : HolbuildSourceIndex.source,
-    external_dirs : string list }
+    external_dirs : string list,
+    extra_output_dir : string }
 
 type keyed_node = {node : node, input_key : string}
 
@@ -110,8 +113,8 @@ fun validate_extra_output_decl node path =
         | _ => raise Error (context ^ " is only supported for theory-script actions")
   end
 
-fun extra_output_path node declaration =
-  normalize_path (Path.concat(Path.dir (#source_path (source_of node)), declaration))
+fun extra_output_path ({extra_output_dir, ...} : node) declaration =
+  normalize_path (Path.concat(extra_output_dir, declaration))
 
 fun validate_extra_output_ownership analysis selected =
   let
@@ -617,8 +620,26 @@ fun forget_output_digest (plan as {output_digest_cache, ...} : t) node =
 fun forget_output_digests ({output_digest_cache, ...} : t) =
   Array.modify (fn _ => NONE) output_digest_cache
 
-fun make_node external_dirs source =
-  {source = source, external_dirs = external_dirs}
+(* The script's own directory in the root package; in a dependency, its
+   directory under the package's extra-output root, so that no project writes
+   into a dependency's sources. *)
+fun extra_output_dir_of packages (source : HolbuildSourceIndex.source) =
+  case List.find (fn package => HolbuildProject.package_name package = #package source) packages of
+      NONE => raise Error ("no package " ^ #package source ^ " for " ^ #source_path source)
+    | SOME package =>
+        case HolbuildProject.package_extra_output_root package of
+            NONE => Path.dir (#source_path source)
+          | SOME root =>
+              case Path.dir (#relative_path source) of
+                  "" => root
+                | dir => Path.concat(root, dir)
+
+fun analysis_packages (analysis : HolbuildComponentProvider.analysis_state) =
+  HolbuildProjectGraph.packages (HolbuildPackagePrepare.graph (#preparation analysis))
+
+fun make_node packages external_dirs source =
+  {source = source, external_dirs = external_dirs,
+   extra_output_dir = extra_output_dir_of packages source}
 
 fun bootstrap_prefetch_nodes analysis nodes =
   HolbuildComponentProvider.prefetch analysis
@@ -992,7 +1013,7 @@ fun plan_roots components analysis holdir sources roots_of =
       HolbuildComponentProvider.resolution_context_id components
     val _ = HolbuildDependencies.configure_analyser_for_holdir holdir
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
-    val nodes = map (make_node external_dirs) sources
+    val nodes = map (make_node (analysis_packages analysis) external_dirs) sources
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
     val roots = roots_of lookup nodes
@@ -1037,7 +1058,7 @@ fun restore {holdir, sources, roots, selected, analysis, edges,
              resolution_context_id, selected_graph_id, selected_plan_id, resolved_plan_id} =
   let
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
-    val universe = Vector.fromList (map (make_node external_dirs) sources)
+    val universe = Vector.fromList (map (make_node (analysis_packages analysis) external_dirs) sources)
     val nodes = Vector.foldr (op ::) [] universe
     val selected_nodes = map (fn i => Vector.sub(universe, i)) selected
     val keys = Vector.map key universe
@@ -1078,7 +1099,8 @@ fun plan_targets components holdir sources targets =
 (* The positions in SOURCES of the roots plan_targets picks for TARGETS. *)
 fun target_positions sources targets =
   let
-    val nodes = map (make_node []) sources
+    (* Nodes only to look names up in: they build nothing. *)
+    val nodes = map (fn source => {source = source, external_dirs = [], extra_output_dir = ""}) sources
     val positions = build_key_index nodes
     val roots = target_roots (indexed_nodes_named (build_name_index nodes)) nodes (SelectedTargets targets)
   in

@@ -573,6 +573,11 @@ fun prevalidate_graph graph =
   (observed_dirs := [];
    List.mapPartial prevalidate_package (HolbuildProjectGraph.packages graph))
 
+fun with_package_root package_root
+      ({node, package, kind, logical_name, source_path, relative_path, artifacts, policy, ...} : source) : source =
+  {node = node, package = package, package_root = package_root, kind = kind, logical_name = logical_name,
+   source_path = source_path, relative_path = relative_path, artifacts = artifacts, policy = policy}
+
 fun deduplicate_sources sources =
   let
     fun add (source : source, (seen, kept)) =
@@ -629,8 +634,33 @@ fun discover_package scans package =
       case (generated_paths, List.find (fn (k, _) => k = scan_key name source_root) scans) of
           ([], SOME (_, scanned)) => scanned
         | _ => List.foldl scan_existing [] members
-    val sources =
+    val tree_sources =
       deduplicate_sources (List.foldl declared_output existing generated_paths)
+    (* A dependency's theories write their extra outputs under its extra-output
+       root, which mirrors the package layout (see
+       HolbuildProject.package_extra_output_root).  The SML sources there are
+       the package's own, at the same relative paths, in place of any copy in
+       its source tree. *)
+    val overlay =
+      case HolbuildProject.package_extra_output_root package of
+          NONE => []
+        | SOME root =>
+            let
+              fun scan (member, acc) =
+                let val path = HolbuildProject.abs_under root member
+                in
+                  if is_dir path orelse is_readable path then
+                    scan_member name package_id root artifact_root policies generated_paths
+                      excludes exclude_globs (path, acc)
+                  else acc
+                end
+            in
+              map (with_package_root source_root)
+                  (List.foldl scan [] (HolbuildProject.package_members package))
+            end
+    fun shadowed (source : source) =
+      List.exists (fn (output : source) => #relative_path output = #relative_path source) overlay
+    val sources = List.filter (not o shadowed) tree_sources @ overlay
     val _ = validate_action_policies name policies sources
   in
     sources
