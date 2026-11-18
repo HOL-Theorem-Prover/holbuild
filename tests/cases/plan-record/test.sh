@@ -366,6 +366,8 @@ target_switch() {
   printf '\n(* comment *)\n' >> "$p/src/AScript.sml"
   expect_plan "from record (1 files rehashed, " "$p" BTheory
   require_grep "sliced from other targets' plan" "$tmpdir/plan.log"
+  # Every record lists Lib.sml among its sources, but none plans it.
+  expect_plan "full (no plan record for these inputs)" "$p" Lib
   # A new theory is in no record's plan.
   theory "$p/src/EScript.sml" E D
   expect_plan "full (no plan record for these inputs)" "$p" ETheory
