@@ -324,7 +324,8 @@ fun exec_action_help () = print
   \                     run, under a key of its own, then prove its deferred\n\
   \                     proofs. With --ahead-parent, also start on a late\n\
   \                     parent's outline, and install nothing until the\n\
-  \                     parent's entry is in and matches it.\n\
+  \                     parent's entry is in and matches it. With --result\n\
+  \                     FILE, create FILE.outline once the outline is out.\n\
   \--ahead-parent INPUT_KEY:SPEC-SHA256\n\
   \                     Load ahead of this parent, a dependency of the theory\n\
   \                     that another worker is still building from SPEC-SHA256:\n\

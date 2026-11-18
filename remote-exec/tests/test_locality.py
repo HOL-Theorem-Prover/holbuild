@@ -2,6 +2,7 @@
 (deps-key) the host holds; see Coordinator._local_entry."""
 
 import asyncio
+from collections.abc import Callable
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -732,6 +733,11 @@ async def test_a_hold_of_a_theory_the_batch_no_longer_builds_next_is_replaced(
     assert coordinator.holds[key][1] < now + 60
 
 
+def outranking(above: Callable[[str, int], list[str]]) -> Any:
+    """Claims ahead that rank before ready builds of other batches by ``above``, and none of a build's own."""
+    return SimpleNamespace(above=above, deepest={}, deeper=lambda *_: False)
+
+
 async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_stopped_it(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -748,7 +754,7 @@ async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_sto
     monkeypatch.setattr(coordinator, "_claim_ahead", claim_ahead)
 
     claimed, _ = await coordinator._claim(
-        ["high", "standard"], "w", lambda tier, priority: [tier] if tier == "standard" else [], "host-1",
+        ["high", "standard"], "w", outranking(lambda tier, priority: [tier] if tier == "standard" else []), "host-1",
         None, frozenset({"high"}), frozenset({"high"}),
     )
 
@@ -775,7 +781,7 @@ async def test_a_held_build_of_a_hint_only_tier_that_a_claim_ahead_outranks_is_c
     monkeypatch.setattr(coordinator, "_claim_ahead", claim_ahead)
 
     await coordinator._claim(
-        ["high", "standard"], "w", lambda tier, priority: ["high"] if tier == "high" and priority < 1 else [],
+        ["high", "standard"], "w", outranking(lambda tier, priority: ["high"] if tier == "high" and priority < 1 else []),
         "host-1", None, frozenset({"high"}), frozenset({"high"}),
     )
 

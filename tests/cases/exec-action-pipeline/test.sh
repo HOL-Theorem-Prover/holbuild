@@ -203,6 +203,8 @@ worker a "$spec_A" --pipeline
 expect a 0 "status=built"
 require_grep 'pipeline: published the outline' "$tmpdir/a.log"
 require_file "$tmpdir/remote/ac/$(outline_ac_of "$key_A")"
+# The worker learns of the outline from a file beside the result.
+require_file "$tmpdir/a.result.outline"
 worker_wait b
 expect b 0 "status=built"
 grep -qE '^phase-ms=(.*,)?outlined:1(,|$)' "$tmpdir/b.result" || {
@@ -240,6 +242,7 @@ for theory in A B O R; do
   worker "$name" "${!spec_var}"
   expect "$name" 0 "status=built"
   require_no_grep 'published the outline' "$tmpdir/$name.log"
+  [[ ! -e "$tmpdir/$name.result.outline" ]] || { echo "$name marked an outline" >&2; exit 1; }
 done
 for key in "$key_A" "$key_B" "$key_O" "$key_R"; do
   cmp "$first_remote/ac/$(ac_of "$key")" "$tmpdir/remote2/ac/$(ac_of "$key")"

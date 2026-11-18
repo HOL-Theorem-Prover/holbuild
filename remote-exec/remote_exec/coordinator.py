@@ -522,6 +522,7 @@ WITH run_capacity AS MATERIALIZED (
     ) < :run_slots AS available
 )
 SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb, b.priority, ready.theory,
+    ready.critical_depth, ready.descendant_count,
     (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running,
     (SELECT max(l.last_claimed_at) FROM actions l WHERE l.batch_id = b.id) AS last_claimed_at,
     b.created_at,
@@ -531,7 +532,7 @@ FROM batches b
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:classes AS text[]))) c (class)
 CROSS JOIN (SELECT DISTINCT unnest(CAST(:tiers AS text[]))) t (tier)
 CROSS JOIN LATERAL (
-    SELECT a.theory FROM actions a
+    SELECT a.theory, a.critical_depth, a.descendant_count FROM actions a
     WHERE a.batch_id = b.id AND a.state = 'ready' AND a.class = c.class AND a.tier = t.tier
     AND (a.class = 'run' OR a.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()))
     ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
@@ -561,6 +562,15 @@ AND (class = 'run' OR input_key NOT IN (SELECT input_key FROM leases WHERE expir
 AND input_key <> ALL(CAST(:taken AS text[]))
 ORDER BY critical_depth DESC, descendant_count DESC, theory, input_key
 LIMIT 1 FOR UPDATE SKIP LOCKED
+""")
+# Where CLAIM_ACTION would take a batch's first ready build of a tier, as (critical depth, descendants), without
+# locking it; see Coordinator._outranked_by_ahead.
+FIRST_READY_PLACE = sa.text("""
+SELECT critical_depth, descendant_count FROM actions
+WHERE batch_id = :batch_id AND state = 'ready' AND class = 'build' AND tier = :tier
+AND input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
+ORDER BY critical_depth DESC, descendant_count DESC, theory, input_key
+LIMIT 1
 """)
 # Two claims of one key from different batches may both pass the statement's check, each in a snapshot without the
 # other's lease. So a build claim then takes a lock on its key, which it holds until it commits, and checks for a
@@ -628,6 +638,7 @@ WITH RECURSIVE ahead_batches AS MATERIALIZED (
     WHERE b.state = 'running' AND b.ahead_cap IS NOT NULL AND (
         SELECT count(*) FROM actions w
         WHERE w.batch_id = b.id AND w.state = 'running' AND w.ahead = 'ahead' AND w.remaining_deps > 0
+        AND w.input_key <> ALL(CAST(:outlined AS text[]))
     ) < b.ahead_cap
 ), waiting_ahead AS MATERIALIZED (
     SELECT w.batch_id, w.input_key, ARRAY(
@@ -646,7 +657,8 @@ WITH RECURSIVE ahead_batches AS MATERIALIZED (
     SELECT batch_id, input_key FROM generations GROUP BY batch_id, input_key
     HAVING CAST(:depth AS integer) IS NULL OR max(generation) < :depth
 ), children AS MATERIALIZED (
-    SELECT r.batch_id, count(*) AS running_parents, (
+    SELECT r.batch_id, count(*) AS running_parents,
+    count(*) FILTER (WHERE r.input_key = ANY(CAST(:outlined AS text[]))) AS outlined_parents, (
         SELECT a FROM actions a WHERE a.batch_id = r.batch_id AND a.input_key = e.input_key
     ) AS a
     FROM running r CROSS JOIN LATERAL unnest(ARRAY(
@@ -654,7 +666,8 @@ WITH RECURSIVE ahead_batches AS MATERIALIZED (
     )) AS e(input_key)
     GROUP BY r.batch_id, e.input_key
 )
-SELECT (c.a).batch_id, (c.a).input_key, (c.a).tier, b.priority
+SELECT (c.a).batch_id, (c.a).input_key, (c.a).tier, b.priority, (c.a).critical_depth, (c.a).descendant_count,
+    c.outlined_parents = c.running_parents AS outlined
 FROM children c JOIN ahead_batches b ON b.id = c.batch_id
 WHERE (c.a).state = 'waiting' AND (c.a).class = 'build' AND (c.a).ahead <> 'abandoned'
 AND (c.a).remaining_deps = c.running_parents
@@ -697,10 +710,12 @@ GROUP BY input_key, spec_sha256 ORDER BY max(distance) DESC, input_key
 # The most candidates of a batch CLAIM_AHEAD_ACTION checks at once, the best of the shared read: its cost grows with
 # their edges, under the batch's lock.
 AHEAD_CLAIM_KEYS = 32
-# The actions of a batch claimed ahead and still waiting for a parent, which count against its ``ahead_cap``.
+# The actions of a batch claimed ahead and still waiting for a parent, which count against its ``ahead_cap``: all
+# but those that published their outline (:outlined, see Coordinator.outlined), whose children start on it.
 COUNT_WAITING_AHEAD = sa.text(
     "SELECT count(*) FROM actions "
-    "WHERE batch_id = :batch_id AND state = 'running' AND ahead = 'ahead' AND remaining_deps > 0"
+    "WHERE batch_id = :batch_id AND state = 'running' AND ahead = 'ahead' AND remaining_deps > 0 "
+    "AND input_key <> ALL(CAST(:outlined AS text[]))"
 )
 # Recount the parents not done of the running actions claimed ahead of :key that waited for one, returning the new
 # counts. REFRESH leaves running actions alone. :key's children are read once, by key, rather than per running
@@ -783,14 +798,42 @@ DELETE FROM leases WHERE batch_id = :id AND input_key = ANY(ARRAY(SELECT input_k
 
 @dataclass
 class _AheadRead:
-    """AHEAD_CANDIDATES read from ``at``, as (batch, input key, tier), best first, which the claims ahead share,
-    less those they claimed, and the batches and tiers found since with nothing left to claim ahead; with
+    """AHEAD_CANDIDATES read from ``at``, as (batch, input key, tier, priority, (critical depth, descendants),
+    whether its unfinished parents all published their outline), best first, which the claims ahead share, less
+    those they claimed, and the batches and tiers found since with nothing left to claim ahead; with
     Coordinator.ahead_changes when it began."""
 
     at: float
     changes: int
-    candidates: list[tuple[UUID, str, str, int]]
+    candidates: list[tuple[UUID, str, str, int, tuple[int, int], bool]]
     exhausted: set[tuple[UUID, str]]
+
+
+@dataclass
+class _Outranking:
+    """The claims ahead a claim that may take them puts before a ready build (see Coordinator._outranked_by_ahead):
+    ``best``, the highest priority of a candidate of each tier of ``ahead_tiers``, and ``deepest``, the place of
+    each batch and tier's deepest candidate on outlines alone in claim order, from ``read``."""
+
+    tiers: list[str]
+    ahead_tiers: list[str]
+    read: _AheadRead
+    best: dict[str, int]
+    deepest: dict[tuple[UUID, str], tuple[int, int]]
+
+    def above(self, tier: str, priority: int) -> list[str]:
+        """The tiers no later than ``tier`` with a candidate of a batch of a higher priority than ``priority``."""
+        return [
+            t for t in self.ahead_tiers
+            if t in self.best and self.best[t] > priority and self.tiers.index(t) <= self.tiers.index(tier)
+        ]
+
+    def deeper(self, batch_id: UUID, tier: str, ready: tuple[int, int] | None) -> bool:
+        """Whether a candidate of ``batch_id`` and ``tier`` on outlines alone may have a deeper chain of dependents
+        than its first ready build, at ``ready`` or not known, so rank before it as the batch's ready builds rank
+        among themselves."""
+        deepest = self.deepest.get((batch_id, tier))
+        return deepest is not None and (ready is None or deepest > ready)
 
 
 @dataclass
@@ -836,6 +879,9 @@ class _Ranking:
     running_priority: int  # running builds of batches of a positive priority, and the claims of them since the read
     # The theory of each batch and tier's first ready build, until a claim from it makes that unknown.
     theories: dict[tuple[UUID, str], str]
+    # The (critical depth, descendants) of each batch and tier's first ready build, until a claim from it makes
+    # that unknown.
+    depths: dict[tuple[UUID, str], tuple[int, int]]
     capped: bool = False  # see Coordinator._cap_priorities
 
 
@@ -1002,6 +1048,8 @@ class Coordinator:
         # claim; and the workers that last claimed, reported or heartbeat from each host, when, and whether they are
         # burst workers. See _quarantine.
         self.lease_hosts: dict[UUID, tuple[str, str, list[str]]] = {}
+        # The input key of each live lease whose action published its outline (see outlined), by attempt token.
+        self.outlined_keys: dict[UUID, str] = {}
         self.infra_streak: dict[str, tuple[int, UUID | None]] = {}
         self.probe_at: dict[str, datetime] = {}
         self.host_workers: dict[str, dict[str, tuple[datetime, bool]]] = {}
@@ -1342,38 +1390,40 @@ class Coordinator:
         if batch_id is not None:
             await self._end_unheld([(claimed.attempt_token, batch_id)])
 
-    async def _outranked_by_ahead(
-        self, tiers: list[str], ahead_tiers: list[str]
-    ) -> Callable[[str, int], list[str]] | None:
-        """For a ready build of a tier and priority, the tiers of ``ahead_tiers`` no later than its tier in
-        ``tiers`` with an action that may be claimed ahead of a batch of a higher priority, which ranks before the
-        build; none when there is no such action. Ready builds of the same priority come first, so with no
-        priorities set claims ahead wait for every ready build, as they did before priorities ranked them. None
-        when nothing may be claimed ahead."""
+    async def _outranked_by_ahead(self, tiers: list[str], ahead_tiers: list[str]) -> _Outranking | None:
+        """The actions of ``ahead_tiers`` that may be claimed ahead and rank before a ready build of ``tiers``:
+        those of a batch of a higher priority than the build's, of a tier no later than its, and those of its own
+        batch and tier whose unfinished parents all published their outline, with a deeper chain of dependents.
+        Builds of a batch rank among themselves that way, deepest first, and such a child starts on its parents'
+        outlines at once, like a ready build. One with a parent yet to publish its outline would wait for it, so
+        it comes after ready builds of its priority, as do those of other batches of the same priority. None when
+        nothing may be claimed ahead."""
         read = await self._ahead_candidates()
-        best: dict[str, int] = {}  # the highest priority of a candidate of each tier
-        for batch_id, _, tier, priority in read.candidates:
+        best: dict[str, int] = {}
+        deepest: dict[tuple[UUID, str], tuple[int, int]] = {}
+        for batch_id, _, tier, priority, place, outlined in read.candidates:
             if tier in ahead_tiers and (batch_id, tier) not in read.exhausted:
                 best[tier] = max(best.get(tier, priority), priority)
+                if outlined:
+                    deepest.setdefault((batch_id, tier), place)  # the read is best first
         if not best:
             return None
-        return lambda tier, priority: [
-            t for t in ahead_tiers if t in best and best[t] > priority and tiers.index(t) <= tiers.index(tier)
-        ]
+        return _Outranking(tiers, ahead_tiers, read, best, deepest)
 
     async def _claim(
         self,
         tiers: list[str],
         worker: str,
-        outranked: Callable[[str, int], list[str]] | None = None,
+        outranked: _Outranking | None = None,
         host_id: str | None = None,
         hint: Hint | None = None,
         hint_only: frozenset[str] = frozenset(),
         held_tiers: frozenset[str] = frozenset(),
     ) -> tuple[Claim | None, float | None]:
         """Lease a ready build of ``tiers`` from the shared ranking, else a run action. Before a ready build that
-        ranks after an action that may be claimed ahead, claim one of the tiers ``outranked`` gives for it, of a
-        higher priority than the build's; failing that, the build is claimed after all. A claim from ``host_id``
+        ranks after an action that may be claimed ahead, claim one that ``outranked`` ranks before it: of a batch
+        of a higher priority, else of its own batch and tier with a deeper chain of dependents; failing that, the
+        build is claimed after all. A claim from ``host_id``
         may take a build its host is warm for, the batch and tier ``hint`` it was woken for, or a build of
         ``held_tiers`` held for its host; see _claim_build.
 
@@ -1413,18 +1463,30 @@ class Coordinator:
                 # The next ready build ranks after an action that may be claimed ahead, by a ranking read since
                 # this claim started.
                 assert outranked is not None
-                if ranking.capped:  # by a concurrent claim, since: claims ahead no longer outrank the build
-                    outranked = None
-                    continue
-                _, priority, *_, tier, _ = stopped
-                # Only batches of a positive priority, above the build's, are claimed from: counted before the
-                # claim's await, as _claim_build's are.
-                ranking.running_priority += 1
-                self._cap_priorities(ranking)
-                claimed = await self._claim_ahead(outranked(tier, -priority), worker, above=-priority)
-                if claimed is not None:
-                    return claimed, None
-                ranking.running_priority -= 1
+                _, priority, *_, batch_id, tier, _ = stopped
+                # Capped by a concurrent claim since, claims ahead of other batches no longer outrank the build.
+                if not ranking.capped and (above := outranked.above(tier, -priority)):
+                    # Only batches of a positive priority, above the build's, are claimed from: counted before the
+                    # claim's await, as _claim_build's are.
+                    ranking.running_priority += 1
+                    self._cap_priorities(ranking)
+                    claimed = await self._claim_ahead(above, worker, above=-priority)
+                    if claimed is not None:
+                        return claimed, None
+                    ranking.running_priority -= 1
+                if (batch_id, tier) in outranked.deepest:
+                    ready = ranking.depths.get((batch_id, tier))
+                    if ready is None:  # a claim since the read took the batch's first ready build
+                        async with self.engine.connect() as conn:
+                            row = (await conn.execute(FIRST_READY_PLACE, {"batch_id": batch_id, "tier": tier})).first()
+                        if row is not None:
+                            ready = ranking.depths[(batch_id, tier)] = (row.critical_depth, row.descendant_count)
+                    if ready is not None and outranked.deeper(batch_id, tier, ready):
+                        claimed = await self._claim_ahead_in(
+                            outranked.read, batch_id, tier, worker, deeper_than=ready
+                        )
+                        if claimed is not None:
+                            return claimed, None
                 outranked = None
                 continue
             # Builds of tiers hint_only not held for this host are no candidates.
@@ -1521,6 +1583,9 @@ class Coordinator:
                 "lease": self.settings.lease_seconds,
             },
         )
+        # An earlier lease's outline is no longer this run's.
+        for earlier in [t for t, key in self.outlined_keys.items() if key == row.input_key]:
+            del self.outlined_keys[earlier]
         return Claim(
             token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb,
             ahead_parents, self.settings.pipeline and bool(ahead_batch),
@@ -1541,7 +1606,7 @@ class Coordinator:
         # Tier by tier, as a plain claim takes them, then in the read's order.
         for tier in tiers:
             for batch_id in dict.fromkeys(
-                b for b, _, t, priority in read.candidates if t == tier and (above is None or priority > above)
+                b for b, _, t, priority, *_ in read.candidates if t == tier and (above is None or priority > above)
             ):
                 if (batch_id, tier) in read.exhausted:
                     continue
@@ -1550,9 +1615,13 @@ class Coordinator:
                     return claimed
         return None
 
-    async def _claim_ahead_in(self, read: _AheadRead, batch_id: UUID, tier: str, worker: str) -> Claim | None:
+    async def _claim_ahead_in(
+        self, read: _AheadRead, batch_id: UUID, tier: str, worker: str, *, deeper_than: tuple[int, int] | None = None
+    ) -> Claim | None:
         """Lease the best action of ``tier`` of ``batch_id`` that ``read`` found may be claimed ahead, if any still
-        may, or mark the batch and tier exhausted in ``read``.
+        may, or mark the batch and tier exhausted in ``read``. With ``deeper_than``, only of those on outlines alone
+        with a deeper chain of dependents, as (critical depth, descendants): when none may, they leave ``read``, and
+        the batch's others stay candidates.
 
         This process's claims ahead of one batch take their turns in memory before the batch's row lock, which each
         would otherwise wait for holding a pooled connection: one big batch's claims filled the pool. A claim whose
@@ -1560,9 +1629,13 @@ class Coordinator:
         async with self._ahead_turn(batch_id):
             if (batch_id, tier) in read.exhausted:
                 return None
-            keys = [key for b, key, t, _ in read.candidates if (b, t) == (batch_id, tier)][:AHEAD_CLAIM_KEYS]
+            keys = [
+                key for b, key, t, _, place, outlined in read.candidates
+                if (b, t) == (batch_id, tier) and (deeper_than is None or (outlined and place > deeper_than))
+            ][:AHEAD_CLAIM_KEYS]
             if not keys:
-                read.exhausted.add((batch_id, tier))
+                if deeper_than is None:
+                    read.exhausted.add((batch_id, tier))
                 return None
             async with self.engine.begin() as conn:
                 batch = (
@@ -1578,13 +1651,19 @@ class Coordinator:
                 waiting = 0
                 if batch is not None:
                     # Counted after the lock, in a snapshot that sees every claim ahead committed before it.
-                    waiting = await conn.scalar(COUNT_WAITING_AHEAD, {"batch_id": batch_id})
+                    waiting = await conn.scalar(
+                        COUNT_WAITING_AHEAD, {"batch_id": batch_id, "outlined": list(self.outlined_keys.values())}
+                    )
                     if waiting < batch.ahead_cap:
                         row = await self._lock_unleased(
                             conn, CLAIM_AHEAD_ACTION, {"batch_id": batch_id, "keys": keys, "tier": tier, "depth": depth}
                         )
                 if row is None:
-                    read.exhausted.add((batch_id, tier))
+                    if deeper_than is None:
+                        read.exhausted.add((batch_id, tier))
+                    else:
+                        tried = set(keys)
+                        read.candidates = [c for c in read.candidates if c[0] != batch_id or c[1] not in tried]
                     return None
                 parents = (
                     await conn.execute(AHEAD_PARENTS, {"batch_id": batch_id, "keys": [row.input_key], "depth": depth})
@@ -1637,9 +1716,20 @@ class Coordinator:
                 return read
             at, changes = loop.time(), self.ahead_changes
             async with self.engine.connect() as conn:
-                rows = (await conn.execute(AHEAD_CANDIDATES, {"depth": self.settings.ahead_depth_limit})).all()
+                rows = (await conn.execute(
+                    AHEAD_CANDIDATES,
+                    {"depth": self.settings.ahead_depth_limit, "outlined": list(self.outlined_keys.values())},
+                )).all()
             self.ahead_read = _AheadRead(
-                at, changes, [(row.batch_id, row.input_key, row.tier, row.priority) for row in rows], set()
+                at, changes,
+                [
+                    (
+                        row.batch_id, row.input_key, row.tier, row.priority,
+                        (row.critical_depth, row.descendant_count), row.outlined,
+                    )
+                    for row in rows
+                ],
+                set(),
             )
             return self.ahead_read
 
@@ -1687,7 +1777,7 @@ class Coordinator:
         self,
         conn: AsyncConnection,
         ranking: "_Ranking",
-        outranked: Callable[[str, int], list[str]] | None = None,
+        outranked: _Outranking | None = None,
         host_id: str | None = None,
         hint: Hint | None = None,
         *,
@@ -1744,7 +1834,10 @@ class Coordinator:
             if tier in hint_only and not fits:
                 held.append(entry)
                 continue
-            if not ranking.capped and outranked is not None and outranked(tier, -priority):
+            if outranked is not None and (
+                (not ranking.capped and outranked.above(tier, -priority))
+                or outranked.deeper(batch_id, tier, ranking.depths.get((batch_id, tier)))
+            ):
                 heapq.heappush(ranking.heap, entry)
                 put_back_held()
                 # Held builds rank before claims ahead too, so a claim that left some waits for their holds to end.
@@ -1770,8 +1863,9 @@ class Coordinator:
                 ranking.heap,
                 (tier_position, priority, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),
             )
-            # The batch's next ready build is another one, whose theory the ranking doesn't know.
+            # The batch's next ready build is another one, whose theory and place the ranking don't know.
             theory = ranking.theories.pop((batch_id, tier), None)
+            ranking.depths.pop((batch_id, tier), None)
             if priority != 0:
                 ranking.running_priority += 1
                 self._cap_priorities(ranking)
@@ -2199,6 +2293,7 @@ class Coordinator:
         ranking = _Ranking(
             at, forgotten, heap, {(row.batch_id, row.tier) for row in rows}, set(),
             rows[0].running_priority if rows else 0, {(row.batch_id, row.tier): row.theory for row in rows},
+            {(row.batch_id, row.tier): (row.critical_depth, row.descendant_count) for row in rows},
         )
         self._cap_priorities(ranking)
         return ranking
@@ -2450,6 +2545,23 @@ class Coordinator:
             self.report_worker(*lease)
         return live
 
+    async def outlined(self, token: UUID) -> None:
+        """Record that the action of a live lease published its outline. An action claimed ahead stops counting
+        against its batch's ``ahead_cap`` then, so that its children may be claimed ahead too. Kept in memory, as
+        ``lease_hosts`` is: a restart forgets it, and the action counts against the cap again until it ends. A stale
+        token records nothing: its heartbeat stops the action."""
+        async with self.engine.connect() as conn:
+            key = await conn.scalar(
+                sa.text("SELECT input_key FROM leases WHERE attempt_token = :token AND expires_at > now()"),
+                {"token": token},
+            )
+        if key is None:
+            return
+        self.outlined_keys[token] = key
+        if len(self.outlined_keys) > MAX_LEASE_HOSTS:
+            del self.outlined_keys[next(iter(self.outlined_keys))]
+        self._ahead_changed()
+
     async def complete(self, token: UUID, result: Result) -> bool:
         """Apply a worker's result record; False when its lease is stale, and the record is dropped.
 
@@ -2619,6 +2731,7 @@ class Coordinator:
         if built:
             await self._finish_when_done(batch_id)
         self.lease_hosts.pop(token, None)
+        self.outlined_keys.pop(token, None)
         if leased is not None:
             self._record_result(leased[0], batch_id, result)
             self._learn_locality(leased[0], action.theory, result)
@@ -2818,6 +2931,7 @@ class Coordinator:
             if lease is None:
                 return
             self.lease_hosts.pop(token, None)
+            self.outlined_keys.pop(token, None)
             action = (
                 await conn.execute(
                     sa.text(

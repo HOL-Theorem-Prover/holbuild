@@ -352,9 +352,10 @@ STATEMENTS = [
     Statement(
         cm.CLAIM_ACTION, lambda f: {"batch_id": f.fresh, "class": "build", "tier": "standard", "taken": []}, 2_900
     ),
+    Statement(cm.FIRST_READY_PLACE, lambda f: {"batch_id": f.fresh, "tier": "standard"}, 2_900),
     Statement(cm.LOCK_KEY, lambda f: {"key": f.arrival.keys("ready")[0]}, 100),
     Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("ready")[0]}, 2_100),
-    Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2}, 120_000),
+    Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2, "outlined": [f.parent_of_ahead()]}, 120_000),
     Statement(
         cm.CLAIM_AHEAD_ACTION,
         lambda f: {"batch_id": f.fresh, "keys": f.ahead_candidates(), "tier": "standard", "depth": 2, "taken": []},
@@ -365,7 +366,12 @@ STATEMENTS = [
         lambda f: {"batch_id": f.fresh, "keys": f.arrival.keys("running", "ahead")[-1:], "depth": 2},
         100,
     ),
-    Statement(cm.COUNT_WAITING_AHEAD, lambda f: {"batch_id": f.fresh}, 1_100),
+    Statement(cm.COUNT_WAITING_AHEAD, lambda f: {"batch_id": f.fresh, "outlined": [f.parent_of_ahead()]}, 1_100),
+    Statement(
+        "SELECT input_key FROM leases WHERE attempt_token = :token AND expires_at > now()",
+        lambda f: {"token": f.token},
+        100,
+    ),
     Statement(cm.REFRESH_AHEAD_CHILDREN, lambda f: {"batch_id": f.fresh, "key": f.parent_of_ahead()}, 1_100),
     Statement(cm.REVOKE_AHEAD, lambda f: {"batch_id": f.fresh, "keys": [f.parent_of_ahead()]}, 12_000),
     Statement(cm.PEERS, lambda f: {"batch_id": f.fresh, "input_key": f.steady_arrival.keys("waiting")[0]}, 13_000),

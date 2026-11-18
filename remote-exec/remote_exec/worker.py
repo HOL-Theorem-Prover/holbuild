@@ -292,6 +292,18 @@ class Coordinator:
             raise RuntimeError(f"heartbeat answered {status}: {body}")
         return status == 200
 
+    def outlined(self, token: str) -> None:
+        """Tell the coordinator the action published its outline, so that its children may be claimed ahead. A
+        coordinator without the endpoint (404) is no error, nor one that can't be reached: the outline is only a
+        head start."""
+        try:
+            status, body = self.post_reporting(f"/v1/work/{token}/outlined", {}, timeout=REQUEST_TIMEOUT_S)
+        except COORDINATOR_ERRORS as error:
+            print(f"could not report the outline: {error}", file=sys.stderr)
+            return
+        if status not in (204, 404):
+            print(f"outline report answered {status}: {body}", file=sys.stderr)
+
     def complete(self, token: str, record: str, retry_s: float) -> None:
         """Report an action's result. A coordinator that can't be reached or answers 5xx, as while it restarts, is
         asked again for up to ``retry_s`` seconds, so the result isn't lost while the action's lease still holds."""
@@ -1234,12 +1246,18 @@ def execute(
         # The bound holds while the result is being posted too, which retries for as long as the lease.
         hard_stop: threading.Timer | None = None
         sampled = stepped
+        # exec-action --pipeline creates it once it published the action's outline.
+        outline = result + ".outline"
+        told_outline = False
         try:
             while process.poll() is None:
                 if reported is None:
                     if lease.check():
                         lost = True
                         break
+                    if not told_outline and os.path.exists(outline):
+                        told_outline = True
+                        threading.Thread(target=lease.coordinator.outlined, args=(lease.token,), daemon=True).start()
                     if (record := read_result(result)) is not None:
                         now = time.monotonic()
                         if cooperate_dir is None:

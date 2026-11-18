@@ -98,6 +98,8 @@ else sleep 2; fi
 [ -z "$HOLBUILD_FAKE_CRASH" ] || [ "$HOLBUILD_FAKE_CRASH" != 1 ] || exit 70
 [ -z "$HOLBUILD_FAKE_CRASH" ] || kill -s "$HOLBUILD_FAKE_CRASH" $$
 while [ "$#" -gt 0 ]; do
+  # HOLBUILD_FAKE_OUTLINE: publish an outline a second before the result, as exec-action --pipeline does
+  if [ "$1" = --result ] && [ -n "$HOLBUILD_FAKE_OUTLINE" ]; then : > "$2.outline"; sleep 1; fi
   if [ "$1" = --result ]; then printf '%s' "${{HOLBUILD_FAKE_RECORD:-{RECORD}}}" > "$2.tmp"; mv "$2.tmp" "$2"; fi
   shift
 done
@@ -137,7 +139,7 @@ class Server:
     protection: list[dict[str, object]] = field(default_factory=list)
     claims: list[dict[str, object]] = field(default_factory=list)
     heartbeats: list[dict[str, object]] = field(default_factory=list)
-    lease_posts: list[str] = field(default_factory=list)  # "heartbeat" and "complete", in the order they came
+    lease_posts: list[str] = field(default_factory=list)  # "heartbeat", "outlined", "complete", in the order they came
     reports: list[dict[str, object]] = field(default_factory=list)
     report_status: int = 204  # 404 from a coordinator older than /v1/work/report
     lease_lost: bool = False
@@ -203,8 +205,10 @@ def server() -> Iterator[Server]:
             if self.path == "/v1/work/report":
                 state.reports.append(json.loads(body))
                 return self.reply(state.report_status)
-            if self.path.endswith(("/heartbeat", "/complete")):
+            if self.path.endswith(("/heartbeat", "/complete", "/outlined")):
                 state.lease_posts.append(self.path.rsplit("/", 1)[1])
+            if self.path.endswith("/outlined"):
+                return self.reply(204)
             if self.path.endswith("/complete"):
                 if state.unavailable > 0:
                     state.unavailable -= 1
@@ -497,6 +501,25 @@ def test_the_result_is_reported_before_exec_action_exits_and_a_lost_lease_then_s
         assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
     assert server.completed == [RECORD]
     assert not Path(f"{logs[1]}.termed").exists()
+
+
+def test_an_outline_exec_action_published_is_reported_once_before_the_result(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.next_claim = {**claim(), "pipeline": True}
+    monkeypatch.setenv("HOLBUILD_FAKE_OUTLINE", "1")
+    with running_worker(tmp_path, server, "0") as process:
+        deadline = time.monotonic() + 20
+        while not server.completed and time.monotonic() < deadline:
+            time.sleep(0.05)
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=20) == 0, (tmp_path / "worker.log").read_text()
+    assert server.completed == [RECORD]
+    assert "--pipeline" in logs[1].read_text().split()
+    posts = [post for post in server.lease_posts if post != "heartbeat"]
+    assert posts == ["outlined", "complete"], (tmp_path / "worker.log").read_text()
 
 
 def test_a_drain_after_the_result_completes_the_action_once(

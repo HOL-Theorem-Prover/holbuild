@@ -98,6 +98,35 @@ async def test_builds_of_a_batch_that_loads_ahead_are_claimed_pipelined_unless_t
     assert claimed is not None and claimed["theory"] == "pkg:y" and claimed["pipeline"] is False
 
 
+async def test_an_action_that_published_its_outline_frees_its_slot_of_the_cap_for_its_children(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache
+) -> None:
+    coordinator.settings.ahead_depth = 0
+    await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "b")], speculative_loading="1")
+    a = await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+    assert await claim_ahead(http) is None  # the cap is full
+
+    # A stale token marks nothing.
+    response = await http.post(f"/v1/work/{uuid4()}/outlined", headers=WORKER)
+    assert response.status_code == 204
+    assert await claim_ahead(http) is None
+
+    response = await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)
+    assert response.status_code == 204
+    c = await claim_ahead(http)
+    assert c is not None and (c["theory"], c["ahead_parents"]) == ("pkg:c", parents("a") + parents("b"))
+    assert list(coordinator.outlined_keys.values()) == [input_key("b")]
+
+    # Its result forgets it.
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, a, result("a", "built"))).status_code == 200
+    cache.keys.add(ac_key("b"))
+    assert (await complete(http, b["attempt_token"], result("b", "built"))).status_code == 200
+    assert coordinator.outlined_keys == {}
+
+
 async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_ready(
     http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
 ) -> None:
@@ -131,6 +160,25 @@ async def test_a_claim_ahead_comes_after_ready_builds_of_its_priority_and_before
         assert claimed is not None
         order.append(claimed["theory"].removeprefix("pkg:"))
     assert order[:2] == ["x", "b"] and sorted(order[2:]) == ["y", "z"]
+
+
+@pytest.mark.parametrize(("outlined", "order"), [(False, ["r", "l", "b"]), (True, ["r", "b", "l"])])
+async def test_a_claim_ahead_on_outlines_alone_with_a_deeper_chain_than_its_batch_s_ready_builds_comes_before_them(
+    http: httpx.AsyncClient, outlined: bool, order: list[str]
+) -> None:
+    await submit(
+        http, ["a", "b", "c", "r", "s", "l"], [("b", "a"), ("c", "b"), ("s", "r")], speculative_loading="4"
+    )
+    a = await claim_named(http, "a")
+    if outlined:
+        assert (await http.post(f"/v1/work/{a}/outlined", headers=WORKER)).status_code == 204
+
+    # "r" ranks as deep as "b" and comes first. Then "b", whose parent is still running, comes before the leaf "l"
+    # only once that parent's outline is out; "c", whose parent "b" has published none, never does.
+    claimed = []
+    while (action := await claim_ahead(http)) is not None:
+        claimed.append(action["theory"].removeprefix("pkg:"))
+    assert claimed[:3] == order
 
 
 async def test_a_ready_build_waits_only_for_a_claim_ahead_of_its_tier_or_an_earlier_one(
@@ -1248,9 +1296,9 @@ async def test_reading_the_candidates_reads_each_childs_action_by_key(
         for depth in (1, None):
             query = coordinator_module.AHEAD_CANDIDATES
             plan = await connection.scalar(
-                sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query.text}"), {"depth": depth}
+                sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query.text}"), {"depth": depth, "outlined": []}
             )
-            rows = await connection.execute(query, {"depth": depth})
+            rows = await connection.execute(query, {"depth": depth, "outlined": []})
             assert {row.input_key for row in rows} == {f"k{i}" for i in range(width, 2 * width)}
             assert handled(plan[0]["Plan"]) < 10 * width * parents
         await connection.rollback()

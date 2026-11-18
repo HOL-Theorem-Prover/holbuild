@@ -13477,7 +13477,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         publish_theory_cache (cache_warning_subject logical (#source_file action)) key (tactic_timeout policy)
           (file (logical ^ ".sig")) published_sml (file (logical ^ ".dat")) NONE [] metadata;
         ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = upload_entry_blobs remote key});
-        HolbuildStatus.message_stderr "holbuild: pipeline: published the outline\n"
+        HolbuildStatus.message_stderr "holbuild: pipeline: published the outline\n";
+        (* The worker tells the coordinator, which then lets the theory's
+           children be claimed ahead beyond the batch's cap. *)
+        Option.app (fn file => write_text (file ^ ".outline") "") (!HolbuildActionSandbox.result_file)
       end
       handle e => warn ("not publishing the outline: " ^ General.exnMessage e)
     (* The build of an action whose own entry the cache doesn't hold, from
