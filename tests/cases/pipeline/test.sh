@@ -794,7 +794,7 @@ require_same_as_unpipelined ahead CTheory A B C
 rm -rf "$tmpdir/ahead-coop"
 cp -r "$tmpdir/ahead" "$tmpdir/ahead-coop"
 rm -rf "$tmpdir/ahead-coop/.holbuild"
-(cd "$tmpdir/ahead-coop" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --skip-checkpoints --skip-proof-steps \
+(cd "$tmpdir/ahead-coop" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --no-cache --skip-checkpoints --skip-proof-steps \
    --cooperate-dir "$tmpdir/ahead-coop-dir" --child-charge 256 CTheory) > "$tmpdir/ahead-coop.log" 2>&1
 log=$tmpdir/ahead-coop.log
 require_grep "pipeline: dispatch ahead: CTheory (late BTheory)" "$log"
