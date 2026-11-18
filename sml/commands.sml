@@ -2152,15 +2152,22 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 SOME batch_id => finish true [] NONE batch_id
               | NONE => export_and_submit true (not detach) NONE [] []
           end
+        (* The owners' batch leaves the requested plan's record write for the
+           requested batch: a replan, if the owners rebuilt, queues its own. *)
         fun build_owners owner_plan =
-          let val owner_options = build_options_for index entry_plan owner_plan []
+          let
+            val owner_options = build_options_for index entry_plan owner_plan []
+            val requested_write = !pending_plan_write
+            fun restore () = pending_plan_write := requested_write
           in
-            remote_build_plan
-              (owner_options, owner_plan,
-               HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node owner_options project)
-                 (action_toolchain_key toolchain_key) owner_plan,
-               toolchain_key)
-              NONE
+            pending_plan_write := (fn () => ());
+            (remote_build_plan
+               (owner_options, owner_plan,
+                HolbuildBuildPlan.input_keys (HolbuildBuildExec.build_config_lines_for_node owner_options project)
+                  (action_toolchain_key toolchain_key) owner_plan,
+                toolchain_key)
+               NONE
+             handle e => (restore (); raise e)) before restore ()
           end
         fun replan () =
           if Option.isSome prepared orelse watch

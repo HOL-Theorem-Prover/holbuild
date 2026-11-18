@@ -588,6 +588,24 @@ fun transitive_project_deps
           end
   end
 
+(* Whether DEP is in NODE's dependency closure.  The search stops at DEP and
+   keeps nothing, for the rare check that needs one answer, not the closure. *)
+fun depends_on ({selected_key_index, selected_adjacency, ...} : t) node dep =
+  case (find_key_id selected_key_index (key node), find_key_id selected_key_index (key dep)) of
+      (SOME from, SOME target) =>
+        let
+          val seen = Array.array (Vector.length selected_adjacency, false)
+          fun reach [] = false
+            | reach (id :: rest) =
+                id = target orelse
+                (if Array.sub (seen, id) then reach rest
+                 else (Array.update (seen, id, true);
+                       reach (List.revAppend (Vector.sub (selected_adjacency, id), rest))))
+        in
+          reach (Vector.sub (selected_adjacency, from))
+        end
+    | _ => false
+
 (* A selected node's position, which indexes the plan's per-node caches. *)
 fun plan_node_id ({selected_key_index, ...} : t) node =
   indexed_key_id selected_key_index (key node)

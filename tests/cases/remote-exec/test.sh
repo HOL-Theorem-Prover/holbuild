@@ -225,7 +225,8 @@ require_grep "holbuild: remote batch b2" "$tmpdir/detach.log"
 rm "$state/watch"
 # A detached build writes the record of its edited plan, after the POST.
 [[ $(< "$state/b2.watched") == "$record_before" ]] || { echo "plan record changed before the POST" >&2; exit 1; }
-[[ $(plan_digest) != "$record_before" ]] || { echo "detach left the plan record unchanged" >&2; exit 1; }
+record_after=$(plan_digest)
+[[ $record_after != absent && $record_after != "$record_before" ]] || { echo "detach wrote no new plan record" >&2; exit 1; }
 refute_grep "Theory built\|restored from cache" "$tmpdir/detach.log"
 run attach 0 build --remote-exec "$coordinator" --attach b2 BTheory
 require_grep "BTheory restored from cache" "$tmpdir/attach.log"
