@@ -166,12 +166,15 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
 
         async def summarize_forever() -> None:
             at, cpu = time.monotonic(), time.process_time()
-            while True:
-                await asyncio.sleep(SUMMARY_SECONDS)
-                now, now_cpu = time.monotonic(), time.process_time()
-                summary_logger.info(summary_line(counts, now - at, now_cpu - cpu))
-                counts.clear()
-                at, cpu = now, now_cpu
+            try:
+                while True:
+                    await asyncio.sleep(SUMMARY_SECONDS)
+                    now, now_cpu = time.monotonic(), time.process_time()
+                    summary_logger.info(summary_line(counts, now - at, now_cpu - cpu))
+                    counts.clear()
+                    at, cpu = now, now_cpu
+            finally:  # the part of a minute before a shutdown, so a restart loses none of its counts
+                summary_logger.info(summary_line(counts, time.monotonic() - at, time.process_time() - cpu))
 
         pool_controller = asyncio.create_task(cache_pool_forever()) if coordinator.cache_pool is not None else None
         sweeper = asyncio.create_task(sweep_forever())

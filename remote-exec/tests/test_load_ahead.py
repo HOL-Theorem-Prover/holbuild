@@ -212,13 +212,14 @@ async def test_concurrent_claims_ahead_of_one_batch_wait_for_its_lock_one_connec
     await submit(http, ["p", *children], [(c, "p") for c in children], speculative_loading="2")
     await claim_named(http, "p")
     holding: set[int] = set()
-    most = 0
+    most = locks = 0
 
     def lock(conn: Any, cursor: Any, statement: str, *_: Any) -> None:
-        nonlocal most
+        nonlocal most, locks
         if statement.startswith("SELECT ahead_cap, max_heap_mb FROM batches"):
             holding.add(id(conn))
             most = max(most, len(holding))
+            locks += 1
 
     def end(conn: Any) -> None:
         holding.discard(id(conn))
@@ -233,6 +234,7 @@ async def test_concurrent_claims_ahead_of_one_batch_wait_for_its_lock_one_connec
             sa.event.remove(remote_exec_engine.sync_engine, name, listener)
     assert len([c for c in claims if c is not None]) == 2
     assert most == 1
+    assert locks == 2  # the claims after the second skip the full batch without a connection
 
 
 async def test_claims_ahead_go_one_generation_deep_and_follow_a_parent_finishing(
