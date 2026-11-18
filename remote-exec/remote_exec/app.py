@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -19,6 +20,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from remote_exec.auth import cache_discovery_token
 from remote_exec.coordinator import (
@@ -34,6 +36,9 @@ from remote_exec.coordinator import (
 from remote_exec.formats import FormatError, parse_batch, parse_result
 
 logger = logging.getLogger(__name__)
+# Under uvicorn's own logger, which uvicorn sends to stderr at INFO; this module's would show only warnings.
+summary_logger = logging.getLogger("uvicorn.requests")
+SUMMARY_SECONDS = 60.0
 
 Tier = Literal["standard", "high"]
 
@@ -87,6 +92,54 @@ async def text_body(request: Request) -> str:
         raise HTTPException(400, f"body is not UTF-8: {error}") from error
 
 
+# Requests by method, route and status since the last summary line; they replace uvicorn's access log, whose line per
+# request cost the event loop more than the counting does.
+type ResponseCounts = Counter[tuple[str, str, int]]
+
+
+class CountResponses:
+    """ASGI middleware adding each response to ``counts``, by method, route template (``-`` for no route) and status;
+    a request that raised counts as a 500, which the outer error handler answers."""
+
+    def __init__(self, app: ASGIApp, counts: ResponseCounts) -> None:
+        self.app = app
+        self.counts = counts
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def counted(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+                self.counts[_response_key(scope, message["status"])] += 1
+            await send(message)
+
+        try:
+            await self.app(scope, receive, counted)
+        except Exception:
+            if not started:
+                self.counts[_response_key(scope, 500)] += 1
+            raise
+
+
+def _response_key(scope: Scope, status: int) -> tuple[str, str, int]:
+    route = scope.get("route")
+    return scope["method"], getattr(route, "path", "-"), status
+
+
+def summary_line(counts: ResponseCounts, seconds: float, cpu_seconds: float) -> str:
+    """One log line of the responses in ``counts`` over the last ``seconds``, most frequent first, and the CPU the
+    process used meanwhile."""
+    total = sum(counts.values())
+    per_request = f", {1000 * cpu_seconds / total:.1f} ms each" if total else ""
+    responses = ", ".join(f"{method} {route} {status} {n}" for (method, route, status), n in counts.most_common())
+    return f"{total} responses in {seconds:.0f} s, {cpu_seconds:.1f} CPU-s{per_request}: {responses}"
+
+
 def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
     """The coordinator's routes over ``coordinator``; the lifespan runs the periodic sweep and closes it."""
 
@@ -111,11 +164,27 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                     logger.exception("cache pool reconciliation failed; keeping lifecycle ownership")
                 await asyncio.sleep(settings.sweep_seconds)
 
+        async def summarize_forever() -> None:
+            at, cpu = time.monotonic(), time.process_time()
+            try:
+                while True:
+                    await asyncio.sleep(SUMMARY_SECONDS)
+                    now, now_cpu = time.monotonic(), time.process_time()
+                    summary_logger.info(summary_line(counts, now - at, now_cpu - cpu))
+                    counts.clear()
+                    at, cpu = now, now_cpu
+            finally:  # the part of a minute before a shutdown, so a restart loses none of its counts
+                summary_logger.info(summary_line(counts, time.monotonic() - at, time.process_time() - cpu))
+
         pool_controller = asyncio.create_task(cache_pool_forever()) if coordinator.cache_pool is not None else None
         sweeper = asyncio.create_task(sweep_forever())
+        summarizer = asyncio.create_task(summarize_forever())
         try:
             yield
         finally:
+            summarizer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await summarizer
             sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sweeper
@@ -125,7 +194,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                     await pool_controller
             await coordinator.aclose()
 
+    counts: ResponseCounts = Counter()
     app = FastAPI(title="holbuild remote-exec coordinator", lifespan=lifespan)
+    app.add_middleware(CountResponses, counts=counts)
+    app.state.response_counts = counts
     client = [Depends(bearer(settings.client_token))]
     worker = [Depends(bearer(settings.worker_token))]
     discovery_token = cache_discovery_token(settings.worker_token.get_secret_value())
@@ -189,7 +261,8 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         batch = await coordinator.get(batch_id)
         if batch is None:
             raise HTTPException(404, f"no batch {batch_id}")
-        return asdict(batch)
+        # Shallow: asdict deep-copies every action, which a big batch's status paid for in CPU.
+        return {**vars(batch), "actions": [vars(action) for action in batch.actions]}
 
     @app.post("/v1/batches/{batch_id}/cancel", dependencies=client)
     async def cancel(batch_id: UUID) -> dict[str, str]:
@@ -217,7 +290,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                     for action in actions:
                         if seen.get(action.input_key) != action:
                             seen[action.input_key] = action
-                            yield json.dumps(jsonable_encoder({"type": "action", **asdict(action)})) + "\n"
+                            yield json.dumps(jsonable_encoder({"type": "action", **vars(action)})) + "\n"
                             last_line = time.monotonic()
                     if batch.state != "running":
                         yield json.dumps({"type": "batch", "state": batch.state, "failure": batch.failure}) + "\n"
@@ -299,9 +372,12 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         )
         # After the claim, so claims arriving together still share their reads. Its worker's next claim comes 30 s
         # after this one arrived at the soonest, which dwarfs any skew between this clock and the database's.
-        if not await request.is_disconnected():
-            held = None if claimed is None else str(claimed.attempt_token)
-            await coordinator.release_unheld(body.worker, held, arrived)
+        await coordinator.release_unheld(body.worker, None if claimed is None else str(claimed.attempt_token), arrived)
+        if await request.is_disconnected():
+            # The worker went as the claim returned: nobody gets the answer.
+            if claimed is not None:
+                await coordinator.give_back(claimed)
+            return Response(status_code=204)
         if claimed is None:
             return Response(status_code=204)
         return asdict(claimed)

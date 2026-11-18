@@ -3,7 +3,7 @@ import contextlib
 import hashlib
 import json
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from collections.abc import Callable
@@ -12,11 +12,13 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from pydantic import TypeAdapter
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from starlette.requests import Request
 
 from remote_exec import coordinator as coordinator_module
-from remote_exec.app import create_app
+from remote_exec.app import CountResponses, create_app, summary_line
 from remote_exec.coordinator import Claim, Coordinator, HostReport, _claim_rank
 from remote_exec.formats import parse_result
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, Settled
@@ -773,6 +775,83 @@ async def test_a_claim_that_gets_an_action_ends_the_leases_its_worker_got_no_ans
     assert (actions[lost["theory"]]["attempts"], actions[lost["theory"]]["last_failure"]) == (0, "unavailable")
     assert (actions[held["theory"]]["state"], actions[held["theory"]]["attempts"]) == ("running", 1)
     assert (await http.post(f"/v1/work/{held['attempt_token']}/heartbeat", headers=WORKER)).status_code == 200
+
+
+@pytest.mark.parametrize("quarantined", [False, True])
+async def test_a_claim_whose_worker_has_gone_gives_its_action_back(
+    http: httpx.AsyncClient, coordinator: Coordinator, quarantined: bool
+) -> None:
+    """A worker stopped while its claim waited gets no answer: the action goes back at once, not when the lease
+    expires, and its host isn't taken to run it. A quarantined host's probe claim gives it back too."""
+    if quarantined:
+        coordinator.infra_streak["host-a"] = (coordinator_module.QUARANTINE_FAILURES, None)
+        coordinator.probe_at["host-a"] = coordinator.clock() - timedelta(seconds=coordinator_module.PROBE_SECONDS)
+    batch_id = await submit(http, ["a"])
+
+    async def gone() -> bool:
+        return True
+
+    assert await coordinator.claim(["standard"], "w9", 0, gone, "host-a") is None
+    await coordinator.released()
+    (action,) = (await batch(http, batch_id))["actions"]
+    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+    assert not coordinator.lease_hosts and not coordinator.host_keys.get("host-a")
+    claimed = await coordinator.claim(["standard"], "w10")
+    assert claimed is not None and claimed.theory == "pkg:a"
+
+
+async def test_a_woken_claim_whose_worker_left_while_it_took_the_action_gives_it_back(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker is there while its claim waits and when a release wakes it, and goes while the claim takes the
+    action: only the check after taking it can see that."""
+    left = False
+    claim_once = coordinator._claim
+
+    async def leaving(*args: Any) -> Any:
+        nonlocal left
+        claimed, held_until = await claim_once(*args)
+        left = claimed is not None
+        return claimed, held_until
+
+    async def gone() -> bool:
+        return left
+
+    monkeypatch.setattr(coordinator, "_claim", leaving)
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "w9", 10, gone))
+    while not coordinator.claim_waiters:
+        await asyncio.sleep(0.01)
+    batch_id = await submit(http, ["a"])
+    assert await waiting is None and left
+    await coordinator.released()
+    (action,) = (await batch(http, batch_id))["actions"]
+    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+
+
+async def test_a_claim_whose_worker_left_as_the_endpoint_answered_gives_its_action_back(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker is there through the coordinator's checks and leaves while the endpoint ends its unheld leases:
+    the endpoint's last check gives the claim back and answers 204."""
+    left = False
+    release_unheld = coordinator.release_unheld
+
+    async def leaving(*args: Any) -> None:
+        nonlocal left
+        await release_unheld(*args)
+        left = True
+
+    async def gone(_: Request) -> bool:
+        return left
+
+    monkeypatch.setattr(coordinator, "release_unheld", leaving)
+    monkeypatch.setattr(Request, "is_disconnected", gone)
+    batch_id = await submit(http, ["a"])
+    response = await http.post("/v1/work/claim", json={"tier": "standard", "worker": "w9"}, headers=WORKER)
+    assert response.status_code == 204 and left
+    await coordinator.released()
+    (action,) = (await batch(http, batch_id))["actions"]
+    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
 
 
 async def test_a_late_claim_leaves_the_leases_its_worker_claimed_since(
@@ -2464,6 +2543,17 @@ async def test_batch_status_shows_each_actions_phase_timings(http: httpx.AsyncCl
     assert timings == {"a": {"hydrate": 812, "hol": 1500, "wall": 10}, "b": None}
 
 
+async def test_batch_status_reads_as_the_batch_s_fields(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    batch_id = await submit(http, ["a", "b"])
+    token = await claim_named(http, "a", worker="w1")
+    assert (await complete(http, token, result("a", "built", phase_ms="hol:1500"))).status_code == 200
+
+    status = await coordinator.get(UUID(batch_id))
+    assert status is not None
+    # As the endpoint encoded asdict(batch) before: through its dict[str, object] response type.
+    assert await batch(http, batch_id) == TypeAdapter(dict[str, object]).dump_python(asdict(status), mode="json")
+
+
 async def test_a_malformed_phase_timing_is_refused(http: httpx.AsyncClient) -> None:
     await submit(http, ["a"])
     token = await claim_named(http, "a")
@@ -3769,3 +3859,33 @@ async def test_queue_reports_priority_subsets_without_double_counting(
     assert (queue["ready_priority"], queue["running_priority"]) == (1, 1)
     assert queue["priority_cap"] == coordinator.settings.priority_cap
     assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (3, 2, 1)
+
+
+async def test_responses_are_counted_by_route_and_status_for_the_summary_line(coordinator: Coordinator) -> None:
+    app = create_app(coordinator, coordinator.settings)
+    async with httpx.AsyncClient(transport=Settled(app, coordinator), base_url="http://coordinator.test") as http:
+        batch_id = await submit(http, ["a"])
+        await batch(http, batch_id)
+        await batch(http, str(uuid4()))
+        await http.get("/v1/nothing-here")
+    assert app.state.response_counts == {
+        ("POST", "/v1/batches", 201): 1,
+        ("GET", "/v1/batches/{batch_id}", 200): 1,
+        ("GET", "/v1/batches/{batch_id}", 404): 1,
+        ("GET", "-", 404): 1,
+    }
+    assert summary_line(app.state.response_counts, 60.2, 0.8) == (
+        "4 responses in 60 s, 0.8 CPU-s, 200.0 ms each: POST /v1/batches 201 1, GET /v1/batches/{batch_id} 200 1, "
+        "GET /v1/batches/{batch_id} 404 1, GET - 404 1"
+    )
+    assert summary_line(Counter(), 60.0, 0.1) == "0 responses in 60 s, 0.1 CPU-s: "
+
+
+async def test_a_request_that_raised_counts_as_a_500() -> None:
+    async def failing(scope: Any, receive: Any, send: Any) -> None:
+        raise RuntimeError("boom")
+
+    counts: Counter[tuple[str, str, int]] = Counter()
+    with pytest.raises(RuntimeError):
+        await CountResponses(failing, counts)({"type": "http", "method": "GET"}, None, None)  # type: ignore[arg-type]
+    assert counts == {("GET", "-", 500): 1}
