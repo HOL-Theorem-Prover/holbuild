@@ -584,31 +584,14 @@ fun extra_output_root_identity package =
 fun extra_output_root_marker root = root ^ ".source"
 
 (* Whether ROOT, the package's extra-output root, holds outputs from its
-   current source.  Readers outside the project lock take one that doesn't as
-   empty. *)
+   current source.  Commands holding the project lock empty one that doesn't
+   (HolbuildBuildExec.reset_extra_output_roots); readers outside the lock take
+   it as empty. *)
 fun extra_output_root_current package root =
   is_dir root andalso
   (SOME (let val input = TextIO.openIn (extra_output_root_marker root)
          in TextIO.inputAll input before TextIO.closeIn input end)
    handle IO.Io _ => NONE) = SOME (extra_output_root_identity package)
-
-(* Under the project lock: empties each dependency's extra-output root that
-   isn't current, recording the identity of its source.  The names of the
-   packages whose roots it emptied. *)
-fun reset_extra_output_roots graph =
-  List.mapPartial
-    (fn package =>
-       case HolbuildProject.package_extra_output_root package of
-           NONE => NONE
-         | SOME root =>
-             if extra_output_root_current package root then NONE
-             else
-               (HolbuildRemoveTree.remove root;
-                HolbuildGenerators.ensure_dir root;
-                let val out = TextIO.openOut (extra_output_root_marker root)
-                in TextIO.output (out, extra_output_root_identity package); TextIO.closeOut out end;
-                SOME (HolbuildProject.package_name package)))
-    (HolbuildProjectGraph.packages graph)
 
 fun prevalidate_package package =
   let
@@ -764,8 +747,8 @@ fun discover_package scans package =
           NONE => []
         | SOME root =>
             (* Under the project lock the root is current
-               (reset_extra_output_roots); outside it, one that isn't is as
-               good as empty. *)
+               (HolbuildBuildExec.reset_extra_output_roots); outside it,
+               one that isn't is as good as empty. *)
             if not (extra_output_root_current package root) then []
             else
             let

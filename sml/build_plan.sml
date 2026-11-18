@@ -1171,7 +1171,9 @@ fun expand_extra_dep_walk base decl : input_expansion =
 
 fun expand_extra_dep base decl = #files (expand_extra_dep_walk base decl)
 
-fun expansion_key base decl = base ^ "\000" ^ decl
+(* In a dependency, what a declaration names depends on the package too: its
+   extra-output root and its theories' declarations. *)
+fun expansion_key package base decl = package ^ "\000" ^ base ^ "\000" ^ decl
 
 (* Expansions and file hashes are kept for the life of the plan, so a plan's
    input keys and the plan record name the same files and contents, except
@@ -1179,17 +1181,20 @@ fun expansion_key base decl = base ^ "\000" ^ decl
    a file an earlier one read. *)
 fun keeps_inputs plan = not (HolbuildComponentProvider.runs_generators (analysis_state plan))
 
-fun input_expansion (plan as {input_expansions, ...} : t) expand base decl =
-  case if keeps_inputs plan then Binarymap.peek(!input_expansions, expansion_key base decl) else NONE of
-      SOME expansion => expansion
-    | NONE =>
-        let val expansion = expand ()
-        in input_expansions := Binarymap.insert(!input_expansions, expansion_key base decl, expansion);
-           expansion
-        end
+fun input_expansion (plan as {input_expansions, ...} : t) expand package base decl =
+  let val key = expansion_key package base decl
+  in
+    case if keeps_inputs plan then Binarymap.peek(!input_expansions, key) else NONE of
+        SOME expansion => expansion
+      | NONE =>
+          let val expansion = expand ()
+          in input_expansions := Binarymap.insert(!input_expansions, key, expansion);
+             expansion
+          end
+  end
 
-fun remember_input_expansion ({input_expansions, ...} : t) base decl expansion =
-  input_expansions := Binarymap.insert(!input_expansions, expansion_key base decl, expansion)
+fun remember_input_expansion ({input_expansions, ...} : t) package base decl expansion =
+  input_expansions := Binarymap.insert(!input_expansions, expansion_key package base decl, expansion)
 
 fun input_hash (plan as {input_hashes, ...} : t) path =
   case if keeps_inputs plan then Binarymap.peek(!input_hashes, path) else NONE of
@@ -1201,11 +1206,12 @@ fun input_hash (plan as {input_hashes, ...} : t) path =
 fun remember_input_hash ({input_hashes, ...} : t) path hash =
   input_hashes := Binarymap.insert(!input_hashes, path, hash)
 
-(* Every extra-input expansion the plan made, as (base, declaration, expansion). *)
+(* Every extra-input expansion the plan made, as (package, base, declaration,
+   expansion). *)
 fun input_expansions ({input_expansions, ...} : t) =
   map (fn (key, expansion) =>
          case String.fields (fn c => c = #"\000") key of
-             [base, decl] => (base, decl, expansion)
+             [package, base, decl] => (package, base, decl, expansion)
            | _ => raise Error ("internal malformed expansion key: " ^ String.toString key))
       (Binarymap.listItems (!input_expansions))
 
@@ -1388,9 +1394,12 @@ fun expand_input plan node (label, base, decl) : input_expansion =
                       else {files = [], dirs = [existing_dir tree_path]}
                     end
                 (* A declared output in the source tree is a stray copy, such
-                   as one 0.14.63 or 0.14.64 wrote there. *)
+                   as one 0.14.63 or 0.14.64 wrote there, unless the
+                   declaration names a directory under the root, which a
+                   build of its theory rejects. *)
                 val strays =
-                  declared_outputs_among plan node (map (fn (rel, _) => package_path dir rel) (#files tree))
+                  List.filter (fn output => not (is_dir (normalize_path (Path.concat(root, output)))))
+                    (declared_outputs_among plan node (map (fn (rel, _) => package_path dir rel) (#files tree)))
                 fun stray (rel, _) = List.exists (fn output => output = package_path dir rel) strays
                 val scripts =
                   declaring_script_files plan node
@@ -1403,7 +1412,7 @@ fun expand_input plan node (label, base, decl) : input_expansion =
   end
 
 fun planned_input_expansion plan node (decl as (_, base, rel)) =
-  input_expansion plan (fn () => expand_input plan node decl) base rel
+  input_expansion plan (fn () => expand_input plan node decl) (#package (source_of node)) base rel
 
 (* The node's manifest-declared and source-declared extra inputs, each with
    the content hashes of the files it names. *)

@@ -163,7 +163,8 @@ require_grep "UTheory is up to date" "$tmpdir/rebuild.log"
 # 0.14.64 of outputs in the dependency's sources, here files the checkout
 # tracks, is dropped without removing them, whether or not their claims
 # survived.
-(cd "$tmpdir/copy" && "$HOLBUILD_BIN" context) > /dev/null
+(cd "$tmpdir/copy" && "$HOLBUILD_BIN" clean DTheory) > /dev/null
+require_file "$tmpdir/copy/.holbuild/packages/dep/extra-outputs.source"
 record=$(grep -l 'results/D.txt' "$project"/.holbuild/extra-outputs/actions/*.outputs)
 output=$(grep -m1 '^path .*results/D.txt$' "$record")
 output=${output#path }

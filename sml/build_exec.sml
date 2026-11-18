@@ -718,8 +718,8 @@ fun record_materialized_extra_outputs project node outputs =
 
 (* Drops the ownership claims and action records of the theories of
    PACKAGES, whose extra-output roots were just emptied
-   (HolbuildSourceIndex.reset_extra_output_roots): they are about files from
-   another source of the package. *)
+   (reset_extra_output_roots): they are about files from another source of
+   the package. *)
 fun drop_extra_output_records project packages =
   let
     fun record_package path =
@@ -739,7 +739,11 @@ fun drop_extra_output_records project packages =
         val paths = names [] before FS.closeDir stream
         fun drop path =
           case record_package path handle IO.Io _ => NONE of
-              SOME package => if member_string package packages then remove_file path else ()
+              SOME package =>
+                if member_string package packages then
+                  FS.remove path
+                  handle OS.SysErr (msg, _) => raise Error ("could not remove " ^ path ^ ": " ^ msg)
+                else ()
             | NONE => ()
       in
         List.app drop paths
@@ -750,6 +754,33 @@ fun drop_extra_output_records project packages =
     drop_in (Path.concat(root, "owners"));
     drop_in (Path.concat(root, "actions"))
   end
+
+(* Under the project lock, before planning: empties each dependency's
+   extra-output root that isn't current (HolbuildSourceIndex.extra_output_root_current)
+   and drops its theories' ownership records, then records the identity of
+   its source, last, so a reset cut short is redone.  The names of the
+   packages whose roots it emptied. *)
+fun reset_extra_output_roots project graph =
+  List.mapPartial
+    (fn package =>
+       case HolbuildProject.package_extra_output_root package of
+           NONE => NONE
+         | SOME root =>
+             if HolbuildSourceIndex.extra_output_root_current package root then NONE
+             else
+               let val name = HolbuildProject.package_name package
+               in
+                 HolbuildRemoveTree.remove root;
+                 if extra_output_registry_path_exists root then
+                   raise Error ("could not empty the extra-output directory " ^ root)
+                 else ();
+                 drop_extra_output_records project [name];
+                 HolbuildGenerators.ensure_dir root;
+                 write_text (HolbuildSourceIndex.extra_output_root_marker root)
+                   (HolbuildSourceIndex.extra_output_root_identity package);
+                 SOME name
+               end)
+    (HolbuildProjectGraph.packages graph)
 
 fun clean_registered_extra_outputs project plan node =
   let

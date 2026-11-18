@@ -183,7 +183,7 @@ type node_entry =
    edges : string list,
    config_lines : string list, input_key : string, extra_inputs_key : string option}
 
-type expansion = {base : string, decl : string, files : (string * string) list, dirs : string list}
+type expansion = {package : string, base : string, decl : string, files : (string * string) list, dirs : string list}
 
 type t =
   {fingerprint : string,
@@ -315,8 +315,8 @@ fun encode ({fingerprint, toolchain, action_toolchain_key, packages, members, di
               line "f" [check_text path, stamp_text stamp, bool_text racy, hash]) files @
        map (fn ({path, stamp, racy} : stamped_dir) =>
               line "d" [check_text path, stamp_text stamp, bool_text racy]) input_dirs @
-       map (fn ({base, decl, files, dirs} : expansion) =>
-              line "X" [check_text base, check_text decl,
+       map (fn ({package, base, decl, files, dirs} : expansion) =>
+              line "X" [check_text package, check_text base, check_text decl,
                         items (map (fn (rel, abs) => parts [rel, abs]) files), items dirs]) expansions @
        map source sources @
        map node selected @
@@ -415,8 +415,8 @@ fun decode text : t =
                 files := {path = path, stamp = parse_stamp st, racy = parse_bool racy, hash = hash} :: !files
             | (#"d", [path, st, racy]) =>
                 input_dirs := {path = path, stamp = parse_stamp st, racy = parse_bool racy} :: !input_dirs
-            | (#"X", [base, decl, xfiles, xdirs]) =>
-                expansions := {base = base, decl = decl,
+            | (#"X", [package, base, decl, xfiles, xdirs]) =>
+                expansions := {package = package, base = base, decl = decl,
                                files = map (fn item => case split_parts item of
                                                            [rel, abs] => (rel, abs)
                                                          | _ => bad "expanded input") (split_items xfiles),
@@ -719,7 +719,7 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
         (Binarymap.listItems file_hashes)
     val input_dir_entries =
       map (fn path => let val st = stamp_of path in {path = path, stamp = st, racy = racy st} end)
-        (SI.sort_unique_strings (List.concat (map (fn (_, _, {dirs, ...}) => dirs) expansions)))
+        (SI.sort_unique_strings (List.concat (map (fn (_, _, _, {dirs, ...}) => dirs) expansions)))
     val dir_entries =
       map (fn (path, SOME st, entries) => {path = path, stamp = st, racy = racy st, entries = entries}
             | (path, NONE, _) => raise Unrecordable ("cannot stat " ^ path))
@@ -736,7 +736,9 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
      dirs = dir_entries,
      files = file_entries,
      input_dirs = input_dir_entries,
-     expansions = map (fn (base, decl, {files, dirs}) => {base = base, decl = decl, files = files, dirs = dirs}) expansions,
+     expansions = map (fn (package, base, decl, {files, dirs}) =>
+                         {package = package, base = base, decl = decl, files = files, dirs = dirs})
+                    expansions,
      sources = sources,
      roots = roots,
      selected = node_entries,
@@ -984,8 +986,8 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
       List.foldl (fn ({path, hash, ...} : file, map) => Binarymap.insert(map, path, hash))
         (Binarymap.mkDict String.compare) (#files record)
     val recorded_expansions =
-      List.foldl (fn (expansion as {base, decl, ...} : expansion, map) =>
-                    Binarymap.insert(map, base ^ "\000" ^ decl, expansion))
+      List.foldl (fn (expansion as {package, base, decl, ...} : expansion, map) =>
+                    Binarymap.insert(map, package ^ "\000" ^ base ^ "\000" ^ decl, expansion))
         (Binarymap.mkDict String.compare) (#expansions record)
     fun file_unchanged (_, abs) =
       case (hash_of abs, Binarymap.peek(recorded_hashes, abs)) of
@@ -999,8 +1001,9 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
         (List.concat (map (BP.generated_sources plan) (BP.generated_source_owner_nodes plan)))
     (* Extra inputs of the selected nodes: an expansion whose directories
        moved is redone; file hashes come from the check above. *)
-    fun recorded_expansion (_, base, decl) =
-      case Binarymap.peek(recorded_expansions, base ^ "\000" ^ decl) of
+    fun recorded_expansion node (_, base, decl) =
+      case Binarymap.peek(recorded_expansions,
+                          #package (BP.source_of node) ^ "\000" ^ base ^ "\000" ^ decl) of
           SOME (expansion as {dirs, ...}) => if List.exists dir_moved dirs then NONE else SOME expansion
         | NONE => NONE
     val _ =
@@ -1008,17 +1011,17 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
         (fn node =>
            List.app
              (fn decl =>
-                case recorded_expansion decl of
+                case recorded_expansion node decl of
                     NONE => ()
-                  | SOME {base, decl, files, dirs} =>
-                      (BP.remember_input_expansion plan base decl {files = files, dirs = dirs};
+                  | SOME {package, base, decl, files, dirs} =>
+                      (BP.remember_input_expansion plan package base decl {files = files, dirs = dirs};
                        List.app (fn (_, abs) => Option.app (BP.remember_input_hash plan abs) (hash_of abs)) files))
              (BP.extra_input_decls plan node))
         (BP.selected_nodes plan)
     fun inputs_unchanged node =
       List.all
         (fn decl =>
-           case recorded_expansion decl of
+           case recorded_expansion node decl of
                NONE => false
              | SOME {files, ...} => List.all file_unchanged files)
         (BP.extra_input_decls plan node)
