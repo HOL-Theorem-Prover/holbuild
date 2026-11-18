@@ -53,7 +53,7 @@ responses by method, route and status, with the CPU seconds the process used and
 ```
 
 Without the image, from this directory: `uv sync`, then `uv run alembic
-upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090`.
+upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090 --no-access-log`.
 
 Migration `0005` adds the action class and its indexes; run migrations with
 the coordinator stopped. To roll back to an image predating `0005`, first
