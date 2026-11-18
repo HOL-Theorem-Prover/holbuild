@@ -4702,12 +4702,20 @@ fun metadata_parent_hashes_match dat_hash_cache plan node text =
     if metadata_has_parent_hashes lines then
       let
         val recorded_parent_hashes = metadata_parent_hashes lines
+        val recorded_parents = project_theory_parents plan recorded_parent_hashes
+        (* A name only one table matches in this plan is allowed when its plan
+           theories aren't the child's dependencies: metadata written under a
+           plan without them, or by an older holbuild, doesn't name them. *)
+        fun in_both_or_unrelated others (name, deps) =
+          List.exists (fn (other, _) => other = name) others orelse
+          List.all (fn dep => not (HolbuildBuildPlan.depends_on plan node dep)) deps
       in
         (* Metadata is a cache for this check, not an authority on the current
            child artifact.  The two parent tables must name the same project
-           theories: otherwise either metadata or the child .dat was truncated.
-           Both name lists come sorted from the tables. *)
-        map #1 child_parents = map #1 (project_theory_parents plan recorded_parent_hashes) andalso
+           theories the child depends on: otherwise either metadata or the
+           child .dat was truncated. *)
+        List.all (in_both_or_unrelated recorded_parents) child_parents andalso
+        List.all (in_both_or_unrelated child_parents) recorded_parents andalso
         List.all (theory_parent_hash_matches dat_hash_cache plan node recorded_parent_hashes)
                  child_parent_deps andalso
         List.all (theory_parent_hash_matches dat_hash_cache plan node child_parent_hashes)

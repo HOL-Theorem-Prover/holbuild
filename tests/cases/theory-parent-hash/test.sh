@@ -521,7 +521,14 @@ QED
 
 val _ = export_theory();
 SML
-(cd "$scope" && "$HOLBUILD_BIN" build BTheory CTheory) > "$tmpdir/scope-initial.log" 2>&1 || { cat "$tmpdir/scope-initial.log" >&2; exit 1; }
+# B is built first without the project C in the plan, so its metadata names no
+# C; adding C to the plan leaves B current.
+(cd "$scope" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/scope-initial.log" 2>&1 || { cat "$tmpdir/scope-initial.log" >&2; exit 1; }
+(cd "$scope" && "$HOLBUILD_BIN" build BTheory CTheory) > "$tmpdir/scope-wider.log" 2>&1 || { cat "$tmpdir/scope-wider.log" >&2; exit 1; }
+require_grep "CTheory built" "$tmpdir/scope-wider.log"
+if grep -q "BTheory built\|BTheory restored" "$tmpdir/scope-wider.log"; then
+  echo "adding an unrelated C to the plan made B out of date" >&2; cat "$tmpdir/scope-wider.log" >&2; exit 1
+fi
 scope_log=$tmpdir/scope-noop.json
 (cd "$scope" && "$HOLBUILD_BIN" --json build BTheory CTheory) > "$scope_log" 2>&1 || { cat "$scope_log" >&2; exit 1; }
 python3 - "$scope_log" <<'PY'
