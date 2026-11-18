@@ -6773,7 +6773,7 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
         (fn () =>
             let val value = ahead ()
             in result := SOME (fn () => value) end
-            handle e => (result := SOME (fn () => raise e); stop_child ()),
+            handle e => (stop_child (); result := SOME (fn () => raise e)),
          [])
     val _ =
       child :=
@@ -7253,7 +7253,8 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
       case (Array.sub (attempt, id), Array.sub (attempt_owner, id)) of
           (ARunning (gen, _), SOME (g, thread)) => g = gen andalso HolbuildMachineMemory.holds_reservation thread
         | (ARunning _, _) => false
-        | (ADone _, _) => true
+        (* Done, it needs no child unless a parent still has to build. *)
+        | (ADone _, _) => Array.sub (plain_started, id)
         | _ =>
             case Array.sub (plain_owner, id) of
                 SOME thread => HolbuildMachineMemory.holds_reservation thread
