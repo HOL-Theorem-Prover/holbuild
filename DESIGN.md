@@ -418,7 +418,10 @@ Before loading dependencies or running a theory script, each HOL child removes
 discovery can add sibling stages at startup, but those directories disappear as
 parallel actions finish. Other project directories retain their search order,
 including built objects needed by dynamic library loads. The same policy runs
-when a child resumes from a checkpoint.
+when a child resumes from a checkpoint. A child that loads ahead of late
+parents also removes `.holbuild/checkpoints` and `.holbuild/logs`, which hold
+no modules, so predicting a parent's loads doesn't search thousands of
+directories.
 
 Theory-script sources may declare deterministic, source-file-relative fixed
 output files with static literal `holbuild_extra_outputs [...]` annotations.

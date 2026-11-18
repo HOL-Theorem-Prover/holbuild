@@ -455,6 +455,20 @@ require_before "dropped attempt: CTheory" "CTheory built" "$log"
 require_file "$tmpdir/digest/.holbuild/plan/outline-skip"
 require_same_as_unpipelined digest CTheory B C
 
+# The same with C started ahead of B: C's attempt took in what B's outline
+# loaded when B arrived, so B's failed gate still drops it.
+rm -rf "$tmpdir/digest-ahead"
+cp -r "$tmpdir/digest" "$tmpdir/digest-ahead"
+rm -rf "$tmpdir/digest-ahead/.holbuild"
+sed -i 's/^val _ = new_theory "B";$/val _ = new_theory "B";\nval _ = OS.Process.sleep (Time.fromSeconds 10);/' "$tmpdir/digest-ahead/src/BScript.sml"
+(cd "$tmpdir/digest-ahead" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --no-cache --skip-checkpoints --skip-proof-steps CTheory) \
+  > "$tmpdir/digest-ahead.log" 2>&1
+log=$tmpdir/digest-ahead.log
+require_grep "pipeline: dispatch ahead: CTheory (late BTheory)" "$log"
+require_before "pipeline: ahead arrived: BTheory for CTheory" "pipeline: gate failed: BTheory (digest differs)" "$log"
+require_before "pipeline: gate failed: BTheory" "pipeline: dropped attempt: CTheory" "$log"
+require_same_as_unpipelined digest-ahead CTheory B C
+
 # Only the numbering differs: A's proof saves a temporary theorem through an
 # alias, which shifts the save index of each later theorem but exports
 # nothing.  Deferred, the proof would save it after the export, so A's
@@ -696,6 +710,11 @@ write_root Forked
 write_root Forked1 Forked
 write_root Forked2 Forked
 write_root Forked3 Forked1
+write_root Fan
+write_root Fan1 Fan
+write_root Fan2 Fan
+write_root Fan3 Fan
+write_root Fan4 Fan
 write_root Wide
 write_root Wide1 Wide
 write_root Wide2 Wide
@@ -707,7 +726,10 @@ write_root Leaf
 log=$tmpdir/order.log
 require_grep "pipeline: dispatch pipelined: BushyTheory (ranked ahead 1, free 3)" "$log"
 require_before "pipeline: dispatch [a-z]*: BushyTheory" "pipeline: dispatch [a-z]*: ForkedTheory" "$log"
-require_before "pipeline: dispatch [a-z]*: ForkedTheory" "pipeline: dispatch [a-z]*: WideTheory" "$log"
+# Depth before descendants: Fan has more descendants than Forked, but is
+# shallower.
+require_before "pipeline: dispatch [a-z]*: ForkedTheory" "pipeline: dispatch [a-z]*: FanTheory" "$log"
+require_before "pipeline: dispatch [a-z]*: FanTheory" "pipeline: dispatch [a-z]*: WideTheory" "$log"
 require_before "pipeline: dispatch [a-z]*: WideTheory" "pipeline: dispatch [a-z]*: NarrowTheory" "$log"
 require_before "pipeline: dispatch [a-z]*: NarrowTheory" "pipeline: dispatch [a-z]*: LeafTheory" "$log"
 

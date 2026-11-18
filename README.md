@@ -1223,8 +1223,8 @@ Removed legacy interfaces:
 A theory's children need its declarations, not its proofs. So in a local
 build with `-j` greater than 1, a cold theory builds *pipelined* when a child
 of it could start on its outline (one whose other parents are built or being
-built) and a job slot would still be free once every ready theory ranked as
-high has one. Workers take theories by rank: the longest chain of dependents
+built) and a job slot would still be free once every ready theory at least as
+deep has one. Workers take theories by rank: the longest chain of dependents
 below a theory first, then its number of descendants. A pipelined theory:
 
 1. Its HOL process runs the script with each `Theorem ... Proof ... QED` proof
