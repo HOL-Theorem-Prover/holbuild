@@ -7408,27 +7408,27 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                 SOME work => SOME work
               | NONE =>
                   let
+                    (* A retained failure's focus prerequisites go before any speculation. *)
+                    val focused = !priority_mode andalso !priority_focus_remaining > 0
                     val ready_pick = pop_ready ()
+                    val first = case ready_pick of SOME (_, priority) => priority orelse focused | NONE => false
                     val attempt_pick = best_attempt ()
-                    val ahead_pick =
-                      case ready_pick of SOME (_, true) => NONE | _ => best_ahead ()
+                    val ahead_pick = if first then NONE else best_ahead ()
                     fun beats (SOME a) (SOME b) = outranks (a, b)
                       | beats (SOME _) NONE = true
                       | beats NONE _ = false
                     fun put_back () = Option.app (fn (id, _) => add_ready id) ready_pick
                     val ready_id = Option.map #1 ready_pick
                   in
-                    case ready_pick of
-                        SOME (_, true) => dispatch_ready (valOf ready_pick)
-                      | _ =>
-                          if beats attempt_pick ready_id andalso not (beats ahead_pick attempt_pick) then
-                            (put_back (); take_attempt (valOf attempt_pick))
-                          else if beats ahead_pick ready_id andalso beats ahead_pick attempt_pick then
-                            (put_back (); start_ahead (valOf ahead_pick))
-                          else
-                            case ready_pick of
-                                SOME pick => dispatch_ready pick
-                              | NONE => NONE
+                    if first then dispatch_ready (valOf ready_pick)
+                    else if beats attempt_pick ready_id andalso not (beats ahead_pick attempt_pick) then
+                      (put_back (); take_attempt (valOf attempt_pick))
+                    else if beats ahead_pick ready_id andalso beats ahead_pick attempt_pick then
+                      (put_back (); start_ahead (valOf ahead_pick))
+                    else
+                      case ready_pick of
+                          SOME pick => dispatch_ready pick
+                        | NONE => NONE
                   end
 
     fun next_work_locked () =

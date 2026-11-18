@@ -838,6 +838,7 @@ SML
   > "$tmpdir/ahead-abandon.log" 2>&1
 log=$tmpdir/ahead-abandon.log
 require_before "pipeline: ahead waiting: CTheory for BTheory" "pipeline: ahead abandoned: CTheory" "$log"
+require_grep "pipeline: ahead abandoned: CTheory (.*evaluated other files than its manifest names" "$log"
 starts=$(grep -c "pipeline: dispatch ahead: CTheory" "$log" || true)
 if (( starts != 1 )); then
   echo "expected C to start ahead once, got $starts" >&2
