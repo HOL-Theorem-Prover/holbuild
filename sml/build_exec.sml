@@ -3218,7 +3218,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : (string * real option) list, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool}
 
 (* checkpoint: the theory restores checkpoints and saves them at all.
    theorem_checkpoints: it also saves them per theorem and definition, and
@@ -4809,13 +4809,11 @@ fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
 (* Whether NODE saves checkpoints as it runs (checkpoint_policy): it is one
-   of the build's targets (a root-package theory when the build names none
-   and the project has no default targets), or every theory is under
-   --all-checkpoints, or under --repl-on-failure, whose REPL starts from
-   wherever a build fails. *)
-fun checkpoint_target_node ({all_checkpoints, repl_on_failure, force_targets, ...} : build_options) project node =
-  all_checkpoints orelse repl_on_failure orelse
-  (if null force_targets then root_package_node project node else force_target_node force_targets node)
+   of the build's checkpoint targets (its targets, or every root-package
+   theory when it has none), or every theory is under --all-checkpoints, or
+   under --repl-on-failure, whose REPL starts from wherever a build fails. *)
+fun checkpoint_target_node ({all_checkpoints, repl_on_failure, checkpoint_targets, ...} : build_options) node =
+  all_checkpoints orelse repl_on_failure orelse force_target_node checkpoint_targets node
 
 (* An impure action never replays checkpoints: its script may compute
    different values on each run (a timestamp, a version string), and
@@ -4824,7 +4822,7 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
   if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
     CheckpointPolicy {checkpoint = not skip_checkpoints andalso not (impure node),
                       theorem_checkpoints = not skip_checkpoints andalso not (impure node),
-                      checkpoint_target = checkpoint_target_node options project node,
+                      checkpoint_target = checkpoint_target_node options node,
                       checkpoint_seconds = checkpoint_seconds,
                       proof_steps = proof_steps,
                       new_ir = new_ir,
@@ -4837,7 +4835,7 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
   else
     CheckpointPolicy {checkpoint = false,
                       theorem_checkpoints = false,
-                      checkpoint_target = checkpoint_target_node options project node,
+                      checkpoint_target = checkpoint_target_node options node,
                       checkpoint_seconds = default_checkpoint_seconds,
                       proof_steps = false,
                       new_ir = false,
@@ -5325,7 +5323,11 @@ fun restore_local_heap tc heap_context base_context checkpoint_root (action : th
          warn ("could not restore a deps heap from the host store: " ^ General.exnMessage e);
          NONE)
   in
-    if deps_checkpoint_exists deps_loaded deps_key then NONE
+    (* Placing a heap removes the theorem checkpoints on this deps_key, among
+       them a failed prefix the theory saved with no deps_loaded (while not
+       a target), which resumes later than the heap would. *)
+    if deps_checkpoint_exists deps_loaded deps_key orelse
+       contains_failed_prefix_ok (theorem_checkpoints_for_deps_root base deps_key) then NONE
     else
       case (SOME (local_heap_location tc heap_context action)
             handle e => (warn ("could not find the host store's deps heap: " ^ General.exnMessage e); NONE)) of
@@ -7685,12 +7687,12 @@ fun build_checked (settled : settled option) failed (options : build_options) tc
 fun build options tc project plan toolchain_key jobs = build_checked NONE [] options tc project plan toolchain_key jobs
 
 (* After remote execution, force and tracing have already been fulfilled. *)
-fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
+fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, checkpoint_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
                            new_ir, proof_scope, node_tactic_timeouts, execution_plan, repl_on_failure,
                            emit_output_hashes, allow_cache_timeout_discrepancy, trknl, fail_fast, all_checkpoints, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = ForceNone, force_targets = force_targets,
-   skip_checkpoints = skip_checkpoints, checkpoint_seconds = checkpoint_seconds,
+   checkpoint_targets = checkpoint_targets, skip_checkpoints = skip_checkpoints, checkpoint_seconds = checkpoint_seconds,
    proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
    node_tactic_timeouts = node_tactic_timeouts, execution_plan = execution_plan,
    trace_steps = false, repl_on_failure = repl_on_failure,
@@ -11219,11 +11221,6 @@ fun shared_manifest_entries text =
             | _ => raise Error ("malformed shared checkpoint manifest line: " ^ line))
     (String.tokens (fn c => c = #"\n") text)
 
-(* The value of a manifest's NAME= line, if it has one. *)
-fun shared_manifest_field name text =
-  Option.map (fn line => String.extract (line, size name + 1, NONE))
-    (List.find (String.isPrefix (name ^ "=")) (String.tokens (fn c => c = #"\n") text))
-
 (* Which of a theory's checkpoints are published on a heap, most recently
    used first, so that a restore probes those rather than every boundary
    of the script, most of which no build saved.  Only a hint: a listed
@@ -11434,7 +11431,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 val text = #manifest action
                 val entries = shared_manifest_entries text
                 val path = tree_path checkpoint_root (#2 (single "leaf" entries))
-                val key = shared_manifest_field "key" text
+                val key = metadata_value "key" (metadata_lines text)
               in
                 case List.find (fn c => #kind c = "failed_prefix" andalso #path c = path andalso key = SOME (#key c))
                                candidates of

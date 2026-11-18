@@ -80,10 +80,19 @@ checkpoints=$project/.holbuild/checkpoints
 # saves THEORY: THEORY's saved states, one per line.
 saves() { find "$checkpoints" -path "*/$1Script.sml*" -name '*.save' 2>/dev/null | sort; }
 # build NAME [TARGET]: build TARGET (default TTheory).
+# A failed build echoes no child log; A's are kept under .holbuild/logs.
+compacted_failed_prefix() {
+  if ! cat "$project"/.holbuild/logs/current/nontarget/ATheory/*.log 2>/dev/null |
+       grep -q "checkpoint kind=failed_prefix share=true"; then
+    echo "build $1 saved no compacted failed prefix" >&2
+    ls -R "$project/.holbuild/logs/current" >&2 || true
+    exit 1
+  fi
+}
 build() {
   local name=$1 target=${2:-TTheory}
   set +e
-  (cd "$project" && "$HOLBUILD_BIN" build "$target") > "$tmpdir/$name.log" 2>&1
+  (cd "$project" && HOLBUILD_CHECKPOINT_TIMING=1 "$HOLBUILD_BIN" build "$target") > "$tmpdir/$name.log" 2>&1
   build_status=$?
   set -e
 }
@@ -122,6 +131,8 @@ build fail
 expect_build fail 1
 require_grep "seeded failure" "$tmpdir/fail.log"
 only_failed_prefix fail
+# With no deps heap under it, the prefix carries every ancestor: compacted.
+compacted_failed_prefix fail
 write_a "ALL_TAC >> ACCEPT_TAC TRUTH"
 build fixed
 expect_build fixed 0
@@ -151,6 +162,7 @@ build timeout
 expect_build timeout 1
 require_grep "timed out" "$tmpdir/timeout.log"
 only_failed_prefix timeout
+compacted_failed_prefix timeout
 write_a "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH"
 build after-timeout
 expect_build after-timeout 0

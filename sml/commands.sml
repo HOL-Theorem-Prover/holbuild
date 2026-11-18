@@ -1231,11 +1231,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       case #build_tactic_timeout project of
           NONE => SOME 2.5
         | SOME timeout => timeout
-    fun build_options_for index entry_plan plan force_targets =
+    (* CHECKPOINT_TARGETS: the theories that save checkpoints as they run
+       (checkpoint_targets_for), whatever FORCE_TARGETS this pass forces. *)
+    fun build_options_for index entry_plan plan force_targets checkpoint_targets =
       {use_cache = use_cache,
        verify_cache = verify_cache,
        force = force,
        force_targets = force_targets,
+       checkpoint_targets = checkpoint_targets,
        fail_fast = fail_fast,
        all_checkpoints = all_checkpoints,
        skip_checkpoints = skip_checkpoints,
@@ -1307,9 +1310,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
          toolchain_key = toolchain_key, components = SOME components}
       end
     fun action_toolchain_key toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
+    (* The build's targets, or every root-package theory when it has none. *)
+    fun checkpoint_targets_for index targets =
+      if null targets then HolbuildSourceIndex.root_package_targets index project else targets
     fun with_options (planned as {index, targets, entry_plan, plan, ...}) =
       (planned,
-       build_options_for index entry_plan plan targets)
+       build_options_for index entry_plan plan targets (checkpoint_targets_for index targets))
     (* The input keys of a plan, which the plan keeps for execution.  Only
        for plans whose theories that write SML sources are up to date: until
        those run, an extra input naming such a source may not exist. *)
@@ -1482,7 +1488,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (fn () => HolbuildBuildExec.build options tc project plan toolchain_key jobs)
         val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, options) = plan_build ()
         fun build_owners owner_plan =
-          execute (build_options_for index entry_plan owner_plan [], owner_plan, toolchain_key)
+          execute (build_options_for index entry_plan owner_plan [] (#checkpoint_targets options), owner_plan, toolchain_key)
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
@@ -1735,7 +1741,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     | entry_targets => SOME (HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
               in
                 timed_phase "build.execute"
-                  (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets)
+                  (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets (#checkpoint_targets build_options))
                               tc project theory_plan toolchain_key jobs)
               end
             (* Diagnose every final failure. A missing proof log retains the
@@ -2125,7 +2131,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           end
         fun build_owners owner_plan =
           remote_build_plan
-            (build_options_for index entry_plan owner_plan [],
+            (build_options_for index entry_plan owner_plan [] (#checkpoint_targets build_options),
              owner_plan, toolchain_key)
             NONE
         fun replan () =
@@ -2640,7 +2646,7 @@ fun default_build_options trknl project index entry_plan plan =
     {use_cache = true,
      verify_cache = true,
      force = HolbuildBuildExec.ForceNone,
-     force_targets = [],
+     force_targets = [], checkpoint_targets = [],
      skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
      proof_steps = true,
      new_ir = true,
@@ -2691,7 +2697,7 @@ fun heap_build_options trknl =
   {use_cache = true,
    verify_cache = true,
    force = HolbuildBuildExec.ForceNone,
-   force_targets = [],
+   force_targets = [], checkpoint_targets = [],
    skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
    proof_steps = false,
    new_ir = false,
