@@ -463,10 +463,10 @@ async def test_a_release_hands_the_claim_it_wakes_the_batch_it_made_ready(
 
     async def recording(
         tiers: list[str], worker: str, outranked: Any = None, host_id: str | None = None,
-        hint: tuple[UUID, str, str] | None = None,
+        hint: tuple[UUID, str, str] | None = None, *rest: Any,
     ) -> Any:
         hints.append(hint)
-        return await claim(tiers, worker, outranked, host_id, hint)
+        return await claim(tiers, worker, outranked, host_id, hint, *rest)
 
     monkeypatch.setattr(coordinator, "_claim", recording)
     waiting = asyncio.create_task(coordinator.claim(["standard"], "w", 10, host_id="host-5"))
@@ -628,3 +628,40 @@ async def test_a_holder_claiming_unwoken_takes_nothing_but_its_held_build_ahead_
     wait_on_host_0(coordinator)
 
     assert await claim_on(http, "host-1") is None
+
+
+async def test_a_holder_claiming_unwoken_takes_a_ready_build_of_an_earlier_tier_before_its_held_build(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    """``h`` peaked above the standard tier, so it is ready as high work; host-1's worker takes high work first."""
+    await submit(http, ["h"])
+    first = await claim_on(http, "host-9")
+    assert first is not None
+    cache.keys.add(ac_key("h"))
+    assert (await complete(http, first["attempt_token"], result("h", "built", peak_rss_mb="5000"))).status_code == 200
+    _, theory = await held_in_a_busier_batch(http, coordinator)
+    await submit(http, ["h"])
+    wait_on_host_0(coordinator)
+
+    claimed = await coordinator.claim(["high", "standard"], "host-1-h", host_id="host-1")
+
+    assert claimed is not None and claimed.theory == "pkg:h"
+
+
+async def test_a_claim_passing_over_a_held_build_wakes_only_the_hosts_it_is_held_for(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """host-0 came to hold the theory after the hold began, so its claim would find the build held for host-1."""
+    batch_id, theory = await held_in_a_busier_batch(http, coordinator)
+    coordinator.host_keys["host-0"] = {theory: None}
+    loop = asyncio.get_running_loop()
+    waiters = {host: loop.create_future() for host in ["host-0", "host-1"]}
+    coordinator.claim_waiters = [
+        (["standard"], _claim_rank(["standard"], host), wake, False) for host, wake in waiters.items()
+    ]
+    coordinator.report_worker("host-0", "host-0-w", ["standard"])
+
+    assert await claim_on(http, "a") is None
+
+    assert waiters["host-1"].result() == ("standard", False, UUID(batch_id), theory)
+    assert not waiters["host-0"].done()
