@@ -1527,10 +1527,16 @@ class Coordinator:
 
     @staticmethod
     def _replace_entry(ranking: "_Ranking", entry: "RankEntry", by: "RankEntry") -> None:
-        """Put ``by`` in ``entry``'s place in ``ranking``, if a concurrent claim hasn't taken it out."""
-        with contextlib.suppress(ValueError):
-            ranking.heap[ranking.heap.index(entry)] = by
-            heapq.heapify(ranking.heap)
+        """Put ``by`` in ``entry``'s place in ``ranking``, if a concurrent claim hasn't taken it out or changed it.
+        The place is found whatever its priority, which a cap may have rewritten since (_cap_priorities), and ``by``
+        is capped as it is."""
+        if ranking.capped:
+            by = (by[0], 0, *by[2:])
+        for i, e in enumerate(ranking.heap):
+            if e[0] == entry[0] and e[2:] == entry[2:]:
+                ranking.heap[i] = by
+                heapq.heapify(ranking.heap)
+                return
 
     async def _claim_run(
         self, tiers: list[str], worker: str, slots: int, *, builds_first: bool = False

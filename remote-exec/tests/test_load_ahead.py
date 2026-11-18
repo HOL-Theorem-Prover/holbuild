@@ -2,17 +2,15 @@
 
 import asyncio
 import time
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncEngine
-
 from conftest import FakeCache
-from remote_exec import coordinator as coordinator_module
-from remote_exec.coordinator import CLAIM_RECHECK_SECONDS, Coordinator, _claim_rank
+from sqlalchemy.ext.asyncio import AsyncEngine
 from test_coordinator import (
     CLIENT,
     WORKER,
@@ -29,6 +27,9 @@ from test_coordinator import (
     states,
     submit,
 )
+
+from remote_exec import coordinator as coordinator_module
+from remote_exec.coordinator import CLAIM_RECHECK_SECONDS, Coordinator, _claim_rank, _Ranking
 
 
 async def claim_ahead(
@@ -98,7 +99,7 @@ async def test_builds_of_a_batch_that_loads_ahead_are_claimed_pipelined_unless_t
     assert claimed is not None and claimed["theory"] == "pkg:x" and claimed["pipeline"] is False
 
     coordinator.settings.pipeline = False
-    await submit(http, ["y"], speculative_loading="4")
+    await submit(http, ["y", "z"], [("z", "y")], speculative_loading="4")
     claimed = await claim(http)
     assert claimed is not None and claimed["theory"] == "pkg:y" and claimed["pipeline"] is False
 
@@ -206,6 +207,21 @@ async def test_a_claim_ahead_on_outlines_alone_counts_as_a_build_of_its_batch_in
         assert action is not None
         claimed.append(action["theory"].removeprefix("pkg:"))
     assert claimed == ["y1", "b", "y2", "l"]
+
+
+def test_a_ranking_entry_counted_for_a_claim_ahead_is_put_back_after_a_cap_rewrote_its_priority() -> None:
+    """A claim ahead on outlines counts in its batch's entry, and a cap reached meanwhile rewrites the priorities:
+    the entry put back when the claim takes nothing is found all the same, and stays capped."""
+    batch, at = uuid4(), datetime.now(UTC)
+    stopped = (0, -2, 1, True, at, at, batch, "standard", None)
+    counted = (0, -2, 2, True, at, at, batch, "standard", None)
+    other = (0, -1, 0, False, at, at, uuid4(), "standard", None)
+    ranking = _Ranking(0.0, 0, [stopped, other], set(), set(), 1, {}, {})
+    Coordinator._replace_entry(ranking, stopped, counted)
+    ranking.capped = True
+    ranking.heap[:] = [(e[0], 0, *e[2:]) for e in ranking.heap]
+    Coordinator._replace_entry(ranking, counted, stopped)
+    assert sorted(ranking.heap, key=lambda e: e[2]) == [(0, 0, *other[2:]), (0, 0, *stopped[2:])]
 
 
 async def test_a_ready_build_waits_only_for_a_claim_ahead_of_its_tier_or_an_earlier_one(
