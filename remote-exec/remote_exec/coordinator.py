@@ -15,7 +15,7 @@ import os
 import shlex
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Self
@@ -311,6 +311,9 @@ class PhaseReport:
     exec: PhaseSeconds = 0
     complete: PhaseSeconds = 0
     after_result: PhaseSeconds = 0
+
+
+PHASE_FIELDS = tuple(field.name for field in fields(PhaseReport))
 
 
 @dataclass(frozen=True)
@@ -786,6 +789,14 @@ class _AheadRead:
     exhausted: set[tuple[UUID, str]]
 
 
+@dataclass
+class _AheadTurn:
+    """The lock a batch's claims ahead take in turn, and how many hold or wait for it."""
+
+    lock: asyncio.Lock
+    claims: int = 0
+
+
 # The unfinished, unclaimed build actions of other running batches with the same key as a build whose lease just ended;
 # see CLAIM_ACTION. With their spec, since a forced or traced build has the same keys as a plain one: only a copy with
 # the same spec is done with the build, the others are just no longer held. Read by primary key, a probe per running
@@ -962,6 +973,7 @@ class Coordinator:
         self.ahead_read: _AheadRead | None = None
         self.ahead_lock = asyncio.Lock()
         self.ahead_changes = 0
+        self.ahead_turns: dict[UUID, _AheadTurn] = {}  # by batch; see _claim_ahead_in
         # When each cache entry was last found, the checks of the cache under way, and how many times
         # input-missing results forgot both; see _in_cache.
         self.found_in_cache: dict[str, float] = {}
@@ -998,8 +1010,10 @@ class Coordinator:
         self.ready_builds = 0
         self.ready_high = 0  # high-tier builds ready at that count
         self.locality = LocalityCounts()
-        # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came; also in memory.
-        self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque(maxlen=MAX_PHASE_REPORTS)
+        # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came, with their sums by
+        # phase, kept as reports come and go: /v1/queue asks for them more often than reports expire. Also in memory.
+        self.phase_reports: deque[tuple[datetime, PhaseReport]] = deque()
+        self.phase_sums = dict.fromkeys(PHASE_FIELDS, 0.0)
         # The wakes of the event streams following each batch; see watch.
         self.batch_watchers: dict[UUID, set[asyncio.Event]] = {}
 
@@ -1019,11 +1033,12 @@ class Coordinator:
                     }
                 },
             ),
-            # Every connection stays open between requests, so bursts of them don't each open a new TLS connection.
+            # Every connection stays open between requests, so bursts of them don't each open a new TLS connection;
+            # for a minute, where httpx closes them after 5 s (the cache nodes' Caddy keeps them 5 min).
             httpx.AsyncClient(
                 timeout=30,
                 follow_redirects=True,
-                limits=httpx.Limits(max_connections=100, max_keepalive_connections=100),
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=100, keepalive_expiry=60),
             ),
             settings,
         )
@@ -1502,47 +1517,74 @@ class Coordinator:
 
     async def _claim_ahead_in(self, read: _AheadRead, batch_id: UUID, tier: str, worker: str) -> Claim | None:
         """Lease the best action of ``tier`` of ``batch_id`` that ``read`` found may be claimed ahead, if any still
-        may, or mark the batch and tier exhausted in ``read``."""
-        keys = [key for b, key, t, _ in read.candidates if (b, t) == (batch_id, tier)][:AHEAD_CLAIM_KEYS]
-        async with self.engine.begin() as conn:
-            batch = (
-                await conn.execute(
-                    sa.text(
-                        "SELECT ahead_cap, max_heap_mb FROM batches WHERE id = :id AND state = 'running' FOR UPDATE"
-                    ),
-                    {"id": batch_id},
-                )
-            ).first()
-            row = None
-            depth = self.settings.ahead_depth_limit
-            waiting = 0
-            if batch is not None:
-                # Counted after the lock, in a snapshot that sees every claim ahead committed before it.
-                waiting = await conn.scalar(COUNT_WAITING_AHEAD, {"batch_id": batch_id})
-                if waiting < batch.ahead_cap:
-                    row = await self._lock_unleased(
-                        conn, CLAIM_AHEAD_ACTION, {"batch_id": batch_id, "keys": keys, "tier": tier, "depth": depth}
-                    )
-            if row is None:
+        may, or mark the batch and tier exhausted in ``read``.
+
+        This process's claims ahead of one batch take their turns in memory before the batch's row lock, which each
+        would otherwise wait for holding a pooled connection: one big batch's claims filled the pool. A claim whose
+        turn comes finds in ``read`` what the claims before it took."""
+        async with self._ahead_turn(batch_id):
+            if (batch_id, tier) in read.exhausted:
+                return None
+            keys = [key for b, key, t, _ in read.candidates if (b, t) == (batch_id, tier)][:AHEAD_CLAIM_KEYS]
+            if not keys:
                 read.exhausted.add((batch_id, tier))
                 return None
-            parents = (
-                await conn.execute(AHEAD_PARENTS, {"batch_id": batch_id, "keys": [row.input_key], "depth": depth})
-            ).all()
-            ahead_parents = tuple(AheadParent(p.input_key, p.spec_sha256) for p in parents)
-            claimed = await self._lease(
-                conn,
-                _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, batch.max_heap_mb),
-                worker,
-                ahead_parents,
-            )
-        # Out of the shared read, so the next claim of this read orders the batches by what remains.
-        read.candidates = [c for c in read.candidates if (c[0], c[1]) != (batch_id, row.input_key)]
+            async with self.engine.begin() as conn:
+                batch = (
+                    await conn.execute(
+                        sa.text(
+                            "SELECT ahead_cap, max_heap_mb FROM batches WHERE id = :id AND state = 'running' FOR UPDATE"
+                        ),
+                        {"id": batch_id},
+                    )
+                ).first()
+                row = None
+                depth = self.settings.ahead_depth_limit
+                waiting = 0
+                if batch is not None:
+                    # Counted after the lock, in a snapshot that sees every claim ahead committed before it.
+                    waiting = await conn.scalar(COUNT_WAITING_AHEAD, {"batch_id": batch_id})
+                    if waiting < batch.ahead_cap:
+                        row = await self._lock_unleased(
+                            conn, CLAIM_AHEAD_ACTION, {"batch_id": batch_id, "keys": keys, "tier": tier, "depth": depth}
+                        )
+                if row is None:
+                    read.exhausted.add((batch_id, tier))
+                    return None
+                parents = (
+                    await conn.execute(AHEAD_PARENTS, {"batch_id": batch_id, "keys": [row.input_key], "depth": depth})
+                ).all()
+                ahead_parents = tuple(AheadParent(p.input_key, p.spec_sha256) for p in parents)
+                claimed = await self._lease(
+                    conn,
+                    _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, batch.max_heap_mb),
+                    worker,
+                    ahead_parents,
+                )
+            # Out of the shared read, so the next claim of this read orders the batches by what remains.
+            read.candidates = [c for c in read.candidates if (c[0], c[1]) != (batch_id, row.input_key)]
+            if waiting + 1 >= batch.ahead_cap:  # this claim filled the cap: the claims waiting their turn skip it
+                read.exhausted.update((batch_id, t) for t in ("standard", "high"))
         self._batch_changed(batch_id)
         # Below the last generation, its own waiting children may now be claimed ahead, while the cap has room.
         if (depth is None or max(p.distance for p in parents) < depth) and waiting + 1 < batch.ahead_cap:
             self._ahead_changed()
         return claimed
+
+    @contextlib.asynccontextmanager
+    async def _ahead_turn(self, batch_id: UUID) -> AsyncIterator[None]:
+        """Hold ``batch_id``'s claims ahead in this process to one at a time; see _claim_ahead_in."""
+        turn = self.ahead_turns.get(batch_id)
+        if turn is None:
+            turn = self.ahead_turns[batch_id] = _AheadTurn(asyncio.Lock())
+        turn.claims += 1
+        try:
+            async with turn.lock:
+                yield
+        finally:
+            turn.claims -= 1
+            if not turn.claims:
+                del self.ahead_turns[batch_id]
 
     async def _ahead_candidates(self) -> _AheadRead:
         """The last read of AHEAD_CANDIDATES if it began after this call, or if it is younger than
@@ -2196,15 +2238,24 @@ class Coordinator:
 
     def report_phases(self, report: PhaseReport) -> None:
         """Take a worker's report of where its time went."""
+        if len(self.phase_reports) >= MAX_PHASE_REPORTS:
+            self._drop_oldest_phases()
         self.phase_reports.append((self.clock(), report))
+        for name in PHASE_FIELDS:
+            self.phase_sums[name] += getattr(report, name)
+
+    def _drop_oldest_phases(self) -> None:
+        _, report = self.phase_reports.popleft()
+        if not self.phase_reports:  # sums of none, without the rounding error the subtractions left
+            self.phase_sums = dict.fromkeys(PHASE_FIELDS, 0.0)
+            return
+        for name in PHASE_FIELDS:
+            self.phase_sums[name] -= getattr(report, name)
 
     def _phase_totals(self, now: datetime) -> PhaseTotals:
         while self.phase_reports and (now - self.phase_reports[0][0]).total_seconds() >= PHASE_WINDOW_SECONDS:
-            self.phase_reports.popleft()
-        sums = {
-            field.name: round(sum(getattr(report, field.name) for _, report in self.phase_reports), 1)
-            for field in fields(PhaseReport)
-        }
+            self._drop_oldest_phases()
+        sums = {name: round(total, 1) for name, total in self.phase_sums.items()}
         return PhaseTotals(PHASE_WINDOW_SECONDS, len(self.phase_reports), PhaseReport(**sums))
 
     async def heartbeat(self, token: UUID, arrived: datetime | None = None) -> bool:

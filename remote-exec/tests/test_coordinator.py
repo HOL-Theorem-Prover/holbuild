@@ -3,7 +3,7 @@ import contextlib
 import hashlib
 import json
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from collections.abc import Callable
@@ -12,12 +12,13 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from pydantic import TypeAdapter
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from starlette.requests import Request
 
 from remote_exec import coordinator as coordinator_module
-from remote_exec.app import create_app
+from remote_exec.app import CountResponses, create_app, summary_line
 from remote_exec.coordinator import Claim, Coordinator, HostReport, _claim_rank
 from remote_exec.formats import parse_result
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, Settled
@@ -2542,6 +2543,17 @@ async def test_batch_status_shows_each_actions_phase_timings(http: httpx.AsyncCl
     assert timings == {"a": {"hydrate": 812, "hol": 1500, "wall": 10}, "b": None}
 
 
+async def test_batch_status_reads_as_the_batch_s_fields(http: httpx.AsyncClient, coordinator: Coordinator) -> None:
+    batch_id = await submit(http, ["a", "b"])
+    token = await claim_named(http, "a", worker="w1")
+    assert (await complete(http, token, result("a", "built", phase_ms="hol:1500"))).status_code == 200
+
+    status = await coordinator.get(UUID(batch_id))
+    assert status is not None
+    # As the endpoint encoded asdict(batch) before: through its dict[str, object] response type.
+    assert await batch(http, batch_id) == TypeAdapter(dict[str, object]).dump_python(asdict(status), mode="json")
+
+
 async def test_a_malformed_phase_timing_is_refused(http: httpx.AsyncClient) -> None:
     await submit(http, ["a"])
     token = await claim_named(http, "a")
@@ -3847,3 +3859,33 @@ async def test_queue_reports_priority_subsets_without_double_counting(
     assert (queue["ready_priority"], queue["running_priority"]) == (1, 1)
     assert queue["priority_cap"] == coordinator.settings.priority_cap
     assert (queue["ready_standard"], queue["running_standard"], queue["waiting"]) == (3, 2, 1)
+
+
+async def test_responses_are_counted_by_route_and_status_for_the_summary_line(coordinator: Coordinator) -> None:
+    app = create_app(coordinator, coordinator.settings)
+    async with httpx.AsyncClient(transport=Settled(app, coordinator), base_url="http://coordinator.test") as http:
+        batch_id = await submit(http, ["a"])
+        await batch(http, batch_id)
+        await batch(http, str(uuid4()))
+        await http.get("/v1/nothing-here")
+    assert app.state.response_counts == {
+        ("POST", "/v1/batches", 201): 1,
+        ("GET", "/v1/batches/{batch_id}", 200): 1,
+        ("GET", "/v1/batches/{batch_id}", 404): 1,
+        ("GET", "-", 404): 1,
+    }
+    assert summary_line(app.state.response_counts, 60.2, 0.8) == (
+        "4 responses in 60 s, 0.8 CPU-s, 200.0 ms each: POST /v1/batches 201 1, GET /v1/batches/{batch_id} 200 1, "
+        "GET /v1/batches/{batch_id} 404 1, GET - 404 1"
+    )
+    assert summary_line(Counter(), 60.0, 0.1) == "0 responses in 60 s, 0.1 CPU-s: "
+
+
+async def test_a_request_that_raised_counts_as_a_500() -> None:
+    async def failing(scope: Any, receive: Any, send: Any) -> None:
+        raise RuntimeError("boom")
+
+    counts: Counter[tuple[str, str, int]] = Counter()
+    with pytest.raises(RuntimeError):
+        await CountResponses(failing, counts)({"type": "http", "method": "GET"}, None, None)  # type: ignore[arg-type]
+    assert counts == {("GET", "-", 500): 1}
