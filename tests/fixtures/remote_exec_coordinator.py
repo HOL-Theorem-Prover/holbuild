@@ -20,7 +20,9 @@ holding a count, makes that many event streams send the first action's running
 state and then break, without running RUN, `down`
 makes the event stream and POST /v1/batches/<id>/cancel answer 503, `ended`
 makes the event stream answer 503 and the cancel answer that the batch is
-already done, `skip` reports the batch done without running RUN, `hang` streams one
+already done, `watch`, holding a directory, makes each submitted batch <id> leave
+STATE/<id>.watched: the sha256 of that directory's files, concatenated in name
+order, or `absent` when it has none, `skip` reports the batch done without running RUN, `hang` streams one
 running event and then nothing until `hang` is removed, without running RUN, `hold`
 holds the stream after the first action's final event until `hold` is removed, and
 `cancelled` reports every action and the batch cancelled without running RUN, and
@@ -33,6 +35,7 @@ the cancel answers that it cancelled the batch.  Every request is logged to
 STATE/requests.log.
 """
 
+import hashlib
 import json
 import pathlib
 import subprocess
@@ -83,6 +86,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(status, {"detail": "restarting"})
         batch_id = f"b{len(list(state.glob('*.batch'))) + 1}"
         (state / f"{batch_id}.batch").write_text(body)
+        watch = state / "watch"
+        if watch.exists():
+            files = sorted(p for p in pathlib.Path(watch.read_text().strip()).glob("*") if p.is_file())
+            digest = hashlib.sha256(b"".join(p.read_bytes() for p in files)).hexdigest() if files else "absent"
+            (state / f"{batch_id}.watched").write_text(digest)
         heap = parse_qs(query).get("max_heap_mb")
         if heap:
             (state / f"{batch_id}.heap").write_text(heap[0])

@@ -1733,7 +1733,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                               (String.tokens (fn c => c = #"\n") batch)
             fun build_locally () =
               timed_phase "build.execute"
-                (fn () => HolbuildBuildExec.build build_options tc project plan toolchain_key jobs)
+                (fn () => HolbuildBuildExec.build_checked NONE [] build_options tc project plan keys toolchain_key jobs)
             (* Under --remote-only the build options only restore (restore_only);
                a detached build has nothing to fall back to. *)
             fun fall_back reason =
@@ -2146,7 +2146,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               case HolbuildRemoteExec.Ok (export defer skip forced)
                    handle HolbuildBuildExec.Error reason => HolbuildRemoteExec.Refused reason of
                   HolbuildRemoteExec.Ok batch => submit resubmit settled skip batch
-                | HolbuildRemoteExec.Refused reason => fall_back reason
+                | HolbuildRemoteExec.Refused reason => (record_pending (); fall_back reason)
           in
             case attach of
                 SOME batch_id => finish true [] NONE batch_id
@@ -2165,7 +2165,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
-          else plan_with_record false true
+          else plan_with_record true true
         val writes_sources = not (null (HolbuildBuildPlan.generated_source_owners plan))
         val reason = "theories that write SML sources build before the rest is planned"
       in

@@ -165,10 +165,21 @@ refute_grep() {
   fi
 }
 
+# The plan record's digest, as the stub's `watch` computes it.
+plan_digest() {
+  local files
+  files=$(find "$project/.holbuild/plan" -maxdepth 1 -type f 2>/dev/null | LC_ALL=C sort)
+  if [[ -z "$files" ]]; then echo absent; else cat $files | sha256sum | cut -c1-64; fi
+}
+
 # Submit and follow: the workers build both theories, and the client restores
-# them from the remote cache without building anything itself.
+# them from the remote cache without building anything itself.  The plan
+# record is written only after the batch is submitted (record mode on, as
+# outside the tests).
 write_theories one
-run follow 0 build --remote-exec "$coordinator" BTheory
+echo "$project/.holbuild/plan" > "$state/watch"
+HOLBUILD_PLAN_RECORD=on run follow 0 build --remote-exec "$coordinator" BTheory
+[[ $(< "$state/b1.watched") == absent ]] || { echo "plan record written before the POST" >&2; exit 1; }
 require_grep "holbuild: remote batch b1" "$tmpdir/follow.log"
 require_grep "holbuild: remote rx:BTheory: done" "$tmpdir/follow.log"
 [[ $(grep -c "remote rx:BTheory: running" "$tmpdir/follow.log") -eq 1 ]] || { cat "$tmpdir/follow.log" >&2; exit 1; }
@@ -199,8 +210,7 @@ assert record['local_outcomes']['built']==0
 assert record['local_outcomes']['restored_remote']==2
 PY
 
-# The plan record is written once the batch is submitted.
-ls "$project"/.holbuild/plan/* > /dev/null
+[[ $(plan_digest) != absent ]] || { echo "follow wrote no plan record" >&2; exit 1; }
 
 # With everything cached there is nothing to submit.
 run cached 0 build --remote-exec "$coordinator" BTheory
@@ -209,11 +219,13 @@ require_grep "remote execution: nothing to build remotely" "$tmpdir/cached.log"
 
 # Detach and reattach.
 write_theories two
-record_before=$(cat "$project"/.holbuild/plan/* | sha256sum)
-run detach 0 build --remote-exec "$coordinator" --detach BTheory
+record_before=$(plan_digest)
+HOLBUILD_PLAN_RECORD=on run detach 0 build --remote-exec "$coordinator" --detach BTheory
 require_grep "holbuild: remote batch b2" "$tmpdir/detach.log"
-# A detached build writes the record of its edited plan too.
-[[ $(cat "$project"/.holbuild/plan/* | sha256sum) != "$record_before" ]] || { echo "detach left the plan record unchanged" >&2; exit 1; }
+rm "$state/watch"
+# A detached build writes the record of its edited plan, after the POST.
+[[ $(< "$state/b2.watched") == "$record_before" ]] || { echo "plan record changed before the POST" >&2; exit 1; }
+[[ $(plan_digest) != "$record_before" ]] || { echo "detach left the plan record unchanged" >&2; exit 1; }
 refute_grep "Theory built\|restored from cache" "$tmpdir/detach.log"
 run attach 0 build --remote-exec "$coordinator" --attach b2 BTheory
 require_grep "BTheory restored from cache" "$tmpdir/attach.log"
