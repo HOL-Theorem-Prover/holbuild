@@ -87,4 +87,13 @@ val _ = if failing then () else
   in assert "un-restored manifests must not hide a missing blob" (BE.file_exists (dir ^ "/remote/cas/" ^ sha)) end;
 val _ = checkpoint "repaired";
 val _ = restore_latest ();
+(* A run that publishes no checkpoint and used none on the heap it restored
+   leaves that heap's absent index absent, rather than writing it empty. *)
+val _ = if failing then () else
+  let
+    val index = dir ^ "/remote/ac/" ^ RC.remote_action_key "index"
+    val _ = BE.remove_file index
+    val _ = BE.publish_shared_checkpoints (RC.remote url) ctx
+              {heap = SOME heap, files = [], stale = [], missing = []} false
+  in assert "a heap-only publish wrote the checkpoint index" (not (BE.file_exists index)) end;
 val _ = print "shared checkpoint publication passed\n";
