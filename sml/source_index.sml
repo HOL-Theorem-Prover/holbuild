@@ -392,6 +392,21 @@ val observed_dirs : (string * string * HolbuildStatCache.ident option * string l
 fun observe_dir package path stamp entries =
   observed_dirs := (package, path, stamp, entries) :: !observed_dirs
 
+(* The extra outputs the theory file at PATH declares, as entries "o<declaration>". *)
+fun declaration_entries path =
+  sort_unique_strings (map (fn output => "o" ^ output) (#extra_outputs (HolbuildDependencies.extract_textual path)))
+  handle IO.Io _ => raise Error ("cannot read " ^ path)
+
+(* What discovery saw at an observed PATH: a directory's classified entries,
+   or the extra outputs a theory file declares, which decide whether its
+   package's extra-output sources are the package's. *)
+fun observed_entries path = if is_dir path then classified_entries path else declaration_entries path
+
+fun observe_declarations package path =
+  let val stamp = HolbuildStatCache.stat_ident path
+  in observe_dir package path stamp (declaration_entries path) end
+  handle Error _ => ()
+
 fun observe_boundary_dir package path =
   let val stamp = HolbuildStatCache.stat_ident path
   in observe_dir package path stamp (classified_entries path) end
@@ -559,7 +574,12 @@ fun prevalidate_package package =
       end
     val existing = List.foldl scan_existing [] members
     val candidates = List.foldl declared_output existing generated_paths
-    val _ = validate_action_policies name policies candidates
+    (* A dependency's targets may also be under its extra-output root, which
+       discovery creates and scans, and checks its policies against. *)
+    val _ =
+      case HolbuildProject.package_extra_output_root package of
+          NONE => validate_action_policies name policies candidates
+        | SOME root => HolbuildGenerators.ensure_dir root
   in
     (* Without generators nothing can change the tree before discovery, so
        discovery reuses this scan instead of walking the tree again. *)
@@ -680,8 +700,9 @@ fun discover_package scans package =
                   else (observe_existing_ancestor path; acc)
                 end
               (* A producer may make the member's directory later, which a
-                 plan record must notice.  The root exists, so the walk ends
-                 at it, never above, where entries change with every build. *)
+                 plan record must notice.  The walk ends at the root, never
+                 above, where entries change with every build; planning
+                 creates the root (prevalidate_package). *)
               and observe_existing_ancestor path =
                 let val parent = Path.dir path
                 in
@@ -689,7 +710,6 @@ fun discover_package scans package =
                   else if parent = root orelse parent = path orelse parent = "" then ()
                   else observe_existing_ancestor parent
                 end
-              val _ = HolbuildGenerators.ensure_dir root
               val found =
                 deduplicate_sources (List.foldl scan [] (HolbuildProject.package_members package))
               val rels = map (fn (output : source) => normalize_path (#relative_path output)) found
@@ -709,13 +729,25 @@ fun discover_package scans package =
                          not (List.exists (fn (script : source) => #source_path script = #source_path output) scripts))
                       admitted
                 in
-                  if null new_scripts then admitted
+                  if null new_scripts then (admitted, scripts)
                   else
                     admit (List.filter (fn script => not (List.exists (fn output => rel_of output = rel_of script) new_scripts)) scripts
                            @ new_scripts)
                 end
+              fun under dir path = dir = "" orelse String.isPrefix (dir ^ "/") path
+              fun relevant (script : source) =
+                #kind script = TheoryScript andalso
+                List.exists (under (Path.dir (rel_of script))) rels
             in
-              if null found then [] else map (with_package_root source_root) (admit tree_sources)
+              if null found then []
+              else
+                let val (admitted, scripts) = admit tree_sources
+                in
+                  (* A plan record must notice a change to what they declare. *)
+                  List.app (fn (script : source) => observe_declarations name (#source_path script))
+                    (List.filter relevant scripts);
+                  map (with_package_root source_root) admitted
+                end
             end
     fun shadowed (source : source) =
       List.exists (fn (output : source) => #relative_path output = #relative_path source) overlay

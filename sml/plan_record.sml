@@ -853,8 +853,9 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
              if not racy andalso same_stamp (st, recorded) then (path, entries) :: held
              else
                (changed := true;
-                if (SI.classified_entries path handle SI.Error _ => fall ("cannot list " ^ path)) = entries then held
-                else fall ("sources added, removed or renamed in " ^ path)))
+                if (SI.observed_entries path handle SI.Error _ => fall ("cannot list " ^ path)) = entries then held
+                else if SI.is_dir path then fall ("sources added, removed or renamed in " ^ path)
+                else fall ("extra outputs declared in " ^ path ^ " changed")))
     val held_dirs = List.foldl check_dir [] (#dirs record)
     (* Files: the recorded hash while the stat holds, else a fresh one. *)
     val rehashed = ref 0

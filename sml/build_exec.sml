@@ -681,7 +681,9 @@ fun claim_extra_outputs project node outputs =
    remove: the tree there may since track a file at that path. *)
 fun legacy_dependency_output project (ExtraOutputOwner {package, ...}) output =
   package <> HolbuildProject.package_name (HolbuildProject.project_package project) andalso
-  not (String.isPrefix (Path.concat(project_artifact_root project, ".holbuild/packages") ^ "/") output)
+  not (String.isPrefix
+         (Path.concat(Path.concat(project_artifact_root project, ".holbuild/packages"), package ^ "/extra-outputs") ^ "/")
+         output)
 
 fun release_extra_output project owner strict output =
   let val claim_path = extra_output_claim_path project output

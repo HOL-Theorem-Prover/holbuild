@@ -296,6 +296,28 @@ SML
 over_build
 require_grep "saw .*P.txt" "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/out/F.txt"
 
+# Nor does a plan record keep a generated source in the extra-output directory
+# once its theory, never built here, stops declaring it: the tracked copy
+# takes its place.
+echo 'structure GenML = struct val x = 2 end' > "$tmpdir/over/.holbuild/packages/dep/extra-outputs/src/GenML.sml"
+cat > "$tmpdir/over/src/WScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "W";
+val _ = if GUse.y > 0 then () else ();
+val _ = export_theory();
+SML
+over_build WTheory
+over_build WTheory
+require_grep "WTheory is up to date" "$tmpdir/over-step.log"
+sleep 1.1
+cat > "$override/GScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "G";
+val _ = export_theory();
+SML
+over_build WTheory
+require_grep "GUse built" "$tmpdir/over-step.log"
+
 # GC runs on a cache of its own, which links no shared toolchains, with a HOL
 # dependency that is never built.
 export HOLBUILD_CACHE=$tmpdir/gc-cache
