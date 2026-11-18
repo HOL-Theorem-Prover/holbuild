@@ -744,20 +744,26 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
             resolved_plan_id = BP.resolved_plan_id plan}}
   end
 
-(* Writes the record of PLAN and its KEYS into DIR, or says why not; PRIOR
-   is the record PLAN was restored from. *)
-fun write dir context prior plan keys =
+fun not_written (Unencodable text) = NotWritten ("a path or name holds a control character: " ^ String.toString text)
+  | not_written (IO.Io {name, cause, ...}) = NotWritten ("cannot write " ^ name ^ ": " ^ General.exnMessage cause)
+  | not_written (OS.SysErr (msg, _)) = NotWritten ("cannot write the record: " ^ msg)
+  | not_written Irregular = NotWritten "dependency edges out of their usual order"
+  | not_written (Unrecordable reason) = NotWritten reason
+  | not_written e = raise e
+
+(* The write of the record of PLAN and its KEYS into DIR, which says why
+   not if it can't; PRIOR is the record PLAN was restored from.  The record
+   is built now, so the stamps of the files planning hashed are taken now:
+   a stamp taken later could pair a replaced file with the old hash. *)
+fun writer dir context prior plan keys : unit -> write_outcome =
   let val record = build context prior plan keys
   in
-    write_record (OS.Path.concat (dir, #fingerprint record)) (encode record);
-    prune_records dir;
-    Written
+    fn () => (write_record (OS.Path.concat (dir, #fingerprint record)) (encode record);
+              prune_records dir;
+              Written)
+             handle e => not_written e
   end
-  handle Unencodable text => NotWritten ("a path or name holds a control character: " ^ String.toString text)
-       | IO.Io {name, cause, ...} => NotWritten ("cannot write " ^ name ^ ": " ^ General.exnMessage cause)
-       | OS.SysErr (msg, _) => NotWritten ("cannot write the record: " ^ msg)
-       | Irregular => NotWritten "dependency edges out of their usual order"
-       | Unrecordable reason => NotWritten reason
+  handle e => let val outcome = not_written e in fn () => outcome end
 
 (* ---- Reading ---- *)
 
