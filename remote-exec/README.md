@@ -527,7 +527,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   only such builds left, it waits until the first hold ends, claiming
   nothing ahead meanwhile. A claim from a host a build is held for takes
   it even if not woken for it, ahead of better-ranked waiting claims, but
-  takes nothing else ahead of them. When
+  takes nothing else ahead of them; a claim ahead of its batch that ranks
+  before it (see Pipelining) still goes first. When
   the hold ends, the best-ranked waiting claim is woken for the build, and
   no claim passes it over again. A wake
   for newly ready work goes to a waiting claim on a kept host holding the
@@ -639,8 +640,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   `descendant_count`, a ready build first on a tie), whether or not its
   parents have posted `outlined`: one on a longer chain than every ready build
   loads its ancestors while its parents finish their outlines, rather than
-  after. A ready build held for the claiming host (see Claims) still
-  goes first, and that claim then takes only the held build. Among candidates with the same `critical_depth` and
+  after. So it does before a ready build held for the claiming host (see
+  Claims), which waits out its hold. Among candidates with the same `critical_depth` and
   `descendant_count`, those whose unfinished parents have all posted
   `outlined` go first, since they start at once. Candidates of
   other batches come after the ready builds of their priority. The record is kept in

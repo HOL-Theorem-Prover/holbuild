@@ -117,44 +117,17 @@ async def test_a_woken_claim_doesn_t_take_the_build_it_was_woken_for_before_its_
     assert claimed is not None and claimed.theory == "pkg:a"
 
 
-async def test_a_build_held_for_the_claim_s_host_goes_before_its_batch_s_deeper_claim_ahead(
+async def test_a_batch_s_deeper_claim_ahead_goes_before_its_build_held_for_the_claim_s_host(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
 ) -> None:
-    """``b`` is held for host-1, which built it before: host-1's claim takes it, though the claim ahead of ``y``, on a
-    deeper chain of the batch, ranks before it for any other claim."""
+    """``b`` is held for host-1, which built it before, but the claim ahead of ``y``, on a deeper chain of the batch,
+    goes first: ``b`` waits out its hold."""
     await run_on(http, cache, "host-1", "b0", "b", D1)
     batch_id = await submit(http, ["x", "y", "z", "b"], [("y", "x"), ("z", "y")], speculative_loading="4")
     x = await claim_on(http, "host-2")
     assert x is not None and x["theory"] == "pkg:x"
     now = asyncio.get_running_loop().time()
     coordinator.holds[(UUID(batch_id), "standard")] = (now, now + 60, "pkg:b")
-
-    body = {"tier": "standard", "worker": "host-1-w", "host": {"id": "host-1", "rank": 0}, "ahead": True}
-    response = await http.post("/v1/work/claim", json=body, headers=WORKER)
-
-    assert response.status_code == 200 and response.json()["theory"] == "pkg:b"
-
-
-async def test_a_claim_held_build_that_another_claim_took_leaves_its_batch_to_the_deeper_claim_ahead(
-    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
-) -> None:
-    """The ranking still has ``b`` held for host-1, but another claim took it: host-1 doesn't take the batch's next
-    ready build ``c`` instead, before which the claim ahead of ``y``, on a deeper chain, goes."""
-    coordinator.settings.claim_ranking_seconds = 3600
-    await run_on(http, cache, "host-1", "b0", "b", D1)
-    deep = UUID(await submit(http, ["x", "y", "z", "b", "c"], [("y", "x"), ("z", "y")], speculative_loading="4"))
-
-    async def plain(theory: str) -> None:
-        response = await http.post("/v1/work/claim", json={"tier": "standard", "worker": f"w-{theory}"}, headers=WORKER)
-        assert response.status_code == 200 and response.json()["theory"] == theory
-
-    await plain("pkg:x")
-    ranking = await coordinator._current_ranking(("standard",))
-    ranking.theories[(deep, "standard")] = "pkg:b"
-    await plain("pkg:b")
-    ranking.theories[(deep, "standard")] = "pkg:b"  # as a ranking read before that claim, of another replica, has it
-    now = asyncio.get_running_loop().time()
-    coordinator.holds[(deep, "standard")] = (now, now + 60, "pkg:b")
 
     body = {"tier": "standard", "worker": "host-1-w", "host": {"id": "host-1", "rank": 0}, "ahead": True}
     response = await http.post("/v1/work/claim", json=body, headers=WORKER)
