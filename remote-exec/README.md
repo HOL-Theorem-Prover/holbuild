@@ -1016,7 +1016,9 @@ another version makes the workers fetch and build that release. The command runs
 `HOLBUILD_REMOTE_EXEC_CURL_CONFIG` and `HOLBUILD_CACHE` pointing at the fleet,
 `HOLBUILD_COOPERATE_DIR` at the memory budget it shares with the workers,
 every other `HOLBUILD_REMOTE_CACHE_*` and `HOLBUILD_REMOTE_EXEC_*` variable
-unset, and the checkout's `bin/` first on `PATH`. Don't pass `--remote-cache`
+unset, and the checkout's `bin/` first on `PATH`; it keeps the rest of the
+caller's environment but bash's `SHELLOPTS` and `BASHOPTS`, which the launcher
+drops for itself. Don't pass `--remote-cache`
 to it: a command-line cache wins over the environment. Theory cache keys don't
 include the holbuild version, so a development build's outputs must never
 reach a shared cache. A project whose outputs are already up to date builds

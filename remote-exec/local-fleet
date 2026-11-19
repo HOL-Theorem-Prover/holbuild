@@ -3,9 +3,13 @@
 # a fresh Postgres, that tree's coordinator, a local cache server and N workers
 # that run the tree's own holbuild, so an unreleased coordinator, worker or
 # exec-action can be tried before it lands. See README "Local test fleet".
+# Start again without an inherited SHELLOPTS or BASHOPTS: their options (xtrace, allexport, monitor, noglob,
+# nullglob, ...) would print or export the secrets below, make setsid fork, or change what the script does.
+if env | grep -qE '^(SHELLOPTS|BASHOPTS)='; then exec env -u SHELLOPTS -u BASHOPTS "$BASH" "$0" "$@"; fi
 set -euo pipefail
-# An inherited SHELLOPTS mustn't export the secrets below or make setsid fork.
 set +o monitor +o allexport
+# COMMAND gets back the caller's values of the names this script assigns.
+caller_exports=$(declare -px)
 
 usage() {
   cat <<'EOF'
@@ -75,16 +79,6 @@ fi
 # --mem=0 books the whole node: leave the budget to holbuild's own reading of the machine.
 if [[ $budget_mb == 0 ]]; then budget_mb=; fi
 
-# Nothing the command or the workers do may reach a shared cache or fleet:
-# a branch's theory outputs share their cache keys with released holbuild.
-while read -r name; do unset "$name"; done < <(compgen -e | grep -E '^HOLBUILD_REMOTE_(CACHE|EXEC)_' || true)
-unset HOLBUILD_CACHE HOLBUILD_COOPERATE_DIR
-# COMMAND keeps the rest of the caller's environment. Every endpoint is on loopback: keep an inherited
-# proxy out of the way.
-export no_proxy=${no_proxy:+$no_proxy,}127.0.0.1 NO_PROXY=${NO_PROXY:+$NO_PROXY,}127.0.0.1
-# holbuild checks a seeded toolchain's HOL checkout with git status, which mustn't refresh its index.
-export GIT_OPTIONAL_LOCKS=0
-
 if [[ -z $dir ]]; then
   mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/holbuild-local-fleet"
   dir=$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/holbuild-local-fleet/run.XXXXXX")
@@ -135,12 +129,19 @@ isolate() {
   # No local variables: one would hide an exported variable of the same name from compgen.
   export -n $(compgen -e | grep -vxE "PATH|HOME|TMPDIR|USER|LOGNAME|LANG|GIT_OPTIONAL_LOCKS$(printf '|%s' "$@")") > /dev/null
   export -nf $(declare -Fx | cut -d' ' -f3)
+  # Names that aren't shell identifiers can't be unexported: the command is run through env -u "${unenv[@]}".
+  mapfile -d '' -t unenv < <(env -0 | grep -zv '^[A-Za-z_][A-Za-z0-9_]*=' | cut -z -d= -f1 |
+    xargs -0 -r printf -- '-u\0%s\0')
 }
 
 command_pid= worker_pids=() service_pids=() pg_started=0 launching=0 pending=0
 terminate() {
-  local pid
-  for pid in "$@"; do kill -TERM "$pid" 2>/dev/null || true; done
+  local pid running
+  # Only those still running: an exited child's PID may since belong to another process.
+  running=" $(jobs -rp | tr '\n' ' ') "
+  for pid in "$@"; do
+    if [[ $running == *" $pid "* ]]; then kill -TERM "$pid" 2>/dev/null || true; fi
+  done
   for pid in "$@"; do wait "$pid" 2>/dev/null || true; done
 }
 # TERM to COMMAND's whole process group (a shell's children too), KILL after 10 s.
@@ -170,12 +171,12 @@ stop() {
   terminate "${service_pids[@]}"
   if ((pg_started)); then
     for table in batches actions leases; do
-      (export PGPASSWORD=$pgpassword && isolate PGPASSWORD && exec psql -X -h "$dir" -p "$pgport" -U postgres -d fleet \
+      (export PGPASSWORD=$pgpassword && isolate PGPASSWORD && exec env "${unenv[@]}" psql -X -h "$dir" -p "$pgport" -U postgres -d fleet \
         -qc "\\copy $table TO '$dir/tables/$table.csv' CSV HEADER") >> "$dir/logs/tables.log" 2>&1 ||
         { echo "local-fleet: copying the $table table failed; keeping $dir/pg (see $dir/logs/tables.log)" >&2
           keep_pg=1; ((status)) || status=1; }
     done
-    if ! (isolate && exec pg_ctl -s -D "$dir/pg" stop -m fast); then
+    if ! (isolate && exec env "${unenv[@]}" pg_ctl -s -D "$dir/pg" stop -m fast); then
       echo "local-fleet: Postgres didn't stop; keeping $dir/pg (stop it with pg_ctl -D $dir/pg stop)" >&2
       keep_pg=1
       ((status)) || status=1
@@ -206,21 +207,21 @@ export -n pgpassword database_url cache_user client_token worker_token
 pgpassword=$(token)
 (umask 077 && printf '%s\n' "$pgpassword" > "$dir/pg.password")
 pgport=$(free_port)
-(isolate && exec initdb -A scram-sha-256 -U postgres --pwfile "$dir/pg.password" -D "$dir/pg") > "$dir/logs/initdb.log"
+(isolate && exec env "${unenv[@]}" initdb -A scram-sha-256 -U postgres --pwfile "$dir/pg.password" -D "$dir/pg") > "$dir/logs/initdb.log"
 rm -f "$dir/pg.password"
 # Set first: an interrupt or a failed wait can leave a server running once pg_ctl has launched it.
 pg_started=1
-(isolate && exec pg_ctl -s -D "$dir/pg" -l "$dir/logs/postgres.log" \
+(isolate && exec env "${unenv[@]}" pg_ctl -s -D "$dir/pg" -l "$dir/logs/postgres.log" \
   -o "-p $pgport -k $dir -c listen_addresses=127.0.0.1 -c max_connections=$((workers * 4 + 100))" start)
-(export PGPASSWORD=$pgpassword && isolate PGPASSWORD && exec createdb -h "$dir" -p "$pgport" -U postgres fleet)
+(export PGPASSWORD=$pgpassword && isolate PGPASSWORD && exec env "${unenv[@]}" createdb -h "$dir" -p "$pgport" -U postgres fleet)
 database_url=postgresql+asyncpg://postgres:$pgpassword@127.0.0.1:$pgport/fleet
 
 # uv keeps the caller's HOME and UV_CACHE_DIR, where its cache and managed Pythons are, but no other UV_*
 # setting and no uv.toml: the services below run this .venv.
-(cd "$tree/remote-exec" && home=$HOME && isolate UV_CACHE_DIR && HOME=$home && exec uv sync --no-config --frozen --quiet)
+(cd "$tree/remote-exec" && home=$HOME && isolate UV_CACHE_DIR && HOME=$home && exec env "${unenv[@]}" uv sync --no-config --frozen --quiet)
 python=$tree/remote-exec/.venv/bin/python
 (cd "$tree/remote-exec" && export REMOTE_EXEC_DATABASE_URL=$database_url && isolate REMOTE_EXEC_DATABASE_URL &&
-  exec .venv/bin/alembic upgrade head) \
+  exec env "${unenv[@]}" .venv/bin/alembic upgrade head) \
   > "$dir/logs/migrate.log" 2>&1
 
 # The cache server takes only requests with this credential, since other accounts can reach its port too.
@@ -230,7 +231,7 @@ cache_user=local-fleet:$(token)
 # Services and workers run in sessions of their own, so a terminal's Ctrl-C reaches only this script,
 # which stops them in order; their secrets go in their environment, not on a command line others can read.
 launching=1
-(isolate && exec setsid "$python" "$tree/tests/fixtures/remote_cache_server.py" "$dir/remote" "$dir/cache.port" \
+(isolate && exec env "${unenv[@]}" setsid "$python" "$tree/tests/fixtures/remote_cache_server.py" "$dir/remote" "$dir/cache.port" \
   "$dir/logs/cache-requests.log" "$dir/cache-control") > "$dir/logs/cache.log" 2>&1 &
 service_pids+=($!)
 started
@@ -250,13 +251,13 @@ launching=1
     REMOTE_EXEC_CACHE_URL=http://$cache_user@${cache_url#http://} REMOTE_EXEC_WARM_WORKERS=$workers
   isolate REMOTE_EXEC_DATABASE_URL REMOTE_EXEC_CLIENT_TOKEN REMOTE_EXEC_WORKER_TOKEN REMOTE_EXEC_CACHE_URL \
     REMOTE_EXEC_WARM_WORKERS
-  exec setsid .venv/bin/uvicorn --factory remote_exec.app:app --host 127.0.0.1 --port "$port" --timeout-graceful-shutdown 2
+  exec env "${unenv[@]}" setsid .venv/bin/uvicorn --factory remote_exec.app:app --host 127.0.0.1 --port "$port" --timeout-graceful-shutdown 2
 ) > "$dir/logs/coordinator.log" 2>&1 &
 service_pids+=($!)
 started
 url=http://127.0.0.1:$port
-# -q: no curl config of the caller's.
-queue() { curl -q -sf --max-time 10 -K "$dir/client.curl" "$url/v1/queue"; }
+# -q: no curl config of the caller's; and no proxy, as for COMMAND below.
+queue() { curl -q -sf --noproxy '*' --max-time 10 -K "$dir/client.curl" "$url/v1/queue"; }
 for _ in $(seq 300); do queue > /dev/null && break; sleep 0.2; done
 queue > /dev/null || { echo "local-fleet: the coordinator didn't answer; see $dir/logs/coordinator.log" >&2; exit 1; }
 
@@ -270,7 +271,7 @@ for i in $(seq "$workers"); do
     # The caller stands in for the worker image here: its HOL4_* solver settings pass, as the image's would.
     isolate REMOTE_EXEC_WORKER_TOKEN HOLBUILD_CACHE HOLBUILD_REMOTE_CACHE_CURL_CONFIG \
       HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES HOLBUILD_ACTION_READ_DIRS PYTHONPATH $(compgen -e | grep '^HOL4_' || true)
-    exec setsid "$python" -m remote_exec.worker \
+    exec env "${unenv[@]}" setsid "$python" -m remote_exec.worker \
       --coordinator "$url" --remote-cache "$cache_url" --tier high --also-claim standard --load-ahead \
       --max-heap 12000 --drain-seconds 20 --share-heaps --cooperate-dir "$dir/cooperate" --cache-limit-gb 100 \
       --baked-releases "$dir/baked" --holbuild-releases-dir "$dir/releases" --name "local-$i"
@@ -294,9 +295,21 @@ echo "local-fleet: $workers workers of holbuild $version from $tree at $url, run
 # of its own (setsid needn't fork here: a background job isn't a group leader), so it can be stopped whole.
 # A background job's stdin would be /dev/null: hand COMMAND this script's own.
 launching=1
-env LOCAL_FLEET_URL="$url" HOLBUILD_REMOTE_CACHE_URL="$cache_url" \
-  HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$dir/cache.curl" HOLBUILD_REMOTE_EXEC_CURL_CONFIG="$dir/client.curl" \
-  HOLBUILD_CACHE="$dir/client-cache" HOLBUILD_COOPERATE_DIR="$dir/cooperate" PATH="$tree/bin:$PATH" setsid "$@" <&0 &
+(
+  # The fleet's settings, in the positional parameters, which the caller's values below can't touch.
+  set -- LOCAL_FLEET_URL="$url" HOLBUILD_REMOTE_CACHE_URL="$cache_url" \
+    HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$dir/cache.curl" HOLBUILD_REMOTE_EXEC_CURL_CONFIG="$dir/client.curl" \
+    HOLBUILD_CACHE="$dir/client-cache" HOLBUILD_COOPERATE_DIR="$dir/cooperate" PATH="$tree/bin:$PATH" setsid "$@"
+  # COMMAND keeps the caller's environment apart from these. Nothing it does may reach a shared cache or
+  # fleet: a branch's theory outputs share their cache keys with released holbuild.
+  eval "$caller_exports"
+  unset $(compgen -e | grep -E '^HOLBUILD_REMOTE_(CACHE|EXEC)_') HOLBUILD_CACHE HOLBUILD_COOPERATE_DIR
+  # Every endpoint is on loopback: keep an inherited proxy out of the way.
+  export no_proxy=${no_proxy:+$no_proxy,}127.0.0.1 NO_PROXY=${NO_PROXY:+$NO_PROXY,}127.0.0.1
+  # holbuild checks a seeded toolchain's HOL checkout with git status, which mustn't refresh its index.
+  export GIT_OPTIONAL_LOCKS=0
+  exec env "$@"
+) <&0 &
 command_pid=$!
 started
 wait "$command_pid"
