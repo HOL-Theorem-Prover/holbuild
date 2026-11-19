@@ -639,7 +639,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   `descendant_count`, a ready build first on a tie), whether or not its
   parents have posted `outlined`: one on a longer chain than every ready build
   loads its ancestors while its parents finish their outlines, rather than
-  after. Among candidates with the same `critical_depth` and
+  after. A ready build held for the claiming host (see Claims) still
+  goes first, and that claim then takes only the held build. Among candidates with the same `critical_depth` and
   `descendant_count`, those whose unfinished parents have all posted
   `outlined` go first, since they start at once. Candidates of
   other batches come after the ready builds of their priority. The record is kept in

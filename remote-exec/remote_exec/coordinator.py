@@ -830,8 +830,8 @@ RETURNING attempt_token
 @dataclass
 class _AheadRead:
     """AHEAD_CANDIDATES read from ``at``, as (batch, input key, tier, priority, (critical depth, descendants)), best
-    first, which the claims ahead share, less those they claimed, and the batches and tiers found since with nothing left to claim ahead; with
-    Coordinator.ahead_changes when it began."""
+    first, which the claims ahead share, less those they claimed, and the batches and tiers found since with nothing
+    left to claim ahead; with Coordinator.ahead_changes when it began."""
 
     at: float
     changes: int
@@ -1887,13 +1887,15 @@ class Coordinator:
             if tier in hint_only and not fits:
                 held.append(entry)
                 continue
-            # A deeper claim ahead of the batch goes first, but not before a build held for this host.
+            # A deeper claim ahead of the batch goes first, but not before a build held for this host, which alone is
+            # then taken.
+            held_head = (
+                outranked is not None and outranked.deeper(batch_id, tier, ranking.depths.get((batch_id, tier)))
+                and self._held_here(ranking, (batch_id, tier), host_id, kept)
+            )
             if outranked is not None and (
                 (not ranking.capped and outranked.above(tier, -priority))
-                or (
-                    outranked.deeper(batch_id, tier, ranking.depths.get((batch_id, tier)))
-                    and not self._held_here(ranking, (batch_id, tier), host_id, kept)
-                )
+                or (not held_head and outranked.deeper(batch_id, tier, ranking.depths.get((batch_id, tier))))
             ):
                 heapq.heappush(ranking.heap, entry)
                 put_back_held()
@@ -1909,7 +1911,7 @@ class Coordinator:
             ):
                 local = None
             # Only the held build is taken for its hold: another of the batch is another claim's to take.
-            only_held = tier in hint_only or held_here
+            only_held = tier in hint_only or held_here or (held_head and local is None)
             if local is not None:
                 ranking.heap[ranking.heap.index(local)] = entry
                 heapq.heapify(ranking.heap)
