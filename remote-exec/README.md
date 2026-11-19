@@ -870,6 +870,9 @@ In `timings`, durations are milliseconds. `started` and `finished`, and
 `holstart`/`holend`, `publishstart`/`publishend`, `logstart`/`logend` are
 absolute Unix milliseconds, not durations. `rebuilt` is 1 for a successful
 source build, 0 for a cache hit or failure. Older workers omit these fields.
+Releases before 0.14.72 can repeat a phase name; the coordinator folds the
+repeats as exec-action does: the earliest `*start`, the latest `*end`, and
+the sum of durations.
 Publication here covers the action's result and log; deferred checkpoint
 uploads happen after the result. Parallel action spans overlap, as do
 nested phase durations. Do not add their totals to obtain elapsed wall time.
