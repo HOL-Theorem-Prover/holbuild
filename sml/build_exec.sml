@@ -9082,7 +9082,8 @@ fun uncached_parents plan uncached node =
    While the remote cache's breaker is tripped, a skipped or failed PUT is
    tried again each second, for up to spec_upload_outage, so that a short
    outage costs a wait rather than the build; each try sends nothing until
-   the breaker admits it.  It stops waiting once stopped () holds. *)
+   the breaker admits it.  Returns whether the blob went up: false when
+   stopped () held before a try, which it then doesn't make. *)
 val spec_upload_outage = Time.fromSeconds 180
 
 fun publish_spec_blob remote stopped {hash, path} =
@@ -9090,15 +9091,16 @@ fun publish_spec_blob remote stopped {hash, path} =
     val give_up = Time.+ (Time.now (), spec_upload_outage)
     fun fail message = raise Error ("could not upload " ^ path ^ ": " ^ message)
     fun retry message =
-      if stopped () orelse Time.>= (Time.now (), give_up) then fail message
+      if Time.>= (Time.now (), give_up) then fail message
       else (OS.Process.sleep (Time.fromSeconds 1); publish ())
     and publish () =
-      case HolbuildRemoteCache.publish_hashed_blob remote {hash = hash, src = path} of
-          HolbuildCacheBackend.Published => ()
-        | HolbuildCacheBackend.AlreadyPresent => ()
-        | HolbuildCacheBackend.Conflict message =>
-            if HolbuildRemoteCache.tripped () then retry message else fail message
-        | HolbuildCacheBackend.Skipped => retry "skipped"
+      not (stopped ()) andalso
+      (case HolbuildRemoteCache.publish_hashed_blob remote {hash = hash, src = path} of
+           HolbuildCacheBackend.Published => true
+         | HolbuildCacheBackend.AlreadyPresent => true
+         | HolbuildCacheBackend.Conflict message =>
+             if HolbuildRemoteCache.tripped () then retry message else fail message
+         | HolbuildCacheBackend.Skipped => retry "skipped")
   in
     publish ()
   end
@@ -9327,7 +9329,8 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
       (let val hash = hash_file path
        in
          if known (path, hash) then ()
-         else (publish_spec_blob remote failed {hash = hash, path = path}; learn (path, hash))
+         else if publish_spec_blob remote failed {hash = hash, path = path} then learn (path, hash)
+         else ()
        end;
        true)
       handle e => (with_failure_lock (fn () => upload_failed := true); raise e)
