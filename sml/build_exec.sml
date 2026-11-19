@@ -12287,7 +12287,7 @@ fun shared_standalone_key heap_key (action : theory_action) =
 type shared_context =
   {store : string, checkpoint_root : string, heap_key : string, index_key : string, standalone_key : string,
    base_state : string, deps_key : string, deps_loaded : string, requested_timeout : real option,
-   candidates : shared_candidate list}
+   candidates : shared_candidate list, module_store : string}
 
 fun shared_context cache checkpoint_root tc root policy (action : theory_action) checkpoints : shared_context =
   let
@@ -12301,7 +12301,8 @@ fun shared_context cache checkpoint_root tc root policy (action : theory_action)
      deps_key = #deps_key action,
      deps_loaded = deps_loaded_path base (#deps_key action),
      requested_timeout = tactic_timeout policy,
-     candidates = shared_candidates policy base checkpoints}
+     candidates = shared_candidates policy base checkpoints,
+     module_store = module_store (#holdir tc)}
   end
 
 fun shared_heap_parent_ok ({deps_loaded, base_state, ...} : shared_context) =
@@ -12612,7 +12613,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
 (* After the run, successful or not: the heap if this run saved it, then,
    if the heap under them is the published one, the new checkpoints. *)
 fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
-                                              deps_key, deps_loaded, candidates, ...} : shared_context)
+                                              deps_key, deps_loaded, candidates, module_store, ...} : shared_context)
                                ({heap = restored_heap, files = restored, stale, missing} : shared_restore) =
   let
     fun member x xs = List.exists (fn y => y = x) xs
@@ -12662,12 +12663,26 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         uploaded := Redblackset.addList
           (!uploaded, List.mapPartial (fn (_, sha, succeeded) => if !succeeded then SOME sha else NONE) pending)
       end
+    (* The child wrote the heap's module table, so it may name any file the
+       worker can read: a heap naming one that isn't a module of this
+       toolchain's store isn't published. *)
+    fun store_module path =
+      Path.dir path = module_store andalso plain_file_name (Path.file path) andalso
+      (Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false)
+    fun modules_ok () =
+      case List.find (not o store_module) (saved_modules deps_loaded) of
+          NONE => true
+        | SOME path =>
+            (warn ("not publishing the shared deps-loaded heap: it loads " ^ path ^
+                   ", outside the theory module store");
+             false)
     (* A heap this run saved is published only where no other worker's is:
        checkpoints on a heap that lost are chained to bytes no other worker
        has, so they stay local. *)
     fun publish_heap sha =
       if present heap_key orelse
-         not (shared_heap_parent_ok ctx) then NONE
+         not (shared_heap_parent_ok ctx) orelse
+         not (modules_ok ()) then NONE
       else
         let
           val claim_key = shared_heap_claim_key heap_key

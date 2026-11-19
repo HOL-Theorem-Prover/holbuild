@@ -35,7 +35,7 @@ val candidates = rev (List.tabulate (count, fn i => candidate (i + 1)));
 val ctx : BE.shared_context =
   {store = store, checkpoint_root = tree, heap_key = "heap", index_key = "index", standalone_key = "standalone", base_state = base,
    deps_key = "deps", deps_loaded = deps, requested_timeout = NONE,
-   candidates = candidates @ [candidate 1]};
+   candidates = candidates @ [candidate 1], module_store = ""};
 val heap = HolbuildHash.file_sha256 deps;
 val bad = HolbuildHash.file_sha256 (path 12 ^ ".ok");
 val cache = RC.remote url;
