@@ -204,10 +204,17 @@ require_grep '^context-input-layout=package-v1$' "$remote_root/cas/$spec"
 # Successful runs made before declared-input staging must not be reused.
 old_run_key=$(sed '1,/^run-text$/d; /^context-input-layout=/d' "$remote_root/cas/$spec" | sha256sum | cut -d' ' -f1)
 [[ "$run_key" != "$old_run_key" ]]
+# The theories earlier theory actions parked lie outside the root a run
+# empties for its script, and stay with their records.
+mkdir -p "$tmpdir/worker-run/parked/obj"
+printf 'parked\n' > "$tmpdir/worker-run/parked/obj/BTheory.dat"
+printf 'holbuild-action-resident-v1\n' > "$tmpdir/worker-run/parked-records"
 worker run "$spec"
 expect run 0 status=built "input-key=$run_key"
 # Only a theory action's root keeps its dependencies for the next one.
 [[ ! -e "$tmpdir/worker-run/action" ]] || { echo "a run left its action root" >&2; exit 1; }
+[[ -e "$tmpdir/worker-run/parked/obj/BTheory.dat" && -e "$tmpdir/worker-run/parked-records" ]] || {
+  echo "a run removed the parked theories or their records" >&2; exit 1; }
 require_grep '^log=[0-9a-f]\{64\} [0-9]*$' "$tmpdir/run.result"
 log_hash=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/run.result")
 require_file "$remote_root/cas/$log_hash"

@@ -226,23 +226,24 @@ printf 'blob sig %s\n' "$shared" > "$cache_sweep/actions/newer/manifest"
 at 2001 "$cache_sweep/actions/older/manifest"
 at 2002 "$cache_sweep/checkpoints/OldScript.deps/key/deps_loaded.save"
 at 2003 "$cache_sweep/actions/newer/manifest"
-# Parked theories go too when no records name them (a worker short of disk
+# Parked theories go too when they have no records (a worker short of disk
 # drops the records first).
-mkdir -p "$cache_sweep/action-parked/.holbuild/obj"
+mkdir -p "$cache_sweep/parked/.holbuild/obj"
 HOLBUILD_CACHE=$cache_sweep "$HOLBUILD_BIN" exec-action --sweep-only --cache-limit-gb 1 --cache-reserve-gb 0 \
   > "$tmpdir/sweep-only.log" 2>&1 || { cat "$tmpdir/sweep-only.log" >&2; exit 1; }
 evicted "$cache_sweep/actions/older" "the least recently used entry over the cap"
 evicted "$cache_sweep/blobs/$own" "a blob only an evicted entry named"
 evicted "$cache_sweep/checkpoints/OldScript.deps" "an old checkpoint family"
 kept "$cache_sweep/actions/newer" "an entry once the cache fits"
-[[ ! -e "$cache_sweep/action-parked" ]] || { echo "--sweep-only kept parked theories no records name" >&2; exit 1; }
-# So do they when the records name none (a release that doesn't park wrote
-# them).
-mkdir -p "$cache_sweep/action-parked/.holbuild/obj"
-printf 'holbuild-action-resident-v1\n' > "$cache_sweep/action-resident"
+[[ ! -e "$cache_sweep/parked" ]] || { echo "--sweep-only kept parked theories without records" >&2; exit 1; }
+# With their records they stay, whatever the root's records say; where
+# 0.14.79 parked goes.
+mkdir -p "$cache_sweep/parked/.holbuild/obj" "$cache_sweep/action-parked/.holbuild/obj"
+printf 'holbuild-action-resident-v1\n' > "$cache_sweep/parked-records"
 HOLBUILD_CACHE=$cache_sweep "$HOLBUILD_BIN" exec-action --sweep-only --cache-limit-gb 1 --cache-reserve-gb 0 \
   > "$tmpdir/sweep-only.log" 2>&1 || { cat "$tmpdir/sweep-only.log" >&2; exit 1; }
-[[ ! -e "$cache_sweep/action-parked" ]] || { echo "--sweep-only kept parked theories the records don't name" >&2; exit 1; }
+[[ -e "$cache_sweep/parked/.holbuild/obj" ]] || { echo "--sweep-only removed parked theories with records" >&2; exit 1; }
+[[ ! -e "$cache_sweep/action-parked" ]] || { echo "--sweep-only kept 0.14.79's parked theories" >&2; exit 1; }
 if HOLBUILD_CACHE=$cache_sweep "$HOLBUILD_BIN" exec-action --sweep-only "$absent" --cache-limit-gb 1 \
      > "$tmpdir/sweep-only-spec.log" 2>&1; then
   echo "--sweep-only ran with a SPEC" >&2; exit 1

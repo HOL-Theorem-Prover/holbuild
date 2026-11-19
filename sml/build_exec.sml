@@ -10679,8 +10679,15 @@ structure Resident = HolbuildActionResident
 val theory_suffixes = [".sig", ".sml", ".dat", ".tr.gz", ".ui", ".uo"]
 
 (* Where a parked theory's files wait outside the action root ROOT: beside
-   it, at the same paths under ROOT-parked, where HOL finds no theory. *)
-fun parked_root root = root ^ "-parked"
+   it, at the same paths under parked, where HOL finds no theory.  Its
+   records are parked-records, and its manifests' stats parked-stats. *)
+fun parked_root root = Path.concat (Path.dir root, "parked")
+
+fun parked_records root = Path.concat (Path.dir root, "parked-records")
+
+(* Where 0.14.79 parked theories, recording them with the root's own; the
+   releases since drop them. *)
+fun legacy_parked_root root = root ^ "-parked"
 
 fun parked_path root path = parked_root root ^ String.extract (path, size root, NONE)
 
@@ -10807,14 +10814,23 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
        before the read, equal after it, and older than the scan by more than
        a second, so any later replacement shows in the stat. *)
     val manifest_stats_file = Path.concat (cache, "action-manifest-stats")
+    (* Those of the parked theories' manifests, which a release that doesn't
+       park drops when it rewrites the other file. *)
+    val parked_stats_file = Path.concat (cache, "parked-stats")
     val scan_ns = Time.toNanoseconds (Time.now ())
     val known = ref NONE
     (* Read when the first check starts; a damaged record only means the
        manifests are hashed again. *)
     fun load_known () =
       if Option.isSome (!known) then ()
-      else known := SOME (!(#entries (HolbuildStatCache.load {path = manifest_stats_file}))
-                          handle _ => HolbuildStatCache.empty_entries ())
+      else
+        let
+          fun entries path =
+            !(#entries (HolbuildStatCache.load {path = path})) handle _ => HolbuildStatCache.empty_entries ()
+        in
+          known := SOME (Binarymap.foldl (fn (path, entry, dict) => Binarymap.insert (dict, path, entry))
+                                         (entries manifest_stats_file) (entries parked_stats_file))
+        end
     val seen = HolbuildStatCache.new_instance true (SOME manifest_stats_file) (HolbuildStatCache.empty_entries ())
     fun see path entry =
       HolbuildStatCache.with_lock seen (fn () => #entries seen := Binarymap.insert (!(#entries seen), path, entry))
@@ -10924,14 +10940,22 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
     fun restore_deps_now () =
       let
         val checks = map (fn dep => (dep, ref false)) (#deps spec)
+        val parked = List.filter (fn {stem, ...} =>
+                                     case Resident.find resident (in_root root stem) of
+                                         SOME (Resident.Parked _) => true
+                                       | _ => false)
+                                 (#deps spec)
+        fun was_parked {stem, ...} = List.exists (fn dep => #stem dep = stem) parked
         val _ = hydrate_step "hydcheck" (fn () =>
                   (load_known ();
                    transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks))
         val stale = map #1 (List.filter (! o #2) checks)
+        val back = List.filter (fn (dep, stale) => not (!stale) andalso was_parked dep) checks
         val kept_deps = map #1 (List.filter (not o ! o #2) checks)
       in
         hydrate_count "hydstatn" (HolbuildStatCache.with_lock seen (fn () => !(#hits seen) before #hits seen := 0));
         hydrate_count "hydinstn" (length stale);
+        hydrate_count "hydbackn" (length back);
         hydrate_step "hydinst" (fn () =>
           (List.app (restorable (remove_old kept_deps)) stale;
            transfer_all (restorable install) stale))
@@ -11019,7 +11043,18 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                        | _ => ()
                    end)
                 (Resident.theory_keys resident);
-       HolbuildStatCache.flush seen)
+       HolbuildStatCache.flush seen;
+       let
+         val parked = map (HolbuildCache.action_manifest cache) (Resident.parked_keys resident)
+         val entries =
+           List.foldl (fn (path, dict) =>
+                         case Binarymap.peek (!(#entries seen), path) of
+                             SOME entry => Binarymap.insert (dict, path, entry)
+                           | NONE => dict)
+                      (HolbuildStatCache.empty_entries ()) parked
+       in
+         HolbuildStatCache.flush (HolbuildStatCache.new_instance true (SOME parked_stats_file) entries)
+       end)
       handle _ => ())
   end
 
@@ -11845,14 +11880,14 @@ fun with_action_root_lock cache f =
 fun sweep_worker_cache {limit_bytes, reserve_bytes, min_free_bytes} =
   let
     val cache = cache_root ()
-    fun remove_parked () = HolbuildRemoveTree.remove_untrusted_strict (parked_root (Path.concat (cache, "action")))
+    val root = Path.concat (cache, "action")
   in
     with_action_root_lock cache (fn () =>
       ((* Parked theories no record names (a worker short of disk drops the
           records) go. *)
-       case Resident.read (Path.concat (cache, "action-resident")) of
-           SOME records => if Resident.has_parked records then () else remove_parked ()
-         | NONE => remove_parked ();
+       if Option.isSome (Resident.read_entries (parked_records root)) then ()
+       else HolbuildRemoveTree.remove_untrusted_strict (parked_root root);
+       HolbuildRemoveTree.remove_untrusted_strict (legacy_parked_root root);
        enforce_worker_cache_cap
          {cache = cache, checkpoint_root = Path.concat(cache, "checkpoints"), limit_bytes = limit_bytes,
           reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false}))
@@ -14035,7 +14070,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
       (if !theory_action then () else HolbuildRemoveTree.remove_untrusted root;
        empty_writable false)
     (* The hydrate's steps, after it in the report, also when it fails. *)
-    fun add_hydrate_steps () = phases := !hydrate_steps @ !phases
+    (* Whether this action's reset found no records of the root. *)
+    val root_reset = ref false
+    fun add_hydrate_steps () =
+      (hydrate_count "hydresetn" (if !root_reset then 1 else 0);
+       phases := !hydrate_steps @ !phases)
     fun add_restore_steps () = phases := !restore_steps @ !phases
     fun setup_tool_cache (spec : action_spec) =
       case #tool_cache spec of
@@ -14085,24 +14124,29 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
       end
       handle HolbuildRemoteCache.Unavailable msg => (log_unavailable := SOME msg; log_failed msg)
            | e => log_failed (General.exnMessage e)
-    fun empty_all () =
+    val records_files = {file = resident_file, parked_file = parked_records root}
+    fun clear_root () =
       (remove_file resident_file;
-       resident := Resident.fresh resident_file;
-       HolbuildRemoveTree.remove_untrusted_strict root;
-       HolbuildRemoveTree.remove_untrusted_strict (parked_root root))
-    (* The writable directories, empty, and the root's records; with no
-       records for it, the root is emptied too.  Parked theories no record
-       names (a release that doesn't park wrote the records) go. *)
+       HolbuildRemoveTree.remove_untrusted_strict root)
+    (* The writable directories, empty, and the records; with no records of
+       the root, it is emptied too, and with none of the parked theories, so
+       are they.  A parked copy of a stem the root's records hold (a release
+       that doesn't park installed it there meanwhile) goes. *)
     fun reset () =
-      (case if file_exists resident_marker then Resident.read resident_file else NONE of
-           SOME records =>
-             (resident := records;
-              if Resident.has_parked records then ()
-              else HolbuildRemoveTree.remove_untrusted_strict (parked_root root))
-         | NONE => empty_all ();
-       empty_writable true;
-       List.app ensure_dir (root :: checkpoint_root :: writable_dirs);
-       write_text resident_marker "")
+      let
+        val {records, root = rooted, parked, shadowed} =
+          Resident.read records_files {root = file_exists resident_marker}
+      in
+        resident := records;
+        HolbuildRemoveTree.remove_untrusted_strict (legacy_parked_root root);
+        if parked then List.app (fn path => List.app (remove_file o parked_path root) (resident_theory_files path)) shadowed
+        else HolbuildRemoveTree.remove_untrusted_strict (parked_root root);
+        root_reset := not rooted;
+        if rooted then () else clear_root ();
+        empty_writable true;
+        List.app ensure_dir (root :: checkpoint_root :: writable_dirs);
+        write_text resident_marker ""
+      end
     fun run () =
       let
         val _ = reset ()
@@ -14125,8 +14169,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     and run_script spec_text =
       let
         (* A run's script may load any theory under the root by name, so
-           it starts from an empty one, and leaves no records. *)
-        val _ = (empty_all (); resident := Resident.empty (); ensure_dir root)
+           it starts from an empty one, and leaves no records of it.  The
+           parked theories, outside the root, stay. *)
+        val _ = (clear_root (); resident := Resident.empty (); ensure_dir root)
         val _ = check_cancelled ()
         val spec = parse_run_spec spec_text
         val _ = input_key := #run_key spec
