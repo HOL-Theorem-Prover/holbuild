@@ -121,19 +121,22 @@ for c in client-cache $(seq -f worker-cache-%g "$workers"); do
 done
 if [[ -n $budget_mb ]]; then echo $((budget_mb * 1024 * 1024)) > "$dir/cooperate/budget"; fi
 
-# The services, the workers and the tools that set them up each run in a subshell that calls this first: it
-# leaves exported only PATH, a private HOME and TMPDIR, the user, a fixed locale and the names given, so no
-# setting, hook or config file of the caller's (curl's, libpq's, uv's, a deployed fleet's) reaches them. Secrets
-# are passed this way too, never on a command line others can read. No proxy is passed: all they reach is loopback.
+# The services, the workers and the tools that set them up each run in a subshell that calls this first: what
+# it runs gets an environment of PATH, a private HOME and TMPDIR, the user, a fixed locale and the names given,
+# as from env -i, so no setting, function, hook or config file of the caller's (curl's, libpq's, uv's, a deployed
+# fleet's) reaches it. It takes the export off everything else rather than unsetting it, so the launcher's own
+# variables keep their values and read-only ones go too. Secrets are passed this way, never on a command line
+# others can read. No proxy is passed: all they reach is loopback.
 isolate() {
-  local name
+  local name _
   export HOME=$dir/home TMPDIR=$dir/tmp USER=$(id -un) LOGNAME=$(id -un) LANG=C.UTF-8 GIT_OPTIONAL_LOCKS=0
   while read -r name; do
-    case " PATH HOME TMPDIR USER LOGNAME LANG GIT_OPTIONAL_LOCKS $* " in *" $name "*) ;; *) unset "$name" ;; esac
+    case " PATH HOME TMPDIR USER LOGNAME LANG GIT_OPTIONAL_LOCKS $* " in *" $name "*) ;; *) export -n "$name" ;; esac
   done < <(compgen -e)
+  while read -r _ _ name; do export -nf "$name"; done < <(declare -Fx)
 }
 
-command_pid= worker_pids=() service_pids=() pg_started=0
+command_pid= worker_pids=() service_pids=() pg_started=0 launching=0 pending=0
 terminate() {
   local pid
   for pid in "$@"; do kill -TERM "$pid" 2>/dev/null || true; done
@@ -170,20 +173,34 @@ stop() {
         -qc "\\copy $table TO '$dir/tables/$table.csv' CSV HEADER") >> "$dir/logs/tables.log" 2>&1 ||
         echo "local-fleet: copying the $table table failed; see $dir/logs/tables.log" >&2
     done
-    (isolate && exec pg_ctl -s -D "$dir/pg" stop -m fast) || true
+    if ! (isolate && exec pg_ctl -s -D "$dir/pg" stop -m fast); then
+      echo "local-fleet: Postgres didn't stop; keeping $dir/pg (stop it with pg_ctl -D $dir/pg stop)" >&2
+      keep_pg=1
+      ((status)) || status=1
+    fi
   fi
-  if ((!keep)); then rm -rf "$dir"/{pg,home,remote,worker-cache-*,client-cache,hol-toolchains,releases,tmp}; fi
+  if ((!keep)); then
+    rm -rf "$dir"/{home,remote,worker-cache-*,client-cache,hol-toolchains,releases,tmp}
+    ((keep_pg)) || rm -rf "$dir/pg"
+  fi
   echo "local-fleet: logs and tables in $dir" >&2
   exit "$status"
 }
+keep_pg=0
 trap stop EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+# An interrupt between starting a child in the background and recording its PID would leave that child out of
+# the teardown: while one starts, it waits until started runs.
+on_signal() { pending=$1; ((launching)) || exit "$1"; }
+started() { launching=0; ((!pending)) || exit "$pending"; }
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 free_port() { python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 token() { python3 -I -c 'import secrets; print(secrets.token_hex(16))'; }
 
 # Password authentication, since other accounts on the host can reach the TCP port.
+# The launcher's secrets mustn't reach COMMAND through a name the caller happened to export.
+export -n pgpassword database_url cache_user client_token worker_token
 pgpassword=$(token)
 (umask 077 && printf '%s\n' "$pgpassword" > "$dir/pg.password")
 pgport=$(free_port)
@@ -196,9 +213,9 @@ pg_started=1
 (export PGPASSWORD=$pgpassword && isolate PGPASSWORD && exec createdb -h "$dir" -p "$pgport" -U postgres fleet)
 database_url=postgresql+asyncpg://postgres:$pgpassword@127.0.0.1:$pgport/fleet
 
-# uv keeps the caller's HOME and UV_CACHE_DIR, where its cache and managed Pythons are, and no other UV_*
-# setting: the services below run this .venv.
-(cd "$tree/remote-exec" && home=$HOME && isolate UV_CACHE_DIR && HOME=$home && exec uv sync --frozen --quiet)
+# uv keeps the caller's HOME and UV_CACHE_DIR, where its cache and managed Pythons are, but no other UV_*
+# setting and no uv.toml: the services below run this .venv.
+(cd "$tree/remote-exec" && home=$HOME && isolate UV_CACHE_DIR && HOME=$home && exec uv sync --no-config --frozen --quiet)
 python=$tree/remote-exec/.venv/bin/python
 (cd "$tree/remote-exec" && export REMOTE_EXEC_DATABASE_URL=$database_url && isolate REMOTE_EXEC_DATABASE_URL &&
   exec .venv/bin/alembic upgrade head) \
@@ -210,9 +227,11 @@ cache_user=local-fleet:$(token)
   printf 'user = "%s"\n' "$cache_user" > "$dir/cache.curl")
 # Services and workers run in sessions of their own, so a terminal's Ctrl-C reaches only this script,
 # which stops them in order; their secrets go in their environment, not on a command line others can read.
+launching=1
 (isolate && exec setsid "$python" "$tree/tests/fixtures/remote_cache_server.py" "$dir/remote" "$dir/cache.port" \
   "$dir/logs/cache-requests.log" "$dir/cache-control") > "$dir/logs/cache.log" 2>&1 &
 service_pids+=($!)
+started
 for _ in $(seq 100); do [[ -s $dir/cache.port ]] && break; sleep 0.1; done
 [[ -s $dir/cache.port ]] || { echo "local-fleet: the cache server didn't start; see $dir/logs/cache.log" >&2; exit 1; }
 cache_url=http://127.0.0.1:$(< "$dir/cache.port")
@@ -222,6 +241,7 @@ worker_token=$(token)
 (umask 077 && printf 'header = "Authorization: Bearer %s"\n' "$client_token" > "$dir/client.curl")
 
 port=$(free_port)
+launching=1
 (
   cd "$tree/remote-exec"
   export REMOTE_EXEC_DATABASE_URL=$database_url REMOTE_EXEC_CLIENT_TOKEN=$client_token REMOTE_EXEC_WORKER_TOKEN=$worker_token \
@@ -231,6 +251,7 @@ port=$(free_port)
   exec setsid .venv/bin/uvicorn --factory remote_exec.app:app --host 127.0.0.1 --port "$port" --timeout-graceful-shutdown 2
 ) > "$dir/logs/coordinator.log" 2>&1 &
 service_pids+=($!)
+started
 url=http://127.0.0.1:$port
 # -q: no curl config of the caller's.
 queue() { curl -q -sf --max-time 10 -K "$dir/client.curl" "$url/v1/queue"; }
@@ -238,6 +259,7 @@ for _ in $(seq 300); do queue > /dev/null && break; sleep 0.2; done
 queue > /dev/null || { echo "local-fleet: the coordinator didn't answer; see $dir/logs/coordinator.log" >&2; exit 1; }
 
 for i in $(seq "$workers"); do
+  launching=1
   (
     cd "$dir"
     export REMOTE_EXEC_WORKER_TOKEN=$worker_token HOLBUILD_CACHE=$dir/worker-cache-$i \
@@ -252,6 +274,7 @@ for i in $(seq "$workers"); do
       --baked-releases "$dir/baked" --holbuild-releases-dir "$dir/releases" --name "local-$i"
   ) > "$dir/logs/worker-$i.log" 2>&1 &
   worker_pids+=($!)
+  started
 done
 # A worker that fails at startup would leave COMMAND's work unclaimed: wait for the workers to report their
 # host (all of them share it, and the coordinator counts hosts, not workers), then check they're all still up.
@@ -268,8 +291,10 @@ echo "local-fleet: $workers workers of holbuild $version from $tree at $url, run
 # In the background, so a TERM to this script runs the teardown at once, and in a process group
 # of its own (setsid needn't fork here: a background job isn't a group leader), so it can be stopped whole.
 # A background job's stdin would be /dev/null: hand COMMAND this script's own.
+launching=1
 env LOCAL_FLEET_URL="$url" HOLBUILD_REMOTE_CACHE_URL="$cache_url" \
   HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$dir/cache.curl" HOLBUILD_REMOTE_EXEC_CURL_CONFIG="$dir/client.curl" \
   HOLBUILD_CACHE="$dir/client-cache" PATH="$tree/bin:$PATH" setsid "$@" <&0 &
 command_pid=$!
+started
 wait "$command_pid"

@@ -220,6 +220,7 @@ exec {held}< "$remote_root/fixture-replace"
 curl -q -sf -X PUT --data-binary 'new' "$remote_url/fixture-replace"
 [[ $(cat <&"$held") == 'old object' ]] || { echo "the cache fixture's PUT rewrote an open object in place" >&2; exit 1; }
 exec {held}<&-
+[[ $(curl -q -sf "$remote_url/fixture-replace") == new ]] || { echo "the cache fixture didn't serve the replacing PUT's object" >&2; exit 1; }
 rm "$remote_root/fixture-replace"
 : > "$request_log"
 
