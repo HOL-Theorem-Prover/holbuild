@@ -25,7 +25,10 @@ fun find_substring needle haystack =
   let
     val n = size needle
     val h = size haystack
-    fun at i = i + n <= h andalso String.substring(haystack, i, n) = needle
+    val first = if n = 0 then #"\000" else String.sub(needle, 0)
+    (* The first character is checked before a substring is made, which
+       keeps a scan of a whole log cheap. *)
+    fun at i = String.sub(haystack, i) = first andalso String.substring(haystack, i, n) = needle
     fun loop i = if i + n > h then NONE else if at i then SOME i else loop (i + 1)
   in
     if n = 0 then NONE else loop 0
@@ -400,22 +403,6 @@ val failed_fragment_end_prefix = "holbuild failed fragment end: "
 val failed_fragment_span_prefix = "holbuild failed fragment span: "
 val plan_position_prefix = "holbuild plan position: "
 
-fun read_prefix path limit =
-  let
-    val input = TextIO.openIn path
-    fun close () = TextIO.closeIn input handle _ => ()
-    fun loop remaining acc =
-      if remaining <= 0 then String.concat (rev acc)
-      else
-        let val chunk = TextIO.inputN(input, Int.min(4096, remaining))
-        in
-          if size chunk = 0 then String.concat (rev acc)
-          else loop (remaining - size chunk) (chunk :: acc)
-        end
-  in
-    (loop limit [] before close ()) handle e => (close (); raise e)
-  end
-
 fun skip_line_break text offset =
   if offset < size text andalso String.sub(text, offset) = #"\n" then offset + 1
   else offset
@@ -451,10 +438,11 @@ fun plan_position_from_text text =
           if line = "" then NONE else SOME line
         end
 
+(* The whole log: whatever ran before the failure (metis chatter, say) can
+   push the goal state any distance from its start. *)
 fun read_goal_state path =
   let
-    val limit = HolbuildDiagnosticLimits.goal_state ()
-    val text = if limit = 0 then read_text path else read_prefix path (65536 + limit)
+    val text = read_text path
   in
     case top_goal_state_from_text text of
         NONE => NONE
@@ -539,7 +527,7 @@ fun summarize_goal_state_with_log_reference log_available path =
 
 fun plan_position_summary path =
   Option.map (fn position => "plan position: " ^ position ^ "\n")
-             (plan_position_from_text (read_prefix path 65536))
+             (plan_position_from_text (read_text path))
   handle _ => NONE
 
 fun child_failure_line line =

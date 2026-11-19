@@ -101,6 +101,40 @@ async def test_a_claim_doesn_t_swap_to_a_warm_batch_whose_deeper_claim_ahead_on_
     assert claimed is not None and claimed.theory == "pkg:a"
 
 
+async def test_a_woken_claim_doesn_t_take_the_build_it_was_woken_for_before_its_batch_s_deeper_claim_ahead(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """Woken for ``b``, which no host holds, a claim still takes the head ``a``: ``b``'s batch has a claim ahead
+    deeper than its ready build, which goes first."""
+    await submit_as(http, "a1", "a")
+    woken_for = await submit_as(http, "b1", "b")
+    outranked = SimpleNamespace(above=lambda *_: [], deepest={}, deeper=lambda batch, *_: batch == woken_for)
+
+    claimed, _ = await coordinator._claim(
+        ["standard"], "w", outranked, "host-5", (woken_for, "standard", "pkg:b"), frozenset(), frozenset()
+    )
+
+    assert claimed is not None and claimed.theory == "pkg:a"
+
+
+async def test_a_batch_s_deeper_claim_ahead_goes_before_its_build_held_for_the_claim_s_host(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator
+) -> None:
+    """``b`` is held for host-1, which built it before, but the claim ahead of ``y``, on a deeper chain of the batch,
+    goes first: ``b`` waits out its hold."""
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    batch_id = await submit(http, ["x", "y", "z", "b"], [("y", "x"), ("z", "y")], speculative_loading="4")
+    x = await claim_on(http, "host-2")
+    assert x is not None and x["theory"] == "pkg:x"
+    now = asyncio.get_running_loop().time()
+    coordinator.holds[(UUID(batch_id), "standard")] = (now, now + 60, "pkg:b")
+
+    body = {"tier": "standard", "worker": "host-1-w", "host": {"id": "host-1", "rank": 0}, "ahead": True}
+    response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+
+    assert response.status_code == 200 and response.json()["theory"] == "pkg:y"
+
+
 async def test_a_batch_is_passed_over_for_locality_at_most_the_window(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:

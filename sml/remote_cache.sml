@@ -231,11 +231,13 @@ fun head_status url =
   else
     cli_status stall_timeout_seconds ["-I", "--ignore-content-length", "-o", "/dev/null"] url
 
-fun put_status headers {url, src} =
+fun put_status_within timeout headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
-    HolbuildHttp.put {url = url, src = src, headers = headers, timeout = stall_timeout_seconds}
+    HolbuildHttp.put {url = url, src = src, headers = headers, timeout = timeout}
   else
-    cli_status stall_timeout_seconds (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
+    cli_status timeout (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
+
+fun put_status headers request = put_status_within stall_timeout_seconds headers request
 
 (* No HTTP response counts as a transport failure; any HTTP status resets
    the count. After tripping, only one request probes each cooldown. *)
@@ -558,16 +560,20 @@ fun curl_get {url, dst} = curl_get_urls {urls = [url], dst = dst}
 fun successful_put_code code =
   code = 200 orelse code = 201 orelse code = 204
 
-fun curl_put_urls headers {urls, src} =
+(* The result, and the node that answered last, if any. *)
+fun curl_put_urls_at headers {urls, src} =
   (case send_urls "PUT" urls src (fn url => put_status headers {url = url, src = src}) of
-        NONE => HolbuildCacheBackend.Skipped
+        NONE => (NONE, HolbuildCacheBackend.Skipped)
       | SOME (url, HolbuildHttp.Failed message) =>
-          HolbuildCacheBackend.Conflict ("PUT " ^ redact_userinfo url ^ " failed: " ^ message)
+          (SOME url, HolbuildCacheBackend.Conflict ("PUT " ^ redact_userinfo url ^ " failed: " ^ message))
       | SOME (url, HolbuildHttp.Response code) =>
-          if successful_put_code code then HolbuildCacheBackend.Published
-          else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ redact_userinfo url))
+          (SOME url,
+           if successful_put_code code then HolbuildCacheBackend.Published
+           else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ redact_userinfo url)))
   handle e as Unavailable _ => raise e
-       | e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
+       | e => (NONE, HolbuildCacheBackend.Conflict (General.exnMessage e))
+
+fun curl_put_urls headers request = #2 (curl_put_urls_at headers request)
 
 fun curl_put_zstd {urls, src, size} =
   let
@@ -777,17 +783,19 @@ fun repair_action_replicas cache {key, text, attempts, should_replace} =
            | OS.SysErr (detail, _) => (cleanup (); warn_restore_once detail)
     end
 
-fun publish_action_metadata cache key metadata =
+fun publish_action_metadata_at cache key metadata =
   let
     val tmp = temp_path "action-put"
     val urls = action_urls cache key
     fun cleanup () = remove_file tmp
     fun publish () =
-      ((write_text tmp metadata; curl_put_urls [] {urls = urls, src = tmp} before cleanup ())
+      ((write_text tmp metadata; curl_put_urls_at [] {urls = urls, src = tmp} before cleanup ())
        handle e => (cleanup (); raise e))
   in
     publish ()
   end
+
+fun publish_action_metadata cache key metadata = #2 (publish_action_metadata_at cache key metadata)
 
 (* Checked first, as the blobs an action lists go unpublished while the
    remote cache is disabled. *)
@@ -797,9 +805,57 @@ fun publish_action cache {key, text} =
   handle e as Unavailable _ => raise e
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
+(* A node answers a read of an entry it holds on its own disk without asking
+   the shared backing store, so a node holding the entry being replaced would
+   go on serving the old one.  Once a node took the new entry, every other node
+   is sent it too.  These writes are best effort: a node that fails one is only
+   traced and doesn't trip the breaker, so each is given only
+   replica_stall_seconds, and none is sent once refresh_replicas is cleared,
+   as by an interrupted action, which has a few seconds left. *)
+val replica_stall_seconds = 2
+val refresh_replicas = ref true
+fun refresh_action_replicas cache key metadata taken =
+  case List.filter (fn url => SOME url <> taken) (action_urls cache key) of
+      [] => ()
+    | urls =>
+        if tripped () orelse not (!refresh_replicas) then ()
+        else
+          let
+            val tmp = temp_path "action-replica-put"
+            fun put url = traced "PUT" url tmp (fn () => put_status_within replica_stall_seconds [] {url = url, src = tmp})
+            fun skipped detail url =
+              HolbuildStatus.cache_trace ("cache replica refresh skipped: " ^ redact_userinfo url ^ ": " ^ detail)
+            fun report (url, HolbuildHttp.Response code) =
+                  if successful_put_code code then () else skipped ("HTTP " ^ Int.toString code) url
+              | report (url, HolbuildHttp.Failed message) = skipped message url
+          in
+            (write_text tmp metadata;
+             ListPair.app report (urls, probe_all put urls);
+             remove_file tmp)
+            handle e => (remove_file tmp;
+                         HolbuildStatus.cache_trace ("cache replica refresh failed: " ^ General.exnMessage e))
+          end
+
 (* The HTTP write is unconditional.  Callers must authorize replacement from
    action-kind-specific semantics before using this operation. *)
 fun replace_action_unconditionally cache request = publish_action cache request
+
+(* For an entry that is replaced in place as it changes (a checkpoint index,
+   say), which a reader takes from whichever node it asks: replaced as above,
+   then sent to every node.  Not for entries whose replicas are ranked by
+   strength (theory actions), which repair_action_replicas handles. *)
+fun replace_action_everywhere cache {key, text} =
+  if disabled () then HolbuildCacheBackend.Skipped
+  else
+    let val metadata = action_metadata cache key text
+    in
+      case publish_action_metadata_at cache key metadata of
+          (taken, HolbuildCacheBackend.Published) =>
+            (refresh_action_replicas cache key metadata taken; HolbuildCacheBackend.Published)
+        | (_, result) => result
+    end
+    handle e as Unavailable _ => raise e
+         | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 fun put_action cache policy {key, text} =
   if disabled () then HolbuildCacheBackend.Skipped

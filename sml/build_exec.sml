@@ -11887,7 +11887,10 @@ fun merge_phases phases =
    wrote the log started, to its first runtime install (the least
    holloadend: a runtime loaded again later prints its line first), less
    the preload's save (holsave in a line without holloadend).  The log is the child's, so it is read in bounded pieces and a line
-   longer than a phases line could be is skipped. *)
+   longer than a phases line could be is skipped.  Reading stops at the
+   failure summary a worker appends to the log (its first line starts
+   "holbuild: exec-action failed:"): its excerpt of the child's output can
+   quote a phases line. *)
 val hol_log_phase_names =
   ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
    "holcompiledn", "holreplayedn", "holrewoundn"]
@@ -11908,33 +11911,39 @@ fun hol_log_phases log_file child_start =
       if String.isPrefix prefix line then
         SOME (List.mapPartial phase (String.tokens Char.isSpace (String.extract (line, size prefix, NONE))))
       else NONE
-    (* PENDING is the start of the current line, NONE once it is too long. *)
+    val summary = "holbuild: exec-action failed:"
+    (* A line read so far: its first MAX_LINE characters, and whether it is
+       longer. *)
+    fun extend (text, long) piece =
+      if size text + size piece <= max_line then (text ^ piece, long)
+      else (text ^ String.substring (piece, 0, max_line - size text), true)
+    fun add (text, long) found =
+      case (if long then NONE else parse text) of SOME p => p :: found | NONE => found
+    (* PENDING is the current line so far. *)
     fun read ins pending found =
       let val chunk = TextIO.inputN (ins, 65536)
       in
-        if chunk = "" then
-          rev (case Option.mapPartial parse pending of SOME p => p :: found | NONE => found)
+        if chunk = "" then rev (add pending found)
         else
           let
             val pieces = String.fields (fn c => c = #"\n") chunk
-            fun extend (SOME text) piece =
-                  if size text + size piece > max_line then NONE else SOME (text ^ piece)
-              | extend NONE _ = NONE
-            fun lines [last] pending found = (extend pending last, found)
+            fun lines [last] pending found = (SOME (extend pending last), found)
               | lines (piece :: rest) pending found =
-                  let val found = case Option.mapPartial parse (extend pending piece) of
-                                      SOME p => p :: found
-                                    | NONE => found
-                  in lines rest (SOME "") found end
-              | lines [] pending found = (pending, found)
-            val (pending, found) = lines pieces pending found
+                  let val line = extend pending piece
+                  in
+                    if String.isPrefix summary (#1 line) then (NONE, found)
+                    else lines rest ("", false) (add line found)
+                  end
+              | lines [] pending found = (SOME pending, found)
           in
-            read ins pending found
+            case lines pieces pending found of
+                (SOME pending, found) => read ins pending found
+              | (NONE, found) => rev found
           end
       end
     val lines =
       let val ins = TextIO.openIn log_file
-      in (read ins (SOME "") [] before TextIO.closeIn ins) handle e => (TextIO.closeIn ins; raise e) end
+      in (read ins ("", false) [] before TextIO.closeIn ins) handle e => (TextIO.closeIn ins; raise e) end
       handle IO.Io _ => []
     fun value name line = Option.map #2 (List.find (fn (n, _) => n = name) line)
     fun sum name lines = List.foldl (fn (line, total) => total + getOpt (value name line, 0)) 0 lines
@@ -12698,7 +12707,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         val keys = if length merged > shared_index_limit then List.take (merged, shared_index_limit) else merged
       in
         if old = SOME keys then ()
-        else ignore (HolbuildRemoteCache.replace_action_unconditionally remote
+        else ignore (HolbuildRemoteCache.replace_action_everywhere remote
                        {key = index_key, text = shared_index_text keys})
       end
       handle e => warn ("could not update the shared checkpoint index: " ^ General.exnMessage e)
@@ -12783,6 +12792,21 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 SOME (c, key, entries, blobs)
               end
       handle e => (warning c e; NONE)
+    (* The files' hashes, a few files at a time: a replay saves hundreds
+       of MB of checkpoints, and a failed build publishes them before its
+       result. *)
+    fun prehash paths =
+      let
+        val (_, unique) = List.foldl
+          (fn (path, (seen, kept)) =>
+            if Redblackset.member (seen, path) orelse Option.isSome (Redblackmap.peek (!hashes, path)) then (seen, kept)
+            else (Redblackset.add (seen, path), (path, ref NONE) :: kept))
+          (Redblackset.empty String.compare, []) paths
+        (* A file that can't be hashed is left to `hash`, which reports it. *)
+        val _ = transfer_all (fn (path, sha) => sha := SOME (HolbuildHash.file_sha256 path) handle _ => ()) unique
+      in
+        List.app (fn (path, ref (SOME sha)) => hashes := Redblackmap.insert (!hashes, path, sha) | _ => ()) unique
+      end
     fun publish_candidates heap =
       let
         val eligible = List.mapPartial eligible candidates
@@ -12793,13 +12817,19 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           (Redblackset.empty String.compare, []) eligible
         val probes = rev unique
         val _ = parallel_all remote_probe_width probe probes
+        val _ = prehash (List.concat (map (fn (c : shared_candidate, _, absent) =>
+                                              if not (!absent) then []
+                                              else #path c :: getOpt (ancestors false (#path c), []))
+                                          probes))
         val prepared = List.mapPartial (prepare false) probes
         val _ = upload_all (List.concat (map (fn (_, _, _, blobs) =>
                                   map (fn (path, sha, _) => (path, sha)) blobs) prepared))
         val complete = List.filter
           (fn (_, _, _, blobs) => List.all (fn (_, sha, _) => not (needs_upload sha)) blobs) prepared
         fun publish (c : shared_candidate, key, entries, _) =
-          (ignore (HolbuildRemoteCache.replace_action_unconditionally remote
+          (* A failed prefix's entry is replaced as the prefix grows. *)
+          (ignore ((if #kind c = "failed_prefix" then HolbuildRemoteCache.replace_action_everywhere
+                    else HolbuildRemoteCache.replace_action_unconditionally) remote
             {key = key, text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
                                  (("heap", heap, "") :: entries)}))
           handle e => warning c e
@@ -12844,7 +12874,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                         (* The store family is the chain's lowest file. *)
                         val family = #2 (hd blobs)
                       in
-                        ignore (HolbuildRemoteCache.replace_action_unconditionally remote
+                        ignore (HolbuildRemoteCache.replace_action_everywhere remote
                                   {key = standalone_key,
                                    text = shared_manifest shared_standalone_header (SOME (#kind c)) entries ^
                                           "key=" ^ #key c ^ "\n"});
@@ -13955,6 +13985,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     fun cancel _ =
       if !cancelled then () else
       (cancelled := true;
+       HolbuildRemoteCache.refresh_replicas := false;
        if !publishing_checkpoints then () else HolbuildToolchain.cleanup_active_children ())
     (* Keep the driver alive while the sandbox reaps HOL and validates the
        saved checkpoints. The worker bounds this cleanup with a hard stop. *)
@@ -14896,15 +14927,23 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                          TextIO.closeOut out
                        end
                        handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e))
+              fun share () =
+                let val t0 = Time.now ()
+                in
+                  !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
+                  deferred := (fn () => ());
+                  phases := ("share", Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
+                end
               (* An interrupted action has a few seconds to stop in: its
                  saved checkpoints, which a retry resumes from, go before
                  its log. *)
-              val _ =
-                if !cancelled then
-                  (!deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
-                   deferred := (fn () => ()))
-                else ()
+              val _ = if !cancelled then share () else ()
               val log = phase "log" upload_log
+              (* A failed action's go after its log, whose upload they could
+                 otherwise stop by tripping the breaker, but before its
+                 result: the next build, which often starts as soon as the
+                 client has the result, resumes from them. *)
+              val _ = if Option.isSome failure then share () else ()
               (* A final failure's log is its only diagnostic and nothing
                  retries the action to recover it. *)
               val failure =
