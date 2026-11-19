@@ -30,7 +30,9 @@ holds the stream after the first action's final event until `hold` is removed, a
 with the log its worker uploaded as it stopped, and the batch failed at the deadline.  `stopped`
 reports a failed action as a cancel that stopped it leaves it: cancelled with the log its
 worker uploaded, and the batch cancelled; holding `unlogged`, before that log arrived, and
-holding a failure kind, after an earlier attempt failed with it.  When RUN
+holding a failure kind, after an earlier attempt failed with it (`deadline-retried`: stopped
+by the batch deadline on a second attempt).  STATE/<id>.events, when it exists, is batch
+<id>'s recorded event stream: it is sent as it is, without running RUN.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", the batch fails for resubmission naming it,
 as the coordinator does.  Otherwise
@@ -113,6 +115,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(404, {"detail": "no such batch"})
         if (state / "down").exists() or (state / "ended").exists():
             return self.answer(503, {"detail": "restarting"})
+        recorded = state / f"{parts[3]}.events"
+        if recorded.exists():
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            self.wfile.write(recorded.read_bytes())
+            return
         if (state / "hang").exists():
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson")
@@ -197,6 +206,8 @@ class Handler(BaseHTTPRequestHandler):
                             how = (state / "stopped").read_text().strip()
                             event["state"], event["failure_detail"] = "cancelled", None
                             event["last_failure"] = how if how and how != "unlogged" else None
+                            if how == "deadline-retried":
+                                event["last_failure"], event["attempts"] = "deadline", 2
                             if how == "unlogged":
                                 event["log_sha256"] = None
                         elif (state / "deadline").exists():

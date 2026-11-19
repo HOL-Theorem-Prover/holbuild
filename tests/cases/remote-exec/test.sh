@@ -1358,7 +1358,7 @@ require_grep "remote execution: batch $batch cancelled" "$tmpdir/stopped-only.lo
 # Stopped after an earlier attempt failed: the log is printed, labelled as
 # perhaps that attempt's.  Stopped before its log arrived: a later attach
 # shows it.
-for how in memory unlogged deadline; do
+for how in memory unlogged deadline deadline-retried; do
   write_broken "stopped-$how"
   run "stopped-$how-detach" 0 build --remote-exec "$coordinator" --detach BTheory
   batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/stopped-$how-detach.log")
@@ -1373,6 +1373,9 @@ require_grep "child log tail ---" "$tmpdir/stopped-memory.log"
 # Stopped by the batch deadline before the cancel: its log is printed too.
 require_grep "remote rxp:BTheory: stopped at the batch deadline" "$tmpdir/stopped-deadline.log"
 require_grep "child log tail ---" "$tmpdir/stopped-deadline.log"
+# On a second attempt, the log may be the earlier one's.
+require_grep "remote rxp:BTheory: stopped at the batch deadline after an earlier attempt failed; the log below may be that attempt's" \
+  "$tmpdir/stopped-deadline-retried.log"
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/stopped-unlogged-detach.log")
 require_grep "remote rxp:BTheory: stopped with no worker log yet; if its worker uploads one, holbuild build --attach $batch shows it" \
   "$tmpdir/stopped-unlogged.log"
@@ -1412,6 +1415,45 @@ run stopped-narrow 1 build --remote-exec "$coordinator" --remote-only --attach "
 rm "$state/stopped"
 require_grep "child log: .*/.holbuild/logs/remote/[0-9a-f]*\\.log" "$tmpdir/stopped-narrow.log"
 require_grep "b_thm" "$tmpdir/stopped-narrow.log"
+# What an attach shows is its own batch's record: two batches of the same
+# action ended with different logs, and the theory's local log is older than
+# both.  Attaching to the first reads its events, prints and restores its log
+# alone, and neither runs a worker nor sends a request to cancel or submit.
+write_broken recorded
+run recorded-first 0 build --remote-exec "$coordinator" --detach BTheory
+first=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/recorded-first.log")
+run recorded-second 0 build --remote-exec "$coordinator" --detach BTheory
+second=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/recorded-second.log")
+b_key=$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $2 }' "$state/$first.batch")
+[[ $first != "$second" && $b_key == $(awk '$1 == "action" && $5 == "rxp:BTheory" { print $2 }' "$state/$second.batch") ]] ||
+  { echo "wanted two batches of one action, got $first and $second" >&2; exit 1; }
+recorded() { # BATCH MARKER: BATCH ended cancelled, BTheory stopped with a log saying MARKER
+  printf '%s\n' "$2" > "$tmpdir/$2.log"
+  local sha
+  sha=$(sha256sum < "$tmpdir/$2.log" | cut -d' ' -f1)
+  cp "$tmpdir/$2.log" "$remote_root/cas/$sha"
+  printf '%s\n' \
+    "{\"type\": \"action\", \"input_key\": \"$b_key\", \"theory\": \"rxp:BTheory\", \"state\": \"cancelled\", \"tier\": \"standard\", \"attempts\": 1, \"last_failure\": null, \"log_sha256\": \"$sha\"}" \
+    '{"type": "batch", "state": "cancelled", "failure": null}' > "$state/$1.events"
+  echo "$sha"
+}
+first_sha=$(recorded "$first" "the first batch's worker log")
+recorded "$second" "the second batch's worker log" > /dev/null
+echo "a stale local log" > "$project/.holbuild/logs/current/rxp/BTheory/build.log"
+rm -f "$state/result-$b_key"
+: > "$state/requests.log"
+run recorded-attach 1 build --remote-exec "$coordinator" --remote-only --attach "$first" BTheory
+rm "$state/$first.events" "$state/$second.events"
+require_grep "^GET /v1/batches/$first/events" "$state/requests.log"
+refute_grep "^POST" "$state/requests.log"
+refute_grep "/v1/batches/$second" "$state/requests.log"
+require_grep "remote rxp:BTheory: cancelled, log /cas/$first_sha" "$tmpdir/recorded-attach.log"
+require_grep "the first batch's worker log" "$tmpdir/recorded-attach.log"
+refute_grep "the second batch's worker log\|a stale local log" "$tmpdir/recorded-attach.log"
+require_grep "remote execution: batch $first cancelled" "$tmpdir/recorded-attach.log"
+[[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$first_sha" ]] ||
+  { echo "the first batch's log was not restored" >&2; exit 1; }
+[[ ! -e "$state/result-$b_key" ]] || { echo "the attach ran a worker" >&2; exit 1; }
 
 # A static error and a tactic timeout are reported from the worker's log too.
 write_failing_b() {

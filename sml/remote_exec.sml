@@ -254,6 +254,8 @@ fun follow url batch_id (on_change : string * string * string option * string op
     val _ = HolbuildOffline.require_online "follow a remote batch"
     val states : (string * (string * string option * string option)) list ref = ref []
     val names = ref ([] : (string * string) list)
+    (* Actions that ran more than once: an earlier attempt failed. *)
+    val retried : string list ref = ref []
     fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
     (* An action the deadline stopped failed with its batch. *)
     fun failures () =
@@ -270,7 +272,11 @@ fun follow url batch_id (on_change : string * string * string option * string op
         case (state, kind, log) of
             ("cancelled", NONE, SOME _) => SOME {input_key = key, theory = name key, kind = "cancelled", log_sha256 = log}
           | ("cancelled", SOME "deadline", SOME _) =>
-              SOME {input_key = key, theory = name key, kind = "stopped at the batch deadline", log_sha256 = log}
+              SOME {input_key = key, theory = name key,
+                    kind = if List.exists (fn k => k = key) (!retried)
+                           then "stopped at the batch deadline after an earlier attempt failed; the log below may be that attempt's"
+                           else "stopped at the batch deadline",
+                    log_sha256 = log}
           | ("cancelled", SOME earlier, SOME _) =>
               if String.isPrefix "skipped because of " earlier then NONE
               else SOME {input_key = key, theory = name key,
@@ -295,6 +301,8 @@ fun follow url batch_id (on_change : string * string * string option * string op
               val status = (state, failure, log)
               val _ = if state = "running" orelse Option.getOpt (json_int_field "attempts" line, 0) > 0
                       then ran := key :: List.filter (fn k => k <> key) (!ran) else ()
+              val _ = if Option.getOpt (json_int_field "attempts" line, 0) > 1
+                      then retried := key :: List.filter (fn k => k <> key) (!retried) else ()
             in
               names := (key, Option.getOpt (json_string_field "theory" line, key)) ::
                        List.filter (fn (k, _) => k <> key) (!names);
