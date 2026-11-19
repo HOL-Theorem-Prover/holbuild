@@ -866,6 +866,35 @@ async def test_a_hint_only_claim_whose_held_build_a_claim_ahead_goes_before_leav
     assert (head, "high") not in ranking.exhausted
 
 
+async def test_a_hint_only_claim_whose_better_held_build_a_claim_ahead_goes_before_takes_the_head_held_for_it(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``g``, the head, and ``h`` are both held for host-1, which holds more of ``h``; ``h``'s batch has a deeper claim
+    ahead, which goes first, so the claim takes ``g`` under its own hold."""
+    await learn_high(http, cache)
+    await submit(http, ["g"])  # built once with a peak above the standard tier, as learn_high builds h
+    claimed_g = await claim_on(http, "host-9")
+    assert claimed_g is not None and claimed_g["theory"] == "pkg:g"
+    cache.keys.add(ac_key("g"))
+    record = result("g", "built", peak_rss_mb="5000")
+    assert (await complete(http, claimed_g["attempt_token"], record)).status_code == 200
+    head = UUID(await submit(http, ["g"]))
+    held = UUID(await submit(http, ["h"]))
+    now = asyncio.get_running_loop().time()
+    coordinator.holds[(head, "high")] = (now, now + 60, "pkg:g")
+    coordinator.holds[(held, "high")] = (now, now + 60, "pkg:h")
+    coordinator.theory_deps["pkg:g"] = D1
+    coordinator.host_keys["host-1"] = {"pkg:h": None, D1: None}
+    coordinator.report_worker("host-1", "host-1-w", ["high"])
+    outranked = SimpleNamespace(above=lambda *_: [], deepest={}, deeper=lambda batch, *_: batch == held)
+
+    claimed, _ = await coordinator._claim(
+        ["high"], "w", outranked, "host-1", None, frozenset({"high"}), frozenset({"high"})
+    )
+
+    assert claimed is not None and (claimed.batch_id, claimed.theory) == (head, "pkg:g")
+
+
 @pytest.mark.parametrize("failing", ["_lock_unleased", "_lease"])
 async def test_a_hold_taken_by_a_claim_that_fails_to_lease_its_build_is_put_back(
     http: httpx.AsyncClient,

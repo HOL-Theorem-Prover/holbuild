@@ -1903,7 +1903,8 @@ class Coordinator:
                 and outranked.deeper(local[6], local[7], ranking.depths.get((local[6], local[7])))
             ):
                 local = None
-                if tier in hint_only:  # the claim takes only a held build of this tier, and the head isn't held
+                # The claim takes only a held build of this tier: the head, if it is held here too, else none.
+                if tier in hint_only and not self._held_here(ranking, (batch_id, tier), host_id, kept):
                     held.append(entry)
                     continue
             # Only the held build is taken for its hold: another of the batch is another claim's to take.
