@@ -101,6 +101,22 @@ async def test_a_claim_doesn_t_swap_to_a_warm_batch_whose_deeper_claim_ahead_on_
     assert claimed is not None and claimed.theory == "pkg:a"
 
 
+async def test_a_woken_claim_doesn_t_take_the_build_it_was_woken_for_before_its_batch_s_deeper_claim_ahead(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """Woken for ``b``, which no host holds, a claim still takes the head ``a``: ``b``'s batch has a claim ahead
+    deeper than its ready build, which goes first."""
+    await submit_as(http, "a1", "a")
+    woken_for = await submit_as(http, "b1", "b")
+    outranked = SimpleNamespace(above=lambda *_: [], deepest={}, deeper=lambda batch, *_: batch == woken_for)
+
+    claimed, _ = await coordinator._claim(
+        ["standard"], "w", outranked, "host-5", (woken_for, "standard", "pkg:b"), frozenset(), frozenset()
+    )
+
+    assert claimed is not None and claimed.theory == "pkg:a"
+
+
 async def test_a_batch_is_passed_over_for_locality_at_most_the_window(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:

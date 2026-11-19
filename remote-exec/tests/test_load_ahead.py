@@ -136,6 +136,24 @@ async def test_an_action_that_published_its_outline_frees_its_slot_of_the_cap_fo
     assert coordinator.outlined_tokens == {}
 
 
+async def test_a_claim_ahead_past_an_outline_makes_its_children_candidates_at_once(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.ahead_depth = 2
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "b", "c", "d"], [("b", "a"), ("c", "b"), ("d", "c")], speculative_loading="4")
+    await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+    assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204
+    c = await claim_ahead(http)
+    assert c is not None and c["theory"] == "pkg:c"
+    # "c" is a generation ahead of "b"'s outline, though two links from the running "a": "d", a generation further,
+    # may be claimed ahead, and claiming "c" outdated the shared read that didn't have it.
+    d = await claim_ahead(http)
+    assert d is not None and d["theory"] == "pkg:d"
+
+
 async def test_a_locked_claim_ahead_counts_a_parent_s_outline_only_while_it_is_reported(
     http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
 ) -> None:
