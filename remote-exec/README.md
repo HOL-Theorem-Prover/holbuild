@@ -964,8 +964,8 @@ the worker's report of its host, a host of `GET /v1/queue` without `age_s`,
 with `cpu_idle_pct` measured since the worker's previous CPU sample, or null
 when that is under a second old)
 
-- 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120, "max_heap_mb": null, "ahead_parents": [{"input_key": "<sha256>", "spec_sha256": "<sha256>"}, …], "pipeline": false}`:
-  `ahead_parents` lists the ancestors still building when the action was claimed ahead of them, each after its
+- 200 `{"attempt_token": "<uuid>", "batch_id": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120, "max_heap_mb": null, "ahead_parents": [{"input_key": "<sha256>", "spec_sha256": "<sha256>"}, …], "pipeline": false}`:
+  `batch_id` is the batch the action belongs to, which the worker names in its log; `ahead_parents` lists the ancestors still building when the action was claimed ahead of them, each after its
   own such ancestors, and is empty for any other claim; `pipeline` asks the worker to build the action
   pipelined (see "Pipelining")
 - 204 when nothing became ready for the tier within `wait_s`

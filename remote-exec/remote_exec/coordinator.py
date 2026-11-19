@@ -214,6 +214,7 @@ class AheadParent:
 @dataclass(frozen=True)
 class Claim:
     attempt_token: UUID
+    batch_id: UUID
     spec_sha256: str
     input_key: str
     theory: str
@@ -1641,7 +1642,7 @@ class Coordinator:
             },
         )
         return Claim(
-            token, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb,
+            token, row.batch_id, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb,
             ahead_parents, self.settings.pipeline and bool(pipelined),
         )
 

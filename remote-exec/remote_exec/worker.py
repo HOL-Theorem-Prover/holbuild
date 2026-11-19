@@ -1139,7 +1139,9 @@ def run_one(
     spec = claim["spec_sha256"]
     drain = coordinator.drain
     releases = replace(releases, drain=drain)
-    print(f"running {claim['theory']} ({claim['input_key']})", file=sys.stderr, flush=True)
+    # Coordinators before 0.14.80 don't name the batch.
+    batch = f" in batch {claim['batch_id']}" if "batch_id" in claim else ""
+    print(f"running {claim['theory']} ({claim['input_key']}){batch}", file=sys.stderr, flush=True)
     with Lease(coordinator, token, claim["lease_s"], protection, claimed=claimed).held(phases) as lease:
         completed = False
 

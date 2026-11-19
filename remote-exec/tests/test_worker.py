@@ -744,6 +744,25 @@ def test_worker_adds_the_specs_dependency_context_to_the_result_it_reports(
     assert server.completed == [RECORD if deps_key is None else f"{RECORD}deps-key={deps_key}\n"]
 
 
+@pytest.mark.parametrize(("extra", "line"), [
+    ({"batch_id": "b1"}, f"running pkg:A ({'6' * 64}) in batch b1"),
+    ({}, f"running pkg:A ({'6' * 64})"),  # a coordinator before 0.14.80 names no batch
+])
+def test_worker_logs_the_action_it_runs_with_its_batch(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], capsys: pytest.CaptureFixture[str],
+    extra: dict[str, str], line: str,
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+
+    run_one(
+        Coordinator(server.url, "w"), worker_args(tmp_path, server), releases(tmp_path, server),
+        Protection(None, None), {**claim(), **extra}, Phases(),
+    )
+
+    assert line in capsys.readouterr().err.splitlines()
+
+
 AHEAD_PARENTS = [{"input_key": "7" * 64, "spec_sha256": "8" * 64}, {"input_key": "9" * 64, "spec_sha256": "a" * 64}]
 
 
