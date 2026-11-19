@@ -122,8 +122,10 @@ fun fmt_ms t = Real.fmt (StringCvt.FIX (SOME 3)) (1000.0 * t)
    milliseconds per part, each excluding the parts timed inside it, and
    counts.  install resets them, since a failed-prefix heap carries the
    values of the process that saved it, and they are printed at exit as one
-   "holbuild hol-phases" line.  Names are phase names of a result record:
-   lowercase letters only. *)
+   "holbuild hol-phases" line.  A resumed script that goes on past the
+   resumed theorem loads the runtime again, and that copy prints its own
+   line; exec-action sums the lines.  Names are phase names of a result
+   record: lowercase letters only. *)
 val hol_phases_ref = ref ([] : (string * LargeInt.int) list)
 val hol_phase_nested_ms_ref = ref (0 : LargeInt.int)
 

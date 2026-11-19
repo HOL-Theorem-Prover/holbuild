@@ -36,16 +36,25 @@ name = "failed-prefix-compiled-leaves"
 members = ["src"]
 TOML
 
-# $1 is the first leaf, $2 the fourth.
+# $1 is the first leaf, $2 the fourth, $3 (failing by default) the last.
+# The later theorem gives a resumed script a suffix that loads the proof
+# runtime again.
 write_script() {
+  local last=${3:-'FAIL_TAC "moved leaves failure"'}
   cat > "$project/src/AScript.sml" <<SML
 Theory A
 
 Theorem moved_leaves:
-  T /\\ F
+  T /\\ T
 Proof
   $1 >> CONJ_TAC >- ACCEPT_TAC TRUTH >> $2 >>
-  (fn g => ALL_TAC g) >> FAIL_TAC "moved leaves failure"
+  (fn g => ALL_TAC g) >> $last
+QED
+
+Theorem later:
+  T
+Proof
+  ACCEPT_TAC TRUTH
 QED
 SML
 }
@@ -105,3 +114,22 @@ expect_failure "$tmpdir/zero.log"
 require_grep "from: failed-prefix checkpoint in moved_leaves" "$tmpdir/zero.log"
 expect_phase holrewoundn 5 "zero-step resume"
 expect_phase holcompiledn 1 "zero-step resume"
+
+# Fixing the last leaf resumes past the whole prefix and goes on into the
+# suffix, which loads the runtime again.  The resumed theorem's phases must
+# survive that: its runtime's line (the one with holrewoundn) is printed,
+# beside the suffix runtime's own.
+write_script "I ALL_TAC" "(ALL_TAC : tactic)" "ACCEPT_TAC TRUTH"
+if ! (cd "$project" && "$HOLBUILD_BIN" build ATheory) >"$tmpdir/fixed.log" 2>&1; then
+  cat "$tmpdir/fixed.log" >&2
+  echo "expected the fixed proof to build" >&2
+  exit 1
+fi
+require_grep "from: failed-prefix checkpoint in moved_leaves" "$tmpdir/fixed.log"
+fixed_log=$project/.holbuild/logs/current/failed-prefix-compiled-leaves/ATheory/build.log
+require_file "$fixed_log"
+if ! grep '^holbuild hol-phases.* holloadend=' "$fixed_log" | grep -q ' holrewoundn=0'; then
+  echo "fixed resume: expected the resumed theorem's phases line (holrewoundn=0), got:" >&2
+  grep '^holbuild hol-phases' "$fixed_log" >&2 || true
+  exit 1
+fi

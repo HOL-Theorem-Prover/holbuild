@@ -1895,6 +1895,10 @@ fun hol_run_file_arg stage file =
    it, and an OOM kill from another failure, by this. *)
 val last_child_status : OS.Process.status option ref = ref NONE
 
+(* When the latest HOL child of run_hol_files_to_log started (ms since the
+   epoch), for its holload; NONE for a child started otherwise. *)
+val last_child_start : LargeInt.int option ref = ref NONE
+
 (* HOL's `use` remembers a source parse error in the heap and, with
    failOnError set as `hol run` sets it, exits with failure after the next
    top-level declaration.  A checkpoint saved after such an error (holbuild
@@ -1958,6 +1962,7 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
     val _ = ensure_parent log
     val _ = create_current_log_link log current_log
     val _ = last_child_status := NONE
+    val _ = last_child_start := SOME (Time.toMilliseconds (Time.now ()))
     val tool_cache_env =
       case !tool_cache_dir of
           SOME dir => ["env", "HOLBUILD_TOOL_CACHE_DIR=" ^ dir]
@@ -11063,15 +11068,16 @@ fun merge_phases phases =
    proof runtime's at exit (proof_runtime.sml), and the preload's after it
    saves the deps heap.  Only the names the runtime prints are taken, with
    their values summed over the lines; a value that isn't a nonnegative
-   integer is dropped.  holload runs from HOLSTART, when the hol phase
-   began, to the first runtime install (holloadend), less the saves before
-   it.  The log is the child's, so it is read in bounded pieces and a line
+   integer is dropped.  holload runs from CHILD_START, when the child that
+   wrote the log started, to its first runtime install (the least
+   holloadend: a runtime loaded again later prints its line first), less
+   the preload's save (holsave in a line without holloadend).  The log is the child's, so it is read in bounded pieces and a line
    longer than a phases line could be is skipped. *)
 val hol_log_phase_names =
   ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
    "holcompiledn", "holreplayedn", "holrewoundn", "resbyten"]
 
-fun hol_log_phases log_file holstart =
+fun hol_log_phases log_file child_start =
   let
     val prefix = "holbuild hol-phases "
     val max_line = 4096
@@ -11117,15 +11123,12 @@ fun hol_log_phases log_file holstart =
       handle IO.Io _ => []
     fun value name line = Option.map #2 (List.find (fn (n, _) => n = name) line)
     fun sum name lines = List.foldl (fn (line, total) => total + getOpt (value name line, 0)) 0 lines
-    fun before_install [] = NONE
-      | before_install (line :: rest) =
-          case value "holloadend" line of
-              SOME loaded => SOME (loaded, [])
-            | NONE => Option.map (fn (loaded, earlier) => (loaded, line :: earlier)) (before_install rest)
+    val loads = List.mapPartial (value "holloadend") lines
+    val preload = List.filter (fn line => not (isSome (value "holloadend" line))) lines
     val load =
-      case (before_install lines, holstart) of
-          (SOME (loaded, earlier), SOME start) =>
-            let val ms = loaded - start - sum "holsave" earlier
+      case (loads, child_start) of
+          (first :: rest, SOME start) =>
+            let val ms = List.foldl LargeInt.min first rest - start - sum "holsave" preload
             in if ms >= 0 then [("holload", ms)] else [] end
         | _ => []
   in
@@ -11572,7 +11575,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* Places checkpoint C and the chain its manifest ENTRIES name under it:
        on HEAP, or with none on the base state, the chain's lowest file then
        naming its store family. *)
-    fun restore_chain heap (c : shared_candidate) entries =
+    fun restore_chain key heap (c : shared_candidate) entries =
       let
         val (leaf, leaf_rel) = single "leaf" entries
         val _ = if tree_path checkpoint_root leaf_rel = #path c then ()
@@ -11626,7 +11629,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 ("restored shared " ^ (if Option.isSome heap then "" else "standalone ") ^ #kind c ^
                  " checkpoint " ^ leaf_rel ^ "\n");
               HolbuildStatus.message_stdout
-                ("holbuild resume: selected shared " ^ #kind c ^ " checkpoint " ^ candidate_key c ^ "\n");
+                ("holbuild resume: selected shared " ^ #kind c ^ " checkpoint " ^ key ^ "\n");
               SOME {heap = heap, files = map (fn (sha, path) => (path, sha)) restored})
            else (warn ("shared checkpoint failed validation: " ^ leaf_rel); wipe (); NONE)))
       end
@@ -11654,7 +11657,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                    val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
                    val (heap, _) = single "heap" entries
                  in
-                   if heap <> published_heap then NONE else restore_chain (SOME heap) c entries
+                   if heap <> published_heap then NONE else restore_chain (candidate_key c) (SOME heap) c entries
                  end))
     (* The theory's standalone failed prefix: the failed-prefix candidate at
        the path its manifest names. *)
@@ -11674,7 +11677,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 case List.find (fn c => #kind c = "failed_prefix" andalso #path c = path andalso key = SOME (#key c))
                                candidates of
                     SOME c => (ignore (HolbuildRemoteCache.remember_action remote action);
-                               restore_chain NONE c entries)
+                               restore_chain standalone_key NONE c entries)
                   | NONE => NONE
               end))
     (* Fetch a window of manifests at once, then try them in order. Every
@@ -13635,6 +13638,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         val log_dir = current_log_dir root (#package spec) (#logical spec)
         val oom_before = cgroup_oom_kills ()
         val _ = last_child_status := NONE
+        val _ = last_child_start := NONE
         (* Built on a late parent's outline, the run is the load ahead's:
            whatever stops it, nothing of it is published, and the action
            builds again plain. *)
@@ -14259,10 +14263,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                   | _ => failure
               val status = if Option.isSome failure then "failed" else status
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
-              val holstart = Option.map #2 (List.find (fn (name, _) => name = "holstart") (!phases))
               (* The log is read only once the sandbox validated the root it is in. *)
               val hol_phases =
-                if !HolbuildActionSandbox.outputs_validated then hol_log_phases (build_log ()) holstart else []
+                if !HolbuildActionSandbox.outputs_validated then hol_log_phases (build_log ()) (!last_child_start)
+                else []
               val _ = phases := rev (hol_phases @ !resume_steps) @ !phases
               val phases = merge_phases (rev (!phases)) @
                 [("started", Time.toMilliseconds start),
