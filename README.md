@@ -2074,9 +2074,10 @@ The batch keeps the plan's theory order and includes entries with missing blobs.
 Its specs and sources are then uploaded the same way, `--prefetch-concurrency`
 at a time, reporting `uploading to remote cache: N/M files`; after the first
 upload that fails, the rest are skipped and the build falls back (below).
-Each file is uploaded whether or not the cache already holds it: a cache
-node can answer for a blob from its own disk after its backing store has
-dropped it, and an upload writes it there again.
+A file the remote ledger (below) lists is skipped; every other one is
+uploaded whether or not the cache already holds it, since a cache node can
+answer for a blob from its own disk after its backing store has dropped it,
+and an upload writes it there again.
 
 `build --remote-exec URL --priority N` assigns a batch scheduling priority
 between 0 and 2147483647 (default 0). Higher values are claimed before lower

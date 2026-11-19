@@ -504,6 +504,8 @@ fun routed_status_using usable method probe urls path request =
          (hd urls, HolbuildHttp.Failed "no cache response")
   end
 
+fun routed_status method urls path request = routed_status_using (fn _ => true) method request urls path request
+
 (* NONE when the remote cache is disabled, without a request.  With
    fail_closed, raises Unavailable instead, and for no answer, 429 or 5xx. *)
 fun send_result method url request =

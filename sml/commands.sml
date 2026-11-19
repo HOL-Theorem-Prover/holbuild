@@ -2107,11 +2107,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                           SOME item => length retried < max_resubmissions andalso
                                        not (List.exists (fn r => r = item) retried)
                         | NONE => false
+                    (* Every theory a resubmission was for is rebuilt again: a batch
+                       that fails may have cancelled an earlier one's repair. *)
                     val forced =
-                      case (resubmit, missing_theory) of
-                          (true, SOME key) =>
-                            HolbuildBuildExec.theory_keys_depending_on build_options tc project plan keys toolchain_key key
-                        | _ => []
+                      if not resubmit then []
+                      else
+                        HolbuildBuildExec.theory_keys_depending_on build_options tc project plan keys toolchain_key
+                          (List.mapPartial (fn item => if String.isPrefix "theory " item
+                                                       then SOME (String.extract (item, 7, NONE)) else NONE)
+                                           (Option.valOf missing :: retried))
                     val missing_blob = resubmit andalso missing = SOME "blob"
                     val final = null forced andalso not missing_blob
                     (* Last, after the required restores and failure logs. *)

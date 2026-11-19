@@ -8511,14 +8511,14 @@ fun forget_remote_ledger () =
           handle e => warn ("could not forget the remote ledger " ^ path ^ ": " ^ General.exnMessage e)
         end
 
-(* The input keys of the plan's theories whose input key is missing or that
-   depend on that theory. *)
+(* The input keys of the plan's theories whose input key is one of MISSING or
+   that depend on such a theory. *)
 fun theory_keys_depending_on (options : build_options) tc project plan keys toolchain_key missing =
   let
     val key_of = HolbuildBuildPlan.input_key_for keys
+    fun is_missing node = List.exists (fn key => key_of node = key) missing
     fun depends node =
-      key_of node = missing orelse
-      List.exists (fn dep => key_of dep = missing) (HolbuildBuildPlan.transitive_project_deps plan node)
+      is_missing node orelse List.exists is_missing (HolbuildBuildPlan.transitive_project_deps plan node)
   in
     map key_of (List.filter (fn node => is_theory_node node andalso depends node) (HolbuildBuildPlan.selected_nodes plan))
   end

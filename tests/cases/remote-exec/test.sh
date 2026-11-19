@@ -1663,6 +1663,47 @@ require_grep "still missing blob $p_source after 3 attempts; .*; resubmitting$" 
 require_grep "still missing theory .*; resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/twice.log"
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/twice.log"
 
+# Each resubmission rebuilds again every theory an earlier one was for, since
+# a failed batch may have cancelled that repair: here PTheory finds MTheory,
+# then QTheory, not to fit the remote's NTheory and OTheory.
+two=$tmpdir/two-first
+mkdir -p "$two/src"
+sed 's/^name = "rxnd"/name = "rxn2"/' "$tmpdir/nondet/holproject.toml" > "$two/holproject.toml"
+for theory in N O; do
+  sed "s/^Theory N$/Theory $theory/" "$tmpdir/nondet/src/NScript.sml" > "$two/src/${theory}Script.sml"
+done
+for theory in M:N Q:O "P:M Q"; do
+  cat > "$two/src/${theory%%:*}Script.sml" <<SML
+Theory ${theory%%:*}
+Ancestors ${theory##*:}
+
+Theorem ${theory%%:*}_thm:
+  T
+Proof
+  simp[]
+QED
+SML
+done
+for copy in two-again two-client; do
+  mkdir -p "$tmpdir/$copy"
+  cp -r "$two/src" "$two/holproject.toml" "$tmpdir/$copy/"
+done
+for name in two-first two-again two-client; do link_hol_toolchain_cache "$tmpdir/$name-cache"; done
+roots_ac=$(in_copy two-first --remote-cache "$remote_url" action-spec PTheory |
+  awk '$1 == "action" && ($5 == "rxn2:NTheory" || $5 == "rxn2:OTheory") { print $3 }')
+[[ $(wc -w <<< "$roots_ac") -eq 2 ]] || { echo "no actions for NTheory and OTheory" >&2; exit 1; }
+in_copy two-first --remote-cache "$remote_url" build MTheory QTheory > "$tmpdir/two-first.log" 2>&1 ||
+  { cat "$tmpdir/two-first.log" >&2; exit 1; }
+for ac in $roots_ac; do rm "$remote_root/ac/$ac"; done
+in_copy two-again --remote-cache "$remote_url" build NTheory OTheory > "$tmpdir/two-again.log" 2>&1 ||
+  { cat "$tmpdir/two-again.log" >&2; exit 1; }
+in_copy two-client --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only PTheory \
+  > "$tmpdir/two.log" 2>&1 || { cat "$tmpdir/two.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_grep "still missing theory .*; resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/two.log"
+require_grep "still missing theory .*; resubmitting with 3 theories rebuilt or rechecked" "$tmpdir/two.log"
+require_grep "remote execution: remote workers finished 3 of 3 theories" "$tmpdir/two.log"
+require_grep "PTheory restored from cache" "$tmpdir/two.log"
+
 # A warm client's forced target must still run on a warm worker, while its
 # ancestor stays cached. The log must be from that execution, not a local HOL.
 project=$tmpdir/force-project
