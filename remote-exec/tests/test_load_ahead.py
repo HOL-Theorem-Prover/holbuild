@@ -107,7 +107,6 @@ async def test_builds_of_a_batch_that_loads_ahead_are_claimed_pipelined_unless_t
 async def test_an_action_that_published_its_outline_frees_its_slot_of_the_cap_for_its_children(
     http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache
 ) -> None:
-    coordinator.settings.ahead_depth = 0
     await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "b")], speculative_loading="1")
     a = await claim_named(http, "a")
     b = await claim_ahead(http)
@@ -119,6 +118,7 @@ async def test_an_action_that_published_its_outline_frees_its_slot_of_the_cap_fo
     assert response.status_code == 204
     assert await claim_ahead(http) is None
 
+    # Nor does "b", once out, count as a generation: "c" is one generation ahead of it, and waits for both.
     response = await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)
     assert response.status_code == 204
     c = await claim_ahead(http)
@@ -134,6 +134,54 @@ async def test_an_action_that_published_its_outline_frees_its_slot_of_the_cap_fo
     # A report arriving after the result marks nothing.
     assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204
     assert coordinator.outlined_tokens == {}
+
+
+async def test_a_claim_ahead_past_an_outline_makes_its_children_candidates_at_once(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings.ahead_depth = 2
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "b", "c", "d"], [("b", "a"), ("c", "b"), ("d", "c")], speculative_loading="4")
+    await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+    assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204
+    c = await claim_ahead(http)
+    assert c is not None and c["theory"] == "pkg:c"
+    # "c" is a generation ahead of "b"'s outline, though two links from the running "a": "d", a generation further,
+    # may be claimed ahead, and claiming "c" outdated the shared read that didn't have it.
+    d = await claim_ahead(http)
+    assert d is not None and d["theory"] == "pkg:d"
+
+
+async def test_a_locked_claim_ahead_counts_a_parent_s_outline_only_while_it_is_reported(
+    http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
+) -> None:
+    """At ``ahead_depth`` 1, "d" may be claimed ahead of "c", claimed ahead of "b" on "b"'s outline, only on "c"'s own
+    outline: "b"'s, though "b" still waits for the running "a", doesn't make "c" a generation 0. The claim checks it
+    itself, whatever the shared read it was given found."""
+    batch_id = await submit(
+        http, ["a", "b", "c", "d"], [("b", "a"), ("c", "b"), ("d", "c")], speculative_loading="4"
+    )
+    await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+    assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204
+    c = await claim_ahead(http)
+    assert c is not None and c["theory"] == "pkg:c"
+    claiming = {"batch_id": batch_id, "keys": [input_key("d")], "tier": "standard", "depth": 1, "taken": []}
+
+    async def claimed(outlined: list[str]) -> str | None:
+        async with remote_exec_engine.begin() as connection:
+            row = (
+                await connection.execute(coordinator_module.CLAIM_AHEAD_ACTION, {**claiming, "outlined": outlined})
+            ).first()
+            await connection.rollback()
+        return None if row is None else row.theory
+
+    assert await claimed([]) is None
+    assert await claimed([b["attempt_token"]]) is None
+    assert await claimed([c["attempt_token"]]) == "pkg:d"
 
 
 async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_ready(
@@ -171,23 +219,55 @@ async def test_a_claim_ahead_comes_after_ready_builds_of_its_priority_and_before
     assert order[:2] == ["x", "b"] and sorted(order[2:]) == ["y", "z"]
 
 
-@pytest.mark.parametrize(("outlined", "order"), [(False, ["r", "l", "b"]), (True, ["r", "b", "l"])])
-async def test_a_claim_ahead_on_outlines_alone_with_a_deeper_chain_than_its_batch_s_ready_builds_comes_before_them(
-    http: httpx.AsyncClient, outlined: bool, order: list[str]
+async def test_a_claim_ahead_with_a_deeper_chain_than_its_batch_s_ready_builds_comes_before_them(
+    http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
+    coordinator.settings.claim_ranking_seconds = 0  # a plain claim's children are candidates at the next read
     await submit(
-        http, ["a", "b", "c", "r", "s", "l"], [("b", "a"), ("c", "b"), ("s", "r")], speculative_loading="4"
+        http,
+        ["a", "b", "c", "d", "r", "s", "t", "l"],
+        [("b", "a"), ("c", "b"), ("d", "c"), ("s", "r"), ("t", "s")],
+        speculative_loading="4",
     )
-    a = await claim_named(http, "a")
-    if outlined:
-        assert (await http.post(f"/v1/work/{a}/outlined", headers=WORKER)).status_code == 204
+    await claim_named(http, "a")
+    tokens: dict[str, str] = {}
 
-    # "r" ranks as deep as "b" and comes first. Then "b", whose parent is still running, comes before the leaf "l"
-    # only once that parent's outline is out; "c", whose parent "b" has published none, never does.
-    claimed = []
-    while (action := await claim_ahead(http)) is not None:
-        claimed.append(action["theory"].removeprefix("pkg:"))
-    assert claimed[:3] == order
+    async def next_claim() -> str | None:
+        action = await claim_ahead(http)
+        if action is None:
+            return None
+        name = action["theory"].removeprefix("pkg:")
+        tokens[name] = action["attempt_token"]
+        return name
+
+    # "r" ranks as deep as "b" and comes first. Then "b" and "s", whose parents run and have published no outline,
+    # come before the leaf "l": they load their ancestors meanwhile.
+    assert [await next_claim() for _ in range(3)] == ["r", "b", "s"]
+    # "c" is a generation ahead of "b" once its outline is out, and on a longer chain than "l", comes before it.
+    assert (await http.post(f"/v1/work/{tokens['b']}/outlined", headers=WORKER)).status_code == 204
+    assert await next_claim() == "c"
+    # Once "c"'s outline is out too, "d" may be claimed, but ranks no higher than "l", which goes first. "t", two
+    # generations ahead of the running "r" until "s" publishes an outline, never may.
+    assert (await http.post(f"/v1/work/{tokens['c']}/outlined", headers=WORKER)).status_code == 204
+    assert [await next_claim() for _ in range(3)] == ["l", "d", None]
+
+
+async def test_of_claims_ahead_as_deep_the_one_on_outlines_alone_is_taken_first(
+    http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
+) -> None:
+    await submit(http, ["a", "q", "x", "y"], [("x", "a"), ("y", "q")], speculative_loading="4")
+    await claim_named(http, "a")
+    q = await claim_named(http, "q")
+    assert (await http.post(f"/v1/work/{q}/outlined", headers=WORKER)).status_code == 204
+
+    # The shared read ranks it first too: a claim sees only a batch's first AHEAD_CLAIM_KEYS candidates.
+    async with remote_exec_engine.connect() as connection:
+        rows = await connection.execute(coordinator_module.AHEAD_CANDIDATES, {"depth": 1, "outlined": [q]})
+        assert [row.input_key for row in rows] == [input_key("y"), input_key("x")]
+
+    # "x" and "y" rank alike and "x" sorts first, but only "y" can start at once.
+    claimed = await claim_ahead(http)
+    assert claimed is not None and claimed["theory"] == "pkg:y"
 
 
 async def test_a_claim_ahead_on_outlines_alone_counts_as_a_build_of_its_batch_in_the_ranking_claims_share(
@@ -912,7 +992,7 @@ async def test_claiming_and_revoking_ahead_read_each_actions_edges_by_key(
         return plan[0]["Plan"]["Shared Hit Blocks"] + plan[0]["Plan"]["Shared Read Blocks"]
 
     async def reads(connection: Any, batch_id: UUID) -> list[int]:
-        walk = {"batch_id": batch_id, "keys": children, "depth": limit}
+        walk = {"batch_id": batch_id, "keys": children, "depth": limit, "outlined": []}
         return [  # REVOKE_AHEAD last: EXPLAIN ANALYZE runs it
             await pages(connection, coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard", "taken": []}),
             await pages(connection, coordinator_module.AHEAD_PARENTS, {**walk, "keys": children[:1]}),
@@ -1233,7 +1313,7 @@ async def test_claiming_ahead_reads_each_ancestors_action_by_key(
             ),
             {"id": new, "keys": [f"k{i}" for i in range(width, 2 * width)]},
         )
-        walk = {"batch_id": new, "keys": [f"k{i}" for i in range(2 * width, 3 * width)], "depth": 2}
+        walk = {"batch_id": new, "keys": [f"k{i}" for i in range(2 * width, 3 * width)], "depth": 2, "outlined": []}
         claiming = (coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard", "taken": []})
         naming = (coordinator_module.AHEAD_PARENTS, {**walk, "keys": walk["keys"][:1]})
         # The planner's own choice; nested loops alone; and the join a large history's statistics led to: all the
@@ -1281,7 +1361,7 @@ async def test_claiming_ahead_passes_over_a_locked_candidate_and_locks_the_one_i
             sa.text("INSERT INTO edges (batch_id, input_key, parent_key) VALUES (:id, 'c0', 'p'), (:id, 'c1', 'p')"),
             {"id": batch_id},
         )
-    claiming = {"batch_id": batch_id, "keys": ["c0", "c1"], "tier": "standard", "depth": 2, "taken": []}
+    claiming = {"batch_id": batch_id, "keys": ["c0", "c1"], "tier": "standard", "depth": 2, "taken": [], "outlined": []}
     locking = sa.text("SELECT input_key FROM actions WHERE batch_id = :id AND input_key = :key FOR UPDATE NOWAIT")
 
     async def claimed() -> str | None:
