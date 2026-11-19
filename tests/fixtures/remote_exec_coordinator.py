@@ -27,7 +27,12 @@ running event and then nothing until `hang` is removed, without running RUN, `ho
 holds the stream after the first action's final event until `hold` is removed, and
 `cancelled` reports every action and the batch cancelled without running RUN, and
 `deadline` reports a failed action as the batch deadline leaves it: cancelled, then again
-with the log its worker uploaded as it stopped, and the batch failed at the deadline.  When RUN
+with the log its worker uploaded as it stopped, and the batch failed at the deadline.  `stopped`
+reports a failed action as a cancel that stopped it leaves it: cancelled with the log its
+worker uploaded, and the batch cancelled; holding `unlogged`, before that log arrived, and
+holding a failure kind, after an earlier attempt failed with it (`deadline-retried`: stopped
+by the batch deadline on a second attempt).  STATE/<id>.events, when it exists, is batch
+<id>'s recorded event stream: it is sent as it is, without running RUN.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", the batch fails for resubmission naming it,
 as the coordinator does.  Otherwise
@@ -110,6 +115,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(404, {"detail": "no such batch"})
         if (state / "down").exists() or (state / "ended").exists():
             return self.answer(503, {"detail": "restarting"})
+        recorded = state / f"{parts[3]}.events"
+        if recorded.exists():
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            self.wfile.write(recorded.read_bytes())
+            return
         if (state / "hang").exists():
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson")
@@ -188,7 +200,17 @@ class Handler(BaseHTTPRequestHandler):
                         event["last_failure"] = record["failure"]
                         event["log_sha256"] = record["log"].split()[0] if "log" in record else None
                         event["failure_detail"] = record.get("detail")
-                        if (state / "deadline").exists():
+                        if (state / "stopped").exists():
+                            # As the coordinator sends an action someone's cancel stopped while it
+                            # ran: cancelled, with the log its worker uploaded as it stopped.
+                            how = (state / "stopped").read_text().strip()
+                            event["state"], event["failure_detail"] = "cancelled", None
+                            event["last_failure"] = how if how and how != "unlogged" else None
+                            if how == "deadline-retried":
+                                event["last_failure"], event["attempts"] = "deadline", 2
+                            if how == "unlogged":
+                                event["log_sha256"] = None
+                        elif (state / "deadline").exists():
                             # As the coordinator sends it: cancelled at the deadline, then the log its
                             # worker reports as it stops.
                             event["state"], event["last_failure"] = "cancelled", "deadline"
@@ -230,7 +252,8 @@ class Handler(BaseHTTPRequestHandler):
             missing.unlink()
             if what:
                 failure = f"resubmit: an action is still missing {what} after 3 attempts"
-        final = {"type": "batch", "state": "cancelled" if (state / "cancel-after-actions").exists() else final_state,
+        cancel_after = (state / "cancel-after-actions").exists() or (state / "stopped").exists()
+        final = {"type": "batch", "state": "cancelled" if cancel_after else final_state,
                  "failure": failure}
         self.wfile.write((json.dumps(final) + "\n").encode())
 

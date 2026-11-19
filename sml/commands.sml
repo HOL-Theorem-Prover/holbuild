@@ -1667,7 +1667,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     case outcome of
                         HolbuildRemoteExec.Done => ()
                       | HolbuildRemoteExec.Failed (reason, _) => stopped := SOME (batch ^ " " ^ reason, true)
-                      | HolbuildRemoteExec.Cancelled => stopped := SOME (batch ^ " cancelled", false)
+                      | HolbuildRemoteExec.Cancelled _ => stopped := SOME (batch ^ " cancelled", false)
                       | HolbuildRemoteExec.Unfollowable reason =>
                           stopped := SOME (batch ^ " " ^ reason ^
                                            (if HolbuildRemoteExec.cancel url batch_id then ", cancelled the batch"
@@ -1827,7 +1827,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               let
                 val _ = HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n")
                 val needs_local = ref false
-                fun diagnose ({input_key, kind, log_sha256} : HolbuildRemoteExec.action_failure) =
+                fun diagnose ({input_key, kind, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
                   case node_with_input_key input_key of
                       NONE => (NONE, input_key, HolbuildBuildExec.Error ("failed remote action " ^ input_key ^ ": " ^ kind), false)
                     | SOME node =>
@@ -1986,7 +1986,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               in
                 follow_batch ()
               end)
-            fun report_failed_log ({input_key, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
+            fun report_failed_log ({input_key, theory, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
               case log_sha256 of
                   NONE => ()
                 | SOME sha =>
@@ -1996,7 +1996,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                           input_key ^ ": " ^ reason)
                     in
                       (case node_with_input_key input_key of
-                           NONE => warn_log "the action is not in the current plan"
+                           NONE => HolbuildBuildExec.report_batch_log project theory sha
                          | SOME node =>
                              case HolbuildBuildExec.fetch_remote_build_log project node sha of
                                  NONE => HolbuildBuildExec.warn
@@ -2162,9 +2162,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          resubmitted_logs := logs;
                          export_and_submit (Option.valOf missing :: retried) false NONE skip forced)
                   end
-                | (HolbuildRemoteExec.Cancelled, progress) =>
+                | (HolbuildRemoteExec.Cancelled (cancelled_logs, _), progress) =>
                     let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                     in
+                      (* What a stopped action printed is its only diagnostic, as
+                         for an attached batch someone cancelled. *)
+                      List.app (fn (log as {kind, theory, ...} : HolbuildRemoteExec.action_failure) =>
+                                  (if kind = "cancelled" then ()
+                                   else HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ kind ^ "\n");
+                                   report_failed_log log))
+                               cancelled_logs;
                       (* Whoever cancelled it stopped this work, so a --remote-only
                          build doesn't ask for it to be built locally instead. *)
                       if remote_only then raise Error ("remote execution: " ^ reason) else fall_back reason
@@ -2272,18 +2279,41 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           else plan_with_record true true
         val writes_sources = not (null (HolbuildBuildPlan.generated_source_owners plan))
         val reason = "theories that write SML sources build before the rest is planned"
+        (* A batch this plan can't take over, since its keys wait on the
+           generated sources, is followed to its end without cancelling it: its
+           failed or stopped theories' worker logs are printed, under their
+           hashes, as their input keys can't be matched to the plan's yet.  A
+           failed or cancelled one then fails a --remote-only build, which
+           could only restore what it didn't build; otherwise the build goes on
+           as one without --attach would. *)
+        fun follow_then_build batch_id =
+          let
+            val (outcome, _) =
+              HolbuildRemoteExec.while_followed url batch_id (fn () => HolbuildRemoteExec.follow url batch_id (fn _ => ()))
+            fun show ({theory, kind, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
+              case log_sha256 of
+                  NONE => ()
+                | SOME sha =>
+                    (HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ kind ^ "; its worker log:\n");
+                     HolbuildBuildExec.report_batch_log project theory sha)
+            val (ended, failed) =
+              case outcome of
+                  HolbuildRemoteExec.Done => ("finished", false)
+                | HolbuildRemoteExec.Failed (why, failures) => (List.app show failures; (why, true))
+                | HolbuildRemoteExec.Cancelled (stopped, failed) => (List.app show (failed @ stopped); ("cancelled", true))
+                | HolbuildRemoteExec.Unfollowable why => (why, false)
+                | HolbuildRemoteExec.Unreachable why => (why, false)
+            val ended = "remote execution: batch " ^ batch_id ^ " " ^ ended ^ "; " ^ reason
+          in
+            if failed andalso remote_only then raise Error (ended ^ ", so this build restored nothing from it")
+            else if remote_only then HolbuildStatus.message_stderr ("holbuild: " ^ ended ^ "; restoring from the cache\n")
+            else HolbuildBuildExec.warn (ended ^ "; building locally");
+            write_pending_plan ();
+            execute_build ()
+          end
       in
         if writes_sources andalso detach then raise Error ("remote execution: " ^ reason)
-        else if writes_sources andalso Option.isSome attach andalso remote_only then
-          (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "; restoring from the cache\n");
-           Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
-           write_pending_plan ();
-           execute_build ())
-        else if writes_sources andalso Option.isSome attach then
-          (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
-           Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
-           write_pending_plan ();
-           execute_build ())
+        else if writes_sources andalso Option.isSome attach then follow_then_build (valOf attach)
         else
           let
             fun prepare_requested () =
