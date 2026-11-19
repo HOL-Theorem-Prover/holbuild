@@ -1319,10 +1319,29 @@ b_key=$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $2 }' "$state/$batch.
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$b_key")
 require_grep "remote rxp:BTheory: cancelled, log /cas/$log_sha" "$tmpdir/stopped-only.log"
 require_grep "child log tail ---" "$tmpdir/stopped-only.log"
+require_grep "b_thm" "$tmpdir/stopped-only.log"
 require_grep "remote execution: batch $batch cancelled" "$tmpdir/stopped-only.log"
 [[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$log_sha" ]] ||
   { echo "the stopped theory's worker log was not restored" >&2; exit 1; }
 [[ $(grep -c '^POST' "$state/requests.log") -eq $posts ]] || { echo "the attach submitted a batch" >&2; exit 1; }
+# Stopped after an earlier attempt failed: the log is printed, labelled as
+# perhaps that attempt's.  Stopped before its log arrived: a later attach
+# shows it.
+for how in memory unlogged; do
+  write_broken "stopped-$how"
+  run "stopped-$how-detach" 0 build --remote-exec "$coordinator" --detach BTheory
+  batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/stopped-$how-detach.log")
+  echo "$how" > "$state/stopped"
+  run "stopped-$how" 1 build --remote-exec "$coordinator" --remote-only --attach "$batch" BTheory
+  rm "$state/stopped"
+  require_grep "remote execution: batch $batch cancelled" "$tmpdir/stopped-$how.log"
+done
+require_grep "BTheory: cancelled after an attempt that failed (memory); the log below may be that attempt's" \
+  "$tmpdir/stopped-memory.log"
+require_grep "child log tail ---" "$tmpdir/stopped-memory.log"
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/stopped-unlogged-detach.log")
+require_grep "remote rxp:BTheory: stopped before its worker's log arrived; --attach $batch again shows it" \
+  "$tmpdir/stopped-unlogged.log"
 
 # A static error and a tactic timeout are reported from the worker's log too.
 write_failing_b() {

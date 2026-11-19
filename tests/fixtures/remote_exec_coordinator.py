@@ -29,7 +29,8 @@ holds the stream after the first action's final event until `hold` is removed, a
 `deadline` reports a failed action as the batch deadline leaves it: cancelled, then again
 with the log its worker uploaded as it stopped, and the batch failed at the deadline.  `stopped`
 reports a failed action as a cancel that stopped it leaves it: cancelled with the log its
-worker uploaded, and the batch cancelled.  When RUN
+worker uploaded, and the batch cancelled; holding `unlogged`, before that log arrived, and
+holding a failure kind, after an earlier attempt failed with it.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", the batch fails for resubmission naming it,
 as the coordinator does.  Otherwise
@@ -193,7 +194,11 @@ class Handler(BaseHTTPRequestHandler):
                         if (state / "stopped").exists():
                             # As the coordinator sends an action someone's cancel stopped while it
                             # ran: cancelled, with the log its worker uploaded as it stopped.
-                            event["state"], event["last_failure"], event["failure_detail"] = "cancelled", None, None
+                            how = (state / "stopped").read_text().strip()
+                            event["state"], event["failure_detail"] = "cancelled", None
+                            event["last_failure"] = how if how and how != "unlogged" else None
+                            if how == "unlogged":
+                                event["log_sha256"] = None
                         elif (state / "deadline").exists():
                             # As the coordinator sends it: cancelled at the deadline, then the log its
                             # worker reports as it stops.

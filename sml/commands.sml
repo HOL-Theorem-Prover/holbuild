@@ -2124,7 +2124,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     in
                       (* What a stopped action printed is its only diagnostic, as
                          for an attached batch someone cancelled. *)
-                      List.app report_failed_log cancelled_logs;
+                      List.app (fn (log as {kind, input_key, ...} : HolbuildRemoteExec.action_failure) =>
+                                  (if kind = "cancelled" then ()
+                                   else HolbuildStatus.message_stderr
+                                          ("holbuild: remote " ^
+                                           (case node_with_input_key input_key of
+                                                SOME node => HolbuildBuildPlan.logical_name node
+                                              | NONE => input_key) ^
+                                           ": " ^ kind ^ "; the log below may be that attempt's\n");
+                                   report_failed_log log))
+                               cancelled_logs;
                       (* Whoever cancelled it stopped this work, so a --remote-only
                          build doesn't ask for it to be built locally instead. *)
                       if remote_only then raise Error ("remote execution: " ^ reason) else fall_back reason
