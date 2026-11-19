@@ -190,9 +190,9 @@ fun theory_cpu_hook (TheoryDelta.NewTheory _) =
    keeps it: `hol run` from that heap exits with failure after its first
    declaration, printing nothing.  So no checkpoint is saved once the flag is
    set, and an older one at the same path is removed. *)
-fun save_checkpoint ({label, default_share, path, ok_text, depth} :
-                     {label : string, default_share : bool, path : string,
-                      ok_text : string, depth : int}) =
+fun save_with (save_child, with_modules) ({label, default_share, path, ok_text, depth} :
+                                          {label : string, default_share : bool, path : string,
+                                           ok_text : string, depth : int}) =
   let
     fun save () =
       let
@@ -202,7 +202,7 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
         val _ = begin_replacement path
         val _ = if share then PolyML.shareCommonData PolyML.rootFunction else ()
         val t1 = Time.now()
-        val _ = with_theory_cpu_carried (fn () => PolyML.SaveState.saveChild(path, depth))
+        val _ = with_theory_cpu_carried (fn () => save_child (path, depth))
         val t2 = Time.now()
         val _ = write_text_atomically (ok_path path) ok_text
         val _ =
@@ -211,6 +211,7 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
               (TextIO.stdErr,
                String.concat ["holbuild checkpoint kind=", label,
                               " share=", bool_text share,
+                              " with_modules=", bool_text with_modules,
                               " depth=", Int.toString depth,
                               " share_s=", fmt_time (seconds (t0, t1)),
                               " save_s=", fmt_time (seconds (t1, t2)),
@@ -227,6 +228,26 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
       if checkpoint_io_failure e then
         (discard_checkpoint path; warn_checkpoint_failure label path e)
       else raise e
+  end
+
+fun save_checkpoint args = save_with (PolyML.SaveState.saveChild, false) args
+
+(* The deps heap.  Once the dependencies loaded a theory module from its
+   file, it is saved with saveChildWithModules and needs no
+   shareCommonData pass: the modules, most of what the dependencies
+   loaded, stay in their files.  Otherwise it holds every ancestor, and is
+   compacted first, as with a runtime without the call.  Contexts and
+   failed prefixes saved on it with saveChild refer to its modules too. *)
+fun save_deps_checkpoint ({label, path, ok_text, depth, modules} :
+                          {label : string, path : string, ok_text : string, depth : int, modules : bool}) =
+  let
+    fun args share = {label = label, default_share = share, path = path, ok_text = ok_text, depth = depth}
+  in
+    case HolbuildRuntime.save_child_with_modules of
+        SOME save_child =>
+          if HolbuildRuntime.deps_save_shares modules then save_checkpoint (args true)
+          else save_with (save_child, true) (args false)
+      | NONE => save_checkpoint (args true)
   end
 
 

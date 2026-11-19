@@ -16,6 +16,46 @@ struct
   fun share_heap () =
     (PolyML.shareCommonData PolyML.rootFunction; unshared_dat_bytes := 0)
 
+  (* A value by its structure path and name, looked up at run time so that
+     this compiles whether the runtime and HOL have it or not. *)
+  fun lookup_value path name =
+    let
+      fun contents s = PolyML.NameSpace.Structures.contents s
+      fun sub (ns : PolyML.NameSpace.nameSpace) s = Option.map contents (#lookupStruct ns s)
+      val ns = List.foldl (fn (s, ns) => Option.mapPartial (fn ns => sub ns s) ns)
+                          (SOME PolyML.globalNameSpace) path
+    in
+      Option.mapPartial (PolyML.CodeTree.evalue o PolyML.NameSpace.Values.code)
+        (Option.mapPartial (fn ns => #lookupVal ns name) ns)
+    end
+
+  (* PolyML.SaveState.saveChildWithModules, where this Poly/ML has it.  A
+     state it saves refers to the modules the process loaded from files,
+     by id and path, instead of copying them, and loading the state loads
+     them.  Modules the process wrote itself are copied. *)
+  val save_child_with_modules : (string * int -> unit) option =
+    Option.map RunCall.unsafeCast (lookup_value ["PolyML", "SaveState"] "saveChildWithModules")
+
+  (* Whether the process loaded a module from a file: HOL's theory module
+     cache counts those loads (hits), not the modules it writes.  Without
+     that count, whether the runtime has loaded any module at all. *)
+  fun loaded_module_files () =
+    case lookup_value ["TheoryModules"] "statistics" of
+        SOME statistics =>
+          #hits ((RunCall.unsafeCast statistics : unit -> {hits : int, misses : int, writes : int}) ()) > 0
+      | NONE =>
+          case lookup_value ["PolyML", "SaveState"] "showLoadedModules" of
+              SOME loaded => not (null ((RunCall.unsafeCast loaded : unit -> Word8Vector.vector list) ()))
+            | NONE => false
+
+  (* Whether the deps heap's save (HolbuildCheckpointSaveRuntime.
+     save_deps_checkpoint) shares common data first, unless
+     HOLBUILD_SHARE_COMMON_DATA says otherwise: not when it saves the
+     heap with modules, which it does only where holbuild reads such a
+     state (MODULES). *)
+  fun deps_save_shares modules =
+    not (modules andalso Option.isSome save_child_with_modules andalso loaded_module_files ())
+
   (* The size of the .dat beside a theory's .sml, where HOL's file system
      keeps it, or NONE for any other file. *)
   fun theory_dat_size path =
