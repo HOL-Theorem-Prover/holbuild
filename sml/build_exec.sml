@@ -12698,7 +12698,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         val keys = if length merged > shared_index_limit then List.take (merged, shared_index_limit) else merged
       in
         if old = SOME keys then ()
-        else ignore (HolbuildRemoteCache.replace_action_unconditionally remote
+        else ignore (HolbuildRemoteCache.replace_action_everywhere remote
                        {key = index_key, text = shared_index_text keys})
       end
       handle e => warn ("could not update the shared checkpoint index: " ^ General.exnMessage e)
@@ -12783,6 +12783,21 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 SOME (c, key, entries, blobs)
               end
       handle e => (warning c e; NONE)
+    (* The files' hashes, a few files at a time: a replay saves hundreds
+       of MB of checkpoints, and a failed build publishes them before its
+       result. *)
+    fun prehash paths =
+      let
+        val (_, unique) = List.foldl
+          (fn (path, (seen, kept)) =>
+            if Redblackset.member (seen, path) orelse Option.isSome (Redblackmap.peek (!hashes, path)) then (seen, kept)
+            else (Redblackset.add (seen, path), (path, ref NONE) :: kept))
+          (Redblackset.empty String.compare, []) paths
+        (* A file that can't be hashed is left to `hash`, which reports it. *)
+        val _ = transfer_all (fn (path, sha) => sha := SOME (HolbuildHash.file_sha256 path) handle _ => ()) unique
+      in
+        List.app (fn (path, ref (SOME sha)) => hashes := Redblackmap.insert (!hashes, path, sha) | _ => ()) unique
+      end
     fun publish_candidates heap =
       let
         val eligible = List.mapPartial eligible candidates
@@ -12793,13 +12808,19 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           (Redblackset.empty String.compare, []) eligible
         val probes = rev unique
         val _ = parallel_all remote_probe_width probe probes
+        val _ = prehash (List.concat (map (fn (c : shared_candidate, _, absent) =>
+                                              if not (!absent) then []
+                                              else #path c :: getOpt (ancestors false (#path c), []))
+                                          probes))
         val prepared = List.mapPartial (prepare false) probes
         val _ = upload_all (List.concat (map (fn (_, _, _, blobs) =>
                                   map (fn (path, sha, _) => (path, sha)) blobs) prepared))
         val complete = List.filter
           (fn (_, _, _, blobs) => List.all (fn (_, sha, _) => not (needs_upload sha)) blobs) prepared
         fun publish (c : shared_candidate, key, entries, _) =
-          (ignore (HolbuildRemoteCache.replace_action_unconditionally remote
+          (* A failed prefix's entry is replaced as the prefix grows. *)
+          (ignore ((if #kind c = "failed_prefix" then HolbuildRemoteCache.replace_action_everywhere
+                    else HolbuildRemoteCache.replace_action_unconditionally) remote
             {key = key, text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
                                  (("heap", heap, "") :: entries)}))
           handle e => warning c e
@@ -12844,7 +12865,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                         (* The store family is the chain's lowest file. *)
                         val family = #2 (hd blobs)
                       in
-                        ignore (HolbuildRemoteCache.replace_action_unconditionally remote
+                        ignore (HolbuildRemoteCache.replace_action_everywhere remote
                                   {key = standalone_key,
                                    text = shared_manifest shared_standalone_header (SOME (#kind c)) entries ^
                                           "key=" ^ #key c ^ "\n"});
@@ -14898,11 +14919,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                        handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e))
               (* An interrupted action has a few seconds to stop in: its
                  saved checkpoints, which a retry resumes from, go before
-                 its log. *)
+                 its log.  So do a failed one's: the next build, which often
+                 starts as soon as the client has the result, resumes from
+                 them. *)
               val _ =
-                if !cancelled then
-                  (!deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
-                   deferred := (fn () => ()))
+                if !cancelled orelse Option.isSome failure then
+                  let val t0 = Time.now ()
+                  in
+                    !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
+                    deferred := (fn () => ());
+                    phases := ("share", Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
+                  end
                 else ()
               val log = phase "log" upload_log
               (* A final failure's log is its only diagnostic and nothing

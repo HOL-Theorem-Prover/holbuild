@@ -797,9 +797,52 @@ fun publish_action cache {key, text} =
   handle e as Unavailable _ => raise e
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
+(* A node answers a read of an entry it holds on its own disk without asking
+   the shared backing store, so a node holding the entry being replaced would
+   go on serving the old one.  Once a node took the new entry, every node is
+   sent it too.  These writes are best effort: a node that fails one is only
+   traced and doesn't trip the breaker. *)
+fun refresh_action_replicas cache key metadata =
+  case action_urls cache key of
+      [_] => ()
+    | urls =>
+        if tripped () then ()
+        else
+          let
+            val tmp = temp_path "action-replica-put"
+            fun put url = traced "PUT" url tmp (fn () => put_status [] {url = url, src = tmp})
+            fun skipped detail url =
+              HolbuildStatus.cache_trace ("cache replica refresh skipped: " ^ redact_userinfo url ^ ": " ^ detail)
+            fun report (url, HolbuildHttp.Response code) =
+                  if successful_put_code code then () else skipped ("HTTP " ^ Int.toString code) url
+              | report (url, HolbuildHttp.Failed message) = skipped message url
+          in
+            (write_text tmp metadata;
+             ListPair.app report (urls, probe_all put urls);
+             remove_file tmp)
+            handle e => (remove_file tmp;
+                         HolbuildStatus.cache_trace ("cache replica refresh failed: " ^ General.exnMessage e))
+          end
+
 (* The HTTP write is unconditional.  Callers must authorize replacement from
    action-kind-specific semantics before using this operation. *)
 fun replace_action_unconditionally cache request = publish_action cache request
+
+(* For an entry that is replaced in place as it changes (a checkpoint index,
+   say), which a reader takes from whichever node it asks: replaced as above,
+   then sent to every node.  Not for entries whose replicas are ranked by
+   strength (theory actions), which repair_action_replicas handles. *)
+fun replace_action_everywhere cache {key, text} =
+  if disabled () then HolbuildCacheBackend.Skipped
+  else
+    let val metadata = action_metadata cache key text
+    in
+      case publish_action_metadata cache key metadata of
+          HolbuildCacheBackend.Published => (refresh_action_replicas cache key metadata; HolbuildCacheBackend.Published)
+        | result => result
+    end
+    handle e as Unavailable _ => raise e
+         | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
 fun put_action cache policy {key, text} =
   if disabled () then HolbuildCacheBackend.Skipped

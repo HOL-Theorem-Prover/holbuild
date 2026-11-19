@@ -2059,7 +2059,11 @@ heap either, it restores the theory's latest failed prefix that a theory saving
 no heap published (below), else it loads the dependencies cold. After the
 build, successful or not, it publishes its heap if no other worker's is, and
 then, when the heap under them is the published one, the checkpoints it
-saved. A theory that saves no checkpoints as it runs (not a target) and has no
+saved. A passing action publishes them after reporting its result; a failed
+or interrupted one before, so the next build, which often follows at once,
+finds them. The entries that are replaced in place as the theory changes
+(its checkpoint index, a failed prefix) go to every cache node, since a node
+answers from its own disk and one holding the old entry would serve it. A theory that saves no checkpoints as it runs (not a target) and has no
 heap publishes only a failed prefix, its chain down to the toolchain's base
 state, as the theory's one failed prefix. A heap is shared
 only between workers with the same toolchain bytes, cache root, action root,

@@ -300,4 +300,32 @@ val _ = assert "failed secondary repair leaves resident intact" (manifest_at sec
 val _ = seed second "malformed manifest";
 val _ = assert "malformed secondary does not fail primary" (publish_timed () = CB.AlreadyPresent);
 val _ = assert "malformed secondary untouched" (manifest_at second = "malformed manifest");
+
+(* An entry replaced in place (a checkpoint index) goes to every node: a node
+   answers from its own disk, so one still holding the old entry would serve
+   it.  A node failing that write doesn't fail the publication or trip the
+   breaker; ranked theory entries keep the single write. *)
+val index_key = "replica-checkpoint-index";
+val index_ac = RC.remote_action_key index_key;
+fun index_text n = "holbuild-shared-checkpoint-index-v1\ncheckpoint=" ^ Int.toString n ^ "\n";
+fun index_at node = #manifest (RC.metadata_manifest (RC.read_text (stored node "ac" index_ac)));
+fun seed_index node text = RC.write_text (stored node "ac" index_ac) (RC.metadata_text text []);
+val _ = List.app (fn node => seed_index node (index_text 1)) [first, second, third];
+val _ = assert "replace everywhere publishes"
+  (RC.replace_action_everywhere replicas {key = index_key, text = index_text 2} = CB.Published);
+val _ = assert "replace everywhere refreshes every node"
+  (List.all (fn node => index_at node = index_text 2) [first, second, third]);
+val [index_first, index_second, index_third] = RC.ranked_urls replicas index_ac;
+val _ = put index_third "ac-put-status" "503";
+val _ = assert "a failed replica write does not fail the publication"
+  (RC.replace_action_everywhere replicas {key = index_key, text = index_text 3} = CB.Published);
+val _ = clear index_third "ac-put-status";
+val _ = assert "the other nodes took it"
+  (index_at index_first = index_text 3 andalso index_at index_second = index_text 3);
+val _ = assert "the failed node keeps its entry" (index_at index_third = index_text 2);
+val _ = assert "replica writes do not trip the breaker" (not (RC.disabled ()));
+val _ = List.app (fn node => seed_index node (index_text 1)) [first, second, third];
+val _ = RC.replace_action_unconditionally replicas {key = index_key, text = index_text 4};
+val _ = assert "a plain replacement writes one node"
+  (length (List.filter (fn node => index_at node = index_text 4) [first, second, third]) = 1);
 val _ = print "cache ring passed\n";

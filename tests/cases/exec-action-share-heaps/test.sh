@@ -304,6 +304,15 @@ export_t v4
 worker v4 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v4 1 "status=failed" "failure=proof"
 require_grep "seeded failure" "$tmpdir/v4.log"
+# A failed action shares its checkpoints before its result, which the next
+# build may follow at once; a passing one after it.  The theory modules are
+# written after the result either way.
+grep -qE "^phase-ms=(.*,)?share:[0-9]+(,|\$)" "$tmpdir/v4.result" || {
+  echo "v4 didn't share its checkpoints before its result:" >&2; cat "$tmpdir/v4.result" >&2; exit 1; }
+if grep -qE "^phase-ms=(.*,)?share:" "$tmpdir/v3.result"; then
+  echo "v3 shared its checkpoints before its result:" >&2; cat "$tmpdir/v3.result" >&2; exit 1
+fi
+require_grep "exec-action after the result (ms): .* modules_ms=" "$tmpdir/v4.log"
 # A resume that gets past the shared failed prefix and fails later shares
 # the later prefix in its place, and the next resume starts from that.
 restored_steps() {
