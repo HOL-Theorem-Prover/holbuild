@@ -12529,6 +12529,9 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               modules_ok := SOME ok;
               ok
             end
+    (* Once the heap is given up for a module, no candidate on it is tried
+       or counted: the run preloads afresh. *)
+    fun modules_given_up () = !modules_ok = SOME false
     fun single role entries =
       case List.filter (fn (r, _, _) => r = role) entries of
           [(_, sha, arg)] => (sha, arg)
@@ -12627,14 +12630,20 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       case fetched of
           NONE => NONE
         | SOME action =>
-            counting_rejection (#kind c) (candidate_key c)
-              (restore_entry (candidate_key c) (fn () =>
-                 let
-                   val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
-                   val (heap, _) = single "heap" entries
-                 in
-                   if heap <> published_heap then NONE else restore_chain (candidate_key c) (SOME heap) c entries
-                 end))
+          if modules_given_up () then NONE
+          else
+            let
+              val restored =
+                restore_entry (candidate_key c) (fn () =>
+                  let
+                    val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
+                    val (heap, _) = single "heap" entries
+                  in
+                    if heap <> published_heap then NONE else restore_chain (candidate_key c) (SOME heap) c entries
+                  end)
+            in
+              if modules_given_up () then NONE else counting_rejection (#kind c) (candidate_key c) restored
+            end
     (* The theory's standalone failed prefix: the failed-prefix candidate at
        the path its manifest names. *)
     fun try_standalone () =
@@ -12662,7 +12671,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun first_window heap candidates =
       case candidates of
           [] => NONE
-        | _ =>
+        | _ => if modules_given_up () then NONE else
             let
               val n = Int.min (remote_probe_width, length candidates)
               val window = map (fn c => (c, ref NONE)) (List.take (candidates, n))
@@ -12731,7 +12740,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 | SOME heap =>
                     case first_window heap (if resumes then listed candidates else []) of
                         SOME restored => restored
-                      | NONE => try_heap heap)
+                      | NONE => if modules_given_up () then no_files else try_heap heap)
   in
     {heap = heap, files = files, stale = !stale, missing = !missing}
   end

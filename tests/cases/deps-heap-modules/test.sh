@@ -115,6 +115,15 @@ needs_a() {
 }
 
 b_log=$project/.holbuild/logs/current/deps-modules/BTheory/build.log
+# discarded_once LOG: the build discarded the deps heap and the checkpoints
+# on it once, for the missing module, and then preloaded afresh.
+discarded_once() {
+  local all module
+  all=$(grep -c 'discarding invalid checkpoint after HOL state load failure' "$1" || true)
+  module=$(grep -c 'discarding invalid checkpoint after HOL state load failure: .*Required module missing or changed' "$1" || true)
+  [[ $all == 1 && $module == 1 ]] ||
+    { echo "$1: $all discards, $module for a module, not one" >&2; cat "$1" >&2; exit 1; }
+}
 # deps_saved SHARE WITH_MODULES: how B's last build saved its deps heap.
 deps_saved() { require_grep "holbuild checkpoint kind=deps_loaded share=$1 with_modules=$2 " "$b_log"; }
 
@@ -159,7 +168,7 @@ find "$module_cache" -name '*-A-*.pmo' -delete
 edit_b two
 build "$tmpdir/resume.log"
 require_grep 'from: theorem-context checkpoint after b_first' "$tmpdir/resume.log"
-require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/resume.log"
+discarded_once "$tmpdir/resume.log"
 same_outputs
 # The fresh preload loaded A from its .dat again, and wrote the module.
 deps_saved true false
@@ -179,7 +188,7 @@ find "$module_cache" -name '*-A-*.pmo' -delete
 edit_b fixed
 build "$tmpdir/prefix.log"
 require_grep 'from: failed-prefix checkpoint in b_second' "$tmpdir/prefix.log"
-require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/prefix.log"
+discarded_once "$tmpdir/prefix.log"
 same_outputs
 
 # The host's heap store: a tree without a heap takes the store's, but not
@@ -271,6 +280,9 @@ exec_theory B dropped
 phase dropped-B 'rstmoddropn:1'
 require_grep "the shared deps-loaded heap needs a theory module this host lacks: .*-A-.*\.pmo" "$tmpdir/dropped-B.log"
 grep -qx 'status=built' "$tmpdir/dropped-B.result"
+if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/dropped-B.result"; then
+  echo 'checkpoints on the heap given up were tried' >&2; cat "$tmpdir/dropped-B.result" >&2; exit 1
+fi
 
 # The shared heap stays: once the cache has A's module again, W fetches it
 # and resumes from the heap's checkpoints.
