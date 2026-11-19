@@ -586,53 +586,69 @@ KEY_LEASED = sa.text("SELECT EXISTS (SELECT 1 FROM leases WHERE input_key = :key
 # Its worker loads what it can and waits for the unfinished ancestors' outputs. An action whose claim ahead gave up,
 # or lost its lease while it waited, is ``abandoned`` and waits for its parents from then on; one revoked because an
 # ancestor went back to waiting (REVOKE_AHEAD) may be claimed ahead again once its unfinished parents run again.
-#
+# One that published its outline counts as generation 0 too: its children start on the outline.
+
+# The live leases of :outlined, the attempt tokens whose actions published their outline (Coordinator.outlined).
+# Matched through the leases, by token, a lease that ended, by any path, names nothing, nor does a late report.
+OUTLINED_LEASES = (
+    "SELECT batch_id, input_key FROM leases WHERE attempt_token = ANY(CAST(:outlined AS uuid[])) AND expires_at > now()"
+)
+# Whether the parent ``e.parent_key`` of ``{batch}`` is in OUTLINED_LEASES, read by its key (leases_action). An
+# aggregate, since the database plans an EXISTS as a hash of every live lease of :outlined, rows for each outline of
+# the fleet where a walk reads a few.
+OUTLINED_PARENT = (
+    "(SELECT coalesce(bool_or(l.attempt_token = ANY(CAST(:outlined AS uuid[]))), false) FROM leases l "
+    "WHERE l.batch_id = {batch} AND l.input_key = e.parent_key AND l.expires_at > now())"
+)
+
 # AHEAD_WALK: the unfinished ancestors of the actions :keys of :batch_id, with the action each was reached from
 # (``root``) and each of its distances from it: their unfinished parents, and, above a running parent that was
-# itself claimed ahead and still waits for parents, its unfinished parents, up to :depth generations up. Each step
+# itself claimed ahead and still waits for parents, its unfinished parents. ``generation`` is the distance counted
+# only up to the first ancestor of generation 0 on the way (one that waits for no parent, or published its outline,
+# :outlined), and NULL above one that published its outline: the walk stops :depth generations up, but goes on above
+# an outline, so that the walk names every unfinished ancestor of an action claimed ahead on outlines. Each step
 # reads one action's edges and parents by key, and so does ``ancestors`` each ancestor's row: the lookups are
 # subqueries on the row they start from, so that the database plans them by key whatever it guesses of a batch
 # inserted since its last statistics (a join with actions was planned as a scan of every unfinished action). The
 # walk starts from the keys themselves, and :batch_id is read in a subquery: the database takes a batch it has no
 # statistics for, compared with a constant, for about one row, and reads it by batch alone, its keys as a filter
 # (every action of the batch); compared with a value it doesn't know in advance, it reads each key alone.
-AHEAD_WALK = """
-WITH RECURSIVE walk(batch_id, root, input_key, distance) AS (
-    SELECT k.batch_id, k.input_key, e.parent_key, 1
+AHEAD_WALK = f"""
+WITH RECURSIVE walk(batch_id, root, input_key, distance, generation, outlined) AS (
+    SELECT k.batch_id, k.input_key, e.parent_key, 1, 1, {OUTLINED_PARENT.format(batch="k.batch_id")}
     FROM (SELECT (SELECT CAST(:batch_id AS uuid)) AS batch_id, unnest(CAST(:keys AS text[])) AS input_key) k
     CROSS JOIN LATERAL unnest(ARRAY(
         SELECT e.parent_key FROM edges e WHERE e.batch_id = k.batch_id AND e.input_key = k.input_key
     )) AS e(parent_key)
     UNION
-    SELECT w.batch_id, w.root, e.parent_key, w.distance + 1 FROM walk w
+    SELECT w.batch_id, w.root, e.parent_key, w.distance + 1,
+        CASE WHEN NOT w.outlined THEN w.generation + 1 END, {OUTLINED_PARENT.format(batch="w.batch_id")}
+    FROM walk w
     CROSS JOIN LATERAL unnest(ARRAY(
         SELECT e.parent_key FROM edges e WHERE e.batch_id = w.batch_id AND e.input_key = w.input_key
     )) AS e(parent_key)
-    WHERE (CAST(:depth AS integer) IS NULL OR w.distance < :depth) AND (
+    WHERE (CAST(:depth AS integer) IS NULL OR w.outlined OR w.generation IS NULL OR w.generation < :depth) AND (
         SELECT p.state = 'running' AND p.remaining_deps > 0 FROM actions p
         WHERE p.batch_id = w.batch_id AND p.input_key = w.input_key
     )
 ), walked AS MATERIALIZED (
-    SELECT w.root, w.input_key, w.distance, (
+    SELECT w.root, w.input_key, w.distance, w.generation, w.outlined, (
         SELECT p FROM actions p WHERE p.batch_id = w.batch_id AND p.input_key = w.input_key
     ) AS p
     FROM walk w
 ), ancestors AS MATERIALIZED (
-    SELECT root, input_key, distance, (p).spec_sha256, (p).state, (p).remaining_deps
+    SELECT root, input_key, distance, generation, outlined, (p).spec_sha256, (p).state, (p).remaining_deps
     FROM walked WHERE (p).state <> 'done'
 )
 """
-# The live leases of :outlined, the attempt tokens whose actions published their outline (Coordinator.outlined).
-# Matched through the leases, by token, a lease that ended, by any path, names nothing, nor does a late report.
-OUTLINED_LEASES = (
-    "SELECT batch_id, input_key FROM leases WHERE attempt_token = ANY(CAST(:outlined AS uuid[])) AND expires_at > now()"
-)
 
 # The actions that may be claimed ahead, best first: the children of running actions of generation below
 # ``ahead_depth`` of running batches below their ``ahead_cap``. See Coordinator._claim_ahead. Read from the running
 # parents down (edges_parent) rather than per waiting action, since a gate's batch has thousands of those: a child is
 # a candidate when such running parents are all its unfinished ones, by ``remaining_deps``. An action's generation
-# is its longest chain of running actions claimed ahead, down from one of generation 0. CLAIM_AHEAD_ACTION checks
+# is its longest chain of running actions claimed ahead and without an outline, down from one of generation 0: one
+# that waits for no parent or published its outline. Candidates of the same depth whose unfinished parents all
+# published their outline come first, since they start at once. CLAIM_AHEAD_ACTION checks
 # the rule itself under the batch's lock. Every read is by key, whatever the planner guesses of a batch inserted since
 # its last statistics: the few actions waiting ahead are read once with their parents, which the generations are
 # matched against; each running parent's children are read from its edges; and each child's row is read alone. A
@@ -652,9 +668,12 @@ WITH RECURSIVE outlined AS MATERIALIZED ({OUTLINED_LEASES}), ahead_batches AS MA
     ) AS parents
     FROM ahead_batches b JOIN actions w ON w.batch_id = b.id
     WHERE w.state = 'running' AND w.ahead = 'ahead' AND w.remaining_deps > 0
+    AND (w.batch_id, w.input_key) NOT IN (SELECT batch_id, input_key FROM outlined)
 ), generations(batch_id, input_key, generation) AS (
     SELECT r.batch_id, r.input_key, 0
     FROM ahead_batches b JOIN actions r ON r.batch_id = b.id AND r.state = 'running' AND r.remaining_deps = 0
+    UNION
+    SELECT batch_id, input_key, 0 FROM outlined WHERE batch_id IN (SELECT id FROM ahead_batches)
     UNION
     SELECT g.batch_id, w.input_key, g.generation + 1
     FROM generations g JOIN waiting_ahead w ON w.batch_id = g.batch_id AND g.input_key = ANY(w.parents)
@@ -678,12 +697,14 @@ FROM children c JOIN ahead_batches b ON b.id = c.batch_id
 WHERE (c.a).state = 'waiting' AND (c.a).class = 'build' AND (c.a).ahead <> 'abandoned'
 AND (c.a).remaining_deps = c.running_parents
 AND (c.a).input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
-ORDER BY b.priority DESC, (c.a).critical_depth DESC, (c.a).descendant_count DESC, (c.a).theory, (c.a).input_key
+ORDER BY b.priority DESC, (c.a).critical_depth DESC, (c.a).descendant_count DESC,
+    c.outlined_parents = c.running_parents DESC, (c.a).theory, (c.a).input_key
 """)
 
 # Lock the best of a batch's candidates ``keys`` of ``tier`` that may still be claimed ahead, but not one whose key
 # another batch's live lease is building (single-flight; see CLAIM_ACTION) or in :taken: one with an unfinished
-# ancestor in its walk that isn't running, or one :depth generations up that still waits for parents. Each
+# ancestor in its walk that isn't running, or one :depth generations up that still waits for parents and published
+# no outline. Each
 # candidate's row is read by key, as in AHEAD_WALK, and checked; the one taken is then locked through its key. The
 # checks aren't made again on the row locked, which no other transaction changes in the meantime: it waits, and
 # every writer of a waiting action holds its batch's lock first, as the caller does. Checked on the row locked, they
@@ -700,17 +721,18 @@ FROM candidates JOIN actions a ON a.batch_id = (c).batch_id AND a.input_key = (c
 WHERE (c).tier = :tier AND (c).state = 'waiting' AND (c).class = 'build' AND (c).ahead <> 'abandoned'
 AND (c).remaining_deps > 0
 AND (c).input_key NOT IN (
-    SELECT root FROM ancestors WHERE state <> 'running' OR (distance = :depth AND remaining_deps > 0)
+    SELECT root FROM ancestors
+    WHERE state <> 'running' OR (generation = :depth AND remaining_deps > 0 AND NOT outlined)
 )
 AND (c).input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
 AND (c).input_key <> ALL(CAST(:taken AS text[]))
 ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
 LIMIT 1 FOR UPDATE OF a SKIP LOCKED
 """)
-# The unfinished ancestors an action claimed ahead waits for, ancestors first (by their longest distance from it,
-# which for the first is the action's generation), then by key.
+# The unfinished ancestors an action claimed ahead waits for, ancestors first (by their longest distance from it),
+# then by key; the largest ``generation`` of them is the action's.
 AHEAD_PARENTS = sa.text(f"""{AHEAD_WALK}
-SELECT input_key, spec_sha256, max(distance) AS distance FROM ancestors
+SELECT input_key, spec_sha256, max(distance) AS distance, max(generation) AS generation FROM ancestors
 GROUP BY input_key, spec_sha256 ORDER BY max(distance) DESC, input_key
 """)
 # The most candidates of a batch CLAIM_AHEAD_ACTION checks at once, the best of the shared read: its cost grows with
@@ -821,7 +843,7 @@ class _AheadRead:
 class _Outranking:
     """The claims ahead a claim that may take them puts before a ready build (see Coordinator._outranked_by_ahead):
     ``best``, the highest priority of a candidate of each tier of ``ahead_tiers``, and ``deepest``, the place of
-    each batch and tier's deepest candidate on outlines alone in claim order, from ``read``."""
+    each batch and tier's deepest candidate in claim order, from ``read``."""
 
     tiers: list[str]
     ahead_tiers: list[str]
@@ -837,7 +859,7 @@ class _Outranking:
         ]
 
     def deeper(self, batch_id: UUID, tier: str, ready: tuple[int, int] | None) -> bool:
-        """Whether a candidate of ``batch_id`` and ``tier`` on outlines alone may have a deeper chain of dependents
+        """Whether a candidate of ``batch_id`` and ``tier`` may have a deeper chain of dependents
         than its first ready build, at ``ready`` or not known, so rank before it as the batch's ready builds rank
         among themselves."""
         deepest = self.deepest.get((batch_id, tier))
@@ -1404,19 +1426,17 @@ class Coordinator:
     async def _outranked_by_ahead(self, tiers: list[str], ahead_tiers: list[str]) -> _Outranking | None:
         """The actions of ``ahead_tiers`` that may be claimed ahead and rank before a ready build of ``tiers``:
         those of a batch of a higher priority than the build's, of a tier no later than its, and those of its own
-        batch and tier whose unfinished parents all published their outline, with a deeper chain of dependents.
-        Builds of a batch rank among themselves that way, deepest first, and such a child starts on its parents'
-        outlines at once, like a ready build. One with a parent yet to publish its outline would wait for it, so
-        it comes after ready builds of its priority, as do those of other batches of the same priority. None when
-        nothing may be claimed ahead."""
+        batch and tier with a deeper chain of dependents. Builds of a batch rank among themselves that way, deepest
+        first: such a child is on a longer chain than any ready build of its batch, and loads its ancestors while its
+        parents finish their outlines, rather than after. Those of other batches of the same priority come after its
+        ready builds. None when nothing may be claimed ahead."""
         read = await self._ahead_candidates()
         best: dict[str, int] = {}
         deepest: dict[tuple[UUID, str], tuple[int, int]] = {}
-        for batch_id, _, tier, priority, place, outlined in read.candidates:
+        for batch_id, _, tier, priority, place, _ in read.candidates:
             if tier in ahead_tiers and (batch_id, tier) not in read.exhausted:
                 best[tier] = max(best.get(tier, priority), priority)
-                if outlined:
-                    deepest.setdefault((batch_id, tier), place)  # the read is best first
+                deepest.setdefault((batch_id, tier), place)  # the read is best first
         if not best:
             return None
         return _Outranking(tiers, ahead_tiers, read, best, deepest)
@@ -1652,9 +1672,9 @@ class Coordinator:
         self, read: _AheadRead, batch_id: UUID, tier: str, worker: str, *, deeper_than: tuple[int, int] | None = None
     ) -> Claim | None:
         """Lease the best action of ``tier`` of ``batch_id`` that ``read`` found may be claimed ahead, if any still
-        may, or mark the batch and tier exhausted in ``read``. With ``deeper_than``, only of those on outlines alone
-        with a deeper chain of dependents, as (critical depth, descendants): when none may, they leave ``read``, and
-        the batch's others stay candidates.
+        may, or mark the batch and tier exhausted in ``read``. With ``deeper_than``, only of those with a deeper
+        chain of dependents, as (critical depth, descendants): when none may, they leave ``read``, and the batch's
+        others stay candidates.
 
         This process's claims ahead of one batch take their turns in memory before the batch's row lock, which each
         would otherwise wait for holding a pooled connection: one big batch's claims filled the pool. A claim whose
@@ -1663,8 +1683,8 @@ class Coordinator:
             if (batch_id, tier) in read.exhausted:
                 return None
             keys = [
-                key for b, key, t, _, place, outlined in read.candidates
-                if (b, t) == (batch_id, tier) and (deeper_than is None or (outlined and place > deeper_than))
+                key for b, key, t, _, place, _ in read.candidates
+                if (b, t) == (batch_id, tier) and (deeper_than is None or place > deeper_than)
             ][:AHEAD_CLAIM_KEYS]
             if not keys:
                 if deeper_than is None:
@@ -1682,14 +1702,14 @@ class Coordinator:
                 row = None
                 depth = self.settings.ahead_depth_limit
                 waiting = 0
+                outlined = list(self.outlined_tokens)
                 if batch is not None:
                     # Counted after the lock, in a snapshot that sees every claim ahead committed before it.
-                    waiting = await conn.scalar(
-                        COUNT_WAITING_AHEAD, {"batch_id": batch_id, "outlined": list(self.outlined_tokens)}
-                    )
+                    waiting = await conn.scalar(COUNT_WAITING_AHEAD, {"batch_id": batch_id, "outlined": outlined})
                     if waiting < batch.ahead_cap:
                         row = await self._lock_unleased(
-                            conn, CLAIM_AHEAD_ACTION, {"batch_id": batch_id, "keys": keys, "tier": tier, "depth": depth}
+                            conn, CLAIM_AHEAD_ACTION,
+                            {"batch_id": batch_id, "keys": keys, "tier": tier, "depth": depth, "outlined": outlined},
                         )
                 if row is None:
                     if deeper_than is None:
@@ -1699,7 +1719,10 @@ class Coordinator:
                         read.candidates = [c for c in read.candidates if c[0] != batch_id or c[1] not in tried]
                     return None
                 parents = (
-                    await conn.execute(AHEAD_PARENTS, {"batch_id": batch_id, "keys": [row.input_key], "depth": depth})
+                    await conn.execute(
+                        AHEAD_PARENTS,
+                        {"batch_id": batch_id, "keys": [row.input_key], "depth": depth, "outlined": outlined},
+                    )
                 ).all()
                 ahead_parents = tuple(AheadParent(p.input_key, p.spec_sha256) for p in parents)
                 claimed = await self._lease(
@@ -1714,7 +1737,7 @@ class Coordinator:
                 read.exhausted.update((batch_id, t) for t in ("standard", "high"))
         self._batch_changed(batch_id)
         # Below the last generation, its own waiting children may now be claimed ahead, while the cap has room.
-        if (depth is None or max(p.distance for p in parents) < depth) and waiting + 1 < batch.ahead_cap:
+        if (depth is None or max(p.generation or 0 for p in parents) < depth) and waiting + 1 < batch.ahead_cap:
             self._ahead_changed()
         return claimed
 

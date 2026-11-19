@@ -566,8 +566,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   the rest, and those batches take turns when there are more of them than workers. Priority is capped:
   once batches of a positive priority run `REMOTE_EXEC_PRIORITY_CAP` builds together, their builds
   rank like priority-0 ones (fewest running first) and their claims ahead no longer go before ready
-  builds of other batches (a claim ahead on outlines alone still ranks among its own batch's ready
-  builds; see "Pipelining"): priority work loses its precedence, though it still takes workers no other build is ready for.
+  builds of other batches (a claim ahead still ranks among its own batch's ready
+  builds by its chain of dependents; see "Pipelining"): priority work loses its precedence, though it still takes workers no other build is ready for.
   Each shared ranking counts its own claims until its next read, so claims from different tier lists
   may pass the cap by a few builds briefly. A cap at least the fleet's worker count, and a
   coordinator restart, restores strict priority. Within the batch, it
@@ -594,10 +594,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
 - **Loading ahead**, for a batch submitted with `speculative_loading=<cap>`:
   a worker that says it can (`"ahead": true`) and finds nothing ready of the
   batch's priority or higher (in the same tier or an earlier one), or a
-  candidate on outlines alone that ranks before them (see "Pipelining"), may
+  candidate of the batch that ranks before them (see "Pipelining"), may
   claim a waiting build action of the batch whose parents that
   aren't done are all running, at most `REMOTE_EXEC_AHEAD_DEPTH` generations
-  ahead (with 0, any number): a running action that waits for no parent is generation 0, and one
+  ahead (with 0, any number): a running action that waits for no parent, or that published its
+  outline (see "Pipelining"), is generation 0, and one
   claimed ahead is a generation after its latest running parent. Its worker
   loads the action's ancestors that exist and waits for the outputs of the
   running ones, which the claim names in `ahead_parents`, ancestors first. At most `<cap>` of a batch's actions wait ahead at once;
@@ -632,12 +633,15 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   proving, and a child claimed ahead of it may start on that outline; the
   child commits nothing until the parent's own entry passes its gate. Once the
   outline is out, the worker posts `outlined` (below), and until its lease
-  ends the action no longer counts against its batch's `<cap>`. A candidate
-  whose unfinished parents have all posted `outlined` can start at once, so
-  it ranks among its batch's ready builds by its chain of dependents
-  (`critical_depth`, then `descendant_count`, a ready build first on a tie)
-  instead of waiting for them; other candidates come after the ready builds
-  of their priority, since their workers would wait. The record is kept in
+  ends the action no longer counts against its batch's `<cap>` or as a
+  generation against `REMOTE_EXEC_AHEAD_DEPTH`. A candidate ranks among its
+  batch's ready builds by its chain of dependents (`critical_depth`, then
+  `descendant_count`, a ready build first on a tie), whether or not its
+  parents have posted `outlined`: one on a longer chain than every ready build
+  loads its ancestors while its parents finish their outlines, rather than
+  after. Among candidates of one depth, those whose unfinished parents have
+  all posted `outlined` go first, since they start at once. Candidates of
+  other batches come after the ready builds of their priority. The record is kept in
   memory, by attempt token, and names an action only while that lease is
   live; each replica keeps the reports it received, as it does host reports,
   and a restarted coordinator counts such actions against the cap again
