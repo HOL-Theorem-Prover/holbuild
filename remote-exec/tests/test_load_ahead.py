@@ -1294,7 +1294,7 @@ async def test_claiming_ahead_passes_over_a_locked_candidate_and_locks_the_one_i
             sa.text("INSERT INTO edges (batch_id, input_key, parent_key) VALUES (:id, 'c0', 'p'), (:id, 'c1', 'p')"),
             {"id": batch_id},
         )
-    claiming = {"batch_id": batch_id, "keys": ["c0", "c1"], "tier": "standard", "depth": 2, "taken": []}
+    claiming = {"batch_id": batch_id, "keys": ["c0", "c1"], "tier": "standard", "depth": 2, "taken": [], "outlined": []}
     locking = sa.text("SELECT input_key FROM actions WHERE batch_id = :id AND input_key = :key FOR UPDATE NOWAIT")
 
     async def claimed() -> str | None:
