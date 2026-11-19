@@ -167,6 +167,8 @@ async def test_a_repeated_submission_waits_for_the_first_to_commit_and_stores_no
         )
         repeat = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
         async with asyncio.timeout(5), coordinator.engine.connect() as observer:
+            # pg_stat_activity holds still within a transaction, so each look is a transaction of its own.
+            await observer.execution_options(isolation_level="AUTOCOMMIT")
             while not await observer.scalar(sa.text(
                 "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid)))"
             ), {"pid": pid}):
