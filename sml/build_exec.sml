@@ -13976,6 +13976,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     fun cancel _ =
       if !cancelled then () else
       (cancelled := true;
+       HolbuildRemoteCache.refresh_replicas := false;
        if !publishing_checkpoints then () else HolbuildToolchain.cleanup_active_children ())
     (* Keep the driver alive while the sandbox reaps HOL and validates the
        saved checkpoints. The worker bounds this cleanup with a hard stop. *)

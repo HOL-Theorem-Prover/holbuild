@@ -187,6 +187,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(int((control / "cas-put-status").read_text()))
             self.end_headers()
             return
+        while (
+            control is not None
+            and self.path.startswith("/ac/")
+            and (control / "ac-put-hold").exists()
+        ):
+            time.sleep(0.01)
         if (
             control is not None
             and self.path.startswith("/ac/")

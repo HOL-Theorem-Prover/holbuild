@@ -231,11 +231,13 @@ fun head_status url =
   else
     cli_status stall_timeout_seconds ["-I", "--ignore-content-length", "-o", "/dev/null"] url
 
-fun put_status headers {url, src} =
+fun put_status_within timeout headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
-    HolbuildHttp.put {url = url, src = src, headers = headers, timeout = stall_timeout_seconds}
+    HolbuildHttp.put {url = url, src = src, headers = headers, timeout = timeout}
   else
-    cli_status stall_timeout_seconds (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
+    cli_status timeout (List.concat (map (fn header => ["-H", header]) headers) @ ["-T", src, "-o", "/dev/null"]) url
+
+fun put_status headers request = put_status_within stall_timeout_seconds headers request
 
 (* No HTTP response counts as a transport failure; any HTTP status resets
    the count. After tripping, only one request probes each cooldown. *)
@@ -807,16 +809,20 @@ fun publish_action cache {key, text} =
    the shared backing store, so a node holding the entry being replaced would
    go on serving the old one.  Once a node took the new entry, every other node
    is sent it too.  These writes are best effort: a node that fails one is only
-   traced and doesn't trip the breaker. *)
+   traced and doesn't trip the breaker, so each is given only
+   replica_stall_seconds, and none is sent once refresh_replicas is cleared,
+   as by an interrupted action, which has a few seconds left. *)
+val replica_stall_seconds = 2
+val refresh_replicas = ref true
 fun refresh_action_replicas cache key metadata taken =
   case List.filter (fn url => SOME url <> taken) (action_urls cache key) of
       [] => ()
     | urls =>
-        if tripped () then ()
+        if tripped () orelse not (!refresh_replicas) then ()
         else
           let
             val tmp = temp_path "action-replica-put"
-            fun put url = traced "PUT" url tmp (fn () => put_status [] {url = url, src = tmp})
+            fun put url = traced "PUT" url tmp (fn () => put_status_within replica_stall_seconds [] {url = url, src = tmp})
             fun skipped detail url =
               HolbuildStatus.cache_trace ("cache replica refresh skipped: " ^ redact_userinfo url ^ ": " ^ detail)
             fun report (url, HolbuildHttp.Response code) =
