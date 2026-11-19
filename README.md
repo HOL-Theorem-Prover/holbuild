@@ -458,7 +458,9 @@ holbuild --offline build MyTheory
 
 A dependency whose shared checkout is missing fails before checkout or fetch,
 even if its commit is in a local bare mirror; one already in the cache is
-linked as usual. A missing or invalid HOL
+linked as usual. Holbuild 0.14.75 names shared checkouts differently from
+earlier releases, so a project prepared with one of those needs one more run
+with offline mode unset. A missing or invalid HOL
 toolchain also fails before restore or replacement. The error names what needs
 preparing; rerun without `--offline` and with `HOLBUILD_OFFLINE` unset. Valid
 local toolchains can regenerate analyser and source metadata offline.
@@ -868,9 +870,15 @@ val () = holbuild_extra_outputs ["results/test.nsv"];
 
 Each path is relative to the declaring source file and must be a fixed file path
 inside the package: absolute paths, `.`/`..` components, trailing slashes, and
-glob syntax are rejected. The action must produce every declaration. Extra
-outputs participate in up-to-date checks and cache publication/restoration, and
-`holbuild clean TARGET` removes them. Holbuild records ownership lazily and
+glob syntax are rejected. A dependency's sources may be shared with other
+projects, so a theory in a dependency package writes its extra outputs under the
+consuming project's `.holbuild/packages/<name>/extra-outputs/` instead, at the
+path the declaration gives relative to the script's directory in the package;
+SML sources a theory of the package currently declares there are discovered as
+the package's own, and the package's extra inputs that name its declared outputs,
+by path or through a directory or glob, read them there. The action must
+produce every declaration. Extra outputs participate in up-to-date checks and
+cache publication/restoration, and `holbuild clean TARGET` removes them. Holbuild records ownership lazily and
 rejects another action that attempts to materialize the same path. As with
 ordinary outputs, cleaning followed
 by a normal build may restore them from cache; use existing no-cache or impure /
@@ -1014,7 +1022,7 @@ starting state is:
 | --- | --- |
 | Its `deps_loaded` checkpoint matches its current dependencies and `THEORY` is built for its current source | ancestors loaded from the checkpoint, then `THEORY` loaded |
 | Only `THEORY` changed since it was built, or the project directory moved (`THEORY`'s objects name the old directory, so loading it fails with a warning): its `deps_loaded` checkpoint matches its current dependencies | ancestors loaded, `THEORY` not loaded |
-| Otherwise: not built yet, restored from the cache without a local build, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency or the HOL toolchain changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
+| Otherwise: not built yet, built only as a dependency of other targets (build `THEORY` itself, or use `--all-checkpoints`), restored from the cache without a local build, built with `--skip-checkpoints`, checkpoints removed by `gc`, a dependency or the HOL toolchain changed, or `THEORY` is in a dependency package | `[run].heap` if configured, else the HOL base state |
 
 A usable checkpoint takes precedence over `[run].heap`. holbuild prints one
 line naming the state it chose and, on fallback, why. `--from` does not build
@@ -1109,7 +1117,9 @@ holbuild build --skip-checkpoints MyTheory
 
 - `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
   explicit termination proof. If a theorem and terminating definition have the
-  same name, the theorem takes precedence.
+  same name, the theorem takes precedence. Use `THEORY:termination:NAME` to
+  select the termination proof, or `THEORY:theorem:NAME` to select only a theorem.
+  Both explicit forms restrict name suggestions to the selected kind.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
   Steps containing public `HolSmtLib` tactic names (such as `Z3_TAC`, `CVC_TAC`,
   or `z3_tac`) are automatically untimed, including under other structure
@@ -1145,12 +1155,20 @@ holbuild build --skip-checkpoints MyTheory
   remote execution, the log limit uses the worker's environment.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
-- Theorem, declaration and failed-prefix checkpoints are saved in every theory
-  included by `--proof-scope` (root-package theories by default), except one
-  that a local parallel build pipelines (below) because it isn't a requested
-  target. `--all-checkpoints` keeps every such theory unpipelined, so all of
-  them save checkpoints. Checkpoint policy does not change theory outputs or
-  cache keys. Remote action specs carry this policy to the workers.
+- Checkpoints are restored in every theory included by `--proof-scope`
+  (root-package theories by default). The build's requested targets (the
+  default targets when none are given, or every root-package theory when
+  there are none of those either) save them as they run: the
+  `deps_loaded` checkpoint and theorem and declaration contexts, unless a
+  local parallel build pipelines one (below) that it didn't name. Any other
+  theory saves a checkpoint only when one of its proofs fails or times out:
+  the failed proof's prefix, which the next build resumes from. A theory that
+  passes is then not slowed by saving checkpoints nobody will resume from,
+  though editing it later loads its ancestors again. `--all-checkpoints`,
+  and `--repl-on-failure`, make every such theory save them as it runs, and
+  keep it unpipelined (below). Checkpoint policy does not change theory
+  outputs or cache keys. Remote action specs carry this policy to the
+  workers.
 
 A theory's `deps_loaded` checkpoint, its dependencies loaded into the
 toolchain's base state, is also kept once per host in
@@ -1635,9 +1653,11 @@ option proof-steps=<bool>
 option tactic-timeout=<seconds|none>
 option new-ir=<bool>
 option theorem-checkpoints=false   (only for a theory that saves none)
+option checkpoint-target=true      (only for a theory that saves checkpoints as it runs)
 option skip-checkpoints=true      (when checkpoint reuse is disabled)
 option force=true                 (only for a forced theory)
 option trace-steps=true            (only for a traced theory)
+option pipeline=true               (only for a theory that may build pipelined)
 action-text
 <the action text, verbatim to the end of the blob>
 ```
@@ -1669,7 +1689,11 @@ action-text
   default to false. `force` or `trace-steps` disables whole-action cache reuse
   and early cutoff on the worker; `trace-steps` also enables proof-step tracing
   and requires `proof-steps=true`. `skip-checkpoints` disables checkpoint reuse
-  and saving, including shared heaps.
+  and saving, including shared heaps. `pipeline` defaults to false; with it, a
+  worker whose claim asks it to (`exec-action --pipeline`) builds the theory
+  pipelined, unless the spec shows the theory can't be (extra outputs, proof
+  steps without the proof IR, a forced or traced run) or its HOL lacks the
+  context-taking tactics; otherwise it builds plain.
 
 ### Exporting script runs for remote execution
 
@@ -1960,9 +1984,14 @@ For a run, `input-key` is its run key and `built` means it ran.
 `phase-ms` gives the wall time of each phase that ran, in order: `cap` (the
 cache cap sweep), `spec`, `toolchain`, `hydrate` (sources, libraries and
 dependencies; its steps follow it, and are part of it: `hydfiles` the
-sources and libraries, `hyddeps` restoring the dependencies, `hydstale`
-probing the remote cache for stale dependency copies, `hydmisfit` checking
-the dependencies against their parents), `cutoff` (whether an earlier build stands), `analyse`
+sources and libraries, `hyddeps` restoring the dependencies, `hydcheck`
+checking the dependencies already in the action root (with loading and
+saving the record of their cache manifests' stats), `hydinst` removing and
+installing the ones that fail the check, `hydstale` probing the remote cache
+for stale dependency copies, `hydmisfit` checking the dependencies against
+their parents; two of them are counts, not times: `hydstatn` the cache
+manifests trusted on their recorded stat, `hydinstn` the dependencies the
+check sent to `hydinst`), `cutoff` (whether an earlier build stands), `analyse`
 (the script's proof steps and checkpoints), `restore` (shared
 checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
@@ -2012,9 +2041,13 @@ another worker published for the theory's source, the way a local build
 picks one: the last theorem or definition context whose source prefix is
 unchanged, or a failed proof's prefix, with a timeout at least as strict as
 the spec's. If there's none, it restores the dependency heap; if there's no
-heap either, it loads the dependencies cold. After the build, successful or
-not, it publishes its heap if no other worker's is, and then, when the heap
-under them is the published one, the checkpoints it saved. A heap is shared
+heap either, it restores the theory's latest failed prefix that a theory saving
+no heap published (below), else it loads the dependencies cold. After the
+build, successful or not, it publishes its heap if no other worker's is, and
+then, when the heap under them is the published one, the checkpoints it
+saved. A theory that saves no checkpoints as it runs (not a target) and has no
+heap publishes only a failed prefix, its chain down to the toolchain's base
+state, as the theory's one failed prefix. A heap is shared
 only between workers with the same toolchain bytes, cache root, action root,
 platform and holbuild runtime sources compiled into the heap, which is why
 every worker should use the same cache root.
@@ -2069,6 +2102,18 @@ built. That covers a parent that fails, a predicted parent manifest that
 doesn't match, or a parent that is late. The option costs worker time when a
 parent fails, and changes no cache keys. Like `--priority`, it applies to
 replacement batches with `--attach`, and the recovery hint includes it.
+
+Workers also build such a batch's theories pipelined, the way a local build
+does (unless `HOLBUILD_PIPELINE=off` or the coordinator turns it off): a
+theory the build doesn't name as a target publishes its outline before
+proving, and a theory waiting ahead of it starts on that outline. It keeps
+nothing built on an outline until the parent's own outputs pass the gate
+against the outline it loaded; otherwise it is built normally again. A
+theory that itself builds pipelined, within the coordinator's generation
+limit (`REMOTE_EXEC_AHEAD_DEPTH`), and whose unbuilt parents have all
+published their outlines can start at once, so it no longer waits behind
+shallower theories ready to build, and an outlined parent no longer counts
+against N.
 
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with

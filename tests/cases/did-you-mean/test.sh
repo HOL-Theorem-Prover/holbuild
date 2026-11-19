@@ -71,7 +71,7 @@ QED
 Definition count_down_def:
   count_down n = if n = 0 then 0 else count_down (n - 1)
 Termination
-  WF_REL_TAC `measure I` >> simp[]
+  WF_REL_TAC \`measure I\` >> simp[]
 End
 val _ = export_theory();
 SML
@@ -138,3 +138,28 @@ require_grep "^did you mean truth_thm?$" "$tmpdir/plan-theorem.log"
 
 expect_failure plan-termination execution-plan GammaTheory:count_dwn_def
 require_grep "^did you mean count_down_def?$" "$tmpdir/plan-termination.log"
+
+expect_failure explicit-theorem execution-plan GammaTheory:theorem:truth_thn
+require_grep "^holbuild: proof unit not found for execution-plan: GammaTheory:theorem:truth_thn$" "$tmpdir/explicit-theorem.log"
+require_grep "^did you mean truth_thm?$" "$tmpdir/explicit-theorem.log"
+expect_failure explicit-termination execution-plan GammaTheory:termination:count_dwn_def
+require_grep "^holbuild: proof unit not found for execution-plan: GammaTheory:termination:count_dwn_def$" "$tmpdir/explicit-termination.log"
+require_grep "^did you mean count_down_def?$" "$tmpdir/explicit-termination.log"
+
+# An explicit kind neither selects nor suggests a proof of the other kind.
+for name in count_down_def count_dwn_def; do
+  expect_failure wrong-theorem-kind execution-plan "GammaTheory:theorem:$name"
+  require_grep "^holbuild: proof unit not found for execution-plan:" "$tmpdir/wrong-theorem-kind.log"
+  if grep -q "did you mean" "$tmpdir/wrong-theorem-kind.log"; then
+    echo "explicit theorem selector suggested a termination proof" >&2
+    exit 1
+  fi
+done
+for name in truth_thm truth_thn; do
+  expect_failure wrong-termination-kind execution-plan "GammaTheory:termination:$name"
+  require_grep "^holbuild: proof unit not found for execution-plan:" "$tmpdir/wrong-termination-kind.log"
+  if grep -q "did you mean" "$tmpdir/wrong-termination-kind.log"; then
+    echo "explicit termination selector suggested a theorem" >&2
+    exit 1
+  fi
+done

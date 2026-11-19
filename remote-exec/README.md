@@ -42,18 +42,19 @@ what building holbuild and HOL takes. Its entrypoint takes `migrate`,
 docker run -e REMOTE_EXEC_DATABASE_URL=postgresql+asyncpg://user:pass@host/remote_exec holbuild-remote-exec migrate
 docker run -p 8090:8090 -e REMOTE_EXEC_DATABASE_URL=... -e REMOTE_EXEC_CLIENT_TOKEN=... \
   -e REMOTE_EXEC_WORKER_TOKEN=... -e REMOTE_EXEC_CACHE_URL=https://user:pass@cache.example.org \
-  holbuild-remote-exec coordinator [uvicorn options, default --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2 --no-access-log]
+  holbuild-remote-exec coordinator [uvicorn options, default --host 0.0.0.0 --port 8090 --timeout-graceful-shutdown 2]
 ```
 
-The coordinator writes no line per request. Once a minute, and once more at shutdown, it logs a line that counts its
-responses by method, route and status, with the CPU seconds the process used and the CPU time per response:
+Besides uvicorn's access log, which deployment health checks may read for answered claims, the coordinator logs a
+line once a minute, and once more at shutdown, that counts its responses by method, route and status, with the CPU
+seconds the process used and the CPU time per response:
 
 ```text
 2203 responses in 60 s, 25.9 CPU-s, 11.8 ms each: GET /v1/cache/members 200 950, POST /v1/work/claim 200 330, ...
 ```
 
 Without the image, from this directory: `uv sync`, then `uv run alembic
-upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090 --no-access-log`.
+upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090`.
 
 Migration `0005` adds the action class and its indexes; run migrations with
 the coordinator stopped. To roll back to an image predating `0005`, first
@@ -134,6 +135,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_EVENTS_FALLBACK_SECONDS` | most time between an event stream's reads, for other coordinator processes' writes | 10 |
 | `REMOTE_EXEC_SWEEP_SECONDS` | period of the sweep (lease expiry, releases, retention, scaling) | 5 |
 | `REMOTE_EXEC_AHEAD_DEPTH` | how many generations of running ancestors an action may be claimed ahead of, 0 for no limit (see "Loading ahead") | 1 |
+| `REMOTE_EXEC_PIPELINE` | 0 to stop asking workers to build pipelined: claims of new build actions of batches that load ahead then carry `"pipeline": false` (see "Loading ahead") | 1 |
 | `REMOTE_EXEC_RUN_SLOTS` | fleet-wide running run-action cap; 0 pauses new run claims | 30 |
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
 | `REMOTE_EXEC_PRIORITY_CAP` | running builds of positive-priority batches past which their builds rank like priority-0 ones (see Claims); at least the fleet's worker count for strict priority | 128 |
@@ -521,8 +523,13 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   holds more; each batch is passed over that way at most 8 times in a row. A claim from any host that holds less
   of the head's build than a kept host taking its tier leaves it to such
   hosts for 0.5 s from the first time a claim did, waking a claim waiting on
-  one, and takes the next batch instead; with only such builds left, it
-  waits until the first hold ends, claiming nothing ahead meanwhile. A wake
+  one each time a claim leaves it, and takes the next batch instead; with
+  only such builds left, it waits until the first hold ends, claiming
+  nothing ahead meanwhile. A claim from a host a build is held for takes
+  it even if not woken for it, ahead of better-ranked waiting claims, but
+  takes nothing else ahead of them. When
+  the hold ends, the best-ranked waiting claim is woken for the build, and
+  no claim passes it over again. A wake
   for newly ready work goes to a waiting claim on a kept host holding the
   most of it, if more than the first in line, and a woken claim takes that
   build while it is still in the head's band and no other kept host holds
@@ -559,7 +566,8 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   the rest, and those batches take turns when there are more of them than workers. Priority is capped:
   once batches of a positive priority run `REMOTE_EXEC_PRIORITY_CAP` builds together, their builds
   rank like priority-0 ones (fewest running first) and their claims ahead no longer go before ready
-  builds: priority work loses its precedence, though it still takes workers no other build is ready for.
+  builds of other batches (a claim ahead on outlines alone still ranks among its own batch's ready
+  builds; see "Pipelining"): priority work loses its precedence, though it still takes workers no other build is ready for.
   Each shared ranking counts its own claims until its next read, so claims from different tier lists
   may pass the cap by a few builds briefly. A cap at least the fleet's worker count, and a
   coordinator restart, restores strict priority. Within the batch, it
@@ -585,8 +593,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   finds the result cached.
 - **Loading ahead**, for a batch submitted with `speculative_loading=<cap>`:
   a worker that says it can (`"ahead": true`) and finds nothing ready of the
-  batch's priority or higher (in the same tier or an earlier one) may claim a
-  waiting build action of the batch whose parents that
+  batch's priority or higher (in the same tier or an earlier one), or a
+  candidate on outlines alone that ranks before them (see "Pipelining"), may
+  claim a waiting build action of the batch whose parents that
   aren't done are all running, at most `REMOTE_EXEC_AHEAD_DEPTH` generations
   ahead (with 0, any number): a running action that waits for no parent is generation 0, and one
   claimed ahead is a generation after its latest running parent. Its worker
@@ -614,6 +623,26 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   once the clients that submit `speculative_loading` batches run such a
   release. An older one may abandon such a claim (`ahead-abandoned`), which is
   then built plain.
+- **Pipelining**: a claim of a build action of a batch that loads ahead
+  carries `"pipeline": true` unless `REMOTE_EXEC_PIPELINE=0` or it is a plain
+  claim of an action nothing in its batch depends on, and the worker
+  runs it with `exec-action --pipeline` (releases 0.14.75 and later). Such an
+  action, when its spec allows it, publishes its theory's outline (its
+  statements, with the proofs still to check) under a key of its own before
+  proving, and a child claimed ahead of it may start on that outline; the
+  child commits nothing until the parent's own entry passes its gate. Once the
+  outline is out, the worker posts `outlined` (below), and until its lease
+  ends the action no longer counts against its batch's `<cap>`. A candidate
+  whose unfinished parents have all posted `outlined` can start at once, so
+  it ranks among its batch's ready builds by its chain of dependents
+  (`critical_depth`, then `descendant_count`, a ready build first on a tie)
+  instead of waiting for them; other candidates come after the ready builds
+  of their priority, since their workers would wait. The record is kept in
+  memory, by attempt token, and names an action only while that lease is
+  live; each replica keeps the reports it received, as it does host reports,
+  and a restarted coordinator counts such actions against the cap again
+  until they end. Rolling back: `REMOTE_EXEC_PIPELINE=0`, which stops new
+  pipelined claims; actions already running finish as they started.
 - **Retries** by the result's failure class:
 
   | `failure` | What happens |
@@ -924,9 +953,10 @@ the worker's report of its host, a host of `GET /v1/queue` without `age_s`,
 with `cpu_idle_pct` measured since the worker's previous CPU sample, or null
 when that is under a second old)
 
-- 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120, "max_heap_mb": null, "ahead_parents": [{"input_key": "<sha256>", "spec_sha256": "<sha256>"}, …]}`:
+- 200 `{"attempt_token": "<uuid>", "spec_sha256": "<sha256>", "input_key": "<sha256>", "theory": "<package>:<theory>", "lease_s": 120, "max_heap_mb": null, "ahead_parents": [{"input_key": "<sha256>", "spec_sha256": "<sha256>"}, …], "pipeline": false}`:
   `ahead_parents` lists the ancestors still building when the action was claimed ahead of them, each after its
-  own such ancestors, and is empty for any other claim
+  own such ancestors, and is empty for any other claim; `pipeline` asks the worker to build the action
+  pipelined (see "Pipelining")
 - 204 when nothing became ready for the tier within `wait_s`
 
 `POST /v1/work/<attempt_token>/heartbeat`, with no body or `{"host": <report>}`
@@ -934,6 +964,12 @@ when that is under a second old)
 - 200 `{"lease_s": 120}`: the lease now runs `lease_s` seconds from now
 - 409 when the lease expired or was revoked (the batch was cancelled,
   failed or passed its deadline); the worker stops the action
+
+`POST /v1/work/<attempt_token>/outlined`, with no body, once `exec-action
+--pipeline` has published the action's outline (it then creates
+`<result>.outline` beside its result file)
+
+- 204, also for a token that is no longer live, which records nothing
 
 `POST /v1/work/report` with `{"tier": …, "also_claim": […], "worker": "<name>", "host": <report>}`,
 the fields as for a claim, from a worker that isn't claiming, as while it waits for disk

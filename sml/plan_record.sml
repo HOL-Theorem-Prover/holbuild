@@ -22,7 +22,7 @@ structure SC = HolbuildStatCache
 
 exception Error of string
 
-val format = "holbuild-plan-record-v3"
+val format = "holbuild-plan-record-v4"
 val kept_records = 4
 
 datatype mode = Off | On | Check
@@ -183,7 +183,7 @@ type node_entry =
    edges : string list,
    config_lines : string list, input_key : string, extra_inputs_key : string option}
 
-type expansion = {base : string, decl : string, files : (string * string) list, dirs : string list}
+type expansion = {package : string, base : string, decl : string, files : (string * string) list, dirs : string list}
 
 type t =
   {fingerprint : string,
@@ -315,8 +315,8 @@ fun encode ({fingerprint, toolchain, action_toolchain_key, packages, members, di
               line "f" [check_text path, stamp_text stamp, bool_text racy, hash]) files @
        map (fn ({path, stamp, racy} : stamped_dir) =>
               line "d" [check_text path, stamp_text stamp, bool_text racy]) input_dirs @
-       map (fn ({base, decl, files, dirs} : expansion) =>
-              line "X" [check_text base, check_text decl,
+       map (fn ({package, base, decl, files, dirs} : expansion) =>
+              line "X" [check_text package, check_text base, check_text decl,
                         items (map (fn (rel, abs) => parts [rel, abs]) files), items dirs]) expansions @
        map source sources @
        map node selected @
@@ -415,8 +415,8 @@ fun decode text : t =
                 files := {path = path, stamp = parse_stamp st, racy = parse_bool racy, hash = hash} :: !files
             | (#"d", [path, st, racy]) =>
                 input_dirs := {path = path, stamp = parse_stamp st, racy = parse_bool racy} :: !input_dirs
-            | (#"X", [base, decl, xfiles, xdirs]) =>
-                expansions := {base = base, decl = decl,
+            | (#"X", [package, base, decl, xfiles, xdirs]) =>
+                expansions := {package = package, base = base, decl = decl,
                                files = map (fn item => case split_parts item of
                                                            [rel, abs] => (rel, abs)
                                                          | _ => bad "expanded input") (split_items xfiles),
@@ -466,17 +466,20 @@ fun is_pinned_git_package package =
 
 (* The directories of OBSERVED, as discovery listed them, that the record
    watches: not those a scan of HOL or of a pinned checkout listed, whose
-   entries change only with the pin. *)
+   entries change only with the pin, except those under the package's
+   artifact root, where its theories write their extra outputs. *)
 fun watched_dirs graph observed =
   let
     val fixed =
-      map HolbuildProject.package_name
+      map (fn p => (HolbuildProject.package_name p, HolbuildProject.package_artifact_root p ^ "/"))
         (List.filter (fn p => is_hol_package p orelse is_pinned_git_package p)
            (HolbuildProjectGraph.packages graph))
+    fun is_fixed (package, path) =
+      List.exists (fn (name, artifacts) => name = package andalso not (String.isPrefix artifacts path)) fixed
   in
     List.mapPartial
       (fn (package, path, stamp, entries) =>
-         if List.exists (fn name => name = package) fixed then NONE else SOME (path, stamp, entries))
+         if is_fixed (package, path) then NONE else SOME (path, stamp, entries))
       observed
   end
 
@@ -716,7 +719,7 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
         (Binarymap.listItems file_hashes)
     val input_dir_entries =
       map (fn path => let val st = stamp_of path in {path = path, stamp = st, racy = racy st} end)
-        (SI.sort_unique_strings (List.concat (map (fn (_, _, {dirs, ...}) => dirs) expansions)))
+        (SI.sort_unique_strings (List.concat (map (fn (_, _, _, {dirs, ...}) => dirs) expansions)))
     val dir_entries =
       map (fn (path, SOME st, entries) => {path = path, stamp = st, racy = racy st, entries = entries}
             | (path, NONE, _) => raise Unrecordable ("cannot stat " ^ path))
@@ -733,7 +736,9 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
      dirs = dir_entries,
      files = file_entries,
      input_dirs = input_dir_entries,
-     expansions = map (fn (base, decl, {files, dirs}) => {base = base, decl = decl, files = files, dirs = dirs}) expansions,
+     expansions = map (fn (package, base, decl, {files, dirs}) =>
+                         {package = package, base = base, decl = decl, files = files, dirs = dirs})
+                    expansions,
      sources = sources,
      roots = roots,
      selected = node_entries,
@@ -744,20 +749,26 @@ fun build ({fingerprint, start_ns, toolchain, action_toolchain_key, graph, membe
             resolved_plan_id = BP.resolved_plan_id plan}}
   end
 
-(* Writes the record of PLAN and its KEYS into DIR, or says why not; PRIOR
-   is the record PLAN was restored from. *)
-fun write dir context prior plan keys =
+fun not_written (Unencodable text) = NotWritten ("a path or name holds a control character: " ^ String.toString text)
+  | not_written (IO.Io {name, cause, ...}) = NotWritten ("cannot write " ^ name ^ ": " ^ General.exnMessage cause)
+  | not_written (OS.SysErr (msg, _)) = NotWritten ("cannot write the record: " ^ msg)
+  | not_written Irregular = NotWritten "dependency edges out of their usual order"
+  | not_written (Unrecordable reason) = NotWritten reason
+  | not_written e = raise e
+
+(* The write of the record of PLAN and its KEYS into DIR, which says why
+   not if it can't; PRIOR is the record PLAN was restored from.  The record
+   is built now, so the stamps of the files planning hashed are taken now:
+   a stamp taken later could pair a replaced file with the old hash. *)
+fun writer dir context prior plan keys : unit -> write_outcome =
   let val record = build context prior plan keys
   in
-    write_record (OS.Path.concat (dir, #fingerprint record)) (encode record);
-    prune_records dir;
-    Written
+    fn () => (write_record (OS.Path.concat (dir, #fingerprint record)) (encode record);
+              prune_records dir;
+              Written)
+             handle e => not_written e
   end
-  handle Unencodable text => NotWritten ("a path or name holds a control character: " ^ String.toString text)
-       | IO.Io {name, cause, ...} => NotWritten ("cannot write " ^ name ^ ": " ^ General.exnMessage cause)
-       | OS.SysErr (msg, _) => NotWritten ("cannot write the record: " ^ msg)
-       | Irregular => NotWritten "dependency edges out of their usual order"
-       | Unrecordable reason => NotWritten reason
+  handle e => let val outcome = not_written e in fn () => outcome end
 
 (* ---- Reading ---- *)
 
@@ -850,8 +861,9 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
              if not racy andalso same_stamp (st, recorded) then (path, entries) :: held
              else
                (changed := true;
-                if (SI.classified_entries path handle SI.Error _ => fall ("cannot list " ^ path)) = entries then held
-                else fall ("sources added, removed or renamed in " ^ path)))
+                if (SI.observed_entries path handle SI.Error _ => fall ("cannot list " ^ path)) = entries then held
+                else if SI.is_dir path then fall ("sources added, removed or renamed in " ^ path)
+                else fall ("extra outputs declared in " ^ path ^ " changed")))
     val held_dirs = List.foldl check_dir [] (#dirs record)
     (* Files: the recorded hash while the stat holds, else a fresh one. *)
     val rehashed = ref 0
@@ -974,8 +986,8 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
       List.foldl (fn ({path, hash, ...} : file, map) => Binarymap.insert(map, path, hash))
         (Binarymap.mkDict String.compare) (#files record)
     val recorded_expansions =
-      List.foldl (fn (expansion as {base, decl, ...} : expansion, map) =>
-                    Binarymap.insert(map, base ^ "\000" ^ decl, expansion))
+      List.foldl (fn (expansion as {package, base, decl, ...} : expansion, map) =>
+                    Binarymap.insert(map, package ^ "\000" ^ base ^ "\000" ^ decl, expansion))
         (Binarymap.mkDict String.compare) (#expansions record)
     fun file_unchanged (_, abs) =
       case (hash_of abs, Binarymap.peek(recorded_hashes, abs)) of
@@ -989,8 +1001,9 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
         (List.concat (map (BP.generated_sources plan) (BP.generated_source_owner_nodes plan)))
     (* Extra inputs of the selected nodes: an expansion whose directories
        moved is redone; file hashes come from the check above. *)
-    fun recorded_expansion (_, base, decl) =
-      case Binarymap.peek(recorded_expansions, base ^ "\000" ^ decl) of
+    fun recorded_expansion node (_, base, decl) =
+      case Binarymap.peek(recorded_expansions,
+                          #package (BP.source_of node) ^ "\000" ^ base ^ "\000" ^ decl) of
           SOME (expansion as {dirs, ...}) => if List.exists dir_moved dirs then NONE else SOME expansion
         | NONE => NONE
     val _ =
@@ -998,17 +1011,17 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
         (fn node =>
            List.app
              (fn decl =>
-                case recorded_expansion decl of
+                case recorded_expansion node decl of
                     NONE => ()
-                  | SOME {base, decl, files, dirs} =>
-                      (BP.remember_input_expansion plan base decl {files = files, dirs = dirs};
+                  | SOME {package, base, decl, files, dirs} =>
+                      (BP.remember_input_expansion plan package base decl {files = files, dirs = dirs};
                        List.app (fn (_, abs) => Option.app (BP.remember_input_hash plan abs) (hash_of abs)) files))
              (BP.extra_input_decls plan node))
         (BP.selected_nodes plan)
     fun inputs_unchanged node =
       List.all
         (fn decl =>
-           case recorded_expansion decl of
+           case recorded_expansion node decl of
                NONE => false
              | SOME {files, ...} => List.all file_unchanged files)
         (BP.extra_input_decls plan node)

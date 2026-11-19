@@ -188,7 +188,9 @@ fun lexical_absolute path =
 fun checkouts_dir () = Path.concat(Path.concat(lexical_absolute (cache_root ()), "git"), "checkouts")
 fun checkout_locks_dir () = Path.concat(checkouts_dir (), ".locks")
 fun checkout_trash_dir () = Path.concat(checkouts_dir (), ".trash")
-fun checkout_key git rev = url_hash git ^ "-" ^ rev
+(* -v2: 0.14.63 and 0.14.64 wrote dependencies' extra outputs into the
+   checkouts they made, so those are never used again, only collected. *)
+fun checkout_key git rev = url_hash git ^ "-" ^ rev ^ "-v2"
 fun checkout_dir k = Path.concat(checkouts_dir (), k)
 fun last_used_path k = checkout_dir k ^ ".last-used"
 fun usage_lease_path k = Path.concat(checkout_locks_dir (), k ^ ".usage")
@@ -259,8 +261,12 @@ fun shared_checkout name git rev =
 datatype gc_outcome = GcKept | GcRemoved | GcBusy
 
 fun is_checkout_key name =
-  size name = 81 andalso String.sub(name, 40) = #"-" andalso
-  CharVector.all is_hex (String.substring(name, 0, 40) ^ String.extract(name, 41, NONE))
+  let
+    val key = if size name = 84 andalso String.isSuffix "-v2" name then String.substring(name, 0, 81) else name
+  in
+    size key = 81 andalso String.sub(key, 40) = #"-" andalso
+    CharVector.all is_hex (String.substring(key, 0, 40) ^ String.extract(key, 41, NONE))
+  end
 
 fun checkout_keys () = List.filter is_checkout_key (list_dir (checkouts_dir ())) handle OS.SysErr _ => []
 

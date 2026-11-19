@@ -50,6 +50,7 @@ MIN_TOOLCHAIN_SANDBOX_RELEASE = (0, 14, 0)
 MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-parent
 MIN_FREE_FLOOR_RELEASE = (0, 14, 57)  # the first whose exec-action takes --cache-min-free-gb
 MIN_SWEEP_ONLY_RELEASE = (0, 14, 60)  # the first whose exec-action takes --sweep-only
+MIN_PIPELINE_RELEASE = (0, 14, 75)  # the first whose exec-action takes --pipeline
 CACHE_MIN_FREE_GB = 16  # the free space the cache cap keeps on the cache's disk for writers it doesn't count
 
 
@@ -290,6 +291,18 @@ class Coordinator:
         if status not in (200, 409):
             raise RuntimeError(f"heartbeat answered {status}: {body}")
         return status == 200
+
+    def outlined(self, token: str) -> None:
+        """Tell the coordinator the action published its outline, so that its children may be claimed ahead. A
+        coordinator without the endpoint (404) is no error, nor one that can't be reached: the outline is only a
+        head start."""
+        try:
+            status, body = self.post_reporting(f"/v1/work/{token}/outlined", {}, timeout=REQUEST_TIMEOUT_S)
+        except COORDINATOR_ERRORS as error:
+            print(f"could not report the outline: {error}", file=sys.stderr)
+            return
+        if status not in (204, 404):
+            print(f"outline report answered {status}: {body}", file=sys.stderr)
 
     def complete(self, token: str, record: str, retry_s: float) -> None:
         """Report an action's result. A coordinator that can't be reached or answers 5xx, as while it restarts, is
@@ -984,7 +997,7 @@ def exec_action_env(*, version: str, discovery_config: str | None = None) -> dic
 
 def exec_action_command(
     args: argparse.Namespace, holbuild: str, version: str, spec: str, result: str, max_heap_mb: int | None,
-    ahead_parents: list[dict[str, str]],
+    ahead_parents: list[dict[str, str]], *, pipeline: bool = False,
 ) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
     command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
@@ -996,6 +1009,8 @@ def exec_action_command(
     command += ["--result", result]
     if args.share_heaps:
         command.append("--share-heaps")
+    if pipeline and tuple(map(int, version.split("."))) >= MIN_PIPELINE_RELEASE:
+        command.append("--pipeline")
     for parent in ahead_parents:
         command += ["--ahead-parent", f"{parent['input_key']}:{parent['spec_sha256']}"]
     return command
@@ -1216,7 +1231,10 @@ def execute(
         spans = ExecSpans()
         stepped = time.monotonic()
         process = subprocess.Popen(
-            exec_action_command(args, holbuild, version, spec, result, claim.get("max_heap_mb"), ahead_parents),
+            exec_action_command(
+                args, holbuild, version, spec, result, claim.get("max_heap_mb"), ahead_parents,
+                pipeline=claim.get("pipeline", False),
+            ),
             env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )
@@ -1228,12 +1246,18 @@ def execute(
         # The bound holds while the result is being posted too, which retries for as long as the lease.
         hard_stop: threading.Timer | None = None
         sampled = stepped
+        # exec-action --pipeline creates it once it published the action's outline.
+        outline = result + ".outline"
+        told_outline = False
         try:
             while process.poll() is None:
                 if reported is None:
                     if lease.check():
                         lost = True
                         break
+                    if not told_outline and os.path.exists(outline):
+                        told_outline = True
+                        threading.Thread(target=lease.coordinator.outlined, args=(lease.token,), daemon=True).start()
                     if (record := read_result(result)) is not None:
                         now = time.monotonic()
                         if cooperate_dir is None:

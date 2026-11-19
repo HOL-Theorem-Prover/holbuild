@@ -24,10 +24,11 @@ trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
 # dep_rev PROJECT NAME: the commit PROJECT's .holbuild/src/NAME holds. It is a
-# link to the cache's shared checkout <URL hash>-<commit>.
+# link to the cache's shared checkout <URL hash>-<commit>-v2.
 dep_rev() {
   local link
   link=$(readlink "$1/.holbuild/src/$2") || { echo "$1/.holbuild/src/$2 is not a link" >&2; return 1; }
+  link=${link%-v2}
   printf '%s\n' "${link##*-}"
 }
 
@@ -474,7 +475,7 @@ echo three > "$repo/value.txt"
 git -C "$repo" commit -q -am three
 rev3=$(git -C "$repo" rev-parse HEAD)
 mkdir "$tmpdir/race1/.holbuild/src/.tmp-dep-999999999"
-mkdir "$HOLBUILD_CACHE/git/checkouts/$(printf %s "$repo" | sha1sum | cut -d' ' -f1)-$rev3.tmp-999999999"
+mkdir "$HOLBUILD_CACHE/git/checkouts/$(printf %s "$repo" | sha1sum | cut -d' ' -f1)-$rev3-v2.tmp-999999999"
 set_dep_rev "$tmpdir/race1" "$rev3"
 set_dep_rev "$tmpdir/race2" "$rev3"
 race_context repin "$rev3" "$tmpdir/race1" "$tmpdir/race1" "$tmpdir/race2" "$tmpdir/race2"

@@ -127,11 +127,14 @@ With
 fail instead of building locally.
 .RE
 .TP
-.BI execution\-plan " THEORY" : THEOREM
-Print the proof-step execution plan for a theorem (or an explicit termination
-proof).
-If a theorem and a terminating definition have the same name, the theorem
-takes precedence.
+.B execution\-plan \fITHEORY\fR:[\fIKIND\fR:]\fINAME\fR
+Print the proof-step execution plan for a theorem or an explicit termination proof.
+Use
+.B theorem
+or
+.B termination
+to select the proof by kind.
+When the kind is omitted and both proofs have the same name, the theorem takes precedence.
 .TP
 .B check \fITHEORY\fR[:\fITHEOREM\fR] ...
 Build each theory if needed, read its restored Theory.dat metadata without
@@ -317,7 +320,7 @@ Sweep the worker cache only, as
 .B \-\-sweep\-only
 below says, and run no action.
 .TP
-.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-cache\-min\-free\-gb \fIN\fR] [\fB\-\-share\-heaps\fR] [\fB\-\-result \fIFILE\fR] [\fB\-\-ahead\-parent \fIINPUT_KEY\fB:\fISPEC\-SHA256\fR ... [\fB\-\-ahead\-wait\-seconds \fIN\fR]]
+.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-cache\-min\-free\-gb \fIN\fR] [\fB\-\-share\-heaps\fR] [\fB\-\-pipeline\fR] [\fB\-\-result \fIFILE\fR] [\fB\-\-ahead\-parent \fIINPUT_KEY\fB:\fISPEC\-SHA256\fR ... [\fB\-\-ahead\-wait\-seconds \fIN\fR]]
 Run the action specification stored in the remote cache as
 .I SPEC\-SHA256
 (see
@@ -376,9 +379,25 @@ For a worker waiting for disk space.
 .B \-\-share\-heaps
 Resume from the deps-loaded heap and theorem checkpoints other workers
 published, and publish this run's.
+A theory that saves no deps-loaded heap (not a build target) publishes only a
+failed proof's prefix, which a worker with no heap to restore resumes from.
 The host store
 .I CACHE/checkpoint\-store
 keeps their files.
+.TP
+.B \-\-pipeline
+Build a theory whose spec allows it pipelined: publish its outline to the
+remote cache once its script has run, under a key of its own, then prove its
+deferred proofs.
+With
+.BR \-\-ahead\-parent ,
+also start on a late parent's outline, and install nothing until the parent's
+entry is in and matches it.
+With
+.BR \-\-result " FILE" ,
+create
+.I FILE.outline
+once the outline is out.
 .TP
 .BI \-\-result " FILE"
 Where to write the result record (default: standard output).
@@ -704,9 +723,9 @@ that save; 0 saves every context.
 Remote workers use the same value, and no cache key depends on it.
 .TP
 .B \-\-all\-checkpoints
-All root-package theories save checkpoints by default, except a theory that
-is not a target and that a parallel build pipelines into an idle slot.
-With this flag every such theory saves them.
+Build targets save checkpoints as they run; other root-package theories save
+one only when a proof fails or times out.
+With this flag every such theory saves them as it runs, unpipelined.
 Checkpoint policy does not change theory outputs or cache keys.
 .TP
 .B \-\-skip\-proof\-steps

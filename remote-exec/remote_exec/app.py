@@ -92,8 +92,8 @@ async def text_body(request: Request) -> str:
         raise HTTPException(400, f"body is not UTF-8: {error}") from error
 
 
-# Requests by method, route and status since the last summary line; they replace uvicorn's access log, whose line per
-# request cost the event loop more than the counting does.
+# Requests by method, route and status since the last summary line, which totals what uvicorn's access log lists line by
+# line.
 type ResponseCounts = Counter[tuple[str, str, int]]
 
 
@@ -395,6 +395,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         if not await coordinator.heartbeat(attempt_token):
             raise HTTPException(409, "lease expired or revoked; stop the action")
         return {"lease_s": settings.lease_seconds}
+
+    @app.post("/v1/work/{attempt_token}/outlined", status_code=204, dependencies=worker)
+    async def outlined(attempt_token: UUID) -> None:
+        await coordinator.outlined(attempt_token)
 
     @app.post("/v1/work/{attempt_token}/complete", dependencies=worker)
     async def complete(attempt_token: UUID, request: Request) -> dict[str, bool]:
