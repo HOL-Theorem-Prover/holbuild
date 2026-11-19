@@ -168,6 +168,23 @@ async def test_a_slow_submission_is_logged_with_its_size_and_shape(
     assert "POST /v1/batches of 9 bytes (unparsed; batch id new)" in caplog.text
 
 
+async def test_a_submission_slow_to_upload_is_logged(
+    http: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(app_module, "SUBMIT_SLOW_SECONDS", 0.5)
+    body = batch_text(["a"]).encode()
+
+    async def stalling() -> AsyncIterator[bytes]:
+        yield body[:10]
+        await asyncio.sleep(0.6)
+        yield body[10:]
+
+    response = await http.post("/v1/batches", content=stalling(), headers={**CLIENT, "Content-Length": str(len(body))})
+    assert response.status_code == 201, response.text
+
+    assert f"POST /v1/batches of {len(body)} bytes (1 actions, 0 edges; batch id new)" in caplog.text
+
+
 async def blocked_by(observer: AsyncConnection, pid: int) -> int:
     """The backend that waits on a lock ``pid`` holds, once one does; ``observer`` runs in autocommit, since
     pg_stat_activity holds still within a transaction."""
