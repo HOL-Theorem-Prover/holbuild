@@ -4,6 +4,8 @@
 # that run the tree's own holbuild, so an unreleased coordinator, worker or
 # exec-action can be tried before it lands. See README "Local test fleet".
 set -euo pipefail
+# An inherited SHELLOPTS mustn't export the secrets below or make setsid fork.
+set +o monitor +o allexport
 
 usage() {
   cat <<'EOF'
@@ -22,7 +24,8 @@ TREE      a holbuild checkout with bin/holbuild built
 
 COMMAND runs in its own process group with LOCAL_FLEET_URL (the coordinator),
 HOLBUILD_REMOTE_CACHE_URL, HOLBUILD_REMOTE_CACHE_CURL_CONFIG,
-HOLBUILD_REMOTE_EXEC_CURL_CONFIG and HOLBUILD_CACHE set, every other
+HOLBUILD_REMOTE_EXEC_CURL_CONFIG, HOLBUILD_CACHE and HOLBUILD_COOPERATE_DIR (the
+memory budget it shares with the workers) set, every other
 HOLBUILD_REMOTE_CACHE_* and HOLBUILD_REMOTE_EXEC_* variable unset, and TREE/bin
 first on PATH, e.g.
   local-fleet --toolchain ~/.cache/holbuild/hol-toolchains/KEY ~/holbuild -- \
@@ -109,7 +112,7 @@ for t in "${toolchains[@]}"; do
   t=$(realpath "$t")
   entry=$dir/hol-toolchains/$(basename "$t")
   mkdir -p "$entry"
-  find "$t" -mindepth 1 -maxdepth 1 -type f ! -name last-used -exec cp -p {} "$entry/" \;
+  find "$t" -mindepth 1 -maxdepth 1 -type f ! -name last-used -exec cp -p -t "$entry/" {} +
   : > "$entry/last-used"
   ln -sfn "$t/hol" "$entry/hol"
   read_dirs=${read_dirs:+$read_dirs:}$t/hol
@@ -128,12 +131,10 @@ if [[ -n $budget_mb ]]; then echo $((budget_mb * 1024 * 1024)) > "$dir/cooperate
 # variables keep their values and read-only ones go too. Secrets are passed this way, never on a command line
 # others can read. No proxy is passed: all they reach is loopback.
 isolate() {
-  local name _
   export HOME=$dir/home TMPDIR=$dir/tmp USER=$(id -un) LOGNAME=$(id -un) LANG=C.UTF-8 GIT_OPTIONAL_LOCKS=0
-  while read -r name; do
-    case " PATH HOME TMPDIR USER LOGNAME LANG GIT_OPTIONAL_LOCKS $* " in *" $name "*) ;; *) export -n "$name" ;; esac
-  done < <(compgen -e)
-  while read -r _ _ name; do export -nf "$name"; done < <(declare -Fx)
+  # No local variables: one would hide an exported variable of the same name from compgen.
+  export -n $(compgen -e | grep -vxE "PATH|HOME|TMPDIR|USER|LOGNAME|LANG|GIT_OPTIONAL_LOCKS$(printf '|%s' "$@")") > /dev/null
+  export -nf $(declare -Fx | cut -d' ' -f3)
 }
 
 command_pid= worker_pids=() service_pids=() pg_started=0 launching=0 pending=0
@@ -171,7 +172,8 @@ stop() {
     for table in batches actions leases; do
       (export PGPASSWORD=$pgpassword && isolate PGPASSWORD && exec psql -X -h "$dir" -p "$pgport" -U postgres -d fleet \
         -qc "\\copy $table TO '$dir/tables/$table.csv' CSV HEADER") >> "$dir/logs/tables.log" 2>&1 ||
-        echo "local-fleet: copying the $table table failed; see $dir/logs/tables.log" >&2
+        { echo "local-fleet: copying the $table table failed; keeping $dir/pg (see $dir/logs/tables.log)" >&2
+          keep_pg=1; ((status)) || status=1; }
     done
     if ! (isolate && exec pg_ctl -s -D "$dir/pg" stop -m fast); then
       echo "local-fleet: Postgres didn't stop; keeping $dir/pg (stop it with pg_ctl -D $dir/pg stop)" >&2
@@ -294,7 +296,7 @@ echo "local-fleet: $workers workers of holbuild $version from $tree at $url, run
 launching=1
 env LOCAL_FLEET_URL="$url" HOLBUILD_REMOTE_CACHE_URL="$cache_url" \
   HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$dir/cache.curl" HOLBUILD_REMOTE_EXEC_CURL_CONFIG="$dir/client.curl" \
-  HOLBUILD_CACHE="$dir/client-cache" PATH="$tree/bin:$PATH" setsid "$@" <&0 &
+  HOLBUILD_CACHE="$dir/client-cache" HOLBUILD_COOPERATE_DIR="$dir/cooperate" PATH="$tree/bin:$PATH" setsid "$@" <&0 &
 command_pid=$!
 started
 wait "$command_pid"

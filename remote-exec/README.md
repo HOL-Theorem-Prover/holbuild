@@ -1014,6 +1014,7 @@ checkout's `bin/holbuild`, as `holbuild` on the command's `PATH` is; a client of
 another version makes the workers fetch and build that release. The command runs in a process group of its own with `LOCAL_FLEET_URL`,
 `HOLBUILD_REMOTE_CACHE_URL`, `HOLBUILD_REMOTE_CACHE_CURL_CONFIG`,
 `HOLBUILD_REMOTE_EXEC_CURL_CONFIG` and `HOLBUILD_CACHE` pointing at the fleet,
+`HOLBUILD_COOPERATE_DIR` at the memory budget it shares with the workers,
 every other `HOLBUILD_REMOTE_CACHE_*` and `HOLBUILD_REMOTE_EXEC_*` variable
 unset, and the checkout's `bin/` first on `PATH`. Don't pass `--remote-cache`
 to it: a command-line cache wins over the environment. Theory cache keys don't
