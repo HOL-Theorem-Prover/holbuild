@@ -95,6 +95,23 @@ Proof
 QED
 SML
 
+cat > "$project/src/DScript.sml" <<'SML'
+Theory D
+Ancestors A
+
+Theorem d_first:
+  a_value
+Proof
+  simp[a_value_def]
+QED
+
+Theorem d_second:
+  a_value /\ T
+Proof
+  rw[a_value_def] (* d_second *)
+QED
+SML
+
 build() {
   (cd "$project" && HOLBUILD_CHECKPOINT_TIMING=1 "$HOLBUILD_BIN" --cache-dir ../cache -j1 build BTheory) > "$1" 2>&1 ||
     { cat "$1" >&2; return 1; }
@@ -250,6 +267,11 @@ exec_theory B publish
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 modules=$(for heap in $published; do heap_modules "$heap"; done | { grep -- '-A-' || true; } | sort -u)
 [[ -n "$modules" ]] || { echo "no published heap loads A's module" >&2; exit 1; }
+# D has B's dependencies, so its checkpoints are published on B's heap.
+edit_d() { sed -i "s/^  .*(\* d_second.*\$/  rw[a_value_def] (* d_second $1 *)/" "$project/src/DScript.sml"; }
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+exec_theory D d
+require_grep 'restored shared' "$tmpdir/d-D.log"
 
 # W loses its stores: the restore fetches A's module, then the heap.
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
@@ -283,7 +305,18 @@ if grep -qE '^phase-ms=(.*,)?rstmoddropn:' "$tmpdir/replaced-B.result"; then
   echo 'the heap given up was not replaced' >&2; cat "$tmpdir/replaced-B.result" >&2; exit 1
 fi
 
-# A module at its path with another id (here, not a module at all): W's
+# D's checkpoints, on the heap B's run replaced, are rejected once, then
+# republished on the new heap.
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_d later
+exec_theory D d-later
+phase d-later-D 'rstrejectn:[0-9]+'
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_d again
+exec_theory D d-again
+resumed d-again-D 'theorem-context checkpoint after d_first'
+
+# A module at its path with another id (another theory's module): W's
 # HOL child fails to load the heap, preloads afresh, and the heap it saves
 # replaces the published one.  C, on A and Z, has a heap of its own, which
 # loads A's module.
@@ -296,7 +329,9 @@ exec_theory C c
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 for heap in $published; do heap_modules "$heap"; done | grep -q -- '-A-' ||
   { echo "C's published heap doesn't load A's module" >&2; exit 1; }
-printf 'not a module\n' > "$modules"
+z_module=$(find "$worker_modules" -name '*-Z-*.pmo' | head -n 1)
+[[ -n "$z_module" ]] || { echo "W has no module for Z" >&2; exit 1; }
+cp "$z_module" "$modules"
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 edit_c changed
 exec_theory C changed
