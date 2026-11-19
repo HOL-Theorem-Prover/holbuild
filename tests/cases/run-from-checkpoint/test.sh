@@ -104,7 +104,8 @@ cat > "$project/src/Util.sml" <<'SML'
 structure Util = struct val marker = true end
 SML
 
-(cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$tmpdir/build.log" 2>&1 ||
+# Both are targets, so both save deps_loaded checkpoints to run from.
+(cd "$project" && "$HOLBUILD_BIN" build ATheory BTheory) > "$tmpdir/build.log" 2>&1 ||
   { cat "$tmpdir/build.log" >&2; exit 1; }
 
 deps_script=$tmpdir/deps.sml

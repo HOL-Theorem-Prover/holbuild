@@ -11,9 +11,14 @@ exception UnknownTarget of string * string list
 fun unknown_target_message (target, candidates) =
   "unknown build target: " ^ target ^ HolbuildSuggest.did_you_mean target candidates
 
+(* `extra_output_dir` is the directory a theory's declared extra outputs are
+   relative to: see extra_output_dir_of.  KEY, the node's identity, is
+   computed once: plans compare it constantly. *)
 type node =
   { source : HolbuildSourceIndex.source,
-    external_dirs : string list }
+    external_dirs : string list,
+    extra_output_dir : string,
+    key : string }
 
 type keyed_node = {node : node, input_key : string}
 
@@ -68,7 +73,7 @@ fun external_dirs_of ({external_dirs, ...} : node) = external_dirs
 fun logical_name node = #logical_name (source_of node)
 fun package node = #package (source_of node)
 fun relative_path node = #relative_path (source_of node)
-fun key node = package node ^ "\000" ^ relative_path node ^ "\000" ^ logical_name node
+fun key ({key, ...} : node) = key
 
 fun member value values = List.exists (fn x => x = value) values
 
@@ -82,36 +87,22 @@ fun path_components path = String.tokens (fn c => c = #"/" orelse c = #"\\") pat
 fun path_has_suffix suffix path =
   size path >= size suffix andalso
   String.substring(path, size path - size suffix, size suffix) = suffix
-fun has_glob_char path =
-  CharVector.exists (fn c => c = #"*" orelse c = #"?" orelse c = #"[" orelse c = #"]") path
 
 fun validate_extra_output_decl node path =
   let
     val source = source_of node
     val context = "holbuild_extra_outputs in " ^ #source_path source
-    val components = path_components path
-    val invalid_component =
-      List.exists (fn component => component = "." orelse component = "..") components
   in
-    if path = "" then raise Error (context ^ " contains an empty path")
-    else if Path.isAbsolute path then
-      raise Error (context ^ " path must be relative to the declaring source: " ^ path)
-    else if invalid_component then
-      raise Error (context ^ " path must not contain . or .. components: " ^ path)
-    else if path_has_suffix "/" path orelse path_has_suffix "\\" path then
-      raise Error (context ^ " path must name a file, not a directory: " ^ path)
-    else if has_glob_char path then
-      raise Error (context ^ " path must be a fixed file path, not a glob: " ^ path)
-    else if List.null components then
-      raise Error (context ^ " contains an invalid path: " ^ path)
-    else
+    case HolbuildSourceIndex.extra_output_decl_problem path of
+        SOME problem => raise Error (context ^ " " ^ problem)
+      | NONE =>
       case #kind source of
           HolbuildSourceIndex.TheoryScript => ()
         | _ => raise Error (context ^ " is only supported for theory-script actions")
   end
 
-fun extra_output_path node declaration =
-  normalize_path (Path.concat(Path.dir (#source_path (source_of node)), declaration))
+fun extra_output_path ({extra_output_dir, ...} : node) declaration =
+  normalize_path (Path.concat(extra_output_dir, declaration))
 
 fun validate_extra_output_ownership analysis selected =
   let
@@ -250,6 +241,7 @@ type t =
    extra_inputs_key_cache : string option option array,
    input_expansions : (string, input_expansion) Binarymap.dict ref,
    input_hashes : (string, string) Binarymap.dict ref,
+   declared_outputs : (string, (string * string list) list) Binarymap.dict ref,
    known_input_keys : known_input_key option array,
    package_tiers : (string * int) list,
    holdir : string}
@@ -435,16 +427,15 @@ fun reverse_dependency_edges plan node =
   graph_values (#reverse (dependency_graph plan)) node
 
 (* Resolved edges lead from selected nodes to selected nodes: the selection
-   is closed under them. *)
+   is closed under them.  The adjacency holds those edges' targets, in edge
+   order; a node outside the selection has none. *)
 fun direct_project_deps
-      (plan as {selected_key_index, selected_node_index, ...} : t) node =
-  let
-    fun target (edge : resolved_dependency_edge) =
-      Vector.sub(selected_node_index,
-                 indexed_key_id selected_key_index (#to_node edge))
-  in
-    unique_nodes (map target (resolved_dependency_edges plan node))
-  end
+      ({selected_key_index, selected_node_index, selected_adjacency, ...} : t) node =
+  case find_key_id selected_key_index (key node) of
+      NONE => []
+    | SOME id =>
+        unique_nodes (map (fn dep => Vector.sub(selected_node_index, dep))
+                          (Vector.sub(selected_adjacency, id)))
 
 fun direct_external_theories plan node =
   unique_strings
@@ -617,8 +608,32 @@ fun forget_output_digest (plan as {output_digest_cache, ...} : t) node =
 fun forget_output_digests ({output_digest_cache, ...} : t) =
   Array.modify (fn _ => NONE) output_digest_cache
 
-fun make_node external_dirs source =
-  {source = source, external_dirs = external_dirs}
+(* The script's own directory in the root package; in a dependency, its
+   directory under the package's extra-output root, so that no project writes
+   into a dependency's sources. *)
+fun extra_output_root_of packages (source : HolbuildSourceIndex.source) =
+  case List.find (fn package => HolbuildProject.package_name package = #package source) packages of
+      NONE => raise Error ("no package " ^ #package source ^ " for " ^ #source_path source)
+    | SOME package => HolbuildProject.package_extra_output_root package
+
+fun extra_output_dir_of packages (source : HolbuildSourceIndex.source) =
+  case extra_output_root_of packages source of
+      NONE => Path.dir (#source_path source)
+    | SOME root =>
+        case Path.dir (#relative_path source) of
+            "" => root
+          | dir => Path.concat(root, dir)
+
+fun analysis_packages (analysis : HolbuildComponentProvider.analysis_state) =
+  HolbuildProjectGraph.packages (HolbuildPackagePrepare.graph (#preparation analysis))
+
+fun source_key (source : HolbuildSourceIndex.source) =
+  #package source ^ "\000" ^ #relative_path source ^ "\000" ^ #logical_name source
+
+fun make_node packages external_dirs source =
+  {source = source, external_dirs = external_dirs,
+   extra_output_dir = extra_output_dir_of packages source,
+   key = source_key source}
 
 fun bootstrap_prefetch_nodes analysis nodes =
   HolbuildComponentProvider.prefetch analysis
@@ -978,6 +993,7 @@ fun assemble {nodes, name_index, roots, selected, analysis, dependency_graph, re
      extra_inputs_key_cache = Array.array(length selected, NONE),
      input_expansions = ref (Binarymap.mkDict String.compare),
      input_hashes = ref (Binarymap.mkDict String.compare),
+     declared_outputs = ref (Binarymap.mkDict String.compare),
      known_input_keys = Array.array(length selected, NONE),
      package_tiers =
        package_tiers (HolbuildPackagePrepare.graph (#preparation (analysis : HolbuildComponentProvider.analysis_state))),
@@ -992,7 +1008,7 @@ fun plan_roots components analysis holdir sources roots_of =
       HolbuildComponentProvider.resolution_context_id components
     val _ = HolbuildDependencies.configure_analyser_for_holdir holdir
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
-    val nodes = map (make_node external_dirs) sources
+    val nodes = map (make_node (analysis_packages analysis) external_dirs) sources
     val index = build_name_index nodes
     val lookup = indexed_nodes_named index
     val roots = roots_of lookup nodes
@@ -1037,7 +1053,7 @@ fun restore {holdir, sources, roots, selected, analysis, edges,
              resolution_context_id, selected_graph_id, selected_plan_id, resolved_plan_id} =
   let
     val external_dirs = [normalize_path (Path.concat(holdir, "sigobj"))]
-    val universe = Vector.fromList (map (make_node external_dirs) sources)
+    val universe = Vector.fromList (map (make_node (analysis_packages analysis) external_dirs) sources)
     val nodes = Vector.foldr (op ::) [] universe
     val selected_nodes = map (fn i => Vector.sub(universe, i)) selected
     val keys = Vector.map key universe
@@ -1078,7 +1094,10 @@ fun plan_targets components holdir sources targets =
 (* The positions in SOURCES of the roots plan_targets picks for TARGETS. *)
 fun target_positions sources targets =
   let
-    val nodes = map (make_node []) sources
+    (* Nodes only to look names up in: they build nothing. *)
+    val nodes =
+      map (fn source => {source = source, external_dirs = [], extra_output_dir = "", key = source_key source})
+        sources
     val positions = build_key_index nodes
     val roots = target_roots (indexed_nodes_named (build_name_index nodes)) nodes (SelectedTargets targets)
   in
@@ -1152,7 +1171,9 @@ fun expand_extra_dep_walk base decl : input_expansion =
 
 fun expand_extra_dep base decl = #files (expand_extra_dep_walk base decl)
 
-fun expansion_key base decl = base ^ "\000" ^ decl
+(* In a dependency, what a declaration names depends on the package too: its
+   extra-output root and its theories' declarations. *)
+fun expansion_key package base decl = package ^ "\000" ^ base ^ "\000" ^ decl
 
 (* Expansions and file hashes are kept for the life of the plan, so a plan's
    input keys and the plan record name the same files and contents, except
@@ -1160,17 +1181,20 @@ fun expansion_key base decl = base ^ "\000" ^ decl
    a file an earlier one read. *)
 fun keeps_inputs plan = not (HolbuildComponentProvider.runs_generators (analysis_state plan))
 
-fun input_expansion (plan as {input_expansions, ...} : t) base decl =
-  case if keeps_inputs plan then Binarymap.peek(!input_expansions, expansion_key base decl) else NONE of
-      SOME expansion => expansion
-    | NONE =>
-        let val expansion = expand_extra_dep_walk base decl
-        in input_expansions := Binarymap.insert(!input_expansions, expansion_key base decl, expansion);
-           expansion
-        end
+fun input_expansion (plan as {input_expansions, ...} : t) expand package base decl =
+  let val key = expansion_key package base decl
+  in
+    case if keeps_inputs plan then Binarymap.peek(!input_expansions, key) else NONE of
+        SOME expansion => expansion
+      | NONE =>
+          let val expansion = expand ()
+          in input_expansions := Binarymap.insert(!input_expansions, key, expansion);
+             expansion
+          end
+  end
 
-fun remember_input_expansion ({input_expansions, ...} : t) base decl expansion =
-  input_expansions := Binarymap.insert(!input_expansions, expansion_key base decl, expansion)
+fun remember_input_expansion ({input_expansions, ...} : t) package base decl expansion =
+  input_expansions := Binarymap.insert(!input_expansions, expansion_key package base decl, expansion)
 
 fun input_hash (plan as {input_hashes, ...} : t) path =
   case if keeps_inputs plan then Binarymap.peek(!input_hashes, path) else NONE of
@@ -1182,11 +1206,12 @@ fun input_hash (plan as {input_hashes, ...} : t) path =
 fun remember_input_hash ({input_hashes, ...} : t) path hash =
   input_hashes := Binarymap.insert(!input_hashes, path, hash)
 
-(* Every extra-input expansion the plan made, as (base, declaration, expansion). *)
+(* Every extra-input expansion the plan made, as (package, base, declaration,
+   expansion). *)
 fun input_expansions ({input_expansions, ...} : t) =
   map (fn (key, expansion) =>
          case String.fields (fn c => c = #"\000") key of
-             [base, decl] => (base, decl, expansion)
+             [package, base, decl] => (package, base, decl, expansion)
            | _ => raise Error ("internal malformed expansion key: " ^ String.toString key))
       (Binarymap.listItems (!input_expansions))
 
@@ -1203,20 +1228,191 @@ fun lookup_key keys dep =
       SOME input_key => input_key
     | NONE => raise Error ("missing action key for dependency: " ^ logical_name dep)
 
+(* The theories in directory DIR of PACKAGE, each as its file and the
+   package-relative extra outputs it declares, read once per plan. *)
+fun declaring_scripts_in (plan as {declared_outputs, ...} : t) package dir =
+  let val memo_key = package ^ "\000" ^ dir
+  in
+    case Binarymap.peek(!declared_outputs, memo_key) of
+        SOME scripts => scripts
+      | NONE =>
+          let
+            val scripts =
+              map (fn script => (#source_path script, HolbuildSourceIndex.script_extra_outputs script))
+                (List.filter
+                   (fn script => #package script = package andalso #kind script = HolbuildSourceIndex.TheoryScript andalso
+                                 Path.dir (normalize_path (#relative_path script)) = dir)
+                   (map source_of (universe_nodes plan)))
+          in
+            declared_outputs := Binarymap.insert(!declared_outputs, memo_key, scripts);
+            scripts
+          end
+  end
+
+fun declared_outputs_in plan package dir =
+  List.concat (map #2 (declaring_scripts_in plan package dir))
+
+(* The directories a theory declaring REL as an output may be in: REL's own
+   and its ancestors, as declarations have no .. components. *)
+fun output_dirs rel =
+  let
+    fun up dir = if dir = "" then [""] else dir :: up (Path.dir dir)
+  in
+    up (Path.dir rel)
+  end
+
+(* Those of RELS, paths in NODE's package, that a theory of the package
+   declares as extra outputs. *)
+fun declared_outputs_among plan node rels =
+  List.filter
+    (fn rel =>
+       List.exists
+         (fn dir => List.exists (fn output => output = rel) (declared_outputs_in plan (package node) dir))
+         (output_dirs rel))
+    rels
+
+(* The files of the theories whose declarations decide whether RELS, paths in
+   NODE's package, are declared extra outputs. *)
+fun declaring_script_files plan node rels =
+  HolbuildSourceIndex.sort_unique_strings (List.concat
+    (map (fn dir => map #1 (declaring_scripts_in plan (package node) dir))
+       (HolbuildSourceIndex.sort_unique_strings (List.concat (map output_dirs rels)))))
+
+(* A dependency's declared extra outputs are written under its extra-output
+   root (extra_output_dir_of), not next to its sources.  For an extra-input
+   declaration of NODE relative to package directory DIR: SOME of the
+   directory under that root matching DIR; NONE in the root package. *)
+fun input_overlay plan node dir =
+  case extra_output_root_of (analysis_packages (analysis_state plan)) (source_of node) of
+      NONE => NONE
+    | SOME root => SOME (if dir = "" then root else Path.concat(root, dir))
+
+fun package_path dir rel = normalize_path (if dir = "" then rel else Path.concat(dir, rel))
+
+(* The package directory a declaration with LABEL is relative to. *)
+fun input_dir node label = if label = "extra_dep" then "" else Path.dir (relative_path node)
+
 (* The node's extra-input declarations, manifest-declared first, as
-   (label, base directory, declaration). *)
+   (label, base directory, declaration).  In a dependency, a declaration that
+   names an extra output a theory of the package declares is based under the
+   package's extra-output root, where that output is written, whether or not
+   it exists yet; the others are based in the package's source tree, even for
+   a theory another theory generated under that root. *)
 fun extra_input_decls plan node =
   let
     val source = source_of node
+    val script_base =
+      case input_overlay plan node "" of
+          NONE => Path.dir (#source_path source)
+        | SOME _ =>
+            let val dir = input_dir node "source_extra_dep"
+            in if dir = "" then #package_root source else package_path (#package_root source) dir end
+    fun base_of base label decl =
+      let val dir = input_dir node label
+      in
+        case input_overlay plan node dir of
+            NONE => base
+          | SOME overlay =>
+              (* A declaration naming a directory there is one a build of
+                 its theory rejects, so it declares nothing. *)
+              if not (path_has_glob decl) andalso not (Path.isAbsolute decl) andalso
+                 not (null (declared_outputs_among plan node [package_path dir decl])) andalso
+                 not (is_dir (normalize_path (Path.concat(overlay, decl))))
+              then overlay
+              else base
+      end
     val manifest =
-      map (fn input => ("extra_dep", #package_root source, HolbuildProject.extra_input_path input))
+      map (fn input =>
+             let val decl = HolbuildProject.extra_input_path input
+             in ("extra_dep", base_of (#package_root source) "extra_dep" decl, decl) end)
         (HolbuildProject.action_extra_inputs (#policy source))
     val declared =
-      map (fn decl => ("source_extra_dep", Path.dir (#source_path source), decl))
+      map (fn decl =>
+             ("source_extra_dep",
+              base_of script_base "source_extra_dep" decl, decl))
         (#extra_deps (dependencies plan node))
   in
     manifest @ declared
   end
+
+(* What an extra-input declaration of NODE (see extra_input_decls) names.  A
+   directory or glob in a dependency also takes in the package's declared
+   extra outputs under it, which are written under the extra-output root.
+   Its directories to watch include, where a directory under that root
+   doesn't exist yet, the nearest one that does, and the theories whose
+   declarations decide which files count as outputs. *)
+fun expand_input plan node (label, base, decl) : input_expansion =
+  let val dir = input_dir node label
+  in
+    case input_overlay plan node dir of
+        NONE => expand_extra_dep_walk base decl
+      | SOME overlay =>
+          let
+            val root = valOf (input_overlay plan node "")
+            (* Planning under the project lock finds the root current;
+               outside it, one that isn't is as good as empty. *)
+            val current =
+              case List.find (fn package => HolbuildProject.package_name package = #package (source_of node))
+                     (analysis_packages (analysis_state plan)) of
+                  SOME package => HolbuildSourceIndex.extra_output_root_current package root
+                | NONE => false
+          in
+            if Path.isAbsolute decl then expand_extra_dep_walk base decl
+            else if base = overlay then
+              if current then expand_extra_dep_walk base decl
+              else raise Error ("extra dependency not found: " ^ normalize_path (Path.concat(base, decl)))
+            else
+              let
+                fun existing path =
+                  if path = root orelse is_dir path then path else existing (Path.dir path)
+                val glob = path_has_glob decl
+                val start = normalize_path (Path.concat(overlay, decl))
+                val found =
+                  if not current then {files = [], dirs = []}
+                  else if glob then
+                    if is_dir overlay then
+                      let val {files, dirs} = walked_files_under overlay ""
+                      in {files = List.filter (fn (rel, _) => HolbuildSourceIndex.glob_match decl rel) files, dirs = dirs} end
+                    else {files = [], dirs = [existing overlay]}
+                  else if is_dir start then walked_files_under start decl
+                  else if is_dir (normalize_path (Path.concat(base, decl))) then {files = [], dirs = [existing start]}
+                  else {files = [], dirs = []}
+                val declared = declared_outputs_among plan node (map (fn (rel, _) => package_path dir rel) (#files found))
+                val outputs =
+                  List.filter (fn (rel, _) => List.exists (fn output => output = package_path dir rel) declared)
+                    (#files found)
+                val tree =
+                  if null outputs then expand_extra_dep_walk base decl
+                  else
+                    let
+                      val tree_path = if glob then base else normalize_path (Path.concat(base, decl))
+                      fun existing_dir path =
+                        if is_dir path orelse Path.dir path = path then path else existing_dir (Path.dir path)
+                    in
+                      if (OS.FileSys.access (tree_path, []) handle OS.SysErr _ => false)
+                      then expand_extra_dep_walk base decl
+                      else {files = [], dirs = [existing_dir tree_path]}
+                    end
+                (* A declared output in the source tree is a stray copy, such
+                   as one 0.14.63 or 0.14.64 wrote there, unless the
+                   declaration names a directory under the root, which a
+                   build of its theory rejects. *)
+                val strays =
+                  List.filter (fn output => not (is_dir (normalize_path (Path.concat(root, output)))))
+                    (declared_outputs_among plan node (map (fn (rel, _) => package_path dir rel) (#files tree)))
+                fun stray (rel, _) = List.exists (fn output => output = package_path dir rel) strays
+                val scripts =
+                  declaring_script_files plan node
+                    (map (fn (rel, _) => package_path dir rel) (#files tree @ #files found))
+              in
+                {files = List.filter (not o stray) (#files tree) @ outputs,
+                 dirs = #dirs tree @ #dirs found @ scripts}
+              end
+          end
+  end
+
+fun planned_input_expansion plan node (decl as (_, base, rel)) =
+  input_expansion plan (fn () => expand_input plan node decl) (#package (source_of node)) base rel
 
 (* The node's manifest-declared and source-declared extra inputs, each with
    the content hashes of the files it names. *)
@@ -1229,12 +1425,12 @@ fun extra_input_lines plan node =
         (fn (_, base, decl) =>
            HolbuildComponentProvider.ensure_extra_input (analysis_state plan) source base decl)
         decls
-    fun lines (label, base, decl) =
+    fun lines (entry as (label, _, decl)) =
       (label ^ "_decl=" ^ decl) ::
       map (fn line => label ^ "=" ^ line)
         (sort_strings
           (map (fn (rel, abs) => rel ^ "@" ^ input_hash plan abs)
-             (#files (input_expansion plan base decl))))
+             (#files (planned_input_expansion plan node entry))))
   in
     List.concat (map lines decls)
   end
@@ -1270,7 +1466,14 @@ fun default_source_name package relative_path = "$(" ^ package ^ ")/" ^ relative
    which only the planning side has.  The action text carries it to workers. *)
 fun toolchain_source_name ({holdir, ...} : t) node =
   let
-    val path = normalize_path (#source_path (source_of node))
+    val source = source_of node
+    val root = normalize_path (#package_root source)
+    val physical = normalize_path (#source_path source)
+    (* A source under a dependency's extra-output root counts as at its
+       place in the package's tree. *)
+    val path =
+      if String.isPrefix (root ^ "/") physical then physical
+      else normalize_path (Path.concat(root, #relative_path source))
     val dir = normalize_path holdir
   in
     if holdir <> "" andalso String.isPrefix (dir ^ "/") path then

@@ -53,15 +53,16 @@ done
 checkpoints=$project/.holbuild/checkpoints/targets/src
 has_save() { find "$checkpoints/$1" -name "$2" -print -quit 2>/dev/null | grep -q .; }
 
-# Both the requested target and its root-package dependency save checkpoints.
+# The requested target saves checkpoints; its passing dependency saves none.
 log=$tmpdir/build.log
 (cd "$project" && "$HOLBUILD_BIN" build BTheory) > "$log" 2>&1 \
   || { cat "$log" >&2; exit 1; }
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 require_file "$project/.holbuild/obj/src/BTheory.dat"
-has_save AScript.sml.deps deps_loaded.save || { echo "dependency lost its deps_loaded checkpoint" >&2; exit 1; }
+if has_save AScript.sml.deps '*.save' || has_save AScript.sml.theorems '*.save'; then
+  echo "the passing dependency saved checkpoints" >&2; exit 1
+fi
 has_save BScript.sml.deps deps_loaded.save || { echo "target lost its deps_loaded checkpoint" >&2; exit 1; }
-has_save AScript.sml.theorems '*_context.save' || { echo "dependency saved no theorem checkpoints" >&2; exit 1; }
 has_save BScript.sml.theorems '*_context.save' || { echo "target saved no theorem checkpoints" >&2; exit 1; }
 
 # --all-checkpoints changes no input key: it finds both up to date.
@@ -70,7 +71,7 @@ up_log=$tmpdir/up.log
 require_grep "ATheory is up to date" "$up_log"
 require_grep "BTheory is up to date" "$up_log"
 
-# The compatibility alias also keeps outputs byte-identical on a rebuild.
+# --all-checkpoints also saves the dependency's, with byte-identical outputs.
 outputs() { (cd "$project/.holbuild/obj/src" && sha256sum ATheory.sig ATheory.sml ATheory.dat BTheory.sig BTheory.sml BTheory.dat); }
 default_outputs=$(outputs)
 (cd "$project" && "$HOLBUILD_BIN" build --all-checkpoints --force --no-cache BTheory) > "$tmpdir/all-flag.log" 2>&1 \

@@ -18,10 +18,19 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 
 # The sandbox grants only system paths, so a virtualenv's interpreter (whose
 # pyvenv.cfg lives beside it) can't start there; use the one it links to.
 SANDBOXED_PYTHON = os.path.realpath(sys.executable)
+
+
+def path_rule_layout(helper: Path) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        module = runpy.run_path(str(helper), run_name="sandbox")
+    assert ctypes.sizeof(module["PathRule"]) == 12, ctypes.sizeof(module["PathRule"])
+    print("PathRule is 12 bytes and loads without a ctypes warning")
 
 
 def attack(root: Path, worker: int, secret: Path, shared: Path) -> None:
@@ -511,6 +520,7 @@ if __name__ == "__main__":
     elif sys.argv[1] == "--worker":
         worker(Path(sys.argv[2]), Path(sys.argv[3]))
     else:
+        path_rule_layout(Path(sys.argv[1]))
         completion_probe(Path(sys.argv[1]))
         scratch_probe(Path(sys.argv[1]))
         with tempfile.TemporaryDirectory(prefix="holbuild-sandbox-probe-") as directory:

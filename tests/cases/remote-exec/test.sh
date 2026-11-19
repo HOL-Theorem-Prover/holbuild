@@ -60,6 +60,20 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
       continue
     fi
   fi
+  # A worker that finds missing what fail-missing ("THEORY theory KEY" or
+  # "THEORY blob SHA256") names, once, before building THEORY; with
+  # fail-missing-built, after building it.  One that fails what fail-result
+  # names, once, with no log.
+  if [[ -e "$state/fail-missing" && "\$(cut -d' ' -f1 "$state/fail-missing")" == "\$theory" ]]; then
+    cut -d' ' -f2- "$state/fail-missing" > "$state/missing"
+    rm "$state/fail-missing"
+    exit 1
+  fi
+  if [[ -e "$state/fail-result" && "\$(< "$state/fail-result")" == "\$theory" ]]; then
+    printf 'holbuild-action-result-v1\nstatus=failed\nfailure=internal\n' > "$state/result-\$key"
+    rm "$state/fail-result"
+    exit 1
+  fi
   echo "\$theory" >> "$state/ran"
   status=0
   env "\${untrusted[@]}" HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" "\${heap[@]}" \
@@ -74,6 +88,11 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   fi
   if [[ -e "$state/optional-log-outage" && \$theory == *:ATheory ]]; then
     echo 500 > "$tmpdir/cache-control/cas-get-status-\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
+  fi
+  if [[ -e "$state/fail-missing-built" && "\$(cut -d' ' -f1 "$state/fail-missing-built")" == "\$theory" ]]; then
+    cut -d' ' -f2- "$state/fail-missing-built" > "$state/missing"
+    rm "$state/fail-missing-built"
+    exit 1
   fi
   # A remote failure the local source doesn't share: the source heals.
   if [[ \$status -ne 0 && -e "$state/heal" ]]; then
@@ -170,10 +189,20 @@ refute_grep() {
   fi
 }
 
+# The plan record's digest, as the stub's `watch` computes it.
+plan_digest() {
+  if [[ -z $(find "$project/.holbuild/plan" -maxdepth 1 -type f 2>/dev/null) ]]; then echo absent; return; fi
+  find "$project/.holbuild/plan" -maxdepth 1 -type f -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256sum | cut -c1-64
+}
+
 # Submit and follow: the workers build both theories, and the client restores
-# them from the remote cache without building anything itself.
+# them from the remote cache without building anything itself.  The plan
+# record is written only after the batch is submitted (record mode on, as
+# outside the tests).
 write_theories one
-run follow 0 build --remote-exec "$coordinator" BTheory
+echo "$project/.holbuild/plan" > "$state/watch"
+HOLBUILD_PLAN_RECORD=on run follow 0 build --remote-exec "$coordinator" BTheory
+[[ $(< "$state/b1.watched") == absent ]] || { echo "plan record written before the POST" >&2; exit 1; }
 require_grep "holbuild: remote batch b1" "$tmpdir/follow.log"
 require_grep "holbuild: remote rx:BTheory: done" "$tmpdir/follow.log"
 [[ $(grep -c "remote rx:BTheory: running" "$tmpdir/follow.log") -eq 1 ]] || { cat "$tmpdir/follow.log" >&2; exit 1; }
@@ -204,15 +233,26 @@ assert record['local_outcomes']['built']==0
 assert record['local_outcomes']['restored_remote']==2
 PY
 
-# With everything cached there is nothing to submit.
-run cached 0 build --remote-exec "$coordinator" BTheory
+[[ $(plan_digest) != absent ]] || { echo "follow wrote no plan record" >&2; exit 1; }
+
+# With everything cached there is nothing to submit, and the deferred plan
+# record is still written.
+rm "$project"/.holbuild/plan/*
+HOLBUILD_PLAN_RECORD=on run cached 0 build --remote-exec "$coordinator" BTheory
 refute_grep "remote batch" "$tmpdir/cached.log"
 require_grep "remote execution: nothing to build remotely" "$tmpdir/cached.log"
+[[ $(plan_digest) != absent ]] || { echo "an empty batch wrote no plan record" >&2; exit 1; }
 
 # Detach and reattach.
 write_theories two
-run detach 0 build --remote-exec "$coordinator" --detach BTheory
+record_before=$(plan_digest)
+HOLBUILD_PLAN_RECORD=on run detach 0 build --remote-exec "$coordinator" --detach BTheory
 require_grep "holbuild: remote batch b2" "$tmpdir/detach.log"
+rm "$state/watch"
+# A detached build writes the record of its edited plan, after the POST.
+[[ $(< "$state/b2.watched") == "$record_before" ]] || { echo "plan record changed before the POST" >&2; exit 1; }
+record_after=$(plan_digest)
+[[ $record_after != absent && $record_after != "$record_before" ]] || { echo "detach wrote no new plan record" >&2; exit 1; }
 refute_grep "Theory built\|restored from cache" "$tmpdir/detach.log"
 run attach 0 build --remote-exec "$coordinator" --attach b2 BTheory
 require_grep "BTheory restored from cache" "$tmpdir/attach.log"
@@ -430,6 +470,16 @@ batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/ledger-seed.log")
 for spec in $(awk '$1 == "action" { print $4 }' "$state/$batch.batch"); do
   refute_grep "^blob $spec$" "$ledger_file"
 done
+# --remote-only builds nothing locally, but its workers build pipelined
+# whatever the local rule would pipeline: ATheory, not the target BTheory.
+[[ $(awk '$1 == "action" && $5 ~ /ATheory$/' "$state/$batch.batch" | wc -l) -eq 1 ]] ||
+  { cat "$state/$batch.batch" >&2; exit 1; }
+while read -r spec theory; do
+  case $theory in
+    *ATheory) require_grep '^option pipeline=true$' "$remote_root/cas/$spec" ;;
+    *) refute_grep '^option pipeline=true$' "$remote_root/cas/$spec" ;;
+  esac
+done < <(awk '$1 == "action" { print $4, $5 }' "$state/$batch.batch")
 # A build with nothing to do doesn't read the ledger: a FIFO in its place
 # would block the read.
 cp "$ledger_file" "$tmpdir/ledger.seed"
@@ -1763,6 +1813,74 @@ require_grep 'could not fetch the remote build log for rxoptional:ATheory' "$tmp
 require_grep 'build.execute' "$tmpdir/optional-log.timing"
 rm "$state/optional-log-outage"
 
+# A batch that fails for resubmission after its workers built ATheory: B's
+# worker finds A missing, so the resubmitted batch rechecks A, which its
+# worker finds built and reports with no log.  A's log from the first batch
+# must still reach logs/current.
+project=$tmpdir/resubmit-logs-project
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxresubmitlogs"
+[build]
+members = ["src"]
+TOML
+write_theories resubmit-logs
+a_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:ATheory" { print $2 }')
+[[ -n $a_key ]] || { echo "no action for ATheory" >&2; exit 1; }
+echo "rxresubmitlogs:BTheory theory $a_key" > "$state/fail-missing"
+: > "$state/results"
+run resubmit-logs 0 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/resubmit-logs.log"
+[[ "$(< "$state/results")" == \
+   $'rxresubmitlogs:ATheory status=built\nrxresubmitlogs:ATheory status=cached\nrxresubmitlogs:BTheory status=built' ]] ||
+  { echo "worker results:" >&2; cat "$state/results" >&2; exit 1; }
+for theory in ATheory BTheory; do
+  require_file "$project/.holbuild/logs/current/rxresubmitlogs/$theory/build.log"
+done
+require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
+# A resubmission naming B itself leaves A, which the remote cache now
+# holds, out of the second batch; A's log still comes from the first.
+write_theories resubmit-logs-left-out
+rm -rf "$project/.holbuild/logs/current"
+b_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:BTheory" { print $2 }')
+echo "rxresubmitlogs:BTheory theory $b_key" > "$state/fail-missing"
+: > "$state/results"
+run resubmit-logs-left-out 0 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubmit-logs-left-out.log"
+[[ "$(< "$state/results")" == $'rxresubmitlogs:ATheory status=built\nrxresubmitlogs:BTheory status=built' ]] ||
+  { echo "worker results:" >&2; cat "$state/results" >&2; exit 1; }
+for theory in ATheory BTheory; do
+  require_file "$project/.holbuild/logs/current/rxresubmitlogs/$theory/build.log"
+done
+
+# A theory that fails in the resubmitted batch keeps no log from the first:
+# on the second submission, A's worker fails it.
+write_theories resubmit-logs-failed
+rm -rf "$project/.holbuild/logs/current"
+a_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:ATheory" { print $2 }')
+echo "rxresubmitlogs:BTheory theory $a_key" > "$state/fail-missing"
+echo "[[ ! -e '$state/submitted' ]] || echo rxresubmitlogs:ATheory > '$state/fail-result'; touch '$state/submitted'" \
+  > "$state/on-submit"
+run resubmit-logs-failed 75 build --remote-exec "$coordinator" --remote-only BTheory
+rm "$state/on-submit" "$state/submitted"
+require_grep "resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/resubmit-logs-failed.log"
+require_grep "rxresubmitlogs:ATheory: failed (internal)" "$tmpdir/resubmit-logs-failed.log"
+require_no_file "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
+
+# A resubmission that finds everything built already still restores the
+# first batch's logs: B's worker builds it, then reports a blob missing.
+write_theories resubmit-logs-built
+rm -rf "$project/.holbuild/logs/current"
+echo "rxresubmitlogs:BTheory blob $(printf '0%.0s' {1..64})" > "$state/fail-missing-built"
+run resubmit-logs-built 0 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "still missing blob 0* after 3 attempts; .*; resubmitting$" "$tmpdir/resubmit-logs-built.log"
+require_grep "nothing to build remotely" "$tmpdir/resubmit-logs-built.log"
+for theory in ATheory BTheory; do
+  require_file "$project/.holbuild/logs/current/rxresubmitlogs/$theory/build.log"
+done
+
 # The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
 copy_nondet heap-cap rxheap
 cat > "$tmpdir/heap-cap/src/HeapScript.sml" <<'SML'
@@ -2524,3 +2642,39 @@ cp "$tmpdir/ring-weak-ac" "${ranked_roots[1]}/ac/$ring_ac"
 ring_worker ring-built-worker built
 require_grep '^proof-timeout=2.5$' "${ranked_roots[0]}/ac/$ring_ac"
 require_grep '^proof-timeout=2.5$' "${ranked_roots[1]}/ac/$ring_ac"
+
+# The plan record written after the POST keeps the stamps taken when planning
+# hashed the inputs: an input whose link moves to an older file while the
+# batch is submitted is hashed again by the next plan, which check mode
+# compares with full planning.
+project=$tmpdir/swap
+mkdir -p "$project/src" "$project/data"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxswap"
+
+[build]
+members = ["src"]
+
+[actions.ATheory]
+extra_inputs = ["data/in.txt"]
+TOML
+cat > "$project/src/AScript.sml" <<'SML'
+Theory A
+Ancestors bool
+SML
+echo one > "$project/one.txt"
+echo two > "$project/two.txt"
+ln -s ../one.txt "$project/data/in.txt"
+# Neither file's stat is recent enough for the record to distrust it.
+sleep 1.1
+echo "ln -sfn ../two.txt '$project/data/in.txt'" > "$state/on-submit"
+touch "$state/skip"
+HOLBUILD_PLAN_RECORD=on run swap 0 --verbose build --remote-exec "$coordinator" --detach ATheory
+rm "$state/on-submit"
+[[ $(readlink "$project/data/in.txt") == ../two.txt ]] || { echo "the input was not swapped at the POST" >&2; exit 1; }
+[[ $(plan_digest) != absent ]] || { cat "$tmpdir/swap.log" >&2; echo "the swap build wrote no plan record" >&2; exit 1; }
+HOLBUILD_PLAN_RECORD=check run swap-check 0 --verbose build --remote-exec "$coordinator" --detach ATheory
+rm "$state/skip"
+require_grep "plan: from record (1 files rehashed" "$tmpdir/swap-check.log"

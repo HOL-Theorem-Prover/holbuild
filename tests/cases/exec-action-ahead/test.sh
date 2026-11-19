@@ -411,11 +411,11 @@ expect other-x 3 "status=failed" "failure=ahead-abandoned"
 require_grep 'does not match its parents' "$tmpdir/other-x.log"
 
 # Plain builds of B, of G, whose script loads A, and of J against a second
-# cache publish the same entries.
+# cache publish the same entries.  The same targets give the same specs.
 first_remote=$tmpdir/remote
 kill "$server_pid"; wait "$server_pid" 2>/dev/null || true
 start_remote_cache_server "$tmpdir/remote2" "$tmpdir/server2"
-hb action-spec --upload BTheory GTheory JTheory ZTheory > /dev/null
+hb action-spec --upload CTheory ETheory FTheory GTheory ITheory JTheory KTheory ZTheory > /dev/null
 worker plain-a "$spec_A"
 expect plain-a 0 "status=built"
 worker plain-b "$spec_B"

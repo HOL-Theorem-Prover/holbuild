@@ -106,7 +106,7 @@ HOLBUILD_OFFLINE=0 PATH="$blocked_path" "$HOLBUILD_BIN" --offline context > "$tm
 cmp "$tmpdir/context-online" "$tmpdir/context-offline"
 # A project links the shared checkout offline, but a missing shared checkout
 # is not made from the mirror.
-shared=$HOLBUILD_CACHE/git/checkouts/$(printf %s "$tmpdir/dep" | sha1sum | cut -d' ' -f1)-$rev
+shared=$HOLBUILD_CACHE/git/checkouts/$(printf %s "$tmpdir/dep" | sha1sum | cut -d' ' -f1)-$rev-v2
 [[ $(readlink .holbuild/src/dep) == "$shared" ]]
 rm .holbuild/src/dep
 HOLBUILD_OFFLINE=1 PATH="$blocked_path" "$HOLBUILD_BIN" context > /dev/null

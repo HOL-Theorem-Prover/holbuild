@@ -2,17 +2,15 @@
 
 import asyncio
 import time
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncEngine
-
 from conftest import FakeCache
-from remote_exec import coordinator as coordinator_module
-from remote_exec.coordinator import CLAIM_RECHECK_SECONDS, Coordinator, _claim_rank
+from sqlalchemy.ext.asyncio import AsyncEngine
 from test_coordinator import (
     CLIENT,
     WORKER,
@@ -29,6 +27,9 @@ from test_coordinator import (
     states,
     submit,
 )
+
+from remote_exec import coordinator as coordinator_module
+from remote_exec.coordinator import CLAIM_RECHECK_SECONDS, Coordinator, _claim_rank, _Ranking
 
 
 async def claim_ahead(
@@ -79,6 +80,62 @@ async def test_a_batch_without_speculative_loading_is_never_claimed_ahead(http: 
     assert await claim_ahead(http) is None
 
 
+async def test_builds_of_a_batch_that_loads_ahead_are_claimed_pipelined_unless_the_setting_is_off(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    claimed = await claim(http)
+    assert claimed is not None and claimed["pipeline"] is True
+    claimed = await claim_ahead(http)
+    assert claimed is not None and claimed["theory"] == "pkg:b" and claimed["pipeline"] is True
+
+    # Nothing would start on the outline of a leaf claimed plain.
+    await submit(http, ["l"], speculative_loading="4")
+    claimed = await claim(http)
+    assert claimed is not None and claimed["theory"] == "pkg:l" and claimed["pipeline"] is False
+
+    await submit(http, ["x"])
+    claimed = await claim(http)
+    assert claimed is not None and claimed["theory"] == "pkg:x" and claimed["pipeline"] is False
+
+    coordinator.settings.pipeline = False
+    await submit(http, ["y", "z"], [("z", "y")], speculative_loading="4")
+    claimed = await claim(http)
+    assert claimed is not None and claimed["theory"] == "pkg:y" and claimed["pipeline"] is False
+
+
+async def test_an_action_that_published_its_outline_frees_its_slot_of_the_cap_for_its_children(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache
+) -> None:
+    coordinator.settings.ahead_depth = 0
+    await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "b")], speculative_loading="1")
+    a = await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+    assert await claim_ahead(http) is None  # the cap is full
+
+    # A stale token marks nothing.
+    response = await http.post(f"/v1/work/{uuid4()}/outlined", headers=WORKER)
+    assert response.status_code == 204
+    assert await claim_ahead(http) is None
+
+    response = await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)
+    assert response.status_code == 204
+    c = await claim_ahead(http)
+    assert c is not None and (c["theory"], c["ahead_parents"]) == ("pkg:c", parents("a") + parents("b"))
+    assert list(coordinator.outlined_tokens) == [UUID(b["attempt_token"])]
+
+    # Its result forgets it.
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, a, result("a", "built"))).status_code == 200
+    cache.keys.add(ac_key("b"))
+    assert (await complete(http, b["attempt_token"], result("b", "built"))).status_code == 200
+    assert coordinator.outlined_tokens == {}
+    # A report arriving after the result marks nothing.
+    assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204
+    assert coordinator.outlined_tokens == {}
+
+
 async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_ready(
     http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
 ) -> None:
@@ -112,6 +169,59 @@ async def test_a_claim_ahead_comes_after_ready_builds_of_its_priority_and_before
         assert claimed is not None
         order.append(claimed["theory"].removeprefix("pkg:"))
     assert order[:2] == ["x", "b"] and sorted(order[2:]) == ["y", "z"]
+
+
+@pytest.mark.parametrize(("outlined", "order"), [(False, ["r", "l", "b"]), (True, ["r", "b", "l"])])
+async def test_a_claim_ahead_on_outlines_alone_with_a_deeper_chain_than_its_batch_s_ready_builds_comes_before_them(
+    http: httpx.AsyncClient, outlined: bool, order: list[str]
+) -> None:
+    await submit(
+        http, ["a", "b", "c", "r", "s", "l"], [("b", "a"), ("c", "b"), ("s", "r")], speculative_loading="4"
+    )
+    a = await claim_named(http, "a")
+    if outlined:
+        assert (await http.post(f"/v1/work/{a}/outlined", headers=WORKER)).status_code == 204
+
+    # "r" ranks as deep as "b" and comes first. Then "b", whose parent is still running, comes before the leaf "l"
+    # only once that parent's outline is out; "c", whose parent "b" has published none, never does.
+    claimed = []
+    while (action := await claim_ahead(http)) is not None:
+        claimed.append(action["theory"].removeprefix("pkg:"))
+    assert claimed[:3] == order
+
+
+async def test_a_claim_ahead_on_outlines_alone_counts_as_a_build_of_its_batch_in_the_ranking_claims_share(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a", "b", "c", "l"], [("b", "a"), ("c", "b")], speculative_loading="4")
+    a = await claim_named(http, "a")
+    assert (await http.post(f"/v1/work/{a}/outlined", headers=WORKER)).status_code == 204
+    await submit(http, ["y1", "y2"])
+    coordinator.settings.claim_ranking_seconds = 3600
+
+    # Batches take turns by their running builds: "b", claimed ahead, is the second of its batch, so the other
+    # batch's "y2" comes before "l".
+    claimed = []
+    for _ in range(4):
+        action = await claim_ahead(http)
+        assert action is not None
+        claimed.append(action["theory"].removeprefix("pkg:"))
+    assert claimed == ["y1", "b", "y2", "l"]
+
+
+def test_a_ranking_entry_counted_for_a_claim_ahead_is_put_back_after_a_cap_rewrote_its_priority() -> None:
+    """A claim ahead on outlines counts in its batch's entry, and a cap reached meanwhile rewrites the priorities:
+    the entry put back when the claim takes nothing is found all the same, and stays capped."""
+    batch, at = uuid4(), datetime.now(UTC)
+    stopped = (0, -2, 1, True, at, at, batch, "standard", None)
+    counted = (0, -2, 2, True, at, at, batch, "standard", None)
+    other = (0, -1, 0, False, at, at, uuid4(), "standard", None)
+    ranking = _Ranking(0.0, 0, [stopped, other], set(), set(), 1, {}, {})
+    Coordinator._replace_entry(ranking, stopped, counted)
+    ranking.capped = True
+    ranking.heap[:] = [(e[0], 0, *e[2:]) for e in ranking.heap]
+    Coordinator._replace_entry(ranking, counted, stopped)
+    assert sorted(ranking.heap, key=lambda e: e[2]) == [(0, 0, *other[2:]), (0, 0, *stopped[2:])]
 
 
 async def test_a_ready_build_waits_only_for_a_claim_ahead_of_its_tier_or_an_earlier_one(
@@ -324,7 +434,8 @@ async def test_actions_waiting_ahead_ask_for_no_burst_worker_until_their_parents
 ) -> None:
     await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
     a = await claim_named(http, "a")
-    assert await claim_ahead(http) is not None
+    b = await claim_ahead(http)
+    assert b is not None
 
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
     assert (queue["running_standard"], queue["waiting_ahead_standard"]) == (2, 1)
@@ -332,6 +443,14 @@ async def test_actions_waiting_ahead_ask_for_no_burst_worker_until_their_parents
         active = await coordinator._counts(conn, coordinator_module.COUNT_ACTIVE)
     assert (active.running_standard, active.waiting_ahead_standard) == (2, 1)
     assert coordinator_module.burst_demand(active, warm_workers=1, max_burst_workers=16) == 0
+
+    # One that published its outline proves while its parent finishes: it waits no more.
+    assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204
+    queue = (await http.get("/v1/queue", headers=CLIENT)).json()
+    assert (queue["running_standard"], queue["waiting_ahead_standard"]) == (2, 0)
+    async with coordinator.engine.connect() as conn:
+        active = await coordinator._counts(conn, coordinator_module.COUNT_ACTIVE)
+    assert active.waiting_ahead_standard == 0
 
     cache.keys.add(ac_key("a"))
     assert (await complete(http, a, result("a", "built"))).status_code == 200
@@ -373,7 +492,7 @@ async def test_claims_of_workers_that_load_ahead_share_reads_of_the_candidates(
 
     def count(conn: Any, cursor: Any, statement: str, *_: Any) -> None:
         nonlocal reads
-        reads += "WITH RECURSIVE ahead_batches AS" in statement  # AHEAD_CANDIDATES
+        reads += "WITH RECURSIVE outlined AS" in statement  # AHEAD_CANDIDATES
 
     sa.event.listen(remote_exec_engine.sync_engine, "before_cursor_execute", count)
     try:
@@ -510,7 +629,7 @@ async def test_a_parent_lease_expired_wakes_a_claim_waiting_for_the_slot_its_rev
 
 
 async def test_a_parent_back_to_waiting_revokes_what_was_claimed_ahead_of_it_and_of_that(
-    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, remote_exec_engine: AsyncEngine
 ) -> None:
     await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "b")], speculative_loading="4")
     a = await claim_named(http, "a")
@@ -520,11 +639,14 @@ async def test_a_parent_back_to_waiting_revokes_what_was_claimed_ahead_of_it_and
     assert (await complete(http, a, result("a", "built"))).status_code == 200
     c = await claim_ahead(http)
     assert c is not None and c["theory"] == "pkg:c"
+    assert (await http.post(f"/v1/work/{c['attempt_token']}/outlined", headers=WORKER)).status_code == 204
 
     # "b" gives up loading ahead; "c" can't get its parent's outputs before "b" is claimed again.
     assert (await complete(http, b["attempt_token"], result("b", "failed", "ahead-abandoned"))).status_code == 200
     assert await ahead_state(remote_exec_engine, "c") == ("waiting", "no", 0, 1)
     assert (await http.post(f"/v1/work/{c['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
+    # Nor does its outline count any more.
+    assert coordinator.outlined_tokens == {}
 
 
 async def test_a_chain_revoked_by_its_root_s_retry_is_claimed_ahead_again_once_the_root_runs_again(
@@ -1229,9 +1351,9 @@ async def test_reading_the_candidates_reads_each_childs_action_by_key(
         for depth in (1, None):
             query = coordinator_module.AHEAD_CANDIDATES
             plan = await connection.scalar(
-                sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query.text}"), {"depth": depth}
+                sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query.text}"), {"depth": depth, "outlined": []}
             )
-            rows = await connection.execute(query, {"depth": depth})
+            rows = await connection.execute(query, {"depth": depth, "outlined": []})
             assert {row.input_key for row in rows} == {f"k{i}" for i in range(width, 2 * width)}
             assert handled(plan[0]["Plan"]) < 10 * width * parents
         await connection.rollback()
