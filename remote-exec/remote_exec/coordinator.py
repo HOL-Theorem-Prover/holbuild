@@ -1144,11 +1144,15 @@ class Coordinator:
 
     async def submit(
         self, batch: Batch, profile: str, action_class: str = "build", max_heap_mb: int | None = None,
-        *, fail_fast: bool = False, priority: int = 0, ahead_cap: int | None = None,
+        *, fail_fast: bool = False, priority: int = 0, ahead_cap: int | None = None, batch_id: UUID | None = None,
     ) -> UUID:
         """Store a batch; its actions without uncached parents become ready. With ``ahead_cap``, up to that many
-        of its actions at once may be claimed ahead of their parents; see _claim_ahead."""
-        batch_id = uuid4()
+        of its actions at once may be claimed ahead of their parents; see _claim_ahead.
+
+        The batch is stored under ``batch_id``, a new id if None. A batch already stored under it is kept as it is,
+        and its id returned: that is a client's retry of a submission whose answer it never got. A retry that comes
+        while the first submission is still storing waits for it."""
+        batch_id = batch_id or uuid4()
         parents: defaultdict[str, int] = defaultdict(int)
         for child, _ in batch.edges:
             parents[child] += 1
@@ -1156,6 +1160,25 @@ class Coordinator:
         packages = [a.theory.split(":", 1)[0] for a in batch.actions]
         names = [a.theory.split(":", 1)[1] for a in batch.actions]
         async with self.engine.begin() as conn:
+            stored = await conn.scalar(
+                sa.text(
+                    "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority, ahead_cap) "
+                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority, :ahead_cap) "
+                    "ON CONFLICT (id) DO NOTHING RETURNING id"
+                ),
+                {
+                    "id": batch_id,
+                    "state": "running" if batch.actions else "done",
+                    "profile": profile,
+                    "max_heap_mb": max_heap_mb,
+                    "fail_fast": fail_fast,
+                    "priority": priority,
+                    "ahead_cap": ahead_cap,
+                },
+            )
+            if stored is None:
+                logger.warning("batch %s was submitted again; answering with the batch already stored", batch_id)
+                return batch_id
             # Retention takes the same key order: heap/index scan order can otherwise deadlock overlapping writes.
             hints = await conn.execute(
                 sa.text(
@@ -1170,21 +1193,6 @@ class Coordinator:
                 {"profile": profile, "packages": packages, "names": names},
             )
             high = {theory for theory, peak in hints if peak >= self.settings.standard_tier_mb}
-            await conn.execute(
-                sa.text(
-                    "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority, ahead_cap) "
-                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority, :ahead_cap)"
-                ),
-                {
-                    "id": batch_id,
-                    "state": "running" if batch.actions else "done",
-                    "profile": profile,
-                    "max_heap_mb": max_heap_mb,
-                    "fail_fast": fail_fast,
-                    "priority": priority,
-                    "ahead_cap": ahead_cap,
-                },
-            )
             if batch.actions:
                 await conn.execute(
                     sa.text(

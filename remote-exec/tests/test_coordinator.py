@@ -6,7 +6,7 @@ import time
 from collections import Counter, deque
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -17,10 +17,11 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from starlette.requests import Request
 
+from remote_exec import app as app_module
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import CountResponses, create_app, summary_line
 from remote_exec.coordinator import Claim, Coordinator, HostReport, _claim_rank
-from remote_exec.formats import FormatError, parse_result
+from remote_exec.formats import FormatError, parse_batch, parse_result
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, Settled
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -127,6 +128,138 @@ async def test_submit_rejects_bad_batches_and_tokens(http: httpx.AsyncClient) ->
     assert (await http.post("/v1/batches", content=batch_text(["a"]), headers=WORKER)).status_code == 401
     claim_body = {"tier": "standard", "worker": "w"}
     assert (await http.post("/v1/work/claim", json=claim_body, headers=CLIENT)).status_code == 401
+
+
+async def test_a_submission_repeated_under_its_id_answers_with_the_batch_stored_first(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    batch_id = str(uuid4())
+    headers = {**CLIENT, "Holbuild-Batch-Id": batch_id}
+    hint_touched = sa.text("SELECT updated_at FROM peak_hints WHERE package = 'pkg' AND theory = 'a'")
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(sa.text(
+            "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb, updated_at) "
+            "VALUES ('pkg', 'a', 'default', 100, now() - interval '1 day')"
+        ))
+    touched = []
+    for _ in range(2):
+        response = await http.post("/v1/batches", content=batch_text(["a", "b"], [("b", "a")]), headers=headers)
+        assert response.status_code == 201, response.text
+        assert response.json()["batch_id"] == batch_id
+        async with coordinator.engine.connect() as conn:
+            touched.append(await conn.scalar(hint_touched))
+
+    assert touched[0] == touched[1]  # the repeat left the peak hints alone
+    async with coordinator.engine.connect() as conn:
+        assert await conn.scalar(sa.text("SELECT count(*) FROM batches")) == 1
+        assert await conn.scalar(sa.text("SELECT count(*) FROM actions")) == 2
+    assert await states(http, batch_id) == {"a": "ready", "b": "waiting"}
+
+
+async def test_a_slow_submission_is_logged_with_its_size_and_shape(
+    http: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(app_module, "SUBMIT_SLOW_SECONDS", 0.0)
+    body = batch_text(["a", "b"], [("b", "a")])
+    assert (await http.post("/v1/batches", content=body, headers=CLIENT)).status_code == 201
+    assert (await http.post("/v1/batches", content="nonsense\n", headers=CLIENT)).status_code == 400
+
+    assert f"POST /v1/batches of {len(body)} bytes (2 actions, 1 edges; batch id new)" in caplog.text
+    assert "POST /v1/batches of 9 bytes (unparsed; batch id new)" in caplog.text
+
+
+async def test_a_submission_slow_to_upload_is_logged(
+    http: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(app_module, "SUBMIT_SLOW_SECONDS", 0.5)
+    body = batch_text(["a"]).encode()
+
+    async def stalling() -> AsyncIterator[bytes]:
+        yield body[:10]
+        await asyncio.sleep(0.6)
+        yield body[10:]
+
+    response = await http.post("/v1/batches", content=stalling(), headers={**CLIENT, "Content-Length": str(len(body))})
+    assert response.status_code == 201, response.text
+
+    assert f"POST /v1/batches of {len(body)} bytes (1 actions, 0 edges; batch id new)" in caplog.text
+
+
+async def blocked_by(observer: AsyncConnection, pid: int) -> int:
+    """The backend that waits on a lock ``pid`` holds, once one does; ``observer`` runs in autocommit, since
+    pg_stat_activity holds still within a transaction."""
+    while (waiter := await observer.scalar(
+        sa.text("SELECT pid FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid))"), {"pid": pid}
+    )) is None:
+        await asyncio.sleep(0.01)
+    return waiter
+
+
+@contextlib.asynccontextmanager
+async def a_repeat_waiting_on_a_paused_submission(
+    coordinator: Coordinator, batch_id: UUID
+) -> AsyncIterator[tuple[AsyncConnection, int, asyncio.Task[UUID], asyncio.Task[UUID]]]:
+    """Two submissions of one batch under ``batch_id``: the first, by the backend it yields the pid of, stored its
+    batch row and waits on its peak hint, which the connection it yields holds locked; the repeat waits on that row."""
+    batch = parse_batch(batch_text(["a"]))
+    async with coordinator.engine.connect() as hold, coordinator.engine.connect() as observer:
+        await observer.execution_options(isolation_level="AUTOCOMMIT")
+        await hold.execute(sa.text(
+            "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb, updated_at) "
+            "VALUES ('pkg', 'a', 'default', 100, now())"
+        ))
+        await hold.commit()
+        await hold.execute(sa.text("SELECT 1 FROM peak_hints FOR UPDATE"))
+        holder = await hold.scalar(sa.text("SELECT pg_backend_pid()"))
+        first = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
+        repeat: asyncio.Task[UUID] | None = None
+        try:
+            async with asyncio.timeout(5):
+                first_pid = await blocked_by(observer, holder)
+            repeat = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
+            async with asyncio.timeout(5):
+                await blocked_by(observer, first_pid)
+            assert not repeat.done()
+            yield hold, first_pid, first, repeat
+        finally:
+            # A test that stopped early leaves no submission to store its batch after it.
+            for task in (first, repeat):
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+
+
+async def stored_rows(coordinator: Coordinator) -> tuple[int, int]:
+    async with coordinator.engine.connect() as conn:
+        return (
+            await conn.scalar(sa.text("SELECT count(*) FROM batches")),
+            await conn.scalar(sa.text("SELECT count(*) FROM actions")),
+        )
+
+
+async def test_a_repeated_submission_waits_for_the_first_to_store_and_stores_nothing_more(
+    coordinator: Coordinator,
+) -> None:
+    batch_id = uuid4()
+    async with a_repeat_waiting_on_a_paused_submission(coordinator, batch_id) as (hold, _, first, repeat):
+        await hold.commit()
+        assert await asyncio.wait_for(first, 10) == batch_id
+        assert await asyncio.wait_for(repeat, 10) == batch_id
+
+    assert await stored_rows(coordinator) == (1, 1)
+
+
+async def test_a_repeated_submission_stores_the_batch_when_the_first_fails(coordinator: Coordinator) -> None:
+    batch_id = uuid4()
+    async with a_repeat_waiting_on_a_paused_submission(coordinator, batch_id) as (hold, first_pid, first, repeat):
+        await hold.execute(sa.text("SELECT pg_cancel_backend(:pid)"), {"pid": first_pid})
+        with pytest.raises(sa.exc.DBAPIError, match="canceling statement"):
+            await asyncio.wait_for(first, 10)
+        await hold.rollback()
+        assert await asyncio.wait_for(repeat, 10) == batch_id
+
+    assert await stored_rows(coordinator) == (1, 1)
 
 
 async def test_empty_batch_is_done(http: httpx.AsyncClient) -> None:
