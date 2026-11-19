@@ -204,29 +204,10 @@ require_grep '^context-input-layout=package-v1$' "$remote_root/cas/$spec"
 # Successful runs made before declared-input staging must not be reused.
 old_run_key=$(sed '1,/^run-text$/d; /^context-input-layout=/d' "$remote_root/cas/$spec" | sha256sum | cut -d' ' -f1)
 [[ "$run_key" != "$old_run_key" ]]
-# The theories earlier theory actions parked lie outside the root a run
-# empties for its script, and stay with their records and stats, even one
-# whose stem the root's records hold too, which only a theory action drops.
-parked_stem=.holbuild/obj/x/BTheory
-mkdir -p "$tmpdir/worker-run/action/.holbuild" "$tmpdir/worker-run/parked/.holbuild/obj/x"
-touch "$tmpdir/worker-run/action/.holbuild/resident"
-printf 'parked\n' > "$tmpdir/worker-run/parked/$parked_stem.dat"
-record() { printf 'holbuild-action-resident-v1\n%s\t%s\tx:BTheory\tkey\tsource\t-\t-\tdat\t-\t-\n' "$1" "$tmpdir/worker-run/action/$parked_stem"; }
-record theory > "$tmpdir/worker-run/action-resident"
-record parked > "$tmpdir/worker-run/parked-records"
-printf 'stats\n' > "$tmpdir/worker-run/parked-stats"
-cp "$tmpdir/worker-run/parked-records" "$tmpdir/parked-records.before"
-parked_inode=$(stat -c %i "$tmpdir/worker-run/parked/$parked_stem.dat")
-# Held, so that a new file can't get the same inode back.
-ln "$tmpdir/worker-run/parked/$parked_stem.dat" "$tmpdir/parked-held.dat"
 worker run "$spec"
 expect run 0 status=built "input-key=$run_key"
 # Only a theory action's root keeps its dependencies for the next one.
 [[ ! -e "$tmpdir/worker-run/action" ]] || { echo "a run left its action root" >&2; exit 1; }
-[[ $(stat -c %i "$tmpdir/worker-run/parked/$parked_stem.dat" 2>/dev/null) == "$parked_inode" ]] &&
-  cmp -s "$tmpdir/parked-records.before" "$tmpdir/worker-run/parked-records" &&
-  [[ $(cat "$tmpdir/worker-run/parked-stats") == stats ]] || {
-  echo "a run changed the parked theories, their records or their stats" >&2; exit 1; }
 require_grep '^log=[0-9a-f]\{64\} [0-9]*$' "$tmpdir/run.result"
 log_hash=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/run.result")
 require_file "$remote_root/cas/$log_hash"
