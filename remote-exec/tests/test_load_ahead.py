@@ -1126,6 +1126,7 @@ async def test_with_no_depth_limit_revoking_reads_each_ancestor_claimed_ahead_on
             ),
             {"id": batch_id, "n": n},
         )
+        await connection.execute(sa.text("ANALYZE"))
         await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
         plan = await connection.scalar(
             sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.REVOKE_AHEAD.text}"),
