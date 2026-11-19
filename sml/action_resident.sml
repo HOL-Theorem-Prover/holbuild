@@ -11,7 +11,9 @@
 
    A dependency theory the next action doesn't name is parked: its files
    move out of the root, beside it, where HOL never looks, and come back
-   when a later action names it again with the same key. *)
+   when a later action names it again with the same key.  The parked
+   theories' records are kept in a file of their own, which releases that
+   don't park never read or rewrite. *)
 structure HolbuildActionResident =
 struct
 
@@ -40,16 +42,23 @@ datatype entry =
   | Parked of theory
 
 type t =
-  {file : string option, entries : (string, entry) Binarymap.dict ref,
+  {file : string option, parked_file : string option, entries : (string, entry) Binarymap.dict ref,
    wanted : string Binaryset.set ref, lock : Mutex.mutex}
 
 val header = "holbuild-action-resident-v1"
 
-fun new file entries =
-  {file = file, entries = ref entries, wanted = ref (Binaryset.empty String.compare), lock = Mutex.mutex ()}
+fun new file parked_file entries =
+  {file = file, parked_file = parked_file, entries = ref entries, wanted = ref (Binaryset.empty String.compare),
+   lock = Mutex.mutex ()}
 
 (* Records that are never written, for a root emptied before its action. *)
-fun empty () = new NONE (Binarymap.mkDict String.compare)
+fun empty () = new NONE NONE (Binarymap.mkDict String.compare)
+
+(* Whether saving keeps parked theories' records. *)
+fun keeps_parked ({parked_file, ...} : t) = Option.isSome parked_file
+
+fun is_parked (Parked _) = true
+  | is_parked _ = false
 
 fun locked ({lock, ...} : t) f =
   (Mutex.lock lock; (f () before Mutex.unlock lock) handle e => (Mutex.unlock lock; raise e))
@@ -106,11 +115,8 @@ fun read_file path =
 
 fun remove_file path = OS.FileSys.remove path handle OS.SysErr _ => ()
 
-(* No records, kept at FILE once saved. *)
-fun fresh file = new (SOME file) (Binarymap.mkDict String.compare)
-
-(* The records kept at FILE; NONE when there are none or they can't be read. *)
-fun read file =
+(* The entries kept at FILE; NONE when there are none or they can't be read. *)
+fun read_entries file =
   let
     val text = SOME (read_file file) handle _ => NONE
   in
@@ -118,29 +124,59 @@ fun read file =
         SOME (first :: lines) =>
           if first <> header then NONE
           else
-            (SOME (new (SOME file)
-                       (List.foldl (fn (text, dict) => let val (path, entry) = parse_line text
-                                                       in Binarymap.insert (dict, path, entry) end)
-                                   (Binarymap.mkDict String.compare) lines))
+            (SOME (List.foldl (fn (text, dict) => let val (path, entry) = parse_line text
+                                                  in Binarymap.insert (dict, path, entry) end)
+                              (Binarymap.mkDict String.compare) lines)
              handle Malformed => NONE)
       | _ => NONE
   end
 
-(* Before the tree changes: a worker stopped from here on finds no records. *)
-fun discard ({file, ...} : t) = Option.app remove_file file
+(* The records kept at FILE, read only when ROOT says the root is the one
+   they describe, and at PARKED_FILE; ROOT and PARKED say which were read.
+   A parked theory whose path the root's records hold (a release that
+   doesn't park installed it there meanwhile) is left out, and listed in
+   SHADOWED for its files to go.  Parked lines in FILE, which a release
+   that kept them there wrote about a directory of its own, are dropped. *)
+fun read {file, parked_file} {root} =
+  let
+    val main = if root then read_entries file else NONE
+    val parked = read_entries parked_file
+    val rooted =
+      Binarymap.foldl (fn (path, entry, dict) => if is_parked entry then dict else Binarymap.insert (dict, path, entry))
+                      (Binarymap.mkDict String.compare)
+                      (getOpt (main, Binarymap.mkDict String.compare))
+    val (entries, shadowed) =
+      Binarymap.foldl
+        (fn (path, entry, (dict, shadowed)) =>
+            if not (is_parked entry) then (dict, shadowed)
+            else if Option.isSome (Binarymap.peek (rooted, path)) then (dict, path :: shadowed)
+            else (Binarymap.insert (dict, path, entry), shadowed))
+        (rooted, [])
+        (getOpt (parked, Binarymap.mkDict String.compare))
+  in
+    {records = new (SOME file) (SOME parked_file) entries, root = Option.isSome main, parked = Option.isSome parked,
+     shadowed = shadowed}
+  end
 
-fun save ({file, entries, ...} : t) =
-  case file of
-      NONE => ()
-    | SOME path =>
-        let
-          val text = String.concat (header ^ "\n" :: map line (Binarymap.listItems (!entries)))
-          val tmp = path ^ ".tmp"
-          val output = TextIO.openOut tmp
-        in
-          (TextIO.output (output, text); TextIO.closeOut output; OS.FileSys.rename {old = tmp, new = path})
-          handle e => (TextIO.closeOut output handle _ => (); remove_file tmp; raise e)
-        end
+(* Before the tree changes: a worker stopped from here on finds no records. *)
+fun discard ({file, parked_file, ...} : t) = (Option.app remove_file file; Option.app remove_file parked_file)
+
+fun write_records path entries =
+  let
+    val text = String.concat (header ^ "\n" :: map line entries)
+    val tmp = path ^ ".tmp"
+    val output = TextIO.openOut tmp
+  in
+    (TextIO.output (output, text); TextIO.closeOut output; OS.FileSys.rename {old = tmp, new = path})
+    handle e => (TextIO.closeOut output handle _ => (); remove_file tmp; raise e)
+  end
+
+fun save ({file, parked_file, entries, ...} : t) =
+  let val (parked, rooted) = List.partition (is_parked o #2) (Binarymap.listItems (!entries))
+  in
+    Option.app (fn path => write_records path rooted) file;
+    Option.app (fn path => write_records path parked) parked_file
+  end
 
 (* A hydrate names what it wants in the root; prune drops the rest. *)
 fun start (t as {wanted, ...} : t) = locked t (fn () => wanted := Binaryset.empty String.compare)
@@ -182,8 +218,8 @@ fun theory_keys (t as {entries, ...} : t) =
                                        | _ => NONE)
                                      (Binarymap.listItems (!entries)))
 
-fun has_parked (t as {entries, ...} : t) =
-  locked t (fn () => List.exists (fn (_, Parked _) => true | _ => false) (Binarymap.listItems (!entries)))
+fun parked_keys (t as {entries, ...} : t) =
+  locked t (fn () => List.mapPartial (fn (_, Parked {key, ...}) => SOME key | _ => NONE) (Binarymap.listItems (!entries)))
 
 (* Replaces every entry the hydrate didn't want by what RETIRE makes of it,
    which removes or parks what the entry stands for; NONE drops the entry. *)

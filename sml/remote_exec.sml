@@ -113,16 +113,26 @@ fun write_text path text =
   let val out = TextIO.openOut path
   in (TextIO.output (out, text); TextIO.closeOut out) handle e => (TextIO.closeOut out; raise e) end
 
+(* A random batch id in UUID form, for the coordinator to store a batch under. *)
+fun new_batch_id () =
+  let
+    val hex = String.map Char.toLower (HolbuildTempPath.new_token () ^ HolbuildTempPath.new_token ())
+    fun part (start, length) = String.substring (hex, start, length)
+  in
+    String.concatWith "-" [part (0, 8), part (8, 4), part (12, 4), part (16, 4), part (20, 12)]
+  end
+
 (* Submits a batch, with QUERY ("" or "?...") after the path; Ok carries
    its id.  A 5xx answer (a proxy's 502-504 while the coordinator restarts,
    or the coordinator's own 500 while it's overloaded) or a 429 is retried after each of retry_delays_seconds, since
    it passes like a restart; other 4xx errors aren't.  An unreachable
    coordinator is retried the same way when WAIT_UNREACHABLE (the caller has
    nothing to fall back to, as under --remote-only), and refused at once
-   otherwise, so that a build that can go on locally does.  A gateway error that comes after the
-   coordinator stored the batch (it was stopped between storing and
-   answering) leaves a copy that nobody follows: it runs to its end or
-   deadline, repeating work whose results the cache dedupes. *)
+   otherwise, so that a build that can go on locally does.  Every attempt
+   names the same batch id, chosen here, so an attempt the coordinator stored
+   but never answered (it was slower than request_max_time_seconds, or was
+   stopped between storing and answering) leaves no second copy: the
+   coordinator answers a repeat with the batch it stored. *)
 fun submit_with_query wait_unreachable url query maxheap batch_text : attempt =
   let
     val _ = HolbuildOffline.require_online "submit a remote batch"
@@ -131,6 +141,7 @@ fun submit_with_query wait_unreachable url query maxheap batch_text : attempt =
       | SOME n => (if query = "" then "?" else "&") ^ "max_heap_mb=" ^ Int.toString n)
     val body = HolbuildTempPath.temporary "remote-exec-batch"
     val _ = write_text body batch_text
+    val id = new_batch_id ()
     fun post delays =
       let
         val result =
@@ -138,7 +149,8 @@ fun submit_with_query wait_unreachable url query maxheap batch_text : attempt =
             {program = "curl",
              args = curl_args (endpoint url ("/v1/batches" ^ query))
                       ["--max-time", Int.toString request_max_time_seconds, "-X", "POST",
-                       "-H", "Content-Type: text/plain", "--data-binary", "@" ^ body,
+                       "-H", "Content-Type: text/plain", "-H", "Holbuild-Batch-Id: " ^ id,
+                       "--data-binary", "@" ^ body,
                        "-w", "\n%{http_code}"],
              stderr = HolbuildSpawn.Merge}
         val (lines, status) = split_status (#output result)

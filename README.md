@@ -2003,9 +2003,11 @@ checking the dependencies already in the action root (with loading and
 saving the record of their cache manifests' stats), `hydinst` removing and
 installing the ones that fail the check, `hydstale` probing the remote cache
 for stale dependency copies, `hydmisfit` checking the dependencies against
-their parents; two of them are counts, not times: `hydstatn` the cache
+their parents; four of them are counts, not times: `hydstatn` the cache
 manifests trusted on their recorded stat, `hydinstn` the dependencies the
-check sent to `hydinst`), `cutoff` (whether an earlier build stands), `analyse`
+check sent to `hydinst`, `hydbackn` the parked dependencies taken back,
+`hydresetn` 1 when the action found no records of its root, which it
+emptied), `cutoff` (whether an earlier build stands), `analyse`
 (the script's proof steps and checkpoints), `restore` (shared
 checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
@@ -2134,8 +2136,12 @@ against the outline it loaded; otherwise it is built normally again. A
 theory that itself builds pipelined, within the coordinator's generation
 limit (`REMOTE_EXEC_AHEAD_DEPTH`), and whose unbuilt parents have all
 published their outlines can start at once, so it no longer waits behind
-shallower theories ready to build, and an outlined parent no longer counts
-against N.
+shallower theories ready to build. Neither an outlined parent nor a theory
+whose unbuilt parents have all published their outlines counts against N, and
+the latter is taken even when N others wait. The coordinator doesn't know
+whether such a theory can build pipelined; one that can't (a build target
+that saves theorem checkpoints, or one with extra outputs) waits for its
+parents' final outputs without counting against N.
 
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with

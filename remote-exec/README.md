@@ -255,9 +255,10 @@ there, so an action a busy host couldn't start yet stays at the coordinator
 for a worker on another host. Likewise a worker claims only while its temp
 dir and its `HOLBUILD_CACHE` root each have 4 GiB free, so a host whose disk
 is full doesn't take actions it would only fail. A worker short of disk first
-empties the `action`, `action-parked` and `tmp` directories of its
-`HOLBUILD_CACHE` root, which its own finished actions left behind, and drops
-`action-resident`, the record of what `action` and `action-parked` held. While it still waits, each poll it runs the cache sweep an
+empties the `action`, `parked`, `action-parked` and `tmp` directories of its
+`HOLBUILD_CACHE` root, which its own finished actions left behind, and first
+drops `action-resident` and `parked-records`, the records of what `action`
+and `parked` held. While it still waits, each poll it runs the cache sweep an
 action would start with, `exec-action --sweep-only` with its cap and the 16 GB
 floor, using the newest release it has that takes it (0.14.60 and later), and
 reports its host to the coordinator with `POST /v1/work/report`.
@@ -603,8 +604,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   claimed ahead is a generation after its latest running parent. Its worker
   loads the action's ancestors that exist and waits for the outputs of the
   running ones, which the claim names in `ahead_parents`, ancestors first. At most `<cap>` of a batch's actions wait ahead at once;
-  among the candidates of the batches below their cap, the claim takes its
-  first tier with one, then the highest batch priority, then the longest chain
+  one whose unfinished parents have all posted `outlined` (see "Pipelining")
+  doesn't wait, so it doesn't count and may be claimed even when `<cap>` others
+  wait; this is checked again under the batch's lock. Among the candidates of
+  the batches below their cap, and those of a batch at its cap that don't
+  wait, the claim takes its first tier with one, then the highest batch priority, then the longest chain
   of dependents. Claims share one read of the candidates: a claim takes the
   last read if it began after the claim asked, or if it is younger than
   `REMOTE_EXEC_CLAIM_RANKING_SECONDS` and no parent finished, went back to
@@ -635,7 +639,14 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   child commits nothing until the parent's own entry passes its gate. Once the
   outline is out, the worker posts `outlined` (below), and until its lease
   ends the action no longer counts against its batch's `<cap>` or as a
-  generation against `REMOTE_EXEC_AHEAD_DEPTH`. A candidate ranks among its
+  generation against `REMOTE_EXEC_AHEAD_DEPTH`, and nor does a child claimed
+  ahead whose unfinished parents have all posted it count against `<cap>`, or
+  as waiting in burst demand. The coordinator doesn't know which children's
+  specs allow pipelining: a child whose spec doesn't (a build target that
+  saves theorem checkpoints, a theory with extra outputs, a forced one)
+  waits on its worker for its parents' final outputs all the same, without
+  taking a slot of `<cap>`. A batch built with pipelining off throughout
+  posts no `outlined`, so all its children claimed ahead count. A candidate ranks among its
   batch's ready builds by its chain of dependents (`critical_depth`, then
   `descendant_count`, a ready build first on a tie), whether or not its
   parents have posted `outlined`: one on a longer chain than every ready build
@@ -833,6 +844,13 @@ from 0 to 2147483647; invalid values return 422. Existing batches retain priorit
 at once be claimed ahead of their parents (see "Loading ahead"); without it
 none is. A run batch with it returns 400.
 
+A `Holbuild-Batch-Id: <uuid>` header names the id to store the batch under;
+without it the coordinator picks one. A batch already stored under that id is
+kept as it is and its id returned, so a client that retries a submission whose
+answer it never got (it timed out, or a proxy failed) under the same id makes
+no second copy. A retry that comes while the first is still being stored waits
+for it. holbuild sends one random id with every attempt of a submission.
+
 - 201 `{"batch_id": "<uuid>"}`
 - 400 when the batch is malformed (bad header or line, duplicate action, an
   edge to a theory outside the batch), or is a run batch with edges or
@@ -941,7 +959,9 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   ```
   Tier counts include both classes; `ready_run` and `running_run` are the
   run subsets across tiers. `waiting_ahead_standard` and `waiting_ahead_high`
-  count the running actions claimed ahead that still wait for a parent. A phase's share of the workers' time is its
+  count the running actions claimed ahead that still wait: they haven't posted
+  `outlined` themselves, and an unfinished parent has no live lease that posted
+  it (one that expired or was retried no longer counts). A phase's share of the workers' time is its
   seconds over the sum of all. A host is its workers' latest report,
   `age_s` seconds old,
   except that `cpu_idle_pct` is the latest one measured:

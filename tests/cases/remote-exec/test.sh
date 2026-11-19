@@ -912,13 +912,17 @@ require_grep "^action $key_a .* rx:ATheory$" "$state/$batch.batch"
 refute_grep "^action .* rx:BTheory$" "$state/$batch.batch"
 require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/local-cache-integrity.log"
 
-# A submission answered 502 while the coordinator restarts is retried, and
-# given up on when it stays down.
+# A submission answered 502 while the coordinator restarts is retried, under
+# the batch id of its first attempt, and given up on when it stays down.
 write_theories restarting
 echo 2 > "$state/unavailable"
+rm -f "$state/submitted-ids"
 run restarting-only 0 build --remote-exec "$coordinator" --remote-only BTheory
 [[ $(grep -c "coordinator refused the batch (HTTP 502): .*restarting.*; retrying" "$tmpdir/restarting-only.log") -eq 2 ]] ||
   { cat "$tmpdir/restarting-only.log" >&2; exit 1; }
+[[ $(wc -l < "$state/submitted-ids") -eq 3 && $(sort -u "$state/submitted-ids" | wc -l) -eq 1 ]] ||
+  { cat "$state/submitted-ids" >&2; exit 1; }
+require_grep '^[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}$' "$state/submitted-ids"
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/restarting-only.log"
 rm "$state/unavailable"
 write_theories unavailable
@@ -1857,11 +1861,15 @@ rm -f "$remote_root/cas/$p_source" "$tmpdir/worker-cache/blobs/$p_source"
 mkdir -p "$tmpdir/twice-client-cache/remote-ledger"
 printf '#started %s\nblob %s\n' "$(date +%s)" "$p_source" \
   > "$tmpdir/twice-client-cache/remote-ledger/$(basename "$ledger_file")"
+rm -f "$state/submitted-ids"
 in_copy twice-client --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only PTheory \
   > "$tmpdir/twice.log" 2>&1 || { cat "$tmpdir/twice.log" "$tmpdir/worker.log" >&2; exit 1; }
 require_grep "still missing blob $p_source after 3 attempts; .*; resubmitting$" "$tmpdir/twice.log"
 require_grep "still missing theory .*; resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/twice.log"
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/twice.log"
+# Each resubmission is a new batch, under an id of its own.
+[[ $(wc -l < "$state/submitted-ids") -eq 3 && $(sort -u "$state/submitted-ids" | wc -l) -eq 3 ]] ||
+  { cat "$state/submitted-ids" >&2; exit 1; }
 
 # Each resubmission rebuilds again every theory an earlier one was for, since
 # a failed batch may have cancelled that repair: here PTheory finds MTheory,
