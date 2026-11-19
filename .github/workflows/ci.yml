@@ -196,6 +196,7 @@ jobs:
         run: >-
           tests/run.sh theory-modules basic-theory checkpoint-extra-inputs
           checkpoint-recovery exec-action exec-action-share-heaps
+          preload-large-theory-sharing
 
       - name: Save theory-module HOL toolchain cache
         if: steps.module-hol-toolchain-cache.outputs.cache-hit != 'true'

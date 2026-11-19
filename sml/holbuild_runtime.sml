@@ -1,6 +1,50 @@
 structure HolbuildRuntime =
 struct
-  val load = Meta.load
+  (* Poly/ML's GC no longer shares common data by itself, and loading a
+     theory keeps its decoded .dat live.  Where each theory's .dat repeats
+     most of its parent's, as CakeML's translator theories do (each tens of
+     MiB), a chain of them fills the heap with duplicates before the script
+     starts.  So loading a theory whose .dat is large, or after the theories
+     loaded since the last share add up to a lot, shares the heap's common
+     data: before the theory, if anything is unshared, and after it.  A load
+     of the usual size never shares. *)
+  val large_single_dat : Position.int = 67108864
+  val large_cumulative_dat : Position.int = 134217728
+  (* Bytes of theory .dat files loaded since the last share. *)
+  val unshared_dat_bytes : Position.int ref = ref 0
+
+  fun share_heap () =
+    (PolyML.shareCommonData PolyML.rootFunction; unshared_dat_bytes := 0)
+
+  (* The size of the .dat beside a theory's .sml, where HOL's file system
+     keeps it, or NONE for any other file. *)
+  fun theory_dat_size path =
+    let val expanded = holpathdb.subst_pathvars path handle _ => path
+    in
+      if String.isSuffix "Theory.sml" expanded then
+        SOME (HFS_NameMunge.toFSfn false OS.FileSys.fileSize (OS.Path.base expanded ^ ".dat")
+              handle _ => 0)
+      else NONE
+    end
+
+  (* USE, sharing the heap around a theory as the comment above says. *)
+  fun use_with_large_theory_sharing use path =
+    case theory_dat_size path of
+        NONE => use path
+      | SOME size =>
+          (if !unshared_dat_bytes > 0 andalso
+              (size >= large_single_dat orelse !unshared_dat_bytes + size >= large_cumulative_dat)
+           then share_heap () else ();
+           use path;
+           unshared_dat_bytes := !unshared_dat_bytes + size;
+           if size >= large_single_dat orelse !unshared_dat_bytes >= large_cumulative_dat
+           then share_heap () else ())
+
+  (* How a preload loads a module.  The lines after this structure make it
+     share through use_with_large_theory_sharing, on whichever loader this
+     HOL has. *)
+  val loader = ref Meta.load
+  fun load module = !loader module
   val use = use
   val print = TextIO.print
   val export_theory = Theory.export_theory
@@ -230,4 +274,31 @@ struct
 
   fun export_theory_if_needed sig_path =
     if readable sig_path then () else export_theory ()
+end
+
+(* A HOL with theory modules evaluates a theory's source only when its module
+   is missing, through Meta.moduleSourceLoader; one without has Meta.loadPlan.
+   Names Meta may lack are compiled only once Meta is known to have them.
+   The source loader is wrapped for one load at a time: the child policy may
+   replace it after this file runs. *)
+local
+  fun meta_has names =
+    case #lookupStruct PolyML.globalNameSpace "Meta" of
+        NONE => false
+      | SOME meta =>
+          List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents meta)) names
+in
+  val _ =
+    if meta_has ["moduleSourceLoader"] then
+      CompilerSpecific.quietbind
+        ("val _ = HolbuildRuntime.loader := (fn module => " ^
+         "let val source = !Meta.moduleSourceLoader " ^
+         "in Meta.moduleSourceLoader := " ^
+         "(fn use => source (HolbuildRuntime.use_with_large_theory_sharing use)); " ^
+         "(Meta.load module handle e => (Meta.moduleSourceLoader := source; PolyML.Exception.reraise e)); " ^
+         "Meta.moduleSourceLoader := source end);")
+    else if meta_has ["loadPlan", "qquse"] then
+      CompilerSpecific.quietbind
+        "val _ = HolbuildRuntime.loader := Meta.loadPlan (HolbuildRuntime.use_with_large_theory_sharing Meta.qquse);"
+    else ()
 end

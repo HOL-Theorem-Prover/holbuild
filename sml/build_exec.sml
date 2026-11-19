@@ -13114,7 +13114,7 @@ fun write_ahead_preload {load_lines, dir, share, path} =
       if_meta_has ["moduleSourceLoader"]
         ("val _ = let val loader = !Meta.moduleSourceLoader in " ^
          "Meta.moduleSourceLoader := (fn use => fn file => (HolbuildAheadLoad.record file; loader use file)); " ^
-         "HolbuildAheadLoad.loader := Meta.load; " ^
+         "HolbuildAheadLoad.loader := HolbuildRuntime.load; " ^
          "HolbuildAheadLoad.restore := (fn () => Meta.moduleSourceLoader := loader) end;") ::
       "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^ Bool.toString share ^ ";" ::
       "structure HolbuildAheadPlainRuntime = HolbuildRuntime;" ::

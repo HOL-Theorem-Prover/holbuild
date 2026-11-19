@@ -56,10 +56,12 @@ struct
       if !dir <> "" andalso String.isPrefix (!dir ^ "/") expanded then ()
       else (recorded := expanded :: !recorded; count := !count + 1)
     end
-  fun recording_use file = (record file; Meta.qquse file)
+  fun recording_use file =
+    (record file; HolbuildRuntime.use_with_large_theory_sharing Meta.qquse file)
   (* How the preload loads a module.  On a HOL with theory modules the
-     preload makes it Meta.load, recording through Meta.moduleSourceLoader,
-     so modules load from the module store as in a plain load. *)
+     preload makes it HolbuildRuntime.load, recording through
+     Meta.moduleSourceLoader, so modules load from the module store as in a
+     plain load. *)
   val loader = ref (Meta.loadPlan recording_use)
   fun load module = !loader module
   (* Puts back what the preload changed of HOL's loader. *)
@@ -170,7 +172,7 @@ struct
       (* Before waiting-P, so the timings count the share as loading. *)
       val _ =
         if !share andalso not (exists ("arrived-" ^ parent)) then
-          (share := false; PolyML.shareCommonData PolyML.rootFunction; PolyML.fullGC ();
+          (share := false; HolbuildRuntime.share_heap (); PolyML.fullGC ();
            write "shared" parent)
         else ()
       val _ = write ("waiting-" ^ parent) ""
