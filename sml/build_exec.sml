@@ -4037,6 +4037,10 @@ fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
 
 (* The theory modules a deps heap saved with saveChildWithModules loads
    (save_deps_checkpoint), by path; none where holbuild can't read them. *)
+(* A module file a shared heap may list: not one of a store's control
+   files (module_store_unsupported, module_store_base_theories). *)
+fun heap_module_name file = plain_file_name file andalso String.isSuffix ".pmo" file
+
 fun saved_modules path =
   case show_module_dependencies of
       NONE => []
@@ -12667,7 +12671,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
        worker can read: a heap naming one that isn't a module of this
        toolchain's store isn't published. *)
     fun store_module path =
-      Path.dir path = module_store andalso plain_file_name (Path.file path) andalso
+      Path.dir path = module_store andalso heap_module_name (Path.file path) andalso
       (Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false)
     fun modules_ok () =
       case List.find (not o store_module) (saved_modules deps_loaded) of
@@ -13632,7 +13636,7 @@ fun fetch_heap_modules remote tc (modules, paths) =
       if Path.dir path <> store then NONE
       else
         Option.map (fn (_, sha, file) => (sha, file))
-          (List.find (fn (role, _, file) => role = "module" andalso file = Path.file path andalso plain_file_name file)
+          (List.find (fn (role, _, file) => role = "module" andalso file = Path.file path andalso heap_module_name file)
                      modules)
     val wanted = List.mapPartial listed paths
     val staging = store_temp (Path.concat (store, ".heap-modules"))
