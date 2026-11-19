@@ -1798,6 +1798,21 @@ for theory in ATheory BTheory; do
   require_file "$project/.holbuild/logs/current/rxresubmitlogs/$theory/build.log"
 done
 require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
+# A resubmission naming B itself leaves A, which the remote cache now
+# holds, out of the second batch; A's log still comes from the first.
+write_theories resubmit-logs-left-out
+rm -rf "$project/.holbuild/logs/current"
+b_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:BTheory" { print $2 }')
+echo "rxresubmitlogs:BTheory theory $b_key" > "$state/fail-missing"
+: > "$state/results"
+run resubmit-logs-left-out 0 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubmit-logs-left-out.log"
+[[ "$(< "$state/results")" == $'rxresubmitlogs:ATheory status=built\nrxresubmitlogs:BTheory status=built' ]] ||
+  { echo "worker results:" >&2; cat "$state/results" >&2; exit 1; }
+for theory in ATheory BTheory; do
+  require_file "$project/.holbuild/logs/current/rxresubmitlogs/$theory/build.log"
+done
+
 # A theory that fails in the resubmitted batch keeps no log from the first:
 # on the second submission, A's worker fails it.
 write_theories resubmit-logs-failed
