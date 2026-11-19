@@ -33,7 +33,9 @@
    little left to do.  Later waits don't share again: on a chain of late
    parents they last only as long as one parent's own hand-off.  A full GC
    follows the share: the share frees the duplicates but leaves them in the
-   heap, and the GC hands that space back while the child waits. *)
+   heap, and the GC hands that space back while the child waits.  No wait
+   shares when the save won't (HolbuildRuntime.deps_save_shares): one that
+   refers to the theory modules loaded instead of copying them. *)
 structure HolbuildAheadLoad =
 struct
   val dir = ref ""
@@ -171,7 +173,7 @@ struct
       val since = List.drop (rev (!recorded), position)
       (* Before waiting-P, so the timings count the share as loading. *)
       val _ =
-        if !share andalso not (exists ("arrived-" ^ parent)) then
+        if !share andalso not (exists ("arrived-" ^ parent)) andalso HolbuildRuntime.deps_save_shares () then
           (share := false; HolbuildRuntime.share_heap (); PolyML.fullGC ();
            write "shared" parent)
         else ()

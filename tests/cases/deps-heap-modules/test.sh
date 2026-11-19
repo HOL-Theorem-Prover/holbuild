@@ -75,7 +75,7 @@ QED
 Theorem b_second:
   a_value /\ T
 Proof
-  simp[a_value_def]
+  rw[a_value_def] (* b_second *)
 QED
 SML
 
@@ -83,8 +83,10 @@ build() {
   (cd "$project" && HOLBUILD_CHECKPOINT_TIMING=1 "$HOLBUILD_BIN" --cache-dir ../cache -j1 build BTheory) > "$1" 2>&1 ||
     { cat "$1" >&2; return 1; }
 }
-# Changes B's proofs without changing a line number or an output.
-edit_b() { sed -i "s/^  simp\[a_value_def\].*\$/  simp[a_value_def] (* $1 *)/" "$project/src/BScript.sml"; }
+# Changes b_second's proof without changing a line number or an output,
+# so that a build can resume from b_first's context.
+edit_b() { sed -i "s/^  .*(\* b_second.*\$/  rw[a_value_def] (* b_second $1 *)/" "$project/src/BScript.sml"; }
+break_b() { sed -i "s/^  .*(\* b_second.*\$/  FAIL_TAC \"b_second broken\" (* b_second *)/" "$project/src/BScript.sml"; }
 checkpoints=$project/.holbuild/checkpoints/deps-modules/src
 deps_heap() { find "$checkpoints/BScript.sml.deps" -name deps_loaded.save | head -n 1; }
 same_outputs() { for ext in dat sig sml; do cmp "$tmpdir/BTheory.$ext" "$project/.holbuild/obj/src/BTheory.$ext"; done; }
@@ -107,6 +109,10 @@ build "$tmpdir/first.log"
 deps_saved true false
 echo 'val _ = PolyML.SaveState.saveChildWithModules;' > "$tmpdir/probe.sml"
 if ! "$HOLDIR/bin/hol" run --noconfig "$tmpdir/probe.sml" > /dev/null 2>&1; then
+  if [[ ${HOLBUILD_TEST_REQUIRE_MODULE_HEAPS:-0} == 1 ]]; then
+    echo 'this Poly/ML has no PolyML.SaveState.saveChildWithModules' >&2
+    exit 1
+  fi
   echo 'deps heaps that refer to modules unsupported by this Poly/ML'
   exit 0
 fi
@@ -132,10 +138,29 @@ same_outputs
 find "$module_cache" -name '*-A-*.pmo' -delete
 edit_b two
 build "$tmpdir/resume.log"
+require_grep 'from: theorem-context checkpoint after b_first' "$tmpdir/resume.log"
 require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/resume.log"
 same_outputs
 # The fresh preload loaded A from its .dat again, and wrote the module.
 deps_saved true false
+
+# A resume from b_second's failed prefix, on such a heap, after A's module
+# went.
+rm -rf "$checkpoints" "$HOLBUILD_CACHE/checkpoint-store"
+edit_b prefix
+build "$tmpdir/prefix-heap.log"
+deps_saved false true
+break_b
+if build "$tmpdir/broken.log" 2> /dev/null; then
+  echo 'b_second built with a failing proof' >&2; exit 1
+fi
+require_grep 'b_second broken' "$tmpdir/broken.log"
+find "$module_cache" -name '*-A-*.pmo' -delete
+edit_b fixed
+build "$tmpdir/prefix.log"
+require_grep 'from: failed-prefix checkpoint in b_second' "$tmpdir/prefix.log"
+require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/prefix.log"
+same_outputs
 
 # The host's heap store: a tree without a heap takes the store's, but not
 # once A's module went.
@@ -187,6 +212,17 @@ phase() {
   grep -qE "^phase-ms=(.*,)?$2(,|\$)" "$tmpdir/$1.result" ||
     { echo "$1 lacks phase $2:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1; }
 }
+# resumed NAME: NAME's HOL child started from the restored deps heap or a
+# checkpoint on it, and dropped none.
+resumed() {
+  phase "$1" 'res(deps|ctx)n:1'
+  grep -qE 'from: (deps-loaded|theorem-context) checkpoint' "$tmpdir/$1.log" ||
+    { echo "$1 didn't resume:" >&2; cat "$tmpdir/$1.log" >&2; exit 1; }
+  if grep -qE '^phase-ms=(.*,)?rstdropn:' "$tmpdir/$1.result" ||
+     grep -q 'discarding invalid checkpoint' "$tmpdir/$1.log"; then
+    echo "$1 dropped a checkpoint:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1
+  fi
+}
 worker_modules=$worker/theory-modules
 exec_theory Z z unshared
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
@@ -201,6 +237,7 @@ edit_b four
 exec_theory B fetch
 phase fetch-B 'rstmodn:1'
 require_grep 'restored shared' "$tmpdir/fetch-B.log"
+resumed fetch-B
 [[ -f "$modules" ]] || { echo "A's module wasn't fetched to $modules" >&2; exit 1; }
 
 # The remote cache loses A's module too: the heap is dropped, and B preloads
@@ -219,6 +256,7 @@ rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_b six
 exec_theory B replaced
 require_grep 'restored shared' "$tmpdir/replaced-B.log"
+resumed replaced-B
 if grep -qE '^phase-ms=(.*,)?rstmoddropn:' "$tmpdir/replaced-B.result"; then
   echo 'the heap given up was not replaced' >&2; cat "$tmpdir/replaced-B.result" >&2; exit 1
 fi
