@@ -15,10 +15,13 @@ val _ = temp_add_user_printer ("goalprint.fld",
              sysprint {gravs = gravs, binderp = false, depth = depth} (rand t)));
 
 (* Prints the goal with HOL's own term printer, then fails, so holbuild prints
-   the same goal for the failed step. *)
+   the same goal for the failed step.  The installed printer is replaced by
+   one holbuild's printer ignores: if holbuild fell back to the installed
+   printer, the goal would show CUSTOM. *)
 fun expected_goal_tac g =
   (TextIO.output (TextIO.stdErr,
      "expected goal:\n" ^ PP.pp_to_string 100 goalStack.std_pp_goal g ^ "\nexpected goal end\n");
+   ignore (Parse.set_term_printer (fn _ => PP.add_string "CUSTOM"));
    FAIL_TAC "goal printed" g)
 
 Theorem printed_goal:

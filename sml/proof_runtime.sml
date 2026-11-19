@@ -799,7 +799,9 @@ fun save_theorem_context () =
    a sentinel term captures the term printer once it is set up; printing each
    term through it does what Parse.pp_term does, without the rebuild.  HOL
    from 9bbea3b4b0 on keeps the splitter, which leaves this little to save.
-   NONE when the capture did not run. *)
+   The goal is printed with the current grammars even when a script installed
+   its own printer with Parse.set_term_printer.  NONE when the capture did not
+   run. *)
 fun cached_grammar_term_printer () =
   let
     val (tyG, tmG) = Parse.current_grammars ()
