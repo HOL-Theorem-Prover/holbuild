@@ -10758,20 +10758,9 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       let
         val path = in_root root stem
         val _ = ensure_parent path
-        val manifest = HolbuildCache.action_manifest cache key
-        val stat_before = HolbuildStatCache.stat_ident manifest
         val {manifest_text = source_text, metadata = metadata as {parents, mldeps}} =
           restore_spec_theory remote root resolver
             {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE}
-        val source = HolbuildHash.string_sha256 source_text
-        (* The manifest's stat, by the rule hash_manifest keeps it under. *)
-        val _ =
-          case (stat_before, HolbuildStatCache.stat_ident manifest) of
-              (SOME ident, SOME after) =>
-                if HolbuildStatCache.same_ident (ident, after) andalso not (HolbuildPlanRecord.racy_at scan_ns ident)
-                then see manifest (ident, source)
-                else ()
-            | _ => ()
         val {sig_hash, ...} = cache_manifest_blobs_from_lines key (cache_manifest_lines source_text)
         (* Those of Resident.hashed_suffixes: the .sml has its .dat path
            written in, and the .ui and .uo are the manifests just written. *)
@@ -10781,7 +10770,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
            HolbuildHash.string_sha256 (manifest_text (uo_lines stem metadata))]
       in
         Resident.put resident path
-          (Resident.Theory {target = target, key = key, source = source,
+          (Resident.Theory {target = target, key = key, source = HolbuildHash.string_sha256 source_text,
                             parents = parents, mldeps = mldeps, dat_hash = hol_dat_hash (path ^ ".dat"),
                             dat_parents = Binarymap.listItems (parse_dat_parent_hashes (read_dat_header (path ^ ".dat"))),
                             hashes = hashes})

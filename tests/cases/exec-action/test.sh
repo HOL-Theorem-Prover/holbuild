@@ -552,7 +552,10 @@ parked_b="$tmpdir/worker-c/action-parked${stem_b#"$tmpdir/worker-c/action"}"
   awk -F'\t' -v stem="$stem_b" '$1 == "parked" && $2 == stem { found = 1 } END { exit !found }' \
     "$tmpdir/worker-c/action-resident" || {
   echo "worker c didn't park B" >&2; cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
-# An action naming B again takes it back instead of installing it.
+# An action naming B again takes it back instead of installing it; B's
+# manifest, over a second old, has its stat recorded then, and kept while B
+# waits parked, so taking B back again needn't hash it.
+sleep 1.1
 worker c "$spec_c"
 expect c 0
 [[ $(stat -c %i "$stem_b.dat") == "$inode_b" && ! -e "$parked_b.dat" ]] || {
@@ -562,6 +565,8 @@ grep -qE "^phase-ms=(.*,)?hydinstn:0(,|\$)" "$tmpdir/c.result" || {
 worker c "$spec_a2"
 expect c 0
 [[ $(stat -c %i "$parked_b.dat" 2>/dev/null) == "$inode_b" ]] || { echo "worker c didn't park B again" >&2; exit 1; }
+grep -qF "$tmpdir/worker-c/actions/$(key_for "$tmpdir/batch.txt" worker:BTheory)/manifest" "$tmpdir/worker-c/action-manifest-stats" || {
+  echo "worker c dropped the stat of parked B's manifest" >&2; cat "$tmpdir/worker-c/action-manifest-stats" >&2; exit 1; }
 # A kept dependency's manifest hash is recorded by the manifest's stat once
 # the manifest is more than a second older than the hydrate, and trusted
 # while the stat is unchanged; a change to the manifest still shows.
@@ -593,16 +598,10 @@ expect c 0
 require_file "$parked_b.dat"
 touch "$tmpdir/worker-c/action/.holbuild/obj/stray"
 rm "$tmpdir/worker-c/action-resident"
-# A's manifest more than a second old, so its install records its stat.
-sleep 1.1
 worker c "$spec_a2"
 expect c 0
 [[ ! -e "$tmpdir/worker-c/action/.holbuild/obj/stray" ]] || { echo "worker c kept a root it has no records of" >&2; exit 1; }
 [[ ! -e "$tmpdir/worker-c/action-parked" ]] || { echo "worker c kept parked theories it has no records of" >&2; exit 1; }
-worker c "$spec_a2"
-expect c 0
-grep -qE "^phase-ms=(.*,)?hydstatn:[1-9][0-9]*(,|\$)" "$tmpdir/c.result" || {
-  echo "worker c hashed A's manifest again after installing it:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
 # A release that keeps no records removes the root around its actions; the
 # records go once the root is emptied, even when the action then fails.
 rm -rf "$tmpdir/worker-c/action"
