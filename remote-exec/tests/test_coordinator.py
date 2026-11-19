@@ -3731,6 +3731,12 @@ async def test_claim_carries_its_batch_heap_limit(
     assert first["max_heap_mb"] == second["max_heap_mb"] == max_heap_mb
 
 
+async def test_claim_names_its_batch(http: httpx.AsyncClient) -> None:
+    first, second = await submit(http, ["A"]), await submit(http, ["B"])
+    claims = [await claim(http), await claim(http)]
+    assert {c["theory"]: c["batch_id"] for c in claims if c is not None} == {"pkg:A": first, "pkg:B": second}
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "bad", "2147483648"])
 async def test_submit_rejects_invalid_heap_limit(http: httpx.AsyncClient, value: str) -> None:
     response = await http.post(
