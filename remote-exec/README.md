@@ -257,7 +257,7 @@ dir and its `HOLBUILD_CACHE` root each have 4 GiB free, so a host whose disk
 is full doesn't take actions it would only fail. A worker short of disk first
 empties the `action`, `parked`, `action-parked` and `tmp` directories of its
 `HOLBUILD_CACHE` root, which its own finished actions left behind (releases
-0.14.79 to 0.14.82 parked theories in `parked` and `action-parked`), and drops
+0.14.79 to 0.14.83 parked theories in `parked` and `action-parked`), and drops
 `action-resident`, `parked-records` and `parked-stats`, the records of what
 `action` and `parked` held. While it still waits, each poll it runs the cache sweep an
 action would start with, `exec-action --sweep-only` with its cap and the 16 GB
