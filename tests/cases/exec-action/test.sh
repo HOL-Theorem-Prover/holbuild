@@ -629,6 +629,7 @@ expect c 0
 worker c "$spec_a2"
 expect c 0
 inode_b=$(stat -c %i "$parked_b.dat")
+ln -f "$parked_b.dat" "$tmpdir/b-held.dat"
 rm "$tmpdir/worker-c/action-manifest-stats"
 worker c "$spec_c"
 expect c 0
@@ -645,6 +646,7 @@ mkdir -p "$(dirname "$stem_b")"
 cp -a "$(dirname "$parked_b")/." "$(dirname "$stem_b")/"
 printf '%s\n' "$b_line" >> "$tmpdir/worker-c/action-resident"
 inode_b=$(stat -c %i "$stem_b.dat")
+ln -f "$stem_b.dat" "$tmpdir/b-held.dat"
 worker c "$spec_c"
 expect c 0
 [[ ! -e "$parked_b.dat" && $(stat -c %i "$stem_b.dat") == "$inode_b" ]] &&
@@ -697,6 +699,7 @@ expect c 0
 grep -qE "^phase-ms=(.*,)?hydresetn:1(,|\$)" "$tmpdir/c.result" || {
   echo "worker c counted no reset:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
 inode_b=$(stat -c %i "$parked_b.dat")
+ln -f "$parked_b.dat" "$tmpdir/b-held.dat"
 worker c "$spec_c"
 expect c 0
 [[ $(stat -c %i "$stem_b.dat") == "$inode_b" ]] || {

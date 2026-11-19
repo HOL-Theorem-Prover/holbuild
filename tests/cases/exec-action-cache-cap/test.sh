@@ -241,8 +241,10 @@ kept "$cache_sweep/actions/newer" "an entry once the cache fits"
   echo "--sweep-only kept parked theories without readable records, or their files" >&2; exit 1; }
 # So do they with readable records (a worker image that drops only the
 # root's records), and so does where 0.14.79 parked.
-mkdir -p "$cache_sweep/parked/.holbuild/obj" "$cache_sweep/action-parked/.holbuild/obj"
-printf 'holbuild-action-resident-v1\n' > "$cache_sweep/parked-records"
+mkdir -p "$cache_sweep/parked/.holbuild/obj/x" "$cache_sweep/action-parked/.holbuild/obj"
+printf 'parked\n' > "$cache_sweep/parked/.holbuild/obj/x/BTheory.dat"
+printf 'holbuild-action-resident-v1\nparked\t%s\tx:BTheory\tkey\tsource\t-\t-\tdat\t-\t-\n' \
+  "$cache_sweep/action/.holbuild/obj/x/BTheory" > "$cache_sweep/parked-records"
 printf 'stats\n' > "$cache_sweep/parked-stats"
 HOLBUILD_CACHE=$cache_sweep "$HOLBUILD_BIN" exec-action --sweep-only --cache-limit-gb 1 --cache-reserve-gb 0 \
   > "$tmpdir/sweep-only.log" 2>&1 || { cat "$tmpdir/sweep-only.log" >&2; exit 1; }
