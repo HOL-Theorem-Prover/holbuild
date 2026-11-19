@@ -9005,14 +9005,15 @@ fun uncached_parents plan uncached node =
     rev parents
   end
 
+(* PUT whether or not the remote cache already holds the blob: a cache
+   node can answer for a blob from its own disk after its backing store has
+   dropped it, and a PUT writes it to that store anew. *)
 fun publish_spec_blob remote {hash, path} =
-  if HolbuildRemoteCache.blob_confirmed_present remote hash then ()
-  else
-    case HolbuildRemoteCache.publish_hashed_blob remote {hash = hash, src = path} of
-        HolbuildCacheBackend.Published => ()
-      | HolbuildCacheBackend.AlreadyPresent => ()
-      | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
-      | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+  case HolbuildRemoteCache.publish_hashed_blob remote {hash = hash, src = path} of
+      HolbuildCacheBackend.Published => ()
+    | HolbuildCacheBackend.AlreadyPresent => ()
+    | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
+    | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
 
 (* The remote ledger: what earlier exports found the remote cache at a URL
    to hold, one "theory <input key>" or "blob <sha256>" per line, so that the
@@ -9023,16 +9024,53 @@ fun publish_spec_blob remote {hash, path} =
    (forget_remote_ledger) and resubmits.  Builds change it under its lock,
    rewriting it whole; a build that would take it past
    max_remote_ledger_entries keeps only those it used or learned, so it
-   grows past that bound only as far as one build's own entries. *)
+   grows past that bound only as far as one build's own entries.
+
+   A remote cache may drop what it holds after a while, however often it is
+   read (one over S3 expires each object a fixed time after it was written).
+   So the ledger's first line, "#started <seconds>", says when its oldest
+   entry was learned, and a ledger started remote_ledger_lifetime_seconds ago
+   or more, or without that line, counts as empty.  Its blobs are learned
+   only from PUTs, which write them anew; a theory it lists that the remote
+   cache dropped since costs a resubmission, as above. *)
 fun remote_ledger_path remote =
   Path.concat(Path.concat(cache_root (), "remote-ledger"),
               HolbuildHash.string_sha256 (HolbuildRemoteCache.base_url remote))
 
 val max_remote_ledger_entries = 100000
 
+val remote_ledger_lifetime_seconds : LargeInt.int = 12 * 60 * 60
+
+val remote_ledger_started = "#started "
+
+(* TEXT if it is a ledger started less than remote_ledger_lifetime_seconds
+   before NOW, with when it started; else the empty ledger, starting NOW. *)
+fun live_remote_ledger now text =
+  let
+    val first = hd (String.fields (fn c => c = #"\n") text)
+    val started =
+      if String.isPrefix remote_ledger_started first
+      then LargeInt.fromString (String.extract (first, size remote_ledger_started, NONE))
+      else NONE
+  in
+    case started of
+        SOME t => if t <= now andalso now - t < remote_ledger_lifetime_seconds then (t, text) else (now, "")
+      | NONE => (now, "")
+  end
+
+fun now_seconds () = Time.toSeconds (Time.now ())
+
+fun read_live_remote_ledger path =
+  live_remote_ledger (now_seconds ()) (read_text path handle IO.Io _ => "")
+
 fun read_remote_ledger path =
-  Binaryset.addList (Binaryset.empty String.compare, String.tokens (fn c => c = #"\n") (read_text path))
-  handle IO.Io _ => Binaryset.empty String.compare
+  let val (started, text) = read_live_remote_ledger path
+  in
+    (started,
+     Binaryset.addList (Binaryset.empty String.compare,
+                        List.filter (not o String.isPrefix remote_ledger_started)
+                          (String.tokens (fn c => c = #"\n") text)))
+  end
 
 (* Whether ITEM is a whole line of TEXT, by binary search: the ledger is
    written sorted by String.compare.  Only an exact whole line matches, so a
@@ -9071,14 +9109,16 @@ fun with_remote_ledger_lock path f =
 fun record_remote_ledger_entries path {learned, used} =
   with_remote_ledger_lock path (fn () =>
     let
-      val existing = detail_time_phase "action_spec.ledger.parse" (fn () => read_remote_ledger path)
+      val (started, existing) = detail_time_phase "action_spec.ledger.parse" (fn () => read_remote_ledger path)
       val merged = Binaryset.addList (existing, learned)
       val entries =
         if Binaryset.numItems merged <= max_remote_ledger_entries then merged
         else Binaryset.addList (Binaryset.intersection (existing, used), learned)
     in
       detail_time_phase "action_spec.ledger.write" (fn () =>
-        write_text path (String.concat (map (fn line => line ^ "\n") (Binaryset.listItems entries))))
+        write_text path (String.concat (map (fn line => line ^ "\n")
+                                          ((remote_ledger_started ^ LargeInt.toString started) ::
+                                           Binaryset.listItems entries))))
     end)
   handle e => warn ("could not record the remote ledger " ^ path ^ ": " ^ General.exnMessage e)
 
@@ -9092,14 +9132,14 @@ fun forget_remote_ledger () =
           handle e => warn ("could not forget the remote ledger " ^ path ^ ": " ^ General.exnMessage e)
         end
 
-(* The input keys of the plan's theories whose input key is missing or that
-   depend on that theory. *)
+(* The input keys of the plan's theories whose input key is one of MISSING or
+   that depend on such a theory. *)
 fun theory_keys_depending_on (options : build_options) tc project plan keys toolchain_key missing =
   let
     val key_of = HolbuildBuildPlan.input_key_for keys
+    fun is_missing node = List.exists (fn key => key_of node = key) missing
     fun depends node =
-      key_of node = missing orelse
-      List.exists (fn dep => key_of dep = missing) (HolbuildBuildPlan.transitive_project_deps plan node)
+      is_missing node orelse List.exists is_missing (HolbuildBuildPlan.transitive_project_deps plan node)
   in
     map key_of (List.filter (fn node => is_theory_node node andalso depends node) (HolbuildBuildPlan.selected_nodes plan))
   end
@@ -9376,7 +9416,7 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
        nothing to do reads none of it. *)
     val ledger_text =
       if ledger andalso not (null uncached_actions andalso null deps_actions) then
-        (read_text ledger_path handle IO.Io _ => "")
+        #2 (read_live_remote_ledger ledger_path)
       else ""
     fun known item = sorted_lines_member ledger_text item andalso (add used item; true)
     fun known_theory (node, action) =
