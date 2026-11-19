@@ -33,7 +33,7 @@ from remote_exec.coordinator import (
     Settings,
     is_auth_failure,
 )
-from remote_exec.formats import FormatError, parse_batch, parse_result
+from remote_exec.formats import Batch, FormatError, parse_batch, parse_result
 
 logger = logging.getLogger(__name__)
 # Under uvicorn's own logger, which uvicorn sends to stderr at INFO; this module's would show only warnings.
@@ -246,6 +246,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         batch_id: UUID | None = Header(default=None, alias="Holbuild-Batch-Id"),
     ) -> dict[str, UUID]:
         started = time.monotonic()
+        batch: Batch | None = None
         try:
             try:
                 batch = parse_batch(await text_body(request))
@@ -264,9 +265,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         finally:
             # Timed from before the body is read, so a slow upload or parse shows too.
             if (seconds := time.monotonic() - started) >= SUBMIT_SLOW_SECONDS:
+                shape = "unparsed" if batch is None else f"{len(batch.actions)} actions, {len(batch.edges)} edges"
                 logger.warning(
-                    "POST /v1/batches of %s bytes (batch id %s) took %.1f s",
-                    request.headers.get("content-length", "?"), batch_id or "new", seconds,
+                    "POST /v1/batches of %s bytes (%s; batch id %s) took %.1f s",
+                    request.headers.get("content-length", "?"), shape, batch_id or "new", seconds,
                 )
 
     @app.get("/v1/batches/{batch_id}", dependencies=client)

@@ -17,6 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from starlette.requests import Request
 
+from remote_exec import app as app_module
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import CountResponses, create_app, summary_line
 from remote_exec.coordinator import Claim, Coordinator, HostReport, _claim_rank
@@ -153,6 +154,18 @@ async def test_a_submission_repeated_under_its_id_answers_with_the_batch_stored_
         assert await conn.scalar(sa.text("SELECT count(*) FROM batches")) == 1
         assert await conn.scalar(sa.text("SELECT count(*) FROM actions")) == 2
     assert await states(http, batch_id) == {"a": "ready", "b": "waiting"}
+
+
+async def test_a_slow_submission_is_logged_with_its_size_and_shape(
+    http: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(app_module, "SUBMIT_SLOW_SECONDS", 0.0)
+    body = batch_text(["a", "b"], [("b", "a")])
+    assert (await http.post("/v1/batches", content=body, headers=CLIENT)).status_code == 201
+    assert (await http.post("/v1/batches", content="nonsense\n", headers=CLIENT)).status_code == 400
+
+    assert f"POST /v1/batches of {len(body)} bytes (2 actions, 1 edges; batch id new)" in caplog.text
+    assert "POST /v1/batches of 9 bytes (unparsed; batch id new)" in caplog.text
 
 
 async def blocked_by(observer: AsyncConnection, pid: int) -> int:
