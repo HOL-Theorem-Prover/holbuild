@@ -2,9 +2,11 @@
 set -euo pipefail
 
 # HolbuildRuntime.load shares the heap's common data around a theory whose
-# .dat is large, on either loader HOL may have, and loads in the same order.
-# Three stand-in theories C -> B -> A, B's .dat sparse at 64 MiB; each
-# theory prints the bytes of .dat loaded since the last share.
+# .dat is large, and before one that brings the .dat loaded since the last
+# share to 128 MiB, on either loader HOL may have, and loads in the same
+# order.  A chain of stand-in theories F -> E -> D -> C -> B -> A with sparse
+# .dat files, B's at 64 MiB and D's to F's at 48 MiB; each theory prints the
+# bytes of .dat loaded since the last share, and each share prints "share".
 
 HOLBUILD_BIN=$1
 HOLDIR=$2
@@ -32,23 +34,31 @@ theory() {
 theory A ""
 theory B A
 theory C B
+theory D C
+theory E D
+theory F E
 head -c 1000 /dev/zero > "$objs/ATheory.dat"
 truncate -s 64M "$objs/BTheory.dat"
 head -c 1000 /dev/zero > "$objs/CTheory.dat"
+truncate -s 48M "$objs/DTheory.dat" "$objs/ETheory.dat" "$objs/FTheory.dat"
 
 run_load() {
   local mode=$1 prelude=$2
   cat > "$tmpdir/$mode.sml" <<SML
+structure PolyML = struct open PolyML
+  fun shareCommonData x = (TextIO.print "share\\n"; PolyML.shareCommonData x) end;
 $prelude
 use "$HOLBUILD_ROOT/sml/holbuild_runtime.sml";
 val _ = Meta.loadPath := "$mods" :: !Meta.loadPath;
-val _ = HolbuildRuntime.load "CTheory";
+val _ = HolbuildRuntime.load "FTheory";
 val _ = print ("end " ^ Position.toString (!HolbuildRuntime.unshared_dat_bytes) ^ "\n");
 SML
   "$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" "$tmpdir/$mode.sml" \
     > "$tmpdir/$mode.log" 2>&1 || { cat "$tmpdir/$mode.log" >&2; exit 1; }
-  # A's bytes are shared before B and B's after it; C's stay unshared.
-  if [[ $(grep -E '^(A|B|C|end) ' "$tmpdir/$mode.log") != $'A 0\nB 0\nC 0\nend 1000' ]]; then
+  # A's bytes are shared before B and B's after it; C's, D's and E's before
+  # F, whose own stay unshared.
+  expected=$'A 0\nshare\nB 0\nshare\nC 0\nD 1000\nE 50332648\nshare\nF 0\nend 50331648'
+  if [[ $(grep -E '^(share$|[A-F] |end )' "$tmpdir/$mode.log") != "$expected" ]]; then
     echo "$mode: unexpected load order or sharing" >&2
     cat "$tmpdir/$mode.log" >&2
     exit 1

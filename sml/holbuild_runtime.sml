@@ -37,8 +37,9 @@ struct
            then share_heap () else ();
            use path;
            unshared_dat_bytes := !unshared_dat_bytes + size;
-           if size >= large_single_dat orelse !unshared_dat_bytes >= large_cumulative_dat
-           then share_heap () else ())
+           (* Anything loaded before was shared above, so only a large
+              theory can bring the count to a share here. *)
+           if size >= large_single_dat then share_heap () else ())
 
   (* How a preload loads a module: sharing through
      use_with_large_theory_sharing, on whichever loader this HOL has.  A HOL
