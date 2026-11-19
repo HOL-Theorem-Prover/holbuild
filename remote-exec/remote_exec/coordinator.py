@@ -1887,9 +1887,13 @@ class Coordinator:
             if tier in hint_only and not fits:
                 held.append(entry)
                 continue
+            # A deeper claim ahead of the batch goes first, but not before a build held for this host.
             if outranked is not None and (
                 (not ranking.capped and outranked.above(tier, -priority))
-                or outranked.deeper(batch_id, tier, ranking.depths.get((batch_id, tier)))
+                or (
+                    outranked.deeper(batch_id, tier, ranking.depths.get((batch_id, tier)))
+                    and not self._held_here(ranking, (batch_id, tier), host_id, kept)
+                )
             ):
                 heapq.heappush(ranking.heap, entry)
                 put_back_held()
