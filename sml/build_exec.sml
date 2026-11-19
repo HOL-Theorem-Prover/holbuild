@@ -10563,25 +10563,72 @@ structure Resident = HolbuildActionResident
 
 val theory_suffixes = [".sig", ".sml", ".dat", ".tr.gz", ".ui", ".uo"]
 
+(* Where a parked theory's files wait outside the action root ROOT: beside
+   it, at the same paths under ROOT-parked, where HOL finds no theory. *)
+fun parked_root root = root ^ "-parked"
+
+fun parked_path root path = parked_root root ^ String.extract (path, size root, NONE)
+
+fun action_extra_dir root key = in_root root (Path.concat (".holbuild/action-extra", key))
+
+(* Every path a dependency theory installed at PATH in ROOT occupies. *)
+fun resident_theory_files path =
+  List.concat (map (fn suffix => [path ^ suffix, hfs_remapped_path (path ^ suffix)]) theory_suffixes)
+
+(* Removes the directories under ROOT that DIR, emptied, leaves empty up
+   from it, which a cold root wouldn't have. *)
+fun remove_empty_dirs root dir =
+  if dir = root orelse not (String.isPrefix (root ^ "/") dir) then ()
+  else (FS.rmDir dir; remove_empty_dirs root (Path.dir dir)) handle OS.SysErr _ => ()
+
 (* Removes what an entry of the action root's records stands for, and the
    directories that leaves empty, which a cold root wouldn't have. *)
 fun remove_resident root (path, entry) =
   let
-    fun remove_empty dir =
-      if dir = root orelse not (String.isPrefix (root ^ "/") dir) then ()
-      else (FS.rmDir dir; remove_empty (Path.dir dir)) handle OS.SysErr _ => ()
-    fun remove path = (remove_file path; remove_empty (Path.dir path))
-    fun remove_object path = (remove path; remove (hfs_remapped_path path))
+    fun remove path = (remove_file path; remove_empty_dirs root (Path.dir path))
     fun remove_theory key =
-      (List.app (fn suffix => remove_object (path ^ suffix)) theory_suffixes;
-       remove_tree (in_root root (Path.concat (".holbuild/action-extra", key))))
+      (List.app remove (resident_theory_files path);
+       remove_tree (action_extra_dir root key))
   in
     case entry of
         Resident.Theory {key, ...} => remove_theory key
       | Resident.Scratch key => remove_theory key
+      | Resident.Parked {key, ...} =>
+          (List.app (remove_file o parked_path root) (resident_theory_files path);
+           remove_tree (parked_path root (action_extra_dir root key)))
       | Resident.File _ => remove path
-      | Resident.Manifest _ => remove_object path
+      | Resident.Manifest _ => (remove path; remove (hfs_remapped_path path))
   end
+
+(* Moves the files of a dependency theory at PATH between ROOT and its parked
+   copy (TO_PARKED says which way), with its extra outputs; a file it lacks
+   (a .tr.gz, say) is skipped.  Leaves no directory it empties in ROOT. *)
+fun move_theory root to_parked (path, key) =
+  let
+    fun move src_of dst_of file =
+      let val (src, dst) = (src_of file, dst_of file)
+      in
+        if not (path_exists src) then ()
+        else (ensure_parent dst; rename_replace {old = src, new = dst};
+              if to_parked then remove_empty_dirs root (Path.dir src) else ())
+      end
+    val (src_of, dst_of) = if to_parked then (fn p => p, parked_path root) else (parked_path root, fn p => p)
+    val extras = action_extra_dir root key
+  in
+    List.app (move src_of dst_of) (resident_theory_files path);
+    if path_exists (src_of extras) then (remove_tree (dst_of extras); move src_of dst_of extras) else ()
+  end
+
+(* What a hydrate that doesn't want an entry of the records leaves: a
+   dependency theory parked, a parked one as it is, anything else removed. *)
+fun retire_resident root (path, entry) =
+  case entry of
+      Resident.Theory (theory as {key, ...}) =>
+        ((move_theory root true (path, key); SOME (Resident.Parked theory))
+         handle OS.SysErr _ =>
+           (remove_resident root (path, entry); remove_resident root (path, Resident.Parked theory); NONE))
+    | Resident.Parked _ => SOME entry
+    | _ => (remove_resident root (path, entry); NONE)
 
 (* Step 3: the caller's files, given as {hash, dst}, the spec's libraries
    and library manifests from the spec, dependency theories from the cache;
@@ -10682,18 +10729,27 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             end)
         (HolbuildCache.get_action cache key)
     (* A dependency installed from the local cache's current entry for its
-       key, with the .uo this spec would write, stays. *)
+       key, with the .uo this spec would write, stays, or comes back from
+       where an earlier hydrate parked it. *)
     fun kept {target, stem, key} =
-      let val path = in_root root stem
+      let
+        val path = in_root root stem
+        fun same {target = t, key = k, source, ...} = t = target andalso k = key andalso source_sha key = SOME source
+        fun fits {parents, mldeps, ...} =
+          Resident.file_hash resident (path ^ ".uo") =
+            SOME (HolbuildHash.string_sha256 (manifest_text (uo_lines stem {parents = parents, mldeps = mldeps}))) andalso
+          present (List.concat (map (fn suffix => objects (path ^ suffix)) [".sig", ".sml", ".dat", ".ui", ".uo"])) andalso
+          (Resident.want resident path; true)
       in
-        case Resident.theory resident path of
-            SOME {target = t, key = k, source, parents, mldeps, ...} =>
-              t = target andalso k = key andalso source_sha key = SOME source andalso
-              Resident.file_hash resident (path ^ ".uo") =
-                SOME (HolbuildHash.string_sha256 (manifest_text (uo_lines stem {parents = parents, mldeps = mldeps}))) andalso
-              present (List.concat (map (fn suffix => objects (path ^ suffix)) [".sig", ".sml", ".dat", ".ui", ".uo"])) andalso
-              (Resident.want resident path; true)
-          | NONE => false
+        case Resident.find resident path of
+            SOME (Resident.Theory theory) => same theory andalso fits theory
+          | SOME (Resident.Parked theory) =>
+              same theory andalso
+              (* A file the move misses shows in the presence check. *)
+              ((move_theory root false (path, key) handle OS.SysErr _ => ());
+               Resident.put resident path (Resident.Theory theory);
+               fits theory)
+          | _ => false
       end
     fun remove_old {stem, ...} =
       let val path = in_root root stem
@@ -10702,9 +10758,20 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       let
         val path = in_root root stem
         val _ = ensure_parent path
+        val manifest = HolbuildCache.action_manifest cache key
+        val stat_before = HolbuildStatCache.stat_ident manifest
         val {manifest_text = source_text, metadata = metadata as {parents, mldeps}} =
           restore_spec_theory remote root resolver
             {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE}
+        val source = HolbuildHash.string_sha256 source_text
+        (* The manifest's stat, by the rule hash_manifest keeps it under. *)
+        val _ =
+          case (stat_before, HolbuildStatCache.stat_ident manifest) of
+              (SOME ident, SOME after) =>
+                if HolbuildStatCache.same_ident (ident, after) andalso not (HolbuildPlanRecord.racy_at scan_ns ident)
+                then see manifest (ident, source)
+                else ()
+            | _ => ()
         val {sig_hash, ...} = cache_manifest_blobs_from_lines key (cache_manifest_lines source_text)
         (* Those of Resident.hashed_suffixes: the .sml has its .dat path
            written in, and the .ui and .uo are the manifests just written. *)
@@ -10714,7 +10781,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
            HolbuildHash.string_sha256 (manifest_text (uo_lines stem metadata))]
       in
         Resident.put resident path
-          (Resident.Theory {target = target, key = key, source = HolbuildHash.string_sha256 source_text,
+          (Resident.Theory {target = target, key = key, source = source,
                             parents = parents, mldeps = mldeps, dat_hash = hol_dat_hash (path ^ ".dat"),
                             dat_parents = Binarymap.listItems (parse_dat_parent_hashes (read_dat_header (path ^ ".dat"))),
                             hashes = hashes})
@@ -10786,7 +10853,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                    Resident.put resident path (Resident.Scratch key)
                 end)
              scratch;
-    Resident.prune resident (remove_resident root);
+    Resident.prune resident (retire_resident root);
     (* Extra outputs lie under their theory's key, so a directory there for
        no recorded key (an early cutoff restores the action's own under its
        earlier key) is nobody's. *)
@@ -10812,8 +10879,21 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                 raise ActionFailed (InputMissing ("theory " ^ key),
                                     "dependency " ^ target ^ " does not match its parents in the cache");
     Resident.save resident;
-    (* A stale or missing record only means a manifest is hashed again. *)
-    hydrate_step "hydcheck" (fn () => HolbuildStatCache.flush seen handle _ => ())
+    (* A stale or missing record only means a manifest is hashed again.  The
+       stats of the parked theories' manifests, which no check read, stay. *)
+    hydrate_step "hydcheck" (fn () =>
+      (load_known ();
+       List.app (fn key =>
+                   let val path = HolbuildCache.action_manifest cache key
+                   in
+                     case (Binarymap.peek (!(#entries seen), path),
+                           Option.mapPartial (fn entries => Binarymap.peek (entries, path)) (!known)) of
+                         (NONE, SOME entry) => see path entry
+                       | _ => ()
+                   end)
+                (Resident.theory_keys resident);
+       HolbuildStatCache.flush seen)
+      handle _ => ())
   end
 
 (* The stems of the project objects the build loads: the ones its preload
@@ -13789,12 +13869,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     fun empty_all () =
       (remove_file resident_file;
        resident := Resident.fresh resident_file;
-       HolbuildRemoveTree.remove_untrusted_strict root)
+       HolbuildRemoveTree.remove_untrusted_strict root;
+       HolbuildRemoveTree.remove_untrusted_strict (parked_root root))
     (* The writable directories, empty, and the root's records; with no
-       records for it, the root is emptied too. *)
+       records for it, the root is emptied too.  Parked theories no record
+       names (a release that doesn't park wrote the records) go. *)
     fun reset () =
       (case if file_exists resident_marker then Resident.read resident_file else NONE of
-           SOME records => resident := records
+           SOME records =>
+             (resident := records;
+              if Resident.has_parked records then ()
+              else HolbuildRemoveTree.remove_untrusted_strict (parked_root root))
          | NONE => empty_all ();
        empty_writable true;
        List.app ensure_dir (root :: checkpoint_root :: writable_dirs);
