@@ -6536,7 +6536,7 @@ fun write_ahead_preload {load_lines, dir, share, path} =
       if_meta_has ["moduleSourceLoader"]
         ("val _ = let val loader = !Meta.moduleSourceLoader in " ^
          "Meta.moduleSourceLoader := (fn use => fn file => (HolbuildAheadLoad.record file; loader use file)); " ^
-         "HolbuildAheadLoad.loader := Meta.load; " ^
+         "HolbuildAheadLoad.loader := HolbuildRuntime.load; " ^
          "HolbuildAheadLoad.restore := (fn () => Meta.moduleSourceLoader := loader) end;") ::
       (* HOL put every directory of the project on the load path, the
          thousands under holbuild's checkpoints and logs too; none holds a
