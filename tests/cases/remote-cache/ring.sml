@@ -323,7 +323,15 @@ val _ = clear index_third "ac-put-status";
 val _ = assert "the other nodes took it"
   (index_at index_first = index_text 3 andalso index_at index_second = index_text 3);
 val _ = assert "the failed node keeps its entry" (index_at index_third = index_text 2);
-val _ = assert "replica writes do not trip the breaker" (not (RC.disabled ()));
+(* Three nodes with no answer, which as primary writes would trip the
+   breaker, are skipped by the refresh without counting. *)
+val dead = RC.remote (one ^ ",http://127.0.0.1:1,http://127.0.0.1:2,http://127.0.0.1:3");
+fun dead_key n =
+  let val key = "replica-dead-" ^ Int.toString n
+  in if hd (RC.ranked_urls dead (RC.remote_action_key key)) = one then key else dead_key (n + 1) end;
+val _ = assert "unanswered replica writes do not fail the publication"
+  (RC.replace_action_everywhere dead {key = dead_key 0, text = index_text 5} = CB.Published);
+val _ = assert "unanswered replica writes do not trip the breaker" (not (RC.tripped ()));
 val _ = List.app (fn node => seed_index node (index_text 1)) [first, second, third];
 val _ = RC.replace_action_unconditionally replicas {key = index_key, text = index_text 4};
 val _ = assert "a plain replacement writes one node"

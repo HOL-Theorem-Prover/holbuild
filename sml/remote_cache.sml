@@ -558,16 +558,20 @@ fun curl_get {url, dst} = curl_get_urls {urls = [url], dst = dst}
 fun successful_put_code code =
   code = 200 orelse code = 201 orelse code = 204
 
-fun curl_put_urls headers {urls, src} =
+(* The result, and the node that answered last, if any. *)
+fun curl_put_urls_at headers {urls, src} =
   (case send_urls "PUT" urls src (fn url => put_status headers {url = url, src = src}) of
-        NONE => HolbuildCacheBackend.Skipped
+        NONE => (NONE, HolbuildCacheBackend.Skipped)
       | SOME (url, HolbuildHttp.Failed message) =>
-          HolbuildCacheBackend.Conflict ("PUT " ^ redact_userinfo url ^ " failed: " ^ message)
+          (SOME url, HolbuildCacheBackend.Conflict ("PUT " ^ redact_userinfo url ^ " failed: " ^ message))
       | SOME (url, HolbuildHttp.Response code) =>
-          if successful_put_code code then HolbuildCacheBackend.Published
-          else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ redact_userinfo url))
+          (SOME url,
+           if successful_put_code code then HolbuildCacheBackend.Published
+           else HolbuildCacheBackend.Conflict ("HTTP " ^ Int.toString code ^ " from " ^ redact_userinfo url)))
   handle e as Unavailable _ => raise e
-       | e => (HolbuildCacheBackend.Conflict (General.exnMessage e))
+       | e => (NONE, HolbuildCacheBackend.Conflict (General.exnMessage e))
+
+fun curl_put_urls headers request = #2 (curl_put_urls_at headers request)
 
 fun curl_put_zstd {urls, src, size} =
   let
@@ -777,17 +781,19 @@ fun repair_action_replicas cache {key, text, attempts, should_replace} =
            | OS.SysErr (detail, _) => (cleanup (); warn_restore_once detail)
     end
 
-fun publish_action_metadata cache key metadata =
+fun publish_action_metadata_at cache key metadata =
   let
     val tmp = temp_path "action-put"
     val urls = action_urls cache key
     fun cleanup () = remove_file tmp
     fun publish () =
-      ((write_text tmp metadata; curl_put_urls [] {urls = urls, src = tmp} before cleanup ())
+      ((write_text tmp metadata; curl_put_urls_at [] {urls = urls, src = tmp} before cleanup ())
        handle e => (cleanup (); raise e))
   in
     publish ()
   end
+
+fun publish_action_metadata cache key metadata = #2 (publish_action_metadata_at cache key metadata)
 
 (* Checked first, as the blobs an action lists go unpublished while the
    remote cache is disabled. *)
@@ -799,12 +805,12 @@ fun publish_action cache {key, text} =
 
 (* A node answers a read of an entry it holds on its own disk without asking
    the shared backing store, so a node holding the entry being replaced would
-   go on serving the old one.  Once a node took the new entry, every node is
-   sent it too.  These writes are best effort: a node that fails one is only
+   go on serving the old one.  Once a node took the new entry, every other node
+   is sent it too.  These writes are best effort: a node that fails one is only
    traced and doesn't trip the breaker. *)
-fun refresh_action_replicas cache key metadata =
-  case action_urls cache key of
-      [_] => ()
+fun refresh_action_replicas cache key metadata taken =
+  case List.filter (fn url => SOME url <> taken) (action_urls cache key) of
+      [] => ()
     | urls =>
         if tripped () then ()
         else
@@ -837,9 +843,10 @@ fun replace_action_everywhere cache {key, text} =
   else
     let val metadata = action_metadata cache key text
     in
-      case publish_action_metadata cache key metadata of
-          HolbuildCacheBackend.Published => (refresh_action_replicas cache key metadata; HolbuildCacheBackend.Published)
-        | result => result
+      case publish_action_metadata_at cache key metadata of
+          (taken, HolbuildCacheBackend.Published) =>
+            (refresh_action_replicas cache key metadata taken; HolbuildCacheBackend.Published)
+        | (_, result) => result
     end
     handle e as Unavailable _ => raise e
          | e => HolbuildCacheBackend.Conflict (General.exnMessage e)

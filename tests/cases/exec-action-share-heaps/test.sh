@@ -301,6 +301,7 @@ resumed v3d "theorem-context checkpoint after t4" "theorem_context checkpoint"
 # A failed proof shares its failed prefix, and the fixed proof resumes from it.
 write_t "T \\/ F" "FAIL_TAC \"seeded failure\""
 export_t v4
+touch "$tmpdir/before-v4"
 worker v4 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v4 1 "status=failed" "failure=proof"
 require_grep "seeded failure" "$tmpdir/v4.log"
@@ -312,6 +313,16 @@ grep -qE "^phase-ms=(.*,)?share:[0-9]+(,|\$)" "$tmpdir/v4.result" || {
 if grep -qE "^phase-ms=(.*,)?share:" "$tmpdir/v3.result"; then
   echo "v3 shared its checkpoints before its result:" >&2; cat "$tmpdir/v3.result" >&2; exit 1
 fi
+# Its failed prefix and index entries reached the cache before the result
+# was written.
+shared_entries() {
+  find "$tmpdir/remote/ac" -type f -newer "$1" -print0 |
+    xargs -0r grep -lE "^(kind=failed_prefix|holbuild-shared-checkpoint-index-v1)\$" || true
+}
+[[ -n "$(shared_entries "$tmpdir/before-v4")" ]] || {
+  echo "v4 published no failed prefix" >&2; exit 1; }
+[[ -z "$(shared_entries "$tmpdir/v4.result")" ]] || {
+  echo "v4 published its failed prefix after its result:" >&2; shared_entries "$tmpdir/v4.result" >&2; exit 1; }
 require_grep "exec-action after the result (ms): .* modules_ms=" "$tmpdir/v4.log"
 # A resume that gets past the shared failed prefix and fails later shares
 # the later prefix in its place, and the next resume starts from that.

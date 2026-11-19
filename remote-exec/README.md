@@ -873,9 +873,11 @@ source build, 0 for a cache hit or failure. Older workers omit these fields.
 Releases before 0.14.72 can repeat a phase name; the coordinator folds the
 repeats as exec-action does: the earliest `*start`, the latest `*end`, and
 the sum of durations.
-Publication here covers the action's result and log; a passing action's
-checkpoint uploads happen after the result, a failed or interrupted one's
-before its log, timed as `share`. Parallel action spans overlap, as do
+Publication here covers the action's result and log. A passing action's
+checkpoint uploads happen after its result. A failed action's happen between
+its log and its result, and an interrupted one's before its log. Either is
+timed as `share`, which encloses their `publish` span. Parallel action spans
+overlap, as do
 nested phase durations. Do not add their totals to obtain elapsed wall time.
 
 `POST /v1/batches/<batch_id>/cancel`

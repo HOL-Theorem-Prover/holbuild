@@ -14917,21 +14917,23 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                          TextIO.closeOut out
                        end
                        handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e))
+              fun share () =
+                let val t0 = Time.now ()
+                in
+                  !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
+                  deferred := (fn () => ());
+                  phases := ("share", Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
+                end
               (* An interrupted action has a few seconds to stop in: its
                  saved checkpoints, which a retry resumes from, go before
-                 its log.  So do a failed one's: the next build, which often
-                 starts as soon as the client has the result, resumes from
-                 them. *)
-              val _ =
-                if !cancelled orelse Option.isSome failure then
-                  let val t0 = Time.now ()
-                  in
-                    !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
-                    deferred := (fn () => ());
-                    phases := ("share", Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
-                  end
-                else ()
+                 its log. *)
+              val _ = if !cancelled then share () else ()
               val log = phase "log" upload_log
+              (* A failed action's go after its log, whose upload they could
+                 otherwise stop by tripping the breaker, but before its
+                 result: the next build, which often starts as soon as the
+                 client has the result, resumes from them. *)
+              val _ = if Option.isSome failure then share () else ()
               (* A final failure's log is its only diagnostic and nothing
                  retries the action to recover it. *)
               val failure =
