@@ -554,10 +554,9 @@ fun child_failure_excerpt lines =
     fun scan [] _ failure terminal = (failure, terminal)
       | scan (remaining as line :: rest) preceding failure terminal =
           if String.isPrefix "holbuild: exec-action failed:" line then (failure, terminal)
+          else if runtime_marker line then scan rest preceding failure terminal
           else
-            scan rest
-              (if runtime_marker line then preceding
-               else take_n 10 (line :: preceding) [])
+            scan rest (take_n 10 (line :: preceding) [])
               (if child_failure_line line then SOME remaining else failure)
               (if String.isPrefix "Uncaught exception" line then SOME (line, rev preceding)
                else terminal)

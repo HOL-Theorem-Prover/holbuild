@@ -11786,8 +11786,8 @@ fun merge_phases phases =
    the preload's save (holsave in a line without holloadend).  The log is the child's, so it is read in bounded pieces and a line
    longer than a phases line could be is skipped.  Reading stops at the
    failure summary a worker appends to the log (its first line starts
-   "holbuild: exec-action failed:"): its excerpt of the child's output can
-   quote a phases line. *)
+   "holbuild: exec-action failed:"): what follows is holbuild's report on
+   the child's output, not that output, so no phases line there counts. *)
 val hol_log_phase_names =
   ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
    "holcompiledn", "holreplayedn", "holrewoundn"]
