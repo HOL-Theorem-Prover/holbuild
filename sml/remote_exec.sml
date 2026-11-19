@@ -11,12 +11,15 @@ struct
 (* A step that yields text (a batch, a batch id) or says why it couldn't. *)
 datatype attempt = Ok of string | Refused of string
 
-(* A final action failure and its worker log, when one was uploaded. *)
-type action_failure = {input_key : string, kind : string, log_sha256 : string option}
+(* A final action failure and its worker log, when one was uploaded.  THEORY
+   is the action's `package:theory`, as the coordinator names it. *)
+type action_failure = {input_key : string, theory : string, kind : string, log_sha256 : string option}
 
 datatype outcome = Done
                  | Failed of string * action_failure list
-                 | Cancelled              (* someone cancelled the batch *)
+                 | Cancelled of action_failure list * action_failure list
+                   (* someone cancelled the batch: its stopped actions with a
+                      worker log, and the actions that had failed before *)
                  | Unfollowable of string (* the coordinator won't stream it; it may still run *)
                  | Unreachable of string  (* the coordinator couldn't be asked *)
 
@@ -253,12 +256,43 @@ fun follow url batch_id (on_change : string * string * string option * string op
     val _ = HolbuildOffline.require_online "follow a remote batch"
     val states : (string * (string * string option * string option)) list ref = ref []
     val names = ref ([] : (string * string) list)
+    (* Actions that ran more than once: an earlier attempt failed. *)
+    val retried : string list ref = ref []
+    fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
     (* An action the deadline stopped failed with its batch. *)
     fun failures () =
       List.mapPartial (fn (key, (state, kind, log)) =>
         if state = "failed" orelse (state = "cancelled" andalso kind = SOME "deadline") then
-          SOME {input_key = key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
+          SOME {input_key = key, theory = name key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
         else NONE) (rev (!states))
+    (* Actions that failed, which a batch cancelled afterwards still holds. *)
+    fun failed () =
+      List.mapPartial (fn (key, (state, kind, log)) =>
+        if state = "failed" then
+          SOME {input_key = key, theory = name key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
+        else NONE) (rev (!states))
+    (* An action stopped by a cancel, or by the batch deadline before a cancel
+       ended the batch, with the log its worker uploaded as it stopped it:
+       what it printed up to then.  After an earlier attempt failed, the log
+       may be that attempt's, if the stopped one uploaded none. *)
+    fun stopped () =
+      List.mapPartial (fn (key, (state, kind, log)) =>
+        case (state, kind, log) of
+            ("cancelled", NONE, SOME _) => SOME {input_key = key, theory = name key, kind = "cancelled", log_sha256 = log}
+          | ("cancelled", SOME "deadline", SOME _) =>
+              SOME {input_key = key, theory = name key,
+                    kind = if List.exists (fn k => k = key) (!retried)
+                           then "stopped at the batch deadline after an earlier attempt failed; the log below may be that attempt's"
+                           else "stopped at the batch deadline",
+                    log_sha256 = log}
+          | ("cancelled", SOME earlier, SOME _) =>
+              if String.isPrefix "skipped because of " earlier then NONE
+              else SOME {input_key = key, theory = name key,
+                         kind = "cancelled after an attempt that failed (" ^ earlier ^ "); the log below may be that attempt's",
+                         log_sha256 = log}
+          | _ => NONE) (rev (!states))
+    (* Actions a worker ran, whose log may arrive after their cancellation. *)
+    val ran : string list ref = ref []
     (* A line cut off by a dropped connection, perhaps with curl's error
        after it, is no event. *)
     fun complete line = Substring.isSuffix "}" (Substring.dropr Char.isSpace (Substring.full line))
@@ -273,6 +307,10 @@ fun follow url batch_id (on_change : string * string * string option * string op
               val log = json_string_field "log_sha256" line
               val previous = List.find (fn (k, _) => k = key) (!states)
               val status = (state, failure, log)
+              val _ = if state = "running" orelse Option.getOpt (json_int_field "attempts" line, 0) > 0
+                      then ran := key :: List.filter (fn k => k <> key) (!ran) else ()
+              val _ = if Option.getOpt (json_int_field "attempts" line, 0) > 1
+                      then retried := key :: List.filter (fn k => k <> key) (!retried) else ()
             in
               names := (key, Option.getOpt (json_string_field "theory" line, key)) ::
                        List.filter (fn (k, _) => k <> key) (!names);
@@ -289,7 +327,7 @@ fun follow url batch_id (on_change : string * string * string option * string op
             outcome :=
               SOME (case json_string_field "state" line of
                         SOME "done" => Done
-                      | SOME "cancelled" => Cancelled
+                      | SOME "cancelled" => Cancelled (stopped (), failed ())
                       | SOME state =>
                           Failed (state ^ (case json_string_field "failure" line of
                                                SOME failure => ": " ^ failure
@@ -336,13 +374,25 @@ fun follow url batch_id (on_change : string * string * string option * string op
     val _ = !command_follow (batch_id, followed_at, Time.now ())
     val skipped = List.filter (fn (_, (state, reason, _)) =>
       state = "cancelled" andalso String.isPrefix "skipped because of " (Option.getOpt (reason, ""))) (!states)
-    fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
+    (* A cancel doesn't wait for a stopped worker's log, which a later
+       follow of the batch fetches. *)
+    val _ =
+      case outcome of
+          Cancelled _ =>
+            List.app (fn (key, _) =>
+              HolbuildStatus.message_stderr ("holbuild: remote " ^ name key ^ ": stopped with no worker log yet; " ^
+                "if its worker uploads one, holbuild build --attach " ^ batch_id ^ " shows it\n"))
+              (List.filter (fn (key, (state, kind, log)) =>
+                 state = "cancelled" andalso log = NONE andalso List.exists (fn k => k = key) (!ran) andalso
+                 (* A skipped action's lease is gone, so no log can follow. *)
+                 not (String.isPrefix "skipped because of " (Option.getOpt (kind, "")))) (rev (!states)))
+        | _ => ()
     val _ =
       if null (failures ()) andalso null skipped then ()
       else
         (HolbuildStatus.message_stderr ("holbuild: remote failure summary: " ^
            Int.toString (length (failures ())) ^ " failed, " ^ Int.toString (length skipped) ^ " skipped\n");
-         List.app (fn {input_key, kind, log_sha256} =>
+         List.app (fn {input_key, kind, log_sha256, ...} : action_failure =>
            HolbuildStatus.message_stderr ("holbuild: remote " ^ name input_key ^ ": failed (" ^ kind ^ ")" ^
              (case log_sha256 of SOME sha => ", log /cas/" ^ sha | NONE => ", no worker log") ^ "\n")) (failures ());
          List.app (fn (key, (_, reason, _)) =>

@@ -651,7 +651,7 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   | `publish`, `toolchain`, `internal` | retried, until the action has been claimed `MAX_ATTEMPTS` times |
   | `disk` | retried once; a second `disk` in a row, or `MAX_ATTEMPTS` claims, is final |
   | `input-missing` naming a theory of the batch other than the action itself or one that depends on it | that theory is built again and the action waits for it, until the action has been claimed `MAX_ATTEMPTS` times |
-  | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`, naming the theory as `theory <input_key>`; the client resubmits once with that theory and every theory that depends on it, and otherwise the next build exports a new batch |
+  | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`, naming the theory as `theory <input_key>` or the blob as `blob <sha256>`; the client resubmits, for a theory with every theory that depends on it rebuilt, for a blob after uploading the batch's sources again, once per theory and once for any blob, up to 5 times in all, and otherwise the next build exports a new batch |
   | `unavailable` | retried without counting the claim, `MAX_INTERRUPTIONS` times; after that like `internal` |
   | `ahead-abandoned` | from an action claimed ahead: back to waiting without counting the claim, and claimed only once its parents are done from then on; from any other, like `internal` |
   | `proof`, `tactic-timeout`, `spec-rejected`, `script`, `timeout` | final; `script` means the script failed or omitted an output, `timeout` means it exceeded its time limit |
@@ -870,6 +870,9 @@ In `timings`, durations are milliseconds. `started` and `finished`, and
 `holstart`/`holend`, `publishstart`/`publishend`, `logstart`/`logend` are
 absolute Unix milliseconds, not durations. `rebuilt` is 1 for a successful
 source build, 0 for a cache hit or failure. Older workers omit these fields.
+Releases before 0.14.72 can repeat a phase name; the coordinator folds the
+repeats as exec-action does: the earliest `*start`, the latest `*end`, and
+the sum of durations.
 Publication here covers the action's result and log; deferred checkpoint
 uploads happen after the result. Parallel action spans overlap, as do
 nested phase durations. Do not add their totals to obtain elapsed wall time.
@@ -1020,6 +1023,70 @@ not know the revision: to start an image predating `0016`, stop the
 coordinator and use this image to run `alembic downgrade 0015` first. This
 drops only the diagnostic columns and the index; result and scheduling state
 are kept.
+
+## Local test fleet
+
+`local-fleet` runs a command against a private fleet built from one holbuild
+checkout, to try an unreleased coordinator, worker or `exec-action` on real
+builds before it lands:
+
+```bash
+make bin/holbuild    # in the checkout to try
+remote-exec/local-fleet --workers 8 --toolchain ~/.cache/holbuild/hol-toolchains/KEY ~/holbuild-branch -- \
+  sh -c 'cd ~/project && holbuild build FooTheory --remote-exec "$LOCAL_FLEET_URL" --remote-only'
+```
+
+It starts a fresh Postgres database (`initdb`, `pg_ctl`, `createdb` and `psql`
+on `PATH`; password authentication, since other accounts can reach its port),
+that checkout's coordinator, the test suite's cache server
+(`tests/fixtures/remote_cache_server.py`, which takes only requests carrying a
+generated credential, for the same reason) and N workers, each with its own
+cache, whose baked-releases root holds the checkout under its own version. An
+action runs the checkout's holbuild when the client that submitted it is that
+checkout's `bin/holbuild`, as `holbuild` on the command's `PATH` is; a client of
+another version makes the workers fetch and build that release. The command runs in a process group of its own with `LOCAL_FLEET_URL`,
+`HOLBUILD_REMOTE_CACHE_URL`, `HOLBUILD_REMOTE_CACHE_CURL_CONFIG`,
+`HOLBUILD_REMOTE_EXEC_CURL_CONFIG` and `HOLBUILD_CACHE` pointing at the fleet,
+`HOLBUILD_COOPERATE_DIR` at the memory budget it shares with the workers,
+every other `HOLBUILD_REMOTE_CACHE_*` and `HOLBUILD_REMOTE_EXEC_*` variable
+unset, and the checkout's `bin/` first on `PATH`; it keeps the rest of the
+caller's environment but bash's `SHELLOPTS` and `BASHOPTS`. Don't pass `--remote-cache`
+to it: a command-line cache wins over the environment. Theory cache keys don't
+include the holbuild version, so a development build's outputs must never
+reach a shared cache. A project whose outputs are already up to date builds
+nothing, so the fleet sees no work: start from a tree without them.
+
+The fleet starts with no HOL toolchain, and `--remote-only` won't build one.
+`--toolchain <cache>/hol-toolchains/<key>` (repeatable) uses one already built
+in another holbuild cache: its `hol/` tree is read in place, since HOL bakes in
+its absolute paths, and granted to actions through `HOLBUILD_ACTION_READ_DIRS`;
+its locks, `last-used` marker and analysers stay private to the run, so the run
+holds no lease on it: seed from an entry in current use, which that cache's
+garbage collection won't retire mid-run. `holbuild buildhol` in the project
+prints the path of the one it uses.
+
+The services, the workers and the tools that set them up (`uv`, `alembic`
+and the Postgres tools) start from an empty environment, so none of the
+caller's settings or config files (a deployed fleet's `REMOTE_EXEC_*`, curl's,
+libpq's, uv's) reach them: of the caller's environment, only `PATH` passes, `uv`
+also keeps `HOME` and `UV_CACHE_DIR` for its cache, and the workers also get
+`HOLBUILD_ACTION_READ_DIRS` and the `HOL4_*` solver settings, which stand in
+for the worker image's. Their `HOME` is a private directory in the run
+directory. Inside a Slurm allocation, its memory (`--mem` or `--mem-per-cpu`)
+is the workers' admission budget.
+
+The run directory (`--dir`, else a new one in `~/.cache/holbuild-local-fleet`)
+must be new or empty, a plain path of at most 89 characters (Postgres's socket
+is in it), and not under `/tmp`, and is made readable by its owner only; the workers' `TMPDIR`
+is inside it: as in the image, the action sandbox lets HOL write `/tmp` only
+when no worker state is there. The services and workers run in sessions of
+their own, so a terminal's Ctrl-C reaches only the launcher, and `127.0.0.1` is
+added to the command's `no_proxy`. On exit, interrupt or termination the command's
+process group is stopped (TERM, then KILL after 10 s), then the workers, which drain while the coordinator and cache still
+take their results, then the coordinator and cache. The run directory keeps
+the logs and CSV copies of the `batches`, `actions` and `leases` tables, and
+`--keep` also keeps the database and caches. Master and a branch both report
+the next version, so compare them in two runs.
 
 ## Tests
 

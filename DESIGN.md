@@ -418,7 +418,10 @@ Before loading dependencies or running a theory script, each HOL child removes
 discovery can add sibling stages at startup, but those directories disappear as
 parallel actions finish. Other project directories retain their search order,
 including built objects needed by dynamic library loads. The same policy runs
-when a child resumes from a checkpoint.
+when a child resumes from a checkpoint. A child that loads ahead of late
+parents also removes `.holbuild/checkpoints` and `.holbuild/logs`, which hold
+no modules, so predicting a parent's loads doesn't search thousands of
+directories.
 
 Theory-script sources may declare deterministic, source-file-relative fixed
 output files with static literal `holbuild_extra_outputs [...]` annotations.
@@ -853,7 +856,7 @@ files timestamped within a second of the export's start are rehashed. Library
 and context-script hashes must still match the plan. The table is not persisted
 between exports. Run planning computes identities first; only runs selected for
 export construct context metadata. Fetch-only calls and cache hits avoid that
-work. Run exports check remote source availability on every call rather than
+work. Run exports upload their sources on every call rather than
 using the persistent upload ledger, since they have no missing-input resubmission.
 
 Avoid hardlinking cache blobs into project `.holbuild/`: even if cache blobs are meant

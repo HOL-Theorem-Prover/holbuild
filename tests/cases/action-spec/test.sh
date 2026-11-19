@@ -220,8 +220,9 @@ total=$(sed -n 's|^uploading to remote cache: 0/\([0-9][0-9]*\) files$|\1|p' "$t
 [[ -n "$total" ]] || { cat "$tmpdir/upload-progress.log" >&2; exit 1; }
 require_grep "^uploading to remote cache: $total/$total files\$" "$tmpdir/upload-progress.log"
 
-# Resident blobs are skipped through both HTTP clients. An unknown HEAD
-# response must still attempt the PUT, rather than assume a blob exists.
+# Resident blobs are uploaded again through both HTTP clients, without asking
+# first: a cache node can answer for a blob from its own disk after its
+# backing store has dropped it.
 for client in libcurl cli; do
   if [[ "$client" == cli ]]; then
     export HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so
@@ -229,40 +230,8 @@ for client in libcurl cli; do
   : > "$request_log"
   hb action-spec --upload CTheory > "$tmpdir/batch-resident.txt"
   diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-resident.txt"
-  [[ $(grep -c '^HEAD /cas/' "$request_log") -eq 8 ]]
-  if grep -q '^PUT /cas/' "$request_log"; then
-    echo "resident blobs were uploaded again" >&2
-    exit 1
-  fi
-  echo 503 > "$tmpdir/control/head-status"
-  : > "$request_log"
-  hb action-spec --upload CTheory > "$tmpdir/batch-unknown-head.txt"
-  diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-unknown-head.txt"
+  ! grep -q '^HEAD /cas/' "$request_log" || { echo "the export asked before uploading" >&2; exit 1; }
   [[ $(grep -c '^PUT /cas/' "$request_log") -eq 8 ]]
-  rm "$tmpdir/control/head-status"
-  # Hold PUT responses until three follow failed HEADs. Counting optional
-  # HEAD failures against the breaker would suppress the third PUT.
-  rm "$tmpdir/control/cas-put-count"
-  touch "$tmpdir/control/head-disconnect" "$tmpdir/control/cas-put-enable"
-  (cd "$project" && exec "$HOLBUILD_BIN" --remote-cache "$remote_url" \
-    --prefetch-concurrency 3 action-spec --upload CTheory) \
-    > "$tmpdir/batch-head-disconnect.txt" 2> "$tmpdir/head-disconnect.log" &
-  export_pid=$!
-  for _ in {1..500}; do
-    count=$(cat "$tmpdir/control/cas-put-count" 2>/dev/null || echo 0)
-    [[ "$count" -ge 3 ]] && break
-    kill -0 "$export_pid" 2>/dev/null || break
-    sleep 0.01
-  done
-  [[ "$count" -eq 3 ]] || {
-    echo "expected three PUTs after failed HEADs, observed $count" >&2
-    exit 1
-  }
-  touch "$tmpdir/control/cas-put-release"
-  wait "$export_pid"
-  unset export_pid
-  rm "$tmpdir/control/head-disconnect" "$tmpdir/control/cas-put-enable" "$tmpdir/control/cas-put-release"
-  diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-head-disconnect.txt"
   unset HOLBUILD_TEST_LIBCURL
 done
 
@@ -275,7 +244,9 @@ hb --prefetch-concurrency 1 action-spec --upload CTheory > "$tmpdir/batch-retrie
 diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-retried.txt"
 [[ ! -e "$tmpdir/control/cas-put-fail-once" ]] || { echo "the upload was not refused once" >&2; exit 1; }
 cmp "$project/.holbuild/action-specs/$missing_spec" "$remote_root/cas/$missing_spec"
-[[ $(grep -c "^PUT /cas/$missing_spec\$" "$request_log") -eq 2 ]] || {
+# Every blob is uploaded, so the refused upload is the first one.
+first_put=$(grep -m 1 '^PUT /cas/' "$request_log")
+[[ $(grep -cxF "$first_put" "$request_log") -eq 2 ]] || {
   echo "expected the refused upload and its retry:" >&2
   grep '^PUT /cas/' "$request_log" >&2
   exit 1

@@ -836,15 +836,6 @@ fun blob_present cache sha256 =
   handle e as Unavailable _ => raise e
        | _ => true
 
-(* An optional upload probe must not disable PUTs when a server drops HEADs.
-   Leave the breaker to the normal cache requests, and skip only confirmed hits. *)
-fun blob_confirmed_present cache sha256 =
-  if tripped () then false
-  else
-    let val urls = cas_urls cache sha256
-    in #2 (routed_status "HEAD" urls "" head_status) = HolbuildHttp.Response 200 end
-    handle _ => false
-
 fun verify_downloaded_blob path ({sha256, size} : blob_entry) =
   if Position.toString (FS.fileSize path) <> size then
     HolbuildCacheBackend.Corrupt ("downloaded blob size mismatch: " ^ sha256)

@@ -1222,14 +1222,28 @@ Removed legacy interfaces:
 
 ### Pipelined builds
 
-A theory's children need its declarations, not its proofs. So when a local
-build with `-j` greater than 1 would otherwise leave a job slot idle, a cold
-theory builds *pipelined*:
+A theory's children need its declarations, not its proofs. So in a local
+build with `-j` greater than 1, a cold theory builds *pipelined* when a child
+of it could start on its outline (one whose other parents are built or being
+built) and a job slot would still be free once every ready theory at least as
+deep has one. Workers take the deepest work first: the longest chain of
+dependents below a theory. On equal depth, ready theories go first, then
+queued attempts, then attempts that can start early (below); within each,
+the theory with more descendants goes first.
+A pipelined theory:
 
 1. Its HOL process runs the script with each `Theorem ... Proof ... QED` proof
    deferred, and exports the theory. That export is the theory's *outline*.
 2. The theory's cold children start at once, loading the outline in place of
-   the finished theory.
+   the finished theory. A child can even start before the outline is out,
+   while a slot is idle: it loads its other ancestors and the parent's
+   predicted ones meanwhile, then the parent's outline (or outputs) once they
+   come, checking that they load exactly what was predicted: the same files
+   as a plain build, with the parent's signature after its dependencies. At most `-j` / 3 (up to 6) children wait like
+   this at once; one whose parent's build stops, or whose prediction was
+   wrong, is abandoned and builds later without starting early. With
+   `--cooperate-dir`, children don't start early: one waiting would hold a
+   memory reservation its parent's build may need.
 3. Meanwhile the deferred proofs run on up to 4 threads (at most `-j`;
    `HOLBUILD_PROOF_THREADS` overrides), each in the context its goal was
    stated in. The theory's data is then written with their dependencies and
@@ -2074,8 +2088,10 @@ The batch keeps the plan's theory order and includes entries with missing blobs.
 Its specs and sources are then uploaded the same way, `--prefetch-concurrency`
 at a time, reporting `uploading to remote cache: N/M files`; after the first
 upload that fails, the rest are skipped and the build falls back (below).
-Before compressing and uploading a file, it checks the CAS and skips the file
-only when the cache confirms it is already present.
+A file the remote ledger (below) lists is skipped; every other one is
+uploaded whether or not the cache already holds it, since a cache node can
+answer for a blob from its own disk after its backing store has dropped it,
+and an upload writes it there again.
 
 `build --remote-exec URL --priority N` assigns a batch scheduling priority
 between 0 and 2147483647 (default 0). Higher values are claimed before lower
@@ -2207,7 +2223,10 @@ uploads find the remote cache to hold is kept in the cache root's
 `remote-ledger/`, shared by every project and worktree using that cache root,
 so a later build doesn't ask again. A build that would take it past 100000
 entries keeps only the entries it used or learned, so it grows past that only
-as far as one build's own entries.
+as far as one build's own entries. A remote cache may drop what it holds a
+while after it was written, however often it is read, so the ledger's first
+line, `#started <seconds>`, says when it was started, and a ledger started 12
+hours ago or more, or without that line, counts as empty.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
@@ -2215,12 +2234,14 @@ batch, or the batch fails other than by a failed proof (below), it warns and
 builds locally. A theory the remote cache holds may not fit the parents it
 holds, as when a nondeterministic theory was built twice; the workers can't
 use it, and the coordinator fails the batch for resubmission naming it
-(`resubmit: ... theory <input_key>`). Such a batch is resubmitted once first,
+(`resubmit: ... theory <input_key>`). Such a batch is resubmitted
 with that theory and every theory that depends on it, for the workers to
 rebuild or recheck against the cached parents. The remote cache may also have
 lost a theory or source the remote ledger says it holds: on a resubmission
 for either, the build forgets the ledger, and a batch missing a blob
-(`resubmit: ... blob <sha256>`) is resubmitted once too, uploading it again. A submission
+(`resubmit: ... blob <sha256>`) is resubmitted too, uploading its blobs again.
+A build resubmits again for each theory a worker finds missing that no earlier
+resubmission was for, and for the first missing blob, up to 5 times. A submission
 answered 5xx, as a proxy in front of the coordinator answers while it
 restarts or the coordinator itself answers while it's overloaded, or 429,
 is retried, and an event stream that breaks is reattached; either is given up on once the coordinator stays unavailable for
@@ -2275,7 +2296,13 @@ behavior. A batch being resubmitted does not fetch failure logs first.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building
-locally. `--attach <id>` follows that batch and then builds as above. A
+locally. `--attach <id>` follows that batch and then builds as above. When
+the plan has a theory that writes SML sources, which no batch can take over,
+it follows the batch to its end, prints its failed or stopped theories' logs
+(saved under `.holbuild/logs/remote/<sha>.log`), and then restores from the
+cache under `--remote-only`, or builds locally without it, submitting nothing;
+under `--remote-only` a batch that failed or was cancelled fails the build
+instead. A
 `--remote-only` build that loses the event stream says how to reattach.
 
 `run` and `repl` take `--remote-exec URL` and `--remote-only` too, before the

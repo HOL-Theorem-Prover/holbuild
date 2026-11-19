@@ -71,7 +71,7 @@ val _ = assert "an optional GET ends at the primary's 404" (fetch cache digest =
 val _ = assert "an optional HEAD ends at the primary's 404" (not (RC.blob_present cache digest));
 val _ = assert "GET 404 handoff" (RC.required (fn () => fetch cache digest) = CB.Hit andalso RC.read_text dst = text);
 val _ = assert "HEAD 404 handoff"
-  (RC.required (fn () => RC.blob_present cache digest andalso RC.blob_confirmed_present cache digest));
+  (RC.required (fn () => RC.blob_present cache digest));
 val key = "handoff-action";
 val ac = RC.remote_action_key key;
 val [ac_primary, ac_backup] = RC.ranked_urls cache ac;
@@ -82,7 +82,7 @@ fun transient_case code =
    put primary "head-status" code;
    put primary "cas-put-status" code;
    assert "GET transient fallback" (fetch cache digest = CB.Hit);
-   assert "HEAD transient fallback" (RC.blob_present cache digest andalso RC.blob_confirmed_present cache digest);
+   assert "HEAD transient fallback" (RC.blob_present cache digest);
    assert "PUT transient fallback" (publish cache digest = CB.Published);
    clear primary "get-status"; clear primary "head-status"; clear primary "cas-put-status";
    put ac_primary "get-status" code; put ac_primary "ac-put-status" code;
