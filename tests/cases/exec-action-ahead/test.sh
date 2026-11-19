@@ -338,7 +338,15 @@ for name in ahead ahead-lib ahead-order ahead2; do
   worker_wait "$name"
   expect "$name" 0 "status=built"
   ahead_phases "$name" || { echo "no load-ahead timings:" >&2; cat "$tmpdir/$name.result" >&2; exit 1; }
+  grep -qE '^phase-ms=(.*,)?holload:[0-9]+' "$tmpdir/$name.result" || {
+    echo "no holload for the child loaded ahead:" >&2; cat "$tmpdir/$name.result" >&2; exit 1
+  }
 done
+# holload leaves out the wait for the late parent, seconds here.
+phase_ms() { sed -n "s/^phase-ms=\(.*,\)\?$2:\([0-9]*\).*/\2/p" "$tmpdir/$1.result"; }
+if (( $(phase_ms ahead-order holload) >= $(phase_ms ahead-order aheadwait) )); then
+  echo "holload counts the wait for the late parent:" >&2; cat "$tmpdir/ahead-order.result" >&2; exit 1
+fi
 # A preload that stops after its parents arrived gives the run up, whatever
 # stopped it: a plain retry reports what a plain build would.
 worker_wait ahead-fails

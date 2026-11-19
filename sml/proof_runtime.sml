@@ -118,6 +118,44 @@ fun repeat_iteration_guard_message limit =
 fun seconds (a, b) = Time.toReal (Time.-(b, a))
 fun fmt_ms t = Real.fmt (StringCvt.FIX (SOME 3)) (1000.0 * t)
 
+(* Where this process's proving time went, for exec-action's result: wall
+   milliseconds per part, each excluding the parts timed inside it, and
+   counts.  install resets them, since a failed-prefix heap carries the
+   values of the process that saved it, and they are printed at exit as one
+   "holbuild hol-phases" line.  A resumed script that goes on past the
+   resumed theorem loads the runtime again, and that copy prints its own
+   line; exec-action sums the lines.  Names are phase names of a result
+   record: lowercase letters only. *)
+val hol_phases_ref = ref ([] : (string * LargeInt.int) list)
+val hol_phase_nested_ms_ref = ref (0 : LargeInt.int)
+
+fun add_hol_phase name n =
+  hol_phases_ref :=
+    (case List.find (fn (m, _) => m = name) (!hol_phases_ref) of
+         SOME (_, earlier) => (name, earlier + n) :: List.filter (fn (m, _) => m <> name) (!hol_phases_ref)
+       | NONE => (name, n) :: !hol_phases_ref)
+
+fun timed_hol_phase name f =
+  let
+    val outer_nested = !hol_phase_nested_ms_ref
+    val _ = hol_phase_nested_ms_ref := 0
+    val t0 = Time.now ()
+    fun record () =
+      (* The wall clock can step back: a part never takes less than 0 ms. *)
+      let val elapsed = LargeInt.max (0, Time.toMilliseconds (Time.-(Time.now (), t0)))
+      in
+        add_hol_phase name (LargeInt.max (0, elapsed - !hol_phase_nested_ms_ref));
+        hol_phase_nested_ms_ref := outer_nested + elapsed
+      end
+  in
+    (f () before record ()) handle e => (record (); raise e)
+  end
+
+fun print_hol_phases () =
+  TextIO.output (TextIO.stdErr,
+    String.concat ("holbuild hol-phases" ::
+                   map (fn (name, n) => " " ^ name ^ "=" ^ LargeInt.toString n) (rev (!hol_phases_ref))) ^ "\n")
+
 fun write_timeout_marker label seconds =
   case !tactic_timeout_marker_ref of
       NONE => ()
@@ -696,7 +734,7 @@ fun advance_failed_prefix_checkpoint path ok_text depth =
 
 (* A resumed proof saves only when it got past the prefix it restored: one that
    fails at the same step would save the same state again. *)
-fun save_failed_prefix_checkpoint () =
+fun save_failed_prefix_checkpoint () = timed_hol_phase "holsave" (fn () =>
   case !theorem_info_ref of
       NONE => ()
     | SOME (kind, _, _, _, _, failed_prefix_path, failed_prefix_ok, proof_attrs, depth) =>
@@ -723,7 +761,7 @@ fun save_failed_prefix_checkpoint () =
             val _ = save_checkpoint "failed_prefix" share failed_prefix_path failed_prefix_ok depth
             val _ = write_text_file (failed_prefix_path ^ ".meta") meta_text
             val _ = write_text_file (failed_prefix_path ^ ".prefix") prefix_text
-          in () end
+          in () end)
 
 fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok) =
   let val depth = length (PolyML.SaveState.showHierarchy())
@@ -750,9 +788,10 @@ fun save_theorem_context () =
         (context_info_ref := NONE;
          if not (!checkpoint_enabled_ref andalso !context_checkpoints_ref) then ()
          else
-           HolbuildCheckpointSaveRuntime.save_context_checkpoint
-             {label = "theorem_context", default_share = false, path = context_path,
-              ok_text = context_ok, depth = depth})
+           timed_hol_phase "holsave" (fn () =>
+             HolbuildCheckpointSaveRuntime.save_context_checkpoint
+               {label = "theorem_context", default_share = false, path = context_path,
+                ok_text = context_ok, depth = depth}))
 
 fun goal_text goal = PP.pp_to_string 100 goalStack.std_pp_goal goal ^ "\n"
 
@@ -763,24 +802,28 @@ fun numbered_goal_text total (index, goal) =
   String.concat ["holbuild goal ", Int.toString index, " of ", Int.toString total, ":\n",
                  goal_text goal]
 
-fun limited_all_goals_text text =
-  let val limit = HolbuildDiagnosticLimits.failed_goals ()
-  in
-    if limit = 0 orelse size text <= limit then text
-    else
-      String.concat [String.substring(text, 0, limit),
-                     "\nholbuild failed tactic input goals truncated after ", Int.toString limit, " bytes\n"]
-  end
-
+(* Goals are formatted only up to the limit: a failed step can leave many
+   large goals, and only the first limit bytes are printed. *)
 fun all_goals_text goals =
   if length goals <= 1 then ""
   else
     let
       val total = length goals
-      val indexed = ListPair.zip (List.tabulate(total, fn i => i + 1), goals)
-      val text = String.concat (map (numbered_goal_text total) indexed)
+      val limit = HolbuildDiagnosticLimits.failed_goals ()
+      fun collect _ [] _ texts = (String.concat (rev texts), false)
+        | collect index (goal :: rest) bytes texts =
+            if limit > 0 andalso bytes >= limit then (String.concat (rev texts), true)
+            else
+              let val text = numbered_goal_text total (index, goal)
+              in collect (index + 1) rest (bytes + size text) (text :: texts) end
+      val (text, omitted) = collect 1 goals 0 []
+      val shown =
+        if limit = 0 orelse (size text <= limit andalso not omitted) then text
+        else
+          String.concat [String.substring(text, 0, limit),
+                         "\nholbuild failed tactic input goals truncated after ", Int.toString limit, " bytes\n"]
     in
-      String.concat ["holbuild all failed tactic input goals:\n", limited_all_goals_text text,
+      String.concat ["holbuild all failed tactic input goals:\n", shown,
                      "holbuild end all failed tactic input goals\n"]
     end
 
@@ -892,7 +935,7 @@ fun diagnostic_fragment_label label =
             | NONE => s
   end
 
-fun print_goal_state label goals =
+fun print_goal_state label goals = timed_hol_phase "holprint" (fn () =>
   (failed_goal_state_printed_ref := true;
    TextIO.output(TextIO.stdErr,
     String.concat ["\nholbuild goal state at failed fragment: ", diagnostic_fragment_label label,
@@ -904,7 +947,7 @@ fun print_goal_state label goals =
                    "holbuild failed tactic top input goal:\n",
                    top_goal_text goals,
                    "holbuild end failed tactic top input goal\n",
-                   all_goals_text goals]))
+                   all_goals_text goals])))
 
 fun print_current_goal_state label =
   print_goal_state label (history_top_goals() handle _ => [])
@@ -989,7 +1032,8 @@ fun compile_tactic label program =
   case Option.mapPartial (fn {tactics, ...} => List.find (fn (text, _) => text = program) tactics) (!proof_factories_ref) of
       SOME (_, make) => make
     | NONE =>
-        if quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (fn () => (" ^ program ^ "));") then
+        if (add_hol_phase "holcompiledn" 1;
+            quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (fn () => (" ^ program ^ "));")) then
           !compiled_tactic_ref
         else raise Fail ("tactic fragment did not compile: " ^ label)
 
@@ -997,7 +1041,8 @@ fun compile_list_tactic label program =
   case Option.mapPartial (fn {list_tactics, ...} => List.find (fn (text, _) => text = program) list_tactics) (!proof_factories_ref) of
       SOME (_, make) => make
     | NONE =>
-        if quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (fn () => (" ^ program ^ "));") then
+        if (add_hol_phase "holcompiledn" 1;
+            quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (fn () => (" ^ program ^ "));")) then
           !compiled_list_tactic_ref
         else raise Fail ("list tactic fragment did not compile: " ^ label)
 
@@ -1016,6 +1061,18 @@ fun no_built_leaves () = Binarymap.mkDict String.compare : (string, built_leaf) 
 
 val built_leaves_ref = ref (no_built_leaves ())
 
+(* Compiled leaf programs of the current theorem, keyed by kind and program
+   but not span: an edit that shifts the spans of unchanged leaves rebuilds
+   them from these without compiling them again.  Every leaf of one proof
+   compiles in the same environment, so a program compiles to the same
+   factory wherever it sits. *)
+datatype compiled_leaf = CompiledTactic of unit -> Tactical.tactic
+                       | CompiledListTactic of unit -> Tactical.list_tactic
+
+fun no_compiled_leaves () = Binarymap.mkDict String.compare : (string, compiled_leaf) Binarymap.dict
+
+val compiled_leaves_ref = ref (no_compiled_leaves ())
+
 (* Leaf applications are numbered in order; a TRY, ORELSE or REPEAT that
    rolls the proof back doesn't reuse the numbers, since it doesn't undo what
    the applications did to their leaves.  leaf_uses_ref holds, for each
@@ -1032,6 +1089,7 @@ val leaf_boundaries_ref = ref (no_leaf_boundaries ())
 
 fun reset_built_leaves () =
   (built_leaves_ref := no_built_leaves ();
+   compiled_leaves_ref := no_compiled_leaves ();
    leaf_applications_ref := 0;
    leaf_uses_ref := no_leaf_uses ();
    leaf_boundaries_ref := no_leaf_boundaries ())
@@ -1469,18 +1527,43 @@ fun run_maybe_traced_step index display_index proof_step =
    leaf whose construction fails is reported at its plan position.
    Compilation is outside the step budget, construction inside it: rule
    arguments can do arbitrary work before returning a tactic.  Leaves already
-   in built_leaves_ref are kept. *)
+   in built_leaves_ref are kept, and a leaf missing there is compiled only if
+   its program isn't in compiled_leaves_ref.  Entries for leaves no longer in
+   the plan are dropped. *)
 fun construct_plan_leaves display_index steps =
   let
-    fun build d proof_step start_pos end_pos label program make =
-      let val key = leaf_key start_pos end_pos program
+    val no_keys = Binarymap.mkDict String.compare : (string, unit) Binarymap.dict
+    val leaf_keys = ref no_keys
+    val compile_keys = ref no_keys
+    fun construct (CompiledTactic make) = BuiltTactic (make ())
+      | construct (CompiledListTactic make) = BuiltListTactic (make ())
+    fun build d proof_step start_pos end_pos label program kind compile =
+      let
+        val key = leaf_key start_pos end_pos program
+        val compile_key = kind ^ ":" ^ program
+        val _ = leaf_keys := Binarymap.insert (!leaf_keys, key, ())
+        val _ = compile_keys := Binarymap.insert (!compile_keys, compile_key, ())
       in
         if Option.isSome (Binarymap.peek (!built_leaves_ref, key)) then ()
         else
-          with_plan_position d (HolbuildProofIr.step_kind proof_step) label (start_pos, end_pos) (fn () =>
-            built_leaves_ref :=
-              Binarymap.insert (!built_leaves_ref, key, with_tactic_timeout label program make ()))
+          let
+            val compiled =
+              case Binarymap.peek (!compiled_leaves_ref, compile_key) of
+                  SOME compiled => compiled
+                | NONE =>
+                    let val compiled = compile label program
+                    in compiled_leaves_ref := Binarymap.insert (!compiled_leaves_ref, compile_key, compiled);
+                       compiled
+                    end
+          in
+            with_plan_position d (HolbuildProofIr.step_kind proof_step) label (start_pos, end_pos) (fn () =>
+              built_leaves_ref :=
+                Binarymap.insert (!built_leaves_ref, key,
+                                  with_tactic_timeout label program (fn () => construct compiled) ()))
+          end
       end
+    fun tactic label program = CompiledTactic (compile_tactic label program)
+    fun list_tactic label program = CompiledListTactic (compile_list_tactic label program)
     fun walk_list _ [] = ()
       | walk_list d (proof_step :: rest) =
           (walk d proof_step; walk_list (d + HolbuildProofIr.display_line_count proof_step) rest)
@@ -1492,27 +1575,31 @@ fun construct_plan_leaves display_index steps =
     and walk d proof_step =
       case proof_step of
           HolbuildProofIr.StepTactic {start_pos, end_pos, label, program} =>
-            let val make = compile_tactic label program
-            in build d proof_step start_pos end_pos label program (fn () => BuiltTactic (make ())) end
+            build d proof_step start_pos end_pos label program "tactic" tactic
         | HolbuildProofIr.StepList {start_pos, end_pos, label, program} =>
-            let val make = compile_list_tactic label program
-            in build d proof_step start_pos end_pos label program (fn () => BuiltListTactic (make ())) end
+            build d proof_step start_pos end_pos label program "list_tactic" list_tactic
         | HolbuildProofIr.StepEach {body, ...} => walk_list (d + 1) body
         | HolbuildProofIr.StepSelect {start_pos, end_pos, selector, body, ...} =>
             ((case HolbuildProofIr.selector_program selector of
                   NONE => ()
                 | SOME program =>
-                    let
-                      val label = HolbuildProofIr.step_label proof_step
-                      val make = compile_tactic label program
-                    in build d proof_step start_pos end_pos label program (fn () => BuiltTactic (make ())) end);
+                    build d proof_step start_pos end_pos (HolbuildProofIr.step_label proof_step) program
+                          "tactic" tactic);
              walk_list (d + 1) body)
         | HolbuildProofIr.StepRepeat {body, ...} => walk_list (d + 1) body
         | HolbuildProofIr.StepTry {body, ...} => walk_list (d + 1) body
         | HolbuildProofIr.StepCases {cases, ...} => walk_headed_bodies (d + 1) cases
         | HolbuildProofIr.StepChoice {alternatives, ...} => walk_headed_bodies (d + 1) alternatives
+    fun keep_only keys dict =
+      Binarymap.foldl (fn (key, _, kept) =>
+                         if Option.isSome (Binarymap.peek (keys, key)) then kept
+                         else #1 (Binarymap.remove (kept, key)))
+                      dict dict
   in
-    walk_list display_index steps
+    walk_list display_index steps;
+    built_leaves_ref := keep_only (!leaf_keys) (!built_leaves_ref);
+    leaf_uses_ref := keep_only (!leaf_keys) (!leaf_uses_ref);
+    compiled_leaves_ref := keep_only (!compile_keys) (!compiled_leaves_ref)
   end
 
 fun run_built_steps resume_after_path display_index steps =
@@ -1577,6 +1664,7 @@ fun run_built_steps resume_after_path display_index steps =
           Option.map HolbuildSha256.string_hex
             (HolbuildProofIr.canonical_dependency_prefix steps path)
       in
+        add_hol_phase "holreplayedn" 1;
         successful_step_count_ref := count;
         record_leaf_boundary count;
         successful_prefix_end_ref := prefix_end;
@@ -1846,12 +1934,19 @@ fun run_built_steps resume_after_path display_index steps =
       | NONE => ()
   end
 
+(* A failed-prefix resume from before the first leaf rebuilds every leaf but
+   keeps the compiled programs its heap holds. *)
 fun run_structural_steps_with_resume resume_after_path display_index steps =
   ((case resume_after_path of
-        NONE => reset_built_leaves ()
+        NONE =>
+          let val compiled = !compiled_leaves_ref
+          in
+            reset_built_leaves ();
+            if !failed_prefix_resume_active_ref then compiled_leaves_ref := compiled else ()
+          end
       | SOME _ => ());
-   construct_plan_leaves display_index steps;
-   run_built_steps resume_after_path display_index steps;
+   timed_hol_phase "holleaves" (fn () => construct_plan_leaves display_index steps);
+   timed_hol_phase "holtactics" (fn () => run_built_steps resume_after_path display_index steps);
    reset_built_leaves ())
   handle e => (reset_built_leaves (); raise e)
 
@@ -2200,7 +2295,20 @@ fun take_at_most 0 _ = []
   | take_at_most _ [] = []
   | take_at_most n (x :: xs) = if n > 0 then x :: take_at_most (n - 1) xs else []
 
-fun salvage_failed_prefix_leaves plan leaves =
+val no_salvage = {step_count = 0, prefix_end = 0, path = [], focus = [], leaf_signature = NONE,
+                  prefix_signature = NONE, history_count = 0,
+                  events = [], frames = [], leaves = []}
+
+fun salvaged_through leaves ({count, path, focus, frames, events, sig_text, prefix_signature, history_count, ...} : leaf_snapshot)
+                     prefix_end =
+  {step_count = count, prefix_end = prefix_end, path = path, focus = focus,
+   leaf_signature = SOME sig_text, prefix_signature = prefix_signature,
+   history_count = history_count,
+   events = events, frames = frames, leaves = take_at_most count leaves}
+
+(* The longest prefix of leaves the edited plan still reaches the same way,
+   checking each leaf's dependency-prefix hash. *)
+fun salvage_leaf_by_leaf plan leaves =
   let
     fun current_signature path =
       case step_at_path plan path of
@@ -2224,19 +2332,44 @@ fun salvage_failed_prefix_leaves plan leaves =
           else last
   in
     case loop 1 leaves NONE of
-        NONE => {step_count = 0, prefix_end = 0, path = [], focus = [], leaf_signature = NONE,
-                 prefix_signature = NONE, history_count = 0,
-                 events = [], frames = [], leaves = []}
-      | SOME ({count, path, focus, frames, events, sig_text, prefix_signature, history_count, ...} : leaf_snapshot) =>
+        NONE => no_salvage
+      | SOME (leaf as {path, ...} : leaf_snapshot) =>
           (case current_signature path of
-               SOME (_, _, current_end, _) =>
-                 {step_count = count, prefix_end = current_end, path = path, focus = focus,
-                  leaf_signature = SOME sig_text, prefix_signature = prefix_signature,
-                  history_count = history_count,
-                  events = events, frames = frames, leaves = take_at_most count leaves}
-             | NONE => {step_count = 0, prefix_end = 0, path = [], focus = [], leaf_signature = NONE,
-                         prefix_signature = NONE, history_count = 0,
-                         events = [], frames = [], leaves = []})
+               SOME (_, _, current_end, _) => salvaged_through leaves leaf current_end
+             | NONE => no_salvage)
+  end
+
+(* As salvage_leaf_by_leaf, hashing once: a leaf's dependency prefix holds
+   everything run before it, so if the last leaf passing the cheap checks
+   has its saved hash, every leaf before it does too.  Otherwise the leaves
+   before it are checked one by one. *)
+fun salvage_failed_prefix_leaves plan leaves =
+  let
+    fun cheap_valid ({count, prefix_end, path, sig_text, prefix_signature, ...} : leaf_snapshot) expected_count =
+      count = expected_count andalso Option.isSome prefix_signature andalso
+      (case step_at_path plan path of
+           SOME step =>
+             prefix_end = HolbuildProofIr.step_end step andalso
+             sig_text = (HolbuildProofIr.step_kind step, HolbuildProofIr.step_program step)
+         | NONE => false)
+    fun scan _ [] last = last
+      | scan expected (leaf :: rest) last =
+          if cheap_valid leaf expected then scan (expected + 1) rest (SOME leaf)
+          else last
+    val salvaged =
+      case scan 1 leaves NONE of
+          NONE => no_salvage
+        | SOME (leaf as {count, path, prefix_end, prefix_signature, ...} : leaf_snapshot) =>
+            if Option.map HolbuildSha256.string_hex (HolbuildProofIr.canonical_dependency_prefix plan path) =
+               prefix_signature
+            then salvaged_through leaves leaf prefix_end
+            else salvage_leaf_by_leaf plan (take_at_most (count - 1) leaves)
+  in
+    (* Tests check the single hash against the leaf-by-leaf check. *)
+    if Option.getOpt (HolbuildCheckpointSaveRuntime.env_bool "HOLBUILD_CHECK_SALVAGE", false) andalso
+       salvaged <> salvage_leaf_by_leaf plan leaves
+    then raise Fail "internal error: failed-prefix salvage disagrees with the leaf-by-leaf check"
+    else salvaged
   end
 
 fun resumable_failed_prefix_metadata plan metadata =
@@ -2288,19 +2421,21 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
                                             Int.toString (!history_step_count_ref),
                                             " metadata=", Int.toString (#history_count metadata)])
           val resume_metadata =
-            rewind_past_shared_leaves plan (resumable_failed_prefix_metadata plan metadata)
-          val _ = drop_leaves_from (#step_count resume_metadata)
+            timed_hol_phase "holsalvage" (fn () =>
+              rewind_past_shared_leaves plan (resumable_failed_prefix_metadata plan metadata))
+          val _ = add_hol_phase "holrewoundn" (LargeInt.fromInt (#step_count metadata - #step_count resume_metadata))
           val backup_count = #history_count metadata - #history_count resume_metadata
           val _ =
             if backup_count >= 0 then ()
             else raise Fail "invalid proof-ir failed-prefix metadata: salvage history exceeds checkpoint history"
-          val _ =
-            (backup_n backup_count
+          val _ = timed_hol_phase "holrewind" (fn () =>
+            (drop_leaves_from (#step_count resume_metadata);
+             backup_n backup_count
              handle History.CANT_BACKUP_ANYMORE =>
                raise Fail (String.concat ["failed-prefix checkpoint cannot rewind ",
                                           Int.toString backup_count,
                                           " proof history steps; checkpoint history retained fewer steps than its metadata history_count=",
-                                          Int.toString (#history_count metadata)]))
+                                          Int.toString (#history_count metadata)])))
           val _ = trace_plan name plan
           val _ = stop_after_plan_if_requested ()
           val metadata = resume_metadata
@@ -2368,7 +2503,10 @@ fun proof_ir_prover ctxt (g, tac) =
              raise e)
 
 fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
-  (checkpoint_enabled_ref := checkpoint_enabled;
+  (hol_phases_ref := [("holloadend", Time.toMilliseconds (Time.now ()))];
+   hol_phase_nested_ms_ref := 0;
+   OS.Process.atExit print_hol_phases;
+   checkpoint_enabled_ref := checkpoint_enabled;
    context_checkpoints_ref := context_checkpoints;
    share_failed_prefix_ref := share_failed_prefix;
    tactic_timeout_ref := tactic_timeout;
