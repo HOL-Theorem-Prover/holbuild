@@ -2576,6 +2576,15 @@ def test_a_wall_phase_beside_wall_ms_is_refused() -> None:
         parse_result(result("a", "built", phase_ms="wall:5"))
 
 
+def test_a_non_ascii_digit_timing_is_refused() -> None:
+    with pytest.raises(FormatError):
+        parse_result(result("a", "built", phase_ms="hol:\u00b2"))
+    with pytest.raises(FormatError):
+        parse_result(result("a", "built", phase_ms="hol:1,hol:\u00b2"))
+    with pytest.raises(FormatError):
+        parse_result(result("a", "built").replace("wall-ms=10", "wall-ms=\u00b2"))
+
+
 async def test_events_keep_a_quiet_stream_alive_with_blank_lines(
     coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
 ) -> None:

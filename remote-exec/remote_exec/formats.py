@@ -170,12 +170,12 @@ def parse_result(text: str) -> Result:
     timings: dict[str, int] = {}
     for item in fields["phase-ms"].split(",") if "phase-ms" in fields else []:
         name, sep, ms = item.partition(":")
-        if not (sep and PHASE.fullmatch(name) and ms.isdigit()):
+        if not (sep and PHASE.fullmatch(name) and ms.isascii() and ms.isdigit()):
             raise FormatError(f"bad phase-ms: {fields['phase-ms']!r}")
         timings[name] = _merge_phase(name, timings.get(name), int(ms))
     wall = fields.get("wall-ms")
     if wall is not None:
-        if not wall.isdigit() or "wall" in timings:
+        if not (wall.isascii() and wall.isdigit()) or "wall" in timings:
             raise FormatError(f"bad wall-ms: {wall!r}")
         timings["wall"] = int(wall)
     return Result(

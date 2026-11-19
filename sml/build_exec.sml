@@ -11028,8 +11028,8 @@ fun phases_text sep unit phases =
 
 (* One entry per phase name, where it first ran: a phase run again (the
    hydrate of a load ahead that builds plain after all) adds its time, and
-   a span keeps its earliest start and latest end.  The coordinator refuses
-   a result naming a phase twice. *)
+   a span keeps its earliest start and latest end.  The coordinator folds
+   repeated names the same way, as releases before 0.14.72 send them. *)
 fun merge_phases phases =
   let
     fun combine name (a, b) =
