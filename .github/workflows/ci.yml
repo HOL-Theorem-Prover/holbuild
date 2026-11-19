@@ -193,6 +193,7 @@ jobs:
           HOLBUILD_TEST_JOBS: '4'
           HOLBUILD_TEST_HOL_REV: ${{ steps.module-hol4-pin.outputs.hol4-ref }}
           HOLBUILD_TEST_REQUIRE_THEORY_MODULES: '1'
+          HOLBUILD_TEST_REQUIRE_MODULE_HEAPS: '1'
         run: >-
           tests/run.sh theory-modules basic-theory checkpoint-extra-inputs
           checkpoint-recovery exec-action exec-action-share-heaps deps-heap-modules

@@ -4,7 +4,7 @@
 
 ARG PYTHON_IMAGE=python:3.14-slim-trixie
 # The same Poly/ML as holbuild's CI.
-ARG POLYML_TAG=v5.9.2-seq13
+ARG POLYML_TAG=v5.9.2-seq14
 
 FROM ${PYTHON_IMAGE} AS polyml
 ARG POLYML_REPO=https://github.com/sequent-dev-bot/polyml.git
