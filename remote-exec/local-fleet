@@ -3,13 +3,14 @@
 # a fresh Postgres, that tree's coordinator, a local cache server and N workers
 # that run the tree's own holbuild, so an unreleased coordinator, worker or
 # exec-action can be tried before it lands. See README "Local test fleet".
-# Start again without an inherited SHELLOPTS or BASHOPTS: their options (xtrace, allexport, monitor, noglob,
-# nullglob, ...) would print or export the secrets below, make setsid fork, or change what the script does.
-if env | grep -qE '^(SHELLOPTS|BASHOPTS)='; then exec env -u SHELLOPTS -u BASHOPTS "$BASH" "$0" "$@"; fi
+# Start again in privileged mode, which takes no shell options (SHELLOPTS, BASHOPTS), BASH_ENV hook or functions
+# from the environment: xtrace, allexport, monitor or noglob, say, would print or export the secrets below, make
+# setsid fork or change what the script does, and a function would stand in for a command it runs.
+[[ $- == *p* ]] || exec "$BASH" -p "$0" "$@"
 set -euo pipefail
-set +o monitor +o allexport
-# COMMAND gets back the caller's values of the names this script assigns.
-caller_exports=$(declare -px)
+# COMMAND gets back the caller's values of the names this script assigns. SHELLOPTS and BASHOPTS, read-only
+# here, reach it unchanged.
+caller_exports=$(declare -px | grep -vE '^declare -[a-zA-Z]+ (SHELLOPTS|BASHOPTS)=')
 
 usage() {
   cat <<'EOF'
@@ -118,19 +119,16 @@ for c in client-cache $(seq -f worker-cache-%g "$workers"); do
 done
 if [[ -n $budget_mb ]]; then echo $((budget_mb * 1024 * 1024)) > "$dir/cooperate/budget"; fi
 
-# The services, the workers and the tools that set them up each run in a subshell that calls this first: what
-# it runs gets an environment of PATH, a private HOME and TMPDIR, the user, a fixed locale and the names given,
-# as from env -i, so no setting, function, hook or config file of the caller's (curl's, libpq's, uv's, a deployed
-# fleet's) reaches it. It takes the export off everything else rather than unsetting it, so the launcher's own
-# variables keep their values and read-only ones go too. Secrets are passed this way, never on a command line
-# others can read. No proxy is passed: all they reach is loopback.
+# The services, the workers and the tools that set them up each run in a subshell that calls this first, and
+# start through env "${unenv[@]}": what they run gets an environment of PATH, a private HOME and TMPDIR, the user,
+# a fixed locale and the names given, as from env -i, so no setting, function, hook or config file of the
+# caller's (curl's, libpq's, uv's, a deployed fleet's) reaches it. unenv removes every other name the
+# environment holds, whatever bash made of it; only names go on the command line, so secrets are passed in the
+# environment, never where others can read them. No proxy is passed: all they reach is loopback.
 isolate() {
   export HOME=$dir/home TMPDIR=$dir/tmp USER=$(id -un) LOGNAME=$(id -un) LANG=C.UTF-8 GIT_OPTIONAL_LOCKS=0
-  # No local variables: one would hide an exported variable of the same name from compgen.
-  export -n $(compgen -e | grep -vxE "PATH|HOME|TMPDIR|USER|LOGNAME|LANG|GIT_OPTIONAL_LOCKS$(printf '|%s' "$@")") > /dev/null
-  export -nf $(declare -Fx | cut -d' ' -f3)
-  # Names that aren't shell identifiers can't be unexported: the command is run through env -u "${unenv[@]}".
-  mapfile -d '' -t unenv < <(env -0 | grep -zv '^[A-Za-z_][A-Za-z0-9_]*=' | cut -z -d= -f1 |
+  mapfile -d '' -t unenv < <(env -0 | cut -z -d= -f1 |
+    grep -zvxE "PATH|HOME|TMPDIR|USER|LOGNAME|LANG|GIT_OPTIONAL_LOCKS$(printf '|%s' "$@")" |
     xargs -0 -r printf -- '-u\0%s\0')
 }
 
@@ -302,6 +300,8 @@ launching=1
     HOLBUILD_CACHE="$dir/client-cache" HOLBUILD_COOPERATE_DIR="$dir/cooperate" PATH="$tree/bin:$PATH" setsid "$@"
   # COMMAND keeps the caller's environment apart from these. Nothing it does may reach a shared cache or
   # fleet: a branch's theory outputs share their cache keys with released holbuild.
+  # Arrays here, which bash doesn't export: unset, so the caller's exported scalars of those names come back.
+  unset toolchains worker_pids service_pids
   eval "$caller_exports"
   unset $(compgen -e | grep -E '^HOLBUILD_REMOTE_(CACHE|EXEC)_') HOLBUILD_CACHE HOLBUILD_COOPERATE_DIR
   # Every endpoint is on loopback: keep an inherited proxy out of the way.
