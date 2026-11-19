@@ -295,10 +295,7 @@ val show_module_dependencies : (string -> (string * string) list) option =
          (Option.mapPartial (fn s => #lookupVal (contents s) "showModuleDependencies") save_state))
   end
 
-(* Whether holbuild reads deps heaps saved with modules.  Such heaps are
-   replaced in the shared cache when a theory module they load is missing or
-   changed; publishing replaces the stale entries on every node only then,
-   so that on other runtimes it writes to the cache as before. *)
+(* Whether holbuild reads deps heaps saved with modules. *)
 val module_heaps_read = Option.isSome show_module_dependencies
 
 (* PolyML child heaps remember their parent-chain filenames. The shared runtime
@@ -4084,8 +4081,7 @@ val dropped_checkpoints = ref 0
 
 (* How often the child, since the build started, failed to load the deps
    heap for a theory module it loads that is missing or has another id:
-   exec-action's rstmodrejn.  A shared heap restored then is replaced by
-   the one the run saves. *)
+   exec-action's rstmodrejn. *)
 val rejected_heap_modules = ref 0
 
 fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
@@ -5485,6 +5481,8 @@ fun restore_local_heap tc heap_context base_context checkpoint_root (action : th
             (FS.fullPath parent = FS.fullPath (hol_context_path base_context) handle OS.SysErr _ => false)
         | NONE => false
     val module_missing = ref false
+    (* The store heap placed and then rejected for a missing module. *)
+    val rejected = ref NONE
     fun modules_ok () =
       case missing_saved_modules deps_loaded of
           [] => true
@@ -5505,20 +5503,30 @@ fun restore_local_heap tc heap_context base_context checkpoint_root (action : th
              (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
               touch_dir (Path.concat(store, heap));
               placed)
-           else (remove_checkpoint deps_loaded; NONE)
+           else
+             (if !module_missing then rejected := placed else ();
+              remove_checkpoint deps_loaded;
+              NONE)
          end))
       handle e =>
         (remove_checkpoint deps_loaded;
          warn ("could not restore a deps heap from the host store: " ^ General.exnMessage e);
          NONE)
     (* A store heap whose module is gone stays unusable until the module
-       comes back: evicted, unless another tree holds it, so that later
-       builds don't place it again. *)
+       comes back: evicted, unless another tree holds it or replaced it
+       since, so that later builds don't place it again. *)
     fun place location =
-      place_leased location before
-      (if !module_missing then
-         ignore (try_evict_unlinked_store_family (Path.concat(#store location, #heap location)))
-       else ())
+      let val dir = Path.concat(#store location, #heap location)
+      in
+        place_leased location before
+        (case !rejected of
+             SOME id =>
+               ignore (try_evict_store_family_if
+                         (fn () => store_heap_links dir = 1 andalso
+                                   file_id (Path.concat(dir, "deps_loaded.save")) = SOME id)
+                         dir)
+           | NONE => ())
+      end
   in
     (* Placing a heap removes the theorem checkpoints on this deps_key, among
        them a failed prefix the theory saved with no deps_loaded (while not
@@ -12493,7 +12501,8 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
        store lacks: they are fetched first.  The phases count the modules
        fetched (rstmodn) and the heaps given up for one still missing
        (rstmoddropn), once per heap: every checkpoint on it needs them.
-       A heap given up is replaced, like one whose blob the cache lost. *)
+       A heap given up only falls back here, to a fresh preload: the
+       shared one stays, for the hosts that have its modules. *)
     val modules_ok = ref (NONE : bool option)
     fun heap_modules_ok () =
       case !modules_ok of
@@ -12512,10 +12521,8 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                         case still of
                             [] => true
                           | module :: _ =>
-                              (* Marked stale, so that the heap this run saves replaces it. *)
                               (add_restore_step "rstmoddropn" 1;
                                warn ("the shared deps-loaded heap needs a theory module this host lacks: " ^ module);
-                               stale := heap_key :: !stale;
                                false)
                       end
             in
@@ -12733,13 +12740,6 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
 
 (* After the run, successful or not: the heap if this run saved it, then,
    if the heap under them is the published one, the new checkpoints. *)
-(* RESTORED, its heap marked stale if the child failed to load it for a
-   theory module (rejected_heap_modules), so that the heap the run saved
-   replaces it. *)
-fun heap_rejected ({heap_key, ...} : shared_context) ({heap, files, stale, missing} : shared_restore) =
-  {heap = heap, files = files, missing = missing,
-   stale = if !rejected_heap_modules > 0 andalso Option.isSome heap then heap_key :: stale else stale}
-
 fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
                                               deps_key, deps_loaded, candidates, ...} : shared_context)
                                ({heap = restored_heap, files = restored, stale, missing} : shared_restore) =
@@ -12822,13 +12822,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               val manifest = shared_manifest "holbuild-shared-heap-v1" NONE [("heap", sha, "")]
               val _ = upload_all [(deps_loaded, sha)]
               val _ = if needs_upload sha then raise Error ("could not upload " ^ deps_loaded) else ()
-              (* A heap replaced, on every node: one still holding the old
-                 entry would keep handing it out.  Only where module heaps
-                 are read (module_heaps_read). *)
-              val _ =
-                if member heap_key stale andalso module_heaps_read
-                then HolbuildRemoteCache.replace_action_everywhere remote {key = heap_key, text = manifest}
-                else HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
+              val _ = HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
             in
               if HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote heap_key) = SOME manifest then
                 (store_add store sha {sha = sha, src = deps_loaded, save = true}; SOME sha)
@@ -12915,29 +12909,12 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         SOME (c, shared_checkpoint_key heap_key (#kind c) (#key c), ref false)
       else NONE
       handle e => (warning c e; NONE)
-    (* An entry naming a heap other than HEAP, the one published, is
-       chained to a heap since replaced, so it is republished on HEAP, on
-       every node (its flag in SUPERSEDED).  Only where module heaps are
-       read (module_heaps_read). *)
-    fun probe heap superseded (c, key, absent) =
-      let
-        fun on_other_heap text =
-          not (List.exists (fn (role, sha, _) => role = "heap" andalso sha = heap) (shared_manifest_entries text))
-          handle _ => true
-        val existing = if member key stale then NONE else HolbuildRemoteCache.fetch_action remote key
-        val other =
-          module_heaps_read andalso
-          (case existing of
-               SOME {manifest, ...} => on_other_heap manifest
-             | NONE => false)
-      in
-        if other then Option.app (fn (_, flag) => flag := true) (List.find (fn (k, _) => k = key) superseded)
-        else ();
-        (* Presence alone must not mark an un-restored entry's blobs as
-           known: its /ac/ entry can outlive those blobs. *)
-        absent := (not (Option.isSome existing) orelse other orelse
-                   (#kind c = "failed_prefix" andalso replaces_restored (#path c)))
-      end
+    fun probe (c, key, absent) =
+      (* Presence alone must not mark an un-restored entry's blobs as known:
+         its /ac/ entry can outlive those blobs. *)
+      (absent := (member key stale orelse
+                  not (Option.isSome (HolbuildRemoteCache.fetch_action remote key)) orelse
+                  (#kind c = "failed_prefix" andalso replaces_restored (#path c))))
       handle e => warning c e
     fun prepare on_base (c : shared_candidate, key, absent) =
       if not (!absent) then NONE
@@ -12991,8 +12968,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             else (Redblackset.add (seen, key), item :: kept))
           (Redblackset.empty String.compare, []) eligible
         val probes = rev unique
-        val superseded = map (fn (_, key, _) => (key, ref false)) probes
-        val _ = parallel_all remote_probe_width (probe heap superseded) probes
+        val _ = parallel_all remote_probe_width probe probes
         val _ = prehash (List.concat (map (fn (c : shared_candidate, _, absent) =>
                                               if not (!absent) then []
                                               else #path c :: getOpt (ancestors false (#path c), []))
@@ -13004,8 +12980,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           (fn (_, _, _, blobs) => List.all (fn (_, sha, _) => not (needs_upload sha)) blobs) prepared
         fun publish (c : shared_candidate, key, entries, _) =
           (* A failed prefix's entry is replaced as the prefix grows. *)
-          (ignore ((if #kind c = "failed_prefix" orelse List.exists (fn (k, flag) => k = key andalso !flag) superseded
-                    then HolbuildRemoteCache.replace_action_everywhere
+          (ignore ((if #kind c = "failed_prefix" then HolbuildRemoteCache.replace_action_everywhere
                     else HolbuildRemoteCache.replace_action_unconditionally) remote
             {key = key, text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
                                  (("heap", heap, "") :: entries)}))
@@ -14596,7 +14571,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               case shared of
                   SOME ctx =>
                     (publishing_checkpoints := true;
-                     (phase "publish" (fn () => publish_shared_checkpoints remote ctx (heap_rejected ctx restored))
+                     (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
                       before publishing_checkpoints := false)
                      handle e => (publishing_checkpoints := false; raise e))
                 | NONE => ()

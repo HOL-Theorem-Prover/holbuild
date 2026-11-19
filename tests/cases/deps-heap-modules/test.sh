@@ -95,23 +95,6 @@ Proof
 QED
 SML
 
-cat > "$project/src/DScript.sml" <<'SML'
-Theory D
-Ancestors A
-
-Theorem d_first:
-  a_value
-Proof
-  simp[a_value_def]
-QED
-
-Theorem d_second:
-  a_value /\ T
-Proof
-  rw[a_value_def] (* d_second *)
-QED
-SML
-
 build() {
   (cd "$project" && HOLBUILD_CHECKPOINT_TIMING=1 "$HOLBUILD_BIN" --cache-dir ../cache -j1 build BTheory) > "$1" 2>&1 ||
     { cat "$1" >&2; return 1; }
@@ -267,11 +250,6 @@ exec_theory B publish
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 modules=$(for heap in $published; do heap_modules "$heap"; done | { grep -- '-A-' || true; } | sort -u)
 [[ -n "$modules" ]] || { echo "no published heap loads A's module" >&2; exit 1; }
-# D has B's dependencies, so its checkpoints are published on B's heap.
-edit_d() { sed -i "s/^  .*(\* d_second.*\$/  rw[a_value_def] (* d_second $1 *)/" "$project/src/DScript.sml"; }
-rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
-exec_theory D d
-require_grep 'restored shared' "$tmpdir/d-D.log"
 
 # W loses its stores: the restore fetches A's module, then the heap.
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
@@ -283,8 +261,8 @@ resumed fetch-B
 [[ -f "$modules" ]] || { echo "A's module wasn't fetched to $modules" >&2; exit 1; }
 cp "$modules" "$tmpdir/A.pmo"
 
-# The remote cache loses A's module too: the heap is dropped, and B preloads
-# afresh.
+# The remote cache loses A's module too: W gives the heap up, and B
+# preloads afresh.
 module_sha=$(sha256sum "$modules" | cut -d' ' -f1)
 echo 404 > "$tmpdir/control/cas-get-status-$module_sha"
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
@@ -294,34 +272,20 @@ phase dropped-B 'rstmoddropn:1'
 require_grep "the shared deps-loaded heap needs a theory module this host lacks: .*-A-.*\.pmo" "$tmpdir/dropped-B.log"
 grep -qx 'status=built' "$tmpdir/dropped-B.result"
 
-# B's run published the heap it saved in place of the one it gave up, and
-# the checkpoints on it in place of those on the old heap.
+# The shared heap stays: once the cache has A's module again, W fetches it
+# and resumes from the heap's checkpoints.
+rm -f "$tmpdir/control/cas-get-status-$module_sha"
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_b six
-exec_theory B replaced
-require_grep 'restored shared' "$tmpdir/replaced-B.log"
-resumed replaced-B 'theorem-context checkpoint after b_first'
-if grep -qE '^phase-ms=(.*,)?rstmoddropn:' "$tmpdir/replaced-B.result"; then
-  echo 'the heap given up was not replaced' >&2; cat "$tmpdir/replaced-B.result" >&2; exit 1
-fi
-
-# D's checkpoints, on the heap B's run replaced, are rejected once, then
-# republished on the new heap.
-rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
-edit_d later
-exec_theory D d-later
-phase d-later-D 'rstrejectn:[0-9]+'
-rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
-edit_d again
-exec_theory D d-again
-resumed d-again-D 'theorem-context checkpoint after d_first'
+exec_theory B healed
+phase healed-B 'rstmodn:1'
+require_grep 'restored shared' "$tmpdir/healed-B.log"
+resumed healed-B 'theorem-context checkpoint after b_first'
 
 # A module at its path with another id (another theory's module): W's
-# HOL child fails to load the heap, preloads afresh, and the heap it saves
-# replaces the published one.  C, on A and Z, has a heap of its own, which
-# loads A's module.
+# HOL child fails to load the heap and preloads afresh.  C, on A and Z, has
+# a heap of its own, which loads A's module.
 edit_c() { sed -i "s/^  .*(\* c_thm.*\$/  rw[a_value_def] (* c_thm $1 *)/" "$project/src/CScript.sml"; }
-rm -f "$tmpdir/control/cas-get-status-$module_sha"
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 mkdir -p "$(dirname "$modules")"
 cp "$tmpdir/A.pmo" "$modules"
@@ -340,8 +304,10 @@ require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpd
 phase changed-C 'rstdropn:1'
 phase changed-C 'rstmodrejn:1'
 require_grep 'Required module missing or changed' "$tmpdir/changed-C.log"
-rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
-edit_c replaced
-exec_theory C c-replaced
-require_grep 'restored shared' "$tmpdir/c-replaced-C.log"
-resumed c-replaced-C 'theorem-context checkpoint after c_first'
+# The shared heap and its checkpoints stay: with A's module back, W
+# resumes from them.
+rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
+edit_c healed
+exec_theory C c-healed
+require_grep 'restored shared' "$tmpdir/c-healed-C.log"
+resumed c-healed-C 'theorem-context checkpoint after c_first'
