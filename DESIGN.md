@@ -1215,11 +1215,14 @@ inside it: at the `TRY` or choice's entry, or at the start of the timed-out iter
 structural repeat. Tactic-level `REPEAT`/`rpt` is an opaque leaf (see above), so it is
 timed as one step and fails like any other leaf.
 
-`execution-plan THEORY:THEOREM` and `--trace-steps` are debugging/inspection paths.
-`holbuild execution-plan THEORY:THEOREM` is static inspection for proof steps: it
-discovers sources, finds the named theorem in the named theory script, pretty-prints
-the executable proof-IR step plan, and exits without acquiring the project build lock,
-planning dependencies, consulting cache/up-to-date state, or executing the proof.
+`holbuild execution-plan THEORY:NAME` prints the proof-step plan for a theorem
+or an explicit termination proof. If both have the same name, it selects the
+theorem. Use `THEORY:termination:NAME` to select the termination proof or
+`THEORY:theorem:NAME` to select the theorem explicitly.
+
+The command discovers sources and reads the selected proof from the theory
+script. It prints the executable proof-IR plan without taking the project
+build lock, planning dependencies, consulting the cache or executing the proof.
 The pretty form must remain faithful to the IR: each numbered line is one executable tactic/list-tactic operation or structural delimiter; indentation
 and parenthesized body text are formatting only. List-step labels describe the
 list tactic itself, without legacy `>> list_tac` prefixes; the `list-step` kind

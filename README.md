@@ -88,7 +88,7 @@ The executable includes the Poly/ML runtime, so running it does not require
 an installed Poly/ML. Building HOL toolchains still requires `poly` and
 `polyc`, plus HOL's other build dependencies. Archives include holbuild's
 `LICENSE`, the SML/NJ notice, and Poly/ML's license in `share/holbuild`.
-The same release also offers `polyml-v5.9.2-seq12-source.tar.gz`, the exact
+The same release also offers `polyml-v5.9.2-seq13-source.tar.gz`, the exact
 Poly/ML sources used for both binaries. Poly/ML is built with
 `--disable-shared --without-gmp`; the holbuild sources for rebuilding/relinking
 are available at the release tag.
@@ -1117,7 +1117,9 @@ holbuild build --skip-checkpoints MyTheory
 
 - `execution-plan THEORY:NAME` prints the proof-step plan for one theorem or
   explicit termination proof. If a theorem and terminating definition have the
-  same name, the theorem takes precedence.
+  same name, the theorem takes precedence. Use `THEORY:termination:NAME` to
+  select the termination proof, or `THEORY:theorem:NAME` to select only a theorem.
+  Both explicit forms restrict name suggestions to the selected kind.
 - `--tactic-timeout SECONDS` changes the per-step timeout; `0` disables it.
   Steps containing public `HolSmtLib` tactic names (such as `Z3_TAC`, `CVC_TAC`,
   or `z3_tac`) are automatically untimed, including under other structure
