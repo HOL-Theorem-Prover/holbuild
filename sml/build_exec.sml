@@ -7884,24 +7884,32 @@ fun node_with_input_key plan keys =
       in Binarymap.peek (dict, input_key) end
   end
 
-(* Fetch a worker's log to the same location as a local theory build.  The
-   worker reported it, so it is read as required. *)
+(* Fetch a worker's log to LOG, replacing what was there.  The worker reported
+   it, so it is read as required. *)
+fun fetch_remote_log log log_sha256 =
+  (ensure_parent log;
+   remove_file log;
+   (case HolbuildRemoteCacheConfig.url () of
+        NONE => NONE
+      | SOME url =>
+          case HolbuildRemoteCache.required (fn () =>
+                 HolbuildRemoteCache.fetch_unlisted_blob (HolbuildRemoteCache.remote url)
+                   {hash = log_sha256, dst = log}) of
+              HolbuildCacheBackend.Hit => SOME log
+            | _ => (remove_file log; NONE))
+   handle e => (remove_file log; raise e))
+
+(* Fetch a worker's log to the same location as a local theory build. *)
 fun fetch_remote_build_log project node log_sha256 =
-  let
-    val log = current_build_log (current_log_dir (project_artifact_root project) (package node) (logical_name node))
-  in
-    ensure_parent log;
-    remove_file log;
-    (case HolbuildRemoteCacheConfig.url () of
-         NONE => NONE
-       | SOME url =>
-           case HolbuildRemoteCache.required (fn () =>
-                  HolbuildRemoteCache.fetch_unlisted_blob (HolbuildRemoteCache.remote url)
-                    {hash = log_sha256, dst = log}) of
-               HolbuildCacheBackend.Hit => SOME log
-             | _ => (remove_file log; NONE))
-    handle e => (remove_file log; raise e)
-  end
+  fetch_remote_log (current_build_log (current_log_dir (project_artifact_root project) (package node) (logical_name node)))
+    log_sha256
+
+(* Fetch a worker's log that no theory of the plan is known to own to a path
+   named for its hash, leaving the theories' own logs alone. *)
+fun fetch_remote_batch_log project log_sha256 =
+  fetch_remote_log
+    (Path.concat(Path.concat(project_artifact_root project, ".holbuild/logs/remote"), log_sha256 ^ ".log"))
+    log_sha256
 
 (* The logs of the theories a failed batch finished, for what they report
    (such as a proof step that passed on its retry).  They are optional: one

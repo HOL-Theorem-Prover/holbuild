@@ -2275,10 +2275,12 @@ behavior. A batch being resubmitted does not fetch failure logs first.
 
 `--detach` submits the batch, prints its id (`holbuild: remote batch <id>`)
 and exits; if the batch can't be submitted, it fails rather than building
-locally. `--attach <id>` follows that batch and then builds as above; when
+locally. `--attach <id>` follows that batch and then builds as above. When
 the plan has a theory that writes SML sources, which no batch can take over,
-it only reports how the batch ended and its failed or stopped theories' logs,
-restores nothing and fails. A
+it follows the batch to its end, prints its failed or stopped theories' logs
+(saved under `.holbuild/logs/remote/<sha>.log`), and then builds as without
+`--attach`; under `--remote-only` a batch that failed or was cancelled fails
+the build instead. A
 `--remote-only` build that loses the event stream says how to reattach.
 
 `run` and `repl` take `--remote-exec URL` and `--remote-only` too, before the

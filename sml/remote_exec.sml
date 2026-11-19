@@ -261,18 +261,20 @@ fun follow url batch_id (on_change : string * string * string option * string op
         if state = "failed" orelse (state = "cancelled" andalso kind = SOME "deadline") then
           SOME {input_key = key, theory = name key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
         else NONE) (rev (!states))
-    (* An action stopped by a cancel, with the log its worker uploaded as it
-       stopped it: what it printed up to then.  After an earlier attempt
-       failed, the log may be that attempt's, if the stopped one uploaded
-       none. *)
+    (* An action stopped by a cancel, or by the batch deadline before a cancel
+       ended the batch, with the log its worker uploaded as it stopped it:
+       what it printed up to then.  After an earlier attempt failed, the log
+       may be that attempt's, if the stopped one uploaded none. *)
     fun stopped () =
       List.mapPartial (fn (key, (state, kind, log)) =>
         case (state, kind, log) of
             ("cancelled", NONE, SOME _) => SOME {input_key = key, theory = name key, kind = "cancelled", log_sha256 = log}
+          | ("cancelled", SOME "deadline", SOME _) =>
+              SOME {input_key = key, theory = name key, kind = "stopped at the batch deadline", log_sha256 = log}
           | ("cancelled", SOME earlier, SOME _) =>
-              if earlier = "deadline" orelse String.isPrefix "skipped because of " earlier then NONE
+              if String.isPrefix "skipped because of " earlier then NONE
               else SOME {input_key = key, theory = name key,
-                         kind = "cancelled after an attempt that failed (" ^ earlier ^ ")",
+                         kind = "cancelled after an attempt that failed (" ^ earlier ^ "); the log below may be that attempt's",
                          log_sha256 = log}
           | _ => NONE) (rev (!states))
     (* Actions a worker ran, whose log may arrive after their cancellation. *)
