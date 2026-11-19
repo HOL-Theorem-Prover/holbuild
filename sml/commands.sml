@@ -2040,19 +2040,25 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                resubmitted batch leaves out what the remote cache now holds
                and reports no log for a theory its worker finds built, so the
                logs of the batch before it are carried to its restores, where
-               a theory's log from the later batch replaces the earlier one. *)
+               a theory's log from the later batch replaces the earlier one,
+               and a theory that failed in the later batch keeps none. *)
             val resubmitted_logs = ref []
-            fun carry_logs earlier later =
+            fun carry_logs earlier later failed =
               Redblackmap.listItems
                 (List.foldl
                    (fn ((key, NONE), table) =>
                          if Redblackmap.inDomain (table, key) then table else Redblackmap.insert (table, key, NONE)
                      | ((key, log), table) => Redblackmap.insert (table, key, log))
-                   (Redblackmap.mkDict String.compare) (earlier @ later))
+                   (Redblackmap.mkDict String.compare)
+                   (List.filter (fn (key, _) => not (List.exists (fn k => k = key) failed)) earlier @ later))
             fun finish resubmit skip in_batch batch_id =
               let
                 val (outcome, batch_logs, settled, failure_spans, early) = follow in_batch batch_id
-                val logs = carry_logs (!resubmitted_logs) batch_logs
+                val failed =
+                  case outcome of
+                      (HolbuildRemoteExec.Failed (_, failures), _) => map #input_key failures
+                    | _ => []
+                val logs = carry_logs (!resubmitted_logs) batch_logs failed
                 val _ = resubmitted_logs := []
                 (* Whatever follows (a restore, a resubmission, a local build)
                    doesn't overlap the span analysis; its results stay readable. *)
@@ -2156,6 +2162,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             and submit resubmit settled skip batch =
               if null (batch_keys batch) then
                 (record_pending ();
+                 (* A resubmission can find everything built already. *)
+                 if null (!resubmitted_logs) then ()
+                 else
+                   (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key
+                      (!resubmitted_logs);
+                    resubmitted_logs := []);
                  if not (null (!deferred)) then submit_deferred resubmit settled skip
                  else if not (null skip) then restore_after_failures settled skip
                  else

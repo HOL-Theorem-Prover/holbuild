@@ -60,11 +60,18 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
       continue
     fi
   fi
-  # A worker that finds missing what fail-missing ("THEORY theory KEY") names,
-  # once, before building THEORY.
+  # A worker that finds missing what fail-missing ("THEORY theory KEY" or
+  # "THEORY blob SHA256") names, once, before building THEORY; with
+  # fail-missing-built, after building it.  One that fails what fail-result
+  # names, once, with no log.
   if [[ -e "$state/fail-missing" && "\$(cut -d' ' -f1 "$state/fail-missing")" == "\$theory" ]]; then
     cut -d' ' -f2- "$state/fail-missing" > "$state/missing"
     rm "$state/fail-missing"
+    exit 1
+  fi
+  if [[ -e "$state/fail-result" && "\$(< "$state/fail-result")" == "\$theory" ]]; then
+    printf 'holbuild-action-result-v1\nstatus=failed\nfailure=internal\n' > "$state/result-\$key"
+    rm "$state/fail-result"
     exit 1
   fi
   echo "\$theory" >> "$state/ran"
@@ -81,6 +88,11 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   fi
   if [[ -e "$state/optional-log-outage" && \$theory == *:ATheory ]]; then
     echo 500 > "$tmpdir/cache-control/cas-get-status-\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
+  fi
+  if [[ -e "$state/fail-missing-built" && "\$(cut -d' ' -f1 "$state/fail-missing-built")" == "\$theory" ]]; then
+    cut -d' ' -f2- "$state/fail-missing-built" > "$state/missing"
+    rm "$state/fail-missing-built"
+    exit 1
   fi
   # A remote failure the local source doesn't share: the source heals.
   if [[ \$status -ne 0 && -e "$state/heal" ]]; then
@@ -1786,6 +1798,31 @@ for theory in ATheory BTheory; do
   require_file "$project/.holbuild/logs/current/rxresubmitlogs/$theory/build.log"
 done
 require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
+# A theory that fails in the resubmitted batch keeps no log from the first:
+# on the second submission, A's worker fails it.
+write_theories resubmit-logs-failed
+rm -rf "$project/.holbuild/logs/current"
+a_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:ATheory" { print $2 }')
+echo "rxresubmitlogs:BTheory theory $a_key" > "$state/fail-missing"
+echo "[[ ! -e '$state/submitted' ]] || echo rxresubmitlogs:ATheory > '$state/fail-result'; touch '$state/submitted'" \
+  > "$state/on-submit"
+run resubmit-logs-failed 75 build --remote-exec "$coordinator" --remote-only BTheory
+rm "$state/on-submit" "$state/submitted"
+require_grep "resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/resubmit-logs-failed.log"
+require_grep "rxresubmitlogs:ATheory: failed (internal)" "$tmpdir/resubmit-logs-failed.log"
+require_no_file "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
+
+# A resubmission that finds everything built already still restores the
+# first batch's logs: B's worker builds it, then reports a blob missing.
+write_theories resubmit-logs-built
+rm -rf "$project/.holbuild/logs/current"
+echo "rxresubmitlogs:BTheory blob $(printf '0%.0s' {1..64})" > "$state/fail-missing-built"
+run resubmit-logs-built 0 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "still missing blob 0* after 3 attempts; .*; resubmitting$" "$tmpdir/resubmit-logs-built.log"
+require_grep "nothing to build remotely" "$tmpdir/resubmit-logs-built.log"
+for theory in ATheory BTheory; do
+  require_file "$project/.holbuild/logs/current/rxresubmitlogs/$theory/build.log"
+done
 
 # The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
 copy_nondet heap-cap rxheap
