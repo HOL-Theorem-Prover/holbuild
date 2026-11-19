@@ -42,7 +42,7 @@ val _ =
              base_state = OS.FileSys.fullPath (env "BASE_STATE"), deps_key = "deps",
              deps_loaded = tree ^ "/deps.save", requested_timeout = NONE, candidates = []}
           val _ = BE.restore_steps := []
-          val {heap, ...} = BE.restore_shared_checkpoints remote ctx false
+          val {heap, ...} = BE.restore_shared_checkpoints remote ctx false (fn _ => ())
           val waited = List.exists (fn (name, _) => name = "rstwait") (!BE.restore_steps)
         in
           write (getOpt (heap, "none") ^ (if waited then " waited" else ""))
