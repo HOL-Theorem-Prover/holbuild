@@ -4216,11 +4216,17 @@ fun prepare_theory_stage speculative tc root (action : theory_action) =
        pipelined = speculative}
   end
 
-(* Set by exec-action for the next run_theory_action: the theory child it
-   started ahead of the action's parents, which the run joins instead of
-   starting one, once it has written the preload and the script the child
-   evaluates next. *)
-val attached_child : (unit -> unit) option ref = ref NONE
+(* Set for the next run_theory_action on the same thread: the theory child
+   exec-action or a local pipelined build started ahead of the action's
+   parents, which the run joins instead of starting one, once it has written
+   the preload and the script the child evaluates next.  Per thread, as a
+   local build runs several. *)
+val attached_child_tag : (unit -> unit) option Universal.tag = Universal.tag ()
+
+fun set_attached_child join = Thread.setLocal (attached_child_tag, join)
+
+fun take_attached_child () =
+  Option.join (Thread.getLocal attached_child_tag) before set_attached_child NONE
 
 (* SPECULATIVE_LOG: the run is a pipelined build's speculative one (an
    outline, or a proof on outlined parents), which logs there, produces no
@@ -4252,7 +4258,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
       map (fn declaration => (declaration, staged_extra_output_path stage declaration))
           (#extra_outputs action)
     (* A child started ahead of its parents runs in the stage already. *)
-    val attached = !attached_child before attached_child := NONE
+    val attached = take_attached_child ()
     val _ = if Option.isSome attached then () else prepare_theory_stage speculative tc root action
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
     val _ =
@@ -6061,11 +6067,25 @@ fun refresh_checkpoint_budget_after_node state project node protected_bases =
    costs only time: the theory, or what loaded the outline, builds again
    without pipelining, and the theory's input key goes on a skip list.
 
-   Pipelining costs CPU, so it only fills slots that would otherwise sit
-   idle.  A theory whose parents are all built is pipelined only if, when a
-   worker takes it, every other ready node has a free worker too and one
-   is still left over; otherwise it builds plain.  A speculative attempt
-   is the last work a worker takes, after every ready node. *)
+   Pipelining costs CPU, so it goes where it shortens the build's longest
+   chain.  Workers take ready nodes and queued attempts alike by rank: the
+   longest chain of dependents below a node first, then its count of
+   descendants.  A theory whose parents are all built is pipelined only if
+   a child of it could start on its outline (one whose other parents are
+   available or being built), and a worker is still left over once every
+   ready node ranked as high has one; otherwise it builds plain.
+
+   A cold theory whose parents are each available or being built, some of
+   them not yet outlined, may start its attempt ahead of those late
+   parents (load_ahead_locally): its child loads everything else while
+   they run, and the late parents' outlines or outputs once they come.  At
+   most min(6, jobs div 3) such attempts wait for parents at once, and one
+   starts only while another worker is idle; none for a theory that would
+   cut off on its dependencies' outputs on disk.  One whose late parent stops
+   coming (its build was dropped, or will build plain again) or whose load
+   differs from what the parents' manifests name is abandoned: it is
+   considered again as if it had never started, and starts no further
+   attempt ahead of its parents in this build. *)
 
 fun pipeline_trace line = cache_trace ("pipeline: " ^ line)
 
@@ -6345,6 +6365,195 @@ fun outline_view root (outlined : (HolbuildBuildPlan.node * string) list) =
     fn stem => Option.map #2 (List.find (fn (s, _) => s = stem) table)
   end
 
+fun ahead_runtime_path () = Path.concat (HolbuildRuntimePaths.runtime_root (), "sml/ahead_load_runtime.sml")
+
+(* The ML modules a script adds by a literal add_ML_dependency call; others
+   it may add are seen only once it has run. *)
+fun literal_ml_dependencies text =
+  let
+    val call = "add_ML_dependency"
+    fun scan rest names =
+      let val (_, found) = Substring.position call rest
+      in
+        if Substring.isEmpty found then rev names
+        else
+          let val after = Substring.dropl Char.isSpace (Substring.triml (size call) found)
+          in
+            if Substring.first after = SOME #"\"" then
+              let val (name, _) = Substring.splitl (fn c => c <> #"\"") (Substring.triml 1 after)
+              in scan after (Substring.string name :: names) end
+            else scan after names
+          end
+      end
+  in
+    unique_strings (scan (Substring.full text) [])
+  end
+
+(* The parent theories a .dat records, read from its header only. *)
+fun dat_parent_names path =
+  map #1 (Binarymap.listItems (parse_dat_parent_hashes (read_dat_header path)))
+
+(* The manifest lines a late parent's entry will have, predicted from its
+   loads before it is built: the theories its preload loads that no other of
+   them has as an ancestor, and the ML modules its script adds literally,
+   ordered as restore_spec_theory orders them.  The walk follows the loader
+   from BASE, the modules the child had loaded at its start, through the
+   manifests on disk (the action root's, the toolchain's and the parent's
+   libraries', LIB_MANIFESTS: those not on disk yet, each its path and
+   lines), as the child's working directory CWD and load path find
+   them.  PARENTS memoizes each theory's recorded parents across calls; it
+   gets the parent's own predicted ones, for a later late parent whose walk
+   finds this one's stand-in, which has no .dat. *)
+fun predicted_theory_loads {root, cwd, holdir, base = {loaded, path}, resolve, parents_memo,
+                            parent : {logical : string, loads : theory_load list,
+                                      lib_manifests : (string * string list) list},
+                            source_text} =
+  let
+    fun subst entry =
+      if String.isPrefix "$(HOLDIR)" entry then holdir ^ String.extract (entry, size "$(HOLDIR)", NONE) else entry
+    val lib_manifests = #lib_manifests parent
+    (* HOL's loader reads <dir>/x.ui from <dir>/.hol/objs/x.ui (HOL's
+       HFS_NameMunge); a toolchain built by recent HOL has it only there. *)
+    fun find module ext =
+      let
+        fun at dir =
+          let val file = Path.mkAbsolute {path = module ^ ext, relativeTo = Path.mkAbsolute {path = dir, relativeTo = cwd}}
+          in List.find file_exists [file, hfs_remapped_path file] end
+        fun first [] = NONE
+          | first (dir :: dirs) = case at dir of SOME file => SOME file | NONE => first dirs
+      in
+        if Path.isAbsolute module then at "." else first ("." :: path)
+      end
+    fun manifest module ext =
+      case List.find (fn (file, _) => file = module ^ ext) lib_manifests of
+          SOME (_, lines) => lines
+        | NONE =>
+            case find module ext of
+                SOME file => String.tokens (fn c => c = #"\n") (read_text file)
+              | NONE => raise Error ("no load manifest " ^ module ^ ext)
+    fun is_file entry = has_suffix ".sml" entry orelse has_suffix ".sig" entry
+    val base = Binaryset.addList (Binaryset.empty String.compare, loaded)
+    val visited = ref (Binarymap.mkDict String.compare)
+    fun visit entry =
+      if is_file entry then ()
+      else
+        let
+          val module = subst entry
+          val name = Path.file module
+        in
+          if Binaryset.member (base, name) orelse Option.isSome (Binarymap.peek (!visited, name)) then ()
+          else (visited := Binarymap.insert (!visited, name, module);
+                List.app visit (manifest module ".ui" @ manifest module ".uo"))
+        end
+    fun load_arg (LoadTheory name) = name
+      | load_arg (LoadLibrary name) = name
+      | load_arg (LoadObject stem) = in_root root stem
+    val _ = List.app (visit o load_arg) (#loads parent)
+    fun parents name =
+      case Binarymap.peek (!parents_memo, name) of
+          SOME known => known
+        | NONE =>
+            let
+              val module = Option.getOpt (Binarymap.peek (!visited, name), name)
+              val found =
+                if not (has_suffix "Theory" name) then []
+                else
+                  case find module ".uo" of
+                      NONE => []
+                    | SOME uo =>
+                        let val dat = Path.base (FS.realPath uo) ^ ".dat"
+                        in if file_exists dat then map (fn p => p ^ "Theory") (dat_parent_names dat) else [] end
+            in
+              parents_memo := Binarymap.insert (!parents_memo, name, found);
+              found
+            end
+    val ancestors_memo = ref (Binarymap.mkDict String.compare)
+    fun ancestors name =
+      case Binarymap.peek (!ancestors_memo, name) of
+          SOME known => known
+        | NONE =>
+            let
+              val ps = parents name
+              val all = List.foldl (fn (p, set) => Binaryset.union (set, ancestors p))
+                                   (Binaryset.addList (Binaryset.empty String.compare, ps)) ps
+            in
+              ancestors_memo := Binarymap.insert (!ancestors_memo, name, all);
+              all
+            end
+    val theories =
+      List.filter (fn name => has_suffix "Theory" name andalso not (null (parents name)))
+                  (loaded @ map #1 (Binarymap.listItems (!visited)))
+    val inherited =
+      List.foldl (fn (name, set) => Binaryset.union (set, ancestors name)) (Binaryset.empty String.compare) theories
+    val fringe = List.filter (fn name => not (Binaryset.member (inherited, name))) theories
+    val _ = parents_memo := Binarymap.insert (!parents_memo, #logical parent, fringe)
+  in
+    generated_theory_loads resolve
+      {parents = map (drop_suffix "Theory") fringe, mldeps = literal_ml_dependencies source_text}
+  end
+
+(* The child's report of what its base context loaded and where it looks. *)
+fun read_base_report path =
+  let
+    val lines = String.tokens (fn c => c = #"\n") (read_text path)
+    fun field prefix = List.mapPartial (fn line => if String.isPrefix prefix line then SOME (String.extract (line, size prefix, NONE)) else NONE) lines
+  in
+    {loaded = field "loaded ", path = field "path "}
+  end
+
+(* The file the child evaluates first: the runtime, the recording loader and
+   LOAD_LINES under it, which pass through the stand-ins, and a last step
+   that waits for exec-action to write the files the child evaluates next. *)
+(* Writes the stand-in for late parent NAME at load stem STEM: its .uo
+   loads PREDICTED, its predicted manifest, between the runtime's enter and
+   wait steps, which keep their files in DIR. *)
+fun write_stand_in {dir, name, stem, predicted} =
+  let
+    fun marker file = Path.concat (dir, file)
+    val enter = marker (name ^ "-enter.sml")
+    val wait = marker (name ^ "-wait.sml")
+  in
+    write_text enter ("val _ = HolbuildAheadLoad.enter " ^ HolbuildToolchain.sml_string name ^ ";\n");
+    write_text wait
+      ("val _ = HolbuildAheadLoad.wait {parent = " ^ HolbuildToolchain.sml_string name ^
+       ", ui = " ^ HolbuildToolchain.sml_string (marker (name ^ ".ui")) ^
+       ", uo = " ^ HolbuildToolchain.sml_string (marker (name ^ ".uo")) ^ "};\n");
+    ensure_dir (Path.dir (hfs_remapped_path stem));
+    write_object_manifest (stem ^ ".ui") [];
+    write_object_manifest (stem ^ ".uo") (enter :: predicted @ [wait])
+  end
+
+fun write_ahead_preload {load_lines, dir, share, path} =
+  let
+    val no_loader = HolbuildToolchain.sml_string "this toolchain's HOL has no Meta.loadPlan"
+    val lines =
+      runtime_line () ::
+      "val _ = if (case #lookupStruct PolyML.globalNameSpace \"Meta\" of NONE => false | SOME meta => " ^
+        "Option.isSome (#lookupVal (PolyML.NameSpace.Structures.contents meta) \"loadPlan\")) then () " ^
+        "else (HolbuildRuntime.write_text " ^ HolbuildToolchain.sml_string (Path.concat (dir, "abandoned")) ^
+        " " ^ no_loader ^ "; OS.Process.exit OS.Process.failure);" ::
+      "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (ahead_runtime_path ()) ^ ";" ::
+      if_meta_has ["moduleSourceLoader"]
+        ("val _ = let val loader = !Meta.moduleSourceLoader in " ^
+         "Meta.moduleSourceLoader := (fn use => fn file => (HolbuildAheadLoad.record file; loader use file)); " ^
+         "HolbuildAheadLoad.loader := Meta.load; " ^
+         "HolbuildAheadLoad.restore := (fn () => Meta.moduleSourceLoader := loader) end;") ::
+      (* HOL put every directory of the project on the load path, the
+         thousands under holbuild's checkpoints and logs too; none holds a
+         module, and predicting a load manifest searches the path. *)
+      "val _ = Meta.loadPath := List.filter (fn dir => not (String.isSubstring \"/.holbuild/checkpoints/\" (dir ^ \"/\") " ^
+        "orelse String.isSubstring \"/.holbuild/logs/\" (dir ^ \"/\"))) (!Meta.loadPath);" ::
+      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^ Bool.toString share ^ ";" ::
+      "structure HolbuildAheadPlainRuntime = HolbuildRuntime;" ::
+      "structure HolbuildRuntime = struct open HolbuildRuntime val load = HolbuildAheadLoad.load end;" ::
+      (load_lines @
+       ["val _ = HolbuildAheadLoad.finish ();",
+        (* The plain preload saves the heap later actions resume from. *)
+        "structure HolbuildRuntime = HolbuildAheadPlainRuntime;"])
+  in
+    write_text path (String.concatWith "\n" lines ^ "\n")
+  end
+
 (* The theory action of a speculative run of NODE: staged under its own
    KEY, loading its dependencies through VIEW. *)
 fun speculative_action root plan keys toolchain_key view key node : theory_action =
@@ -6448,12 +6657,151 @@ fun with_outline_watch stage on_outline f =
     result
   end
 
+exception AheadAbandoned of string
+
+(* Starts the theory child of a pipelined build in STAGE ahead of LATE, its
+   parents still being built, as exec-action --ahead-parent does: the child
+   loads its other ancestors at once, and in each late parent's place its
+   stand-in at STAND_IN (the parent's predicted manifest between an enter and
+   a wait step), whose wait step lets the load go on once ARRIVED, polled,
+   gives the parent's load stem.  Then RUN builds the theory, joining the
+   child, which logs to LOG_DIR as RUN would.  The markers go in DIR.  Raises AheadAbandoned when ARRIVED raises
+   it or the child's load differs from what the parents' manifests name.
+   The child runs on this thread, so stopping this thread's children stops
+   it; RUN runs on another. *)
+fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in, arrived}
+                       (action : theory_action) stage log_dir run =
+  let
+    val _ = (prepare_theory_stage true tc root action; remove_tree dir; ensure_dir dir)
+    fun marker name = Path.concat (dir, name)
+    fun drop name = write_text (marker name) ""
+    val _ =
+      write_ahead_preload
+        {load_lines = map (theory_load_line root) (#loads action), dir = dir, share = false,
+         path = Path.concat (stage, "holbuild-ahead-preload.sml")}
+    val files =
+      map (fn name => Path.concat (stage, name))
+        ["holbuild-child-policy.sml", "holbuild-ahead-preload.sml", "holbuild-preload.sml",
+         Path.file (#source_file action), "holbuild-export-theory.sml"]
+    val child : exn option option ref = ref NONE
+    val result = ref NONE
+    val owner = Thread.self ()
+    fun child_done () = Option.isSome (!child)
+    fun pause () = OS.Process.sleep (Time.fromMilliseconds 50)
+    fun await_child () = if child_done () then () else (pause (); await_child ())
+    fun stop_child () =
+      if child_done () then () else (HolbuildProcessGroup.kill_thread_children owner; pause (); stop_child ())
+    fun abandoned () = if file_exists (marker "abandoned") then SOME (read_text (marker "abandoned")) else NONE
+    fun abandon_stopped what =
+      raise AheadAbandoned
+        (case (abandoned (), !child) of
+             (SOME reason, _) => reason
+           | (NONE, SOME (SOME e)) => "the child stopped " ^ what ^ ": " ^ General.exnMessage e
+           | _ => "the child stopped " ^ what)
+    fun wait_until ready =
+      if ready () then ()
+      else if child_done () then abandon_stopped "before its parents arrived"
+      else (pause (); wait_until ready)
+    fun resolve name = Option.map (fn (stem, order) => (view_stem view stem, order)) (plan_load_stem plan name)
+    fun load (LoadObject stem) = LoadObject (view_stem view (in_root root stem))
+      | load other = other
+    fun write_parent_stand_in base parents_memo parent =
+      let
+        val stem = stand_in parent
+        val predicted =
+          predicted_theory_loads
+            {root = root, cwd = FS.fullPath stage, holdir = FS.fullPath (#holdir tc), base = base,
+             resolve = resolve, parents_memo = parents_memo,
+             parent = {logical = logical_name parent, loads = map load (preload_loads root plan parent),
+                       lib_manifests = []},
+             source_text = read_text (source_file parent)}
+      in
+        write_stand_in {dir = dir, name = Path.file stem, stem = stem, predicted = predicted}
+      end
+      handle e as AheadAbandoned _ => raise e
+           | e => raise AheadAbandoned ("cannot predict the load manifest of " ^ logical_name parent ^ ": " ^
+                                        General.exnMessage e)
+    fun arrive (parent, from) =
+      let val name = Path.file (stand_in parent)
+      in
+        copy_binary (from ^ ".ui") (marker (name ^ ".ui"));
+        copy_binary (from ^ ".uo") (marker (name ^ ".uo"));
+        drop ("arrived-" ^ name)
+      end
+    (* A late parent's child has reached its stand-in's wait step. *)
+    val seen_waiting = ref ([] : string list)
+    fun note_waiting parent =
+      let val name = Path.file (stand_in parent)
+      in
+        if List.exists (fn n => n = name) (!seen_waiting) orelse not (file_exists (marker ("waiting-" ^ name))) then ()
+        else (seen_waiting := name :: !seen_waiting;
+              pipeline_trace ("ahead waiting: " ^ #logical action ^ " for " ^ logical_name parent))
+      end
+    fun poll [] = ()
+      | poll pending =
+          let
+            val came = List.mapPartial (fn parent => Option.map (fn from => (parent, from)) (arrived parent)) pending
+            fun has_come parent = List.exists (fn (p, _) => HolbuildBuildPlan.key p = HolbuildBuildPlan.key parent) came
+          in
+            List.app arrive came;
+            if not (null came) then ()
+            else if child_done () then abandon_stopped "before its parents arrived"
+            else (List.app note_waiting pending; pause ());
+            poll (List.filter (not o has_come) pending)
+          end
+    (* The late parents' own manifests in place of their stand-ins, for a
+       script that loads one itself. *)
+    fun replace_stand_ins () =
+      List.app
+        (fn parent =>
+            let val stem = stand_in parent and name = Path.file (stand_in parent)
+            in
+              List.app (fn suffix => write_object_manifest (stem ^ suffix) (lines_of (read_text (marker (name ^ suffix)))))
+                [".ui", ".uo"]
+            end)
+        late
+    fun join () =
+      (wait_until (fn () => file_exists (marker "finishing"));
+       replace_stand_ins ();
+       drop "ready";
+       await_child ();
+       case (abandoned (), !child) of
+           (SOME reason, _) => raise AheadAbandoned reason
+         | (NONE, SOME (SOME e)) => raise e
+         | _ => ())
+    fun ahead () =
+      (wait_until (fn () => file_exists (marker "base-loaded"));
+       List.app (write_parent_stand_in (read_base_report (marker "base-loaded")) (ref (Binarymap.mkDict String.compare))) late;
+       drop "stand-ins";
+       poll late;
+       set_attached_child (SOME join);
+       run ())
+    val _ =
+      Thread.fork
+        (fn () =>
+            let val value = ahead ()
+            in result := SOME (fn () => value) end
+            handle e => (stop_child (); result := SOME (fn () => raise e)),
+         [])
+    val _ =
+      child :=
+        SOME ((run_hol_files_to_log tc stage stage base_context files "holbuild-build.log"
+                 (SOME (current_build_log log_dir))
+                 "hol run failed while building theory script";
+               NONE)
+              handle e => SOME e)
+    fun await_result () = case !result of SOME value => value () | NONE => (pause (); await_result ())
+  in
+    await_result ()
+  end
+
 (* Proves theory NODE with its dependencies loaded through VIEW, staged
    under run name NAME, and leaves its outputs in the stage: in one HOL
    process that defers its proofs, publishes its outline once the script
    has run (ON_OUTLINE is then called with the stage), and proves them on
-   several threads. *)
-fun build_speculative options tc project base_context plan keys toolchain_key run_dir view name on_outline node =
+   several threads.  AHEAD, if given, starts the child ahead of the theory's
+   late parents (load_ahead_locally). *)
+fun build_speculative options tc project base_context plan keys toolchain_key run_dir view name on_outline ahead node =
   let
     val root = project_artifact_root project
     val policy = speculative_policy (checkpoint_policy_for_node options project node)
@@ -6468,20 +6816,25 @@ fun build_speculative options tc project base_context plan keys toolchain_key ru
     val deferred =
       if proof_steps_enabled policy then source_text
       else deferred_source source_text (discover_theorem_boundaries_strict source source_text)
-    val generated_metadata =
-      with_outline_watch stage (fn () => on_outline stage)
-        (fn () =>
-            run_theory_action_checkpoints (fn () => ()) (SOME log_dir) false policy tc root checkpoint_root base_context
-              action deferred (action_checkpoints policy checkpoint_root action deferred))
-      handle e => (remove_tree (stage_root_at root key); raise e)
-    val _ =
-      if path_exists (stage_finalized_marker stage) then ()
-      else
-        (remove_tree (stage_root_at root key);
-         raise Error (logical_name node ^ ": the pipelined build ended before its deferred proofs were finalized"))
+    fun run () =
+      let
+        val generated_metadata =
+          with_outline_watch stage (fn () => on_outline stage)
+            (fn () =>
+                run_theory_action_checkpoints (fn () => ()) (SOME log_dir) false policy tc root checkpoint_root base_context
+                  action deferred (action_checkpoints policy checkpoint_root action deferred))
+        val _ =
+          if path_exists (stage_finalized_marker stage) then ()
+          else raise Error (logical_name node ^ ": the pipelined build ended before its deferred proofs were finalized")
+      in
+        {stage_root = stage_root_at root key, stage = stage, log_dir = log_dir,
+         generated_metadata = generated_metadata}
+      end
   in
-    {stage_root = stage_root_at root key, stage = stage, log_dir = log_dir,
-     generated_metadata = generated_metadata}
+    (case ahead of
+         NONE => run ()
+       | SOME start => start action stage log_dir run)
+    handle e => (remove_tree (stage_root_at root key); raise e)
   end
 
 fun build_error_message e =
@@ -6611,8 +6964,11 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
         PlainWork of int
       | CommitWork of int * speculative_result
       | OutlineWork of int * int * (HolbuildBuildPlan.node * string) list
-      | AttemptWork of int * int * (HolbuildBuildPlan.node * string) list
-    datatype 'a speculation = Succeeded of 'a | NotCold | Failed of string
+      (* An attempt's late parents, each with its producer when the
+         attempt started: the generation of its attempt, or NONE for its
+         plain build. *)
+      | AttemptWork of int * int * (HolbuildBuildPlan.node * string) list * (int * int option) list
+    datatype 'a speculation = Succeeded of 'a | NotCold | Failed of string | Abandoned of string
     val deps_of = Array.array (node_count, [] : int list)
     val committed = Array.array (node_count, false)
     val plain_started = Array.array (node_count, false)
@@ -6620,9 +6976,23 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     val attempt = Array.array (node_count, ANone)
     val outline_owner = Array.array (node_count, NONE : (int * Thread.thread) option)
     val attempt_owner = Array.array (node_count, NONE : (int * Thread.thread) option)
+    (* The worker that took each node's plain build. *)
     val cold = Array.array (node_count, NONE : bool option)
     (* Whether a theory's ready outline exports what its outputs on disk do. *)
     val outline_unchanged = Array.array (node_count, false)
+    (* Attempts started ahead of late parents: each one's generation and
+       how many of its late parents have yet to arrive; and the theories
+       whose attempt ahead was abandoned. *)
+    val waiting_ahead = ref ([] : (int * int) list)
+    val started_ahead = Array.array (node_count, false)
+    val no_ahead = Array.array (node_count, false)
+    (* Whether a theory would cut off on its dependencies' outputs on disk
+       when first considered to start ahead: a late parent's outline can't
+       show whether it will. *)
+    val ahead_cuts_off = Array.array (node_count, NONE : bool option)
+    val ahead_cap = Int.min (6, jobs div 3)
+    val ahead_candidates = ref ([] : int list)
+    val ahead_listed = Array.array (node_count, false)
     val outline_skips = ref (Binaryset.addList (Binaryset.empty String.compare,
                                           if pipelining then read_outline_skips root else []))
     val next_gen = ref 0
@@ -6693,6 +7063,53 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
 
     val _ = register_nodes 0
 
+    (* A node's rank: the longest chain of selected dependents below it,
+       then its count of descendants. *)
+    val critical_depth = Array.array (node_count, ~1)
+    fun depth id =
+      if Array.sub (critical_depth, id) >= 0 then Array.sub (critical_depth, id)
+      else
+        let val d = List.foldl (fn (c, m) => Int.max (m, 1 + depth c)) 0 (Array.sub (dependents, id))
+        in Array.update (critical_depth, id, d); d end
+    val descendant_count = Array.array (node_count, 0)
+    val _ =
+      let
+        val width = (node_count + 7) div 8
+        val sets = Array.array (node_count, NONE : Word8Array.array option)
+        fun mark set id =
+          Word8Array.update (set, id div 8,
+                             Word8.orb (Word8Array.sub (set, id div 8), Word8.<< (0w1, Word.fromInt (id mod 8))))
+        fun descendants id =
+          case Array.sub (sets, id) of
+              SOME set => set
+            | NONE =>
+                let val set = Word8Array.array (width, 0w0)
+                in
+                  List.app (fn c => let val below = descendants c
+                                    in Word8Array.modifyi (fn (i, w) => Word8.orb (w, Word8Array.sub (below, i))) set;
+                                       mark set c
+                                    end)
+                    (Array.sub (dependents, id));
+                  Array.update (sets, id, SOME set);
+                  set
+                end
+        fun bits w = if w = 0w0 then 0 else Word8.toInt (Word8.andb (w, 0w1)) + bits (Word8.>> (w, 0w1))
+      in
+        List.app (fn id => Array.update (descendant_count, id,
+                                         Word8Array.foldl (fn (w, n) => n + bits w) 0 (descendants id)))
+          (List.tabulate (node_count, fn id => id))
+      end
+    fun outranks (a, b) =
+      depth a > depth b orelse (depth a = depth b andalso Array.sub (descendant_count, a) > Array.sub (descendant_count, b))
+
+    (* The best-ranked of IDS that MATCHES, and the others. *)
+    fun best_matching matches ids =
+      case List.filter matches ids of
+          [] => NONE
+        | first :: rest =>
+            let val best = List.foldl (fn (id, b) => if outranks (id, b) then id else b) first rest
+            in SOME (best, List.filter (fn id => id <> best) ids) end
+
     val priority_focus = Array.array (node_count, false)
     val priority_focus_remaining = ref 0
     val priority_mode = ref false
@@ -6730,43 +7147,29 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     fun lock () = Mutex.lock mutex
     fun unlock () = Mutex.unlock mutex
 
-    fun pop_matching_ready matches prefix rest =
-      case rest of
-          [] => NONE
-        | id :: suffix =>
-            if matches id then SOME (id, rev prefix @ suffix)
-            else pop_matching_ready matches (id :: prefix) suffix
-
     fun priority_focus_node id = Array.sub (priority_focus, id)
 
     fun note_ready_pop priority =
       if priority then priority_ready_count := !priority_ready_count - 1 else ()
 
+    (* The best-ranked ready node, retained failures' first. *)
     fun pop_ready () =
-      case !ready of
-          [] => NONE
-        | id :: rest =>
-            if !priority_mode andalso !priority_focus_remaining > 0 then
-              (case pop_matching_ready priority_focus_node [] (id :: rest) of
-                   SOME (focus_id, remaining) =>
-                     let val priority = failed_prefix_priority_node focus_id
-                     in
-                       ready := remaining;
-                       note_ready_pop priority;
-                       SOME (focus_id, priority)
-                     end
-                 | NONE => NONE)
-            else
-              (priority_mode := false;
-               if !priority_ready_count > 0 then
-                 case pop_matching_ready failed_prefix_priority_node [] (id :: rest) of
-                     SOME (priority_id, remaining) =>
-                       (ready := remaining; note_ready_pop true; SOME (priority_id, true))
-                   | NONE =>
-                       if !priority_running > 0 then NONE
-                       else (ready := rest; SOME (id, false))
-               else if !priority_running > 0 then NONE
-               else (ready := rest; SOME (id, false)))
+      let
+        fun take matches priority =
+          case best_matching matches (!ready) of
+              SOME (id, remaining) => (ready := remaining; note_ready_pop (priority id); SOME (id, priority id))
+            | NONE => NONE
+      in
+        if null (!ready) then NONE
+        else if !priority_mode andalso !priority_focus_remaining > 0 then
+          take priority_focus_node failed_prefix_priority_node
+        else
+          (priority_mode := false;
+           if !priority_ready_count > 0 andalso List.exists failed_prefix_priority_node (!ready) then
+             take failed_prefix_priority_node (fn _ => true)
+           else if !priority_running > 0 then NONE
+           else take (fn _ => true) (fn _ => false))
+      end
 
     fun is_theory id =
       #kind (HolbuildBuildPlan.source_of (Vector.sub (nodes, id))) = HolbuildSourceIndex.TheoryScript
@@ -6812,11 +7215,6 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                 | _ => raise Error ("internal error: the outline of " ^ node_name id ^ " is gone"))
           (Binaryset.listItems consumed)
 
-    fun pop_commit () =
-      case !commit_queue of
-          [] => NONE
-        | (id, result) :: rest => (commit_queue := rest; mark_active_node id; SOME (CommitWork (id, result)))
-
     fun pop_outline () =
       case !outline_queue of
           [] => NONE
@@ -6830,58 +7228,204 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                    else pop_outline ()
                | _ => pop_outline ())
 
-    fun start_attempt id gen consumed =
+    fun available id =
+      Array.sub (committed, id) orelse (case Array.sub (outline, id) of OReady _ => true | _ => false)
+
+    fun consumed_by deps =
+      List.foldl
+        (fn (dep, acc) =>
+            if Array.sub (committed, dep) then acc
+            else case Array.sub (outline, dep) of
+                     OReady (_, _, consumed) => Binaryset.add (Binaryset.union (acc, consumed), dep)
+                   | _ => acc)
+        (Binaryset.empty int_compare) deps
+
+    (* Whether node ID is being built: a worker has its build, its commit,
+       its attempt or its outline, or its attempt is done and waits to
+       commit. *)
+    fun producing id =
+      Array.sub (active_nodes, id) orelse Option.isSome (Array.sub (outline_owner, id)) orelse
+      (case Array.sub (attempt, id) of ARunning _ => true | ADone _ => true | _ => false)
+
+    (* Which build of a late parent ID an attempt waits for: its attempt's
+       generation, or NONE for its plain build. *)
+    fun producer id =
+      case Array.sub (attempt, id) of ARunning (gen, _) => SOME gen | ADone (gen, _, _) => SOME gen | _ => NONE
+
+    (* A parent an attempt can start ahead of: a theory being built on
+       parents that are all available, and not itself still waiting for
+       late parents of its own, whose outlines it hasn't loaded yet. *)
+    fun late_parent id =
+      not (available id) andalso is_theory id andalso producing id andalso
+      not (case producer id of SOME g => List.exists (fn (w, _) => w = g) (!waiting_ahead) | NONE => false) andalso
+      List.all available (Array.sub (deps_of, id))
+
+    (* Whether a dependent of ID could start on its outline. *)
+    fun has_eligible_child id =
+      List.exists (fn c => List.all (fn d => d = id orelse available d orelse producing d) (Array.sub (deps_of, c)))
+        (Array.sub (dependents, id))
+
+    fun note_ahead_candidate id =
+      if Array.sub (ahead_listed, id) then ()
+      else (Array.update (ahead_listed, id, true); ahead_candidates := id :: !ahead_candidates)
+
+    fun dispatched id = List.app note_ahead_candidate (Array.sub (dependents, id))
+
+    fun start_attempt id gen consumed late =
       (Array.update (attempt, id, ARunning (gen, consumed));
        if outlinable id then Array.update (outline, id, ORunning (gen, consumed)) else ();
        Array.update (attempt_owner, id, SOME (gen, Thread.self ()));
-       SOME (AttemptWork (id, gen, view_of consumed)))
+       dispatched id;
+       SOME (AttemptWork (id, gen, view_of consumed, late)))
 
-    fun pop_attempt () =
-      case !attempt_queue of
+    fun pop_commit () =
+      case !commit_queue of
           [] => NONE
-        | (id, gen) :: rest =>
-            (attempt_queue := rest;
-             case Array.sub (attempt, id) of
-                 AQueued (current, consumed) =>
-                   if current = gen andalso not (Array.sub (committed, id)) andalso not (Array.sub (skipped, id)) then
-                     start_attempt id gen consumed
-                   else pop_attempt ()
-               | _ => pop_attempt ())
+        | (id, result) :: rest =>
+            (commit_queue := rest; mark_active_node id; dispatched id; SOME (CommitWork (id, result)))
 
-    (* A speculable theory is pipelined only if a worker would still be
-       left idle once every ready node had one (see "Pipelined builds").
-       The commit and outline queues are empty here, and running doesn't
-       count this worker yet. *)
-    fun pop_plain () =
-      case pop_ready () of
-          SOME (id, priority) =>
-            if pipelining andalso speculable id then
-              let
-                val pending = length (!ready) + 1
-                val free = jobs - !running
-                val pipelined = pending < free
-              in
-                pipeline_trace ("dispatch " ^ (if pipelined then "pipelined" else "plain") ^ ": " ^
-                                node_name id ^ " (pending " ^ Int.toString pending ^
-                                ", free " ^ Int.toString free ^ ")");
-                if pipelined then
-                  (Array.update (plain_started, id, false);
-                   start_attempt id (new_gen ()) (Binaryset.empty int_compare))
-                else (mark_active_node id; SOME (PlainWork id))
-              end
-            else
-              (mark_active_node id;
-               if priority then priority_running := !priority_running + 1 else ();
-               SOME (PlainWork id))
-        | NONE => NONE
+    (* The best-ranked queued attempt still current. *)
+    fun best_attempt () =
+      let
+        fun current (id, gen) =
+          not (Array.sub (committed, id)) andalso not (Array.sub (skipped, id)) andalso
+          (case Array.sub (attempt, id) of AQueued (g, _) => g = gen | _ => false)
+        val _ = attempt_queue := List.filter current (!attempt_queue)
+      in
+        Option.map #1 (best_matching (fn _ => true) (map #1 (!attempt_queue)))
+      end
 
+    fun take_attempt id =
+      case (List.find (fn (queued, _) => queued = id) (!attempt_queue), Array.sub (attempt, id)) of
+          (SOME (_, gen), AQueued (_, consumed)) =>
+            (attempt_queue := List.filter (fn (queued, _) => queued <> id) (!attempt_queue);
+             start_attempt id gen consumed [])
+        | _ => NONE
+
+    (* The late parents of theory ID, if it can start its attempt ahead of
+       them now. *)
+    fun ahead_of id =
+      let val deps = Array.sub (deps_of, id)
+      in
+        if Array.sub (no_ahead, id) orelse not (List.all (fn d => available d orelse late_parent d) deps) then NONE
+        else
+          case List.filter (not o available) deps of
+              [] => NONE
+            | late =>
+                if not (speculable id) then NONE
+                else
+                  let
+                    val cut =
+                      case Array.sub (ahead_cuts_off, id) of
+                          SOME known => known
+                        | NONE => let val known = cuts_off id in Array.update (ahead_cuts_off, id, SOME known); known end
+                  in
+                    if cut then NONE else SOME late
+                  end
+      end
+
+    (* The best-ranked theory that can start its attempt ahead of its late
+       parents, if one may start. *)
+    fun best_ahead () =
+      (* Under machine memory admission a child waiting ahead would hold a
+         lease its late parent's build may need. *)
+      if not pipelining orelse Option.isSome (!HolbuildMachineMemory.settings) orelse
+         length (!waiting_ahead) >= ahead_cap orelse jobs - !running <= 1 then NONE
+      else
+        let
+          fun waits id =
+            not (Array.sub (committed, id)) andalso not (Array.sub (skipped, id)) andalso
+            not (Array.sub (plain_started, id)) andalso Array.sub (remaining_deps, id) > 0 andalso
+            (case Array.sub (attempt, id) of ANone => true | _ => false)
+          val (kept, gone) = List.partition waits (!ahead_candidates)
+          val _ = List.app (fn id => Array.update (ahead_listed, id, false)) gone
+          val _ = ahead_candidates := kept
+        in
+          Option.map #1 (best_matching (Option.isSome o ahead_of) kept)
+        end
+
+    fun start_ahead id =
+      case ahead_of id of
+          NONE => NONE
+        | SOME late =>
+            let
+              val gen = new_gen ()
+              (* The outlines a late parent's outline will load; one with
+                 no attempt running comes built, loading none. *)
+              fun consumed_of p =
+                case Array.sub (attempt, p) of
+                    ARunning (_, consumed) => consumed
+                  | _ => Binaryset.empty int_compare
+              val consumed =
+                List.foldl (fn (p, acc) => Binaryset.union (acc, consumed_of p))
+                  (consumed_by (Array.sub (deps_of, id))) late
+            in
+              waiting_ahead := (gen, length late) :: !waiting_ahead;
+              Array.update (started_ahead, id, true);
+              pipeline_trace ("dispatch ahead: " ^ node_name id ^ " (late " ^
+                              String.concatWith ", " (map node_name late) ^ ")");
+              start_attempt id gen consumed (map (fn p => (p, producer p)) late)
+            end
+
+    (* A ready node, pipelined if a child could start on its outline and a
+       worker would still be left over once every ready node ranked as high
+       had one.  The commit and outline queues are empty here, and running
+       doesn't count this worker yet. *)
+    fun dispatch_ready (id, priority) =
+      if pipelining andalso speculable id then
+        let
+          val free = jobs - !running
+          val ahead_of_it = length (List.filter (fn r => depth r >= depth id) (!ready))
+          val pipelined = outlinable id andalso has_eligible_child id andalso 1 + ahead_of_it < free
+        in
+          pipeline_trace ("dispatch " ^ (if pipelined then "pipelined" else "plain") ^ ": " ^
+                          node_name id ^ " (ranked ahead " ^ Int.toString ahead_of_it ^
+                          ", free " ^ Int.toString free ^ ")");
+          if pipelined then
+            (Array.update (plain_started, id, false);
+             start_attempt id (new_gen ()) (Binaryset.empty int_compare) [])
+          else (mark_active_node id; dispatched id;
+                SOME (PlainWork id))
+        end
+      else
+        (mark_active_node id;
+         dispatched id;
+         if priority then priority_running := !priority_running + 1 else ();
+         SOME (PlainWork id))
+
+    (* Commits, then outlines, then the deepest of the best-ranked ready
+       node, queued attempt and attempt that can start ahead, in that order
+       on equal depth.  A retained failure's replay goes first. *)
     fun pop_work () =
       case pop_commit () of
           SOME work => SOME work
         | NONE =>
             case pop_outline () of
                 SOME work => SOME work
-              | NONE => case pop_plain () of SOME work => SOME work | NONE => pop_attempt ()
+              | NONE =>
+                  let
+                    (* A retained failure's focus prerequisites go before any speculation. *)
+                    val focused = !priority_mode andalso !priority_focus_remaining > 0
+                    val ready_pick = pop_ready ()
+                    val first = case ready_pick of SOME (_, priority) => priority orelse focused | NONE => false
+                    val attempt_pick = best_attempt ()
+                    val ahead_pick = if first then NONE else best_ahead ()
+                    fun beats (SOME a) (SOME b) = depth a > depth b
+                      | beats (SOME _) NONE = true
+                      | beats NONE _ = false
+                    fun put_back () = Option.app (fn (id, _) => add_ready id) ready_pick
+                    val ready_id = Option.map #1 ready_pick
+                  in
+                    if first then dispatch_ready (valOf ready_pick)
+                    else if beats attempt_pick ready_id andalso not (beats ahead_pick attempt_pick) then
+                      (put_back (); take_attempt (valOf attempt_pick))
+                    else if beats ahead_pick ready_id andalso beats ahead_pick attempt_pick then
+                      (put_back (); start_ahead (valOf ahead_pick))
+                    else
+                      case ready_pick of
+                          SOME pick => dispatch_ready pick
+                        | NONE => NONE
+                  end
 
     fun next_work_locked () =
             if !stopped orelse (#fail_fast options andalso not (null (!failures))) then NONE
@@ -6900,18 +7444,6 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
 
     fun next_work () = with_lock next_work_locked
 
-    fun available id =
-      Array.sub (committed, id) orelse (case Array.sub (outline, id) of OReady _ => true | _ => false)
-
-    fun consumed_by deps =
-      List.foldl
-        (fn (dep, acc) =>
-            if Array.sub (committed, dep) then acc
-            else case Array.sub (outline, dep) of
-                     OReady (_, _, consumed) => Binaryset.add (Binaryset.union (acc, consumed), dep)
-                   | _ => acc)
-        (Binaryset.empty int_compare) deps
-
     fun stop_owner owners id gen =
       case Array.sub (owners, id) of
           SOME (owner_gen, thread) =>
@@ -6924,8 +7456,9 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
        or outlined: a library's outline; while some are only outlined, a
        theory's speculative attempt, queued.  Once they are all committed,
        its build: a commit of its attempt, if it has one, or the ready
-       queue, where pop_plain decides whether to pipeline it.  An attempt
-       still queued then is withdrawn.
+       queue, where dispatch_ready decides whether to pipeline it.  An
+       attempt still queued then stays queued if a child could load its
+       outline, on its built parents; otherwise it is withdrawn.
 
        A theory that would cut off early runs no HOL, so it gets no attempt:
        not while every theory outline it would load exports what that
@@ -6937,6 +7470,8 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
       if Array.sub (committed, id) orelse Array.sub (skipped, id) then ()
       else
         let
+          (* A parent's outline or commit can change whether it cuts off. *)
+          val _ = Array.update (ahead_cuts_off, id, NONE)
           val deps = Array.sub (deps_of, id)
           val all_available = pipelining andalso List.all available deps
           val _ =
@@ -6969,6 +7504,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                           attempt_queue := !attempt_queue @ [(id, gen)]
                         end
                     end
+                  else if pipelining andalso Array.sub (remaining_deps, id) > 0 then note_ahead_candidate id
                   else ()
               | _ => ()
           fun make_ready () =
@@ -6983,7 +7519,11 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                   (Array.update (plain_started, id, true);
                    commit_queue := !commit_queue @ [(id, result)])
               | ARunning _ => ()
-              | AQueued _ => (Array.update (attempt, id, ANone); make_ready ())
+              | AQueued (gen, _) =>
+                  (* An attempt on the spine stays queued, on built parents. *)
+                  if outlinable id andalso not (cuts_off id) then
+                    Array.update (attempt, id, AQueued (gen, Binaryset.empty int_compare))
+                  else (Array.update (attempt, id, ANone); make_ready ())
               | _ => make_ready ()
         end
 
@@ -7013,7 +7553,10 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
               (Array.update (outline, id, ONone); pipeline_trace ("dropped outline: " ^ node_name id))
             else ();
             if attempt_hit then
-              (Array.update (attempt, id, ANone); pipeline_trace ("dropped attempt: " ^ node_name id))
+              (Array.update (attempt, id, ANone);
+               (* An attempt started ahead doesn't start ahead again. *)
+               if Array.sub (started_ahead, id) then Array.update (no_ahead, id, true) else ();
+               pipeline_trace ("dropped attempt: " ^ node_name id))
             else ();
             outline_hit orelse attempt_hit
           end
@@ -7196,7 +7739,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
             in with_lock (fn () => Array.update (cold, id, SOME value)); value end
 
     fun speculate run =
-      run () handle e => Failed (build_error_message e)
+      run () handle AheadAbandoned msg => Abandoned msg | e => Failed (build_error_message e)
 
     fun finish_outline_locked id gen base outcome =
       (running := !running - 1;
@@ -7212,6 +7755,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                         pipeline_trace ("outline ready: " ^ node_name id);
                         List.app consider_locked (Array.sub (dependents, id)))
                    | NotCold => Array.update (outline, id, OOff)
+                   | Abandoned _ => Array.update (outline, id, OOff)
                    | Failed msg =>
                        (Array.update (outline, id, OOff);
                         #outline_failures counts := !(#outline_failures counts) + 1;
@@ -7224,14 +7768,18 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
         fun drop () = case outcome of Succeeded {stage_root, ...} => remove_tree stage_root | _ => ()
       in
         running := !running - 1;
+        waiting_ahead := List.filter (fn (g, _) => g <> gen) (!waiting_ahead);
         (case Array.sub (attempt, id) of
              ARunning (current, consumed) =>
                if current <> gen orelse speculation_stopped_locked () orelse Array.sub (skipped, id) then drop ()
                else
                  (Array.update (attempt_owner, id, NONE);
-                  (* An outline it never published won't come. *)
+                  (* An outline it never published won't come, unless the
+                     theory starts over. *)
                   (case Array.sub (outline, id) of
-                       ORunning (g, _) => if g = gen then Array.update (outline, id, OOff) else ()
+                       ORunning (g, _) =>
+                         if g <> gen then ()
+                         else Array.update (outline, id, case outcome of Abandoned _ => ONone | _ => OOff)
                      | _ => ());
                   case outcome of
                       Succeeded result =>
@@ -7250,7 +7798,11 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                          #attempt_failures counts := !(#attempt_failures counts) + 1;
                          let val key = HolbuildBuildPlan.input_key_for keys (Vector.sub (nodes, id))
                          in outline_skips := Binaryset.add (!outline_skips, key); add_outline_skip root key end;
-                         pipeline_trace ("attempt failed: " ^ node_name id ^ "\n" ^ msg));
+                         pipeline_trace ("attempt failed: " ^ node_name id ^ "\n" ^ msg))
+                    | Abandoned msg =>
+                        (Array.update (attempt, id, ANone);
+                         Array.update (no_ahead, id, true);
+                         pipeline_trace ("ahead abandoned: " ^ node_name id ^ " (" ^ msg ^ ")"));
                   consider_locked id)
            | _ => drop ());
         signal ()
@@ -7269,15 +7821,20 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
 
     (* The outline the pipelined build GEN of theory ID published in STAGE,
        installed for its dependents unless that build has been dropped. *)
-    fun publish_theory_outline id gen view stage =
+    fun publish_theory_outline id gen stage =
       let
         val base = Path.concat(run_dir, Int.toString gen)
         fun current () =
           not (speculation_stopped_locked ()) andalso
           (case Array.sub (outline, id) of ORunning (g, _) => g = gen | _ => false)
+        (* What the attempt loaded: its late parents' too, once arrived. *)
+        fun loaded () =
+          if current () then (case Array.sub (outline, id) of ORunning (_, consumed) => SOME (view_of consumed) | _ => NONE)
+          else NONE
       in
-        if not (with_lock current) then ()
-        else
+        case with_lock loaded of
+          NONE => ()
+        | SOME view =>
           case speculate (fn () => (install_theory_outline root plan (outline_view root view) stage base
                                       (Vector.sub (nodes, id));
                                     Succeeded ())) of
@@ -7307,8 +7864,71 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                                        (case outcome of Failed msg => "\n" ^ msg | _ => ""))))
       end
 
-    fun run_attempt id gen view =
+    (* For attempt GEN of theory ID, started ahead of its late parent P
+       while P's build PRODUCER (producer) ran: P's load stem once that
+       build has outlined P or P is built, after which the attempt has
+       loaded it.  Raises AheadAbandoned once the attempt is dropped or
+       that build of P is no longer running. *)
+    fun arrived id gen (p, p_producer) =
+      with_lock
+        (fn () =>
+            let
+              fun gone why = raise AheadAbandoned why
+              val stem = load_stem (Vector.sub (nodes, p))
+              val same_build =
+                case p_producer of
+                    SOME _ => producer p = p_producer
+                  | NONE => Array.sub (active_nodes, p) andalso producer p = NONE
+              fun note consumed =
+                (Array.update (attempt, id, ARunning (gen, consumed));
+                 (case Array.sub (outline, id) of
+                      ORunning (g, _) => if g = gen then Array.update (outline, id, ORunning (gen, consumed)) else ()
+                    | _ => ());
+                 waiting_ahead :=
+                   List.mapPartial (fn (g, n) => if g <> gen then SOME (g, n) else if n > 1 then SOME (g, n - 1) else NONE)
+                     (!waiting_ahead);
+                 pipeline_trace ("ahead arrived: " ^ node_name p ^ " for " ^ node_name id);
+                 signal ())
+              fun other consumed =
+                if Array.sub (committed, p) then (note consumed; SOME stem)
+                else if same_build then NONE
+                else gone ("the build of " ^ node_name p ^ " it started ahead of stopped")
+            in
+              case Array.sub (attempt, id) of
+                  ARunning (current, consumed) =>
+                    if current <> gen orelse speculation_stopped_locked () orelse Array.sub (skipped, id) then
+                      gone "the attempt was dropped"
+                    else
+                      (* An outline is what the attempt predicted P's
+                         manifest from; a built P comes only without one. *)
+                      (case Array.sub (outline, p) of
+                           OReady (g, base, outlined) =>
+                             if p_producer = SOME g then
+                               (note (Binaryset.add (Binaryset.union (consumed, outlined), p));
+                                SOME (outline_path root base stem))
+                             else other consumed
+                         | _ => other consumed)
+                | _ => gone "the attempt was dropped"
+            end)
+
+    fun run_attempt id gen view late =
       let
+        val node = Vector.sub (nodes, id)
+        val outlines = outline_view root view
+        val dir = Path.concat(run_dir, "ahead-" ^ Int.toString gen)
+        fun stand_in parent = outline_path root dir (load_stem parent)
+        val late_nodes = map (fn (p, _) => Vector.sub (nodes, p)) late
+        val ahead_view =
+          fn stem => case List.find (fn parent => load_stem parent = stem) late_nodes of
+                         SOME parent => SOME (stand_in parent)
+                       | NONE => outlines stem
+        val ahead =
+          if null late then NONE
+          else
+            SOME (load_ahead_locally
+                    {tc = tc, root = root, plan = plan, base_context = base_context, view = ahead_view, dir = dir,
+                     late = late_nodes, stand_in = stand_in, arrived = fn parent =>
+                       arrived id gen (valOf (List.find (fn (p, _) => p = node_id parent) late))})
         val outcome =
           speculate
             (fn () =>
@@ -7316,8 +7936,9 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                 else
                   Succeeded
                     (build_speculative options tc project base_context plan keys toolchain_key run_dir
-                       (outline_view root view) (Int.toString gen) (publish_theory_outline id gen view)
-                       (Vector.sub (nodes, id))))
+                       (if null late then outlines else ahead_view) (Int.toString gen)
+                       (publish_theory_outline id gen) ahead node))
+        val _ = if null late then () else remove_tree dir
       in
         with_lock (fn () => finish_attempt_locked id gen outcome)
       end
@@ -7360,7 +7981,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
           case next_work () of
               NONE => worker_exit ()
             | SOME (OutlineWork (id, gen, view)) => (run_outline id gen view; loop ())
-            | SOME (AttemptWork (id, gen, view)) => (run_attempt id gen view; loop ())
+            | SOME (AttemptWork (id, gen, view, late)) => (run_attempt id gen view late; loop ())
             | SOME (CommitWork (id, result)) =>
                 build id false
                   (fn node =>
@@ -12967,166 +13588,6 @@ fun publish_tool_cache remote store key dir restored =
 val ahead_wait_limit = ref (Time.fromSeconds 14400)
 val ahead_poll_interval = Time.fromSeconds 2
 
-fun ahead_runtime_path () = Path.concat (HolbuildRuntimePaths.runtime_root (), "sml/ahead_load_runtime.sml")
-
-(* The ML modules a script adds by a literal add_ML_dependency call; others
-   it may add are seen only once it has run. *)
-fun literal_ml_dependencies text =
-  let
-    val call = "add_ML_dependency"
-    fun scan rest names =
-      let val (_, found) = Substring.position call rest
-      in
-        if Substring.isEmpty found then rev names
-        else
-          let val after = Substring.dropl Char.isSpace (Substring.triml (size call) found)
-          in
-            if Substring.first after = SOME #"\"" then
-              let val (name, _) = Substring.splitl (fn c => c <> #"\"") (Substring.triml 1 after)
-              in scan after (Substring.string name :: names) end
-            else scan after names
-          end
-      end
-  in
-    unique_strings (scan (Substring.full text) [])
-  end
-
-(* The parent theories a .dat records, read from its header only. *)
-fun dat_parent_names path =
-  map #1 (Binarymap.listItems (parse_dat_parent_hashes (read_dat_header path)))
-
-(* The manifest lines a late parent's entry will have, predicted from its
-   spec before it is built: the theories its preload loads that no other of
-   them has as an ancestor, and the ML modules its script adds literally,
-   ordered as restore_spec_theory orders them.  The walk follows the loader
-   from BASE, the modules the child had loaded at its start, through the
-   manifests on disk (the action root's, the toolchain's and the parent's
-   libraries'), as the child's working directory CWD and load path find
-   them.  PARENTS memoizes each theory's recorded parents across calls; it
-   gets the parent's own predicted ones, for a later late parent whose walk
-   finds this one's stand-in, which has no .dat. *)
-fun predicted_theory_loads {root, cwd, holdir, base = {loaded, path}, resolve, parents_memo,
-                            parent : action_spec, source_text} =
-  let
-    fun subst entry =
-      if String.isPrefix "$(HOLDIR)" entry then holdir ^ String.extract (entry, size "$(HOLDIR)", NONE) else entry
-    fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
-    val lib_manifests = map (fn {stem, suffix, loads, ...} => (in_root root stem ^ suffix, map lib_load loads)) (#libs parent)
-    (* HOL's loader reads <dir>/x.ui from <dir>/.hol/objs/x.ui (HOL's
-       HFS_NameMunge); a toolchain built by recent HOL has it only there. *)
-    fun find module ext =
-      List.find file_exists
-        (List.concat
-           (map (fn dir =>
-                   let val file = Path.mkAbsolute {path = module ^ ext, relativeTo = Path.mkAbsolute {path = dir, relativeTo = cwd}}
-                   in [file, hfs_remapped_path file] end)
-                ("." :: path)))
-    fun manifest module ext =
-      case List.find (fn (file, _) => file = module ^ ext) lib_manifests of
-          SOME (_, lines) => lines
-        | NONE =>
-            case find module ext of
-                SOME file => String.tokens (fn c => c = #"\n") (read_text file)
-              | NONE => raise Error ("no load manifest " ^ module ^ ext)
-    fun is_file entry = has_suffix ".sml" entry orelse has_suffix ".sig" entry
-    val base = Binaryset.addList (Binaryset.empty String.compare, loaded)
-    val visited = ref (Binarymap.mkDict String.compare)
-    fun visit entry =
-      if is_file entry then ()
-      else
-        let
-          val module = subst entry
-          val name = Path.file module
-        in
-          if Binaryset.member (base, name) orelse Option.isSome (Binarymap.peek (!visited, name)) then ()
-          else (visited := Binarymap.insert (!visited, name, module);
-                List.app visit (manifest module ".ui" @ manifest module ".uo"))
-        end
-    fun load_arg (LoadTheory name) = name
-      | load_arg (LoadLibrary name) = name
-      | load_arg (LoadObject stem) = in_root root stem
-    val _ = List.app (visit o load_arg) (#loads parent)
-    fun parents name =
-      case Binarymap.peek (!parents_memo, name) of
-          SOME known => known
-        | NONE =>
-            let
-              val module = Option.getOpt (Binarymap.peek (!visited, name), name)
-              val found =
-                if not (has_suffix "Theory" name) then []
-                else
-                  case find module ".uo" of
-                      NONE => []
-                    | SOME uo =>
-                        let val dat = Path.base (FS.realPath uo) ^ ".dat"
-                        in if file_exists dat then map (fn p => p ^ "Theory") (dat_parent_names dat) else [] end
-            in
-              parents_memo := Binarymap.insert (!parents_memo, name, found);
-              found
-            end
-    val ancestors_memo = ref (Binarymap.mkDict String.compare)
-    fun ancestors name =
-      case Binarymap.peek (!ancestors_memo, name) of
-          SOME known => known
-        | NONE =>
-            let
-              val ps = parents name
-              val all = List.foldl (fn (p, set) => Binaryset.union (set, ancestors p))
-                                   (Binaryset.addList (Binaryset.empty String.compare, ps)) ps
-            in
-              ancestors_memo := Binarymap.insert (!ancestors_memo, name, all);
-              all
-            end
-    val theories =
-      List.filter (fn name => has_suffix "Theory" name andalso not (null (parents name)))
-                  (loaded @ map #1 (Binarymap.listItems (!visited)))
-    val inherited =
-      List.foldl (fn (name, set) => Binaryset.union (set, ancestors name)) (Binaryset.empty String.compare) theories
-    val fringe = List.filter (fn name => not (Binaryset.member (inherited, name))) theories
-    val _ = parents_memo := Binarymap.insert (!parents_memo, #logical parent, fringe)
-  in
-    generated_theory_loads resolve
-      {parents = map (drop_suffix "Theory") fringe, mldeps = literal_ml_dependencies source_text}
-  end
-
-(* The child's report of what its base context loaded and where it looks. *)
-fun read_base_report path =
-  let
-    val lines = String.tokens (fn c => c = #"\n") (read_text path)
-    fun field prefix = List.mapPartial (fn line => if String.isPrefix prefix line then SOME (String.extract (line, size prefix, NONE)) else NONE) lines
-  in
-    {loaded = field "loaded ", path = field "path "}
-  end
-
-(* The file the child evaluates first: the runtime, the recording loader and
-   LOAD_LINES under it, which pass through the stand-ins, and a last step
-   that waits for exec-action to write the files the child evaluates next. *)
-fun write_ahead_preload {load_lines, dir, share, path} =
-  let
-    val no_loader = HolbuildToolchain.sml_string "this toolchain's HOL has no Meta.loadPlan"
-    val lines =
-      runtime_line () ::
-      "val _ = if (case #lookupStruct PolyML.globalNameSpace \"Meta\" of NONE => false | SOME meta => " ^
-        "Option.isSome (#lookupVal (PolyML.NameSpace.Structures.contents meta) \"loadPlan\")) then () " ^
-        "else (HolbuildRuntime.write_text " ^ HolbuildToolchain.sml_string (Path.concat (dir, "abandoned")) ^
-        " " ^ no_loader ^ "; OS.Process.exit OS.Process.failure);" ::
-      "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (ahead_runtime_path ()) ^ ";" ::
-      if_meta_has ["moduleSourceLoader"]
-        ("val _ = let val loader = !Meta.moduleSourceLoader in " ^
-         "Meta.moduleSourceLoader := (fn use => fn file => (HolbuildAheadLoad.record file; loader use file)); " ^
-         "HolbuildAheadLoad.loader := Meta.load; " ^
-         "HolbuildAheadLoad.restore := (fn () => Meta.moduleSourceLoader := loader) end;") ::
-      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^ Bool.toString share ^ ";" ::
-      "structure HolbuildAheadPlainRuntime = HolbuildRuntime;" ::
-      "structure HolbuildRuntime = struct open HolbuildRuntime val load = HolbuildAheadLoad.load end;" ::
-      (load_lines @
-       ["val _ = HolbuildAheadLoad.finish ();",
-        (* The plain preload saves the heap later actions resume from. *)
-        "structure HolbuildRuntime = HolbuildAheadPlainRuntime;"])
-  in
-    write_text path (String.concatWith "\n" lines ^ "\n")
-  end
-
 (* Pipelining on remote workers (exec-action --pipeline, for a spec whose
    theory may pipeline): the theory builds as a pipelined build does
    locally, in one HOL process that defers its proofs.  Its outline goes to
@@ -13584,7 +14045,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                   SOME (key, dir, restored) =>
                     phase "toolpublish" (fn () => publish_tool_cache remote (share_store cache) key dir restored)
                 | NONE => ()
-            val _ = attached_child := Option.map #join ahead
+            val _ = set_attached_child (Option.map #join ahead)
             (* A pipelined run leaves its outputs in the stage. *)
             fun run_hol () =
               run_theory_action_checkpoints check_cancelled (if pipelined then SOME log_dir else NONE) true policy tc
@@ -13594,7 +14055,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                 if pipelined then with_outline_watch stage (fn () => publish_outline action policy stage) run_hol
                 else run_hol ())
               handle e =>
-                (attached_child := NONE;
+                (set_attached_child NONE;
                  deferred :=
                    (fn () =>
                       (publish_shared ();
@@ -13827,6 +14288,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
            else (OS.Process.sleep interval; wait_until ready interval))
         val resolver = spec_resolver (theory_spec_deps spec)
         fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
+        fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
         fun stand_in ({stem, ...} : {target : string, stem : string, key : string}, parent : action_spec) base parents_memo =
           let
             val name = Path.file stem
@@ -13838,20 +14300,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val predicted =
               predicted_theory_loads
                 {root = root, cwd = FS.fullPath stage, holdir = FS.fullPath (#holdir tc), base = base,
-                 resolve = resolve, parents_memo = parents_memo, parent = parent,
+                 resolve = resolve, parents_memo = parents_memo,
+                 parent = {logical = #logical parent, loads = #loads parent,
+                           lib_manifests = map (fn {stem, suffix, loads, ...} =>
+                                                  (in_root root stem ^ suffix, map lib_load loads))
+                                               (#libs parent)},
                  source_text = read_text parent_source}
-            val enter = marker (name ^ "-enter.sml")
-            val wait = marker (name ^ "-wait.sml")
-            val stem_path = in_root root stem
           in
-            write_text enter ("val _ = HolbuildAheadLoad.enter " ^ HolbuildToolchain.sml_string name ^ ";\n");
-            write_text wait
-              ("val _ = HolbuildAheadLoad.wait {parent = " ^ HolbuildToolchain.sml_string name ^
-               ", ui = " ^ HolbuildToolchain.sml_string (marker (name ^ ".ui")) ^
-               ", uo = " ^ HolbuildToolchain.sml_string (marker (name ^ ".uo")) ^ "};\n");
-            ensure_dir (Path.dir (hfs_remapped_path stem_path));
-            write_object_manifest (stem_path ^ ".ui") [];
-            write_object_manifest (stem_path ^ ".uo") (enter :: predicted @ [wait])
+            write_stand_in {dir = dir, name = name, stem = in_root root stem, predicted = predicted}
           end
           handle e as ActionFailed _ => raise e
                | e as HolbuildRemoteCache.Unavailable _ => raise e

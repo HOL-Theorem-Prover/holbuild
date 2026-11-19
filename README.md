@@ -1222,14 +1222,28 @@ Removed legacy interfaces:
 
 ### Pipelined builds
 
-A theory's children need its declarations, not its proofs. So when a local
-build with `-j` greater than 1 would otherwise leave a job slot idle, a cold
-theory builds *pipelined*:
+A theory's children need its declarations, not its proofs. So in a local
+build with `-j` greater than 1, a cold theory builds *pipelined* when a child
+of it could start on its outline (one whose other parents are built or being
+built) and a job slot would still be free once every ready theory at least as
+deep has one. Workers take the deepest work first: the longest chain of
+dependents below a theory. On equal depth, ready theories go first, then
+queued attempts, then attempts that can start early (below); within each,
+the theory with more descendants goes first.
+A pipelined theory:
 
 1. Its HOL process runs the script with each `Theorem ... Proof ... QED` proof
    deferred, and exports the theory. That export is the theory's *outline*.
 2. The theory's cold children start at once, loading the outline in place of
-   the finished theory.
+   the finished theory. A child can even start before the outline is out,
+   while a slot is idle: it loads its other ancestors and the parent's
+   predicted ones meanwhile, then the parent's outline (or outputs) once they
+   come, checking that they load exactly what was predicted: the same files
+   as a plain build, with the parent's signature after its dependencies. At most `-j` / 3 (up to 6) children wait like
+   this at once; one whose parent's build stops, or whose prediction was
+   wrong, is abandoned and builds later without starting early. With
+   `--cooperate-dir`, children don't start early: one waiting would hold a
+   memory reservation its parent's build may need.
 3. Meanwhile the deferred proofs run on up to 4 threads (at most `-j`;
    `HOLBUILD_PROOF_THREADS` overrides), each in the context its goal was
    stated in. The theory's data is then written with their dependencies and

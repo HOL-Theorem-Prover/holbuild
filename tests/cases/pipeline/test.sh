@@ -357,7 +357,9 @@ require_same_as_unpipelined cycle CTheory A B C
 
 # A cheat in scope: B's proof uses A's cheated theorem, so it carries the
 # cheat once proved, which an outline can't predict.  B publishes no outline,
-# and C builds on the committed B.
+# and C builds on the committed B: its attempt either waits for B's commit or,
+# started ahead of B on A's outline, finds the committed B loading the
+# committed A instead, is abandoned and builds plain.
 new_project withheld
 cat > "$tmpdir/withheld/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib;
@@ -387,7 +389,7 @@ require_grep "pipeline: gate passed: ATheory" "$log"
 require_grep "pipeline: outline withheld: BTheory (oracle cheat in theory A)" "$log"
 require_no_grep "outline ready: BTheory" "$log"
 require_no_grep "gate failed" "$log"
-require_before "committed: BTheory" "attempt done: CTheory" "$log"
+require_before "committed: BTheory" "attempt done: CTheory\\|dispatch plain: CTheory" "$log"
 require_same_as_unpipelined withheld CTheory A B C
 
 # The same from a cheat in A itself, in a [local] lemma whose proof does more
@@ -447,10 +449,25 @@ require_grep "pipeline: gate passed: ATheory" "$log"
 require_grep "pipeline: gate failed: BTheory (digest differs)" "$log"
 require_grep "pipeline: attempt done: CTheory" "$log"
 require_grep "pipeline: dropped attempt: CTheory" "$log"
-# C then builds again, on the committed B.
-require_before "dropped attempt: CTheory" "committed: CTheory" "$log"
+# C then builds again, on the committed B: plain, as it has no child to
+# start on its outline.
+require_before "dropped attempt: CTheory" "CTheory built" "$log"
 require_file "$tmpdir/digest/.holbuild/plan/outline-skip"
 require_same_as_unpipelined digest CTheory B C
+
+# The same with C started ahead of B: C's attempt took in what B's outline
+# loaded when B arrived, so B's failed gate still drops it.
+rm -rf "$tmpdir/digest-ahead"
+cp -r "$tmpdir/digest" "$tmpdir/digest-ahead"
+rm -rf "$tmpdir/digest-ahead/.holbuild"
+sed -i 's/^val _ = new_theory "B";$/val _ = new_theory "B";\nval _ = OS.Process.sleep (Time.fromSeconds 10);/' "$tmpdir/digest-ahead/src/BScript.sml"
+(cd "$tmpdir/digest-ahead" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --no-cache --skip-checkpoints --skip-proof-steps CTheory) \
+  > "$tmpdir/digest-ahead.log" 2>&1
+log=$tmpdir/digest-ahead.log
+require_grep "pipeline: dispatch ahead: CTheory (late BTheory)" "$log"
+require_before "pipeline: ahead arrived: BTheory for CTheory" "pipeline: gate failed: BTheory (digest differs)" "$log"
+require_before "pipeline: gate failed: BTheory" "pipeline: dropped attempt: CTheory" "$log"
+require_same_as_unpipelined digest-ahead CTheory B C
 
 # Only the numbering differs: A's proof saves a temporary theorem through an
 # alias, which shifts the save index of each later theorem but exports
@@ -591,7 +608,7 @@ write_b_and_c idle
 (cd "$tmpdir/idle" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j2 build --no-cache --skip-checkpoints --skip-proof-steps CTheory) \
   > "$tmpdir/idle.log" 2>&1
 log=$tmpdir/idle.log
-require_grep "pipeline: dispatch pipelined: ATheory (pending 1, free 2)" "$log"
+require_grep "pipeline: dispatch pipelined: ATheory (ranked ahead 0, free 2)" "$log"
 require_grep "pipeline: attempt done: BTheory" "$log"
 require_grep "pipeline: attempt done: CTheory" "$log"
 require_grep "pipeline: committed: CTheory" "$log"
@@ -600,8 +617,7 @@ require_no_grep "dispatch pipelined: [BC]Theory" "$log"
 require_same_as_unpipelined idle CTheory A B C
 
 # Under a backlog nothing is pipelined: six independent theories at -j2.
-# Each worker that takes one leaves at least as many ready as free, so each
-# builds plain, but for the last if both workers are free then.
+# None has a child that could start on its outline, so each builds plain.
 new_project backlog
 for t in R1 R2 R3 R4 R5 R6; do
   cat > "$tmpdir/backlog/src/${t}Script.sml" <<SML
@@ -620,8 +636,8 @@ done
 log=$tmpdir/backlog.log
 plain=$(grep -c "pipeline: dispatch plain: R" "$log" || true)
 pipelined=$(grep -c "pipeline: dispatch pipelined: R" "$log" || true)
-if (( plain < 5 || plain + pipelined != 6 )); then
-  echo "expected at least 5 of the 6 theories dispatched plain, got $plain plain and $pipelined pipelined" >&2
+if (( plain != 6 || pipelined != 0 )); then
+  echo "expected the 6 theories dispatched plain, got $plain plain and $pipelined pipelined" >&2
   cat "$log" >&2
   exit 1
 fi
@@ -629,6 +645,125 @@ require_no_grep "dispatch pipelined: .*free 1)" "$log"
 for t in $(sed -n 's/.*pipeline: dispatch plain: \([A-Za-z0-9]*\)Theory .*/\1/p' "$log"); do
   require_no_grep "attempt done: ${t}Theory" "$log"
 done
+
+# A worker is left over for a pipelined build only once every ready theory
+# ranked as high has one: three equally deep roots at -j3, each with a
+# child that could start on its outline.  The first dispatched sees two
+# more ranked as high with three workers free, so it builds plain.
+new_project ranked
+for t in R1 R2 R3; do
+  cat > "$tmpdir/ranked/src/${t}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$t";
+Theorem ${t}_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+  cat > "$tmpdir/ranked/src/${t}ChildScript.sml" <<SML
+open HolKernel Parse boolLib bossLib ${t}Theory;
+val _ = new_theory "${t}Child";
+Theorem ${t}Child_thm:
+  T
+Proof
+  ACCEPT_TAC ${t}Theory.${t}_thm
+QED
+val _ = export_theory();
+SML
+done
+(cd "$tmpdir/ranked" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j3 build --no-cache --skip-checkpoints --skip-proof-steps) \
+  > "$tmpdir/ranked.log" 2>&1
+log=$tmpdir/ranked.log
+require_grep "pipeline: dispatch plain: R[123]Theory (ranked ahead 2, free 3)" "$log"
+
+# The child must be able to start: K needs P and Q, and Q waits on S, which
+# heads the deeper chain and goes first.  When P is dispatched Q has no
+# build yet, so K couldn't start on P's outline and P builds plain, though
+# workers are free.
+new_project eligible
+write_eligible() {
+  local name=$1
+  shift
+  local opens=""
+  for dep in "$@"; do opens="$opens ${dep}Theory"; done
+  cat > "$tmpdir/eligible/src/${name}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib$opens;
+val _ = new_theory "$name";
+Theorem ${name}_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+}
+write_eligible S
+write_eligible Q S
+write_eligible P
+write_eligible K P Q
+(cd "$tmpdir/eligible" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j3 build --no-cache --skip-checkpoints --skip-proof-steps) \
+  > "$tmpdir/eligible.log" 2>&1
+log=$tmpdir/eligible.log
+require_before "pipeline: dispatch [a-z]*: STheory" "pipeline: dispatch [a-z]*: PTheory" "$log"
+require_grep "pipeline: dispatch plain: PTheory (ranked ahead 0, free 2)" "$log"
+require_grep "KTheory built" "$log"
+
+# Ranking: at -j3, Bushy and Forked head chains two links long, Bushy with
+# one child but four descendants, Forked with two children but three; Wide
+# and Narrow head one link (two children and one), and Leaf none.  Workers
+# take Bushy (more descendants, not children), then Forked, then Wide, then
+# Narrow; Bushy is pipelined, since of the other ready roots only Forked
+# ranks as high and counts against its spare worker.
+new_project order
+write_root() {
+  local name=$1
+  shift
+  local opens=""
+  for dep in "$@"; do opens="$opens ${dep}Theory"; done
+  cat > "$tmpdir/order/src/${name}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib$opens;
+val _ = new_theory "$name";
+Theorem ${name}_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+}
+write_root Bushy
+write_root Bushy1 Bushy
+write_root Bushy2 Bushy1
+write_root Bushy3 Bushy1
+write_root Bushy4 Bushy1
+write_root Forked
+write_root Forked1 Forked
+write_root Forked2 Forked
+write_root Forked3 Forked1
+write_root Fan
+write_root Fan1 Fan
+write_root Fan2 Fan
+write_root Fan3 Fan
+write_root Fan4 Fan
+write_root Wide
+write_root Wide1 Wide
+write_root Wide2 Wide
+write_root Narrow
+write_root Narrow1 Narrow
+write_root Leaf
+(cd "$tmpdir/order" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j3 build --no-cache --skip-checkpoints --skip-proof-steps) \
+  > "$tmpdir/order.log" 2>&1
+log=$tmpdir/order.log
+require_grep "pipeline: dispatch pipelined: BushyTheory (ranked ahead 1, free 3)" "$log"
+require_before "pipeline: dispatch [a-z]*: BushyTheory" "pipeline: dispatch [a-z]*: ForkedTheory" "$log"
+# Depth before descendants: Fan has more descendants than Forked, but is
+# shallower.
+require_before "pipeline: dispatch [a-z]*: ForkedTheory" "pipeline: dispatch [a-z]*: FanTheory" "$log"
+require_before "pipeline: dispatch [a-z]*: FanTheory" "pipeline: dispatch [a-z]*: WideTheory" "$log"
+require_before "pipeline: dispatch [a-z]*: WideTheory" "pipeline: dispatch [a-z]*: NarrowTheory" "$log"
+require_before "pipeline: dispatch [a-z]*: NarrowTheory" "pipeline: dispatch [a-z]*: LeafTheory" "$log"
 
 # Early cutoff: a theory whose dependencies' outputs end up as they were runs
 # no HOL, so no attempt.  A's proof edit leaves its outline what A's outputs
@@ -669,3 +804,141 @@ require_grep "pipeline: gate failed: ATheory (digest differs)" "$log"
 require_no_grep "early cutoff: [BC]Theory " "$log"
 require_grep "BTheory built" "$log"
 require_grep "CTheory built" "$log"
+
+# Loading ahead: C starts its attempt while B's still runs its script, B's
+# outline not yet published, and loads everything else meanwhile, then B's
+# outline once it comes.  Its outputs are those of a plain build.
+new_project ahead
+cat > "$tmpdir/ahead/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem a_thm:
+  T
+Proof
+  $slow_truth
+QED
+val _ = export_theory();
+SML
+cat > "$tmpdir/ahead/src/BScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib ATheory;
+val _ = new_theory "B";
+val _ = OS.Process.sleep (Time.fromSeconds 10);
+Theorem b_thm:
+  T /\ T
+Proof
+  CONJ_TAC >> ACCEPT_TAC ATheory.a_thm
+QED
+val _ = export_theory();
+SML
+cat > "$tmpdir/ahead/src/CScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib BTheory;
+val _ = new_theory "C";
+Theorem c_thm:
+  T /\ T
+Proof
+  ACCEPT_TAC BTheory.b_thm
+QED
+val _ = export_theory();
+SML
+build_pipelined ahead CTheory
+log=$tmpdir/ahead.log
+require_grep "pipeline: dispatch ahead: CTheory (late BTheory)" "$log"
+# C's child has loaded B's predicted ancestors (A) and waits at B's
+# stand-in before B's outline is out.
+require_before "pipeline: ahead waiting: CTheory for BTheory" "pipeline: outline ready: BTheory" "$log"
+require_grep "pipeline: ahead arrived: BTheory for CTheory" "$log"
+require_grep "pipeline: attempt done: CTheory" "$log"
+require_grep "pipeline: committed: CTheory" "$log"
+require_no_grep "ahead abandoned" "$log"
+require_same_as_unpipelined ahead CTheory A B C
+
+# Chained: D starts ahead of C only once C, itself started ahead of B, has
+# loaded B's outline, so D predicts C's loads from what C really loaded.
+rm -rf "$tmpdir/ahead-chain"
+cp -r "$tmpdir/ahead" "$tmpdir/ahead-chain"
+rm -rf "$tmpdir/ahead-chain/.holbuild"
+cat > "$tmpdir/ahead-chain/src/CScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib BTheory;
+val _ = new_theory "C";
+val _ = OS.Process.sleep (Time.fromSeconds 10);
+Theorem c_thm:
+  T /\ T
+Proof
+  ACCEPT_TAC BTheory.b_thm
+QED
+val _ = export_theory();
+SML
+cat > "$tmpdir/ahead-chain/src/DScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib CTheory;
+val _ = new_theory "D";
+Theorem d_thm:
+  T /\ T
+Proof
+  ACCEPT_TAC CTheory.c_thm
+QED
+val _ = export_theory();
+SML
+# -j6, so two children may wait ahead at once and only the rule holds D back.
+(cd "$tmpdir/ahead-chain" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j6 build --no-cache --skip-checkpoints --skip-proof-steps DTheory) \
+  > "$tmpdir/ahead-chain.log" 2>&1
+log=$tmpdir/ahead-chain.log
+require_before "pipeline: ahead arrived: BTheory for CTheory" "pipeline: dispatch ahead: DTheory (late CTheory)" "$log"
+require_grep "pipeline: committed: DTheory" "$log"
+require_no_grep "ahead abandoned" "$log"
+require_same_as_unpipelined ahead-chain DTheory A B C D
+
+# Under machine memory cooperation nothing starts ahead, since a child
+# waiting ahead would hold a lease its late parent may need; C still
+# pipelines on B's outline.
+rm -rf "$tmpdir/ahead-coop"
+cp -r "$tmpdir/ahead" "$tmpdir/ahead-coop"
+rm -rf "$tmpdir/ahead-coop/.holbuild"
+# Plenty of memory and no cgroup limit, so admission depends on the
+# reservations alone, not on what the test machine has free.
+printf 'MemTotal:        67108864 kB\nMemAvailable:    67108864 kB\n' > "$tmpdir/plenty-meminfo"
+(cd "$tmpdir/ahead-coop" && HOLBUILD_TEST_MEMINFO=$tmpdir/plenty-meminfo HOLBUILD_TEST_CGROUP= \
+   HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --no-cache --skip-checkpoints --skip-proof-steps \
+   --cooperate-dir "$tmpdir/ahead-coop-dir" --child-charge 256 CTheory) > "$tmpdir/ahead-coop.log" 2>&1
+log=$tmpdir/ahead-coop.log
+require_no_grep "pipeline: dispatch ahead" "$log"
+require_grep "pipeline: outline ready: BTheory" "$log"
+require_grep "pipeline: attempt done: CTheory" "$log"
+require_grep "pipeline: committed: CTheory" "$log"
+
+# Abandoning: B loads a theory its source doesn't name, so C's child, which
+# loaded B's predicted manifest and waits at its stand-in, finds B's real
+# load differs and is abandoned.  C then builds without starting ahead
+# again, and nothing is remembered against it.
+rm -rf "$tmpdir/ahead-abandon"
+cp -r "$tmpdir/ahead" "$tmpdir/ahead-abandon"
+rm -rf "$tmpdir/ahead-abandon/.holbuild"
+cat > "$tmpdir/ahead-abandon/src/BScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib ATheory;
+val _ = load (String.concat ["gcd", "Theory"]);
+val _ = new_theory "B";
+val _ = OS.Process.sleep (Time.fromSeconds 10);
+Theorem b_thm:
+  T /\ T
+Proof
+  CONJ_TAC >> ACCEPT_TAC ATheory.a_thm
+QED
+val _ = export_theory();
+SML
+(cd "$tmpdir/ahead-abandon" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j4 build --no-cache --skip-checkpoints --skip-proof-steps CTheory) \
+  > "$tmpdir/ahead-abandon.log" 2>&1
+log=$tmpdir/ahead-abandon.log
+require_before "pipeline: ahead waiting: CTheory for BTheory" "pipeline: ahead abandoned: CTheory" "$log"
+require_grep "pipeline: ahead abandoned: CTheory (.*evaluated other files than its manifest names" "$log"
+starts=$(grep -c "pipeline: dispatch ahead: CTheory" "$log" || true)
+if (( starts != 1 )); then
+  echo "expected C to start ahead once, got $starts" >&2
+  cat "$log" >&2
+  exit 1
+fi
+require_grep "pipeline: committed: CTheory\\|CTheory built" "$log"
+if [[ -s "$tmpdir/ahead-abandon/.holbuild/plan/outline-skip" ]]; then
+  echo "an abandoned load ahead left an outline-skip entry" >&2
+  cat "$tmpdir/ahead-abandon/.holbuild/plan/outline-skip" >&2
+  exit 1
+fi
+require_same_as_unpipelined ahead-abandon CTheory A B C
