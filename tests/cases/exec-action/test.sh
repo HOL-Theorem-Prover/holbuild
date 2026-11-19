@@ -666,26 +666,21 @@ worker c "$spec_a2"
 expect c 0
 [[ ! -e "$orphan" ]] || { echo "worker c kept extra outputs nobody records" >&2; exit 1; }
 require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
-# A parked dependency's extra outputs wait with it and come back with it.
+# Parking leaves a dependency's extra outputs in the root, where a hydrate
+# that wants no theory of its key removes them; then it's installed again.
 worker c "$spec_missing_rss"
 expect c 0
 parked_a="$tmpdir/worker-c/action-parked${stem_a#"$tmpdir/worker-c/action"}"
 [[ ! -e "$stem_a.dat" && -e "$parked_a.dat" && ! -e "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a" ]] || {
-  echo "worker c didn't park A with its extra outputs" >&2; exit 1; }
-require_file "$tmpdir/worker-c/action-parked/.holbuild/action-extra/$key_a/results/A.nsv"
+  echo "worker c didn't park A, or kept its extra outputs" >&2; exit 1; }
+[[ ! -e "$tmpdir/worker-c/action-parked/.holbuild/action-extra" ]] || {
+  echo "worker c parked extra outputs" >&2; exit 1; }
 worker c "$spec_a2"
 expect c 0
 require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
-[[ ! -e "$tmpdir/worker-c/action-parked/.holbuild/action-extra/$key_a" ]] || {
-  echo "worker c left A's extra outputs parked" >&2; exit 1; }
-# Extra outputs lie under the key, which another stem may share and have
-# taken meanwhile: a parked theory whose extra outputs went is installed.
-worker c "$spec_missing_rss"
-expect c 0
-rm -r "$tmpdir/worker-c/action-parked/.holbuild/action-extra/$key_a"
-worker c "$spec_a2"
-expect c 0
-require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
+[[ -e "$stem_a.dat" && ! -e "$parked_a.dat" ]] || { echo "worker c didn't install A again" >&2; exit 1; }
+grep -qE "^phase-ms=(.*,)?hydinstn:[1-9][0-9]*(,|\$)" "$tmpdir/c.result" || {
+  echo "worker c took A back without its extra outputs" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
 # Nor does parking another stem of A's key (a package copy, say) take the
 # extra outputs A keeps using.
 awk -F'\t' -v OFS='\t' -v stem="$stem_a" -v other="$tmpdir/worker-c/action/.holbuild/obj/other/ATheory" \
@@ -705,6 +700,14 @@ stem_a=$(resident_stem 'ATheory$')
 stem_b=$(resident_stem 'BTheory$')
 [[ -n "$stem_a" && -n "$stem_b" && $(dirname "$stem_a") == $(dirname "$stem_b") ]] || {
   cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
+# Removing a stale copy keeps the extra outputs of a key a kept dependency
+# shares.
+awk -F'\t' -v OFS='\t' -v stem="$stem_b" -v key="$key_a" '$1 == "theory" && $2 == stem { $4 = key } { print }' \
+  "$tmpdir/worker-c/action-resident" > "$tmpdir/b-as-a.records"
+mv "$tmpdir/b-as-a.records" "$tmpdir/worker-c/action-resident"
+worker c "$spec_c"
+expect c 0
+require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
 inode_a=$(stat -c %i "$stem_a.dat")
 inode_b=$(stat -c %i "$stem_b.dat")
 ln -f "$stem_a.dat" "$tmpdir/a-held.dat"
