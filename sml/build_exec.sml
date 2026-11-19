@@ -7905,11 +7905,30 @@ fun fetch_remote_build_log project node log_sha256 =
     log_sha256
 
 (* Fetch a worker's log that no theory of the plan is known to own to a path
-   named for its hash, leaving the theories' own logs alone. *)
+   named for its hash, leaving the theories' own logs alone.  The hash comes
+   from the coordinator, so a malformed one touches no file. *)
 fun fetch_remote_batch_log project log_sha256 =
-  fetch_remote_log
-    (Path.concat(Path.concat(project_artifact_root project, ".holbuild/logs/remote"), log_sha256 ^ ".log"))
-    log_sha256
+  if not (HolbuildHash.valid_sha256 log_sha256)
+  then raise Error ("the coordinator named a malformed log hash: " ^ log_sha256)
+  else
+    fetch_remote_log
+      (Path.concat(Path.concat(project_artifact_root project, ".holbuild/logs/remote"), log_sha256 ^ ".log"))
+      log_sha256
+
+(* Print THEORY's worker log, which no theory of the plan is known to own; one
+   that can't be fetched is warned of. *)
+fun report_batch_log project theory log_sha256 =
+  let
+    fun warn_log reason = warn ("remote execution: could not fetch the build log of " ^ theory ^ ": " ^ reason)
+  in
+    (case fetch_remote_batch_log project log_sha256 of
+         SOME path => HolbuildStatus.message_stderr (child_log_detail path ^ "\n")
+       | NONE => warn_log "the remote cache doesn't hold it")
+    handle HolbuildRemoteCache.Unavailable reason => warn_log reason
+         | Error reason => warn_log reason
+         | OS.SysErr (reason, _) => warn_log reason
+         | e as IO.Io _ => warn_log (General.exnMessage e)
+  end
 
 (* The logs of the theories a failed batch finished, for what they report
    (such as a proof step that passed on its retry).  They are optional: one

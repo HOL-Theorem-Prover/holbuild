@@ -1402,6 +1402,16 @@ require_grep "remote execution: batch $batch cancelled; theories that write SML 
   "$tmpdir/stopped-gen.log"
 refute_grep "^POST" "$state/requests.log"
 refute_grep "GenTheory built\|BTheory built\|restored from cache" "$tmpdir/stopped-gen.log"
+# Attached for a target set its stopped theory isn't in, the log is printed
+# under its hash all the same.
+write_broken stopped-narrow
+run stopped-narrow-detach 0 build --remote-exec "$coordinator" --detach BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/stopped-narrow-detach.log")
+touch "$state/stopped"
+run stopped-narrow 1 build --remote-exec "$coordinator" --remote-only --attach "$batch" ATheory
+rm "$state/stopped"
+require_grep "child log: .*/.holbuild/logs/remote/[0-9a-f]*\\.log" "$tmpdir/stopped-narrow.log"
+require_grep "b_thm" "$tmpdir/stopped-narrow.log"
 
 # A static error and a tactic timeout are reported from the worker's log too.
 write_failing_b() {

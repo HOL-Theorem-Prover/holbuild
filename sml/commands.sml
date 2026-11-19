@@ -1982,7 +1982,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               in
                 follow_batch ()
               end)
-            fun report_failed_log ({input_key, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
+            fun report_failed_log ({input_key, theory, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
               case log_sha256 of
                   NONE => ()
                 | SOME sha =>
@@ -1992,7 +1992,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                           input_key ^ ": " ^ reason)
                     in
                       (case node_with_input_key input_key of
-                           NONE => warn_log "the action is not in the current plan"
+                           NONE => HolbuildBuildExec.report_batch_log project theory sha
                          | SOME node =>
                              case HolbuildBuildExec.fetch_remote_build_log project node sha of
                                  NONE => HolbuildBuildExec.warn
@@ -2273,11 +2273,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   NONE => ()
                 | SOME sha =>
                     (HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ kind ^ "; its worker log:\n");
-                     case HolbuildBuildExec.fetch_remote_batch_log project sha of
-                         SOME path => HolbuildStatus.message_stderr (HolbuildBuildExec.child_log_detail path ^ "\n")
-                       | NONE => HolbuildBuildExec.warn ("remote execution: could not fetch the build log of " ^ theory))
-                    handle HolbuildRemoteCache.Unavailable why =>
-                             HolbuildBuildExec.warn ("remote execution: could not fetch the build log of " ^ theory ^ ": " ^ why)
+                     HolbuildBuildExec.report_batch_log project theory sha)
             val (ended, failed) =
               case outcome of
                   HolbuildRemoteExec.Done => ("finished", false)
