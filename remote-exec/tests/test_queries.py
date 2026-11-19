@@ -674,6 +674,30 @@ async def test_with_only_its_plain_claims_outlined_the_fresh_batch_is_at_its_cap
     assert candidates and all(row.outlined for row in candidates)
 
 
+
+@pytest.mark.parametrize("nested_loops", [False, True], ids=["default", "nested-loops"])
+async def test_below_its_cap_with_no_outlines_the_fresh_batch_s_candidates_handle_few_rows(
+    fleet: Fleet, nested_loops: bool
+) -> None:
+    """AHEAD_CANDIDATES with pipelining off, on ``fresh`` below a cap of 64 with its actions claimed ahead waiting:
+    the plan reads the batch's waiting actions and the generations below them within the statement's budget."""
+    async with fleet.engine.begin() as connection:
+        await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
+        if nested_loops:
+            await connection.execute(sa.text("SET LOCAL enable_hashjoin = off"))
+            await connection.execute(sa.text("SET LOCAL enable_mergejoin = off"))
+        await connection.execute(sa.text("UPDATE batches SET ahead_cap = 64 WHERE id = :id"), {"id": fleet.fresh})
+        parameters = {"depth": 2, "outlined": []}
+        waiting = await connection.scalar(cm.COUNT_WAITING_AHEAD, {"batch_id": fleet.fresh, "outlined": []})
+        rows = (await connection.execute(cm.AHEAD_CANDIDATES, parameters)).all()
+        plan = await connection.scalar(
+            sa.text(f"EXPLAIN (ANALYZE, FORMAT JSON) {cm.AHEAD_CANDIDATES.text}"), parameters
+        )
+        await connection.rollback()
+    assert 0 < waiting < 64
+    assert any(row.batch_id == fleet.fresh for row in rows)
+    assert 0 < round(handled(plan[0]["Plan"])) <= 120_000
+
 def test_every_statement_has_a_budget() -> None:
     """Each statement of the coordinator is in STATEMENTS once, and each entry of STATEMENTS is one statement."""
     module, inline = module_statements(), inline_statements()
