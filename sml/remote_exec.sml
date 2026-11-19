@@ -17,7 +17,9 @@ type action_failure = {input_key : string, theory : string, kind : string, log_s
 
 datatype outcome = Done
                  | Failed of string * action_failure list
-                 | Cancelled of action_failure list (* someone cancelled the batch; its stopped actions with a worker log *)
+                 | Cancelled of action_failure list * action_failure list
+                   (* someone cancelled the batch: its stopped actions with a
+                      worker log, and the actions that had failed before *)
                  | Unfollowable of string (* the coordinator won't stream it; it may still run *)
                  | Unreachable of string  (* the coordinator couldn't be asked *)
 
@@ -263,6 +265,12 @@ fun follow url batch_id (on_change : string * string * string option * string op
         if state = "failed" orelse (state = "cancelled" andalso kind = SOME "deadline") then
           SOME {input_key = key, theory = name key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
         else NONE) (rev (!states))
+    (* Actions that failed, which a batch cancelled afterwards still holds. *)
+    fun failed () =
+      List.mapPartial (fn (key, (state, kind, log)) =>
+        if state = "failed" then
+          SOME {input_key = key, theory = name key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
+        else NONE) (rev (!states))
     (* An action stopped by a cancel, or by the batch deadline before a cancel
        ended the batch, with the log its worker uploaded as it stopped it:
        what it printed up to then.  After an earlier attempt failed, the log
@@ -319,7 +327,7 @@ fun follow url batch_id (on_change : string * string * string option * string op
             outcome :=
               SOME (case json_string_field "state" line of
                         SOME "done" => Done
-                      | SOME "cancelled" => Cancelled (stopped ())
+                      | SOME "cancelled" => Cancelled (stopped (), failed ())
                       | SOME state =>
                           Failed (state ^ (case json_string_field "failure" line of
                                                SOME failure => ": " ^ failure
@@ -374,8 +382,10 @@ fun follow url batch_id (on_change : string * string * string option * string op
             List.app (fn (key, _) =>
               HolbuildStatus.message_stderr ("holbuild: remote " ^ name key ^ ": stopped with no worker log yet; " ^
                 "if its worker uploads one, holbuild build --attach " ^ batch_id ^ " shows it\n"))
-              (List.filter (fn (key, (state, _, log)) =>
-                 state = "cancelled" andalso log = NONE andalso List.exists (fn k => k = key) (!ran)) (rev (!states)))
+              (List.filter (fn (key, (state, kind, log)) =>
+                 state = "cancelled" andalso log = NONE andalso List.exists (fn k => k = key) (!ran) andalso
+                 (* A skipped action's lease is gone, so no log can follow. *)
+                 not (String.isPrefix "skipped because of " (Option.getOpt (kind, "")))) (rev (!states)))
         | _ => ()
     val _ =
       if null (failures ()) andalso null skipped then ()

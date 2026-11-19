@@ -2140,7 +2140,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          resubmitted_logs := logs;
                          export_and_submit false false NONE skip forced)
                   end
-                | (HolbuildRemoteExec.Cancelled cancelled_logs, progress) =>
+                | (HolbuildRemoteExec.Cancelled (cancelled_logs, _), progress) =>
                     let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                     in
                       (* What a stopped action printed is its only diagnostic, as
@@ -2278,7 +2278,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               case outcome of
                   HolbuildRemoteExec.Done => ("finished", false)
                 | HolbuildRemoteExec.Failed (why, failures) => (List.app show failures; (why, true))
-                | HolbuildRemoteExec.Cancelled stopped => (List.app show stopped; ("cancelled", true))
+                | HolbuildRemoteExec.Cancelled (stopped, failed) => (List.app show (failed @ stopped); ("cancelled", true))
                 | HolbuildRemoteExec.Unfollowable why => (why, false)
                 | HolbuildRemoteExec.Unreachable why => (why, false)
             val ended = "remote execution: batch " ^ batch_id ^ " " ^ ended ^ "; " ^ reason

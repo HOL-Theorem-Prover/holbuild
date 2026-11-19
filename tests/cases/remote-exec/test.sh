@@ -742,11 +742,14 @@ refute_grep "GenTheory built" "$tmpdir/generated.log"
 # A finished batch such a plan attaches to is followed, then the build restores
 # as one without --attach would, cancelling and submitting nothing.
 gen_batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/generated.log" | head -n 1)
+rm "$generated/src/GenML.sml"
 : > "$state/requests.log"
 (cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only --attach "$gen_batch" UseLib) \
   > "$tmpdir/generated-done.log" 2>&1 || { cat "$tmpdir/generated-done.log" >&2; exit 1; }
 require_grep "remote execution: batch $gen_batch finished; theories that write SML sources build before the rest is planned; restoring from the cache" \
   "$tmpdir/generated-done.log"
+require_grep "GenTheory restored from cache" "$tmpdir/generated-done.log"
+[[ -f "$generated/src/GenML.sml" ]] || { echo "the restore after the attach wrote no GenML.sml" >&2; exit 1; }
 require_grep "^GET /v1/batches/$gen_batch/events" "$state/requests.log"
 refute_grep "^POST" "$state/requests.log"
 : > "$state/requests.log"
@@ -1440,7 +1443,8 @@ recorded() { # BATCH MARKER: BATCH ended cancelled, BTheory stopped with a log s
 first_sha=$(recorded "$first" "the first batch's worker log")
 recorded "$second" "the second batch's worker log" > /dev/null
 echo "a stale local log" > "$project/.holbuild/logs/current/rxp/BTheory/build.log"
-rm -f "$state/result-$b_key"
+touch "$state/ran"
+ran_before=$(grep -c . "$state/ran" || true)
 : > "$state/requests.log"
 run recorded-attach 1 build --remote-exec "$coordinator" --remote-only --attach "$first" BTheory
 rm "$state/$first.events" "$state/$second.events"
@@ -1453,7 +1457,72 @@ refute_grep "the second batch's worker log\|a stale local log" "$tmpdir/recorded
 require_grep "remote execution: batch $first cancelled" "$tmpdir/recorded-attach.log"
 [[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$first_sha" ]] ||
   { echo "the first batch's log was not restored" >&2; exit 1; }
-[[ ! -e "$state/result-$b_key" ]] || { echo "the attach ran a worker" >&2; exit 1; }
+[[ $(grep -c . "$state/ran" || true) -eq $ran_before ]] || { echo "the attach ran a worker" >&2; cat "$state/ran" >&2; exit 1; }
+# A plan whose source-writing theory is in a dependency package can't take a
+# batch over either.  Attached to a batch whose action failed before someone
+# cancelled it, the build prints the failed action's log as well as the
+# stopped one's, and runs, cancels and submits nothing.
+genpkg=$tmpdir/genpkg
+mkdir -p "$genpkg/src"
+cat > "$genpkg/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxgenpkg"
+
+[build]
+members = ["src"]
+TOML
+cp "$generated/src/GenScript.sml" "$genpkg/src/"
+git -C "$genpkg" init -q
+git -C "$genpkg" add .
+git -C "$genpkg" -c user.name=t -c user.email=t@t commit -q -m gen
+dependent=$tmpdir/dependent
+mkdir -p "$dependent/src"
+cat > "$dependent/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxdependent"
+
+[build]
+members = ["src"]
+
+[dependencies.rxgenpkg]
+git = "$genpkg"
+rev = "$(git -C "$genpkg" rev-parse HEAD)"
+TOML
+cat > "$dependent/src/UseScript.sml" <<SML
+Theory Use
+Ancestors Gen
+SML
+printf '%s\n' "the failed action's worker log" > "$tmpdir/dep-failed.log"
+printf '%s\n' "the stopped action's worker log" > "$tmpdir/dep-stopped.log"
+failed_sha=$(sha256sum < "$tmpdir/dep-failed.log" | cut -d' ' -f1)
+stopped_sha=$(sha256sum < "$tmpdir/dep-stopped.log" | cut -d' ' -f1)
+cp "$tmpdir/dep-failed.log" "$remote_root/cas/$failed_sha"
+cp "$tmpdir/dep-stopped.log" "$remote_root/cas/$stopped_sha"
+: > "$state/depgen.batch"
+printf '%s\n' \
+  "{\"type\": \"action\", \"input_key\": \"k1\", \"theory\": \"rxgenpkg:GenTheory\", \"state\": \"failed\", \"tier\": \"standard\", \"attempts\": 1, \"last_failure\": \"proof\", \"log_sha256\": \"$failed_sha\"}" \
+  "{\"type\": \"action\", \"input_key\": \"k2\", \"theory\": \"rxdependent:UseTheory\", \"state\": \"cancelled\", \"tier\": \"standard\", \"attempts\": 1, \"last_failure\": null, \"log_sha256\": \"$stopped_sha\"}" \
+  '{"type": "batch", "state": "cancelled", "failure": null}' > "$state/depgen.events"
+ran_before=$(grep -c . "$state/ran" || true)
+: > "$state/requests.log"
+set +e
+(cd "$dependent" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only --attach depgen UseTheory) \
+  > "$tmpdir/dep-attach.log" 2>&1
+status=$?
+set -e
+rm "$state/depgen.events"
+[[ $status -eq 1 ]] || { echo "dep-attach exited $status, wanted 1" >&2; cat "$tmpdir/dep-attach.log" >&2; exit 1; }
+require_grep "remote rxgenpkg:GenTheory: proof; its worker log:" "$tmpdir/dep-attach.log"
+require_grep "the failed action's worker log" "$tmpdir/dep-attach.log"
+require_grep "remote rxdependent:UseTheory: cancelled; its worker log:" "$tmpdir/dep-attach.log"
+require_grep "the stopped action's worker log" "$tmpdir/dep-attach.log"
+require_grep "remote execution: batch depgen cancelled; theories that write SML sources build before the rest is planned, so this build restored nothing from it" \
+  "$tmpdir/dep-attach.log"
+require_grep "^GET /v1/batches/depgen/events" "$state/requests.log"
+refute_grep "^POST" "$state/requests.log"
+[[ $(grep -c . "$state/ran" || true) -eq $ran_before ]] || { echo "the attach ran a worker" >&2; cat "$state/ran" >&2; exit 1; }
 
 # A static error and a tactic timeout are reported from the worker's log too.
 write_failing_b() {
