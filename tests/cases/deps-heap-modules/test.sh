@@ -154,22 +154,29 @@ if grep -q 'discarding invalid checkpoint' "$tmpdir/store.log"; then
 fi
 same_outputs
 
-# Shared heaps.  On worker W, Z's run writes A's module and publishes it;
-# B's then loads it and publishes a heap that refers to it.
+# Shared heaps.  A runs on another worker, so that W's store is fresh when
+# Z's run on W writes the modules Z loads, A's among them, and publishes
+# them.  Z shares no heap: its heap, saved before A's module existed,
+# would serve B, which has the same dependencies.  B's run on W then loads
+# A's module and publishes a heap that refers to it.
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 server_pids+=("$server_pid")
 worker=$tmpdir/worker
-# exec_theory THEORY NAME: exec-action of THEORY's current spec on W, after
-# A's if A has one.
+# exec_theory THEORY NAME [unshared]: exec-action of THEORY's current spec
+# on W, sharing heaps unless told otherwise, after A's on another worker if
+# A has one.
 exec_theory() {
-  local theory=$1 name=$2 batch=$tmpdir/$2.batch spec dep
+  local theory=$1 name=$2 batch=$tmpdir/$2.batch spec dep cache share=(--share-heaps)
+  [[ ${3:-} != unshared ]] || share=()
   (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload "${theory}Theory") > "$batch"
-  link_hol_toolchain_cache "$worker"
   for dep in A "$theory"; do
     spec=$(awk -v want="deps-modules:${dep}Theory" '$1 == "action" && $5 == want { print $4 }' "$batch")
     # A cached theory has no action.
     [[ -n "$spec" ]] || continue
-    HOLBUILD_CACHE=$worker "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" --share-heaps \
+    cache=$worker
+    [[ $dep == "$theory" ]] || cache=$tmpdir/worker-deps
+    link_hol_toolchain_cache "$cache"
+    HOLBUILD_CACHE=$cache "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" ${share[@]+"${share[@]}"} \
       --cache-limit-gb 1000 --result "$tmpdir/$name-$dep.result" > "$tmpdir/$name-$dep.log" 2>&1 ||
       { cat "$tmpdir/$name-$dep.log" "$tmpdir/$name-$dep.result" >&2; return 1; }
     grep -qxE 'status=(built|cached)' "$tmpdir/$name-$dep.result" ||
@@ -181,10 +188,11 @@ phase() {
     { echo "$1 lacks phase $2:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1; }
 }
 worker_modules=$worker/theory-modules
-exec_theory Z z
+exec_theory Z z unshared
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 exec_theory B publish
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
-modules=$(for heap in $published; do heap_modules "$heap"; done | grep -- '-A-' | sort -u)
+modules=$(for heap in $published; do heap_modules "$heap"; done | { grep -- '-A-' || true; } | sort -u)
 [[ -n "$modules" ]] || { echo "no published heap loads A's module" >&2; exit 1; }
 
 # W loses its stores: the restore fetches A's module, then the heap.
