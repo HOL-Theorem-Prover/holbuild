@@ -704,12 +704,12 @@ ORDER BY b.priority DESC, (c.a).critical_depth DESC, (c.a).descendant_count DESC
 # Lock the best of a batch's candidates ``keys`` of ``tier`` that may still be claimed ahead, but not one whose key
 # another batch's live lease is building (single-flight; see CLAIM_ACTION) or in :taken: one with an unfinished
 # ancestor in its walk that isn't running, or one :depth generations up that still waits for parents and published
-# no outline. Each
-# candidate's row is read by key, as in AHEAD_WALK, and checked; the one taken is then locked through its key. The
-# checks aren't made again on the row locked, which no other transaction changes in the meantime: it waits, and
-# every writer of a waiting action holds its batch's lock first, as the caller does. Checked on the row locked, they
-# let the database read the batch's unfinished actions of the tier instead, which it takes for none on a batch it has
-# no statistics for.
+# no outline. Of those as deep, one whose unfinished parents all published their outline goes first, as in
+# AHEAD_CANDIDATES. Each candidate's row is read by key, as in AHEAD_WALK, and checked; the one taken is then locked
+# through its key. The checks aren't made again on the row locked, which no other transaction changes in the
+# meantime: it waits, and every writer of a waiting action holds its batch's lock first, as the caller does. Checked
+# on the row locked, they let the database read the batch's unfinished actions of the tier instead, which it takes
+# for none on a batch it has no statistics for.
 CLAIM_AHEAD_ACTION = sa.text(f"""{AHEAD_WALK}, candidates AS MATERIALIZED (
     SELECT (
         SELECT c FROM actions c WHERE c.batch_id = (SELECT CAST(:batch_id AS uuid)) AND c.input_key = k.input_key
@@ -726,7 +726,8 @@ AND (c).input_key NOT IN (
 )
 AND (c).input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
 AND (c).input_key <> ALL(CAST(:taken AS text[]))
-ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
+ORDER BY a.critical_depth DESC, a.descendant_count DESC,
+    a.input_key NOT IN (SELECT root FROM ancestors WHERE distance = 1 AND NOT outlined) DESC, a.theory, a.input_key
 LIMIT 1 FOR UPDATE OF a SKIP LOCKED
 """)
 # The unfinished ancestors an action claimed ahead waits for, ancestors first (by their longest distance from it),

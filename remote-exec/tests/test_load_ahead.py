@@ -203,6 +203,17 @@ async def test_a_claim_ahead_with_a_deeper_chain_than_its_batch_s_ready_builds_c
     assert [await next_claim() for _ in range(2)] == ["d", None]
 
 
+async def test_of_claims_ahead_as_deep_the_one_on_outlines_alone_is_taken_first(http: httpx.AsyncClient) -> None:
+    await submit(http, ["a", "q", "x", "y"], [("x", "a"), ("y", "q")], speculative_loading="4")
+    await claim_named(http, "a")
+    q = await claim_named(http, "q")
+    assert (await http.post(f"/v1/work/{q}/outlined", headers=WORKER)).status_code == 204
+
+    # "x" and "y" rank alike and "x" sorts first, but only "y" can start at once.
+    claimed = await claim_ahead(http)
+    assert claimed is not None and claimed["theory"] == "pkg:y"
+
+
 async def test_a_claim_ahead_on_outlines_alone_counts_as_a_build_of_its_batch_in_the_ranking_claims_share(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
