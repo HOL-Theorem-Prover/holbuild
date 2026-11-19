@@ -323,3 +323,20 @@ edit_c healed
 exec_theory C c-healed
 require_grep 'restored shared' "$tmpdir/c-healed-C.log"
 resumed c-healed-C 'theorem-context checkpoint after c_first'
+
+# A proof-only change to A (here, a source line moved) changes ATheory.dat
+# but not B's dependencies' key, so B's shared heap still loads A's old
+# module.  W, lacking it, fetches it as the heap's entry lists it, not by
+# the current ATheory.dat.
+sed -i 's/^Definition a_value_def:/(* moved down a line *)\nDefinition a_value_def:/' "$project/src/AScript.sml"
+rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
+edit_b seven
+exec_theory B proof-edit
+require_grep 'restored shared' "$tmpdir/proof-edit-B.log"
+phase proof-edit-B 'rstmodn:1'
+resumed proof-edit-B 'theorem-context checkpoint after b_first'
+[[ -f "$modules" ]] || { echo "A's old module wasn't fetched to $modules" >&2; exit 1; }
+# W's store has A's module for the current ATheory.dat too, under its own
+# name.
+[[ $(find "$worker_modules" -name '*-A-*.pmo' | wc -l) == 2 ]] ||
+  { echo "A's proof-only change didn't change ATheory.dat" >&2; exit 1; }

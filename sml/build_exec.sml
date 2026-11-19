@@ -4036,15 +4036,17 @@ fun place_state stored dst =
 fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
 
 (* The theory modules a deps heap saved with saveChildWithModules loads
-   (save_deps_checkpoint), by path, that aren't there.  Loading the heap
-   fails without them, as it does when one has another id than the heap
-   records. *)
-fun missing_saved_modules path =
+   (save_deps_checkpoint), by path; none where holbuild can't read them. *)
+fun saved_modules path =
   case show_module_dependencies of
       NONE => []
-    | SOME show =>
-        List.filter (not o file_exists) (map #2 (show path))
-        handle e => (warn ("could not list the theory modules of " ^ path ^ ": " ^ General.exnMessage e); [])
+    | SOME show => map #2 (show path)
+
+(* Those of them that aren't there.  Loading the heap fails without them,
+   as it does when one has another id than the heap records. *)
+fun missing_saved_modules path =
+  List.filter (not o file_exists) (saved_modules path)
+  handle e => (warn ("could not list the theory modules of " ^ path ^ ": " ^ General.exnMessage e); [])
 
 (* Whether a run may start from a context or failed-prefix checkpoint.  Saved
    ML state does not include files written by the script, so a theory with
@@ -12472,8 +12474,9 @@ val nothing_restored : shared_restore = {heap = NONE, files = [], stale = [], mi
    else the heap, placed in the action's checkpoint tree, which is empty. *)
 (* With RESUMES false the run saves every boundary itself, so only the heap
    is restored: a linked checkpoint would sit where it saves. *)
-(* FETCH_MODULES fetches into this host's module store those of the
-   theory modules it is given, by path, that another host published. *)
+(* FETCH_MODULES (the heap entry's module entries, paths) fetches into
+   this host's module store those of the theory modules at the paths that
+   the entries list. *)
 fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
                                               deps_key, deps_loaded,
                                               requested_timeout, candidates, ...} : shared_context) resumes
@@ -12504,6 +12507,8 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
        A heap given up only falls back here, to a fresh preload: the
        shared one stays, for the hosts that have its modules. *)
     val modules_ok = ref (NONE : bool option)
+    (* The heap entry's module entries. *)
+    val heap_modules = ref ([] : (string * string * string) list)
     fun heap_modules_ok () =
       case !modules_ok of
           SOME ok => ok
@@ -12514,7 +12519,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                     [] => true
                   | missing =>
                       let
-                        val _ = restore_step "rstmodfetch" (fn () => fetch_modules missing)
+                        val _ = restore_step "rstmodfetch" (fn () => fetch_modules (!heap_modules, missing))
                         val still = missing_saved_modules deps_loaded
                       in
                         (* Those of MISSING now present: a sweep may take others since. *)
@@ -12736,7 +12741,8 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 | found => found) of
             NONE => no_files
           | SOME text =>
-              case (SOME (#1 (single "heap" (shared_manifest_entries text)))
+              case (let val entries = shared_manifest_entries text
+                    in heap_modules := entries; SOME (#1 (single "heap" entries)) end
                     handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
                   NONE => no_files
                 | SOME heap =>
@@ -12830,9 +12836,17 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           fun release () = ignore (write_claim 0) handle HolbuildRemoteCache.Unavailable _ => ()
           fun upload () =
             let
-              val manifest = shared_manifest "holbuild-shared-heap-v1" NONE [("heap", sha, "")]
-              val _ = upload_all [(deps_loaded, sha)]
-              val _ = if needs_upload sha then raise Error ("could not upload " ^ deps_loaded) else ()
+              (* With the theory modules the heap loads, from this host's
+                 store, for the hosts that lack them (fetch_heap_modules). *)
+              val modules = map (fn path => (path, HolbuildHash.file_sha256 path)) (saved_modules deps_loaded)
+              val manifest =
+                shared_manifest "holbuild-shared-heap-v1" NONE
+                  (("heap", sha, "") :: map (fn (path, module) => ("module", module, Path.file path)) modules)
+              val _ = upload_all ((deps_loaded, sha) :: modules)
+              val _ =
+                case List.find (fn (_, blob) => needs_upload blob) ((deps_loaded, sha) :: modules) of
+                    SOME (path, _) => raise Error ("could not upload " ^ path)
+                  | NONE => ()
               val _ = HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
             in
               if HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote heap_key) = SOME manifest then
@@ -13736,56 +13750,42 @@ fun publish_modules remote {store, modules, deadline} =
     !published
   end
 
-(* Where theory NAME's files are, by stem: the action's project
-   dependency's (DEPS), else the toolchain's, beside its object in sigobj;
-   NONE for a name with no files, no theory of this build. *)
-fun module_theory_base root tc (deps : {target : string, stem : string, key : string} list) name =
-  case List.find (fn {target, ...} => theory_name_from_logical (#2 (target_name target)) = name) deps of
-      SOME {stem, ...} => SOME (in_root root stem)
-    | NONE =>
-        let val uo = Path.concat (Path.concat (#holdir tc, "sigobj"), name ^ "Theory.uo")
-        in SOME (Path.concat (Path.dir (FS.realPath uo), name ^ "Theory"))
-        end
-        handle OS.SysErr _ => NONE
-
-(* The remote keys of the MISSING modules of STORE, each a
-   (`<theory>-<.dat SHA-1>.pmo`, .dat) pair. *)
-fun module_remote_keys tc store missing =
-  let
-    val toolchain = HolbuildToolchain.toolchain_key tc
-    val shas = HolbuildHash.files_sha256 (map #2 missing)
-  in
-    ListPair.mapEq
-      (fn ((wanted, _), sha) =>
-          (wanted, module_remote_key {toolchain = toolchain, store = store, wanted = wanted, dat_sha256 = sha}))
-      (missing, shas)
-  end
-
-(* Before a shared deps heap is restored: fetches into the host's store
-   the published ones of the theory modules at PATHS, which the heap loads
-   and the store lacks, each a module of one of the action's theories,
-   whose files are in ROOT or the toolchain.  A module of another store
-   isn't fetched. *)
-fun fetch_heap_modules remote root tc deps paths =
+(* Before a shared deps heap is restored: fetches into the host's module
+   store those of the theory modules at PATHS, which the heap loads and the
+   store lacks, that the heap's entry lists (MODULES, its ("module",
+   SHA-256, file name) entries).  The publisher listed them from its own
+   store, so they are the modules the heap was saved with, whatever .dat
+   files the action has now.  A module of another store isn't fetched. *)
+fun fetch_heap_modules remote tc (modules, paths) =
   let
     val store = module_store (#holdir tc)
-    (* <id>-<theory>-<40 hex digits>.pmo *)
-    fun wanted path =
-      case (if Path.dir path = store then module_file_theory_part (Path.file path) else NONE) of
-          NONE => NONE
-        | SOME part =>
-            if size part <= 45 then NONE
-            else
-              Option.map (fn b => (part, b ^ ".dat"))
-                (module_theory_base root tc deps (String.substring (part, 0, size part - 45)))
-    val missing = List.mapPartial wanted paths
+    fun listed path =
+      if Path.dir path <> store then NONE
+      else
+        Option.map (fn (_, sha, file) => (sha, file))
+          (List.find (fn (role, _, file) => role = "module" andalso file = Path.file path andalso plain_file_name file)
+                     modules)
+    val wanted = List.mapPartial listed paths
+    val staging = store_temp (Path.concat (store, ".heap-modules"))
+    val deadline = Time.+ (Time.now (), shared_heap_wait)
+    fun fetch (sha, file) =
+      if not (module_request_fits deadline) then ()
+      else
+        let val tmp = Path.concat (staging, file)
+        in
+          case HolbuildRemoteCache.fetch_unlisted_blob_within
+                 HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp} of
+              HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = Path.concat (store, file)}
+            | _ => remove_file tmp
+        end
+        handle e => warn ("theory module not fetched: " ^ General.exnMessage e)
   in
-    if null missing then ()
+    if null wanted then ()
     else
-      ignore (fetch_published_modules remote
-                {store = store, staging = store_temp (Path.concat (store, ".heap-modules")),
-                 wanted = module_remote_keys tc store missing,
-                 deadline = Time.+ (Time.now (), shared_heap_wait)})
+      (HolbuildRemoveTree.remove_untrusted staging;
+       ensure_dir staging;
+       parallel_all remote_probe_width fetch wanted;
+       HolbuildRemoveTree.remove_untrusted staging)
   end
   handle e => warn ("theory modules not fetched: " ^ General.exnMessage e)
 
@@ -13815,7 +13815,19 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
   let
     val store = module_store (#holdir tc)
     val base_theories_file = Path.concat (store, module_store_base_theories)
-    val base = module_theory_base root tc deps
+    val project =
+      map (fn {target, stem, ...} =>
+              (theory_name_from_logical (#2 (target_name target)), in_root root stem))
+          deps
+    fun toolchain_base name =
+      let val uo = Path.concat (Path.concat (#holdir tc, "sigobj"), name ^ "Theory.uo")
+      in SOME (Path.concat (Path.dir (FS.realPath uo), name ^ "Theory"))
+      end
+      handle OS.SysErr _ => NONE
+    fun base name =
+      case List.find (fn (n, _) => n = name) project of
+          SOME (_, stem) => SOME stem
+        | NONE => toolchain_base name
     (* The base state's theories have no modules, so they count as seen. *)
     val base_theories =
       if file_exists base_theories_file
@@ -13841,7 +13853,7 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
         (fn LoadTheory name =>
               if has_suffix "Theory" name then SOME (drop_suffix "Theory" name) else NONE
           | _ => NONE)
-        loads @ map (fn {target, ...} => theory_name_from_logical (#2 (target_name target))) deps
+        loads @ map #1 project
     val seen0 = Binaryset.addList (Binaryset.empty String.compare, getOpt (base_theories, []))
     val theories = rev (#2 (List.foldl visit (seen0, []) roots))
     val expected =
@@ -13923,6 +13935,18 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
            clean ())
           handle e => (clean (); raise e)
         end
+    (* The remote keys of the MISSING modules; the toolchain is hashed only
+       when some are missing. *)
+    fun remote_keys missing =
+      let
+        val toolchain = HolbuildToolchain.toolchain_key tc
+        val shas = HolbuildHash.files_sha256 (map #2 missing)
+      in
+        ListPair.mapEq
+          (fn ((wanted, _), sha) =>
+              (wanted, module_remote_key {toolchain = toolchain, store = store, wanted = wanted, dat_sha256 = sha}))
+          (missing, shas)
+      end
     val missing = missing_modules ()
     val probed = ref 0
     val fetched = ref 0
@@ -13931,7 +13955,7 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
        and publish what the writer stored. *)
     fun fill () =
       let
-        val keys = module_remote_keys tc store missing handle e => (warn ("theory modules not fetched: " ^ General.exnMessage e); [])
+        val keys = remote_keys missing handle e => (warn ("theory modules not fetched: " ^ General.exnMessage e); [])
         val _ =
           probed :=
             fetch_published_modules remote
@@ -14573,7 +14597,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                     (restore_steps := [];
                      (phase "restore" (fn () =>
                         restore_shared_checkpoints remote ctx (resumes_from_checkpoints policy action)
-                          (fetch_heap_modules remote root tc (#deps spec)))
+                          (fetch_heap_modules remote tc))
                       before add_restore_steps ())
                      handle e => (add_restore_steps (); raise e))
                 | _ => nothing_restored
