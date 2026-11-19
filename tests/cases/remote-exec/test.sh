@@ -1305,6 +1305,25 @@ require_grep "batch $batch failed: deadline: still running after 12 h" "$tmpdir/
 [[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$log_sha" ]] ||
   { echo "the deadline-stopped theory's worker log was not restored" >&2; exit 1; }
 
+# An attached batch someone cancelled while an action ran: what the action's
+# worker printed up to then, in the log it uploaded as it stopped, is printed
+# and restored, though nothing failed; nothing is submitted again.
+write_broken stopped
+run stopped-detach 0 build --remote-exec "$coordinator" --detach BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/stopped-detach.log")
+posts=$(grep -c '^POST' "$state/requests.log")
+touch "$state/stopped"
+run stopped-only 1 build --remote-exec "$coordinator" --remote-only --attach "$batch" BTheory
+rm "$state/stopped"
+b_key=$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $2 }' "$state/$batch.batch")
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$state/result-$b_key")
+require_grep "remote rxp:BTheory: cancelled, log /cas/$log_sha" "$tmpdir/stopped-only.log"
+require_grep "child log tail ---" "$tmpdir/stopped-only.log"
+require_grep "remote execution: batch $batch cancelled" "$tmpdir/stopped-only.log"
+[[ $(sha256sum < "$project/.holbuild/logs/current/rxp/BTheory/build.log" | cut -d' ' -f1) == "$log_sha" ]] ||
+  { echo "the stopped theory's worker log was not restored" >&2; exit 1; }
+[[ $(grep -c '^POST' "$state/requests.log") -eq $posts ]] || { echo "the attach submitted a batch" >&2; exit 1; }
+
 # A static error and a tactic timeout are reported from the worker's log too.
 write_failing_b() {
   cat > "$project/src/BScript.sml" <<SML

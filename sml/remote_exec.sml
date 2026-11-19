@@ -16,7 +16,7 @@ type action_failure = {input_key : string, kind : string, log_sha256 : string op
 
 datatype outcome = Done
                  | Failed of string * action_failure list
-                 | Cancelled              (* someone cancelled the batch *)
+                 | Cancelled of action_failure list (* someone cancelled the batch; its stopped actions with a worker log *)
                  | Unfollowable of string (* the coordinator won't stream it; it may still run *)
                  | Unreachable of string  (* the coordinator couldn't be asked *)
 
@@ -259,6 +259,13 @@ fun follow url batch_id (on_change : string * string * string option * string op
         if state = "failed" orelse (state = "cancelled" andalso kind = SOME "deadline") then
           SOME {input_key = key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
         else NONE) (rev (!states))
+    (* An action stopped by a cancel, with the log its worker uploaded as it
+       stopped it: what it printed up to then. *)
+    fun stopped () =
+      List.mapPartial (fn (key, (state, kind, log)) =>
+        case (state, kind, log) of
+            ("cancelled", NONE, SOME _) => SOME {input_key = key, kind = "cancelled", log_sha256 = log}
+          | _ => NONE) (rev (!states))
     (* A line cut off by a dropped connection, perhaps with curl's error
        after it, is no event. *)
     fun complete line = Substring.isSuffix "}" (Substring.dropr Char.isSpace (Substring.full line))
@@ -289,7 +296,7 @@ fun follow url batch_id (on_change : string * string * string option * string op
             outcome :=
               SOME (case json_string_field "state" line of
                         SOME "done" => Done
-                      | SOME "cancelled" => Cancelled
+                      | SOME "cancelled" => Cancelled (stopped ())
                       | SOME state =>
                           Failed (state ^ (case json_string_field "failure" line of
                                                SOME failure => ": " ^ failure

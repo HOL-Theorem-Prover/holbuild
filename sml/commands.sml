@@ -1663,7 +1663,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     case outcome of
                         HolbuildRemoteExec.Done => ()
                       | HolbuildRemoteExec.Failed (reason, _) => stopped := SOME (batch ^ " " ^ reason, true)
-                      | HolbuildRemoteExec.Cancelled => stopped := SOME (batch ^ " cancelled", false)
+                      | HolbuildRemoteExec.Cancelled _ => stopped := SOME (batch ^ " cancelled", false)
                       | HolbuildRemoteExec.Unfollowable reason =>
                           stopped := SOME (batch ^ " " ^ reason ^
                                            (if HolbuildRemoteExec.cancel url batch_id then ", cancelled the batch"
@@ -2119,9 +2119,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          export_and_submit false false NONE skip forced)
                   end
-                | (HolbuildRemoteExec.Cancelled, progress) =>
+                | (HolbuildRemoteExec.Cancelled cancelled_logs, progress) =>
                     let val reason = "batch " ^ batch_id ^ " cancelled; " ^ finished progress
                     in
+                      (* What a stopped action printed is its only diagnostic, as
+                         for an attached batch someone cancelled. *)
+                      List.app report_failed_log cancelled_logs;
                       (* Whoever cancelled it stopped this work, so a --remote-only
                          build doesn't ask for it to be built locally instead. *)
                       if remote_only then raise Error ("remote execution: " ^ reason) else fall_back reason
