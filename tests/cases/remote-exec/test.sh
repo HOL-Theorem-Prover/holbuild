@@ -571,6 +571,13 @@ forced_copy_build ledger-forced-again
 [[ $(stat -c %Y "$ledger_file") == $(date -d '2000-01-01' +%s) ]] ||
   { echo "a build that learned nothing recorded the ledger" >&2; exit 1; }
 cp "$ledger_file" "$tmpdir/ledger.sorted"
+# Rewriting the ledger keeps when it was started, past the cap (below) too:
+# else a ledger in steady use would never expire.
+started="#started $(( $(date +%s) - 3600 ))"
+sed -i "1s/.*/$started/" "$tmpdir/ledger.sorted"
+cp "$tmpdir/ledger.sorted" "$ledger_file"
+ledger_copy_build ledger-started
+[[ $(head -n 1 "$ledger_file") == "$started" ]] || { head -n 1 "$ledger_file" >&2; exit 1; }
 # Past 100000 entries, the build recording the ledger keeps only the entries it
 # used or learned: BScript.sml's blob, which it used, and the new
 # AScript.sml's, which it learned, but none of the filler.
@@ -582,6 +589,7 @@ LC_ALL=C sort -c "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
 refute_grep "^blob f" "$ledger_file"
 grep -qxF "$b_entry" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
 grep -qxF "blob $a_copy_source" "$ledger_file" || { cat "$ledger_file" >&2; exit 1; }
+[[ $(head -n 1 "$ledger_file") == "$started" ]] || { head -n 1 "$ledger_file" >&2; exit 1; }
 # Each entry kept was in the ledger, or one the build asked the remote cache about.
 while read -r kind hash; do
   [[ $kind != "#started" ]] || continue

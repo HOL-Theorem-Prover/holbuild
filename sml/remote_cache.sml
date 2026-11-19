@@ -504,8 +504,6 @@ fun routed_status_using usable method probe urls path request =
          (hd urls, HolbuildHttp.Failed "no cache response")
   end
 
-fun routed_status method urls path request = routed_status_using (fn _ => true) method request urls path request
-
 (* NONE when the remote cache is disabled, without a request.  With
    fail_closed, raises Unavailable instead, and for no answer, 429 or 5xx. *)
 fun send_result method url request =
@@ -835,15 +833,6 @@ fun blob_present cache sha256 =
   end
   handle e as Unavailable _ => raise e
        | _ => true
-
-(* An optional upload probe must not disable PUTs when a server drops HEADs.
-   Leave the breaker to the normal cache requests, and skip only confirmed hits. *)
-fun blob_confirmed_present cache sha256 =
-  if tripped () then false
-  else
-    let val urls = cas_urls cache sha256
-    in #2 (routed_status "HEAD" urls "" head_status) = HolbuildHttp.Response 200 end
-    handle _ => false
 
 fun verify_downloaded_blob path ({sha256, size} : blob_entry) =
   if Position.toString (FS.fileSize path) <> size then

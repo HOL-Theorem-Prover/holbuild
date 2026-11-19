@@ -2074,8 +2074,9 @@ The batch keeps the plan's theory order and includes entries with missing blobs.
 Its specs and sources are then uploaded the same way, `--prefetch-concurrency`
 at a time, reporting `uploading to remote cache: N/M files`; after the first
 upload that fails, the rest are skipped and the build falls back (below).
-Before compressing and uploading a file, it checks the CAS and skips the file
-only when the cache confirms it is already present.
+Each file is uploaded whether or not the cache already holds it: a cache
+node can answer for a blob from its own disk after its backing store has
+dropped it, and an upload writes it there again.
 
 `build --remote-exec URL --priority N` assigns a batch scheduling priority
 between 0 and 2147483647 (default 0). Higher values are claimed before lower
@@ -2207,7 +2208,10 @@ uploads find the remote cache to hold is kept in the cache root's
 `remote-ledger/`, shared by every project and worktree using that cache root,
 so a later build doesn't ask again. A build that would take it past 100000
 entries keeps only the entries it used or learned, so it grows past that only
-as far as one build's own entries.
+as far as one build's own entries. A remote cache may drop what it holds a
+while after it was written, however often it is read, so the ledger's first
+line, `#started <seconds>`, says when it was started, and a ledger started 12
+hours ago or more, or without that line, counts as empty.
 
 The build never waits on remote execution alone. If the closure can't run
 remotely (see `action-spec`), the coordinator can't be reached or refuses the
@@ -2215,12 +2219,14 @@ batch, or the batch fails other than by a failed proof (below), it warns and
 builds locally. A theory the remote cache holds may not fit the parents it
 holds, as when a nondeterministic theory was built twice; the workers can't
 use it, and the coordinator fails the batch for resubmission naming it
-(`resubmit: ... theory <input_key>`). Such a batch is resubmitted once first,
+(`resubmit: ... theory <input_key>`). Such a batch is resubmitted
 with that theory and every theory that depends on it, for the workers to
 rebuild or recheck against the cached parents. The remote cache may also have
 lost a theory or source the remote ledger says it holds: on a resubmission
 for either, the build forgets the ledger, and a batch missing a blob
-(`resubmit: ... blob <sha256>`) is resubmitted once too, uploading it again. A submission
+(`resubmit: ... blob <sha256>`) is resubmitted too, uploading its blobs again.
+A build resubmits again for each theory a worker finds missing that no earlier
+resubmission was for, and for the first missing blob, up to 5 times. A submission
 answered 5xx, as a proxy in front of the coordinator answers while it
 restarts or the coordinator itself answers while it's overloaded, or 429,
 is retried, and an event stream that breaks is reattached; either is given up on once the coordinator stays unavailable for

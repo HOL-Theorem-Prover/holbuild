@@ -853,7 +853,7 @@ files timestamped within a second of the export's start are rehashed. Library
 and context-script hashes must still match the plan. The table is not persisted
 between exports. Run planning computes identities first; only runs selected for
 export construct context metadata. Fetch-only calls and cache hits avoid that
-work. Run exports check remote source availability on every call rather than
+work. Run exports upload their sources on every call rather than
 using the persistent upload ledger, since they have no missing-input resubmission.
 
 Avoid hardlinking cache blobs into project `.holbuild/`: even if cache blobs are meant
