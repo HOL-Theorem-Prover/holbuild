@@ -780,7 +780,14 @@ a later rewrite always changes it. A manifest with no such stat, as one
 installed by this hydrate, is read and hashed. The file is a cache: losing it
 only costs the hashing. It rewrites a kept theory's `.uo` when this spec resolves its
 parents to other stems, and removes every item the spec doesn't name, so the
-root ends as a cold hydrate leaves it. The parent check and the cutoff read
+root ends as a cold hydrate leaves it. A dependency theory it doesn't name is
+parked rather than removed: its files, `.hol/objs` copies and extra outputs
+move to `<cache root>/action-parked` at the same paths, outside the root HOL
+scans, under a `parked` record, and a later hydrate whose spec names it with
+the same key and manifest moves it back instead of installing it. Records
+without parked lines (written by a release before parking) or no records
+remove `action-parked` whole; the manifest stats of parked theories stay in
+`action-manifest-stats`. The parent check and the cutoff read
 the records rather than hashing ~4 files per dependency. A kept item whose
 files went missing is reinstalled with a warning naming the lost path; a HOL
 load that can't find a file the records say the hydrate put in the root fails

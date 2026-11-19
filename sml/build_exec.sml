@@ -10745,10 +10745,16 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             SOME (Resident.Theory theory) => same theory andalso fits theory
           | SOME (Resident.Parked theory) =>
               same theory andalso
-              (* A file the move misses shows in the presence check. *)
-              ((move_theory root false (path, key) handle OS.SysErr _ => ());
-               Resident.put resident path (Resident.Theory theory);
-               fits theory)
+              ((move_theory root false (path, key);
+                Resident.put resident path (Resident.Theory theory);
+                fits theory)
+               handle OS.SysErr _ =>
+                 (* Split between the root and its parked copy: neither
+                    half stays, and the dependency is installed afresh. *)
+                 (remove_resident root (path, Resident.Parked theory);
+                  remove_resident root (path, Resident.Theory theory);
+                  Resident.put resident path (Resident.Theory theory);
+                  false))
           | _ => false
       end
     fun remove_old {stem, ...} =

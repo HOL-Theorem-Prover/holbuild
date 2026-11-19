@@ -565,8 +565,17 @@ grep -qE "^phase-ms=(.*,)?hydinstn:0(,|\$)" "$tmpdir/c.result" || {
 worker c "$spec_a2"
 expect c 0
 [[ $(stat -c %i "$parked_b.dat" 2>/dev/null) == "$inode_b" ]] || { echo "worker c didn't park B again" >&2; exit 1; }
-grep -qF "$tmpdir/worker-c/actions/$(key_for "$tmpdir/batch.txt" worker:BTheory)/manifest" "$tmpdir/worker-c/action-manifest-stats" || {
+key_b=$(key_for "$tmpdir/batch.txt" worker:BTheory)
+grep -qF "$tmpdir/worker-c/actions/$key_b/manifest" "$tmpdir/worker-c/action-manifest-stats" || {
   echo "worker c dropped the stat of parked B's manifest" >&2; cat "$tmpdir/worker-c/action-manifest-stats" >&2; exit 1; }
+# A parked dependency whose local entry changed meanwhile is installed again.
+printf '\n' >> "$tmpdir/worker-c/actions/$key_b/manifest"
+worker c "$spec_c"
+expect c 0
+[[ $(stat -c %i "$stem_b.dat") != "$inode_b" && ! -e "$parked_b.dat" ]] || {
+  echo "worker c took B back after its entry changed" >&2; exit 1; }
+worker c "$spec_a2"
+expect c 0
 # A kept dependency's manifest hash is recorded by the manifest's stat once
 # the manifest is more than a second older than the hydrate, and trusted
 # while the stat is unchanged; a change to the manifest still shows.
@@ -639,7 +648,6 @@ expect c 0
 require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
 # Two dependencies in one directory, both replaced in one hydrate: each
 # install's directory must survive the removal of the other's old copy.
-key_b=$(key_for "$tmpdir/batch.txt" worker:BTheory)
 worker c "$spec_c"
 expect c 0
 stem_a=$(resident_stem 'ATheory$')
