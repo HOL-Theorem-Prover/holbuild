@@ -1225,8 +1225,9 @@ build with `-j` greater than 1, a cold theory builds *pipelined* when a child
 of it could start on its outline (one whose other parents are built or being
 built) and a job slot would still be free once every ready theory at least as
 deep has one. Workers take the deepest work first: the longest chain of
-dependents below a theory. On equal depth, ready theories go before attempts
-waiting to start, and the number of descendants decides among ready theories.
+dependents below a theory. On equal depth, ready theories go first, then
+queued attempts, then attempts that can start early (below); within each,
+the theory with more descendants goes first.
 A pipelined theory:
 
 1. Its HOL process runs the script with each `Theorem ... Proof ... QED` proof
