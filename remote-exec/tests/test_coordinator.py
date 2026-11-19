@@ -20,7 +20,7 @@ from starlette.requests import Request
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import CountResponses, create_app, summary_line
 from remote_exec.coordinator import Claim, Coordinator, HostReport, _claim_rank
-from remote_exec.formats import parse_result
+from remote_exec.formats import FormatError, parse_result
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, Settled
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -2558,6 +2558,22 @@ async def test_a_malformed_phase_timing_is_refused(http: httpx.AsyncClient) -> N
     await submit(http, ["a"])
     token = await claim_named(http, "a")
     assert (await complete(http, token, result("a", "built", phase_ms="hydrate"))).status_code == 400
+
+
+def test_a_repeated_phase_duration_is_summed() -> None:
+    # Releases before 0.14.72 repeat phase names.
+    record = result("a", "built", phase_ms="hydrate:5,hol:1500,hydrate:7")
+    assert parse_result(record).timings == {"hydrate": 12, "hol": 1500, "wall": 10}
+
+
+def test_a_repeated_phase_span_keeps_the_earliest_start_and_latest_end() -> None:
+    record = result("a", "built", phase_ms="holstart:200,holend:300,holstart:100,holend:250")
+    assert parse_result(record).timings == {"holstart": 100, "holend": 300, "wall": 10}
+
+
+def test_a_wall_phase_beside_wall_ms_is_refused() -> None:
+    with pytest.raises(FormatError):
+        parse_result(result("a", "built", phase_ms="wall:5"))
 
 
 async def test_events_keep_a_quiet_stream_alive_with_blank_lines(
