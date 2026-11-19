@@ -1823,7 +1823,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               let
                 val _ = HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "\n")
                 val needs_local = ref false
-                fun diagnose ({input_key, kind, log_sha256} : HolbuildRemoteExec.action_failure) =
+                fun diagnose ({input_key, kind, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
                   case node_with_input_key input_key of
                       NONE => (NONE, input_key, HolbuildBuildExec.Error ("failed remote action " ^ input_key ^ ": " ^ kind), false)
                     | SOME node =>
@@ -2235,18 +2235,41 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           else plan_with_record true true
         val writes_sources = not (null (HolbuildBuildPlan.generated_source_owners plan))
         val reason = "theories that write SML sources build before the rest is planned"
+        (* A batch this plan can't take over, since its keys wait on the
+           generated sources: following it reports how it ended and its failed
+           or stopped theories' worker logs, then fails, having restored and
+           built nothing. *)
+        fun follow_only batch_id =
+          let
+            val (outcome, _) =
+              HolbuildRemoteExec.while_followed url batch_id (fn () => HolbuildRemoteExec.follow url batch_id (fn _ => ()))
+            fun node_named theory =
+              List.find (fn node => HolbuildBuildPlan.package node ^ ":" ^ HolbuildBuildPlan.logical_name node = theory)
+                (HolbuildBuildPlan.selected_nodes plan)
+            fun show ({theory, kind, log_sha256, ...} : HolbuildRemoteExec.action_failure) =
+              case (log_sha256, node_named theory) of
+                  (SOME sha, SOME node) =>
+                    (HolbuildStatus.message_stderr ("holbuild: remote " ^ theory ^ ": " ^ kind ^ "; its worker log:\n");
+                     case HolbuildBuildExec.fetch_remote_build_log project node sha of
+                         SOME path => HolbuildStatus.message_stderr (HolbuildBuildExec.child_log_detail path ^ "\n")
+                       | NONE => HolbuildBuildExec.warn ("remote execution: could not fetch the build log of " ^ theory))
+                    handle HolbuildRemoteCache.Unavailable why =>
+                             HolbuildBuildExec.warn ("remote execution: could not fetch the build log of " ^ theory ^ ": " ^ why)
+                | _ => ()
+            val ended =
+              case outcome of
+                  HolbuildRemoteExec.Done => "finished"
+                | HolbuildRemoteExec.Failed (why, failures) => (List.app show failures; why)
+                | HolbuildRemoteExec.Cancelled stopped => (List.app show stopped; "cancelled")
+                | HolbuildRemoteExec.Unfollowable why => (HolbuildHolSharedCache.local_build_needed := remote_only; why)
+                | HolbuildRemoteExec.Unreachable why => (HolbuildHolSharedCache.local_build_needed := remote_only; why)
+          in
+            raise Error ("remote execution: batch " ^ batch_id ^ " " ^ ended ^ "; " ^ reason ^
+                         ", so this build restored nothing from it")
+          end
       in
         if writes_sources andalso detach then raise Error ("remote execution: " ^ reason)
-        else if writes_sources andalso Option.isSome attach andalso remote_only then
-          (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ reason ^ "; restoring from the cache\n");
-           Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
-           write_pending_plan ();
-           execute_build ())
-        else if writes_sources andalso Option.isSome attach then
-          (HolbuildBuildExec.warn ("remote execution: " ^ reason ^ "; building locally");
-           Option.app (fn batch_id => ignore (HolbuildRemoteExec.cancel url batch_id)) attach;
-           write_pending_plan ();
-           execute_build ())
+        else if writes_sources andalso Option.isSome attach then follow_only (valOf attach)
         else
           let
             fun prepare_requested () =

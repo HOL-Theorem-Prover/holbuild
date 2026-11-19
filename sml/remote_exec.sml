@@ -11,8 +11,9 @@ struct
 (* A step that yields text (a batch, a batch id) or says why it couldn't. *)
 datatype attempt = Ok of string | Refused of string
 
-(* A final action failure and its worker log, when one was uploaded. *)
-type action_failure = {input_key : string, kind : string, log_sha256 : string option}
+(* A final action failure and its worker log, when one was uploaded.  THEORY
+   is the action's `package:theory`, as the coordinator names it. *)
+type action_failure = {input_key : string, theory : string, kind : string, log_sha256 : string option}
 
 datatype outcome = Done
                  | Failed of string * action_failure list
@@ -253,11 +254,12 @@ fun follow url batch_id (on_change : string * string * string option * string op
     val _ = HolbuildOffline.require_online "follow a remote batch"
     val states : (string * (string * string option * string option)) list ref = ref []
     val names = ref ([] : (string * string) list)
+    fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
     (* An action the deadline stopped failed with its batch. *)
     fun failures () =
       List.mapPartial (fn (key, (state, kind, log)) =>
         if state = "failed" orelse (state = "cancelled" andalso kind = SOME "deadline") then
-          SOME {input_key = key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
+          SOME {input_key = key, theory = name key, kind = Option.getOpt (kind, "internal"), log_sha256 = log}
         else NONE) (rev (!states))
     (* An action stopped by a cancel, with the log its worker uploaded as it
        stopped it: what it printed up to then.  After an earlier attempt
@@ -266,10 +268,11 @@ fun follow url batch_id (on_change : string * string * string option * string op
     fun stopped () =
       List.mapPartial (fn (key, (state, kind, log)) =>
         case (state, kind, log) of
-            ("cancelled", NONE, SOME _) => SOME {input_key = key, kind = "cancelled", log_sha256 = log}
+            ("cancelled", NONE, SOME _) => SOME {input_key = key, theory = name key, kind = "cancelled", log_sha256 = log}
           | ("cancelled", SOME earlier, SOME _) =>
               if earlier = "deadline" orelse String.isPrefix "skipped because of " earlier then NONE
-              else SOME {input_key = key, kind = "cancelled after an attempt that failed (" ^ earlier ^ ")",
+              else SOME {input_key = key, theory = name key,
+                         kind = "cancelled after an attempt that failed (" ^ earlier ^ ")",
                          log_sha256 = log}
           | _ => NONE) (rev (!states))
     (* Actions a worker ran, whose log may arrive after their cancellation. *)
@@ -353,15 +356,14 @@ fun follow url batch_id (on_change : string * string * string option * string op
     val _ = !command_follow (batch_id, followed_at, Time.now ())
     val skipped = List.filter (fn (_, (state, reason, _)) =>
       state = "cancelled" andalso String.isPrefix "skipped because of " (Option.getOpt (reason, ""))) (!states)
-    fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
     (* A cancel doesn't wait for a stopped worker's log, which a later
        follow of the batch fetches. *)
     val _ =
       case outcome of
           Cancelled _ =>
             List.app (fn (key, _) =>
-              HolbuildStatus.message_stderr ("holbuild: remote " ^ name key ^ ": stopped before its worker's log " ^
-                "arrived; --attach " ^ batch_id ^ " again shows it once it does\n"))
+              HolbuildStatus.message_stderr ("holbuild: remote " ^ name key ^ ": stopped with no worker log yet; " ^
+                "if its worker uploads one, holbuild build --attach " ^ batch_id ^ " shows it\n"))
               (List.filter (fn (key, (state, _, log)) =>
                  state = "cancelled" andalso log = NONE andalso List.exists (fn k => k = key) (!ran)) (rev (!states)))
         | _ => ()
@@ -370,7 +372,7 @@ fun follow url batch_id (on_change : string * string * string option * string op
       else
         (HolbuildStatus.message_stderr ("holbuild: remote failure summary: " ^
            Int.toString (length (failures ())) ^ " failed, " ^ Int.toString (length skipped) ^ " skipped\n");
-         List.app (fn {input_key, kind, log_sha256} =>
+         List.app (fn {input_key, kind, log_sha256, ...} : action_failure =>
            HolbuildStatus.message_stderr ("holbuild: remote " ^ name input_key ^ ": failed (" ^ kind ^ ")" ^
              (case log_sha256 of SOME sha => ", log /cas/" ^ sha | NONE => ", no worker log") ^ "\n")) (failures ());
          List.app (fn (key, (_, reason, _)) =>

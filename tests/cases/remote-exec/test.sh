@@ -700,16 +700,18 @@ SML
   > "$tmpdir/generated-detach.log" 2>&1 && { cat "$tmpdir/generated-detach.log" >&2; exit 1; }
 require_grep "remote execution: theories that write SML sources build before the rest is planned" "$tmpdir/generated-detach.log"
 refute_grep "GenTheory built" "$tmpdir/generated-detach.log"
-# --remote-only restores, so with nothing cached it fails without building,
-# and cancels a batch it was to attach to.
+# --remote-only restores, so with nothing cached it fails without building.
+# A batch it was to attach to is only followed, never cancelled: this one is
+# unknown, so it can't be.
 set +e
 (cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only --attach genb UseLib) \
   > "$tmpdir/generated-only.log" 2>&1
 status=$?
 set -e
 [[ $status -eq 75 ]] || { echo "generated-only exited $status, wanted 75" >&2; cat "$tmpdir/generated-only.log" >&2; exit 1; }
-require_grep "build before the rest is planned; restoring from the cache" "$tmpdir/generated-only.log"
-require_grep "^POST /v1/batches/genb/cancel " "$state/requests.log"
+require_grep "remote execution: batch genb can't be followed (HTTP 404)" "$tmpdir/generated-only.log"
+require_grep "build before the rest is planned, so this build restored nothing from it" "$tmpdir/generated-only.log"
+refute_grep "^POST /v1/batches" "$state/requests.log"
 : > "$state/requests.log"
 refute_grep "GenTheory built" "$tmpdir/generated-only.log"
 (cd "$generated" && "$HOLBUILD_BIN" --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only UseLib) \
@@ -1340,8 +1342,30 @@ require_grep "BTheory: cancelled after an attempt that failed (memory); the log 
   "$tmpdir/stopped-memory.log"
 require_grep "child log tail ---" "$tmpdir/stopped-memory.log"
 batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/stopped-unlogged-detach.log")
-require_grep "remote rxp:BTheory: stopped before its worker's log arrived; --attach $batch again shows it" \
+require_grep "remote rxp:BTheory: stopped with no worker log yet; if its worker uploads one, holbuild build --attach $batch shows it" \
   "$tmpdir/stopped-unlogged.log"
+# A plan with a theory that writes SML sources can't take the batch over, so
+# attaching to it only reports how it ended, with the stopped theory's log:
+# nothing is cancelled, submitted, restored or built.
+write_broken stopped-gen
+run stopped-gen-detach 0 build --remote-exec "$coordinator" --detach BTheory
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/stopped-gen-detach.log")
+cat > "$project/src/GenScript.sml" <<SML
+Theory Gen
+
+fun holbuild_extra_outputs (_ : string list) = ();
+val () = holbuild_extra_outputs ["GenML.sml"];
+SML
+: > "$state/requests.log"
+touch "$state/stopped"
+run stopped-gen 1 build --remote-exec "$coordinator" --remote-only --attach "$batch" BTheory GenTheory
+rm "$state/stopped" "$project/src/GenScript.sml"
+require_grep "remote rxp:BTheory: cancelled; its worker log:" "$tmpdir/stopped-gen.log"
+require_grep "b_thm" "$tmpdir/stopped-gen.log"
+require_grep "remote execution: batch $batch cancelled; theories that write SML sources build before the rest is planned, so this build restored nothing from it" \
+  "$tmpdir/stopped-gen.log"
+refute_grep "^POST" "$state/requests.log"
+refute_grep "GenTheory built\|BTheory built\|restored from cache" "$tmpdir/stopped-gen.log"
 
 # A static error and a tactic timeout are reported from the worker's log too.
 write_failing_b() {
