@@ -11892,9 +11892,9 @@ fun sweep_worker_cache {limit_bytes, reserve_bytes, min_free_bytes} =
     val root = Path.concat (cache, "action")
   in
     with_action_root_lock cache (fn () =>
-      ((* Parked theories no record names (a worker short of disk drops the
-          records) go. *)
-       if Option.isSome (Resident.read_entries (parked_records root)) then () else remove_parked root;
+      ((* Only a worker short of disk sweeps, and the cap doesn't count the
+          parked theories, so they go, whatever their records say. *)
+       remove_parked root;
        HolbuildRemoveTree.remove_untrusted_strict (legacy_parked_root root);
        enforce_worker_cache_cap
          {cache = cache, checkpoint_root = Path.concat(cache, "checkpoints"), limit_bytes = limit_bytes,

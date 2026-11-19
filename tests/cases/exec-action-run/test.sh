@@ -216,11 +216,14 @@ record theory > "$tmpdir/worker-run/action-resident"
 record parked > "$tmpdir/worker-run/parked-records"
 printf 'stats\n' > "$tmpdir/worker-run/parked-stats"
 cp "$tmpdir/worker-run/parked-records" "$tmpdir/parked-records.before"
+parked_inode=$(stat -c %i "$tmpdir/worker-run/parked/$parked_stem.dat")
+# Held, so that a new file can't get the same inode back.
+ln "$tmpdir/worker-run/parked/$parked_stem.dat" "$tmpdir/parked-held.dat"
 worker run "$spec"
 expect run 0 status=built "input-key=$run_key"
 # Only a theory action's root keeps its dependencies for the next one.
 [[ ! -e "$tmpdir/worker-run/action" ]] || { echo "a run left its action root" >&2; exit 1; }
-[[ -e "$tmpdir/worker-run/parked/$parked_stem.dat" ]] &&
+[[ $(stat -c %i "$tmpdir/worker-run/parked/$parked_stem.dat" 2>/dev/null) == "$parked_inode" ]] &&
   cmp -s "$tmpdir/parked-records.before" "$tmpdir/worker-run/parked-records" &&
   [[ $(cat "$tmpdir/worker-run/parked-stats") == stats ]] || {
   echo "a run changed the parked theories, their records or their stats" >&2; exit 1; }
