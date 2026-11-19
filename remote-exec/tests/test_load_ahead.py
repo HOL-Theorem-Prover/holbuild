@@ -169,7 +169,10 @@ async def test_a_locked_claim_ahead_counts_a_parent_s_outline_only_while_it_is_r
     assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204
     c = await claim_ahead(http)
     assert c is not None and c["theory"] == "pkg:c"
-    claiming = {"batch_id": batch_id, "keys": [input_key("d")], "tier": "standard", "depth": 1, "taken": []}
+    claiming = {
+        "batch_id": batch_id, "keys": [input_key("d")], "tier": "standard", "depth": 1, "taken": [],
+        "outlined_only": False,
+    }
 
     async def claimed(outlined: list[str]) -> str | None:
         async with remote_exec_engine.begin() as connection:
@@ -646,6 +649,88 @@ async def test_a_batch_at_its_cap_is_left_out_of_the_read_of_candidates(
     assert (await coordinator._ahead_candidates()).candidates == []
 
 
+async def test_at_its_cap_a_batch_claims_ahead_only_a_child_whose_parents_all_published_their_outline(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """A child whose unfinished parents all published their outline starts on them and waits for nothing: with the
+    cap full, it is still claimed ahead, and takes no slot of it. One with a parent without an outline waits."""
+    roots = [f"r{i}" for i in range(16)] + ["o", "u"]
+    children = [f"c{i}" for i in range(16)] + ["x", "w"]
+    edges = [(f"c{i}", f"r{i}") for i in range(16)] + [("x", "o"), ("w", "u")]
+    batch_id = await submit(http, roots + children, edges, speculative_loading="16")
+    tokens = await claim_all(http, len(roots))
+    assert sorted(tokens) == sorted(roots)
+    for _ in range(16):
+        claimed = await claim_ahead(http)
+        assert claimed is not None and claimed["theory"].startswith("pkg:c")
+    assert await claim_ahead(http) is None
+
+    assert (await http.post(f"/v1/work/{tokens['o']}/outlined", headers=WORKER)).status_code == 204
+    x = await claim_ahead(http)
+    assert x is not None and (x["theory"], x["ahead_parents"]) == ("pkg:x", parents("o"))
+    assert await claim_ahead(http) is None  # "w" waits for "u", which published no outline
+
+    queue = (await http.get("/v1/queue", headers=CLIENT)).json()
+    assert (queue["running_standard"], queue["waiting_ahead_standard"]) == (35, 16)
+    async with coordinator.engine.connect() as conn:
+        active = await coordinator._counts(conn, coordinator_module.COUNT_ACTIVE)
+        waiting = await conn.scalar(
+            coordinator_module.COUNT_WAITING_AHEAD,
+            {"batch_id": batch_id, "outlined": list(coordinator.outlined_tokens)},
+        )
+    assert (active.waiting_ahead_standard, waiting) == (16, 16)
+
+
+async def test_at_its_cap_a_batch_claims_no_child_ahead_whose_parent_s_outlined_lease_ended_since_the_read(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: AsyncEngine
+) -> None:
+    coordinator.settings.claim_ranking_seconds = 3600
+    await submit(http, ["a", "b", "o", "x"], [("b", "a"), ("x", "o")], speculative_loading="1")
+    tokens = await claim_all(http, 2)
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+    assert (await http.post(f"/v1/work/{tokens['o']}/outlined", headers=WORKER)).status_code == 204
+    read = await coordinator._ahead_candidates()
+    assert [(c[1], c[5]) for c in read.candidates] == [(input_key("x"), True)]
+
+    # The shared read still has "x" whose parent's lease ended, unswept: the claim checks the outline itself.
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(
+            sa.text("UPDATE leases SET expires_at = now() - interval '1 second' WHERE input_key = :key"),
+            {"key": input_key("o")},
+        )
+    assert await claim_ahead(http) is None
+    assert (await ahead_state(remote_exec_engine, "x"))[0] == "waiting"
+
+
+async def test_a_read_from_under_the_cap_still_claims_an_outline_ready_child_once_another_coordinator_fills_it(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """The shared read ranks more than AHEAD_CLAIM_KEYS children that would wait before the one that won't; once
+    another coordinator's claim fills the cap, that one is still claimed."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    replica = Coordinator(coordinator.engine, coordinator.cache, coordinator.settings)
+    count = coordinator_module.AHEAD_CLAIM_KEYS + 2
+    roots = ["o"] + [f"r{i:02}" for i in range(count)]
+    children = ["x"] + [f"c{i:02}" for i in range(count)] + [f"g{i:02}" for i in range(count)]
+    edges = [("x", "o")] + [(f"c{i:02}", f"r{i:02}") for i in range(count)] + [
+        (f"g{i:02}", f"c{i:02}") for i in range(count)
+    ]
+    await submit(http, roots + children, edges, speculative_loading="1")
+    tokens = await claim_all(http, len(roots))
+    assert (await http.post(f"/v1/work/{tokens['o']}/outlined", headers=WORKER)).status_code == 204
+    read = await coordinator._ahead_candidates()
+    assert [(c[1], c[5]) for c in read.candidates] == [
+        *((input_key(f"c{i:02}"), False) for i in range(count)), (input_key("x"), True)
+    ]
+
+    filled = await replica.claim(["standard"], "w-replica", ahead=True)
+    assert filled is not None and filled.theory == "pkg:c00"
+    x = await claim_ahead(http)
+    assert x is not None and (x["theory"], x["ahead_parents"]) == ("pkg:x", parents("o"))
+    assert await claim_ahead(http) is None
+
+
 # An action abandoned ahead waits for its parents from then on; one retried may be claimed ahead again.
 @pytest.mark.parametrize(("failure", "next_ahead"), [("ahead-abandoned", "c"), ("unavailable", "b"), ("publish", "b")])
 async def test_a_claim_ahead_given_up_wakes_a_claim_waiting_for_its_slot_of_the_cap(
@@ -994,7 +1079,10 @@ async def test_claiming_and_revoking_ahead_read_each_actions_edges_by_key(
     async def reads(connection: Any, batch_id: UUID) -> list[int]:
         walk = {"batch_id": batch_id, "keys": children, "depth": limit, "outlined": []}
         return [  # REVOKE_AHEAD last: EXPLAIN ANALYZE runs it
-            await pages(connection, coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard", "taken": []}),
+            await pages(
+                connection, coordinator_module.CLAIM_AHEAD_ACTION,
+                {**walk, "tier": "standard", "taken": [], "outlined_only": False},
+            ),
             await pages(connection, coordinator_module.AHEAD_PARENTS, {**walk, "keys": children[:1]}),
             await pages(connection, coordinator_module.REFRESH_AHEAD_CHILDREN, {"batch_id": batch_id, "key": "k0"}),
             await pages(connection, coordinator_module.REVOKE_AHEAD, {"batch_id": batch_id, "keys": ["k0"]}),
@@ -1066,6 +1154,7 @@ async def test_with_no_depth_limit_revoking_reads_each_ancestor_claimed_ahead_on
             ),
             {"id": batch_id, "n": n},
         )
+        await connection.execute(sa.text("ANALYZE"))
         await connection.execute(sa.text("SET LOCAL statement_timeout = '10s'"))
         plan = await connection.scalar(
             sa.text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {coordinator_module.REVOKE_AHEAD.text}"),
@@ -1314,7 +1403,9 @@ async def test_claiming_ahead_reads_each_ancestors_action_by_key(
             {"id": new, "keys": [f"k{i}" for i in range(width, 2 * width)]},
         )
         walk = {"batch_id": new, "keys": [f"k{i}" for i in range(2 * width, 3 * width)], "depth": 2, "outlined": []}
-        claiming = (coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard", "taken": []})
+        claiming = (
+            coordinator_module.CLAIM_AHEAD_ACTION, {**walk, "tier": "standard", "taken": [], "outlined_only": False}
+        )
         naming = (coordinator_module.AHEAD_PARENTS, {**walk, "keys": walk["keys"][:1]})
         # The planner's own choice; nested loops alone; and the join a large history's statistics led to: all the
         # unfinished actions hashed, for a few ancestors. Claiming locks its candidate's row through a join, which
@@ -1361,7 +1452,10 @@ async def test_claiming_ahead_passes_over_a_locked_candidate_and_locks_the_one_i
             sa.text("INSERT INTO edges (batch_id, input_key, parent_key) VALUES (:id, 'c0', 'p'), (:id, 'c1', 'p')"),
             {"id": batch_id},
         )
-    claiming = {"batch_id": batch_id, "keys": ["c0", "c1"], "tier": "standard", "depth": 2, "taken": [], "outlined": []}
+    claiming = {
+        "batch_id": batch_id, "keys": ["c0", "c1"], "tier": "standard", "depth": 2, "taken": [], "outlined": [],
+        "outlined_only": False,
+    }
     locking = sa.text("SELECT input_key FROM actions WHERE batch_id = :id AND input_key = :key FOR UPDATE NOWAIT")
 
     async def claimed() -> str | None:

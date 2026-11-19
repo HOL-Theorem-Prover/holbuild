@@ -2136,8 +2136,12 @@ against the outline it loaded; otherwise it is built normally again. A
 theory that itself builds pipelined, within the coordinator's generation
 limit (`REMOTE_EXEC_AHEAD_DEPTH`), and whose unbuilt parents have all
 published their outlines can start at once, so it no longer waits behind
-shallower theories ready to build, and an outlined parent no longer counts
-against N.
+shallower theories ready to build. Neither an outlined parent nor a theory
+whose unbuilt parents have all published their outlines counts against N, and
+the latter is taken even when N others wait. The coordinator doesn't know
+whether such a theory can build pipelined; one that can't (a build target
+that saves theorem checkpoints, or one with extra outputs) waits for its
+parents' final outputs without counting against N.
 
 `build --remote-exec URL` hands the theories the remote cache lacks, and
 that aren't already built here, to a remote-execution coordinator, which runs them on its workers with
