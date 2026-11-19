@@ -4074,6 +4074,11 @@ fun first_changed_byte path (checkpoint : HolbuildTheoryCheckpoints.checkpoint) 
    child, since the build started: exec-action's rstdropn. *)
 val dropped_checkpoints = ref 0
 
+(* Whether the child, since the build started, failed to load the deps
+   heap for a theory module it loads that is missing or has another id:
+   a shared heap restored then is replaced by the one the run saves. *)
+val rejected_heap_modules = ref false
+
 fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
     val _ = resume_steps := []
@@ -4392,7 +4397,8 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
        saved on it are discarded, and the retry preloads afresh. *)
     fun discard_loaded_checkpoint_after_load_failure msg =
       if Option.isSome (find_substring "Required module missing or changed" msg) then
-        remove_deps_checkpoint_family checkpoint_base deps_key deps_loaded
+        (rejected_heap_modules := true;
+         remove_deps_checkpoint_family checkpoint_base deps_key deps_loaded)
       else
         remove_loaded_checkpoint_descendants checkpoint_base deps_key deps_loaded theorem_checkpoints declaration_checkpoints
           (hol_context_path (#context run_spec))
@@ -12702,6 +12708,13 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
 
 (* After the run, successful or not: the heap if this run saved it, then,
    if the heap under them is the published one, the new checkpoints. *)
+(* RESTORED, its heap marked stale if the child failed to load it for a
+   theory module (rejected_heap_modules), so that the heap the run saved
+   replaces it. *)
+fun heap_rejected ({heap_key, ...} : shared_context) ({heap, files, stale, missing} : shared_restore) =
+  {heap = heap, files = files, missing = missing,
+   stale = if !rejected_heap_modules andalso Option.isSome heap then heap_key :: stale else stale}
+
 fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
                                               deps_key, deps_loaded, candidates, ...} : shared_context)
                                ({heap = restored_heap, files = restored, stale, missing} : shared_restore) =
@@ -12784,7 +12797,12 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               val manifest = shared_manifest "holbuild-shared-heap-v1" NONE [("heap", sha, "")]
               val _ = upload_all [(deps_loaded, sha)]
               val _ = if needs_upload sha then raise Error ("could not upload " ^ deps_loaded) else ()
-              val _ = HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
+              (* A heap replaced, on every node: one still holding the old
+                 entry would keep handing it out. *)
+              val _ =
+                if member heap_key stale
+                then HolbuildRemoteCache.replace_action_everywhere remote {key = heap_key, text = manifest}
+                else HolbuildRemoteCache.publish_action remote {key = heap_key, text = manifest}
             in
               if HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote heap_key) = SOME manifest then
                 (store_add store sha {sha = sha, src = deps_loaded, save = true}; SOME sha)
@@ -14491,6 +14509,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         (* A load ahead's child is already running: it set the start. *)
         val _ = if isSome ahead then () else last_child_start := NONE
         val _ = dropped_checkpoints := 0
+        val _ = rejected_heap_modules := false
         (* Built on a late parent's outline, the run is the load ahead's:
            whatever stops it, nothing of it is published, and the action
            builds again plain. *)
@@ -14532,7 +14551,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               case shared of
                   SOME ctx =>
                     (publishing_checkpoints := true;
-                     (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
+                     (phase "publish" (fn () => publish_shared_checkpoints remote ctx (heap_rejected ctx restored))
                       before publishing_checkpoints := false)
                      handle e => (publishing_checkpoints := false; raise e))
                 | NONE => ()

@@ -62,6 +62,16 @@ Proof
   simp[a_value_def]
 QED
 SML
+cat > "$project/src/CScript.sml" <<'SML'
+Theory C
+Ancestors A Z
+
+Theorem c_thm:
+  a_value
+Proof
+  rw[a_value_def] (* c_thm *)
+QED
+SML
 cat > "$project/src/BScript.sml" <<'SML'
 Theory B
 Ancestors A
@@ -107,32 +117,36 @@ deps_saved() { require_grep "holbuild checkpoint kind=deps_loaded share=$1 with_
 # saveChildWithModules.  It writes A's module.
 build "$tmpdir/first.log"
 deps_saved true false
-echo 'val _ = PolyML.SaveState.saveChildWithModules;' > "$tmpdir/probe.sml"
-if ! "$HOLDIR/bin/hol" run --noconfig "$tmpdir/probe.sml" > /dev/null 2>&1; then
+# skip REASON: the rest needs what this toolchain lacks.
+skip() {
   if [[ ${HOLBUILD_TEST_REQUIRE_MODULE_HEAPS:-0} == 1 ]]; then
-    echo 'this Poly/ML has no PolyML.SaveState.saveChildWithModules' >&2
+    echo "deps heaps that refer to modules need $1" >&2
     exit 1
   fi
-  echo 'deps heaps that refer to modules unsupported by this Poly/ML'
+  echo "deps heaps that refer to modules unsupported: no $1"
   exit 0
-fi
-# The next fresh preload loads A's module, and the heap it saves refers to it.
+}
 if grep -q 'module-cache unsupported' "$b_log" ||
    [[ -z "$(find "$module_cache" -name '*-A-*.pmo' 2>/dev/null)" ]]; then
-  if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
-    echo 'deps heaps that refer to modules need theory module support' >&2
-    exit 1
-  fi
-  echo 'deps heaps that refer to modules unsupported by this HOL'
-  exit 0
+  [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} != 1 ]] ||
+    { echo 'deps heaps that refer to modules need theory module support' >&2; exit 1; }
+  skip 'theory module support'
 fi
+# The next fresh preload loads A's module, and the heap it saves refers to
+# it, if Poly/ML has saveChildWithModules; without it, the heap is saved
+# shared, holding A, as before.
 for ext in dat sig sml; do cp "$project/.holbuild/obj/src/BTheory.$ext" "$tmpdir/BTheory.$ext"; done
 rm -rf "$checkpoints/BScript.sml.deps" "$checkpoints/BScript.sml.theorems" "$HOLBUILD_CACHE/checkpoint-store"
 edit_b one
 build "$tmpdir/module.log"
+same_outputs
+echo 'val _ = PolyML.SaveState.saveChildWithModules;' > "$tmpdir/probe.sml"
+if ! "$HOLDIR/bin/hol" run --noconfig "$tmpdir/probe.sml" > /dev/null 2>&1; then
+  deps_saved true false
+  skip 'PolyML.SaveState.saveChildWithModules'
+fi
 deps_saved false true
 needs_a "$(deps_heap)"
-same_outputs
 
 # A resume from b_first's context, on that heap, after A's module went.
 find "$module_cache" -name '*-A-*.pmo' -delete
@@ -239,6 +253,7 @@ phase fetch-B 'rstmodn:1'
 require_grep 'restored shared' "$tmpdir/fetch-B.log"
 resumed fetch-B
 [[ -f "$modules" ]] || { echo "A's module wasn't fetched to $modules" >&2; exit 1; }
+cp "$modules" "$tmpdir/A.pmo"
 
 # The remote cache loses A's module too: the heap is dropped, and B preloads
 # afresh.
@@ -260,3 +275,29 @@ resumed replaced-B
 if grep -qE '^phase-ms=(.*,)?rstmoddropn:' "$tmpdir/replaced-B.result"; then
   echo 'the heap given up was not replaced' >&2; cat "$tmpdir/replaced-B.result" >&2; exit 1
 fi
+
+# A module at its path with another id (here, not a module at all): W's
+# HOL child fails to load the heap, preloads afresh, and the heap it saves
+# replaces the published one.  C, on A and Z, has a heap of its own, which
+# loads A's module.
+edit_c() { sed -i "s/^  .*(\* c_thm.*\$/  rw[a_value_def] (* c_thm $1 *)/" "$project/src/CScript.sml"; }
+rm -f "$tmpdir/control/cas-get-status-$module_sha"
+rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
+mkdir -p "$(dirname "$modules")"
+cp "$tmpdir/A.pmo" "$modules"
+exec_theory C c
+published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
+for heap in $published; do heap_modules "$heap"; done | grep -q -- '-A-' ||
+  { echo "C's published heap doesn't load A's module" >&2; exit 1; }
+printf 'not a module\n' > "$modules"
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_c changed
+exec_theory C changed
+require_grep 'restored shared' "$tmpdir/changed-C.log"
+require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/changed-C.log"
+phase changed-C 'rstdropn:1'
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_c replaced
+exec_theory C c-replaced
+require_grep 'restored shared' "$tmpdir/c-replaced-C.log"
+resumed c-replaced-C
