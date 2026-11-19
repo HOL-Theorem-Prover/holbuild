@@ -53,11 +53,12 @@ declare -A proofs=(
 )
 
 child_log=$project/.holbuild/logs/current/failed-prefix-salvage-oracle/ATheory/instrumented-failure.log
-# Where the salvaged prefix ends (resbyten): just past the unchanged leaf
-# before the edit, nested in the combinator, so the hash taken there is
-# that of a nested path.  An `rpt` body runs as one leaf, which the edit
-# changes, so nothing of it is kept.
-declare -A kept_end=([select]=29 [each]=20 [cases]=20 [choice]=23 [try]=12 [repeat]=0)
+# The leaf runs the resume rewinds (holrewoundn) when the salvage keeps the
+# prefix through the unchanged leaf before the edit, nested in the
+# combinator, so the hash taken there is that of a nested path; a salvage
+# that stopped before that leaf would rewind more.  An `rpt` body runs as
+# one leaf, which the edit changes, so all of it is rewound.
+declare -A rewound=([select]=2 [each]=3 [cases]=4 [choice]=2 [try]=3 [repeat]=2)
 for construct in select each cases choice try repeat; do
   name=salvage_$construct
   for edit in "(ALL_TAC)" "I ALL_TAC" "(ALL_TAC : tactic)"; do
@@ -85,10 +86,10 @@ SML
     require_grep "oracle failure" "$log"
     if [[ "$edit" != "(ALL_TAC)" ]]; then
       require_grep "from: failed-prefix checkpoint in $name" "$log"
-      kept=$(grep '^holbuild hol-phases' "$child_log" | tail -n 1 | sed -n 's/.* resbyten=\([0-9]*\).*/\1/p')
-      if [[ "$kept" != "${kept_end[$construct]}" ]]; then
+      got=$(grep '^holbuild hol-phases' "$child_log" | tail -n 1 | sed -n 's/.* holrewoundn=\([0-9]*\).*/\1/p')
+      if [[ "$got" != "${rewound[$construct]}" ]]; then
         grep '^holbuild hol-phases' "$child_log" >&2 || true
-        echo "$name: expected the salvage to keep the prefix through offset ${kept_end[$construct]}, got '$kept'" >&2
+        echo "$name: expected the resume to rewind ${rewound[$construct]} leaf runs, got '$got'" >&2
         exit 1
       fi
     fi

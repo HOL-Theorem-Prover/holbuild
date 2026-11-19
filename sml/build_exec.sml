@@ -4025,9 +4025,25 @@ fun resumes_from_checkpoints policy (action : theory_action) =
 
 (* What the last theory script written resumes from, as result phases: a
    count of 1 for its kind (failed prefix, theorem or definition context,
-   deps heap; none for a fresh preload), the failed prefix's step count and
-   the resume point's source offset. *)
+   deps heap; none for a fresh preload), the failed prefix's step count,
+   the resume point's source offset and, for a failed prefix, a bound on
+   the first source byte the edit changed. *)
 val resume_steps = ref ([] : (string * LargeInt.int) list)
+
+(* resbyten: the source offset of the first byte where the theorem's tactic
+   differs from the prefix the failed-prefix checkpoint at PATH ran (its
+   .prefix), or of the prefix's end when the tactic still starts with it,
+   so no byte before it changed.  Nothing without a readable .prefix. *)
+fun first_changed_byte path (checkpoint : HolbuildTheoryCheckpoints.checkpoint) =
+  let
+    val ran = read_text (path ^ ".prefix")
+    val now = #tactic_text checkpoint
+    fun same i = i < size ran andalso i < size now andalso String.sub (ran, i) = String.sub (now, i)
+    fun differ i = if same i then differ (i + 1) else i
+  in
+    [("resbyten", LargeInt.fromInt (#tactic_start checkpoint + differ 0))]
+  end
+  handle IO.Io _ => []
 
 (* Checkpoints dropped because loading or resuming them failed in the
    child, since the build started: exec-action's rstdropn. *)
@@ -4080,7 +4096,8 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
           val _ = write_text staged_script (failed_prefix_resume_source policy contexts timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
           val _ = failed_prefix_resume_message logical checkpoint step_count
           val _ = resume_steps := [("resfpn", 1), ("resstepn", LargeInt.fromInt step_count),
-                                   ("resboundary", LargeInt.fromInt (#boundary checkpoint))]
+                                   ("resboundary", LargeInt.fromInt (#boundary checkpoint))] @
+                                  first_changed_byte path checkpoint
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME (path, step_count)}
         end
@@ -11082,7 +11099,7 @@ fun merge_phases phases =
    longer than a phases line could be is skipped. *)
 val hol_log_phase_names =
   ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
-   "holcompiledn", "holreplayedn", "holrewoundn", "resbyten"]
+   "holcompiledn", "holreplayedn", "holrewoundn"]
 
 fun hol_log_phases log_file child_start =
   let

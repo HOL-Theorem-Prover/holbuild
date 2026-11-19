@@ -321,6 +321,11 @@ for step in resfpn resstepn resboundary holload holsalvage holrewind holleaves h
   grep -qE "^phase-ms=(.*,)?$step:[0-9]+(,|\$)" "$tmpdir/v4a.result" || {
     echo "v4a's record lacks phase $step:" >&2; cat "$tmpdir/v4a.result" >&2; exit 1; }
 done
+# v4 ran "CONJ_TAC >- ACCEPT_TAC TRUTH" before failing, and v4a's tactic
+# still starts with it: no byte before its end changed.
+tactic=$(grep -bo 'CONJ_TAC >- ACCEPT_TAC TRUTH >> ALL_TAC' "$project/src/TScript.sml" | cut -d: -f1)
+grep -qE "^phase-ms=(.*,)?resbyten:$((tactic + 28))(,|\$)" "$tmpdir/v4a.result" || {
+  echo "v4a's resbyten is not $((tactic + 28)):" >&2; cat "$tmpdir/v4a.result" >&2; exit 1; }
 forget_local
 worker v4b "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v4b 1 "status=failed" "failure=proof"
