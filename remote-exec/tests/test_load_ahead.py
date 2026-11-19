@@ -136,6 +136,29 @@ async def test_an_action_that_published_its_outline_frees_its_slot_of_the_cap_fo
     assert coordinator.outlined_tokens == {}
 
 
+async def test_a_locked_claim_ahead_counts_a_parent_s_outline_only_while_it_is_reported(
+    http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
+) -> None:
+    """At ``ahead_depth`` 1, "c" may be claimed ahead of "b", claimed ahead of the running "a", only on "b"'s outline:
+    the claim checks it itself, whatever the shared read it was given found."""
+    batch_id = await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "b")], speculative_loading="4")
+    await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+    claiming = {"batch_id": batch_id, "keys": [input_key("c")], "tier": "standard", "depth": 1, "taken": []}
+
+    async def claimed(outlined: list[str]) -> str | None:
+        async with remote_exec_engine.begin() as connection:
+            row = (
+                await connection.execute(coordinator_module.CLAIM_AHEAD_ACTION, {**claiming, "outlined": outlined})
+            ).first()
+            await connection.rollback()
+        return None if row is None else row.theory
+
+    assert await claimed([]) is None
+    assert await claimed([b["attempt_token"]]) == "pkg:c"
+
+
 async def test_a_child_is_claimed_ahead_of_its_running_parent_once_nothing_is_ready(
     http: httpx.AsyncClient, remote_exec_engine: AsyncEngine
 ) -> None:

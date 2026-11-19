@@ -646,8 +646,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   memory, by attempt token, and names an action only while that lease is
   live; each replica keeps the reports it received, as it does host reports,
   and a restarted coordinator counts such actions against the cap again
-  until they end. Rolling back: `REMOTE_EXEC_PIPELINE=0`, which stops new
-  pipelined claims; actions already running finish as they started.
+  until they end. `REMOTE_EXEC_PIPELINE=0` stops new pipelined claims;
+  actions already running finish as they started. It doesn't change the
+  claim order: a candidate deeper than its batch's ready builds still goes
+  first, and its worker then waits for its parents' outputs instead of their
+  outlines. Restoring the earlier order takes the earlier coordinator.
 - **Retries** by the result's failure class:
 
   | `failure` | What happens |
