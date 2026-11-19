@@ -437,6 +437,38 @@ for limit in 100000 0 unlimited; do
     > "$tmpdir/synthetic-large-goal-$limit.log" 2>&1
 done
 
+# Whatever HOL printed before the failure (metis output, say) can put the
+# diagnostic past any fixed prefix of the log.
+chatter_log=$tmpdir/chatter-before-goal.log
+for i in $(seq 3000); do printf 'metis: r[+0+12]+0+0+0+0+1+2+3+4+5#\n'; done > "$chatter_log"
+cat >> "$chatter_log" <<'LOG'
+holbuild goal state at failed fragment: simp []
+holbuild plan position: 3 tactic simp []
+holbuild failed tactic input goal count: 2
+holbuild failed tactic top input goal:
+    late goal
+holbuild end failed tactic top input goal
+LOG
+cat > "$synthetic_large_goal_check" <<SML
+OS.FileSys.chDir "$repo_root";
+use "sml/holbuild-script.sml";
+val _ = if OS.FileSys.fileSize "$chatter_log" > 65536 + 4096 then ()
+        else raise Fail "the chatter is too short to test anything";
+val state = valOf (HolbuildTheoryDiagnostics.read_goal_state "$chatter_log");
+val _ = if #top_goal state = "    late goal\n" andalso #remaining_goals state = SOME 2 andalso
+           not (#marker_truncated state) then ()
+        else raise Fail "goal state after the chatter";
+val _ = if HolbuildTheoryDiagnostics.plan_position_summary "$chatter_log" =
+           SOME "plan position: 3 tactic simp []\n" then ()
+        else raise Fail "plan position after the chatter";
+val _ = OS.Process.exit OS.Process.success;
+SML
+HOLBUILD_HOLDIR="$HOLDIR" HOLDIR="$HOLDIR" poly --error-exit < "$synthetic_large_goal_check" \
+  > "$tmpdir/chatter-before-goal.log.check" 2>&1 || {
+  cat "$tmpdir/chatter-before-goal.log.check" >&2
+  exit 1
+}
+
 multi_goal_project=$tmpdir/multi-goal-project
 mkdir -p "$multi_goal_project/src"
 cat > "$multi_goal_project/holproject.toml" <<TOML
