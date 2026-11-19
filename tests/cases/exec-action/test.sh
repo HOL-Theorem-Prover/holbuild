@@ -650,6 +650,28 @@ expect c 0
 [[ ! -e "$parked_b.dat" && $(stat -c %i "$stem_b.dat") == "$inode_b" ]] &&
   grep -qE "^phase-ms=(.*,)?hydinstn:0(,|\$)" "$tmpdir/c.result" || {
   echo "worker c kept a parked copy of a stem in the root:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
+# A 0.14.79 worker parked in action-parked, with parked lines in the root's
+# records; those lines are dropped, not carried into parked-records, and the
+# theory is installed afresh when wanted again.
+legacy_b="$tmpdir/worker-c/action-parked${stem_b#"$tmpdir/worker-c/action"}"
+objs_b="$(dirname "$stem_b")/.hol/objs/$(basename "$stem_b")"
+legacy_objs_b="$tmpdir/worker-c/action-parked${objs_b#"$tmpdir/worker-c/action"}"
+mkdir -p "$(dirname "$legacy_b")" "$(dirname "$legacy_objs_b")"
+for file in "$stem_b".* "$objs_b".*; do
+  case $file in "$stem_b".*) mv "$file" "$legacy_b${file#"$stem_b"}" ;; *) mv "$file" "$legacy_objs_b${file#"$objs_b"}" ;; esac
+done
+sed -i "s|^theory\t$stem_b\t|parked\t$stem_b\t|" "$tmpdir/worker-c/action-resident"
+grep -q "^parked	$stem_b	" "$tmpdir/worker-c/action-resident" || { cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
+worker c "$spec_a2"
+expect c 0
+[[ ! -e "$tmpdir/worker-c/action-parked" && ! -e "$stem_b.dat" && ! -e "$parked_b.dat" ]] &&
+  ! grep -q "	$stem_b	" "$tmpdir/worker-c/parked-records" || {
+  echo "worker c carried 0.14.79's parked B over" >&2; cat "$tmpdir/worker-c/parked-records" >&2; exit 1; }
+worker c "$spec_c"
+expect c 0
+require_file "$stem_b.dat"
+grep -qE "^phase-ms=(.*,)?hydinstn:[1-9][0-9]*(,|\$)" "$tmpdir/c.result" || {
+  echo "worker c didn't install B again:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
 # Without their records the parked theories go.
 worker c "$spec_a2"
 expect c 0
