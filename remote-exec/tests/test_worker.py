@@ -746,7 +746,7 @@ def test_worker_adds_the_specs_dependency_context_to_the_result_it_reports(
 
 @pytest.mark.parametrize(("extra", "line"), [
     ({"batch_id": "b1"}, f"running pkg:A ({'6' * 64}) in batch b1"),
-    ({}, f"running pkg:A ({'6' * 64})"),  # a coordinator before 0.14.79 names no batch
+    ({}, f"running pkg:A ({'6' * 64})"),  # a coordinator before 0.14.80 names no batch
 ])
 def test_worker_logs_the_action_it_runs_with_its_batch(
     tmp_path: Path, server: Server, logs: tuple[Path, Path], capsys: pytest.CaptureFixture[str],
