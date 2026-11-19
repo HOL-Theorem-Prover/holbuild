@@ -1224,8 +1224,10 @@ A theory's children need its declarations, not its proofs. So in a local
 build with `-j` greater than 1, a cold theory builds *pipelined* when a child
 of it could start on its outline (one whose other parents are built or being
 built) and a job slot would still be free once every ready theory at least as
-deep has one. Workers take theories by rank: the longest chain of dependents
-below a theory first, then its number of descendants. A pipelined theory:
+deep has one. Workers take the deepest work first: the longest chain of
+dependents below a theory. On equal depth, ready theories go before attempts
+waiting to start, and the number of descendants decides among ready theories.
+A pipelined theory:
 
 1. Its HOL process runs the script with each `Theorem ... Proof ... QED` proof
    deferred, and exports the theory. That export is the theory's *outline*.

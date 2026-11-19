@@ -678,6 +678,38 @@ done
 log=$tmpdir/ranked.log
 require_grep "pipeline: dispatch plain: R[123]Theory (ranked ahead 2, free 3)" "$log"
 
+# The child must be able to start: K needs P and Q, and Q waits on S, which
+# heads the deeper chain and goes first.  When P is dispatched Q has no
+# build yet, so K couldn't start on P's outline and P builds plain, though
+# workers are free.
+new_project eligible
+write_eligible() {
+  local name=$1
+  shift
+  local opens=""
+  for dep in "$@"; do opens="$opens ${dep}Theory"; done
+  cat > "$tmpdir/eligible/src/${name}Script.sml" <<SML
+open HolKernel Parse boolLib bossLib$opens;
+val _ = new_theory "$name";
+Theorem ${name}_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+}
+write_eligible S
+write_eligible Q S
+write_eligible P
+write_eligible K P Q
+(cd "$tmpdir/eligible" && HOLBUILD_CACHE_TRACE=1 "$HOLBUILD_BIN" -j3 build --no-cache --skip-checkpoints --skip-proof-steps) \
+  > "$tmpdir/eligible.log" 2>&1
+log=$tmpdir/eligible.log
+require_before "pipeline: dispatch [a-z]*: STheory" "pipeline: dispatch [a-z]*: PTheory" "$log"
+require_grep "pipeline: dispatch plain: PTheory (ranked ahead 0, free 2)" "$log"
+require_grep "KTheory built" "$log"
+
 # Ranking: at -j3, Bushy and Forked head chains two links long, Bushy with
 # one child but four descendants, Forked with two children but three; Wide
 # and Narrow head one link (two children and one), and Leaf none.  Workers
