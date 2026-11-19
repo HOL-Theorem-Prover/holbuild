@@ -547,18 +547,24 @@ fun take_n n lines acc =
 fun child_failure_excerpt lines =
   let
     (* A worker appends its derived summary to the raw log.  Diagnose only
-       the raw output, and keep preceding output separate from the cause. *)
+       the raw output, and keep preceding output separate from the cause.
+       Leave out holbuild's own runtime marker lines (`holbuild hol-phases
+       ...`): they carry per-run values, not HOL output. *)
+    fun runtime_marker line = String.isPrefix "holbuild " line
     fun scan [] _ failure terminal = (failure, terminal)
       | scan (remaining as line :: rest) preceding failure terminal =
           if String.isPrefix "holbuild: exec-action failed:" line then (failure, terminal)
           else
-            scan rest (take_n 10 (line :: preceding) [])
+            scan rest
+              (if runtime_marker line then preceding
+               else take_n 10 (line :: preceding) [])
               (if child_failure_line line then SOME remaining else failure)
               (if String.isPrefix "Uncaught exception" line then SOME (line, rev preceding)
                else terminal)
     fun raw_excerpt [] = []
       | raw_excerpt (line :: rest) =
           if String.isPrefix "holbuild: exec-action failed:" line then []
+          else if runtime_marker line then raw_excerpt rest
           else line :: raw_excerpt rest
   in
     case scan lines [] NONE NONE of
