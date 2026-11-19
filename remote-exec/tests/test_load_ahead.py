@@ -197,10 +197,11 @@ async def test_a_claim_ahead_with_a_deeper_chain_than_its_batch_s_ready_builds_c
     assert [await next_claim() for _ in range(3)] == ["r", "b", "s"]
     # "c" is a generation ahead of "b" once its outline is out, and on a longer chain than "l", comes before it.
     assert (await http.post(f"/v1/work/{tokens['b']}/outlined", headers=WORKER)).status_code == 204
-    assert [await next_claim() for _ in range(3)] == ["c", "l", None]
-    # "d" and "t", two generations ahead of the running "a" and "r", wait for an outline of "c" or "s".
+    assert await next_claim() == "c"
+    # Once "c"'s outline is out too, "d" may be claimed, but ranks no higher than "l", which goes first. "t", two
+    # generations ahead of the running "r" until "s" publishes an outline, never may.
     assert (await http.post(f"/v1/work/{tokens['c']}/outlined", headers=WORKER)).status_code == 204
-    assert [await next_claim() for _ in range(2)] == ["d", None]
+    assert [await next_claim() for _ in range(3)] == ["l", "d", None]
 
 
 async def test_of_claims_ahead_as_deep_the_one_on_outlines_alone_is_taken_first(http: httpx.AsyncClient) -> None:
