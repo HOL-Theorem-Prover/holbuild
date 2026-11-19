@@ -45,6 +45,7 @@ RELEASE_CACHE_CHECKS = 48
 # Transactions a release pass holds at once, so a pass over many batches leaves pooled connections to the rest.
 RELEASE_TRANSACTIONS = 8
 RELEASE_SLOW_SECONDS = 5.0  # a release pass that takes this long is logged
+SUBMIT_SLOW_SECONDS = 10.0  # a submission that takes this long is logged
 
 # A statement, or a transaction left idle, that runs longer than this is ended by the database, so one stuck
 # query can't hold a connection, or the locks it took, for good.
@@ -1123,11 +1124,16 @@ class Coordinator:
 
     async def submit(
         self, batch: Batch, profile: str, action_class: str = "build", max_heap_mb: int | None = None,
-        *, fail_fast: bool = False, priority: int = 0, ahead_cap: int | None = None,
+        *, fail_fast: bool = False, priority: int = 0, ahead_cap: int | None = None, batch_id: UUID | None = None,
     ) -> UUID:
         """Store a batch; its actions without uncached parents become ready. With ``ahead_cap``, up to that many
-        of its actions at once may be claimed ahead of their parents; see _claim_ahead."""
-        batch_id = uuid4()
+        of its actions at once may be claimed ahead of their parents; see _claim_ahead.
+
+        The batch is stored under ``batch_id``, a new id if None. A batch already stored under it is kept as it is,
+        and its id returned: that is a client's retry of a submission whose answer it never got. A retry that comes
+        while the first submission is still storing waits for it."""
+        started = time.monotonic()
+        batch_id = batch_id or uuid4()
         parents: defaultdict[str, int] = defaultdict(int)
         for child, _ in batch.edges:
             parents[child] += 1
@@ -1149,10 +1155,11 @@ class Coordinator:
                 {"profile": profile, "packages": packages, "names": names},
             )
             high = {theory for theory, peak in hints if peak >= self.settings.standard_tier_mb}
-            await conn.execute(
+            stored = await conn.scalar(
                 sa.text(
                     "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority, ahead_cap) "
-                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority, :ahead_cap)"
+                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority, :ahead_cap) "
+                    "ON CONFLICT (id) DO NOTHING RETURNING id"
                 ),
                 {
                     "id": batch_id,
@@ -1164,6 +1171,9 @@ class Coordinator:
                     "ahead_cap": ahead_cap,
                 },
             )
+            if stored is None:
+                logger.warning("batch %s was submitted again; answering with the batch already stored", batch_id)
+                return batch_id
             if batch.actions:
                 await conn.execute(
                     sa.text(
@@ -1197,6 +1207,10 @@ class Coordinator:
         await self.release(batch_id)
         if batch.actions:
             self.request_scale()
+        if (seconds := time.monotonic() - started) >= SUBMIT_SLOW_SECONDS:
+            logger.warning(
+                "submitting %s took %.1f s: %d actions, %d edges", batch_id, seconds, len(batch.actions), len(batch.edges)
+            )
         return batch_id
 
     async def get(self, batch_id: UUID) -> BatchStatus | None:

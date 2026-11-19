@@ -912,13 +912,17 @@ require_grep "^action $key_a .* rx:ATheory$" "$state/$batch.batch"
 refute_grep "^action .* rx:BTheory$" "$state/$batch.batch"
 require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/local-cache-integrity.log"
 
-# A submission answered 502 while the coordinator restarts is retried, and
-# given up on when it stays down.
+# A submission answered 502 while the coordinator restarts is retried, under
+# the batch id of its first attempt, and given up on when it stays down.
 write_theories restarting
 echo 2 > "$state/unavailable"
+rm -f "$state/submitted-ids"
 run restarting-only 0 build --remote-exec "$coordinator" --remote-only BTheory
 [[ $(grep -c "coordinator refused the batch (HTTP 502): .*restarting.*; retrying" "$tmpdir/restarting-only.log") -eq 2 ]] ||
   { cat "$tmpdir/restarting-only.log" >&2; exit 1; }
+[[ $(wc -l < "$state/submitted-ids") -eq 3 && $(sort -u "$state/submitted-ids" | wc -l) -eq 1 ]] ||
+  { cat "$state/submitted-ids" >&2; exit 1; }
+require_grep '^[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}$' "$state/submitted-ids"
 require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/restarting-only.log"
 rm "$state/unavailable"
 write_theories unavailable

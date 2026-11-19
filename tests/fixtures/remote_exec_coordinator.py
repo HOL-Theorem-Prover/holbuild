@@ -37,7 +37,8 @@ fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", the batch fails for resubmission naming it,
 as the coordinator does.  Otherwise
 the cancel answers that it cancelled the batch.  Every request is logged to
-STATE/requests.log.
+STATE/requests.log, and each POST /v1/batches's Holbuild-Batch-Id header to
+STATE/submitted-ids.
 """
 
 import hashlib
@@ -81,6 +82,8 @@ class Handler(BaseHTTPRequestHandler):
         path, _, query = self.path.partition("?")
         if path != "/v1/batches":
             return self.answer(404, {"detail": "Not Found"})
+        with open(state / "submitted-ids", "a") as ids:
+            ids.write(f"{self.headers.get('Holbuild-Batch-Id', '-')}\n")
         if (state / "refuse").exists():
             return self.answer(400, {"detail": "batch refused by the stub"})
         unavailable = state / "unavailable"

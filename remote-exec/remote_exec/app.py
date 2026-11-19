@@ -242,6 +242,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         priority: int = Query(default=0, ge=0, le=2147483647),
         action_class: Literal["build", "run"] = Query(default="build", alias="class"),
         speculative_loading: int | None = Query(default=None, ge=1, le=64),
+        batch_id: UUID | None = Header(default=None, alias="Holbuild-Batch-Id"),
     ) -> dict[str, UUID]:
         try:
             batch = parse_batch(await text_body(request))
@@ -253,7 +254,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             raise HTTPException(400, "run batches have no parents to load ahead of: speculative_loading is not allowed")
         return {"batch_id": await coordinator.submit(
             batch, profile, action_class, max_heap_mb, fail_fast=fail_fast, priority=priority,
-            ahead_cap=speculative_loading,
+            ahead_cap=speculative_loading, batch_id=batch_id,
         )}
 
     @app.get("/v1/batches/{batch_id}", dependencies=client)

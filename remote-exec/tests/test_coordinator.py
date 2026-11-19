@@ -20,7 +20,7 @@ from starlette.requests import Request
 from remote_exec import coordinator as coordinator_module
 from remote_exec.app import CountResponses, create_app, summary_line
 from remote_exec.coordinator import Claim, Coordinator, HostReport, _claim_rank
-from remote_exec.formats import FormatError, parse_result
+from remote_exec.formats import FormatError, parse_batch, parse_result
 from conftest import CLIENT_TOKEN, WORKER_TOKEN, FakeCache, Settled
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
@@ -127,6 +127,41 @@ async def test_submit_rejects_bad_batches_and_tokens(http: httpx.AsyncClient) ->
     assert (await http.post("/v1/batches", content=batch_text(["a"]), headers=WORKER)).status_code == 401
     claim_body = {"tier": "standard", "worker": "w"}
     assert (await http.post("/v1/work/claim", json=claim_body, headers=CLIENT)).status_code == 401
+
+
+async def test_a_submission_repeated_under_its_id_answers_with_the_batch_stored_first(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    batch_id = str(uuid4())
+    headers = {**CLIENT, "Holbuild-Batch-Id": batch_id}
+    for _ in range(2):
+        response = await http.post("/v1/batches", content=batch_text(["a", "b"], [("b", "a")]), headers=headers)
+        assert response.status_code == 201, response.text
+        assert response.json()["batch_id"] == batch_id
+
+    async with coordinator.engine.connect() as conn:
+        assert await conn.scalar(sa.text("SELECT count(*) FROM batches")) == 1
+        assert await conn.scalar(sa.text("SELECT count(*) FROM actions")) == 2
+    assert await states(http, batch_id) == {"a": "ready", "b": "waiting"}
+
+
+async def test_a_repeated_submission_waits_for_the_first_to_commit_and_stores_nothing_more(
+    coordinator: Coordinator,
+) -> None:
+    batch_id = uuid4()
+    batch = parse_batch(batch_text(["a"]))
+    async with coordinator.engine.connect() as first:
+        await first.execute(
+            sa.text("INSERT INTO batches (id, state, profile) VALUES (:id, 'running', 'default')"), {"id": batch_id}
+        )
+        repeat = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
+        await asyncio.sleep(0.5)
+        assert not repeat.done()
+        await first.commit()
+        assert await asyncio.wait_for(repeat, 10) == batch_id
+
+    async with coordinator.engine.connect() as conn:
+        assert await conn.scalar(sa.text("SELECT count(*) FROM actions")) == 0
 
 
 async def test_empty_batch_is_done(http: httpx.AsyncClient) -> None:

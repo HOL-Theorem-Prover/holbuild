@@ -823,6 +823,13 @@ from 0 to 2147483647; invalid values return 422. Existing batches retain priorit
 at once be claimed ahead of their parents (see "Loading ahead"); without it
 none is. A run batch with it returns 400.
 
+A `Holbuild-Batch-Id: <uuid>` header names the id to store the batch under;
+without it the coordinator picks one. A batch already stored under that id is
+kept as it is and its id returned, so a client that retries a submission whose
+answer it never got (it timed out, or a proxy failed) under the same id makes
+no second copy. A retry that comes while the first is still being stored waits
+for it. holbuild sends one random id with every attempt of a submission.
+
 - 201 `{"batch_id": "<uuid>"}`
 - 400 when the batch is malformed (bad header or line, duplicate action, an
   edge to a theory outside the batch), or is a run batch with edges or
