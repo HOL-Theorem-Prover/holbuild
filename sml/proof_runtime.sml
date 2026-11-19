@@ -139,9 +139,10 @@ fun timed_hol_phase name f =
     val _ = hol_phase_nested_ms_ref := 0
     val t0 = Time.now ()
     fun record () =
-      let val elapsed = Time.toMilliseconds (Time.-(Time.now (), t0))
+      (* The wall clock can step back: a part never takes less than 0 ms. *)
+      let val elapsed = LargeInt.max (0, Time.toMilliseconds (Time.-(Time.now (), t0)))
       in
-        add_hol_phase name (elapsed - !hol_phase_nested_ms_ref);
+        add_hol_phase name (LargeInt.max (0, elapsed - !hol_phase_nested_ms_ref));
         hol_phase_nested_ms_ref := outer_nested + elapsed
       end
   in
@@ -2421,7 +2422,8 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
             timed_hol_phase "holsalvage" (fn () =>
               rewind_past_shared_leaves plan (resumable_failed_prefix_metadata plan metadata))
           val _ = add_hol_phase "holrewoundn" (LargeInt.fromInt (#step_count metadata - #step_count resume_metadata))
-          (* Where the resumed proof goes on: the first changed byte is at or after it. *)
+          (* The source offset where the resumed proof goes on: the end of the
+             salvaged prefix's last leaf, or 0. *)
           val _ = add_hol_phase "resbyten" (LargeInt.fromInt (#prefix_end resume_metadata))
           val backup_count = #history_count metadata - #history_count resume_metadata
           val _ =

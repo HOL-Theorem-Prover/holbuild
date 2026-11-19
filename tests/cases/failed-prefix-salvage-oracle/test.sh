@@ -12,9 +12,10 @@ source "$SCRIPT_DIR/../../lib.sh"
 # leaf.  With HOLBUILD_CHECK_SALVAGE=1 (tests/run.sh sets it) every salvage
 # is also checked leaf by leaf and a disagreement fails the build.  Each
 # proof below is edited inside a structural combinator, once keeping every
-# later leaf where it was (the single hash then misses and the leaf-by-leaf
-# check finds the prefix) and once moving them (the hash at the last leaf
-# before the edit matches).
+# later leaf where it was and once moving them; the edited leaf ends the
+# cheap checks, so the hash is taken at the leaf before it.  An edit outside
+# every leaf (a selector) leaves all leaves passing the cheap checks: the
+# hash then misses and the leaf-by-leaf check finds the prefix.
 export HOLBUILD_CHECK_SALVAGE=1
 
 tmpdir=$(make_temp_dir)
@@ -80,6 +81,45 @@ SML
     fi
   done
 done
+
+# Changing the selector keeps every leaf's span and program, so the scan
+# passes all three leaves; the third leaf's dependency prefix holds the
+# selector, so its hash misses and the leaf-by-leaf check keeps two.
+write_selector() {
+  cat > "$project/src/AScript.sml" <<SML
+Theory A
+
+Theorem salvage_selector:
+  T /\\ F
+Proof
+  ALL_TAC >> CONJ_TAC >>~- ([\`$1\`], ALL_TAC >> FAIL_TAC "oracle failure")
+QED
+SML
+}
+for selected in T F; do
+  write_selector "$selected"
+  log=$tmpdir/selector-$selected.log
+  if (cd "$project" && "$HOLBUILD_BIN" build ATheory) >"$log" 2>&1; then
+    cat "$log" >&2
+    echo "expected salvage_selector to fail selecting $selected" >&2
+    exit 1
+  fi
+  if grep -q "salvage disagrees" "$log"; then
+    cat "$log" >&2
+    echo "salvage_selector: single-hash salvage disagrees with the leaf-by-leaf check" >&2
+    exit 1
+  fi
+  require_grep "oracle failure" "$log"
+done
+require_grep "from: failed-prefix checkpoint in salvage_selector" "$tmpdir/selector-F.log"
+child_log=$project/.holbuild/logs/current/failed-prefix-salvage-oracle/ATheory/instrumented-failure.log
+require_file "$child_log"
+rewound=$(grep '^holbuild hol-phases' "$child_log" | tail -n 1 | sed -n 's/.* holrewoundn=\([0-9]*\).*/\1/p')
+if [[ "$rewound" != 1 ]]; then
+  grep '^holbuild hol-phases' "$child_log" >&2 || true
+  echo "salvage_selector: expected the leaf-by-leaf check to rewind 1 of 3 leaves, got '$rewound'" >&2
+  exit 1
+fi
 
 # A leaf saved without a prefix signature ends the salvage before it, on
 # both paths.  Metadata with one is refused when parsed, so this calls the

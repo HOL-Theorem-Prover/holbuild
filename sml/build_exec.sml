@@ -342,7 +342,9 @@ fun manifest_loads plan node =
   map load_name (ordered_loads plan node load_stem (HolbuildBuildPlan.direct_project_deps plan node))
 
 (* The deps heap keeps only the toolchain's load path, not the project's
-   directories HOL put there: other trees of the project resume from it. *)
+   directories HOL put there: other trees of the project resume from it.
+   The save's time is printed as a holsave phase (hol_log_phases); the
+   timing binds nothing, so the heap holds what it did without it. *)
 fun write_preload load_lines deps_loaded deps_ok path =
   let
     val save = save_heap_expr {label = "deps_loaded", share_common_data = true,
@@ -350,8 +352,10 @@ fun write_preload load_lines deps_loaded deps_ok path =
     val lines = runtime_line () ::
                 (load_lines @
                  [checkpoint_save_runtime_line (),
-                  "val _ = HolbuildCheckpointSaveRuntime.with_toolchain_load_path (fn () => " ^
-                  save ^ ");"])
+                  "val _ = let val start = Time.now () in " ^
+                  "HolbuildCheckpointSaveRuntime.with_toolchain_load_path (fn () => " ^ save ^ "); " ^
+                  "TextIO.output (TextIO.stdErr, \"holbuild hol-phases holsave=\" ^ " ^
+                  "LargeInt.toString (LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))) ^ \"\\n\") end;"])
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -11055,36 +11059,74 @@ fun merge_phases phases =
     List.foldl add [] phases
   end
 
-(* The phases in the "holbuild hol-phases" lines HOL children print at exit
-   (proof_runtime.sml), summed over the children of an action, and holload:
-   from HOLSTART, when the hol phase began, to the first child's install. *)
+(* The phases in the "holbuild hol-phases" lines a theory child prints: the
+   proof runtime's at exit (proof_runtime.sml), and the preload's after it
+   saves the deps heap.  Only the names the runtime prints are taken, with
+   their values summed over the lines; a value that isn't a nonnegative
+   integer is dropped.  holload runs from HOLSTART, when the hol phase
+   began, to the first runtime install (holloadend), less the saves before
+   it.  The log is the child's, so it is read in bounded pieces and a line
+   longer than a phases line could be is skipped. *)
+val hol_log_phase_names =
+  ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
+   "holcompiledn", "holreplayedn", "holrewoundn", "resbyten"]
+
 fun hol_log_phases log_file holstart =
   let
-    val prefix = "holbuild hol-phases"
+    val prefix = "holbuild hol-phases "
+    val max_line = 4096
     fun phase item =
       case String.fields (fn c => c = #"=") item of
           [name, value] =>
-            if name <> "" andalso CharVector.all Char.isLower name then
-              Option.map (fn n => (name, n)) (LargeInt.fromString value)
+            if List.exists (fn known => known = name) hol_log_phase_names andalso
+               value <> "" andalso CharVector.all Char.isDigit value
+            then Option.map (fn n => (name, n)) (LargeInt.fromString value)
             else NONE
         | _ => NONE
-    fun read ins found =
-      case TextIO.inputLine ins of
-          NONE => rev found
-        | SOME line =>
-            if String.isPrefix prefix line then
-              read ins (List.mapPartial phase (String.tokens Char.isSpace (String.extract (line, size prefix, NONE))) :: found)
-            else read ins found
+    fun parse line =
+      if String.isPrefix prefix line then
+        SOME (List.mapPartial phase (String.tokens Char.isSpace (String.extract (line, size prefix, NONE))))
+      else NONE
+    (* PENDING is the start of the current line, NONE once it is too long. *)
+    fun read ins pending found =
+      let val chunk = TextIO.inputN (ins, 65536)
+      in
+        if chunk = "" then
+          rev (case Option.mapPartial parse pending of SOME p => p :: found | NONE => found)
+        else
+          let
+            val pieces = String.fields (fn c => c = #"\n") chunk
+            fun extend (SOME text) piece =
+                  if size text + size piece > max_line then NONE else SOME (text ^ piece)
+              | extend NONE _ = NONE
+            fun lines [last] pending found = (extend pending last, found)
+              | lines (piece :: rest) pending found =
+                  let val found = case Option.mapPartial parse (extend pending piece) of
+                                      SOME p => p :: found
+                                    | NONE => found
+                  in lines rest (SOME "") found end
+              | lines [] pending found = (pending, found)
+            val (pending, found) = lines pieces pending found
+          in
+            read ins pending found
+          end
+      end
     val lines =
       let val ins = TextIO.openIn log_file
-      in (read ins [] before TextIO.closeIn ins) handle e => (TextIO.closeIn ins; raise e) end
+      in (read ins (SOME "") [] before TextIO.closeIn ins) handle e => (TextIO.closeIn ins; raise e) end
       handle IO.Io _ => []
+    fun value name line = Option.map #2 (List.find (fn (n, _) => n = name) line)
+    fun sum name lines = List.foldl (fn (line, total) => total + getOpt (value name line, 0)) 0 lines
+    fun before_install [] = NONE
+      | before_install (line :: rest) =
+          case value "holloadend" line of
+              SOME loaded => SOME (loaded, [])
+            | NONE => Option.map (fn (loaded, earlier) => (loaded, line :: earlier)) (before_install rest)
     val load =
-      case (lines, holstart) of
-          (first :: _, SOME start) =>
-            (case List.find (fn (name, _) => name = "holloadend") first of
-                 SOME (_, loaded) => if loaded >= start then [("holload", loaded - start)] else []
-               | NONE => [])
+      case (before_install lines, holstart) of
+          (SOME (loaded, earlier), SOME start) =>
+            let val ms = loaded - start - sum "holsave" earlier
+            in if ms >= 0 then [("holload", ms)] else [] end
         | _ => []
   in
     load @ List.filter (fn (name, _) => name <> "holloadend") (List.concat lines)
@@ -11583,6 +11625,8 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
              (HolbuildStatus.message_stdout
                 ("restored shared " ^ (if Option.isSome heap then "" else "standalone ") ^ #kind c ^
                  " checkpoint " ^ leaf_rel ^ "\n");
+              HolbuildStatus.message_stdout
+                ("holbuild resume: selected shared " ^ #kind c ^ " checkpoint " ^ candidate_key c ^ "\n");
               SOME {heap = heap, files = map (fn (sha, path) => (path, sha)) restored})
            else (warn ("shared checkpoint failed validation: " ^ leaf_rel); wipe (); NONE)))
       end
@@ -11591,30 +11635,34 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       handle MissingSharedBlob sha => (missing_blob key sha; wipe (); NONE)
            | e => (warn ("could not restore shared checkpoint: " ^ General.exnMessage e);
                    wipe (); NONE)
+    (* A fetched manifest whose checkpoint isn't restored is a rejection. *)
+    fun counting_rejection kind key restored =
+      case restored of
+          NONE =>
+            (add_restore_step "rstrejectn" 1;
+             HolbuildStatus.message_stdout
+               ("holbuild resume: rejected shared " ^ kind ^ " checkpoint " ^ key ^ "\n");
+             NONE)
+        | SOME _ => restored
     fun try_candidate published_heap (c : shared_candidate, fetched) =
       case fetched of
           NONE => NONE
         | SOME action =>
-            case restore_entry (candidate_key c) (fn () =>
-                   let
-                     val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
-                     val (heap, _) = single "heap" entries
-                   in
-                     if heap <> published_heap then NONE else restore_chain (SOME heap) c entries
-                   end) of
-                NONE =>
-                  (add_restore_step "rstrejectn" 1;
-                   HolbuildStatus.message_stdout
-                     ("holbuild resume: rejected shared " ^ #kind c ^ " checkpoint " ^ candidate_key c ^ "\n");
-                   NONE)
-              | restored => restored
+            counting_rejection (#kind c) (candidate_key c)
+              (restore_entry (candidate_key c) (fn () =>
+                 let
+                   val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
+                   val (heap, _) = single "heap" entries
+                 in
+                   if heap <> published_heap then NONE else restore_chain (SOME heap) c entries
+                 end))
     (* The theory's standalone failed prefix: the failed-prefix candidate at
        the path its manifest names. *)
     fun try_standalone () =
       case restore_step "rstprobe" (fn () => HolbuildRemoteCache.fetch_action remote standalone_key) of
           NONE => NONE
         | SOME action =>
-            restore_entry standalone_key (fn () =>
+            counting_rejection "standalone failed_prefix" standalone_key (restore_entry standalone_key (fn () =>
               let
                 (* Only the manifest of a candidate it tries records its blobs
                    as present, as in first_window. *)
@@ -11628,7 +11676,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                     SOME c => (ignore (HolbuildRemoteCache.remember_action remote action);
                                restore_chain NONE c entries)
                   | NONE => NONE
-              end)
+              end))
     (* Fetch a window of manifests at once, then try them in order. Every
        fetch has ended before a window is tried, and only a manifest that is
        tried records its blobs as present. *)
@@ -14212,7 +14260,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               val status = if Option.isSome failure then "failed" else status
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
               val holstart = Option.map #2 (List.find (fn (name, _) => name = "holstart") (!phases))
-              val _ = phases := rev (hol_log_phases (build_log ()) holstart @ !resume_steps) @ !phases
+              (* The log is read only once the sandbox validated the root it is in. *)
+              val hol_phases =
+                if !HolbuildActionSandbox.outputs_validated then hol_log_phases (build_log ()) holstart else []
+              val _ = phases := rev (hol_phases @ !resume_steps) @ !phases
               val phases = merge_phases (rev (!phases)) @
                 [("started", Time.toMilliseconds start),
                  ("finished", Time.toMilliseconds (Time.now ()))] @
