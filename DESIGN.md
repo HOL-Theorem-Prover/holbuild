@@ -780,16 +780,7 @@ a later rewrite always changes it. A manifest with no such stat, as one
 installed by this hydrate, is read and hashed. The file is a cache: losing it
 only costs the hashing. It rewrites a kept theory's `.uo` when this spec resolves its
 parents to other stems, and removes every item the spec doesn't name, so the
-root ends as a cold hydrate leaves it. A dependency theory it doesn't name is
-parked rather than removed: its files and `.hol/objs` copies move to
-`<cache root>/action-parked` at the same paths, outside the root HOL scans,
-under a `parked` record, and a later hydrate whose spec names it with the
-same key and manifest moves it back instead of installing it. Its extra
-outputs stay in the root, under its key, until a hydrate wants no theory of
-that key; one that comes back without them is installed again. Records
-without parked lines (written by a release before parking) or no records
-remove `action-parked` whole; the manifest stats of parked theories stay in
-`action-manifest-stats`. The parent check and the cutoff read
+root ends as a cold hydrate leaves it. The parent check and the cutoff read
 the records rather than hashing ~4 files per dependency. A kept item whose
 files went missing is reinstalled with a warning naming the lost path; a HOL
 load that can't find a file the records say the hydrate put in the root fails
@@ -799,17 +790,14 @@ own error. The stems the action
 writes besides its dependencies (its own outputs, and with loading ahead its
 late parents) are emptied and recorded as scratch, which the next hydrate
 removes or reinstalls. Extra outputs lie under their theory's key in
-`.holbuild/action-extra`; the hydrate removes those of every key it neither
-records nor wants, as an early cutoff restores the action's own under its
-earlier key, and a removed copy's unless a dependency it keeps shares the key.
+`.holbuild/action-extra`; the hydrate removes those of every key it doesn't
+record, as an early cutoff restores the action's own under its earlier key.
 The hydrate deletes the record file before it changes
 the tree and writes it back once it passed, so a worker stopped part way
 starts from an empty root. Script runs put every object directory under the
 root on `loadPath`, so they start from an empty root, leave no records, and the root is removed
 after them. The
-cache cap doesn't count the root or `action-parked`, which holds the
-dependencies of earlier specs, one copy per path: the disk floor sees them,
-and a worker short of disk empties both.
+cache cap doesn't count the root: it holds one spec's dependencies.
 
 ## Global cache
 

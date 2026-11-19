@@ -255,9 +255,11 @@ there, so an action a busy host couldn't start yet stays at the coordinator
 for a worker on another host. Likewise a worker claims only while its temp
 dir and its `HOLBUILD_CACHE` root each have 4 GiB free, so a host whose disk
 is full doesn't take actions it would only fail. A worker short of disk first
-empties the `action`, `action-parked` and `tmp` directories of its
-`HOLBUILD_CACHE` root, which its own finished actions left behind, and drops
-`action-resident`, the record of what `action` and `action-parked` held. While it still waits, each poll it runs the cache sweep an
+empties the `action`, `parked`, `action-parked` and `tmp` directories of its
+`HOLBUILD_CACHE` root, which its own finished actions left behind (releases
+0.14.79 to 0.14.82 parked theories in `parked` and `action-parked`), and drops
+`action-resident`, `parked-records` and `parked-stats`, the records of what
+`action` and `parked` held. While it still waits, each poll it runs the cache sweep an
 action would start with, `exec-action --sweep-only` with its cap and the 16 GB
 floor, using the newest release it has that takes it (0.14.60 and later), and
 reports its host to the coordinator with `POST /v1/work/report`.

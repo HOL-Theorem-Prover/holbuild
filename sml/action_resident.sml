@@ -7,11 +7,7 @@
 
    A hydrate deletes the record file before it changes the tree and writes
    it back once it has passed, so a worker that stops part way finds none and
-   starts from an empty root.
-
-   A dependency theory the next action doesn't name is parked: its files
-   move out of the root, beside it, where HOL never looks, and come back
-   when a later action names it again with the same key. *)
+   starts from an empty root. *)
 structure HolbuildActionResident =
 struct
 
@@ -36,8 +32,6 @@ datatype entry =
      and those of parents it loads ahead of, with their key.  The next
      hydrate removes them. *)
   | Scratch of string
-  (* A dependency theory moved out of the root, as it was installed. *)
-  | Parked of theory
 
 type t =
   {file : string option, entries : (string, entry) Binarymap.dict ref,
@@ -61,44 +55,33 @@ fun uncommas "-" = []
   | uncommas text = String.fields (fn c => c = #",") text
 
 fun line (path, entry) =
-  let
-    fun theory kind {target, key, source, parents, mldeps, dat_hash, dat_parents, hashes} =
-      [kind, path, target, key, source, commas parents, commas mldeps, dat_hash,
-       commas (map (fn (name, hash) => name ^ "=" ^ hash) dat_parents), commas hashes]
-  in
-    String.concatWith "\t"
-      (case entry of
-           Theory fields => theory "theory" fields
-         | Parked fields => theory "parked" fields
-         | File sha => ["file", path, sha]
-         | Manifest sha => ["manifest", path, sha]
-         | Scratch key => ["scratch", path, key]) ^ "\n"
-  end
+  String.concatWith "\t"
+    (case entry of
+         Theory {target, key, source, parents, mldeps, dat_hash, dat_parents, hashes} =>
+           ["theory", path, target, key, source, commas parents, commas mldeps, dat_hash,
+            commas (map (fn (name, hash) => name ^ "=" ^ hash) dat_parents), commas hashes]
+       | File sha => ["file", path, sha]
+       | Manifest sha => ["manifest", path, sha]
+       | Scratch key => ["scratch", path, key]) ^ "\n"
 
 exception Malformed
 
 fun parse_line text =
-  let
-    fun theory target key source parents mldeps dat_hash dat_parents hashes =
-      {target = target, key = key, source = source, parents = uncommas parents, mldeps = uncommas mldeps,
-       dat_hash = dat_hash,
-       dat_parents =
-         map (fn pair => case String.fields (fn c => c = #"=") pair of
-                             [name, hash] => (name, hash)
-                           | _ => raise Malformed)
-             (uncommas dat_parents),
-       hashes = uncommas hashes}
-  in
-    case String.fields (fn c => c = #"\t") text of
-        ["theory", path, target, key, source, parents, mldeps, dat_hash, dat_parents, hashes] =>
-          (path, Theory (theory target key source parents mldeps dat_hash dat_parents hashes))
-      | ["parked", path, target, key, source, parents, mldeps, dat_hash, dat_parents, hashes] =>
-          (path, Parked (theory target key source parents mldeps dat_hash dat_parents hashes))
-      | ["file", path, sha] => (path, File sha)
-      | ["manifest", path, sha] => (path, Manifest sha)
-      | ["scratch", path, key] => (path, Scratch key)
-      | _ => raise Malformed
-  end
+  case String.fields (fn c => c = #"\t") text of
+      ["theory", path, target, key, source, parents, mldeps, dat_hash, dat_parents, hashes] =>
+        (path,
+         Theory {target = target, key = key, source = source, parents = uncommas parents, mldeps = uncommas mldeps,
+                 dat_hash = dat_hash,
+                 dat_parents =
+                   map (fn pair => case String.fields (fn c => c = #"=") pair of
+                                       [name, hash] => (name, hash)
+                                     | _ => raise Malformed)
+                       (uncommas dat_parents),
+                 hashes = uncommas hashes})
+    | ["file", path, sha] => (path, File sha)
+    | ["manifest", path, sha] => (path, Manifest sha)
+    | ["scratch", path, key] => (path, Scratch key)
+    | _ => raise Malformed
 
 fun read_file path =
   let val input = TextIO.openIn path
@@ -176,27 +159,16 @@ fun file_hash t path =
     else by_suffix 0 hashed_suffixes
   end
 
-(* The keys of the dependency theories recorded, in the root or parked. *)
-fun theory_keys (t as {entries, ...} : t) =
-  locked t (fn () => List.mapPartial (fn (_, Theory {key, ...}) => SOME key | (_, Parked {key, ...}) => SOME key
-                                       | _ => NONE)
-                                     (Binarymap.listItems (!entries)))
-
-fun has_parked (t as {entries, ...} : t) =
-  locked t (fn () => List.exists (fn (_, Parked _) => true | _ => false) (Binarymap.listItems (!entries)))
-
-(* Replaces every entry the hydrate didn't want by what RETIRE makes of it,
-   which removes or parks what the entry stands for; NONE drops the entry. *)
-fun prune (t as {entries, wanted, ...} : t) retire =
+(* Removes, with REMOVE, every entry the hydrate didn't want. *)
+fun prune (t as {entries, wanted, ...} : t) remove =
   let
     val unwanted =
       locked t (fn () => List.filter (fn (path, _) => not (Binaryset.member (!wanted, path)))
                                      (Binarymap.listItems (!entries)))
   in
     List.app (fn (path, entry) =>
-                case retire (path, entry) of
-                    SOME kept => locked t (fn () => entries := Binarymap.insert (!entries, path, kept))
-                  | NONE => locked t (fn () => entries := #1 (Binarymap.remove (!entries, path))))
+                (remove (path, entry);
+                 locked t (fn () => entries := #1 (Binarymap.remove (!entries, path)))))
              unwanted
   end
 
