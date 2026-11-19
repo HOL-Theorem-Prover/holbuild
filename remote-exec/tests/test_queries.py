@@ -367,13 +367,16 @@ STATEMENTS = [
     Statement(cm.LOCK_KEY, lambda f: {"key": f.arrival.keys("ready")[0]}, 100),
     Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("ready")[0]}, 2_100),
     Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2, "outlined": f.outlined()}, 120_000),
-    Statement(
-        cm.CLAIM_AHEAD_ACTION,
-        lambda f: {
-            "batch_id": f.fresh, "keys": f.ahead_candidates(), "tier": "standard", "depth": 2, "taken": [],
-            "outlined": f.outlined(),
-        },
-        1_400,
+    *(
+        Statement(
+            cm.CLAIM_AHEAD_ACTION,
+            lambda f, outlined_only=outlined_only: {
+                "batch_id": f.fresh, "keys": f.ahead_candidates(), "tier": "standard", "depth": 2, "taken": [],
+                "outlined": f.outlined(), "outlined_only": outlined_only,
+            },
+            1_400,
+        )
+        for outlined_only in (False, True)
     ),
     Statement(
         cm.AHEAD_PARENTS,
