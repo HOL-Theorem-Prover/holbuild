@@ -134,11 +134,21 @@ async def test_a_submission_repeated_under_its_id_answers_with_the_batch_stored_
 ) -> None:
     batch_id = str(uuid4())
     headers = {**CLIENT, "Holbuild-Batch-Id": batch_id}
+    hint_touched = sa.text("SELECT updated_at FROM peak_hints WHERE package = 'pkg' AND theory = 'a'")
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(sa.text(
+            "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb, updated_at) "
+            "VALUES ('pkg', 'a', 'default', 100, now() - interval '1 day')"
+        ))
+    touched = []
     for _ in range(2):
         response = await http.post("/v1/batches", content=batch_text(["a", "b"], [("b", "a")]), headers=headers)
         assert response.status_code == 201, response.text
         assert response.json()["batch_id"] == batch_id
+        async with coordinator.engine.connect() as conn:
+            touched.append(await conn.scalar(hint_touched))
 
+    assert touched[0] == touched[1]  # the repeat left the peak hints alone
     async with coordinator.engine.connect() as conn:
         assert await conn.scalar(sa.text("SELECT count(*) FROM batches")) == 1
         assert await conn.scalar(sa.text("SELECT count(*) FROM actions")) == 2
@@ -151,11 +161,16 @@ async def test_a_repeated_submission_waits_for_the_first_to_commit_and_stores_no
     batch_id = uuid4()
     batch = parse_batch(batch_text(["a"]))
     async with coordinator.engine.connect() as first:
+        pid = await first.scalar(sa.text("SELECT pg_backend_pid()"))
         await first.execute(
             sa.text("INSERT INTO batches (id, state, profile) VALUES (:id, 'running', 'default')"), {"id": batch_id}
         )
         repeat = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
-        await asyncio.sleep(0.5)
+        async with asyncio.timeout(5), coordinator.engine.connect() as observer:
+            while not await observer.scalar(sa.text(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid)))"
+            ), {"pid": pid}):
+                await asyncio.sleep(0.01)
         assert not repeat.done()
         await first.commit()
         assert await asyncio.wait_for(repeat, 10) == batch_id

@@ -1140,78 +1140,83 @@ class Coordinator:
         dag_priority = dag_priorities([a.input_key for a in batch.actions], batch.edges)
         packages = [a.theory.split(":", 1)[0] for a in batch.actions]
         names = [a.theory.split(":", 1)[1] for a in batch.actions]
-        async with self.engine.begin() as conn:
-            # Retention takes the same key order: heap/index scan order can otherwise deadlock overlapping writes.
-            hints = await conn.execute(
-                sa.text(
-                    "WITH locked AS (SELECT package, theory, profile FROM peak_hints WHERE profile = :profile "
-                    "AND (package, theory) IN "
-                    "(SELECT * FROM unnest(CAST(:packages AS text[]), CAST(:names AS text[]))) "
-                    "ORDER BY package, theory, profile FOR UPDATE) "
-                    "UPDATE peak_hints h SET updated_at = now() FROM locked l "
-                    "WHERE (h.package, h.theory, h.profile) = (l.package, l.theory, l.profile) "
-                    "RETURNING h.package || ':' || h.theory, h.peak_rss_mb"
-                ),
-                {"profile": profile, "packages": packages, "names": names},
-            )
-            high = {theory for theory, peak in hints if peak >= self.settings.standard_tier_mb}
-            stored = await conn.scalar(
-                sa.text(
-                    "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority, ahead_cap) "
-                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority, :ahead_cap) "
-                    "ON CONFLICT (id) DO NOTHING RETURNING id"
-                ),
-                {
-                    "id": batch_id,
-                    "state": "running" if batch.actions else "done",
-                    "profile": profile,
-                    "max_heap_mb": max_heap_mb,
-                    "fail_fast": fail_fast,
-                    "priority": priority,
-                    "ahead_cap": ahead_cap,
-                },
-            )
-            if stored is None:
-                logger.warning("batch %s was submitted again; answering with the batch already stored", batch_id)
-                return batch_id
-            if batch.actions:
-                await conn.execute(
+        try:
+            async with self.engine.begin() as conn:
+                stored = await conn.scalar(
                     sa.text(
-                        "INSERT INTO actions "
-                        "(batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier, "
-                        "critical_depth, descendant_count, class) "
-                        "VALUES (:batch_id, :input_key, :ac_key, :spec, :theory, :remaining, 'waiting', :tier, "
-                        ":depth, :descendants, :class)"
+                        "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority, ahead_cap) "
+                        "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority, :ahead_cap) "
+                        "ON CONFLICT (id) DO NOTHING RETURNING id"
                     ),
-                    [
-                        {
-                            "batch_id": batch_id,
-                            "input_key": a.input_key,
-                            "ac_key": a.ac_key,
-                            "spec": a.spec_sha256,
-                            "theory": a.theory,
-                            "remaining": parents[a.input_key],
-                            "tier": "high" if a.theory in high else "standard",
-                            "depth": dag_priority[a.input_key].critical_depth,
-                            "descendants": dag_priority[a.input_key].descendant_count,
-                            "class": action_class,
-                        }
-                        for a in batch.actions
-                    ],
+                    {
+                        "id": batch_id,
+                        "state": "running" if batch.actions else "done",
+                        "profile": profile,
+                        "max_heap_mb": max_heap_mb,
+                        "fail_fast": fail_fast,
+                        "priority": priority,
+                        "ahead_cap": ahead_cap,
+                    },
                 )
-            if batch.edges:
-                await conn.execute(
-                    sa.text("INSERT INTO edges (batch_id, input_key, parent_key) VALUES (:batch_id, :child, :parent)"),
-                    [{"batch_id": batch_id, "child": child, "parent": parent} for child, parent in batch.edges],
+                if stored is None:
+                    logger.warning("batch %s was submitted again; answering with the batch already stored", batch_id)
+                    return batch_id
+                # Retention takes the same key order: heap/index scan order can otherwise deadlock overlapping writes.
+                hints = await conn.execute(
+                    sa.text(
+                        "WITH locked AS (SELECT package, theory, profile FROM peak_hints WHERE profile = :profile "
+                        "AND (package, theory) IN "
+                        "(SELECT * FROM unnest(CAST(:packages AS text[]), CAST(:names AS text[]))) "
+                        "ORDER BY package, theory, profile FOR UPDATE) "
+                        "UPDATE peak_hints h SET updated_at = now() FROM locked l "
+                        "WHERE (h.package, h.theory, h.profile) = (l.package, l.theory, l.profile) "
+                        "RETURNING h.package || ':' || h.theory, h.peak_rss_mb"
+                    ),
+                    {"profile": profile, "packages": packages, "names": names},
                 )
-        await self.release(batch_id)
-        if batch.actions:
-            self.request_scale()
-        if (seconds := time.monotonic() - started) >= SUBMIT_SLOW_SECONDS:
-            logger.warning(
-                "submitting %s took %.1f s: %d actions, %d edges", batch_id, seconds, len(batch.actions), len(batch.edges)
-            )
-        return batch_id
+                high = {theory for theory, peak in hints if peak >= self.settings.standard_tier_mb}
+                if batch.actions:
+                    await conn.execute(
+                        sa.text(
+                            "INSERT INTO actions "
+                            "(batch_id, input_key, ac_key, spec_sha256, theory, remaining_deps, state, tier, "
+                            "critical_depth, descendant_count, class) "
+                            "VALUES (:batch_id, :input_key, :ac_key, :spec, :theory, :remaining, 'waiting', :tier, "
+                            ":depth, :descendants, :class)"
+                        ),
+                        [
+                            {
+                                "batch_id": batch_id,
+                                "input_key": a.input_key,
+                                "ac_key": a.ac_key,
+                                "spec": a.spec_sha256,
+                                "theory": a.theory,
+                                "remaining": parents[a.input_key],
+                                "tier": "high" if a.theory in high else "standard",
+                                "depth": dag_priority[a.input_key].critical_depth,
+                                "descendants": dag_priority[a.input_key].descendant_count,
+                                "class": action_class,
+                            }
+                            for a in batch.actions
+                        ],
+                    )
+                if batch.edges:
+                    await conn.execute(
+                        sa.text(
+                            "INSERT INTO edges (batch_id, input_key, parent_key) VALUES (:batch_id, :child, :parent)"
+                        ),
+                        [{"batch_id": batch_id, "child": child, "parent": parent} for child, parent in batch.edges],
+                    )
+            await self.release(batch_id)
+            if batch.actions:
+                self.request_scale()
+            return batch_id
+        finally:
+            if (seconds := time.monotonic() - started) >= SUBMIT_SLOW_SECONDS:
+                logger.warning(
+                    "submitting %s took %.1f s: %d actions, %d edges",
+                    batch_id, seconds, len(batch.actions), len(batch.edges),
+                )
 
     async def get(self, batch_id: UUID) -> BatchStatus | None:
         changed = await self.changes(batch_id, 0)
