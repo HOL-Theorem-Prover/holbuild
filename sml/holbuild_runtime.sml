@@ -40,11 +40,37 @@ struct
            if size >= large_single_dat orelse !unshared_dat_bytes >= large_cumulative_dat
            then share_heap () else ())
 
-  (* How a preload loads a module.  The lines after this structure make it
-     share through use_with_large_theory_sharing, on whichever loader this
-     HOL has. *)
-  val loader = ref Meta.load
-  fun load module = !loader module
+  (* How a preload loads a module: sharing through
+     use_with_large_theory_sharing, on whichever loader this HOL has.  A HOL
+     with theory modules evaluates a theory's source only when its module is
+     missing, through Meta.moduleSourceLoader; one without has Meta.loadPlan.
+     Names Meta may lack are compiled only once Meta is known to have them,
+     at the first load: a file is bound only once all of it has run, so
+     this structure can't be named while it loads.  The source loader is
+     wrapped for one load at a time, as the child policy may replace it. *)
+  val loader : (string -> unit) option ref = ref NONE
+  fun meta_has names =
+    case #lookupStruct PolyML.globalNameSpace "Meta" of
+        NONE => false
+      | SOME meta =>
+          List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents meta)) names
+  fun choose_loader () =
+    if meta_has ["moduleSourceLoader"] then
+      CompilerSpecific.quietbind
+        ("val _ = HolbuildRuntime.loader := SOME (fn module => " ^
+         "let val source = !Meta.moduleSourceLoader " ^
+         "in Meta.moduleSourceLoader := " ^
+         "(fn use => source (HolbuildRuntime.use_with_large_theory_sharing use)); " ^
+         "(Meta.load module handle e => (Meta.moduleSourceLoader := source; PolyML.Exception.reraise e)); " ^
+         "Meta.moduleSourceLoader := source end);")
+    else if meta_has ["loadPlan", "qquse"] then
+      CompilerSpecific.quietbind
+        "val _ = HolbuildRuntime.loader := SOME (Meta.loadPlan (HolbuildRuntime.use_with_large_theory_sharing Meta.qquse));"
+    else loader := SOME Meta.load
+  fun load module =
+    case !loader of
+        SOME load => load module
+      | NONE => (choose_loader (); valOf (!loader) module)
   val use = use
   val print = TextIO.print
   val export_theory = Theory.export_theory
@@ -274,31 +300,4 @@ struct
 
   fun export_theory_if_needed sig_path =
     if readable sig_path then () else export_theory ()
-end
-
-(* A HOL with theory modules evaluates a theory's source only when its module
-   is missing, through Meta.moduleSourceLoader; one without has Meta.loadPlan.
-   Names Meta may lack are compiled only once Meta is known to have them.
-   The source loader is wrapped for one load at a time: the child policy may
-   replace it after this file runs. *)
-local
-  fun meta_has names =
-    case #lookupStruct PolyML.globalNameSpace "Meta" of
-        NONE => false
-      | SOME meta =>
-          List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents meta)) names
-in
-  val _ =
-    if meta_has ["moduleSourceLoader"] then
-      CompilerSpecific.quietbind
-        ("val _ = HolbuildRuntime.loader := (fn module => " ^
-         "let val source = !Meta.moduleSourceLoader " ^
-         "in Meta.moduleSourceLoader := " ^
-         "(fn use => source (HolbuildRuntime.use_with_large_theory_sharing use)); " ^
-         "(Meta.load module handle e => (Meta.moduleSourceLoader := source; PolyML.Exception.reraise e)); " ^
-         "Meta.moduleSourceLoader := source end);")
-    else if meta_has ["loadPlan", "qquse"] then
-      CompilerSpecific.quietbind
-        "val _ = HolbuildRuntime.loader := Meta.loadPlan (HolbuildRuntime.use_with_large_theory_sharing Meta.qquse);"
-    else ()
 end

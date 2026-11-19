@@ -45,8 +45,8 @@ val _ = Meta.loadPath := "$mods" :: !Meta.loadPath;
 val _ = HolbuildRuntime.load "CTheory";
 val _ = print ("end " ^ Position.toString (!HolbuildRuntime.unshared_dat_bytes) ^ "\n");
 SML
-  # Through the REPL: HolbuildRuntime exists only once the first line ran.
-  "$HOLDIR/bin/hol" --noconfig < "$tmpdir/$mode.sml" > "$tmpdir/$mode.log" 2>&1
+  "$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" "$tmpdir/$mode.sml" \
+    > "$tmpdir/$mode.log" 2>&1 || { cat "$tmpdir/$mode.log" >&2; exit 1; }
   # A's bytes are shared before B and B's after it; C's stay unshared.
   if [[ $(grep -E '^(A|B|C|end) ' "$tmpdir/$mode.log") != $'A 0\nB 0\nC 0\nend 1000' ]]; then
     echo "$mode: unexpected load order or sharing" >&2
