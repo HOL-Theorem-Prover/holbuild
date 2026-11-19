@@ -134,13 +134,20 @@ fun termination_tactic_prefix ({name, definition_start, tactic_text, proof_ir_pl
 fun termination_tactic_suffix ({proof_ir_plan, ...} : termination) =
   case proof_ir_plan of NONE => "))" | SOME _ => "))))))"
 
-fun save_declaration_context_line ({safe_name, context_path, context_ok, ...} : declaration_checkpoint) =
-  String.concat
-    ["\nval _ = HolbuildCheckpointSaveRuntime.save_context_checkpoint {label = ",
-     HolbuildToolchain.sml_string ("definition_context:" ^ safe_name),
-     ", default_share = false, path = ", HolbuildToolchain.sml_string context_path,
-     ", ok_text = ", HolbuildToolchain.sml_string context_ok,
-     ", depth = HolbuildRuntime.save_hierarchy_depth ()};\n"]
+(* With the proof runtime installed, the save is timed as its holsave. *)
+fun save_declaration_context_line timed ({safe_name, context_path, context_ok, ...} : declaration_checkpoint) =
+  let
+    val save =
+      String.concat
+        ["HolbuildCheckpointSaveRuntime.save_context_checkpoint {label = ",
+         HolbuildToolchain.sml_string ("definition_context:" ^ safe_name),
+         ", default_share = false, path = ", HolbuildToolchain.sml_string context_path,
+         ", ok_text = ", HolbuildToolchain.sml_string context_ok,
+         ", depth = HolbuildRuntime.save_hierarchy_depth ()}"]
+  in
+    if timed then "\nval _ = HolbuildProofRuntime.timed_hol_phase \"holsave\" (fn () => " ^ save ^ ");\n"
+    else "\nval _ = " ^ save ^ ";\n"
+  end
 
 fun runtime_lines lines =
   String.concat (map (fn line => line ^ "\n") lines)
@@ -345,8 +352,9 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
        new_ir = new_ir}
     (* A resumed script loads the checkpoint runtime even with no checkpoint
        left to save: it carries the theory's CPU time over from the checkpoint. *)
+    val proof_runtime = not (null active_checkpoints andalso null active_terminations)
     fun prelude () =
-      (if null active_checkpoints andalso null active_terminations then
+      (if not proof_runtime then
          if start_offset > 0 orelse not (null active_declaration_checkpoints)
          then checkpoint_save_runtime_prelude checkpoint_seconds else ""
        else runtime_prelude (runtime_config ())) ^
@@ -418,7 +426,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
             else
               loop boundary rest
                 (resume_at boundary ::
-                 save_declaration_context_line declaration_checkpoint ::
+                 save_declaration_context_line proof_runtime declaration_checkpoint ::
                  source_slice pos boundary ::
                  acc)
         | TerminationEvent (termination as {definition_start, boundary, tactic_start, tactic_end, ...}) :: rest =>

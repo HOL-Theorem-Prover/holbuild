@@ -733,18 +733,18 @@ def wait_for_disk(
 ) -> None:
     """Return once the host's disk has room for an action (``disk_shortfall``), or the worker drains, so that a
     worker on a full disk doesn't claim action after action only to fail each at once while other hosts could run
-    them. First the worker deletes what its own actions left in its cache root: the action sandboxes and temp
-    files, which no other worker shares and no action of its own uses between claims, and the record of what its
-    action root holds, which would no longer be true. Each poll it still waits it runs ``sweep``, the cache's own
-    eviction of checkpoints and shared entries, and reports the host, so the coordinator keeps the host, its disk
-    and its workers in view."""
+    them. First the worker deletes what its own actions left in its cache root: the action sandboxes, temp files
+    and parked theories, which no other worker shares and no action of its own uses between claims, and the record
+    of what its action root holds, which would no longer be true. Each poll it still waits it runs ``sweep``, the
+    cache's own eviction of checkpoints and shared entries, and reports the host, so the coordinator keeps the
+    host, its disk and its workers in view."""
     if disk_shortfall() is None:
         return
     cache = os.environ.get("HOLBUILD_CACHE")
     if cache:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(os.path.join(cache, "action-resident"))
-        for directory in ("action", "tmp"):
+        for directory in ("action", "action-parked", "tmp"):
             remove_children(os.path.join(cache, directory))
     logged = False
     while disk_shortfall() is not None:

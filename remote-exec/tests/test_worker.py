@@ -1163,8 +1163,10 @@ def test_an_idle_worker_short_of_disk_sweeps_the_cache_until_there_is_room_witho
     tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Emptying its own scratch can't make room the shared cache and the checkpoints hold: the worker runs their
-    eviction each poll while short, and the record of its action root goes before the root does."""
+    eviction each poll while short, and the record of its action root goes before the root and its parked
+    theories do."""
     (tmp_path / "action" / "a1").mkdir(parents=True)
+    (tmp_path / "action-parked" / "p1").mkdir(parents=True)
     (tmp_path / "action-resident").write_text("holbuild-action-resident-v1\n")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path))
     sweeps = 0
@@ -1189,6 +1191,7 @@ def test_an_idle_worker_short_of_disk_sweeps_the_cache_until_there_is_room_witho
 
     assert (sweeps, waits, len(server.reports)) == (3, 2, 2)
     assert not (tmp_path / "action-resident").exists()
+    assert list((tmp_path / "action-parked").iterdir()) == []
 
 
 @pytest.mark.parametrize("mode", [0o000, 0o300])
