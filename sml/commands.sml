@@ -2036,10 +2036,24 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                to rebuild or recheck against the cached parents.  A theory or
                blob the remote ledger took the remote cache to hold may be gone
                too: the ledger is forgotten, and a batch missing a blob is
-               resubmitted once, for the export to upload it again. *)
+               resubmitted once, for the export to upload it again.  The
+               resubmitted batch leaves out what the remote cache now holds
+               and reports no log for a theory its worker finds built, so the
+               logs of the batch before it are carried to its restores, where
+               a theory's log from the later batch replaces the earlier one. *)
+            val resubmitted_logs = ref []
+            fun carry_logs earlier later =
+              Redblackmap.listItems
+                (List.foldl
+                   (fn ((key, NONE), table) =>
+                         if Redblackmap.inDomain (table, key) then table else Redblackmap.insert (table, key, NONE)
+                     | ((key, log), table) => Redblackmap.insert (table, key, log))
+                   (Redblackmap.mkDict String.compare) (earlier @ later))
             fun finish resubmit skip in_batch batch_id =
               let
-                val (outcome, logs, settled, failure_spans, early) = follow in_batch batch_id
+                val (outcome, batch_logs, settled, failure_spans, early) = follow in_batch batch_id
+                val logs = carry_logs (!resubmitted_logs) batch_logs
+                val _ = resubmitted_logs := []
                 (* Whatever follows (a restore, a resubmission, a local build)
                    doesn't overlap the span analysis; its results stay readable. *)
                 val _ = #stop failure_spans ()
@@ -2117,6 +2131,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          HolbuildBuildExec.forget_remote_ledger ();
                          (* Their local entries may be the ones that don't fit. *)
                          HolbuildBuildExec.drop_local_cache_entries forced;
+                         resubmitted_logs := logs;
                          export_and_submit false false NONE skip forced)
                   end
                 | (HolbuildRemoteExec.Cancelled, progress) =>

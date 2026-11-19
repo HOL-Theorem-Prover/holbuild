@@ -60,6 +60,13 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
       continue
     fi
   fi
+  # A worker that finds missing what fail-missing ("THEORY theory KEY") names,
+  # once, before building THEORY.
+  if [[ -e "$state/fail-missing" && "\$(cut -d' ' -f1 "$state/fail-missing")" == "\$theory" ]]; then
+    cut -d' ' -f2- "$state/fail-missing" > "$state/missing"
+    rm "$state/fail-missing"
+    exit 1
+  fi
   echo "\$theory" >> "$state/ran"
   status=0
   env "\${untrusted[@]}" HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" "\${heap[@]}" \
@@ -1751,6 +1758,34 @@ require_grep 'could not fetch the remote build log for rxoptional:ATheory' "$tmp
 [[ $(local_hol_runs "$tmpdir/optional-log.timing") -eq 0 ]] || { cat "$tmpdir/optional-log.timing" >&2; exit 1; }
 require_grep 'build.execute' "$tmpdir/optional-log.timing"
 rm "$state/optional-log-outage"
+
+# A batch that fails for resubmission after its workers built ATheory: B's
+# worker finds A missing, so the resubmitted batch rechecks A, which its
+# worker finds built and reports with no log.  A's log from the first batch
+# must still reach logs/current.
+project=$tmpdir/resubmit-logs-project
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxresubmitlogs"
+[build]
+members = ["src"]
+TOML
+write_theories resubmit-logs
+a_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:ATheory" { print $2 }')
+[[ -n $a_key ]] || { echo "no action for ATheory" >&2; exit 1; }
+echo "rxresubmitlogs:BTheory theory $a_key" > "$state/fail-missing"
+: > "$state/results"
+run resubmit-logs 0 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/resubmit-logs.log"
+[[ "$(< "$state/results")" == \
+   $'rxresubmitlogs:ATheory status=built\nrxresubmitlogs:ATheory status=cached\nrxresubmitlogs:BTheory status=built' ]] ||
+  { echo "worker results:" >&2; cat "$state/results" >&2; exit 1; }
+for theory in ATheory BTheory; do
+  require_file "$project/.holbuild/logs/current/rxresubmitlogs/$theory/build.log"
+done
+require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
 
 # The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
 copy_nondet heap-cap rxheap
