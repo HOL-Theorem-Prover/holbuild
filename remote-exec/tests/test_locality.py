@@ -837,6 +837,35 @@ async def test_a_held_build_of_a_hint_only_tier_that_a_claim_ahead_outranks_is_c
     assert asked == [["high"]]
 
 
+async def test_a_hint_only_claim_whose_held_build_a_claim_ahead_goes_before_leaves_the_head_s_build_ready(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``h`` of the second batch is held for host-1, but its batch's deeper claim ahead goes first. Deferring high,
+    the claim takes nothing high: it leaves the head batch's ``h`` to the next claim rather than lock and drop it."""
+    await learn_high(http, cache)
+    head = UUID(await submit(http, ["h"]))
+    held = UUID(await submit(http, ["h"]))
+    now = asyncio.get_running_loop().time()
+    coordinator.holds[(held, "high")] = (now, now + 60, "pkg:h")
+    coordinator.host_keys["host-1"] = {"pkg:h": None}
+    coordinator.report_worker("host-1", "host-1-w", ["high"])
+
+    async def claim_ahead(*_: object, **__: object) -> None:
+        return None
+
+    monkeypatch.setattr(coordinator, "_claim_ahead", claim_ahead)
+    outranked = SimpleNamespace(above=lambda *_: [], deepest={}, deeper=lambda batch, *_: batch == held)
+    coordinator.settings.claim_ranking_seconds = 3600
+    ranking = await coordinator._current_ranking(("high",))
+
+    claimed, _ = await coordinator._claim(
+        ["high"], "w", outranked, "host-1", None, frozenset({"high"}), frozenset({"high"})
+    )
+
+    assert claimed is None
+    assert (head, "high") not in ranking.exhausted
+
+
 @pytest.mark.parametrize("failing", ["_lock_unleased", "_lease"])
 async def test_a_hold_taken_by_a_claim_that_fails_to_lease_its_build_is_put_back(
     http: httpx.AsyncClient,
