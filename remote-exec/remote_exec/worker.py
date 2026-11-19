@@ -742,7 +742,7 @@ def wait_for_disk(
         return
     cache = os.environ.get("HOLBUILD_CACHE")
     if cache:
-        for records in ("action-resident", "parked-records"):
+        for records in ("action-resident", "parked-records", "parked-stats"):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(os.path.join(cache, records))
         for directory in ("action", "parked", "action-parked", "tmp"):

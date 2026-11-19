@@ -791,8 +791,9 @@ The parked theories' records and their manifests' stats
 (`<cache root>/parked-stats`) are files of their own, so a release that
 doesn't park, which rejects or rewrites the root's, leaves them, and so does
 a script run emptying the root. Without `parked-records` the hydrate removes
-`parked` whole; a parked copy of a stem the root's records hold (a release
-that doesn't park installed it there) goes, and the root's is used. 0.14.79
+`parked` whole, with `parked-stats`; a theory action removes a parked copy
+of a stem the root's records hold (a release that doesn't park installed it
+there) and uses the root's. 0.14.79
 parked in `action-parked` with `parked` lines in `action-resident`; the
 hydrate drops those lines and removes that directory. The parent check and
 the cutoff read

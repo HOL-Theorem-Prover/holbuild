@@ -54,6 +54,9 @@ fun new file parked_file entries =
 (* Records that are never written, for a root emptied before its action. *)
 fun empty () = new NONE NONE (Binarymap.mkDict String.compare)
 
+(* Whether saving keeps parked theories' records. *)
+fun keeps_parked ({parked_file, ...} : t) = Option.isSome parked_file
+
 fun is_parked (Parked _) = true
   | is_parked _ = false
 

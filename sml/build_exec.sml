@@ -10685,6 +10685,13 @@ fun parked_root root = Path.concat (Path.dir root, "parked")
 
 fun parked_records root = Path.concat (Path.dir root, "parked-records")
 
+fun parked_stats root = Path.concat (Path.dir root, "parked-stats")
+
+(* The parked theories with their records and stats. *)
+fun remove_parked root =
+  (HolbuildRemoveTree.remove_untrusted_strict (parked_root root);
+   List.app (fn path => OS.FileSys.remove path handle OS.SysErr _ => ()) [parked_records root, parked_stats root])
+
 (* Where 0.14.79 parked theories, recording them with the root's own; the
    releases since drop them. *)
 fun legacy_parked_root root = root ^ "-parked"
@@ -10816,7 +10823,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
     val manifest_stats_file = Path.concat (cache, "action-manifest-stats")
     (* Those of the parked theories' manifests, which a release that doesn't
        park drops when it rewrites the other file. *)
-    val parked_stats_file = Path.concat (cache, "parked-stats")
+    val parked_stats_file = parked_stats root
     val scan_ns = Time.toNanoseconds (Time.now ())
     val known = ref NONE
     (* Read when the first check starts; a damaged record only means the
@@ -11044,6 +11051,8 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                    end)
                 (Resident.theory_keys resident);
        HolbuildStatCache.flush seen;
+       (* Records kept nowhere (a run's) name no parked theory. *)
+       if not (Resident.keeps_parked resident) then () else
        let
          val parked = map (HolbuildCache.action_manifest cache) (Resident.parked_keys resident)
          val entries =
@@ -11885,8 +11894,7 @@ fun sweep_worker_cache {limit_bytes, reserve_bytes, min_free_bytes} =
     with_action_root_lock cache (fn () =>
       ((* Parked theories no record names (a worker short of disk drops the
           records) go. *)
-       if Option.isSome (Resident.read_entries (parked_records root)) then ()
-       else HolbuildRemoveTree.remove_untrusted_strict (parked_root root);
+       if Option.isSome (Resident.read_entries (parked_records root)) then () else remove_parked root;
        HolbuildRemoveTree.remove_untrusted_strict (legacy_parked_root root);
        enforce_worker_cache_cap
          {cache = cache, checkpoint_root = Path.concat(cache, "checkpoints"), limit_bytes = limit_bytes,
@@ -14074,6 +14082,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     val root_reset = ref false
     fun add_hydrate_steps () =
       (hydrate_count "hydresetn" (if !root_reset then 1 else 0);
+       root_reset := false;
        phases := !hydrate_steps @ !phases)
     fun add_restore_steps () = phases := !restore_steps @ !phases
     fun setup_tool_cache (spec : action_spec) =
@@ -14128,10 +14137,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     fun clear_root () =
       (remove_file resident_file;
        HolbuildRemoveTree.remove_untrusted_strict root)
+    (* Parked copies of stems the root's records hold (a release that doesn't
+       park installed them there meanwhile), which a theory action removes;
+       a run, which empties the root, leaves them. *)
+    val shadowed_parked = ref []
     (* The writable directories, empty, and the records; with no records of
        the root, it is emptied too, and with none of the parked theories, so
-       are they.  A parked copy of a stem the root's records hold (a release
-       that doesn't park installed it there meanwhile) goes. *)
+       are they. *)
     fun reset () =
       let
         val {records, root = rooted, parked, shadowed} =
@@ -14139,8 +14151,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
       in
         resident := records;
         HolbuildRemoveTree.remove_untrusted_strict (legacy_parked_root root);
-        if parked then List.app (fn path => List.app (remove_file o parked_path root) (resident_theory_files path)) shadowed
-        else HolbuildRemoveTree.remove_untrusted_strict (parked_root root);
+        shadowed_parked := shadowed;
+        if parked then () else remove_parked root;
         root_reset := not rooted;
         if rooted then () else clear_root ();
         empty_writable true;
@@ -14203,6 +14215,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     and run_theory spec_text =
       let
         val _ = theory_action := true
+        val _ = List.app (fn path => List.app (remove_file o parked_path root) (resident_theory_files path))
+                         (!shadowed_parked)
         val _ = HolbuildActionSandbox.action_write_dirs := SOME writable_dirs
         val spec = parse_action_spec spec_text
         val _ = input_key := #input_key spec

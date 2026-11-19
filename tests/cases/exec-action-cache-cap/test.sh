@@ -226,16 +226,19 @@ printf 'blob sig %s\n' "$shared" > "$cache_sweep/actions/newer/manifest"
 at 2001 "$cache_sweep/actions/older/manifest"
 at 2002 "$cache_sweep/checkpoints/OldScript.deps/key/deps_loaded.save"
 at 2003 "$cache_sweep/actions/newer/manifest"
-# Parked theories go too when they have no records (a worker short of disk
-# drops the records first).
+# Parked theories go too, with their stats, when they have no readable
+# records (a worker short of disk drops the records first).
 mkdir -p "$cache_sweep/parked/.holbuild/obj"
+printf 'damaged\n' > "$cache_sweep/parked-records"
+printf 'stats\n' > "$cache_sweep/parked-stats"
 HOLBUILD_CACHE=$cache_sweep "$HOLBUILD_BIN" exec-action --sweep-only --cache-limit-gb 1 --cache-reserve-gb 0 \
   > "$tmpdir/sweep-only.log" 2>&1 || { cat "$tmpdir/sweep-only.log" >&2; exit 1; }
 evicted "$cache_sweep/actions/older" "the least recently used entry over the cap"
 evicted "$cache_sweep/blobs/$own" "a blob only an evicted entry named"
 evicted "$cache_sweep/checkpoints/OldScript.deps" "an old checkpoint family"
 kept "$cache_sweep/actions/newer" "an entry once the cache fits"
-[[ ! -e "$cache_sweep/parked" ]] || { echo "--sweep-only kept parked theories without records" >&2; exit 1; }
+[[ ! -e "$cache_sweep/parked" && ! -e "$cache_sweep/parked-records" && ! -e "$cache_sweep/parked-stats" ]] || {
+  echo "--sweep-only kept parked theories without readable records, or their files" >&2; exit 1; }
 # With their records they stay, whatever the root's records say; where
 # 0.14.79 parked goes.
 mkdir -p "$cache_sweep/parked/.holbuild/obj" "$cache_sweep/action-parked/.holbuild/obj"

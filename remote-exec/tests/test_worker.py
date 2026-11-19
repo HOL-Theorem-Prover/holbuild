@@ -1170,6 +1170,7 @@ def test_an_idle_worker_short_of_disk_sweeps_the_cache_until_there_is_room_witho
     (tmp_path / "action-parked" / "p1").mkdir(parents=True)
     (tmp_path / "action-resident").write_text("holbuild-action-resident-v1\n")
     (tmp_path / "parked-records").write_text("holbuild-action-resident-v1\n")
+    (tmp_path / "parked-stats").write_text("stats\n")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path))
     sweeps = 0
 
@@ -1195,6 +1196,7 @@ def test_an_idle_worker_short_of_disk_sweeps_the_cache_until_there_is_room_witho
     assert (sweeps, waits, len(server.reports)) == (3, 2, 2)
     assert not (tmp_path / "action-resident").exists()
     assert not (tmp_path / "parked-records").exists()
+    assert not (tmp_path / "parked-stats").exists()
     assert list((tmp_path / "parked").iterdir()) == []
     assert list((tmp_path / "action-parked").iterdir()) == []
 
