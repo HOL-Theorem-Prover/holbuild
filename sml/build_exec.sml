@@ -11887,7 +11887,10 @@ fun merge_phases phases =
    wrote the log started, to its first runtime install (the least
    holloadend: a runtime loaded again later prints its line first), less
    the preload's save (holsave in a line without holloadend).  The log is the child's, so it is read in bounded pieces and a line
-   longer than a phases line could be is skipped. *)
+   longer than a phases line could be is skipped.  Reading stops at the
+   failure summary a worker appends to the log (its first line starts
+   "holbuild: exec-action failed:"): its excerpt of the child's output can
+   quote a phases line. *)
 val hol_log_phase_names =
   ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
    "holcompiledn", "holreplayedn", "holrewoundn"]
@@ -11908,33 +11911,39 @@ fun hol_log_phases log_file child_start =
       if String.isPrefix prefix line then
         SOME (List.mapPartial phase (String.tokens Char.isSpace (String.extract (line, size prefix, NONE))))
       else NONE
-    (* PENDING is the start of the current line, NONE once it is too long. *)
+    val summary = "holbuild: exec-action failed:"
+    (* A line read so far: its first MAX_LINE characters, and whether it is
+       longer. *)
+    fun extend (text, long) piece =
+      if size text + size piece <= max_line then (text ^ piece, long)
+      else (text ^ String.substring (piece, 0, max_line - size text), true)
+    fun add (text, long) found =
+      case (if long then NONE else parse text) of SOME p => p :: found | NONE => found
+    (* PENDING is the current line so far. *)
     fun read ins pending found =
       let val chunk = TextIO.inputN (ins, 65536)
       in
-        if chunk = "" then
-          rev (case Option.mapPartial parse pending of SOME p => p :: found | NONE => found)
+        if chunk = "" then rev (add pending found)
         else
           let
             val pieces = String.fields (fn c => c = #"\n") chunk
-            fun extend (SOME text) piece =
-                  if size text + size piece > max_line then NONE else SOME (text ^ piece)
-              | extend NONE _ = NONE
-            fun lines [last] pending found = (extend pending last, found)
+            fun lines [last] pending found = (SOME (extend pending last), found)
               | lines (piece :: rest) pending found =
-                  let val found = case Option.mapPartial parse (extend pending piece) of
-                                      SOME p => p :: found
-                                    | NONE => found
-                  in lines rest (SOME "") found end
-              | lines [] pending found = (pending, found)
-            val (pending, found) = lines pieces pending found
+                  let val line = extend pending piece
+                  in
+                    if String.isPrefix summary (#1 line) then (NONE, found)
+                    else lines rest ("", false) (add line found)
+                  end
+              | lines [] pending found = (SOME pending, found)
           in
-            read ins pending found
+            case lines pieces pending found of
+                (SOME pending, found) => read ins pending found
+              | (NONE, found) => rev found
           end
       end
     val lines =
       let val ins = TextIO.openIn log_file
-      in (read ins (SOME "") [] before TextIO.closeIn ins) handle e => (TextIO.closeIn ins; raise e) end
+      in (read ins ("", false) [] before TextIO.closeIn ins) handle e => (TextIO.closeIn ins; raise e) end
       handle IO.Io _ => []
     fun value name line = Option.map #2 (List.find (fn (n, _) => n = name) line)
     fun sum name lines = List.foldl (fn (line, total) => total + getOpt (value name line, 0)) 0 lines
