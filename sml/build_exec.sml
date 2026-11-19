@@ -10306,16 +10306,17 @@ fun verify_action_spec (spec : action_spec) =
     let
       fun under dirs path =
         path = normalize_path path andalso List.exists (fn dir => String.isPrefix (".holbuild/" ^ dir ^ "/") path) dirs
-      (* A stem in a .hol directory would lie on another's remapped copies. *)
+      (* A stem in a .hol/objs directory would lie on another's remapped
+         copies. *)
       fun object_stem path =
-        under ["obj", "packages"] path andalso not (List.exists (fn c => c = ".hol") (String.fields (fn c => c = #"/") path))
+        under ["obj", "packages"] path andalso not (String.isSubstring "/.hol/objs/" path)
       val {sig_path, sml_path, data_path} = #outputs spec
       val stem = drop_suffix ".dat" data_path
     in
       check (List.all (under ["action-src"] o #path) (#libraries spec))
         "a library file is not a canonical action-src path";
       check (List.all object_stem (data_path :: map #stem (#deps spec) @ map #stem (#libs spec)))
-        "an object is not a canonical path under .holbuild/obj or .holbuild/packages outside .hol";
+        "an object is not a canonical path under .holbuild/obj or .holbuild/packages outside .hol/objs";
       check (String.isSuffix ".dat" data_path andalso sig_path = stem ^ ".sig" andalso sml_path = stem ^ ".sml")
         "the outputs are not one theory's"
     end
@@ -10584,34 +10585,36 @@ fun remove_empty_dirs root dir =
   if dir = root orelse not (String.isPrefix (root ^ "/") dir) then ()
   else (FS.rmDir dir; remove_empty_dirs root (Path.dir dir)) handle OS.SysErr _ => ()
 
+fun remove_in_root root path = (remove_file path; remove_empty_dirs root (Path.dir path))
+
+(* Removes a theory at PATH in ROOT, with its parked copy when PARKED, and
+   the extra outputs of its KEY in the root when EXTRAS. *)
+fun remove_theory root {parked, extras} (path, key) =
+  (if parked then
+     (List.app (remove_file o parked_path root) (resident_theory_files path);
+      remove_tree (parked_path root (action_extra_dir root key)))
+   else ();
+   List.app (remove_in_root root) (resident_theory_files path);
+   if extras then remove_tree (action_extra_dir root key) else ())
+
 (* Removes what an entry of the action root's records stands for, and the
    directories that leaves empty, which a cold root wouldn't have. *)
 fun remove_resident root (path, entry) =
-  let
-    fun remove path = (remove_file path; remove_empty_dirs root (Path.dir path))
-    fun remove_theory key =
-      (List.app remove (resident_theory_files path);
-       remove_tree (action_extra_dir root key))
-  in
-    case entry of
-        Resident.Theory {key, ...} => remove_theory key
-      | Resident.Scratch key => remove_theory key
-      | Resident.Parked theory =>
-          (* Both places: a move back that failed part way leaves the
-             files split between them. *)
-          (List.app (remove_file o parked_path root) (resident_theory_files path);
-           remove_tree (parked_path root (action_extra_dir root (#key theory)));
-           remove_resident root (path, Resident.Theory theory))
-      | Resident.File _ => remove path
-      | Resident.Manifest _ => (remove path; remove (hfs_remapped_path path))
-  end
+  case entry of
+      Resident.Theory {key, ...} => remove_theory root {parked = false, extras = true} (path, key)
+    | Resident.Scratch key => remove_theory root {parked = false, extras = true} (path, key)
+      (* Both places: a move back that failed part way leaves the files
+         split between them. *)
+    | Resident.Parked {key, ...} => remove_theory root {parked = true, extras = true} (path, key)
+    | Resident.File _ => remove_in_root root path
+    | Resident.Manifest _ => (remove_in_root root path; remove_in_root root (hfs_remapped_path path))
 
 (* Moves the files of a dependency theory at PATH between ROOT and its parked
-   copy (TO_PARKED says which way), with its extra outputs' directory; a file
-   it lacks (a .tr.gz, say) is skipped, as is a directory in a file's place
-   (a source directory named like one).  Leaves no directory it empties in
-   ROOT. *)
-fun move_theory root to_parked (path, key) =
+   copy (TO_PARKED says which way), with its extra outputs' directory unless
+   EXTRAS is false; a file it lacks (a .tr.gz, say) is skipped, as is a
+   directory in a file's place (a source directory named like one).  Leaves
+   no directory it empties in ROOT. *)
+fun move_theory root {to_parked, extras = move_extras} (path, key) =
   let
     val (src_of, dst_of) = if to_parked then (fn p => p, parked_path root) else (parked_path root, fn p => p)
     fun move file =
@@ -10625,17 +10628,21 @@ fun move_theory root to_parked (path, key) =
   in
     List.app (fn file => if path_exists (src_of file) andalso not (FS.isDir (src_of file)) then move file else ())
              (resident_theory_files path);
-    if path_exists (src_of extras) then (remove_tree (dst_of extras); move extras) else ()
+    if move_extras andalso path_exists (src_of extras) then (remove_tree (dst_of extras); move extras) else ()
   end
 
 (* What a hydrate that doesn't want an entry of the records leaves: a
-   dependency theory parked, a parked one as it is, anything else removed. *)
-fun retire_resident root (path, entry) =
+   dependency theory parked, a parked one as it is, anything else removed.
+   Extra outputs lie under the key, so those of a key a wanted dependency
+   shares (SHARED says which) stay in the root. *)
+fun retire_resident root shared (path, entry) =
   case entry of
       Resident.Theory (theory as {key, ...}) =>
-        ((move_theory root true (path, key); SOME (Resident.Parked theory))
-         handle OS.SysErr _ =>
-           (remove_resident root (path, Resident.Parked theory); NONE))
+        let val extras = not (shared key)
+        in
+          (move_theory root {to_parked = true, extras = extras} (path, key); SOME (Resident.Parked theory))
+          handle OS.SysErr _ => (remove_theory root {parked = true, extras = extras} (path, key); NONE)
+        end
     | Resident.Parked _ => SOME entry
     | _ => (remove_resident root (path, entry); NONE)
 
@@ -10763,7 +10770,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             SOME (Resident.Theory theory) => same theory andalso fits theory
           | SOME (Resident.Parked theory) =>
               same theory andalso
-              ((move_theory root false (path, key);
+              ((move_theory root {to_parked = false, extras = true} (path, key);
                 Resident.put resident path (Resident.Theory theory);
                 extras_back key andalso fits theory)
                (* Still parked, so the removal of the stale copies clears
@@ -10862,7 +10869,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                    Resident.put resident path (Resident.Scratch key)
                 end)
              scratch;
-    Resident.prune resident (retire_resident root);
+    Resident.prune resident (retire_resident root (fn key => List.exists (fn dep => #key dep = key) (#deps spec)));
     (* Extra outputs lie under their theory's key, so a directory there for
        no recorded key (an early cutoff restores the action's own under its
        earlier key) is nobody's. *)

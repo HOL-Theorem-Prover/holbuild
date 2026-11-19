@@ -291,7 +291,7 @@ spec_hol_stem=$(sha256sum "$tmpdir/hol-stem" | cut -d' ' -f1)
 curl -fsS -X PUT --data-binary "@$tmpdir/hol-stem" "$remote_url/cas/$spec_hol_stem"
 worker hol-stem "$spec_hol_stem"
 expect hol-stem 4 "status=failed" "failure=spec-rejected"
-require_grep "outside .hol" "$tmpdir/hol-stem.log"
+require_grep "outside .hol/objs" "$tmpdir/hol-stem.log"
 # Or one that writes where the worker keeps a dependency other than as
 # that dependency: a library manifest over its object, a library file or
 # an output at its script, or a path spelled two ways.
@@ -686,6 +686,17 @@ rm -r "$tmpdir/worker-c/action-parked/.holbuild/action-extra/$key_a"
 worker c "$spec_a2"
 expect c 0
 require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
+# Nor does parking another stem of A's key (a package copy, say) take the
+# extra outputs A keeps using.
+awk -F'\t' -v OFS='\t' -v stem="$stem_a" -v other="$tmpdir/worker-c/action/.holbuild/obj/other/ATheory" \
+  '$1 == "theory" && $2 == stem { $2 = other; print }' "$tmpdir/worker-c/action-resident" > "$tmpdir/other-a.line"
+[[ -s "$tmpdir/other-a.line" ]] || { cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
+cat "$tmpdir/other-a.line" >> "$tmpdir/worker-c/action-resident"
+worker c "$spec_a2"
+expect c 0
+require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
+grep -q "^parked	$tmpdir/worker-c/action/.holbuild/obj/other/ATheory	" "$tmpdir/worker-c/action-resident" || {
+  echo "worker c didn't park the other stem of A's key" >&2; cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
 # Two dependencies in one directory, both replaced in one hydrate: each
 # install's directory must survive the removal of the other's old copy.
 worker c "$spec_c"
