@@ -12517,7 +12517,9 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                         val _ = restore_step "rstmodfetch" (fn () => fetch_modules missing)
                         val still = missing_saved_modules deps_loaded
                       in
-                        add_restore_step "rstmodn" (LargeInt.fromInt (length missing - length still));
+                        (* Those of MISSING now present: a sweep may take others since. *)
+                        add_restore_step "rstmodn"
+                          (LargeInt.fromInt (length (List.filter (fn path => not (member_string path still)) missing)));
                         case still of
                             [] => true
                           | module :: _ =>
