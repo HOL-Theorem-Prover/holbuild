@@ -9082,15 +9082,15 @@ fun uncached_parents plan uncached node =
    While the remote cache's breaker is tripped, a skipped or failed PUT is
    tried again each second, for up to spec_upload_outage, so that a short
    outage costs a wait rather than the build; each try sends nothing until
-   the breaker admits it. *)
+   the breaker admits it.  It stops waiting once stopped () holds. *)
 val spec_upload_outage = Time.fromSeconds 180
 
-fun publish_spec_blob remote {hash, path} =
+fun publish_spec_blob remote stopped {hash, path} =
   let
     val give_up = Time.+ (Time.now (), spec_upload_outage)
     fun fail message = raise Error ("could not upload " ^ path ^ ": " ^ message)
     fun retry message =
-      if Time.>= (Time.now (), give_up) then fail message
+      if stopped () orelse Time.>= (Time.now (), give_up) then fail message
       else (OS.Process.sleep (Time.fromSeconds 1); publish ())
     and publish () =
       case HolbuildRemoteCache.publish_hashed_blob remote {hash = hash, src = path} of
@@ -9310,8 +9310,8 @@ fun failing_on_pool remote jobs doing items_name pred items =
 
 (* Uploads FILES to the remote cache's CAS, those it lacks, on the prefetch
    pool.  Specs share their sources, so each file goes up once.  After the
-   first failure the uploads not yet started are skipped, for the caller to
-   fall back at once.  A file whose (path, sha256) known holds is taken as
+   first failure the uploads not yet started are skipped, and those waiting
+   out the remote cache's breaker stop, for the caller to fall back at once.  A file whose (path, sha256) known holds is taken as
    present; learn is told the (path, sha256) of each one uploaded or found
    present. *)
 fun upload_spec_files hash_file remote jobs {known, learn} files =
@@ -9321,12 +9321,13 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
     fun with_failure_lock f =
       (Mutex.lock failure_mutex; f () before Mutex.unlock failure_mutex)
       handle e => (Mutex.unlock failure_mutex; raise e)
+    fun failed () = with_failure_lock (fn () => !upload_failed)
     fun uploaded remote path =
-      with_failure_lock (fn () => !upload_failed) orelse
+      failed () orelse
       (let val hash = hash_file path
        in
          if known (path, hash) then ()
-         else (publish_spec_blob remote {hash = hash, path = path}; learn (path, hash))
+         else (publish_spec_blob remote failed {hash = hash, path = path}; learn (path, hash))
        end;
        true)
       handle e => (with_failure_lock (fn () => upload_failed := true); raise e)

@@ -107,6 +107,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             status.unlink()
             return code
 
+    def cas_put_drop_once(self) -> bool:
+        """Whether to leave this CAS PUT unanswered: once per control/cas-put-drop-once."""
+        if control is None or not self.path.startswith("/cas/"):
+            return False
+        with action_put_lock:
+            marker = control / "cas-put-drop-once"
+            if not marker.exists():
+                return False
+            marker.unlink()
+            return True
+
     def do_GET(self):
         self.record_request()
         self.gate_action_get()
@@ -182,6 +193,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.gate_cas_put()
+        if self.cas_put_drop_once():
+            self.close_connection = True
+            return
         failure = self.cas_put_fail_once()
         if failure is not None:
             self.send_response(failure)

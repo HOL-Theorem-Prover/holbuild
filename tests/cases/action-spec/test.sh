@@ -270,9 +270,10 @@ require_grep 'name=action_spec.upload.*status=fail' "$tmpdir/failed-upload.timin
 }
 
 # Lookups that get no answer trip the remote cache's breaker before the
-# uploads start: they wait out its cooldown and go through, so the export
-# still succeeds.
-touch "$tmpdir/control/ac-get-drop"
+# uploads start: they wait out its cooldown, and the next one when the
+# recovery probe, an upload, gets no answer either, then go through, so the
+# export still succeeds.
+touch "$tmpdir/control/ac-get-drop" "$tmpdir/control/cas-put-drop-once"
 if ! hb --prefetch-concurrency 1 action-spec --upload CTheory \
     > "$tmpdir/batch-outage.txt" 2> "$tmpdir/upload-outage.log"; then
   cat "$tmpdir/upload-outage.log" >&2
@@ -281,7 +282,9 @@ fi
 rm "$tmpdir/control/ac-get-drop"
 diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-outage.txt"
 require_grep 'remote cache disabled for 60 seconds after 3 requests in a row failed' "$tmpdir/upload-outage.log"
+require_grep 'remote cache disabled for 60 seconds after a recovery probe failed' "$tmpdir/upload-outage.log"
 require_grep 'remote cache available again' "$tmpdir/upload-outage.log"
+[[ ! -e "$tmpdir/control/cas-put-drop-once" ]] || { echo "no upload went unanswered" >&2; exit 1; }
 cmp "$project/.holbuild/action-specs/$missing_spec" "$remote_root/cas/$missing_spec"
 
 # Once A is in the remote cache, only B and C are left, and B waits for nothing.
