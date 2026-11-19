@@ -186,13 +186,45 @@ fun theory_cpu_hook (TheoryDelta.NewTheory _) =
          | NONE => ())
   | theory_cpu_hook _ = ()
 
+(* A value by its structure path and name, looked up at run time so that
+   this compiles whether the runtime and HOL have it or not. *)
+fun lookup_value path name =
+  let
+    fun contents s = PolyML.NameSpace.Structures.contents s
+    fun sub (ns : PolyML.NameSpace.nameSpace) s = Option.map contents (#lookupStruct ns s)
+    val ns = List.foldl (fn (s, ns) => Option.mapPartial (fn ns => sub ns s) ns)
+                        (SOME PolyML.globalNameSpace) path
+  in
+    Option.mapPartial (PolyML.CodeTree.evalue o PolyML.NameSpace.Values.code)
+      (Option.mapPartial (fn ns => #lookupVal ns name) ns)
+  end
+
+(* PolyML.SaveState.saveChildWithModules, where this Poly/ML has it.  A
+   state it saves refers to the modules the process loaded from files,
+   by id and path, instead of copying them, and loading the state loads
+   them.  Modules the process wrote itself are copied. *)
+val save_child_with_modules : (string * int -> unit) option =
+  Option.map RunCall.unsafeCast (lookup_value ["PolyML", "SaveState"] "saveChildWithModules")
+
+(* Whether the process loaded a module from a file: HOL's theory module
+   cache counts those loads (hits), not the modules it writes.  Without
+   that count, whether the runtime has loaded any module at all. *)
+fun loaded_module_files () =
+  case lookup_value ["TheoryModules"] "statistics" of
+      SOME statistics =>
+        #hits ((RunCall.unsafeCast statistics : unit -> {hits : int, misses : int, writes : int}) ()) > 0
+    | NONE =>
+        case lookup_value ["PolyML", "SaveState"] "showLoadedModules" of
+            SOME loaded => not (null ((RunCall.unsafeCast loaded : unit -> Word8Vector.vector list) ()))
+          | NONE => false
+
 (* After a source parse error QUse's error flag is set, and a heap saved then
    keeps it: `hol run` from that heap exits with failure after its first
    declaration, printing nothing.  So no checkpoint is saved once the flag is
    set, and an older one at the same path is removed. *)
-fun save_checkpoint ({label, default_share, path, ok_text, depth} :
-                     {label : string, default_share : bool, path : string,
-                      ok_text : string, depth : int}) =
+fun save_with (save_child, with_modules) ({label, default_share, path, ok_text, depth} :
+                                          {label : string, default_share : bool, path : string,
+                                           ok_text : string, depth : int}) =
   let
     fun save () =
       let
@@ -202,7 +234,7 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
         val _ = begin_replacement path
         val _ = if share then PolyML.shareCommonData PolyML.rootFunction else ()
         val t1 = Time.now()
-        val _ = with_theory_cpu_carried (fn () => PolyML.SaveState.saveChild(path, depth))
+        val _ = with_theory_cpu_carried (fn () => save_child (path, depth))
         val t2 = Time.now()
         val _ = write_text_atomically (ok_path path) ok_text
         val _ =
@@ -211,6 +243,7 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
               (TextIO.stdErr,
                String.concat ["holbuild checkpoint kind=", label,
                               " share=", bool_text share,
+                              " with_modules=", bool_text with_modules,
                               " depth=", Int.toString depth,
                               " share_s=", fmt_time (seconds (t0, t1)),
                               " save_s=", fmt_time (seconds (t1, t2)),
@@ -227,6 +260,26 @@ fun save_checkpoint ({label, default_share, path, ok_text, depth} :
       if checkpoint_io_failure e then
         (discard_checkpoint path; warn_checkpoint_failure label path e)
       else raise e
+  end
+
+fun save_checkpoint args = save_with (PolyML.SaveState.saveChild, false) args
+
+(* The deps heap.  Once the dependencies loaded a theory module from its
+   file, it is saved with saveChildWithModules and needs no
+   shareCommonData pass: the modules, most of what the dependencies
+   loaded, stay in their files.  Otherwise it holds every ancestor, and is
+   compacted first, as with a runtime without the call.  Contexts and
+   failed prefixes saved on it with saveChild refer to its modules too. *)
+fun save_deps_checkpoint ({label, path, ok_text, depth} :
+                          {label : string, path : string, ok_text : string, depth : int}) =
+  let
+    fun args share = {label = label, default_share = share, path = path, ok_text = ok_text, depth = depth}
+  in
+    case save_child_with_modules of
+        SOME save_child =>
+          if loaded_module_files () then save_with (save_child, true) (args false)
+          else save_checkpoint (args true)
+      | NONE => save_checkpoint (args true)
   end
 
 
