@@ -692,8 +692,7 @@ WITH RECURSIVE outlined AS MATERIALIZED ({OUTLINED_LEASES}), ahead_batches AS MA
     )) AS e(input_key)
     GROUP BY r.batch_id, e.input_key
 )
-SELECT (c.a).batch_id, (c.a).input_key, (c.a).tier, b.priority, (c.a).critical_depth, (c.a).descendant_count,
-    c.outlined_parents = c.running_parents AS outlined
+SELECT (c.a).batch_id, (c.a).input_key, (c.a).tier, b.priority, (c.a).critical_depth, (c.a).descendant_count
 FROM children c JOIN ahead_batches b ON b.id = c.batch_id
 WHERE (c.a).state = 'waiting' AND (c.a).class = 'build' AND (c.a).ahead <> 'abandoned'
 AND (c.a).remaining_deps = c.running_parents
@@ -830,14 +829,13 @@ RETURNING attempt_token
 
 @dataclass
 class _AheadRead:
-    """AHEAD_CANDIDATES read from ``at``, as (batch, input key, tier, priority, (critical depth, descendants),
-    whether its unfinished parents all published their outline), best first, which the claims ahead share, less
-    those they claimed, and the batches and tiers found since with nothing left to claim ahead; with
+    """AHEAD_CANDIDATES read from ``at``, as (batch, input key, tier, priority, (critical depth, descendants)), best
+    first, which the claims ahead share, less those they claimed, and the batches and tiers found since with nothing left to claim ahead; with
     Coordinator.ahead_changes when it began."""
 
     at: float
     changes: int
-    candidates: list[tuple[UUID, str, str, int, tuple[int, int], bool]]
+    candidates: list[tuple[UUID, str, str, int, tuple[int, int]]]
     exhausted: set[tuple[UUID, str]]
 
 
@@ -1435,7 +1433,7 @@ class Coordinator:
         read = await self._ahead_candidates()
         best: dict[str, int] = {}
         deepest: dict[tuple[UUID, str], tuple[int, int]] = {}
-        for batch_id, _, tier, priority, place, _ in read.candidates:
+        for batch_id, _, tier, priority, place in read.candidates:
             if tier in ahead_tiers and (batch_id, tier) not in read.exhausted:
                 best[tier] = max(best.get(tier, priority), priority)
                 deepest.setdefault((batch_id, tier), place)  # the read is best first
@@ -1685,7 +1683,7 @@ class Coordinator:
             if (batch_id, tier) in read.exhausted:
                 return None
             keys = [
-                key for b, key, t, _, place, _ in read.candidates
+                key for b, key, t, _, place in read.candidates
                 if (b, t) == (batch_id, tier) and (deeper_than is None or place > deeper_than)
             ][:AHEAD_CLAIM_KEYS]
             if not keys:
@@ -1781,10 +1779,7 @@ class Coordinator:
             self.ahead_read = _AheadRead(
                 at, changes,
                 [
-                    (
-                        row.batch_id, row.input_key, row.tier, row.priority,
-                        (row.critical_depth, row.descendant_count), row.outlined,
-                    )
+                    (row.batch_id, row.input_key, row.tier, row.priority, (row.critical_depth, row.descendant_count))
                     for row in rows
                 ],
                 set(),
@@ -1902,16 +1897,15 @@ class Coordinator:
                 return None, held_until, entry
             passed = None  # the candidate passed over for one this host is warm for
             local = hinted if tier in hint_only else hinted or self._local_entry(ranking, entry, host_id, kept)
+            held_here = local is not None and self._held_here(ranking, (local[6], local[7]), host_id, kept)
             # Nor is a batch swapped in whose deeper claim ahead goes before its ready build, unless held here.
             if (
-                local is not None and not (local is hinted and fits) and outranked is not None
+                local is not None and not held_here and outranked is not None
                 and outranked.deeper(local[6], local[7], ranking.depths.get((local[6], local[7])))
             ):
                 local = None
             # Only the held build is taken for its hold: another of the batch is another claim's to take.
-            only_held = tier in hint_only or (
-                local is not None and self._held_here(ranking, (local[6], local[7]), host_id, kept)
-            )
+            only_held = tier in hint_only or held_here
             if local is not None:
                 ranking.heap[ranking.heap.index(local)] = entry
                 heapq.heapify(ranking.heap)
