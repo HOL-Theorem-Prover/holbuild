@@ -1663,10 +1663,11 @@ class Coordinator:
         )
 
     async def _claim_ahead(self, tiers: list[str], worker: str, *, above: int | None = None) -> Claim | None:
-        """Lease an action of ``tiers`` ahead of its parents: of the running batches with an ``ahead_cap`` and
-        fewer than that many actions waiting ahead, the action whose chain of dependents is deepest of those whose
-        unfinished parents all run, at most ``ahead_depth`` generations ahead (CLAIM_AHEAD_ACTION). Its claim names
-        its unfinished ancestors, ancestors first, whose outputs its worker waits for.
+        """Lease an action of ``tiers`` ahead of its parents: of the running batches with an ``ahead_cap``, the
+        action whose chain of dependents is deepest of those whose unfinished parents all run, at most
+        ``ahead_depth`` generations ahead (CLAIM_AHEAD_ACTION); of a batch with that many actions waiting ahead
+        (WAITING_AHEAD), only one whose unfinished parents all published their outline. Its claim names its
+        unfinished ancestors, ancestors first, whose outputs its worker waits for.
 
         Candidates come from a read the claims of ``claim_ranking_seconds`` share; each batch is then locked, as
         every writer of it does first, so its cap and the parents' states are rechecked against concurrent claims

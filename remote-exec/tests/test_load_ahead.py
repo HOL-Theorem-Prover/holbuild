@@ -703,6 +703,34 @@ async def test_at_its_cap_a_batch_claims_no_child_ahead_whose_parent_s_outlined_
     assert (await ahead_state(remote_exec_engine, "x"))[0] == "waiting"
 
 
+async def test_a_read_from_under_the_cap_still_claims_an_outline_ready_child_once_another_coordinator_fills_it(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """The shared read ranks more than AHEAD_CLAIM_KEYS children that would wait before the one that won't; once
+    another coordinator's claim fills the cap, that one is still claimed."""
+    coordinator.settings.claim_ranking_seconds = 3600
+    replica = Coordinator(coordinator.engine, coordinator.cache, coordinator.settings)
+    count = coordinator_module.AHEAD_CLAIM_KEYS + 2
+    roots = ["o"] + [f"r{i:02}" for i in range(count)]
+    children = ["x"] + [f"c{i:02}" for i in range(count)] + [f"g{i:02}" for i in range(count)]
+    edges = [("x", "o")] + [(f"c{i:02}", f"r{i:02}") for i in range(count)] + [
+        (f"g{i:02}", f"c{i:02}") for i in range(count)
+    ]
+    await submit(http, roots + children, edges, speculative_loading="1")
+    tokens = await claim_all(http, len(roots))
+    assert (await http.post(f"/v1/work/{tokens['o']}/outlined", headers=WORKER)).status_code == 204
+    read = await coordinator._ahead_candidates()
+    assert [(c[1], c[5]) for c in read.candidates] == [
+        *((input_key(f"c{i:02}"), False) for i in range(count)), (input_key("x"), True)
+    ]
+
+    filled = await replica.claim(["standard"], "w-replica", ahead=True)
+    assert filled is not None and filled.theory == "pkg:c00"
+    x = await claim_ahead(http)
+    assert x is not None and (x["theory"], x["ahead_parents"]) == ("pkg:x", parents("o"))
+    assert await claim_ahead(http) is None
+
+
 # An action abandoned ahead waits for its parents from then on; one retried may be claimed ahead again.
 @pytest.mark.parametrize(("failure", "next_ahead"), [("ahead-abandoned", "c"), ("unavailable", "b"), ("publish", "b")])
 async def test_a_claim_ahead_given_up_wakes_a_claim_waiting_for_its_slot_of_the_cap(
