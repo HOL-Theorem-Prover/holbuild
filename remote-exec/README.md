@@ -999,7 +999,7 @@ builds before it lands:
 
 ```bash
 make bin/holbuild    # in the checkout to try
-remote-exec/local-fleet --workers 8 --toolchain ~/.cache/holbuild/hol-toolchains/<key> ~/holbuild-branch -- \
+remote-exec/local-fleet --workers 8 --toolchain ~/.cache/holbuild/hol-toolchains/KEY ~/holbuild-branch -- \
   sh -c 'cd ~/project && holbuild build FooTheory --remote-exec "$LOCAL_FLEET_URL" --remote-only'
 ```
 
@@ -1030,19 +1030,23 @@ holds no lease on it: seed from an entry in current use, which that cache's
 garbage collection won't retire mid-run. `holbuild buildhol` in the project
 prints the path of the one it uses.
 
-`REMOTE_EXEC_*` variables in the environment configure the coordinator, except
-`REMOTE_EXEC_SCALE_CMD`, `REMOTE_EXEC_CACHE_POOL_CMD` and
-`REMOTE_EXEC_CACHE_SLOTS`, which are unset because they would reach a deployed
-fleet's scaler and cache pool. Inside a Slurm allocation, its memory
-(`--mem` or `--mem-per-cpu`) is the workers' admission budget.
+The services, the workers and the tools that set them up (`uv`, `alembic`
+and the Postgres tools) start from an empty environment, so none of the
+caller's settings or config files (a deployed fleet's `REMOTE_EXEC_*`, curl's,
+libpq's, uv's) reach them: of the caller's environment, only `PATH` passes, `uv`
+also keeps `HOME` and `UV_CACHE_DIR` for its cache, and the workers also get
+`HOLBUILD_ACTION_READ_DIRS` and the `HOL4_*` solver settings, which stand in
+for the worker image's. Their `HOME` is a private directory in the run
+directory. Inside a Slurm allocation, its memory (`--mem` or `--mem-per-cpu`)
+is the workers' admission budget.
 
 The run directory (`--dir`, else a new one in `~/.cache/holbuild-local-fleet`)
-must be new or empty, a plain path, and not under `/tmp`, and is made readable
-by its owner only; the workers' `TMPDIR`
+must be new or empty, a plain path of at most 89 characters (Postgres's socket
+is in it), and not under `/tmp`, and is made readable by its owner only; the workers' `TMPDIR`
 is inside it: as in the image, the action sandbox lets HOL write `/tmp` only
 when no worker state is there. The services and workers run in sessions of
 their own, so a terminal's Ctrl-C reaches only the launcher, and `127.0.0.1` is
-added to `no_proxy`. On exit, interrupt or termination the command's
+added to the command's `no_proxy`. On exit, interrupt or termination the command's
 process group is stopped (TERM, then KILL after 10 s), then the workers, which drain while the coordinator and cache still
 take their results, then the coordinator and cache. The run directory keeps
 the logs and CSV copies of the `batches`, `actions` and `leases` tables, and
