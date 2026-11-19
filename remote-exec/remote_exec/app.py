@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 # Under uvicorn's own logger, which uvicorn sends to stderr at INFO; this module's would show only warnings.
 summary_logger = logging.getLogger("uvicorn.requests")
 SUMMARY_SECONDS = 60.0
+SUBMIT_SLOW_SECONDS = 10.0  # a POST /v1/batches that takes this long is logged
 
 Tier = Literal["standard", "high"]
 
@@ -244,18 +245,29 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         speculative_loading: int | None = Query(default=None, ge=1, le=64),
         batch_id: UUID | None = Header(default=None, alias="Holbuild-Batch-Id"),
     ) -> dict[str, UUID]:
+        started = time.monotonic()
         try:
-            batch = parse_batch(await text_body(request))
-        except FormatError as error:
-            raise HTTPException(400, str(error)) from error
-        if action_class == "run" and batch.edges:
-            raise HTTPException(400, "run batches require independent actions: dependency edges are not allowed")
-        if action_class == "run" and speculative_loading is not None:
-            raise HTTPException(400, "run batches have no parents to load ahead of: speculative_loading is not allowed")
-        return {"batch_id": await coordinator.submit(
-            batch, profile, action_class, max_heap_mb, fail_fast=fail_fast, priority=priority,
-            ahead_cap=speculative_loading, batch_id=batch_id,
-        )}
+            try:
+                batch = parse_batch(await text_body(request))
+            except FormatError as error:
+                raise HTTPException(400, str(error)) from error
+            if action_class == "run" and batch.edges:
+                raise HTTPException(400, "run batches require independent actions: dependency edges are not allowed")
+            if action_class == "run" and speculative_loading is not None:
+                raise HTTPException(
+                    400, "run batches have no parents to load ahead of: speculative_loading is not allowed"
+                )
+            return {"batch_id": await coordinator.submit(
+                batch, profile, action_class, max_heap_mb, fail_fast=fail_fast, priority=priority,
+                ahead_cap=speculative_loading, batch_id=batch_id,
+            )}
+        finally:
+            # Timed from before the body is read, so a slow upload or parse shows too.
+            if (seconds := time.monotonic() - started) >= SUBMIT_SLOW_SECONDS:
+                logger.warning(
+                    "POST /v1/batches of %s bytes (batch id %s) took %.1f s",
+                    request.headers.get("content-length", "?"), batch_id or "new", seconds,
+                )
 
     @app.get("/v1/batches/{batch_id}", dependencies=client)
     async def status(batch_id: UUID) -> dict[str, object]:

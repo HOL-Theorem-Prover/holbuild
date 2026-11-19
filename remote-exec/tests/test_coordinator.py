@@ -6,7 +6,7 @@ import time
 from collections import Counter, deque
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -155,30 +155,72 @@ async def test_a_submission_repeated_under_its_id_answers_with_the_batch_stored_
     assert await states(http, batch_id) == {"a": "ready", "b": "waiting"}
 
 
-async def test_a_repeated_submission_waits_for_the_first_to_commit_and_stores_nothing_more(
+async def blocked_by(observer: AsyncConnection, pid: int) -> int:
+    """The backend that waits on a lock ``pid`` holds, once one does; ``observer`` runs in autocommit, since
+    pg_stat_activity holds still within a transaction."""
+    while (waiter := await observer.scalar(
+        sa.text("SELECT pid FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid))"), {"pid": pid}
+    )) is None:
+        await asyncio.sleep(0.01)
+    return waiter
+
+
+@contextlib.asynccontextmanager
+async def a_repeat_waiting_on_a_paused_submission(
+    coordinator: Coordinator, batch_id: UUID
+) -> AsyncIterator[tuple[AsyncConnection, int, asyncio.Task[UUID], asyncio.Task[UUID]]]:
+    """Two submissions of one batch under ``batch_id``: the first, by the backend it yields the pid of, stored its
+    batch row and waits on its peak hint, which the connection it yields holds locked; the repeat waits on that row."""
+    batch = parse_batch(batch_text(["a"]))
+    async with coordinator.engine.connect() as hold, coordinator.engine.connect() as observer:
+        await observer.execution_options(isolation_level="AUTOCOMMIT")
+        await hold.execute(sa.text(
+            "INSERT INTO peak_hints (package, theory, profile, peak_rss_mb, updated_at) "
+            "VALUES ('pkg', 'a', 'default', 100, now())"
+        ))
+        await hold.commit()
+        await hold.execute(sa.text("SELECT 1 FROM peak_hints FOR UPDATE"))
+        holder = await hold.scalar(sa.text("SELECT pg_backend_pid()"))
+        first = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
+        async with asyncio.timeout(5):
+            first_pid = await blocked_by(observer, holder)
+        repeat = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
+        async with asyncio.timeout(5):
+            await blocked_by(observer, first_pid)
+        assert not repeat.done()
+        yield hold, first_pid, first, repeat
+
+
+async def stored_rows(coordinator: Coordinator) -> tuple[int, int]:
+    async with coordinator.engine.connect() as conn:
+        return (
+            await conn.scalar(sa.text("SELECT count(*) FROM batches")),
+            await conn.scalar(sa.text("SELECT count(*) FROM actions")),
+        )
+
+
+async def test_a_repeated_submission_waits_for_the_first_to_store_and_stores_nothing_more(
     coordinator: Coordinator,
 ) -> None:
     batch_id = uuid4()
-    batch = parse_batch(batch_text(["a"]))
-    async with coordinator.engine.connect() as first:
-        pid = await first.scalar(sa.text("SELECT pg_backend_pid()"))
-        await first.execute(
-            sa.text("INSERT INTO batches (id, state, profile) VALUES (:id, 'running', 'default')"), {"id": batch_id}
-        )
-        repeat = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
-        async with asyncio.timeout(5), coordinator.engine.connect() as observer:
-            # pg_stat_activity holds still within a transaction, so each look is a transaction of its own.
-            await observer.execution_options(isolation_level="AUTOCOMMIT")
-            while not await observer.scalar(sa.text(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid)))"
-            ), {"pid": pid}):
-                await asyncio.sleep(0.01)
-        assert not repeat.done()
-        await first.commit()
+    async with a_repeat_waiting_on_a_paused_submission(coordinator, batch_id) as (hold, _, first, repeat):
+        await hold.commit()
+        assert await asyncio.wait_for(first, 10) == batch_id
         assert await asyncio.wait_for(repeat, 10) == batch_id
 
-    async with coordinator.engine.connect() as conn:
-        assert await conn.scalar(sa.text("SELECT count(*) FROM actions")) == 0
+    assert await stored_rows(coordinator) == (1, 1)
+
+
+async def test_a_repeated_submission_stores_the_batch_when_the_first_fails(coordinator: Coordinator) -> None:
+    batch_id = uuid4()
+    async with a_repeat_waiting_on_a_paused_submission(coordinator, batch_id) as (hold, first_pid, first, repeat):
+        await hold.execute(sa.text("SELECT pg_cancel_backend(:pid)"), {"pid": first_pid})
+        with pytest.raises(sa.exc.DBAPIError, match="canceling statement"):
+            await asyncio.wait_for(first, 10)
+        await hold.rollback()
+        assert await asyncio.wait_for(repeat, 10) == batch_id
+
+    assert await stored_rows(coordinator) == (1, 1)
 
 
 async def test_empty_batch_is_done(http: httpx.AsyncClient) -> None:
