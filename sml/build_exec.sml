@@ -9078,13 +9078,30 @@ fun uncached_parents plan uncached node =
 
 (* PUT whether or not the remote cache already holds the blob: a cache
    node can answer for a blob from its own disk after its backing store has
-   dropped it, and a PUT writes it to that store anew. *)
+   dropped it, and a PUT writes it to that store anew.
+   While the remote cache's breaker is tripped, a skipped or failed PUT is
+   tried again each second, for up to spec_upload_outage, so that a short
+   outage costs a wait rather than the build; each try sends nothing until
+   the breaker admits it. *)
+val spec_upload_outage = Time.fromSeconds 180
+
 fun publish_spec_blob remote {hash, path} =
-  case HolbuildRemoteCache.publish_hashed_blob remote {hash = hash, src = path} of
-      HolbuildCacheBackend.Published => ()
-    | HolbuildCacheBackend.AlreadyPresent => ()
-    | HolbuildCacheBackend.Conflict message => raise Error ("could not upload " ^ path ^ ": " ^ message)
-    | HolbuildCacheBackend.Skipped => raise Error ("could not upload " ^ path ^ ": skipped")
+  let
+    val give_up = Time.+ (Time.now (), spec_upload_outage)
+    fun fail message = raise Error ("could not upload " ^ path ^ ": " ^ message)
+    fun retry message =
+      if Time.>= (Time.now (), give_up) then fail message
+      else (OS.Process.sleep (Time.fromSeconds 1); publish ())
+    and publish () =
+      case HolbuildRemoteCache.publish_hashed_blob remote {hash = hash, src = path} of
+          HolbuildCacheBackend.Published => ()
+        | HolbuildCacheBackend.AlreadyPresent => ()
+        | HolbuildCacheBackend.Conflict message =>
+            if HolbuildRemoteCache.tripped () then retry message else fail message
+        | HolbuildCacheBackend.Skipped => retry "skipped"
+  in
+    publish ()
+  end
 
 (* The remote ledger: what earlier exports found the remote cache at a URL
    to hold, one "theory <input key>" or "blob <sha256>" per line, so that the

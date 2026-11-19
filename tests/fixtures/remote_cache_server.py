@@ -116,6 +116,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(int((control / "get-status").read_text()))
             self.end_headers()
             return
+        if (
+            control is not None
+            and self.path.startswith("/ac/")
+            and (control / "ac-get-drop").exists()
+        ):
+            # Close the connection unanswered: a transport failure.
+            self.close_connection = True
+            return
         if control is not None and self.path.startswith("/ac/"):
             key = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
             for name in (f"ac-get-status-{key}", "ac-get-status"):
