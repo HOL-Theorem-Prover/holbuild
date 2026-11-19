@@ -213,6 +213,17 @@ PY
 remote_root=$tmpdir/remote
 start_remote_cache_server "$remote_root" "$tmpdir/server"
 
+# The fixture replaces an object rather than rewriting it, so a GET that has it open while a
+# PUT replaces it still reads the whole old object.
+curl -q -sf -X PUT --data-binary 'old object' "$remote_url/fixture-replace"
+exec {held}< "$remote_root/fixture-replace"
+curl -q -sf -X PUT --data-binary 'new' "$remote_url/fixture-replace"
+[[ $(cat <&"$held") == 'old object' ]] || { echo "the cache fixture's PUT rewrote an open object in place" >&2; exit 1; }
+exec {held}<&-
+[[ $(curl -q -sf "$remote_url/fixture-replace") == new ]] || { echo "the cache fixture didn't serve the replacing PUT's object" >&2; exit 1; }
+rm "$remote_root/fixture-replace"
+: > "$request_log"
+
 first=$tmpdir/first
 second=$tmpdir/second
 write_project "$first"

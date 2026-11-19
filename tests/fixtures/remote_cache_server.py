@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import http.server
+import os
 import pathlib
 import subprocess
 import threading
@@ -215,7 +216,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         )
         self.gate_action_put(action_sequence, "before")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        # Into place whole, so a concurrent GET of the same object never reads it half-written.
+        partial = path.with_name(f".{path.name}.{threading.get_ident()}.partial")
+        partial.write_bytes(data)
+        os.replace(partial, path)
         self.gate_action_put(action_sequence, "after")
         self.send_response(201)
         self.end_headers()

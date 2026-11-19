@@ -1,0 +1,320 @@
+#!/usr/bin/env -S bash -p
+# Run a command against a private remote-exec fleet built from one holbuild tree:
+# a fresh Postgres, that tree's coordinator, a local cache server and N workers
+# that run the tree's own holbuild, so an unreleased coordinator, worker or
+# exec-action can be tried before it lands. See README "Local test fleet".
+# Run in privileged mode (when started as bash local-fleet, start again in it), which takes no shell options
+# (SHELLOPTS, BASHOPTS), BASH_ENV hook or functions from the environment: xtrace, allexport, monitor or noglob,
+# say, would print or export the secrets below, make setsid fork or change what the script does, and a function
+# would stand in for a command it runs.
+[[ $- == *p* ]] || exec "$BASH" -p "$0" "$@"
+set -euo pipefail
+# COMMAND gets back the caller's values of the names this script assigns. SHELLOPTS and BASHOPTS, read-only
+# here and holding this script's options, don't reach it.
+caller_exports=$(declare -px | grep -vE '^declare -[a-zA-Z]+ (SHELLOPTS|BASHOPTS)=')
+
+usage() {
+  cat <<'EOF'
+usage: local-fleet [--workers N] [--dir DIR] [--toolchain DIR]... [--keep] TREE -- COMMAND...
+
+TREE      a holbuild checkout with bin/holbuild built
+--workers workers to start (default 4)
+--dir     run directory for logs, the database and caches: new or empty, not under
+          /tmp, a plain path (default: a new directory in ~/.cache/holbuild-local-fleet)
+--toolchain
+          a built HOL toolchain, one entry of a holbuild cache's hol-toolchains, to
+          use without building it; repeatable. Its hol/ tree is used in place (HOL
+          bakes its absolute paths in) and never written; the entry's locks,
+          last-used marker and analysers stay private to the fleet
+--keep    keep the caches and database when done (logs and tables are always kept)
+
+COMMAND runs in its own process group with LOCAL_FLEET_URL (the coordinator),
+HOLBUILD_REMOTE_CACHE_URL, HOLBUILD_REMOTE_CACHE_CURL_CONFIG,
+HOLBUILD_REMOTE_EXEC_CURL_CONFIG, HOLBUILD_CACHE and HOLBUILD_COOPERATE_DIR (the
+memory budget it shares with the workers) set, every other
+HOLBUILD_REMOTE_CACHE_* and HOLBUILD_REMOTE_EXEC_* variable unset, and TREE/bin
+first on PATH, e.g.
+  local-fleet --toolchain ~/.cache/holbuild/hol-toolchains/KEY ~/holbuild -- \
+    sh -c 'holbuild build FooTheory --remote-exec "$LOCAL_FLEET_URL" --remote-only'
+The services, the workers and the tools that set them up start from an empty
+environment: of the caller's, only PATH reaches them, and the workers also get
+HOLBUILD_ACTION_READ_DIRS and the HOL4_* solver settings, which a worker image sets.
+Needs initdb, pg_ctl, createdb and psql on PATH, and uv.
+EOF
+}
+
+workers=4 dir= keep=0 toolchains=()
+while (($#)); do
+  case $1 in
+    --workers) workers=${2:?--workers needs a number}; shift 2 ;;
+    --dir) dir=${2:?--dir needs a directory}; shift 2 ;;
+    --toolchain) toolchains+=("${2:?--toolchain needs a directory}"); shift 2 ;;
+    --keep) keep=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) usage >&2; exit 2 ;;
+    -*) echo "local-fleet: unknown option $1" >&2; usage >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+tree=$(realpath "${1:?$(usage)}")
+shift
+[[ ${1:-} == -- ]] || { echo "local-fleet: expected -- COMMAND after TREE, got '${1:-}'" >&2; exit 2; }
+shift
+(($#)) || { echo "local-fleet: no COMMAND given" >&2; exit 2; }
+[[ $workers =~ ^[1-9][0-9]*$ ]] || { echo "local-fleet: --workers must be a positive number, got '$workers'" >&2; exit 2; }
+[[ -x $tree/bin/holbuild ]] || { echo "local-fleet: $tree/bin/holbuild is missing; run make bin/holbuild there first" >&2; exit 2; }
+for t in "${toolchains[@]}"; do
+  [[ -f $t/build.ok && -d $t/hol ]] || { echo "local-fleet: $t is not a built HOL toolchain (no build.ok and hol/)" >&2; exit 2; }
+done
+version=$(sed -n 's/^val version = "\(.*\)"$/\1/p' "$tree/sml/version.sml")
+[[ -n $version ]] || { echo "local-fleet: no version in $tree/sml/version.sml" >&2; exit 2; }
+# A Slurm booking's memory is the workers' admission budget.
+budget_mb=
+if [[ -n ${SLURM_MEM_PER_NODE:-} ]]; then
+  budget_mb=$SLURM_MEM_PER_NODE
+elif [[ -n ${SLURM_MEM_PER_CPU:-} ]]; then
+  budget_mb=$((SLURM_MEM_PER_CPU * ${SLURM_CPUS_ON_NODE:?SLURM_MEM_PER_CPU is set but SLURM_CPUS_ON_NODE is not}))
+elif [[ -n ${SLURM_MEM_PER_GPU:-} ]]; then
+  echo "local-fleet: memory booked per GPU; book it with --mem or --mem-per-cpu so the workers' budget is known" >&2
+  exit 2
+fi
+# --mem=0 books the whole node: leave the budget to holbuild's own reading of the machine.
+if [[ $budget_mb == 0 ]]; then budget_mb=; fi
+
+if [[ -z $dir ]]; then
+  mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/holbuild-local-fleet"
+  dir=$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/holbuild-local-fleet/run.XXXXXX")
+fi
+dir=$(realpath -m "$dir")
+# Postgres's socket, $dir/.s.PGSQL.<port>, must fit a socket address (107 bytes).
+((${#dir} <= 89)) || { echo "local-fleet: the run directory $dir is longer than 89 characters, too long for Postgres's socket path" >&2; exit 2; }
+# The action sandbox gives HOL /tmp, where Poly's temp files go (HolSat, intLib), only
+# when no worker state lies under it: the run directory and the workers' TMPDIR stay out.
+[[ $dir/ != /tmp/* ]] || { echo "local-fleet: the run directory $dir is under /tmp, which the action sandbox would then withhold from HOL" >&2; exit 2; }
+# It goes unquoted into Postgres's options and quoted into psql's commands.
+[[ $dir =~ ^[A-Za-z0-9/._+-]+$ ]] || { echo "local-fleet: the run directory $dir must be a plain path (letters, digits, / . _ + -)" >&2; exit 2; }
+mkdir -p -m 700 "$dir"
+[[ -O $dir ]] || { echo "local-fleet: the run directory $dir isn't yours" >&2; exit 2; }
+not_empty() { echo "local-fleet: the run directory $dir is not empty; give a new or empty one" >&2; exit 2; }
+[[ -z $(ls -A "$dir") ]] || not_empty
+chmod 700 "$dir"
+# Checked again now that only its owner can write it. Creating logs/ claims the directory: of two runs
+# given the same one, only the first gets it.
+if [[ -n $(ls -A "$dir") ]] || ! mkdir "$dir/logs" 2>/dev/null; then not_empty; fi
+mkdir -p "$dir"/{home,remote,baked,releases,cooperate,client-cache,hol-toolchains,tables,tmp}
+ln -sfn "$tree" "$dir/baked/v$version"
+read_dirs=${HOLBUILD_ACTION_READ_DIRS:-}
+for t in "${toolchains[@]}"; do
+  t=$(realpath "$t")
+  entry=$dir/hol-toolchains/$(basename "$t")
+  mkdir -p "$entry"
+  find "$t" -mindepth 1 -maxdepth 1 -type f ! -name last-used -exec cp -p -t "$entry/" {} +
+  : > "$entry/last-used"
+  ln -sfn "$t/hol" "$entry/hol"
+  read_dirs=${read_dirs:+$read_dirs:}$t/hol
+done
+# Each worker needs a cache of its own: exec-action locks it for the whole action.
+for c in client-cache $(seq -f worker-cache-%g "$workers"); do
+  mkdir -p "$dir/$c"
+  ln -sfn "$dir/hol-toolchains" "$dir/$c/hol-toolchains"
+done
+if [[ -n $budget_mb ]]; then echo $((budget_mb * 1024 * 1024)) > "$dir/cooperate/budget"; fi
+
+# The services, the workers and the tools that set them up each run in a subshell that calls this first, and
+# start through env "${unenv[@]}": what they run gets an environment of PATH, a private HOME and TMPDIR, the user,
+# a fixed locale and the names given, as from env -i, so no setting, function, hook or config file of the
+# caller's (curl's, libpq's, uv's, a deployed fleet's) reaches it. unenv removes every other name the
+# environment holds, whatever bash made of it; only names go on the command line, so secrets are passed in the
+# environment, never where others can read them. No proxy is passed: all they reach is loopback.
+isolate() {
+  export HOME=$dir/home TMPDIR=$dir/tmp USER=$(id -un) LOGNAME=$(id -un) LANG=C.UTF-8 GIT_OPTIONAL_LOCKS=0
+  mapfile -d '' -t unenv < <(env -0 | cut -z -d= -f1 |
+    { grep -zvxE "PATH|HOME|TMPDIR|USER|LOGNAME|LANG|GIT_OPTIONAL_LOCKS$(printf '|%s' "$@")" || (($? == 1)); } |
+    xargs -0 -r printf -- '-u\0%s\0')
+  # Fail closed: a list cut short would let the rest of the environment through.
+  wait "$!"
+}
+
+command_pid= worker_pids=() service_pids=() pg_started=0 launching=0 pending=0
+terminate() {
+  local pid running
+  # Only those still running: an exited child's PID may since belong to another process.
+  running=" $(jobs -rp | tr '\n' ' ') "
+  for pid in "$@"; do
+    if [[ $running == *" $pid "* ]]; then kill -TERM "$pid" 2>/dev/null || true; fi
+  done
+  for pid in "$@"; do wait "$pid" 2>/dev/null || true; done
+}
+# TERM to COMMAND's whole process group (a shell's children too), KILL after 10 s.
+# Bash reaps COMMAND while it waits on sleep, so the group's leader doesn't linger as a zombie.
+# Until the child has exec'd setsid it has no group of its own: signal it by its PID then.
+signal_command() { kill "-$1" -- "-$command_pid" 2>/dev/null || kill "-$1" "$command_pid" 2>/dev/null; }
+group_gone_within() {
+  local _
+  for _ in $(seq "$1"); do signal_command 0 || return 0; sleep 0.1; done
+  return 1
+}
+stop_command() {
+  signal_command TERM || return 0
+  group_gone_within 100 && return 0
+  signal_command KILL || return 0
+  group_gone_within 50 && return 0
+  echo "local-fleet: COMMAND's process group $command_pid outlived SIGKILL; going on without it" >&2
+}
+stop() {
+  local status=$?
+  # A second interrupt mustn't cut the teardown short: what it stops runs in sessions of its own.
+  trap - EXIT
+  trap '' INT TERM
+  # Workers drain while the coordinator and cache still take their results and logs.
+  if [[ -n $command_pid ]]; then stop_command; fi
+  terminate "${worker_pids[@]}"
+  terminate "${service_pids[@]}"
+  if ((pg_started)); then
+    for table in batches actions leases; do
+      (export PGPASSWORD=$pgpassword && isolate PGPASSWORD && exec env "${unenv[@]}" psql -X -h "$dir" -p "$pgport" -U postgres -d fleet \
+        -qc "\\copy $table TO '$dir/tables/$table.csv' CSV HEADER") >> "$dir/logs/tables.log" 2>&1 ||
+        { echo "local-fleet: copying the $table table failed; keeping $dir/pg (see $dir/logs/tables.log)" >&2
+          keep_pg=1; ((status)) || status=1; }
+    done
+    if ! (isolate && exec env "${unenv[@]}" pg_ctl -s -D "$dir/pg" stop -m fast); then
+      echo "local-fleet: Postgres didn't stop; keeping $dir/pg (stop it with pg_ctl -D $dir/pg stop)" >&2
+      keep_pg=1
+      ((status)) || status=1
+    fi
+  fi
+  if ((!keep)); then
+    rm -rf "$dir"/{home,remote,worker-cache-*,client-cache,hol-toolchains,releases,tmp}
+    ((keep_pg)) || rm -rf "$dir/pg"
+  fi
+  echo "local-fleet: logs and tables in $dir" >&2
+  exit "$status"
+}
+keep_pg=0
+trap stop EXIT
+# An interrupt between starting a child in the background and recording its PID would leave that child out of
+# the teardown: while one starts, it waits until started runs.
+on_signal() { pending=$1; ((launching)) || exit "$1"; }
+started() { launching=0; ((!pending)) || exit "$pending"; }
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+free_port() { python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+token() { python3 -I -c 'import secrets; print(secrets.token_hex(16))'; }
+
+# Password authentication, since other accounts on the host can reach the TCP port.
+# The launcher's secrets mustn't reach COMMAND through a name the caller happened to export.
+export -n pgpassword database_url cache_user client_token worker_token
+pgpassword=$(token)
+(umask 077 && printf '%s\n' "$pgpassword" > "$dir/pg.password")
+pgport=$(free_port)
+(isolate && exec env "${unenv[@]}" initdb -A scram-sha-256 -U postgres --pwfile "$dir/pg.password" -D "$dir/pg") > "$dir/logs/initdb.log"
+rm -f "$dir/pg.password"
+# Set first: an interrupt or a failed wait can leave a server running once pg_ctl has launched it.
+pg_started=1
+(isolate && exec env "${unenv[@]}" pg_ctl -s -D "$dir/pg" -l "$dir/logs/postgres.log" \
+  -o "-p $pgport -k $dir -c listen_addresses=127.0.0.1 -c max_connections=$((workers * 4 + 100))" start)
+(export PGPASSWORD=$pgpassword && isolate PGPASSWORD && exec env "${unenv[@]}" createdb -h "$dir" -p "$pgport" -U postgres fleet)
+database_url=postgresql+asyncpg://postgres:$pgpassword@127.0.0.1:$pgport/fleet
+
+# uv keeps the caller's HOME and UV_CACHE_DIR, where its cache and managed Pythons are, but no other UV_*
+# setting and no uv.toml: the services below run this .venv.
+(cd "$tree/remote-exec" && home=$HOME && isolate UV_CACHE_DIR && HOME=$home && exec env "${unenv[@]}" uv sync --no-config --frozen --quiet)
+python=$tree/remote-exec/.venv/bin/python
+(cd "$tree/remote-exec" && export REMOTE_EXEC_DATABASE_URL=$database_url && isolate REMOTE_EXEC_DATABASE_URL &&
+  exec env "${unenv[@]}" .venv/bin/alembic upgrade head) \
+  > "$dir/logs/migrate.log" 2>&1
+
+# The cache server takes only requests with this credential, since other accounts can reach its port too.
+cache_user=local-fleet:$(token)
+(umask 077 && mkdir "$dir/cache-control" && printf 'Basic %s\n' "$(printf %s "$cache_user" | base64 -w0)" > "$dir/cache-control/authorization" &&
+  printf 'user = "%s"\n' "$cache_user" > "$dir/cache.curl")
+# Services and workers run in sessions of their own, so a terminal's Ctrl-C reaches only this script,
+# which stops them in order; their secrets go in their environment, not on a command line others can read.
+launching=1
+(isolate && exec env "${unenv[@]}" setsid "$python" "$tree/tests/fixtures/remote_cache_server.py" "$dir/remote" "$dir/cache.port" \
+  "$dir/logs/cache-requests.log" "$dir/cache-control") > "$dir/logs/cache.log" 2>&1 &
+service_pids+=($!)
+started
+for _ in $(seq 100); do [[ -s $dir/cache.port ]] && break; sleep 0.1; done
+[[ -s $dir/cache.port ]] || { echo "local-fleet: the cache server didn't start; see $dir/logs/cache.log" >&2; exit 1; }
+cache_url=http://127.0.0.1:$(< "$dir/cache.port")
+
+client_token=$(token)
+worker_token=$(token)
+(umask 077 && printf 'header = "Authorization: Bearer %s"\n' "$client_token" > "$dir/client.curl")
+
+port=$(free_port)
+launching=1
+(
+  cd "$tree/remote-exec"
+  export REMOTE_EXEC_DATABASE_URL=$database_url REMOTE_EXEC_CLIENT_TOKEN=$client_token REMOTE_EXEC_WORKER_TOKEN=$worker_token \
+    REMOTE_EXEC_CACHE_URL=http://$cache_user@${cache_url#http://} REMOTE_EXEC_WARM_WORKERS=$workers
+  isolate REMOTE_EXEC_DATABASE_URL REMOTE_EXEC_CLIENT_TOKEN REMOTE_EXEC_WORKER_TOKEN REMOTE_EXEC_CACHE_URL \
+    REMOTE_EXEC_WARM_WORKERS
+  exec env "${unenv[@]}" setsid .venv/bin/uvicorn --factory remote_exec.app:app --host 127.0.0.1 --port "$port" --timeout-graceful-shutdown 2
+) > "$dir/logs/coordinator.log" 2>&1 &
+service_pids+=($!)
+started
+url=http://127.0.0.1:$port
+# -q: no curl config of the caller's; and no proxy, as for COMMAND below.
+queue() { curl -q -sf --noproxy '*' --max-time 10 -K "$dir/client.curl" "$url/v1/queue"; }
+for _ in $(seq 300); do queue > /dev/null && break; sleep 0.2; done
+queue > /dev/null || { echo "local-fleet: the coordinator didn't answer; see $dir/logs/coordinator.log" >&2; exit 1; }
+
+for i in $(seq "$workers"); do
+  launching=1
+  (
+    cd "$dir"
+    export REMOTE_EXEC_WORKER_TOKEN=$worker_token HOLBUILD_CACHE=$dir/worker-cache-$i \
+      HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$dir/cache.curl HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' \
+      HOLBUILD_ACTION_READ_DIRS=$read_dirs PYTHONPATH=$tree/remote-exec
+    # The caller stands in for the worker image here: its HOL4_* solver settings pass, as the image's would.
+    isolate REMOTE_EXEC_WORKER_TOKEN HOLBUILD_CACHE HOLBUILD_REMOTE_CACHE_CURL_CONFIG \
+      HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES HOLBUILD_ACTION_READ_DIRS PYTHONPATH $(compgen -e | grep '^HOL4_' || true)
+    exec env "${unenv[@]}" setsid "$python" -m remote_exec.worker \
+      --coordinator "$url" --remote-cache "$cache_url" --tier high --also-claim standard --load-ahead \
+      --max-heap 12000 --drain-seconds 20 --share-heaps --cooperate-dir "$dir/cooperate" --cache-limit-gb 100 \
+      --baked-releases "$dir/baked" --holbuild-releases-dir "$dir/releases" --name "local-$i"
+  ) > "$dir/logs/worker-$i.log" 2>&1 &
+  worker_pids+=($!)
+  started
+done
+# A worker that fails at startup would leave COMMAND's work unclaimed: wait for the workers to report their
+# host (all of them share it, and the coordinator counts hosts, not workers), then check they're all still up.
+reported() { queue | python3 -I -c 'import json, sys; sys.exit(0 if json.load(sys.stdin)["hosts"] else 1)'; }
+for _ in $(seq 60); do reported && break; sleep 0.5; done
+reported || { echo "local-fleet: no worker reported to the coordinator in 30 s; see $dir/logs/worker-*.log" >&2; exit 1; }
+sleep 2
+for i in $(seq "$workers"); do
+  kill -0 "${worker_pids[i - 1]}" 2>/dev/null ||
+    { echo "local-fleet: worker $i exited at startup; see $dir/logs/worker-$i.log" >&2; exit 1; }
+done
+
+echo "local-fleet: $workers workers of holbuild $version from $tree at $url, run dir $dir" >&2
+# In the background, so a TERM to this script runs the teardown at once, and in a process group
+# of its own (setsid needn't fork here: a background job isn't a group leader), so it can be stopped whole.
+# A background job's stdin would be /dev/null: hand COMMAND this script's own.
+launching=1
+(
+  # The fleet's settings, in the positional parameters, which the caller's values below can't touch.
+  set -- LOCAL_FLEET_URL="$url" HOLBUILD_REMOTE_CACHE_URL="$cache_url" \
+    HOLBUILD_REMOTE_CACHE_CURL_CONFIG="$dir/cache.curl" HOLBUILD_REMOTE_EXEC_CURL_CONFIG="$dir/client.curl" \
+    HOLBUILD_CACHE="$dir/client-cache" HOLBUILD_COOPERATE_DIR="$dir/cooperate" PATH="$tree/bin:$PATH" setsid "$@"
+  # COMMAND keeps the caller's environment apart from these. Nothing it does may reach a shared cache or
+  # fleet: a branch's theory outputs share their cache keys with released holbuild.
+  # Arrays here, which bash doesn't export: unset, so the caller's exported scalars of those names come back.
+  unset toolchains worker_pids service_pids
+  eval "$caller_exports"
+  unset $(compgen -e | grep -E '^HOLBUILD_REMOTE_(CACHE|EXEC)_') HOLBUILD_CACHE HOLBUILD_COOPERATE_DIR
+  # Every endpoint is on loopback: keep an inherited proxy out of the way.
+  # curl and Python read the lowercase name first: each spelling starts from the other when unset.
+  no_proxy=${no_proxy-${NO_PROXY-}} NO_PROXY=${NO_PROXY-${no_proxy-}}
+  export no_proxy=${no_proxy:+$no_proxy,}127.0.0.1 NO_PROXY=${NO_PROXY:+$NO_PROXY,}127.0.0.1
+  # holbuild checks a seeded toolchain's HOL checkout with git status, which mustn't refresh its index.
+  export GIT_OPTIONAL_LOCKS=0
+  exec env -u SHELLOPTS -u BASHOPTS "$@"
+) <&0 &
+command_pid=$!
+started
+wait "$command_pid"
