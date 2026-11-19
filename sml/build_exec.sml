@@ -7393,9 +7393,9 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
          if priority then priority_running := !priority_running + 1 else ();
          SOME (PlainWork id))
 
-    (* Commits, then outlines, then the best-ranked of the ready nodes, the
-       queued attempts and the attempts that can start ahead, in that order
-       on a tie.  A retained failure's replay goes first. *)
+    (* Commits, then outlines, then the deepest of the best-ranked ready
+       node, queued attempt and attempt that can start ahead, in that order
+       on equal depth.  A retained failure's replay goes first. *)
     fun pop_work () =
       case pop_commit () of
           SOME work => SOME work
@@ -7410,7 +7410,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                     val first = case ready_pick of SOME (_, priority) => priority orelse focused | NONE => false
                     val attempt_pick = best_attempt ()
                     val ahead_pick = if first then NONE else best_ahead ()
-                    fun beats (SOME a) (SOME b) = outranks (a, b)
+                    fun beats (SOME a) (SOME b) = depth a > depth b
                       | beats (SOME _) NONE = true
                       | beats NONE _ = false
                     fun put_back () = Option.app (fn (id, _) => add_ready id) ready_pick

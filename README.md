@@ -1233,8 +1233,8 @@ below a theory first, then its number of descendants. A pipelined theory:
    the finished theory. A child can even start before the outline is out,
    while a slot is idle: it loads its other ancestors and the parent's
    predicted ones meanwhile, then the parent's outline (or outputs) once they
-   come, checking that they load exactly what was predicted, so the load
-   order is a plain build's. At most `-j` / 3 (up to 6) children wait like
+   come, checking that they load exactly what was predicted: the same files
+   as a plain build, with the parent's signature after its dependencies. At most `-j` / 3 (up to 6) children wait like
    this at once; one whose parent's build stops, or whose prediction was
    wrong, is abandoned and builds later without starting early. With
    `--cooperate-dir`, children don't start early: one waiting would hold a
