@@ -792,7 +792,7 @@ assert summary.startswith('Exception raised at boolLib.store_thm_at:'), summary
 assert 'terminal proof failure' in summary, summary
 assert 'handled diagnostic' not in summary, summary
 PY
-# The summary quotes the runtime's phases line, and the record counts the
+# The summary leaves out the runtime's phases line, and the record counts the
 # phases lines of the child's output (the preload's and the runtime's) once.
 PYTHONPATH="$HOLBUILD_ROOT/remote-exec" python3 - "$tmpdir/d-action.log" "$tmpdir/d.result" <<'PY'
 import collections, pathlib, sys
@@ -802,7 +802,7 @@ raw, summary = pathlib.Path(sys.argv[1]).read_text().split('\nholbuild: exec-act
 prefix = 'holbuild hol-phases '
 lines = [line for line in raw.splitlines() if line.startswith(prefix)]
 runtime = [line for line in lines if ' holloadend=' in line]
-assert len(runtime) == 1 and runtime[0] in summary.splitlines(), (lines, summary)
+assert len(runtime) == 1 and runtime[0] not in summary.splitlines(), (lines, summary)
 expected = collections.Counter()
 for line in lines:
     for item in line[len(prefix):].split():
