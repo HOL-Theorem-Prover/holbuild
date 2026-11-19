@@ -640,7 +640,12 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   ends the action no longer counts against its batch's `<cap>` or as a
   generation against `REMOTE_EXEC_AHEAD_DEPTH`, and nor does a child claimed
   ahead whose unfinished parents have all posted it count against `<cap>`, or
-  as waiting in burst demand. A candidate ranks among its
+  as waiting in burst demand. The coordinator doesn't know which children's
+  specs allow pipelining: a child whose spec doesn't (a build target that
+  saves theorem checkpoints, a theory with extra outputs, a forced one)
+  waits on its worker for its parents' final outputs all the same, without
+  taking a slot of `<cap>`. A batch built with pipelining off throughout
+  posts no `outlined`, so all its children claimed ahead count. A candidate ranks among its
   batch's ready builds by its chain of dependents (`critical_depth`, then
   `descendant_count`, a ready build first on a tie), whether or not its
   parents have posted `outlined`: one on a longer chain than every ready build
