@@ -232,7 +232,7 @@ resumed v3 "theorem-context checkpoint after t2" "theorem_context checkpoint"
 require_grep "shared checkpoint index lists [1-9][0-9]* of" "$tmpdir/v3.log"
 same_outputs v3
 # With an empty store the restore fetched the heap and its chain, and says so.
-for step in rstprobe rstplace rstfetch rstfetchn rstfetchkb rstheap rstheapkb; do
+for step in rstprobe rstplace rstfetch rstfetchn rstfetchkb rstheap rstheapkb rstindexn resctxn resboundary; do
   grep -qE "^phase-ms=(.*,)?$step:[0-9]+(,|\$)" "$tmpdir/v3.result" || {
     echo "v3's record lacks restore step $step:" >&2; cat "$tmpdir/v3.result" >&2; exit 1; }
 done
@@ -316,6 +316,11 @@ worker v4a "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v4a 1 "status=failed" "failure=proof"
 require_grep "later failure" "$tmpdir/v4a.log"
 resumed v4a "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
+# A failed action's record still has the HOL child's phases and the resume.
+for step in resfpn resstepn resboundary holload holsalvage holrewind holleaves holtactics holprint holsave resbyten; do
+  grep -qE "^phase-ms=(.*,)?$step:[0-9]+(,|\$)" "$tmpdir/v4a.result" || {
+    echo "v4a's record lacks phase $step:" >&2; cat "$tmpdir/v4a.result" >&2; exit 1; }
+done
 forget_local
 worker v4b "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v4b 1 "status=failed" "failure=proof"

@@ -601,6 +601,37 @@ assert goals.count("p" * 5000) == 2, "missing full input goals"
 PYTHON
 done
 
+# A limit of exactly the goals' size prints them whole; one byte less cuts
+# them with the notice.
+goals_size=$(python3 - "$multi_goal_large_child_log" <<'PYTHON'
+import sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+print(len(text.split("holbuild all failed tactic input goals:\n", 1)[1].split(
+    "holbuild end all failed tactic input goals", 1)[0].encode()))
+PYTHON
+)
+for limit in "$goals_size" "$((goals_size - 1))"; do
+  if (cd "$multi_goal_large_project" && HOLBUILD_FAILED_GOALS_LIMIT=$limit \
+      "$HOLBUILD_BIN" build ATheory) > "$tmpdir/multi-goal-boundary-$limit.log" 2>&1; then
+    echo "expected large multi-goal proof to fail build" >&2
+    exit 1
+  fi
+  python3 - "$multi_goal_large_child_log" "$limit" "$goals_size" <<'PYTHON'
+import sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+limit, size = int(sys.argv[2]), int(sys.argv[3])
+goals = text.split("holbuild all failed tactic input goals:\n", 1)[1].split(
+    "holbuild end all failed tactic input goals", 1)[0]
+notice = f"\nholbuild failed tactic input goals truncated after {limit} bytes\n"
+if limit == size:
+    assert "truncated after" not in goals and len(goals.encode()) == size, goals[-200:]
+else:
+    assert goals.endswith(notice) and len(goals.encode()) == limit + len(notice), goals[-200:]
+PYTHON
+done
+
 # Old failed-prefix heaps capture the pre-configuration diagnostic printer.
 python3 - "$multi_goal_large_project/.holbuild/checkpoints" <<'PYTHON'
 import sys

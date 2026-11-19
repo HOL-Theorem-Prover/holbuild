@@ -4013,8 +4013,15 @@ fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
 fun resumes_from_checkpoints policy (action : theory_action) =
   null (#extra_outputs action) andalso not (trace_steps policy)
 
+(* What the last theory script written resumes from, as result phases: a
+   count of 1 for its kind (failed prefix, theorem or definition context,
+   deps heap; none for a fresh preload), the failed prefix's step count and
+   the resume point's source offset. *)
+val resume_steps = ref ([] : (string * LargeInt.int) list)
+
 fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
+    val _ = resume_steps := []
     val source_name = #source_name action
     val logical = #logical action
     val load_lines = map (theory_load_line root) (#loads action)
@@ -4040,6 +4047,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
         (ensure_source_checkpoint_parents ();
          write_text staged_script (instrumented_source false policy false (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          deps_loaded_resume_message logical;
+         resume_steps := [("resdepsn", 1)];
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
       (* A theory that isn't a target saves no deps heap: its failed
          prefix, if any, is then a child of the base state. *)
@@ -4057,6 +4065,8 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
           val contexts = deps_checkpoint_exists deps_loaded deps_key
           val _ = write_text staged_script (failed_prefix_resume_source policy contexts timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
           val _ = failed_prefix_resume_message logical checkpoint step_count
+          val _ = resume_steps := [("resfpn", 1), ("resstepn", LargeInt.fromInt step_count),
+                                   ("resboundary", LargeInt.fromInt (#boundary checkpoint))]
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME (path, step_count)}
         end
@@ -4065,6 +4075,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
           val _ = ensure_source_checkpoint_parents ()
           val _ = write_text staged_script (instrumented_source false policy false (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
           val _ = source_context_resume_message logical (#source_file action) source_text kind safe_name boundary
+          val _ = resume_steps := [("resctxn", 1), ("resboundary", LargeInt.fromInt boundary)]
         in
           {context = HolState path, files = [staged_script], failure_checkpoints = failure_checkpoints @ [deps_loaded], failed_prefix_context = NONE}
         end
@@ -11044,6 +11055,41 @@ fun merge_phases phases =
     List.foldl add [] phases
   end
 
+(* The phases in the "holbuild hol-phases" lines HOL children print at exit
+   (proof_runtime.sml), summed over the children of an action, and holload:
+   from HOLSTART, when the hol phase began, to the first child's install. *)
+fun hol_log_phases log_file holstart =
+  let
+    val prefix = "holbuild hol-phases"
+    fun phase item =
+      case String.fields (fn c => c = #"=") item of
+          [name, value] =>
+            if name <> "" andalso CharVector.all Char.isLower name then
+              Option.map (fn n => (name, n)) (LargeInt.fromString value)
+            else NONE
+        | _ => NONE
+    fun read ins found =
+      case TextIO.inputLine ins of
+          NONE => rev found
+        | SOME line =>
+            if String.isPrefix prefix line then
+              read ins (List.mapPartial phase (String.tokens Char.isSpace (String.extract (line, size prefix, NONE))) :: found)
+            else read ins found
+    val lines =
+      let val ins = TextIO.openIn log_file
+      in (read ins [] before TextIO.closeIn ins) handle e => (TextIO.closeIn ins; raise e) end
+      handle IO.Io _ => []
+    val load =
+      case (lines, holstart) of
+          (first :: _, SOME start) =>
+            (case List.find (fn (name, _) => name = "holloadend") first of
+                 SOME (_, loaded) => if loaded >= start then [("holload", loaded - start)] else []
+               | NONE => [])
+        | _ => []
+  in
+    load @ List.filter (fn (name, _) => name <> "holloadend") (List.concat lines)
+  end
+
 (* A failure message as one line of a result record: printable ASCII, every
    other character a space, at most 500 characters. *)
 fun result_detail msg =
@@ -11549,13 +11595,19 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       case fetched of
           NONE => NONE
         | SOME action =>
-            restore_entry (candidate_key c) (fn () =>
-              let
-                val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
-                val (heap, _) = single "heap" entries
-              in
-                if heap <> published_heap then NONE else restore_chain (SOME heap) c entries
-              end)
+            case restore_entry (candidate_key c) (fn () =>
+                   let
+                     val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
+                     val (heap, _) = single "heap" entries
+                   in
+                     if heap <> published_heap then NONE else restore_chain (SOME heap) c entries
+                   end) of
+                NONE =>
+                  (add_restore_step "rstrejectn" 1;
+                   HolbuildStatus.message_stdout
+                     ("holbuild resume: rejected shared " ^ #kind c ^ " checkpoint " ^ candidate_key c ^ "\n");
+                   NONE)
+              | restored => restored
     (* The theory's standalone failed prefix: the failed-prefix candidate at
        the path its manifest names. *)
     fun try_standalone () =
@@ -11605,11 +11657,13 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             case Option.mapPartial (shared_index_keys o #manifest)
                                    (restore_step "rstprobe" (fn () => HolbuildRemoteCache.fetch_action remote index_key)) of
                 NONE =>
-                  (HolbuildStatus.message_stdout
+                  (add_restore_step "rstindexn" 0;
+                   HolbuildStatus.message_stdout
                      ("no shared checkpoint index: probing all " ^ count ^ " candidates\n");
                    candidates)
               | SOME keys =>
                   let
+                    val _ = add_restore_step "rstindexn" 1
                     val published = Redblackset.addList (Redblackset.empty String.compare, keys)
                     val kept = List.filter (fn c => Redblackset.member (published, candidate_key c)) candidates
                   in
@@ -14157,6 +14211,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                   | _ => failure
               val status = if Option.isSome failure then "failed" else status
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
+              val holstart = Option.map #2 (List.find (fn (name, _) => name = "holstart") (!phases))
+              val _ = phases := rev (hol_log_phases (build_log ()) holstart @ !resume_steps) @ !phases
               val phases = merge_phases (rev (!phases)) @
                 [("started", Time.toMilliseconds start),
                  ("finished", Time.toMilliseconds (Time.now ()))] @

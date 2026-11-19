@@ -396,7 +396,7 @@ expect b 0 "status=built"
 cmp "$tmpdir/dep.dat" "$tmpdir/worker-b/blobs/$dep_dat"
 # Its record times the action and its phases.
 require_grep '^wall-ms=[0-9][0-9]*$' "$tmpdir/b.result"
-for phase in hydrate hydfiles hyddeps hydcheck hydinst hydstale hydmisfit analyse hol check; do
+for phase in hydrate hydfiles hyddeps hydcheck hydinst hydstale hydmisfit analyse hol check holload holleaves holtactics; do
   grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/b.result" || {
     echo "b's record lacks phase $phase:" >&2; cat "$tmpdir/b.result" >&2; exit 1; }
 done
@@ -408,6 +408,7 @@ assert timings['started'] <= timings['holstart'] <= timings['holend'] <= timings
 assert timings['publishstart'] <= timings['publishend'] <= timings['finished']
 assert timings['started'] <= timings['logstart'] <= timings['logend'] <= timings['finished']
 assert timings['rebuilt']==1
+assert timings['holload'] <= timings['holend'] - timings['holstart']
 PY
 # A corrupt local payload is fetched by the same verified path.
 link_hol_toolchain_cache "$tmpdir/worker-c"
