@@ -793,6 +793,52 @@ fun save_theorem_context () =
                {label = "theorem_context", default_share = false, path = context_path,
                 ok_text = context_ok, depth = depth}))
 
+(* Parse.pp_term rebuilds the printer's token splitter from the whole grammar
+   for every term (about 17 ms each with vyper-hol's grammar), so a goal with
+   hundreds of assumptions took seconds to print.  A one-shot user printer on
+   a sentinel term captures the term printer once it is set up; printing each
+   term through it does what Parse.pp_term does, without the rebuild.  HOL
+   from 9bbea3b4b0 on keeps the splitter, which leaves this little to save.
+   NONE when the capture did not run. *)
+fun cached_grammar_term_printer () =
+  let
+    val (tyG, tmG) = Parse.current_grammars ()
+    val name = " holbuild goal printer "
+    val sentinel =
+      Term.mk_var (GrammarSpecials.mk_fakeconst_name
+                     {original = SOME {Thy = "min", Name = name}, fake = name},
+                   Type.bool)
+    val captured = ref NONE
+    fun capture _ _ sysprint (ppfns : term_pp_types.ppstream_funs) gravs _ _ =
+      case !captured of
+          SOME _ => raise term_pp_types.UserPP_Failed
+        | NONE =>
+            (captured := SOME (fn t =>
+               Parse.mlower
+                 (#ublock ppfns HOLPP.CONSISTENT 0
+                    (sysprint {gravs = gravs, binderp = false,
+                               depth = !Globals.max_print_depth} t)));
+             smpp.nothing)
+    val (_, boot) =
+      Parse.print_from_grammars
+        (tyG, term_grammar.add_user_printer (name, sentinel, capture) tmG)
+    val _ = boot sentinel
+  in
+    !captured
+  end
+  handle Interrupt => raise Interrupt
+       | _ => NONE
+
+fun with_cached_grammar_term_printer f =
+  case cached_grammar_term_printer () of
+      NONE => f ()
+    | SOME printer =>
+        let val old = Parse.set_term_printer printer
+        in
+          (f () before ignore (Parse.set_term_printer old))
+          handle e => (ignore (Parse.set_term_printer old); raise e)
+        end
+
 fun goal_text goal = PP.pp_to_string 100 goalStack.std_pp_goal goal ^ "\n"
 
 fun top_goal_text [] = "<no open goals>\n"
@@ -937,7 +983,7 @@ fun diagnostic_fragment_label label =
 
 fun print_goal_state label goals = timed_hol_phase "holprint" (fn () =>
   (failed_goal_state_printed_ref := true;
-   TextIO.output(TextIO.stdErr,
+   TextIO.output(TextIO.stdErr, with_cached_grammar_term_printer (fn () =>
     String.concat ["\nholbuild goal state at failed fragment: ", diagnostic_fragment_label label,
                    failed_theorem_line (),
                    failed_step_end_line (),
@@ -947,7 +993,7 @@ fun print_goal_state label goals = timed_hol_phase "holprint" (fn () =>
                    "holbuild failed tactic top input goal:\n",
                    top_goal_text goals,
                    "holbuild end failed tactic top input goal\n",
-                   all_goals_text goals])))
+                   all_goals_text goals]))))
 
 fun print_current_goal_state label =
   print_goal_state label (history_top_goals() handle _ => [])
