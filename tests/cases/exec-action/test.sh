@@ -534,9 +534,9 @@ elif [[ ! -e "$HOLDIR/tools-poly/poly/theory_modules.ML" ]]; then
 fi
 
 # The next action on worker c keeps the dependencies it names again, here
-# A, and parks the rest beside the root, where HOL finds no theory, with
-# records of their own; a dependency whose local entry changed since is
-# installed again, and without records the worker empties what they'd name.
+# A, and parks the rest beside the root, where HOL finds no theory; a
+# dependency whose local entry changed since is installed again, and
+# without its records the worker empties the root and the parked theories.
 cat > "$project/src/A2Script.sml" <<'SML'
 Theory A2
 Ancestors A
@@ -568,14 +568,11 @@ worker c "$spec_a2"
 expect c 0
 [[ $(stat -c %i "$stem_a.dat") == "$inode_a" ]] || { echo "worker c installed A again" >&2; exit 1; }
 [[ ! -e "$stem_b.dat" && -z $(resident_stem 'BTheory$') ]] || { echo "worker c kept B, which A2 doesn't name" >&2; exit 1; }
-parked_b="$tmpdir/worker-c/parked${stem_b#"$tmpdir/worker-c/action"}"
+parked_b="$tmpdir/worker-c/action-parked${stem_b#"$tmpdir/worker-c/action"}"
 [[ $(stat -c %i "$parked_b.dat" 2>/dev/null) == "$inode_b" ]] &&
   awk -F'\t' -v stem="$stem_b" '$1 == "parked" && $2 == stem { found = 1 } END { exit !found }' \
-    "$tmpdir/worker-c/parked-records" || {
-  echo "worker c didn't park B" >&2; cat "$tmpdir/worker-c/parked-records" >&2; exit 1; }
-# A release that doesn't park would reject the root's records with a parked line.
-! grep -q '^parked' "$tmpdir/worker-c/action-resident" || {
-  echo "worker c recorded a parked theory with the root's" >&2; exit 1; }
+    "$tmpdir/worker-c/action-resident" || {
+  echo "worker c didn't park B" >&2; cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
 # An action naming B again takes it back instead of installing it; B's
 # manifest, over a second old, has its stat recorded then, and kept while B
 # waits parked, so taking B back again needn't hash it.
@@ -584,16 +581,14 @@ worker c "$spec_c"
 expect c 0
 [[ $(stat -c %i "$stem_b.dat") == "$inode_b" && ! -e "$parked_b.dat" ]] || {
   echo "worker c installed B again instead of taking it back" >&2; exit 1; }
-grep -qE "^phase-ms=(.*,)?hydinstn:0(,|\$)" "$tmpdir/c.result" &&
-  grep -qE "^phase-ms=(.*,)?hydbackn:1(,|\$)" "$tmpdir/c.result" &&
-  grep -qE "^phase-ms=(.*,)?hydresetn:0(,|\$)" "$tmpdir/c.result" || {
+grep -qE "^phase-ms=(.*,)?hydinstn:0(,|\$)" "$tmpdir/c.result" || {
   echo "worker c installed a dependency it had parked:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
 worker c "$spec_a2"
 expect c 0
 [[ $(stat -c %i "$parked_b.dat" 2>/dev/null) == "$inode_b" ]] || { echo "worker c didn't park B again" >&2; exit 1; }
 key_b=$(key_for "$tmpdir/batch.txt" worker:BTheory)
-grep -qF "$tmpdir/worker-c/actions/$key_b/manifest" "$tmpdir/worker-c/parked-stats" || {
-  echo "worker c dropped the stat of parked B's manifest" >&2; cat "$tmpdir/worker-c/parked-stats" >&2; exit 1; }
+grep -qF "$tmpdir/worker-c/actions/$key_b/manifest" "$tmpdir/worker-c/action-manifest-stats" || {
+  echo "worker c dropped the stat of parked B's manifest" >&2; cat "$tmpdir/worker-c/action-manifest-stats" >&2; exit 1; }
 # A parked dependency whose local entry changed meanwhile is installed again.
 printf '\n' >> "$tmpdir/worker-c/actions/$key_b/manifest"
 worker c "$spec_c"
@@ -621,91 +616,22 @@ expect c 0
 grep -qE "^phase-ms=(.*,)?hydinstn:[1-9][0-9]*(,|\$)" "$tmpdir/c.result" || {
   echo "worker c counted no install:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
 [[ $(stat -c %i "$stem_a.dat") != "$inode_a" ]] || { echo "worker c kept A after its entry changed" >&2; exit 1; }
-# A release that doesn't park rewrites the stats with its own manifests'
-# only; parked B's stat, kept apart, still spares taking B back a hash.
-sleep 1.1
-worker c "$spec_c"
-expect c 0
+# Records from a release that doesn't park name no parked theory, which go.
+sed -i '/^parked\t/d' "$tmpdir/worker-c/action-resident"
 worker c "$spec_a2"
 expect c 0
-inode_b=$(stat -c %i "$parked_b.dat")
-ln -f "$parked_b.dat" "$tmpdir/b-held.dat"
-rm "$tmpdir/worker-c/action-manifest-stats"
-worker c "$spec_c"
-expect c 0
-[[ $(stat -c %i "$stem_b.dat") == "$inode_b" ]] &&
-  grep -qE "^phase-ms=(.*,)?hydstatn:[1-9][0-9]*(,|\$)" "$tmpdir/c.result" || {
-  echo "worker c lost parked B's stat with the root's:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
-# A parked copy of a stem the root's records hold, as a release that
-# doesn't park installs, goes; the root's copy is the one used.
-b_line=$(awk -F'\t' -v stem="$stem_b" '$1 == "theory" && $2 == stem' "$tmpdir/worker-c/action-resident")
-worker c "$spec_a2"
-expect c 0
-require_file "$parked_b.dat"
-mkdir -p "$(dirname "$stem_b")"
-cp -a "$(dirname "$parked_b")/." "$(dirname "$stem_b")/"
-printf '%s\n' "$b_line" >> "$tmpdir/worker-c/action-resident"
-inode_b=$(stat -c %i "$stem_b.dat")
-ln -f "$stem_b.dat" "$tmpdir/b-held.dat"
-worker c "$spec_c"
-expect c 0
-[[ ! -e "$parked_b.dat" && $(stat -c %i "$stem_b.dat") == "$inode_b" ]] &&
-  grep -qE "^phase-ms=(.*,)?hydinstn:0(,|\$)" "$tmpdir/c.result" || {
-  echo "worker c kept a parked copy of a stem in the root:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
-# A 0.14.79 worker parked in action-parked, with parked lines in the root's
-# records; those lines are dropped, not carried into parked-records, and the
-# theory is installed afresh when wanted again.
-legacy_b="$tmpdir/worker-c/action-parked${stem_b#"$tmpdir/worker-c/action"}"
-objs_b="$(dirname "$stem_b")/.hol/objs/$(basename "$stem_b")"
-legacy_objs_b="$tmpdir/worker-c/action-parked${objs_b#"$tmpdir/worker-c/action"}"
-mkdir -p "$(dirname "$legacy_b")" "$(dirname "$legacy_objs_b")"
-for file in "$stem_b".* "$objs_b".*; do
-  case $file in "$stem_b".*) mv "$file" "$legacy_b${file#"$stem_b"}" ;; *) mv "$file" "$legacy_objs_b${file#"$objs_b"}" ;; esac
-done
-sed -i "s|^theory\t$stem_b\t|parked\t$stem_b\t|" "$tmpdir/worker-c/action-resident"
-grep -q "^parked	$stem_b	" "$tmpdir/worker-c/action-resident" || { cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
-worker c "$spec_a2"
-expect c 0
-[[ ! -e "$tmpdir/worker-c/action-parked" && ! -e "$stem_b.dat" && ! -e "$parked_b.dat" ]] &&
-  ! grep -q "	$stem_b	" "$tmpdir/worker-c/parked-records" || {
-  echo "worker c carried 0.14.79's parked B over" >&2; cat "$tmpdir/worker-c/parked-records" >&2; exit 1; }
-worker c "$spec_c"
-expect c 0
-require_file "$stem_b.dat"
-grep -qE "^phase-ms=(.*,)?hydinstn:[1-9][0-9]*(,|\$)" "$tmpdir/c.result" || {
-  echo "worker c didn't install B again:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
-# Without their records the parked theories go.
-worker c "$spec_a2"
-expect c 0
-require_file "$parked_b.dat"
-rm "$tmpdir/worker-c/parked-records"
-worker c "$spec_a2"
-expect c 0
-[[ ! -e "$tmpdir/worker-c/parked" ]] || { echo "worker c kept parked theories it has no records of" >&2; exit 1; }
+[[ ! -e "$parked_b.dat" ]] || { echo "worker c kept a parked theory its records don't name" >&2; exit 1; }
 worker c "$spec_c"
 expect c 0
 worker c "$spec_a2"
 expect c 0
 require_file "$parked_b.dat"
-# Without the root's records the root is emptied, but the parked theories
-# stay; where 0.14.79 parked goes.
 touch "$tmpdir/worker-c/action/.holbuild/obj/stray"
-mkdir -p "$tmpdir/worker-c/action-parked/.holbuild"
 rm "$tmpdir/worker-c/action-resident"
 worker c "$spec_a2"
 expect c 0
 [[ ! -e "$tmpdir/worker-c/action/.holbuild/obj/stray" ]] || { echo "worker c kept a root it has no records of" >&2; exit 1; }
-[[ ! -e "$tmpdir/worker-c/action-parked" ]] || { echo "worker c kept 0.14.79's parked theories" >&2; exit 1; }
-grep -qE "^phase-ms=(.*,)?hydresetn:1(,|\$)" "$tmpdir/c.result" || {
-  echo "worker c counted no reset:" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
-inode_b=$(stat -c %i "$parked_b.dat")
-ln -f "$parked_b.dat" "$tmpdir/b-held.dat"
-worker c "$spec_c"
-expect c 0
-[[ $(stat -c %i "$stem_b.dat") == "$inode_b" ]] || {
-  echo "worker c dropped parked B with the root's records" >&2; cat "$tmpdir/c.result" >&2; exit 1; }
-worker c "$spec_a2"
-expect c 0
+[[ ! -e "$tmpdir/worker-c/action-parked" ]] || { echo "worker c kept parked theories it has no records of" >&2; exit 1; }
 # A release that keeps no records removes the root around its actions; the
 # records go once the root is emptied, even when the action then fails.
 rm -rf "$tmpdir/worker-c/action"
@@ -745,10 +671,10 @@ require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.ns
 # that wants no theory of its key removes them; then it's installed again.
 worker c "$spec_missing_rss"
 expect c 0
-parked_a="$tmpdir/worker-c/parked${stem_a#"$tmpdir/worker-c/action"}"
+parked_a="$tmpdir/worker-c/action-parked${stem_a#"$tmpdir/worker-c/action"}"
 [[ ! -e "$stem_a.dat" && -e "$parked_a.dat" && ! -e "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a" ]] || {
   echo "worker c didn't park A, or kept its extra outputs" >&2; exit 1; }
-[[ ! -e "$tmpdir/worker-c/parked/.holbuild/action-extra" ]] || {
+[[ ! -e "$tmpdir/worker-c/action-parked/.holbuild/action-extra" ]] || {
   echo "worker c parked extra outputs" >&2; exit 1; }
 worker c "$spec_a2"
 expect c 0
@@ -765,8 +691,8 @@ cat "$tmpdir/other-a.line" >> "$tmpdir/worker-c/action-resident"
 worker c "$spec_a2"
 expect c 0
 require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
-grep -q "^parked	$tmpdir/worker-c/action/.holbuild/obj/other/ATheory	" "$tmpdir/worker-c/parked-records" || {
-  echo "worker c didn't park the other stem of A's key" >&2; cat "$tmpdir/worker-c/parked-records" >&2; exit 1; }
+grep -q "^parked	$tmpdir/worker-c/action/.holbuild/obj/other/ATheory	" "$tmpdir/worker-c/action-resident" || {
+  echo "worker c didn't park the other stem of A's key" >&2; cat "$tmpdir/worker-c/action-resident" >&2; exit 1; }
 # Two dependencies in one directory, both replaced in one hydrate: each
 # install's directory must survive the removal of the other's old copy.
 worker c "$spec_c"

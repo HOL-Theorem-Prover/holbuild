@@ -1163,21 +1163,17 @@ def test_an_idle_worker_short_of_disk_sweeps_the_cache_until_there_is_room_witho
     tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Emptying its own scratch can't make room the shared cache and the checkpoints hold: the worker runs their
-    eviction each poll while short, and the records of its action root and parked theories go before the
-    directories they describe do."""
+    eviction each poll while short, and the record of its action root goes before the root and its parked
+    theories do."""
     (tmp_path / "action" / "a1").mkdir(parents=True)
-    (tmp_path / "parked" / "p1").mkdir(parents=True)
     (tmp_path / "action-parked" / "p1").mkdir(parents=True)
     (tmp_path / "action-resident").write_text("holbuild-action-resident-v1\n")
-    (tmp_path / "parked-records").write_text("holbuild-action-resident-v1\n")
-    (tmp_path / "parked-stats").write_text("stats\n")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path))
     sweeps = 0
 
     def sweep() -> None:
         nonlocal sweeps
         assert not (tmp_path / "action-resident").exists(), "the sweep ran before the action root's record went"
-        assert not (tmp_path / "parked-records").exists(), "the sweep ran before the parked theories' record went"
         sweeps += 1
 
     monkeypatch.setattr(worker, "disk_shortfall", lambda: "short" if sweeps < 3 else None)
@@ -1195,9 +1191,6 @@ def test_an_idle_worker_short_of_disk_sweeps_the_cache_until_there_is_room_witho
 
     assert (sweeps, waits, len(server.reports)) == (3, 2, 2)
     assert not (tmp_path / "action-resident").exists()
-    assert not (tmp_path / "parked-records").exists()
-    assert not (tmp_path / "parked-stats").exists()
-    assert list((tmp_path / "parked").iterdir()) == []
     assert list((tmp_path / "action-parked").iterdir()) == []
 
 
