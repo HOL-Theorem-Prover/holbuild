@@ -1,15 +1,16 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S bash -p
 # Run a command against a private remote-exec fleet built from one holbuild tree:
 # a fresh Postgres, that tree's coordinator, a local cache server and N workers
 # that run the tree's own holbuild, so an unreleased coordinator, worker or
 # exec-action can be tried before it lands. See README "Local test fleet".
-# Start again in privileged mode, which takes no shell options (SHELLOPTS, BASHOPTS), BASH_ENV hook or functions
-# from the environment: xtrace, allexport, monitor or noglob, say, would print or export the secrets below, make
-# setsid fork or change what the script does, and a function would stand in for a command it runs.
+# Run in privileged mode (when started as bash local-fleet, start again in it), which takes no shell options
+# (SHELLOPTS, BASHOPTS), BASH_ENV hook or functions from the environment: xtrace, allexport, monitor or noglob,
+# say, would print or export the secrets below, make setsid fork or change what the script does, and a function
+# would stand in for a command it runs.
 [[ $- == *p* ]] || exec "$BASH" -p "$0" "$@"
 set -euo pipefail
 # COMMAND gets back the caller's values of the names this script assigns. SHELLOPTS and BASHOPTS, read-only
-# here, reach it unchanged.
+# here and holding this script's options, don't reach it.
 caller_exports=$(declare -px | grep -vE '^declare -[a-zA-Z]+ (SHELLOPTS|BASHOPTS)=')
 
 usage() {
@@ -128,8 +129,10 @@ if [[ -n $budget_mb ]]; then echo $((budget_mb * 1024 * 1024)) > "$dir/cooperate
 isolate() {
   export HOME=$dir/home TMPDIR=$dir/tmp USER=$(id -un) LOGNAME=$(id -un) LANG=C.UTF-8 GIT_OPTIONAL_LOCKS=0
   mapfile -d '' -t unenv < <(env -0 | cut -z -d= -f1 |
-    grep -zvxE "PATH|HOME|TMPDIR|USER|LOGNAME|LANG|GIT_OPTIONAL_LOCKS$(printf '|%s' "$@")" |
+    { grep -zvxE "PATH|HOME|TMPDIR|USER|LOGNAME|LANG|GIT_OPTIONAL_LOCKS$(printf '|%s' "$@")" || (($? == 1)); } |
     xargs -0 -r printf -- '-u\0%s\0')
+  # Fail closed: a list cut short would let the rest of the environment through.
+  wait "$!"
 }
 
 command_pid= worker_pids=() service_pids=() pg_started=0 launching=0 pending=0
@@ -305,10 +308,12 @@ launching=1
   eval "$caller_exports"
   unset $(compgen -e | grep -E '^HOLBUILD_REMOTE_(CACHE|EXEC)_') HOLBUILD_CACHE HOLBUILD_COOPERATE_DIR
   # Every endpoint is on loopback: keep an inherited proxy out of the way.
+  # curl and Python read the lowercase name first: each spelling starts from the other when unset.
+  no_proxy=${no_proxy-${NO_PROXY-}} NO_PROXY=${NO_PROXY-${no_proxy-}}
   export no_proxy=${no_proxy:+$no_proxy,}127.0.0.1 NO_PROXY=${NO_PROXY:+$NO_PROXY,}127.0.0.1
   # holbuild checks a seeded toolchain's HOL checkout with git status, which mustn't refresh its index.
   export GIT_OPTIONAL_LOCKS=0
-  exec env "$@"
+  exec env -u SHELLOPTS -u BASHOPTS "$@"
 ) <&0 &
 command_pid=$!
 started
