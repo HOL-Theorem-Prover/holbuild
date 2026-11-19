@@ -10593,30 +10593,36 @@ fun remove_resident root (path, entry) =
     case entry of
         Resident.Theory {key, ...} => remove_theory key
       | Resident.Scratch key => remove_theory key
-      | Resident.Parked {key, ...} =>
+      | Resident.Parked theory =>
+          (* Both places: a move back that failed part way leaves the
+             files split between them. *)
           (List.app (remove_file o parked_path root) (resident_theory_files path);
-           remove_tree (parked_path root (action_extra_dir root key)))
+           remove_tree (parked_path root (action_extra_dir root (#key theory)));
+           remove_resident root (path, Resident.Theory theory))
       | Resident.File _ => remove path
       | Resident.Manifest _ => (remove path; remove (hfs_remapped_path path))
   end
 
 (* Moves the files of a dependency theory at PATH between ROOT and its parked
-   copy (TO_PARKED says which way), with its extra outputs; a file it lacks
-   (a .tr.gz, say) is skipped.  Leaves no directory it empties in ROOT. *)
+   copy (TO_PARKED says which way), with its extra outputs' directory; a file
+   it lacks (a .tr.gz, say) is skipped, as is a directory in a file's place
+   (a source directory named like one).  Leaves no directory it empties in
+   ROOT. *)
 fun move_theory root to_parked (path, key) =
   let
-    fun move src_of dst_of file =
+    val (src_of, dst_of) = if to_parked then (fn p => p, parked_path root) else (parked_path root, fn p => p)
+    fun move file =
       let val (src, dst) = (src_of file, dst_of file)
       in
-        if not (path_exists src) then ()
-        else (ensure_parent dst; rename_replace {old = src, new = dst};
-              if to_parked then remove_empty_dirs root (Path.dir src) else ())
+        ensure_parent dst;
+        rename_replace {old = src, new = dst};
+        if to_parked then remove_empty_dirs root (Path.dir src) else ()
       end
-    val (src_of, dst_of) = if to_parked then (fn p => p, parked_path root) else (parked_path root, fn p => p)
     val extras = action_extra_dir root key
   in
-    List.app (move src_of dst_of) (resident_theory_files path);
-    if path_exists (src_of extras) then (remove_tree (dst_of extras); move src_of dst_of extras) else ()
+    List.app (fn file => if path_exists (src_of file) andalso not (FS.isDir (src_of file)) then move file else ())
+             (resident_theory_files path);
+    if path_exists (src_of extras) then (remove_tree (dst_of extras); move extras) else ()
   end
 
 (* What a hydrate that doesn't want an entry of the records leaves: a
@@ -10626,7 +10632,7 @@ fun retire_resident root (path, entry) =
       Resident.Theory (theory as {key, ...}) =>
         ((move_theory root true (path, key); SOME (Resident.Parked theory))
          handle OS.SysErr _ =>
-           (remove_resident root (path, entry); remove_resident root (path, Resident.Parked theory); NONE))
+           (remove_resident root (path, Resident.Parked theory); NONE))
     | Resident.Parked _ => SOME entry
     | _ => (remove_resident root (path, entry); NONE)
 
@@ -10748,13 +10754,9 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
               ((move_theory root false (path, key);
                 Resident.put resident path (Resident.Theory theory);
                 fits theory)
-               handle OS.SysErr _ =>
-                 (* Split between the root and its parked copy: neither
-                    half stays, and the dependency is installed afresh. *)
-                 (remove_resident root (path, Resident.Parked theory);
-                  remove_resident root (path, Resident.Theory theory);
-                  Resident.put resident path (Resident.Theory theory);
-                  false))
+               (* Still parked, so the removal of the stale copies clears
+                  both places before the installs. *)
+               handle OS.SysErr _ => false)
           | _ => false
       end
     fun remove_old {stem, ...} =
@@ -10826,7 +10828,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       hydrate_step "hydstale" (fn () => drop_stale_dep_copies remote spec wanted) andalso (restore_deps (); true)
     (* Every path an item writes: two items sharing one would let a kept
        item stand for files another replaced or removed. *)
-    fun theory_files stem = List.concat (map (fn suffix => objects (in_root root stem ^ suffix)) theory_suffixes)
+    fun theory_files stem = resident_theory_files (in_root root stem)
     val claims =
       map #dst files @
       List.concat (map (fn {stem, suffix, ...} => objects (in_root root (stem ^ suffix))) (#libs spec)) @

@@ -804,7 +804,9 @@ the tree and writes it back once it passed, so a worker stopped part way
 starts from an empty root. Script runs put every object directory under the
 root on `loadPath`, so they start from an empty root, leave no records, and the root is removed
 after them. The
-cache cap doesn't count the root: it holds one spec's dependencies.
+cache cap doesn't count the root or `action-parked`, which holds the
+dependencies of earlier specs, one copy per path: the disk floor sees them,
+and a worker short of disk empties both.
 
 ## Global cache
 

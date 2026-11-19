@@ -646,6 +646,18 @@ worker c "$spec_a2"
 expect c 0
 [[ ! -e "$orphan" ]] || { echo "worker c kept extra outputs nobody records" >&2; exit 1; }
 require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
+# A parked dependency's extra outputs wait with it and come back with it.
+worker c "$spec_missing_rss"
+expect c 0
+parked_a="$tmpdir/worker-c/action-parked${stem_a#"$tmpdir/worker-c/action"}"
+[[ ! -e "$stem_a.dat" && -e "$parked_a.dat" && ! -e "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a" ]] || {
+  echo "worker c didn't park A with its extra outputs" >&2; exit 1; }
+require_file "$tmpdir/worker-c/action-parked/.holbuild/action-extra/$key_a/results/A.nsv"
+worker c "$spec_a2"
+expect c 0
+require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
+[[ ! -e "$tmpdir/worker-c/action-parked/.holbuild/action-extra/$key_a" ]] || {
+  echo "worker c left A's extra outputs parked" >&2; exit 1; }
 # Two dependencies in one directory, both replaced in one hydrate: each
 # install's directory must survive the removal of the other's old copy.
 worker c "$spec_c"
