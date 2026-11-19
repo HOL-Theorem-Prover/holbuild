@@ -278,6 +278,23 @@ fun checkpoint_save_runtime_helper_path () =
 fun checkpoint_save_runtime_line () =
   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";"
 
+(* PolyML.SaveState.showModuleDependencies, where holbuild's own Poly/ML
+   has it, looked up by name so that holbuild builds on any Poly/ML.  A
+   Poly/ML without it can't read a state saved with modules, not even its
+   parent, so then the toolchain's, which may have it, saves none
+   (save_deps_heap_expr). *)
+val show_module_dependencies : (string -> (string * string) list) option =
+  let
+    fun contents s = PolyML.NameSpace.Structures.contents s
+    val save_state =
+      Option.mapPartial (fn polyml => #lookupStruct (contents polyml) "SaveState")
+                        (#lookupStruct PolyML.globalNameSpace "PolyML")
+  in
+    Option.map RunCall.unsafeCast
+      (Option.mapPartial (PolyML.CodeTree.evalue o PolyML.NameSpace.Values.code)
+         (Option.mapPartial (fn s => #lookupVal (contents s) "showModuleDependencies") save_state))
+  end
+
 (* PolyML child heaps remember their parent-chain filenames. The shared runtime
    helper saves checkpoints directly to the final .save path and publishes .ok
    metadata last via an atomic .ok.tmp rename. *)
@@ -287,7 +304,8 @@ fun save_deps_heap_expr {label, output, ok_text} =
      HolbuildToolchain.sml_string label,
      ", path = ", HolbuildToolchain.sml_string output,
      ", ok_text = ", HolbuildToolchain.sml_string ok_text,
-     ", depth = HolbuildRuntime.save_hierarchy_depth ()}"]
+     ", depth = HolbuildRuntime.save_hierarchy_depth ()",
+     ", modules = ", Bool.toString (Option.isSome show_module_dependencies), "}"]
 
 fun direct_external_loads plan node =
   unique_strings
@@ -4014,22 +4032,6 @@ fun place_state stored dst =
 
 fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
 
-(* PolyML.SaveState.showModuleDependencies, where this Poly/ML has it,
-   looked up by name so that holbuild builds on any Poly/ML: holbuild's
-   own Poly/ML is the toolchain's, and one without it saves no state that
-   depends on modules. *)
-val show_module_dependencies : (string -> (string * string) list) option =
-  let
-    fun contents s = PolyML.NameSpace.Structures.contents s
-    val save_state =
-      Option.mapPartial (fn polyml => #lookupStruct (contents polyml) "SaveState")
-                        (#lookupStruct PolyML.globalNameSpace "PolyML")
-  in
-    Option.map RunCall.unsafeCast
-      (Option.mapPartial (PolyML.CodeTree.evalue o PolyML.NameSpace.Values.code)
-         (Option.mapPartial (fn s => #lookupVal (contents s) "showModuleDependencies") save_state))
-  end
-
 (* The theory modules a deps heap saved with saveChildWithModules loads
    (save_deps_checkpoint), by path, that aren't there.  Loading the heap
    fails without them, as it does when one has another id than the heap
@@ -4074,10 +4076,11 @@ fun first_changed_byte path (checkpoint : HolbuildTheoryCheckpoints.checkpoint) 
    child, since the build started: exec-action's rstdropn. *)
 val dropped_checkpoints = ref 0
 
-(* Whether the child, since the build started, failed to load the deps
+(* How often the child, since the build started, failed to load the deps
    heap for a theory module it loads that is missing or has another id:
-   a shared heap restored then is replaced by the one the run saves. *)
-val rejected_heap_modules = ref false
+   exec-action's rstmodrejn.  A shared heap restored then is replaced by
+   the one the run saves. *)
+val rejected_heap_modules = ref 0
 
 fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
@@ -4397,7 +4400,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
        saved on it are discarded, and the retry preloads afresh. *)
     fun discard_loaded_checkpoint_after_load_failure msg =
       if Option.isSome (find_substring "Required module missing or changed" msg) then
-        (rejected_heap_modules := true;
+        (rejected_heap_modules := !rejected_heap_modules + 1;
          remove_deps_checkpoint_family checkpoint_base deps_key deps_loaded)
       else
         remove_loaded_checkpoint_descendants checkpoint_base deps_key deps_loaded theorem_checkpoints declaration_checkpoints
@@ -4462,7 +4465,10 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
             val invalid = hol_context_path (#context run_spec)
             val _ = discard_loaded_checkpoint_after_load_failure msg
             val _ = dropped_checkpoints := !dropped_checkpoints + 1
-            val _ = warn ("discarding invalid checkpoint after HOL state load failure: " ^ invalid)
+            val module_error =
+              List.find (String.isSubstring "Required module missing or changed") (String.tokens (fn c => c = #"\n") msg)
+            val _ = warn ("discarding invalid checkpoint after HOL state load failure: " ^ invalid ^
+                          (case module_error of SOME line => " (" ^ line ^ ")" | NONE => ""))
           in
             raise RetryInvalidCheckpoint
           end
@@ -6628,7 +6634,8 @@ fun write_ahead_preload {load_lines, dir, share, path} =
          module, and predicting a load manifest searches the path. *)
       "val _ = Meta.loadPath := List.filter (fn dir => not (String.isSubstring \"/.holbuild/checkpoints/\" (dir ^ \"/\") " ^
         "orelse String.isSubstring \"/.holbuild/logs/\" (dir ^ \"/\"))) (!Meta.loadPath);" ::
-      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^ Bool.toString share ^ ";" ::
+      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^ Bool.toString share ^ " " ^
+        Bool.toString (Option.isSome show_module_dependencies) ^ ";" ::
       "structure HolbuildAheadPlainRuntime = HolbuildRuntime;" ::
       "structure HolbuildRuntime = struct open HolbuildRuntime val load = HolbuildAheadLoad.load end;" ::
       (load_lines @
@@ -12713,7 +12720,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
    replaces it. *)
 fun heap_rejected ({heap_key, ...} : shared_context) ({heap, files, stale, missing} : shared_restore) =
   {heap = heap, files = files, missing = missing,
-   stale = if !rejected_heap_modules andalso Option.isSome heap then heap_key :: stale else stale}
+   stale = if !rejected_heap_modules > 0 andalso Option.isSome heap then heap_key :: stale else stale}
 
 fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
                                               deps_key, deps_loaded, candidates, ...} : shared_context)
@@ -12889,12 +12896,28 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         SOME (c, shared_checkpoint_key heap_key (#kind c) (#key c), ref false)
       else NONE
       handle e => (warning c e; NONE)
-    fun probe (c, key, absent) =
-      (* Presence alone must not mark an un-restored entry's blobs as known:
-         its /ac/ entry can outlive those blobs. *)
-      (absent := (member key stale orelse
-                  not (Option.isSome (HolbuildRemoteCache.fetch_action remote key)) orelse
-                  (#kind c = "failed_prefix" andalso replaces_restored (#path c))))
+    (* With REPLACED, HEAP was published anew in place of another (stale):
+       an entry naming any other heap is chained to that one, so it is
+       republished on HEAP, on every node (its flag in SUPERSEDED). *)
+    fun probe heap replaced superseded (c, key, absent) =
+      let
+        fun on_other_heap text =
+          not (List.exists (fn (role, sha, _) => role = "heap" andalso sha = heap) (shared_manifest_entries text))
+          handle _ => true
+        val existing = if member key stale then NONE else HolbuildRemoteCache.fetch_action remote key
+        val other =
+          replaced andalso
+          (case existing of
+               SOME {manifest, ...} => on_other_heap manifest
+             | NONE => false)
+      in
+        if other then Option.app (fn (_, flag) => flag := true) (List.find (fn (k, _) => k = key) superseded)
+        else ();
+        (* Presence alone must not mark an un-restored entry's blobs as
+           known: its /ac/ entry can outlive those blobs. *)
+        absent := (not (Option.isSome existing) orelse other orelse
+                   (#kind c = "failed_prefix" andalso replaces_restored (#path c)))
+      end
       handle e => warning c e
     fun prepare on_base (c : shared_candidate, key, absent) =
       if not (!absent) then NONE
@@ -12939,7 +12962,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       in
         List.app (fn (path, ref (SOME sha)) => hashes := Redblackmap.insert (!hashes, path, sha) | _ => ()) unique
       end
-    fun publish_candidates heap =
+    fun publish_candidates heap replaced =
       let
         val eligible = List.mapPartial eligible candidates
         val (_, unique) = List.foldl
@@ -12948,7 +12971,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             else (Redblackset.add (seen, key), item :: kept))
           (Redblackset.empty String.compare, []) eligible
         val probes = rev unique
-        val _ = parallel_all remote_probe_width probe probes
+        val superseded = map (fn (_, key, _) => (key, ref false)) probes
+        val _ = parallel_all remote_probe_width (probe heap replaced superseded) probes
         val _ = prehash (List.concat (map (fn (c : shared_candidate, _, absent) =>
                                               if not (!absent) then []
                                               else #path c :: getOpt (ancestors false (#path c), []))
@@ -12960,7 +12984,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           (fn (_, _, _, blobs) => List.all (fn (_, sha, _) => not (needs_upload sha)) blobs) prepared
         fun publish (c : shared_candidate, key, entries, _) =
           (* A failed prefix's entry is replaced as the prefix grows. *)
-          (ignore ((if #kind c = "failed_prefix" then HolbuildRemoteCache.replace_action_everywhere
+          (ignore ((if #kind c = "failed_prefix" orelse List.exists (fn (k, flag) => k = key andalso !flag) superseded
+                    then HolbuildRemoteCache.replace_action_everywhere
                     else HolbuildRemoteCache.replace_action_unconditionally) remote
             {key = key, text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
                                  (("heap", heap, "") :: entries)}))
@@ -13017,7 +13042,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
   in
     case heap of
         NONE => if deps_checkpoint_exists deps_loaded deps_key then () else publish_standalone ()
-      | SOME heap => publish_candidates heap
+      | SOME heap => publish_candidates heap (restored_heap <> SOME heap andalso member heap_key stale)
   end
   handle e => warn ("shared checkpoint publish failed: " ^ General.exnMessage e)
 
@@ -14509,7 +14534,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         (* A load ahead's child is already running: it set the start. *)
         val _ = if isSome ahead then () else last_child_start := NONE
         val _ = dropped_checkpoints := 0
-        val _ = rejected_heap_modules := false
+        val _ = rejected_heap_modules := 0
         (* Built on a late parent's outline, the run is the load ahead's:
            whatever stops it, nothing of it is published, and the action
            builds again plain. *)
@@ -15146,7 +15171,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               val hol_phases =
                 if !HolbuildActionSandbox.outputs_validated then hol_log_phases (build_log ()) (!last_child_start)
                 else []
-              val drops = if !dropped_checkpoints > 0 then [("rstdropn", LargeInt.fromInt (!dropped_checkpoints))] else []
+              fun count (name, n) = if !n > 0 then [(name, LargeInt.fromInt (!n))] else []
+              val drops = count ("rstdropn", dropped_checkpoints) @ count ("rstmodrejn", rejected_heap_modules)
               val _ = phases := rev (hol_phases @ !resume_steps @ drops) @ !phases
               val phases = merge_phases (rev (!phases)) @
                 [("started", Time.toMilliseconds start),

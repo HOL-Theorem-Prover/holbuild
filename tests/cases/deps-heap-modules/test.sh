@@ -66,6 +66,12 @@ cat > "$project/src/CScript.sml" <<'SML'
 Theory C
 Ancestors A Z
 
+Theorem c_first:
+  a_value
+Proof
+  simp[a_value_def]
+QED
+
 Theorem c_thm:
   a_value
 Proof
@@ -226,11 +232,11 @@ phase() {
   grep -qE "^phase-ms=(.*,)?$2(,|\$)" "$tmpdir/$1.result" ||
     { echo "$1 lacks phase $2:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1; }
 }
-# resumed NAME: NAME's HOL child started from the restored deps heap or a
-# checkpoint on it, and dropped none.
+# resumed NAME [FROM]: NAME's HOL child started from the restored deps
+# heap or a checkpoint on it (FROM, a regex, if given), and dropped none.
 resumed() {
   phase "$1" 'res(deps|ctx)n:1'
-  grep -qE 'from: (deps-loaded|theorem-context) checkpoint' "$tmpdir/$1.log" ||
+  grep -qE "from: ${2:-(deps-loaded|theorem-context) checkpoint}" "$tmpdir/$1.log" ||
     { echo "$1 didn't resume:" >&2; cat "$tmpdir/$1.log" >&2; exit 1; }
   if grep -qE '^phase-ms=(.*,)?rstdropn:' "$tmpdir/$1.result" ||
      grep -q 'discarding invalid checkpoint' "$tmpdir/$1.log"; then
@@ -266,12 +272,13 @@ phase dropped-B 'rstmoddropn:1'
 require_grep "the shared deps-loaded heap needs a theory module this host lacks: .*-A-.*\.pmo" "$tmpdir/dropped-B.log"
 grep -qx 'status=built' "$tmpdir/dropped-B.result"
 
-# B's run published the heap it saved in place of the one it gave up.
+# B's run published the heap it saved in place of the one it gave up, and
+# the checkpoints on it in place of those on the old heap.
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_b six
 exec_theory B replaced
 require_grep 'restored shared' "$tmpdir/replaced-B.log"
-resumed replaced-B
+resumed replaced-B 'theorem-context checkpoint after b_first'
 if grep -qE '^phase-ms=(.*,)?rstmoddropn:' "$tmpdir/replaced-B.result"; then
   echo 'the heap given up was not replaced' >&2; cat "$tmpdir/replaced-B.result" >&2; exit 1
 fi
@@ -296,8 +303,10 @@ exec_theory C changed
 require_grep 'restored shared' "$tmpdir/changed-C.log"
 require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/changed-C.log"
 phase changed-C 'rstdropn:1'
+phase changed-C 'rstmodrejn:1'
+require_grep 'Required module missing or changed' "$tmpdir/changed-C.log"
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 edit_c replaced
 exec_theory C c-replaced
 require_grep 'restored shared' "$tmpdir/c-replaced-C.log"
-resumed c-replaced-C
+resumed c-replaced-C 'theorem-context checkpoint after c_first'

@@ -238,15 +238,15 @@ fun save_checkpoint args = save_with (PolyML.SaveState.saveChild, false) args
    loaded, stay in their files.  Otherwise it holds every ancestor, and is
    compacted first, as with a runtime without the call.  Contexts and
    failed prefixes saved on it with saveChild refer to its modules too. *)
-fun save_deps_checkpoint ({label, path, ok_text, depth} :
-                          {label : string, path : string, ok_text : string, depth : int}) =
+fun save_deps_checkpoint ({label, path, ok_text, depth, modules} :
+                          {label : string, path : string, ok_text : string, depth : int, modules : bool}) =
   let
     fun args share = {label = label, default_share = share, path = path, ok_text = ok_text, depth = depth}
   in
     case HolbuildRuntime.save_child_with_modules of
         SOME save_child =>
-          if HolbuildRuntime.loaded_module_files () then save_with (save_child, true) (args false)
-          else save_checkpoint (args true)
+          if HolbuildRuntime.deps_save_shares modules then save_checkpoint (args true)
+          else save_with (save_child, true) (args false)
       | NONE => save_checkpoint (args true)
   end
 

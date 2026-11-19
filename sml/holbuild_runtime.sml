@@ -51,9 +51,10 @@ struct
   (* Whether the deps heap's save (HolbuildCheckpointSaveRuntime.
      save_deps_checkpoint) shares common data first, unless
      HOLBUILD_SHARE_COMMON_DATA says otherwise: not when it saves the
-     heap with modules. *)
-  fun deps_save_shares () =
-    not (Option.isSome save_child_with_modules andalso loaded_module_files ())
+     heap with modules, which it does only where holbuild reads such a
+     state (MODULES). *)
+  fun deps_save_shares modules =
+    not (modules andalso Option.isSome save_child_with_modules andalso loaded_module_files ())
 
   (* The size of the .dat beside a theory's .sml, where HOL's file system
      keeps it, or NONE for any other file. *)
