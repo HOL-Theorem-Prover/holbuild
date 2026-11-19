@@ -272,6 +272,26 @@ curl -fsS -X PUT --data-binary "@$tmpdir/blob-path" "$remote_url/cas/$spec_blob_
 worker blob-path "$spec_blob_path"
 expect blob-path 4 "status=failed" "failure=spec-rejected"
 require_grep "a file's SHA-256 is malformed" "$tmpdir/blob-path.log"
+# A dependency stem inside a .hol directory would lie on the remapped copies
+# of the theory beside it.
+python3 - "$project/.holbuild/action-specs/$spec_b" "$tmpdir/hol-stem" <<'PY'
+import sys
+head, text = open(sys.argv[1], "rb").read().split(b"\naction-text\n", 1)
+lines = head.split(b"\n")
+for i, line in enumerate(lines):
+    if line.startswith(b"dep theory "):
+        dep = line.split(b" ")
+        stem = dep[3].rsplit(b"/", 1)
+        dep[3] = stem[0] + b"/.hol/objs/" + stem[1]
+        lines[i] = b" ".join(dep)
+        break
+open(sys.argv[2], "wb").write(b"\n".join(lines) + b"\naction-text\n" + text)
+PY
+spec_hol_stem=$(sha256sum "$tmpdir/hol-stem" | cut -d' ' -f1)
+curl -fsS -X PUT --data-binary "@$tmpdir/hol-stem" "$remote_url/cas/$spec_hol_stem"
+worker hol-stem "$spec_hol_stem"
+expect hol-stem 4 "status=failed" "failure=spec-rejected"
+require_grep "outside .hol" "$tmpdir/hol-stem.log"
 # Or one that writes where the worker keeps a dependency other than as
 # that dependency: a library manifest over its object, a library file or
 # an output at its script, or a path spelled two ways.
@@ -658,6 +678,14 @@ expect c 0
 require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
 [[ ! -e "$tmpdir/worker-c/action-parked/.holbuild/action-extra/$key_a" ]] || {
   echo "worker c left A's extra outputs parked" >&2; exit 1; }
+# Extra outputs lie under the key, which another stem may share and have
+# taken meanwhile: a parked theory whose extra outputs went is installed.
+worker c "$spec_missing_rss"
+expect c 0
+rm -r "$tmpdir/worker-c/action-parked/.holbuild/action-extra/$key_a"
+worker c "$spec_a2"
+expect c 0
+require_file "$tmpdir/worker-c/action/.holbuild/action-extra/$key_a/results/A.nsv"
 # Two dependencies in one directory, both replaced in one hydrate: each
 # install's directory must survive the removal of the other's old copy.
 worker c "$spec_c"

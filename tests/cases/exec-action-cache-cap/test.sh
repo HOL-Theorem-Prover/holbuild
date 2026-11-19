@@ -226,12 +226,16 @@ printf 'blob sig %s\n' "$shared" > "$cache_sweep/actions/newer/manifest"
 at 2001 "$cache_sweep/actions/older/manifest"
 at 2002 "$cache_sweep/checkpoints/OldScript.deps/key/deps_loaded.save"
 at 2003 "$cache_sweep/actions/newer/manifest"
+# Parked theories go too when no records name them (a worker short of disk
+# drops the records first).
+mkdir -p "$cache_sweep/action-parked/.holbuild/obj"
 HOLBUILD_CACHE=$cache_sweep "$HOLBUILD_BIN" exec-action --sweep-only --cache-limit-gb 1 --cache-reserve-gb 0 \
   > "$tmpdir/sweep-only.log" 2>&1 || { cat "$tmpdir/sweep-only.log" >&2; exit 1; }
 evicted "$cache_sweep/actions/older" "the least recently used entry over the cap"
 evicted "$cache_sweep/blobs/$own" "a blob only an evicted entry named"
 evicted "$cache_sweep/checkpoints/OldScript.deps" "an old checkpoint family"
 kept "$cache_sweep/actions/newer" "an entry once the cache fits"
+[[ ! -e "$cache_sweep/action-parked" ]] || { echo "--sweep-only kept parked theories no records name" >&2; exit 1; }
 if HOLBUILD_CACHE=$cache_sweep "$HOLBUILD_BIN" exec-action --sweep-only "$absent" --cache-limit-gb 1 \
      > "$tmpdir/sweep-only-spec.log" 2>&1; then
   echo "--sweep-only ran with a SPEC" >&2; exit 1

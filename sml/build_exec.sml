@@ -10306,13 +10306,16 @@ fun verify_action_spec (spec : action_spec) =
     let
       fun under dirs path =
         path = normalize_path path andalso List.exists (fn dir => String.isPrefix (".holbuild/" ^ dir ^ "/") path) dirs
+      (* A stem in a .hol directory would lie on another's remapped copies. *)
+      fun object_stem path =
+        under ["obj", "packages"] path andalso not (List.exists (fn c => c = ".hol") (String.fields (fn c => c = #"/") path))
       val {sig_path, sml_path, data_path} = #outputs spec
       val stem = drop_suffix ".dat" data_path
     in
       check (List.all (under ["action-src"] o #path) (#libraries spec))
         "a library file is not a canonical action-src path";
-      check (List.all (under ["obj", "packages"]) (data_path :: map #stem (#deps spec) @ map #stem (#libs spec)))
-        "an object is not a canonical path under .holbuild/obj or .holbuild/packages";
+      check (List.all object_stem (data_path :: map #stem (#deps spec) @ map #stem (#libs spec)))
+        "an object is not a canonical path under .holbuild/obj or .holbuild/packages outside .hol";
       check (String.isSuffix ".dat" data_path andalso sig_path = stem ^ ".sig" andalso sml_path = stem ^ ".sml")
         "the outputs are not one theory's"
     end
@@ -10741,6 +10744,15 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       let
         val path = in_root root stem
         fun same {target = t, key = k, source, ...} = t = target andalso k = key andalso source_sha key = SOME source
+        (* Extra outputs lie under the key, which another stem's record
+           may share and have taken or removed meanwhile. *)
+        fun extras_back key =
+          case HolbuildCache.get_action cache key of
+              NONE => false
+            | SOME text =>
+                List.all (fn (decl, _) =>
+                             path_exists (in_root root (normalize_path (String.concatWith "/" [".holbuild/action-extra", key, decl]))))
+                         (#extra_hashes (cache_manifest_blobs_from_lines key (cache_manifest_lines text)))
         fun fits {parents, mldeps, ...} =
           Resident.file_hash resident (path ^ ".uo") =
             SOME (HolbuildHash.string_sha256 (manifest_text (uo_lines stem {parents = parents, mldeps = mldeps}))) andalso
@@ -10753,7 +10765,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
               same theory andalso
               ((move_theory root false (path, key);
                 Resident.put resident path (Resident.Theory theory);
-                fits theory)
+                extras_back key andalso fits theory)
                (* Still parked, so the removal of the stale copies clears
                   both places before the installs. *)
                handle OS.SysErr _ => false)
@@ -11716,9 +11728,13 @@ fun sweep_worker_cache {limit_bytes, reserve_bytes, min_free_bytes} =
   let val cache = cache_root ()
   in
     with_action_root_lock cache (fn () =>
-      enforce_worker_cache_cap
-        {cache = cache, checkpoint_root = Path.concat(cache, "checkpoints"), limit_bytes = limit_bytes,
-         reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false})
+      ((* With no records (a worker short of disk drops them), nothing
+          names the parked theories. *)
+       if file_exists (Path.concat (cache, "action-resident")) then ()
+       else HolbuildRemoveTree.remove_untrusted_strict (parked_root (Path.concat (cache, "action")));
+       enforce_worker_cache_cap
+         {cache = cache, checkpoint_root = Path.concat(cache, "checkpoints"), limit_bytes = limit_bytes,
+          reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false}))
   end
 
 fun phases_text sep unit phases =
