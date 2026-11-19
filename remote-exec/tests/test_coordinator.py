@@ -195,13 +195,22 @@ async def a_repeat_waiting_on_a_paused_submission(
         await hold.execute(sa.text("SELECT 1 FROM peak_hints FOR UPDATE"))
         holder = await hold.scalar(sa.text("SELECT pg_backend_pid()"))
         first = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
-        async with asyncio.timeout(5):
-            first_pid = await blocked_by(observer, holder)
-        repeat = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
-        async with asyncio.timeout(5):
-            await blocked_by(observer, first_pid)
-        assert not repeat.done()
-        yield hold, first_pid, first, repeat
+        repeat: asyncio.Task[UUID] | None = None
+        try:
+            async with asyncio.timeout(5):
+                first_pid = await blocked_by(observer, holder)
+            repeat = asyncio.create_task(coordinator.submit(batch, "default", batch_id=batch_id))
+            async with asyncio.timeout(5):
+                await blocked_by(observer, first_pid)
+            assert not repeat.done()
+            yield hold, first_pid, first, repeat
+        finally:
+            # A test that stopped early leaves no submission to store its batch after it.
+            for task in (first, repeat):
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
 
 
 async def stored_rows(coordinator: Coordinator) -> tuple[int, int]:
