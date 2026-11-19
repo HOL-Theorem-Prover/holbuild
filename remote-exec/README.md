@@ -943,7 +943,9 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   ```
   Tier counts include both classes; `ready_run` and `running_run` are the
   run subsets across tiers. `waiting_ahead_standard` and `waiting_ahead_high`
-  count the running actions claimed ahead that still wait for a parent that hasn't posted `outlined`. A phase's share of the workers' time is its
+  count the running actions claimed ahead that still wait: they haven't posted
+  `outlined` themselves, and an unfinished parent has no live lease that posted
+  it (one that expired or was retried no longer counts). A phase's share of the workers' time is its
   seconds over the sum of all. A host is its workers' latest report,
   `age_s` seconds old,
   except that `cpu_idle_pct` is the latest one measured:

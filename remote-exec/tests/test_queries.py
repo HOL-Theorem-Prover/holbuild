@@ -98,7 +98,8 @@ class Fleet:
     """The seeded database: ``fresh`` and ``steady`` were inserted after the last ANALYZE, ``old`` is a
     finished batch past retention. ``token`` is a live lease of ``fresh``, ``expired`` an expired one of
     ``steady``. ``since`` numbers the transaction that changed a few of ``fresh``'s actions last.
-    ``running_tokens`` are the leases of ``fresh``'s running actions."""
+    ``running_tokens`` are the leases of ``fresh``'s running actions, ``plain_tokens`` those of its running actions
+    not claimed ahead."""
 
     engine: AsyncEngine
     parents: list[list[int]]
@@ -111,6 +112,7 @@ class Fleet:
     expired: UUID
     since: int
     running_tokens: list[UUID]
+    plain_tokens: list[UUID]
 
     def parent_of_ahead(self) -> str:
         """A running action of ``fresh`` with children claimed ahead."""
@@ -122,6 +124,13 @@ class Fleet:
         its outline: the largest array of outlined tokens a statement is given, whose actions the counts of actions
         waiting ahead exclude."""
         return self.running_tokens
+
+    def outlined_plain(self) -> list[UUID]:
+        """The leases of the running actions of ``fresh`` not claimed ahead, as if each had published its outline:
+        the actions claimed ahead one generation down start on them, but the one two generations down still waits,
+        and fills ``fresh``'s cap of 1, which leaves only children whose unfinished parents all published theirs to
+        claim."""
+        return self.plain_tokens
 
     def ahead_candidates(self) -> list[str]:
         """Waiting actions of ``fresh`` whose unfinished parents all run, which may be claimed ahead."""
@@ -249,7 +258,7 @@ async def seed(engine: AsyncEngine) -> Fleet:
             ),
             {"id": steady},
         )
-        await insert(connection, fresh, parents, arrival, priority=2, ahead_cap=64)
+        await insert(connection, fresh, parents, arrival, priority=2, ahead_cap=1)
         token = await connection.scalar(
             sa.text("SELECT attempt_token FROM leases WHERE batch_id = :id AND input_key = :key"),
             {"id": fresh, "key": arrival.keys("running")[0]},
@@ -257,13 +266,22 @@ async def seed(engine: AsyncEngine) -> Fleet:
         running_tokens = list(
             await connection.scalars(sa.text("SELECT attempt_token FROM leases WHERE batch_id = :id"), {"id": fresh})
         )
+        plain_tokens = list(
+            await connection.scalars(
+                sa.text("SELECT attempt_token FROM leases WHERE batch_id = :id AND input_key = ANY(:keys)"),
+                {"id": fresh, "keys": arrival.keys("running")},
+            )
+        )
     async with engine.begin() as connection:
         since = int(await connection.scalar(sa.text("SELECT CAST(pg_current_xact_id() AS text)")))
         await connection.execute(
             sa.text("UPDATE actions SET log_sha256 = 'log' WHERE batch_id = :id AND input_key = ANY(:keys)"),
             {"id": fresh, "keys": arrival.keys("ready")[:20]},
         )
-    return Fleet(engine, parents, fresh, steady, old, arrival, steady_arrival, token, expired, since, running_tokens)
+    return Fleet(
+        engine, parents, fresh, steady, old, arrival, steady_arrival, token, expired, since,
+        running_tokens, plain_tokens,
+    )
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -367,16 +385,22 @@ STATEMENTS = [
     Statement(cm.LOCK_KEY, lambda f: {"key": f.arrival.keys("ready")[0]}, 100),
     Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("ready")[0]}, 2_100),
     Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2, "outlined": f.outlined()}, 120_000),
-    *(
-        Statement(
-            cm.CLAIM_AHEAD_ACTION,
-            lambda f, outlined_only=outlined_only: {
-                "batch_id": f.fresh, "keys": f.ahead_candidates(), "tier": "standard", "depth": 2, "taken": [],
-                "outlined": f.outlined(), "outlined_only": outlined_only,
-            },
-            1_400,
-        )
-        for outlined_only in (False, True)
+    Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2, "outlined": f.outlined_plain()}, 120_000),
+    Statement(
+        cm.CLAIM_AHEAD_ACTION,
+        lambda f: {
+            "batch_id": f.fresh, "keys": f.ahead_candidates(), "tier": "standard", "depth": 2, "taken": [],
+            "outlined": f.outlined(), "outlined_only": False,
+        },
+        1_400,
+    ),
+    Statement(
+        cm.CLAIM_AHEAD_ACTION,
+        lambda f: {
+            "batch_id": f.fresh, "keys": f.ahead_candidates(), "tier": "standard", "depth": 2, "taken": [],
+            "outlined": f.outlined_plain(), "outlined_only": True,
+        },
+        1_400,
     ),
     Statement(
         cm.AHEAD_PARENTS,
@@ -386,6 +410,7 @@ STATEMENTS = [
         100,
     ),
     Statement(cm.COUNT_WAITING_AHEAD, lambda f: {"batch_id": f.fresh, "outlined": f.outlined()}, 1_100),
+    Statement(cm.COUNT_WAITING_AHEAD, lambda f: {"batch_id": f.fresh, "outlined": f.outlined_plain()}, 1_300),
     Statement(
         "SELECT true FROM leases WHERE attempt_token = :token AND expires_at > now()",
         lambda f: {"token": f.token},
@@ -402,7 +427,9 @@ STATEMENTS = [
         cm.PEAK_COVERED, lambda f: {"package": "pkg", "theory": "t0", "profile": "default", "peak": 2000}, 100
     ),
     Statement(cm.COUNT_UNFINISHED, lambda f: {"outlined": f.outlined()}, 93_000),
+    Statement(cm.COUNT_UNFINISHED, lambda f: {"outlined": f.outlined_plain()}, 93_000),
     Statement(cm.COUNT_ACTIVE, lambda f: {"outlined": f.outlined()}, 18_000),
+    Statement(cm.COUNT_ACTIVE, lambda f: {"outlined": f.outlined_plain()}, 18_000),
     Statement(cm.HELD_TARGET, lambda f: {"now": now(), "hold": 900.0, "cap": 100}, 1_800),
     # submit
     Statement(
@@ -628,6 +655,23 @@ async def rows_handled(fleet: Fleet, statement: Statement, *, nested_loops: bool
         )
         await connection.rollback()
     return round(handled(plan[0]["Plan"]))
+
+
+async def test_with_only_its_plain_claims_outlined_the_fresh_batch_is_at_its_cap_with_children_to_claim(
+    fleet: Fleet,
+) -> None:
+    """The budgets with ``outlined_plain`` plan the cap's paths: the action claimed ahead two generations down
+    waits, and fills the cap, and the children of outlined actions alone may still be claimed ahead."""
+    async with fleet.engine.connect() as connection:
+        waiting = await connection.scalar(
+            cm.COUNT_WAITING_AHEAD, {"batch_id": fleet.fresh, "outlined": fleet.outlined_plain()}
+        )
+        rows = (await connection.execute(
+            cm.AHEAD_CANDIDATES, {"depth": 2, "outlined": fleet.outlined_plain()}
+        )).all()
+    assert waiting == 1
+    candidates = [row for row in rows if row.batch_id == fleet.fresh]
+    assert candidates and all(row.outlined for row in candidates)
 
 
 def test_every_statement_has_a_budget() -> None:
