@@ -13,7 +13,8 @@ source "$SCRIPT_DIR/../../lib.sh"
 # is also checked leaf by leaf and a disagreement fails the build.  Each
 # proof below is edited inside a structural combinator, once keeping every
 # later leaf where it was and once moving them; the edited leaf ends the
-# cheap checks, so the hash is taken at the leaf before it.  An edit outside
+# cheap checks, so the hash is taken at the leaf before it, an unchanged
+# leaf inside the same combinator.  An edit outside
 # every leaf (a selector) leaves all leaves passing the cheap checks: the
 # hash then misses and the leaf-by-leaf check finds the prefix.
 export HOLBUILD_CHECK_SALVAGE=1
@@ -43,14 +44,20 @@ TOML
 
 # Each proof has @@ where the edit goes.
 declare -A proofs=(
-  [select]='CONJ_TAC >>~- ([`F`], @@ >> ALL_TAC >> FAIL_TAC "oracle failure")'
-  [each]='CONJ_TAC >> (@@ >> ALL_TAC >> (fn g => ALL_TAC g)) >> FAIL_TAC "oracle failure"'
-  [cases]='CONJ_TAC >| [@@ >> ALL_TAC, ALL_TAC] >> ALL_TAC >> FAIL_TAC "oracle failure"'
-  [choice]='(NO_TAC ORELSE @@) >> ALL_TAC >> FAIL_TAC "oracle failure"'
-  [try]='TRY (@@ >> ALL_TAC) >> ALL_TAC >> FAIL_TAC "oracle failure"'
-  [repeat]='rpt (CONJ_TAC >> @@) >> ALL_TAC >> FAIL_TAC "oracle failure"'
+  [select]='CONJ_TAC >>~- ([`F`], ALL_TAC >> @@ >> ALL_TAC >> FAIL_TAC "oracle failure")'
+  [each]='CONJ_TAC >> (ALL_TAC >> @@ >> ALL_TAC >> (fn g => ALL_TAC g)) >> FAIL_TAC "oracle failure"'
+  [cases]='CONJ_TAC >| [ALL_TAC >> @@ >> ALL_TAC, ALL_TAC] >> ALL_TAC >> FAIL_TAC "oracle failure"'
+  [choice]='(NO_TAC ORELSE (ALL_TAC >> @@)) >> ALL_TAC >> FAIL_TAC "oracle failure"'
+  [try]='TRY (ALL_TAC >> @@ >> ALL_TAC) >> ALL_TAC >> FAIL_TAC "oracle failure"'
+  [repeat]='rpt (CONJ_TAC >> ALL_TAC >> @@) >> ALL_TAC >> FAIL_TAC "oracle failure"'
 )
 
+child_log=$project/.holbuild/logs/current/failed-prefix-salvage-oracle/ATheory/instrumented-failure.log
+# Where the salvaged prefix ends (resbyten): just past the unchanged leaf
+# before the edit, nested in the combinator, so the hash taken there is
+# that of a nested path.  An `rpt` body runs as one leaf, which the edit
+# changes, so nothing of it is kept.
+declare -A kept_end=([select]=29 [each]=20 [cases]=20 [choice]=23 [try]=12 [repeat]=0)
 for construct in select each cases choice try repeat; do
   name=salvage_$construct
   for edit in "(ALL_TAC)" "I ALL_TAC" "(ALL_TAC : tactic)"; do
@@ -78,6 +85,12 @@ SML
     require_grep "oracle failure" "$log"
     if [[ "$edit" != "(ALL_TAC)" ]]; then
       require_grep "from: failed-prefix checkpoint in $name" "$log"
+      kept=$(grep '^holbuild hol-phases' "$child_log" | tail -n 1 | sed -n 's/.* resbyten=\([0-9]*\).*/\1/p')
+      if [[ "$kept" != "${kept_end[$construct]}" ]]; then
+        grep '^holbuild hol-phases' "$child_log" >&2 || true
+        echo "$name: expected the salvage to keep the prefix through offset ${kept_end[$construct]}, got '$kept'" >&2
+        exit 1
+      fi
     fi
   done
 done
@@ -112,7 +125,6 @@ for selected in T F; do
   require_grep "oracle failure" "$log"
 done
 require_grep "from: failed-prefix checkpoint in salvage_selector" "$tmpdir/selector-F.log"
-child_log=$project/.holbuild/logs/current/failed-prefix-salvage-oracle/ATheory/instrumented-failure.log
 require_file "$child_log"
 rewound=$(grep '^holbuild hol-phases' "$child_log" | tail -n 1 | sed -n 's/.* holrewoundn=\([0-9]*\).*/\1/p')
 if [[ "$rewound" != 1 ]]; then

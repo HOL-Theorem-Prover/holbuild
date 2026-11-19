@@ -1896,7 +1896,8 @@ fun hol_run_file_arg stage file =
 val last_child_status : OS.Process.status option ref = ref NONE
 
 (* When the latest HOL child of run_hol_files_to_log started (ms since the
-   epoch), for its holload; NONE for a child started otherwise. *)
+   epoch), for its holload; NONE for a child started otherwise.  A load
+   ahead's join moves it past the child's waits for late parents. *)
 val last_child_start : LargeInt.int option ref = ref NONE
 
 (* HOL's `use` remembers a source parse error in the heap and, with
@@ -4028,6 +4029,10 @@ fun resumes_from_checkpoints policy (action : theory_action) =
    the resume point's source offset. *)
 val resume_steps = ref ([] : (string * LargeInt.int) list)
 
+(* Checkpoints dropped because loading or resuming them failed in the
+   child, since the build started: exec-action's rstdropn. *)
+val dropped_checkpoints = ref 0
+
 fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
     val _ = resume_steps := []
@@ -4359,6 +4364,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
                     "invalid proof-ir failed-prefix metadata",
                     "proof-ir dynamic replay mismatch"] then
                 (remove_checkpoint path;
+                 dropped_checkpoints := !dropped_checkpoints + 1;
                  warn ("discarding failed-prefix checkpoint after failed resume: " ^ path);
                  true)
               else false
@@ -4395,6 +4401,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
           let
             val invalid = hol_context_path (#context run_spec)
             val _ = discard_loaded_checkpoint_after_load_failure ()
+            val _ = dropped_checkpoints := !dropped_checkpoints + 1
             val _ = warn ("discarding invalid checkpoint after HOL state load failure: " ^ invalid)
           in
             raise RetryInvalidCheckpoint
@@ -13638,7 +13645,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         val log_dir = current_log_dir root (#package spec) (#logical spec)
         val oom_before = cgroup_oom_kills ()
         val _ = last_child_status := NONE
-        val _ = last_child_start := NONE
+        (* A load ahead's child is already running: it set the start. *)
+        val _ = if isSome ahead then () else last_child_start := NONE
+        val _ = dropped_checkpoints := 0
         (* Built on a late parent's outline, the run is the load ahead's:
            whatever stops it, nothing of it is published, and the action
            builds again plain. *)
@@ -13900,6 +13909,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
            the preload's barrier. *)
         val arrivals = ref ([] : (string * Time.time) list)
         val released = ref (NONE : Time.time option)
+        val waited_ms = ref (0 : LargeInt.int)
         (* aheadwait: the time the child spent in its waits, each from its
            entry (waiting-P, finishing) to its marker (or to now, for one
            still waiting); aheadload: the rest of its preload. *)
@@ -13916,6 +13926,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                   late
             val wait = List.foldl op+ (waited ("finishing", getOpt (!released, now))) parents
           in
+            waited_ms := wait;
             phases := ("aheadwait", wait) :: ("aheadload", LargeInt.max (0, ms (getOpt (!released, now), started) - wait)) :: !phases
           end
         val deadline = Time.+ (started, !ahead_wait_limit)
@@ -14166,6 +14177,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                           released := SOME (Time.now ());
                           await_child ();
                           record_timings ();
+                          (* holload leaves out the waits aheadwait reports. *)
+                          last_child_start := Option.map (fn start => start + !waited_ms) (!last_child_start);
                           case (abandoned (), !outcome) of
                               (SOME reason, _) => abandon reason
                             | (NONE, SOME (SOME e)) => raise e
@@ -14267,7 +14280,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               val hol_phases =
                 if !HolbuildActionSandbox.outputs_validated then hol_log_phases (build_log ()) (!last_child_start)
                 else []
-              val _ = phases := rev (hol_phases @ !resume_steps) @ !phases
+              val drops = if !dropped_checkpoints > 0 then [("rstdropn", LargeInt.fromInt (!dropped_checkpoints))] else []
+              val _ = phases := rev (hol_phases @ !resume_steps @ drops) @ !phases
               val phases = merge_phases (rev (!phases)) @
                 [("started", Time.toMilliseconds start),
                  ("finished", Time.toMilliseconds (Time.now ()))] @
