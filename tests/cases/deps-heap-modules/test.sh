@@ -247,7 +247,7 @@ resumed() {
   phase "$1" 'res(deps|ctx)n:1'
   grep -qE "from: ${2:-(deps-loaded|theorem-context) checkpoint}" "$tmpdir/$1.log" ||
     { echo "$1 didn't resume:" >&2; cat "$tmpdir/$1.log" >&2; exit 1; }
-  if grep -qE '^phase-ms=(.*,)?rstdropn:' "$tmpdir/$1.result" ||
+  if grep -qE '^phase-ms=(.*,)?(rstdropn|rstmodrejn):' "$tmpdir/$1.result" ||
      grep -q 'discarding invalid checkpoint' "$tmpdir/$1.log"; then
     echo "$1 dropped a checkpoint:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1
   fi
@@ -294,9 +294,8 @@ phase healed-B 'rstmodn:1'
 require_grep 'restored shared' "$tmpdir/healed-B.log"
 resumed healed-B 'theorem-context checkpoint after b_first'
 
-# A module at its path with another id (another theory's module): W's
-# HOL child fails to load the heap and preloads afresh.  C, on A and Z, has
-# a heap of its own, which loads A's module.
+# C's heap loads A's module. A module for the same .dat file with a
+# different Poly/ML ID must be replaced before C can resume.
 edit_c() { sed -i "s/^  .*(\* c_thm.*\$/  rw[a_value_def] (* c_thm $1 *)/" "$project/src/CScript.sml"; }
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 mkdir -p "$(dirname "$modules")"
@@ -305,6 +304,46 @@ exec_theory C c
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 for heap in $published; do heap_modules "$heap"; done | grep -q -- '-A-' ||
   { echo "C's published heap doesn't load A's module" >&2; exit 1; }
+# Export the same theory's theorem values with different sharing in the
+# module. Keep the decoded ATheory.dat and the normal module filename.
+cat > "$tmpdir/alternate-module.sml" <<'SML'
+val _ = PolyML.use (valOf (OS.Process.getEnv "MODULE_HELPER"));
+val _ = let
+  open TheoryModules
+  fun env name = valOf (OS.Process.getEnv name)
+  val stem = env "A_STEM"
+  val path = stem ^ ".dat"
+  val (thy, hash) = valOf (sml_header (stem ^ ".sml"))
+  val (data, _) = TheoryReader.decode_thydata {thyname = thy, path = path, hash = hash}
+  val digest = file_digest path
+  val signature_root :: values_root :: rest =
+    valOf (module_roots "ATheory" digest data (core_bindings ()))
+  val (name, values) = Universal.tagProject TheoryReader.values_tag values_root
+  fun copy th = Thm.EQ_MP (Thm.REFL (Thm.concl th)) th
+  val alternate = Universal.tagInject TheoryReader.values_tag (name, Vector.map copy values)
+  val roots = signature_root :: alternate :: rest
+  val base_id = valOf (base_id_of (env "BASE_STATE"))
+  val id = #1 (Save.getModuleInfo (env "MODULE"))
+  val _ = save_module (env "MODULE") base_id roots
+in
+  if #1 (Save.getModuleInfo (env "MODULE")) = id
+  then raise Fail "A's modules have the same Poly/ML ID"
+  else ()
+end;
+SML
+BASE_STATE=$HOLDIR/bin/hol.state
+A_STEM=$project/.holbuild/obj/src/ATheory BASE_STATE=$BASE_STATE MODULE=$modules \
+  MODULE_HELPER=$HOLDIR/tools-poly/poly/theory_modules.ML \
+  "$HOLDIR/bin/hol" run --noconfig --holstate "$BASE_STATE" "$tmpdir/alternate-module.sml"
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_c same-theory
+exec_theory C same-theory
+require_grep 'restored shared' "$tmpdir/same-theory-C.log"
+phase same-theory-C 'rstmodn:1'
+resumed same-theory-C 'theorem-context checkpoint after c_first'
+cmp "$tmpdir/A.pmo" "$modules"
+
+# A module for a different theory at A's path is recovered the same way.
 z_module=$(find "$worker_modules" -name '*-Z-*.pmo' | head -n 1)
 [[ -n "$z_module" ]] || { echo "W has no module for Z" >&2; exit 1; }
 cp "$z_module" "$modules"
@@ -312,10 +351,9 @@ rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 edit_c changed
 exec_theory C changed
 require_grep 'restored shared' "$tmpdir/changed-C.log"
-require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/changed-C.log"
-phase changed-C 'rstdropn:1'
-phase changed-C 'rstmodrejn:1'
-require_grep 'Required module missing or changed' "$tmpdir/changed-C.log"
+phase changed-C 'rstmodn:1'
+resumed changed-C 'theorem-context checkpoint after c_first'
+cmp "$tmpdir/A.pmo" "$modules"
 # The shared heap and its checkpoints stay: with A's module back, W
 # resumes from them.
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"

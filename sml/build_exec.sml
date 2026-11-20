@@ -4046,8 +4046,8 @@ fun saved_modules path =
       NONE => []
     | SOME show => map #2 (show path)
 
-(* Those of them that aren't there.  Loading the heap fails without them,
-   as it does when one has another id than the heap records. *)
+(* The local heap store checks for missing modules. The shared store also
+   has a digest for each module in its heap manifest. *)
 fun missing_saved_modules path =
   List.filter (not o file_exists) (saved_modules path)
   handle e => (warn ("could not list the theory modules of " ^ path ^ ": " ^ General.exnMessage e); [])
@@ -12364,7 +12364,7 @@ val nothing_restored : shared_restore = {heap = NONE, files = [], stale = [], mi
    this host's module store those of the theory modules at the paths that
    the entries list. *)
 fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
-                                              deps_key, deps_loaded,
+                                              deps_key, deps_loaded, module_store,
                                               requested_timeout, candidates, ...} : shared_context) resumes
                                fetch_modules =
   let
@@ -12386,10 +12386,26 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
        touch_dir (Path.concat(store, heap)))
     fun place_heap heap = (place heap (heap, deps_loaded); heap_placed heap)
-    (* A heap saved on another host may load theory modules this host's
-       store lacks: they are fetched first.  The phases count the modules
-       fetched (rstmodn) and the heaps given up for one still missing
-       (rstmoddropn), once per heap: every checkpoint on it needs them.
+    (* A module at the right path may have been written on another host
+       with a different ID. Match the blob recorded alongside the heap
+       before attempting to load it. *)
+    fun wrong_modules digests paths =
+      let
+        val checks = map (fn path => (path, ref false)) paths
+        fun matches path =
+          (case Redblackmap.peek (digests, Path.file path) of
+              SOME sha =>
+                Path.dir path = module_store andalso
+                Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) andalso
+                HolbuildHash.file_sha256 path = sha
+            | NONE => false)
+          handle OS.SysErr _ => false | IO.Io _ => false
+      in
+        transfer_all (fn (path, ok) => ok := matches path) checks;
+        List.mapPartial (fn (path, ok) => if !ok then NONE else SOME path) checks
+      end
+    (* The phases count the modules fetched (rstmodn) and the heaps given
+       up for a module still unavailable (rstmoddropn), once per heap.
        A heap given up only falls back here, to a fresh preload: the
        shared one stays, for the hosts that have its modules. *)
     val modules_ok = ref (NONE : bool option)
@@ -12400,17 +12416,19 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           SOME ok => ok
         | NONE =>
             let
+              fun add_digest (("module", sha, file), digests) =
+                    if heap_module_name file then Redblackmap.insert (digests, file, sha) else digests
+                | add_digest (_, digests) = digests
+              val digests = List.foldl add_digest (Redblackmap.mkDict String.compare) (!heap_modules)
               val ok =
-                case missing_saved_modules deps_loaded of
+                case wrong_modules digests (saved_modules deps_loaded) of
                     [] => true
                   | missing =>
                       let
                         val _ = restore_step "rstmodfetch" (fn () => fetch_modules (!heap_modules, missing))
-                        val still = missing_saved_modules deps_loaded
+                        val still = wrong_modules digests missing
                       in
-                        (* Those of MISSING now present: a sweep may take others since. *)
-                        add_restore_step "rstmodn"
-                          (LargeInt.fromInt (length (List.filter (fn path => not (member_string path still)) missing)));
+                        add_restore_step "rstmodn" (LargeInt.fromInt (length missing - length still));
                         case still of
                             [] => true
                           | module :: _ =>
@@ -13650,12 +13668,8 @@ fun publish_modules remote {store, modules, deadline} =
     !published
   end
 
-(* Before a shared deps heap is restored: fetches into the host's module
-   store those of the theory modules at PATHS, which the heap loads and the
-   store lacks, that the heap's entry lists (MODULES, its ("module",
-   SHA-256, file name) entries).  The publisher listed them from its own
-   store, so they are the modules the heap was saved with, whatever .dat
-   files the action has now.  A module of another store isn't fetched. *)
+(* Restore missing or mismatched modules from the heap manifest. These are
+   the blobs saved with the heap, even if the action's .dat files changed. *)
 fun fetch_heap_modules remote tc (modules, paths) =
   let
     val store = module_store (#holdir tc)
