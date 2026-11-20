@@ -1103,8 +1103,8 @@ class Coordinator:
         self.lease_hosts: dict[UUID, tuple[str, str, list[str]]] = {}
         # The attempt tokens of the leases whose action published its outline (see outlined), oldest first.
         self.outlined_tokens: dict[UUID, None] = {}
-        # Per running batch, oldest first, the inputs each of its unfinished actions last found missing that the
-        # batch doesn't rebuild itself, for a resubmission to name them all (see _input_missing). Ones lost to a
+        # Per running batch, oldest first, the inputs each of its actions last found missing that the batch doesn't
+        # rebuild itself, for a resubmission to name those of its unfinished ones (see _also_missing). Ones lost to a
         # restart or another replica only leave that resubmission naming fewer.
         self.missing_inputs: dict[UUID, dict[str, list[str]]] = {}
         self.infra_streak: dict[str, tuple[int, UUID | None]] = {}
@@ -2514,9 +2514,6 @@ class Coordinator:
                 if done:
                     await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": done})
                     await self._finish_if_done(conn, batch_id)
-        missing = self.missing_inputs.get(batch_id, {})
-        for key in done:
-            missing.pop(key, None)
         remaining = self.peers_done.get(batch_id, {})
         for key in queued:
             remaining.pop(key, None)
@@ -2799,7 +2796,6 @@ class Coordinator:
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
             if built:
-                self.missing_inputs.get(batch_id, {}).pop(action.input_key, None)
                 await self._set_state(conn, batch_id, action.input_key, "done")
                 if result.peak_rss_mb is not None:
                     peaks.append((package, theory, action.profile, result.peak_rss_mb))
@@ -3530,7 +3526,7 @@ class Coordinator:
                     batch_id,
                     parent,
                     f"resubmit: {action.theory} ({first}) is not in the cache after it built"
-                    f"{self._also_missing(batch_id, first)}",
+                    f"{await self._also_missing(conn, batch_id, first)}",
                 )
         self._batch_changed(batch_id)
         return requeued
@@ -3571,7 +3567,7 @@ class Coordinator:
             # A holbuild before 0.14.89 reads the first theory named, or else a blob: after a missing blob, or no
             # missing input named, it is named alone.
             also = (
-                self._also_missing(batch_id, f"theory {missing.key}", more)
+                await self._also_missing(conn, batch_id, f"theory {missing.key}", more)
                 if missing is not None and missing.kind == "theory"
                 else ""
             )
@@ -3595,10 +3591,27 @@ class Coordinator:
         if len(self.missing_inputs) > MAX_MISSING_BATCHES:
             del self.missing_inputs[next(iter(self.missing_inputs))]
 
-    def _also_missing(self, batch_id: UUID, first: str, own: list[str] | None = None) -> str:
+    async def _also_missing(
+        self, conn: AsyncConnection, batch_id: UUID, first: str, own: list[str] | None = None
+    ) -> str:
         """The tail of a ``resubmit:`` failure naming ``first``: ``own``, then the inputs the batch's unfinished
-        actions found missing, deduplicated, so that the resubmission rebuilds them all at once."""
-        others = [item for items in self.missing_inputs.pop(batch_id, {}).values() for item in items]
+        actions last found missing, deduplicated, so that the resubmission rebuilds them all at once. An action
+        that finished since (built here or by another batch, failed or skipped) is left out."""
+        remembered = self.missing_inputs.pop(batch_id, {})
+        unfinished = (
+            set(
+                await conn.scalars(
+                    sa.text(
+                        "SELECT input_key FROM actions WHERE batch_id = :batch_id "
+                        "AND state IN ('waiting', 'ready', 'running') AND input_key = ANY(:keys)"
+                    ),
+                    {"batch_id": batch_id, "keys": list(remembered)},
+                )
+            )
+            if remembered
+            else set()
+        )
+        others = [item for key, items in remembered.items() if key in unfinished for item in items]
         named = [item for item in dict.fromkeys((own or []) + others) if item != first]
         return f"; also missing {', '.join(named)}" if named else ""
 
