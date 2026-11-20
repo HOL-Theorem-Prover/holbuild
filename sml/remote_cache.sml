@@ -575,6 +575,17 @@ fun curl_put_urls_at headers {urls, src} =
 
 fun curl_put_urls headers request = #2 (curl_put_urls_at headers request)
 
+(* Whether a PUT's Conflict, as curl_put_urls_at words it, is one a later try
+   may not meet: no answer, or a 429 or 5xx answer. *)
+fun transient_put_failure message =
+  (String.isPrefix "PUT " message andalso String.isSubstring " failed: " message) orelse
+  (case String.tokens (fn c => c = #" ") message of
+       "HTTP" :: code :: "from" :: _ =>
+         (case Int.fromString code of
+              SOME code => transient (HolbuildHttp.Response code)
+            | NONE => false)
+     | _ => false)
+
 fun curl_put_zstd {urls, src, size} =
   let
     val compressed = temp_path "zstd-put"

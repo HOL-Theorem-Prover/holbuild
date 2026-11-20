@@ -252,18 +252,45 @@ first_put=$(grep -m 1 '^PUT /cas/' "$request_log")
   exit 1
 }
 
-# After the first upload fails twice, the rest are skipped and the export fails.
+# Uploads ride out answers a later try may not get, 429s, 5xxs and none at
+# all, without tripping the breaker: each refused upload is asked again by the
+# one-node ring, then tried again a second later.
 rm "$remote_root/cas/$missing_spec"
-echo 500 > "$tmpdir/control/cas-put-status"
+printf '%s\n' 503 503 drop 429 500 drop > "$tmpdir/control/cas-put-fail-once"
+: > "$request_log"
+if ! hb --prefetch-concurrency 1 action-spec --upload CTheory \
+    > "$tmpdir/batch-transient.txt" 2> "$tmpdir/upload-transient.log"; then
+  cat "$tmpdir/upload-transient.log" >&2
+  exit 1
+fi
+diff -u "$tmpdir/batch1.txt" "$tmpdir/batch-transient.txt"
+[[ ! -e "$tmpdir/control/cas-put-fail-once" ]] || { echo "not every refusal was met" >&2; exit 1; }
+! grep -q 'remote cache disabled' "$tmpdir/upload-transient.log" || {
+  echo "the breaker tripped:" >&2
+  cat "$tmpdir/upload-transient.log" >&2
+  exit 1
+}
+cmp "$project/.holbuild/action-specs/$missing_spec" "$remote_root/cas/$missing_spec"
+first_put=$(grep -m 1 '^PUT /cas/' "$request_log")
+[[ $(grep -cxF "$first_put" "$request_log") -eq 7 ]] || {
+  echo "expected six refused uploads and the one that went through:" >&2
+  grep '^PUT /cas/' "$request_log" >&2
+  exit 1
+}
+
+# After the first upload is refused for good, the rest are skipped and the
+# export fails.
+rm "$remote_root/cas/$missing_spec"
+echo 403 > "$tmpdir/control/cas-put-status"
 : > "$request_log"
 if HOLBUILD_TIMING_LOG="$tmpdir/failed-upload.timing" hb --prefetch-concurrency 1 action-spec --upload CTheory > /dev/null 2> "$tmpdir/upload-failure.log"; then
   echo "an export whose upload failed succeeded" >&2
   exit 1
 fi
 rm "$tmpdir/control/cas-put-status"
-require_grep 'could not upload .*HTTP 500' "$tmpdir/upload-failure.log"
+require_grep 'could not upload .*HTTP 403' "$tmpdir/upload-failure.log"
 require_grep 'name=action_spec.upload.*status=fail' "$tmpdir/failed-upload.timing"
-[[ $(grep -c '^PUT /cas/' "$request_log") -eq 2 ]] || {
+[[ $(grep -c '^PUT /cas/' "$request_log") -eq 1 ]] || {
   echo "uploads went on after the first failure:" >&2
   grep '^PUT /cas/' "$request_log" >&2
   exit 1

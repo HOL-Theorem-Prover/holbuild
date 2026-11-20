@@ -95,17 +95,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         while not (control / "cas-put-release").exists():
             time.sleep(0.01)
 
-    def cas_put_fail_once(self):
-        """The status in control/cas-put-fail-once, answered to one CAS PUT."""
+    def cas_put_fail_once(self) -> int | str | None:
+        """The first line of control/cas-put-fail-once, taken by one CAS PUT:
+        a status to answer, or "drop" to leave it unanswered."""
         if control is None or not self.path.startswith("/cas/"):
             return None
         with action_put_lock:
             status = control / "cas-put-fail-once"
             if not status.exists():
                 return None
-            code = int(status.read_text())
-            status.unlink()
-            return code
+            first, *rest = status.read_text().split()
+            if rest:
+                status.write_text("".join(f"{line}\n" for line in rest))
+            else:
+                status.unlink()
+            return first if first == "drop" else int(first)
 
     def cas_put_drop_once(self) -> bool:
         """Whether to leave this CAS PUT unanswered: once per control/cas-put-drop-once."""
@@ -197,6 +201,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return
         failure = self.cas_put_fail_once()
+        if failure == "drop":
+            self.close_connection = True
+            return
         if failure is not None:
             self.send_response(failure)
             self.end_headers()
