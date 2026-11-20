@@ -2606,6 +2606,20 @@ async def test_a_batch_failed_for_resubmission_names_what_an_action_waiting_on_a
     )
 
 
+async def test_a_batch_failed_for_resubmission_names_what_the_last_attempt_found_missing(
+    http: httpx.AsyncClient,
+) -> None:
+    batch_id = await submit(http, ["a"])
+    for key in ("x", "y", "y"):
+        token = await claim_named(http, "a")
+        record = result("a", "failed", "input-missing", missing=f"theory {input_key(key)}")
+        assert (await complete(http, token, record)).status_code == 200
+    status = await batch(http, batch_id)
+    assert status["state"] == "failed"
+    # x, which an earlier attempt found missing, came back.
+    assert status["failure"] == f"resubmit: pkg:a is still missing theory {input_key('y')} after 3 attempts"
+
+
 async def test_a_batch_failed_for_a_missing_blob_names_it_alone(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a", "b"])
     held: dict[str, str] = {}

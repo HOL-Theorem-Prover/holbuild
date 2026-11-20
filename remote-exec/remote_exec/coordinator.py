@@ -2514,6 +2514,9 @@ class Coordinator:
                 if done:
                     await conn.execute(REFRESH_CHILDREN, {"batch_id": batch_id, "keys": done})
                     await self._finish_if_done(conn, batch_id)
+        missing = self.missing_inputs.get(batch_id, {})
+        for key in done:
+            missing.pop(key, None)
         remaining = self.peers_done.get(batch_id, {})
         for key in queued:
             remaining.pop(key, None)
@@ -3560,6 +3563,8 @@ class Coordinator:
                 await self._finish_if_done(conn, batch_id)
                 return
         if attempts >= self.settings.max_attempts:
+            # What it found missing before is superseded by this last report.
+            self.missing_inputs.get(batch_id, {}).pop(input_key, None)
             what = f"{missing.kind} {missing.key}" if missing else "an input"
             if rebuilt is not None:
                 what = f"{rebuilt} ({what})"
