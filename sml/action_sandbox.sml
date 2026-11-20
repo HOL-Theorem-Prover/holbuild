@@ -192,7 +192,7 @@ fun grant_options ({writable, readable = extra, toolchain} : grants) =
     val cache = absolute (HolbuildCacheConfig.cache_root ())
     val protected_paths =
       map (fn part => OS.Path.concat (cache, part))
-          ["actions", "blobs", "locks", "cooperate", "toolchain-trust", "git",
+          ["actions", "blobs", "locks", "action-locks", "cooperate", "toolchain-trust", "git",
            "hol-toolchains/.locks", "action.lock"] @
       List.mapPartial
         (fn entry =>

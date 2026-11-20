@@ -92,4 +92,25 @@ fun at_path (FileLock {fd, path}) =
   in Posix.FileSys.ST.dev held = Posix.FileSys.ST.dev named andalso Posix.FileSys.ST.ino held = Posix.FileSys.ST.ino named end
   handle OS.SysErr _ => false
 fun path (FileLock {path, ...}) = path
+(* Lock files that remove_unheld may unlink. A remover unlinks only while it
+   holds the lock, and these lockers retry when the inode they locked is no
+   longer the one at the path, so no holder is split from a new opener. *)
+fun try_acquire_removable {path} =
+  case try_acquire_path {path = path, obsolete_kind = NONE} of
+      SOME lock => if at_path lock then SOME lock else (release lock; try_acquire_removable {path = path})
+    | NONE => NONE
+fun acquire_removable_wait {path} =
+  let val lock = acquire_exclusive_path_wait {path = path}
+  in if at_path lock then lock else (release lock; acquire_removable_wait {path = path}) end
+(* Unlinks a removable lock file unless a process holds its lock, and returns
+   whether it did. The caller must hold no lock on the path. *)
+fun remove_unheld {path} =
+  let
+    val fd = Posix.FileSys.openf(path, Posix.FileSys.O_RDWR, Posix.FileSys.O.flags [])
+    val lock = FileLock {fd = fd, path = path}
+  in
+    ((try_lock_fd fd andalso at_path lock andalso (FS.remove path; true)) before release lock)
+    handle e => (release lock; raise e)
+  end
+  handle OS.SysErr _ => false
 end

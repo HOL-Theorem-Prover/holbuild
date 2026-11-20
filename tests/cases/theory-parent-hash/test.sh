@@ -69,7 +69,9 @@ val _ = print "parent-hash parser unit tests passed\n"
 SML
 
 # Hold the same fcntl lock as a concurrent publisher. Release it after the
-# invalidation caller starts; a nonblocking skip must fail the assertion.
+# invalidation caller starts; a nonblocking skip must fail the assertion. GC
+# unlinks the file while holding it: the waiter then gets the orphaned inode
+# and must retry on the path, recreating the lock file.
 HOLBUILD_TEST_LOCK_READY="$tmpdir/lock-ready" python3 - "$tmpdir" <<'PYTEST'
 import fcntl
 import os
@@ -84,7 +86,7 @@ key = "a" * 64
 manifest = cache / "actions" / key / "manifest"
 manifest.parent.mkdir(parents=True, exist_ok=True)
 manifest.write_text("rejected\n")
-lock_path = cache / "locks" / f"action-{key}.lock"
+lock_path = cache / "action-locks" / key[:2] / f"{key}.lock"
 lock_path.parent.mkdir(parents=True, exist_ok=True)
 with lock_path.open("a+") as lock, (tmp / "parent-hash-parser-test.sml").open() as source, (tmp / "parent-hash-parser-test.log").open("w") as log:
     fcntl.lockf(lock, fcntl.LOCK_EX)
@@ -96,13 +98,32 @@ with lock_path.open("a+") as lock, (tmp / "parent-hash-parser-test.sml").open() 
                 child.kill()
                 raise SystemExit("invalidation caller did not start")
             time.sleep(0.01)
+        # The child waits on our lock, so a failure here must kill it, or
+        # Popen's exit would wait for it forever.
         try:
-            child.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            pass
-        fcntl.lockf(lock, fcntl.LOCK_UN)
-        if child.wait(timeout=60) != 0:
-            raise SystemExit("parent-hash parser/invalidation test failed")
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            # Unlink only once the waiter holds the file open, or it would simply
+            # create a new one and the retry would go untested. The probe needs
+            # Linux's /proc; elsewhere only the plain wait is tested.
+            if sys.platform.startswith("linux"):
+                deadline = time.monotonic() + 60
+                while not any(os.path.realpath(f"/proc/{child.pid}/fd/{fd}") == str(lock_path.resolve())
+                              for fd in os.listdir(f"/proc/{child.pid}/fd")):
+                    if child.poll() is not None or time.monotonic() >= deadline:
+                        raise SystemExit("invalidation caller never opened the lock file")
+                    time.sleep(0.01)
+                lock_path.unlink()
+            fcntl.lockf(lock, fcntl.LOCK_UN)
+            if child.wait(timeout=60) != 0:
+                raise SystemExit("parent-hash parser/invalidation test failed")
+            if not lock_path.exists():
+                raise SystemExit("a waiter kept the lock of an unlinked file")
+        except BaseException:
+            child.kill()
+            raise
 PYTEST
 grep -q "parent-hash parser unit tests passed" "$tmpdir/parent-hash-parser-test.log"
 

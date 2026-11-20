@@ -25,6 +25,10 @@ fun actions_dir root = HolbuildFSCacheBackend.actions_dir (filesystem_cache root
 fun blobs_dir root = HolbuildFSCacheBackend.blobs_dir (filesystem_cache root)
 fun tmp_dir root = HolbuildFSCacheBackend.tmp_dir (filesystem_cache root)
 fun locks_dir root = HolbuildFSCacheBackend.locks_dir (filesystem_cache root)
+fun remove_unheld_action_lock root key =
+  HolbuildFSCacheBackend.remove_unheld_action_lock
+    (HolbuildFSCacheBackend.action_lock (filesystem_cache root) key)
+fun action_locks_dir root = HolbuildFSCacheBackend.action_locks_dir (filesystem_cache root)
 fun theory_modules_dir root = Path.concat(root, "theory-modules")
 fun analysis_dir root = Path.concat(root, "analysis")
 fun action_dir root key = HolbuildFSCacheBackend.action_dir (filesystem_cache root) key
@@ -293,6 +297,19 @@ fun remove_obsolete_action_lock_dirs cutoff dir =
         else (removed, false))
     0
 
+fun is_regular_entry path =
+  Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false
+
+(* Never follows a symlinked shard or lock out of the cache. *)
+fun remove_stale_action_locks cutoff dir =
+  gc_stage "action locks" (List.concat (map children (List.filter is_dir_entry (children dir))))
+    (fn (path, removed) =>
+        if is_regular_entry path andalso stale cutoff path andalso
+           HolbuildFSCacheBackend.remove_unheld_action_lock path then
+          (removed + 1, true)
+        else (removed, false))
+    0
+
 fun blob_name path = Path.file path
 
 fun stale_blob_candidates cutoff paths =
@@ -376,9 +393,11 @@ fun try_acquire_lock root =
   in
     case HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "cache gc"} of
         SOME lock =>
-          ((HolbuildFileLock.write_text (gc_lock_owner_path lock_path) (gc_lock_owner ());
-            SOME (GcLock lock))
-           handle e => (HolbuildFileLock.release lock; raise e))
+          (* The owner note only names the holder in errors; a locks/ directory
+             that refuses new names must not stop GC. *)
+          ((HolbuildFileLock.write_text (gc_lock_owner_path lock_path) (gc_lock_owner ())
+            handle IO.Io _ => () | OS.SysErr _ => ());
+           SOME (GcLock lock))
       | NONE => NONE
   end
   handle HolbuildFileLock.Error msg => raise Error ("could not acquire cache gc lock: " ^ msg)
@@ -426,7 +445,8 @@ fun collect_root root days : gc_counts =
     val tmp = remove_stale_children "tmp" cutoff (tmp_dir root)
     val modules = remove_stale_children "theory modules" cutoff (theory_modules_dir root)
     val analysis = remove_stale_children "analysis" cutoff (analysis_dir root)
-    val locks = remove_obsolete_action_lock_dirs cutoff (locks_dir root)
+    val locks = remove_obsolete_action_lock_dirs cutoff (locks_dir root) +
+                remove_stale_action_locks cutoff (action_locks_dir root)
     val blob_paths = children (blobs_dir root)
     val candidates = stale_blob_candidates cutoff blob_paths
     val (candidates, actions) = collect_live_actions cutoff root candidates

@@ -47,6 +47,8 @@ sig
   val blobs_dir : t -> string
   val tmp_dir : t -> string
   val locks_dir : t -> string
+  val action_locks_dir : t -> string
+  val action_lock : t -> string -> string
   val action_dir : t -> string -> string
   val action_manifest : t -> string -> string
   val blob_path : t -> string -> string
@@ -71,6 +73,9 @@ sig
   val with_action_publish_lock : t -> string -> (unit -> 'a) -> (unit -> 'a) -> 'a
   (* Waits for a concurrent publisher before running the callback. *)
   val with_action_publish_lock_wait : t -> string -> (unit -> 'a) -> 'a
+  (* Unlinks an action lock file under action_locks_dir unless a process or one
+     of this process's threads holds it; true if it did. *)
+  val remove_unheld_action_lock : string -> bool
 
   (* Bytes written into the cache since its last GC, counting this process's
      writes not yet flushed. *)

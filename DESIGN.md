@@ -808,7 +808,8 @@ The global cache is optional and immutable:
   actions/<action-key>/manifest
   blobs/<content-hash>
   tmp/
-  locks/
+  locks/                    gc.lock, GC bookkeeping
+  action-locks/<xx>/<action-key>.lock
 ```
 
 Cache lookup happens only after resolution and action-key computation.
@@ -914,6 +915,10 @@ GC should remove stale tmp dirs, remove old action manifests by refreshed mtime,
 mark blobs still reachable from non-expired manifests, and sweep old unreferenced
 blobs. Races with builds should degrade to cache misses and source rebuilds. Cache GC
 uses a cache-local POSIX file lock at `locks/gc.lock` to avoid concurrent GC runs.
+It unlinks a stale action lock only while holding it, and lockers retry when
+the file they locked is no longer at its path, so no holder is split from a
+new opener. Older holbuild versions kept one action lock per key in a flat
+`locks/`, which GC never prunes.
 
 ## Heaps and checkpoints
 
