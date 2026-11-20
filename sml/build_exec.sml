@@ -9159,10 +9159,11 @@ fun uncached_parents plan uncached node =
 (* PUT whether or not the remote cache already holds the blob: a cache
    node can answer for a blob from its own disk after its backing store has
    dropped it, and a PUT writes it to that store anew.
-   While the remote cache's breaker is tripped, a skipped or failed PUT is
-   tried again each second, for up to spec_upload_outage, so that a short
-   outage costs a wait rather than the build; each try sends nothing until
-   the breaker admits it.  Returns whether the blob went up: false when
+   A skipped PUT, a PUT that got no answer or a 429 or 5xx, and any failed
+   PUT while the remote cache's breaker is tripped, is tried again each
+   second, for up to spec_upload_outage, so that a short outage costs a wait
+   rather than the build; each try sends nothing until the breaker admits it.
+   Any other failure fails at once.  Returns whether the blob went up: false when
    stopped () held before a try, which it then doesn't make. *)
 val spec_upload_outage = Time.fromSeconds 180
 
@@ -9179,7 +9180,10 @@ fun publish_spec_blob remote stopped {hash, path} =
            HolbuildCacheBackend.Published => true
          | HolbuildCacheBackend.AlreadyPresent => true
          | HolbuildCacheBackend.Conflict message =>
-             if HolbuildRemoteCache.tripped () then retry message else fail message
+             if HolbuildRemoteCache.tripped () orelse
+                HolbuildRemoteCache.transient_put_failure message
+             then retry message
+             else fail message
          | HolbuildCacheBackend.Skipped => retry "skipped")
   in
     publish ()
