@@ -10211,7 +10211,7 @@ datatype action_failure =
     ProofFailure
   | TacticTimeoutFailure
   | MemoryFailure
-  | InputMissing of string  (* "theory <input_key>" or "blob <sha256>" *)
+  | InputMissing of string list  (* "theory <input_key>" or "blob <sha256>", each missing; one at least *)
   | PublishFailure
   | ToolchainFailure
   | DiskFailure
@@ -10657,7 +10657,7 @@ fun fetch_spec_blob remote {hash, dst} =
             (case HolbuildCache.publish_blob cache {hash = hash, src = dst} of
                  HolbuildCacheBackend.Conflict msg => warn ("could not keep blob " ^ hash ^ ": " ^ msg)
                | _ => ())
-        | HolbuildCacheBackend.Miss => raise ActionFailed (InputMissing ("blob " ^ hash), "blob " ^ hash ^ " is not in the cache")
+        | HolbuildCacheBackend.Miss => raise ActionFailed (InputMissing ["blob " ^ hash], "blob " ^ hash ^ " is not in the cache")
         | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch blob " ^ hash ^ ": " ^ msg)
   in
     ensure_parent dst;
@@ -10940,9 +10940,24 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | e as ActionFailed (DiskFailure, _) => raise e
            | e as ActionFailed (InternalFailure, _) => raise e
-           | e => raise action_failed (InputMissing ("theory " ^ key))
+           | e => raise action_failed (InputMissing ["theory " ^ key])
                           ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                            General.exnMessage e)
+    (* Every dependency is tried, so a failure names each one missing, not
+       just the first: the batch is then resubmitted once for all of them. *)
+    fun restorable_all f deps =
+      let
+        val missing = Array.array (length deps, NONE)
+        fun restore (i, dep) =
+          restorable f dep handle ActionFailed (InputMissing items, msg) => Array.update (missing, i, SOME (items, msg))
+      in
+        transfer_all restore (ListPair.zip (List.tabulate (length deps, fn i => i), deps));
+        case List.mapPartial (fn x => x) (Array.foldr op:: [] missing) of
+            [] => ()
+          | found as (_, msg) :: rest =>
+              raise ActionFailed (InputMissing (List.concat (map #1 found)),
+                                  if null rest then msg else msg ^ " (and " ^ Int.toString (length rest) ^ " more)")
+      end
     (* Removing a dependency's old copy removes the directories it leaves
        empty, which may be the directory another install has just made; so
        the old copies all go before the installs run in parallel. *)
@@ -10958,16 +10973,16 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
         hydrate_count "hydinstn" (length stale);
         hydrate_step "hydinst" (fn () =>
           (List.app (restorable remove_old) stale;
-           transfer_all (restorable install) stale))
+           restorable_all install stale))
       end
-    (* Each dependency's .dat against its parents', from the records. *)
-    fun misfit () =
+    (* The dependencies whose .dat doesn't fit their parents', from the records. *)
+    fun misfits () =
       hydrate_step "hydmisfit" (fn () =>
         let
           val by_name = deps_by_parent_name spec
           fun dat_hash stem = Option.map #dat_hash (Resident.theory resident (in_root root stem))
         in
-          List.find
+          List.filter
             (fn {stem, ...} =>
                 not (parent_hashes_match by_name dat_hash
                        (case Resident.theory resident (in_root root stem) of
@@ -11018,15 +11033,16 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
        List.app write_lib (#libs spec)));
     restore_deps ();
     ignore (refresh direct);
-    case misfit () of
-        NONE => ()
-      | SOME first =>
+    case misfits () of
+        [] => ()
+      | first =>
           (* The files change only if the refresh drops a copy. *)
-          case (if refresh (fn _ => true) then misfit () else SOME first) of
-              NONE => ()
-            | SOME {target, key, ...} =>
-                raise ActionFailed (InputMissing ("theory " ^ key),
-                                    "dependency " ^ target ^ " does not match its parents in the cache");
+          case (if refresh (fn _ => true) then misfits () else first) of
+              [] => ()
+            | found as {target, ...} :: rest =>
+                raise ActionFailed (InputMissing (map (fn {key, ...} => "theory " ^ key) found),
+                                    "dependency " ^ target ^ " does not match its parents in the cache" ^
+                                    (if null rest then "" else " (and " ^ Int.toString (length rest) ^ " more)"));
     Resident.save resident;
     (* A stale or missing record only means a manifest is hashed again. *)
     hydrate_step "hydcheck" (fn () => HolbuildStatCache.flush seen handle _ => ())
@@ -11985,7 +12001,11 @@ fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak
                | _ => [])
         | SOME (kind, msg) =>
             ("failure=" ^ failure_name kind) ::
-            (case kind of InputMissing missing => ["missing=" ^ missing] | _ => []) @
+            (* The first for coordinators that know one only. *)
+            (case kind of
+                 InputMissing (missing :: more) =>
+                   ("missing=" ^ missing) :: (if null more then [] else ["missing-more=" ^ String.concatWith "," more])
+               | _ => []) @
             (case log of NONE => ["detail=" ^ result_detail msg] | SOME _ => [])) @
      (case peak of SOME mb => ["peak-rss-mb=" ^ Int.toString mb] | NONE => []) @
      ["wall-ms=" ^ LargeInt.toString wall_ms] @
@@ -14834,7 +14854,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               handle e as HolbuildRemoteCache.Unavailable _ => raise e
                    | e as ActionFailed (DiskFailure, _) => raise e
                    | e as ActionFailed (InternalFailure, _) => raise e
-                   | e => raise action_failed (InputMissing ("theory " ^ key))
+                   | e => raise action_failed (InputMissing ["theory " ^ key])
                                   ("dependency " ^ target ^ " (" ^ key ^ ") is not restorable from the cache: " ^
                                    General.exnMessage e)
             val recorded = parse_dat_parent_hashes (read_dat_header (staged ^ ".dat"))

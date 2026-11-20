@@ -582,6 +582,12 @@ STATEMENTS = [
         10_000,
     ),
     Statement(
+        "SELECT input_key FROM actions WHERE batch_id = :batch_id "
+        "AND state IN ('waiting', 'ready', 'running') AND input_key = ANY(:keys)",
+        lambda f: {"batch_id": f.fresh, "keys": f.arrival.keys("waiting")[:50]},
+        13_000,
+    ),
+    Statement(
         "SELECT input_key, parent_key FROM edges WHERE batch_id = :batch_id", lambda f: {"batch_id": f.fresh}, 180_000
     ),
     Statement(

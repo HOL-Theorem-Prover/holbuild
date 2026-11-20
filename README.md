@@ -1984,6 +1984,7 @@ input-key=<input_key>
 status=built|cached|failed
 failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal|unavailable
 missing=theory <input_key> | blob <sha256>
+missing-more=theory <input_key>,...
 detail=<message>
 peak-rss-mb=<n>
 wall-ms=<n>
@@ -1991,7 +1992,9 @@ phase-ms=<phase>:<n>,...
 log=<sha256> <size>
 ```
 
-`failure` appears on failure, and `missing` with `input-missing`. A failure
+`failure` appears on failure, and `missing` with `input-missing`: the first
+input found missing, and in `missing-more` any others, since the worker tries
+every dependency before it fails. A failure
 with no `log` (a spec rejected before any HOL ran, say) gives its message in
 `detail`, on one line of printable ASCII of at most 500 characters.
 For a run, `input-key` is its run key and `built` means it ran.
@@ -2245,14 +2248,16 @@ batch, or the batch fails other than by a failed proof (below), it warns and
 builds locally. A theory the remote cache holds may not fit the parents it
 holds, as when a nondeterministic theory was built twice; the workers can't
 use it, and the coordinator fails the batch for resubmission naming it
-(`resubmit: ... theory <input_key>`). Such a batch is resubmitted
-with that theory and every theory that depends on it, for the workers to
+(`resubmit: ... theory <input_key>`), and any other input that action or the
+batch's other unfinished actions found missing
+(`; also missing theory <input_key>, ...`). Such a batch is resubmitted
+with those theories and every theory that depends on them, for the workers to
 rebuild or recheck against the cached parents. The remote cache may also have
 lost a theory or source the remote ledger says it holds: on a resubmission
 for either, the build forgets the ledger, and a batch missing a blob
 (`resubmit: ... blob <sha256>`) is resubmitted too, uploading its blobs again.
-A build resubmits again for each theory a worker finds missing that no earlier
-resubmission was for, and for the first missing blob, up to 5 times. A submission
+A build resubmits again while a failed batch names a theory missing that no earlier
+resubmission was for, or the first missing blob, up to 5 times. A submission
 answered 5xx, as a proxy in front of the coordinator answers while it
 restarts or the coordinator itself answers while it's overloaded, or 429,
 is retried, and an event stream that breaks is reattached; either is given up on once the coordinator stays unavailable for

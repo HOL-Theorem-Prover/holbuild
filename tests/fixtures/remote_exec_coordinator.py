@@ -34,8 +34,8 @@ holding a failure kind, after an earlier attempt failed with it (`deadline-retri
 by the batch deadline on a second attempt).  STATE/<id>.events, when it exists, is batch
 <id>'s recorded event stream: it is sent as it is, without running RUN.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
-"theory <input key>" or "blob <sha256>", the batch fails for resubmission naming it,
-as the coordinator does.  Otherwise
+"theory <input key>" or "blob <sha256>", and on a second line the others it found missing,
+comma-separated, the batch fails for resubmission naming them, as the coordinator does.  Otherwise
 the cancel answers that it cancelled the batch.  Every request is logged to
 STATE/requests.log, and each POST /v1/batches's Holbuild-Batch-Id header to
 STATE/submitted-ids.
@@ -251,10 +251,11 @@ class Handler(BaseHTTPRequestHandler):
             else "an action failed"
         missing = state / "missing"
         if not ok and missing.exists():
-            what = missing.read_text().strip()
+            what, *more = missing.read_text().splitlines() or [""]
             missing.unlink()
+            also = f"; also missing {', '.join(more[0].split(','))}" if more and more[0] else ""
             if what:
-                failure = f"resubmit: an action is still missing {what} after 3 attempts"
+                failure = f"resubmit: an action is still missing {what} after 3 attempts{also}"
         cancel_after = (state / "cancel-after-actions").exists() or (state / "stopped").exists()
         final = {"type": "batch", "state": "cancelled" if cancel_after else final_state,
                  "failure": failure}

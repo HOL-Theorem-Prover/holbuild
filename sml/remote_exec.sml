@@ -184,34 +184,48 @@ fun submit_with_query wait_unreachable url query maxheap batch_text : attempt =
 fun submit wait_unreachable url maxheap batch_text =
   submit_with_query wait_unreachable url "" maxheap batch_text
 
-(* The input key of the theory a failed batch's workers could not use, when
-   the coordinator failed it for resubmission naming the theory as
+(* The input keys of the theories a failed batch's workers could not use,
+   when the coordinator failed it for resubmission naming each as
    "theory <input_key>". *)
-fun resubmit_theory_key reason =
+fun resubmit_theory_keys reason =
   case HolbuildStatus.find_substring "resubmit: " reason of
-      NONE => NONE
+      NONE => []
     | SOME start =>
         let
           fun scan text =
             case HolbuildStatus.find_substring "theory " text of
-                NONE => NONE
+                NONE => []
               | SOME i =>
                   let
                     val rest = String.extract (text, i + size "theory ", NONE)
                     val key = Substring.string (Substring.takel Char.isHexDigit (Substring.full rest))
+                    val keys = scan rest
                   in
-                    if HolbuildHash.valid_hex 64 key then SOME key else scan rest
+                    if HolbuildHash.valid_hex 64 key then key :: List.filter (fn k => k <> key) keys else keys
                   end
         in
           scan (String.extract (reason, start, NONE))
         end
 
-(* Whether the coordinator failed the batch for resubmission because a
-   worker found a blob missing ("missing blob <sha256>"). *)
+(* Whether the coordinator failed the batch for resubmission naming a blob a
+   worker found missing ("blob <sha256>"), first or among the others. *)
 fun resubmit_missing_blob reason =
   case HolbuildStatus.find_substring "resubmit: " reason of
       NONE => false
-    | SOME start => Option.isSome (HolbuildStatus.find_substring "missing blob " (String.extract (reason, start, NONE)))
+    | SOME start =>
+        let
+          fun scan text =
+            case HolbuildStatus.find_substring "blob " text of
+                NONE => false
+              | SOME i =>
+                  let val rest = String.extract (text, i + size "blob ", NONE)
+                  in
+                    HolbuildHash.valid_hex 64 (Substring.string (Substring.takel Char.isHexDigit (Substring.full rest)))
+                    orelse scan rest
+                  end
+        in
+          scan (String.extract (reason, start, NONE))
+        end
 
 fun report_action line =
   let
