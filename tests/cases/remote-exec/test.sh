@@ -1912,8 +1912,8 @@ require_grep "still missing theory [0-9a-f]\{64\} after 3 attempts; also missing
 require_grep "remote execution: remote workers finished 3 of 3 theories" "$tmpdir/two.log"
 require_grep "PTheory restored from cache" "$tmpdir/two.log"
 
-# A worker that can't restore two dependencies the client took the remote
-# cache to hold (its ledger says so, but both expired) names both, and one
+# A worker that can't restore two dependencies the client found in the remote
+# cache (both expire once the batch is submitted) names both, and one
 # resubmission rebuilds them.
 three=$tmpdir/three-first
 mkdir -p "$three/src"
@@ -1933,21 +1933,18 @@ done
 mkdir -p "$tmpdir/three-client"
 cp -r "$three/src" "$three/holproject.toml" "$tmpdir/three-client/"
 for name in three-first three-client; do link_hol_toolchain_cache "$tmpdir/$name-cache"; done
-roots=$(in_copy three-first --remote-cache "$remote_url" action-spec PTheory |
-  awk '$1 == "action" && ($5 == "rxn3:NTheory" || $5 == "rxn3:OTheory") { print $2, $3 }')
-[[ $(wc -l <<< "$roots") -eq 2 ]] || { echo "no actions for NTheory and OTheory" >&2; exit 1; }
+roots_ac=$(in_copy three-first --remote-cache "$remote_url" action-spec PTheory |
+  awk '$1 == "action" && ($5 == "rxn3:NTheory" || $5 == "rxn3:OTheory") { print $3 }')
+[[ $(wc -w <<< "$roots_ac") -eq 2 ]] || { echo "no actions for NTheory and OTheory" >&2; exit 1; }
 in_copy three-first --remote-cache "$remote_url" build NTheory OTheory > "$tmpdir/three-first.log" 2>&1 ||
   { cat "$tmpdir/three-first.log" >&2; exit 1; }
-mkdir -p "$tmpdir/three-client-cache/remote-ledger"
 {
-  echo "#started $(date +%s)"
-  while read -r key ac; do
-    rm "$remote_root/ac/$ac"
-    echo "theory $key"
-  done <<< "$roots" | LC_ALL=C sort
-} > "$tmpdir/three-client-cache/remote-ledger/$(basename "$ledger_file")"
+  for ac in $roots_ac; do echo "rm -f '$remote_root/ac/$ac'"; done
+  echo "rm '$state/on-submit'"
+} > "$state/on-submit"
 in_copy three-client --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only PTheory \
   > "$tmpdir/three.log" 2>&1 || { cat "$tmpdir/three.log" "$tmpdir/worker.log" >&2; exit 1; }
+require_no_file "$state/on-submit"
 require_grep "still missing theory [0-9a-f]\{64\} after 3 attempts; also missing theory [0-9a-f]\{64\}; .*; resubmitting with 3 theories rebuilt or rechecked" "$tmpdir/three.log"
 [[ $(grep -c "resubmitting" "$tmpdir/three.log") -eq 1 ]] || { cat "$tmpdir/three.log" >&2; exit 1; }
 require_grep "PTheory restored from cache" "$tmpdir/three.log"
