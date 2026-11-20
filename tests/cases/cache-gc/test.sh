@@ -76,6 +76,7 @@ kill "$holder"; wait "$holder" 2>/dev/null || true
 holder=
 require_file "$cache/action-locks/ab/ab-held.lock"
 require_file "$tmpdir/outside/outside.lock"
+[[ -L "$cache/action-locks/ab/ab-link.lock" ]] || { echo "symlinked action lock was removed" >&2; exit 1; }
 require_file "$cache/action-locks/ab/ab-fresh.lock"
 [[ ! -e "$cache/action-locks/ab/ab-stale.lock" ]] || { echo "stale unheld action lock survived" >&2; exit 1; }
 [[ -f "$cache/locks/gc.lock" ]] || { echo "cache gc lock file missing" >&2; exit 1; }
