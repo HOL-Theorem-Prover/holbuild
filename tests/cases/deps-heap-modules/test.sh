@@ -16,7 +16,12 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 server_pids=()
+worker_pid=
 cleanup() {
+  if [[ -n "$worker_pid" ]]; then
+    touch "$tmpdir/control/action-get-release"
+    wait "$worker_pid" 2>/dev/null || true
+  fi
   for pid in ${server_pids[@]+"${server_pids[@]}"}; do
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -216,13 +221,15 @@ same_outputs
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 server_pids+=("$server_pid")
 worker=$tmpdir/worker
-# exec_theory THEORY NAME [unshared]: exec-action of THEORY's current spec
+# exec_theory THEORY NAME [unshared] [tool cache name]: exec-action of THEORY's current spec
 # on W, sharing heaps unless told otherwise, after A's on another worker if
 # A has one.
 exec_theory() {
-  local theory=$1 name=$2 batch=$tmpdir/$2.batch spec dep cache share=(--share-heaps)
+  local theory=$1 name=$2 batch=$tmpdir/$2.batch spec dep cache share=(--share-heaps) options=()
   [[ ${3:-} != unshared ]] || share=()
-  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload "${theory}Theory") > "$batch"
+  [[ -z ${4:-} ]] || options=(--tool-cache "$4")
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload \
+    ${options[@]+"${options[@]}"} "${theory}Theory") > "$batch"
   for dep in A "$theory"; do
     spec=$(awk -v want="deps-modules:${dep}Theory" '$1 == "action" && $5 == want { print $4 }' "$batch")
     # A cached theory has no action.
@@ -346,6 +353,7 @@ cmp "$tmpdir/A.pmo" "$modules"
 # A module for a different theory at A's path is recovered the same way.
 z_module=$(find "$worker_modules" -name '*-Z-*.pmo' | head -n 1)
 [[ -n "$z_module" ]] || { echo "W has no module for Z" >&2; exit 1; }
+cp "$z_module" "$tmpdir/Z.pmo"
 cp "$z_module" "$modules"
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 edit_c changed
@@ -361,6 +369,37 @@ edit_c healed
 exec_theory C c-healed
 require_grep 'restored shared' "$tmpdir/c-healed-C.log"
 resumed c-healed-C 'theorem-context checkpoint after c_first'
+
+# Tool cache lookup happens after checkpoint restore and before HOL starts.
+# Pause there to replace the module after its digest was checked. HOL must
+# still reject the restored checkpoint and rebuild successfully.
+spec_c=$(awk '$1 == "action" && $5 == "deps-modules:CTheory" { print $4 }' "$tmpdir/c.batch")
+spec_file=$project/.holbuild/action-specs/$spec_c
+tool_key=$(printf 'holbuild-tool-cache-v1\nname=post-restore\ndeps_key=%s\ntoolchain=%s' \
+  "$(sed -n 's/^deps-key=//p' "$spec_file")" "$(sed -n 's/^toolchain=//p' "$spec_file")" | sha256sum | cut -d' ' -f1)
+control=$tmpdir/control
+printf 'holbuild-remote-ac-v1\n%s\n' "$tool_key" | sha256sum | cut -d' ' -f1 > "$control/action-get-key"
+touch "$control/action-get-enable"
+edit_c post-restore
+exec_theory C post-restore shared post-restore &
+worker_pid=$!
+for _ in {1..3000}; do
+  [[ -s "$control/action-get-count" ]] && break
+  kill -0 "$worker_pid" 2>/dev/null || break
+  sleep 0.01
+done
+[[ -s "$control/action-get-count" ]] || { echo 'C did not reach the tool cache lookup' >&2; exit 1; }
+cp "$tmpdir/Z.pmo" "$tmpdir/replacement.pmo"
+mv "$tmpdir/replacement.pmo" "$modules"
+touch "$control/action-get-release"
+wait "$worker_pid"
+worker_pid=
+rm "$control/action-get-enable" "$control/action-get-key" "$control/action-get-release"
+require_grep 'restored shared theorem_context checkpoint' "$tmpdir/post-restore-C.log"
+require_grep 'Required module missing or changed' "$tmpdir/post-restore-C.log"
+phase post-restore-C 'rstmodrejn:1'
+phase post-restore-C 'rstdropn:1'
+require_grep '^status=built$' "$tmpdir/post-restore-C.result"
 
 # A proof-only change to A (here, a source line moved) changes ATheory.dat
 # but not B's dependencies' key, so B's shared heap still loads A's old
