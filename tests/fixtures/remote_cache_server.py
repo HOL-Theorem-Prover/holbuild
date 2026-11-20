@@ -76,6 +76,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if not (control / "action-get-enable").exists():
             return
+        key = control / "action-get-key"
+        if key.exists() and self.path != f"/ac/{key.read_text().strip()}":
+            return
         with action_put_lock:
             count_file = control / "action-get-count"
             count = int(count_file.read_text()) if count_file.exists() else 0

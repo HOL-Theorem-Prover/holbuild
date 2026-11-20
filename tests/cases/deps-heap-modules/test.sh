@@ -16,7 +16,12 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 server_pids=()
+worker_pid=
 cleanup() {
+  if [[ -n "$worker_pid" ]]; then
+    touch "$tmpdir/control/action-get-release"
+    wait "$worker_pid" 2>/dev/null || true
+  fi
   for pid in ${server_pids[@]+"${server_pids[@]}"}; do
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
@@ -216,13 +221,15 @@ same_outputs
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 server_pids+=("$server_pid")
 worker=$tmpdir/worker
-# exec_theory THEORY NAME [unshared]: exec-action of THEORY's current spec
+# exec_theory THEORY NAME [unshared] [tool cache name]: exec-action of THEORY's current spec
 # on W, sharing heaps unless told otherwise, after A's on another worker if
 # A has one.
 exec_theory() {
-  local theory=$1 name=$2 batch=$tmpdir/$2.batch spec dep cache share=(--share-heaps)
+  local theory=$1 name=$2 batch=$tmpdir/$2.batch spec dep cache share=(--share-heaps) options=()
   [[ ${3:-} != unshared ]] || share=()
-  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload "${theory}Theory") > "$batch"
+  [[ -z ${4:-} ]] || options=(--tool-cache "$4")
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload \
+    ${options[@]+"${options[@]}"} "${theory}Theory") > "$batch"
   for dep in A "$theory"; do
     spec=$(awk -v want="deps-modules:${dep}Theory" '$1 == "action" && $5 == want { print $4 }' "$batch")
     # A cached theory has no action.
@@ -247,7 +254,7 @@ resumed() {
   phase "$1" 'res(deps|ctx)n:1'
   grep -qE "from: ${2:-(deps-loaded|theorem-context) checkpoint}" "$tmpdir/$1.log" ||
     { echo "$1 didn't resume:" >&2; cat "$tmpdir/$1.log" >&2; exit 1; }
-  if grep -qE '^phase-ms=(.*,)?rstdropn:' "$tmpdir/$1.result" ||
+  if grep -qE '^phase-ms=(.*,)?(rstdropn|rstmodrejn):' "$tmpdir/$1.result" ||
      grep -q 'discarding invalid checkpoint' "$tmpdir/$1.log"; then
     echo "$1 dropped a checkpoint:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1
   fi
@@ -260,10 +267,25 @@ published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 modules=$(for heap in $published; do heap_modules "$heap"; done | { grep -- '-A-' || true; } | sort -u)
 [[ -n "$modules" ]] || { echo "no published heap loads A's module" >&2; exit 1; }
 
-# W loses its stores: the restore fetches A's module, then the heap.
+# W loses its stores. The first cache node for A's module returns 404.
+# Restore must fetch the recorded module from the other cache node.
+module_sha=$(sha256sum "$modules" | cut -d' ' -f1)
+primary_url=$remote_url
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/mirror" "$tmpdir/mirror-control"
+server_pids+=("$server_pid")
+mirror_url=$remote_url
+rank() { printf '%s:%s' "$1" "$module_sha" | sha256sum | cut -d' ' -f1; }
+miss_control=$tmpdir/control
+if [[ $(rank "$mirror_url") > $(rank "$primary_url") ]]; then
+  miss_control=$tmpdir/mirror-control
+fi
+echo 404 > "$miss_control/cas-get-status-$module_sha"
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_b four
+remote_url=$primary_url,$mirror_url
 exec_theory B fetch
+remote_url=$primary_url
+rm "$miss_control/cas-get-status-$module_sha"
 phase fetch-B 'rstmodn:1'
 require_grep 'restored shared' "$tmpdir/fetch-B.log"
 resumed fetch-B
@@ -272,13 +294,12 @@ cp "$modules" "$tmpdir/A.pmo"
 
 # The remote cache loses A's module too: W gives the heap up, and B
 # preloads afresh.
-module_sha=$(sha256sum "$modules" | cut -d' ' -f1)
 echo 404 > "$tmpdir/control/cas-get-status-$module_sha"
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_b five
 exec_theory B dropped
 phase dropped-B 'rstmoddropn:1'
-require_grep "the shared deps-loaded heap needs a theory module this host lacks: .*-A-.*\.pmo" "$tmpdir/dropped-B.log"
+require_grep "the shared deps-loaded heap needs a missing or unverifiable theory module: .*-A-.*\.pmo" "$tmpdir/dropped-B.log"
 grep -qx 'status=built' "$tmpdir/dropped-B.result"
 if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/dropped-B.result"; then
   echo 'checkpoints on the heap given up were tried' >&2; cat "$tmpdir/dropped-B.result" >&2; exit 1
@@ -294,9 +315,41 @@ phase healed-B 'rstmodn:1'
 require_grep 'restored shared' "$tmpdir/healed-B.log"
 resumed healed-B 'theorem-context checkpoint after b_first'
 
-# A module at its path with another id (another theory's module): W's
-# HOL child fails to load the heap and preloads afresh.  C, on A and Z, has
-# a heap of its own, which loads A's module.
+# A heap needs its own manifest to identify A's module even if the file is
+# already present. Reject missing or conflicting entries without changing it.
+heap_entry=$(grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote/ac/*)
+cp "$heap_entry" "$tmpdir/B-heap.entry"
+manifest=$(sed '1,/^manifest-text-v1$/d' "$tmpdir/B-heap.entry")$'\n'
+set_heap_manifest() {
+  local text=$1
+  {
+    printf 'holbuild-remote-cache-action-v2\nmanifest-sha256 %s\nmanifest-size %s\n' \
+      "$(printf '%s' "$text" | sha256sum | cut -d' ' -f1)" "${#text}"
+    awk -v omit="${2:-}" '$1 == "blob" && $2 != omit' "$tmpdir/B-heap.entry"
+    printf 'manifest-text-v1\n%s' "$text"
+  } > "$heap_entry"
+}
+unlisted=$(printf '%s' "$manifest" | sed '/ module /d')$'\n'
+set_heap_manifest "$unlisted" "$module_sha"
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_b unlisted
+exec_theory B unlisted
+phase unlisted-B 'rstmoddropn:1'
+require_grep '^status=built$' "$tmpdir/unlisted-B.result"
+cmp "$tmpdir/A.pmo" "$modules"
+
+heap_sha=$(printf '%s' "$manifest" | sed -n 's/^blob=\([0-9a-f]*\) heap$/\1/p')
+set_heap_manifest "$manifest""blob=$heap_sha module ${modules##*/}"$'\n'
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_b conflicting
+exec_theory B conflicting
+require_grep 'conflicting theory module digests' "$tmpdir/conflicting-B.log"
+require_grep '^status=built$' "$tmpdir/conflicting-B.result"
+cmp "$tmpdir/A.pmo" "$modules"
+mv "$tmpdir/B-heap.entry" "$heap_entry"
+
+# C's heap loads A's module. A module for the same .dat file with a
+# different Poly/ML ID must be replaced before C can resume.
 edit_c() { sed -i "s/^  .*(\* c_thm.*\$/  rw[a_value_def] (* c_thm $1 *)/" "$project/src/CScript.sml"; }
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 mkdir -p "$(dirname "$modules")"
@@ -305,17 +358,57 @@ exec_theory C c
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 for heap in $published; do heap_modules "$heap"; done | grep -q -- '-A-' ||
   { echo "C's published heap doesn't load A's module" >&2; exit 1; }
+# Export the same theory's theorem values with different sharing in the
+# module. Keep the decoded ATheory.dat and the normal module filename.
+cat > "$tmpdir/alternate-module.sml" <<'SML'
+val _ = PolyML.use (valOf (OS.Process.getEnv "MODULE_HELPER"));
+val _ = let
+  open TheoryModules
+  fun env name = valOf (OS.Process.getEnv name)
+  val stem = env "A_STEM"
+  val path = stem ^ ".dat"
+  val (thy, hash) = valOf (sml_header (stem ^ ".sml"))
+  val (data, _) = TheoryReader.decode_thydata {thyname = thy, path = path, hash = hash}
+  val digest = file_digest path
+  val signature_root :: values_root :: rest =
+    valOf (module_roots "ATheory" digest data (core_bindings ()))
+  val (name, values) = Universal.tagProject TheoryReader.values_tag values_root
+  fun copy th = Thm.EQ_MP (Thm.REFL (Thm.concl th)) th
+  val alternate = Universal.tagInject TheoryReader.values_tag (name, Vector.map copy values)
+  val roots = signature_root :: alternate :: rest
+  val base_id = valOf (base_id_of (env "BASE_STATE"))
+  val id = #1 (Save.getModuleInfo (env "MODULE"))
+  val _ = save_module (env "MODULE") base_id roots
+in
+  if #1 (Save.getModuleInfo (env "MODULE")) = id
+  then raise Fail "A's modules have the same Poly/ML ID"
+  else ()
+end;
+SML
+BASE_STATE=$HOLDIR/bin/hol.state
+A_STEM=$project/.holbuild/obj/src/ATheory BASE_STATE=$BASE_STATE MODULE=$modules \
+  MODULE_HELPER=$HOLDIR/tools-poly/poly/theory_modules.ML \
+  "$HOLDIR/bin/hol" run --noconfig --holstate "$BASE_STATE" "$tmpdir/alternate-module.sml"
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_c same-theory
+exec_theory C same-theory
+require_grep 'restored shared' "$tmpdir/same-theory-C.log"
+phase same-theory-C 'rstmodn:1'
+resumed same-theory-C 'theorem-context checkpoint after c_first'
+cmp "$tmpdir/A.pmo" "$modules"
+
+# A module for a different theory at A's path is recovered the same way.
 z_module=$(find "$worker_modules" -name '*-Z-*.pmo' | head -n 1)
 [[ -n "$z_module" ]] || { echo "W has no module for Z" >&2; exit 1; }
+cp "$z_module" "$tmpdir/Z.pmo"
 cp "$z_module" "$modules"
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 edit_c changed
 exec_theory C changed
 require_grep 'restored shared' "$tmpdir/changed-C.log"
-require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/changed-C.log"
-phase changed-C 'rstdropn:1'
-phase changed-C 'rstmodrejn:1'
-require_grep 'Required module missing or changed' "$tmpdir/changed-C.log"
+phase changed-C 'rstmodn:1'
+resumed changed-C 'theorem-context checkpoint after c_first'
+cmp "$tmpdir/A.pmo" "$modules"
 # The shared heap and its checkpoints stay: with A's module back, W
 # resumes from them.
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
@@ -323,6 +416,37 @@ edit_c healed
 exec_theory C c-healed
 require_grep 'restored shared' "$tmpdir/c-healed-C.log"
 resumed c-healed-C 'theorem-context checkpoint after c_first'
+
+# Tool cache lookup happens after checkpoint restore and before HOL starts.
+# Pause there to replace the module after its digest was checked. HOL must
+# still reject the restored checkpoint and rebuild successfully.
+spec_c=$(awk '$1 == "action" && $5 == "deps-modules:CTheory" { print $4 }' "$tmpdir/c.batch")
+spec_file=$project/.holbuild/action-specs/$spec_c
+tool_key=$(printf 'holbuild-tool-cache-v1\nname=post-restore\ndeps_key=%s\ntoolchain=%s' \
+  "$(sed -n 's/^deps-key=//p' "$spec_file")" "$(sed -n 's/^toolchain=//p' "$spec_file")" | sha256sum | cut -d' ' -f1)
+control=$tmpdir/control
+printf 'holbuild-remote-ac-v1\n%s\n' "$tool_key" | sha256sum | cut -d' ' -f1 > "$control/action-get-key"
+touch "$control/action-get-enable"
+edit_c post-restore
+exec_theory C post-restore shared post-restore &
+worker_pid=$!
+for _ in {1..3000}; do
+  [[ -s "$control/action-get-count" ]] && break
+  kill -0 "$worker_pid" 2>/dev/null || break
+  sleep 0.01
+done
+[[ -s "$control/action-get-count" ]] || { echo 'C did not reach the tool cache lookup' >&2; exit 1; }
+cp "$tmpdir/Z.pmo" "$tmpdir/replacement.pmo"
+mv "$tmpdir/replacement.pmo" "$modules"
+touch "$control/action-get-release"
+wait "$worker_pid"
+worker_pid=
+rm "$control/action-get-enable" "$control/action-get-key" "$control/action-get-release"
+require_grep 'restored shared theorem_context checkpoint' "$tmpdir/post-restore-C.log"
+require_grep 'Required module missing or changed' "$tmpdir/post-restore-C.log"
+phase post-restore-C 'rstmodrejn:1'
+phase post-restore-C 'rstdropn:1'
+require_grep '^status=built$' "$tmpdir/post-restore-C.result"
 
 # A proof-only change to A (here, a source line moved) changes ATheory.dat
 # but not B's dependencies' key, so B's shared heap still loads A's old
