@@ -98,24 +98,30 @@ with lock_path.open("a+") as lock, (tmp / "parent-hash-parser-test.sml").open() 
                 child.kill()
                 raise SystemExit("invalidation caller did not start")
             time.sleep(0.01)
+        # The child waits on our lock, so a failure here must kill it, or
+        # Popen's exit would wait for it forever.
         try:
-            child.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            pass
-        # Unlink only once the waiter holds the file open, or it would simply
-        # create a new one and the retry would go untested.
-        deadline = time.monotonic() + 60
-        while not any(os.path.realpath(f"/proc/{child.pid}/fd/{fd}") == str(lock_path.resolve())
-                      for fd in os.listdir(f"/proc/{child.pid}/fd")):
-            if child.poll() is not None or time.monotonic() >= deadline:
-                raise SystemExit("invalidation caller never opened the lock file")
-            time.sleep(0.01)
-        lock_path.unlink()
-        fcntl.lockf(lock, fcntl.LOCK_UN)
-        if child.wait(timeout=60) != 0:
-            raise SystemExit("parent-hash parser/invalidation test failed")
-        if not lock_path.exists():
-            raise SystemExit("a waiter kept the lock of an unlinked file")
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            # Unlink only once the waiter holds the file open, or it would simply
+            # create a new one and the retry would go untested.
+            deadline = time.monotonic() + 60
+            while not any(os.path.realpath(f"/proc/{child.pid}/fd/{fd}") == str(lock_path.resolve())
+                          for fd in os.listdir(f"/proc/{child.pid}/fd")):
+                if child.poll() is not None or time.monotonic() >= deadline:
+                    raise SystemExit("invalidation caller never opened the lock file")
+                time.sleep(0.01)
+            lock_path.unlink()
+            fcntl.lockf(lock, fcntl.LOCK_UN)
+            if child.wait(timeout=60) != 0:
+                raise SystemExit("parent-hash parser/invalidation test failed")
+            if not lock_path.exists():
+                raise SystemExit("a waiter kept the lock of an unlinked file")
+        except BaseException:
+            child.kill()
+            raise
 PYTEST
 grep -q "parent-hash parser unit tests passed" "$tmpdir/parent-hash-parser-test.log"
 
