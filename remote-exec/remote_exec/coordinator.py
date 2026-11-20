@@ -3563,7 +3563,7 @@ class Coordinator:
             what = f"{missing.kind} {missing.key}" if missing else "an input"
             if rebuilt is not None:
                 what = f"{rebuilt} ({what})"
-            # A holbuild before 0.14.88 reads the first theory named, or else a blob: after a missing blob, or no
+            # A holbuild before 0.14.89 reads the first theory named, or else a blob: after a missing blob, or no
             # missing input named, it is named alone.
             also = (
                 self._also_missing(batch_id, f"theory {missing.key}", more)

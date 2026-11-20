@@ -67,7 +67,7 @@ class Result:
     detail: str | None = None  # why a failure with no log failed, as sanitize_detail leaves it
     # The spec's deps-key, which the worker adds: the dependency context whose shared heap the action loaded.
     deps_key: str | None = None
-    missing_more: tuple[Missing, ...] = ()  # the other inputs missing, which holbuild before 0.14.88 doesn't report
+    missing_more: tuple[Missing, ...] = ()  # the other inputs missing, which holbuild before 0.14.89 doesn't report
 
 
 def sanitize_detail(text: str) -> str:
