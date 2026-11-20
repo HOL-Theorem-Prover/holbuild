@@ -2569,6 +2569,61 @@ async def test_a_batch_failed_for_resubmission_also_names_what_its_unfinished_ac
     )
 
 
+async def take_claim(http: httpx.AsyncClient, held: dict[str, str], name: str) -> str:
+    """The token of a claim of ``name``: one in ``held``, the tokens claimed and not completed yet by name, or a new
+    one, adding any other action claimed before it to ``held``."""
+    while name not in held:
+        claimed = await claim(http)
+        assert claimed is not None
+        held[claimed["theory"].removeprefix("pkg:")] = claimed["attempt_token"]
+    return held.pop(name)
+
+
+async def test_a_batch_failed_for_resubmission_names_what_an_action_waiting_on_a_rebuild_found_missing(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    batch_id = await submit(http, ["a", "c", "d"], [("c", "a")])
+    held: dict[str, str] = {}
+    token = await take_claim(http, held, "a")
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built", peak_rss_mb="100"))).status_code == 200
+    # c finds a, which the batch rebuilds, and y, which it doesn't, missing; it waits for a.
+    token = await take_claim(http, held, "c")
+    record = result(
+        "c", "failed", "input-missing", missing=f"theory {input_key('a')}", missing_more=f"theory {input_key('y')}"
+    )
+    assert (await complete(http, token, record)).status_code == 200
+    assert (await states(http, batch_id))["c"] == "waiting"
+    for _ in range(3):
+        token = await take_claim(http, held, "d")
+        record = result("d", "failed", "input-missing", missing=f"theory {input_key('z')}")
+        assert (await complete(http, token, record)).status_code == 200
+    status = await batch(http, batch_id)
+    assert status["state"] == "failed"
+    assert status["failure"] == (
+        f"resubmit: pkg:d is still missing theory {input_key('z')} after 3 attempts; "
+        f"also missing theory {input_key('y')}"
+    )
+
+
+async def test_a_batch_failed_for_a_missing_blob_names_it_alone(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a", "b"])
+    held: dict[str, str] = {}
+    token = await take_claim(http, held, "b")
+    record = result("b", "failed", "input-missing", missing=f"theory {input_key('x')}")
+    assert (await complete(http, token, record)).status_code == 200
+    for _ in range(3):
+        token = await take_claim(http, held, "a")
+        record = result(
+            "a", "failed", "input-missing", missing=f"blob {'b' * 64}", missing_more=f"theory {input_key('y')}"
+        )
+        assert (await complete(http, token, record)).status_code == 200
+    status = await batch(http, batch_id)
+    assert status["state"] == "failed"
+    # Older clients would take a theory named anywhere for the one missing.
+    assert status["failure"] == f"resubmit: pkg:a is still missing blob {'b' * 64} after 3 attempts"
+
+
 async def test_a_rebuilt_theory_still_missing_fails_the_batch_naming_its_key(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:

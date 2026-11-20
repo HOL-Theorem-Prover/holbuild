@@ -207,12 +207,25 @@ fun resubmit_theory_keys reason =
           scan (String.extract (reason, start, NONE))
         end
 
-(* Whether the coordinator failed the batch for resubmission because a
-   worker found a blob missing ("missing blob <sha256>"). *)
+(* Whether the coordinator failed the batch for resubmission naming a blob a
+   worker found missing ("blob <sha256>"), first or among the others. *)
 fun resubmit_missing_blob reason =
   case HolbuildStatus.find_substring "resubmit: " reason of
       NONE => false
-    | SOME start => Option.isSome (HolbuildStatus.find_substring "missing blob " (String.extract (reason, start, NONE)))
+    | SOME start =>
+        let
+          fun scan text =
+            case HolbuildStatus.find_substring "blob " text of
+                NONE => false
+              | SOME i =>
+                  let val rest = String.extract (text, i + size "blob ", NONE)
+                  in
+                    HolbuildHash.valid_hex 64 (Substring.string (Substring.takel Char.isHexDigit (Substring.full rest)))
+                    orelse scan rest
+                  end
+        in
+          scan (String.extract (reason, start, NONE))
+        end
 
 fun report_action line =
   let

@@ -2248,8 +2248,9 @@ batch, or the batch fails other than by a failed proof (below), it warns and
 builds locally. A theory the remote cache holds may not fit the parents it
 holds, as when a nondeterministic theory was built twice; the workers can't
 use it, and the coordinator fails the batch for resubmission naming it
-(`resubmit: ... theory <input_key>`), and any other theory the worker found
-missing (`; also missing theory <input_key>, ...`). Such a batch is resubmitted
+(`resubmit: ... theory <input_key>`), and any other input that action or the
+batch's other unfinished actions found missing
+(`; also missing theory <input_key>, ...`). Such a batch is resubmitted
 with those theories and every theory that depends on them, for the workers to
 rebuild or recheck against the cached parents. The remote cache may also have
 lost a theory or source the remote ledger says it holds: on a resubmission

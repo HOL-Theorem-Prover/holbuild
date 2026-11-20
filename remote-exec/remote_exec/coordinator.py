@@ -3521,8 +3521,13 @@ class Coordinator:
             if requeued:
                 await self._requeue(conn, batch_id, parent, ahead_batch=batch.ahead_cap is not None)
             else:
+                first = f"theory {parent}"
                 await self._fail_batch(
-                    conn, batch_id, parent, f"resubmit: {action.theory} (theory {parent}) is not in the cache after it built"
+                    conn,
+                    batch_id,
+                    parent,
+                    f"resubmit: {action.theory} ({first}) is not in the cache after it built"
+                    f"{self._also_missing(batch_id, first)}",
                 )
         self._batch_changed(batch_id)
         return requeued
@@ -3539,6 +3544,7 @@ class Coordinator:
         holds the action back until that theory is rebuilt and the cache holds it again.
         """
         missing = result.missing
+        more = [f"{item.kind} {item.key}" for item in result.missing_more]
         rebuilt = None
         if missing is not None and missing.kind == "theory":
             rebuilt = await conn.scalar(
@@ -3557,32 +3563,39 @@ class Coordinator:
             what = f"{missing.kind} {missing.key}" if missing else "an input"
             if rebuilt is not None:
                 what = f"{rebuilt} ({what})"
-            # The others after the first, which is all a holbuild before 0.14.88 reads: this action's, then those the
-            # batch's other actions found, so that the resubmission rebuilds them all at once.
-            more = [
-                item
-                for item in dict.fromkeys(
-                    [f"{m.kind} {m.key}" for m in result.missing_more]
-                    + [item for items in self.missing_inputs.pop(batch_id, {}).values() for item in items]
-                )
-                if missing is None or item != f"{missing.kind} {missing.key}"
-            ]
-            also = f"; also missing {', '.join(more)}" if more else ""
+            # A holbuild before 0.14.88 reads the first theory named, or else a blob: after a missing blob, or no
+            # missing input named, it is named alone.
+            also = (
+                self._also_missing(batch_id, f"theory {missing.key}", more)
+                if missing is not None and missing.kind == "theory"
+                else ""
+            )
             await self._fail_batch(
                 conn, batch_id, input_key, f"resubmit: {theory} is still missing {what} after {attempts} attempts{also}"
             )
         elif (
             rebuilt is not None and missing is not None and await self._add_edge(conn, batch_id, input_key, missing.key)
         ):
+            # The batch rebuilds the first; the others may be inputs it doesn't.
+            self._remember_missing(batch_id, input_key, more)
             await self._back_to_waiting(conn, batch_id, input_key, ahead_batch=ahead_batch)
             await self._requeue(conn, batch_id, missing.key, ahead_batch=ahead_batch)
         else:
-            self.missing_inputs.setdefault(batch_id, {})[input_key] = [
-                f"{item.kind} {item.key}" for item in ([missing] if missing else []) + list(result.missing_more)
-            ]
-            if len(self.missing_inputs) > MAX_MISSING_BATCHES:
-                del self.missing_inputs[next(iter(self.missing_inputs))]
+            self._remember_missing(batch_id, input_key, ([f"{missing.kind} {missing.key}"] if missing else []) + more)
             await self._retry(conn, batch_id, input_key, ahead_batch=ahead_batch)
+
+    def _remember_missing(self, batch_id: UUID, input_key: str, items: list[str]) -> None:
+        """Remember the inputs action ``input_key`` of the batch found missing, in place of those it found before."""
+        self.missing_inputs.setdefault(batch_id, {})[input_key] = items
+        if len(self.missing_inputs) > MAX_MISSING_BATCHES:
+            del self.missing_inputs[next(iter(self.missing_inputs))]
+
+    def _also_missing(self, batch_id: UUID, first: str, own: list[str] | None = None) -> str:
+        """The tail of a ``resubmit:`` failure naming ``first``: ``own``, then the inputs the batch's unfinished
+        actions found missing, deduplicated, so that the resubmission rebuilds them all at once."""
+        others = [item for items in self.missing_inputs.pop(batch_id, {}).values() for item in items]
+        named = [item for item in dict.fromkeys((own or []) + others) if item != first]
+        return f"; also missing {', '.join(named)}" if named else ""
 
     async def _add_edge(self, conn: AsyncConnection, batch_id: UUID, child: str, parent: str) -> bool:
         """Make ``child`` depend on ``parent``, updating the priorities it changes; False, adding nothing, when the
@@ -3740,6 +3753,7 @@ class Coordinator:
 
     async def _end_batch(self, conn: AsyncConnection, batch_id: UUID, state: str, failure: str | None) -> None:
         """Give a running batch its final state; its unfinished actions are cancelled and their leases revoked."""
+        self.missing_inputs.pop(batch_id, None)
         await conn.execute(
             sa.text("UPDATE batches SET state = :state, failure = :failure WHERE id = :id"),
             {"id": batch_id, "state": state, "failure": failure},
