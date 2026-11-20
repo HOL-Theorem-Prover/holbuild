@@ -253,10 +253,11 @@ first_put=$(grep -m 1 '^PUT /cas/' "$request_log")
 }
 
 # Uploads ride out answers a later try may not get, 429s, 5xxs and none at
-# all, without tripping the breaker: each refused upload is asked again by the
-# one-node ring, then tried again a second later.
+# all, without tripping the breaker.  The one-node ring asks again after a 429
+# or 5xx, so the upload itself sees 429, no answer, 500, no answer, and is
+# tried again a second after each.
 rm "$remote_root/cas/$missing_spec"
-printf '%s\n' 503 503 drop 429 500 drop > "$tmpdir/control/cas-put-fail-once"
+printf '%s\n' 503 429 drop 500 500 drop > "$tmpdir/control/cas-put-fail-once"
 : > "$request_log"
 if ! hb --prefetch-concurrency 1 action-spec --upload CTheory \
     > "$tmpdir/batch-transient.txt" 2> "$tmpdir/upload-transient.log"; then
