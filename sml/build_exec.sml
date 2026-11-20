@@ -13686,10 +13686,15 @@ fun fetch_heap_modules remote tc wanted =
     fun fetch (sha, file) =
       if not (module_request_fits deadline) then ()
       else
-        let val tmp = Path.concat (staging, file)
+        let
+          val tmp = Path.concat (staging, file)
+          (* The heap entry already names the blob. A replica may have the
+             entry before the replica holding the module has uploaded it. *)
+          fun get () = HolbuildRemoteCache.required (fn () =>
+            HolbuildRemoteCache.fetch_unlisted_blob_within
+                 HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp})
         in
-          case HolbuildRemoteCache.fetch_unlisted_blob_within
-                 HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp} of
+          case get () of
               HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = Path.concat (store, file)}
             | _ => remove_file tmp
         end

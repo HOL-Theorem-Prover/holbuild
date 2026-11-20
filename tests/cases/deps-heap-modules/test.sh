@@ -267,10 +267,25 @@ published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 modules=$(for heap in $published; do heap_modules "$heap"; done | { grep -- '-A-' || true; } | sort -u)
 [[ -n "$modules" ]] || { echo "no published heap loads A's module" >&2; exit 1; }
 
-# W loses its stores: the restore fetches A's module, then the heap.
+# W loses its stores. The first cache node for A's module returns 404.
+# Restore must fetch the recorded module from the other cache node.
+module_sha=$(sha256sum "$modules" | cut -d' ' -f1)
+primary_url=$remote_url
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/mirror" "$tmpdir/mirror-control"
+server_pids+=("$server_pid")
+mirror_url=$remote_url
+rank() { printf '%s:%s' "$1" "$module_sha" | sha256sum | cut -d' ' -f1; }
+miss_control=$tmpdir/control
+if [[ $(rank "$mirror_url") > $(rank "$primary_url") ]]; then
+  miss_control=$tmpdir/mirror-control
+fi
+echo 404 > "$miss_control/cas-get-status-$module_sha"
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_b four
+remote_url=$primary_url,$mirror_url
 exec_theory B fetch
+remote_url=$primary_url
+rm "$miss_control/cas-get-status-$module_sha"
 phase fetch-B 'rstmodn:1'
 require_grep 'restored shared' "$tmpdir/fetch-B.log"
 resumed fetch-B
@@ -279,7 +294,6 @@ cp "$modules" "$tmpdir/A.pmo"
 
 # The remote cache loses A's module too: W gives the heap up, and B
 # preloads afresh.
-module_sha=$(sha256sum "$modules" | cut -d' ' -f1)
 echo 404 > "$tmpdir/control/cas-get-status-$module_sha"
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_b five
