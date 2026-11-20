@@ -102,6 +102,14 @@ with lock_path.open("a+") as lock, (tmp / "parent-hash-parser-test.sml").open() 
             child.wait(timeout=1)
         except subprocess.TimeoutExpired:
             pass
+        # Unlink only once the waiter holds the file open, or it would simply
+        # create a new one and the retry would go untested.
+        deadline = time.monotonic() + 60
+        while not any(os.path.realpath(f"/proc/{child.pid}/fd/{fd}") == str(lock_path.resolve())
+                      for fd in os.listdir(f"/proc/{child.pid}/fd")):
+            if child.poll() is not None or time.monotonic() >= deadline:
+                raise SystemExit("invalidation caller never opened the lock file")
+            time.sleep(0.01)
         lock_path.unlink()
         fcntl.lockf(lock, fcntl.LOCK_UN)
         if child.wait(timeout=60) != 0:
