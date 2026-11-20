@@ -48,6 +48,7 @@ sig
   val tmp_dir : t -> string
   val locks_dir : t -> string
   val action_locks_dir : t -> string
+  val action_lock : t -> string -> string
   val action_dir : t -> string -> string
   val action_manifest : t -> string -> string
   val blob_path : t -> string -> string

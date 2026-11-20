@@ -218,8 +218,10 @@ its user, so the credentials can come from the environment. `HOLBUILD_CACHE`
 is `/var/cache/holbuild` in the image. It must be the worker's own cache root:
 `exec-action --cache-limit-gb` sweeps the whole root before each action, so a
 root shared with ordinary builds would lose their cache. Containers on one host
-may share cache directories, provided they also share `locks/`: cap sweeps and
-explicit cache GC use its `gc.lock`. With a positive reserve, actions
+may share cache directories, provided they also share `locks/` and
+`action-locks/`: cap sweeps and explicit cache GC use `locks/gc.lock`, and
+publishers of one action exclude each other through its lock in
+`action-locks/`. With a positive reserve, actions
 reuse shared byte measurements for up to 60 seconds while shared and private
 sizes stay within the limit, while sizing private checkpoints on each call;
 the theory-modules store is a shared root like the others. Eviction still goes

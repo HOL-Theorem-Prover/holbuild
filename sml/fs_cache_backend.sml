@@ -152,8 +152,13 @@ fun growth_since_gc cache =
 
 fun discard_growth cache = ignore (take_growth (root cache))
 
+(* Overwritten in place: a locks/ directory full or written by older holbuild
+   versions may refuse the new name an atomic replace needs, and GC must still
+   run there. A lost reset only makes the next automatic GC come early. *)
 fun reset_growth cache =
-  (ignore (take_growth (root cache)); write_text (growth_journal cache) "0\n")
+  (ignore (take_growth (root cache));
+   HolbuildFileLock.write_text (growth_journal cache) "0\n"
+   handle IO.Io _ => () | OS.SysErr _ => ())
 
 val manifest_growth_bytes : Position.int = 1048576
 

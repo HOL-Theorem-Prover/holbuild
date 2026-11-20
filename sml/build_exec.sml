@@ -11449,7 +11449,9 @@ fun local_cache_families cache =
          let val freed = remove_paths [dir]
          in
            if path_exists dir then NONE
-           else SOME (freed + remove_paths (List.concat (map release (Redblackset.listItems blobs))))
+           else
+             (ignore (HolbuildCache.remove_unheld_action_lock cache (Path.file dir));
+              SOME (freed + remove_paths (List.concat (map release (Redblackset.listItems blobs)))))
          end}
     (* An unpublished blob may belong to a sibling's in-flight transfer.
        Prefer all other families until its five-minute grace has elapsed. *)

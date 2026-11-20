@@ -8,7 +8,11 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-cleanup() { chmod -R u+w "$tmpdir" 2>/dev/null || true; rm -rf "$tmpdir"; }
+holder=
+cleanup() {
+  if [[ -n $holder ]]; then kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true; fi
+  chmod -R u+w "$tmpdir" 2>/dev/null || true; rm -rf "$tmpdir"
+}
 trap cleanup EXIT
 
 cache=$tmpdir/cache
@@ -36,6 +40,12 @@ mkdir -p "$cache/action-locks/ab"
 : > "$cache/action-locks/ab/ab-stale.lock"
 : > "$cache/action-locks/ab/ab-fresh.lock"
 touch -d '10 days ago' "$cache/action-locks/ab/ab-held.lock" "$cache/action-locks/ab/ab-stale.lock"
+# A symlinked shard or lock never leads GC out of the cache.
+mkdir -p "$tmpdir/outside"
+: > "$tmpdir/outside/outside.lock"
+touch -d '10 days ago' "$tmpdir/outside/outside.lock"
+ln -s "$tmpdir/outside" "$cache/action-locks/cd"
+ln -s "$tmpdir/outside/outside.lock" "$cache/action-locks/ab/ab-link.lock"
 python3 -c '
 import fcntl, os, sys, time
 with open(sys.argv[1], "r+") as lock:
@@ -63,11 +73,28 @@ require_file "$cache/blobs/live"
 [[ ! -e "$cache/locks/action-stale.lock" ]] || { echo "stale action lock survived" >&2; exit 1; }
 require_file "$cache/locks/action-regular.lock"
 kill "$holder"; wait "$holder" 2>/dev/null || true
+holder=
 require_file "$cache/action-locks/ab/ab-held.lock"
+require_file "$tmpdir/outside/outside.lock"
 require_file "$cache/action-locks/ab/ab-fresh.lock"
 [[ ! -e "$cache/action-locks/ab/ab-stale.lock" ]] || { echo "stale unheld action lock survived" >&2; exit 1; }
 [[ -f "$cache/locks/gc.lock" ]] || { echo "cache gc lock file missing" >&2; exit 1; }
 [[ ! -e "$cache/locks/gc.lock.owner" ]] || { echo "cache gc lock owner survived" >&2; exit 1; }
+
+# A locks/ directory that refuses new names (one older versions filled) still
+# lets GC reclaim action locks.
+: > "$cache/action-locks/ab/ab-stale.lock"
+touch -d '10 days ago' "$cache/action-locks/ab/ab-stale.lock"
+chmod a-w "$cache/locks"
+if [[ -w "$cache/locks" ]]; then
+  :  # running as a user that ignores file permissions
+else
+  env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/locked-gc.log" 2>&1 ||
+    { cat "$tmpdir/locked-gc.log" >&2; echo "GC failed with a read-only locks/" >&2; exit 1; }
+  [[ ! -e "$cache/action-locks/ab/ab-stale.lock" ]] ||
+    { echo "stale action lock survived a read-only locks/" >&2; exit 1; }
+fi
+chmod u+w "$cache/locks"
 
 # Once the legacy live blob is healed, no manifest needs reading. The regular
 # lock files also need no scan on filesystems with conventional link counts.

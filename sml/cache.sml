@@ -25,6 +25,9 @@ fun actions_dir root = HolbuildFSCacheBackend.actions_dir (filesystem_cache root
 fun blobs_dir root = HolbuildFSCacheBackend.blobs_dir (filesystem_cache root)
 fun tmp_dir root = HolbuildFSCacheBackend.tmp_dir (filesystem_cache root)
 fun locks_dir root = HolbuildFSCacheBackend.locks_dir (filesystem_cache root)
+fun remove_unheld_action_lock root key =
+  HolbuildFSCacheBackend.remove_unheld_action_lock
+    (HolbuildFSCacheBackend.action_lock (filesystem_cache root) key)
 fun action_locks_dir root = HolbuildFSCacheBackend.action_locks_dir (filesystem_cache root)
 fun theory_modules_dir root = Path.concat(root, "theory-modules")
 fun analysis_dir root = Path.concat(root, "analysis")
@@ -294,10 +297,15 @@ fun remove_obsolete_action_lock_dirs cutoff dir =
         else (removed, false))
     0
 
+fun is_regular_entry path =
+  Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false
+
+(* Never follows a symlinked shard or lock out of the cache. *)
 fun remove_stale_action_locks cutoff dir =
-  gc_stage "action locks" (List.concat (map children (children dir)))
+  gc_stage "action locks" (List.concat (map children (List.filter is_dir_entry (children dir))))
     (fn (path, removed) =>
-        if stale cutoff path andalso HolbuildFSCacheBackend.remove_unheld_action_lock path then
+        if is_regular_entry path andalso stale cutoff path andalso
+           HolbuildFSCacheBackend.remove_unheld_action_lock path then
           (removed + 1, true)
         else (removed, false))
     0
@@ -385,9 +393,11 @@ fun try_acquire_lock root =
   in
     case HolbuildFileLock.try_acquire_path {path = lock_path, obsolete_kind = SOME "cache gc"} of
         SOME lock =>
-          ((HolbuildFileLock.write_text (gc_lock_owner_path lock_path) (gc_lock_owner ());
-            SOME (GcLock lock))
-           handle e => (HolbuildFileLock.release lock; raise e))
+          (* The owner note only names the holder in errors; a locks/ directory
+             that refuses new names must not stop GC. *)
+          ((HolbuildFileLock.write_text (gc_lock_owner_path lock_path) (gc_lock_owner ())
+            handle IO.Io _ => () | OS.SysErr _ => ());
+           SOME (GcLock lock))
       | NONE => NONE
   end
   handle HolbuildFileLock.Error msg => raise Error ("could not acquire cache gc lock: " ^ msg)

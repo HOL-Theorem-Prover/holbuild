@@ -69,7 +69,9 @@ val _ = print "parent-hash parser unit tests passed\n"
 SML
 
 # Hold the same fcntl lock as a concurrent publisher. Release it after the
-# invalidation caller starts; a nonblocking skip must fail the assertion.
+# invalidation caller starts; a nonblocking skip must fail the assertion. GC
+# unlinks the file while holding it: the waiter then gets the orphaned inode
+# and must retry on the path, recreating the lock file.
 HOLBUILD_TEST_LOCK_READY="$tmpdir/lock-ready" python3 - "$tmpdir" <<'PYTEST'
 import fcntl
 import os
@@ -100,9 +102,12 @@ with lock_path.open("a+") as lock, (tmp / "parent-hash-parser-test.sml").open() 
             child.wait(timeout=1)
         except subprocess.TimeoutExpired:
             pass
+        lock_path.unlink()
         fcntl.lockf(lock, fcntl.LOCK_UN)
         if child.wait(timeout=60) != 0:
             raise SystemExit("parent-hash parser/invalidation test failed")
+        if not lock_path.exists():
+            raise SystemExit("a waiter kept the lock of an unlinked file")
 PYTEST
 grep -q "parent-hash parser unit tests passed" "$tmpdir/parent-hash-parser-test.log"
 

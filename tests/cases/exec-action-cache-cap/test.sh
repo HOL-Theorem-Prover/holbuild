@@ -206,6 +206,9 @@ printf 'blob sig %s\nblob dat %s\n' "$shared" "$own" > "$cache2/actions/older/ma
 printf 'blob sig %s\n' "$shared" > "$cache2/actions/newer/manifest"
 at 2001 "$cache2/actions/older/manifest"
 at 2002 "$cache2/actions/newer/manifest"
+mkdir -p "$cache2/action-locks/ol" "$cache2/action-locks/ne"
+: > "$cache2/action-locks/ol/older.lock"
+: > "$cache2/action-locks/ne/newer.lock"
 set +e
 HOLBUILD_CACHE=$cache2 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$absent" \
   --result "$tmpdir/result" --cache-limit-gb 2 --cache-reserve-gb 0 > "$tmpdir/exec3.log" 2>&1
@@ -214,6 +217,8 @@ evicted "$cache2/actions/older" "the least recently used entry over the cap"
 evicted "$cache2/blobs/$own" "a blob only an evicted entry named"
 kept "$cache2/actions/newer" "an entry once the cache fits"
 kept "$cache2/blobs/$shared" "a blob a surviving entry names"
+evicted "$cache2/action-locks/ol/older.lock" "an evicted entry's action lock"
+kept "$cache2/action-locks/ne/newer.lock" "a surviving entry's action lock"
 
 # --sweep-only runs the same sweep without an action or a remote cache, for a
 # worker waiting for disk space, and exits 0.

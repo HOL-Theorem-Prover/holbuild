@@ -2035,8 +2035,9 @@ GB minus a reserve for the action itself (`--cache-reserve-gb`, by default a
 tenth of `N`). A theory's checkpoints go together, a toolchain goes with its
 analysers, and a toolchain another holbuild process is using is kept.
 
-Workers sharing a host coordinate sweeps through `<cache root>/locks/gc.lock`;
-share `locks/` along with the cache directories. Private checkpoints and theory modules are sized
+Workers sharing a host coordinate sweeps through `<cache root>/locks/gc.lock`
+and publish each action under its lock in `<cache root>/action-locks/`; share
+`locks/` and `action-locks/` along with the cache directories. Private checkpoints and theory modules are sized
 on every action. With a positive reserve and a target of at least 64 GiB,
 shared sizes can be reused for up to 60 seconds when the last measurement plus
 current private sizes fit under the target. Smaller targets and zero-reserve
