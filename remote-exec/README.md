@@ -977,8 +977,10 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   worker's `--max-heap` now, or held the worker back from claiming since its
   previous report. `disk_free` is null from workers too old
   to report them; `quarantined` is `"disk"` or `"failures"` while the host is
-  quarantined, else null. `workers` counts the host's workers that claimed,
-  reported or heartbeat to this coordinator process in the last 2 minutes.
+  quarantined, else null. `workers` counts the host's workers that, in the
+  last 2 minutes, claimed or reported to this coordinator process, or
+  heartbeat a lease it handed out: after a restart, a worker busy with one
+  long action counts again only once it claims or reports.
 
 ### Worker
 
