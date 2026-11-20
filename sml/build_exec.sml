@@ -12770,10 +12770,12 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   (("heap", sha, "") :: map (fn (path, module) => ("module", module, Path.file path)) modules)
               (* The host that wrote a module usually published it
                  (publish_modules), so only those the cache lacks are put.
-                 A cache that doesn't answer leaves the module to be put. *)
+                 A cache that doesn't answer leaves the module to be put.  Not
+                 a required read: a dead node beside a 404 must give a miss,
+                 not a failure that trips the breaker before the puts. *)
               fun probe (path, module) =
                 if needs_upload module andalso
-                   (HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.blob_present remote module)
+                   (HolbuildRemoteCache.blob_present remote module
                     handle HolbuildRemoteCache.Unavailable _ => false)
                 then HolbuildRemoteCache.remember_blob remote
                        {sha256 = module, size = Position.toString (FS.fileSize path)}
