@@ -3550,8 +3550,12 @@ class Coordinator:
             what = f"{missing.kind} {missing.key}" if missing else "an input"
             if rebuilt is not None:
                 what = f"{rebuilt} ({what})"
+            # The others after the first, which is all a holbuild before 0.14.88 reads, so that the resubmission
+            # rebuilds them all at once.
+            more = list(dict.fromkeys(f"{m.kind} {m.key}" for m in result.missing_more if m != missing))
+            also = f"; also missing {', '.join(more)}" if more else ""
             await self._fail_batch(
-                conn, batch_id, input_key, f"resubmit: {theory} is still missing {what} after {attempts} attempts"
+                conn, batch_id, input_key, f"resubmit: {theory} is still missing {what} after {attempts} attempts{also}"
             )
         elif (
             rebuilt is not None and missing is not None and await self._add_edge(conn, batch_id, input_key, missing.key)

@@ -2524,6 +2524,23 @@ async def test_other_missing_inputs_retry_then_fail_the_batch_for_resubmission(
     assert status["failure"] == f"resubmit: pkg:a is still missing {missing} after 3 attempts"
 
 
+async def test_a_batch_failed_for_resubmission_names_every_input_missing(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a"])
+    first, second, third = (input_key(name) for name in ("x", "y", "z"))
+    # The first is repeated among the others, and so is the second.
+    more = f"theory {second},theory {first},theory {third},theory {second}"
+    record = result("a", "failed", "input-missing", missing=f"theory {first}", missing_more=more)
+    for _ in range(3):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, record)).status_code == 200
+    status = await batch(http, batch_id)
+    assert status["state"] == "failed"
+    assert status["failure"] == (
+        f"resubmit: pkg:a is still missing theory {first} after 3 attempts; "
+        f"also missing theory {second}, theory {third}"
+    )
+
+
 async def test_a_rebuilt_theory_still_missing_fails_the_batch_naming_its_key(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:

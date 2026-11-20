@@ -58,7 +58,7 @@ class Result:
     input_key: str | None  # holbuild leaves it empty when the spec couldn't be read
     status: str  # built | cached | failed
     failure: str | None
-    missing: Missing | None
+    missing: Missing | None  # the first input missing
     peak_rss_mb: int | None
     log_sha256: str | None
     # Durations in ms; started/finished and hol/publish/log start/end are Unix ms.
@@ -67,6 +67,7 @@ class Result:
     detail: str | None = None  # why a failure with no log failed, as sanitize_detail leaves it
     # The spec's deps-key, which the worker adds: the dependency context whose shared heap the action loaded.
     deps_key: str | None = None
+    missing_more: tuple[Missing, ...] = ()  # the other inputs missing, which holbuild before 0.14.88 doesn't report
 
 
 def sanitize_detail(text: str) -> str:
@@ -135,6 +136,16 @@ def _merge_phase(name: str, old: int | None, ms: int) -> int:
     return old + ms
 
 
+def _missing(item: str) -> Missing:
+    match item.split(" "):
+        case ["theory", key]:
+            return Missing("theory", _expect(SHA256, key, "missing theory"))
+        case ["blob", key]:
+            return Missing("blob", _expect(SHA256, key, "missing blob"))
+        case _:
+            raise FormatError(f"bad missing: {item!r}")
+
+
 def parse_result(text: str) -> Result:
     """Parse a ``holbuild-action-result-v1`` record, as ``holbuild exec-action --result`` writes it."""
     lines = text.splitlines()
@@ -154,15 +165,8 @@ def parse_result(text: str) -> Result:
     failure = fields.get("failure")
     if (failure is None) != (status != "failed") or (failure is not None and failure not in FAILURES):
         raise FormatError(f"status {status} with failure {failure!r}")
-    missing = None
-    if "missing" in fields:
-        match fields["missing"].split(" "):
-            case ["theory", key]:
-                missing = Missing("theory", _expect(SHA256, key, "missing theory"))
-            case ["blob", key]:
-                missing = Missing("blob", _expect(SHA256, key, "missing blob"))
-            case _:
-                raise FormatError(f"bad missing: {fields['missing']!r}")
+    missing = _missing(fields["missing"]) if "missing" in fields else None
+    missing_more = tuple(map(_missing, fields["missing-more"].split(","))) if fields.get("missing-more") else ()
     peak = fields.get("peak-rss-mb")
     if peak is not None and not peak.isdigit():
         raise FormatError(f"bad peak-rss-mb: {peak!r}")
@@ -184,6 +188,7 @@ def parse_result(text: str) -> Result:
         status=status,
         failure=failure,
         missing=missing,
+        missing_more=missing_more,
         peak_rss_mb=int(peak) if peak is not None else None,
         log_sha256=_expect(SHA256, log.split(" ")[0], "log") if log else None,
         timings=timings or None,
