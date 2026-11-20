@@ -185,6 +185,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(int((control / "head-status").read_text()))
             self.end_headers()
             return
+        if control is not None and self.path.startswith("/cas/"):
+            digest = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
+            status = control / f"cas-head-status-{digest}"
+            if status.exists():
+                self.send_response(int(status.read_text()))
+                self.end_headers()
+                return
         path = self.object_path()
         if path is None:
             return

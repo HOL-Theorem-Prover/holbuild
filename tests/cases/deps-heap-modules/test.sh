@@ -262,14 +262,31 @@ resumed() {
 worker_modules=$worker/theory-modules
 exec_theory Z z unshared
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+server_log=$tmpdir/server/requests.log
+z_requests=$(wc -l < "$server_log")
 exec_theory B publish
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 modules=$(for heap in $published; do heap_modules "$heap"; done | { grep -- '-A-' || true; } | sort -u)
 [[ -n "$modules" ]] || { echo "no published heap loads A's module" >&2; exit 1; }
+module_sha=$(sha256sum "$modules" | cut -d' ' -f1)
+
+# Z's run published A's module, so B's heap publish finds it in the cache
+# and puts the heap but not the module.
+grep -qx "PUT /cas/$module_sha" <<< "$(head -n "$z_requests" "$server_log")" ||
+  { echo "Z's run didn't publish A's module" >&2; exit 1; }
+publish_requests=$(tail -n +"$((z_requests + 1))" "$server_log")
+grep -qx "HEAD /cas/$module_sha" <<< "$publish_requests" ||
+  { echo "B's heap publish didn't probe A's module" >&2; exit 1; }
+if grep -qx "PUT /cas/$module_sha" <<< "$publish_requests"; then
+  echo "B's heap publish put A's module again" >&2; exit 1
+fi
+for heap in $published; do
+  grep -qx "PUT /cas/$(sha256sum "$heap" | cut -d' ' -f1)" <<< "$publish_requests" ||
+    { echo "B's heap publish didn't put the heap $heap" >&2; exit 1; }
+done
 
 # W loses its stores. The first cache node for A's module returns 404.
 # Restore must fetch the recorded module from the other cache node.
-module_sha=$(sha256sum "$modules" | cut -d' ' -f1)
 primary_url=$remote_url
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/mirror" "$tmpdir/mirror-control"
 server_pids+=("$server_pid")
@@ -354,7 +371,17 @@ edit_c() { sed -i "s/^  .*(\* c_thm.*\$/  rw[a_value_def] (* c_thm $1 *)/" "$pro
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 mkdir -p "$(dirname "$modules")"
 cp "$tmpdir/A.pmo" "$modules"
+# A cache that fails the probe of A's module leaves it to be put, and C's
+# heap is published all the same.
+echo 503 > "$tmpdir/control/cas-head-status-$module_sha"
+c_requests=$(wc -l < "$server_log")
 exec_theory C c
+rm "$tmpdir/control/cas-head-status-$module_sha"
+publish_requests=$(tail -n +"$((c_requests + 1))" "$server_log")
+grep -qx "HEAD /cas/$module_sha" <<< "$publish_requests" ||
+  { echo "C's heap publish didn't probe A's module" >&2; exit 1; }
+grep -qx "PUT /cas/$module_sha" <<< "$publish_requests" ||
+  { echo "C's heap publish didn't put A's module after a failed probe" >&2; exit 1; }
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 for heap in $published; do heap_modules "$heap"; done | grep -q -- '-A-' ||
   { echo "C's published heap doesn't load A's module" >&2; exit 1; }
