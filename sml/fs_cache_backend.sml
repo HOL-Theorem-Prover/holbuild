@@ -309,14 +309,18 @@ fun consume_verified_blob cache (request as {hash, src}) =
   end
   handle e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
-fun action_lock cache key = Path.concat(locks_dir cache, "action-" ^ key ^ ".lock")
+(* One lock file per action key, in 256 shards: one flat directory of millions
+   of names fills ext4's hash tree, and creating a name in a full leaf fails
+   with ENOSPC. GC unlinks stale ones (remove_unheld_action_lock). *)
+fun action_locks_dir cache = Path.concat(root cache, "action-locks")
+fun action_lock cache key =
+  Path.concat(Path.concat(action_locks_dir cache, String.substring(key, 0, Int.min(2, size key))),
+              key ^ ".lock")
 
 datatype action_lock_handle = ActionLockHandle of HolbuildFileLock.t
 
 fun try_acquire_action_lock cache key =
-  (case HolbuildFileLock.try_acquire_path {path = action_lock cache key, obsolete_kind = SOME "action cache"} of
-       SOME lock => SOME (ActionLockHandle lock)
-     | NONE => NONE)
+  Option.map ActionLockHandle (HolbuildFileLock.try_acquire_removable {path = action_lock cache key})
   handle HolbuildFileLock.Error _ => NONE
 
 fun release_action_lock (ActionLockHandle lock) = HolbuildFileLock.release lock
@@ -348,6 +352,26 @@ fun with_action_mutex cache key f =
     handle e => (Mutex.unlock mutex; raise e)
   end
 
+(* fcntl locks don't exclude threads of one process, and closing the remover's
+   descriptor would drop a thread's lock, so a path one of this process's
+   threads holds or is acquiring stays. The map lock keeps a thread from
+   starting to acquire it meanwhile. *)
+fun remove_unheld_action_lock path =
+  let
+    val _ = Mutex.lock action_mutexes_lock
+    fun remove () = HolbuildFileLock.remove_unheld {path = path}
+    val removed =
+      (case Redblackmap.peek (!action_mutexes, path) of
+           NONE => remove ()
+         | SOME mutex =>
+             Mutex.trylock mutex andalso
+             ((remove () before Mutex.unlock mutex) handle e => (Mutex.unlock mutex; raise e)))
+      handle e => (Mutex.unlock action_mutexes_lock; raise e)
+  in
+    Mutex.unlock action_mutexes_lock;
+    removed
+  end
+
 fun with_action_publish_lock cache key publish skip =
   with_action_mutex cache key (fn () =>
     case try_acquire_action_lock cache key of
@@ -359,9 +383,7 @@ fun with_action_publish_lock cache key publish skip =
 fun with_action_publish_lock_wait cache key publish =
   with_action_mutex cache key (fn () =>
     let
-      val path = action_lock cache key
-      val _ = HolbuildFileLock.remove_obsolete_lock_dir "action cache" path
-      val lock = HolbuildFileLock.acquire_exclusive_path_wait {path = path}
+      val lock = HolbuildFileLock.acquire_removable_wait {path = action_lock cache key}
     in
       (publish () before HolbuildFileLock.release lock)
       handle e => (HolbuildFileLock.release lock; raise e)

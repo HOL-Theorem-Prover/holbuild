@@ -146,15 +146,27 @@ fun check_merge (old, incoming, best, changed) =
 val weak = manifest NONE;
 val strong = manifest (SOME 2.5);
 val strongest = manifest (SOME 1.0);
-(* Older holbuild versions used directory locks. Transfers must migrate them
-   just like build-time cache publication does. *)
+(* Action locks live in shards outside the flat locks directory, which older
+   holbuild versions filled until creating a name there failed (ENOSPC). A
+   locks directory that refuses new names must not stop publication. *)
 val _ = OS.FileSys.mkDir (HolbuildFSCacheBackend.locks_dir cache);
-val _ = OS.FileSys.mkDir
-  (join (HolbuildFSCacheBackend.locks_dir cache, "action-" ^ key ^ ".lock"));
+val _ = Posix.FileSys.chmod (HolbuildFSCacheBackend.locks_dir cache,
+                             Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.ixusr]);
 val _ = List.app check_merge
   [(strong, weak, strong, false), (weak, strong, strong, true),
    (strongest, strong, strongest, false), (strong, strongest, strongest, true),
    (strong, strong, strong, false)];
+val lock_path = join (join (join (join (tmp, "cache"), "action-locks"), String.substring (key, 0, 2)),
+                      key ^ ".lock");
+val _ = assert "action lock is not in its shard" (OS.FileSys.access (lock_path, []));
+(* GC reclaims action locks, but never one this process holds. *)
+val _ = assert "held action lock was removed"
+  (HolbuildFSCacheBackend.with_action_publish_lock cache key
+     (fn () => not (HolbuildFSCacheBackend.remove_unheld_action_lock lock_path)) (fn () => false));
+val _ = assert "unheld action lock was kept" (HolbuildFSCacheBackend.remove_unheld_action_lock lock_path);
+val _ = assert "removed action lock still exists" (not (OS.FileSys.access (lock_path, [])));
+val _ = check_merge (strong, strong, strong, false);
+val _ = Posix.FileSys.chmod (HolbuildFSCacheBackend.locks_dir cache, Posix.FileSys.S.irwxu);
 fun replace_line prefix replacement text =
   String.concatWith "\n"
     (map (fn line => if String.isPrefix prefix line then replacement else line)

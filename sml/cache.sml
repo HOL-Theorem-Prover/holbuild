@@ -25,6 +25,7 @@ fun actions_dir root = HolbuildFSCacheBackend.actions_dir (filesystem_cache root
 fun blobs_dir root = HolbuildFSCacheBackend.blobs_dir (filesystem_cache root)
 fun tmp_dir root = HolbuildFSCacheBackend.tmp_dir (filesystem_cache root)
 fun locks_dir root = HolbuildFSCacheBackend.locks_dir (filesystem_cache root)
+fun action_locks_dir root = HolbuildFSCacheBackend.action_locks_dir (filesystem_cache root)
 fun theory_modules_dir root = Path.concat(root, "theory-modules")
 fun analysis_dir root = Path.concat(root, "analysis")
 fun action_dir root key = HolbuildFSCacheBackend.action_dir (filesystem_cache root) key
@@ -293,6 +294,14 @@ fun remove_obsolete_action_lock_dirs cutoff dir =
         else (removed, false))
     0
 
+fun remove_stale_action_locks cutoff dir =
+  gc_stage "action locks" (List.concat (map children (children dir)))
+    (fn (path, removed) =>
+        if stale cutoff path andalso HolbuildFSCacheBackend.remove_unheld_action_lock path then
+          (removed + 1, true)
+        else (removed, false))
+    0
+
 fun blob_name path = Path.file path
 
 fun stale_blob_candidates cutoff paths =
@@ -426,7 +435,8 @@ fun collect_root root days : gc_counts =
     val tmp = remove_stale_children "tmp" cutoff (tmp_dir root)
     val modules = remove_stale_children "theory modules" cutoff (theory_modules_dir root)
     val analysis = remove_stale_children "analysis" cutoff (analysis_dir root)
-    val locks = remove_obsolete_action_lock_dirs cutoff (locks_dir root)
+    val locks = remove_obsolete_action_lock_dirs cutoff (locks_dir root) +
+                remove_stale_action_locks cutoff (action_locks_dir root)
     val blob_paths = children (blobs_dir root)
     val candidates = stale_blob_candidates cutoff blob_paths
     val (candidates, actions) = collect_live_actions cutoff root candidates

@@ -84,7 +84,7 @@ key = "a" * 64
 manifest = cache / "actions" / key / "manifest"
 manifest.parent.mkdir(parents=True, exist_ok=True)
 manifest.write_text("rejected\n")
-lock_path = cache / "locks" / f"action-{key}.lock"
+lock_path = cache / "action-locks" / key[:2] / f"{key}.lock"
 lock_path.parent.mkdir(parents=True, exist_ok=True)
 with lock_path.open("a+") as lock, (tmp / "parent-hash-parser-test.sml").open() as source, (tmp / "parent-hash-parser-test.log").open("w") as log:
     fcntl.lockf(lock, fcntl.LOCK_EX)

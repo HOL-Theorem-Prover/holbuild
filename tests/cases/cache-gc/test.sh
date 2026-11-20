@@ -30,6 +30,23 @@ touch -d '10 days ago' \
   "$cache/locks/action-regular.lock" \
   "$cache/locks/action-stale.lock"
 
+# Sharded action locks: GC unlinks stale ones nobody holds.
+mkdir -p "$cache/action-locks/ab"
+: > "$cache/action-locks/ab/ab-held.lock"
+: > "$cache/action-locks/ab/ab-stale.lock"
+: > "$cache/action-locks/ab/ab-fresh.lock"
+touch -d '10 days ago' "$cache/action-locks/ab/ab-held.lock" "$cache/action-locks/ab/ab-stale.lock"
+python3 -c '
+import fcntl, os, sys, time
+with open(sys.argv[1], "r+") as lock:
+    fcntl.lockf(lock, fcntl.LOCK_EX)
+    open(sys.argv[2], "w").close()
+    time.sleep(120)
+' "$cache/action-locks/ab/ab-held.lock" "$tmpdir/held-ready" &
+holder=$!
+for _ in $(seq 100); do [[ -e "$tmpdir/held-ready" ]] && break; sleep 0.1; done
+require_file "$tmpdir/held-ready"
+
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/cache-gc.log"
 
 require_file "$cache/blobs/live"
@@ -45,6 +62,10 @@ require_file "$cache/blobs/live"
 [[ ! -e "$cache/tmp/oldtmp" ]] || { echo "stale tmp survived" >&2; exit 1; }
 [[ ! -e "$cache/locks/action-stale.lock" ]] || { echo "stale action lock survived" >&2; exit 1; }
 require_file "$cache/locks/action-regular.lock"
+kill "$holder"; wait "$holder" 2>/dev/null || true
+require_file "$cache/action-locks/ab/ab-held.lock"
+require_file "$cache/action-locks/ab/ab-fresh.lock"
+[[ ! -e "$cache/action-locks/ab/ab-stale.lock" ]] || { echo "stale unheld action lock survived" >&2; exit 1; }
 [[ -f "$cache/locks/gc.lock" ]] || { echo "cache gc lock file missing" >&2; exit 1; }
 [[ ! -e "$cache/locks/gc.lock.owner" ]] || { echo "cache gc lock owner survived" >&2; exit 1; }
 
