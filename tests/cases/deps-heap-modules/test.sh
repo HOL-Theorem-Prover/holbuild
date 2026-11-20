@@ -299,7 +299,7 @@ rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_b five
 exec_theory B dropped
 phase dropped-B 'rstmoddropn:1'
-require_grep "the shared deps-loaded heap needs a theory module this host lacks: .*-A-.*\.pmo" "$tmpdir/dropped-B.log"
+require_grep "the shared deps-loaded heap needs a missing or unverifiable theory module: .*-A-.*\.pmo" "$tmpdir/dropped-B.log"
 grep -qx 'status=built' "$tmpdir/dropped-B.result"
 if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/dropped-B.result"; then
   echo 'checkpoints on the heap given up were tried' >&2; cat "$tmpdir/dropped-B.result" >&2; exit 1

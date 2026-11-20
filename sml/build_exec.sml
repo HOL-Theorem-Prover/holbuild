@@ -12438,7 +12438,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                             [] => true
                           | module :: _ =>
                               (add_restore_step "rstmoddropn" 1;
-                               warn ("the shared deps-loaded heap needs a theory module this host lacks: " ^ module);
+                               warn ("the shared deps-loaded heap needs a missing or unverifiable theory module: " ^ module);
                                false)
                       end
             in
