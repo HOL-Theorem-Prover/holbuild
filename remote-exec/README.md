@@ -969,7 +969,7 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   `age_s` seconds old,
   except that `cpu_idle_pct` is the latest one measured:
   ```json
-  {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "rank": 0, "disk_free": 81200000000, "age_s": 1.2, "quarantined": null}
+  {"id": "<boot_id>", "cpu_idle_pct": 31.5, "mem_total": 133680000000, "mem_available": 61200000000, "budget": 120800000000, "reserved": 92300000000, "leases": 29, "memory_short": false, "rank": 0, "disk_free": 81200000000, "age_s": 1.2, "quarantined": null, "workers": 30}
   ```
   Memory is in bytes: `MemTotal` and `MemAvailable`, the `--cooperate-dir`
   budget, the charges of the leases held there and their number;
@@ -977,7 +977,8 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   worker's `--max-heap` now, or held the worker back from claiming since its
   previous report. `disk_free` is null from workers too old
   to report them; `quarantined` is `"disk"` or `"failures"` while the host is
-  quarantined, else null.
+  quarantined, else null. `workers` counts the host's workers that claimed,
+  reported or heartbeat to this coordinator process in the last 2 minutes.
 
 ### Worker
 
@@ -988,7 +989,7 @@ seconds the worker spent in each phase since its previous claim, each
 non-negative, a missing phase 0; `wait_s` is how long the coordinator
 holds the request open for an action to become ready, 0 by default and at
 most 50, so that a proxy's usual 60 s idle timeout doesn't cut it; `host` is
-the worker's report of its host, a host of `GET /v1/queue` without `age_s`,
+the worker's report of its host, a host of `GET /v1/queue` without `age_s`, `quarantined` and `workers`,
 with `cpu_idle_pct` measured since the worker's previous CPU sample, or null
 when that is under a second old)
 

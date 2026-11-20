@@ -479,13 +479,35 @@ async def test_queue_lists_the_hosts_workers_reported(http: httpx.AsyncClient, c
 
     hosts = (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"]
     assert hosts == [
-        {**host_report("h1", 30.0), "age_s": 5.0, "quarantined": None},  # the last idle share measured
-        {**host_report("h2", 80.0), "age_s": 5.0, "quarantined": None},
+        {**host_report("h1", 30.0), "age_s": 5.0, "quarantined": None, "workers": 1},  # the last idle share measured
+        {**host_report("h2", 80.0), "age_s": 5.0, "quarantined": None, "workers": 1},
     ]
 
     now += timedelta(seconds=120)
     assert (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"] == []
     assert coordinator.hosts == {}
+
+
+async def test_queue_counts_each_hosts_workers_seen_in_the_last_two_minutes(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    coordinator.clock = lambda: now
+
+    async def report(worker: str) -> None:
+        body = {"tier": "standard", "worker": worker, "host": host_report("h1", 30.0)}
+        assert (await http.post("/v1/work/report", json=body, headers=WORKER)).status_code == 204
+
+    for worker in ("w1", "w2", "w3"):
+        await report(worker)
+    assert [h["workers"] for h in (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"]] == [3]
+
+    now += timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS / 2)
+    for worker in ("w1", "w2"):
+        await report(worker)
+    now += timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS / 2)
+    # w3 has been silent for HOST_REPORT_SECONDS.
+    assert [h["workers"] for h in (await http.get("/v1/queue", headers=CLIENT)).json()["hosts"]] == [2]
 
 
 async def test_queue_sums_the_phases_workers_reported_in_the_last_ten_minutes(

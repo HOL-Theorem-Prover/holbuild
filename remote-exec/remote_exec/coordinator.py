@@ -335,12 +335,14 @@ Quarantine = Literal["disk", "failures"]
 
 @dataclass(frozen=True)
 class HostStatus:
-    """A host's latest report, ``age_s`` seconds old, with the latest ``cpu_idle_pct`` measured, and why it is
-    quarantined, if it is."""
+    """A host's latest report, ``age_s`` seconds old, with the latest ``cpu_idle_pct`` measured, why it is
+    quarantined, if it is, and how many of its workers claimed, reported or heartbeat in the last
+    ``HOST_REPORT_SECONDS``."""
 
     report: HostReport
     age_s: float
-    quarantined: Quarantine | None = None
+    quarantined: Quarantine | None
+    workers: int
 
 
 @dataclass(frozen=True)
@@ -3201,7 +3203,12 @@ class Coordinator:
         self._forget_silent_hosts(now)
         demand = self._burst_demand(counts)
         hosts = [
-            HostStatus(report, round((now - at).total_seconds(), 1), self._quarantine(host_id))
+            HostStatus(
+                report,
+                round((now - at).total_seconds(), 1),
+                self._quarantine(host_id),
+                len(self.host_workers.get(host_id, ())),
+            )
             for host_id, (at, report) in self.hosts.items()
         ]
         return QueueStatus(
