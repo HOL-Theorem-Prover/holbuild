@@ -68,6 +68,8 @@ RAN_FAILURES = frozenset({"proof", "timeout", "tactic-timeout", "memory"})
 PROBE_SECONDS = 60
 # Leases whose host the coordinator remembers at most, the oldest forgotten first.
 MAX_LEASE_HOSTS = 10_000
+# Running batches whose missing inputs the coordinator remembers at most, the oldest forgotten first.
+MAX_MISSING_BATCHES = 1_000
 # The highest --host-rank a worker may report (worker.py checks the same bound at start).
 MAX_HOST_RANK = 1000
 # The queue sums the phase reports of workers' last this many seconds; at most MAX_PHASE_REPORTS are kept.
@@ -1101,6 +1103,10 @@ class Coordinator:
         self.lease_hosts: dict[UUID, tuple[str, str, list[str]]] = {}
         # The attempt tokens of the leases whose action published its outline (see outlined), oldest first.
         self.outlined_tokens: dict[UUID, None] = {}
+        # Per running batch, oldest first, the inputs each of its unfinished actions last found missing that the
+        # batch doesn't rebuild itself, for a resubmission to name them all (see _input_missing). Ones lost to a
+        # restart or another replica only leave that resubmission naming fewer.
+        self.missing_inputs: dict[UUID, dict[str, list[str]]] = {}
         self.infra_streak: dict[str, tuple[int, UUID | None]] = {}
         self.probe_at: dict[str, datetime] = {}
         self.host_workers: dict[str, dict[str, tuple[datetime, bool]]] = {}
@@ -2790,6 +2796,7 @@ class Coordinator:
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
             if built:
+                self.missing_inputs.get(batch_id, {}).pop(action.input_key, None)
                 await self._set_state(conn, batch_id, action.input_key, "done")
                 if result.peak_rss_mb is not None:
                     peaks.append((package, theory, action.profile, result.peak_rss_mb))
@@ -3550,9 +3557,16 @@ class Coordinator:
             what = f"{missing.kind} {missing.key}" if missing else "an input"
             if rebuilt is not None:
                 what = f"{rebuilt} ({what})"
-            # The others after the first, which is all a holbuild before 0.14.88 reads, so that the resubmission
-            # rebuilds them all at once.
-            more = list(dict.fromkeys(f"{m.kind} {m.key}" for m in result.missing_more if m != missing))
+            # The others after the first, which is all a holbuild before 0.14.88 reads: this action's, then those the
+            # batch's other actions found, so that the resubmission rebuilds them all at once.
+            more = [
+                item
+                for item in dict.fromkeys(
+                    [f"{m.kind} {m.key}" for m in result.missing_more]
+                    + [item for items in self.missing_inputs.pop(batch_id, {}).values() for item in items]
+                )
+                if missing is None or item != f"{missing.kind} {missing.key}"
+            ]
             also = f"; also missing {', '.join(more)}" if more else ""
             await self._fail_batch(
                 conn, batch_id, input_key, f"resubmit: {theory} is still missing {what} after {attempts} attempts{also}"
@@ -3563,6 +3577,11 @@ class Coordinator:
             await self._back_to_waiting(conn, batch_id, input_key, ahead_batch=ahead_batch)
             await self._requeue(conn, batch_id, missing.key, ahead_batch=ahead_batch)
         else:
+            self.missing_inputs.setdefault(batch_id, {})[input_key] = [
+                f"{item.kind} {item.key}" for item in ([missing] if missing else []) + list(result.missing_more)
+            ]
+            if len(self.missing_inputs) > MAX_MISSING_BATCHES:
+                del self.missing_inputs[next(iter(self.missing_inputs))]
             await self._retry(conn, batch_id, input_key, ahead_batch=ahead_batch)
 
     async def _add_edge(self, conn: AsyncConnection, batch_id: UUID, child: str, parent: str) -> bool:

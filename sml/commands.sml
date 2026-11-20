@@ -2099,9 +2099,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     val missing =
                       if proof_failure then []
                       else
-                        case HolbuildRemoteExec.resubmit_theory_keys reason of
-                            [] => if HolbuildRemoteExec.resubmit_missing_blob reason then ["blob"] else []
-                          | keys => map (fn key => "theory " ^ key) keys
+                        map (fn key => "theory " ^ key) (HolbuildRemoteExec.resubmit_theory_keys reason) @
+                        (if HolbuildRemoteExec.resubmit_missing_blob reason then ["blob"] else [])
                     val resubmit =
                       length retried < max_resubmissions andalso
                       List.exists (fn item => not (List.exists (fn r => r = item) (List.concat retried))) missing
@@ -2114,7 +2113,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                           (List.mapPartial (fn item => if String.isPrefix "theory " item
                                                        then SOME (String.extract (item, 7, NONE)) else NONE)
                                            (List.concat (missing :: retried)))
-                    val missing_blob = resubmit andalso missing = ["blob"]
+                    val missing_blob = resubmit andalso List.exists (fn item => item = "blob") missing
                     val final = null forced andalso not missing_blob
                     (* Last, after the required restores and failure logs. *)
                     fun restore_finished_logs () =

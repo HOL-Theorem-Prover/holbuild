@@ -2541,6 +2541,34 @@ async def test_a_batch_failed_for_resubmission_names_every_input_missing(http: h
     )
 
 
+async def test_a_batch_failed_for_resubmission_also_names_what_its_unfinished_actions_found_missing(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"])
+    found = {name: f"theory {input_key(key)}" for name, key in (("a", "x"), ("b", "y"), ("c", "z"))}
+
+    def missing(name: str) -> str:
+        return result(name, "failed", "input-missing", missing=found[name])
+
+    for name, token in (await claim_all(http, 3)).items():
+        assert (await complete(http, token, missing(name))).status_code == 200
+    # b finds its input the second time, so what it found missing before is no longer named.
+    for name, token in (await claim_all(http, 3)).items():
+        if name == "b":
+            cache.keys.add(ac_key("b"))
+            record = result("b", "built", peak_rss_mb="100")
+        else:
+            record = missing(name)
+        assert (await complete(http, token, record)).status_code == 200
+    tokens = await claim_all(http, 2)
+    assert (await complete(http, tokens["a"], missing("a"))).status_code == 200
+    status = await batch(http, batch_id)
+    assert status["state"] == "failed"
+    assert status["failure"] == (
+        f"resubmit: pkg:a is still missing {found['a']} after 3 attempts; also missing {found['c']}"
+    )
+
+
 async def test_a_rebuilt_theory_still_missing_fails_the_batch_naming_its_key(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
