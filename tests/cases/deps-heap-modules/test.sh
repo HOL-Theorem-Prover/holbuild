@@ -301,6 +301,39 @@ phase healed-B 'rstmodn:1'
 require_grep 'restored shared' "$tmpdir/healed-B.log"
 resumed healed-B 'theorem-context checkpoint after b_first'
 
+# A heap needs its own manifest to identify A's module even if the file is
+# already present. Reject missing or conflicting entries without changing it.
+heap_entry=$(grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote/ac/*)
+cp "$heap_entry" "$tmpdir/B-heap.entry"
+manifest=$(sed '1,/^manifest-text-v1$/d' "$tmpdir/B-heap.entry")$'\n'
+set_heap_manifest() {
+  local text=$1
+  {
+    printf 'holbuild-remote-cache-action-v2\nmanifest-sha256 %s\nmanifest-size %s\n' \
+      "$(printf '%s' "$text" | sha256sum | cut -d' ' -f1)" "${#text}"
+    awk -v omit="${2:-}" '$1 == "blob" && $2 != omit' "$tmpdir/B-heap.entry"
+    printf 'manifest-text-v1\n%s' "$text"
+  } > "$heap_entry"
+}
+unlisted=$(printf '%s' "$manifest" | sed '/ module /d')$'\n'
+set_heap_manifest "$unlisted" "$module_sha"
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_b unlisted
+exec_theory B unlisted
+phase unlisted-B 'rstmoddropn:1'
+require_grep '^status=built$' "$tmpdir/unlisted-B.result"
+cmp "$tmpdir/A.pmo" "$modules"
+
+heap_sha=$(printf '%s' "$manifest" | sed -n 's/^blob=\([0-9a-f]*\) heap$/\1/p')
+set_heap_manifest "$manifest""blob=$heap_sha module ${modules##*/}"$'\n'
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_b conflicting
+exec_theory B conflicting
+require_grep 'conflicting theory module digests' "$tmpdir/conflicting-B.log"
+require_grep '^status=built$' "$tmpdir/conflicting-B.result"
+cmp "$tmpdir/A.pmo" "$modules"
+mv "$tmpdir/B-heap.entry" "$heap_entry"
+
 # C's heap loads A's module. A module for the same .dat file with a
 # different Poly/ML ID must be replaced before C can resume.
 edit_c() { sed -i "s/^  .*(\* c_thm.*\$/  rw[a_value_def] (* c_thm $1 *)/" "$project/src/CScript.sml"; }

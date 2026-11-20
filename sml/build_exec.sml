@@ -12360,9 +12360,8 @@ val nothing_restored : shared_restore = {heap = NONE, files = [], stale = [], mi
    else the heap, placed in the action's checkpoint tree, which is empty. *)
 (* With RESUMES false the run saves every boundary itself, so only the heap
    is restored: a linked checkpoint would sit where it saves. *)
-(* FETCH_MODULES (the heap entry's module entries, paths) fetches into
-   this host's module store those of the theory modules at the paths that
-   the entries list. *)
+(* FETCH_MODULES installs (digest, filename) pairs from the heap entry
+   into this host's module store. *)
 fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
                                               deps_key, deps_loaded, module_store,
                                               requested_timeout, candidates, ...} : shared_context) resumes
@@ -12386,16 +12385,26 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       (write_text (checkpoint_ok_path deps_loaded) (deps_checkpoint_ok_text deps_key);
        touch_dir (Path.concat(store, heap)))
     fun place_heap heap = (place heap (heap, deps_loaded); heap_placed heap)
+    val heap_modules = ref (Redblackmap.mkDict String.compare : (string, string) Redblackmap.dict)
+    fun add_digest (("module", sha, file), digests) =
+          if not (heap_module_name file) then digests
+          else
+            (case Redblackmap.peek (digests, file) of
+                 NONE => Redblackmap.insert (digests, file, sha)
+               | SOME old => if old = sha then digests
+                             else raise Error ("conflicting theory module digests for " ^ file))
+      | add_digest (_, digests) = digests
+    fun digest path =
+      if Path.dir path = module_store then Redblackmap.peek (!heap_modules, Path.file path) else NONE
     (* A module at the right path may have been written on another host
        with a different ID. Match the blob recorded alongside the heap
        before attempting to load it. *)
-    fun wrong_modules digests paths =
+    fun wrong_modules paths =
       let
         val checks = map (fn path => (path, ref false)) paths
         fun matches path =
-          (case Redblackmap.peek (digests, Path.file path) of
+          (case digest path of
               SOME sha =>
-                Path.dir path = module_store andalso
                 Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) andalso
                 HolbuildHash.file_sha256 path = sha
             | NONE => false)
@@ -12409,24 +12418,20 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
        A heap given up only falls back here, to a fresh preload: the
        shared one stays, for the hosts that have its modules. *)
     val modules_ok = ref (NONE : bool option)
-    (* The heap entry's module entries. *)
-    val heap_modules = ref ([] : (string * string * string) list)
     fun heap_modules_ok () =
       case !modules_ok of
           SOME ok => ok
         | NONE =>
             let
-              fun add_digest (("module", sha, file), digests) =
-                    if heap_module_name file then Redblackmap.insert (digests, file, sha) else digests
-                | add_digest (_, digests) = digests
-              val digests = List.foldl add_digest (Redblackmap.mkDict String.compare) (!heap_modules)
               val ok =
-                case wrong_modules digests (saved_modules deps_loaded) of
+                case wrong_modules (saved_modules deps_loaded) of
                     [] => true
                   | missing =>
                       let
-                        val _ = restore_step "rstmodfetch" (fn () => fetch_modules (!heap_modules, missing))
-                        val still = wrong_modules digests missing
+                        fun want path = Option.map (fn sha => (sha, Path.file path)) (digest path)
+                        val wanted = List.mapPartial want missing
+                        val _ = restore_step "rstmodfetch" (fn () => fetch_modules wanted)
+                        val still = wrong_modules missing
                       in
                         add_restore_step "rstmodn" (LargeInt.fromInt (length missing - length still));
                         case still of
@@ -12646,7 +12651,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             NONE => no_files
           | SOME text =>
               case (let val entries = shared_manifest_entries text
-                    in heap_modules := entries; SOME (#1 (single "heap" entries)) end
+                    in
+                      heap_modules := List.foldl add_digest (Redblackmap.mkDict String.compare) entries;
+                      SOME (#1 (single "heap" entries))
+                    end
                     handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
                   NONE => no_files
                 | SOME heap =>
@@ -13670,16 +13678,9 @@ fun publish_modules remote {store, modules, deadline} =
 
 (* Restore missing or mismatched modules from the heap manifest. These are
    the blobs saved with the heap, even if the action's .dat files changed. *)
-fun fetch_heap_modules remote tc (modules, paths) =
+fun fetch_heap_modules remote tc wanted =
   let
     val store = module_store (#holdir tc)
-    fun listed path =
-      if Path.dir path <> store then NONE
-      else
-        Option.map (fn (_, sha, file) => (sha, file))
-          (List.find (fn (role, _, file) => role = "module" andalso file = Path.file path andalso heap_module_name file)
-                     modules)
-    val wanted = List.mapPartial listed paths
     val staging = store_temp (Path.concat (store, ".heap-modules"))
     val deadline = Time.+ (Time.now (), shared_heap_wait)
     fun fetch (sha, file) =
