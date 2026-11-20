@@ -156,6 +156,16 @@ if grep -q '^log=' "$tmpdir/setup.result"; then
   exit 1
 fi
 require_grep 'HOL sandbox failed: sandbox grant contains protected worker state' "$tmpdir/setup.log"
+# A confined read lock on a publish lock would stall publishers and GC.
+mkdir -p "$tmpdir/worker/action-locks"
+set +e
+HOLBUILD_ACTION_READ_DIRS="$tmpdir/worker/action-locks" HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" \
+  --max-heap 1024 --remote-cache "$remote_url" exec-action "$spec" --cache-limit-gb 1000 \
+  --result "$tmpdir/locks-grant.result" > "$tmpdir/locks-grant.log" 2>&1
+locks_grant_status=$?
+set -e
+[[ $locks_grant_status == 3 ]] || { cat "$tmpdir/locks-grant.log" "$tmpdir/locks-grant.result" >&2; exit 1; }
+require_grep 'HOL sandbox failed: sandbox grant contains protected worker state' "$tmpdir/locks-grant.log"
 
 # A failed output check must bypass checkpoint recovery and diagnostics that
 # inspect child-written logs. Use an isolated runtime to inject the failure.
