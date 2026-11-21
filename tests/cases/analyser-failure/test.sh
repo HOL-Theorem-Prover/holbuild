@@ -258,7 +258,8 @@ fun reset mode = (write "mode" mode; write "attempts" "");
 fun policy new_ir =
   B.CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false,
                       checkpoint_seconds = 2.0, proof_steps = true, new_ir = new_ir, tactic_timeout = NONE,
-                      execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false};
+                      execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false,
+                      promote_preload = false};
 val action =
   {input_key = "", deps_key = "", inputs_key = NONE, package = "p", logical = "A",
    relative_path = "AScript.sml", source_file = path "AScript.sml", source_name = "AScript.sml",
