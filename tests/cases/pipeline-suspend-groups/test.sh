@@ -110,9 +110,12 @@ fast='--skip-checkpoints --skip-proof-steps'
 # Groups that pass: a closed group whose last Resume is slow; nested
 # Resumes; two groups that overlap and share a label (with other goals,
 # which HOL needs); a group finalised
-# [local], which the script still uses; and a group the build keeps in
-# place, since its span looks the suspension up, whose `Resume` block
-# suspends through a helper, so it stays in place too.
+# [local], which the script still uses; a group the build keeps in place,
+# since its span looks the suspension up, whose `Resume` block suspends
+# through a helper (with its body at the start of a line), so it stays in
+# place too; and one kept in place since the script reads its theorem's
+# hypotheses before its `Finalise`, where the stub would have a
+# placeholder.
 new_project pass
 cat > "$tmpdir/pass/src/AScript.sml" <<SML
 open HolKernel Parse boolLib bossLib markerLib;
@@ -179,7 +182,8 @@ Proof
   CONJ_TAC >> ACCEPT_TAC hidden
 QED
 
-fun more_tac () = suspend "more";
+fun more_tac () =
+rpt strip_tac >> suspend "more";
 Theorem looked_up:
   T
 Proof
@@ -193,6 +197,17 @@ Resume looked_up[more]:
   ACCEPT_TAC TRUTH
 QED
 Finalise looked_up
+
+Theorem counted:
+  F ==> F
+Proof
+  suspend "one"
+QED
+val _ = save_thm ("counted_hyp", if aconv (rand (hd (hyp counted))) \`\`F ==> F\`\` then TRUTH else EQT_INTRO TRUTH);
+Resume counted[one]:
+  simp[]
+QED
+Finalise counted
 
 val _ = export_theory();
 SML
@@ -334,6 +349,62 @@ val _ = export_theory();
 SML
 check_fallback helper_cheat 1
 
+# Two groups open at once that suspend the same goal under the same label,
+# which a plain build rejects when it stashes the second.  (Not `T`, the
+# first group's placeholder.)
+new_project same_goal
+cat > "$tmpdir/same_goal/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "A";
+Theorem t:
+  F ==> F
+Proof
+  suspend "a"
+QED
+Theorem u:
+  F ==> F
+Proof
+  suspend "a"
+QED
+Resume t[a]:
+  simp[]
+QED
+Resume u[a]:
+  simp[]
+QED
+Finalise t
+Finalise u
+val _ = export_theory();
+SML
+check_fallback same_goal 0
+if [[ $groups = 1 ]]; then
+  require_grep "suspend the same goal under the same label" "$tmpdir/same_goal.log"
+fi
+
+# The same with the second theorem in place (it isn't resumed here): the
+# group stays in place too.
+new_project same_goal_in_place
+cat > "$tmpdir/same_goal_in_place/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "A";
+Theorem t:
+  F ==> F
+Proof
+  suspend "a"
+QED
+Theorem u:
+  F ==> F
+Proof
+  suspend "a"
+QED
+Resume t[a]:
+  simp[]
+QED
+Finalise t
+val _ = export_theory();
+SML
+check_fallback same_goal_in_place 0
+
 # A group finalised [local] whose Resume block proves its goal from the
 # theorem's own deferred stub, where a plain build has the suspended
 # theorem itself, which proves nothing.
@@ -353,3 +424,22 @@ Finalise t[local]
 val _ = export_theory();
 SML
 check_fallback own_stub 0
+
+# A deferred local theorem proved from its own stub, through a reference
+# the script sets after it: no theorem of the export depends on it, and the
+# cycle is still found, so A builds plain, where the reference holds TRUTH.
+new_project local_cycle
+cat > "$tmpdir/local_cycle/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+val r = ref TRUTH;
+Triviality a_local:
+  T
+Proof
+  (fn g => ACCEPT_TAC (!r) g)
+QED
+val _ = r := a_local;
+val _ = export_theory();
+SML
+groups=1 check_fallback local_cycle 1
+require_grep "deferred proofs depend on each other" "$tmpdir/local_cycle.log"

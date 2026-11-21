@@ -3716,56 +3716,33 @@ fun deferrable_proof resumed kind name names_smlname tactic =
 
 fun identifier_char c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'"
 
-(* Whether TEXT has the whole identifier WORD. *)
-fun mentions_identifier text word =
+(* How many times TEXT has the whole identifier WORD. *)
+fun identifier_count text word =
   let
     val n = size word
-    fun search start =
+    fun search start count =
       let val (prefix, rest) = Substring.position word (Substring.extract (text, start, NONE))
       in
-        if Substring.isEmpty rest then false
+        if Substring.isEmpty rest then count
         else
-          let val i = start + Substring.size prefix
+          let
+            val i = start + Substring.size prefix
+            val whole =
+              (i = 0 orelse not (identifier_char (String.sub (text, i - 1)))) andalso
+              (i + n >= size text orelse not (identifier_char (String.sub (text, i + n))))
           in
-            ((i = 0 orelse not (identifier_char (String.sub (text, i - 1)))) andalso
-             (i + n >= size text orelse not (identifier_char (String.sub (text, i + n))))) orelse
-            search (i + 1)
+            search (i + 1) (if whole then count + 1 else count)
           end
       end
   in
-    n > 0 andalso search 0
+    if n = 0 then 0 else search 0 0
   end
 
-(* TEXT with its ML comments and strings blanked to spaces, so offsets
-   stay the same. *)
-fun blank_comments_and_strings text =
-  let
-    val n = size text
-    val out = CharArray.tabulate (n, fn i => String.sub (text, i))
-    fun blank i = if String.sub (text, i) = #"\n" then () else CharArray.update (out, i, #" ")
-    fun at i s = i + size s <= n andalso String.substring (text, i, size s) = s
-    fun code i =
-      if i >= n then ()
-      else if at i "(*" then (blank i; blank (i + 1); comment (i + 2) 1)
-      else if String.sub (text, i) = #"\"" then (blank i; string (i + 1))
-      else code (i + 1)
-    and comment i depth =
-      if i >= n then ()
-      else if at i "(*" then (blank i; blank (i + 1); comment (i + 2) (depth + 1))
-      else if at i "*)" then
-        (blank i; blank (i + 1); if depth = 1 then code (i + 2) else comment (i + 2) (depth - 1))
-      else (blank i; comment (i + 1) depth)
-    and string i =
-      if i >= n then ()
-      else if String.sub (text, i) = #"\\" then (blank i; if i + 1 < n then blank (i + 1) else (); string (i + 2))
-      else if String.sub (text, i) = #"\"" then (blank i; code (i + 1))
-      else (blank i; string (i + 1))
-  in
-    code 0; CharArray.vector out
-  end
+fun mentions_identifier text word = identifier_count text word > 0
 
 (* The offset just past the first `Finalise NAME` at or after START in
-   BLANKED (blank_comments_and_strings), if there is one. *)
+   BLANKED (HolbuildDependencies.blank_comments_and_strings), if there is
+   one. *)
 fun finalise_end blanked name start =
   let
     val word = "Finalise"
@@ -3794,12 +3771,11 @@ fun finalise_end blanked name start =
 
 (* The top-level helpers of SOURCE_TEXT that may suspend a goal or cheat:
    each `fun`, `val` or `and` at the start of a line whose body, up to the
-   next line that starts with something else than a space, mentions
-   `suspend` or `cheat` (as mentions_at_identifier_start finds them) or
-   such a helper. *)
+   next line that starts a declaration, mentions `suspend` or `cheat` (as
+   mentions_at_identifier_start finds them) or such a helper. *)
 fun suspending_helpers source_text =
   let
-    val lines = String.fields (fn c => c = #"\n") (blank_comments_and_strings source_text)
+    val lines = String.fields (fn c => c = #"\n") (HolbuildDependencies.blank_comments_and_strings source_text)
     fun keyword line = List.find (fn k => String.isPrefix (k ^ " ") line) ["fun", "val", "and"]
     fun helper_name line =
       case String.tokens (fn c => Char.isSpace c) line of
@@ -3807,14 +3783,21 @@ fun suspending_helpers source_text =
         | _ :: name :: _ => SOME name
         | _ => NONE
     fun name_of tok = Substring.string (Substring.takel identifier_char (Substring.full tok))
-    fun starts_column0 line = line <> "" andalso not (Char.isSpace (String.sub (line, 0)))
+    val declarations =
+      ["fun", "val", "and", "local", "in", "end", "open", "structure", "signature", "functor",
+       "type", "datatype", "exception", "infix", "infixl", "infixr", "nonfix",
+       "Theorem", "Triviality", "Resume", "Finalise", "Definition", "Datatype", "Inductive",
+       "CoInductive", "Overload", "Type", "Proof", "QED", "Termination", "End"]
+    fun starts_declaration line =
+      line <> "" andalso not (Char.isSpace (String.sub (line, 0))) andalso
+      List.exists (fn d => d = name_of line) declarations
     fun defs [] acc = rev acc
       | defs (line :: rest) acc =
           case (keyword line, helper_name line) of
               (SOME _, SOME tok) =>
                 let
                   fun body [] lines = (rev lines, [])
-                    | body (l :: ls) lines = if starts_column0 l then (rev lines, l :: ls) else body ls (l :: lines)
+                    | body (l :: ls) lines = if starts_declaration l then (rev lines, l :: ls) else body ls (l :: lines)
                   val (bodylines, rest') = body rest [line]
                   val name = name_of tok
                 in
@@ -3861,10 +3844,18 @@ fun has_suspension_pruning (tc : HolbuildToolchain.t) =
    label and lies between the theorem and its `Finalise`, none of the
    blocks mentions `cheat` or names `smlname`, and the source from the
    theorem to its `Finalise` doesn't look up suspensions or resumptions,
-   whose answers would be the group's dummies.  Otherwise the theorem
-   stays in place, and its `Resume` blocks defer alone (deferrable_proof)
-   unless they mention a helper that may suspend (suspending_helpers),
-   whose suspension a deferred block would lose. *)
+   whose answers would be the group's dummies, nor names the theorem
+   outside those blocks' headers and the `Finalise` (its value there is
+   the stub, which suspends the dummies).  A group's suspended goals are
+   only known once it is proved, so no block that may suspend (it names
+   `suspend` or such a helper, or is a theorem the script resumes) may lie
+   in that span unless it is one of a group too: a goal it suspended
+   could be one of the group's, under the same label, which a build in
+   place rejects.  (HolbuildDeferred fails two groups that suspend the
+   same goal.)  Otherwise the theorem stays in place, and its `Resume`
+   blocks defer alone (deferrable_proof) unless they mention a helper
+   that may suspend (suspending_helpers), whose suspension a deferred
+   block would lose. *)
 fun proof_deferrals groups source_text
       (blocks : {kind : string, name : string, theorem_start : int, tactic_start : int,
                  tactic_text : string, ok : bool} list) =
@@ -3879,7 +3870,7 @@ fun proof_deferrals groups source_text
         if Substring.size rest < 2 then NONE
         else SOME (Substring.string (Substring.slice (rest, 1, SOME (Substring.size rest - 2))))
       end
-    val blanked = blank_comments_and_strings source_text
+    val blanked = HolbuildDependencies.blank_comments_and_strings source_text
     fun group (theorem as {theorem_start, name, ...}) =
       let
         val resumes = List.filter (fn b => #kind b = "resume" andalso base (#name b) = name) blocks
@@ -3894,7 +3885,9 @@ fun proof_deferrals groups source_text
         case finalise_end blanked name theorem_start of
             NONE => NONE
           | SOME stop =>
-              let val span = String.substring (source_text, theorem_start, stop - theorem_start)
+              let
+                val span = String.substring (source_text, theorem_start, stop - theorem_start)
+                val blanked_span = String.substring (blanked, theorem_start, stop - theorem_start)
               in
                 if length (List.filter (fn b => #kind b = "theorem" andalso #name b = name) blocks) = 1 andalso
                    List.all (fn b => #ok b andalso not (names_smlname b) andalso
@@ -3902,18 +3895,37 @@ fun proof_deferrals groups source_text
                    List.all (fn b => Option.isSome (label (#name b)) andalso
                                      #theorem_start b > theorem_start andalso #theorem_start b < stop) resumes andalso
                    not (mentions_identifier span "lookup_suspension") andalso
-                   not (mentions_identifier span "lookup_resumption")
-                then SOME (name, labels, length resumes)
+                   not (mentions_identifier span "lookup_resumption") andalso
+                   identifier_count blanked_span name = length resumes + 2
+                then SOME {name = name, labels = labels, resumes = length resumes,
+                           start = theorem_start, stop = stop}
                 else NONE
               end
       end
+    val helpers = suspending_helpers source_text
+    fun theorem_of {kind, name, ...} = if kind = "resume" then base name else name
+    fun may_suspend {kind, name, tactic_text, ...} =
+      mentions_at_identifier_start tactic_text "suspend" orelse
+      List.exists (mentions_identifier tactic_text) helpers orelse
+      (kind = "theorem" andalso List.exists (fn r => r = name) resumed)
+    (* Drops the groups whose span holds a block that may suspend outside
+       the groups kept, until none does. *)
+    fun separate gs =
+      let
+        fun grouped b = List.exists (fn g => #name g = theorem_of b) gs
+        fun clear {start, stop, ...} =
+          not (List.exists (fn b => #theorem_start b > start andalso #theorem_start b < stop andalso
+                                    not (grouped b) andalso may_suspend b) blocks)
+        val kept = List.filter clear gs
+      in
+        if length kept = length gs then gs else separate kept
+      end
     val grouped =
       if not groups then []
-      else List.mapPartial (fn b => if #kind b = "theorem" andalso List.exists (fn r => r = #name b) resumed then group b else NONE) blocks
-    val helpers = suspending_helpers source_text
+      else separate (List.mapPartial (fn b => if #kind b = "theorem" andalso List.exists (fn r => r = #name b) resumed then group b else NONE) blocks)
     fun deferral (b as {kind, name, tactic_text, ok, ...}) =
-      case List.find (fn (g, _, _) => g = (if kind = "resume" then base name else name)) grouped of
-          SOME (g, labels, resumes) =>
+      case List.find (fn g => #name g = theorem_of b) grouped of
+          SOME {name = g, labels, resumes, ...} =>
             if kind = "theorem" then HolbuildTheoryCheckpoints.DeferGroup {labels = labels, resumes = resumes}
             else HolbuildTheoryCheckpoints.DeferResume {theorem = g, label = valOf (label name)}
         | NONE =>
@@ -6565,8 +6577,8 @@ fun deferred_source groups source_text boundaries =
                     wrap (k + 1) (String.concat ["HolbuildDeferred.defer ", Int.toString k, " ", str name])
                 | HolbuildTheoryCheckpoints.DeferGroup {labels, resumes} =>
                     wrap (k + 1)
-                      (String.concat ["HolbuildDeferred.defer_group ", Int.toString k, " ", str name, " [",
-                                      String.concatWith ", " (map str labels), "] ", Int.toString resumes])
+                      (String.concat ["HolbuildDeferred.defer_group ", Int.toString k, " ", str name, " ",
+                                      HolbuildToolchain.sml_list labels, " ", Int.toString resumes])
                 | HolbuildTheoryCheckpoints.DeferResume {theorem, label} =>
                     wrap k (String.concat ["HolbuildDeferred.defer_resume ", str theorem, " ", str label])
             end

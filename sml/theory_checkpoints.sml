@@ -399,7 +399,6 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                      source_slice pos theorem_start ::
                      acc)
                 fun next () = let val k = !deferred in deferred := k + 1; Int.toString k end
-                fun strings l = "[" ^ String.concatWith ", " (map HolbuildToolchain.sml_string l) ^ "]"
                 fun inline () =
                   let
                     val factories =
@@ -429,7 +428,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                                      String.concatWith " "
                                        ["HolbuildDeferred.defer_group_steps", next (),
                                         HolbuildToolchain.sml_string (#name checkpoint),
-                                        strings labels, Int.toString resumes]
+                                        HolbuildToolchain.sml_list labels, Int.toString resumes]
                                  | DeferResume {theorem, label} =>
                                      String.concatWith " "
                                        ["HolbuildDeferred.defer_resume_steps",
