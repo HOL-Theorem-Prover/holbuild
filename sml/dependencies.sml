@@ -105,7 +105,12 @@ fun scan_string text start =
         case sub i of
             #"\"" => (String.implode (rev acc), i + 1)
           | #"\\" =>
-              if i + 1 < n then loop (i + 2) (sub (i + 1) :: acc)
+              if i + 1 < n andalso Char.isSpace (sub (i + 1)) then
+                (* A gap: whitespace between two backslashes, which the
+                   string doesn't contain. *)
+                let fun gap j = if j >= n then j else if sub j = #"\\" then j + 1 else gap (j + 1)
+                in loop (gap (i + 1)) acc end
+              else if i + 1 < n then loop (i + 2) (sub (i + 1) :: acc)
               else loop (i + 1) acc
           | c => loop (i + 1) (c :: acc)
   in
@@ -138,6 +143,33 @@ fun skip_comment text start =
       else loop depth (i + 1)
   in
     loop 1 start
+  end
+
+(* TEXT with its comments and string literals blanked, newlines kept, so
+   that names in them are not found and offsets and line numbers still
+   hold. *)
+fun blank_comments_and_strings text =
+  let
+    val n = size text
+    val out = CharArray.tabulate (n, fn i => String.sub (text, i))
+    fun blank (i, stop) =
+      if i >= stop then ()
+      else
+        ((if String.sub (text, i) = #"\n" then () else CharArray.update (out, i, #" "));
+         blank (i + 1, stop))
+    fun at i c = i < n andalso String.sub (text, i) = c
+    fun code i =
+      if i >= n then ()
+      else if at i #"(" andalso at (i + 1) #"*" then
+        let val stop = skip_comment text (i + 2)
+        in blank (i, stop); code stop end
+      else if at i #"\"" then
+        let val (_, stop) = scan_string text (i + 1)
+        in blank (i, stop); code stop end
+      else code (i + 1)
+  in
+    code 0;
+    CharArray.vector out
   end
 
 fun scan_word text start =

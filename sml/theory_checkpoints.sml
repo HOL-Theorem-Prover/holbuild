@@ -301,11 +301,21 @@ datatype instrument_event =
 | DeclarationCheckpointEvent of declaration_checkpoint
 | TerminationEvent of termination
 
-(* DEFER: whether a pipelined build defers a theorem's proof (see
-   HolbuildDeferred).  A deferred proof keeps its precompiled steps (its
-   factories), so no step is compiled after the script has run, where
-   later bindings would shadow the theorem's; a theorem without them is
-   not deferred. *)
+(* How a pipelined build runs a theorem's or `Resume` block's proof (see
+   HolbuildDeferred): in place, deferred alone, or deferred with the
+   `Resume` blocks of the theorem, given the labels they resume and how
+   many there are, as the block THEOREM[LABEL] of that group. *)
+datatype deferral =
+  Inline
+| Defer
+| DeferGroup of {labels : string list, resumes : int}
+| DeferResume of {theorem : string, label : string}
+
+(* DEFER: how a pipelined build runs a theorem's proof.  A deferred proof
+   keeps its precompiled steps (its factories), so no step is compiled
+   after the script has run, where later bindings would shadow the
+   theorem's; a theorem without them is not deferred, nor is a group with
+   a block without them (build_exec's checkpoint_deferral). *)
 fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, defer} :
                 {source : string, source_name : string, start_offset : int, checkpoints : checkpoint list,
                  declaration_checkpoints : declaration_checkpoint list,
@@ -315,7 +325,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                  tactic_timeout : real option, timeout_marker : string option,
                  plan_theorem : string option, trace_all : bool,
                  plan_only_marker : string option, new_ir : bool,
-                 defer : checkpoint -> bool}) =
+                 defer : checkpoint -> deferral}) =
   let
     val n = size source
     val deferred = ref 0
@@ -388,38 +398,49 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                      setup ::
                      source_slice pos theorem_start ::
                      acc)
+                fun next () = let val k = !deferred in deferred := k + 1; Int.toString k end
+                fun inline () =
+                  let
+                    val factories =
+                      if null (#proof_attrs checkpoint) then "NONE"
+                      else case #proof_ir_factories checkpoint of
+                               NONE => "NONE"
+                             | SOME code => "SOME (" ^ code ^ ")"
+                  in
+                    emit (begin_theorem_line checkpoint)
+                         "HolbuildProofRuntime.proof_ir_tactic (fn () => ("
+                         (factories_suffix factories)
+                         "val _ = holbuild_save_theorem_context();\n"
+                  end
               in
-                case (if defer checkpoint then #proof_ir_factories checkpoint else NONE) of
-                    SOME code =>
-                      let val k = !deferred
-                      in
-                        deferred := k + 1;
-                        (* The runtime learns which theorem it proves when
-                           the proof runs (`begin_theorem` inside the setup
-                           thunk), written on one line so the tactic keeps
-                           its own lines. *)
-                        emit ""
-                             (String.concat
-                                ["HolbuildDeferred.defer_steps ", Int.toString k, " ",
-                                 HolbuildToolchain.sml_string (#name checkpoint),
-                                 " (fn () => let ", one_line (begin_theorem_line checkpoint),
-                                 "in () end) (fn () => HolbuildProofRuntime.proof_ir_tactic (fn () => ("])
-                             (factories_suffix ("SOME (" ^ code ^ ")") ^ ")")
-                             ""
-                      end
-                  | NONE =>
-                      let
-                        val factories =
-                          if null (#proof_attrs checkpoint) then "NONE"
-                          else case #proof_ir_factories checkpoint of
-                                   NONE => "NONE"
-                                 | SOME code => "SOME (" ^ code ^ ")"
-                      in
-                        emit (begin_theorem_line checkpoint)
-                             "HolbuildProofRuntime.proof_ir_tactic (fn () => ("
-                             (factories_suffix factories)
-                             "val _ = holbuild_save_theorem_context();\n"
-                      end
+                case (defer checkpoint, #proof_ir_factories checkpoint) of
+                    (Inline, _) => inline ()
+                  | (_, NONE) => inline ()
+                  | (deferral, SOME code) =>
+                      (* The runtime learns which theorem it proves when
+                         the proof runs (`begin_theorem` inside the setup
+                         thunk), written on one line so the tactic keeps
+                         its own lines. *)
+                      emit ""
+                           (String.concat
+                              [case deferral of
+                                   DeferGroup {labels, resumes} =>
+                                     String.concatWith " "
+                                       ["HolbuildDeferred.defer_group_steps", next (),
+                                        HolbuildToolchain.sml_string (#name checkpoint),
+                                        HolbuildToolchain.sml_list labels, Int.toString resumes]
+                                 | DeferResume {theorem, label} =>
+                                     String.concatWith " "
+                                       ["HolbuildDeferred.defer_resume_steps",
+                                        HolbuildToolchain.sml_string theorem, HolbuildToolchain.sml_string label]
+                                 | _ =>
+                                     String.concatWith " "
+                                       ["HolbuildDeferred.defer_steps", next (),
+                                        HolbuildToolchain.sml_string (#name checkpoint)],
+                               " (fn () => let ", one_line (begin_theorem_line checkpoint),
+                               "in () end) (fn () => HolbuildProofRuntime.proof_ir_tactic (fn () => ("])
+                           (factories_suffix ("SOME (" ^ code ^ ")") ^ ")")
+                           ""
               end
         | DeclarationCheckpointEvent (declaration_checkpoint as {boundary, ...}) :: rest =>
             if boundary <= start_offset orelse boundary < pos then loop pos rest acc

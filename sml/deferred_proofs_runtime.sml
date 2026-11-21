@@ -24,34 +24,125 @@ struct
   val marker_base = 1000000
   val oracle_prefix = "holbuild_deferred_"
 
+  (* A `Resume` block of a deferred group (below): its label, the context,
+     tactic and setup it runs with, and the deferred groups open (not
+     finalised) when the script reached it. *)
+  type resume = {label : string, ctxt : Context.t, make : unit -> Tactical.tactic,
+                 setup : (unit -> unit) option, open_with : string list}
+
   (* SETUP, for a proof run by holbuild's proof runtime (proof steps on),
-     tells the runtime which theorem the proof is before it runs. *)
+     tells the runtime which theorem the proof is before it runs.  GROUP
+     is set for a theorem deferred with its `Resume` blocks: the labels
+     they resume, how many there are, those the script has reached, the
+     latest first, and the deferred groups still open (not finalised)
+     when the script stated it. *)
   type item = {k : int, name : string, ctxt : Context.t, goal : Tactical.goal,
-               make : unit -> Tactical.tactic, setup : (unit -> unit) option}
+               make : unit -> Tactical.tactic, setup : (unit -> unit) option,
+               group : {labels : string list, resumes : int, reached : resume list ref,
+                        open_with : string list} option}
 
   (* Elaboration runs on one thread; prove_all drains these. *)
   val queue = ref ([] : item list)
   val marker_data = ref (NONE : HOLsexp.t option)
   val proved = ref ([] : (int * ((string * int list) list * string list)) list)
 
-  fun defer_with setup k name make : Tactical.tactic = fn goal => fn ctxt =>
+  (* A theorem of GOAL carrying proof k's markers. *)
+  fun stub k goal =
     let
       val empty_tag = Thm.tag (Thm.REFL boolSyntax.T)
       val dep = Dep.DEP_UNSAVED [(Theory.current_theory (), [marker_base + k])]
-      val stub = Thm.add_tag (Tag.set_dep dep empty_tag,
-                              Thm.mk_oracle_thm (oracle_prefix ^ Int.toString k) goal)
     in
-      (* Each goal number names one theorem's proof; a second stub for it
-         would share the first one's markers. *)
-      if List.exists (fn {k = queued, ...} : item => queued = k) (!queue) then
-        raise Fail ("deferred goal " ^ Int.toString k ^ " (" ^ name ^ ") queued twice")
-      else ();
-      queue := {k = k, name = name, ctxt = ctxt, goal = goal, make = make, setup = setup} :: !queue;
-      Tactic.ACCEPT_TAC stub goal ctxt
+      Thm.add_tag (Tag.set_dep dep empty_tag, Thm.mk_oracle_thm (oracle_prefix ^ Int.toString k) goal)
     end
+
+  fun enqueue (item as {k, name, ...} : item) =
+    (* Each goal number names one theorem's proof; a second stub for it
+       would share the first one's markers. *)
+    if List.exists (fn {k = queued, ...} : item => queued = k) (!queue) then
+      raise Fail ("deferred goal " ^ Int.toString k ^ " (" ^ name ^ ") queued twice")
+    else queue := item :: !queue
+
+  fun defer_with setup k name make : Tactical.tactic = fn goal => fn ctxt =>
+    (enqueue {k = k, name = name, ctxt = ctxt, goal = goal, make = make, setup = setup, group = NONE};
+     Tactic.ACCEPT_TAC (stub k goal) goal ctxt)
 
   fun defer k name make = defer_with NONE k name make
   fun defer_steps k name setup make = defer_with (SOME setup) k name make
+
+  (* Deferred groups.  A theorem that suspends goals (markerLib.suspend),
+     whose `Resume` blocks follow it in the script and whose `Finalise`
+     follows them, is deferred with its blocks as one proof k.  At the
+     theorem, its stub carries a suspended goal for each label the blocks
+     resume, each the true statement B_k; each block's stub proves B_k.
+     markerLib then stashes the theorem, resumes it and finalises it as it
+     would the real one, so the theorem is saved at its `Finalise` and the
+     theory data records the same suspensions; once a theory is exported
+     those of a finalised theorem are gone (HOL's markerLib drops the
+     out-of-date ones, which build_exec checks the toolchain does before
+     deferring a group).  prove_all then proves the theorem, and each
+     block in its own context, and assembles them as Finalise does.
+
+     B_k is a different closed term for each k, so that two groups open at
+     once, resuming the same label, never share a suspended goal (which
+     markerLib would read as one citing the other), and the kernel proves
+     it, so every statement made under proof k's markers is true. *)
+  fun dummy_body k =
+    let
+      fun digits 0 acc = acc
+        | digits n acc = digits (n div 2) ((n mod 2 = 1) :: acc)
+      fun digit true = boolSyntax.mk_neg boolSyntax.F
+        | digit false = boolSyntax.T
+    in
+      if k = 0 then boolSyntax.T else boolSyntax.list_mk_conj (map digit (digits k []))
+    end
+
+  fun dummy_thm k = Drule.EQT_ELIM (Conv.QCONV (Rewrite.REWRITE_CONV []) (dummy_body k))
+
+  (* markerLib's encoding of a label whose goal has no closure
+     variables. *)
+  fun encoded_label label =
+    let val encoded = "0 " ^ label
+    in
+      if boolLib.decode_suspend_label encoded = (label, 0) then encoded
+      else raise Fail ("label " ^ label ^ " has no encoding as a suspended goal")
+    end
+
+  (* |- suspendlabel <label> B_k. *)
+  fun dummy_label_thm k label = markerLib.add_suspension_label (encoded_label label) (dummy_thm k)
+
+  fun open_groups () =
+    List.mapPartial
+      (fn {name, group, ...} : item =>
+          if Option.isSome group andalso
+             Option.isSome (markerLib.lookup_suspension (Theory.current_theory () ^ "." ^ name))
+          then SOME name
+          else NONE)
+      (!queue)
+
+  fun defer_group_with setup k name labels resumes make : Tactical.tactic = fn goal => fn ctxt =>
+    let val suspended = map (fn label => Thm.concl (dummy_label_thm k label)) labels
+    in
+      enqueue {k = k, name = name, ctxt = ctxt, goal = goal, make = make, setup = setup,
+               group = SOME {labels = labels, resumes = resumes, reached = ref [], open_with = open_groups ()}};
+      Tactic.ACCEPT_TAC (stub k (suspended @ #1 goal, #2 goal)) goal ctxt
+    end
+
+  fun defer_group k name labels resumes make = defer_group_with NONE k name labels resumes make
+  fun defer_group_steps k name labels resumes setup make = defer_group_with (SOME setup) k name labels resumes make
+
+  (* The `Resume` block LABEL of the deferred group THEOREM: markerLib gives
+     it the group's B_k to prove. *)
+  fun defer_resume_with setup theorem label make : Tactical.tactic = fn goal => fn ctxt =>
+    case List.find (fn {name, group, ...} : item => name = theorem andalso Option.isSome group) (!queue) of
+        SOME {k, group = SOME {reached, ...}, ...} =>
+          if null (#1 goal) andalso Term.aconv (#2 goal) (dummy_body k) then
+            (reached := {label = label, ctxt = ctxt, make = make, setup = setup, open_with = open_groups ()} :: !reached;
+             Tactic.ACCEPT_TAC (stub k goal) goal ctxt)
+          else raise Fail ("Resume " ^ theorem ^ "[" ^ label ^ "] has another goal than its deferred group's")
+      | _ => raise Fail ("Resume " ^ theorem ^ "[" ^ label ^ "] has no deferred group")
+
+  fun defer_resume theorem label make = defer_resume_with NONE theorem label make
+  fun defer_resume_steps theorem label setup make = defer_resume_with (SOME setup) theorem label make
 
   fun segment_data ty = Theory.LoadableThyData.segment_data {thy = Theory.current_theory (), thydataty = ty}
 
@@ -109,10 +200,195 @@ struct
         NONE => th
       | SOME ty => raise Fail ("the proof wrote theory data of type " ^ ty)
 
-  fun prove_one types ({ctxt, goal, make, ...} : item) =
-    Context.with_context ctxt
-      (fn () => let val initial = thydata_of types
-                in checked goal initial (Tactical.TAC_PROOF_in ctxt (goal, make ())) end) ()
+  (* What markerLib's build_suspendlabel_thms gives for the goals NCTS of
+     LABEL, proved by TH: |- suspendlabel <label> G for each.  (markerLib
+     keeps it and the functions it uses to itself.) *)
+  local
+    open HolKernel boolLib
+    val suspendimp = prim_mk_const {Thy = "marker", Name = "suspendimp"}
+    val resconj = prim_mk_const {Thy = "marker", Name = "resconj"}
+    fun dest_binop c t =
+      let val (f, r) = dest_comb t
+          val (g, l) = dest_comb f
+      in if same_const g c then (l, r) else raise Fail "dest_binop" end
+    val is_suspimp = can (dest_binop suspendimp)
+    fun strip_suspimp t =
+      case Lib.total (dest_binop suspendimp) t of
+          SOME (a, rest) => let val (asms, g) = strip_suspimp rest in (a :: asms, g) end
+        | NONE => ([], t)
+    fun strip_foralls 0 t = ([], t)
+      | strip_foralls n t =
+          let val (v, body) = dest_forall t
+              val (vs, rest) = strip_foralls (n - 1) body
+          in (v :: vs, rest) end
+    val to_suspimp = SYM markerTheory.suspendimp_def
+    fun sDISCH t th = CONV_RULE (RATOR_CONV (RATOR_CONV (K to_suspimp))) (DISCH t th)
+    val from_resconj = RATOR_CONV (RATOR_CONV (REWR_CONV markerTheory.resconj_def))
+    fun resconjs 1 th = [th]
+      | resconjs n th =
+          if Lib.can (dest_binop resconj) (concl th) then
+            let val (th1, th2) = CONJ_PAIR (CONV_RULE from_resconj th)
+            in th1 :: resconjs (n - 1) th2 end
+          else raise Fail "not a resumption conjunction"
+    fun label_thm label ((nc, s_t), th) =
+      let
+        val (closure, body) = strip_foralls nc s_t
+        val result = if is_suspimp (concl th) then th else itlist sDISCH (#1 (strip_suspimp body)) th
+      in
+        markerLib.add_suspension_label (Int.toString nc ^ " " ^ label) (GENL closure result)
+      end
+  in
+    fun suspendlabel_thms label (ncts, th) =
+      map (label_thm label) (ListPair.zip (ncts, resconjs (length ncts) th))
+  end
+
+  fun is_suspended t = Option.isSome (boolLib.dest_suspended t)
+  fun term_in t ts = List.exists (fn u => Term.aconv t u) ts
+
+  (* The goals each deferred group suspended, by group: those its
+     theorem's proof suspended, which markerLib registers, so that a build
+     in place rejects them in any other theorem or block while the group
+     is open, with the groups open when the script stated it; and, per
+     block, those the block suspended again, with the groups open when the
+     script reached it.  In the outline a group suspends only its dummies,
+     so markerLib couldn't see that; prove_all fails when a goal a group
+     registered recurs, under the same label, in another group's theorem
+     or block stated while the first was open. *)
+  val slabs_mutex = Mutex.mutex ()
+  val group_slabs =
+    ref ([] : {name : string, open_with : string list, initial : Term.term list,
+               nested : (string list * Term.term list) list} list)
+  fun record_slabs entry =
+    (Mutex.lock slabs_mutex; group_slabs := entry :: !group_slabs; Mutex.unlock slabs_mutex)
+  fun check_shared_slabs () =
+    let
+      fun member x xs = List.exists (fn y => y = x) xs
+      fun meet xs ys = List.exists (fn h => term_in h ys) xs
+      (* Whether A's registered goals recur in B where A was open. *)
+      fun cited (a : {name : string, open_with : string list, initial : Term.term list,
+                      nested : (string list * Term.term list) list}) b =
+        (member (#name a) (#open_with b) andalso meet (#initial a) (#initial b)) orelse
+        List.exists (fn (open_with, slabs) => member (#name a) open_with andalso meet (#initial a) slabs) (#nested b)
+      fun clash [] = ()
+        | clash (a :: rest) =
+            (case List.find (fn b => #name b <> #name a andalso (cited a b orelse cited b a)) rest of
+                 SOME b =>
+                   raise Fail ("the deferred groups " ^ #name b ^ " and " ^ #name a ^
+                               " suspend the same goal under the same label")
+               | NONE => clash rest)
+    in
+      clash (!group_slabs)
+    end
+
+  (* The theorem of group item K, NAME, its blocks proved by PROVE_BLOCK
+     (in a block's context, with its setup) and assembled as markerLib's
+     Finalise does.  Fails as a build in place fails: a theorem or block
+     whose proof cites a theorem still suspended where it is stated, a
+     label with no goal to resume, a resumption that reintroduces what it
+     discharges, a goal left suspended; or else where the outline went
+     another way than a build in place would: a block the script didn't
+     reach. *)
+  fun prove_group prove_block ({k, name, ctxt, goal, make, setup, group, ...} : item) =
+    let
+      val {labels, resumes, reached, open_with} =
+        case group of SOME g => g | NONE => raise Fail "not a deferred group"
+      val blocks = rev (!reached)
+      val _ =
+        if length blocks = resumes then ()
+        else raise Fail (Int.toString resumes ^ " Resume blocks of " ^ name ^ ", " ^
+                         Int.toString (length blocks) ^ " reached by the script")
+      (* Every statement the outline made under proof k's markers is true. *)
+      val _ = List.app (fn label => ignore (dummy_label_thm k label)) labels
+      (* As a build in place checks a theorem when it is stashed and a block
+         when it is resumed: a goal the proof suspended (or one of the
+         theorem's own, for a block) is fine, one that an open suspension
+         holds in the block's context is cited from it. *)
+      fun check what ctxt asl own th =
+        (* Assembly may drop a block's theorem (when a later block resumes
+           the same label), and with it the marker the cycle check reads. *)
+        (if List.exists (fn s => s = oracle_prefix ^ Int.toString k) (#1 (Tag.dest_tag (Thm.tag th))) then
+           raise Fail ("the proof of " ^ what ^ " uses the stub of its own deferred group")
+         else ();
+         List.app
+          (fn h =>
+              if term_in h asl then ()
+              else if not (is_suspended h) then
+                raise Fail ("the proof of " ^ what ^ " left a hypothesis its goal lacks: " ^ Parse.term_to_string h)
+              else if term_in h own then
+                raise Fail ("the proof of " ^ what ^ " reintroduces a goal its theorem suspended")
+              else
+                case Context.with_context ctxt (fn () => !boolLib.slab_owner_lookup h) () of
+                    SOME (thy, n) => raise Fail ("the proof of " ^ what ^ " cites still-suspended theorem " ^ thy ^ "." ^ n)
+                  | NONE => ())
+          (Thm.hyp th))
+      val th0 = prove_block (ctxt, goal, make, setup)
+      val _ = check name ctxt (#1 goal) [] th0
+      (* Each block's open groups, goal and theorem, the latest first. *)
+      val block_ths = ref []
+      (* Resumption theorems, the latest first, as markerLib keeps them. *)
+      fun resume ({label, ctxt, make, setup, open_with = opened} : resume, resumed) =
+        let
+          val what = name ^ "[" ^ label ^ "]"
+          val ncts = markerLib.extract_suspended_goal (th0 :: resumed) label
+                     handle Feedback.HOL_ERR _ => raise Fail ("no suspended goal labelled " ^ what)
+          val g = markerLib.resumption_to_goal ncts
+          val th = prove_block (ctxt, g, make, setup)
+        in
+          check what ctxt (#1 g) (Thm.hyp th0) th;
+          block_ths := (opened, g, th) :: !block_ths;
+          rev (suspendlabel_thms label (ncts, th)) @ resumed
+        end
+      val resumed = List.foldl resume [] blocks
+      val block_ths = !block_ths
+      fun suspended th = List.filter is_suspended (Thm.hyp th)
+      fun resumption h =
+        case List.find (fn r => Term.aconv (Thm.concl r) h) resumed of
+            SOME r => r
+          | NONE => raise Fail ("no resumption proves " ^ Parse.term_to_string h ^ " of " ^ name)
+      fun assemble th current =
+        let
+          val th' = List.foldl (fn (h, acc) => Drule.PROVE_HYP (resumption h) acc) th current
+          val remaining = suspended th'
+        in
+          if null remaining then th'
+          else if List.exists (fn h => term_in h remaining) current then
+            raise Fail ("the resumptions of " ^ name ^ " reintroduce the goals they discharge")
+          else assemble th' remaining
+        end
+      val th = assemble th0 (suspended th0)
+      val _ = record_slabs {name = name, open_with = open_with, initial = suspended th0,
+                            nested = map (fn (opened, g, th) => (opened, List.filter (fn h => not (term_in h (#1 g))) (suspended th))) block_ths}
+    in
+      if not (Term.aconv (Thm.concl th) (#2 goal)) then
+        raise Fail ("the assembled theorem of " ^ name ^ " has another conclusion than its goal")
+      else
+        case List.find (fn h => not (term_in h (#1 goal))) (Thm.hyp th) of
+            SOME h => raise Fail ("the assembled theorem of " ^ name ^ " has a hypothesis its goal lacks: " ^
+                                  Parse.term_to_string h)
+          | NONE => th
+    end
+
+  (* As the LSP replays a deferred proof, in its goal's context (see above);
+     a group's theorem and blocks each in its own. *)
+  fun prove_one types (item as {ctxt, goal, make, group, ...} : item) =
+    let
+      fun pinned ctxt f = Context.with_context ctxt f ()
+      fun prove_block (ctxt, goal, make, _) =
+        pinned ctxt (fn () =>
+          let
+            val initial = thydata_of types
+            val th = Tactical.TAC_PROOF_in ctxt (goal, make ())
+          in
+            case changed_thydata initial of
+                NONE => th
+              | SOME ty => raise Fail ("the proof wrote theory data of type " ^ ty)
+          end)
+    in
+      case group of
+          NONE => pinned ctxt (fn () => let val initial = thydata_of types
+                                        in checked goal initial (Tactical.TAC_PROOF_in ctxt (goal, make ())) end)
+        | SOME _ => prove_group prove_block item
+    end
 
   fun result k th =
     let val tag = Thm.tag th
@@ -128,12 +404,28 @@ struct
   fun prove_in_place types items =
     let
       val after_export = Context.snapshot ()
-      fun prove ({k, name, ctxt, goal, make, setup} : item) =
+      fun prove_block (ctxt, goal, make, setup) =
         let
           val _ = Context.restore ctxt
           val initial = thydata_of types
-          val th = (Option.app (fn f => f ()) setup;
-                    checked goal initial (Tactical.prove_goal_in ctxt (goal, make ())))
+          val th = (Option.app (fn f => f ()) setup; Tactical.prove_goal_in ctxt (goal, make ()))
+        in
+          case changed_thydata initial of
+              NONE => th
+            | SOME ty => raise Fail ("the proof wrote theory data of type " ^ ty)
+        end
+      fun prove (item as {k, name, ctxt, goal, make, setup, group} : item) =
+        let
+          val th = (case group of
+                        NONE =>
+                          let
+                            val _ = Context.restore ctxt
+                            val initial = thydata_of types
+                          in
+                            Option.app (fn f => f ()) setup;
+                            checked goal initial (Tactical.prove_goal_in ctxt (goal, make ()))
+                          end
+                      | SOME _ => prove_group prove_block item)
                    handle e => raise Fail ("deferred proof of " ^ name ^ " failed: " ^
                                            (Feedback.exn_to_string e handle Interrupt => "interrupted"))
         in
@@ -158,8 +450,20 @@ struct
       | TheoryDelta.UpdBinding (name, _) => "updated " ^ name
       | TheoryDelta.DelBinding name => "deleted " ^ name
 
+  (* A deferred group whose theorem the script didn't finalise would
+     leave its stub in the theory's suspensions. *)
+  fun check_finalised () =
+    List.app (fn {name, group, ...} : item =>
+                 if Option.isSome group andalso
+                    Option.isSome (markerLib.lookup_suspension (Theory.current_theory () ^ "." ^ name))
+                 then raise Fail ("the deferred group " ^ name ^ " was not finalised")
+                 else ())
+             (!queue)
+
   fun prove_all threads =
     let
+      val _ = check_finalised ()
+      val _ = group_slabs := []
       val types = thydata_types ()
       val items = ref (rev (!queue))
       val _ = queue := []
@@ -218,7 +522,7 @@ struct
       case (!change, if in_place then NONE else changed_thydata live) of
           (SOME what, _) => raise Fail ("a deferred proof changed the theory: " ^ what)
         | (NONE, SOME ty) => raise Fail ("a deferred proof wrote theory data of type " ^ ty)
-        | (NONE, NONE) => proved := !results
+        | (NONE, NONE) => (check_shared_slabs (); proved := !results)
     end
 
   fun merge_strings [] ys = ys
@@ -517,6 +821,9 @@ struct
                             resolved
                           end
           in
+            (* Every proof, also one whose theorem the data doesn't hold (a
+               [local] one only another proof used). *)
+            List.app (fn (k, _) => ignore (lookup k)) (!proved);
             write_data sig_path (rewrite_data lookup data)
           end
 end

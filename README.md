@@ -1279,7 +1279,28 @@ in `.holbuild/plan/outline-skip`, and that input is never pipelined again.
 Proofs that use `cheat` or `suspend`, theorems the script `Resume`s, and
 `Resume` blocks whose header names `smlname` (the stub would give the name a
 theorem with the subgoal's assumptions as hypotheses) run in place; a label
-that only contains the word `smlname` is run in place too. A theory is not pipelined if it saves checkpoints and is a
+that only contains the word `smlname` is run in place too, and so is a
+`Resume` block that uses a top-level helper whose body mentions `suspend` or
+`cheat`.
+
+One exception: when HOL's markerLib drops finalised suspensions from a
+theory's export (it defines `susp_uptodate`), a theorem that the script's
+`Resume X[label]` blocks resume and its `Finalise X` saves is deferred with
+those blocks as one proof. The outline suspends a placeholder goal per label,
+so the script's `Resume` and `Finalise` run on placeholders and save the
+theorem where a plain build does; after the export the theorem's proof and
+each block run in order and are put together as `Finalise` does. The group
+runs in place instead if one of its blocks uses `cheat` or `smlname`, a
+`Resume X` names no label or comes after the `Finalise`, or the source from
+the theorem to its `Finalise` calls markerLib's `lookup_suspension`, `lookup_resumption`,
+`resume`, `prim_resume`, `set_suspended_goal`, `prim_set_suspended_goal` or
+`finalise_suspended_thm` (itself or through a top-level helper whose body
+mentions them), names `X` anywhere but those headers (until the `Finalise`, `X`'s value
+is the stub, whose hypotheses are the placeholders), or, outside the proofs of
+groups, mentions `suspend` or a top-level helper that may suspend, or holds a
+theorem the script resumes. As with `Thm.tag` above, code that reaches `X`'s
+stub some other way (a lookup in a library or inside a structure) and branches
+on its hypotheses without failing outputs what it saw. A theory is not pipelined if it saves checkpoints and is a
 requested target or the build passes `--all-checkpoints`, if it declares
 extra outputs, or under `--trace-steps`, `--repl-on-failure`, a tracing
 kernel or an execution plan.

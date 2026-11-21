@@ -3593,36 +3593,10 @@ val kernel_bypass_names =
    "TheoryReader", "RunCall", "unsafeCast", "PolyML.compiler", "PolyML.Compiler",
    "PolyML.use", "OS.Process.system", "Unix.execute"]
 
-(* text with its comments and string literals blanked, newlines kept, so that
-   names in them are not reported and line numbers still hold. *)
-fun blank_comments_and_strings text =
-  let
-    val n = size text
-    val out = CharArray.tabulate (n, fn i => String.sub (text, i))
-    fun blank (i, stop) =
-      if i >= stop then ()
-      else
-        ((if String.sub (text, i) = #"\n" then () else CharArray.update (out, i, #" "));
-         blank (i + 1, stop))
-    fun at i c = i < n andalso String.sub (text, i) = c
-    fun code i =
-      if i >= n then ()
-      else if at i #"(" andalso at (i + 1) #"*" then
-        let val stop = HolbuildDependencies.skip_comment text (i + 2)
-        in blank (i, stop); code stop end
-      else if at i #"\"" then
-        let val (_, stop) = HolbuildDependencies.scan_string text (i + 1)
-        in blank (i, stop); code stop end
-      else code (i + 1)
-  in
-    code 0;
-    CharArray.vector out
-  end
-
 (* The kernel-bypass names a source text uses, as (line, name), in order. *)
 fun kernel_bypass_uses text =
   let
-    val code = blank_comments_and_strings text
+    val code = HolbuildDependencies.blank_comments_and_strings text
     val n = size code
     fun boundary i = i < 0 orelse i >= n orelse not (HolbuildDependencies.is_word_char (String.sub (code, i)))
     fun name_at i name =

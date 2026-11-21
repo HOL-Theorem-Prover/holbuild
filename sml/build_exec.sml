@@ -3700,9 +3700,9 @@ fun resume_header_names_smlname source_text theorem_start tactic_start =
   end
 
 (* Whether a pipelined build defers the proof TACTIC of a theorem or
-   `Resume` block (KIND) named NAME, given the theorems RESUMED: see
-   deferred_source.  NAMES_SMLNAME says the block's header names `smlname`
-   (resume_header_names_smlname).
+   `Resume` block (KIND) named NAME on its own, given the theorems RESUMED
+   in the script: see deferred_source.  NAMES_SMLNAME says the block's
+   header names `smlname` (resume_header_names_smlname).
 
    A `Resume` block whose header names `smlname` stays in place, since its
    deferred stub would give `smlname` a theorem the real proof doesn't:
@@ -3725,18 +3725,282 @@ fun deferrable_proof resumed kind name names_smlname tactic =
   not (mentions_at_identifier_start tactic "cheat") andalso
   not (mentions_at_identifier_start tactic "suspend")
 
-(* For a pipelined build, which of CHECKPOINTS, of the script SOURCE_TEXT,
-   the instrumented script defers (HolbuildTheoryCheckpoints.instrument). *)
-fun deferrable_checkpoint source_text (checkpoints : HolbuildTheoryCheckpoints.checkpoint list) =
-  let val resumed = resumed_theorems (map (fn {kind, name, ...} => (kind, name)) checkpoints)
-  in fn ({kind, name, theorem_start, tactic_start, tactic_text, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
-          deferrable_proof resumed kind name
-            (kind = "resume" andalso resume_header_names_smlname source_text theorem_start tactic_start)
-            tactic_text
+fun identifier_char c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'"
+
+(* The offsets in TEXT of the whole identifier WORD, in order. *)
+fun identifier_positions text word =
+  let
+    val n = size word
+    fun search start acc =
+      let val (prefix, rest) = Substring.position word (Substring.extract (text, start, NONE))
+      in
+        if Substring.isEmpty rest then rev acc
+        else
+          let
+            val i = start + Substring.size prefix
+            val whole =
+              (i = 0 orelse not (identifier_char (String.sub (text, i - 1)))) andalso
+              (i + n >= size text orelse not (identifier_char (String.sub (text, i + n))))
+          in
+            search (i + 1) (if whole then i :: acc else acc)
+          end
+      end
+  in
+    if n = 0 then [] else search 0 []
   end
 
-(* DEFER_PROOFS: the script is a pipelined build's, which defers what
-   proofs it can. *)
+fun mentions_identifier text word = not (null (identifier_positions text word))
+
+(* The offset just past the first `Finalise NAME` at the start of a line
+   (where HOL's lexer reads one) at or after START in BLANKED
+   (HolbuildDependencies.blank_comments_and_strings), if there is one. *)
+fun finalise_end blanked name start =
+  let
+    val word = "Finalise"
+    val n = size blanked
+    fun skip_space i = if i < n andalso Char.isSpace (String.sub (blanked, i)) then skip_space (i + 1) else i
+    fun search start =
+      let val (prefix, rest) = Substring.position word (Substring.extract (blanked, start, NONE))
+      in
+        if Substring.isEmpty rest then NONE
+        else
+          let
+            val i = start + Substring.size prefix
+            val j = skip_space (i + size word)
+            val stop = j + size name
+          in
+            if (i = 0 orelse String.sub (blanked, i - 1) = #"\n") andalso
+               j > i + size word andalso stop <= n andalso String.substring (blanked, j, size name) = name andalso
+               (stop = n orelse not (identifier_char (String.sub (blanked, stop))))
+            then SOME stop
+            else search (i + 1)
+          end
+      end
+  in
+    search start
+  end
+
+(* The top-level helpers of SOURCE_TEXT that MENTIONS: each `fun`, `val` or
+   `and` at the start of a line whose body, up to the next line that starts
+   a declaration, MENTIONS holds of (blanked by
+   HolbuildDependencies.blank_comments_and_strings) or mentions such a
+   helper. *)
+fun top_level_helpers mentions source_text =
+  let
+    val lines = String.fields (fn c => c = #"\n") (HolbuildDependencies.blank_comments_and_strings source_text)
+    fun name_of tok = Substring.string (Substring.takel identifier_char (Substring.full tok))
+    fun first_token line =
+      if line = "" orelse Char.isSpace (String.sub (line, 0)) then "" else name_of line
+    val declarations =
+      ["fun", "val", "and", "local", "in", "end", "open", "structure", "signature", "functor",
+       "type", "datatype", "exception", "infix", "infixl", "infixr", "nonfix",
+       "Theorem", "Triviality", "Resume", "Finalise", "Definition", "Datatype", "Inductive",
+       "CoInductive", "Overload", "Type", "Proof", "QED", "Termination", "End"]
+    fun starts_declaration line = List.exists (fn d => d = first_token line) declarations
+    fun helper_name body =
+      case String.tokens Char.isSpace body of
+          _ :: "rec" :: name :: _ => name_of name
+        | _ :: name :: _ => name_of name
+        | _ => ""
+    fun defs [] acc = rev acc
+      | defs (line :: rest) acc =
+          if List.exists (fn k => k = first_token line) ["fun", "val", "and"] then
+            let
+              fun body [] lines = (rev lines, [])
+                | body (l :: ls) lines = if starts_declaration l then (rev lines, l :: ls) else body ls (l :: lines)
+              val (bodylines, rest') = body rest [line]
+              val text = String.concatWith "\n" bodylines
+              val name = helper_name text
+            in
+              defs rest' (if name = "" orelse name = "_" then acc else (name, text) :: acc)
+            end
+          else defs rest acc
+    val defs = defs lines []
+    fun grow found =
+      let
+        val more =
+          List.mapPartial
+            (fn (name, body) =>
+                if List.exists (fn f => f = name) found then NONE
+                else if mentions body orelse List.exists (mentions_identifier body) found then SOME name
+                else NONE)
+            defs
+      in
+        if null more then found else grow (more @ found)
+      end
+  in
+    grow []
+  end
+
+(* The top-level helpers of SOURCE_TEXT that may suspend a goal or cheat
+   (top_level_helpers). *)
+fun suspending_helpers source_text =
+  top_level_helpers
+    (fn body => mentions_at_identifier_start body "suspend" orelse mentions_at_identifier_start body "cheat")
+    source_text
+
+(* The markerLib calls that read a suspended theorem or resume one. *)
+val lookup_names =
+  ["lookup_suspension", "lookup_resumption", "resume", "prim_resume", "set_suspended_goal",
+   "prim_set_suspended_goal", "finalise_suspended_thm"]
+
+(* Whether TC's markerLib drops, when a theory is exported, the
+   suspensions the theory itself finalised, which deferring a suspend
+   and `Resume` group needs (proof_deferrals). *)
+fun has_suspension_pruning (tc : HolbuildToolchain.t) =
+  String.isSubstring "susp_uptodate" (read_text (Path.concat(#holdir tc, "src/marker/markerLib.sml")))
+  handle IO.Io _ => false
+
+(* For a pipelined build of the script SOURCE_TEXT, with BLOCKS its theorem
+   and `Resume` blocks in order (OK: whether the block may be deferred at
+   all), how each block's proof runs, by the block's theorem_start: see
+   deferred_source.
+
+   With GROUPS (the toolchain's markerLib drops the suspensions a theory
+   finalises when it exports, so a group's dummy suspensions never reach
+   its outline's export), a theorem that the script's `Resume` blocks
+   resume and its `Finalise` saves defers with those blocks, as one group:
+   if the theorem has one block, every one of its `Resume` blocks names a
+   label and lies between the theorem and its `Finalise`, none of the
+   blocks mentions `cheat` or names `smlname`, and the source from the
+   theorem to its `Finalise` doesn't call markerLib to read or resume a
+   suspension (lookup_names), itself or through a top-level helper
+   (top_level_helpers), which would see the group's dummies, nor names the
+   theorem outside its header, those blocks' headers and the `Finalise`
+   (its value there is the stub, which suspends the dummies).  A group's suspended goals are only known once
+   it is proved, so outside the proofs of groups that span may not mention
+   `suspend` or a helper that may suspend, nor hold a theorem the script
+   resumes: a goal suspended there could be one of the group's, under the
+   same label, which a build in place rejects.  (HolbuildDeferred fails
+   two groups that suspend the same goal.)  Otherwise the theorem stays in place, and its `Resume`
+   blocks defer alone (deferrable_proof) unless they mention a helper
+   that may suspend (suspending_helpers), whose suspension a deferred
+   block would lose. *)
+fun proof_deferrals groups source_text
+      (blocks : {kind : string, name : string, theorem_start : int, tactic_start : int,
+                 tactic_text : string, ok : bool} list) =
+  let
+    val resumed = resumed_theorems (map (fn {kind, name, ...} => (kind, name)) blocks)
+    fun names_smlname {kind, theorem_start, tactic_start, ...} =
+      kind = "resume" andalso resume_header_names_smlname source_text theorem_start tactic_start
+    fun base name = Substring.string (#1 (Substring.splitl (fn c => c <> #"[") (Substring.full name)))
+    fun label name =
+      let val (_, rest) = Substring.splitl (fn c => c <> #"[") (Substring.full name)
+      in
+        if Substring.size rest < 2 then NONE
+        else SOME (Substring.string (Substring.slice (rest, 1, SOME (Substring.size rest - 2))))
+      end
+    val blanked = HolbuildDependencies.blank_comments_and_strings source_text
+    val lookup_helpers =
+      top_level_helpers (fn body => List.exists (mentions_identifier body) lookup_names) source_text
+    fun group (theorem as {theorem_start, name, ...}) =
+      let
+        (* Whether the source from the theorem to STOP, its `Finalise`,
+           names it only in its header, in its `Resume` blocks' HEADERS and
+           in the `Finalise`. *)
+        fun named_in_headers_only headers stop =
+          case map (fn i => theorem_start + i)
+                   (identifier_positions (String.substring (blanked, theorem_start, stop - theorem_start)) name) of
+              [] => false
+            | _ :: rest =>
+                List.all (fn p => p = stop - size name orelse
+                                  List.exists (fn (a, z) => a <= p andalso p < z) headers) rest
+        val resumes = List.filter (fn b => #kind b = "resume" andalso base (#name b) = name) blocks
+        val all = theorem :: resumes
+        val labels =
+          List.foldl (fn (b, acc) =>
+                        case label (#name b) of
+                            SOME l => if List.exists (fn x => x = l) acc then acc else acc @ [l]
+                          | NONE => acc)
+                     [] resumes
+      in
+        case finalise_end blanked name theorem_start of
+            NONE => NONE
+          | SOME stop =>
+              let
+                val blanked_span = String.substring (blanked, theorem_start, stop - theorem_start)
+              in
+                if length (List.filter (fn b => #kind b = "theorem" andalso #name b = name) blocks) = 1 andalso
+                   List.all (fn b => #ok b andalso not (names_smlname b) andalso
+                                     not (mentions_at_identifier_start (#tactic_text b) "cheat")) all andalso
+                   List.all (fn b => Option.isSome (label (#name b)) andalso
+                                     #theorem_start b > theorem_start andalso #theorem_start b < stop) resumes andalso
+                   not (List.exists (mentions_identifier blanked_span) (lookup_names @ lookup_helpers)) andalso
+                   named_in_headers_only (map (fn b => (#theorem_start b, #tactic_start b)) resumes) stop
+                then SOME {name = name, labels = labels, resumes = length resumes,
+                           start = theorem_start, stop = stop}
+                else NONE
+              end
+      end
+    val helpers = suspending_helpers source_text
+    fun theorem_of {kind, name, ...} = if kind = "resume" then base name else name
+    (* Drops the groups whose span, outside the proofs of the groups kept,
+       mentions `suspend` or a helper that may suspend, or holds a theorem
+       the script resumes, until none does. *)
+    fun separate gs =
+      let
+        fun grouped b = List.exists (fn g => #name g = theorem_of b) gs
+        val proofs =
+          List.mapPartial
+            (fn b as {tactic_start, tactic_text, ...} =>
+                if grouped b then SOME (tactic_start, tactic_start + size tactic_text) else NONE)
+            blocks
+        fun outside start stop =
+          CharVector.tabulate (stop - start, fn i =>
+            let val p = start + i
+            in if List.exists (fn (a, z) => a <= p andalso p < z) proofs then #" " else String.sub (blanked, p) end)
+        fun clear {start, stop, ...} =
+          let val text = outside start stop
+          in
+            not (mentions_at_identifier_start text "suspend") andalso
+            not (List.exists (mentions_identifier text) helpers) andalso
+            not (List.exists (fn b => #kind b = "theorem" andalso #theorem_start b > start andalso
+                                      #theorem_start b < stop andalso not (grouped b) andalso
+                                      List.exists (fn r => r = #name b) resumed) blocks)
+          end
+        val kept = List.filter clear gs
+      in
+        if length kept = length gs then gs else separate kept
+      end
+    val grouped =
+      if not groups then []
+      else separate (List.mapPartial (fn b => if #kind b = "theorem" andalso List.exists (fn r => r = #name b) resumed then group b else NONE) blocks)
+    fun deferral (b as {kind, name, tactic_text, ok, ...}) =
+      case List.find (fn g => #name g = theorem_of b) grouped of
+          SOME {name = g, labels, resumes, ...} =>
+            if kind = "theorem" then HolbuildTheoryCheckpoints.DeferGroup {labels = labels, resumes = resumes}
+            else HolbuildTheoryCheckpoints.DeferResume {theorem = g, label = valOf (label name)}
+        | NONE =>
+            if ok andalso deferrable_proof resumed kind name (names_smlname b) tactic_text andalso
+               not (kind = "resume" andalso List.exists (mentions_identifier tactic_text) helpers)
+            then HolbuildTheoryCheckpoints.Defer
+            else HolbuildTheoryCheckpoints.Inline
+    val decided = map (fn b => (#theorem_start b, deferral b)) blocks
+  in
+    fn theorem_start =>
+      case List.find (fn (s, _) => s = theorem_start) decided of
+          SOME (_, d) => d
+        | NONE => HolbuildTheoryCheckpoints.Inline
+  end
+
+(* For a pipelined build with GROUPS (proof_deferrals), how the
+   instrumented script runs each of CHECKPOINTS, of the script SOURCE_TEXT
+   (HolbuildTheoryCheckpoints.instrument).  Only a block with precompiled
+   steps defers. *)
+fun checkpoint_deferral groups source_text (checkpoints : HolbuildTheoryCheckpoints.checkpoint list) =
+  let
+    val deferral =
+      proof_deferrals groups source_text
+        (map (fn {kind, name, theorem_start, tactic_start, tactic_text, proof_ir_factories, ...} =>
+                 {kind = kind, name = name, theorem_start = theorem_start, tactic_start = tactic_start,
+                  tactic_text = tactic_text, ok = Option.isSome proof_ir_factories})
+             checkpoints)
+  in
+    fn ({theorem_start, ...} : HolbuildTheoryCheckpoints.checkpoint) => deferral theorem_start
+  end
+
+(* DEFER_PROOFS: SOME GROUPS when the script is a pipelined build's,
+   which defers what proofs it can (proof_deferrals). *)
 (* SHARE_FAILED_PREFIX: the script runs from the toolchain's base state with
    no deps heap (proof_runtime.sml). *)
 fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker plan_only_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
@@ -3755,7 +4019,9 @@ fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker p
        trace_all = trace_steps policy,
        plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy,
-       defer = if defer_proofs then deferrable_checkpoint source_text checkpoints else (fn _ => false)}
+       defer = case defer_proofs of
+                   SOME groups => checkpoint_deferral groups source_text checkpoints
+                 | NONE => (fn _ => HolbuildTheoryCheckpoints.Inline)}
   else plain_source_from_checkpoint source_name source_text start_offset
 
 fun replay_candidate policy base theorem_checkpoints declaration_checkpoints =
@@ -3866,7 +4132,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker plan_only_marker 
          trace_all = trace_steps policy,
          plan_only_marker = plan_only_marker,
          new_ir = proof_ir_enabled policy,
-         defer = fn _ => false}
+         defer = fn _ => HolbuildTheoryCheckpoints.Inline}
   in
     String.concat
       [HolbuildTheoryCheckpoints.generated_code_pragma source, prelude,
@@ -4159,7 +4425,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
            List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints)
       fun run_from_deps_checkpoint () =
         (ensure_source_checkpoint_parents ();
-         write_text staged_script (instrumented_source false policy false (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source NONE policy false (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          deps_loaded_resume_message logical;
          resume_steps := [("resdepsn", 1)];
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
@@ -4170,7 +4436,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
          ensure_source_checkpoint_parents ();
          if saves_progress policy then write_preload load_lines deps_loaded deps_ok preload
          else write_plain_preload load_lines preload;
-         write_text staged_script (instrumented_source false policy (not (saves_progress policy)) (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source NONE policy (not (saves_progress policy)) (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
         let
@@ -4188,7 +4454,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
       fun run_from_replay {boundary, path, safe_name, kind, failure_checkpoints} =
         let
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (instrumented_source false policy false (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
+          val _ = write_text staged_script (instrumented_source NONE policy false (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
           val _ = source_context_resume_message logical (#source_file action) source_text kind safe_name boundary
           val _ = resume_steps := [("resctxn", 1), ("resboundary", LargeInt.fromInt boundary)]
         in
@@ -4396,7 +4662,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val _ = remove_file timeout_marker
     val _ = remove_file plan_only_marker
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
-    val run_spec = write_theory_script (speculative andalso proof_steps_enabled policy) policy root checkpoint_root base_context action source_text
+    val run_spec = write_theory_script (if speculative andalso proof_steps_enabled policy then SOME (has_suspension_pruning tc) else NONE) policy root checkpoint_root base_context action source_text
                                     theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
                                     (if execution_plan_only policy then SOME plan_only_marker else NONE)
     (* A speculative child runs no checkpoints, so it starts from the
@@ -6323,38 +6589,52 @@ fun unoutline_path root run_dir path =
         | [] => path
   end
 
-(* Whether TEXT has WORD where an identifier starts. *)
 (* The theory script SOURCE_TEXT, with BOUNDARIES its theorem spans, for a
-   pipelined build: every proof deferred, in `HolbuildDeferred.defer`
-   (sml/deferred_proofs_runtime.sml), which accepts its goal at once and
-   proves it after the theory is exported.  A proof that mentions `cheat`
-   stays, so its oracle is there when the theory decides whether to publish
-   its outline (HolbuildDeferred.publish_outline).  A proof (or `Resume` block) that suspends
-   goals stays too, so they are still suspended for the `Resume` blocks
-   that prove them and its `Finalise` saves the theorem where the real
-   build does.  A theorem the script resumes suspends, whether or not its
-   proof names `suspend` (a helper tactic can call it), so it stays as
-   well; HolbuildDeferred fails any other deferred proof that suspends.  A
-   `Resume` block that names `smlname` stays too (deferrable_proof). *)
-fun deferred_source source_text boundaries =
+   pipelined build: each proof proof_deferrals defers (given GROUPS) goes
+   to HolbuildDeferred (sml/deferred_proofs_runtime.sml), which accepts its
+   goal at once and proves it after the theory is exported.  A proof that
+   mentions `cheat` stays, so its oracle is there when the theory decides
+   whether to publish its outline (HolbuildDeferred.publish_outline).  A
+   theorem that suspends goals for `Resume` blocks defers with them as one
+   group (HolbuildDeferred.defer_group), its outline suspending a dummy
+   goal per label, so the script's `Resume` and `Finalise` still run, on
+   those dummies; when it can't, it stays in place, and so does any other
+   proof that names `suspend`, so the goals it suspends are there for the
+   `Resume` blocks that prove them and its `Finalise` saves the theorem
+   where the real build does.  HolbuildDeferred fails any other deferred
+   proof that suspends.  A `Resume` block that names `smlname` stays too
+   (deferrable_proof). *)
+fun deferred_source groups source_text boundaries =
   let
-    val deferred = deferrable_proof (resumed_theorems (map (fn {kind, name, ...} => (kind, name)) boundaries))
+    val deferral =
+      proof_deferrals groups source_text
+        (map (fn {kind, name, theorem_start, tactic_start, tactic_text, ...} =>
+                 {kind = kind, name = name, theorem_start = theorem_start, tactic_start = tactic_start,
+                  tactic_text = tactic_text, ok = true})
+             boundaries)
+    fun str s = HolbuildToolchain.sml_string s
     fun splice [] _ pos acc = String.concat (rev (String.extract (source_text, pos, NONE) :: acc))
-      | splice ({kind, name, theorem_start, tactic_start, tactic_end, ...} :: rest) k pos acc =
+      | splice ({name, theorem_start, tactic_start, tactic_end, ...} :: rest) k pos acc =
           if tactic_start < pos orelse tactic_end < tactic_start then
             raise Error "theorem spans out of order"
           else
-            let val tactic = String.substring (source_text, tactic_start, tactic_end - tactic_start)
-            in
-              if not (deferred kind name
-                        (kind = "resume" andalso resume_header_names_smlname source_text theorem_start tactic_start)
-                        tactic)
-              then splice rest k pos acc
-              else
-                splice rest (k + 1) tactic_end
-                  (String.concat ["HolbuildDeferred.defer ", Int.toString k, " ",
-                                  HolbuildToolchain.sml_string name, " (fn () => (", tactic, "))"] ::
+            let
+              val tactic = String.substring (source_text, tactic_start, tactic_end - tactic_start)
+              fun wrap k' call =
+                splice rest k' tactic_end
+                  (String.concat [call, " (fn () => (", tactic, "))"] ::
                    String.substring (source_text, pos, tactic_start - pos) :: acc)
+            in
+              case deferral theorem_start of
+                  HolbuildTheoryCheckpoints.Inline => splice rest k pos acc
+                | HolbuildTheoryCheckpoints.Defer =>
+                    wrap (k + 1) (String.concat ["HolbuildDeferred.defer ", Int.toString k, " ", str name])
+                | HolbuildTheoryCheckpoints.DeferGroup {labels, resumes} =>
+                    wrap (k + 1)
+                      (String.concat ["HolbuildDeferred.defer_group ", Int.toString k, " ", str name, " ",
+                                      HolbuildToolchain.sml_list labels, " ", Int.toString resumes])
+                | HolbuildTheoryCheckpoints.DeferResume {theorem, label} =>
+                    wrap k (String.concat ["HolbuildDeferred.defer_resume ", str theorem, " ", str label])
             end
   in
     splice boundaries 0 0 []
@@ -6989,7 +7269,7 @@ fun build_speculative options tc project base_context plan keys toolchain_key ru
     (* With proof steps on, the instrumented script defers the proofs. *)
     val deferred =
       if proof_steps_enabled policy then source_text
-      else deferred_source source_text (discover_theorem_boundaries_strict source source_text)
+      else deferred_source (has_suspension_pruning tc) source_text (discover_theorem_boundaries_strict source source_text)
     fun run () =
       let
         val generated_metadata =
@@ -14773,7 +15053,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val source_text =
               if not pipelined orelse proof_steps_enabled policy then source_text
               else
-                deferred_source source_text (discover_theorem_boundaries_strict (#source_file action) source_text)
+                deferred_source (has_suspension_pruning tc) source_text (discover_theorem_boundaries_strict (#source_file action) source_text)
                 handle Error msg => raise ActionFailed (ScriptFailure, "cannot defer the proofs: " ^ msg)
             val checkpoints = phase "analyse" (fn () => action_checkpoints policy checkpoint_root action source_text)
             val shared =
