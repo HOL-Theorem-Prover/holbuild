@@ -111,8 +111,10 @@ pause='(fn g => (OS.Process.sleep (Time.fromSeconds 2); ALL_TAC g))'
 slow_truth="$pause >> $pause >> $pause >> $pause >> ACCEPT_TAC TRUTH"
 fast='--skip-checkpoints --skip-proof-steps'
 
-# Groups that pass: a closed group whose last Resume is slow; nested
-# Resumes; two groups that overlap and share a label (with other goals,
+# Groups that pass: a closed group whose last Resume is slow; one with a
+# `Resume` block for a label its theorem's proof never suspends (its
+# `suspend` runs on no goal), which markerLib skips, so it never runs;
+# nested Resumes; two groups that overlap and share a label (with other goals,
 # which HOL needs); a group finalised
 # [local], which the script still uses; a group the build keeps in place,
 # since its span looks the suspension up, whose `Resume` block suspends
@@ -137,6 +139,19 @@ Resume closed[right]:
   $slow_truth
 QED
 Finalise closed
+
+Theorem dead_label:
+  T /\\ T
+Proof
+  CONJ_TAC >- suspend "live" >- ACCEPT_TAC TRUTH >> suspend "dead"
+QED
+Resume dead_label[dead]:
+  NO_TAC
+QED
+Resume dead_label[live]:
+  ACCEPT_TAC TRUTH
+QED
+Finalise dead_label
 
 Theorem nested:
   p ==> p

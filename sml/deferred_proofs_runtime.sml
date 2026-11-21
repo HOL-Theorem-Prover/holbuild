@@ -284,10 +284,10 @@ struct
      (in a block's context, with its setup) and assembled as markerLib's
      Finalise does.  Fails as a build in place fails: a theorem or block
      whose proof cites a theorem still suspended where it is stated, a
-     label with no goal to resume, a resumption that reintroduces what it
-     discharges, a goal left suspended; or else where the outline went
-     another way than a build in place would: a block the script didn't
-     reach. *)
+     resumption that reintroduces what it discharges, a goal left
+     suspended; or else where the outline went another way than a build
+     in place would: a block the script didn't reach.  A block whose label
+     has no goal to resume doesn't run, as in place. *)
   fun prove_group prove_block ({k, name, ctxt, goal, make, setup, group, ...} : item) =
     let
       val {labels, resumes, reached, open_with} =
@@ -325,19 +325,25 @@ struct
       val _ = check name ctxt (#1 goal) [] th0
       (* Each block's open groups, goal and theorem, the latest first. *)
       val block_ths = ref []
-      (* Resumption theorems, the latest first, as markerLib keeps them. *)
+      (* Resumption theorems, the latest first, as markerLib keeps them.
+         A block whose label has no suspended goal doesn't run, as
+         markerLib's resume skips it in place: th0 and RESUMED hold every
+         theorem markerLib looks the label up in, since it files each
+         resumption under every label of its hypotheses.  A goal left
+         without a resumption still fails the assembly. *)
       fun resume ({label, ctxt, make, setup, open_with = opened} : resume, resumed) =
-        let
-          val what = name ^ "[" ^ label ^ "]"
-          val ncts = markerLib.extract_suspended_goal (th0 :: resumed) label
-                     handle Feedback.HOL_ERR _ => raise Fail ("no suspended goal labelled " ^ what)
-          val g = markerLib.resumption_to_goal ncts
-          val th = prove_block (ctxt, g, make, setup)
-        in
-          check what ctxt (#1 g) (Thm.hyp th0) th;
-          block_ths := (opened, g, th) :: !block_ths;
-          rev (suspendlabel_thms label (ncts, th)) @ resumed
-        end
+        case Lib.total (markerLib.extract_suspended_goal (th0 :: resumed)) label of
+            NONE => resumed
+          | SOME ncts =>
+              let
+                val what = name ^ "[" ^ label ^ "]"
+                val g = markerLib.resumption_to_goal ncts
+                val th = prove_block (ctxt, g, make, setup)
+              in
+                check what ctxt (#1 g) (Thm.hyp th0) th;
+                block_ths := (opened, g, th) :: !block_ths;
+                rev (suspendlabel_thms label (ncts, th)) @ resumed
+              end
       val resumed = List.foldl resume [] blocks
       val block_ths = !block_ths
       fun suspended th = List.filter is_suspended (Thm.hyp th)
