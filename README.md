@@ -1348,12 +1348,12 @@ reused as is.
 ### Giving a tool a file it reads
 
 `holbuild build --scratch-input FILE` gives each theory's HOL processes the
-environment variable `HOLBUILD_SCRATCH_INPUT`, the path of FILE: locally FILE
-itself, on a remote worker a read-only copy fetched from the remote cache (see
-"Running one theory action as a remote worker"). It is a niche option for data
-a tool reads during a build that must not change what the build produces, such
-as the index a proof search consults to suggest tactics that the build then
-checks. No key covers it: not a theory's cache key nor any checkpoint's, so
+environment variable `HOLBUILD_SCRATCH_INPUT`, the path of FILE, a regular file:
+locally FILE itself, on a remote worker a read-only copy fetched from the
+remote cache (see "Running one theory action as a remote worker"). It is a
+niche option for data a tool reads during a build that must not change what
+the build produces, such as the index a proof search consults to suggest
+tactics that the build then checks. No key covers it: not a theory's cache key nor any checkpoint's, so
 outputs and checkpoints built with one FILE, or none, are reused with another.
 A script whose outputs depend on what FILE holds builds wrongly cached
 theories; declare such a file as an extra input instead.

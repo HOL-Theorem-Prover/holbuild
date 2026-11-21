@@ -105,6 +105,11 @@ if hb action-spec --scratch-input "$tmpdir/missing.txt" UTheory > "$tmpdir/missi
   echo "a missing scratch input was accepted" >&2; exit 1
 fi
 require_grep "\-\-scratch-input: no file" "$tmpdir/missing.log"
+mkfifo "$tmpdir/fifo"
+if hb action-spec --scratch-input "$tmpdir/fifo" UTheory > "$tmpdir/fifo.log" 2>&1; then
+  echo "a FIFO was accepted as the scratch input" >&2; exit 1
+fi
+require_grep "\-\-scratch-input takes a regular file" "$tmpdir/fifo.log"
 
 # worker_command NAME SPEC [OPTION...]: exec-action of SPEC in the worker's
 # cache root, sharing heaps.
@@ -148,11 +153,30 @@ HOLBUILD_CACHE=$tmpdir/worker-a "$HOLBUILD_BIN" --remote-cache "$remote_url" exe
 wait "$u_pid" || true
 built u-one one
 
-# Another input resumes from the theorem context the first shared.
+# Another input resumes from the theorem context the first shared.  The run
+# loads ahead of A, unpublished until U waits for it; then the heap U shared
+# makes the load ahead start over plain, which empties the action root, so
+# the input is staged again.
 write_u 'ACCEPT_TAC TRUTH'
 hb action-spec --upload --scratch-input "$tmpdir/two.txt" UTheory > "$tmpdir/batch-u2.txt"
-worker_command u-two "$(field "$tmpdir/batch-u2.txt" scratch:UTheory 4)"
+# A is built, so only the first batch exports it.
+key_A=$(field "$tmpdir/batch-one.txt" scratch:ATheory 2)
+ac_A=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_A" | sha256sum | cut -d' ' -f1)
+mv "$tmpdir/remote/ac/$ac_A" "$tmpdir/ac-A"
+worker_command u-two "$(field "$tmpdir/batch-u2.txt" scratch:UTheory 4)" \
+  --ahead-parent "$key_A:$(field "$tmpdir/batch-one.txt" scratch:ATheory 4)" &
+u_pid=$!
+background+=("$u_pid")
+for _ in {1..1200}; do
+  [[ -e "$waiting" ]] && break
+  kill -0 "$u_pid" 2>/dev/null || break
+  sleep 0.1
+done
+[[ -e "$waiting" ]] || { echo "U never waited for A" >&2; cat "$tmpdir/u-two.log" >&2; exit 1; }
+mv "$tmpdir/ac-A" "$tmpdir/remote/ac/$ac_A"
+wait "$u_pid" || true
 built u-two two
+require_grep "loading ahead found a build to reuse; building plain" "$tmpdir/u-two.log"
 require_grep "from: theorem-context checkpoint after u1" "$tmpdir/u-two.log"
 
 # Locally the child reads FILE itself, and every checkpoint U saves has the

@@ -2385,8 +2385,10 @@ fun split_scratch_input_flag args =
         let val path = OS.FileSys.fullPath file
                        handle OS.SysErr _ => raise Error ("--scratch-input: no file " ^ HolbuildHash.quote file)
         in
-          if OS.FileSys.isDir path then
-            raise Error ("--scratch-input takes a file, not the directory " ^ HolbuildHash.quote file)
+          (* A FIFO or device would read differently for the hash, the
+             upload and each child. *)
+          if not (Posix.FileSys.ST.isReg (Posix.FileSys.stat path)) then
+            raise Error ("--scratch-input takes a regular file, not " ^ HolbuildHash.quote file)
           else
             (HolbuildBuildExec.scratch_input_file := SOME path;
              HolbuildBuildExec.scratch_input_path := SOME path;

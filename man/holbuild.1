@@ -812,7 +812,7 @@ Give each theory's HOL processes
 .BR HOLBUILD_SCRATCH_INPUT ,
 the path of
 .I FILE
-(on a remote worker, a read-only copy), for data a tool reads that must not
+(a regular file; on a remote worker, a read-only copy), for data a tool reads that must not
 change what the build produces.
 No key covers it: outputs and checkpoints are cached as if it were absent,
 so they must not depend on it.
