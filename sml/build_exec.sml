@@ -12025,8 +12025,8 @@ fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak
       "status=" ^ status] @
      (case failure of
           NONE =>
-            (case (case (log, log_error) of (NONE, SOME msg) => [msg] | _ => []) @
-                  (case fallback of SOME msg => ["pipelined attempt failed, built plain: " ^ msg] | NONE => []) of
+            (case (case fallback of SOME msg => ["pipelined attempt failed, built plain: " ^ msg] | NONE => []) @
+                  (case (log, log_error) of (NONE, SOME msg) => [msg] | _ => []) of
                  [] => []
                | details => ["detail=" ^ result_detail (String.concatWith "; " details)])
         | SOME (kind, msg) =>
