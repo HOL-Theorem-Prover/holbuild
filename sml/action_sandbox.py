@@ -161,7 +161,14 @@ class Linux:
         try:
             for paths, access in ((readable, read), (writable, tree), (scratch, write)):
                 for path in paths:
-                    parent = os.open(path, os.O_PATH | os.O_CLOEXEC)
+                    try:
+                        parent = os.open(path, os.O_PATH | os.O_CLOEXEC)
+                    except FileNotFoundError:
+                        # A read grant gone since holbuild listed it (a theory
+                        # module swept from its store) grants nothing.
+                        if access == read:
+                            continue
+                        raise
                     try:
                         allowed = access if stat.S_ISDIR(os.fstat(parent).st_mode) else access & (1 | 2 | 4 | (1 << 14))
                         rule = PathRule(allowed, parent)
@@ -299,9 +306,10 @@ class Policy:
     toolchain: bool = False
 
     def validate(self) -> None:
-        for grant in self.readable + self.writable + self.scratch:
+        for grant in self.writable + self.scratch:
             if not grant.exists():
                 raise SandboxError(f"sandbox grant does not exist: {grant}")
+        for grant in self.readable + self.writable + self.scratch:
             if self.exposes(grant):
                 raise SandboxError(f"sandbox grant contains protected worker state: {grant}")
 
@@ -732,6 +740,18 @@ def signal_late_members(group: int, sig: int, signaled: dict[int, Process]) -> N
         close_processes(signaled)
 
 
+def existing(paths: list[str]) -> list[Path]:
+    """The resolved read grants that still exist: a theory module listed for
+    the action can be swept from its store before the helper starts."""
+    found: list[Path] = []
+    for path in paths:
+        try:
+            found.append(Path(path).resolve(strict=True))
+        except FileNotFoundError:
+            pass
+    return found
+
+
 def spellings(name: str) -> tuple[set[Path], set[Path]]:
     """The path as given, each link met while resolving it, and its target;
     and every directory passed through on the way.
@@ -938,7 +958,7 @@ def main() -> int:
                            [sys.executable, "-I", "-c", "import os; os.kill(os.getpid(), 0)"])
         policy = Policy(
             [Path(path).resolve(strict=True) for path in args.write],
-            [Path(path).resolve(strict=True) for path in args.read],
+            existing(args.read),
             [path for name in args.forbid for path in spellings(name)[0]] +
             [path.resolve() for path in (args.completed, options) if path is not None],
             toolchain=args.toolchain,

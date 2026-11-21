@@ -11,9 +11,10 @@ val outputs_validated = ref false
 (* exec-action's --result file: the worker's, so never exposed to the action. *)
 val result_file : string option ref = ref NONE
 
-(* Directories every sandboxed child may read, such as the host's store of
-   HOL theory modules, which no child writes. *)
-val shared_reads : string list ref = ref []
+(* The theory module files a theory child may read, from the host's store,
+   which no child writes or lists.  Called at each launch, so it sees
+   modules installed since it was set. *)
+val module_reads : (unit -> string list) ref = ref (fn () => [])
 (* While set, a child writes only these directories and may read, but not
    write, the private roots. *)
 val output_dirs : string list option ref = ref NONE
@@ -184,7 +185,7 @@ fun grant_options ({writable, readable = extra, toolchain} : grants) =
         "/usr", "/bin", "/sbin", "/lib", "/lib64", "/dev/urandom", "/dev/zero", "/proc/meminfo",
         "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/localtime",
         "/etc/ssl/certs", "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf", "/etc/gai.conf"] @
-       poly_libraries @ extra @ !shared_reads @ fields "HOLBUILD_ACTION_READ_DIRS" @
+       poly_libraries @ extra @ fields "HOLBUILD_ACTION_READ_DIRS" @
        List.mapPartial OS.Process.getEnv ["HOLBUILD_POLYC", "HOLBUILD_ANALYSER_SRC"])
     (* As configured, not normalized: the helper also forbids each link on
        the way, and resolves ".." after a link the way open does. *)
@@ -215,9 +216,12 @@ fun grant_options ({writable, readable = extra, toolchain} : grants) =
   in
     (if toolchain then ["--toolchain"] else []) @
     options "--write" (map full writable) @
-    options "--read" (map full readable) @ options "--forbid" forbidden @
-    (* Restored states link into the store, which actions read in parts. *)
-    options "--keep-read-only" [OS.Path.concat (cache, "checkpoint-store")] @
+    (* A theory module can be swept from its store after exists saw it. *)
+    options "--read" (List.mapPartial (fn path => SOME (full path) handle OS.SysErr _ => NONE) readable) @
+    options "--forbid" forbidden @
+    (* Restored states link into the store, and theory children read
+       single modules of the theory module stores. *)
+    options "--keep-read-only" (map (fn dir => OS.Path.concat (cache, dir)) ["checkpoint-store", "theory-modules"]) @
     (* Poly/ML's OS.FileSys.tmpName always creates files in /tmp, ignoring
        TMPDIR; HolSat and HolSmt need it.  The helper leaves it out if
        protected worker state, holbuild's TMPDIR included, lies beneath it. *)
@@ -331,16 +335,17 @@ fun checkpoint_grants checkpoints =
 (* The theory action: its private roots are what the worker harvests.
    Under with_output_dirs (the worker's module writer), the child writes
    only those directories and reads the action root; it runs after the
-   action's checkpoints are gone. *)
+   action's checkpoints are gone.  Either reads the modules module_reads
+   names. *)
 fun action_grants (root, checkpoints) : grants =
   case !output_dirs of
       NONE =>
         let val {writable = saves, readable = stored} = checkpoint_grants checkpoints
         in
           {writable = getOpt (!action_write_dirs, [root]) @ saves,
-           readable = [root, checkpoints] @ stored, toolchain = false}
+           readable = [root, checkpoints] @ stored @ !module_reads (), toolchain = false}
         end
-    | SOME dirs => {writable = dirs, readable = [root], toolchain = false}
+    | SOME dirs => {writable = dirs, readable = root :: !module_reads (), toolchain = false}
 
 fun launch argv execute =
   case !private_roots of
