@@ -541,6 +541,17 @@ def test_high_work_draws_its_scale_in_line_over_the_hosts_with_burst_workers(coo
     assert (coordinator._kept_hosts(1), coordinator._kept_hosts(1, "high")) == ({"host-0"}, {"host-9"})
 
 
+def test_full_hosts_come_before_partly_drained_ones_below_the_line(coordinator: Coordinator) -> None:
+    """host-0 kept one of its workers through a scale-in; full host-1 can run the work alone, so host-0 is above
+    the line, though it comes first in canonical order."""
+    coordinator.settings.warm_workers = 0
+    coordinator.report_worker("host-0", "host-0-w0", ["high", "standard"])
+    for i in range(4):
+        coordinator.report_worker("host-1", f"host-1-w{i}", ["high", "standard"])
+
+    assert (coordinator._kept_hosts(3), coordinator._kept_hosts(3, "high")) == ({"host-1"}, {"host-1"})
+
+
 def test_the_high_line_counts_high_work_and_burst_workers_only(coordinator: Coordinator) -> None:
     """One ready high build needs one burst host, whatever the warm workers wanted; with host-8's burst worker
     leased, host-9 too, though host-8's standard workers are free."""
@@ -592,18 +603,23 @@ async def test_a_claim_passing_over_a_held_build_wakes_a_holder_that_began_waiti
 async def test_the_end_of_a_hold_wakes_a_waiting_claim_for_the_build_left(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cold host-3 leaves ``b1`` to host-1 and takes ``a1``; when the hold ends, the claim waiting on cold host-9 is
-    woken for ``b1``, though host-1 never came for it, and nothing new was made ready."""
+    """Cold host-3 leaves ``b1`` to host-1 and takes ``a1``, which wakes the claim waiting on host-8 in case batch
+    ``a`` has another; when the hold ends, the claim waiting on cold host-9 is woken for ``b1``, though host-1 never
+    came for it, and nothing new was made ready."""
     monkeypatch.setattr(coordinator_module, "LOCALITY_HOLD_SECONDS", 0.05)
     coordinator.settings.warm_workers = 3
     await run_on(http, cache, "host-1", "b0", "b", D1)
     batch_id = await submit_as(http, "b1", "b")
     await submit_as(http, "a1", "a")
-    wake = asyncio.get_running_loop().create_future()
-    coordinator.claim_waiters = [(["standard"], _claim_rank(["standard"], "host-9"), wake, False)]
+    wake, passed_on = asyncio.get_running_loop().create_future(), asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters = [
+        (["standard"], _claim_rank(["standard"], "host-9"), wake, False),
+        (["standard"], _claim_rank(["standard"], "host-8"), passed_on, False),
+    ]
     made_ready = coordinator.made_ready
     claimed = await claim_on(http, "host-3")
     assert claimed is not None and claimed["theory"] == "pkg:a"
+    assert passed_on.result() == ("standard", False, None, None)
 
     await asyncio.wait_for(asyncio.shield(wake), 5)
 
@@ -1033,7 +1049,7 @@ async def test_a_holder_claiming_unwoken_tries_each_tier_with_a_held_build(
     coordinator.host_keys["host-1"]["pkg:h"] = None
     coordinator.claim_waiters = [
         (
-            ["high", "standard"], _claim_rank(["high", "standard"], "host-0"),
+            ["high", "standard"], _claim_rank(["high", "standard"], "host-0", 0, 1),  # its one worker below
             asyncio.get_running_loop().create_future(), False,
         )
     ]

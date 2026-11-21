@@ -1269,7 +1269,9 @@ async def test_an_action_made_ready_wakes_one_of_the_waiting_claims(
     done, pending = await asyncio.wait(waiting, timeout=10, return_when=asyncio.FIRST_COMPLETED)
     assert [task.result().theory for task in done] == ["pkg:a"]
     await asyncio.sleep(0.5)
-    assert attempts == 11  # the other nine slept on
+    # The claim that took it woke one more, as the ranking doesn't know whether the batch has another; the other
+    # eight slept on.
+    assert attempts == 12
     for task in pending:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
@@ -1410,6 +1412,61 @@ async def test_tail_hosts_empty_once_demand_falls_after_a_peak_ran_every_theory_
         task.cancel()
     await asyncio.gather(*waiting, return_exceptions=True)
     assert tail_leases[-12:] == [0] * 12, tail_leases
+
+
+async def test_a_partly_drained_host_loses_work_to_a_full_one_and_empties(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scale-in stopped the idle workers of burst host-0, the first in canonical order, and left two running; burst
+    host-1 kept all four. A stream of work that host-1 alone can run then goes to host-1, so host-0 empties and can
+    scale in."""
+    burst = ["high", "standard"]
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only wakes end the waits in time
+    workers = {"host-0": 2, "host-1": 4}
+    running: deque[tuple[str, str, Claim]] = deque()  # host, action name and claim of each lease, oldest first
+    claimed: asyncio.Queue[tuple[str, Claim]] = asyncio.Queue()
+    waiting: list[asyncio.Task[None]] = []
+
+    def report() -> None:
+        for host, count in workers.items():
+            leases = sum(h == host for h, _, _ in running)
+            coordinator.report_host(HostReport(host, 50.0, 64 << 30, 40 << 30, 52 << 30, 6 << 30, leases, False, 1))
+            for slot in range(count):
+                coordinator.report_worker(host, f"{host}-{slot}", burst)
+
+    async def submit_action(name: str) -> None:
+        text = f"holbuild-action-batch-v1\naction {input_key(name)} {ac_key(name)} {spec(name)} pkg:{name}\n"
+        assert (await http.post("/v1/batches", content=text, headers=CLIENT)).status_code == 201
+
+    async def free_slot(host: str) -> None:
+        claim = await coordinator.claim(burst, host, 30, host_id=host, host_rank=1)
+        assert claim is not None
+        await claimed.put((host, claim))
+
+    report()
+    for host in ["host-0", "host-1", "host-0", "host-1"]:
+        await submit_action(name := f"start-{len(running)}")
+        claim = await coordinator.claim(burst, host, host_id=host, host_rank=1)
+        assert claim is not None
+        running.append((host, name, claim))
+    for host in ["host-1", "host-1"]:  # host-1's idle workers wait for work
+        waiting.append(asyncio.create_task(free_slot(host)))
+    drained_leases = []
+    for step in range(12):
+        host, name, claim = running.popleft()
+        cache.keys.add(ac_key(name))
+        assert (await complete(http, str(claim.attempt_token), result(name, "built"))).status_code == 200
+        waiting.append(asyncio.create_task(free_slot(host)))
+        report()
+        await asyncio.sleep(0.05)
+        await submit_action(f"s{step}")
+        host, claim = await asyncio.wait_for(claimed.get(), 10)
+        running.append((host, f"s{step}", claim))
+        drained_leases.append(sum(h == "host-0" for h, _, _ in running))
+    for task in waiting:
+        task.cancel()
+    await asyncio.gather(*waiting, return_exceptions=True)
+    assert drained_leases[-8:] == [0] * 8, drained_leases
 
 
 def busy(host_id: str, leases: int) -> HostReport:
@@ -1704,6 +1761,88 @@ async def test_rechecking_tail_host_defers_ready_work_to_a_better_waiter(
     coordinator.claim_waiters.remove(waiter)
     claimed = await coordinator.claim(["high", "standard"], "preferred", host_id="host-a")
     assert claimed is not None and claimed.theory == "pkg:a"
+
+
+async def test_a_tail_host_claims_while_more_builds_are_ready_than_better_waiters(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a", "b"])
+    await coordinator.queue()  # counts the ready builds
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
+    claimed = await coordinator.claim(["standard"], "tail", host_id="host-b")
+    # The lease wakes the better waiter for the build left.
+    assert claimed is not None and wake.result()[0] == "standard"
+    # Another better waiter can take that build, though no count ran since.
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
+    assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
+
+
+async def test_a_tail_host_defers_to_a_better_waiter_when_the_other_ready_builds_wait_on_single_flight(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a"])
+    assert await coordinator.claim(["standard"], "w", host_id="host-a") is not None
+    await submit(http, ["a", "b"])  # its ``a`` waits for that lease, so only ``b`` can be claimed
+    await coordinator.queue()
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
+    assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
+
+
+async def test_a_tail_host_defers_to_a_better_waiter_when_the_ready_builds_share_one_key(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a"])
+    await submit(http, ["a"])  # single-flight leases ``a`` once
+    await coordinator.queue()
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
+    assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
+
+
+async def test_a_lease_while_the_ready_builds_are_counted_still_counts_off_them(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await submit(http, ["a", "b"])
+    counts = coordinator._counts
+
+    async def leasing_meanwhile(*args: Any) -> Any:
+        read = await counts(*args)
+        assert await coordinator.claim(["standard"], "w", host_id="host-a") is not None
+        return read
+
+    monkeypatch.setattr(coordinator, "_counts", leasing_meanwhile)
+    await coordinator.queue()
+    assert coordinator.claimable["standard"] == 1
+
+
+@pytest.mark.parametrize("hosts", [["host-a", "host-b", "host-c"], ["host-a"] * 3], ids=["deferring", "one-host"])
+async def test_each_claim_that_leases_a_build_wakes_the_next_waiting_claim_while_builds_remain(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, hosts: list[str]
+) -> None:
+    """Claims from host-b and host-c defer to the one from host-a; those from one host defer to none."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 1.0)
+    loop = asyncio.get_running_loop()
+    claims = []
+    for host in hosts:
+        claims.append(asyncio.create_task(coordinator.claim(["standard"], f"{host}-w{len(claims)}", 10, host_id=host)))
+        await asyncio.sleep(0.3)
+    # Made ready by another coordinator process: no wake here, and this one's count still finds nothing ready.
+    with monkeypatch.context() as patch:
+        patch.setattr(coordinator, "_wake_claim", lambda *args, **kwargs: None)
+        await submit(http, ["a", "b", "c"])
+    started = loop.time()
+    try:
+        for claim in claims:
+            assert (await asyncio.wait_for(claim, 5)) is not None
+        # The first claimed at its recheck, then the others in turn, not at their own rechecks 0.4 and 0.7 s on.
+        assert loop.time() - started < 0.4
+    finally:
+        for claim in claims:
+            claim.cancel()
+        await asyncio.gather(*claims, return_exceptions=True)
 
 
 async def test_burst_can_claim_high_while_warm_waits_for_standard(
