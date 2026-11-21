@@ -259,6 +259,8 @@ there, so an action a busy host couldn't start yet stays at the coordinator
 for a worker on another host. Likewise a worker claims only while its temp
 dir and its `HOLBUILD_CACHE` root each have 4 GiB free, so a host whose disk
 is full doesn't take actions it would only fail. A worker short of disk first
+stops the `exec-action` it runs in the background after a result (below),
+deletes the `module-writer-<pid>` roots module writers it stopped left, and
 empties the `action`, `parked`, `action-parked` and `tmp` directories of its
 `HOLBUILD_CACHE` root, which its own finished actions left behind (releases
 0.14.79 to 0.14.83 parked theories in `parked` and `action-parked`), and drops
@@ -314,9 +316,16 @@ workers do when they aren't running HOL:
   `--cooperate-dir`;
 - `complete`: reporting the result;
 - `after_result`: `exec-action` after its result is reported, publishing
-  shared checkpoints and tools for later actions, emptying the action's
-  directory, refreshing the cache-cap measurement and writing theory
-  modules. The worker stops it 120 s after the result.
+  shared checkpoints and tools for later actions and emptying the action's
+  directory, until it releases the action-root lock (`action.lock` in the
+  worker's cache). It then refreshes the cache-cap measurement and writes
+  theory modules in the background while the worker claims its next action;
+  releases before 0.14.94 keep the lock, and the worker waits, until they
+  exit. The worker kills it 120 s after the result, and stops it when it
+  drains, when it is short of disk, and once it has reported the next
+  action's result. One runs in the background at a time: the next
+  `exec-action` waits for `post-result.lock`, which the previous one holds
+  until it exits, before its own sweep and writer.
 
 ## Action isolation
 

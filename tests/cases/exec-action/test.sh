@@ -417,7 +417,10 @@ printf 'corrupt dependency\n' > "$tmpdir/worker-c/blobs/$dep_dat"
 # When worker c compresses a theory module to publish it, a heap restore
 # renames another copy over the module in the store, as a sibling worker's
 # can (fetch_heap_modules): the shim saves the module and puts other bytes
-# at its path before the real zstd reads its input.
+# at its path before the real zstd reads its input.  It also records
+# whether worker c's action-root lock is free by then: the writer runs
+# after exec-action lets the worker's next action have the root.  The
+# probes take the lock, so concurrent compressions take turns.
 zstd_shim=$tmpdir/zstd-shim
 swapped=$tmpdir/swapped-modules
 mkdir -p "$zstd_shim" "$swapped"
@@ -425,6 +428,14 @@ cat > "$zstd_shim/zstd" <<SH
 #!/usr/bin/env bash
 src=\${!#}
 if [[ \$src == *.pmo ]]; then
+  flock "$tmpdir/lock-probe" python3 -c 'import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("free")
+except OSError:
+    print("held")' "$tmpdir/worker-c/action.lock" >> "$tmpdir/lock-at-publish"
+  [[ -e "$tmpdir/previous-let-go" ]] || echo "before the previous action let go" >> "$tmpdir/lock-at-publish"
   for module in "$tmpdir"/worker-c/theory-modules/*/"\$(basename "\$src")"; do
     [[ -f \$module && ! -e "$swapped/\$(basename "\$module")" ]] || continue
     cp "\$module" "$swapped/"
@@ -436,7 +447,18 @@ exec "$(command -v zstd)" "\$@"
 SH
 chmod +x "$zstd_shim/zstd"
 if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
+  # A previous action of worker c still runs its work after its result for
+  # 3 s: this one's writer waits for it.
+  python3 -c 'import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)
+fcntl.lockf(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(3)
+open(sys.argv[3], "w").close()' "$tmpdir/worker-c/post-result.lock" "$tmpdir/previous-holds" "$tmpdir/previous-let-go" &
+  previous=$!
+  until [[ -e "$tmpdir/previous-holds" ]]; do sleep 0.05; done
   PATH="$zstd_shim:$PATH" worker c "$spec_c"
+  wait "$previous"
 else
   worker c "$spec_c"
 fi
@@ -482,6 +504,11 @@ if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   require_grep 'modules_published=[1-9]' "$tmpdir/c.log"
   [[ -z $(find "$tmpdir/worker-c/action" -name 'theory-module-writer*') ]] || {
     echo "worker c's writer left its files in the action root" >&2; exit 1; }
+  [[ -s "$tmpdir/lock-at-publish" && -z $(grep -v '^free$' "$tmpdir/lock-at-publish") ]] || {
+    echo "worker c's writer ran holding the action-root lock, or before the previous action let go:" >&2
+    cat "$tmpdir/lock-at-publish" >&2; exit 1; }
+  [[ -z $(compgen -G "$tmpdir/worker-c/module-writer-*") ]] || {
+    echo "worker c's writer left its root" >&2; exit 1; }
   [[ ! -e "$tmpdir/worker-c/checkpoints" ]] || {
     echo "worker c's action left its checkpoints after the result" >&2; exit 1; }
   # The next child on worker c loads A and B from those modules, not from

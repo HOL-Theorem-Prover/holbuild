@@ -80,9 +80,12 @@ CHECKPOINT_PUBLISH_SECONDS = 15
 # How often a running exec-action is checked for exit and for its result, and how often its HOL children are.
 POLL_SECONDS = 0.1
 HOL_SAMPLE_SECONDS = 1.0
-# How long exec-action may go on publishing checkpoints for later actions after its result is reported. A large
-# theory's publish takes up to ~30 s; past this a hung upload stops parking the worker.
+# How long exec-action may go on after its result is reported: publishing checkpoints for later actions, which parks
+# the worker, and then the cache sweep and the module writer, which run on while the worker takes its next action. A
+# large theory's publish takes up to ~30 s; past this a hung upload stops parking the worker.
 POST_RESULT_SECONDS = 120.0
+# The roots exec-action's module writer reads its inputs from after the result, in the cache root.
+WRITER_ROOT_PREFIX = "module-writer-"
 DRAIN_CHECKPOINT_PUBLISH_SECONDS = 8
 # What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read, and where
 # HOL's libraries find external solvers (the action sandbox passes the same SOLVER_ENV on to HOL). The rest of the
@@ -678,9 +681,8 @@ def least_free_bytes() -> int:
     return min(map(free_bytes, disk_paths()))
 
 
-def remove_children(directory: str) -> None:
-    """Delete everything in ``directory``, keeping it; a missing one has nothing to delete. HOL leaves read-only
-    directories behind, which are made writable first."""
+def remove_entry(entry: os.DirEntry[str]) -> None:
+    """Delete a file or a whole tree. HOL leaves read-only directories behind, which are made writable first."""
     def writable(function: Callable[..., Any], path: str, _: BaseException) -> None:
         os.chmod(os.path.dirname(path), 0o700)
         if function in (os.open, os.scandir):
@@ -691,17 +693,22 @@ def remove_children(directory: str) -> None:
             function(path)
 
     try:
+        if entry.is_dir(follow_symlinks=False):
+            shutil.rmtree(entry.path, onexc=writable)
+        else:
+            os.unlink(entry.path)
+    except OSError as error:
+        print(f"cleaning {entry.path} failed: {error}", file=sys.stderr)
+
+
+def remove_children(directory: str) -> None:
+    """Delete everything in ``directory``, keeping it; a missing one has nothing to delete."""
+    try:
         entries = list(os.scandir(directory))
     except FileNotFoundError:
         return
     for entry in entries:
-        try:
-            if entry.is_dir(follow_symlinks=False):
-                shutil.rmtree(entry.path, onexc=writable)
-            else:
-                os.unlink(entry.path)
-        except OSError as error:
-            print(f"cleaning {entry.path} failed: {error}", file=sys.stderr)
+        remove_entry(entry)
 
 
 def sweep_cache(releases: Releases, cache_limit_gb: int) -> None:
@@ -729,19 +736,29 @@ def sweep_cache(releases: Releases, cache_limit_gb: int) -> None:
 
 
 def wait_for_disk(
-    drain: Drain, coordinator: Coordinator, tiers: list[str], worker: str, sweep: Callable[[], None]
+    drain: Drain, coordinator: Coordinator, tiers: list[str], worker: str, sweep: Callable[[], None],
+    *, reaper: "Reaper | None" = None,
 ) -> None:
     """Return once the host's disk has room for an action (``disk_shortfall``), or the worker drains, so that a
     worker on a full disk doesn't claim action after action only to fail each at once while other hosts could run
     them. First the worker deletes what its own actions left in its cache root: the action sandboxes, temp files
     and the parked theories releases 0.14.79-0.14.83 left, which no other worker shares and no action of its own
-    uses between claims, and the record of what its action root holds, which would no longer be true. Each poll it
+    uses between claims, and the record of what its action root holds, which would no longer be true. It stops
+    the exec-action still running after its result, if any, and deletes the module writers' roots
+    (``module-writer-<pid>``), which a writer killed before it was done leaves. Each poll it
     still waits it runs ``sweep``, the cache's own eviction of checkpoints and shared entries, and reports the host,
     so the coordinator keeps the host, its disk and its workers in view."""
     if disk_shortfall() is None:
         return
+    if reaper is not None:
+        reaper.stop()
     cache = os.environ.get("HOLBUILD_CACHE")
     if cache:
+        writer_roots: list[os.DirEntry[str]] = []
+        with contextlib.suppress(FileNotFoundError), os.scandir(cache) as entries:
+            writer_roots = [entry for entry in entries if entry.name.startswith(WRITER_ROOT_PREFIX)]
+        for entry in writer_roots:
+            remove_entry(entry)
         for records in ("action-resident", "parked-records", "parked-stats"):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(os.path.join(cache, records))
@@ -1131,11 +1148,13 @@ def run_one(
     phases: Phases,
     *,
     claimed: float | None = None,
+    reaper: "Reaper | None" = None,
 ) -> bool:
     """Run one claimed action to its end, or until its lease is lost, and report it, adding its phases' time to
     ``phases``. An error in the worker is reported for a retry and then raised, so that ``main`` waits before it
     claims again. True when exec-action reported the remote cache ``unavailable``, after which ``main`` waits too.
-    ``claimed`` is when the claim's request was sent (``time.monotonic()``), by default now."""
+    ``claimed`` is when the claim's request was sent (``time.monotonic()``), by default now. With a ``reaper``,
+    exec-action's work after its result goes on there once it lets go of the action root."""
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
     drain = coordinator.drain
@@ -1161,7 +1180,7 @@ def run_one(
                 lease.done.set()
 
         try:
-            record = execute(args, releases, lease, claim, phases, report)
+            record = execute(args, releases, lease, claim, phases, report, reaper=reaper)
         except CacheUnavailable as error:
             # The cache couldn't give the spec, as while it restarts: the action is retried without counting it.
             if not completed:
@@ -1182,6 +1201,73 @@ def run_one(
         return "failure=unavailable" in record.splitlines()
 
 
+def released(lock: str) -> bool:
+    """Whether exec-action has let go of the worker's action root: its fcntl lock on ``lock``, which it holds from
+    before the action until it has emptied the root after the result. Releases before 0.14.94 hold it until they exit."""
+    try:
+        fd = os.open(lock, os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+class Reaper:
+    """The one exec-action a worker leaves running once it has let go of the action root after its result: the
+    cache cap's sweep and the theory module writer, which only help later actions, then run while the worker claims
+    and runs its next action. It is killed POST_RESULT_SECONDS after its result, and stopped once the next action's
+    result is reported (that exec-action waits for this one's exit before its own sweep and writer), when the worker
+    is short of disk and when it drains."""
+
+    def __init__(self, drain: Drain, lock: str) -> None:
+        self.drain = drain
+        self.lock = lock  # exec-action's action-root lock, $HOLBUILD_CACHE/action.lock
+        self.running: tuple[threading.Thread, threading.Event] | None = None
+
+    def hand(self, process: subprocess.Popen[Any], deadline: float, theory: str) -> None:
+        """Takes over ``process``, stopping it at ``deadline`` (``time.monotonic()``) at the latest."""
+        self.stop()
+        stop = threading.Event()
+        thread = threading.Thread(target=self._reap, args=(process, deadline, theory, stop), daemon=True)
+        thread.start()
+        self.running = thread, stop
+
+    def stop_soon(self) -> None:
+        """Has the exec-action it holds, if any, stopped, without waiting for it."""
+        if self.running is not None:
+            self.running[1].set()
+
+    def stop(self) -> None:
+        """Stops the exec-action it holds, if any, and returns once it is reaped."""
+        if self.running is None:
+            return
+        thread, stop = self.running
+        stop.set()
+        thread.join()
+        self.running = None
+
+    def _reap(self, process: subprocess.Popen[Any], deadline: float, theory: str, stop: threading.Event) -> None:
+        # As in execute: killed at the deadline, also while stop_group gives it time to exit.
+        hard_stop = threading.Timer(max(0.0, deadline - time.monotonic()), kill_group, (process,))
+        hard_stop.daemon = True
+        hard_stop.start()
+        try:
+            while process.poll() is None and not self.drain.stop.is_set() and time.monotonic() < deadline:
+                if stop.wait(min(POLL_SECONDS, max(0.0, deadline - time.monotonic()))):
+                    break
+            if process.poll() is None:
+                print(f"{theory}: stopping exec-action's work after its result", file=sys.stderr, flush=True)
+            stop_group(process)
+        finally:
+            hard_stop.cancel()
+        print(f"{theory}: exit {process.returncode} after the result", file=sys.stderr, flush=True)
+
+
 def read_result(path: str) -> str | None:
     """exec-action's result record, once it has written one; it renames it into place whole."""
     try:
@@ -1198,10 +1284,13 @@ def execute(
     claim: dict[str, Any],
     phases: Phases,
     report: Callable[[str], None],
+    *,
+    reaper: Reaper | None = None,
 ) -> str | None:
     """The result record of the claimed action, or None once its lease is lost. A record exec-action writes
     while it runs is passed to ``report`` at once; the record returned is then that one. One it writes as it
-    stops for a lost lease is reported too, for the log of the action it stopped."""
+    stops for a lost lease is reported too, for the log of the action it stopped. Once exec-action has reported and
+    let go of the action root, the rest of its run goes to ``reaper``, if given."""
     spec = claim["spec_sha256"]
     drain = releases.drain
     drain.publish_seconds = 0.0
@@ -1241,9 +1330,10 @@ def execute(
             env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )
-        drained_out = lost = False
+        drained_out = lost = handed = False
         # exec-action writes its result (atomically) before publishing for later actions; it is reported then,
-        # and the worker waits for the rest without the lease, at most POST_RESULT_SECONDS.
+        # and the worker waits for the rest without the lease, at most POST_RESULT_SECONDS: with a reaper, only
+        # until exec-action lets go of the action root, which the next action needs.
         reported: str | None = None
         seen = after_result = 0.0
         # The bound holds while the result is being posted too, which retries for as long as the lease.
@@ -1274,7 +1364,14 @@ def execute(
                         report(record)
                         reported = record
                         stepped = after_result = time.monotonic()
+                        if reaper is not None:
+                            # At most one exec-action after its result: this one waits for the previous one's
+                            # exit before its own sweep and writer.
+                            reaper.stop_soon()
                         continue
+                elif reaper is not None and released(reaper.lock):
+                    handed = True
+                    break
                 elif time.monotonic() - seen >= POST_RESULT_SECONDS:
                     print(f"{claim['theory']}: exec-action still running {POST_RESULT_SECONDS:.0f} s after its result; "
                           "stopping it", file=sys.stderr, flush=True)
@@ -1293,7 +1390,7 @@ def execute(
             if hard_stop is not None:
                 hard_stop.cancel()
             timed_out = seen > 0 and time.monotonic() - seen >= POST_RESULT_SECONDS
-            if process.poll() is None and not timed_out:
+            if not handed and process.poll() is None and not timed_out:
                 drain.publish_seconds = DRAIN_CHECKPOINT_PUBLISH_SECONDS
                 # Signal only the driver: it stops HOL, uploads the log, writes its record and then publishes
                 # the sandbox-validated saves. Killing its group here loses them.
@@ -1311,7 +1408,8 @@ def execute(
                         process.wait(timeout=min(0.1, remaining))
                     except subprocess.TimeoutExpired:
                         pass
-            stop_group(process)
+            if not handed:
+                stop_group(process)
             if reported is not None:
                 phases.add("after_result", time.monotonic() - after_result)
             elif cooperate_dir is None:
@@ -1322,6 +1420,13 @@ def execute(
                 phases.add("before_hol", spans.before_hol)
                 phases.add("hol", spans.hol)
                 phases.add("after_hol", spans.after_hol)
+        if handed:
+            assert reaper is not None
+            reaper.hand(process, seen + POST_RESULT_SECONDS, claim["theory"])
+            return reported
+        if reaper is not None:
+            # This one exited, or was stopped, before the worker saw its result.
+            reaper.stop_soon()
         if reported is not None:
             # Reported already: whatever the driver did after its result changes nothing for the client.
             print(f"{claim['theory']}: exit {process.returncode} after the result", file=sys.stderr, flush=True)
@@ -1529,9 +1634,11 @@ def main() -> None:
                 out.write('header = "' + header + '"\n')
             releases = replace(releases, discovery_config=config)
         sweep = functools.partial(sweep_cache, releases, args.cache_limit_gb)
+        reaper = Reaper(drain, os.path.join(os.environ["HOLBUILD_CACHE"], "action.lock"))
+        resources.callback(reaper.stop)
         while not drain.stop.is_set():
             with phases.timed("idle"):
-                wait_for_disk(drain, coordinator, tiers, args.name, sweep)
+                wait_for_disk(drain, coordinator, tiers, args.name, sweep, reaper=reaper)
             if args.cooperate_dir is not None:
                 try:
                     with phases.timed("memory_wait"), drain.interruptible():
@@ -1554,7 +1661,9 @@ def main() -> None:
                 nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
                 releases = replace(releases, remote_cache=",".join(nodes))
             try:
-                unavailable = run_one(coordinator, args, releases, protection, claim, phases, claimed=started)
+                unavailable = run_one(
+                    coordinator, args, releases, protection, claim, phases, claimed=started, reaper=reaper
+                )
             except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
                 # Else the next claim ends the lease and the coordinator retries; a rerun finds a published result
                 # cached. Waiting keeps a worker from failing ready action after ready action while the cache or the

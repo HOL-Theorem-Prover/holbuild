@@ -14098,6 +14098,10 @@ val module_writer_time = Time.fromSeconds 60
 val module_writer_budget = Time.fromSeconds 100
 val module_writer_min_time = Time.fromSeconds 5
 
+(* The module writer's root after the result, in the cache root, named
+   for its exec-action's process. *)
+val writer_root_prefix = "module-writer-"
+
 (* The fewest missing modules a writer starts for once the store has its
    base theories.  A writer costs about as much to start as loading
    sixteen theories from their .dat files instead of their modules, so an
@@ -14557,14 +14561,18 @@ fun write_missing_modules remote root tc wanted deadline =
    took, how many modules it stored of how many missing, how many entries it
    looked up in the remote cache, and how many modules it fetched and
    published. *)
+(* Whether the toolchain's HOL can write theory modules, as far as is known
+   before trying. *)
+fun module_writer_supported holdir =
+  file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
+  not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
+
 fun fill_module_store remote root tc wanted deadline =
   let
     val t0 = Time.now ()
-    val holdir = #holdir tc
     val none = {installed = 0, missing = 0, probed = 0, fetched = 0, published = 0}
     val {installed, missing, probed, fetched, published} =
-      (if file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
-          not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
+      (if module_writer_supported (#holdir tc)
        then write_missing_modules remote root tc wanted deadline
        else none)
       handle e => (warn ("theory modules not written: " ^ General.exnMessage e); none)
@@ -14753,10 +14761,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
        neither. *)
     val deferred = ref (fn () => ())
     (* The theory-module writer, which runs last after the result, given
-       until a deadline: see fill_module_store. *)
-    val write_modules =
-      ref (fn (_ : Time.time) => {ms = LargeInt.fromInt 0, installed = 0, missing = 0, probed = 0, fetched = 0,
-                       published = 0})
+       until a deadline (see fill_module_store): the files it reads from the
+       action root, and the writer given the root it finds them in. *)
+    val write_modules = ref NONE
     fun cancel _ =
       if !cancelled then () else
       (cancelled := true;
@@ -14842,6 +14849,37 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     fun empty_root () =
       (if !theory_action then () else HolbuildRemoveTree.remove_untrusted root;
        empty_writable false)
+    (* After the result, the module writer reads its inputs from a root of
+       its own, as the worker's next action takes the action root over once
+       this one lets go of its lock.  Per process: the previous action's
+       writer may still be running. *)
+    val writer_root = Path.concat (cache, writer_root_prefix ^ HolbuildFileLock.current_pid_text ())
+    val writer_checkpoints = Path.concat (writer_root, "checkpoints")
+    (* Links the writer's INPUTS from the action root into the writer root,
+       before empty_root, and removes the roots of writers killed before
+       they removed their own: SOME WRITE once they are there. *)
+    fun stage_writer {inputs, write} =
+      let
+        fun stale path =
+          let val name = Path.file path
+          in
+            String.isPrefix writer_root_prefix name andalso
+            not (path_exists ("/proc/" ^ String.extract (name, size writer_root_prefix, NONE)))
+          end
+        fun stage path =
+          let val (src, dst) = (in_root root path, in_root writer_root path)
+          in ensure_parent dst; Posix.FileSys.link {old = src, new = dst} handle OS.SysErr _ => copy_binary src dst end
+      in
+        List.app HolbuildRemoveTree.remove_untrusted (List.filter stale (HolbuildCache.children cache));
+        HolbuildRemoveTree.remove_untrusted writer_root;
+        ensure_dir (Path.concat (writer_root, ".holbuild"));
+        List.app stage inputs;
+        SOME write
+      end
+      handle e =>
+        (warn ("theory modules not written: " ^ General.exnMessage e);
+         HolbuildRemoveTree.remove_untrusted writer_root;
+         NONE)
     (* The hydrate's steps, after it in the report, also when it fails. *)
     fun add_hydrate_steps () = phases := !hydrate_steps @ !phases
     fun add_restore_steps () = phases := !restore_steps @ !phases
@@ -15093,8 +15131,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
            on the host find the modules.  By now a load ahead has its late
            parents in the root too. *)
         fun set_write_modules () =
-          if not (!HolbuildActionSandbox.outputs_validated) then ()
-          else write_modules := fill_module_store remote root tc {deps = #deps spec, loads = #loads spec}
+          if not (!HolbuildActionSandbox.outputs_validated) orelse not (module_writer_supported (#holdir tc)) then ()
+          else
+            write_modules :=
+              (* holbuild reads a theory's files by their names, HOL by
+                 the names it maps them to. *)
+              SOME {inputs = List.concat (map (fn {stem, ...} =>
+                                                  List.concat (map (fn file => [file, hfs_remapped_path file])
+                                                                   [stem ^ ".dat", stem ^ ".sml"]))
+                                              (#deps spec)),
+                    write = fn writer_root =>
+                              fill_module_store remote writer_root tc {deps = #deps spec, loads = #loads spec}}
         val action =
           spec_theory_action root spec (cutoff_context spec cutoff)
         val _ =
@@ -15694,7 +15741,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
       in
         if !cancelled then ("failed", SOME (UnavailableFailure, "interrupted")) else result
       end
-    val (status, failure, log) =
+    val (failure, t0, writer) =
       with_action_root_lock cache
         (fn () =>
             let
@@ -15788,34 +15835,58 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               let
                 val t0 = Time.now ()
                 val _ = !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e)
-                val _ = empty_root ()
-                (* A worker draining after the result has a few seconds left
-                   for the publish, not for a cache scan or the writer.  The
-                   writer goes last: it only saves later actions loading
-                   time, and stops before the worker's kill. *)
-                val none = {ms = LargeInt.fromInt 0, installed = 0, missing = 0, probed = 0, fetched = 0,
-                       published = 0}
-                val {ms, installed, missing, probed, fetched, published} =
-                  if !cancelled then none else
-                  let val {limit_bytes, reserve_bytes, min_free_bytes} = cache_cap
-                  in
-                    enforce_worker_cache_cap
-                      {cache = cache, checkpoint_root = checkpoint_root, limit_bytes = limit_bytes,
-                       reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = true};
-                    if !cancelled then none
-                    else !write_modules (Time.+ (t0, module_writer_budget))
-                  end
+                val writer = if !cancelled then NONE else Option.mapPartial stage_writer (!write_modules)
               in
-                HolbuildStatus.message_stderr
-                  ("holbuild: exec-action after the result (ms): " ^
-                   LargeInt.toString (Time.toMilliseconds (Time.-(Time.now (), t0))) ^
-                   " modules_ms=" ^ LargeInt.toString ms ^
-                   " modules_installed=" ^ Int.toString installed ^ "/" ^ Int.toString missing ^
-                   " modules_probed=" ^ Int.toString probed ^ " modules_fetched=" ^ Int.toString fetched ^
-                   " modules_published=" ^ Int.toString published ^ "\n")
-              end;
-              (status, failure, log)
+                empty_root ();
+                (failure, t0, writer)
+              end
             end)
+    (* Past the action-root lock, the worker's next action can start in the
+       root.  A worker draining after the result has a few seconds left for
+       the publish, not for a cache scan or the writer.  The writer goes
+       last: it only saves later actions loading time, and stops before the
+       worker's kill. *)
+    val none = {ms = LargeInt.fromInt 0, installed = 0, missing = 0, probed = 0, fetched = 0, published = 0}
+    (* One exec-action of a worker at a time sweeps and writes modules after
+       its result: the previous one may still be at it, until the worker
+       stops it once it has this one's result. *)
+    val post_result_path = Path.concat (cache, "post-result.lock")
+    fun post_result_lock deadline =
+      case HolbuildFileLock.try_acquire_path {path = post_result_path, obsolete_kind = NONE} of
+          SOME lock => SOME lock
+        | NONE =>
+            if !cancelled then NONE
+            else if Time.>= (Time.now (), deadline) then
+              (warn "the previous action's work after its result still runs: skipping the cache sweep and the module writer";
+               NONE)
+            else (OS.Process.sleep (Time.fromMilliseconds 100); post_result_lock deadline)
+    val post_result = if !cancelled then NONE else post_result_lock (Time.+ (t0, module_writer_budget))
+    val {ms, installed, missing, probed, fetched, published} =
+      if not (Option.isSome post_result) then none else
+      let val {limit_bytes, reserve_bytes, min_free_bytes} = cache_cap
+      in
+        (* The checkpoint root is the next action's now: this sweep is
+           given an empty one instead. *)
+        enforce_worker_cache_cap
+          {cache = cache, checkpoint_root = writer_checkpoints, limit_bytes = limit_bytes,
+           reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = true};
+        case writer of
+            SOME write =>
+              if !cancelled then none
+              else (HolbuildActionSandbox.enable (writer_root, writer_checkpoints);
+                    write writer_root (Time.+ (t0, module_writer_budget)))
+          | NONE => none
+      end
+    val _ = if Option.isSome writer then HolbuildRemoveTree.remove_untrusted writer_root else ()
+    val _ = Option.app HolbuildFileLock.release post_result
+    val _ =
+      HolbuildStatus.message_stderr
+        ("holbuild: exec-action after the result (ms): " ^
+         LargeInt.toString (Time.toMilliseconds (Time.-(Time.now (), t0))) ^
+         " modules_ms=" ^ LargeInt.toString ms ^
+         " modules_installed=" ^ Int.toString installed ^ "/" ^ Int.toString missing ^
+         " modules_probed=" ^ Int.toString probed ^ " modules_fetched=" ^ Int.toString fetched ^
+         " modules_published=" ^ Int.toString published ^ "\n")
   in
     case failure of
         NONE => 0
