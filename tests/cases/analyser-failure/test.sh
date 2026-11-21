@@ -285,8 +285,9 @@ val _ = assert "parse error needs one analysis" (attempts () = 1);
 val killed_plans = checkpoints "killed";
 val _ = assert "killed proof-IR span request: no checkpoints" (null (#theorem_checkpoints killed_plans));
 val _ = assert "killed proof-IR span request: no further analysis" (attempts () = 3);
-val _ = checkpoints "failure";
-val _ = assert "failed proof-IR span request: one fallback analysis" (attempts () = 2);
+val failed_plans = checkpoints "failure";
+val _ = assert "failed proof-IR span request: no checkpoints" (null (#theorem_checkpoints failed_plans));
+val _ = assert "failed proof-IR span request: no further analysis" (attempts () = 1);
 
 val _ = print "span planning tests passed\n";
 SML

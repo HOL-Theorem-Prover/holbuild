@@ -5316,28 +5316,26 @@ fun declaration_checkpoints_for_action policy checkpoint_root (action : theory_a
 fun action_checkpoints policy checkpoint_root (action : theory_action) source_text =
   let
     (* One analyser process finds the spans and plans their proofs, rather
-       than one for each.  If it fails, the separate requests below give
-       the diagnostics they always have; if it was killed, they would be
-       killed too. *)
-    val (scanned, killed) =
+       than one for each.  It reads the whole source, so when it fails no
+       other request over the source is made: one would most likely fail
+       the same way, and the theory builds without proof steps. *)
+    val (scanned, source_spans) =
       if proof_steps_enabled policy andalso proof_ir_enabled policy then
-        (SOME (detail_time_phase "build.exec.node.analyse_boundaries"
-                 (fn () =>
-                     detail_time_phase "build.exec.node.analyse_terminations"
-                       (fn () =>
-                           detail_time_phase "build.exec.node.proof_ir_plan"
-                             (fn () => HolbuildTheorySpans.scan_with_proof_ir_plans (#source_file action) source_text)))),
-         NONE)
-        handle HolbuildTheoryCheckpoints.Error _ => (NONE, NONE)
-             | HolbuildTheorySpans.Killed msg => (NONE, SOME msg)
-      else (NONE, NONE)
-    val source_spans =
-      case (scanned, killed) of
-          (SOME {boundaries, errors, terminations, termination_error, ...}, _) =>
-            {source_boundaries = SOME {boundaries = boundaries, errors = errors},
-             termination_diagnostics = without_termination_diagnostics action termination_error terminations}
-        | (NONE, SOME msg) => source_spans_unavailable policy action msg
-        | (NONE, NONE) => source_spans_for_action policy action source_text
+        let
+          val scanned as {boundaries, errors, terminations, termination_error, ...} =
+            detail_time_phase "build.exec.node.analyse_boundaries"
+              (fn () =>
+                  detail_time_phase "build.exec.node.analyse_terminations"
+                    (fn () =>
+                        detail_time_phase "build.exec.node.proof_ir_plan"
+                          (fn () => HolbuildTheorySpans.scan_with_proof_ir_plans (#source_file action) source_text)))
+        in
+          (SOME scanned,
+           {source_boundaries = SOME {boundaries = boundaries, errors = errors},
+            termination_diagnostics = without_termination_diagnostics action termination_error terminations})
+        end
+        handle HolbuildTheoryCheckpoints.Error msg => (NONE, source_spans_unavailable policy action msg)
+      else (NONE, source_spans_for_action policy action source_text)
     val theorem_checkpoints =
       case #source_boundaries source_spans of
           NONE => []

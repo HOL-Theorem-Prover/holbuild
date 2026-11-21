@@ -13,32 +13,22 @@ fun analyser () =
       SOME path => path
     | NONE => raise HolbuildTheoryCheckpoints.Error "internal error: HOL analyser is not configured"
 
-(* The analyser was killed (after run_analyser's retries): another request
-   over the same source would most likely be killed too. *)
-exception Killed of string
-
-fun run_killable wants source_path =
+fun run wants source_path =
   let
     val request = String.concatWith "\n"
       [P.join ["version", P.protocol_version],
        P.join ["command", "analyse"],
        P.join (["file", "1", source_path] @ wants),
        P.join ["end"]] ^ "\n"
-    val result as {output, response, status, ...} =
+    val result as {output, response, ...} =
       HolbuildDependencies.run_analyser {analyser = analyser (), request = request, capture_stderr = true}
-    fun failure () = "holbuild-hol-analyser failed for " ^ source_path ^
-                     "\n" ^ HolbuildDependencies.analyser_failure result
   in
     print output;
     case response of
         SOME text => String.tokens (fn c => c = #"\n") text
-      | NONE =>
-          if HolbuildDependencies.analyser_killed status then raise Killed (failure ())
-          else raise HolbuildTheoryCheckpoints.Error (failure ())
+      | NONE => raise HolbuildTheoryCheckpoints.Error ("holbuild-hol-analyser failed for " ^ source_path ^
+          "\n" ^ HolbuildDependencies.analyser_failure result)
   end
-
-fun run wants source_path =
-  run_killable wants source_path handle Killed msg => raise HolbuildTheoryCheckpoints.Error msg
 
 fun parse_boundary fields =
   case fields of
@@ -72,7 +62,7 @@ fun parse_termination fields =
          proof_ir_plan = NONE}
     | _ => raise HolbuildTheoryCheckpoints.Error "bad analyser termination record"
 
-fun response_records_from run wants source_path =
+fun response_records wants source_path =
   let
     fun incomplete detail =
       raise HolbuildTheoryCheckpoints.Error
@@ -105,8 +95,6 @@ fun response_records_from run wants source_path =
   in
     loop (run wants source_path) false false [] []
   end
-
-fun response_records wants source_path = response_records_from run wants source_path
 
 fun boundary_record fields =
   case fields of
@@ -155,13 +143,11 @@ fun scan_boundaries_and_terminations_recovering_strict source_path _ =
 
 (* As scan_boundaries_and_terminations_recovering_strict, with each
    boundary's and termination's proof-IR plan expression and factories, in
-   their order, from the same analyser process.  Raises Killed if the
-   analyser was killed. *)
+   their order, from the same analyser process. *)
 fun scan_with_proof_ir_plans source_path _ =
   let
     val (records, errors) =
-      response_records_from run_killable
-        ["boundaries-recovering", "terminations-strict", "proof-ir-plans"] source_path
+      response_records ["boundaries-recovering", "terminations-strict", "proof-ir-plans"] source_path
     val boundaries = map parse_boundary (List.filter boundary_record records)
     val terminations = map parse_termination (List.filter termination_record records)
     val plans = List.mapPartial (fn "begin-proof-ir" :: fields => SOME fields | _ => NONE) records
