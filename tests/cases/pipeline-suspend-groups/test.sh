@@ -166,6 +166,31 @@ QED
 Finalise second
 Finalise first
 
+Theorem twin1:
+  p ==> p
+Proof
+  DISCH_TAC >> suspend "outer1"
+QED
+Theorem twin2:
+  p ==> p
+Proof
+  DISCH_TAC >> suspend "outer2"
+QED
+Resume twin1[outer1]:
+  suspend "inner"
+QED
+Resume twin2[outer2]:
+  suspend "inner"
+QED
+Resume twin1[inner]:
+  FIRST_ASSUM ACCEPT_TAC
+QED
+Resume twin2[inner]:
+  FIRST_ASSUM ACCEPT_TAC
+QED
+Finalise twin1
+Finalise twin2
+
 Theorem hidden:
   T
 Proof
@@ -197,6 +222,18 @@ Resume looked_up[more]:
   ACCEPT_TAC TRUTH
 QED
 Finalise looked_up
+
+val peek = markerLib.lookup_suspension;
+Theorem peeked:
+  F ==> F
+Proof
+  suspend "one"
+QED
+val _ = save_thm ("peeked_hyp", case peek "A.peeked" of SOME (_, th) => if aconv (rand (hd (hyp th))) \`\`F ==> F\`\` then TRUTH else EQT_INTRO TRUTH | NONE => EQT_INTRO TRUTH);
+Resume peeked[one]:
+  simp[]
+QED
+Finalise peeked
 
 Theorem counted:
   F ==> F
@@ -405,25 +442,56 @@ val _ = export_theory();
 SML
 check_fallback same_goal_in_place 0
 
+# A theorem suspended by ML code between a group's theorem and its
+# Finalise: the same goal under the same label, which a plain build rejects
+# while the group is open, so the group stays in place.
+new_project ml_suspend
+cat > "$tmpdir/ml_suspend/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "A";
+Theorem t:
+  F ==> F
+Proof
+  suspend "a"
+QED
+val y = Q.store_thm ("y", `F ==> F`, suspend "a");
+Resume t[a]:
+  simp[]
+QED
+Finalise t
+Resume y[a]:
+  simp[]
+QED
+Finalise y
+val _ = export_theory();
+SML
+check_fallback ml_suspend 0
+
 # A group finalised [local] whose Resume block proves its goal from the
-# theorem's own deferred stub, where a plain build has the suspended
-# theorem itself, which proves nothing.
+# theorem's own deferred stub, reached through a structure the scan for lookups doesn't read; a
+# plain build has the suspended theorem itself, which proves nothing.
 new_project own_stub
 cat > "$tmpdir/own_stub/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib markerLib;
 val _ = new_theory "A";
+structure Peek = struct
+  fun stub () = #2 (valOf (markerLib.lookup_suspension "A.t"))
+end
 Theorem t:
   F
 Proof
   suspend "a"
 QED
 Resume t[a]:
-  mp_tac (REWRITE_RULE [markerTheory.suspendlabel_def] (DISCH_ALL t)) >> simp[]
+  mp_tac (REWRITE_RULE [markerTheory.suspendlabel_def] (DISCH_ALL (Peek.stub ()))) >> simp[]
 QED
 Finalise t[local]
 val _ = export_theory();
 SML
 check_fallback own_stub 0
+if [[ $groups = 1 ]]; then
+  require_grep "uses the stub of its own deferred group" "$tmpdir/own_stub.log"
+fi
 
 # A deferred local theorem proved from its own stub, through a reference
 # the script sets after it: no theorem of the export depends on it, and the

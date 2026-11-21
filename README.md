@@ -1293,10 +1293,13 @@ each block run in order and are put together as `Finalise` does. The group
 runs in place instead if one of its blocks uses `cheat` or `smlname`, a
 `Resume X` names no label or comes after the `Finalise`, or the source from
 the theorem to its `Finalise` calls `lookup_suspension` or
-`lookup_resumption`, names `X` anywhere but those headers (until the
-`Finalise`, `X`'s value is the stub, whose hypotheses are the placeholders),
-or holds another proof that may suspend and isn't deferred as a group
-itself. A theory is not pipelined if it saves checkpoints and is a
+`lookup_resumption` (itself or through a top-level helper whose body mentions
+them), names `X` anywhere but those headers (until the `Finalise`, `X`'s value
+is the stub, whose hypotheses are the placeholders), or, outside the proofs of
+groups, mentions `suspend` or a top-level helper that may suspend, or holds a
+theorem the script resumes. As with `Thm.tag` above, code that reaches `X`'s
+stub some other way (a lookup in a library or inside a structure) and branches
+on its hypotheses without failing outputs what it saw. A theory is not pipelined if it saves checkpoints and is a
 requested target or the build passes `--all-checkpoints`, if it declares
 extra outputs, or under `--trace-steps`, `--repl-on-failure`, a tracing
 kernel or an execution plan.

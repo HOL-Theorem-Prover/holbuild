@@ -3740,9 +3740,9 @@ fun identifier_count text word =
 
 fun mentions_identifier text word = identifier_count text word > 0
 
-(* The offset just past the first `Finalise NAME` at or after START in
-   BLANKED (HolbuildDependencies.blank_comments_and_strings), if there is
-   one. *)
+(* The offset just past the first `Finalise NAME` at the start of a line
+   (where HOL's lexer reads one) at or after START in BLANKED
+   (HolbuildDependencies.blank_comments_and_strings), if there is one. *)
 fun finalise_end blanked name start =
   let
     val word = "Finalise"
@@ -3758,7 +3758,7 @@ fun finalise_end blanked name start =
             val j = skip_space (i + size word)
             val stop = j + size name
           in
-            if (i = 0 orelse not (identifier_char (String.sub (blanked, i - 1)))) andalso
+            if (i = 0 orelse String.sub (blanked, i - 1) = #"\n") andalso
                j > i + size word andalso stop <= n andalso String.substring (blanked, j, size name) = name andalso
                (stop = n orelse not (identifier_char (String.sub (blanked, stop))))
             then SOME stop
@@ -3769,41 +3769,41 @@ fun finalise_end blanked name start =
     search start
   end
 
-(* The top-level helpers of SOURCE_TEXT that may suspend a goal or cheat:
-   each `fun`, `val` or `and` at the start of a line whose body, up to the
-   next line that starts a declaration, mentions `suspend` or `cheat` (as
-   mentions_at_identifier_start finds them) or such a helper. *)
-fun suspending_helpers source_text =
+(* The top-level helpers of SOURCE_TEXT that MENTIONS: each `fun`, `val` or
+   `and` at the start of a line whose body, up to the next line that starts
+   a declaration, MENTIONS holds of (blanked by
+   HolbuildDependencies.blank_comments_and_strings) or mentions such a
+   helper. *)
+fun top_level_helpers mentions source_text =
   let
     val lines = String.fields (fn c => c = #"\n") (HolbuildDependencies.blank_comments_and_strings source_text)
-    fun keyword line = List.find (fn k => String.isPrefix (k ^ " ") line) ["fun", "val", "and"]
-    fun helper_name line =
-      case String.tokens (fn c => Char.isSpace c) line of
-          _ :: "rec" :: name :: _ => SOME name
-        | _ :: name :: _ => SOME name
-        | _ => NONE
     fun name_of tok = Substring.string (Substring.takel identifier_char (Substring.full tok))
+    fun first_token line =
+      if line = "" orelse Char.isSpace (String.sub (line, 0)) then "" else name_of line
     val declarations =
       ["fun", "val", "and", "local", "in", "end", "open", "structure", "signature", "functor",
        "type", "datatype", "exception", "infix", "infixl", "infixr", "nonfix",
        "Theorem", "Triviality", "Resume", "Finalise", "Definition", "Datatype", "Inductive",
        "CoInductive", "Overload", "Type", "Proof", "QED", "Termination", "End"]
-    fun starts_declaration line =
-      line <> "" andalso not (Char.isSpace (String.sub (line, 0))) andalso
-      List.exists (fn d => d = name_of line) declarations
+    fun starts_declaration line = List.exists (fn d => d = first_token line) declarations
+    fun helper_name body =
+      case String.tokens Char.isSpace body of
+          _ :: "rec" :: name :: _ => name_of name
+        | _ :: name :: _ => name_of name
+        | _ => ""
     fun defs [] acc = rev acc
       | defs (line :: rest) acc =
-          case (keyword line, helper_name line) of
-              (SOME _, SOME tok) =>
-                let
-                  fun body [] lines = (rev lines, [])
-                    | body (l :: ls) lines = if starts_declaration l then (rev lines, l :: ls) else body ls (l :: lines)
-                  val (bodylines, rest') = body rest [line]
-                  val name = name_of tok
-                in
-                  defs rest' (if name = "" orelse name = "_" then acc else (name, String.concatWith "\n" bodylines) :: acc)
-                end
-            | _ => defs rest acc
+          if List.exists (fn k => k = first_token line) ["fun", "val", "and"] then
+            let
+              fun body [] lines = (rev lines, [])
+                | body (l :: ls) lines = if starts_declaration l then (rev lines, l :: ls) else body ls (l :: lines)
+              val (bodylines, rest') = body rest [line]
+              val text = String.concatWith "\n" bodylines
+              val name = helper_name text
+            in
+              defs rest' (if name = "" orelse name = "_" then acc else (name, text) :: acc)
+            end
+          else defs rest acc
     val defs = defs lines []
     fun grow found =
       let
@@ -3811,10 +3811,7 @@ fun suspending_helpers source_text =
           List.mapPartial
             (fn (name, body) =>
                 if List.exists (fn f => f = name) found then NONE
-                else if mentions_at_identifier_start body "suspend" orelse
-                        mentions_at_identifier_start body "cheat" orelse
-                        List.exists (mentions_identifier body) found
-                then SOME name
+                else if mentions body orelse List.exists (mentions_identifier body) found then SOME name
                 else NONE)
             defs
       in
@@ -3823,6 +3820,15 @@ fun suspending_helpers source_text =
   in
     grow []
   end
+
+(* The top-level helpers of SOURCE_TEXT that may suspend a goal or cheat
+   (top_level_helpers). *)
+fun suspending_helpers source_text =
+  top_level_helpers
+    (fn body => mentions_at_identifier_start body "suspend" orelse mentions_at_identifier_start body "cheat")
+    source_text
+
+val lookup_names = ["lookup_suspension", "lookup_resumption"]
 
 (* Whether TC's markerLib drops, when a theory is exported, the
    suspensions the theory itself finalised, which deferring a suspend
@@ -3844,15 +3850,15 @@ fun has_suspension_pruning (tc : HolbuildToolchain.t) =
    label and lies between the theorem and its `Finalise`, none of the
    blocks mentions `cheat` or names `smlname`, and the source from the
    theorem to its `Finalise` doesn't look up suspensions or resumptions,
-   whose answers would be the group's dummies, nor names the theorem
-   outside those blocks' headers and the `Finalise` (its value there is
-   the stub, which suspends the dummies).  A group's suspended goals are
-   only known once it is proved, so no block that may suspend (it names
-   `suspend` or such a helper, or is a theorem the script resumes) may lie
-   in that span unless it is one of a group too: a goal it suspended
-   could be one of the group's, under the same label, which a build in
-   place rejects.  (HolbuildDeferred fails two groups that suspend the
-   same goal.)  Otherwise the theorem stays in place, and its `Resume`
+   itself or through a top-level helper (top_level_helpers), whose answers
+   would be the group's dummies, nor names the theorem outside those
+   blocks' headers and the `Finalise` (its value there is the stub, which
+   suspends the dummies).  A group's suspended goals are only known once
+   it is proved, so outside the proofs of groups that span may not mention
+   `suspend` or a helper that may suspend, nor hold a theorem the script
+   resumes: a goal suspended there could be one of the group's, under the
+   same label, which a build in place rejects.  (HolbuildDeferred fails
+   two groups that suspend the same goal.)  Otherwise the theorem stays in place, and its `Resume`
    blocks defer alone (deferrable_proof) unless they mention a helper
    that may suspend (suspending_helpers), whose suspension a deferred
    block would lose. *)
@@ -3871,6 +3877,8 @@ fun proof_deferrals groups source_text
         else SOME (Substring.string (Substring.slice (rest, 1, SOME (Substring.size rest - 2))))
       end
     val blanked = HolbuildDependencies.blank_comments_and_strings source_text
+    val lookup_helpers =
+      top_level_helpers (fn body => List.exists (mentions_identifier body) lookup_names) source_text
     fun group (theorem as {theorem_start, name, ...}) =
       let
         val resumes = List.filter (fn b => #kind b = "resume" andalso base (#name b) = name) blocks
@@ -3886,7 +3894,6 @@ fun proof_deferrals groups source_text
             NONE => NONE
           | SOME stop =>
               let
-                val span = String.substring (source_text, theorem_start, stop - theorem_start)
                 val blanked_span = String.substring (blanked, theorem_start, stop - theorem_start)
               in
                 if length (List.filter (fn b => #kind b = "theorem" andalso #name b = name) blocks) = 1 andalso
@@ -3894,8 +3901,7 @@ fun proof_deferrals groups source_text
                                      not (mentions_at_identifier_start (#tactic_text b) "cheat")) all andalso
                    List.all (fn b => Option.isSome (label (#name b)) andalso
                                      #theorem_start b > theorem_start andalso #theorem_start b < stop) resumes andalso
-                   not (mentions_identifier span "lookup_suspension") andalso
-                   not (mentions_identifier span "lookup_resumption") andalso
+                   not (List.exists (mentions_identifier blanked_span) (lookup_names @ lookup_helpers)) andalso
                    identifier_count blanked_span name = length resumes + 2
                 then SOME {name = name, labels = labels, resumes = length resumes,
                            start = theorem_start, stop = stop}
@@ -3904,18 +3910,30 @@ fun proof_deferrals groups source_text
       end
     val helpers = suspending_helpers source_text
     fun theorem_of {kind, name, ...} = if kind = "resume" then base name else name
-    fun may_suspend {kind, name, tactic_text, ...} =
-      mentions_at_identifier_start tactic_text "suspend" orelse
-      List.exists (mentions_identifier tactic_text) helpers orelse
-      (kind = "theorem" andalso List.exists (fn r => r = name) resumed)
-    (* Drops the groups whose span holds a block that may suspend outside
-       the groups kept, until none does. *)
+    (* Drops the groups whose span, outside the proofs of the groups kept,
+       mentions `suspend` or a helper that may suspend, or holds a theorem
+       the script resumes, until none does. *)
     fun separate gs =
       let
         fun grouped b = List.exists (fn g => #name g = theorem_of b) gs
+        val proofs =
+          List.mapPartial
+            (fn b as {tactic_start, tactic_text, ...} =>
+                if grouped b then SOME (tactic_start, tactic_start + size tactic_text) else NONE)
+            blocks
+        fun outside start stop =
+          CharVector.tabulate (stop - start, fn i =>
+            let val p = start + i
+            in if List.exists (fn (a, z) => a <= p andalso p < z) proofs then #" " else String.sub (blanked, p) end)
         fun clear {start, stop, ...} =
-          not (List.exists (fn b => #theorem_start b > start andalso #theorem_start b < stop andalso
-                                    not (grouped b) andalso may_suspend b) blocks)
+          let val text = outside start stop
+          in
+            not (mentions_at_identifier_start text "suspend") andalso
+            not (List.exists (mentions_identifier text) helpers) andalso
+            not (List.exists (fn b => #kind b = "theorem" andalso #theorem_start b > start andalso
+                                      #theorem_start b < stop andalso not (grouped b) andalso
+                                      List.exists (fn r => r = #name b) resumed) blocks)
+          end
         val kept = List.filter clear gs
       in
         if length kept = length gs then gs else separate kept

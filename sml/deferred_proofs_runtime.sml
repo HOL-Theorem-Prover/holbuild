@@ -244,24 +244,30 @@ struct
   fun is_suspended t = Option.isSome (boolLib.dest_suspended t)
   fun term_in t ts = List.exists (fn u => Term.aconv t u) ts
 
-  (* The goals each deferred group's proofs suspended, by group, with the
-     groups open when it was stated.  In the outline a group suspends only
-     its dummies, so markerLib couldn't see two theorems open at once
-     suspend the same goal under the same label, which a build in place
-     rejects; prove_all fails when two such groups did. *)
+  (* The goals each deferred group suspended, by group, with the groups
+     open when it was stated: those its theorem suspended (which markerLib
+     registers, so a build in place rejects them in any other theorem or
+     block while the group is open) and those its blocks suspended again.
+     In the outline a group suspends only its dummies, so markerLib
+     couldn't see that; prove_all fails when two groups open at once
+     suspend the same goal under the same label, unless both suspended it
+     in a block. *)
   val slabs_mutex = Mutex.mutex ()
-  val group_slabs = ref ([] : (string * string list * Term.term list) list)
-  fun record_slabs name open_with slabs =
-    (Mutex.lock slabs_mutex; group_slabs := (name, open_with, slabs) :: !group_slabs; Mutex.unlock slabs_mutex)
+  val group_slabs = ref ([] : (string * string list * Term.term list * Term.term list) list)
+  fun record_slabs name open_with initial nested =
+    (Mutex.lock slabs_mutex;
+     group_slabs := (name, open_with, initial, nested) :: !group_slabs;
+     Mutex.unlock slabs_mutex)
   fun check_shared_slabs () =
     let
       fun member x xs = List.exists (fn y => y = x) xs
+      fun meet xs ys = List.exists (fn h => term_in h ys) xs
       fun clash [] = ()
-        | clash ((name, open_with, slabs) :: rest) =
-            (case List.find (fn (other, theirs_open, theirs) =>
+        | clash ((name, open_with, initial, nested) :: rest) =
+            (case List.find (fn (other, theirs_open, their_initial, their_nested) =>
                                other <> name andalso (member other open_with orelse member name theirs_open) andalso
-                               List.exists (fn h => term_in h theirs) slabs) rest of
-                 SOME (other, _, _) =>
+                               (meet initial (their_initial @ their_nested) orelse meet nested their_initial)) rest of
+                 SOME (other, _, _, _) =>
                    raise Fail ("the deferred groups " ^ other ^ " and " ^ name ^
                                " suspend the same goal under the same label")
                | NONE => clash rest)
@@ -345,9 +351,8 @@ struct
           else assemble th' remaining
         end
       val th = assemble th0 (suspended th0)
-      val _ = record_slabs name open_with
-                (suspended th0 @
-                 List.concat (map (fn (g, th) => List.filter (fn h => not (term_in h (#1 g))) (suspended th)) block_ths))
+      val _ = record_slabs name open_with (suspended th0)
+                (List.concat (map (fn (g, th) => List.filter (fn h => not (term_in h (#1 g))) (suspended th)) block_ths))
     in
       if not (Term.aconv (Thm.concl th) (#2 goal)) then
         raise Fail ("the assembled theorem of " ^ name ^ " has another conclusion than its goal")
