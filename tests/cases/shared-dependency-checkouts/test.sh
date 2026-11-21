@@ -159,7 +159,8 @@ require_grep "UTheory is up to date" "$tmpdir/rebuild.log"
 
 # A second project directory links to the same checkout instead of cloning,
 # and restores the dependency's theory and its outputs from the cache.  An
-# output of its own that it never claimed is still refused.  Its record from
+# output of its own that exists with no claim, as in a copied project, is
+# taken over and replaced.  Its record from
 # 0.14.64 of outputs in the dependency's sources, here files the checkout
 # tracks, is dropped without removing them, whether or not their claims
 # survived.
@@ -182,13 +183,8 @@ printf 'holbuild-extra-output-owner-v1\n%s\npath %s\n' "$(sed -n 2p "$record")" 
   fail "second project made another checkout"
 mkdir -p "$tmpdir/copy/src/results"
 echo stray > "$tmpdir/copy/src/results/U.txt"
-if (cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-unowned.log" 2>&1; then
-  fail "build overwrote an unowned extra output"
-fi
-require_grep "extra output already exists without an ownership record: .*src/results/U.txt" "$tmpdir/copy-unowned.log"
-require_grep "DTheory restored from cache" "$tmpdir/copy-unowned.log"
-rm "$tmpdir/copy/src/results/U.txt"
 (cd "$tmpdir/copy" && "$HOLBUILD_BIN" build) > "$tmpdir/copy-build.log" 2>&1 || { cat "$tmpdir/copy-build.log" >&2; fail "second build failed"; }
+require_grep "DTheory restored from cache" "$tmpdir/copy-build.log"
 require_grep "UTheory restored from cache" "$tmpdir/copy-build.log"
 require_outputs "$tmpdir/copy"
 [[ $(snapshot "$checkout") == "$before" ]] || fail "second build wrote into the shared checkout"
