@@ -158,9 +158,12 @@ compare_success_artifacts() {
   compare_dat_semantics "$name" "$hol_artifacts" "$ir_flat"
 }
 
+# check_case EXPECT NAME BODY: EXPECT is `succeeds` or `fails`, what native
+# `hol run` must do with BODY; holbuild's proof-step build must agree with it.
 check_case() {
-  local name=$1
-  local body=$2
+  local expect=$1
+  local name=$2
+  local body=$3
   local project=$tmpdir/$name
   local hol_log=$tmpdir/$name.hol-run.log
   local ir_log=$tmpdir/$name.new-ir.log
@@ -171,6 +174,12 @@ check_case() {
   run_hol_run "$project" "$hol_log"
   local hol_status=$?
   set -e
+  if [[ "$expect" == succeeds && "$hol_status" != 0 ]] ||
+     [[ "$expect" == fails && "$hol_status" == 0 ]]; then
+    echo "hol run exited $hol_status for $name; expected native hol run: $expect" >&2
+    tail -60 "$hol_log" >&2
+    exit 1
+  fi
   if [[ "$hol_status" == 0 ]]; then
     copy_hol_run_artifacts "$project" "$hol_artifacts"
   fi
@@ -196,7 +205,7 @@ check_case() {
   fi
 }
 
-check_case success_suite 'val bad_tac = fn g => ([g], fn _ => TRUTH);
+check_case succeeds success_suite 'val bad_tac = fn g => fn _ => ([g], fn _ => TRUTH);
 
 Theorem existential_name_provider:
   ?sab:bool. sab
@@ -254,7 +263,7 @@ Proof
 QED
 
 Theorem branch_then1_lhs_sequence_success:
-  ((T ∨ T) ⇒ T) ∧ T
+  ((p ∨ q) ⇒ T) ∧ T
 Proof
   CONJ_TAC
   >- (ALL_TAC >> strip_tac >- ACCEPT_TAC TRUTH >> ACCEPT_TAC TRUTH)
@@ -386,7 +395,7 @@ QED
 Theorem if_add_sgs_success:
   T
 Proof
-  ADD_SGS_TAC [`T`] (IF NO_TAC (FAIL_TAC "bad") (ACCEPT_TAC TRUTH))
+  ADD_SGS_TAC [``T``] (IF NO_TAC (FAIL_TAC "bad") (ACCEPT_TAC TRUTH))
   >> ACCEPT_TAC TRUTH
 QED
 
@@ -476,7 +485,7 @@ QED
 Theorem nested_suffices_by_success:
   T
 Proof
-  `T` by (`T` suffices_by (ACCEPT_TAC TRUTH) >> ACCEPT_TAC TRUTH)
+  `T` by (`T` suffices_by simp[] >> ACCEPT_TAC TRUTH)
   >> ACCEPT_TAC TRUTH
 QED
 
@@ -530,7 +539,7 @@ QED
 Theorem select_single_success:
   T ∧ T
 Proof
-  CONJ_TAC >~ `T`
+  CONJ_TAC >~ [`T`]
   >> ACCEPT_TAC TRUTH
   >> ACCEPT_TAC TRUTH
 QED
@@ -553,10 +562,10 @@ Proof
 QED
 
 Theorem unsafe_then1_suffix_precedence:
-  (T ==> T) ∧ T
+  ((T ==> T) ==> T) ∧ T
 Proof
   CONJ_TAC
-  >- (impl_tac >- ACCEPT_TAC TRUTH >> ACCEPT_TAC TRUTH)
+  >- (impl_tac >- ACCEPT_TAC TRUTH >> simp[])
   >> ACCEPT_TAC TRUTH
 QED
 
@@ -576,22 +585,16 @@ Theorem then_suffix_after_solved:
   T
 Proof
   ACCEPT_TAC TRUTH >> FAIL_TAC "should be skipped over []"
-QED
-
-Theorem parser_recovery:
-  T
-Proof
-  ( ACCEPT_TAC TRUTH
 QED'
 
-check_case parser_recovery_compat 'Theorem parser_recovery:
+check_case fails parser_recovery_compat 'Theorem parser_recovery:
   T
 Proof
   ( ACCEPT_TAC TRUTH
 QED'
 require_grep "HOL source parser recovered while instrumenting theorem boundaries for ATheory; using recovered theorem boundaries" "$tmpdir/parser_recovery_compat.new-ir.log"
 
-check_case resume_suite 'open markerLib;
+check_case succeeds resume_suite 'open markerLib;
 
 Theorem partial:
   T ∧ T
@@ -605,19 +608,19 @@ QED
 
 Finalise partial'
 
-check_case first_empty_failure 'Theorem thm:
+check_case fails first_empty_failure 'Theorem thm:
   T
 Proof
   FIRST [] >> ACCEPT_TAC TRUTH
 QED'
 
-check_case map_first_empty_failure 'Theorem thm:
+check_case fails map_first_empty_failure 'Theorem thm:
   T
 Proof
   MAP_FIRST (fn th => ACCEPT_TAC th) [] >> ACCEPT_TAC TRUTH
 QED'
 
-check_case thenl_length_failure 'Theorem thm:
+check_case fails thenl_length_failure 'Theorem thm:
   T ∧ T
 Proof
   CONJ_TAC THENL [ACCEPT_TAC TRUTH]
