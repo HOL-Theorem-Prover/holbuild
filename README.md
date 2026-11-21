@@ -1293,7 +1293,11 @@ theory's export (it defines `susp_uptodate`), a theorem that the script's
 those blocks as one proof. The outline suspends a placeholder goal per label,
 so the script's `Resume` and `Finalise` run on placeholders and save the
 theorem where a plain build does; after the export the theorem's proof and
-each block run in order and are put together as `Finalise` does. The group
+each block run in order and are put together as `Finalise` does. As in place,
+a block whose label the theorem's proof (or an earlier block) never
+suspended, because its `suspend` ran on no goal, doesn't run; a theorem whose
+proof suspends no goal at all builds plain, since a plain build saves it at
+its statement, with its attributes. The group
 runs in place instead if one of its blocks uses `cheat` or `smlname`, a
 `Resume X` names no label or comes after the `Finalise`, or the source from
 the theorem to its `Finalise` calls markerLib's `lookup_suspension`, `lookup_resumption`,
