@@ -80,8 +80,9 @@ CHECKPOINT_PUBLISH_SECONDS = 15
 # How often a running exec-action is checked for exit and for its result, and how often its HOL children are.
 POLL_SECONDS = 0.1
 HOL_SAMPLE_SECONDS = 1.0
-# How long exec-action may go on publishing checkpoints for later actions after its result is reported. A large
-# theory's publish takes up to ~30 s; past this a hung upload stops parking the worker.
+# How long exec-action may go on after its result is reported: publishing checkpoints for later actions, which parks
+# the worker, and then the cache sweep and the module writer, which run on while the worker takes its next action. A
+# large theory's publish takes up to ~30 s; past this a hung upload stops parking the worker.
 POST_RESULT_SECONDS = 120.0
 DRAIN_CHECKPOINT_PUBLISH_SECONDS = 8
 # What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read, and where
@@ -1131,11 +1132,13 @@ def run_one(
     phases: Phases,
     *,
     claimed: float | None = None,
+    reaper: Reaper | None = None,
 ) -> bool:
     """Run one claimed action to its end, or until its lease is lost, and report it, adding its phases' time to
     ``phases``. An error in the worker is reported for a retry and then raised, so that ``main`` waits before it
     claims again. True when exec-action reported the remote cache ``unavailable``, after which ``main`` waits too.
-    ``claimed`` is when the claim's request was sent (``time.monotonic()``), by default now."""
+    ``claimed`` is when the claim's request was sent (``time.monotonic()``), by default now. With a ``reaper``,
+    exec-action's work after its result goes on there once it lets go of the action root."""
     token = claim["attempt_token"]
     spec = claim["spec_sha256"]
     drain = coordinator.drain
@@ -1161,7 +1164,7 @@ def run_one(
                 lease.done.set()
 
         try:
-            record = execute(args, releases, lease, claim, phases, report)
+            record = execute(args, releases, lease, claim, phases, report, reaper=reaper)
         except CacheUnavailable as error:
             # The cache couldn't give the spec, as while it restarts: the action is retried without counting it.
             if not completed:
@@ -1182,6 +1185,60 @@ def run_one(
         return "failure=unavailable" in record.splitlines()
 
 
+def released(lock: str) -> bool:
+    """Whether exec-action has let go of the worker's action root: its fcntl lock on ``lock``, which it holds from
+    before the action until it has emptied the root after the result. Releases before 0.14.94 hold it until they exit."""
+    try:
+        fd = os.open(lock, os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+class Reaper:
+    """The one exec-action a worker leaves running once it has let go of the action root after its result: the
+    cache cap's sweep and the theory module writer, which only help later actions, then run while the worker claims
+    and runs its next action. It is stopped POST_RESULT_SECONDS after its result, when the worker drains, and when
+    the next one is handed over."""
+
+    def __init__(self, drain: Drain, lock: str) -> None:
+        self.drain = drain
+        self.lock = lock  # exec-action's action-root lock, $HOLBUILD_CACHE/action.lock
+        self.running: tuple[threading.Thread, threading.Event] | None = None
+
+    def hand(self, process: subprocess.Popen[Any], deadline: float, theory: str) -> None:
+        """Takes over ``process``, stopping it at ``deadline`` (``time.monotonic()``) at the latest."""
+        self.stop()
+        stop = threading.Event()
+        thread = threading.Thread(target=self._reap, args=(process, deadline, theory, stop), daemon=True)
+        thread.start()
+        self.running = thread, stop
+
+    def stop(self) -> None:
+        """Stops the exec-action it holds, if any, and returns once it is reaped."""
+        if self.running is None:
+            return
+        thread, stop = self.running
+        stop.set()
+        thread.join()
+        self.running = None
+
+    def _reap(self, process: subprocess.Popen[Any], deadline: float, theory: str, stop: threading.Event) -> None:
+        while process.poll() is None and not self.drain.stop.is_set() and time.monotonic() < deadline:
+            if stop.wait(min(POLL_SECONDS, max(0.0, deadline - time.monotonic()))):
+                break
+        if process.poll() is None:
+            print(f"{theory}: stopping exec-action's work after its result", file=sys.stderr, flush=True)
+        stop_group(process)
+        print(f"{theory}: exit {process.returncode} after the result", file=sys.stderr, flush=True)
+
+
 def read_result(path: str) -> str | None:
     """exec-action's result record, once it has written one; it renames it into place whole."""
     try:
@@ -1198,10 +1255,13 @@ def execute(
     claim: dict[str, Any],
     phases: Phases,
     report: Callable[[str], None],
+    *,
+    reaper: Reaper | None = None,
 ) -> str | None:
     """The result record of the claimed action, or None once its lease is lost. A record exec-action writes
     while it runs is passed to ``report`` at once; the record returned is then that one. One it writes as it
-    stops for a lost lease is reported too, for the log of the action it stopped."""
+    stops for a lost lease is reported too, for the log of the action it stopped. Once exec-action has reported and
+    let go of the action root, the rest of its run goes to ``reaper``, if given."""
     spec = claim["spec_sha256"]
     drain = releases.drain
     drain.publish_seconds = 0.0
@@ -1241,9 +1301,10 @@ def execute(
             env=exec_action_env(version=version, discovery_config=releases.discovery_config),
             start_new_session=True
         )
-        drained_out = lost = False
+        drained_out = lost = handed = False
         # exec-action writes its result (atomically) before publishing for later actions; it is reported then,
-        # and the worker waits for the rest without the lease, at most POST_RESULT_SECONDS.
+        # and the worker waits for the rest without the lease, at most POST_RESULT_SECONDS: with a reaper, only
+        # until exec-action lets go of the action root, which the next action needs.
         reported: str | None = None
         seen = after_result = 0.0
         # The bound holds while the result is being posted too, which retries for as long as the lease.
@@ -1275,6 +1336,9 @@ def execute(
                         reported = record
                         stepped = after_result = time.monotonic()
                         continue
+                elif reaper is not None and released(reaper.lock):
+                    handed = True
+                    break
                 elif time.monotonic() - seen >= POST_RESULT_SECONDS:
                     print(f"{claim['theory']}: exec-action still running {POST_RESULT_SECONDS:.0f} s after its result; "
                           "stopping it", file=sys.stderr, flush=True)
@@ -1293,7 +1357,7 @@ def execute(
             if hard_stop is not None:
                 hard_stop.cancel()
             timed_out = seen > 0 and time.monotonic() - seen >= POST_RESULT_SECONDS
-            if process.poll() is None and not timed_out:
+            if not handed and process.poll() is None and not timed_out:
                 drain.publish_seconds = DRAIN_CHECKPOINT_PUBLISH_SECONDS
                 # Signal only the driver: it stops HOL, uploads the log, writes its record and then publishes
                 # the sandbox-validated saves. Killing its group here loses them.
@@ -1311,7 +1375,8 @@ def execute(
                         process.wait(timeout=min(0.1, remaining))
                     except subprocess.TimeoutExpired:
                         pass
-            stop_group(process)
+            if not handed:
+                stop_group(process)
             if reported is not None:
                 phases.add("after_result", time.monotonic() - after_result)
             elif cooperate_dir is None:
@@ -1322,6 +1387,10 @@ def execute(
                 phases.add("before_hol", spans.before_hol)
                 phases.add("hol", spans.hol)
                 phases.add("after_hol", spans.after_hol)
+        if handed:
+            assert reaper is not None
+            reaper.hand(process, seen + POST_RESULT_SECONDS, claim["theory"])
+            return reported
         if reported is not None:
             # Reported already: whatever the driver did after its result changes nothing for the client.
             print(f"{claim['theory']}: exit {process.returncode} after the result", file=sys.stderr, flush=True)
@@ -1529,6 +1598,8 @@ def main() -> None:
                 out.write('header = "' + header + '"\n')
             releases = replace(releases, discovery_config=config)
         sweep = functools.partial(sweep_cache, releases, args.cache_limit_gb)
+        reaper = Reaper(drain, os.path.join(os.environ["HOLBUILD_CACHE"], "action.lock"))
+        resources.callback(reaper.stop)
         while not drain.stop.is_set():
             with phases.timed("idle"):
                 wait_for_disk(drain, coordinator, tiers, args.name, sweep)
@@ -1554,7 +1625,9 @@ def main() -> None:
                 nodes = refresh_cache_members(coordinator, membership, discovery_url, now)
                 releases = replace(releases, remote_cache=",".join(nodes))
             try:
-                unavailable = run_one(coordinator, args, releases, protection, claim, phases, claimed=started)
+                unavailable = run_one(
+                    coordinator, args, releases, protection, claim, phases, claimed=started, reaper=reaper
+                )
             except Exception as error:  # noqa: BLE001  # run_one reported it where it could; the worker goes on
                 # Else the next claim ends the lease and the coordinator retries; a rerun finds a published result
                 # cached. Waiting keeps a worker from failing ready action after ready action while the cache or the

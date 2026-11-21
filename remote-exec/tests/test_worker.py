@@ -63,6 +63,14 @@ INTERRUPTED = f"holbuild-action-result-v1\nspec={SPEC}\ninput-key={'6' * 64}\nst
 FAKE_HOLBUILD = f"""#!/bin/sh
 if [ "$1" = sandbox-check ]; then [ -z "$HOLBUILD_FAKE_LOG" ] || env > "$HOLBUILD_FAKE_LOG.sandbox-env"; exit 0; fi
 echo $$ > "$HOLBUILD_FAKE_LOG.pid"
+# HOLBUILD_FAKE_LOCK: hold the action-root lock until the result is written, as exec-action does
+locker=
+if [ -n "$HOLBUILD_FAKE_LOCK" ]; then
+  mkdir -p "$HOLBUILD_CACHE"
+  python3 -c 'import fcntl, os, sys, time; fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT); fcntl.lockf(fd, fcntl.LOCK_EX); open(sys.argv[2], "w").close(); time.sleep(600)' "$HOLBUILD_CACHE/action.lock" "$HOLBUILD_FAKE_LOG.locked" &
+  locker=$!
+  while [ ! -e "$HOLBUILD_FAKE_LOG.locked" ]; do sleep 0.01; done
+fi
 if [ -n "$HOLBUILD_FAKE_HANG" ]; then
   trap '' TERM
   (while :; do sleep 1; done) &
@@ -103,6 +111,7 @@ while [ "$#" -gt 0 ]; do
   if [ "$1" = --result ]; then printf '%s' "${{HOLBUILD_FAKE_RECORD:-{RECORD}}}" > "$2.tmp"; mv "$2.tmp" "$2"; fi
   shift
 done
+[ -z "$locker" ] || {{ kill "$locker"; wait "$locker"; }}
 # HOLBUILD_FAKE_AFTER: go on for that many seconds after the result, as exec-action publishes for later actions
 if [ -n "$HOLBUILD_FAKE_AFTER" ]; then
   trap 'echo termed > "$HOLBUILD_FAKE_LOG.termed"; exit 1' TERM
@@ -501,6 +510,43 @@ def test_the_result_is_reported_before_exec_action_exits_and_a_lost_lease_then_s
         assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
     assert server.completed == [RECORD]
     assert not Path(f"{logs[1]}.termed").exists()
+
+
+def test_the_worker_claims_again_once_exec_action_lets_go_of_the_action_root_and_a_drain_stops_its_rest(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """exec-action's cache sweep and module writer run on after it releases the action-root lock, while the
+    worker claims its next action; a drain stops them."""
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+    server.next_claim = claim()
+    monkeypatch.setenv("HOLBUILD_FAKE_LOCK", "1")
+    monkeypatch.setenv("HOLBUILD_FAKE_AFTER", "60")
+    with running_worker(tmp_path, server, "0") as process:
+        deadline = time.monotonic() + 20
+        while len(server.claims) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert server.completed == [RECORD], (tmp_path / "worker.log").read_text()
+        assert len(server.claims) >= 2, (tmp_path / "worker.log").read_text()
+        assert Path(f"/proc/{Path(f'{logs[1]}.pid').read_text().strip()}").exists()
+        assert not Path(f"{logs[1]}.after").exists()
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
+    assert Path(f"{logs[1]}.termed").exists()
+
+
+def test_the_reaper_stops_its_exec_action_at_the_deadline_and_holds_one_at_a_time() -> None:
+    reaper = worker.Reaper(worker.Drain(), "/nonexistent/action.lock")
+    first = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    reaper.hand(first, time.monotonic() + 60, "pkg:A")
+    second = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    reaper.hand(second, time.monotonic() + 0.5, "pkg:B")
+    assert first.returncode is not None
+    deadline = time.monotonic() + 5
+    while second.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert second.returncode is not None
+    reaper.stop()
 
 
 def test_an_outline_exec_action_published_is_reported_once_before_the_result(
@@ -970,7 +1016,7 @@ def test_the_lease_runs_from_when_the_claim_was_sent(
     monkeypatch.setattr(worker, "claim_reporting", slow_claim)
     claim_sent: list[float] = []
 
-    def run(*_: object, claimed: float) -> bool:
+    def run(*_: object, claimed: float, **__: object) -> bool:
         claim_sent.append(claimed)
         raise KeyboardInterrupt
 

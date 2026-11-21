@@ -314,9 +314,14 @@ workers do when they aren't running HOL:
   `--cooperate-dir`;
 - `complete`: reporting the result;
 - `after_result`: `exec-action` after its result is reported, publishing
-  shared checkpoints and tools for later actions, emptying the action's
-  directory, refreshing the cache-cap measurement and writing theory
-  modules. The worker stops it 120 s after the result.
+  shared checkpoints and tools for later actions and emptying the action's
+  directory, until it releases the action-root lock (`action.lock` in the
+  worker's cache). It then refreshes the cache-cap measurement and writes
+  theory modules in the background while the worker claims its next action;
+  releases before 0.14.94 keep the lock, and the worker waits, until they
+  exit. The worker stops it 120 s after the result, when it drains, and when
+  the next action reaches the same point: one runs in the background at a
+  time.
 
 ## Action isolation
 
