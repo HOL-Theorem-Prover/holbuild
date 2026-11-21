@@ -343,11 +343,11 @@ fun project_preload_deps plan node =
 fun ordered_loads plan node object deps =
   map #2
     (HolbuildBuildPlan.sort_by_load_order #1
-       (map (fn name => (HolbuildBuildPlan.external_load_order name, LoadTheory name))
+       (map (fn name => (HolbuildBuildPlan.external_load_order_for node name, LoadTheory name))
             (HolbuildBuildPlan.direct_external_theories plan node) @
-        map (fn name => (HolbuildBuildPlan.external_load_order name, LoadLibrary name))
+        map (fn name => (HolbuildBuildPlan.external_load_order_for node name, LoadLibrary name))
             (HolbuildBuildPlan.direct_external_libs plan node) @
-        map (fn dep => (HolbuildBuildPlan.load_order plan dep, LoadObject (object dep)))
+        map (fn dep => (HolbuildBuildPlan.load_order_for plan node dep, LoadObject (object dep)))
             (List.filter loadable_project_dep deps)))
 
 fun preload_loads root plan node =

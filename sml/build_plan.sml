@@ -1499,12 +1499,52 @@ fun compare_load_order ({tier, package, dir, file} : load_order, b : load_order)
     | order => order
 
 (* A HOL theory or library named without a node: it is in $(HOLDIR)/sigobj. *)
-fun external_load_order name : load_order = {tier = 0, package = "", dir = "sigobj", file = name}
+fun stock_external_load_order name : load_order = {tier = 0, package = "", dir = "sigobj", file = name}
+
+(* SCRATCH, measurement only (never for master): with
+   HOLBUILD_SCRATCH_ORDER=heaviest every load list puts theories before
+   libraries, and theories heaviest first: by the number of transitive
+   project dependencies, most first, ties by name.  HOL's theories count as
+   weight 0.  Libraries keep their stock order after every theory.  The
+   order is folded into the tier so specs and workers carry it unchanged.
+   HOLBUILD_SCRATCH_STOCK names a file of logical names (one per line) whose
+   own script loads keep the stock order, so a theory that breaks under the
+   new order can be rebuilt for its dependents. *)
+val scratch_big = 1000000
+
+fun scratch_order () = OS.Process.getEnv "HOLBUILD_SCRATCH_ORDER" = SOME "heaviest"
+
+val scratch_stock_cache : string list option ref = ref NONE
+
+fun scratch_stock_names () =
+  case !scratch_stock_cache of
+      SOME names => names
+    | NONE =>
+        let
+          val names =
+            case OS.Process.getEnv "HOLBUILD_SCRATCH_STOCK" of
+                NONE => []
+              | SOME path =>
+                  let
+                    val input = TextIO.openIn path
+                    val text = TextIO.inputAll input before TextIO.closeIn input
+                  in
+                    String.tokens Char.isSpace text
+                  end
+        in
+          scratch_stock_cache := SOME names; names
+        end
+
+fun external_load_order name : load_order =
+  if not (scratch_order ()) then stock_external_load_order name
+  else if size name > 6 andalso String.isSuffix "Theory" name then
+    {tier = 2 * scratch_big, package = "", dir = "sigobj", file = name}
+  else {tier = 3 * scratch_big, package = "", dir = "sigobj", file = name}
 
 (* Package hol's modules are installed in sigobj, so they sort with the
    external ones; other packages from the HOL tree keep their directory. *)
-fun load_order (plan as {package_tiers, ...} : t) node : load_order =
-  if package node = "hol" then external_load_order (logical_name node)
+fun stock_load_order (plan as {package_tiers, ...} : t) node : load_order =
+  if package node = "hol" then stock_external_load_order (logical_name node)
   else
     case toolchain_source_name plan node of
         SOME name =>
@@ -1517,6 +1557,30 @@ fun load_order (plan as {package_tiers, ...} : t) node : load_order =
                     | NONE => 1,
            package = package node, dir = HolbuildSourceIndex.dirname (relative_path node),
            file = logical_name node}
+
+fun scratch_is_theory node = #kind (source_of node) = HolbuildSourceIndex.TheoryScript
+
+fun load_order plan node : load_order =
+  if not (scratch_order ()) then stock_load_order plan node
+  else if package node = "hol" then external_load_order (logical_name node)
+  else if scratch_is_theory node then
+    {tier = scratch_big + (scratch_big - length (transitive_project_deps plan node)),
+     package = "", dir = "", file = logical_name node}
+  else
+    let val {tier, package, dir, file} = stock_load_order plan node
+    in {tier = 3 * scratch_big + tier, package = package, dir = dir, file = file} end
+
+(* The orders CONSUMER's own loads use: the stock ones for a theory named in
+   HOLBUILD_SCRATCH_STOCK. *)
+fun scratch_stock_consumer consumer =
+  scratch_order () andalso
+  List.exists (fn name => name = logical_name consumer) (scratch_stock_names ())
+
+fun load_order_for plan consumer =
+  if scratch_stock_consumer consumer then stock_load_order plan else load_order plan
+
+fun external_load_order_for consumer =
+  if scratch_stock_consumer consumer then stock_external_load_order else external_load_order
 
 fun sort_by_load_order order values =
   map #2 (sort_pairs (fn ((a, _), (b, _)) => compare_load_order (a, b))
@@ -1535,13 +1599,13 @@ fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_li
     val analysis = analysis_state plan
     val source_hash = source_hash_of analysis node
     (* In load order, so a change of order changes the key. *)
-    val project_deps = map (fn dep => (load_order plan dep, dep_text dep)) (direct_project_deps plan node)
+    val project_deps = map (fn dep => (load_order_for plan node dep, dep_text dep)) (direct_project_deps plan node)
     (* Toolchain objects are a function of the theory toolchain identity, so
        they are named but not hashed: their files carry the install path. *)
     val external_deps =
-      map (fn name => (external_load_order name, "HOL:" ^ name)) (direct_external_theories plan node)
+      map (fn name => (external_load_order_for node name, "HOL:" ^ name)) (direct_external_theories plan node)
     val external_libs =
-      map (fn name => (external_load_order name, "HOLLIB:" ^ name)) (direct_external_libs plan node)
+      map (fn name => (external_load_order_for node name, "HOLLIB:" ^ name)) (direct_external_libs plan node)
     val policy = #policy source
     val declared_deps = HolbuildProject.action_deps policy
     val declared_loads = HolbuildProject.action_loads policy
