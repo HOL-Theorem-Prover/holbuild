@@ -190,8 +190,25 @@ fun static_error_source_line source_path source_text block =
       SOME line => SOME line
     | NONE => source_line_from_loc_marker source_text block
 
+(* The first line of what a fleet worker appends to a theory's log after
+   the child's output: why its pipelined attempt was given up, or why the
+   action failed. *)
+fun worker_report line =
+  String.isPrefix "holbuild: pipeline: building plain:" line orelse
+  String.isPrefix "holbuild: exec-action failed:" line
+
+(* The child's own output in a log's LINES: those before a worker's first
+   report, which can quote an earlier run's errors. *)
+fun child_output lines =
+  let
+    fun take [] acc = rev acc
+      | take (line :: rest) acc = if worker_report line then rev acc else take rest (line :: acc)
+  in
+    take lines []
+  end
+
 fun static_error_summary source_path source_text lines =
-  case find_static_error_block lines of
+  case find_static_error_block (child_output lines) of
       NONE => NONE
     | SOME block =>
         let
@@ -546,14 +563,14 @@ fun take_n n lines acc =
 
 fun child_failure_excerpt lines =
   let
-    (* A worker appends its derived summary to the raw log.  Diagnose only
+    (* A worker appends its reports to the raw log.  Diagnose only
        the raw output, and keep preceding output separate from the cause.
        Leave out holbuild's own runtime marker lines (`holbuild hol-phases
        ...`): they carry per-run values, not HOL output. *)
     fun runtime_marker line = String.isPrefix "holbuild " line
     fun scan [] _ failure terminal = (failure, terminal)
       | scan (remaining as line :: rest) preceding failure terminal =
-          if String.isPrefix "holbuild: exec-action failed:" line then (failure, terminal)
+          if worker_report line then (failure, terminal)
           else if runtime_marker line then scan rest preceding failure terminal
           else
             scan rest (take_n 10 (line :: preceding) [])
@@ -562,7 +579,7 @@ fun child_failure_excerpt lines =
                else terminal)
     fun raw_excerpt [] = []
       | raw_excerpt (line :: rest) =
-          if String.isPrefix "holbuild: exec-action failed:" line then []
+          if worker_report line then []
           else if runtime_marker line then raw_excerpt rest
           else line :: raw_excerpt rest
   in

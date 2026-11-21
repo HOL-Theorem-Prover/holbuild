@@ -235,7 +235,8 @@ fun report_action line =
     val state = if raw_state = "cancelled" andalso
                    String.isPrefix "skipped because of " (Option.getOpt (field "last_failure", ""))
                 then "skipped" else raw_state
-    (* A done action's detail says why it has no log. *)
+    (* A done action's detail says why it has no log, or why its pipelined
+       attempt was given up. *)
     val failure =
       case (field "last_failure", field "failure_detail") of
           (SOME f, SOME detail) => " (" ^ f ^ ": " ^ detail ^ ")"

@@ -11940,9 +11940,10 @@ fun merge_phases phases =
    holloadend: a runtime loaded again later prints its line first), less
    the preload's save (holsave in a line without holloadend).  The log is the child's, so it is read in bounded pieces and a line
    longer than a phases line could be is skipped.  Reading stops at the
-   failure summary a worker appends to the log (its first line starts
-   "holbuild: exec-action failed:"): what follows is holbuild's report on
-   the child's output, not that output, so no phases line there counts. *)
+   first report a worker appends to the log
+   (HolbuildTheoryDiagnostics.worker_report): what follows is holbuild's
+   report on the child's output, not that output, so no phases line there
+   counts. *)
 val hol_log_phase_names =
   ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
    "holcompiledn", "holreplayedn", "holrewoundn"]
@@ -11963,7 +11964,6 @@ fun hol_log_phases log_file child_start =
       if String.isPrefix prefix line then
         SOME (List.mapPartial phase (String.tokens Char.isSpace (String.extract (line, size prefix, NONE))))
       else NONE
-    val summary = "holbuild: exec-action failed:"
     (* A line read so far: its first MAX_LINE characters, and whether it is
        longer. *)
     fun extend (text, long) piece =
@@ -11983,7 +11983,7 @@ fun hol_log_phases log_file child_start =
               | lines (piece :: rest) pending found =
                   let val line = extend pending piece
                   in
-                    if String.isPrefix summary (#1 line) then (NONE, found)
+                    if HolbuildTheoryDiagnostics.worker_report (#1 line) then (NONE, found)
                     else lines rest ("", false) (add line found)
                   end
               | lines [] pending found = (SOME pending, found)
@@ -12019,8 +12019,9 @@ fun result_detail msg =
 
 (* A failure without a log says why in detail=, the client's only
    diagnostic of it; one with a log has the message in the log.  An action
-   that succeeded but whose log upload failed says why the log is missing. *)
-fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak, log, log_error} =
+   that succeeded says there why its log upload failed, and why its
+   pipelined attempt was given up (FALLBACK), which its log holds too. *)
+fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak, log, log_error, fallback} =
   String.concatWith "\n"
     ([action_result_header,
       "spec=" ^ spec_sha256,
@@ -12028,9 +12029,18 @@ fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak
       "status=" ^ status] @
      (case failure of
           NONE =>
-            (case (log, log_error) of
-                 (NONE, SOME msg) => ["detail=" ^ result_detail msg]
-               | _ => [])
+            let
+              val upload = case (log, log_error) of (NONE, SOME msg) => [msg] | _ => []
+              (* A long reason leaves the upload error room. *)
+              fun reason msg =
+                if null upload orelse size msg <= 300 then msg else String.substring (msg, 0, 300)
+            in
+              case (case fallback of
+                        SOME msg => ["pipelined attempt failed, built plain: " ^ reason msg]
+                      | NONE => []) @ upload of
+                  [] => []
+                | details => ["detail=" ^ result_detail (String.concatWith "; " details)]
+            end
         | SOME (kind, msg) =>
             ("failure=" ^ failure_name kind) ::
             (* The first for coordinators that know one only. *)
@@ -14406,6 +14416,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
       end
     val log_unavailable = ref NONE
     val log_required = ref false
+    (* Why the pipelined attempt was given up for a plain build, if it was. *)
+    val fallback = ref NONE
     (* A late parent's entry restores here, outside what the child may write;
        its outline in the other, and this action's own outline is copied to
        the third before it is published. *)
@@ -14598,6 +14610,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
         if kind = ProofFailure orelse kind = ScriptFailure then
           (HolbuildStatus.message_stderr ("holbuild: pipeline: building plain: " ^ msg ^ "\n");
            phases := ("fallback", 1) :: !phases;
+           fallback := SOME msg;
            plain ())
         else raise ActionFailed (kind, msg)
     and run_plain spec tc forced pipelined =
@@ -15295,20 +15308,22 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                        reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false})
                 end
               val (status, failure) = attempt ()
+              (* The plain build's child rewrote the log, so the reason its
+                 pipelined attempt was given up goes after it. *)
+              fun append_to_log line =
+                let
+                  val path = build_log ()
+                  val _ = ensure_parent path
+                  val out = TextIO.openAppend path
+                in
+                  TextIO.output (out, "\n" ^ line ^ "\n");
+                  TextIO.closeOut out
+                end
+                handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e)
               val _ =
                 if not (!HolbuildActionSandbox.outputs_validated) then () else
-                case failure of
-                    NONE => ()
-                  | SOME (_, msg) =>
-                      (let
-                         val path = build_log ()
-                         val _ = ensure_parent path
-                         val out = TextIO.openAppend path
-                       in
-                         TextIO.output (out, "\nholbuild: exec-action failed: " ^ msg ^ "\n");
-                         TextIO.closeOut out
-                       end
-                       handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e))
+                (Option.app (fn msg => append_to_log ("holbuild: pipeline: building plain: " ^ msg)) (!fallback);
+                 Option.app (fn (_, msg) => append_to_log ("holbuild: exec-action failed: " ^ msg)) failure)
               fun share () =
                 let val t0 = Time.now ()
                 in
@@ -15359,7 +15374,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               val text =
                 result_text (spec_sha256, !input_key)
                   {status = status, failure = failure, wall_ms = wall_ms, phases = phases,
-                   peak = !peak, log = log, log_error = !log_error}
+                   peak = !peak, log = log, log_error = !log_error, fallback = !fallback}
             in
               (case failure of
                    SOME (_, msg) => HolbuildStatus.message_stderr ("holbuild: exec-action failed: " ^ msg ^ "\n")

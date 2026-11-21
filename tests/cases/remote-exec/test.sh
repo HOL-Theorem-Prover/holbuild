@@ -40,6 +40,8 @@ heap=()
 [[ ! -e "\${1%.batch}.heap" ]] || heap=(--max-heap "\$(cat "\${1%.batch}.heap")")
 share=
 [[ ! -e "$state/share-heaps" ]] || share=--share-heaps
+pipeline=
+[[ ! -e "$state/pipeline" ]] || pipeline=--pipeline
 rm -f "$state/failed-batch" "$tmpdir/cache-control/ac-put-status"
 
 
@@ -77,7 +79,7 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   echo "\$theory" >> "$state/ran"
   status=0
   env "\${untrusted[@]}" HOLBUILD_CACHE="$tmpdir/worker-cache" "$HOLBUILD_BIN" --remote-cache "$remote_url" "\${heap[@]}" \
-    exec-action "\$spec" --cache-limit-gb 1000 --result "$tmpdir/worker.result" \$share \
+    exec-action "\$spec" --cache-limit-gb 1000 --result "$tmpdir/worker.result" \$share \$pipeline \
     >> "$tmpdir/worker.log" 2>&1 || status=\$?
   echo "\$theory \$(grep '^status=' "$tmpdir/worker.result")" >> "$state/results"
   cp "$tmpdir/worker.result" "$state/result-\$key"
@@ -2654,6 +2656,30 @@ refute_grep 'Theory built\|building locally' "$tmpdir/multi-failure-memory-missi
 in_copy multi-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
   --remote-only --detach --fail-fast BadATheory > "$tmpdir/multi-fail-fast.log" 2>&1
 require_grep '^POST /v1/batches?fail_fast=true ' "$state/requests.log"
+
+# A theory whose pipelined attempt and plain build both fail: the client
+# diagnoses the plain build, not the attempt's report the worker appended to
+# the log after it.
+copy_nondet fallback-failure rxfallbackfailure
+cat > "$tmpdir/fallback-failure/src/FallsScript.sml" <<'SML'
+Theory Falls
+Ancestors bool
+val _ = raise Fail "falls pipelined and plain";
+SML
+cat > "$tmpdir/fallback-failure/src/AfterFallsScript.sml" <<'SML'
+Theory AfterFalls
+Ancestors Falls
+SML
+: > "$state/pipeline"
+status=0
+in_copy fallback-failure --remote-cache "$remote_url" build --remote-exec "$coordinator" \
+  --remote-only AfterFallsTheory > "$tmpdir/fallback-failure.log" 2>&1 || status=$?
+rm "$state/pipeline"
+[[ $status -eq 1 ]] || { cat "$tmpdir/fallback-failure.log" >&2; exit 1; }
+require_grep '^holbuild: pipeline: building plain: ' \
+  "$tmpdir/fallback-failure/.holbuild/logs/current/rxfallbackfailure/FallsTheory/build.log"
+require_grep 'falls pipelined and plain' "$tmpdir/fallback-failure.log"
+refute_grep 'pipeline: building plain' "$tmpdir/fallback-failure.log"
 
 
 # A spec the worker rejects before any HOL runs has no log; its reason

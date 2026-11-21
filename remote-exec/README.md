@@ -878,7 +878,7 @@ for it. holbuild sends one random id with every attempt of a submission.
         "attempts": 1,
         "last_failure": "<failure class>|null",
         "log_sha256": "<sha256 of the last build log a run uploaded, in /cas/; a failure without a log keeps the earlier one>|null",
-        "failure_detail": "<the last result's detail: why it failed without a log; after lease expiries in a row (last_failure \"lease expired\", or \"lease expired N times\" once it fails), the workers that held it>|null",
+        "failure_detail": "<the last result's detail: why it failed without a log, or why one that didn't fail has no log or built plain after its pipelined attempt failed; after lease expiries in a row (last_failure \"lease expired\", or \"lease expired N times\" once it fails), the workers that held it>|null",
         "last_claimed_at": "<ISO 8601 timestamp>|null",
         "finished_at": "<ISO 8601 timestamp>|null",
         "worker": "<worker name>|null",

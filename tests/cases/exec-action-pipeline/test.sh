@@ -276,6 +276,11 @@ worker r "$spec_R" --pipeline
 expect r 0 "status=built"
 require_grep 'pipeline: building plain' "$tmpdir/r.log"
 phase r fallback || { echo "no fallback phase:" >&2; cat "$tmpdir/r.result" >&2; exit 1; }
+# Why it was given up reaches the batch record and the uploaded log.
+require_grep '^detail=pipelined attempt failed, built plain: .*deferred proofs depend on each other' "$tmpdir/r.result"
+read -r r_log _ < <(sed -n 's/^log=//p' "$tmpdir/r.result")
+require_grep '^holbuild: pipeline: building plain: ' "$tmpdir/remote/cas/$r_log"
+require_grep 'deferred proofs depend on each other' "$tmpdir/remote/cas/$r_log"
 
 # Plain builds against a second cache publish the same entries, and a worker
 # not asked to pipeline publishes no outline.
