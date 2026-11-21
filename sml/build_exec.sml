@@ -11935,10 +11935,10 @@ fun merge_phases phases =
    holloadend: a runtime loaded again later prints its line first), less
    the preload's save (holsave in a line without holloadend).  The log is the child's, so it is read in bounded pieces and a line
    longer than a phases line could be is skipped.  Reading stops at the
-   first report a worker appends to the log (a line starting
-   "holbuild: pipeline: building plain:" or "holbuild: exec-action
-   failed:"): what follows is holbuild's report on the child's output, not
-   that output, so no phases line there counts. *)
+   first report a worker appends to the log
+   (HolbuildTheoryDiagnostics.worker_report): what follows is holbuild's
+   report on the child's output, not that output, so no phases line there
+   counts. *)
 val hol_log_phase_names =
   ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
    "holcompiledn", "holreplayedn", "holrewoundn"]
@@ -11959,7 +11959,6 @@ fun hol_log_phases log_file child_start =
       if String.isPrefix prefix line then
         SOME (List.mapPartial phase (String.tokens Char.isSpace (String.extract (line, size prefix, NONE))))
       else NONE
-    val summaries = ["holbuild: pipeline: building plain:", "holbuild: exec-action failed:"]
     (* A line read so far: its first MAX_LINE characters, and whether it is
        longer. *)
     fun extend (text, long) piece =
@@ -11979,7 +11978,7 @@ fun hol_log_phases log_file child_start =
               | lines (piece :: rest) pending found =
                   let val line = extend pending piece
                   in
-                    if List.exists (fn summary => String.isPrefix summary (#1 line)) summaries then (NONE, found)
+                    if HolbuildTheoryDiagnostics.worker_report (#1 line) then (NONE, found)
                     else lines rest ("", false) (add line found)
                   end
               | lines [] pending found = (SOME pending, found)
@@ -12025,10 +12024,18 @@ fun result_text (spec_sha256, input_key) {status, failure, wall_ms, phases, peak
       "status=" ^ status] @
      (case failure of
           NONE =>
-            (case (case fallback of SOME msg => ["pipelined attempt failed, built plain: " ^ msg] | NONE => []) @
-                  (case (log, log_error) of (NONE, SOME msg) => [msg] | _ => []) of
-                 [] => []
-               | details => ["detail=" ^ result_detail (String.concatWith "; " details)])
+            let
+              val upload = case (log, log_error) of (NONE, SOME msg) => [msg] | _ => []
+              (* A long reason leaves the upload error room. *)
+              fun reason msg =
+                if null upload orelse size msg <= 300 then msg else String.substring (msg, 0, 300)
+            in
+              case (case fallback of
+                        SOME msg => ["pipelined attempt failed, built plain: " ^ reason msg]
+                      | NONE => []) @ upload of
+                  [] => []
+                | details => ["detail=" ^ result_detail (String.concatWith "; " details)]
+            end
         | SOME (kind, msg) =>
             ("failure=" ^ failure_name kind) ::
             (* The first for coordinators that know one only. *)
