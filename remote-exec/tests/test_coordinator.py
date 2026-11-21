@@ -1774,6 +1774,18 @@ async def test_a_tail_host_claims_while_more_builds_are_ready_than_better_waiter
     assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
 
 
+async def test_a_tail_host_defers_to_a_better_waiter_when_the_other_ready_builds_wait_on_single_flight(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a"])
+    assert await coordinator.claim(["standard"], "w", host_id="host-a") is not None
+    await submit(http, ["a", "b"])  # its ``a`` waits for that lease, so only ``b`` can be claimed
+    await coordinator.queue()
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
+    assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
+
+
 async def test_each_claim_that_leases_a_build_wakes_the_next_claim_deferring_while_builds_remain(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:

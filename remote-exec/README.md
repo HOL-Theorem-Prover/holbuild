@@ -510,9 +510,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   so a burst host that scale-in partly drained loses work to full ones and
   empties. Claims without a host report follow known hosts of the same
   primary tier. Polling claims defer each tier to better-ranked waiters
-  while those are at least as many as its builds ready; a claim that
-  leases a build wakes the next waiting claim while builds may remain, so
-  claims that deferred don't sleep out their recheck. A waiting
+  while those are at least as many as the builds of that tier a claim
+  could take (ready, and not held back by single-flight); a claim that
+  leases a build wakes the next waiting claim while builds may remain and
+  a waiting claim deferred, so claims that deferred don't sleep out their
+  recheck. A waiting
   standard-only worker still leaves high work available to burst
   workers. This packs work so excess tail hosts can drain for scale-in.
   Each process also remembers, per host, its last 2048 keys, the theories

@@ -356,7 +356,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
     async def queue() -> dict[str, object]:
         status = await coordinator.queue()
         return {
-            **{k: v for k, v in asdict(status.counts).items() if k not in ("high_run", "ready_high_run")},
+            **{k: v for k, v in asdict(status.counts).items() if k not in ("high_run", "ready_high_run", "claimable_standard", "claimable_high")},
             "run_slots": settings.run_slots,
             "run_floor": min(settings.run_floor, settings.run_slots),
             "priority_cap": settings.priority_cap,

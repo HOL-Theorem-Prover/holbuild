@@ -267,6 +267,9 @@ class QueueCounts:
     waiting_ahead_high: int = 0
     high_run: int = 0  # internal: ready or running high-tier runs, for capped burst demand
     ready_high_run: int = 0  # internal: of those, the ready ones
+    # internal: the ready builds a claim could take, not held back behind another batch's live lease of their key
+    claimable_standard: int = 0
+    claimable_high: int = 0
 
 
 # What a host report's counts and sizes may be: JSON's exact integers.
@@ -1007,6 +1010,13 @@ FINISH_IF_DONE = sa.text(
 # Both also count the running actions claimed ahead that wait for a parent (WAITING_AHEAD), as state ``ahead``, for
 # burst_demand: they hold a worker but no burst worker should start for them alone. Not those that published their
 # outline or start on their parents' outlines: they work while their parents finish.
+# Both also count, as state ``claimable``, the ready builds a claim could take: not those single-flight holds back
+# behind another batch's live lease of their key, as CLAIM_ACTION doesn't, for the deferral of claims
+# (Coordinator._defers).
+COUNT_CLAIMABLE = (
+    "SELECT 'claimable', c.tier, c.class, false, count(*) FROM actions c WHERE c.state = 'ready' AND c.class = 'build' "
+    "AND c.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()) GROUP BY c.tier, c.class"
+)
 COUNT_UNFINISHED = sa.text(
     "SELECT a.state, a.tier, a.class, b.priority > 0, count(*) FROM actions a "
     "JOIN batches b ON b.id = a.batch_id "
@@ -1014,13 +1024,15 @@ COUNT_UNFINISHED = sa.text(
     "GROUP BY a.state, a.tier, a.class, b.priority > 0 "
     "UNION ALL SELECT 'ahead', a.tier, a.class, b.priority > 0, count(*) FROM actions a "
     f"JOIN batches b ON b.id = a.batch_id WHERE {WAITING_AHEAD.format(w='a')} "
-    "GROUP BY a.tier, a.class, b.priority > 0"
+    "GROUP BY a.tier, a.class, b.priority > 0 "
+    f"UNION ALL {COUNT_CLAIMABLE}"
 )
 COUNT_ACTIVE = sa.text(
     "SELECT state, tier, class, false, count(*) FROM actions "
     "WHERE state IN ('ready', 'running') GROUP BY state, tier, class "
     "UNION ALL SELECT 'ahead', w.tier, w.class, false, count(*) FROM actions w "
-    f"WHERE {WAITING_AHEAD.format(w='w')} GROUP BY w.tier, w.class"
+    f"WHERE {WAITING_AHEAD.format(w='w')} GROUP BY w.tier, w.class "
+    f"UNION ALL {COUNT_CLAIMABLE}"
 )
 
 
@@ -1139,6 +1151,9 @@ class Coordinator:
         self.holds: dict[tuple[UUID, str], Hold] = {}
         self.ready_builds = 0
         self.ready_high = 0  # high-tier builds ready at that count
+        # Of the builds of each tier ready at that count, those a claim could take, less those this process leased
+        # since (see _defers).
+        self.claimable: dict[str, int] = {}
         self.locality = LocalityCounts()
         # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came, with their sums by
         # phase, kept as reports come and go: /v1/queue asks for them more often than reports expire. Also in memory.
@@ -2492,10 +2507,9 @@ class Coordinator:
     def _defers(self, tier: str, rank: ClaimRank, *, ahead_only: bool) -> bool:
         """Whether a claim ranked ``rank`` leaves ``tier`` to the better-ranked unwoken waiters that take it (those
         that may claim ahead if ``ahead_only``), so polling workers don't spread work onto tail hosts: once one waits,
-        unless, for builds, fewer wait than the last count found builds of the tier ready, as they can't take them
-        all and a deferred claim sleeps until its recheck."""
-        ready = self.ready_high if tier == "high" else self.ready_builds - self.ready_high
-        enough = 1 if ahead_only else max(1, ready)
+        unless, for builds, fewer wait than there are builds of the tier a claim could take (see _count_ready), as
+        they can't take them all and a deferred claim sleeps until its recheck."""
+        enough = 1 if ahead_only else max(1, self.claimable.get(tier, 0))
         better = 0
         for w_tiers, w_rank, w_woken, w_ahead in self.claim_waiters:
             if (
@@ -2511,25 +2525,33 @@ class Coordinator:
         """The rank of a claim of ``tiers`` from ``host_id`` as its host's workers are now; see _claim_rank."""
         return _claim_rank(tiers, host_id, host_rank, len(self.host_workers.get(host_id or "", ())))
 
+    def _count_ready(self, counts: QueueCounts) -> None:
+        """Note the ready builds of ``counts``: all of them, for the scale-in line, and by tier those a claim could
+        take, for the deferral of claims."""
+        self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
+        self.ready_high = counts.ready_high - counts.ready_high_run
+        self.claimable = {"standard": counts.claimable_standard, "high": counts.claimable_high}
+
     def _leased_build(self, ranking: "_Ranking", tier: str) -> None:
-        """Count a build of ``tier`` this process leased from ``ranking`` off the last count's ready builds, so claims
-        stop passing better-ranked waiters (see _defers) once those can take the rest; and while ``ranking`` may still
-        have builds of ``tier`` not held for a host and a claim waiting for one deferred to better-ranked ones, wake
-        the best-ranked claim waiting for one, which passes the wake on as it leases: the claims that deferred would
-        otherwise sleep out their recheck (a held build waits for its hold's end, which wakes one). That wake makes no
-        new work ready, so made_ready stays."""
-        self.ready_builds = max(0, self.ready_builds - 1)
-        if tier == "high":
-            self.ready_high = max(0, self.ready_high - 1)
-        if not any(tier in w_tiers and w_woken in self.deferring for w_tiers, _, w_woken, _ in self.claim_waiters):
+        """Count a build of ``tier`` this process leased from ``ranking`` off the builds of ``tier`` a claim could
+        take, so claims stop passing better-ranked waiters (see _defers) once those can take the rest. Then, while
+        ``ranking`` may still have builds not held for a host of a tier that a waiting claim deferred, wake the
+        best-ranked claim waiting for that tier, this one's first: it passes the wake on as it leases, where the claims
+        that deferred would otherwise sleep out their recheck (a held build waits for its hold's end, which wakes one).
+        That wake makes no new work ready, so made_ready stays."""
+        self.claimable[tier] = max(0, self.claimable.get(tier, 0) - 1)
+        deferred = {t for w_tiers, _, w_woken, _ in self.claim_waiters if w_woken in self.deferring for t in w_tiers}
+        if not deferred:
             return
         now = asyncio.get_running_loop().time()
-        if any(
-            t == tier and (batch_id, t) not in ranking.exhausted and self.holds.get((batch_id, t), (0, now))[1] <= now
-            for *_, batch_id, t, _ in ranking.heap
-        ):
+        left = [
+            e for e in ranking.heap
+            if e[7] in deferred and (e[6], e[7]) not in ranking.exhausted
+            and self.holds.get((e[6], e[7]), (0.0, now))[1] <= now
+        ]
+        if left:
             self.made_ready -= 1  # _wake_claim counts it
-            self._wake_claim(tier)
+            self._wake_claim(tier if any(e[7] == tier for e in left) else min(left)[7])
 
     def _pass_wake(self, woken: asyncio.Future[Wake]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""
@@ -3264,8 +3286,7 @@ class Coordinator:
         async with self.engine.connect() as conn:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
             counts = await self._counts(conn, COUNT_UNFINISHED)
-        self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
-        self.ready_high = counts.ready_high - counts.ready_high_run
+        self._count_ready(counts)
         now = self.clock()
         self._forget_silent_hosts(now)
         demand = self._burst_demand(counts)
@@ -3334,7 +3355,7 @@ class Coordinator:
         for state, tier, action_class, prioritized, n in await conn.execute(
             statement, {"outlined": list(self.outlined_tokens)}
         ):
-            if state == "ahead":
+            if state in ("ahead", "claimable"):
                 count[state, tier] += n
                 continue
             if prioritized and action_class == "build":
@@ -3360,6 +3381,8 @@ class Coordinator:
             running_priority=priorities["running"],
             waiting_ahead_standard=count["ahead", "standard"],
             waiting_ahead_high=count["ahead", "high"],
+            claimable_standard=count["claimable", "standard"],
+            claimable_high=count["claimable", "high"],
         )
 
     async def sweep(self) -> None:
@@ -3400,8 +3423,7 @@ class Coordinator:
         async with self.scale_lock:
             async with self.engine.connect() as conn:
                 counts = await self._counts(conn, COUNT_ACTIVE)
-            self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
-            self.ready_high = counts.ready_high - counts.ready_high_run
+            self._count_ready(counts)
             now = self.clock()
             self._forget_silent_hosts(now)
             demand = self._burst_demand(counts)
