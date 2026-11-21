@@ -1786,6 +1786,33 @@ async def test_a_tail_host_defers_to_a_better_waiter_when_the_other_ready_builds
     assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
 
 
+async def test_a_tail_host_defers_to_a_better_waiter_when_the_ready_builds_share_one_key(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a"])
+    await submit(http, ["a"])  # single-flight leases ``a`` once
+    await coordinator.queue()
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
+    assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
+
+
+async def test_a_lease_while_the_ready_builds_are_counted_still_counts_off_them(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await submit(http, ["a", "b"])
+    counts = coordinator._counts
+
+    async def leasing_meanwhile(*args: Any) -> Any:
+        read = await counts(*args)
+        assert await coordinator.claim(["standard"], "w", host_id="host-a") is not None
+        return read
+
+    monkeypatch.setattr(coordinator, "_counts", leasing_meanwhile)
+    await coordinator.queue()
+    assert coordinator.claimable["standard"] == 1
+
+
 async def test_each_claim_that_leases_a_build_wakes_the_next_claim_deferring_while_builds_remain(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:

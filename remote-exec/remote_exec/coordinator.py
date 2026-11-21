@@ -1010,11 +1010,12 @@ FINISH_IF_DONE = sa.text(
 # Both also count the running actions claimed ahead that wait for a parent (WAITING_AHEAD), as state ``ahead``, for
 # burst_demand: they hold a worker but no burst worker should start for them alone. Not those that published their
 # outline or start on their parents' outlines: they work while their parents finish.
-# Both also count, as state ``claimable``, the ready builds a claim could take: not those single-flight holds back
-# behind another batch's live lease of their key, as CLAIM_ACTION doesn't, for the deferral of claims
-# (Coordinator._defers).
+# Both also count, as state ``claimable``, the ready builds a claim could take, for the deferral of claims
+# (Coordinator._defers): one per key, as single-flight leases a key once, and none whose key another batch's live
+# lease holds back, as CLAIM_ACTION takes none.
 COUNT_CLAIMABLE = (
-    "SELECT 'claimable', c.tier, c.class, false, count(*) FROM actions c WHERE c.state = 'ready' AND c.class = 'build' "
+    "SELECT 'claimable', c.tier, c.class, false, count(DISTINCT c.input_key) FROM actions c "
+    "WHERE c.state = 'ready' AND c.class = 'build' "
     "AND c.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()) GROUP BY c.tier, c.class"
 )
 COUNT_UNFINISHED = sa.text(
@@ -1154,6 +1155,7 @@ class Coordinator:
         # Of the builds of each tier ready at that count, those a claim could take, less those this process leased
         # since (see _defers).
         self.claimable: dict[str, int] = {}
+        self.leased: Counter[str] = Counter()  # the builds this process leased, by tier
         self.locality = LocalityCounts()
         # The phase reports of the last PHASE_WINDOW_SECONDS, oldest first, and when each came, with their sums by
         # phase, kept as reports come and go: /v1/queue asks for them more often than reports expire. Also in memory.
@@ -2525,12 +2527,17 @@ class Coordinator:
         """The rank of a claim of ``tiers`` from ``host_id`` as its host's workers are now; see _claim_rank."""
         return _claim_rank(tiers, host_id, host_rank, len(self.host_workers.get(host_id or "", ())))
 
-    def _count_ready(self, counts: QueueCounts) -> None:
+    def _count_ready(self, counts: QueueCounts, leased: Counter[str]) -> None:
         """Note the ready builds of ``counts``: all of them, for the scale-in line, and by tier those a claim could
-        take, for the deferral of claims."""
+        take, for the deferral of claims, less the builds this process leased since ``leased`` was its count of them,
+        before the counts were read; a lease the read saw already is counted twice, which errs toward deferring."""
         self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
         self.ready_high = counts.ready_high - counts.ready_high_run
-        self.claimable = {"standard": counts.claimable_standard, "high": counts.claimable_high}
+        since = self.leased - leased
+        self.claimable = {
+            "standard": max(0, counts.claimable_standard - since["standard"]),
+            "high": max(0, counts.claimable_high - since["high"]),
+        }
 
     def _leased_build(self, ranking: "_Ranking", tier: str) -> None:
         """Count a build of ``tier`` this process leased from ``ranking`` off the builds of ``tier`` a claim could
@@ -2539,6 +2546,7 @@ class Coordinator:
         best-ranked claim waiting for that tier, this one's first: it passes the wake on as it leases, where the claims
         that deferred would otherwise sleep out their recheck (a held build waits for its hold's end, which wakes one).
         That wake makes no new work ready, so made_ready stays."""
+        self.leased[tier] += 1
         self.claimable[tier] = max(0, self.claimable.get(tier, 0) - 1)
         deferred = {t for w_tiers, _, w_woken, _ in self.claim_waiters if w_woken in self.deferring for t in w_tiers}
         if not deferred:
@@ -3283,10 +3291,11 @@ class Coordinator:
         """The unfinished actions, the burst worker target: the highest demand of the last ``scale_down_hold_s``
         seconds, which the sweeps of every replica record, and of now, the hosts whose workers reported to this
         process in the last ``HOST_REPORT_SECONDS``, by id, and this process's last run of the scale command."""
+        leased = self.leased.copy()
         async with self.engine.connect() as conn:
             desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
             counts = await self._counts(conn, COUNT_UNFINISHED)
-        self._count_ready(counts)
+        self._count_ready(counts, leased)
         now = self.clock()
         self._forget_silent_hosts(now)
         demand = self._burst_demand(counts)
@@ -3421,9 +3430,10 @@ class Coordinator:
     async def scale(self) -> None:
         """Sample demand and apply its held target, serialized with intake and periodic checks."""
         async with self.scale_lock:
+            leased = self.leased.copy()
             async with self.engine.connect() as conn:
                 counts = await self._counts(conn, COUNT_ACTIVE)
-            self._count_ready(counts)
+            self._count_ready(counts, leased)
             now = self.clock()
             self._forget_silent_hosts(now)
             demand = self._burst_demand(counts)
