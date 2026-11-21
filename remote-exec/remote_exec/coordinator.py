@@ -18,7 +18,7 @@ from collections import Counter, defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, NamedTuple, Self
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -1023,7 +1023,18 @@ COUNT_ACTIVE = sa.text(
 )
 
 
-ClaimRank = tuple[bool, bool, int, str]
+class ClaimRank(NamedTuple):
+    """How a waiting claim ranks for wakes and deferral, least first: standard work packs onto warm workers first,
+    then reported hosts of lower rank, then fuller hosts, so a partly drained host loses work to full ones and
+    empties, then hosts in a stable order."""
+
+    burst: bool  # the claim takes high work first
+    unhosted: bool
+    host_rank: int
+    emptier: int  # the host's live workers, negated
+    host_id: str
+
+
 # A wake handed to a waiting claim: its tier, whether it was for a claim ahead, and the batch and theory made ready,
 # if it was for one.
 Wake = tuple[str, bool, UUID | None, str | None]
@@ -1035,9 +1046,9 @@ Hold = tuple[float, float, str]
 RankEntry = tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]
 
 
-def _claim_rank(tiers: list[str], host_id: str | None, host_rank: int = 0) -> ClaimRank:
-    """Pack standard work onto warm workers first, then hosts of lower rank, then hosts in a stable order."""
-    return tiers[0] != "standard", host_id is None, host_rank, host_id or ""
+def _claim_rank(tiers: list[str], host_id: str | None, host_rank: int = 0, workers: int = 0) -> ClaimRank:
+    """The rank of a claim of ``tiers`` from ``host_id`` of ``host_rank``, which runs ``workers`` live workers."""
+    return ClaimRank(tiers[0] != "standard", host_id is None, host_rank, -workers, host_id or "")
 
 
 class Coordinator:
@@ -1332,7 +1343,8 @@ class Coordinator:
         A wait ends early once ``disconnected`` says the worker has gone, and a claim it has gone from by the time
         it took an action gives that action back, so no action is leased to nobody. Each
         action this process's ``release`` makes ready wakes one compatible claim, preferring warm workers, then
-        hosts of lower ``host_rank``, then hosts in canonical order, with FIFO ties. Unwoken claims defer each tier to
+        hosts of lower ``host_rank``, then hosts with more live workers, then hosts in canonical order, with FIFO
+        ties. Unwoken claims defer each tier to
         better-ranked waiters, so polling workers don't spread work back onto tail hosts, but not a tier with a build
         held for their host (_held_for), which they then prefer. Waits recheck every
         ``CLAIM_RECHECK_SECONDS``, for actions another coordinator process made ready and for an action whose
@@ -1344,7 +1356,7 @@ class Coordinator:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
-        rank = _claim_rank(tiers, host_id, host_rank)
+        rank = _claim_rank(tiers, host_id, host_rank, len(self.host_workers.get(host_id or "", ())))
         # Done once a wake was handed to this claim.
         woken: asyncio.Future[Wake] = loop.create_future()
 
@@ -2197,7 +2209,7 @@ class Coordinator:
         waiter = min(
             (
                 w for w in self.claim_waiters
-                if tier in w[0] and not w[2].done() and self._quarantine(w[1][3]) is None
+                if tier in w[0] and not w[2].done() and self._quarantine(w[1].host_id) is None
             ),
             key=lambda w: w[1],
             default=None,
@@ -2233,7 +2245,7 @@ class Coordinator:
         waiter = min(
             (
                 w for w in self.claim_waiters
-                if tier in w[0] and not w[2].done() and w[1][3] in holders
+                if tier in w[0] and not w[2].done() and w[1].host_id in holders
             ),
             key=lambda w: w[1],
             default=None,
@@ -2308,7 +2320,7 @@ class Coordinator:
 
     def _kept_hosts(self, ready: int = 0, tier: str = "standard") -> set[str]:
         """The hosts below the scale-in line for work of ``tier``: in the order claims pack onto them (warm hosts,
-        then by rank and id), the hosts not quarantined whose workers seen lately could run the live leases and the
+        then by rank, fullest first, and id), the hosts not quarantined whose workers seen lately could run the live leases and the
         ready builds (the last count's, or ``ready`` if more), and at least the warm workers. High work, which only
         burst workers take, has a line of its own counting only burst workers: their leases and the ready high
         builds. A host short of memory counts only the workers it runs or that wait for a claim, as the others wait
@@ -2317,10 +2329,10 @@ class Coordinator:
         high = tier == "high"
         leases = Counter(host for host, _, tiers in self.lease_hosts.values() if not high or "high" in tiers)
         waiting = Counter(
-            w_rank[3] for w_tiers, w_rank, w_woken, _ in self.claim_waiters
+            w_rank.host_id for w_tiers, w_rank, w_woken, _ in self.claim_waiters
             if not w_woken.done() and (not high or "high" in w_tiers)
         )
-        hosts: list[tuple[tuple[bool, int, str], int]] = []
+        hosts: list[tuple[tuple[bool, int, int, str], int]] = []
         for host_id, workers in self.host_workers.items():
             fresh = [
                 is_burst for seen, is_burst in workers.values()
@@ -2335,14 +2347,14 @@ class Coordinator:
             busy = leases[host_id] + waiting[host_id]
             short = report is not None and bool(report[1].memory_short)
             slots = max(reported, busy, 1) if short else max(len(fresh), reported, busy, 1)
-            hosts.append(((all(fresh), rank, host_id), slots))
+            hosts.append(((all(fresh), rank, -len(fresh), host_id), slots))
         if high:
-            budget = sum(leases[host_id] for (_, _, host_id), _ in hosts) + max(ready, self.ready_high)
+            budget = sum(leases[host_id] for (*_, host_id), _ in hosts) + max(ready, self.ready_high)
         else:
             budget = max(self.settings.warm_workers, len(self.lease_hosts) + max(ready, self.ready_builds))
         kept: set[str] = set()
         before = 0
-        for (_, _, host_id), slots in sorted(hosts):
+        for (*_, host_id), slots in sorted(hosts):
             if before >= budget:
                 break
             kept.add(host_id)
@@ -2455,16 +2467,16 @@ class Coordinator:
             self.made_ready += 1
         compatible = [
             w for w in self.claim_waiters
-            if tier in w[0] and not w[2].done() and (w[3] or not ahead) and self._quarantine(w[1][3]) is None
+            if tier in w[0] and not w[2].done() and (w[3] or not ahead) and self._quarantine(w[1].host_id) is None
         ]
         waiter = min(compatible, key=lambda w: w[1], default=None)
         if waiter is not None and theory is not None and self.settings.locality:
-            level = self._level(waiter[1][3], theory)
-            holders = [w for w in compatible if self._level(w[1][3], theory) > level]
+            level = self._level(waiter[1].host_id, theory)
+            holders = [w for w in compatible if self._level(w[1].host_id, theory) > level]
             kept = self._kept_hosts(1, tier) if holders else set()  # with the build made ready
-            holders = [w for w in holders if w[1][3] in kept]
-            best = max((self._level(w[1][3], theory) for w in holders), default=0)
-            local = min((w for w in holders if self._level(w[1][3], theory) == best), key=lambda w: w[1], default=None)
+            holders = [w for w in holders if w[1].host_id in kept]
+            best = max((self._level(w[1].host_id, theory) for w in holders), default=0)
+            local = min((w for w in holders if self._level(w[1].host_id, theory) == best), key=lambda w: w[1], default=None)
             if local is not None:
                 waiter = local
                 self.locality.wakes += 1
@@ -2483,7 +2495,7 @@ class Coordinator:
         for w_tiers, w_rank, w_woken, w_ahead in self.claim_waiters:
             if (
                 tier in w_tiers and not w_woken.done() and w_rank < rank and (w_ahead or not ahead_only)
-                and self._quarantine(w_rank[3]) is None
+                and self._quarantine(w_rank.host_id) is None
             ):
                 better += 1
                 if better >= enough:

@@ -541,6 +541,17 @@ def test_high_work_draws_its_scale_in_line_over_the_hosts_with_burst_workers(coo
     assert (coordinator._kept_hosts(1), coordinator._kept_hosts(1, "high")) == ({"host-0"}, {"host-9"})
 
 
+def test_full_hosts_come_before_partly_drained_ones_below_the_line(coordinator: Coordinator) -> None:
+    """host-0 kept one of its workers through a scale-in; full host-1 can run the work alone, so host-0 is above
+    the line, though it comes first in canonical order."""
+    coordinator.settings.warm_workers = 0
+    coordinator.report_worker("host-0", "host-0-w0", ["high", "standard"])
+    for i in range(4):
+        coordinator.report_worker("host-1", f"host-1-w{i}", ["high", "standard"])
+
+    assert (coordinator._kept_hosts(3), coordinator._kept_hosts(3, "high")) == ({"host-1"}, {"host-1"})
+
+
 def test_the_high_line_counts_high_work_and_burst_workers_only(coordinator: Coordinator) -> None:
     """One ready high build needs one burst host, whatever the warm workers wanted; with host-8's burst worker
     leased, host-9 too, though host-8's standard workers are free."""
@@ -653,11 +664,13 @@ async def held_in_a_busier_batch(
 
 
 def wait_on_host_0(coordinator: Coordinator) -> None:
-    """A claim waits on host-0, which ranks before host-1: an unwoken claim from host-1 defers to it."""
+    """A claim waits on host-0, which runs as many workers as host-1 does once it claims and so ranks before it: an
+    unwoken claim from host-1 defers to it."""
     coordinator.claim_waiters = [
-        (["standard"], _claim_rank(["standard"], "host-0"), asyncio.get_running_loop().create_future(), False)
+        (["standard"], _claim_rank(["standard"], "host-0", 0, 2), asyncio.get_running_loop().create_future(), False)
     ]
-    coordinator.report_worker("host-0", "host-0-w", ["standard"])
+    for worker in range(2):
+        coordinator.report_worker("host-0", f"host-0-w{worker}", ["standard"])
 
 
 async def test_a_holder_claiming_unwoken_finds_its_held_build_behind_a_batch_running_less(
@@ -756,7 +769,7 @@ async def test_a_holder_claiming_unwoken_takes_its_held_build_only_while_it_hold
     claim waiting on host-0; one from host-2 takes the build."""
     _, theory = await held_in_a_busier_batch(http, coordinator, context_only=True)
     coordinator.host_keys["host-2"] = {theory: None}
-    coordinator.settings.warm_workers = 4  # host-2 below the scale-in line too
+    coordinator.settings.warm_workers = 5  # host-2 below the scale-in line too
     await submit_as(http, "a1", "a")
     wait_on_host_0(coordinator)
 
@@ -920,6 +933,7 @@ async def test_a_hold_taken_by_a_claim_that_fails_to_lease_its_build_is_put_back
             await coordinator.claim(["standard"], "w", 0, host_id="host-1")
 
     assert coordinator.holds[(held, "standard")] == hold
+    coordinator.report_worker("host-1", "w", ["standard"])  # as many workers as host-3 has once it claims again
     claimed = await claim_on(http, "host-3")
     assert claimed is None
     claimed = await claim_on(http, "host-1")
@@ -944,7 +958,7 @@ async def test_a_holder_claiming_unwoken_finds_the_build_held_for_it_among_sever
 ) -> None:
     """host-1 holds the context of ``x`` and ``y``, and kept host-2 ran ``x``: both builds are held, ``x`` for host-2
     and ``y`` for host-1, which takes ``y`` though the hold of ``x`` began first."""
-    coordinator.settings.warm_workers = 4
+    coordinator.settings.warm_workers = 5
     coordinator.theory_deps["pkg:x"] = coordinator.theory_deps["pkg:y"] = D1
     coordinator.host_keys["host-1"] = {D1: None}
     coordinator.host_keys["host-2"] = {"pkg:x": None}
@@ -1033,7 +1047,7 @@ async def test_a_holder_claiming_unwoken_tries_each_tier_with_a_held_build(
     coordinator.host_keys["host-1"]["pkg:h"] = None
     coordinator.claim_waiters = [
         (
-            ["high", "standard"], _claim_rank(["high", "standard"], "host-0"),
+            ["high", "standard"], _claim_rank(["high", "standard"], "host-0", 0, 1),
             asyncio.get_running_loop().create_future(), False,
         )
     ]

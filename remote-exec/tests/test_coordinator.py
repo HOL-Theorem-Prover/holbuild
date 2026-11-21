@@ -1412,6 +1412,59 @@ async def test_tail_hosts_empty_once_demand_falls_after_a_peak_ran_every_theory_
     assert tail_leases[-12:] == [0] * 12, tail_leases
 
 
+async def test_a_partly_drained_host_loses_work_to_a_full_one_and_empties(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scale-in stopped the idle workers of host-0, the first in canonical order, and left two running; host-1 kept
+    all four. A stream of work that host-1 alone can run then goes to host-1, so host-0 empties and can scale in."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only wakes end the waits in time
+    workers = {"host-0": 2, "host-1": 4}
+    running: deque[tuple[str, str, Claim]] = deque()  # host, action name and claim of each lease, oldest first
+    claimed: asyncio.Queue[tuple[str, Claim]] = asyncio.Queue()
+    waiting: list[asyncio.Task[None]] = []
+
+    def report() -> None:
+        for host, count in workers.items():
+            leases = sum(h == host for h, _, _ in running)
+            coordinator.report_host(HostReport(host, 50.0, 64 << 30, 40 << 30, 52 << 30, 6 << 30, leases, False, 1))
+            for slot in range(count):
+                coordinator.report_worker(host, f"{host}-{slot}", ["standard"])
+
+    async def submit_action(name: str) -> None:
+        text = f"holbuild-action-batch-v1\naction {input_key(name)} {ac_key(name)} {spec(name)} pkg:{name}\n"
+        assert (await http.post("/v1/batches", content=text, headers=CLIENT)).status_code == 201
+
+    async def free_slot(host: str) -> None:
+        claim = await coordinator.claim(["standard"], host, 30, host_id=host, host_rank=1)
+        assert claim is not None
+        await claimed.put((host, claim))
+
+    report()
+    for host in ["host-0", "host-1", "host-0", "host-1"]:
+        await submit_action(name := f"start-{len(running)}")
+        claim = await coordinator.claim(["standard"], host, host_id=host, host_rank=1)
+        assert claim is not None
+        running.append((host, name, claim))
+    for host in ["host-1", "host-1"]:  # host-1's idle workers wait for work
+        waiting.append(asyncio.create_task(free_slot(host)))
+    drained_leases = []
+    for step in range(12):
+        host, name, claim = running.popleft()
+        cache.keys.add(ac_key(name))
+        assert (await complete(http, str(claim.attempt_token), result(name, "built"))).status_code == 200
+        waiting.append(asyncio.create_task(free_slot(host)))
+        report()
+        await asyncio.sleep(0.05)
+        await submit_action(f"s{step}")
+        host, claim = await asyncio.wait_for(claimed.get(), 10)
+        running.append((host, f"s{step}", claim))
+        drained_leases.append(sum(h == "host-0" for h, _, _ in running))
+    for task in waiting:
+        task.cancel()
+    await asyncio.gather(*waiting, return_exceptions=True)
+    assert drained_leases[-8:] == [0] * 8, drained_leases
+
+
 def busy(host_id: str, leases: int) -> HostReport:
     return HostReport(host_id, 50.0, 64 << 30, 40 << 30, 52 << 30, 6 << 30, leases, False)
 
