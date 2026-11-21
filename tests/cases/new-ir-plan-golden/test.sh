@@ -490,13 +490,17 @@ Proof
 QED
 SML
 check_plan first_prove_plan <<'EXPECTED'
-holbuild proof-ir plan ATheory:first_prove_plan source=src/AScript.sml (6 steps)
+holbuild proof-ir plan ATheory:first_prove_plan source=src/AScript.sml (10 steps)
   00 choice FIRST_PROVE [NO_TAC, ACCEPT_TAC TRUTH]
   01   alternative 1
-  02     step NO_TAC
-  03   alternative 2
-  04     step ACCEPT_TAC TRUTH
-  05 end
+  02     select first solve
+  03       step NO_TAC
+  04     end
+  05   alternative 2
+  06     select first solve
+  07       step ACCEPT_TAC TRUTH
+  08     end
+  09 end
 EXPECTED
 
 cat >> "$project/src/AScript.sml" <<'SML'

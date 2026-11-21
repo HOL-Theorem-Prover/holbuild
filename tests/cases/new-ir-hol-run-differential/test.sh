@@ -622,3 +622,19 @@ check_case thenl_length_failure 'Theorem thm:
 Proof
   CONJ_TAC THENL [ACCEPT_TAC TRUTH]
 QED'
+
+# Native FIRST_PROVE runs each alternative THEN NO_TAC: an alternative that
+# leaves goals fails, so the next one runs, or TRY rolls back.
+check_case first_prove_suite 'Theorem first_prove_partial_then_closing:
+  T ∧ T
+Proof
+  FIRST_PROVE [CONJ_TAC, CONJ_TAC >> ACCEPT_TAC TRUTH]
+QED
+
+Theorem first_prove_try_rollback:
+  T ∧ T
+Proof
+  TRY (FIRST_PROVE [CONJ_TAC, CONJ_TAC >- ACCEPT_TAC TRUTH]) >>
+  ACCEPT_TAC (CONJ TRUTH TRUTH)
+QED'
+require_grep 'Saved theorem _______ "first_prove_try_rollback"' "$tmpdir/first_prove_suite.hol-run.log"
