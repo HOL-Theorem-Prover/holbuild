@@ -518,7 +518,8 @@ fun split_flags args =
                   retain_debug_artifacts = retain_debug_artifacts,
                   warn_unreachable = warn_unreachable,
                   emit_output_hashes = emit_output_hashes,
-                  allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy}, [])
+                  allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
+                  promote_preload = false}, [])
         | "--dry-run" :: xs =>
             loop true watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--watch" :: xs =>
@@ -595,7 +596,9 @@ fun split_flags args =
 
 (* check builds plain: step timeouts are build's check, and a timeout-free
    request reuses any built or cached theory, including ones from build
-   --skip-proof-steps --skip-checkpoints. It saves no checkpoints. *)
+   --skip-proof-steps --skip-checkpoints. It saves no checkpoints, so a
+   theory it builds moves a large preload out of the heap --max-heap
+   limits itself (promote_preload). *)
 fun plain_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
@@ -605,7 +608,7 @@ fun plain_build_request targets =
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
-    allow_cache_timeout_discrepancy = false},
+    allow_cache_timeout_discrepancy = false, promote_preload = true},
    targets)
 
 (* heap, executable, run and repl build without proof steps, so no step
@@ -621,7 +624,7 @@ fun heap_build_request targets =
     tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
-    allow_cache_timeout_discrepancy = false},
+    allow_cache_timeout_discrepancy = false, promote_preload = false},
    targets)
 
 fun has_suffix suffix s =
@@ -1217,7 +1220,7 @@ datatype build_mode =
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int,
                    speculative_loading : int option}
 
-fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, checkpoint_seconds, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy}, targets) =
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, checkpoint_seconds, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, promote_preload}, targets) =
   let
     val project =
       case prepared of
@@ -1321,7 +1324,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        emit_output_hashes = emit_output_hashes,
        allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
        trknl = trknl,
-       restore_only = (case mode of RemoteExec {remote_only, ...} => remote_only | _ => false)}
+       restore_only = (case mode of RemoteExec {remote_only, ...} => remote_only | _ => false),
+       promote_preload = promote_preload}
     (* Whether the locked reset emptied an extra-output root that PREPARED,
        made outside the lock, had read. *)
     val prepared_stale = ref false
@@ -2857,7 +2861,7 @@ fun default_build_options trknl project index entry_plan plan =
      emit_output_hashes = false,
      allow_cache_timeout_discrepancy = false,
      trknl = trknl,
-     restore_only = false, fail_fast = false, all_checkpoints = false}
+     restore_only = false, fail_fast = false, all_checkpoints = false, promote_preload = false}
   end
 
 (* Input keys a plain `holbuild build` uses for PLAN's nodes; they name the
@@ -2895,7 +2899,7 @@ fun heap_build_options trknl =
    emit_output_hashes = false,
    allow_cache_timeout_discrepancy = false,
    trknl = trknl,
-   restore_only = false, fail_fast = false, all_checkpoints = false}
+   restore_only = false, fail_fast = false, all_checkpoints = false, promote_preload = false}
 
 fun theory_node node =
   #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript

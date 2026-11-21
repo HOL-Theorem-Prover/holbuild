@@ -616,6 +616,44 @@ if find "$slow/.holbuild" -name '*.save' -print -quit | grep -q .; then
   exit 1
 fi
 
+# check's prebuild moves a preload at or above the threshold out of the
+# counted heap with a transient save it removes at once; below it, it
+# doesn't. A plain build never does.
+project=$tmpdir/promote
+mkdir -p "$project/src"
+{
+  write_schema2_prelude
+  cat <<'TOML'
+[project]
+name = "promote"
+[build]
+members = ["src"]
+TOML
+} > "$project/holproject.toml"
+for name in PromoteSmall PromoteLarge PromoteBuild; do
+  cat > "$project/src/${name}Script.sml" <<SML
+Theory $name
+Theorem ${name}_thm: T
+Proof simp[]
+QED
+SML
+done
+child_log() { printf '%s\n' "$project/.holbuild/logs/current/promote/$1/build.log"; }
+run_check PromoteSmallTheory 0
+require_grep '^PromoteSmallTheory: clean (1 theorem)$' "$log"
+require_grep '^holbuild preload in_use=[0-9]* threshold=1073741824 not promoted$' "$(child_log PromoteSmallTheory)"
+HOLBUILD_PROMOTE_PRELOAD_BYTES=0 run_check PromoteLargeTheory 0
+require_grep '^PromoteLargeTheory: clean (1 theorem)$' "$log"
+require_grep '^holbuild preload in_use=[0-9]* threshold=0 promoted share=[a-z]* share_s=[0-9.]* save_s=[0-9.]* size=[1-9][0-9]*$' \
+  "$(child_log PromoteLargeTheory)"
+if find "$project/.holbuild" -name '*.save' -print -quit | grep -q .; then
+  echo "check left a promoted preload's heap behind" >&2
+  exit 1
+fi
+(cd "$project" && HOLBUILD_PROMOTE_PRELOAD_BYTES=0 "$HOLBUILD_BIN" build --skip-checkpoints PromoteBuildTheory) \
+  > "$tmpdir/promote-build.log" 2>&1
+require_no_grep 'holbuild preload' "$(child_log PromoteBuildTheory)"
+
 # A cold batch builds both targets; a later batch reuses the deepest checkpoint.
 project=$tmpdir/batch-checkpoint
 mkdir -p "$project/src"
