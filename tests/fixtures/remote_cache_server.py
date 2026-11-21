@@ -86,10 +86,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         while not (control / "action-get-release").exists():
             time.sleep(0.01)
 
-    def gate_cas_put(self) -> None:
+    def gate_cas_put(self, size: int) -> None:
+        """Hold a CAS PUT until control/cas-put-release exists: every one while control/cas-put-enable exists, and
+        those of at least the byte count in control/cas-put-enable-min-bytes while that exists."""
         if control is None or not self.path.startswith("/cas/"):
             return
-        if not (control / "cas-put-enable").exists():
+        min_bytes = control / "cas-put-enable-min-bytes"
+        if not (control / "cas-put-enable").exists() and not (
+            min_bytes.exists() and size >= int(min_bytes.read_text())
+        ):
             return
         with action_put_lock:
             count_file = control / "cas-put-count"
@@ -206,7 +211,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path is None:
             return
         data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-        self.gate_cas_put()
+        self.gate_cas_put(len(data))
         if self.cas_put_drop_once():
             self.close_connection = True
             return

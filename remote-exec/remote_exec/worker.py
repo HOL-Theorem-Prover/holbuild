@@ -1295,8 +1295,8 @@ def execute(
             timed_out = seen > 0 and time.monotonic() - seen >= POST_RESULT_SECONDS
             if process.poll() is None and not timed_out:
                 drain.publish_seconds = DRAIN_CHECKPOINT_PUBLISH_SECONDS
-                # Signal only the driver: it stops HOL, publishes the sandbox-validated saves, uploads the log
-                # and writes its record. Killing its group here loses them.
+                # Signal only the driver: it stops HOL, uploads the log, writes its record and then publishes
+                # the sandbox-validated saves. Killing its group here loses them.
                 with contextlib.suppress(ProcessLookupError):
                     process.send_signal(signal.SIGTERM)
                 deadline = time.monotonic() + CHECKPOINT_PUBLISH_SECONDS

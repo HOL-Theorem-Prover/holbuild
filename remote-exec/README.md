@@ -176,12 +176,14 @@ the coordinator retries immediately without counting the interrupted attempt.
 Waiting for work or preparing a release stops immediately. Repeated `SIGTERM`
 does not extend the deadline; interactive Ctrl-C retains its usual behavior.
 The driver gets up to 8 additional seconds after the natural-finish drain
-window to publish completed checkpoints (with `--share-heaps`) and upload the
-build log so far. Lease loss gives it up to 15 seconds, also bounded by the
+window to upload the build log so far and publish completed checkpoints (with
+`--share-heaps`). Lease loss gives it up to 15 seconds, also bounded by the
 drain deadline plus 8 seconds if a drain starts meanwhile. Only the driver
 receives the initial termination signal: it stops HOL, waits for sandbox cleanup
-and output validation, publishes committed checkpoints, then uploads the log and
-writes its result. Repeated signals do not interrupt publication. The worker
+and output validation, uploads the log, writes its result, then publishes
+committed checkpoints. The worker reads the result once the driver exits or is
+killed, so a publication that outlasts the window loses only the checkpoints
+left. Repeated signals do not interrupt publication. The worker
 then terminates the remaining process group, escalating to SIGKILL after 2 seconds.
 Interrupted actions never report `built`. A drained action reports `unavailable`
 with the log the driver uploaded; after a lost lease the worker reports the
@@ -906,8 +908,8 @@ repeats as exec-action does: the earliest `*start`, the latest `*end`, and
 the sum of durations.
 Publication here covers the action's result and log. A passing action's
 checkpoint uploads happen after its result. A failed action's happen between
-its log and its result, and an interrupted one's before its log. Either is
-timed as `share`, which encloses their `publish` span. Parallel action spans
+its log and its result, and an interrupted one's after its result. A failed
+action's are timed as `share`, which encloses their `publish` span. Parallel action spans
 overlap, as do
 nested phase durations. Do not add their totals to obtain elapsed wall time.
 

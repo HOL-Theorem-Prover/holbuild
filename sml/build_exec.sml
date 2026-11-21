@@ -15252,16 +15252,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                   deferred := (fn () => ());
                   phases := ("share", Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
                 end
-              (* An interrupted action has a few seconds to stop in: its
-                 saved checkpoints, which a retry resumes from, go before
-                 its log. *)
-              val _ = if !cancelled then share () else ()
               val log = phase "log" upload_log
               (* A failed action's go after its log, whose upload they could
                  otherwise stop by tripping the breaker, but before its
                  result: the next build, which often starts as soon as the
-                 client has the result, resumes from them. *)
-              val _ = if Option.isSome failure then share () else ()
+                 client has the result, resumes from them.  An interrupted
+                 action's go after its result: it has a few seconds to stop
+                 in and is killed once they pass, so its log and result go
+                 first.  The worker reads the result only once the driver
+                 exits, so the checkpoints that fit still precede it. *)
+              val _ = if Option.isSome failure andalso not (!cancelled) then share () else ()
               (* A final failure's log is its only diagnostic and nothing
                  retries the action to recover it. *)
               val failure =
