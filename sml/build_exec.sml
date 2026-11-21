@@ -13679,25 +13679,34 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
 (* Publishes the module files in STORE, each a (file, remote key) pair,
    starting only requests that end by DEADLINE.  Another writer may have
    published the same module first, with other bytes: either is valid, so
-   its entry stays. *)
-fun publish_modules remote {store, modules, deadline} =
+   its entry stays.  A heap restore (fetch_heap_modules) may rename
+   another copy over a module meanwhile, so each is pinned in the private
+   STAGING directory, and hashed and uploaded from there. *)
+fun publish_modules remote {store, staging, modules, deadline} =
   let
     fun publish (file, key) =
       if not (module_request_fits deadline) then false
       else
         let
           val path = Path.concat (store, file)
-          val sha = HolbuildHash.file_sha256 path
+          val copy = Path.concat (staging, file)
+          fun upload () =
+            let val sha = HolbuildHash.file_sha256 copy
+            in
+              module_request_fits deadline andalso
+              (case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = copy} of
+                   HolbuildCacheBackend.Published => ()
+                 | HolbuildCacheBackend.AlreadyPresent => ()
+                 | _ => raise Error ("could not upload " ^ file);
+               module_request_fits deadline andalso
+               (case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsent
+                       {key = key, text = shared_manifest module_remote_header NONE [("file", sha, file)]} of
+                    HolbuildCacheBackend.Published => true
+                  | _ => false))
+            end
         in
-          case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
-              HolbuildCacheBackend.Published => ()
-            | HolbuildCacheBackend.AlreadyPresent => ()
-            | _ => raise Error ("could not upload " ^ file);
-          module_request_fits deadline andalso
-          (case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsent
-                  {key = key, text = shared_manifest module_remote_header NONE [("file", sha, file)]} of
-               HolbuildCacheBackend.Published => true
-             | _ => false)
+          (Posix.FileSys.link {old = path, new = copy} handle OS.SysErr _ => copy_binary path copy);
+          (upload () before remove_file copy) handle e => (remove_file copy; raise e)
         end
         handle e => (warn ("theory module not published: " ^ General.exnMessage e); false)
     val published = ref 0
@@ -13705,7 +13714,10 @@ fun publish_modules remote {store, modules, deadline} =
     fun one module =
       if publish module then (Mutex.lock mutex; published := !published + 1; Mutex.unlock mutex) else ()
   in
-    transfer_all one modules;
+    HolbuildRemoveTree.remove_untrusted staging;
+    ensure_dir staging;
+    (transfer_all one modules before HolbuildRemoveTree.remove_untrusted staging)
+    handle e => (HolbuildRemoveTree.remove_untrusted staging; raise e);
     !published
   end
 
@@ -13922,7 +13934,7 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
           (write ();
            published :=
              publish_modules remote
-               {store = store,
+               {store = store, staging = output,
                 modules = List.mapPartial
                             (fn file =>
                                 Option.mapPartial
