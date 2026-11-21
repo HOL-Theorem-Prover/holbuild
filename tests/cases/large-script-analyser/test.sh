@@ -55,6 +55,10 @@ literals = ",\n".join(f'"{chunk[i % 64:] + chunk[:i % 64]}"' for i in range(512)
 big = ("open HolKernel Parse boolLib bossLib;\n\nval _ = new_theory \"Big\";\n\n" +
        theorems("before_", 5) +
        "val payload = String.concat [\n" + literals + "];\n\n" +
+       "val decoy = \"x\\\" load \\\"decoyLib\";\n" +
+       "fun holbuild_extra_deps (_ : string list) = ()\n" +
+       "val _ = holbuild_extra_deps [\"after_payload.txt\"];\n" +
+       "val _ = load \"afterPayloadLib\";\n\n" +
        termination + theorems("after_", 40) + "val _ = export_theory ();\n")
 (tmp / "BigScript.sml").write_text(big)
 broken = ("open HolKernel Parse boolLib bossLib;\n\nval _ = new_theory \"Broken\";\n\n" +
@@ -111,6 +115,9 @@ if peak > 6 * len(data) + 256 * 2**20:
 status, stderr, records, peak = analyse("Big-deps", ["deps"])
 if status != 0:
     fail(f"deps request failed ({status}): {stderr}")
+facts = [r for r in records if r[0] in ("load", "extra-dep")]
+if sorted(facts) != [["extra-dep", "after_payload.txt"], ["load", "afterPayloadLib"]]:
+    fail(f"unexpected dependency facts after the literals {facts}")
 print(f"deps request: peak RSS {peak} bytes")
 if peak > 6 * len(data) + 256 * 2**20:
     fail(f"deps request peak RSS {peak} for a {len(data)}-byte script")

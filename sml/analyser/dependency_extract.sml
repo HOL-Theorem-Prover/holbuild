@@ -4,7 +4,7 @@ struct
 structure Path = OS.Path
 exception Error of string
 
-datatype token = Word of string | StringLit of string | Symbol of char
+datatype token = Word of string | Symbol of char
 
 type t =
   { loads : string list,
@@ -99,6 +99,8 @@ fun scan_word text start =
     val stop = loop start
   in (String.substring(text, start, stop - start), stop) end
 
+(* The header's tokens: a literal is skipped unread and stands as the
+   symbol `"`, which no header line contains. *)
 fun tokenize text =
   let
     val n = size text
@@ -108,7 +110,7 @@ fun tokenize text =
       if i >= n then rev acc
       else if Char.isSpace (sub i) then loop (i + 1) acc
       else if opens_comment i then loop (skip_comment text (i + 2)) acc
-      else if sub i = #"\"" then let val (s, next) = scan_string text (i + 1) in loop next (StringLit s :: acc) end
+      else if sub i = #"\"" then loop (skip_string text (i + 1)) (Symbol #"\"" :: acc)
       else if is_word_start (sub i) then let val (word, next) = scan_word text i in loop next (Word word :: acc) end
       else loop (i + 1) (Symbol (sub i) :: acc)
   in loop 0 [] end
