@@ -76,6 +76,19 @@ fun check_size size =
 val sizes = [0, 1, 17, 55, 56, 63, 64, 119, 120, 4096, 5120, 65535, 65536, 196607, 196608, 307200, 1048576, 1048577, 3145731]
 val _ = List.app check_size sizes
 
+(* Prefix hashes, as checkpoint keys use them, equal hashing each prefix
+   whole: ascending (padding boundaries, chunk boundaries, repeats) and
+   out of order. *)
+val prefix_text = HolbuildHash.read_binary_all (join(tmp, "blob-3145731.bin"))
+fun prefix_hash position = HolbuildHash.string_sha256 (String.substring (prefix_text, 0, position))
+fun check_prefixes positions =
+  assert ("prefix sha256 mismatch at " ^ String.concatWith "," (map Int.toString positions))
+    (HolbuildHash.prefix_sha256s prefix_text positions = map prefix_hash positions)
+val _ = check_prefixes []
+val _ = check_prefixes [0, 1, 55, 56, 63, 64, 64, 65, 119, 120, 128, 1048575, 1048576,
+                        1048577, 2097215, 3145730, 3145731]
+val _ = check_prefixes [3145731, 70, 64, 63, 0, 2000000, 1999999, 2000064]
+
 val small_path = join(tmp, "blob-5120.bin")
 val threshold_minus_one = join(tmp, "blob-65535.bin")
 val threshold = join(tmp, "blob-65536.bin")

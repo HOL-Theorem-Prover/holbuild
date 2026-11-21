@@ -20,6 +20,7 @@ while [ "$#" -gt 0 ]; do
     --request) request=$2; shift 2 ;;
     --response) response=$2; shift 2 ;;
     --minheap) minheap=$2; shift 2 ;;
+    --gcpercent) shift 2 ;;
     *) exit 79 ;;
   esac
 done
@@ -41,6 +42,9 @@ case "$mode" in
   child-signal) kill -KILL $$ ;;
   signal) kill -KILL "$PPID"; sleep 2; exit 1 ;;
   parser) printf 'version 1\nok\nbegin-file 1\nparse-error bad-source\nend-file 1\nend\n' > "$response"; exit 0 ;;
+  terminations-error)
+    printf 'version 1\nok\nbegin-file 1\nparse-error bad-source\nterminations-error bad-source\nend-file 1\nend\n' > "$response"
+    exit 0 ;;
   failure) exit 2 ;;
   pressure)
     printf 'oom 8\noom_kill 5\n' > "$state/group/memory.events"
@@ -234,3 +238,63 @@ ANALYSER_FAILURE_TEST_TMP="$tmpdir" ANALYSER_FAILURE_TEST_SANDBOX=$sandbox HOLBU
     exit 1
   }
 require_grep 'analyser failure tests passed' "$tmpdir/test.log"
+
+# The build's span planning: once the combined span request fails or is
+# killed, it starts no further full-source analysis for the theory.  Run
+# against the real HolbuildBuildExec, counting the helper's launches.
+cat > "$tmpdir/spans.sml" <<'SML'
+val root = valOf (OS.Process.getEnv "HOLBUILD_ROOT");
+val tmp = valOf (OS.Process.getEnv "ANALYSER_FAILURE_TEST_TMP");
+val _ = OS.FileSys.chDir root;
+use "sml/holbuild-script.sml";
+structure D = HolbuildDependencies;
+structure B = HolbuildBuildExec;
+
+fun assert name condition = if condition then () else raise Fail name;
+fun path name = OS.Path.concat (tmp, name);
+fun write name text = D.write_file (path name) text;
+fun attempts () = length (String.tokens (fn c => c = #"\n") (D.read_all (path "attempts")));
+fun reset mode = (write "mode" mode; write "attempts" "");
+fun policy new_ir =
+  B.CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false,
+                      checkpoint_seconds = 2.0, proof_steps = true, new_ir = new_ir, tactic_timeout = NONE,
+                      execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false};
+val action =
+  {input_key = "", deps_key = "", inputs_key = NONE, package = "p", logical = "A",
+   relative_path = "AScript.sml", source_file = path "AScript.sml", source_name = "AScript.sml",
+   script_dir = tmp, inputs = [], loads = [],
+   outputs = {sig_path = "", sml_path = "", data_path = ""}, extra_outputs = []} : B.theory_action;
+val _ = D.set_analyser {path = path "bin/analyser", identity = "test"};
+
+fun spans mode =
+  (reset mode; B.source_spans_for_action (policy false) action "");
+fun checkpoints mode =
+  (reset mode; B.action_checkpoints (policy true) "" action "");
+
+val killed = spans "killed";
+val _ = assert "killed combined request: no boundaries" (not (isSome (#source_boundaries killed)));
+val _ = assert "killed combined request: no further analysis" (attempts () = 3);
+val failed = spans "failure";
+val _ = assert "failed combined request: no boundaries" (not (isSome (#source_boundaries failed)));
+val _ = assert "failed combined request: no further analysis" (attempts () = 1);
+val recovered = spans "terminations-error";
+val _ = assert "parse error keeps recovered boundaries"
+  (case #source_boundaries recovered of SOME {errors, ...} => errors = ["bad-source"] | NONE => false);
+val _ = assert "parse error drops terminations" (null (#termination_diagnostics recovered));
+val _ = assert "parse error needs one analysis" (attempts () = 1);
+
+val killed_plans = checkpoints "killed";
+val _ = assert "killed proof-IR span request: no checkpoints" (null (#theorem_checkpoints killed_plans));
+val _ = assert "killed proof-IR span request: no further analysis" (attempts () = 3);
+val failed_plans = checkpoints "failure";
+val _ = assert "failed proof-IR span request: no checkpoints" (null (#theorem_checkpoints failed_plans));
+val _ = assert "failed proof-IR span request: no further analysis" (attempts () = 1);
+
+val _ = print "span planning tests passed\n";
+SML
+ANALYSER_FAILURE_TEST_TMP="$tmpdir" HOLBUILD_TEST_CGROUP= \
+  "${HOLBUILD_POLY:-poly}" --error-exit --gcthreads=1 < "$tmpdir/spans.sml" > "$tmpdir/spans.log" 2>&1 || {
+    tail -100 "$tmpdir/spans.log" >&2
+    exit 1
+  }
+require_grep 'span planning tests passed' "$tmpdir/spans.log"

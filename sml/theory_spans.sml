@@ -106,6 +106,14 @@ fun termination_record fields =
       "termination" :: _ => true
     | _ => false
 
+(* Why the response has no terminations although the source has a parse
+   error the boundaries were recovered from. *)
+fun termination_error records =
+  case List.find (fn "terminations-error" :: _ => true | _ => false) records of
+      SOME [_, text] => SOME text
+    | SOME _ => raise HolbuildTheoryCheckpoints.Error "bad analyser terminations-error record"
+    | NONE => NONE
+
 fun scan source_path _ =
   let val (records, _) = response_records ["boundaries"] source_path
   in map parse_boundary records end
@@ -129,7 +137,8 @@ fun scan_boundaries_and_terminations_recovering_strict source_path _ =
   in
     {boundaries = map parse_boundary (List.filter boundary_record records),
      errors = errors,
-     terminations = map parse_termination (List.filter termination_record records)}
+     terminations = map parse_termination (List.filter termination_record records),
+     termination_error = termination_error records}
   end
 
 (* As scan_boundaries_and_terminations_recovering_strict, with each
@@ -159,6 +168,7 @@ fun scan_with_proof_ir_plans source_path _ =
          Int.toString (length terminations) ^ " terminations")
     else
       {boundaries = boundaries, errors = errors, terminations = terminations,
+       termination_error = termination_error records,
        boundary_plans = map (plan "b") (numbered (List.take (plans, nb))),
        termination_plans = map (plan "t") (numbered (List.drop (plans, nb)))}
   end

@@ -3043,9 +3043,6 @@ fun theorem_checkpoint_ok kind deps_key proof_engine proof_timeout prefix_hash c
 fun theorem_header_hash source theorem_start tactic_start =
   HolbuildToolchain.hash_text (String.substring(source, theorem_start, tactic_start - theorem_start))
 
-fun pre_theorem_hash source theorem_start =
-  HolbuildToolchain.hash_text (String.substring(source, 0, theorem_start))
-
 (* Checkpoints save state from running the script up to a boundary.  Besides
    the source prefix, that run may have read the node's extra inputs, so
    their contents are part of the prefix identity, and the theorems it saved
@@ -3084,7 +3081,11 @@ fun nondefault_source_name (action : theory_action) =
 
 fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key source_name source proof_ir_plans (boundaries : HolbuildTheoryCheckpoints.boundary list) =
   let
-    fun pair (boundary, proof_ir_plan) =
+    (* The hash of the source before each theorem, in one pass over it. *)
+    val pre_theorem_hashes =
+      HolbuildHash.prefix_sha256s source
+        (map (fn ({theorem_start, ...} : HolbuildTheoryCheckpoints.boundary) => theorem_start) boundaries)
+    fun pair ((boundary, proof_ir_plan), pre_theorem_hash) =
       let
         val {kind, name, safe_name, theorem_start, theorem_stop, boundary = boundary_pos, tactic_start,
              tactic_end, tactic_text, proof_attrs, prefix_hash = source_prefix_hash} = boundary
@@ -3094,7 +3095,7 @@ fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key
                                                      proof_engine = proof_engine,
                                                      prefix_hash = prefix_hash}
         val header_hash = theorem_header_hash source theorem_start tactic_start
-        val pre_hash = script_prefix_key inputs_key source_name (pre_theorem_hash source theorem_start)
+        val pre_hash = script_prefix_key inputs_key source_name pre_theorem_hash
       in
         {kind = kind, name = name, safe_name = safe_name, theorem_start = theorem_start,
          theorem_stop = theorem_stop, boundary = boundary_pos,
@@ -3111,15 +3112,16 @@ fun theorem_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key
          proof_ir_factories = Option.map #2 proof_ir_plan}
       end
   in
-    if length proof_ir_plans = length boundaries then ListPair.map pair (boundaries, proof_ir_plans)
+    if length proof_ir_plans = length boundaries
+    then ListPair.map pair (ListPair.zip (boundaries, proof_ir_plans), pre_theorem_hashes)
     else raise Error "internal error: proof-IR plan count does not match theorem boundary count"
   end
 
 fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs_key source_name source terminations =
-  map (fn ({name, safe_name, definition_start, boundary, ...} : HolbuildTheoryCheckpoints.termination) =>
+  ListPair.map (fn (({name, safe_name, definition_start, boundary, ...} : HolbuildTheoryCheckpoints.termination),
+                    source_prefix_hash) =>
           let
-            val prefix_hash =
-              script_prefix_key inputs_key source_name (HolbuildTheoryCheckpoints.prefix_hash source boundary)
+            val prefix_hash = script_prefix_key inputs_key source_name source_prefix_hash
             val checkpoint_key = declaration_checkpoint_key {name = name, safe_name = safe_name,
                                                              boundary = boundary, deps_key = deps_key,
                                                              proof_engine = proof_engine,
@@ -3133,7 +3135,9 @@ fun declaration_checkpoint_specs proof_engine proof_timeout base deps_key inputs
              deps_key = deps_key,
              checkpoint_key = checkpoint_key}
           end)
-      terminations
+      (terminations,
+       HolbuildHash.prefix_sha256s source
+         (map (fn ({boundary, ...} : HolbuildTheoryCheckpoints.termination) => boundary) terminations))
 
 (* What a theory's preload loads, in order, named the same wherever the
    project is checked out. *)
@@ -5268,11 +5272,17 @@ fun termination_proof_plans_for_action policy (action : theory_action) plans ter
       (reject_unenforced_tactic_timeout policy action msg;
        raise Error ("could not create termination proof plans for " ^ #logical action ^ "\n" ^ msg))
 
-fun termination_diagnostics_for_action policy (action : theory_action) source_text =
-  if not (proof_steps_enabled policy) then []
-  else detail_time_phase "build.exec.node.analyse_terminations"
-         (fn () => discover_termination_diagnostics_strict (#source_file action) source_text)
-    handle Error msg =>
+(* The analyser's span request failed, or was killed: build the theory
+   without proof steps rather than run the analyser over the whole source
+   again, which would fail or be killed the same way. *)
+fun source_spans_unavailable policy (action : theory_action) msg =
+  (reject_unenforced_tactic_timeout policy action msg;
+   warn ("could not safely instrument theorem boundaries for " ^ #logical action ^
+         "; building without proof steps/checkpoints for this theory\n" ^ msg);
+   {source_boundaries = NONE, termination_diagnostics = []})
+
+fun without_termination_diagnostics (action : theory_action) NONE terminations = terminations
+  | without_termination_diagnostics action (SOME msg) _ =
       (warn ("could not safely instrument termination diagnostics for " ^ #logical action ^
              "; building without termination goal diagnostics for this theory\n" ^ msg);
        [])
@@ -5287,11 +5297,10 @@ fun source_spans_for_action policy (action : theory_action) source_text =
                 (fn () => discover_boundaries_and_terminations (#source_file action) source_text))
     in
       {source_boundaries = SOME {boundaries = #boundaries combined, errors = #errors combined},
-       termination_diagnostics = #terminations combined}
+       termination_diagnostics =
+         without_termination_diagnostics action (#termination_error combined) (#terminations combined)}
     end
-    handle Error _ =>
-      {source_boundaries = source_boundaries_for_action policy action source_text,
-       termination_diagnostics = termination_diagnostics_for_action policy action source_text}
+    handle Error msg => source_spans_unavailable policy action msg
   else
     {source_boundaries = source_boundaries_for_action policy action source_text,
      termination_diagnostics = []}
@@ -5312,24 +5321,26 @@ fun declaration_checkpoints_for_action policy checkpoint_root (action : theory_a
 fun action_checkpoints policy checkpoint_root (action : theory_action) source_text =
   let
     (* One analyser process finds the spans and plans their proofs, rather
-       than one for each.  If it fails, the separate requests below give
-       the diagnostics they always have. *)
-    val scanned =
+       than one for each.  It reads the whole source, so when it fails no
+       other request over the source is made: one would most likely fail
+       the same way, and the theory builds without proof steps. *)
+    val (scanned, source_spans) =
       if proof_steps_enabled policy andalso proof_ir_enabled policy then
-        SOME (detail_time_phase "build.exec.node.analyse_boundaries"
-                (fn () =>
-                    detail_time_phase "build.exec.node.analyse_terminations"
-                      (fn () =>
-                          detail_time_phase "build.exec.node.proof_ir_plan"
-                            (fn () => HolbuildTheorySpans.scan_with_proof_ir_plans (#source_file action) source_text))))
-        handle HolbuildTheoryCheckpoints.Error _ => NONE
-      else NONE
-    val source_spans =
-      case scanned of
-          SOME {boundaries, errors, terminations, ...} =>
-            {source_boundaries = SOME {boundaries = boundaries, errors = errors},
-             termination_diagnostics = terminations}
-        | NONE => source_spans_for_action policy action source_text
+        let
+          val scanned as {boundaries, errors, terminations, termination_error, ...} =
+            detail_time_phase "build.exec.node.analyse_boundaries"
+              (fn () =>
+                  detail_time_phase "build.exec.node.analyse_terminations"
+                    (fn () =>
+                        detail_time_phase "build.exec.node.proof_ir_plan"
+                          (fn () => HolbuildTheorySpans.scan_with_proof_ir_plans (#source_file action) source_text)))
+        in
+          (SOME scanned,
+           {source_boundaries = SOME {boundaries = boundaries, errors = errors},
+            termination_diagnostics = without_termination_diagnostics action termination_error terminations})
+        end
+        handle HolbuildTheoryCheckpoints.Error msg => (NONE, source_spans_unavailable policy action msg)
+      else (NONE, source_spans_for_action policy action source_text)
     val theorem_checkpoints =
       case #source_boundaries source_spans of
           NONE => []
