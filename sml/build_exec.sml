@@ -14561,14 +14561,18 @@ fun write_missing_modules remote root tc wanted deadline =
    took, how many modules it stored of how many missing, how many entries it
    looked up in the remote cache, and how many modules it fetched and
    published. *)
+(* Whether the toolchain's HOL can write theory modules, as far as is known
+   before trying. *)
+fun module_writer_supported holdir =
+  file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
+  not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
+
 fun fill_module_store remote root tc wanted deadline =
   let
     val t0 = Time.now ()
-    val holdir = #holdir tc
     val none = {installed = 0, missing = 0, probed = 0, fetched = 0, published = 0}
     val {installed, missing, probed, fetched, published} =
-      (if file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
-          not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
+      (if module_writer_supported (#holdir tc)
        then write_missing_modules remote root tc wanted deadline
        else none)
       handle e => (warn ("theory modules not written: " ^ General.exnMessage e); none)
@@ -15129,7 +15133,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
            on the host find the modules.  By now a load ahead has its late
            parents in the root too. *)
         fun set_write_modules () =
-          if not (!HolbuildActionSandbox.outputs_validated) then ()
+          if not (!HolbuildActionSandbox.outputs_validated) orelse not (module_writer_supported (#holdir tc)) then ()
           else
             write_modules :=
               (* holbuild reads a theory's files by their names, HOL by
