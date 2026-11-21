@@ -12516,8 +12516,9 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                         val other_ids = restore_step "rstmodfetch" (fn () => fetch_modules (List.mapPartial want wrong))
                         val rechecked = module_states wrong
                         val still = in_state ModuleWrong rechecked
+                        val fetched = length wrong - length still - length (in_state ModulePoisoned rechecked)
                       in
-                        add_restore_step "rstmodn" (LargeInt.fromInt (length wrong - length still));
+                        add_restore_step "rstmodn" (LargeInt.fromInt fetched);
                         case (other_ids, in_state ModulePoisoned rechecked, still) of
                             (file :: _, _, _) => drop_poisoned file
                           | ([], (_, path) :: _, _) => drop_poisoned path
@@ -12998,19 +12999,20 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     val replaced_mutex = Mutex.mutex ()
     fun replace key =
       (Mutex.lock replaced_mutex; replaced := Redblackset.add (!replaced, key); Mutex.unlock replaced_mutex; true)
-    (* An entry chained to another heap, as one published before the heap
-       entry was replaced, is never restored on HEAP. *)
-    fun on_heap heap action =
-      List.exists (fn (role, sha, _) => role = "heap" andalso sha = heap) (shared_manifest_entries (#manifest action))
+    fun on_heap heap text =
+      List.exists (fn (role, sha, _) => role = "heap" andalso sha = heap) (shared_manifest_entries text)
       handle _ => false
-    fun probe heap (c, key, absent) =
+    (* While HEAP is the published heap, an entry chained to another, as
+       one published before the heap entry was replaced, is never
+       restored.  A run on a heap replaced since leaves the entries alone. *)
+    fun probe heap current (c, key, absent) =
       (* Presence alone must not mark an un-restored entry's blobs as known:
          its /ac/ entry can outlive those blobs. *)
       absent := (member key stale andalso replace key orelse
                  (case HolbuildRemoteCache.fetch_action remote key of
                       NONE => true
                     | SOME action =>
-                        (not (on_heap heap action) orelse
+                        (current andalso not (on_heap heap (#manifest action)) orelse
                          #kind c = "failed_prefix" andalso replaces_restored (#path c)) andalso replace key))
       handle e => warning c e
     fun prepare on_base (c : shared_candidate, key, absent) =
@@ -13065,7 +13067,11 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             else (Redblackset.add (seen, key), item :: kept))
           (Redblackset.empty String.compare, []) eligible
         val probes = rev unique
-        val _ = parallel_all remote_probe_width (probe heap) probes
+        val current =
+          case HolbuildRemoteCache.get_action remote heap_key of
+              SOME text => on_heap heap text
+            | NONE => false
+        val _ = parallel_all remote_probe_width (probe heap current) probes
         val _ = prehash (List.concat (map (fn (c : shared_candidate, _, absent) =>
                                               if not (!absent) then []
                                               else #path c :: getOpt (ancestors false (#path c), []))
