@@ -653,6 +653,32 @@ fi
 (cd "$project" && HOLBUILD_PROMOTE_PRELOAD_BYTES=0 "$HOLBUILD_BIN" build --skip-checkpoints PromoteBuildTheory) \
   > "$tmpdir/promote-build.log" 2>&1
 require_no_grep 'holbuild preload' "$(child_log PromoteBuildTheory)"
+# A theory check builds pipelined (outline first, or ahead of a parent)
+# promotes too.
+cat > "$project/src/PromoteParentScript.sml" <<'SML'
+Theory PromoteParent
+Theorem PromoteParent_thm: T
+Proof simp[]
+QED
+SML
+cat > "$project/src/PromoteChildScript.sml" <<'SML'
+Theory PromoteChild
+Ancestors PromoteParent
+Theorem PromoteChild_thm: T
+Proof simp[]
+QED
+SML
+(cd "$project" && HOLBUILD_CACHE_TRACE=1 HOLBUILD_PROMOTE_PRELOAD_BYTES=0 "$HOLBUILD_BIN" -j4 check PromoteChildTheory) \
+  > "$tmpdir/promote-pipelined.log" 2>&1
+require_grep '^PromoteChildTheory: clean (1 theorem)$' "$tmpdir/promote-pipelined.log"
+require_grep 'pipeline: committed: PromoteParentTheory' "$tmpdir/promote-pipelined.log"
+for name in PromoteParent PromoteChild; do
+  require_grep '^holbuild preload in_use=[0-9]* threshold=0 promoted ' "$(child_log ${name}Theory)"
+done
+if find "$project/.holbuild" -name '*.save' -print -quit | grep -q .; then
+  echo "a pipelined check left a promoted preload's heap behind" >&2
+  exit 1
+fi
 
 # A cold batch builds both targets; a later batch reuses the deepest checkpoint.
 project=$tmpdir/batch-checkpoint

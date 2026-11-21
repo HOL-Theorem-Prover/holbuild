@@ -7097,11 +7097,14 @@ fun speculative_action root plan keys toolchain_key view key node : theory_actio
      outputs = #outputs action, extra_outputs = #extra_outputs action}
   end
 
-fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, ...}) =
+(* A pipelined attempt keeps promote_preload: under check, a theory built
+   ahead or outlined first loads the same ancestors as its plain build. *)
+fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, promote_preload, ...}) =
   CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false,
                     checkpoint_seconds = default_checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout, execution_plan = NONE,
-                    trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false}
+                    trace_steps = false, repl_on_failure = false, trknl = false,
+                    promote_preload = promote_preload}
 
 fun signature_companion plan node =
   List.find
