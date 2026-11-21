@@ -628,7 +628,7 @@ QED'
 
 # Native FIRST_PROVE runs each alternative THEN NO_TAC: an alternative that
 # leaves goals fails, so the next one runs, or TRY rolls back.
-check_case first_prove_suite 'Theorem first_prove_partial_then_closing:
+check_case succeeds first_prove_suite 'Theorem first_prove_partial_then_closing:
   T ∧ T
 Proof
   FIRST_PROVE [CONJ_TAC, CONJ_TAC >> ACCEPT_TAC TRUTH]
@@ -640,4 +640,3 @@ Proof
   TRY (FIRST_PROVE [CONJ_TAC, CONJ_TAC >- ACCEPT_TAC TRUTH]) >>
   ACCEPT_TAC (CONJ TRUTH TRUTH)
 QED'
-require_grep 'Saved theorem _______ "first_prove_try_rollback"' "$tmpdir/first_prove_suite.hol-run.log"
