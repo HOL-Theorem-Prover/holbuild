@@ -654,9 +654,9 @@ child_log() { printf '%s\n' "$project/.holbuild/logs/current/promote/$1/build.lo
 run_check PromoteSmallTheory 0
 require_grep '^PromoteSmallTheory: clean (1 theorem)$' "$log"
 require_grep '^holbuild preload in_use=[0-9]* threshold=1073741824 not promoted$' "$(child_log PromoteSmallTheory)"
-HOLBUILD_PROMOTE_PRELOAD_BYTES=0 run_check PromoteLargeTheory 0
+HOLBUILD_PROMOTE_PRELOAD_BYTES=1 run_check PromoteLargeTheory 0
 require_grep '^PromoteLargeTheory: clean (1 theorem)$' "$log"
-require_grep '^holbuild preload in_use=[0-9]* threshold=0 promoted share=[a-z]* share_s=[0-9.]* save_s=[0-9.]* size=[1-9][0-9]*$' \
+require_grep '^holbuild preload in_use=[1-9][0-9]* threshold=1 promoted share=[a-z]* share_s=[0-9.]* save_s=[0-9.]* size=[1-9][0-9]*$' \
   "$(child_log PromoteLargeTheory)"
 if find "$project/.holbuild" -name '*.save' -print -quit | grep -q .; then
   echo "check left a promoted preload's heap behind" >&2
