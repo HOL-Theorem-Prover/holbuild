@@ -5,7 +5,7 @@ structure Path = OS.Path
 
 exception Error of string
 
-datatype token = Word of string | StringLit of string | Symbol of char
+datatype token = Word of string | StringLit of string | SkippedLit | Symbol of char
 
 type t =
   { loads : string list,
@@ -106,6 +106,18 @@ fun scan_string text start =
     loop start []
   end
 
+fun skip_string text start =
+  let
+    val n = size text
+    fun loop i =
+      if i >= n then i
+      else
+        case String.sub(text, i) of
+            #"\"" => i + 1
+          | #"\\" => loop (i + 2)
+          | _ => loop (i + 1)
+  in Int.min(loop start, n) end
+
 fun skip_comment text start =
   let
     val n = size text
@@ -133,6 +145,25 @@ fun scan_word text start =
     (String.substring(text, start, stop - start), stop)
   end
 
+(* Only a literal right after `load` or `use`, or in a list after
+   `holbuild_extra_deps` or `holbuild_extra_outputs`, is read: the rest are
+   skipped, so a script holding large literals isn't copied into tokens. *)
+fun literal_wanted acc =
+  let
+    fun list_keyword word = word = "holbuild_extra_deps" orelse word = "holbuild_extra_outputs"
+    fun in_list rest =
+      case rest of
+          Symbol #"[" :: Word word :: _ => list_keyword word
+        | Symbol #"," :: more => in_list more
+        | StringLit _ :: more => in_list more
+        | _ => false
+  in
+    case acc of
+        Word "load" :: _ => true
+      | Word "use" :: _ => true
+      | _ => in_list acc
+  end
+
 fun tokenize text =
   let
     val n = size text
@@ -143,8 +174,10 @@ fun tokenize text =
       else if Char.isSpace (sub i) then loop (i + 1) acc
       else if opens_comment i then loop (skip_comment text (i + 2)) acc
       else if sub i = #"\"" then
-        let val (s, next) = scan_string text (i + 1)
-        in loop next (StringLit s :: acc) end
+        if literal_wanted acc then
+          let val (s, next) = scan_string text (i + 1)
+          in loop next (StringLit s :: acc) end
+        else loop (skip_string text (i + 1)) (SkippedLit :: acc)
       else if is_word_start (sub i) then
         let val (word, next) = scan_word text i
         in loop next (Word word :: acc) end

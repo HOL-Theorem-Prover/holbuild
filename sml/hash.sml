@@ -109,6 +109,9 @@ local
   val digest_init = buildCall3 (crypto "EVP_DigestInit_ex", (cPointer, cPointer, cPointer), cInt)
   val digest_update = buildCall3 (crypto "EVP_DigestUpdate", (cPointer, cPointer, cSize), cInt)
   val digest_final = buildCall3 (crypto "EVP_DigestFinal_ex", (cPointer, cPointer, cPointer), cInt)
+  val digest_update_bytes =
+    buildCall3 (crypto "EVP_DigestUpdate", (cPointer, cByteArray, cSize), cInt)
+  val ctx_copy = buildCall2 (crypto "EVP_MD_CTX_copy_ex", (cPointer, cPointer), cInt)
   val read = buildCall3 (libc "read", (cInt, cPointer, cSize), cSsize)
 
   fun with_memory size f =
@@ -130,6 +133,41 @@ local
 
   val chunk_size = 1048576
 
+  fun with_ctx f =
+    let val ctx = ctx_new ()
+    in
+      if ctx = Memory.null then raise Native
+      else f ctx before ctx_free ctx handle e => (ctx_free ctx; raise e)
+    end
+
+  (* As sml_prefix_sha256s: one running digest over TEXT, fed a
+     chunk at a time and copied to finish each position's digest, so no
+     prefix is copied whole. *)
+  fun prefix_digests md text positions =
+    with_ctx (fn ctx =>
+      let
+        fun feed from stop =
+          if from >= stop then ()
+          else
+            let val n = Int.min (chunk_size, stop - from)
+            in
+              check (digest_update_bytes (ctx, Byte.stringToBytes (String.substring (text, from, n)), n));
+              feed (from + n) stop
+            end
+        fun prefix (position, (done, acc)) =
+          if position < done then (done, string_digest md (String.substring (text, 0, position)) :: acc)
+          else
+            (if position > size text then raise Subscript else ();
+             feed done position;
+             (position,
+              with_ctx (fn copy =>
+                (check (ctx_copy (copy, ctx));
+                 finish (fn out => check (digest_final (copy, out, Memory.null))))) :: acc))
+      in
+        check (digest_init (ctx, md, Memory.null));
+        rev (#2 (List.foldl prefix (0, []) positions))
+      end)
+
   (* The file is read into C memory a chunk at a time, never into the heap. *)
   fun file_digest md path =
     let
@@ -150,12 +188,6 @@ local
           loop ();
           finish (fn out => check (digest_final (ctx, out, Memory.null)))
         end
-      fun with_ctx f =
-        let val ctx = ctx_new ()
-        in
-          if ctx = Memory.null then raise Native
-          else f ctx before ctx_free ctx handle e => (ctx_free ctx; raise e)
-        end
     in
       with_ctx (fn ctx => with_memory (Word.fromInt chunk_size) (hash ctx))
         before Posix.IO.close fd
@@ -172,14 +204,15 @@ local
       val abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     in
       if md <> Memory.null andalso string_digest md "abc" = abc
-      then SOME {string = string_digest md, file = file_digest md}
+      then SOME {string = string_digest md, file = file_digest md, prefixes = prefix_digests md}
       else NONE
     end
     handle Foreign _ => NONE
          | Native => NONE
 
   val lock = Mutex.mutex ()
-  val state : {string : string -> string, file : string -> string} option option ref = ref NONE
+  val state : {string : string -> string, file : string -> string,
+               prefixes : string -> int list -> string list} option option ref = ref NONE
 in
   (* The libcrypto hash functions, or NONE without libcrypto.  The lock also
      makes another thread's load visible to this one. *)
@@ -203,6 +236,63 @@ fun string_sha256 text =
   case native () of
       SOME {string, ...} => (string text handle Native => HolbuildSha256.string_hex text)
     | NONE => HolbuildSha256.string_hex text
+
+(* HolbuildSha256.string_hex of each of TEXT's prefixes of lengths
+   POSITIONS, in their order.  The whole 64-byte blocks before a position
+   carry over to the next one and only a copy finishing a digest takes the
+   padding, so in ascending order each byte is compressed once.  A position
+   below the blocks carried over is hashed alone.  (Here rather than in
+   sha256.sml, whose text is part of every deps heap's key.) *)
+fun sml_prefix_sha256s text positions =
+  let
+    val hash = Array.fromList HolbuildSha256.initial
+    val w = Array.array (64, 0w0 : Word32.word)
+    fun padded_size len = ((len + 8) div 64 + 1) * 64
+    (* Compress into H the blocks [base, stop) of the padded message of
+       TEXT's first LEN bytes. *)
+    fun compress_blocks h len base stop =
+      let
+        val bit_len = LargeWord.<< (LargeWord.fromInt len, 0w3)
+        val padded = padded_size len
+        fun byte i =
+          if i < len then Word32.fromInt (Char.ord (String.sub (text, i)))
+          else if i = len then 0wx80
+          else if i < padded - 8 then 0w0
+          else Word32.fromLarge (LargeWord.andb (LargeWord.>> (bit_len, Word.fromInt (8 * (padded - 1 - i))), 0wxff))
+        fun word i =
+          Word32.orb (Word32.orb (Word32.<< (byte i, 0w24), Word32.<< (byte (i + 1), 0w16)),
+                 Word32.orb (Word32.<< (byte (i + 2), 0w8), byte (i + 3)))
+        fun load base j = if j < 16 then (Array.update (w, j, word (base + 4 * j)); load base (j + 1)) else ()
+        fun blocks base =
+          if base < stop then (load base 0; HolbuildSha256.compress (h, w); blocks (base + 64)) else ()
+      in
+        blocks base
+      end
+    fun prefix (position, (done, acc)) =
+      if position < done then (done, HolbuildSha256.string_hex (String.substring (text, 0, position)) :: acc)
+      else
+        let
+          val _ = if position > size text then raise Subscript else ()
+          val whole = position div 64 * 64
+          val _ = compress_blocks hash position done whole
+          val copy = Array.tabulate (8, fn j => Array.sub (hash, j))
+        in
+          compress_blocks copy position whole (padded_size position);
+          (whole, HolbuildSha256.hex_digest copy :: acc)
+        end
+  in
+    rev (#2 (List.foldl prefix (0, []) positions))
+  end
+
+(* The SHA-256 digests of TEXT's prefixes of lengths POSITIONS, in their
+   order: string_sha256 (String.substring (text, 0, p)) for each p, in time
+   and memory linear in TEXT when POSITIONS ascend, as a script's theorem
+   boundaries do. *)
+fun prefix_sha256s text positions =
+  case native () of
+      SOME {prefixes, ...} =>
+        (prefixes text positions handle Native => sml_prefix_sha256s text positions)
+    | NONE => sml_prefix_sha256s text positions
 
 fun string_sha256_large text =
   if size text < small_file_limit orelse uses_libcrypto () then string_sha256 text

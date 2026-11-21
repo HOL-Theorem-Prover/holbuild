@@ -4,7 +4,7 @@ struct
 structure Path = OS.Path
 exception Error of string
 
-datatype token = Word of string | StringLit of string | Symbol of char
+datatype token = Word of string | StringLit of string | SkippedLit | Symbol of char
 
 type t =
   { loads : string list,
@@ -67,6 +67,18 @@ fun scan_string text start =
           | c => loop (i + 1) (c :: acc)
   in loop start [] end
 
+fun skip_string text start =
+  let
+    val n = size text
+    fun loop i =
+      if i >= n then i
+      else
+        case String.sub(text, i) of
+            #"\"" => i + 1
+          | #"\\" => loop (i + 2)
+          | _ => loop (i + 1)
+  in Int.min(loop start, n) end
+
 fun skip_comment text start =
   let
     val n = size text
@@ -87,6 +99,25 @@ fun scan_word text start =
     val stop = loop start
   in (String.substring(text, start, stop - start), stop) end
 
+(* Only a literal right after `load` or `use`, or in a list after
+   `holbuild_extra_deps` or `holbuild_extra_outputs`, is read: the rest are
+   skipped, so a script holding large literals isn't copied into tokens. *)
+fun literal_wanted acc =
+  let
+    fun list_keyword word = word = "holbuild_extra_deps" orelse word = "holbuild_extra_outputs"
+    fun in_list rest =
+      case rest of
+          Symbol #"[" :: Word word :: _ => list_keyword word
+        | Symbol #"," :: more => in_list more
+        | StringLit _ :: more => in_list more
+        | _ => false
+  in
+    case acc of
+        Word "load" :: _ => true
+      | Word "use" :: _ => true
+      | _ => in_list acc
+  end
+
 fun tokenize text =
   let
     val n = size text
@@ -96,7 +127,9 @@ fun tokenize text =
       if i >= n then rev acc
       else if Char.isSpace (sub i) then loop (i + 1) acc
       else if opens_comment i then loop (skip_comment text (i + 2)) acc
-      else if sub i = #"\"" then let val (s, next) = scan_string text (i + 1) in loop next (StringLit s :: acc) end
+      else if sub i = #"\"" then
+        if literal_wanted acc then let val (s, next) = scan_string text (i + 1) in loop next (StringLit s :: acc) end
+        else loop (skip_string text (i + 1)) (SkippedLit :: acc)
       else if is_word_start (sub i) then let val (word, next) = scan_word text i in loop next (Word word :: acc) end
       else loop (i + 1) (Symbol (sub i) :: acc)
   in loop 0 [] end
@@ -155,16 +188,15 @@ fun header_libs text =
       size line >= 2 andalso String.substring(line, 0, 2) = "(*"
     fun is_blank_or_comment line =
       is_blank line orelse starts_comment line
-    fun lines text =
+    (* The line starting at START and where the next one starts, read one
+       at a time: the header ends long before the source does. *)
+    fun line_at start =
       let
         val n = size text
-        fun loop start i acc =
-          if i >= n then rev (String.substring(text, start, n - start) :: acc)
-          else if String.sub(text, i) = #"\n" then
-            loop (i + 1) (i + 1) (String.substring(text, start, i - start) :: acc)
-          else loop start (i + 1) acc
+        fun stop i = if i < n andalso String.sub(text, i) <> #"\n" then stop (i + 1) else i
       in
-        loop 0 0 []
+        if start > n then NONE
+        else let val e = stop start in SOME (String.substring(text, start, e - start), e + 1) end
       end
     fun skip_qualifier rest =
       let
@@ -204,10 +236,10 @@ fun header_libs text =
         if valid 0 tokens then SOME tokens else NONE
       end
     fun after word line = String.extract(line, size word, NONE)
-    fun scan current rest libs =
-      case rest of
-          [] => libs
-        | line :: more =>
+    fun scan current position libs =
+      case line_at position of
+          NONE => libs
+        | SOME (line, more) =>
             if starts_word "Ancestors" line then scan "Ancestors" more libs
             else if starts_word "Libs" line then
               scan "Libs" more
@@ -220,12 +252,12 @@ fun header_libs text =
                     scan current more
                       (if current = "Libs" then add_elements elements libs else libs)
                 | NONE => libs
-    fun find rest =
-      case rest of
-          line :: more => if starts_word "Theory" line then scan "" more [] else find more
-        | [] => []
+    fun find position =
+      case line_at position of
+          SOME (line, more) => if starts_word "Theory" line then scan "" more [] else find more
+        | NONE => []
   in
-    sort_unique (find (lines text))
+    sort_unique (find 0)
   end
 
 fun extract path =

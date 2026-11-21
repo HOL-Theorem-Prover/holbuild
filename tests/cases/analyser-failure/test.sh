@@ -147,6 +147,12 @@ val _ = D.set_analyser {path = path "bin/analyser", identity = "test"};
 val _ = (HolbuildTheorySpans.run ["boundaries"] "AScript.sml"; raise Fail "span failure accepted")
   handle HolbuildTheoryCheckpoints.Error text => assert "span diagnostics"
     (contains text "AScript.sml" andalso contains text "exit status 2" andalso contains text "helper stderr");
+(* A killed span analysis says so, after run_analyser's own retries, so the
+   build starts no further full-source analysis for the theory. *)
+val _ = reset "killed";
+val _ = (HolbuildTheorySpans.scan_with_proof_ir_plans "AScript.sml" ""; raise Fail "killed span accepted")
+  handle HolbuildTheorySpans.Killed text => assert "killed span diagnostics" (contains text "exit status 137");
+val _ = count 3;
 val _ = reset "parser";
 val (_, parser_failure) = D.analyse_files (path "bin/analyser") [("1", "AScript.sml")];
 val _ = (D.outcome_value parser_failure; raise Fail "parser error accepted")
