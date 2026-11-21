@@ -574,7 +574,11 @@ command.
 
 `check` builds the theories, and any `[run].loads`, without proof steps or
 checkpoints: it applies no step timeout (that is `build`'s check) and reuses
-theories built by `holbuild build --skip-proof-steps`. Plain checks do not execute
+theories built by `holbuild build --skip-proof-steps`. A theory it builds whose
+loaded ancestors take 1 GiB or more of the heap first saves them to a temporary
+child heap, which it deletes at once, as `build`'s `deps_loaded` checkpoint does:
+the save moves them out of the heap `--max-heap` limits. The theory's build log
+says how much was in use and whether it did. Plain checks do not execute
 `[run].loads`; fingerprint modes load them in HOL. The tags are those
 recorded in the built theory, which may have been restored from a cache;
 run `holbuild build --no-cache MyTheory` first to check a fresh build.
@@ -1703,6 +1707,7 @@ option new-ir=<bool>
 option theorem-checkpoints=false   (only for a theory that saves none)
 option checkpoint-target=true      (only for a theory that saves checkpoints as it runs)
 option skip-checkpoints=true      (when checkpoint reuse is disabled)
+option promote-preload=true       (only for a theory of `check`'s prebuild)
 option force=true                 (only for a forced theory)
 option trace-steps=true            (only for a traced theory)
 option pipeline=true               (only for a theory that may build pipelined)
