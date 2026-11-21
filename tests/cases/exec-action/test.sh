@@ -414,9 +414,55 @@ PY
 link_hol_toolchain_cache "$tmpdir/worker-c"
 cp -r "$tmpdir/worker-b/actions" "$tmpdir/worker-b/blobs" "$tmpdir/worker-c/"
 printf 'corrupt dependency\n' > "$tmpdir/worker-c/blobs/$dep_dat"
-worker c "$spec_c"
+# When worker c compresses a theory module to publish it, a heap restore
+# renames another copy over the module in the store, as a sibling worker's
+# can (fetch_heap_modules): the shim saves the module and puts other bytes
+# at its path before the real zstd reads its input.
+zstd_shim=$tmpdir/zstd-shim
+swapped=$tmpdir/swapped-modules
+mkdir -p "$zstd_shim" "$swapped"
+cat > "$zstd_shim/zstd" <<SH
+#!/usr/bin/env bash
+src=\${!#}
+if [[ \$src == *.pmo ]]; then
+  for module in "$tmpdir"/worker-c/theory-modules/*/"\$(basename "\$src")"; do
+    [[ -f \$module && ! -e "$swapped/\$(basename "\$module")" ]] || continue
+    cp "\$module" "$swapped/"
+    printf 'another module\\n' > "\$module.swap"
+    mv "\$module.swap" "\$module"
+  done
+fi
+exec "$(command -v zstd)" "\$@"
+SH
+chmod +x "$zstd_shim/zstd"
+if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
+  PATH="$zstd_shim:$PATH" worker c "$spec_c"
+else
+  worker c "$spec_c"
+fi
 expect c 0 "status=built"
 cmp "$tmpdir/dep.dat" "$tmpdir/worker-c/blobs/$dep_dat"
+if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
+  [[ -n $(ls "$swapped") ]] || { echo "worker c compressed no theory module" >&2; exit 1; }
+  # Each swapped module that was published was published with the bytes
+  # the writer stored, under their digest.
+  checked=0
+  for original in "$swapped"/*; do
+    module=$(basename "$original")
+    for sha in $(sed -n "s/^blob=\([0-9a-f]*\) file $module\$/\1/p" "$remote_root"/ac/*); do
+      [[ $(sha256sum < "$remote_root/cas/$sha" | cut -d' ' -f1) == "$sha" ]] || {
+        echo "the published blob of $module doesn't match its digest $sha" >&2; exit 1; }
+      if cmp -s "$original" "$remote_root/cas/$sha"; then checked=$((checked + 1)); fi
+    done
+  done
+  [[ $checked -gt 0 ]] || { echo "worker c published none of the modules swapped under it" >&2; exit 1; }
+  for original in "$swapped"/*; do
+    for module in "$tmpdir"/worker-c/theory-modules/*/"$(basename "$original")"; do
+      cp "$original" "$module.swap"
+      mv "$module.swap" "$module"
+    done
+  done
+fi
 # After C's result, the worker wrote the modules of the theories C loads
 # into the host's store, which theory children only read.
 if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
