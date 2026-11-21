@@ -5,7 +5,6 @@ structure Path = OS.Path
 
 exception Error of string
 
-datatype token = Word of string | StringLit of string | SkippedLit | Symbol of char
 
 type t =
   { loads : string list,
@@ -145,92 +144,62 @@ fun scan_word text start =
     (String.substring(text, start, stop - start), stop)
   end
 
-(* Only a literal right after `load` or `use`, or in a list after
-   `holbuild_extra_deps` or `holbuild_extra_outputs`, is read: the rest are
-   skipped, so a script holding large literals isn't copied into tokens. *)
-fun literal_wanted acc =
-  let
-    fun list_keyword word = word = "holbuild_extra_deps" orelse word = "holbuild_extra_outputs"
-    fun in_list rest =
-      case rest of
-          Symbol #"[" :: Word word :: _ => list_keyword word
-        | Symbol #"," :: more => in_list more
-        | StringLit _ :: more => in_list more
-        | _ => false
-  in
-    case acc of
-        Word "load" :: _ => true
-      | Word "use" :: _ => true
-      | _ => in_list acc
-  end
+fun theory_name s = has_suffix "Theory" s andalso size s > size "Theory"
 
-fun tokenize text =
+(* The dependency facts of a script's text in one pass: the literal after
+   each `load` or `use`, and the literals of each `holbuild_extra_deps` or
+   `holbuild_extra_outputs` list.  Other literals are skipped unread, so a
+   script holding large literals costs no more than its text. *)
+fun scan_dependencies text =
   let
     val n = size text
     fun sub i = String.sub(text, i)
     fun opens_comment i = i + 1 < n andalso sub i = #"(" andalso sub (i + 1) = #"*"
-    fun loop i acc =
-      if i >= n then rev acc
-      else if Char.isSpace (sub i) then loop (i + 1) acc
-      else if opens_comment i then loop (skip_comment text (i + 2)) acc
+    fun list_keyword word = word = "holbuild_extra_deps" orelse word = "holbuild_extra_outputs"
+    fun bad keyword = raise Error ("expected literal string list after " ^ keyword)
+    fun add_list keyword values {loads, uses, extra_deps, extra_outputs} =
+      if keyword = "holbuild_extra_deps"
+      then {loads = loads, uses = uses, extra_deps = values @ extra_deps, extra_outputs = extra_outputs}
+      else {loads = loads, uses = uses, extra_deps = extra_deps, extra_outputs = values @ extra_outputs}
+    (* PREVIOUS is the word just read, if the last token was one; LIST the
+       keyword and literals of the list being read. *)
+    fun loop i previous list (r as {loads, uses, extra_deps, extra_outputs}) =
+      if i >= n then (case list of SOME (keyword, _) => bad keyword | NONE => r)
+      else if Char.isSpace (sub i) then loop (i + 1) previous list r
+      else if opens_comment i then loop (skip_comment text (i + 2)) previous list r
       else if sub i = #"\"" then
-        if literal_wanted acc then
-          let val (s, next) = scan_string text (i + 1)
-          in loop next (StringLit s :: acc) end
-        else loop (skip_string text (i + 1)) (SkippedLit :: acc)
+        case (list, previous) of
+            (SOME (keyword, values), _) =>
+              let val (s, next) = scan_string text (i + 1)
+              in loop next NONE (SOME (keyword, add_unique s values)) r end
+          | (NONE, SOME "load") =>
+              let val (s, next) = scan_string text (i + 1)
+              in loop next NONE NONE {loads = add_unique s loads, uses = uses, extra_deps = extra_deps,
+                                      extra_outputs = extra_outputs} end
+          | (NONE, SOME "use") =>
+              let val (s, next) = scan_string text (i + 1)
+              in loop next NONE NONE {loads = loads, uses = add_unique s uses, extra_deps = extra_deps,
+                                      extra_outputs = extra_outputs} end
+          | (NONE, _) => loop (skip_string text (i + 1)) NONE NONE r
       else if is_word_start (sub i) then
-        let val (word, next) = scan_word text i
-        in loop next (Word word :: acc) end
-      else loop (i + 1) (Symbol (sub i) :: acc)
+        case list of
+            SOME (keyword, _) => bad keyword
+          | NONE => let val (word, next) = scan_word text i in loop next (SOME word) NONE r end
+      else
+        case (list, sub i, previous) of
+            (SOME _, #",", _) => loop (i + 1) NONE list r
+          | (SOME (keyword, values), #"]", _) => loop (i + 1) NONE NONE (add_list keyword values r)
+          | (SOME (keyword, _), _, _) => bad keyword
+          | (NONE, #"[", SOME word) =>
+              loop (i + 1) NONE (if list_keyword word then SOME (word, []) else NONE) r
+          | (NONE, _, _) => loop (i + 1) NONE NONE r
   in
-    loop 0 []
-  end
-
-fun theory_name s = has_suffix "Theory" s andalso size s > size "Theory"
-
-fun extract_string_args keyword tokens =
-  let
-    fun loop rest acc =
-      case rest of
-          Word word :: StringLit value :: xs =>
-            if word = keyword then loop xs (add_unique value acc)
-            else loop (StringLit value :: xs) acc
-        | _ :: xs => loop xs acc
-        | [] => acc
-  in
-    loop tokens []
-  end
-
-fun extract_string_list_args keyword tokens =
-  let
-    fun list rest acc =
-      case rest of
-          Symbol #"]" :: xs => (rev acc, xs)
-        | StringLit value :: xs => list xs (add_unique value acc)
-        | Symbol #"," :: xs => list xs acc
-        | _ => raise Error ("expected literal string list after " ^ keyword)
-    fun loop rest acc =
-      case rest of
-          Word word :: Symbol #"[" :: xs =>
-            if word = keyword then
-              let val (values, rest') = list xs []
-              in loop rest' (values @ acc) end
-            else loop (Symbol #"[" :: xs) acc
-        | Word _ :: _ :: _ =>
-            (case rest of _ :: xs => loop xs acc | [] => acc)
-        | _ :: xs => loop xs acc
-        | [] => acc
-  in
-    loop tokens []
+    loop 0 NONE NONE {loads = [], uses = [], extra_deps = [], extra_outputs = []}
   end
 
 fun extract_textual path =
   let
-    val tokens = tokenize (read_all path)
-    val loads = extract_string_args "load" tokens
-    val uses = extract_string_args "use" tokens
-    val extra_deps = extract_string_list_args "holbuild_extra_deps" tokens
-    val extra_outputs = extract_string_list_args "holbuild_extra_outputs" tokens
+    val {loads, uses, extra_deps, extra_outputs} = scan_dependencies (read_all path)
   in
     {loads = sort_unique loads, uses = sort_unique uses,
      extra_deps = sort_unique extra_deps,

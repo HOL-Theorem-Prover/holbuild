@@ -86,7 +86,8 @@ def analyse(name, wants):
     records = []
     if proc.returncode == 0:
         records = [[unescape(f) for f in line.split(" ")] for line in response.read_text().splitlines()]
-    return proc.returncode, stderr, records, usage.ru_maxrss * 1024
+    # ru_maxrss is in bytes on macOS and in KiB elsewhere.
+    return proc.returncode, stderr, records, usage.ru_maxrss * (1 if sys.platform == "darwin" else 1024)
 
 def fail(message):
     sys.exit(f"large-script-analyser: {message}")
