@@ -15132,7 +15132,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           if not (!HolbuildActionSandbox.outputs_validated) then ()
           else
             write_modules :=
-              SOME {inputs = List.concat (map (fn {stem, ...} => [stem ^ ".dat", stem ^ ".sml"]) (#deps spec)),
+              (* holbuild reads a theory's files by their names, HOL by
+                 the names it maps them to. *)
+              SOME {inputs = List.concat (map (fn {stem, ...} =>
+                                                  List.concat (map (fn file => [file, hfs_remapped_path file])
+                                                                   [stem ^ ".dat", stem ^ ".sml"]))
+                                              (#deps spec)),
                     write = fn writer_root =>
                               fill_module_store remote writer_root tc {deps = #deps spec, loads = #loads spec}}
         val action =

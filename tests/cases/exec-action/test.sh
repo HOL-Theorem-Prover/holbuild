@@ -419,7 +419,8 @@ printf 'corrupt dependency\n' > "$tmpdir/worker-c/blobs/$dep_dat"
 # can (fetch_heap_modules): the shim saves the module and puts other bytes
 # at its path before the real zstd reads its input.  It also records
 # whether worker c's action-root lock is free by then: the writer runs
-# after exec-action lets the worker's next action have the root.
+# after exec-action lets the worker's next action have the root.  The
+# probes take the lock, so concurrent compressions take turns.
 zstd_shim=$tmpdir/zstd-shim
 swapped=$tmpdir/swapped-modules
 mkdir -p "$zstd_shim" "$swapped"
@@ -427,7 +428,7 @@ cat > "$zstd_shim/zstd" <<SH
 #!/usr/bin/env bash
 src=\${!#}
 if [[ \$src == *.pmo ]]; then
-  python3 -c 'import fcntl, os, sys
+  flock "$tmpdir/lock-probe" python3 -c 'import fcntl, os, sys
 fd = os.open(sys.argv[1], os.O_RDWR)
 try:
     fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
