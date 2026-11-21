@@ -12788,9 +12788,12 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             in hashes := Redblackmap.insert (!hashes, path, sha); sha end
     val uploaded = ref (Redblackset.empty String.compare)
     (* has_blob knows only the blobs of the entries this process read. *)
+    (* With the blobs a probe found the cache lacks since. *)
+    val absent_blobs = ref missing
+    val absent_mutex = Mutex.mutex ()
     fun needs_upload sha =
       not (Redblackset.member (!uploaded, sha) orelse
-           HolbuildRemoteCache.has_blob remote sha andalso not (member sha missing))
+           HolbuildRemoteCache.has_blob remote sha andalso not (member sha (!absent_blobs)))
     fun put path sha =
       case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
           HolbuildCacheBackend.Published => ()
@@ -12879,16 +12882,19 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   (("heap", sha, "") :: map (fn (path, module) => ("module", module, Path.file path)) modules)
               (* The host that wrote a module usually published it
                  (publish_modules), so only those the cache lacks are put.
-                 A cache that doesn't answer leaves the module to be put.  Not
-                 a required read: a dead node beside a 404 must give a miss,
-                 not a failure that trips the breaker before the puts. *)
+                 Each is probed, even one named by an entry this run read:
+                 the cache may have lost it since.  A cache that doesn't
+                 answer leaves the module to be put.  Not a required read: a
+                 dead node beside a 404 must give a miss, not a failure that
+                 trips the breaker before the puts. *)
               fun probe (path, module) =
-                if needs_upload module andalso
-                   (HolbuildRemoteCache.blob_present remote module
-                    handle HolbuildRemoteCache.Unavailable _ => false)
+                if Redblackset.member (!uploaded, module) then ()
+                else if (HolbuildRemoteCache.blob_present remote module
+                         handle HolbuildRemoteCache.Unavailable _ => false)
                 then HolbuildRemoteCache.remember_blob remote
                        {sha256 = module, size = Position.toString (FS.fileSize path)}
-                else ()
+                else (Mutex.lock absent_mutex; absent_blobs := module :: !absent_blobs;
+                      Mutex.unlock absent_mutex)
               val _ = parallel_all remote_probe_width probe modules
               val _ = upload_all ((deps_loaded, sha) :: modules)
               val _ =
@@ -13006,8 +13012,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
        one published before the heap entry was replaced, is never
        restored.  A run on a heap replaced since leaves the entries alone. *)
     fun current heap =
-      case HolbuildRemoteCache.get_action remote heap_key of
-          SOME text => on_heap heap text
+      case HolbuildRemoteCache.fetch_action remote heap_key of
+          SOME action => on_heap heap (#manifest action)
         | NONE => false
     fun probe heap (c, key, absent) =
       (* Presence alone must not mark an un-restored entry's blobs as known:
@@ -13090,7 +13096,12 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             {key = key, text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
                                  (("heap", heap, "") :: entries)}))
           handle e => warning c e
-        val _ = transfer_all publish complete
+        (* Another worker may have replaced the heap since the probes:
+           checkpoints on the heap it replaced stay local. *)
+        val publishing = null complete orelse (current heap handle HolbuildRemoteCache.Unavailable _ => false)
+        val _ =
+          if publishing then transfer_all publish complete
+          else HolbuildStatus.message_stdout "the shared deps-loaded heap was replaced: not publishing its checkpoints\n"
         (* Store mutation stays on the main thread, once per physical file,
            rather than once for every manifest that names the file. *)
         val stored = ref (Redblackset.empty String.compare)
@@ -13102,13 +13113,15 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           handle e => warn ("could not store shared checkpoint " ^ path ^ ": " ^ General.exnMessage e)
       in
         List.app (fn (_, _, _, blobs) => List.app add blobs) complete;
-        update_index heap
-          (List.mapPartial (fn (c : shared_candidate) =>
-                               if was_restored (#path c) then SOME (shared_checkpoint_key heap_key (#kind c) (#key c))
-                               else NONE)
-                           candidates @
-           List.mapPartial (fn (_, key, absent) => if !absent then NONE else SOME key) probes @
-           map (fn (_, key, _, _) => key) complete)
+        if not publishing then ()
+        else
+          update_index heap
+            (List.mapPartial (fn (c : shared_candidate) =>
+                                 if was_restored (#path c) then SOME (shared_checkpoint_key heap_key (#kind c) (#key c))
+                                 else NONE)
+                             candidates @
+             List.mapPartial (fn (_, key, absent) => if !absent then NONE else SOME key) probes @
+             map (fn (_, key, _, _) => key) complete)
       end
     (* With no deps heap, the theory's latest failed prefix, chained to the
        base state, unless it is the one restored. *)

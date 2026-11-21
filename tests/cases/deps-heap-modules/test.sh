@@ -529,8 +529,15 @@ poisoned_once() {
   fi
 }
 # Cold: W lacks A's module, and the copy it fetches has another ID than C's
-# heap requires.
+# heap requires.  A second cache node of its own holds the same entries
+# (not their blobs): the replacements must reach it too.
 cp "$tmpdir/C-poisoned.entry" "$c_heap_entry"
+mkdir -p "$tmpdir/replica/ac"
+cp "$tmpdir"/remote/ac/* "$tmpdir/replica/ac/"
+start_remote_cache_server "$tmpdir/replica" "$tmpdir/replica-server"
+server_pids+=("$server_pid")
+replica_url=$remote_url
+remote_url=$primary_url,$replica_url
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_c cold-poisoned
 exec_theory C cold-poisoned
@@ -544,6 +551,16 @@ resumed cold-repaired-C 'theorem-context checkpoint after c_first'
 if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/cold-repaired-C.result"; then
   echo "cold-repaired-C found a checkpoint entry on the replaced heap" >&2; cat "$tmpdir/cold-repaired-C.result" >&2; exit 1
 fi
+for entry in "$tmpdir"/replica/ac/*; do
+  primary_entry=$tmpdir/remote/ac/${entry##*/}
+  [[ -f "$primary_entry" ]] && grep -qxE 'holbuild-shared-(heap|checkpoint)-v1' "$entry" || continue
+  cmp -s "$entry" "$primary_entry" ||
+    { echo "the cache nodes hold different shared entries ${entry##*/}" >&2; exit 1; }
+done
+# Back to one node, holding what either was given.
+remote_url=$primary_url
+cp -n "$tmpdir"/replica/ac/* "$tmpdir/remote/ac/"
+[[ ! -d "$tmpdir/replica/cas" ]] || cp -n "$tmpdir"/replica/cas/* "$tmpdir/remote/cas/"
 
 # C's run gives the poisoned heap up again, and A's module is replaced by
 # the other-ID copy while its publish reads the claim on C's heap: it
