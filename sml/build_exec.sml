@@ -14853,9 +14853,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
        its own, as the worker's next action takes the action root over once
        this one lets go of its lock.  Per process: the previous action's
        writer may still be running. *)
-    val writer_root =
-      Path.concat (cache, writer_root_prefix ^
-                          LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord (Posix.ProcEnv.getpid ()))))
+    val writer_root = Path.concat (cache, writer_root_prefix ^ HolbuildFileLock.current_pid_text ())
     val writer_checkpoints = Path.concat (writer_root, "checkpoints")
     (* Links the writer's INPUTS from the action root into the writer root,
        before empty_root, and removes the roots of writers killed before
@@ -15849,8 +15847,22 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
        last: it only saves later actions loading time, and stops before the
        worker's kill. *)
     val none = {ms = LargeInt.fromInt 0, installed = 0, missing = 0, probed = 0, fetched = 0, published = 0}
+    (* One exec-action of a worker at a time sweeps and writes modules after
+       its result: the previous one may still be at it, until the worker
+       stops it once it has this one's result. *)
+    val post_result_path = Path.concat (cache, "post-result.lock")
+    fun post_result_lock deadline =
+      case HolbuildFileLock.try_acquire_path {path = post_result_path, obsolete_kind = NONE} of
+          SOME lock => SOME lock
+        | NONE =>
+            if !cancelled then NONE
+            else if Time.>= (Time.now (), deadline) then
+              (warn "the previous action's work after its result still runs: skipping the cache sweep and the module writer";
+               NONE)
+            else (OS.Process.sleep (Time.fromMilliseconds 100); post_result_lock deadline)
+    val post_result = if !cancelled then NONE else post_result_lock (Time.+ (t0, module_writer_budget))
     val {ms, installed, missing, probed, fetched, published} =
-      if !cancelled then none else
+      if not (Option.isSome post_result) then none else
       let val {limit_bytes, reserve_bytes, min_free_bytes} = cache_cap
       in
         (* The checkpoint root is the next action's now: this sweep is
@@ -15866,6 +15878,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           | NONE => none
       end
     val _ = if Option.isSome writer then HolbuildRemoveTree.remove_untrusted writer_root else ()
+    val _ = Option.app HolbuildFileLock.release post_result
     val _ =
       HolbuildStatus.message_stderr
         ("holbuild: exec-action after the result (ms): " ^

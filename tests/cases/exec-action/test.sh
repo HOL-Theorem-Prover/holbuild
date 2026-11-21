@@ -435,6 +435,7 @@ try:
     print("free")
 except OSError:
     print("held")' "$tmpdir/worker-c/action.lock" >> "$tmpdir/lock-at-publish"
+  [[ -e "$tmpdir/previous-let-go" ]] || echo "before the previous action let go" >> "$tmpdir/lock-at-publish"
   for module in "$tmpdir"/worker-c/theory-modules/*/"\$(basename "\$src")"; do
     [[ -f \$module && ! -e "$swapped/\$(basename "\$module")" ]] || continue
     cp "\$module" "$swapped/"
@@ -446,7 +447,18 @@ exec "$(command -v zstd)" "\$@"
 SH
 chmod +x "$zstd_shim/zstd"
 if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
+  # A previous action of worker c still runs its work after its result for
+  # 3 s: this one's writer waits for it.
+  python3 -c 'import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)
+fcntl.lockf(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(3)
+open(sys.argv[3], "w").close()' "$tmpdir/worker-c/post-result.lock" "$tmpdir/previous-holds" "$tmpdir/previous-let-go" &
+  previous=$!
+  until [[ -e "$tmpdir/previous-holds" ]]; do sleep 0.05; done
   PATH="$zstd_shim:$PATH" worker c "$spec_c"
+  wait "$previous"
 else
   worker c "$spec_c"
 fi
@@ -493,7 +505,8 @@ if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   [[ -z $(find "$tmpdir/worker-c/action" -name 'theory-module-writer*') ]] || {
     echo "worker c's writer left its files in the action root" >&2; exit 1; }
   [[ -s "$tmpdir/lock-at-publish" && -z $(grep -v '^free$' "$tmpdir/lock-at-publish") ]] || {
-    echo "worker c's writer ran holding the action-root lock" >&2; exit 1; }
+    echo "worker c's writer ran holding the action-root lock, or before the previous action let go:" >&2
+    cat "$tmpdir/lock-at-publish" >&2; exit 1; }
   [[ -z $(compgen -G "$tmpdir/worker-c/module-writer-*") ]] || {
     echo "worker c's writer left its root" >&2; exit 1; }
   [[ ! -e "$tmpdir/worker-c/checkpoints" ]] || {

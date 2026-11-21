@@ -1220,8 +1220,9 @@ def released(lock: str) -> bool:
 class Reaper:
     """The one exec-action a worker leaves running once it has let go of the action root after its result: the
     cache cap's sweep and the theory module writer, which only help later actions, then run while the worker claims
-    and runs its next action. It is stopped POST_RESULT_SECONDS after its result, once the next action has written
-    its result (whose own sweep and writer then come next), when the worker is short of disk and when it drains."""
+    and runs its next action. It is killed POST_RESULT_SECONDS after its result, and stopped once the next action's
+    result is reported (that exec-action waits for this one's exit before its own sweep and writer), when the worker
+    is short of disk and when it drains."""
 
     def __init__(self, drain: Drain, lock: str) -> None:
         self.drain = drain
@@ -1236,6 +1237,11 @@ class Reaper:
         thread.start()
         self.running = thread, stop
 
+    def stop_soon(self) -> None:
+        """Has the exec-action it holds, if any, stopped, without waiting for it."""
+        if self.running is not None:
+            self.running[1].set()
+
     def stop(self) -> None:
         """Stops the exec-action it holds, if any, and returns once it is reaped."""
         if self.running is None:
@@ -1246,14 +1252,19 @@ class Reaper:
         self.running = None
 
     def _reap(self, process: subprocess.Popen[Any], deadline: float, theory: str, stop: threading.Event) -> None:
-        while process.poll() is None and not self.drain.stop.is_set() and time.monotonic() < deadline:
-            if stop.wait(min(POLL_SECONDS, max(0.0, deadline - time.monotonic()))):
-                break
-        if process.poll() is None:
-            print(f"{theory}: stopping exec-action's work after its result", file=sys.stderr, flush=True)
-            if time.monotonic() >= deadline:
-                kill_group(process)
-        stop_group(process)
+        # As in execute: killed at the deadline, also while stop_group gives it time to exit.
+        hard_stop = threading.Timer(max(0.0, deadline - time.monotonic()), kill_group, (process,))
+        hard_stop.daemon = True
+        hard_stop.start()
+        try:
+            while process.poll() is None and not self.drain.stop.is_set() and time.monotonic() < deadline:
+                if stop.wait(min(POLL_SECONDS, max(0.0, deadline - time.monotonic()))):
+                    break
+            if process.poll() is None:
+                print(f"{theory}: stopping exec-action's work after its result", file=sys.stderr, flush=True)
+            stop_group(process)
+        finally:
+            hard_stop.cancel()
         print(f"{theory}: exit {process.returncode} after the result", file=sys.stderr, flush=True)
 
 
@@ -1350,13 +1361,13 @@ def execute(
                         hard_stop = threading.Timer(POST_RESULT_SECONDS, kill_group, (process,))
                         hard_stop.daemon = True
                         hard_stop.start()
-                        if reaper is not None:
-                            # At most one exec-action after its result: this one lets go of the action root and
-                            # starts its own sweep and writer without waiting for the worker.
-                            reaper.stop()
                         report(record)
                         reported = record
                         stepped = after_result = time.monotonic()
+                        if reaper is not None:
+                            # At most one exec-action after its result: this one waits for the previous one's
+                            # exit before its own sweep and writer.
+                            reaper.stop_soon()
                         continue
                 elif reaper is not None and released(reaper.lock):
                     handed = True
@@ -1413,6 +1424,9 @@ def execute(
             assert reaper is not None
             reaper.hand(process, seen + POST_RESULT_SECONDS, claim["theory"])
             return reported
+        if reaper is not None:
+            # This one exited, or was stopped, before the worker saw its result.
+            reaper.stop_soon()
         if reported is not None:
             # Reported already: whatever the driver did after its result changes nothing for the client.
             print(f"{claim['theory']}: exit {process.returncode} after the result", file=sys.stderr, flush=True)

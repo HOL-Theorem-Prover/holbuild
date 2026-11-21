@@ -321,9 +321,11 @@ workers do when they aren't running HOL:
   worker's cache). It then refreshes the cache-cap measurement and writes
   theory modules in the background while the worker claims its next action;
   releases before 0.14.94 keep the lock, and the worker waits, until they
-  exit. The worker stops it 120 s after the result, when it drains, when it
-  is short of disk, and as soon as the next action has written its result,
-  before reporting that one: one runs in the background at a time.
+  exit. The worker kills it 120 s after the result, and stops it when it
+  drains, when it is short of disk, and once it has reported the next
+  action's result. One runs in the background at a time: the next
+  `exec-action` waits for `post-result.lock`, which the previous one holds
+  until it exits, before its own sweep and writer.
 
 ## Action isolation
 
