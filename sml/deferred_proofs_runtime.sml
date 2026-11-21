@@ -323,6 +323,11 @@ struct
           (Thm.hyp th))
       val th0 = prove_block (ctxt, goal, make, setup)
       val _ = check name ctxt (#1 goal) [] th0
+      (* With no suspension a build in place saves the theorem at its
+         statement, with its attributes, where the outline's stub was
+         stashed until its Finalise. *)
+      val _ = if List.exists is_suspended (Thm.hyp th0) then ()
+              else raise Fail ("the proof of " ^ name ^ " suspends no goal")
       (* Each block's open groups, goal and theorem, the latest first. *)
       val block_ths = ref []
       (* Resumption theorems, the latest first, as markerLib keeps them.

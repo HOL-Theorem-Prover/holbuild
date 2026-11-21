@@ -390,6 +390,26 @@ val _ = export_theory();
 SML
 check_fallback unresolved 0
 
+# A theorem whose every `suspend` runs on no goal: a build in place saves
+# it at its statement, with its attribute, and skips its `Resume` block, so
+# the attempt fails and the plain build passes.
+new_project all_dead
+cat > "$tmpdir/all_dead/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "A";
+Theorem all_dead[simp]:
+  T
+Proof
+  ACCEPT_TAC TRUTH >> suspend "dead"
+QED
+Resume all_dead[dead]:
+  NO_TAC
+QED
+Finalise all_dead
+val _ = export_theory();
+SML
+check_fallback all_dead 1
+
 # A Resume block that cites another theorem while it is still suspended.
 new_project cites
 cat > "$tmpdir/cites/src/AScript.sml" <<'SML'
