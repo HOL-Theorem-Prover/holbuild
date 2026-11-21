@@ -603,18 +603,23 @@ async def test_a_claim_passing_over_a_held_build_wakes_a_holder_that_began_waiti
 async def test_the_end_of_a_hold_wakes_a_waiting_claim_for_the_build_left(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cold host-3 leaves ``b1`` to host-1 and takes ``a1``; when the hold ends, the claim waiting on cold host-9 is
-    woken for ``b1``, though host-1 never came for it, and nothing new was made ready."""
+    """Cold host-3 leaves ``b1`` to host-1 and takes ``a1``, which wakes the claim waiting on host-8 in case batch
+    ``a`` has another; when the hold ends, the claim waiting on cold host-9 is woken for ``b1``, though host-1 never
+    came for it, and nothing new was made ready."""
     monkeypatch.setattr(coordinator_module, "LOCALITY_HOLD_SECONDS", 0.05)
     coordinator.settings.warm_workers = 3
     await run_on(http, cache, "host-1", "b0", "b", D1)
     batch_id = await submit_as(http, "b1", "b")
     await submit_as(http, "a1", "a")
-    wake = asyncio.get_running_loop().create_future()
-    coordinator.claim_waiters = [(["standard"], _claim_rank(["standard"], "host-9"), wake, False)]
+    wake, passed_on = asyncio.get_running_loop().create_future(), asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters = [
+        (["standard"], _claim_rank(["standard"], "host-9"), wake, False),
+        (["standard"], _claim_rank(["standard"], "host-8"), passed_on, False),
+    ]
     made_ready = coordinator.made_ready
     claimed = await claim_on(http, "host-3")
     assert claimed is not None and claimed["theory"] == "pkg:a"
+    assert passed_on.result() == ("standard", False, None, None)
 
     await asyncio.wait_for(asyncio.shield(wake), 5)
 

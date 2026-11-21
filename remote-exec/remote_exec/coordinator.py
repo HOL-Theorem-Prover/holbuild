@@ -1096,8 +1096,6 @@ class Coordinator:
         # within a host); see claim.
         self.made_ready = 0
         self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[Wake], bool]] = []
-        # The wakes of the waiting claims that deferred a tier to better-ranked waiters (see _leased_build).
-        self.deferring: set[asyncio.Future[Wake]] = set()
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
@@ -1450,8 +1448,6 @@ class Coordinator:
                 if (self.made_ready, self.ahead_changes if ahead else 0) == seen:
                     waiter = (tiers, rank, woken, ahead)
                     self.claim_waiters.append(waiter)
-                    if len(eligible_tiers) < len(tiers):
-                        self.deferring.add(woken)
                     try:
                         with contextlib.suppress(TimeoutError):
                             # A build left for its holder may be claimed once its hold ends.
@@ -1460,7 +1456,6 @@ class Coordinator:
                                 wait = min(wait, max(0.0, held_until - loop.time()))
                             await asyncio.wait_for(asyncio.shield(woken), wait)
                     finally:
-                        self.deferring.discard(woken)
                         with contextlib.suppress(ValueError):
                             self.claim_waiters.remove(waiter)
                 if disconnected is not None and await disconnected():
@@ -2542,19 +2537,21 @@ class Coordinator:
     def _leased_build(self, ranking: "_Ranking", tier: str) -> None:
         """Count a build of ``tier`` this process leased from ``ranking`` off the builds of ``tier`` a claim could
         take, so claims stop passing better-ranked waiters (see _defers) once those can take the rest. Then, while
-        ``ranking`` may still have builds not held for a host of a tier that a waiting claim deferred, wake the
-        best-ranked claim waiting for that tier, this one's first: it passes the wake on as it leases, where the claims
-        that deferred would otherwise sleep out their recheck (a held build waits for its hold's end, which wakes one).
-        That wake makes no new work ready, so made_ready stays."""
+        ``ranking`` may still have builds not held for a host of a tier a claim waits for, wake the best-ranked claim
+        waiting for that tier, this one's first: it passes the wake on as it leases, where the claims waiting would
+        otherwise sleep out their recheck for work another process made ready, or that they deferred to this one (a
+        held build waits for its hold's end, which wakes one). The ranking doesn't know whether the batch this build
+        came from has another, so the last lease of a batch may wake a claim that finds none. That wake makes no new
+        work ready, so made_ready stays."""
         self.leased[tier] += 1
         self.claimable[tier] = max(0, self.claimable.get(tier, 0) - 1)
-        deferred = {t for w_tiers, _, w_woken, _ in self.claim_waiters if w_woken in self.deferring for t in w_tiers}
-        if not deferred:
+        waiting = {t for w_tiers, _, w_woken, _ in self.claim_waiters if not w_woken.done() for t in w_tiers}
+        if not waiting:
             return
         now = asyncio.get_running_loop().time()
         left = [
             e for e in ranking.heap
-            if e[7] in deferred and (e[6], e[7]) not in ranking.exhausted
+            if e[7] in waiting and (e[6], e[7]) not in ranking.exhausted
             and self.holds.get((e[6], e[7]), (0.0, now))[1] <= now
         ]
         if left:

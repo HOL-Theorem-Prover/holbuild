@@ -1269,7 +1269,9 @@ async def test_an_action_made_ready_wakes_one_of_the_waiting_claims(
     done, pending = await asyncio.wait(waiting, timeout=10, return_when=asyncio.FIRST_COMPLETED)
     assert [task.result().theory for task in done] == ["pkg:a"]
     await asyncio.sleep(0.5)
-    assert attempts == 11  # the other nine slept on
+    # The claim that took it woke one more, as the ranking doesn't know whether the batch has another; the other
+    # eight slept on.
+    assert attempts == 12
     for task in pending:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
@@ -1769,8 +1771,11 @@ async def test_a_tail_host_claims_while_more_builds_are_ready_than_better_waiter
     wake = asyncio.get_running_loop().create_future()
     coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
     claimed = await coordinator.claim(["standard"], "tail", host_id="host-b")
-    assert claimed is not None and not wake.done()
-    # The better waiter can take the build left, though no count ran since.
+    # The lease wakes the better waiter for the build left.
+    assert claimed is not None and wake.result()[0] == "standard"
+    # Another better waiter can take that build, though no count ran since.
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
     assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
 
 
@@ -1813,14 +1818,16 @@ async def test_a_lease_while_the_ready_builds_are_counted_still_counts_off_them(
     assert coordinator.claimable["standard"] == 1
 
 
-async def test_each_claim_that_leases_a_build_wakes_the_next_claim_deferring_while_builds_remain(
-    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("hosts", [["host-a", "host-b", "host-c"], ["host-a"] * 3], ids=["deferring", "one-host"])
+async def test_each_claim_that_leases_a_build_wakes_the_next_waiting_claim_while_builds_remain(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, hosts: list[str]
 ) -> None:
+    """Claims from host-b and host-c defer to the one from host-a; those from one host defer to none."""
     monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 1.0)
     loop = asyncio.get_running_loop()
     claims = []
-    for host in ["host-a", "host-b", "host-c"]:
-        claims.append(asyncio.create_task(coordinator.claim(["standard"], host, 10, host_id=host)))
+    for host in hosts:
+        claims.append(asyncio.create_task(coordinator.claim(["standard"], f"{host}-w{len(claims)}", 10, host_id=host)))
         await asyncio.sleep(0.3)
     # Made ready by another coordinator process: no wake here, and this one's count still finds nothing ready.
     with monkeypatch.context() as patch:
@@ -1830,7 +1837,7 @@ async def test_each_claim_that_leases_a_build_wakes_the_next_claim_deferring_whi
     try:
         for claim in claims:
             assert (await asyncio.wait_for(claim, 5)) is not None
-        # host-a claimed at its recheck, then host-b and host-c in turn, not at their own rechecks 0.4 and 0.7 s on.
+        # The first claimed at its recheck, then the others in turn, not at their own rechecks 0.4 and 0.7 s on.
         assert loop.time() - started < 0.4
     finally:
         for claim in claims:
