@@ -185,6 +185,27 @@ fun selector source ProofStepPlan.SelectFirst = HolbuildProofIr.SelectFirst
 fun select_mode ProofStepPlan.SelectSolve = HolbuildProofIr.SelectSolve
   | select_mode ProofStepPlan.SelectKeep = HolbuildProofIr.SelectKeep
 
+fun strip_group (Group (_, _, tactic)) = strip_group tactic
+  | strip_group (RepairGroup (_, _, tactic, _)) = strip_group tactic
+  | strip_group tactic = tactic
+
+(* ProofStepPlan gives FIRST_PROVE the Choice it gives FIRST, but native
+   FIRST_PROVE runs each alternative THEN NO_TAC.  TacticParse always groups
+   FIRST_PROVE, so its Choice has a source to tell the two apart. *)
+fun is_first_prove source span =
+  case strip_group (TacticParse.parseTacticBlock
+                      (HolbuildProofIrPlanner.parse_tactic_expr (source_text source span))) of
+      FirstProve _ => true
+    | _ => false
+
+fun solve_first steps =
+  let val (start_pos, end_pos) = plan_span "FIRST_PROVE alternative" steps
+  in [HolbuildProofIr.StepSelect
+        {start_pos = start_pos, end_pos = end_pos,
+         selector = HolbuildProofIr.SelectFirst,
+         mode = HolbuildProofIr.SelectSolve, body = steps}]
+  end
+
 fun convert_plan source plan = map (convert_step source) plan
 and convert_step source step =
   case step of
@@ -247,10 +268,15 @@ and convert_step source step =
               case choice_source of
                   SOME span => span
                 | NONE => plan_span "choice" (List.concat converted)
+            val first_prove =
+              case choice_source of
+                  SOME span => is_first_prove source span
+                | NONE => false
         in HolbuildProofIr.StepChoice
              {start_pos = start_pos, end_pos = end_pos,
               label = source_text source (start_pos, end_pos),
-              alternatives = converted}
+              alternatives = if first_prove then map solve_first converted
+                             else converted}
         end
     | ProofStepPlan.Repeat body =>
         let val converted = convert_plan source body

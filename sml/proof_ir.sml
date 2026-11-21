@@ -558,7 +558,8 @@ and plan_tactic source tactic =
     | TacTry (_, t) => [try_step (tactic_span tactic) (plan_tactic source t)]
     | TacRepeat _ => [tactic_step source tactic]
     | TacFirst (_, xs) => [choice_step (tactic_span tactic) (tactic_label source tactic) (map (fn t => plan_tactic source t) xs)]
-    | TacFirstProve (_, xs) => [choice_step (tactic_span tactic) (tactic_label source tactic) (map (fn t => plan_tactic source t) xs)]
+    (* Native FIRST_PROVE runs each alternative THEN NO_TAC. *)
+    | TacFirstProve (_, xs) => [choice_step (tactic_span tactic) (tactic_label source tactic) (map (fn t => [branch_steps source t]) xs)]
     | TacMapFirst (_, xs) => [choice_step (tactic_span tactic) (tactic_label source tactic) (map (fn t => plan_tactic source t) xs)]
     | TacSufficesBy (q, rhs) =>
         [StepTactic {start_pos = #1 q, end_pos = #2 q, label = suffices_tactic_program source q, program = suffices_tactic_program source q},
