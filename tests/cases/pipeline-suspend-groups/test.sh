@@ -409,6 +409,9 @@ Finalise all_dead
 val _ = export_theory();
 SML
 check_fallback all_dead 1
+if [[ $groups = 1 ]]; then
+  require_grep "the proof of all_dead suspends no goal" "$tmpdir/all_dead.log"
+fi
 
 # A Resume block that cites another theorem while it is still suspended.
 new_project cites
