@@ -883,7 +883,9 @@ the package's own, and the package's extra inputs that name its declared outputs
 by path or through a directory or glob, read them there. The action must
 produce every declaration. Extra outputs participate in up-to-date checks and
 cache publication/restoration, and `holbuild clean TARGET` removes them. Holbuild records ownership lazily and
-rejects another action that attempts to materialize the same path. As with
+rejects another action that attempts to materialize the same path. A file already
+at a declared path with no ownership record, as after deleting `.holbuild` or
+copying the project without it, is taken over and replaced. As with
 ordinary outputs, cleaning followed
 by a normal build may restore them from cache; use existing no-cache or impure /
 always-reexecute controls when source execution is required.

@@ -736,21 +736,20 @@ fun recorded_extra_outputs project node =
 
 fun member_string value values = List.exists (fn existing => existing = value) values
 
+(* A declared output with no claim is taken over, even if the file exists:
+   only this theory declares the path (validate_extra_output_ownership), and
+   a file there with no record is one the project's .holbuild no longer
+   knows, as after deleting .holbuild or copying the project. *)
 fun claim_extra_outputs project node outputs =
   let
     val owner = extra_output_owner node
-    val recorded = recorded_extra_outputs project node
     val created = ref ([] : string list)
     fun claim output =
       let val path = extra_output_claim_path project output
       in
         case read_extra_output_claim project output of
-            NONE =>
-              if extra_output_registry_path_exists output andalso
-                 not (member_string output recorded) then
-                raise Error ("extra output already exists without an ownership record: " ^ output)
-              else (write_text path (extra_output_claim_text owner output);
-                    created := path :: !created)
+            NONE => (write_text path (extra_output_claim_text owner output);
+                     created := path :: !created)
           | SOME existing =>
               if same_extra_output_owner (owner, existing) then ()
               else raise Error ("extra output is already owned: " ^ output ^ " by " ^
