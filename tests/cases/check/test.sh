@@ -638,6 +638,18 @@ Proof simp[]
 QED
 SML
 done
+# The child itself removes the transient heap as soon as it is saved: it
+# is gone from the stage, the child's working directory, by the time the
+# script runs.
+cat > "$project/src/PromoteLargeScript.sml" <<'SML'
+Theory PromoteLarge
+val _ = if OS.FileSys.access ("holbuild-preload.sml", []) andalso
+           not (OS.FileSys.access ("holbuild-preload.sml.promote.save", []))
+        then () else raise Fail "the promoted preload's heap is still in the stage";
+Theorem PromoteLarge_thm: T
+Proof simp[]
+QED
+SML
 child_log() { printf '%s\n' "$project/.holbuild/logs/current/promote/$1/build.log"; }
 run_check PromoteSmallTheory 0
 require_grep '^PromoteSmallTheory: clean (1 theorem)$' "$log"

@@ -2330,6 +2330,13 @@ require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdi
 require_grep "ChkTheory restored from cache" "$tmpdir/check-remote.log"
 require_grep "^ChkTheory.chk_thm: clean (1 theorem)$" "$tmpdir/check-remote.log"
 refute_grep "ChkTheory built" "$tmpdir/check-remote.log"
+# check's prebuild asks the worker to promote a large preload: the spec
+# carries the option, and the worker's child logs its decision.
+batch=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/check-remote.log")
+spec=$(awk '$1 == "action" { print $4 }' "$state/$batch.batch")
+require_grep '^option promote-preload=true$' "$remote_root/cas/$spec"
+require_grep '^holbuild preload in_use=[0-9]* threshold=1073741824 not promoted$' \
+  "$tmpdir/check-remote/.holbuild/logs/current/rxchk/ChkTheory/build.log"
 
 copy_nondet check-fp-remote rxchkfp
 cat > "$tmpdir/check-fp-remote/src/ChkFpScript.sml" <<'SML'
