@@ -382,6 +382,69 @@ fun write_preload load_lines deps_loaded deps_ok path =
 fun write_plain_preload load_lines path =
   write_text path (String.concatWith "\n" (runtime_line () :: load_lines) ^ "\n")
 
+(* Where a promoting preload saves its transient heap: in the stage, which
+   the parent clears of it once the child has ended (run_theory_action). *)
+fun promote_scratch_path preload = preload ^ ".promote.save"
+
+(* The local heap in use from which a preload is promoted: 1 GiB, or
+   HOLBUILD_PROMOTE_PRELOAD_BYTES for tests. *)
+fun promote_preload_threshold () =
+  case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_PROMOTE_PRELOAD_BYTES") of
+      SOME bytes => bytes
+    | NONE => 1073741824
+
+(* A theory without checkpoints keeps its preloaded ancestors in Poly/ML's
+   local heap, which --maxheap limits, and which a large preload can leave
+   too little of for the script: a build's deps heap save moves them out of
+   it (save_deps_checkpoint), as any saveChild promotes what it saves to
+   permanent space.  So once the loads hold the threshold or more, this
+   preload saves a transient child heap the same way, with or without
+   modules, and removes it at once: the promoted data stays in memory,
+   nothing reads the file.  A save that can't write its file leaves the
+   preload as it was.  The child's log says what was in use and whether it
+   was promoted.  A later saveChild here would name the removed file as its
+   parent, so only a theory that saves no checkpoint promotes. *)
+fun write_promoting_preload load_lines path =
+  let
+    val scratch = HolbuildToolchain.sml_string (promote_scratch_path path)
+    val promote =
+      String.concat
+        ["val _ = let\n",
+         "  val {sizeHeap, sizeHeapFreeLastGC, ...} = PolyML.Statistics.getLocalStats ()\n",
+         "  val in_use = sizeHeap - sizeHeapFreeLastGC\n",
+         "  val threshold : LargeInt.int = ", Int.toString (promote_preload_threshold ()), "\n",
+         "  fun report text = TextIO.output (TextIO.stdErr, \"holbuild preload in_use=\" ^ LargeInt.toString in_use ^ \" threshold=\" ^ LargeInt.toString threshold ^ \" \" ^ text ^ \"\\n\")\n",
+         "  fun seconds (a, b) = Real.fmt (StringCvt.FIX (SOME 3)) (Time.toReal (Time.- (b, a)))\n",
+         "  fun promote () =\n",
+         "    let\n",
+         "      val share = HolbuildRuntime.deps_save_shares true\n",
+         "      val save = case HolbuildRuntime.save_child_with_modules of\n",
+         "                     SOME save => if share then PolyML.SaveState.saveChild else save\n",
+         "                   | NONE => PolyML.SaveState.saveChild\n",
+         "      val t0 = Time.now ()\n",
+         "      val _ = if share then PolyML.shareCommonData PolyML.rootFunction else ()\n",
+         "      val t1 = Time.now ()\n",
+         "      val _ = OS.FileSys.remove ", scratch, " handle OS.SysErr _ => ()\n",
+         "      val _ = save (", scratch, ", HolbuildRuntime.save_hierarchy_depth ())\n",
+         "      val size = OS.FileSys.fileSize ", scratch, "\n",
+         "      val _ = OS.FileSys.remove ", scratch, "\n",
+         "    in\n",
+         "      report (\"promoted share=\" ^ Bool.toString share ^ \" share_s=\" ^ seconds (t0, t1) ^\n",
+         "              \" save_s=\" ^ seconds (t1, Time.now ()) ^ \" size=\" ^ Position.toString size)\n",
+         "    end\n",
+         "    handle OS.SysErr (msg, SOME err) =>\n",
+         "      if List.exists (fn e => e = err)\n",
+         "           ([Posix.Error.nospc, Posix.Error.fbig, Posix.Error.acces, Posix.Error.perm, Posix.Error.rofs, Posix.Error.io] @\n",
+         "            List.mapPartial Posix.Error.syserror [\"EDQUOT\"])\n",
+         "      then (OS.FileSys.remove ", scratch, " handle OS.SysErr _ => (); report (\"not promoted: \" ^ msg))\n",
+         "      else raise OS.SysErr (msg, SOME err)\n",
+         "in\n",
+         "  if in_use < threshold then report \"not promoted\" else promote ()\n",
+         "end;"]
+  in
+    write_text path (String.concatWith "\n" (runtime_line () :: load_lines @ [promote]) ^ "\n")
+  end
+
 (* HOL's theory exporter enables generated HTML documentation by default.  A
    holbuild child runs in a disposable stage and these files are not build
    artifacts, so generating them only adds pretty-printing and I/O to the
@@ -3339,7 +3402,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool, promote_preload : bool}
 
 (* checkpoint: the theory restores checkpoints and saves them at all.
    theorem_checkpoints: it also saves them per theorem and definition, and
@@ -3348,14 +3411,17 @@ type build_options = {use_cache : bool, verify_cache : bool, force : force_level
    its deps_loaded state and its theorem and definition contexts as it
    runs; any other theory saves only a failed proof's prefix, so a passing
    dependency pays for no checkpoint.  checkpoint_seconds: build's
-   --checkpoint-seconds, the least time between two context saves. *)
+   --checkpoint-seconds, the least time between two context saves.
+   promote_preload: a theory without checkpoints moves a large preload out
+   of the heap --max-heap limits (write_plain_preload); only check's
+   prebuild asks for it. *)
 datatype checkpoint_policy =
-  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool}
+  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool, promote_preload : bool}
 
 val default_checkpoint_seconds = 2.0
 
 val no_checkpoint_policy =
-  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false}
+  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false}
 
 fun checkpoint_enabled (CheckpointPolicy {checkpoint, ...}) = checkpoint
 fun theorem_checkpoints_enabled (CheckpointPolicy {theorem_checkpoints, ...}) = theorem_checkpoints
@@ -3372,6 +3438,7 @@ fun execution_plan (CheckpointPolicy {execution_plan, ...}) = execution_plan
 fun trace_steps (CheckpointPolicy {trace_steps, ...}) = trace_steps
 fun repl_on_failure (CheckpointPolicy {repl_on_failure, ...}) = repl_on_failure
 fun trknl_enabled (CheckpointPolicy {trknl, ...}) = trknl
+fun promotes_preload (CheckpointPolicy {promote_preload, ...}) = promote_preload
 
 fun execution_plan_only (CheckpointPolicy {execution_plan = SOME _, trace_steps = false, ...}) = true
   | execution_plan_only _ = false
@@ -4407,7 +4474,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
     val load_lines = map (theory_load_line root) (#loads action)
   in
   if not (checkpoint_enabled policy) then
-    (write_plain_preload load_lines preload;
+    ((if promotes_preload policy then write_promoting_preload else write_plain_preload) load_lines preload;
      write_text staged_script (instrumented_source defer_proofs policy false (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
      {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
   else
@@ -4759,22 +4826,28 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
           failure_output
       end
     val build_log = Path.concat(stage, "holbuild-build.log")
+    (* A promoting child removes its transient heap itself, unless it
+       ended while saving it. *)
+    fun remove_promote_scratch () =
+      if promotes_preload policy then remove_file (promote_scratch_path preload) else ()
     val _ =
       (check_cancelled ();
        validate_hol_context (#context run_spec);
        detail_time_phase "build.exec.node.child_run"
          (fn () =>
-             case attached of
-                 SOME join =>
-                   if #files run_spec = [preload, staged_script] then join ()
-                   else raise Error "a child loading ahead needs a fresh preload"
-               | NONE =>
-                   run_hol_files_to_log tc stage stage
-                     (#context run_spec)
-                     (child_policy :: (#files run_spec @ [theory_exporter]))
-                     "holbuild-build.log"
-                     (SOME (current_build_log log_dir))
-                     "hol run failed while building theory script"))
+             ((case attached of
+                   SOME join =>
+                     if #files run_spec = [preload, staged_script] then join ()
+                     else raise Error "a child loading ahead needs a fresh preload"
+                 | NONE =>
+                     run_hol_files_to_log tc stage stage
+                       (#context run_spec)
+                       (child_policy :: (#files run_spec @ [theory_exporter]))
+                       "holbuild-build.log"
+                       (SOME (current_build_log log_dir))
+                       "hol run failed while building theory script")
+              before remove_promote_scratch ())
+             handle e => (remove_promote_scratch (); raise e)))
       handle Error msg =>
         (check_cancelled ();
         if invalid_checkpoint_retryable base_context (#context run_spec) msg then
@@ -5313,7 +5386,7 @@ fun checkpoint_target_node ({all_checkpoints, repl_on_failure, checkpoint_target
 (* An impure action never replays checkpoints: its script may compute
    different values on each run (a timestamp, a version string), and
    resuming past that code would restore the values of an earlier run. *)
-fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, ...} : build_options) project node =
+fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...} : build_options) project node =
   if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
     CheckpointPolicy {checkpoint = not skip_checkpoints andalso not (impure node),
                       theorem_checkpoints = not skip_checkpoints andalso not (impure node),
@@ -5326,7 +5399,8 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
                       execution_plan = if proof_steps then execution_plan else NONE,
                       trace_steps = proof_steps andalso trace_steps,
                       repl_on_failure = repl_on_failure,
-                      trknl = trknl}
+                      trknl = trknl,
+                      promote_preload = promote_preload}
   else
     CheckpointPolicy {checkpoint = false,
                       theorem_checkpoints = false,
@@ -5338,7 +5412,8 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
                       execution_plan = NONE,
                       trace_steps = false,
                       repl_on_failure = false,
-                      trknl = trknl}
+                      trknl = trknl,
+                      promote_preload = promote_preload}
 
 fun proof_engine (CheckpointPolicy {proof_steps = false, ...}) = "plain_v1"
   | proof_engine (CheckpointPolicy {new_ir = true, ...}) = "proof_ir_v3"
@@ -7024,11 +7099,14 @@ fun speculative_action root plan keys toolchain_key view key node : theory_actio
      outputs = #outputs action, extra_outputs = #extra_outputs action}
   end
 
-fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, ...}) =
+(* A pipelined attempt keeps promote_preload: under check, a theory built
+   ahead or outlined first loads the same ancestors as its plain build. *)
+fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, promote_preload, ...}) =
   CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false,
                     checkpoint_seconds = default_checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout, execution_plan = NONE,
-                    trace_steps = false, repl_on_failure = false, trknl = false}
+                    trace_steps = false, repl_on_failure = false, trknl = false,
+                    promote_preload = promote_preload}
 
 fun signature_companion plan node =
   List.find
@@ -8865,7 +8943,7 @@ fun build options tc project plan toolchain_key jobs =
 (* After remote execution, force and tracing have already been fulfilled. *)
 fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, checkpoint_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
                            new_ir, proof_scope, node_tactic_timeouts, execution_plan, repl_on_failure,
-                           emit_output_hashes, allow_cache_timeout_discrepancy, trknl, fail_fast, all_checkpoints, ...} : build_options)
+                           emit_output_hashes, allow_cache_timeout_discrepancy, trknl, fail_fast, all_checkpoints, promote_preload, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = ForceNone, force_targets = force_targets,
    checkpoint_targets = checkpoint_targets, skip_checkpoints = skip_checkpoints, checkpoint_seconds = checkpoint_seconds,
@@ -8875,7 +8953,7 @@ fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets
    emit_output_hashes = emit_output_hashes,
    allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy, trknl = trknl,
    restore_only = restore_only, fail_fast = if restore_only then false else fail_fast,
-   all_checkpoints = all_checkpoints}
+   all_checkpoints = all_checkpoints, promote_preload = promote_preload}
 
 (* Early cutoff for the theories export_action_specs deferred, once what they
    depend on is in the cache: restores (or builds, if not theories) the
@@ -9452,6 +9530,7 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
       (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
       (if checkpoint_target_enabled policy then [bool_option "checkpoint-target" true] else []) @
       (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
+      (if promotes_preload policy then [bool_option "promote-preload" true] else []) @
       (if Real.== (checkpoint_seconds policy, default_checkpoint_seconds) then []
        else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
       (if forced then [bool_option "force" true] else []) @
@@ -10597,8 +10676,8 @@ type action_spec =
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list,
    proof_steps : bool, tactic_timeout : real option, new_ir : bool,
-   theorem_checkpoints : bool, checkpoint_target : bool, skip_checkpoints : bool, checkpoint_seconds : real,
-   force : bool, trace_steps : bool,
+   theorem_checkpoints : bool, checkpoint_target : bool, skip_checkpoints : bool, promote_preload : bool,
+   checkpoint_seconds : real, force : bool, trace_steps : bool,
    pipeline : bool, tool_cache : string option, scratch_input : string option, action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
@@ -10735,6 +10814,10 @@ fun parse_action_spec text : action_spec =
      skip_checkpoints =
        (case List.find (fn (k, _) => k = "option skip-checkpoints") (!values) of
             SOME (_, v) => spec_bool "skip-checkpoints" v
+          | NONE => false),
+     promote_preload =
+       (case List.find (fn (k, _) => k = "option promote-preload") (!values) of
+            SOME (_, v) => spec_bool "promote-preload" v
           | NONE => false),
      checkpoint_seconds =
        (case List.find (fn (k, _) => k = "option checkpoint-seconds") (!values) of
@@ -10957,7 +11040,8 @@ fun spec_policy (spec : action_spec) =
                     execution_plan = NONE,
                     trace_steps = #trace_steps spec,
                     repl_on_failure = false,
-                    trknl = false}
+                    trknl = false,
+                    promote_preload = #promote_preload spec}
 
 val no_space = HolbuildCacheTransfer.no_space
 (* A failed child's log is no evidence of a full disk either way: it is on
