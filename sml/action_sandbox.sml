@@ -216,7 +216,9 @@ fun grant_options ({writable, readable = extra, toolchain} : grants) =
   in
     (if toolchain then ["--toolchain"] else []) @
     options "--write" (map full writable) @
-    options "--read" (map full readable) @ options "--forbid" forbidden @
+    (* A theory module can be swept from its store after exists saw it. *)
+    options "--read" (List.mapPartial (fn path => SOME (full path) handle OS.SysErr _ => NONE) readable) @
+    options "--forbid" forbidden @
     (* Restored states link into the store, and theory children read
        single modules of the theory module stores. *)
     options "--keep-read-only" (map (fn dir => OS.Path.concat (cache, dir)) ["checkpoint-store", "theory-modules"]) @

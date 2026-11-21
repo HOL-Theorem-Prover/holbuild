@@ -118,7 +118,10 @@ val _ = HolbuildActionSandbox.enable (action, checkpoints);
 val _ = HolbuildActionSandbox.action_write_dirs := SOME [action ^ "/.holbuild/stage"];
 val _ = HolbuildActionSandbox.toolchain_root := root ^ "/toolchain";
 val _ = HolbuildActionSandbox.poly_executable := root ^ "/home/bin/poly";
-val _ = HolbuildActionSandbox.module_reads := (fn () => [store ^ "/0a-ownTheory-1.pmo"]);
+(* A module swept from the store after it was listed loses its grant
+   instead of failing the launch. *)
+val _ = HolbuildActionSandbox.module_reads :=
+  (fn () => [store ^ "/0a-ownTheory-1.pmo", store ^ "/0a-goneTheory-3.pmo"]);
 val report = action ^ "/.holbuild/stage/report";
 val probe =
   "{ cat \"$1/0a-ownTheory-1.pmo\" && echo own; cat \"$1/0a-otherTheory-2.pmo\" || echo other-denied; " ^
@@ -160,6 +163,10 @@ PATH="$tmpdir/worker-venv/bin:$tmpdir/venv-bin:/usr/local/bin:/usr/bin:/bin:" \
   "$tmpdir/worker-venv/bin/python3" -I "$ROOT/sml/action_sandbox.py" \
     --write "$tmpdir/action" "${grants[@]}" --forbid "$tmpdir/worker-venv" \
     -- /bin/sh -c 'python3 "$@"' sh "$tmpdir/action/python-probe.py" "$tmpdir/worker-venv/pyvenv.cfg"
+
+# So does one gone between holbuild's listing and the helper's start.
+python3 -I "$ROOT/sml/action_sandbox.py" --write "$tmpdir/action" "${grants[@]}" \
+  --read "$tmpdir/cache/theory-modules/store/0a-goneTheory-3.pmo" -- /bin/true
 
 # HOL's solver locations reach the action; other variables, credentials above all, don't.
 solvers=(HOL4_Z3_EXECUTABLE HOL4_CVC_EXECUTABLE HOL4_CSDP_EXECUTABLE HOL4_EPROVER_EXECUTABLE

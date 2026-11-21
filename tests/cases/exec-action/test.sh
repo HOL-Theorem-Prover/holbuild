@@ -485,13 +485,27 @@ if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   [[ ! -e "$tmpdir/worker-c/checkpoints" ]] || {
     echo "worker c's action left its checkpoints after the result" >&2; exit 1; }
   # The next child on worker c loads A and B from those modules, not from
-  # their .dat files.
-  cat > "$project/src/DScript.sml" <<'SML'
+  # their .dat files, and can't read the store's other modules: neither an
+  # unrelated theory's nor A's under another .dat digest.
+  planted=()
+  for store in "$tmpdir"/worker-c/theory-modules/*/; do
+    own=$(compgen -G "$store*-A-*.pmo" | head -n 1) || continue
+    stale=${own%-*}-0000000000000000000000000000000000000000.pmo
+    unrelated=${store}0a-plantedTheory-1111111111111111111111111111111111111111.pmo
+    cp "$own" "$stale"
+    cp "$own" "$unrelated"
+    planted+=("$stale" "$unrelated")
+  done
+  [[ ${#planted[@]} -gt 0 ]] || { echo "worker c's store has no module of A to plant beside" >&2; exit 1; }
+  planted_list=$(printf '"%s", ' "${planted[@]}")
+  cat > "$project/src/DScript.sml" <<SML
 Theory D
 Ancestors B
 
 val _ = if length (PolyML.SaveState.showLoadedModules ()) >= 2 then ()
         else raise Fail "D's child loaded no theory modules"
+val _ = List.app (fn path => (TextIO.closeIn (TextIO.openIn path); raise Fail ("D's child read " ^ path))
+                               handle IO.Io _ => ()) [${planted_list%, }]
 
 Theorem d_thm:
   T
@@ -502,7 +516,7 @@ SML
   hb action-spec --upload DTheory > "$tmpdir/batch-d.txt"
   worker c "$(spec_for "$tmpdir/batch-d.txt" worker:DTheory)"
   expect c 0 "status=built"
-  rm "$project/src/DScript.sml"
+  rm "$project/src/DScript.sml" "${planted[@]}"
   # A failed action fills the store too: a theory's failing attempts are
   # what most often run again on the host.
   cat > "$project/src/FScript.sml" <<'SML'
