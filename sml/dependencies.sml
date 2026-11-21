@@ -99,7 +99,12 @@ fun scan_string text start =
         case sub i of
             #"\"" => (String.implode (rev acc), i + 1)
           | #"\\" =>
-              if i + 1 < n then loop (i + 2) (sub (i + 1) :: acc)
+              if i + 1 < n andalso Char.isSpace (sub (i + 1)) then
+                (* A gap: whitespace between two backslashes, which the
+                   string doesn't contain. *)
+                let fun gap j = if j >= n then j else if sub j = #"\\" then j + 1 else gap (j + 1)
+                in loop (gap (i + 1)) acc end
+              else if i + 1 < n then loop (i + 2) (sub (i + 1) :: acc)
               else loop (i + 1) acc
           | c => loop (i + 1) (c :: acc)
   in

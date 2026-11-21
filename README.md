@@ -1292,9 +1292,10 @@ theorem where a plain build does; after the export the theorem's proof and
 each block run in order and are put together as `Finalise` does. The group
 runs in place instead if one of its blocks uses `cheat` or `smlname`, a
 `Resume X` names no label or comes after the `Finalise`, or the source from
-the theorem to its `Finalise` calls `lookup_suspension` or
-`lookup_resumption` (itself or through a top-level helper whose body mentions
-them), names `X` anywhere but those headers (until the `Finalise`, `X`'s value
+the theorem to its `Finalise` calls markerLib's `lookup_suspension`, `lookup_resumption`,
+`resume`, `prim_resume`, `set_suspended_goal`, `prim_set_suspended_goal` or
+`finalise_suspended_thm` (itself or through a top-level helper whose body
+mentions them), names `X` anywhere but those headers (until the `Finalise`, `X`'s value
 is the stub, whose hypotheses are the placeholders), or, outside the proofs of
 groups, mentions `suspend` or a top-level helper that may suspend, or holds a
 theorem the script resumes. As with `Thm.tag` above, code that reaches `X`'s

@@ -21,6 +21,10 @@ unset HOLBUILD_REMOTE_CACHE_URL
 # wrong builds plain, with the plain build's verdict.
 if grep -q susp_uptodate "$HOLDIR/src/marker/markerLib.sml"; then
   groups=1
+elif [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
+  # The theory-modules job's HOL is the one with the export pruning.
+  echo "expected the theory-modules HOL's markerLib to define susp_uptodate" >&2
+  exit 1
 else
   groups=0
 fi
@@ -190,6 +194,38 @@ Resume twin2[inner]:
 QED
 Finalise twin1
 Finalise twin2
+
+Theorem early:
+  F ==> F
+Proof
+  suspend "again"
+QED
+Theorem late:
+  T /\\ (F ==> F)
+Proof
+  CONJ_TAC >- ACCEPT_TAC TRUTH >> suspend "outer"
+QED
+Resume early[again]:
+  simp[]
+QED
+Finalise early
+Resume late[outer]:
+  suspend "again"
+QED
+Resume late[again]:
+  simp[]
+QED
+Finalise late
+
+Theorem loop:
+  F ==> F
+Proof
+  suspend "loop"
+QED
+Resume loop[loop]:
+  simp[]
+QED
+Finalise loop
 
 Theorem hidden:
   T

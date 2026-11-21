@@ -3716,14 +3716,14 @@ fun deferrable_proof resumed kind name names_smlname tactic =
 
 fun identifier_char c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'"
 
-(* How many times TEXT has the whole identifier WORD. *)
-fun identifier_count text word =
+(* The offsets in TEXT of the whole identifier WORD, in order. *)
+fun identifier_positions text word =
   let
     val n = size word
-    fun search start count =
+    fun search start acc =
       let val (prefix, rest) = Substring.position word (Substring.extract (text, start, NONE))
       in
-        if Substring.isEmpty rest then count
+        if Substring.isEmpty rest then rev acc
         else
           let
             val i = start + Substring.size prefix
@@ -3731,14 +3731,14 @@ fun identifier_count text word =
               (i = 0 orelse not (identifier_char (String.sub (text, i - 1)))) andalso
               (i + n >= size text orelse not (identifier_char (String.sub (text, i + n))))
           in
-            search (i + 1) (if whole then count + 1 else count)
+            search (i + 1) (if whole then i :: acc else acc)
           end
       end
   in
-    if n = 0 then 0 else search 0 0
+    if n = 0 then [] else search 0 []
   end
 
-fun mentions_identifier text word = identifier_count text word > 0
+fun mentions_identifier text word = not (null (identifier_positions text word))
 
 (* The offset just past the first `Finalise NAME` at the start of a line
    (where HOL's lexer reads one) at or after START in BLANKED
@@ -3828,7 +3828,10 @@ fun suspending_helpers source_text =
     (fn body => mentions_at_identifier_start body "suspend" orelse mentions_at_identifier_start body "cheat")
     source_text
 
-val lookup_names = ["lookup_suspension", "lookup_resumption"]
+(* The markerLib calls that read a suspended theorem or resume one. *)
+val lookup_names =
+  ["lookup_suspension", "lookup_resumption", "resume", "prim_resume", "set_suspended_goal",
+   "prim_set_suspended_goal", "finalise_suspended_thm"]
 
 (* Whether TC's markerLib drops, when a theory is exported, the
    suspensions the theory itself finalised, which deferring a suspend
@@ -3849,11 +3852,11 @@ fun has_suspension_pruning (tc : HolbuildToolchain.t) =
    if the theorem has one block, every one of its `Resume` blocks names a
    label and lies between the theorem and its `Finalise`, none of the
    blocks mentions `cheat` or names `smlname`, and the source from the
-   theorem to its `Finalise` doesn't look up suspensions or resumptions,
-   itself or through a top-level helper (top_level_helpers), whose answers
-   would be the group's dummies, nor names the theorem outside those
-   blocks' headers and the `Finalise` (its value there is the stub, which
-   suspends the dummies).  A group's suspended goals are only known once
+   theorem to its `Finalise` doesn't call markerLib to read or resume a
+   suspension (lookup_names), itself or through a top-level helper
+   (top_level_helpers), which would see the group's dummies, nor names the
+   theorem outside its header, those blocks' headers and the `Finalise`
+   (its value there is the stub, which suspends the dummies).  A group's suspended goals are only known once
    it is proved, so outside the proofs of groups that span may not mention
    `suspend` or a helper that may suspend, nor hold a theorem the script
    resumes: a goal suspended there could be one of the group's, under the
@@ -3881,6 +3884,16 @@ fun proof_deferrals groups source_text
       top_level_helpers (fn body => List.exists (mentions_identifier body) lookup_names) source_text
     fun group (theorem as {theorem_start, name, ...}) =
       let
+        (* Whether the source from the theorem to STOP, its `Finalise`,
+           names it only in its header, in its `Resume` blocks' HEADERS and
+           in the `Finalise`. *)
+        fun named_in_headers_only headers stop =
+          case map (fn i => theorem_start + i)
+                   (identifier_positions (String.substring (blanked, theorem_start, stop - theorem_start)) name) of
+              [] => false
+            | _ :: rest =>
+                List.all (fn p => p = stop - size name orelse
+                                  List.exists (fn (a, z) => a <= p andalso p < z) headers) rest
         val resumes = List.filter (fn b => #kind b = "resume" andalso base (#name b) = name) blocks
         val all = theorem :: resumes
         val labels =
@@ -3902,7 +3915,7 @@ fun proof_deferrals groups source_text
                    List.all (fn b => Option.isSome (label (#name b)) andalso
                                      #theorem_start b > theorem_start andalso #theorem_start b < stop) resumes andalso
                    not (List.exists (mentions_identifier blanked_span) (lookup_names @ lookup_helpers)) andalso
-                   identifier_count blanked_span name = length resumes + 2
+                   named_in_headers_only (map (fn b => (#theorem_start b, #tactic_start b)) resumes) stop
                 then SOME {name = name, labels = labels, resumes = length resumes,
                            start = theorem_start, stop = stop}
                 else NONE
