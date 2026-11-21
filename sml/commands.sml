@@ -126,6 +126,11 @@ fun build_help () = print
   \      files in from one build to the next: the cache root's tool-cache/NAME\n\
   \      here; on a remote worker, one the remote cache fills and saves per\n\
   \      theory dependencies.\n\
+  \  --scratch-input FILE\n\
+  \      Give theory children HOLBUILD_SCRATCH_INPUT, the path of FILE (on a\n\
+  \      remote worker, a read-only copy), for data a tool reads that must not\n\
+  \      change what the build produces. No key covers it: outputs and\n\
+  \      checkpoints are cached as if it were absent, so they must not depend on it.\n\
   \  --remote-exec URL [--remote-only] [--priority N] [--speculative-loading[=N]]\n\
   \      [--detach | --attach BATCH-ID]\n\n\
   \With --remote-exec, theories the remote cache lacks and that aren't\n\
@@ -290,9 +295,9 @@ fun action_spec_help () = print
   \Plan TARGETs as build would and write the ActionSpec of every theory the\n\
   \remote cache can't satisfy to .holbuild/action-specs/SHA256, then print the\n\
   \action batch. With --upload, also upload the specs and their sources to the\n\
-  \remote cache. Takes build's cache and proof options and --tool-cache. Needs\n\
-  \--remote-cache. With --remote-only, an uncached HOL toolchain exits 75\n\
-  \instead of building locally.\n\n\
+  \remote cache. Takes build's cache and proof options, --tool-cache and\n\
+  \--scratch-input. Needs --remote-cache. With --remote-only, an uncached HOL\n\
+  \toolchain exits 75 instead of building locally.\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun exec_action_help () = print
@@ -2372,12 +2377,30 @@ fun split_tool_cache_flag args =
     loop [] args
   end
 
+(* Takes build's --scratch-input FILE out of its arguments and sets it up. *)
+fun split_scratch_input_flag args =
+  case args of
+      [] => []
+    | "--scratch-input" :: file :: rest =>
+        let val path = OS.FileSys.fullPath file
+                       handle OS.SysErr _ => raise Error ("--scratch-input: no file " ^ HolbuildHash.quote file)
+        in
+          if OS.FileSys.isDir path then
+            raise Error ("--scratch-input takes a file, not the directory " ^ HolbuildHash.quote file)
+          else
+            (HolbuildBuildExec.scratch_input_file := SOME path;
+             HolbuildBuildExec.scratch_input_path := SOME path;
+             split_scratch_input_flag rest)
+        end
+    | ["--scratch-input"] => raise Error "--scratch-input requires FILE"
+    | x :: rest => x :: split_scratch_input_flag rest
+
 fun action_spec_command tc cli_jobs args =
   let
     val upload = List.exists (fn arg => arg = "--upload") args
     val parsed as ({dry_run, watch, repl_on_failure, execution_plan, ...}, _) =
-      split_flags (split_tool_cache_flag
-        (List.filter (fn arg => arg <> "--upload" andalso arg <> "--remote-only") args))
+      split_flags (split_scratch_input_flag (split_tool_cache_flag
+        (List.filter (fn arg => arg <> "--upload" andalso arg <> "--remote-only") args)))
     val _ =
       if dry_run orelse watch orelse repl_on_failure orelse Option.isSome execution_plan then
         raise Error "action-spec does not run builds: remove --dry-run, --watch and --repl-on-failure"
@@ -2666,7 +2689,7 @@ fun build tc cli_jobs args =
     val (batch_priority, args) = split_build_priority args
     val priority = Option.getOpt (batch_priority, 0)
     val (speculative_loading, args) = split_speculative_loading args
-    val args = split_tool_cache_flag args
+    val args = split_scratch_input_flag (split_tool_cache_flag args)
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
     val parsed as ({dry_run, watch, repl_on_failure, trace_steps, execution_plan, ...}, _) = split_flags args
     val _ =

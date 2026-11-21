@@ -1345,6 +1345,19 @@ toolchain (see "Running one theory action as a remote worker"). The flag
 doesn't change a theory's cache key: a theory built or cached without it is
 reused as is.
 
+### Giving a tool a file it reads
+
+`holbuild build --scratch-input FILE` gives each theory's HOL processes the
+environment variable `HOLBUILD_SCRATCH_INPUT`, the path of FILE: locally FILE
+itself, on a remote worker a read-only copy fetched from the remote cache (see
+"Running one theory action as a remote worker"). It is a niche option for data
+a tool reads during a build that must not change what the build produces, such
+as the index a proof search consults to suggest tactics that the build then
+checks. No key covers it: not a theory's cache key nor any checkpoint's, so
+outputs and checkpoints built with one FILE, or none, are reused with another.
+A script whose outputs depend on what FILE holds builds wrongly cached
+theories; declare such a file as an extra input instead.
+
 ### The plan record
 
 Planning a build discovers every source, analyses its dependencies and
@@ -1896,6 +1909,15 @@ or a directory that breaks these limits, only warns: the action goes on
 without the tool cache. The newest publication replaces the
 entry, so a tool should write each file whole (to a temporary name, then
 renamed) and treat the directory as a cache it may find empty.
+
+A theory exported with `--scratch-input FILE` (see "Giving a tool a file it
+reads") names FILE by its SHA-256 in the spec's `option scratch-input` line,
+and the client uploads FILE with the spec's sources. Before HOL starts, the
+worker fetches it, through its host blob store like a source, to
+`.holbuild/scratch/<sha256>` under the action root, outside the directories the
+action may write, and gives the theory's HOL processes its path as
+`HOLBUILD_SCRATCH_INPUT`. A missing blob fails the action like a missing
+source.
 
 With `--ahead-parent INPUT_KEY:SPEC-SHA256`, given once per dependency that
 another worker is still building from that spec (a late parent), the worker

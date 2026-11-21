@@ -34,7 +34,7 @@ val build_cache_flags =
    "--emit-output-hashes", "--warn-unreachable", "--trknl"]
 val build_cache_valued =
   [("--proof-scope", Words ["root", "all"]), ("--tactic-timeout", Nothing), ("--checkpoint-seconds", Nothing),
-   ("--tool-cache", Nothing)]
+   ("--tool-cache", Nothing), ("--scratch-input", Nothing)]
 
 fun command name : command =
   case name of

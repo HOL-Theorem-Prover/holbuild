@@ -807,6 +807,16 @@ is letters, digits,
 and
 .BR \- .
 .TP
+.BI \-\-scratch\-input " FILE"
+Give each theory's HOL processes
+.BR HOLBUILD_SCRATCH_INPUT ,
+the path of
+.I FILE
+(on a remote worker, a read-only copy), for data a tool reads that must not
+change what the build produces.
+No key covers it: outputs and checkpoints are cached as if it were absent,
+so they must not depend on it.
+.TP
 .BI \-\-remote\-exec " URL"
 Build the theories the remote cache lacks, and that are not built here for
 their current inputs (except with
@@ -1000,6 +1010,11 @@ prints cache and pipeline trace lines.
 .B HOLBUILD_TOOL_CACHE_DIR
 Set by holbuild, with
 .BR \-\-tool\-cache ,
+for each theory's HOL processes.
+.TP
+.B HOLBUILD_SCRATCH_INPUT
+Set by holbuild, with
+.BR \-\-scratch\-input ,
 for each theory's HOL processes.
 .TP
 .BR HOLBUILD_RUN_ROOT ", " HOLBUILD_RUN_CONTEXT ", " HOLBUILD_RUN_CONTEXT_KEY ", " HOLBUILD_RUN_SOURCE ", " HOLBUILD_RUN_OUTPUT_DIR ", " HOLBUILD_RUN_SCRATCH
