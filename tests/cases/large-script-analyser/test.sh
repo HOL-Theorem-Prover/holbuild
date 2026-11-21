@@ -66,6 +66,9 @@ broken = ("open HolKernel Parse boolLib bossLib;\n\nval _ = new_theory \"Broken\
           theorems("later_", 2) + "val _ = export_theory ();\n")
 (tmp / "BrokenScript.sml").write_text(broken)
 
+def escape(field):
+    return "".join({"\\": "\\\\", " ": "\\s", "\n": "\\n", "\t": "\\t"}.get(c, c) for c in field)
+
 def unescape(field):
     out, i = [], 0
     while i < len(field):
@@ -81,8 +84,8 @@ def analyse(name, wants):
     request = tmp / f"{name}.request"
     response = tmp / f"{name}.response"
     source = tmp / f"{name.split('-')[0]}Script.sml"
-    request.write_text(f"version 1\ncommand analyse\nfile 1 {source} {' '.join(wants)}\nend\n")
-    proc = subprocess.Popen([analyser, "--minheap", "128", "--request", str(request),
+    request.write_text(f"version 1\ncommand analyse\nfile 1 {escape(str(source))} {' '.join(wants)}\nend\n")
+    proc = subprocess.Popen([analyser, "--minheap", "128", "--gcpercent", "30", "--request", str(request),
                              "--response", str(response)], stderr=subprocess.PIPE)
     stderr = proc.stderr.read().decode()
     _, status, usage = os.wait4(proc.pid, 0)

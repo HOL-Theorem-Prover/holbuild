@@ -20,6 +20,7 @@ while [ "$#" -gt 0 ]; do
     --request) request=$2; shift 2 ;;
     --response) response=$2; shift 2 ;;
     --minheap) minheap=$2; shift 2 ;;
+    --gcpercent) shift 2 ;;
     *) exit 79 ;;
   esac
 done

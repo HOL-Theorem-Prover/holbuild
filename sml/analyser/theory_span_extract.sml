@@ -132,8 +132,12 @@ datatype boundary_mode = KeepErrored | Strict | Recovering
 fun scan_spans source_path source {boundaries = mode, terminations = want_terminations} =
   let val errors = ref []
       val error_count = ref 0
-      fun record loc span msg = (errors := (loc, span, msg) :: !errors; error_count := !error_count + 1)
       fun error_text (loc, span, msg) = parse_error_text source_path source loc span msg
+      (* A parse error fails a strict request, so it stops the parse. *)
+      val fatal = mode = SOME Strict orelse (want_terminations andalso mode <> SOME Recovering)
+      fun record loc span msg =
+        if fatal then raise Error (error_text (loc, span, msg))
+        else (errors := (loc, span, msg) :: !errors; error_count := !error_count + 1)
       val result = HOLSourceParser.parseSML source_path (parser_reader source) record HOLSourceParser.initialScope
       fun boundary kind name theorem_start theorem_stop tactic_start tactic_end proof_attrs =
         {kind = kind, name = name, theorem_start = theorem_start, theorem_stop = theorem_stop,
@@ -162,7 +166,7 @@ fun scan_spans source_path source {boundaries = mode, terminations = want_termin
                       val {name, proof_attrs} = resume_label_and_attrs id_name attrs
                   in loop (boundary "resume" name resume_ stop s e proof_attrs :: bs) ts end
             | SOME (HOLSourceAST.HOLDefinition {definition_, id = (_, name), colon, quote, termination = SOME {termination_, tac}, stop, ...}) =>
-                if not want_terminations then loop bs ts
+                if not want_terminations orelse !error_count > 0 then loop bs ts
                 else
                   loop bs (termination_diagnostic source
                              {definition_ = definition_, name = name, colon = colon, quote = quote,
@@ -172,13 +176,9 @@ fun scan_spans source_path source {boundaries = mode, terminations = want_termin
       val (pending, terminations) = loop [] []
       val parse_errors = rev (!errors)
       val first_error = case parse_errors of [] => NONE | e :: _ => SOME (error_text e)
-      val _ = case (mode, first_error) of (SOME Strict, SOME text) => raise Error text | _ => ()
       val (terminations, termination_error) =
         case first_error of
-            SOME text =>
-              if not want_terminations then (terminations, NONE)
-              else if mode = SOME Recovering then ([], SOME text)
-              else raise Error text
+            SOME _ => ([], if want_terminations then first_error else NONE)
           | NONE => (terminations, NONE)
       val hashes = HolbuildHash.prefix_sha256s source (map #boundary pending)
       fun finish ({kind, name, theorem_start, theorem_stop, boundary, tactic_start, tactic_end, proof_attrs}, hash) =

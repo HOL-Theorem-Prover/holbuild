@@ -48,7 +48,14 @@ fun analyser_identity () =
    consumes its own options wherever they appear and leaves the rest. *)
 val analyser_min_heap_mb = 128
 
-fun analyser_min_heap_args () = ["--minheap", Int.toString analyser_min_heap_mb]
+(* The analyser allocates fast and keeps little: the dependency request on a
+   130 MB script holds under 300 MB live, yet at Poly's default GC target
+   the heap grew to 1.2-1.5 GB.  Allowing 30% of the time in GC kept it under
+   800 MB at the same run time.  The heap still grows as far as it must. *)
+val analyser_gc_percent = 30
+
+fun analyser_runtime_args () =
+  ["--minheap", Int.toString analyser_min_heap_mb, "--gcpercent", Int.toString analyser_gc_percent]
 
 fun has_suffix suffix s =
   let
@@ -372,7 +379,7 @@ fun run_analyser {analyser, request, capture_stderr} =
       "exec 2> " ^ HolbuildHash.quote (OS.Path.concat(dir, "stderr")) ^ "\n" ^
       String.concatWith " "
         (map HolbuildHash.quote
-           (analyser :: analyser_min_heap_args () @
+           (analyser :: analyser_runtime_args () @
             ["--request", OS.Path.concat(dir, "request"), "--response", OS.Path.concat(dir, "response")]))
     fun result dir before_events {status, output} =
       let

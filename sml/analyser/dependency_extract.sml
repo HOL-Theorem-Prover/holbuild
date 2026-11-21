@@ -287,13 +287,15 @@ fun header_libs text =
 
 fun extract path =
   let
-    val text = read_all path
-    val {loads, uses, extra_deps, extra_outputs} = scan_dependencies text
+    (* Holdep reads the file again itself: keep the text no longer than
+       the scans that need it. *)
+    val ({loads, uses, extra_deps, extra_outputs}, libs) =
+      let val text = read_all path in (scan_dependencies text, header_libs text) end
   in
     {loads = sort_unique loads, uses = sort_unique uses,
      extra_deps = sort_unique extra_deps,
      extra_outputs = sort_unique extra_outputs,
-     holdep_mentions = sort_unique (holdep_mentions path @ header_libs text)}
+     holdep_mentions = sort_unique (holdep_mentions path @ libs)}
   end
 
 end
