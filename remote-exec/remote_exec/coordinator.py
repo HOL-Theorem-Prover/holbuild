@@ -1349,16 +1349,15 @@ class Coordinator:
         woken: asyncio.Future[Wake] = loop.create_future()
 
         def undeferred(*, ahead_only: bool) -> list[str]:
-            """The tiers no better-ranked unwoken waiter takes, of those that may claim ahead if ``ahead_only``."""
+            """The tiers this claim doesn't leave to better-ranked unwoken waiters (see _defers), of those that may
+            claim ahead if ``ahead_only``."""
             # An ahead wake bypassed better-ranked waiters that can't claim ahead, so it lifts only the ahead deferral.
-            return tiers if woken.done() and (ahead_only or not woken.result()[1]) else [
-                tier for tier in tiers
-                if not any(
-                    tier in w_tiers and not w_woken.done() and w_rank < rank and (w_ahead or not ahead_only)
-                    and self._quarantine(w_rank[3]) is None
-                    for w_tiers, w_rank, w_woken, w_ahead in self.claim_waiters
-                )
-            ]
+            if woken.done() and (ahead_only or not woken.result()[1]):
+                return tiers
+            return [tier for tier in tiers if not self._defers(tier, rank, ahead_only=ahead_only)]
+
+        # Whether this claim slept out a wait without a wake: the claims waiting behind it may have deferred to it.
+        rechecked = False
 
         try:
             while True:
@@ -1406,6 +1405,8 @@ class Coordinator:
                     await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only, held_tiers)
                     if claim_tiers else (None, None)
                 )
+                if claimed is not None and rechecked and not woken.done():
+                    self._wake_behind(claim_tiers)
                 # Builds left for their holders still rank before claims ahead.
                 if claimed is None and ahead_tiers and held_until is None:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
@@ -1430,6 +1431,7 @@ class Coordinator:
                     finally:
                         with contextlib.suppress(ValueError):
                             self.claim_waiters.remove(waiter)
+                    rechecked = True
                 if disconnected is not None and await disconnected():
                     self._pass_wake(woken)
                     return None
@@ -2469,6 +2471,37 @@ class Coordinator:
         if waiter is not None:
             waiter[2].set_result((tier, ahead, batch_id, theory))
             self.claim_waiters.remove(waiter)
+
+    def _defers(self, tier: str, rank: ClaimRank, *, ahead_only: bool) -> bool:
+        """Whether a claim ranked ``rank`` leaves ``tier`` to the better-ranked unwoken waiters that take it (those
+        that may claim ahead if ``ahead_only``), so polling workers don't spread work onto tail hosts: once one waits,
+        unless, for builds, fewer wait than the last count found builds of the tier ready, as they can't take them
+        all and a deferred claim sleeps until its recheck."""
+        ready = self.ready_high if tier == "high" else self.ready_builds - self.ready_high
+        enough = 1 if ahead_only else max(1, ready)
+        better = 0
+        for w_tiers, w_rank, w_woken, w_ahead in self.claim_waiters:
+            if (
+                tier in w_tiers and not w_woken.done() and w_rank < rank and (w_ahead or not ahead_only)
+                and self._quarantine(w_rank[3]) is None
+            ):
+                better += 1
+                if better >= enough:
+                    return True
+        return False
+
+    def _wake_behind(self, tiers: list[str]) -> None:
+        """Wake the best-ranked claim waiting for a build the shared ranking of ``tiers`` still has, after a claim that
+        slept out its wait leased one: claims that deferred to it would otherwise sleep out theirs. It makes no new
+        work ready, so made_ready stays."""
+        ranking = self.rankings.get(tuple(tiers))
+        if ranking is None:
+            return
+        for *_, batch_id, tier, _ in ranking.heap:
+            if (batch_id, tier) not in ranking.exhausted:
+                self.made_ready -= 1  # _wake_claim counts it
+                self._wake_claim(tier)
+                return
 
     def _pass_wake(self, woken: asyncio.Future[Wake]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""

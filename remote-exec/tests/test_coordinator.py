@@ -1706,6 +1706,45 @@ async def test_rechecking_tail_host_defers_ready_work_to_a_better_waiter(
     assert claimed is not None and claimed.theory == "pkg:a"
 
 
+async def test_a_tail_host_claims_while_more_builds_are_ready_than_better_waiters(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    await submit(http, ["a", "b"])
+    await coordinator.queue()  # counts the ready builds
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
+    claimed = await coordinator.claim(["standard"], "tail", host_id="host-b")
+    assert claimed is not None and not wake.done()
+    await coordinator.queue()
+    # The better waiter can take the build left.
+    assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
+
+
+async def test_a_claim_that_slept_out_its_wait_wakes_the_claim_deferring_to_it_while_builds_remain(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 1.0)
+    loop = asyncio.get_running_loop()
+    first = asyncio.create_task(coordinator.claim(["standard"], "w1", 10, host_id="host-a"))
+    await asyncio.sleep(0.3)
+    second = asyncio.create_task(coordinator.claim(["standard"], "w2", 10, host_id="host-b"))
+    await asyncio.sleep(0.3)
+    # Made ready by another coordinator process: no wake here, and this one's count still finds nothing ready.
+    with monkeypatch.context() as patch:
+        patch.setattr(coordinator, "_wake_claim", lambda *args, **kwargs: None)
+        await submit(http, ["a", "b"])
+    started = loop.time()
+    try:
+        assert (await asyncio.wait_for(first, 5)) is not None
+        assert (await asyncio.wait_for(second, 5)) is not None
+        # It claimed with the first, not at its own recheck 0.3 s later.
+        assert loop.time() - started < 0.6
+    finally:
+        for task in (first, second):
+            task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+
+
 async def test_burst_can_claim_high_while_warm_waits_for_standard(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
