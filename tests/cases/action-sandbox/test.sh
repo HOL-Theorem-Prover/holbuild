@@ -182,4 +182,23 @@ if grep -E '^(HOL4_YICES_EXECUTABLE|REMOTE_EXEC_WORKER_TOKEN)=' "$tmpdir/action/
   exit 1
 fi
 
+# The scratch input reaches the action only as a file it can read but not
+# change.  As on a worker, the action reads the tree it writes.
+mkdir -p "$tmpdir/scratch"
+printf 'scratch data\n' > "$tmpdir/scratch/input"
+cp "$tmpdir/scratch/input" "$tmpdir/action/input"
+scratch_run() {
+  python3 -I "$ROOT/sml/action_sandbox.py" --write "$tmpdir/action" --read "$tmpdir/action" --read "$tmpdir/scratch" "${grants[@]}" \
+    -- env "HOLBUILD_SCRATCH_INPUT=$1" /bin/sh -c 'cat "$HOLBUILD_SCRATCH_INPUT" > "$1"' sh "$tmpdir/action/scratch-copy"
+}
+scratch_run "$tmpdir/scratch/input"
+cmp "$tmpdir/scratch/input" "$tmpdir/action/scratch-copy"
+for refused in "$tmpdir/action/input:inside a writable directory" "$tmpdir/home/bin/poly:outside the read grants" \
+               "$tmpdir/scratch:is not a regular file"; do
+  if scratch_run "${refused%%:*}" 2> "$tmpdir/scratch.err"; then
+    echo "the sandbox admitted the scratch input ${refused%%:*}" >&2; exit 1
+  fi
+  require_grep "scratch input ${refused#*:}" "$tmpdir/scratch.err"
+done
+
 python3 "$ROOT/tests/fixtures/action_sandbox_probe.py" "$ROOT/sml/action_sandbox.py"

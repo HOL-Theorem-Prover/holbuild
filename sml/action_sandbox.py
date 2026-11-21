@@ -800,6 +800,15 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
                 directory = Path(value).resolve(strict=True)
                 if not any(root == directory or root in directory.parents for root in policy.writable):
                     raise SandboxError(f"tool cache directory outside the action tree: {value}")
+            # The scratch input is a file the action may read but not change.
+            elif key == "HOLBUILD_SCRATCH_INPUT":
+                file = Path(value).resolve(strict=True)
+                if not file.is_file():
+                    raise SandboxError(f"scratch input is not a regular file: {value}")
+                if not any(root == file or root in file.parents for root in policy.readable):
+                    raise SandboxError(f"scratch input outside the read grants: {value}")
+                if any(root == file or root in file.parents for root in policy.writable + policy.scratch):
+                    raise SandboxError(f"scratch input inside a writable directory: {value}")
             elif not key.startswith("HOLBUILD_RUN_"):
                 raise SandboxError(f"unexpected action environment assignment: {key}")
             env[key] = value

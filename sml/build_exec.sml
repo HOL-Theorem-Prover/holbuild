@@ -1970,6 +1970,13 @@ fun exit_detail status log =
 val tool_cache_name : string option ref = ref NONE
 val tool_cache_dir : string option ref = ref NONE
 
+(* build --scratch-input FILE: a file theory children read through
+   HOLBUILD_SCRATCH_INPUT.  The client's FILE, which exported specs name by
+   its SHA-256, and the path children see (on a worker, its staged copy).
+   Nothing keys it: what it holds must not change what a build produces. *)
+val scratch_input_file : string option ref = ref NONE
+val scratch_input_path : string option ref = ref NONE
+
 (* A name safe as one path component: a tool cache's, or a file's in it. *)
 fun plain_file_name name =
   name <> "" andalso name <> "." andalso name <> ".." andalso
@@ -1983,13 +1990,13 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
     val _ = create_current_log_link log current_log
     val _ = last_child_status := NONE
     val _ = last_child_start := SOME (Time.toMilliseconds (Time.now ()))
-    val tool_cache_env =
-      case !tool_cache_dir of
-          SOME dir => ["env", "HOLBUILD_TOOL_CACHE_DIR=" ^ dir]
-        | NONE => []
+    val tool_env =
+      (case !tool_cache_dir of SOME dir => ["HOLBUILD_TOOL_CACHE_DIR=" ^ dir] | NONE => []) @
+      (case !scratch_input_path of SOME path => ["HOLBUILD_SCRATCH_INPUT=" ^ path] | NONE => [])
     val status =
       HolbuildToolchain.run_in_dir_to_file workdir
-        (tool_cache_env @ HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @
+        ((if null tool_env then [] else "env" :: tool_env) @
+         HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @
          hol_context_args context @ file_args)
         log
       handle HolbuildToolchain.Error msg =>
@@ -9171,10 +9178,12 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
       (if trace_steps policy then [bool_option "trace-steps" true] else []) @
       (if pipeline then [bool_option "pipeline" true] else []) @
       (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []) @
+      (case !scratch_input_file of SOME file => ["option scratch-input=" ^ hash_file file] | NONE => []) @
       ["action-text"]
   in
     {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
-     files = source :: map #from (#inputs action) @ library_files}
+     files = source :: map #from (#inputs action) @ library_files @
+             (case !scratch_input_file of SOME file => [file] | NONE => [])}
   end
 
 (* A theory waits for the nearest uncached theories it depends on, looking
@@ -10310,7 +10319,7 @@ type action_spec =
    proof_steps : bool, tactic_timeout : real option, new_ir : bool,
    theorem_checkpoints : bool, checkpoint_target : bool, skip_checkpoints : bool, checkpoint_seconds : real,
    force : bool, trace_steps : bool,
-   pipeline : bool, tool_cache : string option, action_text : string}
+   pipeline : bool, tool_cache : string option, scratch_input : string option, action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
 fun split_spec_text section text =
@@ -10472,6 +10481,7 @@ fun parse_action_spec text : action_spec =
               if plain_file_name name then SOME name
               else reject_spec ("malformed option tool-cache: " ^ HolbuildHash.quote name)
           | NONE => NONE),
+     scratch_input = Option.map #2 (List.find (fn (k, _) => k = "option scratch-input") (!values)),
      action_text = action_text}
   end
 
@@ -10536,6 +10546,8 @@ fun verify_action_spec (spec : action_spec) =
     (* File hashes name blobs in the cache, so they must not be paths. *)
     check (List.all (sha256_text o #sha256) (#source spec :: #inputs spec @ #libraries spec))
       "a file's SHA-256 is malformed";
+    check (case #scratch_input spec of SOME sha => sha256_text sha | NONE => true)
+      "the scratch input's SHA-256 is malformed";
     check (text_hash = #input_key spec) "the action text does not hash to input-key";
     check (#action_text_sha256 spec = text_hash) "action-text-sha256 does not match the action text";
     check (action_text_value spec "package" = #package spec) "the action text names another package";
@@ -14481,6 +14493,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               tool_cache_dir := SOME dir;
               SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
             end
+    (* Outside the writable directories, so the child only reads it. *)
+    fun stage_scratch_input (spec : action_spec) =
+      case #scratch_input spec of
+          NONE => ()
+        | SOME sha =>
+            let val path = FS.fullPath root ^ "/.holbuild/scratch/" ^ sha
+            in
+              fetch_spec_blob remote {hash = sha, dst = path};
+              scratch_input_path := SOME path
+            end
     val run_log = ref NONE
     fun build_log () =
       case !run_log of
@@ -14780,6 +14802,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                      handle e => (publishing_checkpoints := false; raise e))
                 | NONE => ()
             val tool_cache = case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec
+            val _ = if Option.isSome ahead then () else stage_scratch_input spec
             fun publish_tools () =
               if not (!HolbuildActionSandbox.outputs_validated) then () else
               case tool_cache of
@@ -14934,6 +14957,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             | NONE => raise Error ("no hash recorded for " ^ path)
         val source_text = read_text (in_root root (action_source_path package (#path (#source spec))))
         val tool_cache = setup_tool_cache spec
+        val _ = stage_scratch_input spec
         (* The stage's names don't depend on the deps context. *)
         val action = spec_theory_action root spec (cutoff_context spec NONE)
         val stage = action_stage root action
