@@ -5,7 +5,7 @@ source "$ROOT/tests/lib.sh"
 tmpdir=$(make_temp_dir)
 trap 'cleanup_temp_dir "$tmpdir"' EXIT
 mkdir -p "$tmpdir/home/bin" "$tmpdir/home/lib" "$tmpdir/action" "$tmpdir/checkpoints" "$tmpdir/toolchain" "$tmpdir/cache" "$tmpdir/store" "$tmpdir/out"
-touch "$tmpdir/home/bin/poly" "$tmpdir/home/lib/libpolyml.so"
+touch "$tmpdir/home/bin/poly" "$tmpdir/home/lib/libpolyml.so" "$tmpdir/store/a.pmo"
 cat > "$tmpdir/grants.sml" <<'SML'
 use "sml/holbuild-script.sml";
 val root = valOf (OS.Process.getEnv "HOLBUILD_SANDBOX_TEST_ROOT");
@@ -24,13 +24,19 @@ val _ = if contains home orelse contains (home ^ "/bin") then
           raise Fail "Poly executable path exposed its whole installation parent" else ();
 val _ = if contains (home ^ "/bin/poly") andalso contains (home ^ "/lib") then ()
         else raise Fail "Poly executable or shared library was not granted";
-(* The host's theory-module store: every child reads it, none writes it;
-   the worker's module writer writes only its own output directory and,
-   running once the action's checkpoints are removed, reads none. *)
+(* The host's theory-module store: theory children read the modules they
+   are given, never the store itself, and none writes it; the worker's
+   module writer writes only its own output directory and, running once
+   the action's checkpoints are removed, reads none. *)
 fun writes ("--write" :: path :: rest) = path :: writes rest
   | writes (_ :: rest) = writes rest
   | writes [] = [];
-val _ = HolbuildActionSandbox.shared_reads := [root ^ "/store"];
+val _ = if contains (root ^ "/store") then raise Fail "a confined command reads the module store" else ();
+val _ = HolbuildActionSandbox.module_reads := (fn () => [root ^ "/store/a.pmo"]);
+val _ = if List.exists (fn path => path = root ^ "/store/a.pmo")
+                       (reads (HolbuildActionSandbox.grant_options
+                                 {writable = [root ^ "/action"], readable = [], toolchain = false}))
+        then raise Fail "a command other than a theory child reads a module" else ();
 fun launched () =
   HolbuildActionSandbox.grant_options
     (HolbuildActionSandbox.action_grants (root ^ "/action", root ^ "/checkpoints"));
@@ -41,12 +47,13 @@ val _ = OS.FileSys.mkDir (root ^ "/checkpoints");
 fun has path paths = List.exists (fn p => p = path) paths;
 val _ = if writes action = [root ^ "/action", root ^ "/checkpoints"] then ()
         else raise Fail "an action writes more than its roots";
-val _ = if has (root ^ "/store") (reads action) then ()
-        else raise Fail "an action cannot read the module store";
+val _ = if has (root ^ "/store/a.pmo") (reads action) andalso not (has (root ^ "/store") (reads action)) then ()
+        else raise Fail "an action reads the module store, or not its module";
 val _ = if writes writer = [root ^ "/out"] then ()
         else raise Fail "the module writer writes more than its output directory";
-val _ = if List.all (fn p => has p (reads writer)) [root ^ "/action", root ^ "/store"] then ()
-        else raise Fail "the module writer cannot read the action root or the store";
+val _ = if List.all (fn p => has p (reads writer)) [root ^ "/action", root ^ "/store/a.pmo"] andalso
+           not (has (root ^ "/store") (reads writer)) then ()
+        else raise Fail "the module writer reads the store, or not the action root or its module";
 val _ = if has (root ^ "/checkpoints") (reads writer) then
           raise Fail "the module writer reads the action's checkpoints" else ();
 val _ = if writes (launched ()) = writes action then ()
@@ -92,6 +99,40 @@ val _ = if String.isSubstring "contains protected worker state" reason then ()
 SML
 (cd "$ROOT" && env -u HOLBUILD_ACTION_READ_DIRS HOLBUILD_CACHE="$tmpdir/cache" \
   HOLBUILD_SANDBOX_TEST_ROOT="$tmpdir" "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/many-grants.sml")
+
+# A confined theory child reads the modules it is given and nothing else
+# of the module stores: it can't list them, nor open another module even
+# by its exact name, nor write there through /tmp scratch when the cache
+# is under /tmp.
+cat > "$tmpdir/module-grants.sml" <<'SML'
+use "sml/holbuild-script.sml";
+val root = valOf (OS.Process.getEnv "HOLBUILD_SANDBOX_TEST_ROOT");
+val action = root ^ "/modules/action";
+val checkpoints = root ^ "/modules/checkpoints";
+val stores = root ^ "/cache/theory-modules";
+val store = stores ^ "/store";
+fun write path text = let val out = TextIO.openOut path in TextIO.output (out, text); TextIO.closeOut out end;
+val _ = List.app HolbuildToolchain.ensure_dir [action ^ "/.holbuild/stage", checkpoints, store];
+val _ = List.app (fn name => write (store ^ "/" ^ name) "module\n") ["0a-ownTheory-1.pmo", "0a-otherTheory-2.pmo"];
+val _ = HolbuildActionSandbox.enable (action, checkpoints);
+val _ = HolbuildActionSandbox.action_write_dirs := SOME [action ^ "/.holbuild/stage"];
+val _ = HolbuildActionSandbox.toolchain_root := root ^ "/toolchain";
+val _ = HolbuildActionSandbox.poly_executable := root ^ "/home/bin/poly";
+val _ = HolbuildActionSandbox.module_reads := (fn () => [store ^ "/0a-ownTheory-1.pmo"]);
+val report = action ^ "/.holbuild/stage/report";
+val probe =
+  "{ cat \"$1/0a-ownTheory-1.pmo\" && echo own; cat \"$1/0a-otherTheory-2.pmo\" || echo other-denied; " ^
+  "ls \"$1\" || echo store-denied; ls \"$2\" || echo stores-denied; " ^
+  "echo module > \"$1/planted.pmo\" || echo write-denied; } > \"$3\" 2>/dev/null";
+val _ = HolbuildToolchain.run_in_dir_to_file action ["/bin/sh", "-c", probe, "sh", store, stores, report]
+          (root ^ "/modules/log");
+val got = let val input = TextIO.openIn report in TextIO.inputAll input before TextIO.closeIn input end;
+val want = "module\nown\nother-denied\nstore-denied\nstores-denied\nwrite-denied\n";
+val _ = if got = want then () else raise Fail ("the module grants leaked or failed:\n" ^ got);
+val _ = if OS.FileSys.access (store ^ "/planted.pmo", []) then raise Fail "a theory child wrote the module store" else ();
+SML
+(cd "$ROOT" && env -u HOLBUILD_ACTION_READ_DIRS HOLBUILD_CACHE="$tmpdir/cache" \
+  HOLBUILD_SANDBOX_TEST_ROOT="$tmpdir" "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/module-grants.sml")
 
 # The worker's venv must stay outside every grant, including scratch.
 python3 -m venv --without-pip "$tmpdir/worker-venv"

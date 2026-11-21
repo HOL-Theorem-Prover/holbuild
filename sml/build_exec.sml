@@ -4041,6 +4041,11 @@ fun saved_parent path = PolyML.SaveState.showParent path handle _ => NONE
    files (module_store_unsupported, module_store_base_theories). *)
 fun heap_module_name file = plain_file_name file andalso String.isSuffix ".pmo" file
 
+(* Whether PATH is a regular module file directly in STORE. *)
+fun store_module_file store path =
+  Path.dir path = store andalso heap_module_name (Path.file path) andalso
+  (Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false)
+
 (* Each module with the id the heap requires of it. *)
 fun saved_module_ids path =
   case show_module_dependencies of
@@ -12819,11 +12824,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* The child wrote the heap's module table, so it may name any file the
        worker can read: a heap naming one that isn't a module of this
        toolchain's store isn't published. *)
-    fun store_module path =
-      Path.dir path = module_store andalso heap_module_name (Path.file path) andalso
-      (Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false)
     fun modules_ok () =
-      case List.find (not o store_module) (saved_modules deps_loaded) of
+      case List.find (not o store_module_file module_store) (saved_modules deps_loaded) of
           NONE => true
         | SOME path =>
             (warn ("not publishing the shared deps-loaded heap: it loads " ^ path ^
@@ -13916,7 +13918,11 @@ fun fetch_heap_modules remote tc wanted =
    many modules were stored by the writer, of how many missing, and how
    many entries were looked up in the remote cache, and how many modules
    were fetched and published. *)
-fun write_missing_modules remote root tc {deps, loads} deadline =
+(* The modules a child loading LOADS and the theories DEPS may use, as
+   `<theory>-<.dat SHA-1>.pmo` names, each with its theory's base path,
+   parents first; and the store's base theories, once a writer recorded
+   them. *)
+fun expected_modules root tc {deps, loads} =
   let
     val store = module_store (#holdir tc)
     val base_theories_file = Path.concat (store, module_store_base_theories)
@@ -13929,9 +13935,10 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
       in SOME (Path.concat (Path.dir (FS.realPath uo), name ^ "Theory"))
       end
       handle OS.SysErr _ => NONE
+    (* A late parent loading ahead waits for has no .dat yet. *)
     fun base name =
       case List.find (fn (n, _) => n = name) project of
-          SOME (_, stem) => SOME stem
+          SOME (_, stem) => if file_exists (stem ^ ".dat") then SOME stem else NONE
         | NONE => toolchain_base name
     (* The base state's theories have no modules, so they count as seen. *)
     val base_theories =
@@ -13964,6 +13971,55 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
     val expected =
       ListPair.mapEq (fn ((name, b), sha1) => (name ^ "-" ^ sha1 ^ ".pmo", b ^ ".dat"))
         (theories, hol_files_sha1 (map (fn (_, b) => b ^ ".dat") theories))
+  in
+    {expected = expected, theories = theories, base_theories = base_theories}
+  end
+
+(* The modules STORE holds of the EXPECTED names (expected_modules). *)
+fun stored_modules store expected =
+  let
+    val wanted = Binaryset.addList (Binaryset.empty String.compare, expected)
+    fun is_wanted path =
+      case module_file_theory_part (Path.file path) of
+          SOME part => Binaryset.member (wanted, part) andalso store_module_file store path
+        | NONE => false
+  in
+    List.filter is_wanted (HolbuildCache.children store)
+  end
+
+(* For HolbuildActionSandbox.module_reads: what the sandboxed theory
+   children of SPEC may read of their toolchain's store, the modules of the
+   theories they load and those their deps heap DEPS_LOADED, if any, was
+   saved with; found at the first launch, after the hydrate and restore.
+   Modules are optional, so on a failure the children load every theory
+   from its .dat file. *)
+fun theory_module_grants root tc (spec : action_spec) deps_loaded =
+  let
+    val store = module_store (#holdir tc)
+    fun find () =
+      let
+        val heap =
+          case deps_loaded of
+              SOME path =>
+                if file_exists path then List.filter (store_module_file store) (saved_modules path) else []
+            | NONE => []
+        val {expected, ...} = expected_modules root tc {deps = #deps spec, loads = #loads spec}
+      in
+        stored_modules store (map #1 expected) @ heap
+      end
+      handle e => (warn ("theory modules not granted: " ^ General.exnMessage e); [])
+    val found = ref NONE
+  in
+    fn () =>
+      case !found of
+          SOME paths => paths
+        | NONE => let val paths = find () in found := SOME paths; paths end
+  end
+
+fun write_missing_modules remote root tc wanted deadline =
+  let
+    val store = module_store (#holdir tc)
+    val {expected, theories, base_theories} = expected_modules root tc wanted
     fun missing_modules () =
       let
         val stored =
@@ -14027,6 +14083,7 @@ fun write_missing_modules remote root tc {deps, loads} deadline =
           (* Whether the sandbox validated what the child left, which it
              does also for a child it killed or that failed: only then
              are the child's modules stored. *)
+          val _ = HolbuildActionSandbox.module_reads := (fn () => stored_modules store expected_names)
           val validated =
             (HolbuildActionSandbox.with_output_dirs [output] (fn () =>
                ignore (HolbuildToolchain.run_in_dir_to_file_by root
@@ -14325,7 +14382,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
     val root = Path.concat(cache, "action")
     val checkpoint_root = Path.concat(cache, "checkpoints")
     val _ = HolbuildActionSandbox.enable (root, checkpoint_root)
-    val _ = HolbuildActionSandbox.shared_reads := [module_stores ()]
+    val _ = HolbuildActionSandbox.module_reads := (fn () => [])
     val _ = HolbuildActionSandbox.result_file :=
               (* Not normalized: the sandbox resolves ".." after links as open does. *)
               Option.map (fn file => if Path.isAbsolute file then file else FS.getDir () ^ "/" ^ file) result_file
@@ -14630,6 +14687,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
           else write_modules := fill_module_store remote root tc {deps = #deps spec, loads = #loads spec}
         val action =
           spec_theory_action root spec (cutoff_context spec cutoff)
+        val _ =
+          HolbuildActionSandbox.module_reads :=
+            theory_module_grants root tc spec
+              (SOME (deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)))
         (* A local entry that didn't restore must not stand in for this
            build's when the publication is checked, and, as in a local
            build, its theory's checkpoints may hold parents other than
@@ -14893,6 +14954,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
              Path.file (#source_file action), "holbuild-export-theory.sml"]
         val outcome : exn option option ref = ref NONE
         val started = Time.now ()
+        (* Before the late parents arrive; the action's later children
+           look again (build). *)
+        val _ = HolbuildActionSandbox.module_reads := theory_module_grants root tc spec NONE
         val _ =
           Thread.fork
             (fn () =>

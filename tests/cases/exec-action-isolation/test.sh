@@ -29,6 +29,7 @@ for dir in actions blobs locks cooperate; do
 done
 printf 'user = "sentinel:credential"\n' > "$tmpdir/cache.curl"
 chmod 600 "$tmpdir/cache.curl"
+planted_module=0a-plantedTheory-0123456789abcdef0123456789abcdef01234567.pmo
 cat > "$tmpdir/project/src/IsolatedScript.sml" <<SML
 Theory Isolated
 Ancestors bool
@@ -59,6 +60,14 @@ val _ = Posix.IO.setlkw (lock, Posix.IO.FLock.flock {ltype = Posix.IO.F_WRLCK, w
                                                      start = 0, len = 0, pid = NONE});
 val _ = Posix.IO.close lock;
 val _ = refuses "symlink output" (fn () => Posix.FileSys.symlink {old = "$tmpdir/cache.curl", new = "stolen"});
+(* The worker's theory module stores: an action reads only the modules of
+   its own theories, by name, and lists no store. *)
+val _ = refuses "theory module stores listing"
+          (fn () => OS.FileSys.closeDir (OS.FileSys.openDir "$tmpdir/worker/theory-modules"));
+val _ = List.app (fn store =>
+  (refuses "theory module store listing" (fn () => OS.FileSys.closeDir (OS.FileSys.openDir store));
+   refuses "unrelated theory module read" (fn () => read (store ^ "/$planted_module") ())))
+  (String.tokens (fn c => c = #":") (getOpt (OS.Process.getEnv "HOLBUILD_RUN_PROBE_STORES", "")));
 val _ = if OS.Process.isSuccess (OS.Process.system "/bin/sh -c 'exit 0'") then () else raise Fail "child failed";
 val timer = Timer.startRealTimer ();
 val timeout = OS.Process.system "/usr/bin/timeout 0.1 /bin/sleep 2";
@@ -200,10 +209,19 @@ if grep -q '^log=' "$tmpdir/rejected-output.result" || grep -q 'forged unvalidat
   echo 'failed confinement inspected or published child-written diagnostics' >&2
   exit 1
 fi
+# A module of another build in each of the worker's stores, and one in a
+# store of another toolchain.
+mkdir -p "$tmpdir/worker/theory-modules/other"
+stores=
+for store in "$tmpdir"/worker/theory-modules/*/; do
+  store=${store%/}
+  echo module > "$store/$planted_module"
+  stores=$stores${stores:+:}$store
+done
 # A trusted parent process starts with sentinel credentials in its original
 # environment, so /proc/PID/environ tests the actual leak rather than setenv.
 (cd "$tmpdir" && env REMOTE_EXEC_WORKER_TOKEN=worker-sentinel HOLBUILD_REMOTE_CACHE_CURL_CONFIG=cache.curl \
-  HOLBUILD_COOPERATE_DIR= \
+  HOLBUILD_COOPERATE_DIR= HOLBUILD_RUN_PROBE_STORES="$stores" \
   bash -c 'export HOLBUILD_RUN_PROBE_PID=$$; "$@"' worker \
   env HOLBUILD_CACHE="$tmpdir/worker" "$HOLBUILD_BIN" --max-heap 1024 --remote-cache "$remote_url" \
   exec-action "$spec" --cache-limit-gb 1000 --result "$tmpdir/result") > "$tmpdir/worker.log" 2>&1 ||
