@@ -53,14 +53,14 @@ fun checkpoint name =
   in BE.write_text (dir ^ "/" ^ name ^ ".ready") "ready"; wait () end;
 val _ = checkpoint "publish";
 val _ = BE.publish_shared_checkpoints cache ctx
-  {heap = SOME heap, files = [], stale = [], missing = if failing then [bad] else []};
+  {heap = SOME heap, files = [], stale = [], missing = if failing then [bad] else [], poisoned = NONE};
 (* An edit can request the next action immediately after publication. Do
    this before repeat publication or repair, with no local files or store. *)
 fun restore_latest () =
   let
     val _ = BE.remove_tree tree
     val _ = BE.remove_tree store
-    val restored = BE.restore_shared_checkpoints (RC.remote url) ctx true (fn _ => ())
+    val restored = BE.restore_shared_checkpoints (RC.remote url) ctx true (fn _ => [])
     val latest = if failing then 11 else count - 1
   in
     assert "restored latest complete candidate"
@@ -71,7 +71,7 @@ val _ = restore_latest ();
 val _ = checkpoint "published";
 (* Existing manifests skip all uploads. *)
 val _ = if failing then () else BE.publish_shared_checkpoints cache ctx
-  {heap = SOME heap, files = [], stale = [], missing = []};
+  {heap = SOME heap, files = [], stale = [], missing = [], poisoned = NONE};
 val _ = checkpoint "repeated";
 val _ = if failing then () else
   let
@@ -83,7 +83,7 @@ val _ = if failing then () else
     val _ = BE.remove_file (dir ^ "/remote/ac/" ^ RC.remote_action_key key)
     val fresh = RC.remote url
     val _ = RC.remember_blob fresh {sha256 = heap, size = Position.toString (OS.FileSys.fileSize deps)}
-    val _ = BE.publish_shared_checkpoints fresh ctx {heap = SOME heap, files = [], stale = [], missing = []}
+    val _ = BE.publish_shared_checkpoints fresh ctx {heap = SOME heap, files = [], stale = [], missing = [], poisoned = NONE}
   in assert "un-restored manifests must not hide a missing blob" (BE.file_exists (dir ^ "/remote/cas/" ^ sha)) end;
 val _ = checkpoint "repaired";
 val _ = restore_latest ();

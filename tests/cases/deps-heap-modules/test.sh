@@ -207,7 +207,7 @@ rm -rf "$checkpoints"
 find "$module_cache" -name '*-A-*.pmo' -delete
 edit_b three
 build "$tmpdir/store.log"
-require_grep "the host store's deps heap needs a missing theory module: .*-A-.*\.pmo" "$tmpdir/store.log"
+require_grep "the host store's deps heap needs a missing or changed theory module: .*-A-.*\.pmo" "$tmpdir/store.log"
 if grep -q 'discarding invalid checkpoint' "$tmpdir/store.log"; then
   echo 'the store heap was loaded without its module' >&2; cat "$tmpdir/store.log" >&2; exit 1
 fi
@@ -375,7 +375,16 @@ cp "$tmpdir/A.pmo" "$modules"
 # heap is published all the same.
 echo 503 > "$tmpdir/control/cas-head-status-$module_sha"
 c_requests=$(wc -l < "$server_log")
+# The entries of the heaps' publish claims.
+claims() { grep -lx 'holbuild-shared-heap-claim-v1' "$tmpdir"/remote/ac/* | sort || true; }
+claims_before=$(claims)
 exec_theory C c
+c_claim=$(comm -13 <(echo "$claims_before") <(claims))
+[[ -n "$c_claim" && $(wc -l <<< "$c_claim") == 1 ]] || { echo "C's publish made claims: $c_claim" >&2; exit 1; }
+c_heap_entry=$(grep -lx "blob=$module_sha module ${modules##*/}" $(grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote/ac/*) |
+  { grep -vx "$heap_entry" || true; })
+[[ -n "$c_heap_entry" && $(wc -l <<< "$c_heap_entry") == 1 ]] ||
+  { echo "C's heap entries naming A's module: $c_heap_entry" >&2; exit 1; }
 rm "$tmpdir/control/cas-head-status-$module_sha"
 publish_requests=$(tail -n +"$((c_requests + 1))" "$server_log")
 grep -qx "HEAD /cas/$module_sha" <<< "$publish_requests" ||
@@ -416,6 +425,7 @@ BASE_STATE=$HOLDIR/bin/hol.state
 A_STEM=$project/.holbuild/obj/src/ATheory BASE_STATE=$BASE_STATE MODULE=$modules \
   MODULE_HELPER=$HOLDIR/tools-poly/poly/theory_modules.ML \
   "$HOLDIR/bin/hol" run --noconfig --holstate "$BASE_STATE" "$tmpdir/alternate-module.sml"
+cp "$modules" "$tmpdir/alternate-A.pmo"
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 edit_c same-theory
 exec_theory C same-theory
@@ -449,31 +459,173 @@ resumed c-healed-C 'theorem-context checkpoint after c_first'
 # still reject the restored checkpoint and rebuild successfully.
 spec_c=$(awk '$1 == "action" && $5 == "deps-modules:CTheory" { print $4 }' "$tmpdir/c.batch")
 spec_file=$project/.holbuild/action-specs/$spec_c
-tool_key=$(printf 'holbuild-tool-cache-v1\nname=post-restore\ndeps_key=%s\ntoolchain=%s' \
-  "$(sed -n 's/^deps-key=//p' "$spec_file")" "$(sed -n 's/^toolchain=//p' "$spec_file")" | sha256sum | cut -d' ' -f1)
+# c_tool_entry NAME: the cache entry C's run reads for tool cache NAME.
+c_tool_entry() {
+  local key
+  key=$(printf 'holbuild-tool-cache-v1\nname=%s\ndeps_key=%s\ntoolchain=%s' "$1" \
+    "$(sed -n 's/^deps-key=//p' "$spec_file")" "$(sed -n 's/^toolchain=//p' "$spec_file")" | sha256sum | cut -d' ' -f1)
+  printf 'holbuild-remote-ac-v1\n%s\n' "$key" | sha256sum | cut -d' ' -f1
+}
 control=$tmpdir/control
-printf 'holbuild-remote-ac-v1\n%s\n' "$tool_key" | sha256sum | cut -d' ' -f1 > "$control/action-get-key"
-touch "$control/action-get-enable"
+# start_paused ENTRY THEORY NAME...: exec_theory THEORY NAME... in the
+# background, paused at its first read of the cache entry ENTRY until
+# release_paused.
+start_paused() {
+  echo "$1" > "$control/action-get-key"
+  rm -f "$control/action-get-count"
+  touch "$control/action-get-enable"
+  shift
+  exec_theory "$@" &
+  worker_pid=$!
+  for _ in {1..3000}; do
+    [[ -s "$control/action-get-count" ]] && break
+    kill -0 "$worker_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  [[ -s "$control/action-get-count" ]] || { echo "$2-$1 did not reach the paused read" >&2; exit 1; }
+}
+release_paused() {
+  touch "$control/action-get-release"
+  wait "$worker_pid"
+  worker_pid=
+  rm "$control/action-get-enable" "$control/action-get-key" "$control/action-get-release"
+}
 edit_c post-restore
-exec_theory C post-restore shared post-restore &
-worker_pid=$!
-for _ in {1..3000}; do
-  [[ -s "$control/action-get-count" ]] && break
-  kill -0 "$worker_pid" 2>/dev/null || break
-  sleep 0.01
-done
-[[ -s "$control/action-get-count" ]] || { echo 'C did not reach the tool cache lookup' >&2; exit 1; }
+start_paused "$(c_tool_entry post-restore)" C post-restore shared post-restore
 cp "$tmpdir/Z.pmo" "$tmpdir/replacement.pmo"
 mv "$tmpdir/replacement.pmo" "$modules"
-touch "$control/action-get-release"
-wait "$worker_pid"
-worker_pid=
-rm "$control/action-get-enable" "$control/action-get-key" "$control/action-get-release"
+release_paused
 require_grep 'restored shared theorem_context checkpoint' "$tmpdir/post-restore-C.log"
 require_grep 'Required module missing or changed' "$tmpdir/post-restore-C.log"
 phase post-restore-C 'rstmodrejn:1'
 phase post-restore-C 'rstdropn:1'
 require_grep '^status=built$' "$tmpdir/post-restore-C.result"
+
+# A poisoned heap entry: C's, rewritten to name the other-ID copy of A's
+# module, as by a publish that hashed the store while another restore
+# replaced the module there.  Every host loading it rejected the heap.
+alternate_sha=$(sha256sum "$tmpdir/alternate-A.pmo" | cut -d' ' -f1)
+cp "$tmpdir/alternate-A.pmo" "$tmpdir/remote/cas/$alternate_sha"
+cp "$c_heap_entry" "$tmpdir/C-heap.entry"
+poisoned=$(sed '1,/^manifest-text-v1$/d' "$tmpdir/C-heap.entry" | sed "s/$module_sha/$alternate_sha/")$'\n'
+{
+  printf 'holbuild-remote-cache-action-v2\nmanifest-sha256 %s\nmanifest-size %s\n' \
+    "$(printf '%s' "$poisoned" | sha256sum | cut -d' ' -f1)" "${#poisoned}"
+  awk -v old="$module_sha" -v new="$alternate_sha" -v size="$(stat -c %s "$tmpdir/alternate-A.pmo")" \
+    '$1 == "blob" { if ($2 == old) print "blob", new, size; else print }' "$tmpdir/C-heap.entry"
+  printf 'manifest-text-v1\n%s' "$poisoned"
+} > "$tmpdir/C-poisoned.entry"
+# poisoned_once NAME: C's run NAME gave the poisoned heap up before HOL
+# loaded it, built, and replaced the entry.
+poisoned_once() {
+  phase "$1" 'rstmoddropn:1'
+  require_grep "the shared deps-loaded heap's entry names a theory module of another id: .*-A-.*\.pmo" "$tmpdir/$1.log"
+  if grep -qE '^phase-ms=(.*,)?(rstdropn|rstmodrejn):' "$tmpdir/$1.result"; then
+    echo "$1 loaded the poisoned heap" >&2; cat "$tmpdir/$1.result" >&2; exit 1
+  fi
+  require_grep '^status=built$' "$tmpdir/$1.result"
+  if cmp -s "$tmpdir/C-poisoned.entry" "$c_heap_entry"; then
+    echo "$1 left the poisoned entry" >&2; exit 1
+  fi
+}
+# Cold: W lacks A's module, and the copy it fetches has another ID than C's
+# heap requires.  A second cache node of its own holds the same entries
+# (not their blobs): the replacements must reach it too.
+cp "$tmpdir/C-poisoned.entry" "$c_heap_entry"
+mkdir -p "$tmpdir/replica/ac"
+cp "$tmpdir"/remote/ac/* "$tmpdir/replica/ac/"
+start_remote_cache_server "$tmpdir/replica" "$tmpdir/replica-server"
+server_pids+=("$server_pid")
+replica_url=$remote_url
+remote_url=$primary_url,$replica_url
+rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
+edit_c cold-poisoned
+exec_theory C cold-poisoned
+poisoned_once cold-poisoned-C
+# Its checkpoints replace those chained to the poisoned heap, so the next
+# edit resumes from them.
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_c cold-repaired
+exec_theory C cold-repaired
+resumed cold-repaired-C 'theorem-context checkpoint after c_first'
+if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/cold-repaired-C.result"; then
+  echo "cold-repaired-C found a checkpoint entry on the replaced heap" >&2; cat "$tmpdir/cold-repaired-C.result" >&2; exit 1
+fi
+for entry in "$tmpdir"/replica/ac/*; do
+  primary_entry=$tmpdir/remote/ac/${entry##*/}
+  [[ -f "$primary_entry" ]] && grep -qxE 'holbuild-shared-(heap|checkpoint)-v1' "$entry" || continue
+  cmp -s "$entry" "$primary_entry" ||
+    { echo "the cache nodes hold different shared entries ${entry##*/}" >&2; exit 1; }
+done
+# Back to one node, holding what either was given.
+remote_url=$primary_url
+cp -n "$tmpdir"/replica/ac/* "$tmpdir/remote/ac/"
+[[ ! -d "$tmpdir/replica/cas" ]] || cp -n "$tmpdir"/replica/cas/* "$tmpdir/remote/cas/"
+
+# C's run gives the poisoned heap up again, and A's module is replaced by
+# the other-ID copy while its publish reads the claim on C's heap: it
+# publishes no heap, and the entry stays as it was.
+cp "$tmpdir/C-poisoned.entry" "$c_heap_entry"
+rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
+mkdir -p "$(dirname "$modules")"
+cp "$tmpdir/A.pmo" "$modules"
+edit_c publish-swap
+start_paused "${c_claim##*/}" C publish-swap
+cp "$tmpdir/alternate-A.pmo" "$tmpdir/replacement.pmo"
+mv "$tmpdir/replacement.pmo" "$modules"
+release_paused
+phase publish-swap-C 'rstmoddropn:1'
+require_grep '^status=built$' "$tmpdir/publish-swap-C.result"
+require_grep "not publishing the shared deps-loaded heap: its theory module .*-A-.*\.pmo was replaced by one of another id" \
+  "$tmpdir/publish-swap-C.log"
+cmp "$tmpdir/C-poisoned.entry" "$c_heap_entry"
+
+# Warm: W already holds the copy the entry names, so it fetches nothing,
+# but gives the heap up all the same.  C's own heap loads that copy.
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_c warm-poisoned
+warm_requests=$(wc -l < "$server_log")
+exec_theory C warm-poisoned
+poisoned_once warm-poisoned-C
+if tail -n +"$((warm_requests + 1))" "$server_log" | grep -qx "GET /cas/$alternate_sha"; then
+  echo "warm-poisoned-C fetched the module it held" >&2; exit 1
+fi
+grep -qx "blob=$alternate_sha module ${modules##*/}" "$c_heap_entry" ||
+  { echo "C's new heap doesn't load the copy of A's module W holds" >&2; exit 1; }
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_c warm-repaired
+exec_theory C warm-repaired
+resumed warm-repaired-C 'theorem-context checkpoint after c_first'
+if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/warm-repaired-C.result"; then
+  echo "warm-repaired-C found a checkpoint entry on the replaced heap" >&2; cat "$tmpdir/warm-repaired-C.result" >&2; exit 1
+fi
+
+# Two valid heaps need different copies of A's module: C's the other-ID
+# one, B's the first.  A restore of B's heap on the same host installs B's
+# copy after C's restore checked its own and before C's HOL opens it: C's
+# HOL rejects the heap once and C rebuilds, leaving its entry as it was,
+# and each resumes on its next edit.  (One worker cache runs one action at
+# a time; on a fleet host, workers share the module store.)
+cp "$c_heap_entry" "$tmpdir/C-alternate.entry"
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_c overlap
+start_paused "$(c_tool_entry overlap)" C overlap shared overlap
+cp "$tmpdir/A.pmo" "$tmpdir/replacement.pmo"
+mv "$tmpdir/replacement.pmo" "$modules"
+release_paused
+phase overlap-C 'rstmodrejn:1'
+if grep -qE '^phase-ms=(.*,)?rstmoddropn:' "$tmpdir/overlap-C.result"; then
+  echo 'overlap-C gave the heap up' >&2; cat "$tmpdir/overlap-C.result" >&2; exit 1
+fi
+require_grep '^status=built$' "$tmpdir/overlap-C.result"
+cmp "$tmpdir/C-alternate.entry" "$c_heap_entry"
+for theory in C B; do
+  rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+  "edit_${theory,,}" after-overlap
+  exec_theory "$theory" "${theory,,}-after-overlap"
+  phase "${theory,,}-after-overlap-$theory" 'rstmodn:1'
+  resumed "${theory,,}-after-overlap-$theory"
+done
 
 # A proof-only change to A (here, a source line moved) changes ATheory.dat
 # but not B's dependencies' key, so B's shared heap still loads A's old
