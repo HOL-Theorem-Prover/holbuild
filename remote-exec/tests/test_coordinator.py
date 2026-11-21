@@ -1415,8 +1415,10 @@ async def test_tail_hosts_empty_once_demand_falls_after_a_peak_ran_every_theory_
 async def test_a_partly_drained_host_loses_work_to_a_full_one_and_empties(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Scale-in stopped the idle workers of host-0, the first in canonical order, and left two running; host-1 kept
-    all four. A stream of work that host-1 alone can run then goes to host-1, so host-0 empties and can scale in."""
+    """Scale-in stopped the idle workers of burst host-0, the first in canonical order, and left two running; burst
+    host-1 kept all four. A stream of work that host-1 alone can run then goes to host-1, so host-0 empties and can
+    scale in."""
+    burst = ["high", "standard"]
     monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only wakes end the waits in time
     workers = {"host-0": 2, "host-1": 4}
     running: deque[tuple[str, str, Claim]] = deque()  # host, action name and claim of each lease, oldest first
@@ -1428,21 +1430,21 @@ async def test_a_partly_drained_host_loses_work_to_a_full_one_and_empties(
             leases = sum(h == host for h, _, _ in running)
             coordinator.report_host(HostReport(host, 50.0, 64 << 30, 40 << 30, 52 << 30, 6 << 30, leases, False, 1))
             for slot in range(count):
-                coordinator.report_worker(host, f"{host}-{slot}", ["standard"])
+                coordinator.report_worker(host, f"{host}-{slot}", burst)
 
     async def submit_action(name: str) -> None:
         text = f"holbuild-action-batch-v1\naction {input_key(name)} {ac_key(name)} {spec(name)} pkg:{name}\n"
         assert (await http.post("/v1/batches", content=text, headers=CLIENT)).status_code == 201
 
     async def free_slot(host: str) -> None:
-        claim = await coordinator.claim(["standard"], host, 30, host_id=host, host_rank=1)
+        claim = await coordinator.claim(burst, host, 30, host_id=host, host_rank=1)
         assert claim is not None
         await claimed.put((host, claim))
 
     report()
     for host in ["host-0", "host-1", "host-0", "host-1"]:
         await submit_action(name := f"start-{len(running)}")
-        claim = await coordinator.claim(["standard"], host, host_id=host, host_rank=1)
+        claim = await coordinator.claim(burst, host, host_id=host, host_rank=1)
         assert claim is not None
         running.append((host, name, claim))
     for host in ["host-1", "host-1"]:  # host-1's idle workers wait for work
@@ -1768,34 +1770,33 @@ async def test_a_tail_host_claims_while_more_builds_are_ready_than_better_waiter
     coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
     claimed = await coordinator.claim(["standard"], "tail", host_id="host-b")
     assert claimed is not None and not wake.done()
-    await coordinator.queue()
-    # The better waiter can take the build left.
+    # The better waiter can take the build left, though no count ran since.
     assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
 
 
-async def test_a_claim_that_slept_out_its_wait_wakes_the_claim_deferring_to_it_while_builds_remain(
+async def test_each_claim_that_leases_a_build_wakes_the_next_claim_deferring_while_builds_remain(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 1.0)
     loop = asyncio.get_running_loop()
-    first = asyncio.create_task(coordinator.claim(["standard"], "w1", 10, host_id="host-a"))
-    await asyncio.sleep(0.3)
-    second = asyncio.create_task(coordinator.claim(["standard"], "w2", 10, host_id="host-b"))
-    await asyncio.sleep(0.3)
+    claims = []
+    for host in ["host-a", "host-b", "host-c"]:
+        claims.append(asyncio.create_task(coordinator.claim(["standard"], host, 10, host_id=host)))
+        await asyncio.sleep(0.3)
     # Made ready by another coordinator process: no wake here, and this one's count still finds nothing ready.
     with monkeypatch.context() as patch:
         patch.setattr(coordinator, "_wake_claim", lambda *args, **kwargs: None)
-        await submit(http, ["a", "b"])
+        await submit(http, ["a", "b", "c"])
     started = loop.time()
     try:
-        assert (await asyncio.wait_for(first, 5)) is not None
-        assert (await asyncio.wait_for(second, 5)) is not None
-        # It claimed with the first, not at its own recheck 0.3 s later.
-        assert loop.time() - started < 0.6
+        for claim in claims:
+            assert (await asyncio.wait_for(claim, 5)) is not None
+        # host-a claimed at its recheck, then host-b and host-c in turn, not at their own rechecks 0.4 and 0.7 s on.
+        assert loop.time() - started < 0.4
     finally:
-        for task in (first, second):
-            task.cancel()
-        await asyncio.gather(first, second, return_exceptions=True)
+        for claim in claims:
+            claim.cancel()
+        await asyncio.gather(*claims, return_exceptions=True)
 
 
 async def test_burst_can_claim_high_while_warm_waits_for_standard(

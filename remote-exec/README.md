@@ -506,9 +506,14 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   `also_claim` tiers, in order.
   Within each coordinator process, waiting claims prefer standard-primary
   workers for standard work, then hosts in ascending `--host-rank`, then
-  host-id order, with FIFO ties. Claims without a host report follow known hosts of the same
-  primary tier. Polling claims defer each tier to better-ranked waiters;
-  a waiting standard-only worker still leaves high work available to burst
+  burst hosts with more live workers, then host-id order, with FIFO ties,
+  so a burst host that scale-in partly drained loses work to full ones and
+  empties. Claims without a host report follow known hosts of the same
+  primary tier. Polling claims defer each tier to better-ranked waiters
+  while those are at least as many as its builds ready; a claim that
+  leases a build wakes the next waiting claim while builds may remain, so
+  claims that deferred don't sleep out their recheck. A waiting
+  standard-only worker still leaves high work available to burst
   workers. This packs work so excess tail hosts can drain for scale-in.
   Each process also remembers, per host, its last 2048 keys, the theories
   its actions ran and their dependency contexts (the `deps-key` its workers

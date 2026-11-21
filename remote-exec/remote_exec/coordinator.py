@@ -954,6 +954,7 @@ class _Claimed:
     max_heap_mb: int | None
     # The hold the claim took for the build, by its (batch, tier), put back if its lease fails.
     hold: "tuple[tuple[UUID, str], Hold] | None" = None
+    tier: str = ""  # a build's, claimed from a shared ranking
 
 
 # Lock a built action :key of batch :batch_id and its children, in key order, returning nothing. A build's result holds
@@ -1025,13 +1026,13 @@ COUNT_ACTIVE = sa.text(
 
 class ClaimRank(NamedTuple):
     """How a waiting claim ranks for wakes and deferral, least first: standard work packs onto warm workers first,
-    then reported hosts of lower rank, then fuller hosts, so a partly drained host loses work to full ones and
+    then reported hosts of lower rank, then fuller burst hosts, so a partly drained one loses work to full ones and
     empties, then hosts in a stable order."""
 
     burst: bool  # the claim takes high work first
     unhosted: bool
     host_rank: int
-    emptier: int  # the host's live workers, negated
+    emptier: int  # a burst host's live workers, negated
     host_id: str
 
 
@@ -1048,7 +1049,8 @@ RankEntry = tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None
 
 def _claim_rank(tiers: list[str], host_id: str | None, host_rank: int = 0, workers: int = 0) -> ClaimRank:
     """The rank of a claim of ``tiers`` from ``host_id`` of ``host_rank``, which runs ``workers`` live workers."""
-    return ClaimRank(tiers[0] != "standard", host_id is None, host_rank, -workers, host_id or "")
+    burst = tiers[0] != "standard"
+    return ClaimRank(burst, host_id is None, host_rank, -workers if burst else 0, host_id or "")
 
 
 class Coordinator:
@@ -1081,6 +1083,8 @@ class Coordinator:
         # within a host); see claim.
         self.made_ready = 0
         self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[Wake], bool]] = []
+        # The wakes of the waiting claims that deferred a tier to better-ranked waiters (see _leased_build).
+        self.deferring: set[asyncio.Future[Wake]] = set()
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
@@ -1356,7 +1360,7 @@ class Coordinator:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait_s
-        rank = _claim_rank(tiers, host_id, host_rank, len(self.host_workers.get(host_id or "", ())))
+        rank = self._waiter_rank(tiers, host_id, host_rank)
         # Done once a wake was handed to this claim.
         woken: asyncio.Future[Wake] = loop.create_future()
 
@@ -1367,9 +1371,6 @@ class Coordinator:
             if woken.done() and (ahead_only or not woken.result()[1]):
                 return tiers
             return [tier for tier in tiers if not self._defers(tier, rank, ahead_only=ahead_only)]
-
-        # Whether this claim slept out a wait without a wake: the claims waiting behind it may have deferred to it.
-        rechecked = False
 
         try:
             while True:
@@ -1397,6 +1398,7 @@ class Coordinator:
                     continue
                 # Work made claimable during the attempt is retried at once, for workers that can take it.
                 seen = (self.made_ready, self.ahead_changes if ahead else 0)
+                rank = self._waiter_rank(tiers, host_id, host_rank)  # as the host's workers are now
                 eligible_tiers = undeferred(ahead_only=False)
                 # A better-ranked waiter that can't claim ahead leaves the actions claimed ahead to this one.
                 ahead_tiers = undeferred(ahead_only=True) if ahead else []
@@ -1417,8 +1419,6 @@ class Coordinator:
                     await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only, held_tiers)
                     if claim_tiers else (None, None)
                 )
-                if claimed is not None and rechecked and not woken.done():
-                    self._wake_behind(claim_tiers)
                 # Builds left for their holders still rank before claims ahead.
                 if claimed is None and ahead_tiers and held_until is None:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
@@ -1433,6 +1433,8 @@ class Coordinator:
                 if (self.made_ready, self.ahead_changes if ahead else 0) == seen:
                     waiter = (tiers, rank, woken, ahead)
                     self.claim_waiters.append(waiter)
+                    if len(eligible_tiers) < len(tiers):
+                        self.deferring.add(woken)
                     try:
                         with contextlib.suppress(TimeoutError):
                             # A build left for its holder may be claimed once its hold ends.
@@ -1441,9 +1443,9 @@ class Coordinator:
                                 wait = min(wait, max(0.0, held_until - loop.time()))
                             await asyncio.wait_for(asyncio.shield(woken), wait)
                     finally:
+                        self.deferring.discard(woken)
                         with contextlib.suppress(ValueError):
                             self.claim_waiters.remove(waiter)
-                    rechecked = True
                 if disconnected is not None and await disconnected():
                     self._pass_wake(woken)
                     return None
@@ -1535,6 +1537,7 @@ class Coordinator:
                 raise
             if row is not None:
                 self._batch_changed(row.batch_id)
+                self._leased_build(ranking, row.tier)
                 return claimed, None
             if held_until is not None:
                 return None, held_until
@@ -2025,7 +2028,8 @@ class Coordinator:
                 if host_id is not None:
                     self._count_claim(row.theory, tier, host_id, kept)
                 taken = None if hold is None else ((batch_id, tier), hold)
-                return _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb, taken), None, None
+                claimed = _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb, taken, tier)
+                return claimed, None, None
             if passed is not None and (count := self.passed_over.get(passed)) is not None:
                 if count > 1:
                     self.passed_over[passed] = count - 1
@@ -2320,11 +2324,11 @@ class Coordinator:
 
     def _kept_hosts(self, ready: int = 0, tier: str = "standard") -> set[str]:
         """The hosts below the scale-in line for work of ``tier``: in the order claims pack onto them (warm hosts,
-        then by rank, fullest first, and id), the hosts not quarantined whose workers seen lately could run the live leases and the
-        ready builds (the last count's, or ``ready`` if more), and at least the warm workers. High work, which only
-        burst workers take, has a line of its own counting only burst workers: their leases and the ready high
-        builds. A host short of memory counts only the workers it runs or that wait for a claim, as the others wait
-        for memory. A host above the line is to empty, so locality never sends it work."""
+        then by rank, fullest burst hosts first, and id), the hosts not quarantined whose workers seen lately could
+        run the live leases and the ready builds (the last count's, or ``ready`` if more), and at least the warm
+        workers. High work, which only burst workers take, has a line of its own counting only burst workers: their
+        leases and the ready high builds. A host short of memory counts only the workers it runs or that wait for a
+        claim, as the others wait for memory. A host above the line is to empty, so locality never sends it work."""
         now = self.clock()
         high = tier == "high"
         leases = Counter(host for host, _, tiers in self.lease_hosts.values() if not high or "high" in tiers)
@@ -2347,7 +2351,8 @@ class Coordinator:
             busy = leases[host_id] + waiting[host_id]
             short = report is not None and bool(report[1].memory_short)
             slots = max(reported, busy, 1) if short else max(len(fresh), reported, busy, 1)
-            hosts.append(((all(fresh), rank, -len(fresh), host_id), slots))
+            # Fuller burst hosts first, so a partly drained one lies beyond the line and empties.
+            hosts.append(((all(fresh), rank, -len(fresh) if all(fresh) else 0, host_id), slots))
         if high:
             budget = sum(leases[host_id] for (*_, host_id), _ in hosts) + max(ready, self.ready_high)
         else:
@@ -2502,18 +2507,29 @@ class Coordinator:
                     return True
         return False
 
-    def _wake_behind(self, tiers: list[str]) -> None:
-        """Wake the best-ranked claim waiting for a build the shared ranking of ``tiers`` still has, after a claim that
-        slept out its wait leased one: claims that deferred to it would otherwise sleep out theirs. It makes no new
-        work ready, so made_ready stays."""
-        ranking = self.rankings.get(tuple(tiers))
-        if ranking is None:
+    def _waiter_rank(self, tiers: list[str], host_id: str | None, host_rank: int) -> ClaimRank:
+        """The rank of a claim of ``tiers`` from ``host_id`` as its host's workers are now; see _claim_rank."""
+        return _claim_rank(tiers, host_id, host_rank, len(self.host_workers.get(host_id or "", ())))
+
+    def _leased_build(self, ranking: "_Ranking", tier: str) -> None:
+        """Count a build of ``tier`` this process leased from ``ranking`` off the last count's ready builds, so claims
+        stop passing better-ranked waiters (see _defers) once those can take the rest; and while ``ranking`` may still
+        have builds of ``tier`` not held for a host and a claim waiting for one deferred to better-ranked ones, wake
+        the best-ranked claim waiting for one, which passes the wake on as it leases: the claims that deferred would
+        otherwise sleep out their recheck (a held build waits for its hold's end, which wakes one). That wake makes no
+        new work ready, so made_ready stays."""
+        self.ready_builds = max(0, self.ready_builds - 1)
+        if tier == "high":
+            self.ready_high = max(0, self.ready_high - 1)
+        if not any(tier in w_tiers and w_woken in self.deferring for w_tiers, _, w_woken, _ in self.claim_waiters):
             return
-        for *_, batch_id, tier, _ in ranking.heap:
-            if (batch_id, tier) not in ranking.exhausted:
-                self.made_ready -= 1  # _wake_claim counts it
-                self._wake_claim(tier)
-                return
+        now = asyncio.get_running_loop().time()
+        if any(
+            t == tier and (batch_id, t) not in ranking.exhausted and self.holds.get((batch_id, t), (0, now))[1] <= now
+            for *_, batch_id, t, _ in ranking.heap
+        ):
+            self.made_ready -= 1  # _wake_claim counts it
+            self._wake_claim(tier)
 
     def _pass_wake(self, woken: asyncio.Future[Wake]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""
