@@ -435,7 +435,11 @@ fi
 exec "$(command -v zstd)" "\$@"
 SH
 chmod +x "$zstd_shim/zstd"
-PATH="$zstd_shim:$PATH" worker c "$spec_c"
+if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
+  PATH="$zstd_shim:$PATH" worker c "$spec_c"
+else
+  worker c "$spec_c"
+fi
 expect c 0 "status=built"
 cmp "$tmpdir/dep.dat" "$tmpdir/worker-c/blobs/$dep_dat"
 if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
