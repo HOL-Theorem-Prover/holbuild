@@ -13005,14 +13005,18 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* While HEAP is the published heap, an entry chained to another, as
        one published before the heap entry was replaced, is never
        restored.  A run on a heap replaced since leaves the entries alone. *)
-    fun probe heap current (c, key, absent) =
+    fun current heap =
+      case HolbuildRemoteCache.get_action remote heap_key of
+          SOME text => on_heap heap text
+        | NONE => false
+    fun probe heap (c, key, absent) =
       (* Presence alone must not mark an un-restored entry's blobs as known:
          its /ac/ entry can outlive those blobs. *)
       absent := (member key stale andalso replace key orelse
                  (case HolbuildRemoteCache.fetch_action remote key of
                       NONE => true
                     | SOME action =>
-                        (current andalso not (on_heap heap (#manifest action)) orelse
+                        (not (on_heap heap (#manifest action)) andalso current heap orelse
                          #kind c = "failed_prefix" andalso replaces_restored (#path c)) andalso replace key))
       handle e => warning c e
     fun prepare on_base (c : shared_candidate, key, absent) =
@@ -13067,11 +13071,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             else (Redblackset.add (seen, key), item :: kept))
           (Redblackset.empty String.compare, []) eligible
         val probes = rev unique
-        val current =
-          case HolbuildRemoteCache.get_action remote heap_key of
-              SOME text => on_heap heap text
-            | NONE => false
-        val _ = parallel_all remote_probe_width (probe heap current) probes
+        val _ = parallel_all remote_probe_width (probe heap) probes
         val _ = prehash (List.concat (map (fn (c : shared_candidate, _, absent) =>
                                               if not (!absent) then []
                                               else #path c :: getOpt (ancestors false (#path c), []))
