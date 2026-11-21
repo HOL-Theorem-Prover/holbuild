@@ -190,8 +190,25 @@ fun static_error_source_line source_path source_text block =
       SOME line => SOME line
     | NONE => source_line_from_loc_marker source_text block
 
+(* The first line of what a fleet worker appends to a theory's log after
+   the child's output: why its pipelined attempt was given up, or why the
+   action failed. *)
+fun worker_report line =
+  String.isPrefix "holbuild: pipeline: building plain:" line orelse
+  String.isPrefix "holbuild: exec-action failed:" line
+
+(* The child's own output in a log's LINES: those before a worker's first
+   report, which can quote an earlier run's errors. *)
+fun child_output lines =
+  let
+    fun take [] acc = rev acc
+      | take (line :: rest) acc = if worker_report line then rev acc else take rest (line :: acc)
+  in
+    take lines []
+  end
+
 fun static_error_summary source_path source_text lines =
-  case find_static_error_block lines of
+  case find_static_error_block (child_output lines) of
       NONE => NONE
     | SOME block =>
         let
@@ -543,13 +560,6 @@ fun take_n n lines acc =
     case lines of
         [] => rev acc
       | line :: rest => take_n (n - 1) rest (line :: acc)
-
-(* The first line of what a fleet worker appends to a theory's log after
-   the child's output: why its pipelined attempt was given up, or why the
-   action failed. *)
-fun worker_report line =
-  String.isPrefix "holbuild: pipeline: building plain:" line orelse
-  String.isPrefix "holbuild: exec-action failed:" line
 
 fun child_failure_excerpt lines =
   let
