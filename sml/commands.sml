@@ -1971,14 +1971,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    to start: none of it reads what they write. *)
                 val _ = record_pending () handle e => (ignore (stop_all ()); #stop early_pool (); #stop failure_spans (); raise e)
                 val logs = ref []
-                (* Each action's last log on the stream. *)
+                (* Each action's last log on the stream before it was
+                   cancelled: an earlier attempt's, if any. *)
                 val seen = ref []
                 (* Whether a worker found a theory not to fit its parents in
                    the remote cache, rather than missing from it. *)
                 val misfit = ref false
                 fun on_change (key, state, failure, log, detail) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
-                   seen := (key, log) :: List.filter (fn (k, _) => k <> key) (!seen);
+                   if state = "cancelled" then () else seen := (key, log) :: List.filter (fn (k, _) => k <> key) (!seen);
                    if state = "done" then
                      (HolbuildBuildExec.expect_remote_entry key; add key; logs := (key, log) :: !logs)
                    else ();
@@ -2077,10 +2078,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                batch keeps none. *)
             val resubmitted_logs = ref []
             (* The batch the last resubmission came from, with each action's
-               last log its events showed.  A theory its worker finished
-               after the batch failed is left cancelled there, and its log
-               only arrives after the batch's events (late_logs): a log they
-               didn't show. *)
+               last log its events showed before the action was cancelled.  A
+               theory its worker finished after the batch failed is left
+               cancelled there, and its log arrives on the cancelled action,
+               often only after the batch's events (late_logs): a log other
+               than an earlier attempt's. *)
             val resubmitted_from = ref NONE
             fun carried_logs () =
               case !resubmitted_from of

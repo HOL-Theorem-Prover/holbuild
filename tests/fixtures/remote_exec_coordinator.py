@@ -33,7 +33,9 @@ worker uploaded, and the batch cancelled; holding `unlogged`, before that log ar
 holding a failure kind, after an earlier attempt failed with it (`deadline-retried`: stopped
 by the batch deadline on a second attempt).  `cancel-done` reports an action that finished in a
 failed batch as cancelled with an earlier attempt's failure and log, as when its second attempt's
-result came after the batch failed; a later read of the ended batch gets the new log.  STATE/<id>.events, when it exists, is batch
+result came after the batch failed; a later read of the ended batch gets the new log.  Holding
+`streamed`, it streams the new log on the cancelled action, as when the result came before the
+stream's last read.  STATE/<id>.events, when it exists, is batch
 <id>'s recorded event stream: it is sent as it is, without running RUN.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", and on a second line the others it found missing,
@@ -249,7 +251,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write((json.dumps(dict(event, log_sha256="0" * 64)) + "\n").encode())
                     if not (state / "requeue-snapshot").exists():
                         self.wfile.write((json.dumps(dict(event, state="waiting", log_sha256=None)) + "\n").encode())
-                self.wfile.write((json.dumps(dict(event, log_sha256="c" * 64) if late else event) + "\n").encode())
+                if late and (state / "cancel-done").read_text().strip() != "streamed":
+                    event_sent = dict(event, log_sha256="c" * 64)
+                else:
+                    event_sent = event
+                self.wfile.write((json.dumps(event_sent) + "\n").encode())
                 self.wfile.flush()
                 for _ in range(600):
                     if not (state / "hold").exists():

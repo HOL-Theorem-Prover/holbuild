@@ -2171,6 +2171,17 @@ rm "$state/cancel-done"
 require_grep "remote rxresubmitlogs:ATheory: cancelled" "$tmpdir/resubmit-logs-cancelled.log"
 require_grep "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubmit-logs-cancelled.log"
 require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
+# Or its result came before the failed batch's stream ended, which shows it
+# cancelled with its new log.
+write_theories resubmit-logs-streamed
+rm -rf "$project/.holbuild/logs/current"
+b_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:BTheory" { print $2 }')
+echo "rxresubmitlogs:BTheory theory $b_key" > "$state/fail-missing"
+echo streamed > "$state/cancel-done"
+run resubmit-logs-streamed 0 build --remote-exec "$coordinator" --remote-only BTheory
+rm "$state/cancel-done"
+require_grep "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubmit-logs-streamed.log"
+require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
 
 # A theory that fails in the resubmitted batch keeps no log from the first:
 # on the second submission, A's worker fails it.
