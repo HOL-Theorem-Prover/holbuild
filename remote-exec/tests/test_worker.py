@@ -901,6 +901,36 @@ def test_worker_passes_an_ahead_claims_late_parents_to_exec_action(
     ]
 
 
+@pytest.mark.parametrize("ahead", [True, False])
+def test_worker_limits_only_an_ahead_claims_wait_for_its_parents(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], ahead: bool
+) -> None:
+    release_tarball(tmp_path / "holbuild-1.2.3.tar.gz", "1.2.3")
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+
+    run_one(
+        Coordinator(server.url, "w"),
+        worker_args(tmp_path, server, "--ahead-wait-seconds", "180"),
+        releases(tmp_path, server),
+        Protection(None, None),
+        {**claim(), "ahead_parents": AHEAD_PARENTS[:1] if ahead else []},
+        Phases(),
+    )
+
+    assert server.completed == [RECORD]
+    args = logs[1].read_text().split()
+    if ahead:
+        assert args[-4:] == ["--ahead-parent", f"{'7' * 64}:{'8' * 64}", "--ahead-wait-seconds", "180"]
+    else:
+        assert "--ahead-wait-seconds" not in args
+
+
+@pytest.mark.parametrize("seconds", ["0", "-5", "1.5"])
+def test_ahead_wait_seconds_must_be_a_positive_whole_number(tmp_path: Path, server: Server, seconds: str) -> None:
+    with pytest.raises(SystemExit):
+        worker_args(tmp_path, server, "--ahead-wait-seconds", seconds)
+
+
 @pytest.mark.parametrize(("version", "passed"), [("0.14.74", False), ("0.14.75", True)])
 def test_worker_asks_a_release_that_can_to_build_a_pipelined_claim_pipelined(
     tmp_path: Path, server: Server, logs: tuple[Path, Path], version: str, passed: bool

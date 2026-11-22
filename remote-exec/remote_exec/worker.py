@@ -1047,6 +1047,8 @@ def exec_action_command(
         command.append("--pipeline")
     for parent in ahead_parents:
         command += ["--ahead-parent", f"{parent['input_key']}:{parent['spec_sha256']}"]
+    if ahead_parents and args.ahead_wait_seconds is not None:
+        command += ["--ahead-wait-seconds", str(args.ahead_wait_seconds)]
     return command
 
 
@@ -1489,6 +1491,13 @@ def host_rank(text: str) -> int:
     return rank
 
 
+def ahead_wait_seconds(text: str) -> int:
+    seconds = int(text)
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError(f"{text} must be a positive whole number of seconds")
+    return seconds
+
+
 def drain_seconds(text: str) -> float:
     seconds = float(text)
     if not math.isfinite(seconds) or seconds < 0:
@@ -1533,6 +1542,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="also claim theories of batches that load ahead while their parents still build, and wait for them; "
         "for burst workers, so the warm pool stays free for ready work",
+    )
+    parser.add_argument(
+        "--ahead-wait-seconds", type=ahead_wait_seconds,
+        help="holbuild exec-action --ahead-wait-seconds for claims ahead: how long, from the action's start, it may "
+        "load and wait for its parents before giving up (default: exec-action's)",
     )
     parser.add_argument(
         "--holbuild-releases-dir",

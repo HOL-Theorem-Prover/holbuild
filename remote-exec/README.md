@@ -649,7 +649,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   and sends them back to waiting without counting the claim, to be claimed
   ahead again once their unfinished parents run again. A lease that expires
   while its action waits ahead sends it back to waiting without counting the
-  claim too, but it is then claimed only once its parents are done. Batches without the
+  claim too, but it is then claimed only once its parents are done. A worker started with
+  `--ahead-wait-seconds N` gives each action it claims ahead N seconds from its start to load and
+  wait for its parents (`exec-action --ahead-wait-seconds`; 4 h by default); past that it fails as
+  `ahead-abandoned`, which frees the key for another batch's copy and builds the action plainly once
+  its parents are done. Batches without the
   parameter are never claimed ahead. An action runs the `exec-action` of the
   holbuild release that exported it, and only 0.14.36 and later serve claims
   more than one generation ahead: raise `REMOTE_EXEC_AHEAD_DEPTH` above 1 only
