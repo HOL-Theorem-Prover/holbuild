@@ -438,8 +438,9 @@ for key in "$key_B" "$key_G" "$key_J"; do
 done
 
 # The heap is shared at the first wait step that has to wait, and only there:
-# Z waits for X, then for Y, which arrives only after Z waits for it.
-worker_start share "$spec_Z" --ahead-parent "$key_X:$spec_X" --ahead-parent "$key_Y:$spec_Y"
+# Z waits for X, then for Y, which arrives only after Z waits for it.  Only
+# an action sharing heaps saves one, so only it shares.
+worker_start share "$spec_Z" --share-heaps --ahead-parent "$key_X:$spec_X" --ahead-parent "$key_Y:$spec_Y"
 await_marker share waiting-XTheory
 worker share-x "$spec_X"
 expect share-x 0 "status=built"

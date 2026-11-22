@@ -52,7 +52,7 @@ MIN_FREE_FLOOR_RELEASE = (0, 14, 57)  # the first whose exec-action takes --cach
 MIN_SWEEP_ONLY_RELEASE = (0, 14, 60)  # the first whose exec-action takes --sweep-only
 MIN_PIPELINE_RELEASE = (0, 14, 75)  # the first whose exec-action takes --pipeline
 MIN_SHARE_DEPS_HEAP_RELEASE = (0, 14, 99)  # the first whose exec-action takes --share-deps-heap
-CACHE_MIN_FREE_GB = 16  # the free space the cache cap keeps on the cache's disk for writers it doesn't count
+CACHE_MIN_FREE_GB = 16  # --cache-min-free-gb's default: the free space the cache cap keeps on the cache's disk for writers it doesn't count
 
 
 @functools.cache
@@ -794,14 +794,14 @@ def remove_children(directory: str) -> None:
         remove_entry(entry)
 
 
-def sweep_cache(releases: Releases, cache_limit_gb: int) -> None:
+def sweep_cache(releases: Releases, cache_limit_gb: int, cache_min_free_gb: int = CACHE_MIN_FREE_GB) -> None:
     """Evict from the cache root as exec-action does before an action, down to its cap and the free-space floor,
     with the newest release this host has that can do it without an action; none, and nothing is evicted."""
     if (release := releases.newest(MIN_SWEEP_ONLY_RELEASE)) is None:
         return
     version, holbuild = release
     command = [holbuild, "exec-action", "--sweep-only", "--cache-limit-gb", str(cache_limit_gb),
-               "--cache-min-free-gb", str(CACHE_MIN_FREE_GB)]
+               "--cache-min-free-gb", str(cache_min_free_gb)]
     process = subprocess.Popen(command, env=exec_action_env(version=version), stdout=2, start_new_session=True)
     try:
         # A drain stops the sweep: the worker is idle, so it stops at once.
@@ -1110,7 +1110,7 @@ def exec_action_command(
         command += ["--cooperate-dir", args.cooperate_dir]
     command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb)]
     if tuple(map(int, version.split("."))) >= MIN_FREE_FLOOR_RELEASE:
-        command += ["--cache-min-free-gb", str(CACHE_MIN_FREE_GB)]
+        command += ["--cache-min-free-gb", str(args.cache_min_free_gb)]
     command += ["--result", result]
     if args.share_heaps:
         command.append("--share-heaps")
@@ -1611,6 +1611,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="comma-separated remote cache URLs passed to holbuild (or HOLBUILD_REMOTE_CACHE_URL)",
     )
     parser.add_argument("--cache-limit-gb", required=True, type=int, help="holbuild exec-action --cache-limit-gb")
+    parser.add_argument(
+        "--cache-min-free-gb", type=int, default=CACHE_MIN_FREE_GB,
+        help=f"holbuild exec-action --cache-min-free-gb, for actions and idle sweeps (default {CACHE_MIN_FREE_GB})",
+    )
     parser.add_argument("--tier", choices=("standard", "high"), default="standard")
     parser.add_argument(
         "--also-claim",
@@ -1768,7 +1772,7 @@ def main() -> None:
             with open(config, "x", opener=lambda path, flags: os.open(path, flags, 0o600)) as out:
                 out.write('header = "' + header + '"\n')
             releases = replace(releases, discovery_config=config)
-        sweep = functools.partial(sweep_cache, releases, args.cache_limit_gb)
+        sweep = functools.partial(sweep_cache, releases, args.cache_limit_gb, args.cache_min_free_gb)
         reaper = Reaper(drain, os.path.join(os.environ["HOLBUILD_CACHE"], "action.lock"))
         resources.callback(reaper.stop)
         def unprotect() -> None:

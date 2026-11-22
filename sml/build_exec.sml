@@ -7159,11 +7159,12 @@ fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, p
                     trace_steps = false, repl_on_failure = false, trknl = false,
                     promote_preload = promote_preload}
 
-(* exec-action --share-deps-heap shares no theorem or definition
-   checkpoint, and each action starts from an empty checkpoint tree, so
-   saving one would only cost the child time. *)
-fun deps_heap_only_policy (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...}) =
-  CheckpointPolicy {checkpoint = checkpoint, theorem_checkpoints = false, checkpoint_target = checkpoint_target,
+(* An exec-action's checkpoint tree starts empty and is emptied after it,
+   so a checkpoint nothing shares would only cost the child time: under
+   --share-deps-heap it saves the deps heap alone (SAVE_HEAP), and without
+   sharing nothing.  Proof steps and their timeouts stay as the spec says. *)
+fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...}) =
+  CheckpointPolicy {checkpoint = checkpoint andalso save_heap, theorem_checkpoints = false, checkpoint_target = checkpoint_target,
                     checkpoint_seconds = checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout, execution_plan = execution_plan,
                     trace_steps = trace_steps, repl_on_failure = repl_on_failure, trknl = trknl,
@@ -15244,7 +15245,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val stage = action_stage root action
         val policy =
           if pipelined then speculative_policy (spec_policy spec)
-          else if deps_heap_only then deps_heap_only_policy (spec_policy spec)
+          else if not share_heaps then unshared_checkpoints_policy false (spec_policy spec)
+          else if deps_heap_only then unshared_checkpoints_policy true (spec_policy spec)
           else spec_policy spec
         val log_dir = current_log_dir root (#package spec) (#logical spec)
         val oom_before = cgroup_oom_kills ()
@@ -15490,8 +15492,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val _ =
           write_ahead_preload
             {load_lines = map (theory_load_line root) (#loads spec), dir = dir,
-             (* As the plain preload's heap save: none unless it saves one. *)
-             share = not pipelined andalso saves_progress (spec_policy spec) andalso
+             (* As the plain preload's heap save: none unless it saves one,
+                and an action that shares no heap saves none. *)
+             share = not pipelined andalso share_heaps andalso saves_progress (spec_policy spec) andalso
                      env_bool "HOLBUILD_SHARE_COMMON_DATA" true,
              path = Path.concat (stage, "holbuild-ahead-preload.sml")}
         val files =

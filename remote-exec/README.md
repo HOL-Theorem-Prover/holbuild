@@ -155,7 +155,7 @@ A worker:
 ```bash
 docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_CONTENT='user = "user:pass"' \
   holbuild-remote-exec worker --coordinator https://exec.example.org --remote-cache https://cache.example.org \
-  --cache-limit-gb 200 [--tier standard|high] [--also-claim standard] [--max-heap MB] [--cooperate-dir DIR] \
+  --cache-limit-gb 200 [--cache-min-free-gb 16] [--tier standard|high] [--also-claim standard] [--max-heap MB] [--cooperate-dir DIR] \
   [--share-heaps | --share-deps-heap] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20] \
   [--drain-seconds 20] [--host-rank 0]
 ```
@@ -229,7 +229,8 @@ sizes stay within the limit, while sizing private checkpoints on each call;
 the theory-modules store is a shared root like the others. Eviction still goes
 down to the target, after an action's result or once the measurement expires,
 so the reserve holds what arrives in between. For holbuild 0.14.57 and later
-the worker also passes `--cache-min-free-gb 16`: while the disk has less free
+the worker also passes `--cache-min-free-gb` (its own `--cache-min-free-gb`,
+16 by default), to actions and idle sweeps alike: while the disk has less free
 than that, a sweep evicts below the target until the bytes it evicted cover
 the floor plus 8 GB and statvfs says the disk is back over the floor (a heap a
 checkpoint tree still links, or a sparse file, frees fewer blocks than its
