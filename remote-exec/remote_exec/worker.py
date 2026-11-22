@@ -124,6 +124,9 @@ COORDINATOR_ERRORS = (OSError, RuntimeError, http.client.HTTPException, ValueErr
 HEARTBEAT_RETRY_SECONDS = 5.0
 # Waits before each retry of a result report the coordinator couldn't take, as while it restarts; then 8 s apart.
 COMPLETE_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
+# Waits before each retry of a spec fetch a cache of one node left unavailable, as while its daemon restarts: 90 s in
+# all, counted from the first request. A ring's other nodes stand in instead.
+ONE_NODE_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 15.0, 15.0, 15.0, 15.0, 15.0)
 
 
 class DrainStopped(BaseException):
@@ -421,15 +424,28 @@ class Releases:
 
     def _fetch_spec(self, spec_sha256: str, path: str, digest: str) -> bytes | None:
         """The body at ``path`` on the first node ranked by ``digest`` that has it; None when every node answers
-        404."""
+        404. A cache of one node that leaves it unavailable is asked again after each of ``ONE_NODE_RETRY_DELAYS``
+        that still ends within their sum of the first request; a drain ends the wait at once."""
+        nodes = cache_nodes(self.remote_cache)
+        delays = iter(ONE_NODE_RETRY_DELAYS if len(nodes) == 1 else ())
+        deadline = time.monotonic() + sum(ONE_NODE_RETRY_DELAYS)
+        while True:
+            try:
+                return self._fetch_spec_once(nodes, spec_sha256, path, digest)
+            except CacheUnavailable as error:
+                delay = next(delays, None)
+                if delay is None or time.monotonic() + delay > deadline:
+                    raise
+                print(f"{error}; retrying in {delay:g} s", file=sys.stderr, flush=True)
+                if self.drain.stop.wait(delay):
+                    raise DrainStopped from error
+
+    def _fetch_spec_once(self, nodes: list[str], spec_sha256: str, path: str, digest: str) -> bytes | None:
         # -g: no URL globbing, whose errors print the URL with any credentials in it.
         # The status follows the body on its own line: 000 when there was no answer.
-        nodes = cache_nodes(self.remote_cache)
-        command = ["curl", "-fsSLg", "-w", "\n%{http_code}"]
-        if len(nodes) == 1:
-            command += ["--retry", "3"]
-        else:
-            command += ["--connect-timeout", "5", "--speed-limit", "1", "--speed-time", "30"]
+        # A stalled node is given up on within the retry window, so a cache of one node is asked again.
+        command = ["curl", "-fsSLg", "-w", "\n%{http_code}", "--connect-timeout", "5", "--speed-limit", "1",
+                   "--speed-time", "30"]
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
         unavailable: str | None = None

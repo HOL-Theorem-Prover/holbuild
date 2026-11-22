@@ -15,7 +15,9 @@ trap cleanup EXIT
 for failing in 0 1; do
   dir=$tmpdir/$failing
   start_remote_cache_server "$dir/remote" "$dir/server" "$dir/control"
-  PUBLISH_DIR="$dir" PUBLISH_URL="$remote_url" PUBLISH_FAIL="$failing" \
+  # One retry, after 1 s: a fail-closed one-node cache retries while the next
+  # wait ends within the schedule's total (here 6 s) of the first attempt.
+  HOLBUILD_TEST_CACHE_RETRY_DELAYS=1,5 PUBLISH_DIR="$dir" PUBLISH_URL="$remote_url" PUBLISH_FAIL="$failing" \
     python3 "$SCRIPT_DIR/check.py"
   kill "$server_pid"
   wait "$server_pid" 2>/dev/null || true

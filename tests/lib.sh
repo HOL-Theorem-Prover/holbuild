@@ -41,6 +41,7 @@ start_remote_cache_server() {
   local root=$1
   local state_dir=$2
   local control_dir=${3:-}
+  local port=${4:-0}
   local lib_dir port_file
   lib_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   port_file=$state_dir/server.port
@@ -49,7 +50,7 @@ start_remote_cache_server() {
   [[ -z "$control_dir" ]] || mkdir -p "$control_dir"
   : > "$request_log"
   python3 "$lib_dir/fixtures/remote_cache_server.py" \
-    "$root" "$port_file" "$request_log" "$control_dir" &
+    "$root" "$port_file" "$request_log" "$control_dir" "$port" &
   server_pid=$!
   for _ in {1..100}; do
     [[ -s "$port_file" ]] && break

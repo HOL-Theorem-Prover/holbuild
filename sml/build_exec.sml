@@ -14182,7 +14182,7 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
     val mutex = Mutex.mutex ()
     fun fetch (name, key) =
       if not (module_request_fits deadline) then ()
-      else
+      else HolbuildRemoteCache.retrying_within deadline (fn () =>
         (Mutex.lock mutex; probes := !probes + 1; Mutex.unlock mutex;
          case HolbuildRemoteCache.get_action remote key of
              NONE => ()
@@ -14202,7 +14202,7 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
                              HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = Path.concat (store, file)}
                            | _ => remove_file tmp
                        end
-                 | _ => warn ("ignoring a malformed published theory module entry for " ^ name))
+                 | _ => warn ("ignoring a malformed published theory module entry for " ^ name)))
     fun try item = fetch item handle e => warn ("theory module not fetched: " ^ General.exnMessage e)
   in
     HolbuildRemoveTree.remove_untrusted staging;
@@ -14242,7 +14242,8 @@ fun publish_modules remote {store, staging, modules, deadline} =
             end
         in
           (Posix.FileSys.link {old = path, new = copy} handle OS.SysErr _ => copy_binary path copy);
-          (upload () before remove_file copy) handle e => (remove_file copy; raise e)
+          (HolbuildRemoteCache.retrying_within deadline upload before remove_file copy)
+          handle e => (remove_file copy; raise e)
         end
         handle e => (warn ("theory module not published: " ^ General.exnMessage e); false)
     val published = ref 0
@@ -14273,9 +14274,9 @@ fun fetch_heap_modules remote tc wanted =
           val tmp = Path.concat (staging, file)
           (* The heap entry already names the blob. A replica may have the
              entry before the replica holding the module has uploaded it. *)
-          fun get () = HolbuildRemoteCache.required (fn () =>
+          fun get () = HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.retrying_within deadline (fn () =>
             HolbuildRemoteCache.fetch_unlisted_blob_within
-                 HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp})
+                 HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp}))
         in
           case get () of
               HolbuildCacheBackend.Hit =>
@@ -14767,6 +14768,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
       if !cancelled then () else
       (cancelled := true;
        HolbuildRemoteCache.refresh_replicas := false;
+       HolbuildRemoteCache.retry_one_node := false;
        if !publishing_checkpoints then () else HolbuildToolchain.cleanup_active_children ())
     (* Keep the driver alive while the sandbox reaps HOL and validates the
        saved checkpoints. The worker bounds this cleanup with a hard stop. *)
