@@ -390,7 +390,11 @@ checkpoints carry no such guarantee: a failed prefix's state, for one, holds
 what its failing step did, which its key doesn't cover. So `--share-heaps`
 is for workers whose submitters trust each other; a worker serving users who
 don't shares only dependency heaps, with `--share-deps-heap` (actions of
-releases before 0.14.98 then share nothing). Neither provides tenant
+releases before 0.14.98 then share nothing). It restores whatever heap the
+remote cache holds under the key, and releases before 0.14.98 published
+whatever the script left: so such workers need a remote cache that no release
+before 0.14.98 has published heaps to, such as a new one, and no worker that
+passes `--share-heaps` to older releases may publish there. Neither provides tenant
 authorization for shared cache entries, and `build --tool-cache` directories
 are shared by name, dependency key and toolchain whatever the mode.
 

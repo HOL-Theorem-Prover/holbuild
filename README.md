@@ -1870,7 +1870,7 @@ result there, and exits:
 ```sh
 HOLBUILD_CACHE=/var/cache/holbuild holbuild --remote-cache https://cache.example.org \
   --max-heap 32000 --cooperate-dir /var/lib/holbuild/memory \
-  exec-action SPEC-SHA256 --result result.txt --cache-limit-gb 200 [--share-heaps]
+  exec-action SPEC-SHA256 --result result.txt --cache-limit-gb 200 [--share-heaps | --share-deps-heap]
 ```
 
 It runs in `<cache root>/action`, which it locks. The dependencies it
@@ -1881,7 +1881,7 @@ action. Without its records (`<cache root>/action-resident`), as after a
 worker stopped part way, or a release that keeps no records ran there, and
 before every script run, the action root is emptied first. Dependency heaps and checkpoints in `<cache root>/checkpoints`
 are private to the action and are also emptied before and after it; reuse
-across worker actions requires `--share-heaps` (below). A saved heap records the absolute paths it was
+across worker actions requires `--share-heaps`, or `--share-deps-heap` for the heaps alone (below). A saved heap records the absolute paths it was
 built at, so every worker should use the same cache root. One `exec-action`
 runs per cache root at a time; a second waits for the first. The cache root
 is the worker's own: other holbuild commands shouldn't share it, since the
@@ -2135,7 +2135,10 @@ preload waits while the worker hashes it, before the theory script runs, and
 the worker publishes those bytes or nothing. Script checkpoints have no such
 check, so share them only between users who trust each other; a worker
 serving users who don't runs `exec-action --share-deps-heap`, which shares
-dependency heaps and nothing else.
+dependency heaps and nothing else. It restores whatever heap the remote cache
+holds under the key, and a release before 0.14.98 published a heap whatever
+the script had left in its place: give such workers a remote cache that only
+0.14.98 or later has published heaps to, such as a new one.
 
 The checkpoint tree is then the action's own, emptied before and after it;
 the host store `<cache root>/checkpoint-store` keeps the shared files, one

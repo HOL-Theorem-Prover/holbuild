@@ -224,9 +224,16 @@ worker d1 "$deps_url" "$spec_t" --share-deps-heap
   echo "--share-deps-heap shared no deps heap" >&2; cat "$tmpdir/d1.log" >&2; exit 1; }
 [[ $(entries holbuild-shared-checkpoint-v1 "$tmpdir/remote-deps") == 0 ]] || {
   echo "--share-deps-heap shared a script checkpoint" >&2; exit 1; }
+# A --share-heaps worker then shares t1's context there, which an edit of t2
+# could resume from; a --share-deps-heap worker resumes from the heap alone.
+write_t "T" "T /\\ T" ""
+export_t s1 "$deps_url" --share-heaps
+worker s1 "$deps_url" "$spec_t" --share-heaps
+shared=$(entries holbuild-shared-checkpoint-v1 "$tmpdir/remote-deps")
+[[ $shared -gt 0 ]] || { echo "--share-heaps shared no script checkpoint" >&2; cat "$tmpdir/s1.log" >&2; exit 1; }
 write_t "T" "T /\\ T /\\ T" ""
 export_t d2 "$deps_url" --share-deps-heap
 worker d2 "$deps_url" "$spec_t" --share-deps-heap
 resumed_from d2
-[[ $(entries holbuild-shared-checkpoint-v1 "$tmpdir/remote-deps") == 0 ]] || {
+[[ $(entries holbuild-shared-checkpoint-v1 "$tmpdir/remote-deps") == "$shared" ]] || {
   echo "--share-deps-heap shared a script checkpoint" >&2; exit 1; }
