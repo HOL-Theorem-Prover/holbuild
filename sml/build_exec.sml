@@ -361,20 +361,32 @@ fun load_name (LoadTheory name) = name
 fun manifest_loads plan node =
   map load_name (ordered_loads plan node load_stem (HolbuildBuildPlan.direct_project_deps plan node))
 
+(* Where a preload asks the parent to take the deps heap it saved, and waits
+   until the parent removes the request (with_deps_heap_capture). *)
+fun deps_heap_capture_request deps_loaded = deps_loaded ^ ".capture"
+
 (* The deps heap keeps only the toolchain's load path, not the project's
    directories HOL put there: other trees of the project resume from it.
    The save's time is printed as a holsave phase (hol_log_phases); the
-   timing binds nothing, so the heap holds what it did without it. *)
-fun write_preload load_lines deps_loaded deps_ok path =
+   timing binds nothing, so the heap holds what it did without it.  With
+   CAPTURE, the child then waits for the parent to hash the heap before it
+   runs any script code.  The wait comes after the save, so it isn't in the
+   heap and needs no key of its own. *)
+fun write_preload capture load_lines deps_loaded deps_ok path =
   let
     val save = save_deps_heap_expr {label = "deps_loaded", output = deps_loaded, ok_text = deps_ok}
+    val request = HolbuildToolchain.sml_string (deps_heap_capture_request deps_loaded)
+    val wait =
+      "val _ = (TextIO.closeOut (TextIO.openOut " ^ request ^ "); " ^
+      "while OS.FileSys.access (" ^ request ^ ", []) do OS.Process.sleep (Time.fromMilliseconds 5));"
     val lines = runtime_line () ::
                 (load_lines @
                  [checkpoint_save_runtime_line (),
                   "val _ = let val start = Time.now () in " ^
                   "HolbuildCheckpointSaveRuntime.with_toolchain_load_path (fn () => " ^ save ^ "); " ^
                   "TextIO.output (TextIO.stdErr, \"holbuild hol-phases holsave=\" ^ " ^
-                  "LargeInt.toString (LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))) ^ \"\\n\") end;"])
+                  "LargeInt.toString (LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))) ^ \"\\n\") end;"] @
+                 (if capture then [wait] else []))
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -4465,7 +4477,7 @@ val dropped_checkpoints = ref 0
    exec-action's rstmodrejn. *)
 val rejected_heap_modules = ref 0
 
-fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
+fun write_theory_script capture defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
     val _ = resume_steps := []
     val source_name = #source_name action
@@ -4500,7 +4512,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
       fun run_from_fresh_preload () =
         (remove_deps_checkpoint_descendants base deps_key;
          ensure_source_checkpoint_parents ();
-         if saves_progress policy then write_preload load_lines deps_loaded deps_ok preload
+         if saves_progress policy then write_preload capture load_lines deps_loaded deps_ok preload
          else write_plain_preload load_lines preload;
          write_text staged_script (instrumented_source NONE policy (not (saves_progress policy)) (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
@@ -4686,6 +4698,41 @@ fun set_attached_child join = Thread.setLocal (attached_child_tag, join)
 fun take_attached_child () =
   Option.join (Thread.getLocal attached_child_tag) before set_attached_child NONE
 
+(* exec-action --share-heaps: whether a theory run's preload hands the deps
+   heap it saves to the parent before the script runs, and the SHA-256 the
+   parent took, the only deps heap of the action's own it publishes. *)
+val capture_deps_heap = ref false
+val captured_deps_heap = ref (NONE : string option)
+
+(* Runs F, the theory child's run, taking the deps heap when the preload
+   asks (write_preload): its SHA-256, if it is a plain file, goes in
+   captured_deps_heap, and removing the request lets the child go on.  Only
+   the first request counts: script code could write the next. *)
+fun with_deps_heap_capture deps_loaded f =
+  let
+    val request = deps_heap_capture_request deps_loaded
+    val mutex = Mutex.mutex ()
+    val finished = ref false
+    fun locked g = (Mutex.lock mutex; g () before Mutex.unlock mutex)
+    fun requested () = FS.access (request, []) handle OS.SysErr _ => false
+    fun plain_file path = Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false
+    fun heap_sha () =
+      if plain_file deps_loaded then SOME (HolbuildHash.file_sha256 deps_loaded) else NONE
+      handle e => (warn ("could not hash the deps-loaded heap: " ^ General.exnMessage e); NONE)
+    fun take () = (captured_deps_heap := heap_sha (); remove_file request)
+    fun watch () =
+      if locked (fn () => !finished) then ()
+      else if requested () then take ()
+      else (OS.Process.sleep (Time.fromMilliseconds 10); watch ())
+    val _ = captured_deps_heap := NONE
+    val watcher = Thread.fork (watch, [])
+    fun stop () =
+      (locked (fn () => finished := true);
+       while Thread.isActive watcher do OS.Process.sleep (Time.fromMilliseconds 10))
+  in
+    (f () handle e => (stop (); raise e)) before stop ()
+  end
+
 (* SPECULATIVE_LOG: the run is a pipelined build's speculative one (an
    outline, or a proof on outlined parents), which logs there, produces no
    theory module, and leaves its outputs in the stage for the caller to
@@ -4728,7 +4775,8 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val _ = remove_file timeout_marker
     val _ = remove_file plan_only_marker
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
-    val run_spec = write_theory_script (if speculative andalso proof_steps_enabled policy then SOME (has_suspension_pruning tc) else NONE) policy root checkpoint_root base_context action source_text
+    val capture = !capture_deps_heap andalso checkpoint_enabled policy andalso saves_progress policy
+    val run_spec = write_theory_script capture (if speculative andalso proof_steps_enabled policy then SOME (has_suspension_pruning tc) else NONE) policy root checkpoint_root base_context action source_text
                                     theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
                                     (if execution_plan_only policy then SOME plan_only_marker else NONE)
     (* A speculative child runs no checkpoints, so it starts from the
@@ -4829,22 +4877,26 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
        ended while saving it. *)
     fun remove_promote_scratch () =
       if promotes_preload policy then remove_file (promote_scratch_path preload) else ()
+    fun run_child () =
+      case attached of
+          SOME join =>
+            if #files run_spec = [preload, staged_script] then join ()
+            else raise Error "a child loading ahead needs a fresh preload"
+        | NONE =>
+            run_hol_files_to_log tc stage stage
+              (#context run_spec)
+              (child_policy :: (#files run_spec @ [theory_exporter]))
+              "holbuild-build.log"
+              (SOME (current_build_log log_dir))
+              "hol run failed while building theory script"
+    (* Only a fresh preload saves the deps heap, and waits to hand it over. *)
+    val captures = capture andalso #files run_spec = [preload, staged_script]
     val _ =
       (check_cancelled ();
        validate_hol_context (#context run_spec);
        detail_time_phase "build.exec.node.child_run"
          (fn () =>
-             ((case attached of
-                   SOME join =>
-                     if #files run_spec = [preload, staged_script] then join ()
-                     else raise Error "a child loading ahead needs a fresh preload"
-                 | NONE =>
-                     run_hol_files_to_log tc stage stage
-                       (#context run_spec)
-                       (child_policy :: (#files run_spec @ [theory_exporter]))
-                       "holbuild-build.log"
-                       (SOME (current_build_log log_dir))
-                       "hol run failed while building theory script")
+             ((if captures then with_deps_heap_capture deps_loaded run_child else run_child ())
               before remove_promote_scratch ())
              handle e => (remove_promote_scratch (); raise e)))
       handle Error msg =>
