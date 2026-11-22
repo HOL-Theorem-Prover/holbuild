@@ -1600,6 +1600,39 @@ def test_action_of_an_unreleased_holbuild_is_rejected_saying_why(
     assert not logs[1].exists()
 
 
+def test_action_of_a_release_below_the_workers_minimum_is_rejected(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path]
+) -> None:
+    server.specs[SPEC] = "holbuild-action-spec-v1\nholbuild-version=1.2.3\n"
+
+    run_one(
+        Coordinator(server.url, "w"),
+        worker_args(tmp_path, server),
+        replace(releases(tmp_path, server), min_release=(1, 2, 4)),
+        Protection(None, None),
+        claim(),
+        Phases(),
+    )
+
+    [record] = server.completed
+    result = parse_result(record)
+    assert result.failure == "spec-rejected"
+    assert result.detail == "the worker refuses the action: holbuild 1.2.3 is older than this worker's minimum release 1.2.4"
+    assert not logs[1].exists()
+
+
+def test_min_release_is_a_release_no_older_than_mandatory_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = ["--coordinator", "http://coordinator.test", "--remote-cache", "http://cache.test", "--cache-limit-gb", "1"]
+    monkeypatch.delenv("REMOTE_EXEC_MIN_RELEASE", raising=False)
+    assert parse_args(args).min_release == worker.MIN_SANDBOX_RELEASE
+    assert parse_args([*args, "--min-release", "0.14.92"]).min_release == (0, 14, 92)
+    monkeypatch.setenv("REMOTE_EXEC_MIN_RELEASE", "0.14.92")
+    assert parse_args(args).min_release == (0, 14, 92)
+    for bad in ("0.13.57", "0.14", "x"):
+        with pytest.raises(SystemExit):
+            parse_args([*args, "--min-release", bad])
+
+
 def test_a_failure_detail_is_one_line_of_printable_ascii() -> None:
     record = failed_record(SPEC, "spec-rejected", "bad\nspec=\x00\u00e9" + "x" * 600)
     assert record.endswith(f"\nfailure=spec-rejected\ndetail=bad spec=  {'x' * 489}\n")
