@@ -156,7 +156,7 @@ A worker:
 docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_CONTENT='user = "user:pass"' \
   holbuild-remote-exec worker --coordinator https://exec.example.org --remote-cache https://cache.example.org \
   --cache-limit-gb 200 [--tier standard|high] [--also-claim standard] [--max-heap MB] [--cooperate-dir DIR] \
-  [--share-heaps] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20] \
+  [--share-heaps | --share-deps-heap] [--holbuild-releases-dir DIR] [--protection-cmd COMMAND] [--claim-wait-seconds 20] \
   [--drain-seconds 20] [--host-rank 0]
 ```
 
@@ -384,8 +384,15 @@ tails may be lost. Mediated signals identify the supervisor as their sender.
 prefix in the remote cache. Dependency heaps are shared even for older action
 specs that disable theorem checkpoints; `skip-checkpoints` disables both. Only
 completed saves with valid metadata are published, including after interruption.
-Use shared heaps only with a single tenant or trusted cache
-submitters. It does not provide tenant authorization for shared cache entries.
+A heap an action saved is published only with the bytes its preload saved,
+hashed before the theory script ran, so a script can't replace it. Script
+checkpoints carry no such guarantee: a failed prefix's state, for one, holds
+what its failing step did, which its key doesn't cover. So `--share-heaps`
+is for workers whose submitters trust each other; a worker serving users who
+don't shares only dependency heaps, with `--share-deps-heap` (actions of
+releases before 0.14.98 then share nothing). Neither provides tenant
+authorization for shared cache entries, and `build --tool-cache` directories
+are shared by name, dependency key and toolchain whatever the mode.
 
 The supervisor confirms cleanup and output validation through a completion
 file outside the child's filesystem grants. Without that confirmation, the

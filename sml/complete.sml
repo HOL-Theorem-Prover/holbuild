@@ -65,7 +65,7 @@ fun command name : command =
          valued = [("--retention-days", Nothing), ("--max-checkpoints-gb", Nothing)], operands = Nothing}
     | "cache" => {flags = [], valued = [], operands = Nothing}
     | "exec-action" =>
-        {flags = ["--share-heaps", "--sweep-only"],
+        {flags = ["--share-heaps", "--share-deps-heap", "--sweep-only"],
          valued = [("--cache-limit-gb", Nothing), ("--cache-reserve-gb", Nothing), ("--cache-min-free-gb", Nothing),
                    ("--result", Nothing), ("--ahead-parent", Nothing), ("--ahead-wait-seconds", Nothing)],
          operands = Nothing}

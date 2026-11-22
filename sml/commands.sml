@@ -304,7 +304,7 @@ fun exec_action_help () = print
   "Usage:\n\
   \  holbuild --remote-cache URL [GLOBAL OPTIONS] exec-action SPEC-SHA256\n\
   \      --cache-limit-gb N [--cache-reserve-gb N] [--cache-min-free-gb N]\n\
-  \      [--share-heaps] [--pipeline] [--result FILE]\n\
+  \      [--share-heaps | --share-deps-heap] [--pipeline] [--result FILE]\n\
   \      [--ahead-parent INPUT_KEY:SPEC-SHA256 ... [--ahead-wait-seconds N]]\n\
   \  holbuild [GLOBAL OPTIONS] exec-action --sweep-only\n\
   \      --cache-limit-gb N [--cache-reserve-gb N] [--cache-min-free-gb N]\n\n\
@@ -327,6 +327,9 @@ fun exec_action_help () = print
   \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
   \                     other workers published, and publish this run's. The\n\
   \                     host store CACHE/checkpoint-store keeps their files.\n\
+  \--share-deps-heap    As --share-heaps, but share only deps-loaded heaps, no\n\
+  \                     checkpoint the script saved: for workers whose actions\n\
+  \                     come from users who don't trust each other.\n\
   \--pipeline           Build a theory whose spec allows it pipelined: publish\n\
   \                     its outline to the remote cache once its script has\n\
   \                     run, under a key of its own, then prove its deferred\n\
@@ -4198,7 +4201,9 @@ fun exec_action_command maxheap jobs args =
         | NONE => raise Error (label ^ " must be a non-negative integer")
     val sweep_only = List.exists (fn arg => arg = "--sweep-only") args
     val pipeline = List.exists (fn arg => arg = "--pipeline") args
-    val args = List.filter (fn arg => arg <> "--sweep-only" andalso arg <> "--pipeline") args
+    val deps_heap_only = List.exists (fn arg => arg = "--share-deps-heap") args
+    val args = List.filter (fn arg => arg <> "--sweep-only" andalso arg <> "--pipeline" andalso
+                                      arg <> "--share-deps-heap") args
     fun parse (opts as {spec, result, limit, reserve, floor, share}) rest =
       case rest of
           [] => opts
@@ -4253,7 +4258,11 @@ fun exec_action_command maxheap jobs args =
       | take_ahead ["--ahead-wait-seconds"] = raise Error "--ahead-wait-seconds requires N"
       | take_ahead (x :: xs) = x :: take_ahead xs
     val {spec, result, limit, reserve, floor, share} =
-      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, floor = 0, share = false} (take_ahead args)
+      parse {spec = NONE, result = NONE, limit = NONE, reserve = NONE, floor = 0, share = deps_heap_only} (take_ahead args)
+    val _ =
+      if deps_heap_only andalso List.exists (fn arg => arg = "--share-heaps") args then
+        raise Error "exec-action takes --share-heaps or --share-deps-heap, not both"
+      else ()
     val cache_cap =
       case limit of
           SOME limit =>
@@ -4292,6 +4301,7 @@ fun exec_action_command maxheap jobs args =
        HolbuildRemoteCacheConfig.setup_client ();
        HolbuildBuildExec.exec_action
          {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, share_heaps = share,
+          deps_heap_only = deps_heap_only,
           toolchain = toolchain, ahead_parents = rev (!ahead_parents), pipeline = pipeline})
       handle e =>
         (HolbuildStatus.message_stderr

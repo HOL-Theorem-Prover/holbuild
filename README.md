@@ -2130,6 +2130,13 @@ only between workers with the same toolchain bytes, cache root, action root,
 platform and holbuild runtime sources compiled into the heap, which is why
 every worker should use the same cache root.
 
+A worker publishes a heap of its own only as the preload saved it: the
+preload waits while the worker hashes it, before the theory script runs, and
+the worker publishes those bytes or nothing. Script checkpoints have no such
+check, so share them only between users who trust each other; a worker
+serving users who don't runs `exec-action --share-deps-heap`, which shares
+dependency heaps and nothing else.
+
 The checkpoint tree is then the action's own, emptied before and after it;
 the host store `<cache root>/checkpoint-store` keeps the shared files, one
 directory per heap, which the cache cap and `holbuild gc` evict as a unit,

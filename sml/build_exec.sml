@@ -12819,9 +12819,12 @@ fun shared_standalone_key heap_key (action : theory_action) =
 type shared_context =
   {store : string, checkpoint_root : string, heap_key : string, index_key : string, standalone_key : string,
    base_state : string, deps_key : string, deps_loaded : string, requested_timeout : real option,
-   candidates : shared_candidate list, module_store : string}
+   candidates : shared_candidate list, module_store : string, heap_only : bool}
 
-fun shared_context cache checkpoint_root tc root policy (action : theory_action) checkpoints : shared_context =
+(* HEAP_ONLY (exec-action --share-deps-heap): the deps heap is shared, and
+   no checkpoint the script saved: a script checkpoint's state, a failed
+   prefix's above all, may hold what code outside its key did. *)
+fun shared_context heap_only cache checkpoint_root tc root policy (action : theory_action) checkpoints : shared_context =
   let
     val base = action_checkpoint_base checkpoint_root action
     val heap_key = shared_heap_key tc root action
@@ -12833,14 +12836,16 @@ fun shared_context cache checkpoint_root tc root policy (action : theory_action)
      deps_key = #deps_key action,
      deps_loaded = deps_loaded_path base (#deps_key action),
      requested_timeout = tactic_timeout policy,
-     candidates = shared_candidates policy base checkpoints,
-     module_store = module_store (#holdir tc)}
+     candidates = if heap_only then [] else shared_candidates policy base checkpoints,
+     module_store = module_store (#holdir tc), heap_only = heap_only}
   end
 
-fun shared_heap_parent_ok ({deps_loaded, base_state, ...} : shared_context) =
-  case saved_parent deps_loaded of
+fun heap_parent_ok base_state heap =
+  case saved_parent heap of
       SOME parent => (FS.fullPath parent = base_state handle OS.SysErr _ => false)
     | NONE => false
+
+fun shared_heap_parent_ok ({deps_loaded, base_state, ...} : shared_context) = heap_parent_ok base_state deps_loaded
 
 fun tree_relative root path =
   if String.isPrefix (root ^ "/") path then SOME (String.extract(path, size root + 1, NONE)) else NONE
@@ -13176,7 +13181,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* Without a usable heap, a theory that saves none (not a target) may
        have published a failed prefix of its own. *)
     fun or_standalone (restored as {files = [], ...}) =
-          (case (if resumes then try_standalone () else NONE) of
+          (case (if resumes andalso not (#heap_only ctx) then try_standalone () else NONE) of
                SOME standalone => standalone
              | NONE => restored)
       | or_standalone restored = restored
@@ -13273,8 +13278,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* The child wrote the heap's module table, so it may name any file the
        worker can read: a heap naming one that isn't a module of this
        toolchain's store isn't published. *)
-    fun modules_ok () =
-      case List.find (not o store_module_file module_store) (saved_modules deps_loaded) of
+    fun modules_ok heap_file =
+      case List.find (not o store_module_file module_store) (saved_modules heap_file) of
           NONE => true
         | SOME path =>
             (warn ("not publishing the shared deps-loaded heap: it loads " ^ path ^
@@ -13282,11 +13287,10 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
              false)
     (* A heap this run saved is published only where no other worker's is:
        checkpoints on a heap that lost are chained to bytes no other worker
-       has, so they stay local. *)
-    fun publish_heap sha =
-      if heap_present () orelse
-         not (shared_heap_parent_ok ctx) orelse
-         not (modules_ok ()) then NONE
+       has, so they stay local.  HEAP_FILE is the parent's own copy of it,
+       whose bytes are the ones checked and put. *)
+    fun publish_heap_file heap_file sha =
+      if not (heap_parent_ok base_state heap_file) orelse not (modules_ok heap_file) then NONE
       else
         let
           val claim_key = shared_heap_claim_key heap_key
@@ -13320,7 +13324,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                              handle OS.SysErr _ => copy_binary path copy);
                             (id, copy)
                           end)
-                      (saved_module_ids deps_loaded))
+                      (saved_module_ids heap_file))
                before HolbuildRemoveTree.remove_untrusted dir)
               handle e => (HolbuildRemoveTree.remove_untrusted dir; raise e)
             end
@@ -13347,9 +13351,9 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 else (Mutex.lock absent_mutex; absent_blobs := module :: !absent_blobs;
                       Mutex.unlock absent_mutex)
               val _ = parallel_all remote_probe_width probe modules
-              val _ = upload_all ((deps_loaded, sha) :: modules)
+              val _ = upload_all ((heap_file, sha) :: modules)
               val _ =
-                case List.find (fn (_, blob) => needs_upload blob) ((deps_loaded, sha) :: modules) of
+                case List.find (fn (_, blob) => needs_upload blob) ((heap_file, sha) :: modules) of
                     SOME (path, _) => raise Error ("could not upload " ^ path)
                   | NONE => ()
               (* Every node: one still holding an entry this replaces would
@@ -13357,7 +13361,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               val _ = HolbuildRemoteCache.replace_action_everywhere remote {key = heap_key, text = manifest}
             in
               if HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote heap_key) = SOME manifest then
-                (store_add store sha {sha = sha, src = deps_loaded, save = true}; SOME sha)
+                (store_add store sha {sha = sha, src = heap_file, save = true}; SOME sha)
               else NONE
             end
           fun upload () =
@@ -13374,13 +13378,28 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           else (HolbuildStatus.message_stdout "another worker is publishing the shared deps-loaded heap\n";
                 NONE)
         end
+    fun publish_heap sha =
+      if heap_present () then NONE
+      else
+        let val copy = store_temp (store_path store sha sha)
+        in
+          (copy_binary deps_loaded copy;
+           (if HolbuildHash.file_sha256 copy = sha then publish_heap_file copy sha
+            else (warn "not publishing the shared deps-loaded heap: it changed while being published"; NONE))
+           before remove_file copy)
+          handle e => (remove_file copy; raise e)
+        end
     val heap =
       if not (deps_checkpoint_exists deps_loaded deps_key) then NONE
       else
         let val current = hash deps_loaded
         in
-          (* A restored heap Poly failed to load was replaced by this run's. *)
-          if restored_heap = SOME current then restored_heap else publish_heap current
+          (* A restored heap Poly failed to load was replaced by this run's.
+             A heap of this run's own is published only as its preload saved
+             it, before the script ran (with_deps_heap_capture). *)
+          if restored_heap = SOME current then restored_heap
+          else if !captured_deps_heap = SOME current then publish_heap current
+          else (warn "not publishing the shared deps-loaded heap: it isn't the one the preload saved"; NONE)
         end
     fun was_restored path =
       List.exists (fn (p, sha) => p = path andalso (hash path = sha handle _ => false))
@@ -13605,8 +13624,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   end
   in
     case heap of
-        NONE => if deps_checkpoint_exists deps_loaded deps_key then () else publish_standalone ()
-      | SOME heap => publish_candidates heap
+        NONE => if #heap_only ctx orelse deps_checkpoint_exists deps_loaded deps_key then () else publish_standalone ()
+      | SOME heap => if #heap_only ctx then () else publish_candidates heap
   end
   handle e => warn ("shared checkpoint publish failed: " ^ General.exnMessage e)
 
@@ -14805,7 +14824,7 @@ fun snapshot_outline root stage logical snapshot =
    `toolchain` ensures the spec's HOL toolchain and returns it; AHEAD_PARENTS are
    the late parents (--ahead-parent), each its input key and spec; PIPELINE
    lets the theory build pipelined if its spec allows it. *)
-fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ahead_parents, pipeline} =
+fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_only, toolchain, ahead_parents, pipeline} =
   let
     val cancelled = ref false
     val publishing_checkpoints = ref false
@@ -15244,8 +15263,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val shared =
               if not share_heaps orelse not (checkpoint_enabled policy) then NONE
               else
-                SOME (shared_context cache checkpoint_root tc root policy action checkpoints)
+                SOME (shared_context deps_heap_only cache checkpoint_root tc root policy action checkpoints)
                 handle e => (warn ("not sharing heaps: " ^ General.exnMessage e); NONE)
+            val _ = capture_deps_heap := Option.isSome shared
             (* Loading ahead found no heap to restore before it went on. *)
             val restored =
               case (shared, ahead) of
@@ -15719,7 +15739,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               (case cutoff of SOME {pair_key, ...} => cached pair_key | NONE => false) orelse
               (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
                (cached shared_key orelse
-                resumes_from_checkpoints (spec_policy spec) built_action andalso
+                not deps_heap_only andalso resumes_from_checkpoints (spec_policy spec) built_action andalso
                 (* Only a restore that checks its key= line records its blobs. *)
                 Option.isSome (HolbuildRemoteCache.fetch_action remote
                                  (shared_standalone_key shared_key built_action))))

@@ -51,6 +51,7 @@ MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-par
 MIN_FREE_FLOOR_RELEASE = (0, 14, 57)  # the first whose exec-action takes --cache-min-free-gb
 MIN_SWEEP_ONLY_RELEASE = (0, 14, 60)  # the first whose exec-action takes --sweep-only
 MIN_PIPELINE_RELEASE = (0, 14, 75)  # the first whose exec-action takes --pipeline
+MIN_SHARE_DEPS_HEAP_RELEASE = (0, 14, 98)  # the first whose exec-action takes --share-deps-heap
 CACHE_MIN_FREE_GB = 16  # the free space the cache cap keeps on the cache's disk for writers it doesn't count
 
 
@@ -1043,6 +1044,9 @@ def exec_action_command(
     command += ["--result", result]
     if args.share_heaps:
         command.append("--share-heaps")
+    # An older release has no deps-heap-only mode: it shares nothing then.
+    if args.share_deps_heap and tuple(map(int, version.split("."))) >= MIN_SHARE_DEPS_HEAP_RELEASE:
+        command.append("--share-deps-heap")
     if pipeline and tuple(map(int, version.split("."))) >= MIN_PIPELINE_RELEASE:
         command.append("--pipeline")
     for parent in ahead_parents:
@@ -1536,7 +1540,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-heap", type=int, default=12000, help="default holbuild --max-heap MB (default: %(default)s)")
     parser.add_argument("--cooperate-dir", help="holbuild --cooperate-dir, shared by a host's workers")
-    parser.add_argument("--share-heaps", action="store_true", help="holbuild exec-action --share-heaps")
+    sharing = parser.add_mutually_exclusive_group()
+    sharing.add_argument("--share-heaps", action="store_true", help="holbuild exec-action --share-heaps")
+    sharing.add_argument(
+        "--share-deps-heap",
+        action="store_true",
+        help="holbuild exec-action --share-deps-heap, for workers serving users who don't trust each other; "
+        "actions of releases before 0.14.98 share nothing",
+    )
     parser.add_argument(
         "--load-ahead",
         action="store_true",
