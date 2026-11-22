@@ -1699,12 +1699,13 @@ def main() -> None:
         sweep = functools.partial(sweep_cache, releases, args.cache_limit_gb)
         reaper = Reaper(drain, os.path.join(os.environ["HOLBUILD_CACHE"], "action.lock"))
         resources.callback(reaper.stop)
-        def unprotect(timeout: float = 30) -> None:
+        def unprotect() -> None:
             """A worker that waits, found no work or exits is idle: a scale-in may take it."""
             if protection.on is not False:
-                protection.set(enabled=False, timeout=timeout)
+                # Once draining, a stalled clear mustn't outlast the time left before the container is stopped.
+                protection.set(enabled=False, timeout=2 if drain.stop.is_set() else 30)
 
-        resources.callback(unprotect, 2)
+        resources.callback(unprotect)
         # Set when ECS refused protection for a claim or the worker dropped it after PROTECTED_SPELL_SECONDS: the
         # worker then claims only once ECS protects it, so a task being stopped takes no action it would give back.
         protect_first = False

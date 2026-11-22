@@ -849,7 +849,9 @@ claim, so a worker going straight from one action to the next is never
 unprotected; the worker clears it once a claim finds nothing (or fails),
 before it waits for disk or memory, after an `unavailable` result or an error
 in the worker, and when
-it exits, and a worker that dies takes its task down with it. An idle worker
+it exits (once a SIGTERM drains it, each clear waits at most 2 seconds, so a
+stalled agent or `--protection-cmd` can't hold it past the container's stop),
+and a worker that dies takes its task down with it. An idle worker
 claims unprotected, so a scale-in can take idle workers. When ECS refuses to
 protect an unprotected worker for an action it just claimed, the task is
 about to be stopped: the worker gives the action back as `declined` without

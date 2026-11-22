@@ -834,9 +834,11 @@ class ScriptedProtection:
         self.on: bool | None = False
         self.since = 0.0
         self.times: list[float] = []  # when each call came
+        self.timeouts: list[float] = []
 
     def set(self, *, enabled: bool, timeout: float = 30) -> bool:
         self.times.append(time.monotonic())
+        self.timeouts.append(timeout)
         if not enabled and self.clears and not self.clears.pop(0):
             self.events.append("off:failed")
             self.on = None
@@ -853,10 +855,11 @@ class ScriptedProtection:
 def scripted_main(
     tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, fresh: list[bool], claims: int | list[bool],
     *, unavailable: bool = False, calls: list[float] | None = None, clears: list[bool] | None = None,
+    timeouts: list[float] | None = None, drain: bool = False,
 ) -> list[str]:
     """Run ``worker.main`` on ``claims`` claims (or, as a list, claims that find work or not), each run as an
-    action that sets protection and reports the cache ``unavailable`` or not, and return the claims, runs and
-    protection calls in order."""
+    action that sets protection and reports the cache ``unavailable`` or not (after a SIGTERM, with ``drain``),
+    and return the claims, runs and protection calls in order."""
     monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
@@ -874,17 +877,21 @@ def scripted_main(
             raise KeyboardInterrupt
         return left.pop(0)
 
-    def run(_coordinator, _args, _releases, protection, *_rest, **_kwargs) -> bool:
+    def run(coordinator, _args, _releases, protection, *_rest, **_kwargs) -> bool:
         events.append("run")
+        if drain:
+            coordinator.drain.request()
         # As Lease.held: a refusal for an unprotected worker gives the claim back, reported like ``unavailable``.
         return not protection.set(enabled=True, timeout=5) or unavailable
 
     monkeypatch.setattr(worker, "claim_reporting", take)
     monkeypatch.setattr(worker, "run_one", run)
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(KeyboardInterrupt) if not drain else contextlib.nullcontext():
         worker.main()
     if calls is not None:
         calls.extend(protection.times)
+    if timeouts is not None:
+        timeouts.extend(protection.timeouts)
     return events
 
 
@@ -929,6 +936,15 @@ def test_a_worker_drops_protection_before_waiting_out_an_unavailable_cache(
 ) -> None:
     events = scripted_main(tmp_path, server, monkeypatch, [], 1, unavailable=True)
     assert events == ["claim", "run", "on:True", "off", "claim"]
+
+
+def test_a_draining_worker_clears_protection_within_the_time_left_before_its_container_is_stopped(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeouts: list[float] = []
+    events = scripted_main(tmp_path, server, monkeypatch, [], 1, unavailable=True, timeouts=timeouts, drain=True)
+    assert events == ["claim", "run", "on:True", "off"]
+    assert timeouts[-1] == 2
 
 
 @pytest.mark.parametrize("text", ["-1", "nan", "inf"])
