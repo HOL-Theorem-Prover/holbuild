@@ -1444,7 +1444,7 @@ class Coordinator:
                     await self._outranked_by_ahead(tiers, ahead_tiers) if ahead_tiers and claim_tiers else None
                 )
                 claimed, held_until = (
-                    await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only, held_tiers)
+                    await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only, held_tiers, tiers)
                     if claim_tiers else (None, None)
                 )
                 # Builds left for their holders still rank before claims ahead.
@@ -1452,8 +1452,8 @@ class Coordinator:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
-                    # Recorded at once, as _leased_build counted the build off the ready ones, so the scale-in line
-                    # counts it; a lease given back drops it.
+                    # Recorded before the answer, so the scale-in line counts a lease while it waits (as _claim
+                    # records a build's); a lease given back drops it.
                     if claimed is not None and host_id is not None:
                         self._lease_host(claimed.attempt_token, host_id, worker, tiers)
                     claimed = await self._answered(claimed, disconnected)
@@ -1532,6 +1532,7 @@ class Coordinator:
         hint: Hint | None = None,
         hint_only: frozenset[str] = frozenset(),
         held_tiers: frozenset[str] = frozenset(),
+        worker_tiers: list[str] | None = None,
     ) -> tuple[Claim | None, float | None]:
         """Lease a ready build of ``tiers`` from the shared ranking, else a run action. Before a ready build that
         ranks after an action that may be claimed ahead, claim one that ``outranked`` ranks before it: of a batch
@@ -1542,7 +1543,8 @@ class Coordinator:
 
         Also returns, when the only ready builds left are held for other hosts (see _held), when the first hold
         ends: those builds are ready, so no run is claimed, and the claim asks again then. Of tiers ``hint_only``,
-        it may lease only a build held for its host, and no run."""
+        it may lease only a build held for its host, and no run. A build's lease is recorded for ``host_id``, with
+        the claim's ``worker_tiers``, before the wake it passes on, so that wake's scale-in line counts it."""
         started = asyncio.get_running_loop().time()
         key = tuple(tiers)
         ranking = await self._current_ranking(key)
@@ -1569,6 +1571,8 @@ class Coordinator:
                 raise
             if row is not None:
                 self._batch_changed(row.batch_id)
+                if host_id is not None and worker_tiers is not None:
+                    self._lease_host(claimed.attempt_token, host_id, worker, worker_tiers)
                 self._leased_build(ranking, row.tier)
                 return claimed, None
             if held_until is not None:
@@ -2603,20 +2607,21 @@ class Coordinator:
         work ready, so made_ready stays."""
         self.leased[tier] += 1
         self.claimable[tier] = max(0, self.claimable.get(tier, 0) - 1)
+        self.ready_builds = max(0, self.ready_builds - 1)
+        if tier == "high":
+            self.ready_high = max(0, self.ready_high - 1)
         waiting = {t for w_tiers, _, w_woken, _ in self.claim_waiters if not w_woken.done() for t in w_tiers}
+        if not waiting:
+            return
         now = asyncio.get_running_loop().time()
         left = [
             e for e in ranking.heap
             if e[7] in waiting and (e[6], e[7]) not in ranking.exhausted
             and self.holds.get((e[6], e[7]), (0.0, now))[1] <= now
-        ] if waiting else []
+        ]
         if left:
             self.made_ready -= 1  # _wake_claim counts it
             self._wake_claim(tier if any(e[7] == tier for e in left) else min(left)[7])
-        # Only after the wake, as the caller records the lease right after (see claim): the line counts it once.
-        self.ready_builds = max(0, self.ready_builds - 1)
-        if tier == "high":
-            self.ready_high = max(0, self.ready_high - 1)
 
     def _pass_wake(self, woken: asyncio.Future[Wake]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""
