@@ -35,7 +35,9 @@ by the batch deadline on a second attempt).  STATE/<id>.events, when it exists, 
 <id>'s recorded event stream: it is sent as it is, without running RUN.  `late-log`
 reports an action a failed batch's RUN built as cancelled with no log, and records the
 stream there with that action's log, as the coordinator keeps a log that arrives after the
-batch ended and streams an ended batch's last state.  When RUN
+batch ended and streams an ended batch's last state; holding `live`, it reports the log as
+the action is cancelled and records an empty stream, as for a batch that can't be read
+again.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", and on a second line the others it found missing,
 comma-separated, the batch fails for resubmission naming them, as the coordinator does.  Otherwise
@@ -159,6 +161,7 @@ class Handler(BaseHTTPRequestHandler):
         # streams an ended batch's last state; LATE is how a line is kept there.
         kept = []
         late_log = (state / "late-log").exists()
+        late_live = late_log and (state / "late-log").read_text().strip() == "live"
 
         def emit(data, late=None):
             self.wfile.write(data)
@@ -237,6 +240,8 @@ class Handler(BaseHTTPRequestHandler):
                         # only for later reads of the batch.
                         event["state"], event["last_failure"] = "cancelled", None
                         late = dict(event, log_sha256=record["log"].split()[0] if "log" in record else None)
+                        if late_live:
+                            event = late
                     else:
                         event["state"], event["last_failure"] = "done", None
                 elif not ok and not (state / "fail").exists():
@@ -279,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
                  "failure": failure}
         emit((json.dumps(final) + "\n").encode())
         if late_log and not events.exists():
-            events.write_bytes(b"".join(kept))
+            events.write_bytes(b"" if late_live else b"".join(kept))
 
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

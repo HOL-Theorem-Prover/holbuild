@@ -2217,6 +2217,22 @@ require_grep "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubm
   { echo "worker results:" >&2; cat "$state/results" >&2; exit 1; }
 require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
 
+# The same log, seen as A was cancelled, is kept when the ended batch can't be
+# read again.
+write_theories resubmit-live-log
+rm -rf "$project/.holbuild/logs/current"
+a_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:ATheory" { print $2 }')
+echo "rxresubmitlogs:BTheory theory $a_key" > "$state/fail-missing"
+echo live > "$state/late-log"
+: > "$state/results"
+run resubmit-live-log 0 build --remote-exec "$coordinator" --remote-only BTheory
+rm "$state/late-log"
+require_grep "rxresubmitlogs:ATheory: cancelled, log /cas/" "$tmpdir/resubmit-live-log.log"
+[[ "$(< "$state/results")" == \
+   $'rxresubmitlogs:ATheory status=built\nrxresubmitlogs:ATheory status=cached\nrxresubmitlogs:BTheory status=built' ]] ||
+  { echo "worker results:" >&2; cat "$state/results" >&2; exit 1; }
+require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
+
 # The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
 copy_nondet heap-cap rxheap
 cat > "$tmpdir/heap-cap/src/HeapScript.sml" <<'SML'

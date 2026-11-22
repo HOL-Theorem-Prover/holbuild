@@ -1971,6 +1971,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    to start: none of it reads what they write. *)
                 val _ = record_pending () handle e => (ignore (stop_all ()); #stop early_pool (); #stop failure_spans (); raise e)
                 val logs = ref []
+                val cancelled = ref []
                 (* Whether a worker found a cached theory that doesn't fit the
                    parents the cache holds, rather than one the cache lacks. *)
                 val misfit = ref false
@@ -1979,6 +1980,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    if state = "done" then
                      (HolbuildBuildExec.expect_remote_entry key; add key; logs := (key, log) :: !logs)
                    else ();
+                   case (state, failure, log) of
+                       ("cancelled", NONE, SOME sha) => cancelled := (key, sha) :: !cancelled
+                     | _ => ();
                    if failure = SOME "input-missing" andalso
                       Option.isSome (Option.mapPartial (HolbuildStatus.find_substring "does not match its parents") detail)
                    then misfit := true
@@ -1996,7 +2000,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     val settled = stop_all ()
                     val _ = #drain early_pool ()
                   in
-                    (result, rev (!logs), settled, failure_spans, early, !misfit)
+                    (result, rev (!logs), rev (!cancelled), settled, failure_spans, early, !misfit)
                   end
                   handle e => (stop_all (); #stop early_pool (); #stop failure_spans (); raise e)
               in
@@ -2070,11 +2074,15 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                finished as it ended, its log coming only after the stream
                closed, and a later batch then finds it built: a theory done
                with no log takes the log of its cancelled action in the
-               batches before, read again from them.  Only such a theory:
+               batches before, seen as they ran or read again from them,
+               each at most once.  Only such a theory:
                a cancelled action's log may be that of a build the cancel
                stopped. *)
             val resubmitted_logs = ref []
-            val resubmitted_batches = ref []
+            (* The earlier batches in order, each with the logs of its
+               cancelled actions that had no failed attempt, by input key, and
+               whether its stream was read again for them. *)
+            val earlier_batches = ref []
             fun carry_logs earlier later failed =
               Redblackmap.listItems
                 (List.foldl
@@ -2083,20 +2091,27 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                      | ((key, log), table) => Redblackmap.insert (table, key, log))
                    (Redblackmap.mkDict String.compare)
                    (List.filter (fn (key, _) => not (List.exists (fn k => k = key) failed)) earlier @ later))
+            fun fill_from_cancelled logs =
+              let
+                val table =
+                  List.foldl (fn ((key, log), table) => Redblackmap.insert (table, key, log))
+                    (Redblackmap.mkDict String.compare) (List.concat (map (fn (_, seen, _) => seen) (!earlier_batches)))
+              in
+                map (fn (key, NONE) => (key, Redblackmap.peek (table, key)) | entry => entry) logs
+              end
             fun with_cancelled_logs logs =
-              if null (!resubmitted_batches) orelse List.all (fn (_, log) => Option.isSome log) logs then logs
-              else
-                let
-                  val cancelled =
-                    List.foldl (fn ((key, log), table) => Redblackmap.insert (table, key, log))
-                      (Redblackmap.mkDict String.compare)
-                      (List.concat (map (HolbuildRemoteExec.cancelled_logs url) (!resubmitted_batches)))
-                in
-                  map (fn (key, NONE) => (key, Redblackmap.peek (cancelled, key)) | entry => entry) logs
-                end
+              let val filled = fill_from_cancelled logs
+              in
+                if List.all (fn (_, log) => Option.isSome log) filled orelse List.all (fn (_, _, read) => read) (!earlier_batches) then filled
+                else
+                  (earlier_batches :=
+                     map (fn (id, seen, false) => (id, seen @ HolbuildRemoteExec.cancelled_logs url id, true)
+                           | batch => batch) (!earlier_batches);
+                   fill_from_cancelled logs)
+              end
             fun finish retried skip in_batch batch_id =
               let
-                val (outcome, batch_logs, settled, failure_spans, early, misfit) = follow in_batch batch_id
+                val (outcome, batch_logs, batch_cancelled, settled, failure_spans, early, misfit) = follow in_batch batch_id
                 val failed =
                   case outcome of
                       (HolbuildRemoteExec.Failed (_, failures), _) => map #input_key failures
@@ -2203,7 +2218,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          (* Their local entries may be the ones that don't fit. *)
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          resubmitted_logs := logs;
-                         resubmitted_batches := !resubmitted_batches @ [batch_id];
+                         earlier_batches := !earlier_batches @ [(batch_id, batch_cancelled, false)];
                          export_and_submit (missing :: retried) false NONE skip forced)
                   end
                 | (HolbuildRemoteExec.Cancelled (cancelled_logs, _), progress) =>
