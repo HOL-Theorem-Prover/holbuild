@@ -7159,6 +7159,16 @@ fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, p
                     trace_steps = false, repl_on_failure = false, trknl = false,
                     promote_preload = promote_preload}
 
+(* exec-action --share-deps-heap shares no theorem or definition
+   checkpoint, and each action starts from an empty checkpoint tree, so
+   saving one would only cost the child time. *)
+fun deps_heap_only_policy (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...}) =
+  CheckpointPolicy {checkpoint = checkpoint, theorem_checkpoints = false, checkpoint_target = checkpoint_target,
+                    checkpoint_seconds = checkpoint_seconds, proof_steps = proof_steps,
+                    new_ir = new_ir, tactic_timeout = tactic_timeout, execution_plan = execution_plan,
+                    trace_steps = trace_steps, repl_on_failure = repl_on_failure, trknl = trknl,
+                    promote_preload = promote_preload}
+
 fun signature_companion plan node =
   List.find
     (fn candidate => same_package_logical candidate node andalso
@@ -15232,7 +15242,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  if forced then () else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
             | NONE => ()
         val stage = action_stage root action
-        val policy = if pipelined then speculative_policy (spec_policy spec) else spec_policy spec
+        val policy =
+          if pipelined then speculative_policy (spec_policy spec)
+          else if deps_heap_only then deps_heap_only_policy (spec_policy spec)
+          else spec_policy spec
         val log_dir = current_log_dir root (#package spec) (#logical spec)
         val oom_before = cgroup_oom_kills ()
         val _ = last_child_status := NONE

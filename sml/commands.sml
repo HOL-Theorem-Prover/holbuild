@@ -327,9 +327,10 @@ fun exec_action_help () = print
   \--share-heaps        Resume from the deps-loaded heap and theorem checkpoints\n\
   \                     other workers published, and publish this run's. The\n\
   \                     host store CACHE/checkpoint-store keeps their files.\n\
-  \--share-deps-heap    As --share-heaps, but share only deps-loaded heaps, no\n\
-  \                     checkpoint the script saved: for workers whose actions\n\
-  \                     come from users who don't trust each other.\n\
+  \--share-deps-heap    As --share-heaps, but share only deps-loaded heaps and\n\
+  \                     save no theorem or definition checkpoint: for workers\n\
+  \                     whose actions come from users who don't trust each\n\
+  \                     other.\n\
   \--pipeline           Build a theory whose spec allows it pipelined: publish\n\
   \                     its outline to the remote cache once its script has\n\
   \                     run, under a key of its own, then prove its deferred\n\

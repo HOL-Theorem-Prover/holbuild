@@ -77,7 +77,8 @@ val store = root ^ "/cache/checkpoint-store/family";
 val _ = HolbuildToolchain.ensure_dir family;
 val _ = HolbuildToolchain.ensure_dir store;
 val _ = List.app (fn i => OS.FileSys.mkDir (family ^ "/" ^ hex i)) (List.tabulate (700, fn i => i));
-val _ = TextIO.closeOut (TextIO.openOut (store ^ "/state"));
+val _ = List.app (fn name => let val out = TextIO.openOut (store ^ "/" ^ name) in TextIO.output (out, name ^ "\n"); TextIO.closeOut out end)
+                 ["state", "other"];
 val _ = Posix.FileSys.symlink {old = store ^ "/state", new = family ^ "/" ^ hex 0 ^ "/context.save"};
 val _ = HolbuildToolchain.ensure_dir (action ^ "/.holbuild/stage");
 val _ = HolbuildActionSandbox.enable (action, checkpoints);
@@ -92,6 +93,15 @@ fun run argv = HolbuildToolchain.run_in_dir_to_file action argv (root ^ "/many/l
 val _ = run ["/bin/sh", "-c", ": > " ^ family ^ "/" ^ hex 699 ^ "/saved"];
 val _ = if OS.FileSys.access (family ^ "/" ^ hex 699 ^ "/saved", []) then ()
         else raise Fail "the confined child did not save its checkpoint";
+(* The linked state is readable, alone: its store family can't be listed,
+   nor another state in it opened, even by its exact name. *)
+val report = action ^ "/.holbuild/stage/report";
+val _ = run ["/bin/sh", "-c",
+             "{ cat \"$1\" && echo linked; cat \"$2/other\" || echo other-denied; ls \"$2\" || echo family-denied; } > \"$3\" 2>/dev/null",
+             "sh", family ^ "/" ^ hex 0 ^ "/context.save", store, report];
+val got = let val input = TextIO.openIn report in TextIO.inputAll input before TextIO.closeIn input end;
+val _ = if got = "state\nlinked\nother-denied\nfamily-denied\n" then ()
+        else raise Fail ("the checkpoint store grants leaked or failed:\n" ^ got);
 val _ = HolbuildActionSandbox.result_file := SOME (action ^ "/result");
 val reason = (run ["true"]; "") handle HolbuildToolchain.Error msg => msg;
 val _ = if String.isSubstring "contains protected worker state" reason then ()

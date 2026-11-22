@@ -186,8 +186,38 @@ resumed_from v3
 
 # --share-deps-heap: the heap is shared and used, no script checkpoint is.
 # A worker of its own, whose local cache holds none of T's versions above.
+# Nor does its child spend time saving one: at its end, T's script finds
+# the deps heap its preload saved and no context of t1.
 worker_cache=$tmpdir/worker-deps
-write_t "T" "T /\\ T" ""
+probe_tail=$(cat <<SML
+
+local
+  fun find dir suffix =
+    let
+      val stream = OS.FileSys.openDir dir
+      fun loop found =
+        case OS.FileSys.readDir stream of
+            NONE => found
+          | SOME entry =>
+              let val path = OS.Path.concat (dir, entry)
+              in
+                loop (if String.isSuffix suffix entry then path :: found
+                      else if OS.FileSys.isDir path andalso not (OS.FileSys.isLink path)
+                      then find path suffix @ found
+                      else found)
+              end
+    in
+      loop [] before OS.FileSys.closeDir stream
+    end
+in
+  val _ = if null (find "$worker_cache/checkpoints" "deps_loaded.save")
+          then raise Fail "no deps heap saved" else ()
+  val _ = if null (find "$worker_cache/checkpoints" "_context.save") then ()
+          else raise Fail "a theorem context saved under --share-deps-heap"
+end;
+SML
+)
+write_t "T" "T /\\ T" "$probe_tail"
 export_t d1 "$deps_url" --share-deps-heap
 worker d1 "$deps_url" "$spec_t" --share-deps-heap
 [[ $(entries holbuild-shared-heap-v1 "$tmpdir/remote-deps") == 1 ]] || {
