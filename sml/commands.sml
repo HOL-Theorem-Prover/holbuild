@@ -2290,12 +2290,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             and submit retried settled skip batch =
               if null (batch_keys batch) then
                 (record_pending ();
-                 (* A resubmission can find everything built already. *)
-                 if null (!resubmitted_logs) then ()
-                 else
-                   (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key
-                      (with_cancelled_logs "" [] (!resubmitted_logs));
-                    resubmitted_logs := []);
+                 (* A resubmission can find everything built already, also
+                    the theories its batches only cancelled. *)
+                 (case with_cancelled_logs "" [] (!resubmitted_logs) of
+                      [] => ()
+                    | logs =>
+                        (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key logs;
+                         resubmitted_logs := []));
                  if not (null (!deferred)) then submit_deferred retried settled skip
                  else if not (null skip) then restore_after_failures settled skip
                  else

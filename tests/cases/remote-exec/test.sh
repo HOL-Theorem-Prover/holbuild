@@ -2182,6 +2182,19 @@ for theory in ATheory BTheory; do
   require_file "$project/.holbuild/logs/current/rxresubmitlogs/$theory/build.log"
 done
 
+# So do theories its batch only reported cancelled, their logs coming late.
+write_theories resubmit-logs-built-late
+rm -rf "$project/.holbuild/logs/current"
+echo "rxresubmitlogs:BTheory blob $(printf '0%.0s' {1..64})" > "$state/fail-missing-built"
+touch "$state/late-log"
+run resubmit-logs-built-late 0 build --remote-exec "$coordinator" --remote-only BTheory
+rm "$state/late-log"
+require_grep "rxresubmitlogs:BTheory: cancelled$" "$tmpdir/resubmit-logs-built-late.log"
+require_grep "nothing to build remotely" "$tmpdir/resubmit-logs-built-late.log"
+for theory in A B; do
+  require_grep "Theory \"$theory\" took" "$project/.holbuild/logs/current/rxresubmitlogs/${theory}Theory/build.log"
+done
+
 # Each resubmission rebuilds again every theory an earlier one was for, since
 # a failed batch may have cancelled that repair: B's worker finds A missing,
 # then, in the resubmitted batch, B itself.
