@@ -1411,9 +1411,10 @@ class Coordinator:
                     if quarantine == "failures" and (probe is None or (now - probe).total_seconds() >= PROBE_SECONDS):
                         self.probe_at[host_id] = now
                         claimed, _ = await self._claim(tiers, worker)
-                        claimed = await self._answered(claimed, disconnected)
                         if claimed is not None:
                             self._lease_host(claimed.attempt_token, host_id, worker, tiers)
+                        claimed = await self._answered(claimed, disconnected)
+                        if claimed is not None:
                             self._ran_on(host_id, claimed.theory)
                         return claimed
                     remaining = deadline - loop.time()
@@ -1451,9 +1452,12 @@ class Coordinator:
                     claimed = await self._claim_ahead(ahead_tiers, worker)
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
-                    claimed = await self._answered(claimed, disconnected)
+                    # Recorded at once, as _leased_build counted the build off the ready ones, so the scale-in line
+                    # counts it; a lease given back drops it.
                     if claimed is not None and host_id is not None:
                         self._lease_host(claimed.attempt_token, host_id, worker, tiers)
+                    claimed = await self._answered(claimed, disconnected)
+                    if claimed is not None and host_id is not None:
                         self._ran_on(host_id, claimed.theory)
                     return claimed
                 woken = loop.create_future()
@@ -2599,21 +2603,20 @@ class Coordinator:
         work ready, so made_ready stays."""
         self.leased[tier] += 1
         self.claimable[tier] = max(0, self.claimable.get(tier, 0) - 1)
-        self.ready_builds = max(0, self.ready_builds - 1)
-        if tier == "high":
-            self.ready_high = max(0, self.ready_high - 1)
         waiting = {t for w_tiers, _, w_woken, _ in self.claim_waiters if not w_woken.done() for t in w_tiers}
-        if not waiting:
-            return
         now = asyncio.get_running_loop().time()
         left = [
             e for e in ranking.heap
             if e[7] in waiting and (e[6], e[7]) not in ranking.exhausted
             and self.holds.get((e[6], e[7]), (0.0, now))[1] <= now
-        ]
+        ] if waiting else []
         if left:
             self.made_ready -= 1  # _wake_claim counts it
             self._wake_claim(tier if any(e[7] == tier for e in left) else min(left)[7])
+        # Only after the wake, as the caller records the lease right after (see claim): the line counts it once.
+        self.ready_builds = max(0, self.ready_builds - 1)
+        if tier == "high":
+            self.ready_high = max(0, self.ready_high - 1)
 
     def _pass_wake(self, woken: asyncio.Future[Wake]) -> None:
         """Hand the wake of a claim leaving without trying, if it got one, to the next claim it was for."""

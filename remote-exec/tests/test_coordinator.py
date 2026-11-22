@@ -1837,6 +1837,29 @@ async def test_a_lease_since_the_ready_builds_were_counted_takes_no_tail_host_on
     assert await coordinator.claim(burst, "a1", host_id="host-a") is not None
 
 
+async def test_a_lease_passes_its_wake_to_a_tail_host_the_line_takes_in_with_it_counted(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """host-a's workers, one leased, cover one of the two builds another process made ready; host-b's waiting claim
+    takes the other on the wake host-a's lease passes on."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only the wake ends the wait in time
+    burst = ["high", "standard"]
+    for worker in ["a0", "a1"]:
+        coordinator.report_worker("host-a", worker, burst)
+    coordinator.report_worker("host-b", "b0", burst)
+    await submit(http, ["x"])
+    assert await coordinator.claim(burst, "a1", host_id="host-a") is not None
+    tail = asyncio.create_task(coordinator.claim(burst, "b0", 30, host_id="host-b"))
+    while not coordinator.claim_waiters:
+        await asyncio.sleep(0.01)
+    with monkeypatch.context() as patch:
+        patch.setattr(coordinator, "_wake_claim", lambda *args, **kwargs: None)
+        await submit(http, ["a", "b"])
+    await coordinator.queue()
+    assert await coordinator.claim(burst, "a0", host_id="host-a") is not None
+    assert await asyncio.wait_for(tail, 5) is not None
+
+
 async def test_the_standard_line_counts_no_slot_of_a_worker_that_takes_only_high_work(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
