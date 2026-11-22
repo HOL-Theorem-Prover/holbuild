@@ -32,8 +32,8 @@ reports a failed action as a cancel that stopped it leaves it: cancelled with th
 worker uploaded, and the batch cancelled; holding `unlogged`, before that log arrived, and
 holding a failure kind, after an earlier attempt failed with it (`deadline-retried`: stopped
 by the batch deadline on a second attempt).  `cancel-done` reports an action that finished in a
-failed batch as cancelled with no log, as when its result came after the batch failed; a later
-read of the ended batch gets its log.  STATE/<id>.events, when it exists, is batch
+failed batch as cancelled with an earlier attempt's failure and log, as when its second attempt's
+result came after the batch failed; a later read of the ended batch gets the new log.  STATE/<id>.events, when it exists, is batch
 <id>'s recorded event stream: it is sent as it is, without running RUN.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", and on a second line the others it found missing,
@@ -238,9 +238,10 @@ class Handler(BaseHTTPRequestHandler):
                         event["timings"]["wall"] = int(recorded["wall-ms"])
                 late = event["state"] == "done" and not ok and (state / "cancel-done").exists()
                 if late:
-                    # As the coordinator leaves an action whose result came after its batch failed:
-                    # cancelled, and its log only after the stream ended, for a later read.
-                    event["state"] = "cancelled"
+                    # As the coordinator leaves an action whose second attempt's result came after
+                    # its batch failed: cancelled with the first attempt's failure, and the log
+                    # only after the stream ended, for a later read.
+                    event["state"], event["last_failure"], event["attempts"] = "cancelled", "unavailable", 2
                 snapshot.append(event)
                 if event["state"] == "done" and (state / "requeue-log").exists():
                     # The first execution's log was evicted; only the final
@@ -248,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write((json.dumps(dict(event, log_sha256="0" * 64)) + "\n").encode())
                     if not (state / "requeue-snapshot").exists():
                         self.wfile.write((json.dumps(dict(event, state="waiting", log_sha256=None)) + "\n").encode())
-                self.wfile.write((json.dumps(dict(event, log_sha256=None) if late else event) + "\n").encode())
+                self.wfile.write((json.dumps(dict(event, log_sha256="c" * 64) if late else event) + "\n").encode())
                 self.wfile.flush()
                 for _ in range(600):
                     if not (state / "hold").exists():

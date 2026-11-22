@@ -1971,11 +1971,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    to start: none of it reads what they write. *)
                 val _ = record_pending () handle e => (ignore (stop_all ()); #stop early_pool (); #stop failure_spans (); raise e)
                 val logs = ref []
+                (* Each action's last log on the stream. *)
+                val seen = ref []
                 (* Whether a worker found a theory not to fit its parents in
                    the remote cache, rather than missing from it. *)
                 val misfit = ref false
                 fun on_change (key, state, failure, log, detail) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
+                   seen := (key, log) :: List.filter (fn (k, _) => k <> key) (!seen);
                    if state = "done" then
                      (HolbuildBuildExec.expect_remote_entry key; add key; logs := (key, log) :: !logs)
                    else ();
@@ -1997,7 +2000,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     val settled = stop_all ()
                     val _ = #drain early_pool ()
                   in
-                    (result, rev (!logs), !misfit, settled, failure_spans, early)
+                    (result, rev (!logs), !seen, !misfit, settled, failure_spans, early)
                   end
                   handle e => (stop_all (); #stop early_pool (); #stop failure_spans (); raise e)
               in
@@ -2073,16 +2076,22 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                replaces an earlier one, and a theory that failed in the later
                batch keeps none. *)
             val resubmitted_logs = ref []
-            (* The batch the last resubmission came from.  A theory its worker
-               finished after it failed is left cancelled there, and its log
-               only arrives after the batch's events (late_logs). *)
+            (* The batch the last resubmission came from, with each action's
+               last log its events showed.  A theory its worker finished
+               after the batch failed is left cancelled there, and its log
+               only arrives after the batch's events (late_logs): a log they
+               didn't show. *)
             val resubmitted_from = ref NONE
             fun carried_logs () =
               case !resubmitted_from of
                   NONE => !resubmitted_logs
-                | SOME batch_id =>
+                | SOME (batch_id, seen) =>
                     (resubmitted_from := NONE;
-                     !resubmitted_logs @ map (fn (key, sha) => (key, SOME sha)) (HolbuildRemoteExec.late_logs url batch_id))
+                     !resubmitted_logs @
+                     List.mapPartial (fn (key, sha) =>
+                                        if List.exists (fn entry => entry = (key, SOME sha)) seen then NONE
+                                        else SOME (key, SOME sha))
+                       (HolbuildRemoteExec.late_logs url batch_id))
             val misfits = ref []
             fun carry_logs earlier later failed =
               Redblackmap.listItems
@@ -2094,7 +2103,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    (List.filter (fn (key, _) => not (List.exists (fn k => k = key) failed)) earlier @ later))
             fun finish retried skip in_batch batch_id =
               let
-                val (outcome, batch_logs, misfit, settled, failure_spans, early) = follow in_batch batch_id
+                val (outcome, batch_logs, seen_logs, misfit, settled, failure_spans, early) = follow in_batch batch_id
                 val failed =
                   case outcome of
                       (HolbuildRemoteExec.Failed (_, failures), _) => map #input_key failures
@@ -2192,7 +2201,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          (* Their local entries may be the ones that don't fit. *)
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          resubmitted_logs := logs;
-                         resubmitted_from := SOME batch_id;
+                         resubmitted_from := SOME (batch_id, seen_logs);
                          export_and_submit (missing :: retried) false NONE skip forced)
                   end
                 | (HolbuildRemoteExec.Cancelled (cancelled_logs, _), progress) =>
