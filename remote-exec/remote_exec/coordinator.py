@@ -3710,7 +3710,8 @@ class Coordinator:
         attempts, fail the batch for resubmission.
 
         The missing theory may be a transitive dependency, which the batch has no edge for; the edge added here
-        holds the action back until that theory is rebuilt and the cache holds it again.
+        holds the action back until that theory is rebuilt and the cache holds it again. One the batch is still to
+        build costs the action no attempt, and holds it back from claims ahead too.
         """
         missing = result.missing
         more = [f"{item.kind} {item.key}" for item in result.missing_more]
@@ -3727,6 +3728,24 @@ class Coordinator:
             if parent_state in ("failed", "cancelled"):
                 await self._skip(conn, batch_id, input_key, f"skipped because of {rebuilt} ({missing.key})")
                 await self._finish_if_done(conn, batch_id)
+                return
+            if parent_state in ("waiting", "ready", "running") and await self._add_edge(
+                conn, batch_id, input_key, missing.key
+            ):
+                # The batch hasn't built it yet: the action found an earlier build's entry the cache no longer holds
+                # whole. That costs no attempt, and the action waits for the build: claimed ahead of it again, it
+                # would find the same entry.
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET attempts = attempts - 1, "
+                        "ahead = CASE WHEN :ahead_batch THEN 'abandoned' ELSE ahead END "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {"batch_id": batch_id, "input_key": input_key, "ahead_batch": ahead_batch},
+                )
+                self._remember_missing(batch_id, input_key, more)
+                await self._back_to_waiting(conn, batch_id, input_key, ahead_batch=ahead_batch)
+                await self._requeue(conn, batch_id, missing.key, ahead_batch=ahead_batch)
                 return
         if attempts >= self.settings.max_attempts:
             # What it found missing before is superseded by this last report.

@@ -382,6 +382,36 @@ async def test_a_child_held_by_another_batch_wakes_a_waiting_claim_ahead_once_th
     assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
 
 
+async def test_a_claim_ahead_given_up_frees_its_key_for_another_batch_s_ready_copy_at_once(
+    http: httpx.AsyncClient, cache: FakeCache
+) -> None:
+    ahead = await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    a = await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["theory"] == "pkg:b"
+    # Another batch whose parent of "b" is already built: its copy is ready, and held by the claim ahead.
+    ready = await submit(http, ["b"])
+    assert await claim(http) is None
+
+    started = time.monotonic()
+    waiting = asyncio.create_task(claim_ahead(http, wait_s=CLAIM_RECHECK_SECONDS * 2))
+    await asyncio.sleep(0.2)
+    assert not waiting.done()
+    assert (await complete(http, b["attempt_token"], result("b", "failed", "ahead-abandoned"))).status_code == 200
+    claimed = await waiting
+    assert claimed is not None and claimed["theory"] == "pkg:b" and claimed["ahead_parents"] == []
+    assert time.monotonic() - started < CLAIM_RECHECK_SECONDS
+    assert await states(http, ready) == {"b": "running"}
+    assert await states(http, ahead) == {"a": "running", "b": "waiting"}
+    assert [x["attempts"] for x in (await batch(http, ahead))["actions"] if x["theory"] == "pkg:b"] == [0]
+
+    cache.keys.add(ac_key("b"))
+    assert (await complete(http, claimed["attempt_token"], result("b", "built"))).status_code == 200
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, a, result("a", "built"))).status_code == 200
+    assert (await states(http, ready), await states(http, ahead)) == ({"b": "done"}, {"a": "done", "b": "done"})
+
+
 async def test_claims_ahead_take_the_deepest_child_first_and_stop_at_the_cap(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
@@ -920,6 +950,29 @@ async def test_input_missing_from_a_claim_ahead_counts_its_attempt_and_makes_it_
     missing = result("b", "failed", "input-missing", missing=f"theory {input_key('p')}")
     assert (await complete(http, b["attempt_token"], missing)).status_code == 200
     assert await ahead_state(remote_exec_engine, "b") == ("waiting", "no", 1, 2)
+
+
+async def test_input_missing_for_a_parent_still_building_costs_no_attempt_and_waits_for_its_build(
+    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
+) -> None:
+    # The claim ahead finds an entry of an earlier build of the running parent, whose blobs the cache lost. Claimed
+    # ahead again at once, it used up its attempts on the same entry and failed the batch.
+    batch_id = await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    a = await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["ahead_parents"] == parents("a")
+    missing = result("b", "failed", "input-missing", missing=f"theory {input_key('a')}")
+    assert (await complete(http, b["attempt_token"], missing)).status_code == 200
+    assert await ahead_state(remote_exec_engine, "b") == ("waiting", "abandoned", 0, 1)
+    assert await claim_ahead(http) is None
+
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, a, result("a", "built"))).status_code == 200
+    plain = await claim_ahead(http)
+    assert plain is not None and (plain["theory"], plain["ahead_parents"]) == ("pkg:b", [])
+    cache.keys.add(ac_key("b"))
+    assert (await complete(http, plain["attempt_token"], result("b", "built"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "done"
 
 
 async def test_a_claim_ahead_of_several_tiers_takes_its_first_tier_before_a_lower_tier_of_a_batch_with_one(

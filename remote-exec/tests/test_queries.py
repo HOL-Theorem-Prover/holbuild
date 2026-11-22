@@ -531,6 +531,9 @@ STATEMENTS = [
     ),
     Statement("UPDATE actions SET tier = 'high'", lease, 10_000),
     Statement("UPDATE actions SET attempts = attempts - 1, ahead = 'abandoned'", lease, 10_000),
+    Statement(
+        "UPDATE actions SET attempts = attempts - 1, ahead = CASE", lambda f: {**lease(f), "ahead_batch": True}, 10_000
+    ),
     Statement("UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1 WHERE", lease, 10_000),
     Statement("UPDATE actions SET attempts = attempts - 1 WHERE", lease, 10_000),
     # leases a worker never got

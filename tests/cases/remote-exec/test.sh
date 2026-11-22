@@ -3053,3 +3053,34 @@ rm "$state/on-submit"
 HOLBUILD_PLAN_RECORD=check run swap-check 0 --verbose build --remote-exec "$coordinator" --detach ATheory
 rm "$state/skip"
 require_grep "plan: from record (1 files rehashed" "$tmpdir/swap-check.log"
+
+# A build resubmits for as long as each batch finds a theory missing that no
+# earlier one did, past five resubmissions: T's worker finds C1 missing, then
+# in each resubmitted batch the next of C2 ... C6, and the seventh batch builds.
+project=$tmpdir/many-resubmits
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxmany"
+[build]
+members = ["src"]
+TOML
+for n in 1 2 3 4 5 6; do
+  printf 'Theory C%s\nAncestors bool\n' "$n" > "$project/src/C${n}Script.sml"
+done
+printf 'Theory T\nAncestors C1 C2 C3 C4 C5 C6\n' > "$project/src/TScript.sml"
+spec=$(hb action-spec TTheory)
+for n in 1 2 3 4 5 6; do
+  echo "rxmany:TTheory theory $(awk -v theory="rxmany:C${n}Theory" '$1 == "action" && $5 == theory { print $2 }' <<< "$spec")"
+done > "$state/fail-missing-queue"
+# Each submission arms the next miss.
+printf '%s\n' "[[ ! -s '$state/fail-missing-queue' ]] || { head -n 1 '$state/fail-missing-queue' > '$state/fail-missing'; sed -i 1d '$state/fail-missing-queue'; }" \
+  > "$state/on-submit"
+run many-resubmits 0 build --remote-exec "$coordinator" --remote-only TTheory
+rm "$state/on-submit" "$state/fail-missing-queue"
+for n in 1 2 3 4 5 6; do
+  require_grep "resubmitting with $n theories rebuilt or rechecked" "$tmpdir/many-resubmits.log"
+done
+[[ $(grep -c "resubmitting" "$tmpdir/many-resubmits.log") -eq 6 ]] || { cat "$tmpdir/many-resubmits.log" >&2; exit 1; }
+require_grep "TTheory restored from cache" "$tmpdir/many-resubmits.log"
