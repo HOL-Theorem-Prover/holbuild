@@ -2260,6 +2260,8 @@ def test_one_node_spec_fetch_rides_out_a_cache_restart(tmp_path: Path, monkeypat
     assert Releases(str(tmp_path), "unused", "http://172.17.0.1:9092", None).read_spec(SPEC).version == "1.2.3"
     assert [command[-1] for command in asked] == [f"http://172.17.0.1:9092/cas/{SPEC}"] * 3
     assert all("--retry" not in command for command in asked)
+    # A stalled attempt ends well inside the window, so it is asked again.
+    assert all(command[command.index("--speed-time") + 1] == "30" for command in asked)
 
 
 @pytest.mark.parametrize(("nodes", "asks"), [("http://one.test", 4), ("http://one.test,http://two.test", 2)])

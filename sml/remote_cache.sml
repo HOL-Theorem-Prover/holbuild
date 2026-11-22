@@ -548,6 +548,14 @@ fun one_node_retry_delays () =
 
 fun whole_seconds n = Time.fromSeconds (Int.toLarge n)
 
+(* Cleared by exec-action's interrupt: a request then fails at its next
+   unavailable answer, and a wait under way ends within a second. *)
+val retry_one_node = ref true
+
+fun wait_seconds n =
+  if n <= 0 orelse not (!retry_one_node) then ()
+  else (OS.Process.sleep (whole_seconds 1); wait_seconds (n - 1))
+
 fun retrying_one_node method urls attempt =
   case urls of
       [_] =>
@@ -561,7 +569,8 @@ fun retrying_one_node method urls attempt =
               in
                 case delays of
                     delay :: rest =>
-                      if transient result andalso Time.<= (Time.+ (Time.now (), whole_seconds delay), deadline) then
+                      if transient result andalso !retry_one_node andalso
+                         Time.<= (Time.+ (Time.now (), whole_seconds delay), deadline) then
                         (TextIO.output (TextIO.stdErr,
                            "holbuild: remote cache " ^ method ^ " " ^ redact_userinfo url ^ " " ^
                            (case result of
@@ -569,7 +578,7 @@ fun retrying_one_node method urls attempt =
                               | HolbuildHttp.Response code => "answered HTTP " ^ Int.toString code) ^
                            "; retrying in " ^ Int.toString delay ^ " s\n");
                          TextIO.flushOut TextIO.stdErr;
-                         OS.Process.sleep (whole_seconds delay);
+                         wait_seconds delay;
                          loop rest)
                       else (url, result)
                   | [] => (url, result)

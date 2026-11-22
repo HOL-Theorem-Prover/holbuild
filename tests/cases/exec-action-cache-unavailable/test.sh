@@ -128,13 +128,24 @@ worker w
 expect w 3 unavailable "remote cache server error: HTTP 500 for GET"
 rm "$control/ac-get-status"
 
+# Waits up to 30 s for a line matching $1 in the file $2.
+await_line() {
+  local i
+  for i in $(seq 300); do
+    grep -q "$1" "$2" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 # With the cache back, the same worker publishes it, though the cache
-# answers its action PUT 429 for the first two seconds.
+# answers its action PUT 429 until the worker has said it will ask again.
 echo 429 > "$control/ac-put-status"
-(sleep 2; rm "$control/ac-put-status") &
-HOLBUILD_TEST_CACHE_RETRY_DELAYS=1,1,1,1,1 worker w
+rm -f "$tmpdir/w.log"
+(await_line "answered HTTP 429; retrying" "$tmpdir/w.log"; rm "$control/ac-put-status") &
+HOLBUILD_TEST_CACHE_RETRY_DELAYS=2,2,2,2,2 worker w
 grep -qx 'status=cached' "$tmpdir/w.result" || { cat "$tmpdir/w.result" "$tmpdir/w.log" >&2; exit 1; }
-require_grep "remote cache PUT .* answered HTTP 429; retrying in 1 s" "$tmpdir/w.log"
+require_grep "remote cache PUT .* answered HTTP 429; retrying in 2 s" "$tmpdir/w.log"
 require_file "$remote_root/ac/$ac"
 
 # The cache's daemon is replaced, stopped before the new one listens on its
@@ -142,9 +153,9 @@ require_file "$remote_root/ac/$ac"
 port=${remote_url##*:}
 kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
-HOLBUILD_TEST_CACHE_RETRY_DELAYS=1,1,1,1,1 worker swap &
+HOLBUILD_TEST_CACHE_RETRY_DELAYS=2,2,2,2,2 worker swap &
 swap_pid=$!
-sleep 2
+await_line "got no answer: .*; retrying" "$tmpdir/swap.log"
 start_remote_cache_server "$remote_root" "$tmpdir/server-restarted" "$control" "$port"
 wait "$swap_pid"
 if ! grep -qx 'status=cached' "$tmpdir/swap.result"; then
@@ -152,7 +163,7 @@ if ! grep -qx 'status=cached' "$tmpdir/swap.result"; then
   cat "$tmpdir/swap.result" "$tmpdir/swap.log" >&2 || true
   exit 1
 fi
-require_grep "remote cache GET .* got no answer: .*; retrying in 1 s" "$tmpdir/swap.log"
+require_grep "remote cache GET .* got no answer: .*; retrying in 2 s" "$tmpdir/swap.log"
 
 # Two builds of one action can record different proof dependencies, as when
 # their proofs took different paths.  The .dat files then differ only in what

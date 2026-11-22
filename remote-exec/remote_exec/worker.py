@@ -443,9 +443,9 @@ class Releases:
     def _fetch_spec_once(self, nodes: list[str], spec_sha256: str, path: str, digest: str) -> bytes | None:
         # -g: no URL globbing, whose errors print the URL with any credentials in it.
         # The status follows the body on its own line: 000 when there was no answer.
-        command = ["curl", "-fsSLg", "-w", "\n%{http_code}"]
-        if len(nodes) > 1:
-            command += ["--connect-timeout", "5", "--speed-limit", "1", "--speed-time", "30"]
+        # A stalled node is given up on within the retry window, so a cache of one node is asked again.
+        command = ["curl", "-fsSLg", "-w", "\n%{http_code}", "--connect-timeout", "5", "--speed-limit", "1",
+                   "--speed-time", "30"]
         if self.curl_config is not None:
             command += ["-K", self.curl_config]
         unavailable: str | None = None
