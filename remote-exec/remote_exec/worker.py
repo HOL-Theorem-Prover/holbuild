@@ -76,7 +76,7 @@ PROTECTION_MINUTES = 180
 # worker drops protection, waits SPELL_GAP_SECONDS and claims again only once ECS protects it anew, so a scale-in or
 # a rolling deployment that wants the task gone takes it between actions instead of waiting for a queue to run dry.
 # A rolling deployment that doesn't have more protected tasks than it wants accepts the new protection, so only the
-# gap lets it stop the task. About 1/60 of a busy worker's time.
+# gap lets it stop the task. About 1/60 of a busy worker's time; ECS protection only (Protection.spells).
 PROTECTED_SPELL_SECONDS = 3600
 SPELL_GAP_SECONDS = 60
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
@@ -352,20 +352,28 @@ class Coordinator:
                 self.drain.stop.wait(delay)
 
 
+class ProtectionRefused(Exception):
+    """The ECS agent answered a protection request with a failure: it wasn't applied."""
+
+
 class Protection:
     """Scale-in protection while the worker has work: ``--protection-cmd on|off``, or the ECS agent's
     task-protection endpoint when ``ECS_AGENT_URI`` is set, or nothing. It stays on from an action into the next
-    claim, for up to PROTECTED_SPELL_SECONDS, so a worker going straight from one action to the next is never open
-    to a scale-in, and goes off once the worker finds no work, waits before claiming or exits. Failures are logged,
-    never raised."""
+    claim (with ECS, for up to PROTECTED_SPELL_SECONDS), so a worker going straight from one action to the next is
+    never open to a scale-in, and goes off once the worker finds no work, waits before claiming or exits. Failures
+    are logged, never raised."""
 
     def __init__(self, command: str | None, ecs_agent_uri: str | None) -> None:
         self.command = command
         self.ecs_agent_uri = ecs_agent_uri
-        # Whether it is on: the last call that worked turned it on; None after a clear that failed, which ECS may
-        # have applied all the same, so the worker tries the clear again but takes a refusal for an unprotected task's.
+        # Whether it is on: the last call that worked turned it on; None after a clear that failed, or an enable of
+        # an unprotected task that got no answer, either of which may have been applied all the same, so the worker
+        # tries the clear again but takes a refusal for an unprotected task's.
         self.on: bool | None = False
         self.since = 0.0  # when it was turned on (time.monotonic())
+        # Whether the worker drops it now and then (PROTECTED_SPELL_SECONDS): a rolling ECS deployment stops a
+        # protected old task only once its protection is gone. An external scaler's command needs no such gap.
+        self.spells = command is None and ecs_agent_uri is not None
 
     def set(self, *, enabled: bool, timeout: float = 30) -> bool:
         """Turn protection on or off. False when ECS refused to protect the unprotected task with DEPLOYMENT_BLOCKED:
@@ -398,10 +406,10 @@ class Protection:
                     if blocked and enabled and not self.on:
                         print(f"ECS refused scale-in protection: {failure}", file=sys.stderr)
                         return False
-                    raise RuntimeError(str(failure))
+                    raise ProtectionRefused(str(failure))
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
-            if not enabled:
+            if not enabled or (not self.on and not isinstance(error, ProtectionRefused)):
                 self.on = None
             return True
         if enabled and not self.on:
@@ -1613,8 +1621,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--protection-cmd",
-        help="command run with 'on' when the worker takes an action and on each heartbeat, and 'off' when it "
-        "finishes, to keep a scaler from stopping a busy worker",
+        help="command run with 'on' when the worker takes an action and on each heartbeat, and 'off' once it is "
+        "idle (a claim found nothing or failed, it waits for disk or memory, an action came back unavailable) and "
+        "at exit, to keep a scaler from stopping a busy worker",
     )
     parser.add_argument(
         "--name", default=worker_name(os.environ.get("REMOTE_EXEC_IMAGE")),
@@ -1769,7 +1778,8 @@ def main() -> None:
                 # coordinator is down.
                 print(f"action failed in the worker: {error}", file=sys.stderr)
                 unavailable = True
-            if protection.on and (unavailable or time.monotonic() - protection.since > PROTECTED_SPELL_SECONDS):
+            spell_over = protection.spells and time.monotonic() - protection.since > PROTECTED_SPELL_SECONDS
+            if protection.on and (unavailable or spell_over):
                 with phases.timed("lease"):
                     unprotect()
                 protect_first = not unavailable

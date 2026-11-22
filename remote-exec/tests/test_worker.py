@@ -778,6 +778,18 @@ def test_a_refusal_after_a_clear_that_failed_is_taken_for_an_unprotected_tasks(s
     assert not protection.set(enabled=True)
 
 
+def test_an_enable_that_got_no_answer_leaves_protection_unknown_but_one_the_agent_refused_leaves_it_off(
+    server: Server,
+) -> None:
+    unanswered = Protection("false", None)  # the command fails: it may have protected the task all the same
+    assert unanswered.set(enabled=True)
+    assert unanswered.on is None
+    server.protection_reply = {"failure": {"Reason": "TASK_NOT_VALID"}}
+    refused = Protection(None, server.url)
+    assert refused.set(enabled=True)
+    assert refused.on is False
+
+
 def test_ecs_protection_refused_with_an_http_error_is_logged(
     server: Server, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -815,10 +827,12 @@ def test_protection_stays_on_between_back_to_back_actions_and_goes_off_once_a_cl
         deadline = time.monotonic() + 20
         while {"ProtectionEnabled": False} not in server.protection and time.monotonic() < deadline:
             time.sleep(0.05)
+        idle = list(server.protection)  # cleared by the idle worker, not by the exit after SIGTERM
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=10) == 0, (tmp_path / "worker.log").read_text()
     assert server.completed == [RECORD, RECORD], (tmp_path / "worker.log").read_text()
     assert len(server.claims) >= 3
+    assert {"ProtectionEnabled": False} in idle
     *held, cleared = server.protection
     assert all(call["ProtectionEnabled"] for call in held) and cleared == {"ProtectionEnabled": False}
 
@@ -827,8 +841,11 @@ class ScriptedProtection:
     """Protection whose fresh protections ECS accepts or refuses in the order ``fresh`` gives (accepted once it runs
     out), recording each call in ``events``."""
 
-    def __init__(self, events: list[str], fresh: list[bool], clears: list[bool] | None = None) -> None:
+    def __init__(
+        self, events: list[str], fresh: list[bool], clears: list[bool] | None = None, *, spells: bool = True
+    ) -> None:
         self.events = events
+        self.spells = spells
         self.fresh = fresh
         self.clears = clears or []  # whether each clear works (it works once this runs out)
         self.on: bool | None = False
@@ -855,7 +872,7 @@ class ScriptedProtection:
 def scripted_main(
     tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, fresh: list[bool], claims: int | list[bool],
     *, unavailable: bool = False, calls: list[float] | None = None, clears: list[bool] | None = None,
-    timeouts: list[float] | None = None, drain: bool = False,
+    timeouts: list[float] | None = None, drain: bool = False, spells: bool = True,
 ) -> list[str]:
     """Run ``worker.main`` on ``claims`` claims (or, as a list, claims that find work or not), each run as an
     action that sets protection and reports the cache ``unavailable`` or not (after a SIGTERM, with ``drain``),
@@ -867,7 +884,7 @@ def scripted_main(
     monkeypatch.setattr(worker, "wait_for_disk", lambda *_, **_kwargs: None)
     monkeypatch.setattr(worker, "CLAIM_RETRY_SECONDS", 0.01)
     events: list[str] = []
-    protection = ScriptedProtection(events, fresh, clears)
+    protection = ScriptedProtection(events, fresh, clears, spells=spells)
     monkeypatch.setattr(worker, "Protection", lambda *_: protection)
     left = [claim() if work else None for work in ([True] * claims if isinstance(claims, int) else claims)]
 
@@ -916,6 +933,15 @@ def test_a_worker_drops_protection_between_actions_once_protected_for_its_longes
     ]
     # Unprotected for the gap, so a rolling deployment that takes protection again at once can still stop it.
     assert calls[2] - calls[1] >= 0.3 and calls[5] - calls[4] >= 0.3
+
+
+def test_only_ecs_protection_is_dropped_between_actions_after_its_longest_spell(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker, "PROTECTED_SPELL_SECONDS", -1)
+    events = scripted_main(tmp_path, server, monkeypatch, [], 2, spells=False)
+    assert events == ["claim", "run", "on:True", "claim", "run", "on:True", "claim", "off"]
+    assert Protection(None, server.url).spells and not Protection("true", None).spells
 
 
 def test_a_clear_that_failed_is_tried_again_while_the_worker_is_idle_and_as_it_exits(

@@ -860,11 +860,13 @@ claims unprotected, so a scale-in can take idle workers. When ECS refuses to
 protect an unprotected worker for an action it just claimed, the task is
 about to be stopped: the worker gives the action back as `declined` without
 starting it, so another worker takes it at once, and claims again only once
-ECS protects it. A worker that has gone from action to action for an hour
-clears protection at its next action's end, waits a minute and likewise
-claims again only once ECS protects it anew, so a scale-in or rolling
-deployment that wants its task gone takes it between actions rather than once
-the queue runs dry.
+ECS protects it. With ECS protection, a worker that has gone from action to
+action for an hour clears protection at its next action's end, waits a minute
+and likewise claims again only once ECS protects it anew, so a scale-in or
+rolling deployment that wants its task gone takes it between actions rather
+than once the queue runs dry (a rolling deployment doesn't refuse the new
+protection, so only the gap lets it stop the task). That costs a busy worker
+about 1/60 of its time.
 Other failures are logged and the action carries on.
 
 ## Wire format
@@ -930,7 +932,9 @@ for it. holbuild sends one random id with every attempt of a submission.
 
 `last_claimed_at` and `worker` describe the latest claim; a new claim clears
 `finished_at`. An accepted worker result sets `finished_at`, including a
-failure that will be retried. Times come from the coordinator database.
+failure that will be retried; a `declined` one sets nothing, so the failure,
+log and timings it leaves are the last run attempt's, not the latest claim's.
+Times come from the coordinator database.
 Lease expiry and cancellation set no finish time, even when the stopped
 worker's log is kept, so an action cancelled after an accepted failure keeps
 that failure's finish time. Unclaimed actions have null fields; claims an older
