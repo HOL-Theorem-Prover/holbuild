@@ -7442,6 +7442,17 @@ fun build_error_debug_artifacts e =
       ErrorWithDebugArtifacts (_, artifacts) => artifacts
     | _ => HolbuildStatus.no_debug_artifacts
 
+(* E once fail_with_debug_artifacts has reported it: when that printed its
+   diagnostic in full, the error names it in one line, so that the diagnostic
+   is printed once, as for a theory that failed on a remote worker. *)
+fun reported_failure e =
+  if HolbuildStatus.failure_printed () then
+    case e of
+        Error msg => Error (HolbuildStatus.failure_brief msg)
+      | ErrorWithDebugArtifacts (msg, artifacts) => ErrorWithDebugArtifacts (HolbuildStatus.failure_brief msg, artifacts)
+      | _ => e
+  else e
+
 fun raise_build_failures failures =
   case failures of
       [] => ()
@@ -7478,9 +7489,9 @@ fun build_serial is_settled is_failed dat_hash_cache status (options : build_opt
                    | e =>
                        (HolbuildStatus.fail_with_debug_artifacts status key name
                           (build_error_message e) (build_error_debug_artifacts e);
-                        if #fail_fast options then raise e
+                        if #fail_fast options then raise reported_failure e
                         else (blocked := Redblackmap.insert (!blocked, key, name);
-                              failures := (name, e) :: !failures; NONE))
+                              failures := (name, reported_failure e) :: !failures; NONE))
       end
     fun loop [] = ()
       | loop (node :: rest) =
@@ -8620,7 +8631,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                            status (HolbuildBuildPlan.key node) (HolbuildBuildPlan.logical_name node)
                            msg artifacts
                           handle IO.Io _ => ());
-                         finish_failure id e;
+                         finish_failure id (reported_failure e);
                          loop ()
                        end)
                 end

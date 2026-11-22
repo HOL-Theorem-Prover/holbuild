@@ -289,14 +289,16 @@ fun failure_error message =
   end
 
 (* A diagnostic MESSAGE, printed in full already, in one line: its first
-   line, the theorem it names and its error. *)
+   line, the theorem it names unless that line does, and its error. *)
 fun failure_brief message =
   let
     val lines = String.fields (fn c => c = #"\n") message
     val error = failure_error message
   in
     hd lines ^
-    (case first_line_after "theorem: " lines of SOME theorem => ": theorem " ^ theorem | NONE => "") ^
+    (case first_line_after "theorem: " lines of
+         SOME theorem => if String.isPrefix "theorem: " (hd lines) then "" else ": theorem " ^ theorem
+       | NONE => "") ^
     (if error = hd lines then "" else ": " ^ error) ^
     " (full diagnostic above)"
   end
@@ -657,6 +659,10 @@ fun cache_trace_enabled () =
 fun cache_trace line =
   if cache_trace_enabled () then message_stdout (line ^ "\n") else ()
 
+(* Whether a node's failure is printed in full on stderr as it happens.  The
+   error the build then exits with names it in one line (failure_brief). *)
+fun failure_printed () = not (json_mode () orelse finished_only ())
+
 fun fail_with_debug_artifacts status key label msg artifacts =
   (with_lock status
      (fn () =>
@@ -678,7 +684,11 @@ fun fail_with_debug_artifacts status key label msg artifacts =
               else ())
          end);
    if finished_only () then () else !command_failure (label, msg);
-   if json_mode () orelse finished_only () then () else message_stderr (label ^ " failed: " ^ msg ^ "\n"))
+   (* A diagnostic of several lines starts on a line of its own, as a remote
+      one does, so that its "theorem: T (line N)" line stands alone. *)
+   if failure_printed () then
+     message_stderr (label ^ " failed:" ^ (if CharVector.exists (fn c => c = #"\n") msg then "\n" else " ") ^ msg ^ "\n")
+   else ())
 
 (* A node that failed outside any build's status: a theory that failed on a
    remote worker.  Text mode reports it in the build's error. *)
