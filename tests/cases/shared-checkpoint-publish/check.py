@@ -49,7 +49,8 @@ def run() -> None:
             wait_for(process, lambda: (directory / "published.ready").exists())
             lines = requests.read_text().splitlines()
             puts = [line for line in lines if line.startswith("PUT /cas/")]
-            # The refused blob is asked again once: a one-node cache's 500 gets a retry.
+            # The refused blob is asked again once: test.sh shortens a fail-closed
+            # one-node cache's retry schedule to one retry.
             retried = [put for put in set(puts) if puts.count(put) > 1]
             assert len(retried) == (1 if failing else 0) and all(puts.count(put) == 2 for put in retried), \
                 "a spine blob was uploaded more than once"
