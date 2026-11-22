@@ -1822,10 +1822,41 @@ async def test_a_burst_host_above_the_scale_in_line_takes_no_build_the_hosts_bel
     assert await coordinator.claim(burst, "b0", host_id="host-b") is not None
 
 
+async def test_the_standard_line_counts_no_slot_of_a_worker_that_takes_only_high_work(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """host-h is fuller than host-d, so first on the line, but its idle workers can't take the standard build."""
+    await submit(http, ["a"])
+    for worker in ["h0", "h1"]:
+        coordinator.report_worker("host-h", worker, ["high"])
+    coordinator.report_worker("host-d", "d0", ["high", "standard"])
+    await coordinator.queue()
+    claimed = await coordinator.claim(["high", "standard"], "d0", host_id="host-d")
+    assert claimed is not None and claimed.theory == "pkg:a"
+
+
+async def test_a_burst_claim_woken_for_high_work_takes_no_standard_build_above_the_standard_line(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """host-b is on the high line, where host-a's worker doesn't count, but above the standard line, which host-a's
+    worker covers: woken for a high build another claim took, host-b's claim leaves the standard build to it."""
+    burst = ["high", "standard"]
+    await submit(http, ["s"])
+    coordinator.report_worker("host-a", "a0", ["standard"])
+    coordinator.report_worker("host-b", "b0", burst)
+    await coordinator.queue()
+    tail = asyncio.create_task(coordinator.claim(burst, "b0", 1, host_id="host-b"))
+    while not coordinator.claim_waiters:
+        await asyncio.sleep(0.01)
+    coordinator._wake_claim("high")
+    assert await asyncio.wait_for(tail, 10) is None
+
+
 async def burst_hosts_running_a_parent(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> tuple[str, Claim, asyncio.Task[Claim | None]]:
-    """A batch whose ``b`` waits on ``a``, which host-a's worker runs, while host-b's worker waits for a claim."""
+    """A batch whose ``b`` waits on ``a``, which host-a's worker runs, while host-b's worker waits for a claim. The
+    parent runs past TURNAROUND_SECONDS, so only its result tells that its worker was seen."""
     burst = ["high", "standard"]
     batch_id = await submit(http, ["a", "b"], [("b", "a")])
     coordinator.report_worker("host-a", "a0", burst)
@@ -1835,6 +1866,8 @@ async def burst_hosts_running_a_parent(
     tail = asyncio.create_task(coordinator.claim(burst, "b0", 30, host_id="host-b"))
     while not coordinator.claim_waiters:
         await asyncio.sleep(0.01)
+    later = coordinator.clock() + timedelta(seconds=coordinator_module.TURNAROUND_SECONDS + 1)
+    coordinator.clock = lambda: later
     return batch_id, parent, tail
 
 

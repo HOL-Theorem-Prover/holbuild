@@ -1141,7 +1141,7 @@ class Coordinator:
         self.missing_inputs: dict[UUID, dict[str, list[str]]] = {}
         self.infra_streak: dict[str, tuple[int, UUID | None]] = {}
         self.probe_at: dict[str, datetime] = {}
-        self.host_workers: dict[str, dict[str, tuple[datetime, bool]]] = {}
+        self.host_workers: dict[str, dict[str, tuple[datetime, tuple[str, ...]]]] = {}  # when seen, and its tiers
         # For locality, also in memory: the dependency context (deps-key) workers last reported for each theory; the
         # theories each host last ran and their contexts, least recent first, and when the host last had a worker
         # seen lately; the times a batch and tier was passed over for them; each batch and tier a claim left for its
@@ -1387,8 +1387,12 @@ class Coordinator:
             """The tiers this claim doesn't leave to better-ranked unwoken waiters (see _defers), of those that may
             claim ahead if ``ahead_only``."""
             # An ahead wake bypassed better-ranked waiters that can't claim ahead, so it lifts only the ahead deferral.
-            if woken.done() and (ahead_only or not woken.result()[1]):
+            if woken.done() and ahead_only:
                 return tiers
+            # A build wake lifts it for builds, but, from a burst host, only of the tier it was woken for (see
+            # _wake_claim) and the tiers whose scale-in line takes the host in.
+            if woken.done() and not woken.result()[1]:
+                return [tier for tier in tiers if tier == woken.result()[0] or not self._above_line(rank, tier)]
             return [tier for tier in tiers if not self._defers(tier, rank, ahead_only=ahead_only)]
 
         # Counted from entry to return, so its host keeps its slot on the scale-in line (see _kept_hosts) also while
@@ -2361,14 +2365,13 @@ class Coordinator:
         leases = Counter(host for host, _, tiers in self.lease_hosts.values() if not high or "high" in tiers)
         leased = {(host, worker) for host, worker, _ in self.lease_hosts.values()}
         waiting = Counter(
-            w_rank.host_id for w_tiers, w_rank, w_woken, _ in self.claim_waiters
-            if not w_woken.done() and (not high or "high" in w_tiers)
+            w_rank.host_id for w_tiers, w_rank, w_woken, _ in self.claim_waiters if not w_woken.done() and tier in w_tiers
         )
         hosts: list[tuple[tuple[bool, int, int, str], int]] = []
         for host_id, workers in self.host_workers.items():
             fresh = [
-                is_burst for seen, is_burst in workers.values()
-                if (now - seen).total_seconds() < HOST_REPORT_SECONDS and (not high or is_burst)
+                "high" in w_tiers for seen, w_tiers in workers.values()
+                if (now - seen).total_seconds() < HOST_REPORT_SECONDS and (not high or "high" in w_tiers)
             ]
             if not fresh or self._quarantine(host_id) is not None:
                 continue
@@ -2379,8 +2382,8 @@ class Coordinator:
             busy = leases[host_id] + waiting[host_id]
             short = report is not None and bool(report[1].memory_short)
             free = sum(
-                1 for worker, (seen, is_burst) in workers.items()
-                if (not high or is_burst) and (host_id, worker) not in leased
+                1 for worker, (seen, w_tiers) in workers.items()
+                if tier in w_tiers and (host_id, worker) not in leased
                 and ((host_id, worker) in self.claiming or (now - seen).total_seconds() < TURNAROUND_SECONDS)
             )
             # No floor of one, nor the host's last report, which no result updates: a host whose workers all stay
@@ -2540,8 +2543,7 @@ class Coordinator:
         (see _tail_host) leaves builds to the hosts below it whether or not their workers wait now: one that just
         reported a result comes back for the next build, and the line takes in this host once there are more builds
         than those hosts' workers can take, or they stay away."""
-        # The line counts the build the claim would take, also before the sweep counted it.
-        if not ahead_only and self._known_burst(rank) and self._tail_host(rank, self._kept_hosts(1, tier)):
+        if not ahead_only and self._above_line(rank, tier):
             return True
         enough = 1 if ahead_only else max(1, self.claimable.get(tier, 0))
         better = 0
@@ -2563,6 +2565,11 @@ class Coordinator:
         """Whether the claim ranked ``rank`` comes from a burst host above the scale-in line ``kept`` (see _kept_hosts),
         which is to empty, so takes no build a host below it could."""
         return self._known_burst(rank) and rank.host_id not in kept
+
+    def _above_line(self, rank: ClaimRank, tier: str) -> bool:
+        """Whether the claim ranked ``rank`` comes from a burst host above the scale-in line for builds of ``tier``,
+        counting the build it would take, also before the sweep counted it."""
+        return self._known_burst(rank) and self._tail_host(rank, self._kept_hosts(1, tier))
 
     def _waiter_rank(self, tiers: list[str], host_id: str | None, host_rank: int) -> ClaimRank:
         """The rank of a claim of ``tiers`` from ``host_id`` as its host's workers are now; see _claim_rank."""
@@ -2682,7 +2689,7 @@ class Coordinator:
                 del self.lease_hosts[token]
                 self.outlined_tokens.pop(token, None)
         if host_id in self.host_workers or len(self.host_workers) < MAX_HOSTS:
-            self.host_workers.setdefault(host_id, {})[worker] = (self.clock(), "high" in tiers)
+            self.host_workers.setdefault(host_id, {})[worker] = (self.clock(), tuple(tiers))
 
     def _lease_host(self, token: UUID, host_id: str, worker: str, tiers: list[str]) -> None:
         self.lease_hosts[token] = (host_id, worker, tiers)
@@ -2733,10 +2740,10 @@ class Coordinator:
         warm = burst = 0
         for host_id, workers in self.host_workers.items():
             if self._quarantine(host_id) is not None:
-                for worker, (_, is_burst) in workers.items():
+                for worker, (_, tiers) in workers.items():
                     if (host_id, worker) not in busy:
-                        burst += is_burst
-                        warm += not is_burst
+                        burst += "high" in tiers
+                        warm += "high" not in tiers
         return warm, burst
 
     def _burst_demand(self, counts: QueueCounts) -> int:

@@ -260,7 +260,7 @@ async def test_hosts_keep_their_contexts_through_a_quiet_spell_and_count_those_n
         coordinator.report_worker(host, f"{host}-w", ["standard"])
     coordinator.host_keys = {"host-0": {D1: None}, "host-9": {D1: None, D2: None}}
     gone = coordinator.clock() - timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS + 1)
-    coordinator.host_workers["host-9"] = {"host-9-w": (gone, True)}
+    coordinator.host_workers["host-9"] = {"host-9-w": (gone, ("high", "standard"))}
 
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
 

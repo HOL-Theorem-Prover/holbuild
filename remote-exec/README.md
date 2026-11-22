@@ -536,10 +536,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   A host holds a theory's checkpoints if the theory ran there, else possibly
   its context, whose heap a cold host fetches from the cache. Only hosts
   below the scale-in line count as holders: where the hosts, in packing
-  order and counting each host's leases and its other workers that are
-  claiming or were seen in the last 15 s, as one is between a result and
-  its next claim (only leases and waiting claims, or the host's reported
-  leases, on a host short of memory), can run the live leases and the ready
+  order and counting each host's leases and its other workers that take
+  the work's tier and are claiming or were seen in the last 15 s, as one is
+  between a result and its next claim, but at least its leases and waiting
+  claims (only those, or the host's reported leases, on a host short of
+  memory), can run the live leases and the ready
   builds, and at least `REMOTE_EXEC_WARM_WORKERS`; for high work, where the
   hosts with a burst worker can run their leases and the ready high work.
   Hosts above it get no preference, so they still empty when demand falls.
