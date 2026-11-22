@@ -2736,6 +2736,27 @@ async def test_missing_parent_in_the_batch_is_requeued(http: httpx.AsyncClient, 
     assert (await batch(http, batch_id))["state"] == "done"
 
 
+async def test_a_parent_missing_again_once_requeued_costs_the_next_child_no_attempt(
+    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: Any
+) -> None:
+    batch_id = await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")])
+    await build(http, cache, "a")
+    tokens = await claim_all(http, 2)
+
+    cache.keys.discard(ac_key("a"))
+    for name in ("b", "c"):
+        record = result(name, "failed", "input-missing", missing=f"theory {input_key('a')}")
+        assert (await complete(http, tokens[name], record)).status_code == 200
+    assert await states(http, batch_id) == {"a": "ready", "b": "waiting", "c": "waiting"}
+    async with remote_exec_engine.connect() as connection:
+        rows = await connection.execute(sa.text("SELECT theory, attempts FROM actions"))
+        assert {theory: attempts for theory, attempts in rows} == {"pkg:a": 1, "pkg:b": 1, "pkg:c": 0}
+
+    for name in ("a", "b", "c"):
+        await build(http, cache, name)
+    assert (await batch(http, batch_id))["state"] == "done"
+
+
 async def test_missing_transitive_dependency_holds_the_child_until_rebuilt(
     http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
