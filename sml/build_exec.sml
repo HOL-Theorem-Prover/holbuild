@@ -12868,7 +12868,8 @@ fun tree_path root rel =
    the entries found naming blobs the cache no longer holds, with those
    blobs, which the publish replaces. *)
 (* POISONED: the heap entry, when it was found naming a module of another
-   id than its heap loads, which the publish replaces unless it changed. *)
+   id than its heap loads, or a module blob the cache lost, which the
+   publish replaces unless it changed. *)
 type shared_restore =
   {heap : string option, files : (string * string) list, stale : string list, missing : string list,
    poisoned : string option}
@@ -12963,8 +12964,9 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
        once per heap.  A heap given up for a module that could not be
        fetched only falls back here, to a fresh preload: the shared one
        stays, for the hosts that have its modules.  One given up for a
-       module of another id, or one whose blob the cache lost, is replaced
-       by this run's (publish_heap). *)
+       module of another id, or for a module blob the cache lost, is
+       replaced by this run's (publish_heap), unless another worker has
+       replaced it first: several workers lose the same module. *)
     val modules_ok = ref (NONE : bool option)
     fun drop_heap why module = (add_restore_step "rstmoddropn" 1; warn (why ^ ": " ^ module); false)
     fun drop_poisoned module =
@@ -12985,7 +12987,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                         fun want (id, path) = Option.map (fn sha => (sha, Path.file path, id)) (digest path)
                         val {other_ids, lost} =
                           restore_step "rstmodfetch" (fn () => fetch_modules (List.mapPartial want wrong))
-                        val _ = List.app (missing_blob heap_key) lost
+                        val _ =
+                          List.app (fn sha => (warn ("the cache lost blob " ^ sha ^ " of shared entry " ^ heap_key);
+                                               poisoned := !heap_entry))
+                                   lost
                         val rechecked = module_states wrong
                         val still = in_state ModuleWrong rechecked
                         val fetched = length wrong - length still - length (in_state ModulePoisoned rechecked)
@@ -13235,7 +13240,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* An entry naming a blob the cache lost is replaced, as if absent. *)
     fun present key = not (member key stale) andalso Option.isSome (HolbuildRemoteCache.get_action remote key)
     (* So is a heap entry the restore found naming a module of another id
-       than its heap loads, unless another worker has replaced it since. *)
+       than its heap loads, or a module blob the cache lost, unless another
+       worker has replaced it since. *)
     fun heap_present () =
       not (member heap_key stale) andalso
       (case HolbuildRemoteCache.get_action remote heap_key of

@@ -325,8 +325,20 @@ grep -qx 'status=built' "$tmpdir/dropped-B.result"
 if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/dropped-B.result"; then
   echo 'checkpoints on the heap given up were tried' >&2; cat "$tmpdir/dropped-B.result" >&2; exit 1
 fi
-if cmp -s "$heap_entry" "$tmpdir/ac-before-loss/${heap_entry##*/}"; then
+# heap_blob ENTRY: the heap blob a shared heap entry names.
+heap_blob() { sed -n 's/^blob=\([0-9a-f]*\) heap$/\1/p' "$1"; }
+old_heap=$(heap_blob "$tmpdir/ac-before-loss/${heap_entry##*/}")
+new_heap=$(heap_blob "$heap_entry" 2>/dev/null || true)
+if ! grep -qx 'holbuild-shared-heap-v1' "$heap_entry" || [[ -z $new_heap || $new_heap == "$old_heap" ]]; then
   echo 'the heap entry naming a lost module was not replaced' >&2; cat "$tmpdir/dropped-B.log" >&2; exit 1
+fi
+# A cold worker restores the replacement.
+rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
+edit_b repaired
+exec_theory B repaired
+require_grep 'restored shared' "$tmpdir/repaired-B.log"
+if grep -qE '^phase-ms=(.*,)?(rstmoddropn|rstdropn|rstmodrejn):' "$tmpdir/repaired-B.result"; then
+  echo 'the replacement heap was not restored' >&2; cat "$tmpdir/repaired-B.result" >&2; exit 1
 fi
 
 # A node the repair didn't reach still serves the old entries.  Once the
