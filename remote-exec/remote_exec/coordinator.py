@@ -236,6 +236,7 @@ class ActionStatus:
     state: str
     tier: str
     attempts: int
+    interruptions: int  # claims given back unfinished (``unavailable``) that counted no attempt
     last_failure: str | None
     log_sha256: str | None
     failure_detail: str | None  # the last result's detail: why it failed when it has no log
@@ -401,9 +402,9 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int,
     one per high-tier action, since warm workers are standard-tier. Runs contribute at most ``run_slots``
     in each term; the total is at most ``max_burst_workers``.
 
-    Actions waiting ahead of their parents hold burst workers (only burst workers load ahead) but ask for none
-    of their own: the demand is the other actions', plus the workers those hold once ready work needs a burst
-    worker, since they don't take it."""
+    Actions waiting ahead of their parents count apart, one burst worker each: only burst workers load ahead, so
+    warm workers never take them, and the burst workers holding them must not be scaled in while a narrow point
+    of the DAG leaves no ready work."""
     ready = counts.ready_standard + counts.ready_high
     running = counts.running_standard + counts.running_high
     runs = counts.ready_run + counts.running_run
@@ -413,13 +414,7 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int,
         counts.ready_high + counts.running_high - counts.waiting_ahead_high
         - counts.high_run + min(run_slots, counts.high_run)
     )
-    demand = max(0, active - warm_workers, high)
-    # Work beyond what runs is ready work a burst worker could take; runs the run slots hold back are not.
-    running_active = running - ahead - counts.running_run + min(run_slots, counts.running_run)
-    free_run_slots = max(0, run_slots - counts.running_run)
-    ready_high = counts.ready_high - counts.ready_high_run + min(counts.ready_high_run, free_run_slots)
-    if ready_high > 0 or active > max(warm_workers, running_active):
-        demand += ahead
+    demand = max(0, active - warm_workers, high) + ahead
     return min(demand, max_burst_workers)
 
 
@@ -512,7 +507,7 @@ RELEASABLE_BATCH = sa.text(RELEASABLE.format(batch=" AND a.batch_id = :batch_id"
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
 CHANGED_ACTIONS = sa.text("""
-SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, failure_detail,
+SELECT input_key, theory, state, tier, attempts, interruptions, last_failure, log_sha256, failure_detail,
        last_claimed_at, finished_at, worker, CAST(timings AS text)
 FROM actions
 WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)

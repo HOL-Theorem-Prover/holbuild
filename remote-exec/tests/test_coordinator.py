@@ -2527,10 +2527,12 @@ async def test_an_action_its_worker_could_not_start_is_retried_without_using_an_
 async def test_unavailable_results_past_the_interruption_cap_use_attempts(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a"])
     # Five refunded interruptions, then two counted ones: the third counted one fails the batch.
-    for _ in range(5 + 2):
+    for n in range(5 + 2):
         token = await claim_named(http, "a")
         assert (await complete(http, token, result("a", "failed", "unavailable"))).status_code == 200
         assert await states(http, batch_id) == {"a": "ready"}
+        # Batch status counts the refunded ones, which success would clear from last_failure.
+        assert (await batch(http, batch_id))["actions"][0]["interruptions"] == min(n + 1, 5)
     token = await claim_named(http, "a")
     assert (await complete(http, token, result("a", "failed", "unavailable"))).status_code == 200
     status = await batch(http, batch_id)

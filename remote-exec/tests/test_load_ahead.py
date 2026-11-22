@@ -512,7 +512,7 @@ async def test_a_requeued_parent_revokes_the_child_claimed_ahead(
     assert (await http.post(f"/v1/work/{c['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
 
 
-async def test_actions_waiting_ahead_ask_for_no_burst_worker_until_their_parents_are_done(
+async def test_an_action_waiting_ahead_holds_one_burst_worker_of_the_demand_until_it_waits_no_more(
     http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache
 ) -> None:
     await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
@@ -525,7 +525,8 @@ async def test_actions_waiting_ahead_ask_for_no_burst_worker_until_their_parents
     async with coordinator.engine.connect() as conn:
         active = await coordinator._counts(conn, coordinator_module.COUNT_ACTIVE)
     assert (active.running_standard, active.waiting_ahead_standard) == (2, 1)
-    assert coordinator_module.burst_demand(active, warm_workers=1, max_burst_workers=16) == 0
+    # a on the warm worker, b on the burst worker that claimed it ahead
+    assert coordinator_module.burst_demand(active, warm_workers=1, max_burst_workers=16) == 1
 
     # One that published its outline proves while its parent finishes: it waits no more.
     assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204

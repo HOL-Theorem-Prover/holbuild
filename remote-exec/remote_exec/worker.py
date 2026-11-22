@@ -70,7 +70,7 @@ def check_sandbox(executable: str, version: str) -> None:
 # How long each ECS scale-in protection call protects the task. ECS refuses renewals with DEPLOYMENT_BLOCKED once a
 # service has more protected tasks than it wants (a scale-in or a rolling deployment), so the window set when the
 # action was claimed must outlast the longest action. A dead worker still loses it: its container is the task's
-# essential one, so the task stops with it, and the worker clears protection when an action ends or loses its lease.
+# essential one, so the task stops with it, and the worker clears protection once it finds no work (Protection).
 PROTECTION_MINUTES = 180
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
 # Longest wait for a heartbeat or completion answer: above the coordinator's database pool timeout plus the work, so
@@ -346,15 +346,21 @@ class Coordinator:
 
 
 class Protection:
-    """Scale-in protection while the worker holds an action: ``--protection-cmd on|off``, or the ECS agent's
-    task-protection endpoint when ``ECS_AGENT_URI`` is set, or nothing. Failures, such as ECS refusing protection
-    with DEPLOYMENT_BLOCKED in a scale-in or a rolling deployment, are logged, never raised."""
+    """Scale-in protection while the worker has work: ``--protection-cmd on|off``, or the ECS agent's
+    task-protection endpoint when ``ECS_AGENT_URI`` is set, or nothing. It stays on from an action into the next
+    claim, so a worker going straight from one action to the next is never open to a scale-in, and goes off once the
+    worker finds no work or waits before claiming. Failures are logged, never raised."""
 
     def __init__(self, command: str | None, ecs_agent_uri: str | None) -> None:
         self.command = command
         self.ecs_agent_uri = ecs_agent_uri
+        self.on = False  # whether the last call that worked turned it on
 
-    def set(self, *, enabled: bool, timeout: float = 30) -> None:
+    def set(self, *, enabled: bool, timeout: float = 30) -> bool:
+        """Turn protection on or off. False when ECS refused to protect the unprotected task with DEPLOYMENT_BLOCKED:
+        the service has more protected tasks than it wants, as in a scale-in or a rolling deployment, so the task
+        may be stopped at any moment. A refused renewal keeps the window set earlier, and other failures leave the
+        action to the drain, so both give True."""
         try:
             if self.command is not None:
                 subprocess.run([*shlex.split(self.command), "on" if enabled else "off"], check=True, timeout=timeout)
@@ -368,12 +374,23 @@ class Protection:
                     method="PUT",
                     headers={"Content-Type": "application/json"},
                 )
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    payload = json.load(response)
+                try:
+                    with urllib.request.urlopen(request, timeout=timeout) as response:
+                        payload = json.load(response)
+                except urllib.error.HTTPError as error:
+                    payload = json.load(error)  # the agent's failure or error object
+                    payload.setdefault("error", str(error))
                 if failure := payload.get("failure") or payload.get("error"):
+                    blocked = isinstance(failure, dict) and failure.get("Reason") == "DEPLOYMENT_BLOCKED"
+                    if blocked and enabled and not self.on:
+                        print(f"ECS refused scale-in protection: {failure}", file=sys.stderr)
+                        return False
                     raise RuntimeError(str(failure))
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
+            return True
+        self.on = enabled
+        return True
 
 
 @dataclass(frozen=True)
@@ -641,12 +658,14 @@ def child_charge(max_heap: int | None) -> int:
     return min(max_heap or DEFAULT_CHARGE_MIB, DEFAULT_CHARGE_MIB) * MIB
 
 
-def wait_for_memory(directory: str, charge: int, drain: Drain | None = None) -> bool:
+def wait_for_memory(
+    directory: str, charge: int, drain: Drain | None = None, *, before_wait: Callable[[], None] | None = None
+) -> bool:
     """Return once holbuild's admission in ``directory`` would start a child charged ``charge`` bytes, so that a
     worker on a host whose memory is taken doesn't claim an action only to wait on it while other hosts could run it.
     A check, not a reservation: workers racing past it still wait in exec-action's own admission.
 
-    Returns whether it waited."""
+    Calls ``before_wait`` once before it waits. Returns whether it waited."""
     logged = False
     if drain is not None and drain.stop.is_set():
         return False
@@ -654,6 +673,8 @@ def wait_for_memory(directory: str, charge: int, drain: Drain | None = None) -> 
         if not logged:
             print(f"waiting for memory before claiming: {why}", file=sys.stderr, flush=True)
             logged = True
+            if before_wait is not None:
+                before_wait()
         if drain is None:
             time.sleep(MEMORY_POLL_SECONDS)
         elif drain.stop.wait(MEMORY_POLL_SECONDS):
@@ -753,7 +774,7 @@ def sweep_cache(releases: Releases, cache_limit_gb: int) -> None:
 
 def wait_for_disk(
     drain: Drain, coordinator: Coordinator, tiers: list[str], worker: str, sweep: Callable[[], None],
-    *, reaper: "Reaper | None" = None,
+    *, reaper: "Reaper | None" = None, before_wait: Callable[[], None] | None = None,
 ) -> None:
     """Return once the host's disk has room for an action (``disk_shortfall``), or the worker drains, so that a
     worker on a full disk doesn't claim action after action only to fail each at once while other hosts could run
@@ -763,9 +784,12 @@ def wait_for_disk(
     the exec-action still running after its result, if any, and deletes the module writers' roots
     (``module-writer-<pid>``), which a writer killed before it was done leaves. Each poll it
     still waits it runs ``sweep``, the cache's own eviction of checkpoints and shared entries, and reports the host,
-    so the coordinator keeps the host, its disk and its workers in view."""
+    so the coordinator keeps the host, its disk and its workers in view. ``before_wait`` is called first if it
+    has to wait."""
     if disk_shortfall() is None:
         return
+    if before_wait is not None:
+        before_wait()
     if reaper is not None:
         reaper.stop()
     cache = os.environ.get("HOLBUILD_CACHE")
@@ -1070,14 +1094,16 @@ class Lease:
         self.completing = threading.Event()  # the result is being posted: a stale lease no longer stops anything
         self.checking = threading.Lock()
         self.done = threading.Event()
+        self.refused = False  # ECS refused to protect the task for the action: it is being scaled in
         self.thread = threading.Thread(target=self._beat, daemon=True)
 
     @contextlib.contextmanager
     def held(self, phases: Phases) -> Iterator["Lease"]:
-        """Holds the lease, adding the time taking and giving it up blocks for to ``phases``' ``lease``."""
+        """Holds the lease, adding the time taking and giving it up blocks for to ``phases``' ``lease``. Protection
+        stays on after it, for the worker's next claim (Protection)."""
         with phases.timed("lease"):
             if not self.coordinator.drain.stop.is_set():
-                self.protection.set(enabled=True, timeout=5)
+                self.refused = not self.protection.set(enabled=True, timeout=5)
             self.thread.start()
         try:
             yield self
@@ -1088,7 +1114,6 @@ class Lease:
                 self.thread.join(timeout=None if deadline is None else max(
                     0.0, deadline + self.coordinator.drain.publish_seconds + 7 - time.monotonic()
                 ))
-                self.protection.set(enabled=False, timeout=30 if deadline is None else 2)
 
     def check(self) -> bool:
         """Whether the lease is lost, marking it lost once it may have expired at the coordinator before the result
@@ -1195,6 +1220,10 @@ def run_one(
             finally:
                 lease.done.set()
 
+        if lease.refused:
+            # Started now, the action would run until the scale-in stops the task; another worker takes it at once.
+            report(failed_record(spec, "unavailable", "ECS refused scale-in protection: the task is being scaled in"))
+            return True
         try:
             record = execute(args, releases, lease, claim, phases, report, reaper=reaper)
         except CacheUnavailable as error:
@@ -1652,13 +1681,18 @@ def main() -> None:
         sweep = functools.partial(sweep_cache, releases, args.cache_limit_gb)
         reaper = Reaper(drain, os.path.join(os.environ["HOLBUILD_CACHE"], "action.lock"))
         resources.callback(reaper.stop)
+        def unprotect() -> None:
+            """A worker that waits, or found no work, is idle: a scale-in may take it."""
+            if protection.on:
+                protection.set(enabled=False)
+
         while not drain.stop.is_set():
             with phases.timed("idle"):
-                wait_for_disk(drain, coordinator, tiers, args.name, sweep, reaper=reaper)
+                wait_for_disk(drain, coordinator, tiers, args.name, sweep, reaper=reaper, before_wait=unprotect)
             if args.cooperate_dir is not None:
                 try:
                     with phases.timed("memory_wait"), drain.interruptible():
-                        waited = wait_for_memory(args.cooperate_dir, charge, drain)
+                        waited = wait_for_memory(args.cooperate_dir, charge, drain, before_wait=unprotect)
                 except DrainStopped:
                     break
                 if waited and host is not None:
@@ -1668,6 +1702,8 @@ def main() -> None:
             started = time.monotonic()
             claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
             if claim is None:
+                with phases.timed("lease"):
+                    unprotect()
                 # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
                 with phases.timed("idle"):
                     drain.stop.wait(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))

@@ -760,19 +760,15 @@ high-tier action, since warm workers take only standard-tier work, and at
 most `REMOTE_EXEC_MAX_BURST_WORKERS`. Runs contribute only up to
 `REMOTE_EXEC_RUN_SLOTS` in both the total and high-tier demand terms;
 high-tier builds remain uncapped except by `MAX_BURST_WORKERS`. Actions
-claimed ahead and still waiting for a parent hold burst workers, since only
-burst workers load ahead, but ask for none of their own: they are left out of
-both terms, and added back only once ready work needs a burst worker, since
-they don't take it.
+claimed ahead and still waiting for a parent count apart, one burst worker
+each: only burst workers load ahead, so warm workers never take them, and the
+burst workers holding them stay while a narrow point of the graph leaves no
+ready work.
 
 ```text
 active = ready_build + running_build - waiting_ahead + min(RUN_SLOTS, ready_run + running_run)
 high = ready_high_build + running_high_build - waiting_ahead_high + min(RUN_SLOTS, ready_high_run + running_high_run)
-plain = max(0, active - WARM_WORKERS, high)
-running_active = running_build - waiting_ahead + min(RUN_SLOTS, running_run)
-ready_high = ready_high_build + min(ready_high_run, max(0, RUN_SLOTS - running_run))
-demand = min(MAX_BURST_WORKERS, plain + waiting_ahead)   if ready_high > 0 or active > max(WARM_WORKERS, running_active)
-demand = min(MAX_BURST_WORKERS, plain)                   otherwise
+demand = min(MAX_BURST_WORKERS, max(0, active - WARM_WORKERS, high) + waiting_ahead)
 ```
 
 A build's dependency graph narrows and widens: a few theories everything else
@@ -841,15 +837,20 @@ its runtime sources differ.
 
 A scaler that removes idle workers mustn't stop one in the middle of an
 action. With `--protection-cmd COMMAND`, the worker runs `COMMAND on` when it
-takes an action and on each heartbeat, and `COMMAND off` when the action ends.
+takes an action and on each heartbeat, and `COMMAND off` once it is idle.
 Without it, when `ECS_AGENT_URI` is set (as on Amazon ECS), it sets the task's
 scale-in protection through the agent's `task-protection/v1/state` endpoint,
-for 180 minutes at a time. ECS refuses to renew protection with
-`DEPLOYMENT_BLOCKED` while a scale-in or rolling deployment wants the task
-gone, so the window set when the action is claimed has to outlast the longest
-action. The worker clears protection when the action ends or loses its lease,
-and a worker that dies takes its task down with it. Failures are logged and
-the action carries on.
+for 180 minutes at a time. ECS refuses protection with `DEPLOYMENT_BLOCKED`
+while the service has more protected tasks than it wants, as in a scale-in or
+a rolling deployment, so the window set when the action is claimed has to
+outlast the longest action. Protection stays on from one action into the next
+claim, so a worker going straight from one action to the next is never
+unprotected; the worker clears it once a claim finds nothing (or fails), or
+before it waits for disk or memory, and a worker that dies takes its task down
+with it. When ECS refuses to protect an unprotected worker for an action it
+just claimed, the task is about to be stopped: the worker gives the action
+back as `unavailable` without starting it, so another worker takes it at once.
+Other failures are logged and the action carries on.
 
 ## Wire format
 
@@ -898,6 +899,7 @@ for it. holbuild sends one random id with every attempt of a submission.
         "state": "waiting|ready|running|done|failed|cancelled",
         "tier": "standard|high",
         "attempts": 1,
+        "interruptions": 0,
         "last_failure": "<failure class>|null",
         "log_sha256": "<sha256 of the last build log a run uploaded, in /cas/; a failure without a log keeps the earlier one>|null",
         "failure_detail": "<the last result's detail: why it failed without a log, or why one that didn't fail has no log or built plain after its pipelined attempt failed; after lease expiries in a row (last_failure \"lease expired\", or \"lease expired N times\" once it fails), the workers that held it>|null",
@@ -920,6 +922,9 @@ that failure's finish time. Unclaimed actions have null fields; claims an older
 coordinator made have a timestamp without a worker or finish time. Worker
 names are supplied by the worker, defaulting to its hostname and process ID.
 These fields retain only the latest attempt, not its retry history.
+`interruptions` counts the claims of the action that ended `unavailable` (a
+worker drained, scaled in or refused scale-in protection) and were given back
+without counting an attempt, up to `REMOTE_EXEC_MAX_INTERRUPTIONS`.
 
 In `timings`, durations are milliseconds. `started` and `finished`, and
 `holstart`/`holend`, `publishstart`/`publishend`, `logstart`/`logend` are
@@ -949,7 +954,7 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   stream with nothing to send for `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` sends
   an empty line, which clients skip, so a proxy doesn't close it as idle:
   ```json
-  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null, "failure_detail": null, "last_claimed_at": null, "finished_at": null, "worker": null, "timings": null}
+  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "interruptions": 0, "last_failure": null, "log_sha256": null, "failure_detail": null, "last_claimed_at": null, "finished_at": null, "worker": null, "timings": null}
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the
