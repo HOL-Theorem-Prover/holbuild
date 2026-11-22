@@ -31,7 +31,8 @@ with the log its worker uploaded as it stopped, and the batch failed at the dead
 reports a failed action as a cancel that stopped it leaves it: cancelled with the log its
 worker uploaded, and the batch cancelled; holding `unlogged`, before that log arrived, and
 holding a failure kind, after an earlier attempt failed with it (`deadline-retried`: stopped
-by the batch deadline on a second attempt).  STATE/<id>.events, when it exists, is batch
+by the batch deadline on a second attempt).  `cancel-done` reports an action that finished in a
+failed batch cancelled with its log, as when its result came after the batch failed.  STATE/<id>.events, when it exists, is batch
 <id>'s recorded event stream: it is sent as it is, without running RUN.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", and on a second line the others it found missing,
@@ -232,6 +233,10 @@ class Handler(BaseHTTPRequestHandler):
                         event["timings"] = {name: int(ms) for name, ms in
                                             (part.split(":") for part in recorded["phase-ms"].split(","))}
                         event["timings"]["wall"] = int(recorded["wall-ms"])
+                if event["state"] == "done" and not ok and (state / "cancel-done").exists():
+                    # As the coordinator leaves an action whose result came after its batch failed:
+                    # cancelled, with the log its worker uploaded.
+                    event["state"] = "cancelled"
                 if event["state"] == "done" and (state / "requeue-log").exists():
                     # The first execution's log was evicted; only the final
                     # execution's log is usable after the action is requeued.

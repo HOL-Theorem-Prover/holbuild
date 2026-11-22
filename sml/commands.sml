@@ -1661,7 +1661,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                            ["action", run_key, HolbuildRemoteCache.remote_action_key run_key, spec_sha256, name])
                      exported) ^ "\n"
             val query = "?class=run" ^ (case profile of SOME p => "&profile=" ^ p | NONE => "")
-            fun on_change (key, state, failure, log) = states := Redblackmap.insert (!states, key, (state, failure, log))
+            fun on_change (key, state, failure, log, _) = states := Redblackmap.insert (!states, key, (state, failure, log))
           in
             (* A run never runs here, so an unreachable coordinator is waited for. *)
             case HolbuildRemoteExec.submit_with_query true url query (#maxheap tc) batch of
@@ -1971,11 +1971,23 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    to start: none of it reads what they write. *)
                 val _ = record_pending () handle e => (ignore (stop_all ()); #stop early_pool (); #stop failure_spans (); raise e)
                 val logs = ref []
-                fun on_change (key, state, failure, log) =
+                (* Whether a worker found a theory not to fit its parents in
+                   the remote cache, rather than missing from it. *)
+                val misfit = ref false
+                fun on_change (key, state, failure, log, detail) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
                    if state = "done" then
                      (HolbuildBuildExec.expect_remote_entry key; add key; logs := (key, log) :: !logs)
+                   (* A theory can finish with its log after its batch was
+                      cancelled; a resubmission then finds it built and
+                      reports no log. *)
+                   else if state = "cancelled" andalso Option.isSome log then logs := (key, log) :: !logs
                    else ();
+                   case detail of
+                       SOME text =>
+                         if Option.isSome (HolbuildStatus.find_substring "does not match its parents" text)
+                         then misfit := true else ()
+                     | NONE => ();
                    case (state, failure, log) of
                        ("failed", SOME kind, SOME sha) =>
                          if (kind = "proof" orelse kind = "tactic-timeout") andalso
@@ -1989,7 +2001,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     val settled = stop_all ()
                     val _ = #drain early_pool ()
                   in
-                    (result, rev (!logs), settled, failure_spans, early)
+                    (result, rev (!logs), !misfit, settled, failure_spans, early)
                   end
                   handle e => (stop_all (); #stop early_pool (); #stop failure_spans (); raise e)
               in
@@ -2042,12 +2054,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
                HolbuildHolSharedCache.local_build_needed := false)
             (* A theory the remote cache holds may not fit the parents it holds,
-               as when a nondeterministic theory was built twice; the workers
-               then can't use it, and the coordinator fails the batch for
-               resubmission naming it, with any other theory its worker found
-               missing.  It is resubmitted with those theories
-               and every theory that depends on them in the batch, for the workers
-               to rebuild or recheck against the cached parents.  A theory or
+               as when a nondeterministic theory was built twice, or the cache
+               may have lost it; the workers then can't use it, and the
+               coordinator fails the batch for resubmission naming it, with any
+               other theory its worker found missing.  It is resubmitted with
+               those theories, for the workers to rebuild or recheck.  When a
+               worker said one doesn't fit its parents, every theory that
+               depends on those theories is too, as their cached copies were
+               built on the ones that don't fit; MISFITS holds the theories
+               named then.  A plain miss forces the missing theory alone:
+               forcing its cached dependents would send them to workers that
+               restore their other parents, which may be missing too.  A theory or
                blob the remote ledger took the remote cache to hold may be gone
                too: the ledger is forgotten, and a batch missing a blob is
                resubmitted for the export to upload its blobs again.  RETRIED
@@ -2060,6 +2077,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                replaces an earlier one, and a theory that failed in the later
                batch keeps none. *)
             val resubmitted_logs = ref []
+            val misfits = ref []
             fun carry_logs earlier later failed =
               Redblackmap.listItems
                 (List.foldl
@@ -2070,7 +2088,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    (List.filter (fn (key, _) => not (List.exists (fn k => k = key) failed)) earlier @ later))
             fun finish retried skip in_batch batch_id =
               let
-                val (outcome, batch_logs, settled, failure_spans, early) = follow in_batch batch_id
+                val (outcome, batch_logs, misfit, settled, failure_spans, early) = follow in_batch batch_id
                 val failed =
                   case outcome of
                       (HolbuildRemoteExec.Failed (_, failures), _) => map #input_key failures
@@ -2113,15 +2131,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     val resubmit =
                       length retried < max_resubmissions andalso
                       List.exists (fn item => not (List.exists (fn r => r = item) (List.concat retried))) missing
+                    fun theory_keys items =
+                      List.mapPartial (fn item => if String.isPrefix "theory " item
+                                                  then SOME (String.extract (item, 7, NONE)) else NONE) items
+                    val _ = if resubmit andalso misfit then misfits := theory_keys missing @ !misfits else ()
                     (* Every theory a resubmission was for is rebuilt again: a batch
                        that fails may have cancelled an earlier one's repair. *)
                     val forced =
                       if not resubmit then []
                       else
                         HolbuildBuildExec.theory_keys_depending_on build_options tc project plan keys toolchain_key
-                          (List.mapPartial (fn item => if String.isPrefix "theory " item
-                                                       then SOME (String.extract (item, 7, NONE)) else NONE)
-                                           (List.concat (missing :: retried)))
+                          {missing = theory_keys (List.concat (missing :: retried)), misfits = !misfits}
                     val missing_blob = resubmit andalso List.exists (fn item => item = "blob") missing
                     val final = null forced andalso not missing_blob
                     (* Last, after the required restores and failure logs. *)

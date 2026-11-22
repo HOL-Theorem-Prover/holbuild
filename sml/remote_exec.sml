@@ -267,7 +267,7 @@ fun report_action line =
 
 (* Follows a batch's event stream until the batch finishes, printing each
    action whose state changes, and passing on_change the input key, the
-   new state, last failure and log hash, if any, of each.  A stream that breaks (the connection drops,
+   new state, last failure, log hash and failure detail, if any, of each.  A stream that breaks (the connection drops,
    or the coordinator answers 5xx while it restarts) is reattached: after a
    second when it delivered a state change, and after each of
    retry_delays_seconds in a row when it delivered none.  Every stream
@@ -277,7 +277,8 @@ fun report_action line =
    on a quiet stream, so a proxy doesn't close a healthy one for being
    idle.  The coordinator ends a batch at its deadline, so this ends too.  A failed
    batch comes with the action whose proof failed, when one did. *)
-fun follow url batch_id (on_change : string * string * string option * string option -> unit) : outcome * progress =
+fun follow url batch_id (on_change : string * string * string option * string option * string option -> unit)
+    : outcome * progress =
   let
     val followed_at = Time.now ()
     val _ = HolbuildOffline.require_online "follow a remote batch"
@@ -348,7 +349,7 @@ fun follow url batch_id (on_change : string * string * string option * string op
                     missed requeue. Only state progress resets stream retries. *)
                  if Option.map (fn (_, (s, _, _)) => s) previous = SOME state then ()
                  else (changed := true; report_action line);
-                 on_change (key, state, failure, log))
+                 on_change (key, state, failure, log, json_string_field "failure_detail" line))
             end
         | SOME "batch" =>
             outcome :=
