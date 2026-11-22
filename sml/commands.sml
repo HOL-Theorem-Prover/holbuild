@@ -1206,8 +1206,9 @@ fun build_generated_source_owners build components holdir index plan =
     | owners => (build (HolbuildBuildPlan.plan_targets components holdir index owners); true)
 
 (* How many times one remote build resubmits its batch after a worker found
-   a theory or blob missing, each time for a different one. *)
-val max_resubmissions = 5
+   a theory or blob missing, each time for a different one.  A dependency cone
+   whose cached copies expired can take a round per layer to heal. *)
+val max_resubmissions = 32
 
 (* What a planned build does: build its targets, or export their uncached
    theories for remote execution. *)
