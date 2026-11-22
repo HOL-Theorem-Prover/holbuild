@@ -14,6 +14,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import types
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -776,6 +777,7 @@ def test_a_refusal_after_a_clear_that_failed_is_taken_for_an_unprotected_tasks(s
     server.protection_status = 200
     server.protection_reply = {"failure": {"Reason": "DEPLOYMENT_BLOCKED"}}
     assert not protection.set(enabled=True)
+    assert protection.on is False  # so the worker claims again only once ECS protects it
 
 
 def test_an_enable_that_got_no_answer_leaves_protection_unknown_but_one_the_agent_refused_leaves_it_off(
@@ -784,6 +786,7 @@ def test_an_enable_that_got_no_answer_leaves_protection_unknown_but_one_the_agen
     unanswered = Protection("false", None)  # the command fails: it may have protected the task all the same
     assert unanswered.set(enabled=True)
     assert unanswered.on is None
+    assert unanswered.since > 0
     server.protection_reply = {"failure": {"Reason": "TASK_NOT_VALID"}}
     refused = Protection(None, server.url)
     assert refused.set(enabled=True)
@@ -863,20 +866,24 @@ class ScriptedProtection:
         accepted = not enabled or self.on or not self.fresh or self.fresh.pop(0)
         self.events.append(f"on:{accepted}" if enabled else "off")
         if accepted:
-            if enabled and not self.on:
+            if enabled and self.on is False:
                 self.since = time.monotonic()
             self.on = enabled
+        else:
+            self.on = False  # as Protection: the refusal says the task is unprotected
         return accepted
 
 
 def scripted_main(
     tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, fresh: list[bool], claims: int | list[bool],
     *, unavailable: bool = False, calls: list[float] | None = None, clears: list[bool] | None = None,
-    timeouts: list[float] | None = None, drain: bool = False, spells: bool = True,
+    timeouts: list[float] | None = None, drain: bool = False, spells: bool = True, unknown: bool = False,
+    unknown_before: bool = False,
 ) -> list[str]:
     """Run ``worker.main`` on ``claims`` claims (or, as a list, claims that find work or not), each run as an
-    action that sets protection and reports the cache ``unavailable`` or not (after a SIGTERM, with ``drain``),
-    and return the claims, runs and protection calls in order."""
+    action that sets protection (with no answer, with ``unknown``; from an unknown state, with ``unknown_before``)
+    and reports the cache ``unavailable`` or not (after a SIGTERM, with ``drain``), and return the claims, runs
+    and protection calls in order."""
     monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
@@ -899,7 +906,12 @@ def scripted_main(
         if drain:
             coordinator.drain.request()
         # As Lease.held: a refusal for an unprotected worker gives the claim back, reported like ``unavailable``.
-        return not protection.set(enabled=True, timeout=5) or unavailable
+        if unknown_before:
+            protection.on = None
+        refused = not protection.set(enabled=True, timeout=5)
+        if unknown:
+            protection.on = None
+        return refused or unavailable
 
     monkeypatch.setattr(worker, "claim_reporting", take)
     monkeypatch.setattr(worker, "run_one", run)
@@ -962,6 +974,89 @@ def test_a_worker_drops_protection_before_waiting_out_an_unavailable_cache(
 ) -> None:
     events = scripted_main(tmp_path, server, monkeypatch, [], 1, unavailable=True)
     assert events == ["claim", "run", "on:True", "off", "claim"]
+
+
+def test_a_worker_clears_protection_it_may_hold_before_waiting_out_an_unavailable_cache(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = scripted_main(tmp_path, server, monkeypatch, [], 1, unavailable=True, unknown=True)
+    assert events == ["claim", "run", "on:True", "off", "claim"]
+
+
+def test_a_failed_clear_keeps_the_spell_it_ended_over_so_the_next_actions_end_clears_again(server: Server) -> None:
+    protection = Protection(None, server.url)
+    assert protection.set(enabled=True)
+    since = protection.since
+    server.protection_status = 500
+    protection.set(enabled=False)
+    assert protection.on is None
+    server.protection_status = 200
+    assert protection.set(enabled=True)
+    assert protection.on and protection.since == since
+
+
+def test_a_failed_clear_then_an_unanswered_enable_keeps_the_spell_it_ended_over(server: Server) -> None:
+    protection = Protection(None, server.url)
+    assert protection.set(enabled=True)
+    since = protection.since
+    server.protection_status = 500
+    protection.set(enabled=False)
+    protection.ecs_agent_uri = "http://127.0.0.1:1"  # no answer
+    assert protection.set(enabled=True)
+    assert protection.on is None
+    protection.ecs_agent_uri = server.url
+    server.protection_status = 200
+    assert protection.set(enabled=True)
+    assert protection.on and protection.since == since
+
+
+def test_an_ecs_enable_sets_a_window_from_its_request_that_refused_renewals_keep(server: Server) -> None:
+    protection = Protection(None, server.url)
+    before = time.monotonic()
+    assert protection.set(enabled=True)
+    until = protection.until
+    assert before + 180 * 60 <= until <= time.monotonic() + 180 * 60
+    server.protection_reply = {"failure": {"Reason": "DEPLOYMENT_BLOCKED"}}
+    assert protection.set(enabled=True)
+    assert protection.on and protection.until == until
+
+
+def test_a_refusal_while_protection_is_unknown_gates_the_next_claim_on_protection(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = scripted_main(tmp_path, server, monkeypatch, [False, True], 1, unknown_before=True)
+    assert events == ["claim", "run", "on:False", "on:True", "claim", "off"]
+
+
+def test_an_over_spell_is_cleared_at_an_actions_end_while_protection_is_unknown(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker, "PROTECTED_SPELL_SECONDS", -1)
+    monkeypatch.setattr(worker, "SPELL_GAP_SECONDS", 0.01)
+    events = scripted_main(tmp_path, server, monkeypatch, [], 1, unknown=True)
+    assert events == ["claim", "run", "on:True", "off", "on:True", "claim", "off"]
+
+
+def test_a_renewal_refused_after_its_window_lapsed_in_flight_counts_as_lapsed(
+    server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protection = Protection(None, server.url)
+    assert protection.set(enabled=True)
+    protection.until = 5.0
+    clock = iter([0.0, 0.0, 10.0])  # the lapse check, the send, the refusal
+    monkeypatch.setattr(worker, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
+    server.protection_reply = {"failure": {"Reason": "DEPLOYMENT_BLOCKED"}}
+    assert not protection.set(enabled=True)
+    assert protection.on is False
+
+
+def test_protection_ecs_held_past_its_window_counts_as_lapsed(server: Server) -> None:
+    protection = Protection(None, server.url)
+    assert protection.set(enabled=True)
+    protection.until = time.monotonic() - 1  # renewals refused for the whole window
+    server.protection_reply = {"failure": {"Reason": "DEPLOYMENT_BLOCKED"}}
+    assert not protection.set(enabled=True)
+    assert protection.on is False
 
 
 def test_a_draining_worker_clears_protection_within_the_time_left_before_its_container_is_stopped(
