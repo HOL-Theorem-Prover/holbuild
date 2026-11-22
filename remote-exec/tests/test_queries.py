@@ -535,6 +535,7 @@ STATEMENTS = [
         "UPDATE actions SET attempts = attempts - 1, ahead = CASE", lambda f: {**lease(f), "ahead_batch": True}, 10_000
     ),
     Statement("UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1 WHERE", lease, 10_000),
+    Statement("UPDATE actions SET attempts = attempts - 1 WHERE", lease, 10_000),
     # leases a worker never got
     # No index on the worker: it reads the leases, one per running action.
     Statement(cm.UNHELD_LEASES, lambda f: {"worker": "w9", "held": None, "before": datetime.now(UTC)}, 1_200),

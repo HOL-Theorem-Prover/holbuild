@@ -2527,14 +2527,49 @@ async def test_an_action_its_worker_could_not_start_is_retried_without_using_an_
 async def test_unavailable_results_past_the_interruption_cap_use_attempts(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a"])
     # Five refunded interruptions, then two counted ones: the third counted one fails the batch.
-    for _ in range(5 + 2):
+    for n in range(5 + 2):
         token = await claim_named(http, "a")
         assert (await complete(http, token, result("a", "failed", "unavailable"))).status_code == 200
         assert await states(http, batch_id) == {"a": "ready"}
+        # Batch status counts the refunded ones, which success would clear from last_failure.
+        assert (await batch(http, batch_id))["actions"][0]["interruptions"] == min(n + 1, 5)
     token = await claim_named(http, "a")
     assert (await complete(http, token, result("a", "failed", "unavailable"))).status_code == 200
     status = await batch(http, batch_id)
     assert (status["state"], status["failure"]) == ("failed", "pkg:a: unavailable")
+
+
+async def test_a_declined_claim_is_retried_without_counting_an_attempt_or_an_interruption(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a"])
+    for _ in range(coordinator.settings.max_attempts + coordinator.settings.max_interruptions + 1):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", "declined"))).status_code == 200
+        assert await states(http, batch_id) == {"a": "ready"}
+    action = (await batch(http, batch_id))["actions"][0]
+    assert (action["attempts"], action["interruptions"], action["last_failure"]) == (0, 0, None)
+
+
+async def test_a_declined_claim_leaves_the_last_attempts_record_to_the_retry_rules(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a"])
+    for failure in ["disk", "declined"]:
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", failure))).status_code == 200
+    assert (await batch(http, batch_id))["actions"][0]["last_failure"] == "disk"
+    # So a second disk failure in a row is final, as without the declined claim between them.
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "disk"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "failed"
+
+
+async def test_declined_claims_count_nothing_towards_a_hosts_quarantine(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.report_host(busy("host-a", 0))
+    for _ in range(coordinator_module.QUARANTINE_FAILURES + 1):
+        await fail_on(http, coordinator, "host-a", "declined")
+    assert coordinator._quarantine("host-a") is None
 
 
 async def test_disk_failure_retries_once(http: httpx.AsyncClient) -> None:

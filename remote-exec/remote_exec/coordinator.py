@@ -236,6 +236,7 @@ class ActionStatus:
     state: str
     tier: str
     attempts: int
+    interruptions: int  # claims given back unfinished (``unavailable``) that counted no attempt
     last_failure: str | None
     log_sha256: str | None
     failure_detail: str | None  # the last result's detail: why it failed when it has no log
@@ -401,9 +402,9 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int,
     one per high-tier action, since warm workers are standard-tier. Runs contribute at most ``run_slots``
     in each term; the total is at most ``max_burst_workers``.
 
-    Actions waiting ahead of their parents hold burst workers (only burst workers load ahead) but ask for none
-    of their own: the demand is the other actions', plus the workers those hold once ready work needs a burst
-    worker, since they don't take it."""
+    Actions waiting ahead of their parents count apart, one burst worker each: only burst workers load ahead, so
+    warm workers never take them, and the burst workers holding them must not be scaled in while a narrow point
+    of the DAG leaves no ready work."""
     ready = counts.ready_standard + counts.ready_high
     running = counts.running_standard + counts.running_high
     runs = counts.ready_run + counts.running_run
@@ -413,13 +414,7 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int,
         counts.ready_high + counts.running_high - counts.waiting_ahead_high
         - counts.high_run + min(run_slots, counts.high_run)
     )
-    demand = max(0, active - warm_workers, high)
-    # Work beyond what runs is ready work a burst worker could take; runs the run slots hold back are not.
-    running_active = running - ahead - counts.running_run + min(run_slots, counts.running_run)
-    free_run_slots = max(0, run_slots - counts.running_run)
-    ready_high = counts.ready_high - counts.ready_high_run + min(counts.ready_high_run, free_run_slots)
-    if ready_high > 0 or active > max(warm_workers, running_active):
-        demand += ahead
+    demand = max(0, active - warm_workers, high) + ahead
     return min(demand, max_burst_workers)
 
 
@@ -512,7 +507,7 @@ RELEASABLE_BATCH = sa.text(RELEASABLE.format(batch=" AND a.batch_id = :batch_id"
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
 CHANGED_ACTIONS = sa.text("""
-SELECT input_key, theory, state, tier, attempts, last_failure, log_sha256, failure_detail,
+SELECT input_key, theory, state, tier, attempts, interruptions, last_failure, log_sha256, failure_detail,
        last_claimed_at, finished_at, worker, CAST(timings AS text)
 FROM actions
 WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)
@@ -2738,7 +2733,7 @@ class Coordinator:
             self.infra_streak[host_id] = (count + 1, batch if batch == batch_id else None)
             if self._failing(host_id):
                 self.probe_at[host_id] = self.clock()
-        elif result.failure == "ahead-abandoned":
+        elif result.failure in ("ahead-abandoned", "declined"):
             pass
         elif not failing:
             self.infra_streak.pop(host_id, None)
@@ -2760,12 +2755,14 @@ class Coordinator:
 
     def _burst_demand(self, counts: QueueCounts) -> int:
         """``burst_demand`` with the workers of quarantined hosts left out of the capacity: their warm workers
-        don't count as warm, and while there is demand, burst workers replace theirs."""
+        don't count as warm, and while there is demand beyond the actions waiting ahead, which the burst workers
+        holding them meet, burst workers replace theirs."""
         warm, burst = self._quarantined_workers()
         demand = burst_demand(
             counts, max(0, self.settings.warm_workers - warm), self.settings.max_burst_workers, self.settings.run_slots
         )
-        return min(self.settings.max_burst_workers, demand + burst) if demand else 0
+        ahead = counts.waiting_ahead_standard + counts.waiting_ahead_high
+        return min(self.settings.max_burst_workers, demand + burst) if demand > ahead else demand
 
     def report_phases(self, report: PhaseReport) -> None:
         """Take a worker's report of where its time went."""
@@ -2920,24 +2917,26 @@ class Coordinator:
                     f"{action.input_key} (spec {action.spec_sha256})"
                 )
             # A failure without a log, such as an interruption, keeps the log an earlier attempt left, the only
-            # evidence of why that one failed.
-            await conn.execute(
-                sa.text(
-                    "UPDATE actions SET log_sha256 = CASE WHEN CAST(:failed AS boolean) "
-                    "THEN COALESCE(:log, log_sha256) ELSE :log END, last_failure = :failure, failure_detail = :detail, "
-                    "timings = CAST(CAST(:timings AS text) AS jsonb), finished_at = now() "
-                    "WHERE batch_id = :batch_id AND input_key = :input_key"
-                ),
-                {
-                    "failed": result.status == "failed",
-                    "log": result.log_sha256,
-                    "failure": result.failure,
-                    "detail": result.detail,
-                    "timings": json.dumps(result.timings) if result.timings is not None else None,
-                    "batch_id": batch_id,
-                    "input_key": lease.input_key,
-                },
-            )
+            # evidence of why that one failed. A declined claim ran nothing, so it leaves the last attempt's record,
+            # which the retry rules read, as it was.
+            if result.failure != "declined":
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET log_sha256 = CASE WHEN CAST(:failed AS boolean) "
+                        "THEN COALESCE(:log, log_sha256) ELSE :log END, last_failure = :failure, failure_detail = :detail, "
+                        "timings = CAST(CAST(:timings AS text) AS jsonb), finished_at = now() "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {
+                        "failed": result.status == "failed",
+                        "log": result.log_sha256,
+                        "failure": result.failure,
+                        "detail": result.detail,
+                        "timings": json.dumps(result.timings) if result.timings is not None else None,
+                        "batch_id": batch_id,
+                        "input_key": lease.input_key,
+                    },
+                )
             package, theory = action.theory.split(":", 1)
             # Whether a slot of the batch's cap may be free, or the action's children may be claimed ahead, now: a
             # failure frees the action's slot if it was claimed ahead, and those of the actions claimed ahead of it,
@@ -2972,6 +2971,13 @@ class Coordinator:
                         "UPDATE actions SET attempts = attempts - 1, ahead = 'abandoned' "
                         "WHERE batch_id = :batch_id AND input_key = :input_key"
                     ),
+                    {"batch_id": batch_id, "input_key": action.input_key},
+                )
+                await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)
+            elif result.failure == "declined":
+                # A worker being scaled in gave the claim back unstarted: it costs no attempt and interrupted nothing.
+                await conn.execute(
+                    sa.text("UPDATE actions SET attempts = attempts - 1 WHERE batch_id = :batch_id AND input_key = :input_key"),
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
                 await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)
