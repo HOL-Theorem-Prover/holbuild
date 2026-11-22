@@ -285,8 +285,8 @@ fun confined grants argv execute =
 (* The checkpoint tree's states restored from the store are links to it:
    hard links, or symbolic ones where the store is on another mount.  A
    child may only read them, so the tree's writable directories are its
-   largest subtrees without a link, and the store directories symbolic
-   links point into are readable.  Each checkpoint has its own directory,
+   largest subtrees without a link, and the store files symbolic links
+   point to are readable, each alone.  Each checkpoint has its own directory,
    created before the child starts, so it can save every one it hasn't
    restored. *)
 fun checkpoint_grants checkpoints =
@@ -294,15 +294,18 @@ fun checkpoint_grants checkpoints =
     val store = OS.Path.concat (HolbuildCacheConfig.cache_root (), "checkpoint-store")
     val store = (OS.FileSys.fullPath store handle OS.SysErr _ => store) ^ "/"
     fun target path =
-      let val dir = OS.FileSys.fullPath (OS.Path.dir (Posix.FileSys.readlink path))
+      let
+        val linked = Posix.FileSys.readlink path
+        val dir = OS.FileSys.fullPath (OS.Path.dir linked)
       in
-        (* A state's family directory, never the store itself. *)
+        (* The linked state alone, in a family directory of the store: the
+           child may neither list that family nor open its other states. *)
         if String.isPrefix store dir andalso not (CharVector.exists (fn c => c = #"/") (String.extract (dir, size store, NONE)))
-        then dir
+        then OS.Path.concat (dir, OS.Path.file linked)
         else raise Error ("checkpoint link leaves its store family: " ^ path)
       end
     (* NONE when the subtree at DIR has no link; else what of it is
-       writable and the store directories its links point into. *)
+       writable and the store files its links point to. *)
     fun visit dir =
       let
         val stream = OS.FileSys.openDir dir

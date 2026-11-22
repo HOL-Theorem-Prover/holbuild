@@ -1265,6 +1265,37 @@ def test_worker_asks_a_release_that_can_to_build_a_pipelined_claim_pipelined(
     assert ("--pipeline" in logs[1].read_text().split()) == passed
 
 
+@pytest.mark.parametrize(("version", "passed"), [("0.14.98", False), ("0.14.99", True)])
+def test_a_deps_heap_only_worker_shares_nothing_with_a_release_without_that_mode(
+    tmp_path: Path, server: Server, logs: tuple[Path, Path], version: str, passed: bool
+) -> None:
+    release_tarball(tmp_path / f"holbuild-{version}.tar.gz", version)
+    server.specs[SPEC] = f"holbuild-action-spec-v1\nholbuild-version={version}\n"
+    args = worker_args(tmp_path, server)
+    args.share_heaps, args.share_deps_heap = False, True
+
+    run_one(
+        Coordinator(server.url, "w"),
+        args,
+        releases(tmp_path, server),
+        Protection(None, None),
+        claim(),
+        Phases(),
+    )
+
+    assert server.completed == [RECORD]
+    args = logs[1].read_text().split()
+    assert ("--share-deps-heap" in args) == passed
+    assert "--share-heaps" not in args
+
+
+def test_a_worker_takes_one_heap_sharing_mode() -> None:
+    args = ["--coordinator", "http://coordinator.test", "--remote-cache", "http://cache.test", "--cache-limit-gb", "1"]
+    assert parse_args([*args, "--share-deps-heap"]).share_deps_heap
+    with pytest.raises(SystemExit):
+        parse_args([*args, "--share-heaps", "--share-deps-heap"])
+
+
 def test_an_ahead_claim_for_a_release_without_ahead_mode_is_abandoned_unrun(
     tmp_path: Path, server: Server, logs: tuple[Path, Path]
 ) -> None:

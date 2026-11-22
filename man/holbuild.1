@@ -320,7 +320,7 @@ Sweep the worker cache only, as
 .B \-\-sweep\-only
 below says, and run no action.
 .TP
-.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-cache\-min\-free\-gb \fIN\fR] [\fB\-\-share\-heaps\fR] [\fB\-\-pipeline\fR] [\fB\-\-result \fIFILE\fR] [\fB\-\-ahead\-parent \fIINPUT_KEY\fB:\fISPEC\-SHA256\fR ... [\fB\-\-ahead\-wait\-seconds \fIN\fR]]
+.B exec\-action \fISPEC\-SHA256\fR \fB\-\-cache\-limit\-gb \fIN\fR [\fB\-\-cache\-reserve\-gb \fIN\fR] [\fB\-\-cache\-min\-free\-gb \fIN\fR] [\fB\-\-share\-heaps\fR | \fB\-\-share\-deps\-heap\fR] [\fB\-\-pipeline\fR] [\fB\-\-result \fIFILE\fR] [\fB\-\-ahead\-parent \fIINPUT_KEY\fB:\fISPEC\-SHA256\fR ... [\fB\-\-ahead\-wait\-seconds \fIN\fR]]
 Run the action specification stored in the remote cache as
 .I SPEC\-SHA256
 (see
@@ -384,6 +384,18 @@ failed proof's prefix, which a worker with no heap to restore resumes from.
 The host store
 .I CACHE/checkpoint\-store
 keeps their files.
+A heap this run saved is published only as its preload saved it, before the
+theory script ran.
+.TP
+.B \-\-share\-deps\-heap
+As
+.BR \-\-share\-heaps ,
+but share only deps-loaded heaps and save no theorem or definition
+checkpoint: for workers whose actions come from users who don't trust each
+other.
+It restores any heap the remote cache holds under the key, and releases
+before 0.14.99 published heaps a script could replace: use it with a remote
+cache no earlier release has published heaps to, such as a new one.
 .TP
 .B \-\-pipeline
 Build a theory whose spec allows it pipelined: publish its outline to the

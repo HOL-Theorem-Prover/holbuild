@@ -361,20 +361,32 @@ fun load_name (LoadTheory name) = name
 fun manifest_loads plan node =
   map load_name (ordered_loads plan node load_stem (HolbuildBuildPlan.direct_project_deps plan node))
 
+(* Where a preload asks the parent to take the deps heap it saved, and waits
+   until the parent removes the request (with_deps_heap_capture). *)
+fun deps_heap_capture_request deps_loaded = deps_loaded ^ ".capture"
+
 (* The deps heap keeps only the toolchain's load path, not the project's
    directories HOL put there: other trees of the project resume from it.
    The save's time is printed as a holsave phase (hol_log_phases); the
-   timing binds nothing, so the heap holds what it did without it. *)
-fun write_preload load_lines deps_loaded deps_ok path =
+   timing binds nothing, so the heap holds what it did without it.  With
+   CAPTURE, the child then waits for the parent to hash the heap before it
+   runs any script code.  The wait comes after the save, so it isn't in the
+   heap and needs no key of its own. *)
+fun write_preload capture load_lines deps_loaded deps_ok path =
   let
     val save = save_deps_heap_expr {label = "deps_loaded", output = deps_loaded, ok_text = deps_ok}
+    val request = HolbuildToolchain.sml_string (deps_heap_capture_request deps_loaded)
+    val wait =
+      "val _ = (TextIO.closeOut (TextIO.openOut " ^ request ^ "); " ^
+      "while OS.FileSys.access (" ^ request ^ ", []) do OS.Process.sleep (Time.fromMilliseconds 5));"
     val lines = runtime_line () ::
                 (load_lines @
                  [checkpoint_save_runtime_line (),
                   "val _ = let val start = Time.now () in " ^
                   "HolbuildCheckpointSaveRuntime.with_toolchain_load_path (fn () => " ^ save ^ "); " ^
                   "TextIO.output (TextIO.stdErr, \"holbuild hol-phases holsave=\" ^ " ^
-                  "LargeInt.toString (LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))) ^ \"\\n\") end;"])
+                  "LargeInt.toString (LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))) ^ \"\\n\") end;"] @
+                 (if capture then [wait] else []))
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -4465,7 +4477,7 @@ val dropped_checkpoints = ref 0
    exec-action's rstmodrejn. *)
 val rejected_heap_modules = ref 0
 
-fun write_theory_script defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
+fun write_theory_script capture defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
   let
     val _ = resume_steps := []
     val source_name = #source_name action
@@ -4500,7 +4512,7 @@ fun write_theory_script defer_proofs policy root checkpoint_root base_context (a
       fun run_from_fresh_preload () =
         (remove_deps_checkpoint_descendants base deps_key;
          ensure_source_checkpoint_parents ();
-         if saves_progress policy then write_preload load_lines deps_loaded deps_ok preload
+         if saves_progress policy then write_preload capture load_lines deps_loaded deps_ok preload
          else write_plain_preload load_lines preload;
          write_text staged_script (instrumented_source NONE policy (not (saves_progress policy)) (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
@@ -4686,6 +4698,41 @@ fun set_attached_child join = Thread.setLocal (attached_child_tag, join)
 fun take_attached_child () =
   Option.join (Thread.getLocal attached_child_tag) before set_attached_child NONE
 
+(* exec-action --share-heaps: whether a theory run's preload hands the deps
+   heap it saves to the parent before the script runs, and the SHA-256 the
+   parent took, the only deps heap of the action's own it publishes. *)
+val capture_deps_heap = ref false
+val captured_deps_heap = ref (NONE : string option)
+
+(* Runs F, the theory child's run, taking the deps heap when the preload
+   asks (write_preload): its SHA-256, if it is a plain file, goes in
+   captured_deps_heap, and removing the request lets the child go on.  Only
+   the first request counts: script code could write the next. *)
+fun with_deps_heap_capture deps_loaded f =
+  let
+    val request = deps_heap_capture_request deps_loaded
+    val mutex = Mutex.mutex ()
+    val finished = ref false
+    fun locked g = (Mutex.lock mutex; g () before Mutex.unlock mutex)
+    fun requested () = FS.access (request, []) handle OS.SysErr _ => false
+    fun plain_file path = Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false
+    fun heap_sha () =
+      if plain_file deps_loaded then SOME (HolbuildHash.file_sha256 deps_loaded) else NONE
+      handle e => (warn ("could not hash the deps-loaded heap: " ^ General.exnMessage e); NONE)
+    fun take () = (captured_deps_heap := heap_sha (); remove_file request)
+    fun watch () =
+      if locked (fn () => !finished) then ()
+      else if requested () then take ()
+      else (OS.Process.sleep (Time.fromMilliseconds 10); watch ())
+    val _ = captured_deps_heap := NONE
+    val watcher = Thread.fork (watch, [])
+    fun stop () =
+      (locked (fn () => finished := true);
+       while Thread.isActive watcher do OS.Process.sleep (Time.fromMilliseconds 10))
+  in
+    (f () handle e => (stop (); raise e)) before stop ()
+  end
+
 (* SPECULATIVE_LOG: the run is a pipelined build's speculative one (an
    outline, or a proof on outlined parents), which logs there, produces no
    theory module, and leaves its outputs in the stage for the caller to
@@ -4728,7 +4775,8 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val _ = remove_file timeout_marker
     val _ = remove_file plan_only_marker
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
-    val run_spec = write_theory_script (if speculative andalso proof_steps_enabled policy then SOME (has_suspension_pruning tc) else NONE) policy root checkpoint_root base_context action source_text
+    val capture = !capture_deps_heap andalso checkpoint_enabled policy andalso saves_progress policy
+    val run_spec = write_theory_script capture (if speculative andalso proof_steps_enabled policy then SOME (has_suspension_pruning tc) else NONE) policy root checkpoint_root base_context action source_text
                                     theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
                                     (if execution_plan_only policy then SOME plan_only_marker else NONE)
     (* A speculative child runs no checkpoints, so it starts from the
@@ -4829,22 +4877,26 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
        ended while saving it. *)
     fun remove_promote_scratch () =
       if promotes_preload policy then remove_file (promote_scratch_path preload) else ()
+    fun run_child () =
+      case attached of
+          SOME join =>
+            if #files run_spec = [preload, staged_script] then join ()
+            else raise Error "a child loading ahead needs a fresh preload"
+        | NONE =>
+            run_hol_files_to_log tc stage stage
+              (#context run_spec)
+              (child_policy :: (#files run_spec @ [theory_exporter]))
+              "holbuild-build.log"
+              (SOME (current_build_log log_dir))
+              "hol run failed while building theory script"
+    (* Only a fresh preload saves the deps heap, and waits to hand it over. *)
+    val captures = capture andalso #files run_spec = [preload, staged_script]
     val _ =
       (check_cancelled ();
        validate_hol_context (#context run_spec);
        detail_time_phase "build.exec.node.child_run"
          (fn () =>
-             ((case attached of
-                   SOME join =>
-                     if #files run_spec = [preload, staged_script] then join ()
-                     else raise Error "a child loading ahead needs a fresh preload"
-                 | NONE =>
-                     run_hol_files_to_log tc stage stage
-                       (#context run_spec)
-                       (child_policy :: (#files run_spec @ [theory_exporter]))
-                       "holbuild-build.log"
-                       (SOME (current_build_log log_dir))
-                       "hol run failed while building theory script")
+             ((if captures then with_deps_heap_capture deps_loaded run_child else run_child ())
               before remove_promote_scratch ())
              handle e => (remove_promote_scratch (); raise e)))
       handle Error msg =>
@@ -7105,6 +7157,16 @@ fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, p
                     checkpoint_seconds = default_checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout, execution_plan = NONE,
                     trace_steps = false, repl_on_failure = false, trknl = false,
+                    promote_preload = promote_preload}
+
+(* exec-action --share-deps-heap shares no theorem or definition
+   checkpoint, and each action starts from an empty checkpoint tree, so
+   saving one would only cost the child time. *)
+fun deps_heap_only_policy (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...}) =
+  CheckpointPolicy {checkpoint = checkpoint, theorem_checkpoints = false, checkpoint_target = checkpoint_target,
+                    checkpoint_seconds = checkpoint_seconds, proof_steps = proof_steps,
+                    new_ir = new_ir, tactic_timeout = tactic_timeout, execution_plan = execution_plan,
+                    trace_steps = trace_steps, repl_on_failure = repl_on_failure, trknl = trknl,
                     promote_preload = promote_preload}
 
 fun signature_companion plan node =
@@ -12767,9 +12829,12 @@ fun shared_standalone_key heap_key (action : theory_action) =
 type shared_context =
   {store : string, checkpoint_root : string, heap_key : string, index_key : string, standalone_key : string,
    base_state : string, deps_key : string, deps_loaded : string, requested_timeout : real option,
-   candidates : shared_candidate list, module_store : string}
+   candidates : shared_candidate list, module_store : string, heap_only : bool}
 
-fun shared_context cache checkpoint_root tc root policy (action : theory_action) checkpoints : shared_context =
+(* HEAP_ONLY (exec-action --share-deps-heap): the deps heap is shared, and
+   no checkpoint the script saved: a script checkpoint's state, a failed
+   prefix's above all, may hold what code outside its key did. *)
+fun shared_context heap_only cache checkpoint_root tc root policy (action : theory_action) checkpoints : shared_context =
   let
     val base = action_checkpoint_base checkpoint_root action
     val heap_key = shared_heap_key tc root action
@@ -12781,14 +12846,16 @@ fun shared_context cache checkpoint_root tc root policy (action : theory_action)
      deps_key = #deps_key action,
      deps_loaded = deps_loaded_path base (#deps_key action),
      requested_timeout = tactic_timeout policy,
-     candidates = shared_candidates policy base checkpoints,
-     module_store = module_store (#holdir tc)}
+     candidates = if heap_only then [] else shared_candidates policy base checkpoints,
+     module_store = module_store (#holdir tc), heap_only = heap_only}
   end
 
-fun shared_heap_parent_ok ({deps_loaded, base_state, ...} : shared_context) =
-  case saved_parent deps_loaded of
+fun heap_parent_ok base_state heap =
+  case saved_parent heap of
       SOME parent => (FS.fullPath parent = base_state handle OS.SysErr _ => false)
     | NONE => false
+
+fun shared_heap_parent_ok ({deps_loaded, base_state, ...} : shared_context) = heap_parent_ok base_state deps_loaded
 
 fun tree_relative root path =
   if String.isPrefix (root ^ "/") path then SOME (String.extract(path, size root + 1, NONE)) else NONE
@@ -13124,7 +13191,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* Without a usable heap, a theory that saves none (not a target) may
        have published a failed prefix of its own. *)
     fun or_standalone (restored as {files = [], ...}) =
-          (case (if resumes then try_standalone () else NONE) of
+          (case (if resumes andalso not (#heap_only ctx) then try_standalone () else NONE) of
                SOME standalone => standalone
              | NONE => restored)
       | or_standalone restored = restored
@@ -13221,8 +13288,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* The child wrote the heap's module table, so it may name any file the
        worker can read: a heap naming one that isn't a module of this
        toolchain's store isn't published. *)
-    fun modules_ok () =
-      case List.find (not o store_module_file module_store) (saved_modules deps_loaded) of
+    fun modules_ok heap_file =
+      case List.find (not o store_module_file module_store) (saved_modules heap_file) of
           NONE => true
         | SOME path =>
             (warn ("not publishing the shared deps-loaded heap: it loads " ^ path ^
@@ -13230,11 +13297,10 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
              false)
     (* A heap this run saved is published only where no other worker's is:
        checkpoints on a heap that lost are chained to bytes no other worker
-       has, so they stay local. *)
-    fun publish_heap sha =
-      if heap_present () orelse
-         not (shared_heap_parent_ok ctx) orelse
-         not (modules_ok ()) then NONE
+       has, so they stay local.  HEAP_FILE is the parent's own copy of it,
+       whose bytes are the ones checked and put. *)
+    fun publish_heap_file heap_file sha =
+      if not (heap_parent_ok base_state heap_file) orelse not (modules_ok heap_file) then NONE
       else
         let
           val claim_key = shared_heap_claim_key heap_key
@@ -13268,7 +13334,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                              handle OS.SysErr _ => copy_binary path copy);
                             (id, copy)
                           end)
-                      (saved_module_ids deps_loaded))
+                      (saved_module_ids heap_file))
                before HolbuildRemoveTree.remove_untrusted dir)
               handle e => (HolbuildRemoveTree.remove_untrusted dir; raise e)
             end
@@ -13295,9 +13361,9 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 else (Mutex.lock absent_mutex; absent_blobs := module :: !absent_blobs;
                       Mutex.unlock absent_mutex)
               val _ = parallel_all remote_probe_width probe modules
-              val _ = upload_all ((deps_loaded, sha) :: modules)
+              val _ = upload_all ((heap_file, sha) :: modules)
               val _ =
-                case List.find (fn (_, blob) => needs_upload blob) ((deps_loaded, sha) :: modules) of
+                case List.find (fn (_, blob) => needs_upload blob) ((heap_file, sha) :: modules) of
                     SOME (path, _) => raise Error ("could not upload " ^ path)
                   | NONE => ()
               (* Every node: one still holding an entry this replaces would
@@ -13305,7 +13371,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               val _ = HolbuildRemoteCache.replace_action_everywhere remote {key = heap_key, text = manifest}
             in
               if HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote heap_key) = SOME manifest then
-                (store_add store sha {sha = sha, src = deps_loaded, save = true}; SOME sha)
+                (store_add store sha {sha = sha, src = heap_file, save = true}; SOME sha)
               else NONE
             end
           fun upload () =
@@ -13322,13 +13388,28 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           else (HolbuildStatus.message_stdout "another worker is publishing the shared deps-loaded heap\n";
                 NONE)
         end
+    fun publish_heap sha =
+      if heap_present () then NONE
+      else
+        let val copy = store_temp (store_path store sha sha)
+        in
+          (copy_binary deps_loaded copy;
+           (if HolbuildHash.file_sha256 copy = sha then publish_heap_file copy sha
+            else (warn "not publishing the shared deps-loaded heap: it changed while being published"; NONE))
+           before remove_file copy)
+          handle e => (remove_file copy; raise e)
+        end
     val heap =
       if not (deps_checkpoint_exists deps_loaded deps_key) then NONE
       else
         let val current = hash deps_loaded
         in
-          (* A restored heap Poly failed to load was replaced by this run's. *)
-          if restored_heap = SOME current then restored_heap else publish_heap current
+          (* A restored heap Poly failed to load was replaced by this run's.
+             A heap of this run's own is published only as its preload saved
+             it, before the script ran (with_deps_heap_capture). *)
+          if restored_heap = SOME current then restored_heap
+          else if !captured_deps_heap = SOME current then publish_heap current
+          else (warn "not publishing the shared deps-loaded heap: it isn't the one the preload saved"; NONE)
         end
     fun was_restored path =
       List.exists (fn (p, sha) => p = path andalso (hash path = sha handle _ => false))
@@ -13553,8 +13634,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                   end
   in
     case heap of
-        NONE => if deps_checkpoint_exists deps_loaded deps_key then () else publish_standalone ()
-      | SOME heap => publish_candidates heap
+        NONE => if #heap_only ctx orelse deps_checkpoint_exists deps_loaded deps_key then () else publish_standalone ()
+      | SOME heap => if #heap_only ctx then () else publish_candidates heap
   end
   handle e => warn ("shared checkpoint publish failed: " ^ General.exnMessage e)
 
@@ -14753,7 +14834,7 @@ fun snapshot_outline root stage logical snapshot =
    `toolchain` ensures the spec's HOL toolchain and returns it; AHEAD_PARENTS are
    the late parents (--ahead-parent), each its input key and spec; PIPELINE
    lets the theory build pipelined if its spec allows it. *)
-fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ahead_parents, pipeline} =
+fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_only, toolchain, ahead_parents, pipeline} =
   let
     val cancelled = ref false
     val publishing_checkpoints = ref false
@@ -15161,7 +15242,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
                  if forced then () else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
             | NONE => ()
         val stage = action_stage root action
-        val policy = if pipelined then speculative_policy (spec_policy spec) else spec_policy spec
+        val policy =
+          if pipelined then speculative_policy (spec_policy spec)
+          else if deps_heap_only then deps_heap_only_policy (spec_policy spec)
+          else spec_policy spec
         val log_dir = current_log_dir root (#package spec) (#logical spec)
         val oom_before = cgroup_oom_kills ()
         val _ = last_child_status := NONE
@@ -15192,8 +15276,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
             val shared =
               if not share_heaps orelse not (checkpoint_enabled policy) then NONE
               else
-                SOME (shared_context cache checkpoint_root tc root policy action checkpoints)
+                SOME (shared_context deps_heap_only cache checkpoint_root tc root policy action checkpoints)
                 handle e => (warn ("not sharing heaps: " ^ General.exnMessage e); NONE)
+            val _ = capture_deps_heap := Option.isSome shared
             (* Loading ahead found no heap to restore before it went on. *)
             val restored =
               case (shared, ahead) of
@@ -15667,7 +15752,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, toolchain, ah
               (case cutoff of SOME {pair_key, ...} => cached pair_key | NONE => false) orelse
               (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
                (cached shared_key orelse
-                resumes_from_checkpoints (spec_policy spec) built_action andalso
+                not deps_heap_only andalso resumes_from_checkpoints (spec_policy spec) built_action andalso
                 (* Only a restore that checks its key= line records its blobs. *)
                 Option.isSome (HolbuildRemoteCache.fetch_action remote
                                  (shared_standalone_key shared_key built_action))))

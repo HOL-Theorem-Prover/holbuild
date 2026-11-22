@@ -196,7 +196,7 @@ jobs:
           HOLBUILD_TEST_REQUIRE_MODULE_HEAPS: '1'
         run: >-
           tests/run.sh theory-modules basic-theory checkpoint-extra-inputs
-          checkpoint-recovery exec-action exec-action-share-heaps deps-heap-modules
+          checkpoint-recovery exec-action exec-action-share-heaps exec-action-share-heaps-forged deps-heap-modules
           preload-large-theory-sharing pipeline-suspend-groups check-promote-modules
 
       - name: Save theory-module HOL toolchain cache
