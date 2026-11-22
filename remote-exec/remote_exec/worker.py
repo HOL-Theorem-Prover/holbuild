@@ -397,6 +397,8 @@ class Releases:
     baked_root: str = field(default="/opt/holbuild-baked", kw_only=True)
     discovery_config: str | None = field(default=None, kw_only=True)
     drain: Drain = field(default_factory=Drain, kw_only=True, compare=False)
+    # The oldest release this worker runs actions of; never below MIN_SANDBOX_RELEASE.
+    min_release: tuple[int, int, int] = field(default=MIN_SANDBOX_RELEASE, kw_only=True)
 
     def read_spec(self, spec_sha256: str) -> SpecHead:
         """The ``holbuild-version`` and ``deps-key`` of the action spec stored in the remote cache: under ``/cas/``,
@@ -485,6 +487,9 @@ class Releases:
             raise Unreleased(f"holbuild {version!r} is not a release version")
         if tuple(map(int, version.split("."))) < MIN_SANDBOX_RELEASE:
             raise Unreleased(f"holbuild {version} predates mandatory action isolation")
+        if tuple(map(int, version.split("."))) < self.min_release:
+            floor = ".".join(map(str, self.min_release))
+            raise Unreleased(f"holbuild {version} is older than this worker's minimum release {floor}")
         baked = os.path.join(self.baked_root, f"v{version}", "bin", "holbuild")
         if os.path.isfile(baked) and os.access(baked, os.X_OK):
             check_sandbox(baked, version)
@@ -1491,6 +1496,17 @@ def host_rank(text: str) -> int:
     return rank
 
 
+def min_release(text: str) -> tuple[int, int, int]:
+    if not RELEASE.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text} is not a release version")
+    major, minor, patch = map(int, text.split("."))
+    if (major, minor, patch) < MIN_SANDBOX_RELEASE:
+        raise argparse.ArgumentTypeError(
+            f"{text} predates mandatory action isolation ({'.'.join(map(str, MIN_SANDBOX_RELEASE))})"
+        )
+    return (major, minor, patch)
+
+
 def ahead_wait_seconds(text: str) -> int:
     seconds = int(text)
     if seconds <= 0:
@@ -1558,6 +1574,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--baked-releases",
         default=os.environ.get("REMOTE_EXEC_BAKED_RELEASES", "/opt/holbuild-baked"),
         help="preinstalled releases root, checked before downloading (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--min-release", type=min_release,
+        default=os.environ.get("REMOTE_EXEC_MIN_RELEASE", ".".join(map(str, MIN_SANDBOX_RELEASE))),
+        help="refuse actions of holbuild releases older than this one, itself no older than the default "
+        "(default: $REMOTE_EXEC_MIN_RELEASE or %(default)s)",
     )
     parser.add_argument(
         "--holbuild-source-url",
@@ -1638,6 +1660,7 @@ def main() -> None:
         os.environ.get("HOLBUILD_REMOTE_CACHE_CURL_CONFIG"),
         baked_root=args.baked_releases,
         drain=drain,
+        min_release=args.min_release,
     )
     protection = Protection(args.protection_cmd, os.environ.get("ECS_AGENT_URI"))
     tiers = list(dict.fromkeys([args.tier, *args.also_claim]))

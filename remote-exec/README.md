@@ -338,6 +338,12 @@ stacking a notifying seccomp filter. `holbuild sandbox-check` exercises these
 requirements; workers reject a release whose check fails. Releases before
 0.13.58 are rejected because their HOL launch path has no mandatory sandbox.
 Upgrade submitting clients before replacing workers with this version.
+`--min-release VERSION` (or `REMOTE_EXEC_MIN_RELEASE`) raises that floor for one deployment. Before 0.14.92,
+an action may read the whole theory-modules store, which holds modules of
+every build its container (or, if shared, its host) ran; from 0.14.92 it may
+read only the module files its own dependencies need. So workers of tenants
+who must not read each other's theories and share a host's theory-modules
+store take `--min-release 0.14.92`.
 
 The worker and `exec-action` remain trusted: they fetch inputs, manage memory
 leases and publish results. Each HOL process runs with a Landlock filesystem
