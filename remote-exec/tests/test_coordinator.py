@@ -2539,6 +2539,27 @@ async def test_unavailable_results_past_the_interruption_cap_use_attempts(http: 
     assert (status["state"], status["failure"]) == ("failed", "pkg:a: unavailable")
 
 
+async def test_a_declined_claim_is_retried_without_counting_an_attempt_or_an_interruption(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a"])
+    for _ in range(coordinator.settings.max_attempts + coordinator.settings.max_interruptions + 1):
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", "declined"))).status_code == 200
+        assert await states(http, batch_id) == {"a": "ready"}
+    action = (await batch(http, batch_id))["actions"][0]
+    assert (action["attempts"], action["interruptions"], action["last_failure"]) == (0, 0, "declined")
+
+
+async def test_declined_claims_count_nothing_towards_a_hosts_quarantine(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.report_host(busy("host-a", 0))
+    for _ in range(coordinator_module.QUARANTINE_FAILURES + 1):
+        await fail_on(http, coordinator, "host-a", "declined")
+    assert coordinator._quarantine("host-a") is None
+
+
 async def test_disk_failure_retries_once(http: httpx.AsyncClient) -> None:
     batch_id = await submit(http, ["a"])
     token = await claim_named(http, "a")

@@ -788,7 +788,7 @@ def test_a_claim_ecs_refuses_to_protect_is_given_back_without_running_it(
 
     assert unavailable
     assert server.completed == [
-        failed_record(SPEC, "unavailable", "ECS refused scale-in protection: the task is being scaled in")
+        failed_record(SPEC, "declined", "ECS refused scale-in protection: the task is being scaled in")
     ]
     assert not logs[1].exists()
 
@@ -811,6 +811,87 @@ def test_protection_stays_on_between_back_to_back_actions_and_goes_off_once_a_cl
     assert len(server.claims) >= 3
     *held, cleared = server.protection
     assert all(call["ProtectionEnabled"] for call in held) and cleared == {"ProtectionEnabled": False}
+
+
+class ScriptedProtection:
+    """Protection whose fresh protections ECS accepts or refuses in the order ``fresh`` gives (accepted once it runs
+    out), recording each call in ``events``."""
+
+    def __init__(self, events: list[str], fresh: list[bool]) -> None:
+        self.events = events
+        self.fresh = fresh
+        self.on = False
+        self.since = 0.0
+
+    def set(self, *, enabled: bool, timeout: float = 30) -> bool:
+        accepted = not enabled or self.on or not self.fresh or self.fresh.pop(0)
+        self.events.append(f"on:{accepted}" if enabled else "off")
+        if accepted:
+            if enabled and not self.on:
+                self.since = time.monotonic()
+            self.on = enabled
+        return accepted
+
+
+def scripted_main(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, fresh: list[bool], claims: int,
+    *, unavailable: bool = False,
+) -> list[str]:
+    """Run ``worker.main`` on ``claims`` claims, each run as an action that sets protection and reports the
+    cache ``unavailable`` or not, and return the claims, runs and protection calls in order."""
+    monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
+    monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
+    monkeypatch.setattr(worker, "HostTelemetry", lambda *_: None)
+    monkeypatch.setattr(worker, "wait_for_disk", lambda *_, **_kwargs: None)
+    monkeypatch.setattr(worker, "CLAIM_RETRY_SECONDS", 0.01)
+    events: list[str] = []
+    protection = ScriptedProtection(events, fresh)
+    monkeypatch.setattr(worker, "Protection", lambda *_: protection)
+    left = [claim() for _ in range(claims)]
+
+    def take(*_args: object) -> dict[str, object]:
+        events.append("claim")
+        if not left:
+            raise KeyboardInterrupt
+        return left.pop(0)
+
+    def run(_coordinator, _args, _releases, protection, *_rest, **_kwargs) -> bool:
+        events.append("run")
+        # As Lease.held: a refusal for an unprotected worker gives the claim back, reported like ``unavailable``.
+        return not protection.set(enabled=True, timeout=5) or unavailable
+
+    monkeypatch.setattr(worker, "claim_reporting", take)
+    monkeypatch.setattr(worker, "run_one", run)
+    with pytest.raises(KeyboardInterrupt):
+        worker.main()
+    return events
+
+
+def test_a_worker_ecs_refused_protection_claims_again_only_once_ecs_protects_it(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = scripted_main(tmp_path, server, monkeypatch, [False, False, True], 2)
+    # It takes a claim unprotected, as an idle worker does, gives it back on the refusal, and claims nothing more
+    # until ECS protects it; protection then stays on into the next claim and goes off as the worker exits.
+    assert events == ["claim", "run", "on:False", "on:False", "on:True", "claim", "run", "on:True", "claim", "off"]
+
+
+def test_a_worker_drops_protection_between_actions_once_protected_for_its_longest_spell(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker, "PROTECTED_SPELL_SECONDS", -1)
+    events = scripted_main(tmp_path, server, monkeypatch, [], 2)
+    assert events == [
+        "claim", "run", "on:True", "off", "on:True", "claim", "run", "on:True", "off", "on:True", "claim", "off"
+    ]
+
+
+def test_a_worker_drops_protection_before_waiting_out_an_unavailable_cache(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = scripted_main(tmp_path, server, monkeypatch, [], 1, unavailable=True)
+    assert events == ["claim", "run", "on:True", "off", "claim"]
 
 
 @pytest.mark.parametrize("text", ["-1", "nan", "inf"])

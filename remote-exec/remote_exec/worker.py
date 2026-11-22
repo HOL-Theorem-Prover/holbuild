@@ -72,6 +72,10 @@ def check_sandbox(executable: str, version: str) -> None:
 # action was claimed must outlast the longest action. A dead worker still loses it: its container is the task's
 # essential one, so the task stops with it, and the worker clears protection once it finds no work (Protection).
 PROTECTION_MINUTES = 180
+# Longest a worker going from action to action keeps protection without a break. At an action's end past it, the
+# worker drops protection and claims again only once ECS protects it anew, so a scale-in or a rolling deployment
+# that wants the task gone takes it between actions instead of waiting for a queue to run dry.
+PROTECTED_SPELL_SECONDS = 1800
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
 # Longest wait for a heartbeat or completion answer: above the coordinator's database pool timeout plus the work, so
 # a request it accepted is answered rather than given up on and repeated.
@@ -348,13 +352,15 @@ class Coordinator:
 class Protection:
     """Scale-in protection while the worker has work: ``--protection-cmd on|off``, or the ECS agent's
     task-protection endpoint when ``ECS_AGENT_URI`` is set, or nothing. It stays on from an action into the next
-    claim, so a worker going straight from one action to the next is never open to a scale-in, and goes off once the
-    worker finds no work or waits before claiming. Failures are logged, never raised."""
+    claim, for up to PROTECTED_SPELL_SECONDS, so a worker going straight from one action to the next is never open
+    to a scale-in, and goes off once the worker finds no work, waits before claiming or exits. Failures are logged,
+    never raised."""
 
     def __init__(self, command: str | None, ecs_agent_uri: str | None) -> None:
         self.command = command
         self.ecs_agent_uri = ecs_agent_uri
         self.on = False  # whether the last call that worked turned it on
+        self.since = 0.0  # when it was turned on (time.monotonic())
 
     def set(self, *, enabled: bool, timeout: float = 30) -> bool:
         """Turn protection on or off. False when ECS refused to protect the unprotected task with DEPLOYMENT_BLOCKED:
@@ -389,6 +395,8 @@ class Protection:
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
             return True
+        if enabled and not self.on:
+            self.since = time.monotonic()
         self.on = enabled
         return True
 
@@ -1004,9 +1012,10 @@ def failed_record(spec_sha256: str, failure: str, detail: str | None = None) -> 
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
     5xx, or a transfer cut short), that was interrupted (``recordless_failure``) or that the host's disk had no room
-    for (``full_disk``), which is retried without counting the attempt; ``memory`` for one whose exec-action was
-    SIGKILLed; or ``internal`` for any other error in the worker, such as exec-action failing without a record,
-    which is retried. ``detail`` says why, for the client:
+    for (``full_disk``), which is retried without counting the attempt; ``declined`` for one it gave back unstarted
+    because ECS refused it scale-in protection, retried without counting anything; ``memory`` for one whose
+    exec-action was SIGKILLed; or ``internal`` for any other error in the worker, such as exec-action failing without
+    a record, which is retried. ``detail`` says why, for the client:
     the record has no log."""
     record = f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
     return record if detail is None else f"{record}detail={sanitize_detail(detail)}\n"
@@ -1094,7 +1103,7 @@ class Lease:
         self.completing = threading.Event()  # the result is being posted: a stale lease no longer stops anything
         self.checking = threading.Lock()
         self.done = threading.Event()
-        self.refused = False  # ECS refused to protect the task for the action: it is being scaled in
+        self.refused = False  # ECS refused to protect the task for the action: it is being scaled in or replaced
         self.thread = threading.Thread(target=self._beat, daemon=True)
 
     @contextlib.contextmanager
@@ -1222,7 +1231,7 @@ def run_one(
 
         if lease.refused:
             # Started now, the action would run until the scale-in stops the task; another worker takes it at once.
-            report(failed_record(spec, "unavailable", "ECS refused scale-in protection: the task is being scaled in"))
+            report(failed_record(spec, "declined", "ECS refused scale-in protection: the task is being scaled in"))
             return True
         try:
             record = execute(args, releases, lease, claim, phases, report, reaper=reaper)
@@ -1681,11 +1690,15 @@ def main() -> None:
         sweep = functools.partial(sweep_cache, releases, args.cache_limit_gb)
         reaper = Reaper(drain, os.path.join(os.environ["HOLBUILD_CACHE"], "action.lock"))
         resources.callback(reaper.stop)
-        def unprotect() -> None:
-            """A worker that waits, or found no work, is idle: a scale-in may take it."""
+        def unprotect(timeout: float = 30) -> None:
+            """A worker that waits, found no work or exits is idle: a scale-in may take it."""
             if protection.on:
-                protection.set(enabled=False)
+                protection.set(enabled=False, timeout=timeout)
 
+        resources.callback(unprotect, 2)
+        # Set when ECS refused protection for a claim or the worker dropped it after PROTECTED_SPELL_SECONDS: the
+        # worker then claims only once ECS protects it, so a task being stopped takes no action it would give back.
+        protect_first = False
         while not drain.stop.is_set():
             with phases.timed("idle"):
                 wait_for_disk(drain, coordinator, tiers, args.name, sweep, reaper=reaper, before_wait=unprotect)
@@ -1699,9 +1712,17 @@ def main() -> None:
                     host.waited = True
             if drain.stop.is_set():
                 break
+            if protect_first:
+                with phases.timed("lease"):
+                    refused = not protection.set(enabled=True, timeout=5)
+                if refused:
+                    with phases.timed("idle"):
+                        drain.stop.wait(CLAIM_RETRY_SECONDS)
+                    continue
             started = time.monotonic()
             claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
             if claim is None:
+                protect_first = False
                 with phases.timed("lease"):
                     unprotect()
                 # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
@@ -1721,12 +1742,18 @@ def main() -> None:
                 # cached. Waiting keeps a worker from failing ready action after ready action while the cache or the
                 # coordinator is down.
                 print(f"action failed in the worker: {error}", file=sys.stderr)
-                with phases.timed("idle"):
-                    drain.stop.wait(CLAIM_RETRY_SECONDS)
-                continue
+                unavailable = True
+            if protection.on and (unavailable or time.monotonic() - protection.since > PROTECTED_SPELL_SECONDS):
+                with phases.timed("lease"):
+                    unprotect()
+                protect_first = not unavailable
+            else:
+                protect_first = not protection.on  # refused for this action
             if unavailable:
                 # The coordinator readies the action again at once, so without the wait the worker would claim it
-                # straight back while the cache is still down.
+                # straight back while the cache or the coordinator is still down. Waiting keeps a worker from
+                # failing ready action after ready action; after an error in the worker, the next claim ends the
+                # lease and the coordinator retries, and a rerun finds a published result cached.
                 with phases.timed("idle"):
                     drain.stop.wait(CLAIM_RETRY_SECONDS)
 

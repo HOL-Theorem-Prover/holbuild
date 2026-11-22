@@ -2733,7 +2733,7 @@ class Coordinator:
             self.infra_streak[host_id] = (count + 1, batch if batch == batch_id else None)
             if self._failing(host_id):
                 self.probe_at[host_id] = self.clock()
-        elif result.failure == "ahead-abandoned":
+        elif result.failure in ("ahead-abandoned", "declined"):
             pass
         elif not failing:
             self.infra_streak.pop(host_id, None)
@@ -2967,6 +2967,13 @@ class Coordinator:
                         "UPDATE actions SET attempts = attempts - 1, ahead = 'abandoned' "
                         "WHERE batch_id = :batch_id AND input_key = :input_key"
                     ),
+                    {"batch_id": batch_id, "input_key": action.input_key},
+                )
+                await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)
+            elif result.failure == "declined":
+                # A worker being scaled in gave the claim back unstarted: it costs no attempt and interrupted nothing.
+                await conn.execute(
+                    sa.text("UPDATE actions SET attempts = attempts - 1 WHERE batch_id = :batch_id AND input_key = :input_key"),
                     {"batch_id": batch_id, "input_key": action.input_key},
                 )
                 await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)

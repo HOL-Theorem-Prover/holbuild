@@ -702,6 +702,7 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`, naming the theory as `theory <input_key>` or the blob as `blob <sha256>`; after a theory (`; also missing …`) it names, deduplicated, every other input the result names in `missing-more` and those the batch's unfinished actions last reported missing that the batch doesn't rebuild itself (kept in the coordinator process's memory, so after a restart or on another replica it names fewer; a blob named first stays alone, for older clients); the client resubmits, for theories with them rebuilt (and every theory that depends on them, when an action of the batch reported in `failure_detail` that a theory `does not match its parents`), for a blob after uploading the batch's sources again, while the batch names a theory no earlier resubmission was for or the first blob, up to 5 times in all, and otherwise the next build exports a new batch |
   | `unavailable` | retried without counting the claim, `MAX_INTERRUPTIONS` times; after that like `internal` |
   | `ahead-abandoned` | from an action claimed ahead: back to waiting without counting the claim, and claimed only once its parents are done from then on; from any other, like `internal` |
+  | `declined` | given back unstarted by a worker that ECS refused scale-in protection: retried without counting the claim or an interruption, and not counted towards the host's quarantine |
   | `proof`, `tactic-timeout`, `spec-rejected`, `script`, `timeout` | final; `script` means the script failed or omitted an output, `timeout` means it exceeded its time limit |
 
   A worker that gets no answer from the cache for the action's spec, 429,
@@ -845,11 +846,18 @@ while the service has more protected tasks than it wants, as in a scale-in or
 a rolling deployment, so the window set when the action is claimed has to
 outlast the longest action. Protection stays on from one action into the next
 claim, so a worker going straight from one action to the next is never
-unprotected; the worker clears it once a claim finds nothing (or fails), or
-before it waits for disk or memory, and a worker that dies takes its task down
-with it. When ECS refuses to protect an unprotected worker for an action it
-just claimed, the task is about to be stopped: the worker gives the action
-back as `unavailable` without starting it, so another worker takes it at once.
+unprotected; the worker clears it once a claim finds nothing (or fails),
+before it waits for disk or memory, after an `unavailable` result or an error
+in the worker, and when
+it exits, and a worker that dies takes its task down with it. An idle worker
+claims unprotected, so a scale-in can take idle workers. When ECS refuses to
+protect an unprotected worker for an action it just claimed, the task is
+about to be stopped: the worker gives the action back as `declined` without
+starting it, so another worker takes it at once, and claims again only once
+ECS protects it. A worker that has gone from action to action for 30 minutes
+clears protection at its next action's end and likewise claims again only
+once ECS protects it anew, so a scale-in or rolling deployment that wants its
+task gone takes it between actions rather than once the queue runs dry.
 Other failures are logged and the action carries on.
 
 ## Wire format
@@ -923,8 +931,8 @@ coordinator made have a timestamp without a worker or finish time. Worker
 names are supplied by the worker, defaulting to its hostname and process ID.
 These fields retain only the latest attempt, not its retry history.
 `interruptions` counts the claims of the action that ended `unavailable` (a
-worker drained, scaled in or refused scale-in protection) and were given back
-without counting an attempt, up to `REMOTE_EXEC_MAX_INTERRUPTIONS`.
+worker drained or scaled in, or the cache was out) and were given back without
+counting an attempt, up to `REMOTE_EXEC_MAX_INTERRUPTIONS`.
 
 In `timings`, durations are milliseconds. `started` and `finished`, and
 `holstart`/`holend`, `publishstart`/`publishend`, `logstart`/`logend` are
