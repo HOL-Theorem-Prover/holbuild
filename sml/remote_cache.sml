@@ -448,11 +448,11 @@ fun probe_all probe urls =
    holding a weaker copy does not hide a better one on another node.
    A required read that saw a node fail ends with that failure rather than a
    404.
-   A cache of one node gets the second attempt on that node: a 429 or 5xx
-   answer to its first request is asked again once.  No answer at all is not,
-   so an unreachable cache still costs a build one attempt per request until
-   the breaker trips; exec-action waits on such a cache longer
-   (retrying_one_node, below). *)
+   A build's cache of one node gets the second attempt on that node: a 429
+   or 5xx answer to its first request is asked again once.  No answer at all
+   is not, so an unreachable cache still costs a build one attempt per
+   request until the breaker trips.  exec-action (fail_closed) instead waits
+   on such a cache on retrying_one_node's schedule, below. *)
 fun routed_status_using usable method probe urls path request =
   let
     val read = method = "GET" orelse method = "HEAD"
@@ -491,7 +491,8 @@ fun routed_status_using usable method probe urls path request =
               val misses = if miss then misses + 1 else misses
               val missing = if read andalso result = HolbuildHttp.Response 404 then SOME (node, result) else missing
               val rest =
-                if count = 0 andalso null rest andalso transient result andalso not (unanswered result) then
+                if count = 0 andalso null rest andalso not (!fail_closed) andalso transient result andalso
+                   not (unanswered result) then
                   [(node, ask node)]
                 else rest
               val failed = if transient result then SOME (node, result) else failed
@@ -556,6 +557,22 @@ fun wait_seconds n =
   if n <= 0 orelse not (!retry_one_node) then ()
   else (OS.Process.sleep (whole_seconds 1); wait_seconds (n - 1))
 
+(* A caller with a deadline of its own (the theory-module requests) runs F
+   under it: a retry then starts only if it could still end by DEADLINE
+   after a full stall_timeout_seconds.  Per thread, like `required`. *)
+val retry_deadline_tag : Time.time option Universal.tag = Universal.tag ()
+
+fun retry_deadline () = Option.join (Thread.getLocal retry_deadline_tag)
+
+fun retrying_within deadline f =
+  let
+    val outer = retry_deadline ()
+    fun restore () = Thread.setLocal (retry_deadline_tag, outer)
+  in
+    Thread.setLocal (retry_deadline_tag, SOME deadline);
+    (f () before restore ()) handle e => (restore (); raise e)
+  end
+
 fun retrying_one_node method urls attempt =
   case urls of
       [_] =>
@@ -563,14 +580,22 @@ fun retrying_one_node method urls attempt =
         else
           let
             val delays = one_node_retry_delays ()
-            val deadline = Time.+ (Time.now (), whole_seconds (foldl op+ 0 delays))
+            val window = Time.+ (Time.now (), whole_seconds (foldl op+ 0 delays))
+            val own = retry_deadline ()
+            fun fits delay =
+              let val start = Time.+ (Time.now (), whole_seconds delay)
+              in
+                Time.<= (start, window) andalso
+                (case own of
+                     SOME deadline => Time.<= (Time.+ (start, whole_seconds stall_timeout_seconds), deadline)
+                   | NONE => true)
+              end
             fun loop delays =
               let val (url, result) = attempt ()
               in
                 case delays of
                     delay :: rest =>
-                      if transient result andalso !retry_one_node andalso
-                         Time.<= (Time.+ (Time.now (), whole_seconds delay), deadline) then
+                      if transient result andalso !retry_one_node andalso fits delay then
                         (TextIO.output (TextIO.stdErr,
                            "holbuild: remote cache " ^ method ^ " " ^ redact_userinfo url ^ " " ^
                            (case result of
@@ -579,7 +604,7 @@ fun retrying_one_node method urls attempt =
                            "; retrying in " ^ Int.toString delay ^ " s\n");
                          TextIO.flushOut TextIO.stdErr;
                          wait_seconds delay;
-                         loop rest)
+                         if !retry_one_node then loop rest else (url, result))
                       else (url, result)
                   | [] => (url, result)
               end

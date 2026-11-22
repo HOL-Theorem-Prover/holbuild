@@ -2285,9 +2285,12 @@ def test_spec_fetch_retries_only_a_cache_of_one_node_and_only_within_its_window(
 def test_one_node_spec_fetch_stops_waiting_on_drain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(worker, "ONE_NODE_RETRY_DELAYS", (60.0, 60.0))
     drain = worker.Drain()
+    asked: list[list[str]] = []
 
     def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        drain.stop.set()
+        asked.append(command)
+        # The drain comes while the worker waits to ask again.
+        threading.Timer(0.2, drain.stop.set).start()
         return refused(command)
 
     monkeypatch.setattr(subprocess, "run", fetch)
@@ -2295,6 +2298,7 @@ def test_one_node_spec_fetch_stops_waiting_on_drain(tmp_path: Path, monkeypatch:
     with pytest.raises(worker.DrainStopped):
         Releases(str(tmp_path), "unused", "http://one.test", None, drain=drain).read_spec(SPEC)
     assert time.monotonic() - started < 5
+    assert len(asked) == 1
 
 
 def test_worker_cache_ring_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
