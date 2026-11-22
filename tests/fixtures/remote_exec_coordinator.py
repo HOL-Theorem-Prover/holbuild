@@ -31,11 +31,16 @@ with the log its worker uploaded as it stopped, and the batch failed at the dead
 reports a failed action as a cancel that stopped it leaves it: cancelled with the log its
 worker uploaded, and the batch cancelled; holding `unlogged`, before that log arrived, and
 holding a failure kind, after an earlier attempt failed with it (`deadline-retried`: stopped
-by the batch deadline on a second attempt).  STATE/<id>.events, when it exists, is batch
+by the batch deadline on a second attempt).  `cancel-done` reports an action that finished in a
+failed batch as cancelled with an earlier attempt's failure and log, as when its second attempt's
+result came after the batch failed; a later read of the ended batch gets the new log.  Holding
+`streamed`, it streams the new log on the cancelled action, as when the result came before the
+stream's last read.  STATE/<id>.events, when it exists, is batch
 <id>'s recorded event stream: it is sent as it is, without running RUN.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", and on a second line the others it found missing,
-comma-separated, the batch fails for resubmission naming them, as the coordinator does.  Otherwise
+comma-separated, the batch fails for resubmission naming them, as the coordinator does, and its
+final events are recorded as STATE/<id>.events for a later read.  Otherwise
 the cancel answers that it cancelled the batch.  Every request is logged to
 STATE/requests.log, and each POST /v1/batches's Holbuild-Batch-Id header to
 STATE/submitted-ids.
@@ -165,6 +170,7 @@ class Handler(BaseHTTPRequestHandler):
             (state / "cut").unlink()
             self.send_header("Content-Length", "1000")
         self.end_headers()
+        snapshot = []
         for line in batch.read_text().splitlines():
             fields = line.split()
             if fields[0] == "action":
@@ -232,13 +238,24 @@ class Handler(BaseHTTPRequestHandler):
                         event["timings"] = {name: int(ms) for name, ms in
                                             (part.split(":") for part in recorded["phase-ms"].split(","))}
                         event["timings"]["wall"] = int(recorded["wall-ms"])
+                late = event["state"] == "done" and not ok and (state / "cancel-done").exists()
+                if late:
+                    # As the coordinator leaves an action whose second attempt's result came after
+                    # its batch failed: cancelled with the first attempt's failure, and the log
+                    # only after the stream ended, for a later read.
+                    event["state"], event["last_failure"], event["attempts"] = "cancelled", "unavailable", 2
+                snapshot.append(event)
                 if event["state"] == "done" and (state / "requeue-log").exists():
                     # The first execution's log was evicted; only the final
                     # execution's log is usable after the action is requeued.
                     self.wfile.write((json.dumps(dict(event, log_sha256="0" * 64)) + "\n").encode())
                     if not (state / "requeue-snapshot").exists():
                         self.wfile.write((json.dumps(dict(event, state="waiting", log_sha256=None)) + "\n").encode())
-                self.wfile.write((json.dumps(event) + "\n").encode())
+                if late and (state / "cancel-done").read_text().strip() != "streamed":
+                    event_sent = dict(event, log_sha256="c" * 64)
+                else:
+                    event_sent = event
+                self.wfile.write((json.dumps(event_sent) + "\n").encode())
                 self.wfile.flush()
                 for _ in range(600):
                     if not (state / "hold").exists():
@@ -260,6 +277,9 @@ class Handler(BaseHTTPRequestHandler):
         final = {"type": "batch", "state": "cancelled" if cancel_after else final_state,
                  "failure": failure}
         self.wfile.write((json.dumps(final) + "\n").encode())
+        if failure and failure.startswith("resubmit:"):
+            # What a later read of the ended batch replays, as the coordinator does.
+            (state / f"{parts[3]}.events").write_text("".join(json.dumps(event) + "\n" for event in snapshot + [final]))
 
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

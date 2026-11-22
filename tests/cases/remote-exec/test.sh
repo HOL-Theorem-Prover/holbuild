@@ -1916,11 +1916,12 @@ require_grep "PTheory restored from cache" "$tmpdir/two.log"
 
 # A worker that can't restore two dependencies the client found in the remote
 # cache (both expire once the batch is submitted) names both, and one
-# resubmission rebuilds them.
+# resubmission rebuilds them alone: MTheory, cached and built on NTheory,
+# stays out of it.
 three=$tmpdir/three-first
 mkdir -p "$three/src"
 sed 's/^name = "rxnd"/name = "rxn3"/' "$tmpdir/nondet/holproject.toml" > "$three/holproject.toml"
-for theory in N:bool O:bool "P:N O"; do
+for theory in N:bool O:bool M:N "P:M O"; do
   cat > "$three/src/${theory%%:*}Script.sml" <<SML
 Theory ${theory%%:*}
 Ancestors ${theory##*:}
@@ -1938,7 +1939,7 @@ for name in three-first three-client; do link_hol_toolchain_cache "$tmpdir/$name
 roots_ac=$(in_copy three-first --remote-cache "$remote_url" action-spec PTheory |
   awk '$1 == "action" && ($5 == "rxn3:NTheory" || $5 == "rxn3:OTheory") { print $3 }')
 [[ $(wc -w <<< "$roots_ac") -eq 2 ]] || { echo "no actions for NTheory and OTheory" >&2; exit 1; }
-in_copy three-first --remote-cache "$remote_url" build NTheory OTheory > "$tmpdir/three-first.log" 2>&1 ||
+in_copy three-first --remote-cache "$remote_url" build MTheory OTheory > "$tmpdir/three-first.log" 2>&1 ||
   { cat "$tmpdir/three-first.log" >&2; exit 1; }
 {
   for ac in $roots_ac; do echo "rm -f '$remote_root/ac/$ac'"; done
@@ -1947,8 +1948,14 @@ in_copy three-first --remote-cache "$remote_url" build NTheory OTheory > "$tmpdi
 in_copy three-client --remote-cache "$remote_url" build --remote-exec "$coordinator" --remote-only PTheory \
   > "$tmpdir/three.log" 2>&1 || { cat "$tmpdir/three.log" "$tmpdir/worker.log" >&2; exit 1; }
 require_no_file "$state/on-submit"
-require_grep "still missing theory [0-9a-f]\{64\} after 3 attempts; also missing theory [0-9a-f]\{64\}; .*; resubmitting with 3 theories rebuilt or rechecked" "$tmpdir/three.log"
+require_grep "still missing theory [0-9a-f]\{64\} after 3 attempts; also missing theory [0-9a-f]\{64\}; .*; resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/three.log"
 [[ $(grep -c "resubmitting" "$tmpdir/three.log") -eq 1 ]] || { cat "$tmpdir/three.log" >&2; exit 1; }
+resubmitted=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/three.log" | tail -n 1)
+[[ $(awk '$1 == "action" { print $5 }' "$state/$resubmitted.batch" | sort | tr '\n' ' ') == "rxn3:NTheory rxn3:OTheory rxn3:PTheory " ]] ||
+  { echo "resubmitted batch $resubmitted:" >&2; cat "$state/$resubmitted.batch" >&2; exit 1; }
+# P waits on N through the cached M.
+key_of() { awk -v theory="$1" '$1 == "action" && $5 == theory { print $2 }' "$state/$resubmitted.batch"; }
+require_grep "^edge $(key_of rxn3:PTheory) $(key_of rxn3:NTheory)$" "$state/$resubmitted.batch"
 require_grep "PTheory restored from cache" "$tmpdir/three.log"
 
 # A warm client's forced target must still run on a warm worker, while its
@@ -2128,7 +2135,7 @@ a_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:AT
 echo "rxresubmitlogs:BTheory theory $a_key" > "$state/fail-missing"
 : > "$state/results"
 run resubmit-logs 0 build --remote-exec "$coordinator" --remote-only BTheory
-require_grep "resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/resubmit-logs.log"
+require_grep "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubmit-logs.log"
 [[ "$(< "$state/results")" == \
    $'rxresubmitlogs:ATheory status=built\nrxresubmitlogs:ATheory status=cached\nrxresubmitlogs:BTheory status=built' ]] ||
   { echo "worker results:" >&2; cat "$state/results" >&2; exit 1; }
@@ -2151,6 +2158,31 @@ for theory in ATheory BTheory; do
   require_file "$project/.holbuild/logs/current/rxresubmitlogs/$theory/build.log"
 done
 
+# A theory that finished with its log after its batch failed is reported
+# cancelled with that log; the resubmission, naming B, leaves A out, and A's
+# log still comes from the first batch.
+write_theories resubmit-logs-cancelled
+rm -rf "$project/.holbuild/logs/current"
+b_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:BTheory" { print $2 }')
+echo "rxresubmitlogs:BTheory theory $b_key" > "$state/fail-missing"
+touch "$state/cancel-done"
+run resubmit-logs-cancelled 0 build --remote-exec "$coordinator" --remote-only BTheory
+rm "$state/cancel-done"
+require_grep "remote rxresubmitlogs:ATheory: cancelled" "$tmpdir/resubmit-logs-cancelled.log"
+require_grep "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubmit-logs-cancelled.log"
+require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
+# Or its result came before the failed batch's stream ended, which shows it
+# cancelled with its new log.
+write_theories resubmit-logs-streamed
+rm -rf "$project/.holbuild/logs/current"
+b_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:BTheory" { print $2 }')
+echo "rxresubmitlogs:BTheory theory $b_key" > "$state/fail-missing"
+echo streamed > "$state/cancel-done"
+run resubmit-logs-streamed 0 build --remote-exec "$coordinator" --remote-only BTheory
+rm "$state/cancel-done"
+require_grep "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubmit-logs-streamed.log"
+require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
+
 # A theory that fails in the resubmitted batch keeps no log from the first:
 # on the second submission, A's worker fails it.
 write_theories resubmit-logs-failed
@@ -2161,7 +2193,7 @@ echo "[[ ! -e '$state/submitted' ]] || echo rxresubmitlogs:ATheory > '$state/fai
   > "$state/on-submit"
 run resubmit-logs-failed 75 build --remote-exec "$coordinator" --remote-only BTheory
 rm "$state/on-submit" "$state/submitted"
-require_grep "resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/resubmit-logs-failed.log"
+require_grep "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubmit-logs-failed.log"
 require_grep "rxresubmitlogs:ATheory: failed (internal)" "$tmpdir/resubmit-logs-failed.log"
 require_no_file "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
 
@@ -2189,7 +2221,8 @@ printf '%s\n' "echo x >> '$state/submits'" \
   > "$state/on-submit"
 run resubmit-again 0 build --remote-exec "$coordinator" --remote-only BTheory
 rm "$state/on-submit" "$state/submits"
-[[ $(grep -c "resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/resubmit-again.log") -eq 2 ]] ||
+[[ $(grep -c "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubmit-again.log") -eq 1 &&
+   $(grep -c "resubmitting with 2 theories rebuilt or rechecked" "$tmpdir/resubmit-again.log") -eq 1 ]] ||
   { cat "$tmpdir/resubmit-again.log" >&2; exit 1; }
 
 # The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
