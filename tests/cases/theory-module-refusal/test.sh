@@ -203,21 +203,29 @@ SML
 # A worker sharing heaps runs an edited D: its parent shares no deps heap
 # that requires C's refused module, which the preload couldn't release
 # (FAILS=1), and shares one that doesn't.  The child goes on either way.
-# exec_d NAME FAILS [unshared [MIN]]: MIN, the fewest missing modules
-# worth prefetching or writing.
-exec_d() {
-  local name=$1 spec share=(--share-heaps)
+# spec_d NAME: the spec of D, edited, on the current branch, in NAME.spec.
+spec_d() {
+  printf '\n(* %s *)\n' "$1" >> "$project/src/DScript.sml"
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload DTheory) > "$tmpdir/$1.batch"
+  awk '$1 == "action" && $5 == "module-refusal:DTheory" { print $4 }' "$tmpdir/$1.batch" > "$tmpdir/$1.spec"
+  [[ -s "$tmpdir/$1.spec" ]] || { echo "D has no action: $(cat "$tmpdir/$1.batch")" >&2; exit 1; }
+}
+# run_d NAME FAILS [unshared [MIN]]: runs NAME.spec on the worker; MIN,
+# the fewest missing modules worth prefetching or writing.
+run_d() {
+  local name=$1 share=(--share-heaps)
   [[ ${3:-} != unshared ]] || share=()
-  printf '\n(* %s *)\n' "$name" >> "$project/src/DScript.sml"
-  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload DTheory) > "$tmpdir/$name.batch"
-  spec=$(awk '$1 == "action" && $5 == "module-refusal:DTheory" { print $4 }' "$tmpdir/$name.batch")
-  [[ -n $spec ]] || { echo "D has no action: $(cat "$tmpdir/$name.batch")" >&2; exit 1; }
-  rm -rf "$HOLBUILD_CACHE/checkpoint-store" "$HOLBUILD_CACHE/checkpoints"
   HOLBUILD_TEST_RELEASE_MODULE_FAILS=$2 HOLBUILD_TEST_MODULE_MIN_MISSING=${4:-} \
-    "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" \
+    "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$(cat "$tmpdir/$name.spec")" \
     ${share[@]+"${share[@]}"} --cache-limit-gb 1000 --result "$tmpdir/$name.result" > "$tmpdir/$name.log" 2>&1 ||
     { cat "$tmpdir/$name.log" "$tmpdir/$name.result" >&2; exit 1; }
   require_grep '^status=built$' "$tmpdir/$name.result"
+}
+# exec_d NAME FAILS [unshared [MIN]]: both, from no local heap.
+exec_d() {
+  spec_d "$1"
+  rm -rf "$HOLBUILD_CACHE/checkpoint-store" "$HOLBUILD_CACHE/checkpoints"
+  run_d "$@"
 }
 heap_entries() { grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote/ac/* || true; }
 exec_d unreleased 1
@@ -267,4 +275,21 @@ resumed resume-2
 set_a "'a"
 exec_d resume-1 0
 resumed resume-1
+
+# Both at once, the second branch's writer filling in C2's module, which
+# the first branch's heap requires and its restore puts back.
+set_a bool
+spec_d both-2
+set_a "'a"
+spec_d both-1
+rm "$(c_module C2)"
+rm -rf "$HOLBUILD_CACHE/checkpoint-store" "$HOLBUILD_CACHE/checkpoints"
+run_d both-2 0 shared 1 &
+both_2=$!
+run_d both-1 0 &
+both_1=$!
+wait "$both_2"
+wait "$both_1"
+resumed both-2
+resumed both-1
 [[ $(sha256sum < "$c_path") == "$c_sha" ]] || { echo "a worker wrote C's module again" >&2; exit 1; }

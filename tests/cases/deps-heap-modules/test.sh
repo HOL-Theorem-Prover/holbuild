@@ -626,6 +626,15 @@ capture_paused() {
 }
 capture_released() {
   touch "$tmpdir/capture/release"
+  for _ in {1..6000}; do
+    kill -0 "$worker_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$worker_pid" 2>/dev/null; then
+    kill "$worker_pid"
+    echo "the released worker did not finish" >&2
+    exit 1
+  fi
   wait "$worker_pid"
   worker_pid=
 }

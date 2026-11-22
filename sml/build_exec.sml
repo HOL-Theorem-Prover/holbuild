@@ -14620,7 +14620,8 @@ fun converge_modules remote {store, staging, modules, stale, deadline} =
        handle e => warn ("theory module not published: " ^ General.exnMessage e);
        install_own file)
     fun install_published (file, key) text =
-      case shared_manifest_entries text of
+      (* A malformed entry still holds the key: nothing is stored. *)
+      case (shared_manifest_entries text handle Error _ => []) of
           [("file", sha, name)] =>
             if not (plain_file_name name andalso module_file_theory_part name = module_file_theory_part file) then
               warn ("ignoring the published theory module " ^ HolbuildHash.quote name ^ " for " ^ file)
@@ -14662,21 +14663,26 @@ fun converge_modules remote {store, staging, modules, stale, deadline} =
                               if length (HolbuildRemoteCache.action_urls remote key) <= 1
                               then (published_one (); install_own file; NONE)
                               else SOME (file, key, text)
-                          (* Another writer's entry: with no time to fetch
-                             its module, none is stored. *)
-                          | HolbuildCacheBackend.Conflict _ =>
-                              ((if not (module_request_fits deadline) then ()
+                          (* Another writer's entry (put_action names the
+                             node that holds it): its module is stored, or,
+                             with no time to fetch it or no answer, none.
+                             Any other conflict is a failed put. *)
+                          | HolbuildCacheBackend.Conflict at =>
+                              ((if at <> hd (HolbuildRemoteCache.action_urls remote key) then install_own file
+                                else if not (module_request_fits deadline) then ()
                                 else
-                                  case lookup key of
+                                  case (lookup key
+                                        handle Thread.Interrupt => raise Thread.Interrupt
+                                             | e => (warn ("theory module not fetched: " ^ General.exnMessage e); NONE)) of
                                       SOME winner => install_published (file, key) winner
-                                    | NONE => install_own file);
+                                    | NONE => ());
                                NONE)
                           | _ => (install_own file; NONE)
                       end
     fun read_back (file, key, text) =
       if not (module_request_fits deadline) then (published_one (); install_own file)
       else
-        case lookup key of
+        case HolbuildRemoteCache.required (fn () => lookup key) of
             SOME found =>
               if found = text then
                 (HolbuildRemoteCache.refresh_action_replicas remote key
@@ -16426,7 +16432,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  what follows is off the client's path. *)
               (case result_file of
                    SOME path => write_text path text
-                 | NONE => print text);
+                 | NONE => print text)
+              handle e => (drop_heap_snapshot () handle _ => (); raise e);
               let
                 val t0 = Time.now ()
                 val _ = !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e)

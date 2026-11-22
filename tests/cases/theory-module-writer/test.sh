@@ -325,6 +325,32 @@ val _ = check "a module whose put conflicted was stored over the published one"
           (installed = 0 andalso fetched = 1 andalso published = 0 andalso
            E.read_text (OS.Path.concat (store "hol5", a)) = winner);
 
+(* A malformed entry holds A's key: nothing is stored or uploaded. *)
+val _ = OS.FileSys.remove ("$tmpdir/remote/ac/" ^ a_entry);
+(* A blob line with no role, naming A's blob. *)
+val a_blob =
+  hd (List.mapPartial
+        (fn line => if String.isPrefix "blob=" line andalso String.isSubstring " file " line
+                    then SOME (hd (String.tokens (fn c => c = #" ") (String.extract (line, 5, NONE))))
+                    else NONE)
+        (String.tokens (fn c => c = #"\n") (E.read_text "$tmpdir/a-entry-saved")));
+val earlier = entries "$tmpdir/remote/ac";
+val _ = check "a malformed entry was not put"
+          (HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsent
+             {key = "malformed", text = "blob=" ^ a_blob ^ "\n"} = HolbuildCacheBackend.Published);
+val _ = OS.FileSys.rename
+          {old = "$tmpdir/remote/ac/" ^ hd (List.filter (fn e => not (List.exists (fn x => x = e) earlier))
+                                              (entries "$tmpdir/remote/ac")),
+           new = "$tmpdir/remote/ac/" ^ a_entry};
+val _ = E.write_text "$tmpdir/plant" "";
+val _ = remove_store "hol5";
+val puts = cas_puts ();
+val {installed, fetched, published, ...} = fill_by "hol5" 100;
+val _ = check "a module was stored or uploaded under a malformed entry"
+          (installed = 0 andalso fetched = 0 andalso published = 0 andalso not (stored "hol5" a) andalso
+           cas_puts () = puts);
+val _ = E.copy_binary "$tmpdir/a-entry-saved" ("$tmpdir/remote/ac/" ^ a_entry);
+
 (* On a cache of two nodes, a writer stores the modules it published once
    it reads their entries back, and puts them on the other node too. *)
 val remote2 = HolbuildRemoteCache.remote "$remote_url,$remote2_url";
@@ -353,7 +379,13 @@ val _ = OS.FileSys.rename {old = "$tmpdir/remote/ac/" ^ p16_entry, new = "$tmpdi
 val _ = OS.FileSys.remove ("$tmpdir/remote2/ac/" ^ p16_entry);
 val _ = OS.FileSys.remove (OS.Path.concat (store "hol6", p16));
 val _ = E.write_text "$tmpdir/plant" (detach ("replace-entry " ^ p16_entry ^ " $tmpdir/p16-entry"));
+fun entry_puts () =
+  length (List.filter (fn line => line = "PUT /ac/" ^ p16_entry)
+            (List.concat (map (fn log => String.tokens (fn c => c = #"\n") (E.read_text log))
+                              ["$tmpdir/server/requests.log", "$tmpdir/server2/requests.log"])));
+val puts_before = entry_puts ();
 val {installed, fetched, published, ...} = fill6 ();
+val _ = check "the writer's entry was sent to a second node" (entry_puts () = puts_before + 1);
 val _ = check "the writer's module was stored over the one published before its read back"
           (installed = 0 andalso fetched = 1 andalso published = 0 andalso
            E.read_text (OS.Path.concat (store "hol6", p16)) = winner);
