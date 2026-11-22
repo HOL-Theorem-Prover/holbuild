@@ -1881,7 +1881,7 @@ action. Without its records (`<cache root>/action-resident`), as after a
 worker stopped part way, or a release that keeps no records ran there, and
 before every script run, the action root is emptied first. Dependency heaps and checkpoints in `<cache root>/checkpoints`
 are private to the action and are also emptied before and after it; reuse
-across worker actions requires `--share-heaps`, or `--share-deps-heap` for the heaps alone (below). A saved heap records the absolute paths it was
+across worker actions requires `--share-heaps`, or `--share-deps-heap` for the heaps alone (below); without either, the action saves none, though its proof steps and their timeouts run as the spec says. A saved heap records the absolute paths it was
 built at, so every worker should use the same cache root. One `exec-action`
 runs per cache root at a time; a second waits for the first. The cache root
 is the worker's own: other holbuild commands shouldn't share it, since the

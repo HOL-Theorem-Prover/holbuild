@@ -1051,12 +1051,15 @@ def test_worker_passes_the_free_space_floor_only_to_releases_that_take_it(
     server.specs[SPEC] = f"holbuild-action-spec-v1\nholbuild-version={version}\n"
 
     run_one(
-        Coordinator(server.url, "w"), worker_args(tmp_path, server), releases(tmp_path, server),
-        Protection(None, None), claim(), Phases(),
+        Coordinator(server.url, "w"), worker_args(tmp_path, server, "--cache-min-free-gb", "30"),
+        releases(tmp_path, server), Protection(None, None), claim(), Phases(),
     )
 
     assert server.completed == [RECORD]
-    assert ("--cache-min-free-gb" in logs[1].read_text().split()) == floor
+    words = logs[1].read_text().split()
+    assert ("--cache-min-free-gb" in words) == floor
+    if floor:
+        assert words[words.index("--cache-min-free-gb") + 1] == "30"
 
 
 @pytest.mark.parametrize(
@@ -1634,9 +1637,9 @@ def test_the_cache_sweep_runs_the_newest_release_that_has_it(
     releases = Releases(str(built), "unused", "http://cache.test", None, baked_root=str(baked))
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
 
-    worker.sweep_cache(releases, 200)
+    worker.sweep_cache(releases, 200, 30)
 
-    assert log.read_text() == "0.15.0 exec-action --sweep-only --cache-limit-gb 200 --cache-min-free-gb 16\n"
+    assert log.read_text() == "0.15.0 exec-action --sweep-only --cache-limit-gb 200 --cache-min-free-gb 30\n"
     old = tmp_path / "old"
     release(old, "0.14.59")  # released before --sweep-only
     assert Releases(str(tmp_path / "none"), "unused", "", None, baked_root=str(old)).newest(

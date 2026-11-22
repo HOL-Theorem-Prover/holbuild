@@ -393,6 +393,8 @@ As
 but share only deps-loaded heaps and save no theorem or definition
 checkpoint: for workers whose actions come from users who don't trust each
 other.
+Without either, the action saves no checkpoint, since its checkpoint tree is
+emptied after it; proof steps and their timeouts run as the spec says.
 It restores any heap the remote cache holds under the key, and releases
 before 0.14.99 published heaps a script could replace: use it with a remote
 cache no earlier release has published heaps to, such as a new one.

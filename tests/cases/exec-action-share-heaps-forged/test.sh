@@ -150,13 +150,13 @@ worker() {
 
 field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $col }' "$1"; }
 
-# export NAME URL OPTION: T's spec in URL's cache, with A built there.
+# export NAME URL [OPTION]: T's spec in URL's cache, with A built there.
 export_t() {
-  local name=$1 url=$2 option=$3 batch spec_a
+  local name=$1 url=$2 option=${3-} batch spec_a
   batch=$tmpdir/batch-$name.txt
   (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" action-spec --upload TTheory) > "$batch"
   spec_a=$(field "$batch" forged:ATheory 4)
-  [[ -z "$spec_a" ]] || worker "a-$name" "$url" "$spec_a" "$option"
+  [[ -z "$spec_a" ]] || worker "a-$name" "$url" "$spec_a" ${option:+"$option"}
   spec_t=$(field "$batch" forged:TTheory 4)
   [[ -n "$spec_t" ]] || { cat "$batch" >&2; exit 1; }
 }
@@ -237,3 +237,37 @@ worker d2 "$deps_url" "$spec_t" --share-deps-heap
 resumed_from d2
 [[ $(entries holbuild-shared-checkpoint-v1 "$tmpdir/remote-deps") == "$shared" ]] || {
   echo "--share-deps-heap shared a script checkpoint" >&2; exit 1; }
+
+# A worker that shares nothing saves no checkpoint at all: its tree is
+# emptied after the action, unused.
+worker_cache=$tmpdir/worker-unshared
+unshared_tail=$(cat <<SML
+
+local
+  fun saves dir =
+    let
+      val stream = OS.FileSys.openDir dir
+      fun loop found =
+        case OS.FileSys.readDir stream of
+            NONE => found
+          | SOME entry =>
+              let val path = OS.Path.concat (dir, entry)
+              in
+                loop (if String.isSuffix ".save" entry then path :: found
+                      else if OS.FileSys.isDir path andalso not (OS.FileSys.isLink path)
+                      then saves path @ found
+                      else found)
+              end
+    in
+      loop [] before OS.FileSys.closeDir stream
+    end
+in
+  val _ = case saves "$worker_cache/checkpoints" of
+              [] => ()
+            | path :: _ => raise Fail ("an unshared action saved " ^ path)
+end;
+SML
+)
+write_t "T" "T /\\ T" "$unshared_tail"
+export_t u1 "$deps_url"
+worker u1 "$deps_url" "$spec_t"
