@@ -718,6 +718,7 @@ async def test_a_holder_claiming_unwoken_takes_a_ready_build_of_an_earlier_tier_
     await held_in_a_busier_batch(http, coordinator)
     await submit(http, ["h"])
     wait_on_host_0(coordinator)
+    coordinator.report_worker("host-1", "host-1-h", ["high", "standard"])  # as its claim does
 
     claimed = await coordinator.claim(["high", "standard"], "host-1-h", host_id="host-1")
 

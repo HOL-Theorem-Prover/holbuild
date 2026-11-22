@@ -55,6 +55,9 @@ SCALE_CMD_TIMEOUT_S = 60
 
 # A host none of whose workers reported for this long is left out of the queue's hosts, and forgotten.
 HOST_REPORT_SECONDS = 120
+# A worker with no lease that isn't claiming counts as a free slot of its host on the scale-in line (see
+# Coordinator._kept_hosts) for this long after it was last seen, as one does between a result and its next claim.
+TURNAROUND_SECONDS = 15
 # Hosts the coordinator remembers at most; a report from another host beyond them is dropped.
 MAX_HOSTS = 1000
 # A host is quarantined (see Coordinator._quarantine) while its latest report has less disk free than this, the floor
@@ -1096,6 +1099,7 @@ class Coordinator:
         # within a host); see claim.
         self.made_ready = 0
         self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[Wake], bool]] = []
+        self.claiming: Counter[tuple[str, str]] = Counter()  # the claims under way, by host and worker
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
@@ -1387,6 +1391,10 @@ class Coordinator:
                 return tiers
             return [tier for tier in tiers if not self._defers(tier, rank, ahead_only=ahead_only)]
 
+        # Counted from entry to return, so its host keeps its slot on the scale-in line (see _kept_hosts) also while
+        # it tries to claim rather than waits.
+        claiming = (host_id or "", worker)
+        self.claiming[claiming] += 1
         try:
             while True:
                 if host_id is not None and (quarantine := self._quarantine(host_id)) is not None:
@@ -1464,6 +1472,10 @@ class Coordinator:
         except asyncio.CancelledError:
             self._pass_wake(woken)
             raise
+        finally:
+            self.claiming[claiming] -= 1
+            if not self.claiming[claiming]:
+                del self.claiming[claiming]
 
     async def _answered(
         self, claimed: Claim | None, disconnected: Callable[[], Awaitable[bool]] | None
@@ -2218,18 +2230,18 @@ class Coordinator:
     def _wake_at_hold_end(self, head: tuple[UUID, str], hold: Hold) -> None:
         """Wake the best-ranked compatible claim waiting, if one is, for the build of ``head`` whose hold just ended,
         unless a claim took it: the claim that left it may have taken another build, and nothing else would come
-        for it until work is next made ready. It makes no new work ready, so made_ready stays."""
+        for it until work is next made ready. A burst host above the scale-in line isn't woken (see _wake_claim). It
+        makes no new work ready, so made_ready stays."""
         if self.holds.get(head) != hold:
             return
         batch_id, tier = head
-        waiter = min(
-            (
-                w for w in self.claim_waiters
-                if tier in w[0] and not w[2].done() and self._quarantine(w[1].host_id) is None
-            ),
-            key=lambda w: w[1],
-            default=None,
-        )
+        compatible = [
+            w for w in self.claim_waiters if tier in w[0] and not w[2].done() and self._quarantine(w[1].host_id) is None
+        ]
+        if any(self._known_burst(w[1]) for w in compatible):
+            kept = self._kept_hosts(1, tier)
+            compatible = [w for w in compatible if not self._tail_host(w[1], kept)]
+        waiter = min(compatible, key=lambda w: w[1], default=None)
         if waiter is not None:
             waiter[2].set_result((tier, False, batch_id, hold[2]))
             self.claim_waiters.remove(waiter)
@@ -2339,11 +2351,15 @@ class Coordinator:
         then by rank, fullest burst hosts first, and id), the hosts not quarantined whose workers seen lately could
         run the live leases and the ready builds (the last count's, or ``ready`` if more), and at least the warm
         workers. High work, which only burst workers take, has a line of its own counting only burst workers: their
-        leases and the ready high builds. A host short of memory counts only the workers it runs or that wait for a
-        claim, as the others wait for memory. A host above the line is to empty, so locality never sends it work."""
+        leases and the ready high builds. A host's workers with no lease count only while they claim, or for
+        ``TURNAROUND_SECONDS`` after they were last seen, as between a result and the next claim, so one that doesn't
+        come back leaves no slot to wait for. A host short of memory counts only the workers it runs or that wait for
+        a claim, as the others wait for memory. A host above the line is to empty, so locality never sends it work and
+        its burst workers take no build a host below it could (see _defers, _wake_claim)."""
         now = self.clock()
         high = tier == "high"
         leases = Counter(host for host, _, tiers in self.lease_hosts.values() if not high or "high" in tiers)
+        leased = {(host, worker) for host, worker, _ in self.lease_hosts.values()}
         waiting = Counter(
             w_rank.host_id for w_tiers, w_rank, w_woken, _ in self.claim_waiters
             if not w_woken.done() and (not high or "high" in w_tiers)
@@ -2362,7 +2378,16 @@ class Coordinator:
             reported = report[1].leases if report is not None and report[1].leases is not None and not high else 0
             busy = leases[host_id] + waiting[host_id]
             short = report is not None and bool(report[1].memory_short)
-            slots = max(reported, busy, 1) if short else max(len(fresh), reported, busy, 1)
+            free = sum(
+                1 for worker, (seen, is_burst) in workers.items()
+                if (not high or is_burst) and (host_id, worker) not in leased
+                and ((host_id, worker) in self.claiming or (now - seen).total_seconds() < TURNAROUND_SECONDS)
+            )
+            # No floor of one, nor the host's last report, which no result updates: a host whose workers all stay
+            # away leaves no slot to wait for, and isn't kept.
+            slots = max(reported, busy, 1) if short else max(leases[host_id] + free, busy)
+            if not slots:
+                continue
             # Fuller burst hosts first, so a partly drained one lies beyond the line and empties.
             hosts.append(((all(fresh), rank, -len(fresh) if all(fresh) else 0, host_id), slots))
         if high:
@@ -2478,20 +2503,26 @@ class Coordinator:
     ) -> None:
         """Wake the best-ranked compatible claim, with FIFO ties, for an action of ``batch_id`` and ``theory`` made
         ready, if it is for one: of those on hosts below the scale-in line that take ``tier``, the best-ranked that
-        hold the most of ``theory`` (see _local_entry), if more than the best-ranked claim's host. Only normal wakes
-        count newly ready work; changes for capable claims are recorded by _ahead_changed."""
+        hold the most of ``theory`` (see _local_entry), if more than the best-ranked claim's host. A build wake goes
+        to no burst host above the line (see _tail_host): the workers below it come back for the build. Only normal
+        wakes count newly ready work; changes for capable claims are recorded by _ahead_changed."""
         if not ahead:
             self.made_ready += 1
         compatible = [
             w for w in self.claim_waiters
             if tier in w[0] and not w[2].done() and (w[3] or not ahead) and self._quarantine(w[1].host_id) is None
         ]
+        kept: set[str] | None = None  # the line with the build made ready, computed once needed
+        if not ahead and any(self._known_burst(w[1]) for w in compatible):
+            kept = self._kept_hosts(1, tier)
+            compatible = [w for w in compatible if not self._tail_host(w[1], kept)]
         waiter = min(compatible, key=lambda w: w[1], default=None)
         if waiter is not None and theory is not None and self.settings.locality:
             level = self._level(waiter[1].host_id, theory)
             holders = [w for w in compatible if self._level(w[1].host_id, theory) > level]
-            kept = self._kept_hosts(1, tier) if holders else set()  # with the build made ready
-            holders = [w for w in holders if w[1].host_id in kept]
+            if holders and kept is None:
+                kept = self._kept_hosts(1, tier)
+            holders = [w for w in holders if kept is not None and w[1].host_id in kept]
             best = max((self._level(w[1].host_id, theory) for w in holders), default=0)
             local = min((w for w in holders if self._level(w[1].host_id, theory) == best), key=lambda w: w[1], default=None)
             if local is not None:
@@ -2505,7 +2536,13 @@ class Coordinator:
         """Whether a claim ranked ``rank`` leaves ``tier`` to the better-ranked unwoken waiters that take it (those
         that may claim ahead if ``ahead_only``), so polling workers don't spread work onto tail hosts: once one waits,
         unless, for builds, fewer wait than there are builds of the tier a claim could take (see _count_ready), as
-        they can't take them all and a deferred claim sleeps until its recheck."""
+        they can't take them all and a deferred claim sleeps until its recheck. A burst host above the scale-in line
+        (see _tail_host) leaves builds to the hosts below it whether or not their workers wait now: one that just
+        reported a result comes back for the next build, and the line takes in this host once there are more builds
+        than those hosts' workers can take, or they stay away."""
+        # The line counts the build the claim would take, also before the sweep counted it.
+        if not ahead_only and self._known_burst(rank) and self._tail_host(rank, self._kept_hosts(1, tier)):
+            return True
         enough = 1 if ahead_only else max(1, self.claimable.get(tier, 0))
         better = 0
         for w_tiers, w_rank, w_woken, w_ahead in self.claim_waiters:
@@ -2517,6 +2554,15 @@ class Coordinator:
                 if better >= enough:
                     return True
         return False
+
+    def _known_burst(self, rank: ClaimRank) -> bool:
+        """Whether the claim ranked ``rank`` comes from a burst host whose workers the scale-in line counts."""
+        return rank.burst and rank.host_id in self.host_workers
+
+    def _tail_host(self, rank: ClaimRank, kept: set[str]) -> bool:
+        """Whether the claim ranked ``rank`` comes from a burst host above the scale-in line ``kept`` (see _kept_hosts),
+        which is to empty, so takes no build a host below it could."""
+        return self._known_burst(rank) and rank.host_id not in kept
 
     def _waiter_rank(self, tiers: list[str], host_id: str | None, host_rank: int) -> ClaimRank:
         """The rank of a claim of ``tiers`` from ``host_id`` as its host's workers are now; see _claim_rank."""
@@ -2946,6 +2992,8 @@ class Coordinator:
         self.lease_hosts.pop(token, None)
         self.outlined_tokens.pop(token, None)
         if leased is not None:
+            # Seen now, so its host keeps the worker's slot on the scale-in line until it claims again.
+            self.report_worker(*leased)
             self._record_result(leased[0], batch_id, result)
             self._learn_locality(leased[0], action.theory, result)
         self._batch_changed(batch_id)

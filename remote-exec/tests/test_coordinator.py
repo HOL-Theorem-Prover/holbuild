@@ -1443,12 +1443,12 @@ async def test_a_partly_drained_host_loses_work_to_a_full_one_and_empties(
         assert claim is not None
         await claimed.put((host, claim))
 
-    report()
-    for host in ["host-0", "host-1", "host-0", "host-1"]:
+    for host in ["host-0", "host-1", "host-0", "host-1"]:  # before the hosts are known, so on no scale-in line
         await submit_action(name := f"start-{len(running)}")
         claim = await coordinator.claim(burst, host, host_id=host, host_rank=1)
         assert claim is not None
         running.append((host, name, claim))
+    report()
     for host in ["host-1", "host-1"]:  # host-1's idle workers wait for work
         waiting.append(asyncio.create_task(free_slot(host)))
     drained_leases = []
@@ -1800,6 +1800,86 @@ async def test_a_tail_host_defers_to_a_better_waiter_when_the_ready_builds_share
     wake = asyncio.get_running_loop().create_future()
     coordinator.claim_waiters.append((["standard"], _claim_rank(["standard"], "host-a"), wake, False))
     assert await coordinator.claim(["standard"], "tail", host_id="host-b") is None
+
+
+async def test_a_burst_host_above_the_scale_in_line_takes_no_build_the_hosts_below_it_have_workers_for(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """More builds are ready than claims wait below the line, but its hosts' workers could take them all: one that
+    just reported a result comes back for the next build. Once the builds outnumber those workers, the line takes in
+    the burst host above it."""
+    burst = ["high", "standard"]
+    await submit(http, ["a", "b"])
+    for worker in ["a0", "a1"]:
+        coordinator.report_worker("host-a", worker, burst)
+    coordinator.report_worker("host-b", "b0", burst)
+    await coordinator.queue()  # counts the ready builds
+    wake = asyncio.get_running_loop().create_future()
+    coordinator.claim_waiters.append((burst, coordinator._waiter_rank(burst, "host-a", 0), wake, False))
+    assert await coordinator.claim(burst, "b0", host_id="host-b") is None
+    await submit(http, ["c"])
+    await coordinator.queue()
+    assert await coordinator.claim(burst, "b0", host_id="host-b") is not None
+
+
+async def burst_hosts_running_a_parent(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> tuple[str, Claim, asyncio.Task[Claim | None]]:
+    """A batch whose ``b`` waits on ``a``, which host-a's worker runs, while host-b's worker waits for a claim."""
+    burst = ["high", "standard"]
+    batch_id = await submit(http, ["a", "b"], [("b", "a")])
+    coordinator.report_worker("host-a", "a0", burst)
+    coordinator.report_worker("host-b", "b0", burst)
+    parent = await coordinator.claim(burst, "a0", host_id="host-a")
+    assert parent is not None and parent.theory == "pkg:a"
+    tail = asyncio.create_task(coordinator.claim(burst, "b0", 30, host_id="host-b"))
+    while not coordinator.claim_waiters:
+        await asyncio.sleep(0.01)
+    return batch_id, parent, tail
+
+
+async def child_ready(http: httpx.AsyncClient, coordinator: Coordinator, batch_id: str) -> None:
+    async with asyncio.timeout(10):
+        while (await states(http, batch_id))["b"] != "ready":
+            await asyncio.sleep(0.01)
+    await coordinator.queue()  # counts it
+
+
+async def test_a_build_a_result_made_ready_waits_for_the_kept_hosts_worker_back_from_it_not_a_tail_hosts_claim(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Between its result and its next claim, host-a's worker neither holds a lease nor waits, but its host keeps the
+    worker's slot below the line, so the child isn't handed to the claim waiting on burst host-b above it."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only wakes end the waits in time
+    batch_id, parent, tail = await burst_hosts_running_a_parent(http, coordinator)
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, str(parent.attempt_token), result("a", "built"))).status_code == 200
+    await child_ready(http, coordinator, batch_id)
+    await asyncio.sleep(0.05)
+    assert not tail.done()
+    child = await coordinator.claim(["high", "standard"], "a0", host_id="host-a")
+    assert child is not None and child.theory == "pkg:b"
+    tail.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await tail
+
+
+async def test_a_kept_hosts_worker_that_does_not_come_back_from_its_result_leaves_its_slot_to_a_tail_host(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """host-a's worker stays away past TURNAROUND_SECONDS after its result, so host-a has no slot left for the child,
+    and burst host-b's claim, now below the line, takes it at its recheck."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 0.05)
+    batch_id, parent, tail = await burst_hosts_running_a_parent(http, coordinator)
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, str(parent.attempt_token), result("a", "built"))).status_code == 200
+    await child_ready(http, coordinator, batch_id)
+    await asyncio.sleep(0.2)
+    assert not tail.done()
+    later = coordinator.clock() + timedelta(seconds=coordinator_module.TURNAROUND_SECONDS)
+    coordinator.clock = lambda: later
+    child = await asyncio.wait_for(tail, 10)
+    assert child is not None and child.theory == "pkg:b"
 
 
 async def test_a_lease_while_the_ready_builds_are_counted_still_counts_off_them(
