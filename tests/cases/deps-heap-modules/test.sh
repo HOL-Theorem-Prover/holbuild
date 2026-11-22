@@ -309,21 +309,31 @@ resumed fetch-B
 [[ -f "$modules" ]] || { echo "A's module wasn't fetched to $modules" >&2; exit 1; }
 cp "$modules" "$tmpdir/A.pmo"
 
-# The remote cache loses A's module too: W gives the heap up, and B
-# preloads afresh.
+# The remote cache loses A's module too: W gives the heap up, B preloads
+# afresh, and the run replaces the heap's entry, which names a blob the
+# cache lost.
 echo 404 > "$tmpdir/control/cas-get-status-$module_sha"
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
+heap_entry=$(grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote/ac/*)
+cp -a "$tmpdir/remote/ac" "$tmpdir/ac-before-loss"
 edit_b five
 exec_theory B dropped
 phase dropped-B 'rstmoddropn:1'
 require_grep "the shared deps-loaded heap needs a missing or unverifiable theory module: .*-A-.*\.pmo" "$tmpdir/dropped-B.log"
+require_grep "the cache lost blob $module_sha of shared entry" "$tmpdir/dropped-B.log"
 grep -qx 'status=built' "$tmpdir/dropped-B.result"
 if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/dropped-B.result"; then
   echo 'checkpoints on the heap given up were tried' >&2; cat "$tmpdir/dropped-B.result" >&2; exit 1
 fi
+if cmp -s "$heap_entry" "$tmpdir/ac-before-loss/${heap_entry##*/}"; then
+  echo 'the heap entry naming a lost module was not replaced' >&2; cat "$tmpdir/dropped-B.log" >&2; exit 1
+fi
 
-# The shared heap stays: once the cache has A's module again, W fetches it
-# and resumes from the heap's checkpoints.
+# A node the repair didn't reach still serves the old entries.  Once the
+# cache has A's module again, W fetches it and resumes from the heap's
+# checkpoints.
+rm -rf "$tmpdir/remote/ac"
+mv "$tmpdir/ac-before-loss" "$tmpdir/remote/ac"
 rm -f "$tmpdir/control/cas-get-status-$module_sha"
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_b six

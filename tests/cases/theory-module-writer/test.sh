@@ -5,7 +5,7 @@
 # the modules the action wants, nor while another process holds the
 # store's writer lock.  A fake HOL stands in for the writer: it counts its
 # runs, records its output directory's file system and leaves the files
-# named in $tmpdir/writes there.  The worker cache cap's sweep leaves a
+# named in $tmpdir/writes there, each module with bytes of its own.  The worker cache cap's sweep leaves a
 # store alone while its writer runs.  No writer starts too close to its
 # deadline, and one killed at it still stores the modules it finished.  Where /dev/shm is another file
 # system, a store there stands for one a worker's containers share on a
@@ -32,7 +32,9 @@ echo run >> "$tmpdir/$hol.runs"
 cp "\${@: -1}" "$tmpdir/$hol.script"
 out=\$(dirname "\$(grep -o 'openOut "[^"]*/unsupported"' "\${@: -1}" | cut -d'"' -f2)")
 stat -L -c %d "\$out" > "$tmpdir/$hol.output-device"
-while read -r file; do : > "\$out/\$file"; done < "$tmpdir/writes"
+while read -r file; do
+  case \$file in *.pmo) date +%s%N > "\$out/\$file" ;; *) : > "\$out/\$file" ;; esac
+done < "$tmpdir/writes"
 [[ ! -e "$tmpdir/hang" ]] || sleep 20
 SH
   chmod +x "$tmpdir/$hol/bin/hol"
@@ -207,6 +209,32 @@ val {installed, fetched, published, ...} = fill_by "hol4" 100;
 val _ = check "published modules were not fetched"
           (fetched = 2 andalso installed = 0 andalso published = 0 andalso List.all (stored "hol4") [a, b]);
 val _ = check "the writer did not run for the modules still missing" (runs "hol4" = 3);
+
+(* The cache lost A's blob, before its entry: the next writer rewrites A
+   and replaces the entry, so a store after it fetches both again. *)
+fun blob_path hol file = "$tmpdir/remote/cas/" ^ HolbuildHash.file_sha256 (OS.Path.concat (store hol, file));
+val _ = OS.FileSys.remove (blob_path "hol4" a);
+val _ = remove_store "hol4";
+val _ = writes [a, b];
+val {fetched, published, ...} = fill_by "hol4" 100;
+val _ = check "A's lost blob was not replaced" (fetched = 1 andalso published = 1);
+val _ = remove_store "hol4";
+val _ = writes [];
+val {fetched, ...} = fill_by "hol4" 100;
+val _ = check "A's replaced entry was not fetched" (fetched = 2);
+
+(* An entry the writer can't fetch from, but that names a blob the cache
+   holds, stays, and the module the writer wrote for it isn't uploaded. *)
+fun cas_puts () =
+  length (List.filter (String.isPrefix "PUT /cas/")
+            (String.tokens (fn c => c = #"\n") (E.read_text "$tmpdir/server/requests.log")));
+val _ = E.write_text (blob_path "hol4" b) "corrupt\n";
+val _ = remove_store "hol4";
+val _ = writes [a, b];
+val puts = cas_puts ();
+val {fetched, published, ...} = fill_by "hol4" 100;
+val _ = check "a module of a present entry was published"
+          (fetched = 1 andalso published = 0 andalso cas_puts () = puts);
 
 (* A writer whose lock file the sweep unlinked between its open and its
    lock holds a lock nobody else sees: it must not write. *)
