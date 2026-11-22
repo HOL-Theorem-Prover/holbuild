@@ -673,3 +673,15 @@ async def test_empty_batch_does_not_request_scaling(
     await submit(http, [])
     assert coordinator.scale_task is None
     check.assert_not_awaited()
+
+
+def test_quarantined_burst_workers_are_replaced_only_for_demand_beyond_the_actions_waiting_ahead(
+    coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator.settings = coordinator.settings.model_copy(update={"warm_workers": 7, "max_burst_workers": 20})
+    monkeypatch.setattr(coordinator, "_quarantined_workers", lambda: (0, 4))
+    # The burst worker holding the action claimed ahead meets it: nothing to replace a quarantined worker for.
+    ahead = QueueCounts(0, 0, 0, 1, 0, waiting_ahead_standard=1)
+    assert coordinator._burst_demand(ahead) == 1
+    # A high-tier action is demand of its own, so the quarantined burst workers are replaced on top of it.
+    assert coordinator._burst_demand(QueueCounts(0, 0, 1, 1, 0, waiting_ahead_standard=1)) == 2 + 4

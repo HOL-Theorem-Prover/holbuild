@@ -73,9 +73,12 @@ def check_sandbox(executable: str, version: str) -> None:
 # essential one, so the task stops with it, and the worker clears protection once it finds no work (Protection).
 PROTECTION_MINUTES = 180
 # Longest a worker going from action to action keeps protection without a break. At an action's end past it, the
-# worker drops protection and claims again only once ECS protects it anew, so a scale-in or a rolling deployment
-# that wants the task gone takes it between actions instead of waiting for a queue to run dry.
-PROTECTED_SPELL_SECONDS = 1800
+# worker drops protection, waits SPELL_GAP_SECONDS and claims again only once ECS protects it anew, so a scale-in or
+# a rolling deployment that wants the task gone takes it between actions instead of waiting for a queue to run dry.
+# A rolling deployment that doesn't have more protected tasks than it wants accepts the new protection, so only the
+# gap lets it stop the task. About 1/60 of a busy worker's time.
+PROTECTED_SPELL_SECONDS = 3600
+SPELL_GAP_SECONDS = 60
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
 # Longest wait for a heartbeat or completion answer: above the coordinator's database pool timeout plus the work, so
 # a request it accepted is answered rather than given up on and repeated.
@@ -394,6 +397,9 @@ class Protection:
                     raise RuntimeError(str(failure))
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
+            if not enabled:
+                # It may have been cleared all the same: a refusal from here on is taken for an unprotected task's.
+                self.on = False
             return True
         if enabled and not self.on:
             self.since = time.monotonic()
@@ -1747,6 +1753,9 @@ def main() -> None:
                 with phases.timed("lease"):
                     unprotect()
                 protect_first = not unavailable
+                if protect_first:
+                    with phases.timed("idle"):
+                        drain.stop.wait(SPELL_GAP_SECONDS)
             else:
                 protect_first = not protection.on  # refused for this action
             if unavailable:

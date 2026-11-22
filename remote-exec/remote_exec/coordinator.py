@@ -2755,12 +2755,14 @@ class Coordinator:
 
     def _burst_demand(self, counts: QueueCounts) -> int:
         """``burst_demand`` with the workers of quarantined hosts left out of the capacity: their warm workers
-        don't count as warm, and while there is demand, burst workers replace theirs."""
+        don't count as warm, and while there is demand beyond the actions waiting ahead, which the burst workers
+        holding them meet, burst workers replace theirs."""
         warm, burst = self._quarantined_workers()
         demand = burst_demand(
             counts, max(0, self.settings.warm_workers - warm), self.settings.max_burst_workers, self.settings.run_slots
         )
-        return min(self.settings.max_burst_workers, demand + burst) if demand else 0
+        ahead = counts.waiting_ahead_standard + counts.waiting_ahead_high
+        return min(self.settings.max_burst_workers, demand + burst) if demand > ahead else demand
 
     def report_phases(self, report: PhaseReport) -> None:
         """Take a worker's report of where its time went."""

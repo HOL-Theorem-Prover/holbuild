@@ -768,6 +768,16 @@ def test_ecs_protection_failures_other_than_deployment_blocked_are_only_logged(
     assert str(next(iter(reply.values()))) in capsys.readouterr().err
 
 
+def test_a_refusal_after_a_clear_that_failed_is_taken_for_an_unprotected_tasks(server: Server) -> None:
+    protection = Protection(None, server.url)
+    assert protection.set(enabled=True)
+    server.protection_status = 500  # ECS may have cleared it all the same
+    assert protection.set(enabled=False)
+    server.protection_status = 200
+    server.protection_reply = {"failure": {"Reason": "DEPLOYMENT_BLOCKED"}}
+    assert not protection.set(enabled=True)
+
+
 def test_ecs_protection_refused_with_an_http_error_is_logged(
     server: Server, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -822,10 +832,12 @@ class ScriptedProtection:
         self.fresh = fresh
         self.on = False
         self.since = 0.0
+        self.times: list[float] = []  # when each call came
 
     def set(self, *, enabled: bool, timeout: float = 30) -> bool:
         accepted = not enabled or self.on or not self.fresh or self.fresh.pop(0)
         self.events.append(f"on:{accepted}" if enabled else "off")
+        self.times.append(time.monotonic())
         if accepted:
             if enabled and not self.on:
                 self.since = time.monotonic()
@@ -835,7 +847,7 @@ class ScriptedProtection:
 
 def scripted_main(
     tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, fresh: list[bool], claims: int,
-    *, unavailable: bool = False,
+    *, unavailable: bool = False, calls: list[float] | None = None,
 ) -> list[str]:
     """Run ``worker.main`` on ``claims`` claims, each run as an action that sets protection and reports the
     cache ``unavailable`` or not, and return the claims, runs and protection calls in order."""
@@ -865,6 +877,8 @@ def scripted_main(
     monkeypatch.setattr(worker, "run_one", run)
     with pytest.raises(KeyboardInterrupt):
         worker.main()
+    if calls is not None:
+        calls.extend(protection.times)
     return events
 
 
@@ -881,10 +895,14 @@ def test_a_worker_drops_protection_between_actions_once_protected_for_its_longes
     tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(worker, "PROTECTED_SPELL_SECONDS", -1)
-    events = scripted_main(tmp_path, server, monkeypatch, [], 2)
+    monkeypatch.setattr(worker, "SPELL_GAP_SECONDS", 0.3)
+    calls: list[float] = []
+    events = scripted_main(tmp_path, server, monkeypatch, [], 2, calls=calls)
     assert events == [
         "claim", "run", "on:True", "off", "on:True", "claim", "run", "on:True", "off", "on:True", "claim", "off"
     ]
+    # Unprotected for the gap, so a rolling deployment that takes protection again at once can still stop it.
+    assert calls[2] - calls[1] >= 0.3 and calls[5] - calls[4] >= 0.3
 
 
 def test_a_worker_drops_protection_before_waiting_out_an_unavailable_cache(
