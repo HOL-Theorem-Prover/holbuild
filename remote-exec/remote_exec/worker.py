@@ -387,6 +387,7 @@ class Protection:
             return True  # nothing to protect: ``on`` stays False
         if self.on and time.monotonic() >= self.until:
             self.on = False  # ECS let the window lapse while renewals were refused
+        sent = time.monotonic()  # a window ECS applies runs from no earlier than this
         try:
             if self.command is not None:
                 subprocess.run([*shlex.split(self.command), "on" if enabled else "off"], check=True, timeout=timeout)
@@ -408,6 +409,8 @@ class Protection:
                     payload.setdefault("error", str(error))
                 if failure := payload.get("failure") or payload.get("error"):
                     blocked = isinstance(failure, dict) and failure.get("Reason") == "DEPLOYMENT_BLOCKED"
+                    if self.on and time.monotonic() >= self.until:
+                        self.on = False  # the window lapsed while this renewal was in flight
                     if blocked and enabled and not self.on:
                         print(f"ECS refused scale-in protection: {failure}", file=sys.stderr)
                         return False
@@ -415,15 +418,16 @@ class Protection:
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
             if not enabled or (not self.on and not isinstance(error, ProtectionRefused)):
-                if enabled:  # it may have been applied: its spell and window start now
-                    self.since = time.monotonic()
-                    self.until = self.since + PROTECTION_MINUTES * 60 if self.command is None else math.inf
+                if enabled:  # it may have been applied: its window starts now, and its spell unless one is over
+                    if self.on is False:
+                        self.since = sent
+                    self.until = sent + PROTECTION_MINUTES * 60 if self.command is None else math.inf
                 self.on = None
             return True
         if enabled and self.on is False:
-            self.since = time.monotonic()
+            self.since = sent
         if enabled and self.command is None:
-            self.until = time.monotonic() + PROTECTION_MINUTES * 60
+            self.until = sent + PROTECTION_MINUTES * 60
         self.on = enabled
         return True
 

@@ -14,6 +14,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import types
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -985,6 +986,34 @@ def test_a_failed_clear_keeps_the_spell_it_ended_over_so_the_next_actions_end_cl
     server.protection_status = 200
     assert protection.set(enabled=True)
     assert protection.on and protection.since == since
+
+
+def test_a_failed_clear_then_an_unanswered_enable_keeps_the_spell_it_ended_over(server: Server) -> None:
+    protection = Protection(None, server.url)
+    assert protection.set(enabled=True)
+    since = protection.since
+    server.protection_status = 500
+    protection.set(enabled=False)
+    protection.ecs_agent_uri = "http://127.0.0.1:1"  # no answer
+    assert protection.set(enabled=True)
+    assert protection.on is None
+    protection.ecs_agent_uri = server.url
+    server.protection_status = 200
+    assert protection.set(enabled=True)
+    assert protection.on and protection.since == since
+
+
+def test_a_renewal_refused_after_its_window_lapsed_in_flight_counts_as_lapsed(
+    server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protection = Protection(None, server.url)
+    assert protection.set(enabled=True)
+    protection.until = 5.0
+    clock = iter([0.0, 0.0, 10.0])  # the lapse check, the send, the refusal
+    monkeypatch.setattr(worker, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
+    server.protection_reply = {"failure": {"Reason": "DEPLOYMENT_BLOCKED"}}
+    assert not protection.set(enabled=True)
+    assert protection.on is False
 
 
 def test_protection_ecs_held_past_its_window_counts_as_lapsed(server: Server) -> None:
