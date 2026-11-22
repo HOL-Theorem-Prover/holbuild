@@ -1822,6 +1822,21 @@ async def test_a_burst_host_above_the_scale_in_line_takes_no_build_the_hosts_bel
     assert await coordinator.claim(burst, "b0", host_id="host-b") is not None
 
 
+async def test_a_lease_since_the_ready_builds_were_counted_takes_no_tail_host_onto_the_line(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """The count still holds the build host-a's first worker leased; its second worker covers the other."""
+    burst = ["high", "standard"]
+    await submit(http, ["a", "b"])
+    for worker in ["a0", "a1"]:
+        coordinator.report_worker("host-a", worker, burst)
+    coordinator.report_worker("host-b", "b0", burst)
+    await coordinator.queue()
+    assert await coordinator.claim(burst, "a0", host_id="host-a") is not None
+    assert await coordinator.claim(burst, "b0", host_id="host-b") is None
+    assert await coordinator.claim(burst, "a1", host_id="host-a") is not None
+
+
 async def test_the_standard_line_counts_no_slot_of_a_worker_that_takes_only_high_work(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:

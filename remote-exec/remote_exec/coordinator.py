@@ -2579,9 +2579,9 @@ class Coordinator:
         """Note the ready builds of ``counts``: all of them, for the scale-in line, and by tier those a claim could
         take, for the deferral of claims, less the builds this process leased since ``leased`` was its count of them,
         before the counts were read; a lease the read saw already is counted twice, which errs toward deferring."""
-        self.ready_builds = counts.ready_standard + counts.ready_high - counts.ready_run
-        self.ready_high = counts.ready_high - counts.ready_high_run
         since = self.leased - leased
+        self.ready_builds = max(0, counts.ready_standard + counts.ready_high - counts.ready_run - since.total())
+        self.ready_high = max(0, counts.ready_high - counts.ready_high_run - since["high"])
         self.claimable = {
             "standard": max(0, counts.claimable_standard - since["standard"]),
             "high": max(0, counts.claimable_high - since["high"]),
@@ -2589,7 +2589,8 @@ class Coordinator:
 
     def _leased_build(self, ranking: "_Ranking", tier: str) -> None:
         """Count a build of ``tier`` this process leased from ``ranking`` off the builds of ``tier`` a claim could
-        take, so claims stop passing better-ranked waiters (see _defers) once those can take the rest. Then, while
+        take, so claims stop passing better-ranked waiters (see _defers) once those can take the rest, and off the
+        ready builds, which the scale-in line counts beside the leases (see _kept_hosts). Then, while
         ``ranking`` may still have builds not held for a host of a tier a claim waits for, wake the best-ranked claim
         waiting for that tier, this one's first: it passes the wake on as it leases, where the claims waiting would
         otherwise sleep out their recheck for work another process made ready, or that they deferred to this one (a
@@ -2598,6 +2599,9 @@ class Coordinator:
         work ready, so made_ready stays."""
         self.leased[tier] += 1
         self.claimable[tier] = max(0, self.claimable.get(tier, 0) - 1)
+        self.ready_builds = max(0, self.ready_builds - 1)
+        if tier == "high":
+            self.ready_high = max(0, self.ready_high - 1)
         waiting = {t for w_tiers, _, w_woken, _ in self.claim_waiters if not w_woken.done() for t in w_tiers}
         if not waiting:
             return
