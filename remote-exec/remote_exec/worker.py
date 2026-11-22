@@ -370,7 +370,10 @@ class Protection:
         # an unprotected task that got no answer, either of which may have been applied all the same, so the worker
         # tries the clear again but takes a refusal for an unprotected task's.
         self.on: bool | None = False
-        self.since = 0.0  # when it was turned on (time.monotonic())
+        # When it was turned on (time.monotonic()); a clear that failed keeps it, so a spell that ended is still over.
+        self.since = 0.0
+        # When the last ECS window set expires: ECS drops protection then, renewed or not.
+        self.until = math.inf
         # Whether the worker drops it now and then (PROTECTED_SPELL_SECONDS): a rolling ECS deployment stops a
         # protected old task only once its protection is gone. An external scaler's command needs no such gap.
         self.spells = command is None and ecs_agent_uri is not None
@@ -382,6 +385,8 @@ class Protection:
         action to the drain, so both give True."""
         if self.command is None and self.ecs_agent_uri is None:
             return True  # nothing to protect: ``on`` stays False
+        if self.on and time.monotonic() >= self.until:
+            self.on = False  # ECS let the window lapse while renewals were refused
         try:
             if self.command is not None:
                 subprocess.run([*shlex.split(self.command), "on" if enabled else "off"], check=True, timeout=timeout)
@@ -410,10 +415,15 @@ class Protection:
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
             if not enabled or (not self.on and not isinstance(error, ProtectionRefused)):
+                if enabled:  # it may have been applied: its spell and window start now
+                    self.since = time.monotonic()
+                    self.until = self.since + PROTECTION_MINUTES * 60 if self.command is None else math.inf
                 self.on = None
             return True
-        if enabled and not self.on:
+        if enabled and self.on is False:
             self.since = time.monotonic()
+        if enabled and self.command is None:
+            self.until = time.monotonic() + PROTECTION_MINUTES * 60
         self.on = enabled
         return True
 
@@ -1802,7 +1812,7 @@ def main() -> None:
                 print(f"action failed in the worker: {error}", file=sys.stderr)
                 unavailable = True
             spell_over = protection.spells and time.monotonic() - protection.since > PROTECTED_SPELL_SECONDS
-            if protection.on and (unavailable or spell_over):
+            if (unavailable and protection.on is not False) or (protection.on and spell_over):
                 with phases.timed("lease"):
                     unprotect()
                 protect_first = not unavailable

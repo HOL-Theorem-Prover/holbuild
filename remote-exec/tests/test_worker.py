@@ -784,6 +784,7 @@ def test_an_enable_that_got_no_answer_leaves_protection_unknown_but_one_the_agen
     unanswered = Protection("false", None)  # the command fails: it may have protected the task all the same
     assert unanswered.set(enabled=True)
     assert unanswered.on is None
+    assert unanswered.since > 0
     server.protection_reply = {"failure": {"Reason": "TASK_NOT_VALID"}}
     refused = Protection(None, server.url)
     assert refused.set(enabled=True)
@@ -863,7 +864,7 @@ class ScriptedProtection:
         accepted = not enabled or self.on or not self.fresh or self.fresh.pop(0)
         self.events.append(f"on:{accepted}" if enabled else "off")
         if accepted:
-            if enabled and not self.on:
+            if enabled and self.on is False:
                 self.since = time.monotonic()
             self.on = enabled
         return accepted
@@ -872,11 +873,11 @@ class ScriptedProtection:
 def scripted_main(
     tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, fresh: list[bool], claims: int | list[bool],
     *, unavailable: bool = False, calls: list[float] | None = None, clears: list[bool] | None = None,
-    timeouts: list[float] | None = None, drain: bool = False, spells: bool = True,
+    timeouts: list[float] | None = None, drain: bool = False, spells: bool = True, unknown: bool = False,
 ) -> list[str]:
     """Run ``worker.main`` on ``claims`` claims (or, as a list, claims that find work or not), each run as an
-    action that sets protection and reports the cache ``unavailable`` or not (after a SIGTERM, with ``drain``),
-    and return the claims, runs and protection calls in order."""
+    action that sets protection (with no answer, with ``unknown``) and reports the cache ``unavailable`` or not
+    (after a SIGTERM, with ``drain``), and return the claims, runs and protection calls in order."""
     monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
@@ -899,7 +900,10 @@ def scripted_main(
         if drain:
             coordinator.drain.request()
         # As Lease.held: a refusal for an unprotected worker gives the claim back, reported like ``unavailable``.
-        return not protection.set(enabled=True, timeout=5) or unavailable
+        refused = not protection.set(enabled=True, timeout=5)
+        if unknown:
+            protection.on = None
+        return refused or unavailable
 
     monkeypatch.setattr(worker, "claim_reporting", take)
     monkeypatch.setattr(worker, "run_one", run)
@@ -962,6 +966,34 @@ def test_a_worker_drops_protection_before_waiting_out_an_unavailable_cache(
 ) -> None:
     events = scripted_main(tmp_path, server, monkeypatch, [], 1, unavailable=True)
     assert events == ["claim", "run", "on:True", "off", "claim"]
+
+
+def test_a_worker_clears_protection_it_may_hold_before_waiting_out_an_unavailable_cache(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = scripted_main(tmp_path, server, monkeypatch, [], 1, unavailable=True, unknown=True)
+    assert events == ["claim", "run", "on:True", "off", "claim"]
+
+
+def test_a_failed_clear_keeps_the_spell_it_ended_over_so_the_next_actions_end_clears_again(server: Server) -> None:
+    protection = Protection(None, server.url)
+    assert protection.set(enabled=True)
+    since = protection.since
+    server.protection_status = 500
+    protection.set(enabled=False)
+    assert protection.on is None
+    server.protection_status = 200
+    assert protection.set(enabled=True)
+    assert protection.on and protection.since == since
+
+
+def test_protection_ecs_held_past_its_window_counts_as_lapsed(server: Server) -> None:
+    protection = Protection(None, server.url)
+    assert protection.set(enabled=True)
+    protection.until = time.monotonic() - 1  # renewals refused for the whole window
+    server.protection_reply = {"failure": {"Reason": "DEPLOYMENT_BLOCKED"}}
+    assert not protection.set(enabled=True)
+    assert protection.on is False
 
 
 def test_a_draining_worker_clears_protection_within_the_time_left_before_its_container_is_stopped(
