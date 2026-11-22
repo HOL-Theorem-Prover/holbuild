@@ -51,7 +51,7 @@ MIN_AHEAD_RELEASE = (0, 14, 26)  # the first whose exec-action takes --ahead-par
 MIN_FREE_FLOOR_RELEASE = (0, 14, 57)  # the first whose exec-action takes --cache-min-free-gb
 MIN_SWEEP_ONLY_RELEASE = (0, 14, 60)  # the first whose exec-action takes --sweep-only
 MIN_PIPELINE_RELEASE = (0, 14, 75)  # the first whose exec-action takes --pipeline
-MIN_SHARE_DEPS_HEAP_RELEASE = (0, 14, 98)  # the first whose exec-action takes --share-deps-heap
+MIN_SHARE_DEPS_HEAP_RELEASE = (0, 14, 99)  # the first whose exec-action takes --share-deps-heap
 CACHE_MIN_FREE_GB = 16  # the free space the cache cap keeps on the cache's disk for writers it doesn't count
 
 
@@ -1617,7 +1617,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--share-deps-heap",
         action="store_true",
         help="holbuild exec-action --share-deps-heap, for workers serving users who don't trust each other; "
-        "actions of releases before 0.14.98 share nothing",
+        "actions of releases before 0.14.99 share nothing",
     )
     parser.add_argument(
         "--load-ahead",

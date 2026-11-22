@@ -1170,7 +1170,7 @@ def test_worker_asks_a_release_that_can_to_build_a_pipelined_claim_pipelined(
     assert ("--pipeline" in logs[1].read_text().split()) == passed
 
 
-@pytest.mark.parametrize(("version", "passed"), [("0.14.97", False), ("0.14.98", True)])
+@pytest.mark.parametrize(("version", "passed"), [("0.14.98", False), ("0.14.99", True)])
 def test_a_deps_heap_only_worker_shares_nothing_with_a_release_without_that_mode(
     tmp_path: Path, server: Server, logs: tuple[Path, Path], version: str, passed: bool
 ) -> None:

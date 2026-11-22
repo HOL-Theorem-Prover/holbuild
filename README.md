@@ -2136,9 +2136,9 @@ the worker publishes those bytes or nothing. Script checkpoints have no such
 check, so share them only between users who trust each other; a worker
 serving users who don't runs `exec-action --share-deps-heap`, which shares
 dependency heaps and nothing else. It restores whatever heap the remote cache
-holds under the key, and a release before 0.14.98 published a heap whatever
+holds under the key, and a release before 0.14.99 published a heap whatever
 the script had left in its place: give such workers a remote cache that only
-0.14.98 or later has published heaps to, such as a new one.
+0.14.99 or later has published heaps to, such as a new one.
 
 The checkpoint tree is then the action's own, emptied before and after it;
 the host store `<cache root>/checkpoint-store` keeps the shared files, one
