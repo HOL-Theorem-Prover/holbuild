@@ -1953,6 +1953,9 @@ require_grep "still missing theory [0-9a-f]\{64\} after 3 attempts; also missing
 resubmitted=$(sed -n 's/^holbuild: remote batch //p' "$tmpdir/three.log" | tail -n 1)
 [[ $(awk '$1 == "action" { print $5 }' "$state/$resubmitted.batch" | sort | tr '\n' ' ') == "rxn3:NTheory rxn3:OTheory rxn3:PTheory " ]] ||
   { echo "resubmitted batch $resubmitted:" >&2; cat "$state/$resubmitted.batch" >&2; exit 1; }
+# P waits on N through the cached M.
+key_of() { awk -v theory="$1" '$1 == "action" && $5 == theory { print $2 }' "$state/$resubmitted.batch"; }
+require_grep "^edge $(key_of rxn3:PTheory) $(key_of rxn3:NTheory)$" "$state/$resubmitted.batch"
 require_grep "PTheory restored from cache" "$tmpdir/three.log"
 
 # A warm client's forced target must still run on a warm worker, while its

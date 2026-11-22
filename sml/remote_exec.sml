@@ -284,6 +284,8 @@ fun follow url batch_id (on_change : string * string * string option * string op
     val _ = HolbuildOffline.require_online "follow a remote batch"
     val states : (string * (string * string option * string option)) list ref = ref []
     val names = ref ([] : (string * string) list)
+    (* Each action's last failure detail: a new one is a change too. *)
+    val details = ref ([] : (string * string option) list)
     (* Actions that ran more than once: an earlier attempt failed. *)
     val retried : string list ref = ref []
     fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
@@ -335,6 +337,8 @@ fun follow url batch_id (on_change : string * string * string option * string op
               val log = json_string_field "log_sha256" line
               val previous = List.find (fn (k, _) => k = key) (!states)
               val status = (state, failure, log)
+              val detail = json_string_field "failure_detail" line
+              val previous_detail = Option.map #2 (List.find (fn (k, _) => k = key) (!details))
               val _ = if state = "running" orelse Option.getOpt (json_int_field "attempts" line, 0) > 0
                       then ran := key :: List.filter (fn k => k <> key) (!ran) else ()
               val _ = if Option.getOpt (json_int_field "attempts" line, 0) > 1
@@ -342,14 +346,15 @@ fun follow url batch_id (on_change : string * string * string option * string op
             in
               names := (key, Option.getOpt (json_string_field "theory" line, key)) ::
                        List.filter (fn (k, _) => k <> key) (!names);
-              if previous = SOME (key, status) then ()
+              if previous = SOME (key, status) andalso previous_detail = SOME detail then ()
               else
                 (states := (key, status) :: List.filter (fn (k, _) => k <> key) (!states);
+                 details := (key, detail) :: List.filter (fn (k, _) => k <> key) (!details);
                  (* A new log can arrive in a repeated done snapshot after a
                     missed requeue. Only state progress resets stream retries. *)
                  if Option.map (fn (_, (s, _, _)) => s) previous = SOME state then ()
                  else (changed := true; report_action line);
-                 on_change (key, state, failure, log, json_string_field "failure_detail" line))
+                 on_change (key, state, failure, log, detail))
             end
         | SOME "batch" =>
             outcome :=
@@ -459,6 +464,39 @@ fun cancel_within max_time_seconds url batch_id =
   end
 
 val cancel = cancel_within request_max_time_seconds
+
+(* The logs of an ended batch's actions that a worker finished after the
+   batch failed: the coordinator leaves those cancelled, with no failure, and
+   stores their logs as their results come, after the batch's event stream
+   ended.  An ended batch's stream replays each action's last state.  A
+   stopped action's partial log comes with them.  A failure only warns, as
+   the logs are a diagnostic. *)
+fun late_logs url batch_id =
+  let
+    val result =
+      HolbuildSpawn.run
+        {program = "curl",
+         args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/events"))
+                  ["--max-time", Int.toString request_max_time_seconds, "-w", "\n%{http_code}"],
+         stderr = HolbuildSpawn.Merge}
+    val (lines, status) = split_status (#output result)
+    fun late line =
+      if json_string_field "type" line = SOME "action" andalso json_string_field "state" line = SOME "cancelled"
+         andalso json_string_field "last_failure" line = NONE
+      then
+        case (json_string_field "input_key" line, json_string_field "log_sha256" line) of
+            (SOME key, SOME sha) => SOME (key, sha)
+          | _ => NONE
+      else NONE
+  in
+    if status >= 200 andalso status < 300 then List.mapPartial late lines
+    else
+      (HolbuildStatus.message_stderr
+         ("holbuild: warning: could not read the logs of remote batch " ^ batch_id ^
+          (if status = 0 then "" else " (HTTP " ^ Int.toString status ^ ")") ^
+          (case lines of [] => "" | _ => ": " ^ String.concatWith " " lines) ^ "\n");
+       [])
+  end
 
 (* The batch a build is following and would cancel if it stopped following
    it, so that an interrupted build cancels it too (cancel_followed) rather

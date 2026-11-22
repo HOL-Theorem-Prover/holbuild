@@ -1978,10 +1978,6 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
                    if state = "done" then
                      (HolbuildBuildExec.expect_remote_entry key; add key; logs := (key, log) :: !logs)
-                   (* A theory can finish with its log after its batch was
-                      cancelled; a resubmission then finds it built and
-                      reports no log. *)
-                   else if state = "cancelled" andalso Option.isSome log then logs := (key, log) :: !logs
                    else ();
                    case detail of
                        SOME text =>
@@ -2077,6 +2073,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                replaces an earlier one, and a theory that failed in the later
                batch keeps none. *)
             val resubmitted_logs = ref []
+            (* The batch the last resubmission came from.  A theory its worker
+               finished after it failed is left cancelled there, and its log
+               only arrives after the batch's events (late_logs). *)
+            val resubmitted_from = ref NONE
+            fun carried_logs () =
+              case !resubmitted_from of
+                  NONE => !resubmitted_logs
+                | SOME batch_id =>
+                    (resubmitted_from := NONE;
+                     !resubmitted_logs @ map (fn (key, sha) => (key, SOME sha)) (HolbuildRemoteExec.late_logs url batch_id))
             val misfits = ref []
             fun carry_logs earlier later failed =
               Redblackmap.listItems
@@ -2093,7 +2099,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   case outcome of
                       (HolbuildRemoteExec.Failed (_, failures), _) => map #input_key failures
                     | _ => []
-                val logs = carry_logs (!resubmitted_logs) batch_logs failed
+                val logs = carry_logs (carried_logs ()) batch_logs failed
                 val _ = resubmitted_logs := []
                 (* Whatever follows (a restore, a resubmission, a local build)
                    doesn't overlap the span analysis; its results stay readable. *)
@@ -2186,6 +2192,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                          (* Their local entries may be the ones that don't fit. *)
                          HolbuildBuildExec.drop_local_cache_entries forced;
                          resubmitted_logs := logs;
+                         resubmitted_from := SOME batch_id;
                          export_and_submit (missing :: retried) false NONE skip forced)
                   end
                 | (HolbuildRemoteExec.Cancelled (cancelled_logs, _), progress) =>
@@ -2218,11 +2225,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               if null (batch_keys batch) then
                 (record_pending ();
                  (* A resubmission can find everything built already. *)
-                 if null (!resubmitted_logs) then ()
-                 else
-                   (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key
-                      (!resubmitted_logs);
-                    resubmitted_logs := []);
+                 (case carried_logs () of
+                      [] => ()
+                    | logs =>
+                        (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key logs;
+                         resubmitted_logs := []));
                  if not (null (!deferred)) then submit_deferred retried settled skip
                  else if not (null skip) then restore_after_failures settled skip
                  else
