@@ -284,6 +284,9 @@ fun follow url batch_id (on_change : string * string * string option * string op
     val _ = HolbuildOffline.require_online "follow a remote batch"
     val states : (string * (string * string option * string option)) list ref = ref []
     val names = ref ([] : (string * string) list)
+    (* Each action's last failure detail, which on_change gets when only it
+       changed: an attempt can fail anew between two snapshots. *)
+    val details = ref ([] : (string * string option) list)
     (* Actions that ran more than once: an earlier attempt failed. *)
     val retried : string list ref = ref []
     fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
@@ -335,6 +338,8 @@ fun follow url batch_id (on_change : string * string * string option * string op
               val log = json_string_field "log_sha256" line
               val previous = List.find (fn (k, _) => k = key) (!states)
               val status = (state, failure, log)
+              val detail = json_string_field "failure_detail" line
+              val previous_detail = Option.map #2 (List.find (fn (k, _) => k = key) (!details))
               val _ = if state = "running" orelse Option.getOpt (json_int_field "attempts" line, 0) > 0
                       then ran := key :: List.filter (fn k => k <> key) (!ran) else ()
               val _ = if Option.getOpt (json_int_field "attempts" line, 0) > 1
@@ -342,14 +347,15 @@ fun follow url batch_id (on_change : string * string * string option * string op
             in
               names := (key, Option.getOpt (json_string_field "theory" line, key)) ::
                        List.filter (fn (k, _) => k <> key) (!names);
-              if previous = SOME (key, status) then ()
+              if previous = SOME (key, status) andalso previous_detail = SOME detail then ()
               else
                 (states := (key, status) :: List.filter (fn (k, _) => k <> key) (!states);
+                 details := (key, detail) :: List.filter (fn (k, _) => k <> key) (!details);
                  (* A new log can arrive in a repeated done snapshot after a
                     missed requeue. Only state progress resets stream retries. *)
                  if Option.map (fn (_, (s, _, _)) => s) previous = SOME state then ()
                  else (changed := true; report_action line);
-                 on_change (key, state, failure, log, json_string_field "failure_detail" line))
+                 on_change (key, state, failure, log, detail))
             end
         | SOME "batch" =>
             outcome :=

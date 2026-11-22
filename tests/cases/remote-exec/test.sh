@@ -2233,6 +2233,34 @@ require_grep "rxresubmitlogs:ATheory: cancelled, log /cas/" "$tmpdir/resubmit-li
   { echo "worker results:" >&2; cat "$state/results" >&2; exit 1; }
 require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
 
+# A theory that finished as its batch ended, and that the resubmission leaves
+# out as the cache now holds it, gets its late log too: B misses M, not A.
+write_theories resubmit-left-out
+cat > "$project/src/MScript.sml" <<'SML'
+Theory M
+Ancestors bool
+
+Theorem m_thm:
+  T
+Proof
+  simp[] (* resubmit-left-out *)
+QED
+SML
+sed -i 's/^Ancestors A$/Ancestors A M/' "$project/src/BScript.sml"
+rm -rf "$project/.holbuild/logs/current"
+m_key=$(hb action-spec BTheory | awk '$1 == "action" && $5 == "rxresubmitlogs:MTheory" { print $2 }')
+echo "rxresubmitlogs:BTheory theory $m_key" > "$state/fail-missing"
+touch "$state/late-log"
+run resubmit-left-out 0 build --remote-exec "$coordinator" --remote-only BTheory
+rm "$state/late-log" "$project/src/MScript.sml"
+require_grep "rxresubmitlogs:ATheory: cancelled$" "$tmpdir/resubmit-left-out.log"
+require_grep "resubmitting with 1 theories rebuilt or rechecked" "$tmpdir/resubmit-left-out.log"
+left_out_batch=$state/$(sed -n 's/^holbuild: remote batch \(b[0-9]*\)$/\1/p' "$tmpdir/resubmit-left-out.log" | tail -n 1).batch
+[[ "$(awk '$1 == "action" { print $5 }' "$left_out_batch" | sort | tr '\n' ' ')" == \
+   "rxresubmitlogs:BTheory rxresubmitlogs:MTheory " ]] || { cat "$left_out_batch" "$tmpdir/resubmit-left-out.log" >&2; exit 1; }
+require_grep "Theory \"A\" took" "$project/.holbuild/logs/current/rxresubmitlogs/ATheory/build.log"
+require_grep "Theory \"M\" took" "$project/.holbuild/logs/current/rxresubmitlogs/MTheory/build.log"
+
 # The client cap must reach the HOL child, before Poly/ML consumes --maxheap.
 copy_nondet heap-cap rxheap
 cat > "$tmpdir/heap-cap/src/HeapScript.sml" <<'SML'
