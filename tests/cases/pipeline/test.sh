@@ -139,7 +139,9 @@ require_no_grep() {
 # A's suspended theorem, and its Resume block that suspends again, keep
 # their proofs in the outline, so its Finalise still saves it in place, with
 # its attributes.  So does a_hidden, whose proof suspends through a helper
-# tactic, and its Finalise keeps it local.
+# tactic, and its Finalise keeps it local.  a_imp and a_both_left use no
+# theorem from disk, so they are exported without the DISK_THM oracle their
+# outline stubs carry.
 new_project pass
 cat > "$tmpdir/pass/src/AScript.sml" <<SML
 open HolKernel Parse boolLib bossLib;
@@ -148,6 +150,19 @@ Theorem a_thm:
   T
 Proof
   $slow_truth
+QED
+Theorem a_imp:
+  p ==> p
+Proof
+  DISCH_TAC >> FIRST_ASSUM ACCEPT_TAC
+QED
+Definition a_both_def:
+  a_both p q <=> p /\\ q
+End
+Theorem a_both_left:
+  a_both p q ==> p
+Proof
+  PURE_REWRITE_TAC [a_both_def] >> STRIP_TAC >> FIRST_ASSUM ACCEPT_TAC
 QED
 Theorem a_split:
   T /\\ T
