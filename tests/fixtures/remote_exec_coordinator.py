@@ -32,7 +32,10 @@ reports a failed action as a cancel that stopped it leaves it: cancelled with th
 worker uploaded, and the batch cancelled; holding `unlogged`, before that log arrived, and
 holding a failure kind, after an earlier attempt failed with it (`deadline-retried`: stopped
 by the batch deadline on a second attempt).  STATE/<id>.events, when it exists, is batch
-<id>'s recorded event stream: it is sent as it is, without running RUN.  When RUN
+<id>'s recorded event stream: it is sent as it is, without running RUN.  `late-log`
+reports an action a failed batch's RUN built as cancelled with no log, and records the
+stream there with that action's log, as the coordinator keeps a log that arrives after the
+batch ended and streams an ended batch's last state.  When RUN
 fails having written what it found missing to `missing` (which is removed), as
 "theory <input key>" or "blob <sha256>", and on a second line the others it found missing,
 comma-separated, the batch fails for resubmission naming them, as the coordinator does.  Otherwise
@@ -118,12 +121,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.answer(404, {"detail": "no such batch"})
         if (state / "down").exists() or (state / "ended").exists():
             return self.answer(503, {"detail": "restarting"})
-        recorded = state / f"{parts[3]}.events"
-        if recorded.exists():
+        events = state / f"{parts[3]}.events"
+        if events.exists():
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson")
             self.end_headers()
-            self.wfile.write(recorded.read_bytes())
+            self.wfile.write(events.read_bytes())
             return
         if (state / "hang").exists():
             self.send_response(200)
@@ -152,6 +155,15 @@ class Handler(BaseHTTPRequestHandler):
                        "tier": "standard", "attempts": 1, "last_failure": None, "log_sha256": None}
             self.wfile.write((json.dumps(running) + "\n").encode())
             return
+        # What later reads of the batch replay once it ended, as the coordinator
+        # streams an ended batch's last state; LATE is how a line is kept there.
+        kept = []
+        late_log = (state / "late-log").exists()
+
+        def emit(data, late=None):
+            self.wfile.write(data)
+            kept.append(late if late is not None else data)
+
         cancelled = (state / "cancelled").exists()
         run_class = batch.with_suffix(".run").exists()
         ok = cancelled or (state / "skip").exists() or subprocess.run([run, str(batch)]).returncode == 0
@@ -173,15 +185,16 @@ class Handler(BaseHTTPRequestHandler):
                     retried = {"type": "action", "input_key": fields[1], "theory": fields[4], "state": "waiting",
                                "tier": "high", "attempts": 1, "last_failure": "memory",
                                "log_sha256": "c" * 64, "failure_detail": "killed by SIGKILL"}
-                    self.wfile.write((json.dumps(retried) + "\n").encode())
+                    emit((json.dumps(retried) + "\n").encode())
                 for _ in range(2):
                     running = {"type": "action", "input_key": fields[1], "theory": fields[4],
                                "state": "running", "tier": "standard", "attempts": 1,
                                "last_failure": None, "log_sha256": None}
                     if cut:
-                        self.wfile.write(json.dumps(running)[:30].encode())
+                        emit(json.dumps(running)[:30].encode())
                         return
-                    self.wfile.write((json.dumps(running) + "\n").encode())
+                    emit((json.dumps(running) + "\n").encode())
+                late = None
                 event = {"type": "action", "input_key": fields[1], "theory": fields[4],
                          "state": final_state, "tier": "standard", "attempts": 1,
                          "last_failure": None if ok else "proof", "log_sha256": None}
@@ -218,7 +231,12 @@ class Handler(BaseHTTPRequestHandler):
                             # worker reports as it stops.
                             event["state"], event["last_failure"] = "cancelled", "deadline"
                             event["failure_detail"] = "still running after 12 h"
-                            self.wfile.write((json.dumps(dict(event, log_sha256=None)) + "\n").encode())
+                            emit((json.dumps(dict(event, log_sha256=None)) + "\n").encode())
+                    elif late_log:
+                        # Built, but the batch ended before its result came: cancelled, its log kept
+                        # only for later reads of the batch.
+                        event["state"], event["last_failure"] = "cancelled", None
+                        late = dict(event, log_sha256=record["log"].split()[0] if "log" in record else None)
                     else:
                         event["state"], event["last_failure"] = "done", None
                 elif not ok and not (state / "fail").exists():
@@ -235,10 +253,10 @@ class Handler(BaseHTTPRequestHandler):
                 if event["state"] == "done" and (state / "requeue-log").exists():
                     # The first execution's log was evicted; only the final
                     # execution's log is usable after the action is requeued.
-                    self.wfile.write((json.dumps(dict(event, log_sha256="0" * 64)) + "\n").encode())
+                    emit((json.dumps(dict(event, log_sha256="0" * 64)) + "\n").encode())
                     if not (state / "requeue-snapshot").exists():
-                        self.wfile.write((json.dumps(dict(event, state="waiting", log_sha256=None)) + "\n").encode())
-                self.wfile.write((json.dumps(event) + "\n").encode())
+                        emit((json.dumps(dict(event, state="waiting", log_sha256=None)) + "\n").encode())
+                emit((json.dumps(event) + "\n").encode(), (json.dumps(late) + "\n").encode() if late else None)
                 self.wfile.flush()
                 for _ in range(600):
                     if not (state / "hold").exists():
@@ -259,7 +277,9 @@ class Handler(BaseHTTPRequestHandler):
         cancel_after = (state / "cancel-after-actions").exists() or (state / "stopped").exists()
         final = {"type": "batch", "state": "cancelled" if cancel_after else final_state,
                  "failure": failure}
-        self.wfile.write((json.dumps(final) + "\n").encode())
+        emit((json.dumps(final) + "\n").encode())
+        if late_log and not events.exists():
+            events.write_bytes(b"".join(kept))
 
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

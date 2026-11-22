@@ -9728,6 +9728,14 @@ fun theory_keys_depending_on (options : build_options) tc project plan keys tool
     map key_of (List.filter (fn node => is_theory_node node andalso depends node) (HolbuildBuildPlan.selected_nodes plan))
   end
 
+(* The input keys of the plan's theories whose input key is one of MISSING. *)
+fun theory_keys_among plan keys missing =
+  let val key_of = HolbuildBuildPlan.input_key_for keys
+  in
+    map key_of (List.filter (fn node => is_theory_node node andalso List.exists (fn key => key_of node = key) missing)
+                            (HolbuildBuildPlan.selected_nodes plan))
+  end
+
 (* Drops the local cache's entry for key when its outputs differ from the
    remote cache's, so that the next restore takes the remote's; true when it
    dropped it. *)

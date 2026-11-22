@@ -267,7 +267,7 @@ fun report_action line =
 
 (* Follows a batch's event stream until the batch finishes, printing each
    action whose state changes, and passing on_change the input key, the
-   new state, last failure and log hash, if any, of each.  A stream that breaks (the connection drops,
+   new state, last failure, log hash and failure detail, if any, of each.  A stream that breaks (the connection drops,
    or the coordinator answers 5xx while it restarts) is reattached: after a
    second when it delivered a state change, and after each of
    retry_delays_seconds in a row when it delivered none.  Every stream
@@ -277,7 +277,8 @@ fun report_action line =
    on a quiet stream, so a proxy doesn't close a healthy one for being
    idle.  The coordinator ends a batch at its deadline, so this ends too.  A failed
    batch comes with the action whose proof failed, when one did. *)
-fun follow url batch_id (on_change : string * string * string option * string option -> unit) : outcome * progress =
+fun follow url batch_id (on_change : string * string * string option * string option * string option -> unit)
+    : outcome * progress =
   let
     val followed_at = Time.now ()
     val _ = HolbuildOffline.require_online "follow a remote batch"
@@ -348,7 +349,7 @@ fun follow url batch_id (on_change : string * string * string option * string op
                     missed requeue. Only state progress resets stream retries. *)
                  if Option.map (fn (_, (s, _, _)) => s) previous = SOME state then ()
                  else (changed := true; report_action line);
-                 on_change (key, state, failure, log))
+                 on_change (key, state, failure, log, json_string_field "failure_detail" line))
             end
         | SOME "batch" =>
             outcome :=
@@ -429,6 +430,34 @@ fun follow url batch_id (on_change : string * string * string option * string op
     (outcome,
      {built = length (List.filter (fn (_, (state, _, _)) => state = "done") (!states)),
       total = length (!states)})
+  end
+
+(* The logs of an ended batch's cancelled actions that had no failed attempt
+   before, by input key, read from its event stream without reporting
+   anything.  The coordinator keeps the log a stopped worker uploads only
+   once the batch has ended, so the stream that followed the batch may have
+   closed before it came.  Such a log is of a build that finished as the
+   batch ended or of one the cancel stopped.  None when the stream can't be
+   read: the logs are diagnostics. *)
+fun cancelled_logs url batch_id =
+  let
+    val logs = ref []
+    fun on_line line =
+      if json_string_field "type" line = SOME "action" andalso json_string_field "state" line = SOME "cancelled" andalso
+         json_string_field "last_failure" line = NONE
+      then
+        case (json_string_field "input_key" line, json_string_field "log_sha256" line) of
+            (SOME key, SOME log) => logs := (key, log) :: List.filter (fn (k, _) => k <> key) (!logs)
+          | _ => ()
+      else ()
+  in
+    HolbuildSpawn.run_lines
+      {program = "curl",
+       args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/events"))
+                ["-N", "--max-time", Int.toString request_max_time_seconds],
+       stderr = HolbuildSpawn.Discard}
+      on_line;
+    rev (!logs)
   end
 
 (* Asks the coordinator to cancel a batch; true when it did.  It answers

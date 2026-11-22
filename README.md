@@ -2307,8 +2307,10 @@ batch's other unfinished actions found missing
 (`; also missing theory <input_key>, ...`). Such a batch is resubmitted
 with those theories and every theory that depends on them, for the workers to
 rebuild or recheck against the cached parents. The remote cache may also have
-lost a theory or source the remote ledger says it holds: on a resubmission
-for either, the build forgets the ledger, and a batch missing a blob
+lost a theory or source the remote ledger says it holds. A batch whose workers
+found theories the cache lacks, none of them one that doesn't fit, is
+resubmitted with only those theories rebuilt: theories cached on them stay
+cached. On a resubmission for either, the build forgets the ledger, and a batch missing a blob
 (`resubmit: ... blob <sha256>`) is resubmitted too, uploading its blobs again.
 A build resubmits again while a failed batch names a theory missing that no earlier
 resubmission was for, or the first missing blob, up to 5 times. A submission
