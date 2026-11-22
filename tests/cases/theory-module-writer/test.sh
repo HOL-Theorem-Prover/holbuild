@@ -263,6 +263,17 @@ val _ = writes [];
 val {fetched, ...} = fill_by "hol4" 100;
 val _ = check "A's replaced entry was not fetched" (fetched = 2);
 
+(* The cache loses A's blob again, and another host puts it back while
+   this writer runs: the module is fetched, and the entry stays. *)
+val a_blob_path = blob_path "hol4" a;
+val _ = E.copy_binary a_blob_path "$tmpdir/a-blob";
+val _ = OS.FileSys.remove a_blob_path;
+val _ = remove_store "hol4";
+val _ = writes [a];
+val _ = E.write_text "$tmpdir/plant" ("cp $tmpdir/a-blob " ^ a_blob_path ^ "\n");
+val {fetched, published, ...} = fill_by "hol4" 100;
+val _ = check "an entry healed while the writer ran was replaced" (fetched = 2 andalso published = 0);
+
 (* An entry the writer can't fetch from, but that names a blob the cache
    holds, stays, and the module the writer wrote for it isn't uploaded. *)
 fun cas_puts () =
@@ -342,7 +353,6 @@ val _ = OS.FileSys.rename
           {old = "$tmpdir/remote/ac/" ^ hd (List.filter (fn e => not (List.exists (fn x => x = e) earlier))
                                               (entries "$tmpdir/remote/ac")),
            new = "$tmpdir/remote/ac/" ^ a_entry};
-val _ = E.write_text "$tmpdir/plant" "";
 val _ = remove_store "hol5";
 val puts = cas_puts ();
 val {installed, fetched, published, ...} = fill_by "hol5" 100;

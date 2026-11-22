@@ -4826,6 +4826,20 @@ fun snapshot_heap_modules store heap =
       end
   end
 
+(* Tests hold a step at a point while the environment variable VAR names
+   a directory: its "reached" is written, then its "release" awaited. *)
+fun test_pause var =
+  case OS.Process.getEnv var of
+      NONE => ()
+    | SOME dir =>
+        let
+          val release = Path.concat (dir, "release")
+          fun wait () =
+            if file_exists release then () else (OS.Process.sleep (Time.fromMilliseconds 10); wait ())
+        in
+          write_text (Path.concat (dir, "reached")) ""; wait ()
+        end
+
 (* A module id as the preload lists it (write_preload). *)
 fun module_id_hex id =
   String.concat (map (fn c => StringCvt.padLeft #"0" 2 (Int.fmt StringCvt.HEX (ord c))) (explode id))
@@ -4857,23 +4871,11 @@ fun with_deps_heap_capture store deps_loaded f =
       let val ids = String.tokens Char.isSpace (read_text refused)
       in List.exists (fn (id, _) => List.exists (fn r => r = module_id_hex id) ids) (saved_module_ids deps_loaded)
       end
-    (* Tests hold the capture (HOLBUILD_TEST_CAPTURE_PAUSE, a directory:
-       its "reached" is written, then its "release" awaited) to change
-       the heap's modules after the preload saved it. *)
-    fun test_pause () =
-      case OS.Process.getEnv "HOLBUILD_TEST_CAPTURE_PAUSE" of
-          NONE => ()
-        | SOME dir =>
-            let
-              val release = Path.concat (dir, "release")
-              fun wait () =
-                if file_exists release then () else (OS.Process.sleep (Time.fromMilliseconds 10); wait ())
-            in
-              write_text (Path.concat (dir, "reached")) ""; wait ()
-            end
-    (* Whatever fails, the request goes, so the child goes on. *)
+    (* Whatever fails, the request goes, so the child goes on.  Tests hold
+       it (HOLBUILD_TEST_CAPTURE_PAUSE) to change the heap's modules after
+       the preload saved it. *)
     fun take () =
-      ((test_pause ();
+      ((test_pause "HOLBUILD_TEST_CAPTURE_PAUSE";
         if requires_refused () then
           warn "not sharing the deps-loaded heap: it requires a theory module HOL refused"
         else
@@ -14523,14 +14525,12 @@ fun install_module store {src, name} =
    WANTED modules, each a (`<theory>-<.dat SHA-1>.pmo`, remote key) pair,
    starting only requests that end by DEADLINE.  A module is installed
    only from an entry that lists one plain file named for it.  A miss or
-   a failed fetch leaves the module to the writer.  The result: how many
-   entries were looked up, the keys of those whose blob the cache
-   answered 404 for (it expires a blob on its own, before the entry), and
-   the modules with no entry. *)
+   a failed fetch leaves the module to the writer, which looks again.  The
+   result: how many entries were looked up, and the modules with no
+   entry. *)
 fun fetch_published_modules remote {store, staging, wanted, deadline} =
   let
     val probes = ref 0
-    val stale = ref ([] : string list)
     val unpublished = ref ([] : string list)
     val mutex = Mutex.mutex ()
     fun fetch (name, key) =
@@ -14555,8 +14555,6 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
                          (case HolbuildRemoteCache.fetch_unlisted_blob_within
                                  HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp} of
                               HolbuildCacheBackend.Hit => ignore (install_module store {src = tmp, name = file})
-                            | HolbuildCacheBackend.Miss =>
-                                (Mutex.lock mutex; stale := key :: !stale; Mutex.unlock mutex)
                             | _ => ();
                           remove_file tmp)
                        end
@@ -14567,7 +14565,7 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
     ensure_dir staging;
     parallel_all remote_probe_width try wanted;
     HolbuildRemoveTree.remove_untrusted staging;
-    {probes = !probes, stale = !stale, unpublished = !unpublished}
+    {probes = !probes, unpublished = !unpublished}
   end
 
 (* Stores the modules the writer left in STAGING, each a (file, remote
@@ -14578,14 +14576,14 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
    place of this writer's.  This writer's is stored once its entry is
    put (where the cache has several nodes, once a read-back after
    shared_heap_claim_settle finds it there, or finds none); when the
-   published entry's blob is lost (STALE, from fetch_published_modules,
-   or a 404 now), as the entry is replaced with it on every node; and
+   published entry's blob is lost (a 404 when this writer looks the entry
+   up), as the entry is replaced with it on every node; and
    when the cache can't be asked or answer in time.  None is stored when
    the entry another writer published is malformed or its module can't
    be fetched.  A store never replaces a module it has (install_module).
    The result: this writer's files that were stored, and how many modules
    were fetched and how many entries published. *)
-fun converge_modules remote {store, staging, modules, stale, deadline} =
+fun converge_modules remote {store, staging, modules, deadline} =
   let
     val mutex = Mutex.mutex ()
     val installed = ref []
@@ -14645,7 +14643,6 @@ fun converge_modules remote {store, staging, modules, stale, deadline} =
        a read-back confirms. *)
     fun one (file, key) =
       if not (module_request_fits deadline) then (install_own file; NONE)
-      else if List.exists (fn k => k = key) stale then (heal (file, key); NONE)
       else
         case lookup key of
             SOME text => (install_published (file, key) text; NONE)
@@ -14996,13 +14993,11 @@ fun write_missing_modules remote root tc wanted deadline =
     fun fill () =
       let
         val keys = remote_keys missing handle e => (warn ("theory modules not fetched: " ^ General.exnMessage e); [])
-        val stale =
-          (let val {probes, stale, ...} =
-                 fetch_published_modules remote
-                   {store = store, staging = output, wanted = keys,
-                    deadline = Time.- (deadline, module_writer_min_time)}
-           in probed := probes; stale end)
-          handle e => (warn ("theory modules not fetched: " ^ General.exnMessage e); [])
+        val _ =
+          (probed := #probes (fetch_published_modules remote
+                                {store = store, staging = output, wanted = keys,
+                                 deadline = Time.- (deadline, module_writer_min_time)}))
+          handle e => warn ("theory modules not fetched: " ^ General.exnMessage e)
         val still = missing_modules ()
         val _ = fetched := length missing - length still
         fun key_of file =
@@ -15022,7 +15017,7 @@ fun write_missing_modules remote root tc wanted deadline =
               converge_modules remote
                 {store = store, staging = output,
                  modules = List.mapPartial (fn file => Option.map (fn key => (file, key)) (key_of file)) written,
-                 stale = stale, deadline = Time.+ (deadline, module_publish_grace)}
+                 deadline = Time.+ (deadline, module_publish_grace)}
           in
             installed := unkeyed @ #installed result;
             fetched := !fetched + #fetched result;
@@ -15030,7 +15025,9 @@ fun write_missing_modules remote root tc wanted deadline =
           end
       in
         if worth_writing still then
-          ((if write () then store_written () else ()) before clean ())
+          (* Tests hold the writer (HOLBUILD_TEST_WRITER_PAUSE) past its
+             check for missing modules, for a restore to store one. *)
+          ((if write () then (test_pause "HOLBUILD_TEST_WRITER_PAUSE"; store_written ()) else ()) before clean ())
           handle e => (clean (); raise e)
         else ()
       end

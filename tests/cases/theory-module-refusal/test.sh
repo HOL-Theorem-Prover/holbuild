@@ -20,7 +20,9 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 server_pid=
-trap '[[ -z $server_pid ]] || kill "$server_pid" 2>/dev/null; cleanup_temp_dir "$tmpdir"' EXIT
+# A held writer is let go, so that it doesn't outlive the test.
+trap '[[ ! -d $tmpdir/writer ]] || { touch "$tmpdir/writer/release"; sleep 1; }
+      [[ -z $server_pid ]] || kill "$server_pid" 2>/dev/null; cleanup_temp_dir "$tmpdir"' EXIT
 use_case_cache "$tmpdir/cache"
 project=$tmpdir/project
 mkdir -p "$project/src"
@@ -276,20 +278,44 @@ set_a "'a"
 exec_d resume-1 0
 resumed resume-1
 
-# Both at once, the second branch's writer filling in C2's module, which
-# the first branch's heap requires and its restore puts back.
+# Both at once: the second branch's writer is held once it has written
+# the C2 module it found missing, while the first branch's restore stores
+# the C2 its heap requires; the writer's, of another id, stays out of the
+# store.  With C2's entry gone, the writer has no winner to fetch.
 set_a bool
 spec_d both-2
 set_a "'a"
 spec_d both-1
-rm "$(c_module C2)"
-rm -rf "$HOLBUILD_CACHE/checkpoint-store" "$HOLBUILD_CACHE/checkpoints"
-run_d both-2 0 shared 1 &
+c2_path=$(c_module C2)
+rm "$c2_path"
+# Its theory-module entry, not the heap entries that list it too.
+{ grep -rlE -- '^blob=[0-9a-f]+ file [^ ]*-C2-[0-9a-f]+\.pmo$' "$tmpdir/remote/ac" || true; } | xargs -r rm --
+rm -rf "$HOLBUILD_CACHE/checkpoint-store" "$HOLBUILD_CACHE/checkpoints" "$tmpdir/writer"
+mkdir "$tmpdir/writer"
+# wait_for FILE PID: until FILE exists, while PID runs.
+wait_for() {
+  for _ in {1..6000}; do
+    [[ -e $1 ]] && return
+    kill -0 "$2" 2>/dev/null || break
+    sleep 0.1
+  done
+  [[ -e $1 ]] || { echo "$1 did not appear" >&2; exit 1; }
+}
+(export HOLBUILD_TEST_WRITER_PAUSE=$tmpdir/writer; run_d both-2 0 shared 1) &
 both_2=$!
+wait_for "$tmpdir/writer/reached" "$both_2"
+written=$(find "$store/.writer" -name '*-C2-*.pmo')
+[[ -n $written && $(sha256sum < "$written") != "$c2_sha" ]] ||
+  { echo "the second branch's writer wrote no C2 module of another id: $written" >&2; exit 1; }
+[[ ! -e $c2_path ]] || { echo "C2's module was stored before the restore" >&2; exit 1; }
 run_d both-1 0 &
 both_1=$!
+wait_for "$c2_path" "$both_1"
+touch "$tmpdir/writer/release"
 wait "$both_2"
 wait "$both_1"
 resumed both-2
 resumed both-1
+[[ $(c_module C2) == "$c2_path" && $(sha256sum < "$c2_path") == "$c2_sha" ]] ||
+  { echo "the writer replaced the C2 module the restore stored" >&2; exit 1; }
 [[ $(sha256sum < "$c_path") == "$c_sha" ]] || { echo "a worker wrote C's module again" >&2; exit 1; }
