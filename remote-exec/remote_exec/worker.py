@@ -413,6 +413,7 @@ class Protection:
                         self.on = False  # the window lapsed while this renewal was in flight
                     if blocked and enabled and not self.on:
                         print(f"ECS refused scale-in protection: {failure}", file=sys.stderr)
+                        self.on = False  # the refusal says the task is unprotected
                         return False
                     raise ProtectionRefused(str(failure))
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
@@ -1816,7 +1817,7 @@ def main() -> None:
                 print(f"action failed in the worker: {error}", file=sys.stderr)
                 unavailable = True
             spell_over = protection.spells and time.monotonic() - protection.since > PROTECTED_SPELL_SECONDS
-            if (unavailable and protection.on is not False) or (protection.on and spell_over):
+            if protection.on is not False and (unavailable or spell_over):
                 with phases.timed("lease"):
                     unprotect()
                 protect_first = not unavailable
