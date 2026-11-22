@@ -52,9 +52,19 @@ Proof
   REWRITE_TAC [DB.fetch "A" "c_def"]
 QED
 SML
+cat > "$project/src/C2Script.sml" <<'SML'
+Theory C2
+Ancestors B
+
+Theorem c2_thm:
+  c F = T
+Proof
+  REWRITE_TAC [DB.fetch "A" "c_def"]
+QED
+SML
 cat > "$project/src/DScript.sml" <<'SML'
 Theory D
-Ancestors C
+Ancestors C C2
 
 Theorem d_thm:
   T /\ T
@@ -73,7 +83,7 @@ skip() {
   echo "refused theory modules unsupported: no $1"
   exit 0
 }
-c_module() { find "$HOLBUILD_CACHE/theory-modules" -name '*-C-*.pmo'; }
+c_module() { find "$HOLBUILD_CACHE/theory-modules" -name "*-${1:-C}-*.pmo"; }
 
 set_a "'a"
 build "$tmpdir/first.log"
@@ -87,7 +97,9 @@ c_dat=$(sha1sum < "$project/.holbuild/obj/src/CTheory.dat")
 c_path=$(c_module)
 c_id=$(stat -c '%i %s' "$c_path")
 c_sha=$(sha256sum < "$c_path")
+c2_sha=$(sha256sum < "$(c_module C2)")
 store=$(dirname "$c_path")
+a1_dat=$(sha1sum < "$project/.holbuild/obj/src/ATheory.dat" | cut -d' ' -f1)
 
 set_a bool
 build "$tmpdir/second.log"
@@ -95,6 +107,7 @@ build "$tmpdir/second.log"
   { echo "C's .dat file differs on the second branch" >&2; exit 1; }
 d_log=$project/.holbuild/logs/current/module-refusal/DTheory/build.log
 require_grep 'theory modules: C: module refused, loading from .dat' "$d_log"
+require_grep 'theory modules: C2: module refused, loading from .dat' "$d_log"
 [[ $(c_module) == "$c_path" && $(stat -c '%i %s' "$c_path") == "$c_id" && $(sha256sum < "$c_path") == "$c_sha" ]] ||
   { echo "the second branch wrote C's refused module again" >&2; exit 1; }
 
@@ -110,7 +123,7 @@ d_heap=$(find "$project/.holbuild/checkpoints" -path '*DScript.sml.deps*' -name 
 [[ -n $d_heap ]] || { echo 'D saved no deps heap' >&2; exit 1; }
 d_modules=$(heap_modules "$d_heap")
 grep -q -- '-A-' <<< "$d_modules" || { echo "D's deps heap doesn't load A's module: $d_modules" >&2; exit 1; }
-if grep -q -- '-C-' <<< "$d_modules"; then
+if grep -q -- '-C2\?-' <<< "$d_modules"; then
   echo "D's deps heap requires C's refused module: $d_modules" >&2; exit 1
 fi
 
@@ -135,11 +148,11 @@ val tc = {holdir = "$holdir", maxheap = NONE, kernel_variant = HolbuildToolchain
 val store = "$store";
 fun modules part = List.filter (String.isSubstring part) (map OS.Path.file (HolbuildCache.children store));
 
-(* The writer, allowed one module, writes D's after C's refused one. *)
+(* The writer, allowed one module, writes D's after the refused ones. *)
 val {installed, ...} =
   E.fill_module_store (HolbuildRemoteCache.remote "$remote_url") "$project/.holbuild/obj" tc
-    {deps = map dep ["A", "B", "C", "D"], loads = []} (Time.+ (Time.now (), Time.fromSeconds 120));
-val _ = check "the writer didn't store D's module after C's refused one"
+    {deps = map dep ["A", "B", "C", "C2", "D"], loads = []} (Time.+ (Time.now (), Time.fromSeconds 120));
+val _ = check "the writer didn't store D's module after the refused ones"
           (installed = 1 andalso length (modules "-D-") = 1);
 
 (* The parent's capture of D's deps heap, from a child that lists the
@@ -184,20 +197,25 @@ val _ = OS.FileSys.rename {old = "$tmpdir/A.pmo", new = a};
 SML
 (cd "$HOLBUILD_ROOT" && HOLBUILD_CACHE="$HOLBUILD_CACHE" HOLBUILD_TEST_MODULE_WRITER_LIMIT=1 \
   "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/check.sml")
-[[ $(sha256sum < "$c_path") == "$c_sha" ]] || { echo "the writer wrote C's refused module again" >&2; exit 1; }
+[[ $(sha256sum < "$c_path") == "$c_sha" && $(sha256sum < "$(c_module C2)") == "$c2_sha" ]] ||
+  { echo "the writer wrote a refused module again" >&2; exit 1; }
 
 # A worker sharing heaps runs an edited D: its parent shares no deps heap
 # that requires C's refused module, which the preload couldn't release
 # (FAILS=1), and shares one that doesn't.  The child goes on either way.
+# exec_d NAME FAILS [unshared [MIN]]: MIN, the fewest missing modules
+# worth prefetching or writing.
 exec_d() {
-  local name=$1 spec
+  local name=$1 spec share=(--share-heaps)
+  [[ ${3:-} != unshared ]] || share=()
   printf '\n(* %s *)\n' "$name" >> "$project/src/DScript.sml"
   (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload DTheory) > "$tmpdir/$name.batch"
   spec=$(awk '$1 == "action" && $5 == "module-refusal:DTheory" { print $4 }' "$tmpdir/$name.batch")
   [[ -n $spec ]] || { echo "D has no action: $(cat "$tmpdir/$name.batch")" >&2; exit 1; }
   rm -rf "$HOLBUILD_CACHE/checkpoint-store" "$HOLBUILD_CACHE/checkpoints"
-  HOLBUILD_TEST_RELEASE_MODULE_FAILS=$2 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" \
-    --share-heaps --cache-limit-gb 1000 --result "$tmpdir/$name.result" > "$tmpdir/$name.log" 2>&1 ||
+  HOLBUILD_TEST_RELEASE_MODULE_FAILS=$2 HOLBUILD_TEST_MODULE_MIN_MISSING=${4:-} \
+    "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" \
+    ${share[@]+"${share[@]}"} --cache-limit-gb 1000 --result "$tmpdir/$name.result" > "$tmpdir/$name.log" 2>&1 ||
     { cat "$tmpdir/$name.log" "$tmpdir/$name.result" >&2; exit 1; }
   require_grep '^status=built$' "$tmpdir/$name.result"
 }
@@ -211,7 +229,42 @@ if grep -q 'not sharing the deps-loaded heap' "$tmpdir/released.log"; then
 fi
 [[ -n $(heap_entries) ]] || { cat "$tmpdir/released.log" >&2; echo "D's deps heap wasn't shared" >&2; exit 1; }
 grep -q -- ' module .*-A-.*\.pmo$' $(heap_entries) || { echo "the shared heap doesn't load A's module" >&2; exit 1; }
-if grep -q -- ' module .*-C-.*\.pmo$' $(heap_entries); then
+if grep -q -- ' module .*-C2\?-.*\.pmo$' $(heap_entries); then
   echo "the shared heap requires C's refused module" >&2; exit 1
 fi
 [[ $(sha256sum < "$c_path") == "$c_sha" ]] || { echo "the worker wrote C's refused module again" >&2; exit 1; }
+b2_entries=$(heap_entries)
+
+# Back on the first branch, a worker whose store lacks A's module, which
+# no host published, records it as unpublished, and writes and publishes
+# it after its run.  Lacking it again, the next fetches it before its
+# preload, whose shared heap then loads it.
+set_a "'a"
+a1_module() { find "$store" -name "*-A-$a1_dat.pmo"; }
+rm "$(a1_module)"
+exec_d publish-a 0 unshared 1
+require_grep "A-$a1_dat\.pmo" "$store/.probed-missing"
+[[ -n $(a1_module) ]] || { echo "the worker didn't write A's missing module" >&2; exit 1; }
+rm "$(a1_module)" "$store/.probed-missing"
+exec_d prefetch-a 0 shared 1
+b1_entries=$(comm -13 <(echo "$b2_entries") <(heap_entries))
+[[ -n $b1_entries ]] || { echo "the first branch's heap wasn't shared" >&2; exit 1; }
+grep -q -- " module .*-A-$a1_dat\.pmo$" $b1_entries ||
+  { echo "the first branch's shared heap doesn't load the A module fetched before its preload" >&2; exit 1; }
+
+# Each branch in turn resumes from its own shared heap: neither's
+# modules were replaced.
+resumed() {
+  grep -qE '^phase-ms=(.*,)?res(deps|ctx)n:1' "$tmpdir/$1.result" ||
+    { echo "$1 didn't resume:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1; }
+  if grep -qE '^phase-ms=(.*,)?(rstmodrejn|rstdropn|rstmoddropn):' "$tmpdir/$1.result"; then
+    echo "$1 dropped a heap:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1
+  fi
+}
+set_a bool
+exec_d resume-2 0
+resumed resume-2
+set_a "'a"
+exec_d resume-1 0
+resumed resume-1
+[[ $(sha256sum < "$c_path") == "$c_sha" ]] || { echo "a worker wrote C's module again" >&2; exit 1; }

@@ -817,6 +817,25 @@ fun get_action_using usable cache key = Option.map (remember_action cache) (fetc
 
 fun get_action cache key = get_action_using (fn _ => true) cache key
 
+(* The entry for KEY, as get_action finds it, and, with none, whether a
+   node answered that it holds none (a 404), not with an error or an
+   unusable entry. *)
+fun probe_action cache key =
+  let
+    val tmp = temp_path "action"
+    fun found () = SOME (remember_action cache (metadata_manifest (read_text tmp))) handle _ => NONE
+    val result =
+      case send_urls "GET" (action_urls cache key) tmp
+             (fn url => get_status {url = url, dst = tmp, timeout = stall_timeout_seconds}) of
+          SOME (_, HolbuildHttp.Response 200) => {found = found (), missing = false}
+        | SOME (_, HolbuildHttp.Response 404) => {found = NONE, missing = true}
+        | _ => {found = NONE, missing = false}
+  in
+    remove_file tmp; result
+  end
+  handle e as Unavailable _ => raise e
+       | _ => {found = NONE, missing = false}
+
 fun action_metadata cache key text =
   let
     val refs = HolbuildCacheTransfer.unique_blobs text

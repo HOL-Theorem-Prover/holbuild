@@ -23,10 +23,10 @@ mkdir -p "$tmpdir/cache" "$tmpdir/root/src" "$tmpdir/root/.holbuild"
 start_remote_cache_server "$tmpdir/remote2" "$tmpdir/server2"
 server2_pid=$server_pid
 remote2_url=$remote_url
-start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 
 sha() { sha1sum "$1" | cut -d' ' -f1; }
-for hol in hol1 hol2 hol3 hol4 hol5 hol6 hol7; do
+for hol in hol1 hol2 hol3 hol4 hol5 hol6 hol7 hol8; do
   mkdir -p "$tmpdir/$hol/bin" "$tmpdir/$hol/sigobj" "$tmpdir/$hol/tools-poly/poly"
   : > "$tmpdir/$hol/bin/hol.state"
   : > "$tmpdir/$hol/sigobj/boolTheory.uo"
@@ -57,6 +57,39 @@ for i in $(seq 1 16); do
   echo "\"ab12-P$i-$(sha "$tmpdir/root/src/P${i}Theory.dat").pmo\""
 done | paste -sd, > "$tmpdir/p-modules"
 
+# Scripts the fake HOL starts in a session of its own (detach), so they
+# outlive it.  replace-entry ENTRY FILE: once ENTRY is put on either node,
+# it is replaced with FILE on both.
+cat > "$tmpdir/replace-entry" <<SH
+for _ in \$(seq 3000); do
+  [[ -e "$tmpdir/remote/ac/\$1" || -e "$tmpdir/remote2/ac/\$1" ]] && break
+  sleep 0.01
+done
+for node in remote remote2; do cp "\$2" "$tmpdir/\$node-entry"; mv "$tmpdir/\$node-entry" "$tmpdir/\$node/ac/\$1"; done
+SH
+# put-during-upload ENTRY FILE: puts FILE as ENTRY once a blob upload is held.
+cat > "$tmpdir/put-during-upload" <<SH
+for _ in \$(seq 3000); do [[ -e "$tmpdir/control/cas-put-count" ]] && break; sleep 0.01; done
+mv "\$2" "$tmpdir/remote/ac/\$1"
+touch "$tmpdir/control/cas-put-release"
+SH
+# hold-lookups: lets the held entry GETs go after 16 s.
+cat > "$tmpdir/hold-lookups" <<SH
+sleep 16
+touch "$tmpdir/control/action-get-release"
+SH
+# drop-new-entry: removes from both nodes the first entry put after it starts.
+cat > "$tmpdir/drop-new-entry" <<SH
+list() { ls "$tmpdir/remote/ac" "$tmpdir/remote2/ac" 2>/dev/null | grep -v -e : -e '^\$' | LC_ALL=C sort -u; }
+before=\$(list)
+for _ in \$(seq 3000); do
+  new=\$(LC_ALL=C comm -13 <(printf '%s\n' "\$before") <(list))
+  [[ -n \$new ]] && break
+  sleep 0.01
+done
+for entry in \$new; do rm -f "$tmpdir/remote/ac/\$entry" "$tmpdir/remote2/ac/\$entry"; done
+SH
+
 cat > "$tmpdir/writer.sml" <<SML
 use "sml/holbuild-script.sml";
 structure E = HolbuildBuildExec;
@@ -80,6 +113,7 @@ fun store hol = E.module_store ("$tmpdir/" ^ hol);
 fun stored hol file = exists (OS.Path.concat (store hol, file));
 val a = "ab12-A-$a_sha.pmo";
 val b = "ab12-B-$b_sha.pmo";
+fun detach script = "setsid bash $tmpdir/" ^ script ^ " </dev/null >/dev/null 2>&1 &\n";
 fun script_has hol text = String.isSubstring text (E.read_text ("$tmpdir/" ^ hol ^ ".script"));
 
 (* A HOL without the module helper. *)
@@ -251,6 +285,7 @@ val _ = writes [a];
 val _ = fill_by "hol5" 100;
 val a_entry = hd (List.filter (fn e => not (List.exists (fn x => x = e) earlier)) (entries "$tmpdir/remote/ac"));
 val winner = E.read_text (OS.Path.concat (store "hol5", a));
+val _ = E.copy_binary ("$tmpdir/remote/ac/" ^ a_entry) "$tmpdir/a-entry-saved";
 val _ = OS.FileSys.rename {old = "$tmpdir/remote/ac/" ^ a_entry, new = "$tmpdir/a-entry"};
 val _ = remove_store "hol5";
 val _ = E.write_text "$tmpdir/plant" ("mv $tmpdir/a-entry $tmpdir/remote/ac/" ^ a_entry ^ "\n");
@@ -268,6 +303,27 @@ val _ = E.write_text "$tmpdir/plant" ("printf restored > " ^ OS.Path.concat (sto
 val {installed, published, ...} = fill_by "hol5" 100;
 val _ = check "a module in the store was replaced"
           (installed = 0 andalso published = 1 andalso E.read_text (OS.Path.concat (store "hol5", a)) = "restored");
+(* On a cache of one node, an entry put is not read back. *)
+val requests_after_put =
+  List.foldl (fn (line, after) => if line = "PUT /ac/" ^ a_entry then [] else line :: after) []
+    (String.tokens (fn c => c = #"\n") (E.read_text "$tmpdir/server/requests.log"));
+val _ = check "an entry put on a cache of one node was read back"
+          (not (List.exists (fn line => line = "GET /ac/" ^ a_entry) requests_after_put));
+
+(* Another host publishes A while this writer uploads its module: the
+   put conflicts, and the other host's module is stored. *)
+val _ = OS.FileSys.rename {old = "$tmpdir/remote/ac/" ^ a_entry, new = "$tmpdir/a-mine"};
+val _ = remove_store "hol5";
+val _ = E.write_text "$tmpdir/plant"
+          ("touch $tmpdir/control/cas-put-enable\n" ^
+           detach ("put-during-upload " ^ a_entry ^ " $tmpdir/a-entry-winner"));
+val _ = E.copy_binary "$tmpdir/a-entry-saved" "$tmpdir/a-entry-winner";
+val {installed, fetched, published, ...} = fill_by "hol5" 100;
+val _ = List.app (fn f => OS.FileSys.remove ("$tmpdir/control/" ^ f) handle OS.SysErr _ => ())
+          ["cas-put-enable", "cas-put-count", "cas-put-release"];
+val _ = check "a module whose put conflicted was stored over the published one"
+          (installed = 0 andalso fetched = 1 andalso published = 0 andalso
+           E.read_text (OS.Path.concat (store "hol5", a)) = winner);
 
 (* On a cache of two nodes, a writer stores the modules it published once
    it reads their entries back, and puts them on the other node too. *)
@@ -296,12 +352,7 @@ val winner = E.read_text (OS.Path.concat (store "hol6", p16));
 val _ = OS.FileSys.rename {old = "$tmpdir/remote/ac/" ^ p16_entry, new = "$tmpdir/p16-entry"};
 val _ = OS.FileSys.remove ("$tmpdir/remote2/ac/" ^ p16_entry);
 val _ = OS.FileSys.remove (OS.Path.concat (store "hol6", p16));
-val _ = E.write_text "$tmpdir/plant"
-          ("(for _ in \$(seq 1000); do " ^
-           "[[ -e $tmpdir/remote/ac/" ^ p16_entry ^ " || -e $tmpdir/remote2/ac/" ^ p16_entry ^ " ]] && break; " ^
-           "sleep 0.01; done; " ^
-           "for node in remote remote2; do cp $tmpdir/p16-entry $tmpdir/winner-entry; " ^
-           "mv $tmpdir/winner-entry $tmpdir/\$node/ac/" ^ p16_entry ^ "; done) </dev/null >/dev/null 2>&1 &\n");
+val _ = E.write_text "$tmpdir/plant" (detach ("replace-entry " ^ p16_entry ^ " $tmpdir/p16-entry"));
 val {installed, fetched, published, ...} = fill6 ();
 val _ = check "the writer's module was stored over the one published before its read back"
           (installed = 0 andalso fetched = 1 andalso published = 0 andalso
@@ -309,6 +360,18 @@ val _ = check "the writer's module was stored over the one published before its 
 val _ = check "the writer's entry was put on a node over the one published before its read back"
           (List.all (fn node => E.read_text ("$tmpdir/" ^ node ^ "/ac/" ^ p16_entry) = E.read_text "$tmpdir/p16-entry")
                     ["remote", "remote2"]);
+(* Its entry gone at the read back, the writer stores its module. *)
+val p15 = List.nth (ps, 14);
+val _ = OS.FileSys.remove (OS.Path.concat (store "hol6", p16));
+val _ = List.app (fn node => OS.FileSys.remove ("$tmpdir/" ^ node ^ "/ac/" ^ p16_entry)) ["remote", "remote2"];
+val earlier = entries "$tmpdir/remote/ac" @ entries "$tmpdir/remote2/ac";
+fun fresh dir = List.filter (fn e => not (List.exists (fn x => x = e) earlier)) (entries dir);
+val _ = writes [p15];
+val _ = E.write_text "$tmpdir/plant" (detach "drop-new-entry");
+val {installed, fetched, published, ...} = fill6 ();
+val _ = check "a writer whose entry was gone at its read back did not store its module"
+          (installed = 1 andalso fetched = 0 andalso published = 1 andalso stored "hol6" p15 andalso
+           null (fresh "$tmpdir/remote/ac") andalso null (fresh "$tmpdir/remote2/ac"));
 
 (* Before an action's first child, a new store fetches what another host
    published, once it has its base theories (from the v1 store) and lacks
@@ -321,14 +384,23 @@ val published16 = a :: b :: List.take (ps, 14);
 val _ = writes published16;
 val {published, ...} = fill_by "hol7" 100;
 val _ = check "the first writer did not publish 16 modules" (published = 16 andalso runs "hol7" = 1);
+(* A's entry outlives its blob. *)
+val a7_blob = blob_path "hol7" a;
+val a7_bytes = E.read_text a7_blob;
+val _ = OS.FileSys.remove a7_blob;
 val _ = remove_store "hol7";
 fun requests () = length (String.tokens (fn c => c = #"\n") (E.read_text "$tmpdir/server/requests.log"));
 fun prefetch () = E.prefetch_modules remote "$tmpdir/root" (tc "hol7") wanted;
 val _ = prefetch ();
 val probed = OS.Path.concat (store "hol7", ".probed-missing");
-val _ = check "published modules were not prefetched" (List.all (stored "hol7") published16);
-val _ = check "the unpublished modules were not recorded"
-          (exists probed andalso length (String.tokens Char.isSpace (E.read_text probed)) = 2);
+val _ = check "published modules were not prefetched" (List.all (stored "hol7") (tl published16));
+val _ = check "a module whose blob is gone was stored" (not (stored "hol7" a));
+val _ = check "the unpublished modules were not recorded, or one whose blob is gone was"
+          (exists probed andalso
+           E.sort_strings (String.tokens Char.isSpace (E.read_text probed)) =
+           E.sort_strings (List.mapPartial E.module_file_theory_part (List.drop (ps, 14))));
+val _ = E.write_text a7_blob a7_bytes;
+val _ = E.write_text (OS.Path.concat (store "hol7", a)) a7_bytes;
 val _ = check "a writer ran to prefetch" (runs "hol7" = 1);
 fun remove7 files = List.app (fn f => OS.FileSys.remove (OS.Path.concat (store "hol7", f))) files;
 val _ = remove7 (List.take (published16, 15));
@@ -345,6 +417,36 @@ val _ = check "a prefetch didn't give a held lock up in time"
 val _ = unlock holder;
 val _ = prefetch ();
 val _ = check "16 missing modules were not prefetched" (List.all (stored "hol7") published16);
+
+(* With a cache, the writer's child is stopped in time for a stalled
+   request before the publishing deadline, 10 s past the writer's. *)
+val _ = E.write_text "$tmpdir/hol8/tools-poly/poly/theory_modules.ML" "";
+val _ = writes [a, b];
+val _ = E.write_text "$tmpdir/hang" "";
+val {installed, published, ...} = fill_by "hol8" 33;
+val _ = OS.FileSys.remove "$tmpdir/hang";
+val _ = check "a writer's child ran past the time to publish its modules"
+          (installed = 2 andalso published = 2);
+(* A lookup that ends with no time left for an upload: the module is
+   stored, and not uploaded. *)
+val _ = writes [List.nth (ps, 0)];
+val _ = E.write_text "$tmpdir/plant"
+          ("touch $tmpdir/control/action-get-enable\n" ^
+           detach "hold-lookups");
+val puts = cas_puts ();
+val {installed, published, ...} = fill_by "hol8" 33;
+val _ = List.app (fn f => OS.FileSys.remove ("$tmpdir/control/" ^ f) handle OS.SysErr _ => ())
+          ["action-get-enable", "action-get-count", "action-get-release"];
+val _ = check "a module with no time left to publish was not stored, or was uploaded"
+          (installed = 1 andalso published = 0 andalso stored "hol8" (List.nth (ps, 0)) andalso cas_puts () = puts);
+
+(* The remote key of a module is the v1 store's. *)
+val _ = check "a module's remote key changed"
+          (E.module_remote_keys (tc "hol1") [("w", "$tmpdir/root/src/ATheory.dat")] =
+           [("w", HolbuildHash.string_sha256
+                    ("holbuild-theory-module-v1\ntoolchain=" ^ HolbuildToolchain.toolchain_key (tc "hol1") ^
+                     "\nstore=" ^ HolbuildHash.string_sha256 "$tmpdir/hol1" ^ "\nmodule=w\ndat-sha256=" ^
+                     HolbuildHash.file_sha256 "$tmpdir/root/src/ATheory.dat" ^ "\n"))]);
 
 (* A writer whose lock file the sweep unlinked between its open and its
    lock holds a lock nobody else sees: it must not write. *)

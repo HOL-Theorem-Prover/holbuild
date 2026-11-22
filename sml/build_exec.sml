@@ -14371,7 +14371,11 @@ val writer_root_prefix = "module-writer-"
    sixteen theories from their .dat files instead of their modules, so an
    action that lacks only the few parents just built loads those from
    their .dat files. *)
-val module_writer_min_missing = 16
+fun module_writer_min_missing () =
+  (* Tests lower it (HOLBUILD_TEST_MODULE_MIN_MISSING). *)
+  case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_TEST_MODULE_MIN_MISSING") of
+      SOME n => n
+    | NONE => 16
 
 (* Files the module writer leaves in a toolchain's store beside its
    modules and its lock.  [module_store_unsupported]: the toolchain has
@@ -14533,9 +14537,11 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
       if not (module_request_fits deadline) then ()
       else HolbuildRemoteCache.retrying_within deadline (fn () =>
         (Mutex.lock mutex; probes := !probes + 1; Mutex.unlock mutex;
-         case HolbuildRemoteCache.get_action remote key of
-             NONE => (Mutex.lock mutex; unpublished := name :: !unpublished; Mutex.unlock mutex)
-           | SOME text =>
+         case HolbuildRemoteCache.probe_action remote key of
+             {found = NONE, missing} =>
+               if missing then (Mutex.lock mutex; unpublished := name :: !unpublished; Mutex.unlock mutex)
+               else ()
+           | {found = SOME text, ...} =>
                case shared_manifest_entries text of
                    [("file", sha, file)] =>
                      if not (plain_file_name file andalso module_file_theory_part file = SOME name) then
@@ -14604,7 +14610,7 @@ fun converge_modules remote {store, staging, modules, stale, deadline} =
           | _ => NONE
       end
     fun heal (file, key) =
-      ((case upload file of
+      ((case (if module_request_fits deadline then upload file else NONE) of
             SOME sha =>
               if module_request_fits deadline andalso
                  HolbuildRemoteCache.replace_action_everywhere remote {key = key, text = manifest file sha}
@@ -14643,7 +14649,7 @@ fun converge_modules remote {store, staging, modules, stale, deadline} =
         case lookup key of
             SOME text => (install_published (file, key) text; NONE)
           | NONE =>
-              case upload file of
+              case (if module_request_fits deadline then upload file else NONE) of
                   NONE => (install_own file; NONE)
                 | SOME sha =>
                     if not (module_request_fits deadline) then (install_own file; NONE)
@@ -14656,10 +14662,14 @@ fun converge_modules remote {store, staging, modules, stale, deadline} =
                               if length (HolbuildRemoteCache.action_urls remote key) <= 1
                               then (published_one (); install_own file; NONE)
                               else SOME (file, key, text)
+                          (* Another writer's entry: with no time to fetch
+                             its module, none is stored. *)
                           | HolbuildCacheBackend.Conflict _ =>
-                              ((case lookup key of
-                                    SOME winner => install_published (file, key) winner
-                                  | NONE => install_own file);
+                              ((if not (module_request_fits deadline) then ()
+                                else
+                                  case lookup key of
+                                      SOME winner => install_published (file, key) winner
+                                    | NONE => install_own file);
                                NONE)
                           | _ => (install_own file; NONE)
                       end
@@ -14890,7 +14900,7 @@ fun write_missing_modules remote root tc wanted deadline =
       end
     fun worth_writing missing =
       not (null missing) andalso
-      not (isSome base_theories andalso length missing < module_writer_min_missing)
+      not (isSome base_theories andalso length missing < module_writer_min_missing ())
     (* HOL maps <dir>/xTheory.sml to <dir>/.hol/objs/xTheory.sml itself,
        so it is given the unmapped name of a toolchain theory. *)
     fun hol_name b =
@@ -14932,7 +14942,9 @@ fun write_missing_modules remote root tc wanted deadline =
           Time.- (Time.+ (deadline, module_publish_grace),
                   Time.fromSeconds (Int.toLarge HolbuildRemoteCache.stall_timeout_seconds + 2))
       in
-        if not (HolbuildRemoteCache.disabled ()) andalso
+        (* With fail_closed, an open breaker raises rather than says the
+           cache is off. *)
+        if not (HolbuildRemoteCache.disabled () handle HolbuildRemoteCache.Unavailable _ => true) andalso
            Time.<= (Time.+ (now, module_writer_min_time), publish_by)
         then earliest (limit, publish_by)
         else limit
@@ -15110,7 +15122,7 @@ fun prefetch_modules remote root tc wanted =
                (if file_exists probed_file then String.tokens Char.isSpace (read_text probed_file) else []))
           val missing = List.filter (fn (e, _) => not (Binaryset.member (known, e))) expected
         in
-          if isSome base_theories andalso length missing >= module_writer_min_missing then missing else []
+          if isSome base_theories andalso length missing >= module_writer_min_missing () then missing else []
         end
       val give_up = Time.+ (Time.now (), module_prefetch_lock_wait)
       fun acquire () =
