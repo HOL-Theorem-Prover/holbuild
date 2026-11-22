@@ -414,10 +414,11 @@ PY
 link_hol_toolchain_cache "$tmpdir/worker-c"
 cp -r "$tmpdir/worker-b/actions" "$tmpdir/worker-b/blobs" "$tmpdir/worker-c/"
 printf 'corrupt dependency\n' > "$tmpdir/worker-c/blobs/$dep_dat"
-# When worker c compresses a theory module to publish it, a heap restore
-# renames another copy over the module in the store, as a sibling worker's
-# can (fetch_heap_modules): the shim saves the module and puts other bytes
-# at its path before the real zstd reads its input.  It also records
+# When worker c compresses a theory module its writer wrote, to publish it
+# before storing it, a heap restore puts another copy of the module in the
+# store, as a sibling worker's can (fetch_heap_modules): the shim saves the
+# first such module and puts other bytes at its path in the store before
+# the real zstd reads its input.  The store keeps the restored copy.  It also records
 # whether worker c's action-root lock is free by then: the writer runs
 # after exec-action lets the worker's next action have the root.  The
 # probes take the lock, so concurrent compressions take turns.
@@ -436,12 +437,12 @@ try:
 except OSError:
     print("held")' "$tmpdir/worker-c/action.lock" >> "$tmpdir/lock-at-publish"
   [[ -e "$tmpdir/previous-let-go" ]] || echo "before the previous action let go" >> "$tmpdir/lock-at-publish"
-  for module in "$tmpdir"/worker-c/theory-modules/*/"\$(basename "\$src")"; do
-    [[ -f \$module && ! -e "$swapped/\$(basename "\$module")" ]] || continue
-    cp "\$module" "$swapped/"
+  module=\$(dirname "\$(dirname "\$src")")/\$(basename "\$src")
+  if [[ \$src == */.writer/*.pmo && -z \$(ls "$swapped") ]]; then
+    cp "\$src" "$swapped/"
     printf 'another module\\n' > "\$module.swap"
     mv "\$module.swap" "\$module"
-  done
+  fi
 fi
 exec "$(command -v zstd)" "\$@"
 SH
@@ -480,6 +481,8 @@ if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   [[ $checked -gt 0 ]] || { echo "worker c published none of the modules swapped under it" >&2; exit 1; }
   for original in "$swapped"/*; do
     for module in "$tmpdir"/worker-c/theory-modules/*/"$(basename "$original")"; do
+      [[ $(< "$module") == 'another module' ]] ||
+        { echo "worker c stored its module over the one restored meanwhile: $module" >&2; exit 1; }
       cp "$original" "$module.swap"
       mv "$module.swap" "$module"
     done

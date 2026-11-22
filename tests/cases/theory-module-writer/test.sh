@@ -16,12 +16,17 @@ source "$ROOT/tests/lib.sh"
 tmpdir=$(make_temp_dir)
 other_fs=
 server_pid=
-trap '[[ -z $server_pid ]] || kill "$server_pid" 2>/dev/null; cleanup_temp_dir "$tmpdir"; [[ -z $other_fs ]] || rm -rf "$other_fs"' EXIT
+server2_pid=
+trap '[[ -z $server_pid ]] || kill "$server_pid" 2>/dev/null; [[ -z $server2_pid ]] || kill "$server2_pid" 2>/dev/null; cleanup_temp_dir "$tmpdir"; [[ -z $other_fs ]] || rm -rf "$other_fs"' EXIT
 mkdir -p "$tmpdir/cache" "$tmpdir/root/src" "$tmpdir/root/.holbuild"
+# A second node, for a cache of two.
+start_remote_cache_server "$tmpdir/remote2" "$tmpdir/server2"
+server2_pid=$server_pid
+remote2_url=$remote_url
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 
 sha() { sha1sum "$1" | cut -d' ' -f1; }
-for hol in hol1 hol2 hol3 hol4; do
+for hol in hol1 hol2 hol3 hol4 hol5 hol6 hol7; do
   mkdir -p "$tmpdir/$hol/bin" "$tmpdir/$hol/sigobj" "$tmpdir/$hol/tools-poly/poly"
   : > "$tmpdir/$hol/bin/hol.state"
   : > "$tmpdir/$hol/sigobj/boolTheory.uo"
@@ -35,6 +40,7 @@ stat -L -c %d "\$out" > "$tmpdir/$hol.output-device"
 while read -r file; do
   case \$file in *.pmo) date +%s%N > "\$out/\$file" ;; *) : > "\$out/\$file" ;; esac
 done < "$tmpdir/writes"
+[[ ! -e "$tmpdir/plant" ]] || { bash "$tmpdir/plant"; rm "$tmpdir/plant"; }
 [[ ! -e "$tmpdir/hang" ]] || sleep 20
 SH
   chmod +x "$tmpdir/$hol/bin/hol"
@@ -91,7 +97,7 @@ val _ = List.app (fn p => E.write_text (OS.Path.concat (store "hol1", p)) "") ps
 val _ = writes [a, b, "base-theories", "ab12-C-$b_sha.pmo", "other"];
 val _ = fill "hol1";
 val _ = check "no writer ran for an empty store" (runs "hol1" = 1);
-val _ = check "the writer was not asked for the base theories" (script_has "hol1" "TheoryReader.is_canonical");
+val _ = check "the writer was not asked for the base theories" (script_has "hol1" "Theory.ancestry");
 val _ = check "the writer was not given the action's theories"
           (script_has "hol1" "ATheory.sml" andalso script_has "hol1" "BTheory.sml");
 val _ = check "a module or the base theories were not stored"
@@ -136,7 +142,7 @@ val {installed, fetched, ...} = fill_by "hol1" 100;
 val _ = check "B was not fetched" (fetched = 1);
 val _ = check "no writer ran for 16 missing modules" (runs "hol1" = 2 andalso installed = 16);
 val _ = check "the missing modules were not stored" (List.all (stored "hol1") (b :: ps));
-val _ = check "the base theories were asked for again" (not (script_has "hol1" "TheoryReader.is_canonical"));
+val _ = check "the base theories were asked for again" (not (script_has "hol1" "Theory.ancestry"));
 val _ = check "the base theories were replaced"
           (E.read_text (OS.Path.concat (store "hol1", "base-theories")) = "bool\n");
 
@@ -235,6 +241,110 @@ val puts = cas_puts ();
 val {fetched, published, ...} = fill_by "hol4" 100;
 val _ = check "a module of a present entry was published"
           (fetched = 1 andalso published = 0 andalso cas_puts () = puts);
+
+(* Another host published A while this writer ran, with other bytes:
+   its module is stored, not this writer's, which isn't uploaded. *)
+val _ = E.write_text "$tmpdir/hol5/tools-poly/poly/theory_modules.ML" "";
+fun entries dir = E.sort_strings (map OS.Path.file (HolbuildCache.children dir));
+val earlier = entries "$tmpdir/remote/ac";
+val _ = writes [a];
+val _ = fill_by "hol5" 100;
+val a_entry = hd (List.filter (fn e => not (List.exists (fn x => x = e) earlier)) (entries "$tmpdir/remote/ac"));
+val winner = E.read_text (OS.Path.concat (store "hol5", a));
+val _ = OS.FileSys.rename {old = "$tmpdir/remote/ac/" ^ a_entry, new = "$tmpdir/a-entry"};
+val _ = remove_store "hol5";
+val _ = E.write_text "$tmpdir/plant" ("mv $tmpdir/a-entry $tmpdir/remote/ac/" ^ a_entry ^ "\n");
+val puts = cas_puts ();
+val {installed, fetched, published, ...} = fill_by "hol5" 100;
+val _ = check "the writer's module was stored over the published one"
+          (runs "hol5" = 2 andalso installed = 0 andalso fetched = 1 andalso published = 0 andalso
+           E.read_text (OS.Path.concat (store "hol5", a)) = winner);
+val _ = check "a module another host published was uploaded" (cas_puts () = puts);
+
+(* A module a restore put in the store while the writer ran stays. *)
+val _ = remove_store "hol5";
+val _ = OS.FileSys.remove ("$tmpdir/remote/ac/" ^ a_entry);
+val _ = E.write_text "$tmpdir/plant" ("printf restored > " ^ OS.Path.concat (store "hol5", a) ^ "\n");
+val {installed, published, ...} = fill_by "hol5" 100;
+val _ = check "a module in the store was replaced"
+          (installed = 0 andalso published = 1 andalso E.read_text (OS.Path.concat (store "hol5", a)) = "restored");
+
+(* On a cache of two nodes, a writer stores the modules it published once
+   it reads their entries back, and puts them on the other node too. *)
+val remote2 = HolbuildRemoteCache.remote "$remote_url,$remote2_url";
+val _ = E.write_text "$tmpdir/hol6/tools-poly/poly/theory_modules.ML" "";
+val _ = writes [a, b];
+val {installed, published, ...} =
+  E.fill_module_store remote2 "$tmpdir/root" (tc "hol6") wanted (Time.+ (Time.now (), Time.fromSeconds 100));
+val _ = check "a writer on two nodes did not store or publish its modules"
+          (installed = 2 andalso published = 2 andalso List.all (stored "hol6") [a, b]);
+val _ = check "an entry is not on both nodes"
+          (length (entries "$tmpdir/remote2/ac") >= 2 andalso
+           List.all (fn e => exists ("$tmpdir/remote/ac/" ^ e)) (entries "$tmpdir/remote2/ac"));
+
+(* Another host publishes a module between this writer's entry and its
+   read back: its module is stored, not this writer's, and this writer's
+   entry is on neither node. *)
+val p16 = List.nth (ps, 15);
+fun fill6 () =
+  E.fill_module_store remote2 "$tmpdir/root" (tc "hol6") wanted (Time.+ (Time.now (), Time.fromSeconds 100));
+val earlier = entries "$tmpdir/remote/ac";
+val _ = writes [p16];
+val _ = fill6 ();
+val p16_entry = hd (List.filter (fn e => not (List.exists (fn x => x = e) earlier)) (entries "$tmpdir/remote/ac"));
+val winner = E.read_text (OS.Path.concat (store "hol6", p16));
+val _ = OS.FileSys.rename {old = "$tmpdir/remote/ac/" ^ p16_entry, new = "$tmpdir/p16-entry"};
+val _ = OS.FileSys.remove ("$tmpdir/remote2/ac/" ^ p16_entry);
+val _ = OS.FileSys.remove (OS.Path.concat (store "hol6", p16));
+val _ = E.write_text "$tmpdir/plant"
+          ("(for _ in \$(seq 1000); do " ^
+           "[[ -e $tmpdir/remote/ac/" ^ p16_entry ^ " || -e $tmpdir/remote2/ac/" ^ p16_entry ^ " ]] && break; " ^
+           "sleep 0.01; done; " ^
+           "for node in remote remote2; do cp $tmpdir/p16-entry $tmpdir/winner-entry; " ^
+           "mv $tmpdir/winner-entry $tmpdir/\$node/ac/" ^ p16_entry ^ "; done) </dev/null >/dev/null 2>&1 &\n");
+val {installed, fetched, published, ...} = fill6 ();
+val _ = check "the writer's module was stored over the one published before its read back"
+          (installed = 0 andalso fetched = 1 andalso published = 0 andalso
+           E.read_text (OS.Path.concat (store "hol6", p16)) = winner);
+val _ = check "the writer's entry was put on a node over the one published before its read back"
+          (List.all (fn node => E.read_text ("$tmpdir/" ^ node ^ "/ac/" ^ p16_entry) = E.read_text "$tmpdir/p16-entry")
+                    ["remote", "remote2"]);
+
+(* Before an action's first child, a new store fetches what another host
+   published, once it has its base theories (from the v1 store) and lacks
+   16 or more modules not found unpublished before; it records those found
+   unpublished, and gives the store's lock up after a while. *)
+val _ = E.write_text "$tmpdir/hol7/tools-poly/poly/theory_modules.ML" "";
+val _ = OS.FileSys.mkDir (E.module_store_v1 "$tmpdir/hol7");
+val _ = E.write_text (OS.Path.concat (E.module_store_v1 "$tmpdir/hol7", "base-theories")) "bool\n";
+val published16 = a :: b :: List.take (ps, 14);
+val _ = writes published16;
+val {published, ...} = fill_by "hol7" 100;
+val _ = check "the first writer did not publish 16 modules" (published = 16 andalso runs "hol7" = 1);
+val _ = remove_store "hol7";
+fun requests () = length (String.tokens (fn c => c = #"\n") (E.read_text "$tmpdir/server/requests.log"));
+fun prefetch () = E.prefetch_modules remote "$tmpdir/root" (tc "hol7") wanted;
+val _ = prefetch ();
+val probed = OS.Path.concat (store "hol7", ".probed-missing");
+val _ = check "published modules were not prefetched" (List.all (stored "hol7") published16);
+val _ = check "the unpublished modules were not recorded"
+          (exists probed andalso length (String.tokens Char.isSpace (E.read_text probed)) = 2);
+val _ = check "a writer ran to prefetch" (runs "hol7" = 1);
+fun remove7 files = List.app (fn f => OS.FileSys.remove (OS.Path.concat (store "hol7", f))) files;
+val _ = remove7 (List.take (published16, 15));
+val before_requests = requests ();
+val _ = prefetch ();
+val _ = check "a store lacking 15 modules, besides 2 unpublished, was prefetched"
+          (requests () = before_requests);
+val _ = remove7 [List.nth (published16, 15)];
+val holder = lock_store "hol7";
+val t0 = Time.now ();
+val _ = prefetch ();
+val _ = check "a prefetch didn't give a held lock up in time"
+          (Time.< (Time.- (Time.now (), t0), Time.fromSeconds 25) andalso requests () = before_requests);
+val _ = unlock holder;
+val _ = prefetch ();
+val _ = check "16 missing modules were not prefetched" (List.all (stored "hol7") published16);
 
 (* A writer whose lock file the sweep unlinked between its open and its
    lock holds a lock nobody else sees: it must not write. *)
