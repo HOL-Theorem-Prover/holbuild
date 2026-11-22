@@ -2312,8 +2312,9 @@ found theories the cache lacks, none of them one that doesn't fit, is
 resubmitted with only those theories rebuilt: theories cached on them stay
 cached. On a resubmission for either, the build forgets the ledger, and a batch missing a blob
 (`resubmit: ... blob <sha256>`) is resubmitted too, uploading its blobs again.
-A build resubmits again while a failed batch names a theory missing that no earlier
-resubmission was for, or the first missing blob, up to 5 times. A submission
+A build resubmits again while a failed batch names a theory, missing or not
+fitting, that no earlier resubmission was for in the same way, or the first
+missing blob, up to 5 times. A submission
 answered 5xx, as a proxy in front of the coordinator answers while it
 restarts or the coordinator itself answers while it's overloaded, or 429,
 is retried, and an event stream that breaks is reattached; either is given up on once the coordinator stays unavailable for

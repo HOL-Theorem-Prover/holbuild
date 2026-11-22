@@ -2075,7 +2075,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                closed, and a later batch then finds it built: a theory done
                with no log takes the log of its cancelled action in the
                batches before, seen as they ran or read again from them,
-               each at most once.  Only such a theory:
+               each at most once and only as the build restores its logs, so
+               a log kept late still comes.  Only such a theory:
                a cancelled action's log may be that of a build the cancel
                stopped. *)
             val resubmitted_logs = ref []
@@ -2116,7 +2117,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   case outcome of
                       (HolbuildRemoteExec.Failed (_, failures), _) => map #input_key failures
                     | _ => []
-                val logs = with_cancelled_logs (carry_logs (!resubmitted_logs) batch_logs failed)
+                val logs = carry_logs (!resubmitted_logs) batch_logs failed
                 val _ = resubmitted_logs := []
                 (* Whatever follows (a restore, a resubmission, a local build)
                    doesn't overlap the span analysis; its results stay readable. *)
@@ -2126,7 +2127,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   (HolbuildRemoteExec.Done, progress) =>
                     let
                       val log_error =
-                        (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key logs; NONE)
+                        (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key
+                           (with_cancelled_logs logs); NONE)
                         handle HolbuildBuildExec.Error reason => SOME reason
                              | HolbuildRemoteCache.Unavailable reason => SOME reason
                     in
@@ -2179,7 +2181,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     (* Last, after the required restores and failure logs. *)
                     fun restore_finished_logs () =
                       if final then
-                        HolbuildBuildExec.restore_finished_build_logs build_options tc project plan keys toolchain_key logs
+                        HolbuildBuildExec.restore_finished_build_logs build_options tc project plan keys toolchain_key
+                          (with_cancelled_logs logs)
                       else ()
                     (* With keep-going, the deferred theories that don't depend
                        on a failed one still go to the workers, after which the
