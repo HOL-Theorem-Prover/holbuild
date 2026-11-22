@@ -523,7 +523,10 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   could take (ready, and not held back by single-flight); a claim that
   leases a build wakes the next waiting claim while builds may remain, so
   claims that deferred, or that wait for work another coordinator process
-  made ready, don't sleep out their recheck. A waiting
+  made ready, don't sleep out their recheck. A burst host above the
+  scale-in line (below) takes no build: its claims defer whether or not a
+  better-ranked claim waits, and no build wake goes to it; the line takes
+  it in once the hosts below can't run the builds. A waiting
   standard-only worker still leaves high work available to burst
   workers. This packs work so excess tail hosts can drain for scale-in.
   Each process also remembers, per host, its last 2048 keys, the theories
@@ -533,8 +536,11 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   A host holds a theory's checkpoints if the theory ran there, else possibly
   its context, whose heap a cold host fetches from the cache. Only hosts
   below the scale-in line count as holders: where the hosts, in packing
-  order and counting each host's workers or leases (only leases and waiting
-  claims on a host short of memory), can run the live leases and the ready
+  order and counting each host's leases and its other workers that take
+  the work's tier and are claiming or were seen in the last 15 s, as one is
+  between a result and its next claim, but at least its leases and waiting
+  claims (only those, or the host's reported leases, on a host short of
+  memory), can run the live leases and the ready
   builds, and at least `REMOTE_EXEC_WARM_WORKERS`; for high work, where the
   hosts with a burst worker can run their leases and the ready high work.
   Hosts above it get no preference, so they still empty when demand falls.

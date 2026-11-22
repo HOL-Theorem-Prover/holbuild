@@ -260,7 +260,7 @@ async def test_hosts_keep_their_contexts_through_a_quiet_spell_and_count_those_n
         coordinator.report_worker(host, f"{host}-w", ["standard"])
     coordinator.host_keys = {"host-0": {D1: None}, "host-9": {D1: None, D2: None}}
     gone = coordinator.clock() - timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS + 1)
-    coordinator.host_workers["host-9"] = {"host-9-w": (gone, True)}
+    coordinator.host_workers["host-9"] = {"host-9-w": (gone, ("high", "standard"))}
 
     queue = (await http.get("/v1/queue", headers=CLIENT)).json()
 
@@ -718,6 +718,7 @@ async def test_a_holder_claiming_unwoken_takes_a_ready_build_of_an_earlier_tier_
     await held_in_a_busier_batch(http, coordinator)
     await submit(http, ["h"])
     wait_on_host_0(coordinator)
+    coordinator.report_worker("host-1", "host-1-h", ["high", "standard"])  # as its claim does
 
     claimed = await coordinator.claim(["high", "standard"], "host-1-h", host_id="host-1")
 
