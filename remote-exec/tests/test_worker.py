@@ -731,8 +731,8 @@ def test_sigterm_interrupts_release_make_and_releases_the_lease(
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=8) == 0, (tmp_path / "worker.log").read_text()
     assert server.completed == [failed_record(SPEC, "unavailable", DRAINING)]
-    # The task stops with the worker, so the drain leaves its protection on.
     assert server.protection[0] == {"ProtectionEnabled": True, "ExpiresInMinutes": 180}
+    assert server.protection[-1] == {"ProtectionEnabled": False}  # cleared as the worker exits
     assert not (tmp_path / "releases/v1.2.3/.complete").exists()
     assert not logs[1].exists()
     with (tmp_path / "releases/v1.2.3.lock").open("a") as lock:
@@ -827,17 +827,22 @@ class ScriptedProtection:
     """Protection whose fresh protections ECS accepts or refuses in the order ``fresh`` gives (accepted once it runs
     out), recording each call in ``events``."""
 
-    def __init__(self, events: list[str], fresh: list[bool]) -> None:
+    def __init__(self, events: list[str], fresh: list[bool], clears: list[bool] | None = None) -> None:
         self.events = events
         self.fresh = fresh
-        self.on = False
+        self.clears = clears or []  # whether each clear works (it works once this runs out)
+        self.on: bool | None = False
         self.since = 0.0
         self.times: list[float] = []  # when each call came
 
     def set(self, *, enabled: bool, timeout: float = 30) -> bool:
+        self.times.append(time.monotonic())
+        if not enabled and self.clears and not self.clears.pop(0):
+            self.events.append("off:failed")
+            self.on = None
+            return True
         accepted = not enabled or self.on or not self.fresh or self.fresh.pop(0)
         self.events.append(f"on:{accepted}" if enabled else "off")
-        self.times.append(time.monotonic())
         if accepted:
             if enabled and not self.on:
                 self.since = time.monotonic()
@@ -846,11 +851,12 @@ class ScriptedProtection:
 
 
 def scripted_main(
-    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, fresh: list[bool], claims: int,
-    *, unavailable: bool = False, calls: list[float] | None = None,
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, fresh: list[bool], claims: int | list[bool],
+    *, unavailable: bool = False, calls: list[float] | None = None, clears: list[bool] | None = None,
 ) -> list[str]:
-    """Run ``worker.main`` on ``claims`` claims, each run as an action that sets protection and reports the
-    cache ``unavailable`` or not, and return the claims, runs and protection calls in order."""
+    """Run ``worker.main`` on ``claims`` claims (or, as a list, claims that find work or not), each run as an
+    action that sets protection and reports the cache ``unavailable`` or not, and return the claims, runs and
+    protection calls in order."""
     monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
@@ -858,11 +864,11 @@ def scripted_main(
     monkeypatch.setattr(worker, "wait_for_disk", lambda *_, **_kwargs: None)
     monkeypatch.setattr(worker, "CLAIM_RETRY_SECONDS", 0.01)
     events: list[str] = []
-    protection = ScriptedProtection(events, fresh)
+    protection = ScriptedProtection(events, fresh, clears)
     monkeypatch.setattr(worker, "Protection", lambda *_: protection)
-    left = [claim() for _ in range(claims)]
+    left = [claim() if work else None for work in ([True] * claims if isinstance(claims, int) else claims)]
 
-    def take(*_args: object) -> dict[str, object]:
+    def take(*_args: object) -> dict[str, object] | None:
         events.append("claim")
         if not left:
             raise KeyboardInterrupt
@@ -903,6 +909,19 @@ def test_a_worker_drops_protection_between_actions_once_protected_for_its_longes
     ]
     # Unprotected for the gap, so a rolling deployment that takes protection again at once can still stop it.
     assert calls[2] - calls[1] >= 0.3 and calls[5] - calls[4] >= 0.3
+
+
+def test_a_clear_that_failed_is_tried_again_while_the_worker_is_idle_and_as_it_exits(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = scripted_main(tmp_path, server, monkeypatch, [], [True, False, False], clears=[False, False])
+    assert events == ["claim", "run", "on:True", "claim", "off:failed", "claim", "off:failed", "claim", "off"]
+
+
+def test_without_a_protection_backend_protection_is_never_on(server: Server) -> None:
+    protection = Protection(None, None)
+    assert protection.set(enabled=True)
+    assert protection.on is False
 
 
 def test_a_worker_drops_protection_before_waiting_out_an_unavailable_cache(

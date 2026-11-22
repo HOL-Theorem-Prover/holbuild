@@ -2917,24 +2917,26 @@ class Coordinator:
                     f"{action.input_key} (spec {action.spec_sha256})"
                 )
             # A failure without a log, such as an interruption, keeps the log an earlier attempt left, the only
-            # evidence of why that one failed.
-            await conn.execute(
-                sa.text(
-                    "UPDATE actions SET log_sha256 = CASE WHEN CAST(:failed AS boolean) "
-                    "THEN COALESCE(:log, log_sha256) ELSE :log END, last_failure = :failure, failure_detail = :detail, "
-                    "timings = CAST(CAST(:timings AS text) AS jsonb), finished_at = now() "
-                    "WHERE batch_id = :batch_id AND input_key = :input_key"
-                ),
-                {
-                    "failed": result.status == "failed",
-                    "log": result.log_sha256,
-                    "failure": result.failure,
-                    "detail": result.detail,
-                    "timings": json.dumps(result.timings) if result.timings is not None else None,
-                    "batch_id": batch_id,
-                    "input_key": lease.input_key,
-                },
-            )
+            # evidence of why that one failed. A declined claim ran nothing, so it leaves the last attempt's record,
+            # which the retry rules read, as it was.
+            if result.failure != "declined":
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET log_sha256 = CASE WHEN CAST(:failed AS boolean) "
+                        "THEN COALESCE(:log, log_sha256) ELSE :log END, last_failure = :failure, failure_detail = :detail, "
+                        "timings = CAST(CAST(:timings AS text) AS jsonb), finished_at = now() "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {
+                        "failed": result.status == "failed",
+                        "log": result.log_sha256,
+                        "failure": result.failure,
+                        "detail": result.detail,
+                        "timings": json.dumps(result.timings) if result.timings is not None else None,
+                        "batch_id": batch_id,
+                        "input_key": lease.input_key,
+                    },
+                )
             package, theory = action.theory.split(":", 1)
             # Whether a slot of the batch's cap may be free, or the action's children may be claimed ahead, now: a
             # failure frees the action's slot if it was claimed ahead, and those of the actions claimed ahead of it,

@@ -2548,7 +2548,19 @@ async def test_a_declined_claim_is_retried_without_counting_an_attempt_or_an_int
         assert (await complete(http, token, result("a", "failed", "declined"))).status_code == 200
         assert await states(http, batch_id) == {"a": "ready"}
     action = (await batch(http, batch_id))["actions"][0]
-    assert (action["attempts"], action["interruptions"], action["last_failure"]) == (0, 0, "declined")
+    assert (action["attempts"], action["interruptions"], action["last_failure"]) == (0, 0, None)
+
+
+async def test_a_declined_claim_leaves_the_last_attempts_record_to_the_retry_rules(http: httpx.AsyncClient) -> None:
+    batch_id = await submit(http, ["a"])
+    for failure in ["disk", "declined"]:
+        token = await claim_named(http, "a")
+        assert (await complete(http, token, result("a", "failed", failure))).status_code == 200
+    assert (await batch(http, batch_id))["actions"][0]["last_failure"] == "disk"
+    # So a second disk failure in a row is final, as without the declined claim between them.
+    token = await claim_named(http, "a")
+    assert (await complete(http, token, result("a", "failed", "disk"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "failed"
 
 
 async def test_declined_claims_count_nothing_towards_a_hosts_quarantine(

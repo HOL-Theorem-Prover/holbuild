@@ -362,7 +362,9 @@ class Protection:
     def __init__(self, command: str | None, ecs_agent_uri: str | None) -> None:
         self.command = command
         self.ecs_agent_uri = ecs_agent_uri
-        self.on = False  # whether the last call that worked turned it on
+        # Whether it is on: the last call that worked turned it on; None after a clear that failed, which ECS may
+        # have applied all the same, so the worker tries the clear again but takes a refusal for an unprotected task's.
+        self.on: bool | None = False
         self.since = 0.0  # when it was turned on (time.monotonic())
 
     def set(self, *, enabled: bool, timeout: float = 30) -> bool:
@@ -370,6 +372,8 @@ class Protection:
         the service has more protected tasks than it wants, as in a scale-in or a rolling deployment, so the task
         may be stopped at any moment. A refused renewal keeps the window set earlier, and other failures leave the
         action to the drain, so both give True."""
+        if self.command is None and self.ecs_agent_uri is None:
+            return True  # nothing to protect: ``on`` stays False
         try:
             if self.command is not None:
                 subprocess.run([*shlex.split(self.command), "on" if enabled else "off"], check=True, timeout=timeout)
@@ -398,8 +402,7 @@ class Protection:
         except Exception as error:  # noqa: BLE001  # protection is best effort and must never stop an action
             print(f"setting scale-in protection to {enabled} failed: {error}", file=sys.stderr)
             if not enabled:
-                # It may have been cleared all the same: a refusal from here on is taken for an unprotected task's.
-                self.on = False
+                self.on = None
             return True
         if enabled and not self.on:
             self.since = time.monotonic()
@@ -1698,7 +1701,7 @@ def main() -> None:
         resources.callback(reaper.stop)
         def unprotect(timeout: float = 30) -> None:
             """A worker that waits, found no work or exits is idle: a scale-in may take it."""
-            if protection.on:
+            if protection.on is not False:
                 protection.set(enabled=False, timeout=timeout)
 
         resources.callback(unprotect, 2)
@@ -1722,6 +1725,8 @@ def main() -> None:
                 with phases.timed("lease"):
                     refused = not protection.set(enabled=True, timeout=5)
                 if refused:
+                    with phases.timed("lease"):
+                        unprotect()  # a clear that failed before
                     with phases.timed("idle"):
                         drain.stop.wait(CLAIM_RETRY_SECONDS)
                     continue
