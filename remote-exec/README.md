@@ -338,6 +338,12 @@ stacking a notifying seccomp filter. `holbuild sandbox-check` exercises these
 requirements; workers reject a release whose check fails. Releases before
 0.13.58 are rejected because their HOL launch path has no mandatory sandbox.
 Upgrade submitting clients before replacing workers with this version.
+`--min-release VERSION` (or `REMOTE_EXEC_MIN_RELEASE`) raises that floor for one deployment. Before 0.14.92,
+an action may read the whole theory-modules store, which holds modules of
+every build its container (or, if shared, its host) ran; from 0.14.92 it may
+read only the module files its own dependencies need. So workers of tenants
+who must not read each other's theories and share a host's theory-modules
+store take `--min-release 0.14.92`.
 
 The worker and `exec-action` remain trusted: they fetch inputs, manage memory
 leases and publish results. Each HOL process runs with a Landlock filesystem
@@ -717,6 +723,7 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   | any other `input-missing` (a blob, a theory cached at export, or one that can't be the action's input) | retried, since a restore that fails on a network error reports its input missing too; after `MAX_ATTEMPTS` claims the batch fails with `resubmit: …`, naming the theory as `theory <input_key>` or the blob as `blob <sha256>`; after a theory (`; also missing …`) it names, deduplicated, every other input the result names in `missing-more` and those the batch's unfinished actions last reported missing that the batch doesn't rebuild itself (kept in the coordinator process's memory, so after a restart or on another replica it names fewer; a blob named first stays alone, for older clients); the client resubmits, for theories with them rebuilt (and every theory that depends on them, when an action of the batch reported in `failure_detail` that a theory `does not match its parents`), for a blob after uploading the batch's sources again, while the batch names a theory no earlier resubmission was for or the first blob, up to 5 times in all, and otherwise the next build exports a new batch |
   | `unavailable` | retried without counting the claim, `MAX_INTERRUPTIONS` times; after that like `internal` |
   | `ahead-abandoned` | from an action claimed ahead: back to waiting without counting the claim, and claimed only once its parents are done from then on; from any other, like `internal` |
+  | `declined` | given back unstarted by a worker that ECS refused scale-in protection: retried without counting the claim or an interruption, and not counted towards the host's quarantine. Coordinators before it reject the result, so the action waits for its lease to expire: upgrade the coordinator before workers, and roll a coordinator back only once no worker sending `declined` is left |
   | `proof`, `tactic-timeout`, `spec-rejected`, `script`, `timeout` | final; `script` means the script failed or omitted an output, `timeout` means it exceeded its time limit |
 
   A worker that gets no answer from the cache for the action's spec, 429,
@@ -775,19 +782,15 @@ high-tier action, since warm workers take only standard-tier work, and at
 most `REMOTE_EXEC_MAX_BURST_WORKERS`. Runs contribute only up to
 `REMOTE_EXEC_RUN_SLOTS` in both the total and high-tier demand terms;
 high-tier builds remain uncapped except by `MAX_BURST_WORKERS`. Actions
-claimed ahead and still waiting for a parent hold burst workers, since only
-burst workers load ahead, but ask for none of their own: they are left out of
-both terms, and added back only once ready work needs a burst worker, since
-they don't take it.
+claimed ahead and still waiting for a parent count apart, one burst worker
+each: only burst workers load ahead, so warm workers never take them, and the
+burst workers holding them stay while a narrow point of the graph leaves no
+ready work.
 
 ```text
 active = ready_build + running_build - waiting_ahead + min(RUN_SLOTS, ready_run + running_run)
 high = ready_high_build + running_high_build - waiting_ahead_high + min(RUN_SLOTS, ready_high_run + running_high_run)
-plain = max(0, active - WARM_WORKERS, high)
-running_active = running_build - waiting_ahead + min(RUN_SLOTS, running_run)
-ready_high = ready_high_build + min(ready_high_run, max(0, RUN_SLOTS - running_run))
-demand = min(MAX_BURST_WORKERS, plain + waiting_ahead)   if ready_high > 0 or active > max(WARM_WORKERS, running_active)
-demand = min(MAX_BURST_WORKERS, plain)                   otherwise
+demand = min(MAX_BURST_WORKERS, max(0, active - WARM_WORKERS, high) + waiting_ahead)
 ```
 
 A build's dependency graph narrows and widens: a few theories everything else
@@ -856,15 +859,32 @@ its runtime sources differ.
 
 A scaler that removes idle workers mustn't stop one in the middle of an
 action. With `--protection-cmd COMMAND`, the worker runs `COMMAND on` when it
-takes an action and on each heartbeat, and `COMMAND off` when the action ends.
+takes an action and on each heartbeat, and `COMMAND off` once it is idle.
 Without it, when `ECS_AGENT_URI` is set (as on Amazon ECS), it sets the task's
 scale-in protection through the agent's `task-protection/v1/state` endpoint,
-for 180 minutes at a time. ECS refuses to renew protection with
-`DEPLOYMENT_BLOCKED` while a scale-in or rolling deployment wants the task
-gone, so the window set when the action is claimed has to outlast the longest
-action. The worker clears protection when the action ends or loses its lease,
-and a worker that dies takes its task down with it. Failures are logged and
-the action carries on.
+for 180 minutes at a time. ECS refuses protection with `DEPLOYMENT_BLOCKED`
+while the service has more protected tasks than it wants, as in a scale-in or
+a rolling deployment, so the window set when the action is claimed has to
+outlast the longest action. Protection stays on from one action into the next
+claim, so a worker going straight from one action to the next is never
+unprotected; the worker clears it once a claim finds nothing (or fails),
+before it waits for disk or memory, after an `unavailable` result or an error
+in the worker, and when
+it exits (once a SIGTERM drains it, each clear waits at most 2 seconds, so a
+stalled agent or `--protection-cmd` can't hold it past the container's stop),
+and a worker that dies takes its task down with it. An idle worker
+claims unprotected, so a scale-in can take idle workers. When ECS refuses to
+protect an unprotected worker for an action it just claimed, the task is
+about to be stopped: the worker gives the action back as `declined` without
+starting it, so another worker takes it at once, and claims again only once
+ECS protects it. With ECS protection, a worker that has gone from action to
+action for an hour clears protection at its next action's end, waits a minute
+and likewise claims again only once ECS protects it anew, so a scale-in or
+rolling deployment that wants its task gone takes it between actions rather
+than once the queue runs dry (a rolling deployment doesn't refuse the new
+protection, so only the gap lets it stop the task). That costs a busy worker
+about 1/60 of its time.
+Other failures are logged and the action carries on.
 
 ## Wire format
 
@@ -913,6 +933,7 @@ for it. holbuild sends one random id with every attempt of a submission.
         "state": "waiting|ready|running|done|failed|cancelled",
         "tier": "standard|high",
         "attempts": 1,
+        "interruptions": 0,
         "last_failure": "<failure class>|null",
         "log_sha256": "<sha256 of the last build log a run uploaded, in /cas/; a failure without a log keeps the earlier one>|null",
         "failure_detail": "<the last result's detail: why it failed without a log, or why one that didn't fail has no log or built plain after its pipelined attempt failed; after lease expiries in a row (last_failure \"lease expired\", or \"lease expired N times\" once it fails), the workers that held it>|null",
@@ -928,13 +949,19 @@ for it. holbuild sends one random id with every attempt of a submission.
 
 `last_claimed_at` and `worker` describe the latest claim; a new claim clears
 `finished_at`. An accepted worker result sets `finished_at`, including a
-failure that will be retried. Times come from the coordinator database.
+failure that will be retried; a `declined` one sets nothing, so the failure,
+log and timings it leaves are the last run attempt's, not the latest claim's.
+Times come from the coordinator database.
 Lease expiry and cancellation set no finish time, even when the stopped
 worker's log is kept, so an action cancelled after an accepted failure keeps
 that failure's finish time. Unclaimed actions have null fields; claims an older
 coordinator made have a timestamp without a worker or finish time. Worker
 names are supplied by the worker, defaulting to its hostname and process ID.
 These fields retain only the latest attempt, not its retry history.
+`interruptions` counts the claims of the action given back without counting
+an attempt, up to `REMOTE_EXEC_MAX_INTERRUPTIONS`: those that ended
+`unavailable` (a worker drained or scaled in, or the cache was out) and those
+whose worker went on without them (the claim's answer or its result was lost).
 
 In `timings`, durations are milliseconds. `started` and `finished`, and
 `holstart`/`holend`, `publishstart`/`publishend`, `logstart`/`logend` are
@@ -964,7 +991,7 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   stream with nothing to send for `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` sends
   an empty line, which clients skip, so a proxy doesn't close it as idle:
   ```json
-  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "last_failure": null, "log_sha256": null, "failure_detail": null, "last_claimed_at": null, "finished_at": null, "worker": null, "timings": null}
+  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "interruptions": 0, "last_failure": null, "log_sha256": null, "failure_detail": null, "last_claimed_at": null, "finished_at": null, "worker": null, "timings": null}
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the

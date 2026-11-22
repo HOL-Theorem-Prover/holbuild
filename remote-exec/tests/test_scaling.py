@@ -68,11 +68,11 @@ def counts(
         (counts(ready_high=1), 1),  # warm workers are standard-tier, so a high action needs a burst worker
         (counts(running=2, ready_high=1, running_high=1), 2),
         (counts(ready=30, running=10), 16),  # capped
-        # Running actions waiting ahead ask for no worker while no ready work needs a burst worker...
-        (counts(running=6, ahead=4), 0),
-        (counts(running_high=3, ahead_high=3), 0),
-        (counts(ready=1, running=4, ahead=3), 0),  # the warm workers take the rest
-        # ...and count once some does, since they don't take it, whatever their tier.
+        # Running actions waiting ahead hold one burst worker each, whatever their tier and whether or not ready
+        # work needs a burst worker: warm workers don't take them, and theirs mustn't be scaled in.
+        (counts(running=6, ahead=4), 0 + 4),
+        (counts(running_high=3, ahead_high=3), 0 + 3),
+        (counts(ready=1, running=4, ahead=3), 0 + 3),  # the warm workers take the rest
         (counts(ready_high=2, running_high=6, ahead_high=4), 4 + 4),
         (counts(ready_high=1, running=4, running_high=3, ahead=4), 4 + 4),
         (counts(ready=2, running=4, ahead=3), 1 + 3),
@@ -80,26 +80,6 @@ def counts(
 )
 def test_burst_demand(queue: QueueCounts, expected: int) -> None:
     assert burst_demand(queue, warm_workers=2, max_burst_workers=16) == expected
-
-
-def test_burst_demand_counts_the_workers_held_ahead_for_no_high_run_the_run_slots_hold_back() -> None:
-    # One run slot, taken by the running high run: the ready one waits for it, not for a burst worker.
-    queue = counts(
-        running=4, ready_high=1, running_high=1, ready_run=1, running_run=1, high_run=2, ready_high_run=1, ahead=4
-    )
-    assert burst_demand(queue, warm_workers=2, max_burst_workers=16, run_slots=1) == 1
-
-
-def test_burst_demand_counts_the_workers_held_ahead_for_no_high_run_held_back_by_standard_runs() -> None:
-    # One run slot, taken by a running standard run: the ready high run waits for it, not for a burst worker.
-    queue = counts(running=6, ready_high=1, ready_run=1, running_run=1, high_run=1, ready_high_run=1, ahead=4)
-    assert burst_demand(queue, warm_workers=2, max_burst_workers=16, run_slots=1) == 1
-
-
-def test_burst_demand_counts_the_workers_held_ahead_for_no_standard_run_the_run_slots_hold_back() -> None:
-    # One run slot, taken by the running high run: the ready standard run waits for it, not for a burst worker.
-    queue = counts(running=7, ready=1, running_high=1, ready_run=1, running_run=1, high_run=1, ahead=4)
-    assert burst_demand(queue, warm_workers=2, max_burst_workers=16, run_slots=1) == 2
 
 
 def scaled_coordinator(coordinator: Coordinator, tmp_path: Path, script: str) -> tuple[Coordinator, Path]:
@@ -693,3 +673,15 @@ async def test_empty_batch_does_not_request_scaling(
     await submit(http, [])
     assert coordinator.scale_task is None
     check.assert_not_awaited()
+
+
+def test_quarantined_burst_workers_are_replaced_only_for_demand_beyond_the_actions_waiting_ahead(
+    coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator.settings = coordinator.settings.model_copy(update={"warm_workers": 7, "max_burst_workers": 20})
+    monkeypatch.setattr(coordinator, "_quarantined_workers", lambda: (0, 4))
+    # The burst worker holding the action claimed ahead meets it: nothing to replace a quarantined worker for.
+    ahead = QueueCounts(0, 0, 0, 1, 0, waiting_ahead_standard=1)
+    assert coordinator._burst_demand(ahead) == 1
+    # A high-tier action is demand of its own, so the quarantined burst workers are replaced on top of it.
+    assert coordinator._burst_demand(QueueCounts(0, 0, 1, 1, 0, waiting_ahead_standard=1)) == 2 + 4

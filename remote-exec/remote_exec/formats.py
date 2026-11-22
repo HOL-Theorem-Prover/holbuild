@@ -24,6 +24,7 @@ FAILURES = frozenset(
         "timeout",
         "unavailable",
         "ahead-abandoned",  # an action claimed ahead of its parents gave up; it is built once they are done
+        "declined",  # a worker being scaled in gave the claim back before starting it
     }
 )
 

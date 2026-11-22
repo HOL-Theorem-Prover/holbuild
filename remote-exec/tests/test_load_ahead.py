@@ -542,7 +542,7 @@ async def test_a_requeued_parent_revokes_the_child_claimed_ahead(
     assert (await http.post(f"/v1/work/{c['attempt_token']}/heartbeat", headers=WORKER)).status_code == 409
 
 
-async def test_actions_waiting_ahead_ask_for_no_burst_worker_until_their_parents_are_done(
+async def test_an_action_waiting_ahead_holds_one_burst_worker_of_the_demand_until_it_waits_no_more(
     http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache
 ) -> None:
     await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
@@ -555,7 +555,8 @@ async def test_actions_waiting_ahead_ask_for_no_burst_worker_until_their_parents
     async with coordinator.engine.connect() as conn:
         active = await coordinator._counts(conn, coordinator_module.COUNT_ACTIVE)
     assert (active.running_standard, active.waiting_ahead_standard) == (2, 1)
-    assert coordinator_module.burst_demand(active, warm_workers=1, max_burst_workers=16) == 0
+    # a on the warm worker, b on the burst worker that claimed it ahead
+    assert coordinator_module.burst_demand(active, warm_workers=1, max_burst_workers=16) == 1
 
     # One that published its outline proves while its parent finishes: it waits no more.
     assert (await http.post(f"/v1/work/{b['attempt_token']}/outlined", headers=WORKER)).status_code == 204
@@ -949,6 +950,29 @@ async def test_input_missing_from_a_claim_ahead_counts_its_attempt_and_makes_it_
     missing = result("b", "failed", "input-missing", missing=f"theory {input_key('p')}")
     assert (await complete(http, b["attempt_token"], missing)).status_code == 200
     assert await ahead_state(remote_exec_engine, "b") == ("waiting", "no", 1, 2)
+
+
+async def test_input_missing_for_a_parent_still_building_costs_no_attempt_and_waits_for_its_build(
+    http: httpx.AsyncClient, cache: FakeCache, remote_exec_engine: AsyncEngine
+) -> None:
+    # The claim ahead finds an entry of an earlier build of the running parent, whose blobs the cache lost. Claimed
+    # ahead again at once, it used up its attempts on the same entry and failed the batch.
+    batch_id = await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    a = await claim_named(http, "a")
+    b = await claim_ahead(http)
+    assert b is not None and b["ahead_parents"] == parents("a")
+    missing = result("b", "failed", "input-missing", missing=f"theory {input_key('a')}")
+    assert (await complete(http, b["attempt_token"], missing)).status_code == 200
+    assert await ahead_state(remote_exec_engine, "b") == ("waiting", "abandoned", 0, 1)
+    assert await claim_ahead(http) is None
+
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, a, result("a", "built"))).status_code == 200
+    plain = await claim_ahead(http)
+    assert plain is not None and (plain["theory"], plain["ahead_parents"]) == ("pkg:b", [])
+    cache.keys.add(ac_key("b"))
+    assert (await complete(http, plain["attempt_token"], result("b", "built"))).status_code == 200
+    assert (await batch(http, batch_id))["state"] == "done"
 
 
 async def test_a_claim_ahead_of_several_tiers_takes_its_first_tier_before_a_lower_tier_of_a_batch_with_one(
