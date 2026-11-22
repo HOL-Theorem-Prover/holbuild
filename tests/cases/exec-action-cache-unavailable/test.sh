@@ -63,6 +63,10 @@ spec=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $4 }' "$tmpdir/batc
 ac=$(awk '$1 == "action" && $5 == "worker:ATheory" { print $3 }' "$tmpdir/batch.txt")
 [[ -n "$spec" && -n "$ac" ]] || { cat "$tmpdir/batch.txt" >&2; exit 1; }
 
+# exec-action asks a cache of one node again for 90 s before it gives up;
+# these cases want its answer at once.  The cache's restarts are below.
+export HOLBUILD_TEST_CACHE_RETRY_DELAYS=
+
 # worker NAME [URL]: exec-action in NAME's own cache root, against URL
 # (default: the stub cache); the record goes to $tmpdir/NAME.result.
 worker() {
@@ -124,10 +128,31 @@ worker w
 expect w 3 unavailable "remote cache server error: HTTP 500 for GET"
 rm "$control/ac-get-status"
 
-# With the cache back, the same worker publishes it.
-worker w
+# With the cache back, the same worker publishes it, though the cache
+# answers its action PUT 429 for the first two seconds.
+echo 429 > "$control/ac-put-status"
+(sleep 2; rm "$control/ac-put-status") &
+HOLBUILD_TEST_CACHE_RETRY_DELAYS=1,1,1,1,1 worker w
 grep -qx 'status=cached' "$tmpdir/w.result" || { cat "$tmpdir/w.result" "$tmpdir/w.log" >&2; exit 1; }
+require_grep "remote cache PUT .* answered HTTP 429; retrying in 1 s" "$tmpdir/w.log"
 require_file "$remote_root/ac/$ac"
+
+# The cache's daemon is replaced, stopped before the new one listens on its
+# port: a worker that starts meanwhile is refused until then, and goes on.
+port=${remote_url##*:}
+kill "$server_pid"
+wait "$server_pid" 2>/dev/null || true
+HOLBUILD_TEST_CACHE_RETRY_DELAYS=1,1,1,1,1 worker swap &
+swap_pid=$!
+sleep 2
+start_remote_cache_server "$remote_root" "$tmpdir/server-restarted" "$control" "$port"
+wait "$swap_pid"
+if ! grep -qx 'status=cached' "$tmpdir/swap.result"; then
+  echo "the worker didn't ride out the cache's restart" >&2
+  cat "$tmpdir/swap.result" "$tmpdir/swap.log" >&2 || true
+  exit 1
+fi
+require_grep "remote cache GET .* got no answer: .*; retrying in 1 s" "$tmpdir/swap.log"
 
 # Two builds of one action can record different proof dependencies, as when
 # their proofs took different paths.  The .dat files then differ only in what

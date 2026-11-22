@@ -276,6 +276,12 @@ def roomy_disk(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(worker, "free_bytes", lambda _path: 100 * GIB)
 
 
+@pytest.fixture(autouse=True)
+def no_cache_retry_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spec fetch an unavailable cache of one node refuses fails at once, unless a test says otherwise."""
+    monkeypatch.setattr(worker, "ONE_NODE_RETRY_DELAYS", ())
+
+
 def releases(tmp_path: Path, server: Server) -> Releases:
     return Releases(str(tmp_path / "releases"), f"file://{tmp_path}/holbuild-{{version}}.tar.gz", server.url, None)
 
@@ -2233,6 +2239,60 @@ def test_bootstrap_spec_falls_back_before_parsing(
     monkeypatch.setattr(subprocess, "run", fetch)
     assert Releases(str(tmp_path), "unused", ",".join(nodes), None).read_spec(SPEC).version == "1.2.3"
     assert asked == [f"{node}/cas/{SPEC}" for node in ranked_nodes(nodes, SPEC)]
+
+
+def refused(command: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.CompletedProcess(command, 7, b"\n000", b"curl: (7) Failed to connect to 172.17.0.1 port 9092")
+
+
+def test_one_node_spec_fetch_rides_out_a_cache_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The host's cache daemon is replaced stop-first: connections are refused until the new one listens.
+    monkeypatch.setattr(worker, "ONE_NODE_RETRY_DELAYS", (0.01, 0.01, 0.01))
+    asked: list[list[str]] = []
+
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        asked.append(command)
+        if len(asked) <= 2:
+            return refused(command)
+        return subprocess.CompletedProcess(command, 0, b"holbuild-version=1.2.3\n\n200", b"")
+
+    monkeypatch.setattr(subprocess, "run", fetch)
+    assert Releases(str(tmp_path), "unused", "http://172.17.0.1:9092", None).read_spec(SPEC).version == "1.2.3"
+    assert [command[-1] for command in asked] == [f"http://172.17.0.1:9092/cas/{SPEC}"] * 3
+    assert all("--retry" not in command for command in asked)
+
+
+@pytest.mark.parametrize(("nodes", "asks"), [("http://one.test", 4), ("http://one.test,http://two.test", 2)])
+def test_spec_fetch_retries_only_a_cache_of_one_node_and_only_within_its_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nodes: str, asks: int
+) -> None:
+    # The last wait would end past the window, which is the waits' sum counted from the first request.
+    monkeypatch.setattr(worker, "ONE_NODE_RETRY_DELAYS", (0.01, 0.01, 0.01, 10.0))
+    asked: list[str] = []
+
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        asked.append(command[-1])
+        return subprocess.CompletedProcess(command, 22, b"\n503", b"HTTP 503")
+
+    monkeypatch.setattr(subprocess, "run", fetch)
+    with pytest.raises(CacheUnavailable, match="HTTP 503"):
+        Releases(str(tmp_path), "unused", nodes, None).read_spec(SPEC)
+    assert len(asked) == asks
+
+
+def test_one_node_spec_fetch_stops_waiting_on_drain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "ONE_NODE_RETRY_DELAYS", (60.0, 60.0))
+    drain = worker.Drain()
+
+    def fetch(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        drain.stop.set()
+        return refused(command)
+
+    monkeypatch.setattr(subprocess, "run", fetch)
+    started = time.monotonic()
+    with pytest.raises(worker.DrainStopped):
+        Releases(str(tmp_path), "unused", "http://one.test", None, drain=drain).read_spec(SPEC)
+    assert time.monotonic() - started < 5
 
 
 def test_worker_cache_ring_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:

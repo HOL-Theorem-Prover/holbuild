@@ -16,6 +16,8 @@ root = pathlib.Path(sys.argv[1]).resolve()
 port_file = pathlib.Path(sys.argv[2])
 request_log = pathlib.Path(sys.argv[3])
 control = pathlib.Path(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else None
+# A port to listen on, as a restarted server takes its predecessor's; by default any free one.
+port = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 
 action_put_lock = threading.Lock()
 action_put_count = 0
@@ -282,6 +284,6 @@ class Server(http.server.ThreadingHTTPServer):
     request_queue_size = 1024
 
 
-server = Server(("127.0.0.1", 0), Handler)
+server = Server(("127.0.0.1", port), Handler)
 port_file.write_text(str(server.server_address[1]), encoding="utf-8")
 server.serve_forever()

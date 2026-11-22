@@ -450,8 +450,9 @@ fun probe_all probe urls =
    404.
    A cache of one node gets the second attempt on that node: a 429 or 5xx
    answer to its first request is asked again once.  No answer at all is not,
-   so an unreachable cache still costs one attempt per request until the
-   breaker trips. *)
+   so an unreachable cache still costs a build one attempt per request until
+   the breaker trips; exec-action waits on such a cache longer
+   (retrying_one_node, below). *)
 fun routed_status_using usable method probe urls path request =
   let
     val read = method = "GET" orelse method = "HEAD"
@@ -533,8 +534,54 @@ fun send_result method url request =
 fun send method url path request =
   Option.map #2 (send_result method url (fn () => (url, traced method url path request)))
 
+(* exec-action's cache of one node, as each fleet host's own: a request it
+   leaves without a usable answer (none at all, 429 or 5xx), as while that
+   node's daemon restarts, is asked again after each of these waits that
+   still ends within their sum, 90 s, of the first attempt; only then does
+   it fail.  A ring's other nodes stand in instead, and a build goes on
+   without the cache.  Tests shorten them with
+   HOLBUILD_TEST_CACHE_RETRY_DELAYS, comma-separated seconds. *)
+fun one_node_retry_delays () =
+  case OS.Process.getEnv "HOLBUILD_TEST_CACHE_RETRY_DELAYS" of
+      SOME text => List.mapPartial Int.fromString (String.tokens (fn c => c = #",") text)
+    | NONE => [1, 2, 4, 8, 15, 15, 15, 15, 15]
+
+fun whole_seconds n = Time.fromSeconds (Int.toLarge n)
+
+fun retrying_one_node method urls attempt =
+  case urls of
+      [_] =>
+        if not (!fail_closed) then attempt ()
+        else
+          let
+            val delays = one_node_retry_delays ()
+            val deadline = Time.+ (Time.now (), whole_seconds (foldl op+ 0 delays))
+            fun loop delays =
+              let val (url, result) = attempt ()
+              in
+                case delays of
+                    delay :: rest =>
+                      if transient result andalso Time.<= (Time.+ (Time.now (), whole_seconds delay), deadline) then
+                        (TextIO.output (TextIO.stdErr,
+                           "holbuild: remote cache " ^ method ^ " " ^ redact_userinfo url ^ " " ^
+                           (case result of
+                                HolbuildHttp.Failed message => "got no answer: " ^ message
+                              | HolbuildHttp.Response code => "answered HTTP " ^ Int.toString code) ^
+                           "; retrying in " ^ Int.toString delay ^ " s\n");
+                         TextIO.flushOut TextIO.stdErr;
+                         OS.Process.sleep (whole_seconds delay);
+                         loop rest)
+                      else (url, result)
+                  | [] => (url, result)
+              end
+          in
+            loop delays
+          end
+    | _ => attempt ()
+
 fun send_urls_using usable method urls path request =
-  send_result method (hd urls) (fn () => routed_status_using usable method head_status urls path request)
+  send_result method (hd urls) (fn () =>
+    retrying_one_node method urls (fn () => routed_status_using usable method head_status urls path request))
 
 fun send_urls method urls path request = send_urls_using (fn _ => true) method urls path request
 
