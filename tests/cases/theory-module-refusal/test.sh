@@ -244,6 +244,12 @@ if grep -q -- ' module .*-C2\?-.*\.pmo$' $(heap_entries); then
 fi
 [[ $(sha256sum < "$c_path") == "$c_sha" ]] || { echo "the worker wrote C's refused module again" >&2; exit 1; }
 b2_entries=$(heap_entries)
+# Its record counts the preload's module loads: A's from its module, C's
+# and C2's refused, loaded from their .dat files with the rest.
+phase() { sed -n "s/^phase-ms=\(.*,\)\?$2:\([0-9]*\)\(,.*\)\?\$/\2/p" "$tmpdir/$1.result"; }
+hits=$(phase released holmodhitn) misses=$(phase released holmodmissn) refused=$(phase released holmodrefusedn)
+[[ ${hits:-0} -ge 1 && ${misses:-0} -ge 2 && $refused == 2 && -n $(phase released holmodwriten) ]] ||
+  { echo "released's module counts: hits=$hits misses=$misses refused=$refused" >&2; cat "$tmpdir/released.result" >&2; exit 1; }
 
 # Back on the first branch, a worker whose store lacks A's module, which
 # no host published, records it as unpublished, and writes and publishes
