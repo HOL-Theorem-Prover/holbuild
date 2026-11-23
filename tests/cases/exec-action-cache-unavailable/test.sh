@@ -290,20 +290,19 @@ require_grep '^status=built$' "$tmpdir/traced-log.result"
 require_grep '^log=[0-9a-f]* ' "$tmpdir/traced-log.result"
 spec=$spec_a
 
-# A remote entry with other outputs is a real conflict: a worker that builds
-# the action reports `publish`.
-python3 - "$remote_root/ac/$ac" <<'PY'
-import hashlib, sys
-path = sys.argv[1]
+# other_sig_resident TIMEOUT: the remote's entry names another .sig, whose
+# blob the cache holds only if the case put it there, and has proof-timeout
+# TIMEOUT.
+other_sig=$(printf 'other signature\n' | sha256sum | cut -d' ' -f1)
+other_sig_resident() {
+  python3 - "$remote_root/ac/$ac" "$other_sig" "$1" <<'PY'
+import hashlib, re, sys
+path, sig, timeout = sys.argv[1:]
 head, manifest = open(path).read().split("manifest-text-v1\n", 1)
-lines = manifest.split("\n")
-for i, line in enumerate(lines):
-    if line.startswith("blob sig "):
-        lines[i] = "blob sig " + hashlib.sha256(b"other signature\n").hexdigest()
-        break
-else:
+manifest, n = re.subn(r"^blob sig \S+$", "blob sig " + sig, manifest, count=1, flags=re.M)
+if n != 1:
     sys.exit("the entry has no sig blob")
-manifest = "\n".join(lines)
+manifest = re.sub(r"^proof-timeout=.*$", "proof-timeout=" + timeout, manifest, flags=re.M)
 out = []
 for line in head.split("\n"):
     if line.startswith("manifest-sha256 "):
@@ -313,6 +312,29 @@ for line in head.split("\n"):
     out.append(line)
 open(path, "w").write("\n".join(out) + "manifest-text-v1\n" + manifest)
 PY
+}
+timeout=$(sed -n 's/^proof-timeout=//p' "$remote_root/ac/$ac")
+
+# A remote entry with other outputs whose blob the cache lost restores
+# nowhere, so it is no conflict: a worker that builds the action replaces it.
+other_sig_resident "$timeout"
+worker lost-blob
+if [[ "$worker_status" != 0 ]] || ! grep -qx "status=built" "$tmpdir/lost-blob.result"; then
+  echo "an entry whose blob the cache lost was not replaced" >&2
+  cat "$tmpdir/lost-blob.result" "$tmpdir/lost-blob.log" >&2 || true
+  exit 1
+fi
+require_grep "replacing remote cache entry .*: the cache no longer holds all of its blobs" "$tmpdir/lost-blob.log"
+if grep -qx "blob sig $other_sig" "$remote_root/ac/$ac"; then
+  echo "the remote still holds the entry whose blob the cache lost" >&2
+  exit 1
+fi
+
+# A remote entry with other outputs the cache holds is a real conflict: a
+# worker that builds the action, here as the entry's timeout contract is
+# weaker, reports `publish`.
+printf 'other signature\n' > "$remote_root/cas/$other_sig"
+other_sig_resident none
 worker other
 if [[ "$worker_status" != 3 ]] || ! grep -qx "failure=publish" "$tmpdir/other.result"; then
   echo "a conflicting entry was not reported as a publish failure" >&2
