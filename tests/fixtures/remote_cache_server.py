@@ -151,10 +151,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if control is not None and self.path.startswith("/ac/"):
             key = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
+            # control/no-cache-gets: the keys GETs with Cache-Control:
+            # no-cache asked for, one a line.
+            no_cache = "no-cache" in self.headers.get("Cache-Control", "").lower()
+            if no_cache:
+                with open(control / "no-cache-gets", "a") as log:
+                    log.write(key + "\n")
             for name in (f"ac-get-status-{key}", "ac-get-status"):
                 if (control / name).exists():
                     self.send_response(int((control / name).read_text()))
                     self.end_headers()
+                    return
+            # control/ac-stale-<key>: an entry a cache in front of the store
+            # still serves after the store's was replaced, until a GET with
+            # Cache-Control: no-cache has it check its copy.
+            stale = control / f"ac-stale-{key}"
+            if stale.exists():
+                if no_cache:
+                    stale.unlink()
+                else:
+                    data = stale.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
                     return
         if control is not None and self.path.startswith("/cas/"):
             digest = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]

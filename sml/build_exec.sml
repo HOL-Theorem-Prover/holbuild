@@ -179,6 +179,24 @@ fun write_object_manifest path lines =
   (write_manifest path lines;
    write_manifest (hfs_remapped_path path) lines)
 
+(* The .hol/objs copy of PATH, a file a hydrate installs in the action root.
+   A theory action's child writes only its write dirs, so the copy can be a
+   link; a run action's child may write the whole root, so it gets a copy. *)
+fun place_root_object path =
+  let val dst = hfs_remapped_path path
+  in
+    if Option.isSome (!HolbuildActionSandbox.action_write_dirs) then
+      (ensure_parent dst;
+       remove_file dst;
+       Posix.FileSys.link {old = path, new = dst}
+       handle OS.SysErr _ => copy_binary path dst)
+    else link_or_copy_file path dst
+  end
+
+fun write_root_object_manifest path lines =
+  (write_manifest path lines;
+   place_root_object path)
+
 val runtime_line = HolbuildToolchain.runtime_line
 
 fun load_theory_line name = "HolbuildRuntime.load " ^ HolbuildToolchain.sml_string name ^ ";"
@@ -369,6 +387,28 @@ fun deps_heap_capture_request deps_loaded = deps_loaded ^ ".capture"
    the deps heap may require (module_loader_line). *)
 fun deps_heap_refused_modules deps_loaded = deps_loaded ^ ".refused"
 
+(* Compiles [code] when HOL's module helper, once loaded, has the [values].
+   It restates some of the helper's functions; a helper they don't match
+   fails to compile them and keeps its own. *)
+fun if_theory_modules_has values code =
+  "val _ = case #lookupStruct PolyML.globalNameSpace \"TheoryModules\" of " ^
+  "NONE => () | SOME modules => " ^
+  "if List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents modules)) " ^
+  HolbuildToolchain.sml_list values ^ " then " ^
+  "(CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string code ^ " handle _ => ()) else ();"
+
+(* A preload's line after its loads (and after the deps heap's save, so
+   that the heap holds what it did without it): how many theories its
+   process loaded from their modules (hits), from their .dat files
+   (misses) and how many modules it wrote, as HOL's theory module cache
+   counts them, printed as holmodhitn, holmodmissn and holmodwriten phases
+   (hol_log_phases).  Without HOL's module cache it prints nothing. *)
+val module_statistics_line =
+  if_theory_modules_has ["statistics"]
+    ("val _ = let val {hits, misses, writes} = TheoryModules.statistics () in " ^
+     "TextIO.output (TextIO.stdErr, \"holbuild hol-phases holmodhitn=\" ^ Int.toString hits ^ " ^
+     "\" holmodmissn=\" ^ Int.toString misses ^ \" holmodwriten=\" ^ Int.toString writes ^ \"\\n\") end;")
+
 (* The deps heap keeps only the toolchain's load path, not the project's
    directories HOL put there: other trees of the project resume from it.
    The save's time is printed as a holsave phase (hol_log_phases); the
@@ -401,14 +441,15 @@ fun write_preload capture load_lines deps_loaded deps_ok path =
                   "val _ = let val start = Time.now () in " ^
                   "HolbuildCheckpointSaveRuntime.with_toolchain_load_path (fn () => " ^ save ^ "); " ^
                   "TextIO.output (TextIO.stdErr, \"holbuild hol-phases holsave=\" ^ " ^
-                  "LargeInt.toString (LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))) ^ \"\\n\") end;"] @
+                  "LargeInt.toString (LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))) ^ \"\\n\") end;",
+                  module_statistics_line] @
                  (if capture then [list_refused, wait] else []))
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
 
 fun write_plain_preload load_lines path =
-  write_text path (String.concatWith "\n" (runtime_line () :: load_lines) ^ "\n")
+  write_text path (String.concatWith "\n" (runtime_line () :: load_lines @ [module_statistics_line]) ^ "\n")
 
 (* Where a promoting preload saves its transient heap: in the stage, which
    the parent clears of it once the child has ended (run_theory_action). *)
@@ -470,7 +511,7 @@ fun write_promoting_preload load_lines path =
          "  if in_use < threshold then report \"not promoted\" else promote ()\n",
          "end;"]
   in
-    write_text path (String.concatWith "\n" (runtime_line () :: load_lines @ [promote]) ^ "\n")
+    write_text path (String.concatWith "\n" (runtime_line () :: load_lines @ [module_statistics_line, promote]) ^ "\n")
   end
 
 (* HOL's theory exporter enables generated HTML documentation by default.  A
@@ -513,16 +554,6 @@ fun if_meta_has values code =
   "if List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents meta)) " ^
   "[" ^ String.concatWith ", " (map HolbuildToolchain.sml_string values) ^ "] then " ^
   "CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string code ^ " else ();"
-
-(* Compiles [code] when HOL's module helper, once loaded, has the [values].
-   It restates some of the helper's functions; a helper they don't match
-   fails to compile them and keeps its own. *)
-fun if_theory_modules_has values code =
-  "val _ = case #lookupStruct PolyML.globalNameSpace \"TheoryModules\" of " ^
-  "NONE => () | SOME modules => " ^
-  "if List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents modules)) " ^
-  HolbuildToolchain.sml_list values ^ " then " ^
-  "(CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string code ^ " handle _ => ()) else ();"
 
 (* The ids, in hex, of the modules HOL refused that the loader below
    couldn't release (unreleased_modules_line), which a deps heap saved
@@ -1897,7 +1928,21 @@ fun hol_file_sha1 path =
 fun hol_files_sha1 paths =
   HolbuildHash.files_hash {command = "sha1sum", digits = 40, fallback = hol_file_sha1} paths
 
-val theory_sml_hash_literal = HolbuildTheoryCacheManifest.theory_sml_hash_literal
+(* The hash literal of a generated Theory.sml: `hash =` and a quoted
+   SHA-1, the only such literal in the file. *)
+fun theory_sml_hash_literal text =
+  let
+    val (_, rest) = Substring.position "hash =" (Substring.full text)
+    val quoted = Substring.dropl Char.isSpace (Substring.triml (size "hash =") rest)
+  in
+    if Substring.isEmpty rest then NONE
+    else if Substring.size quoted > 41 andalso Substring.sub (quoted, 0) = #"\"" andalso
+            Substring.sub (quoted, 41) = #"\"" andalso
+            HolbuildTheoryCacheManifest.valid_sha1_text
+              (Substring.string (Substring.slice (quoted, 1, SOME 40)))
+    then SOME (Substring.string (Substring.slice (quoted, 1, SOME 40)))
+    else NONE
+  end
 
 (* A theory's .dat is known by the hash its Theory.sml carries, which is
    what its children record for it and what HOL's link_parents compares:
@@ -1915,6 +1960,10 @@ fun hol_dat_hash path =
   in
     case literal of SOME hash => hash | NONE => hol_file_sha1 path
   end
+
+(* hol_dat_hash of the .dat at PATH, given its Theory.sml's text. *)
+fun written_dat_hash path sml_text =
+  case theory_sml_hash_literal sml_text of SOME hash => hash | NONE => hol_file_sha1 path
 
 type file_hash_cache = {entries : (string, string) Binarymap.dict ref, mutex : Mutex.mutex}
 
@@ -2510,15 +2559,6 @@ fun cache_manifest_outputs_equal_but_dat input_key left right =
     #mldeps l = #mldeps r
   end
 
-(* Whether the theory entry RESIDENT gives way to INCOMING, the same build
-   under a stronger timeout contract and maybe another theory digest
-   (HolbuildTheoryCacheManifest.weaker_but_for_digest), reading each one's
-   Theory.sml from the cache at ROOT. *)
-fun cache_entry_weaker_but_for_digest root input_key incoming resident =
-  HolbuildTheoryCacheManifest.weaker_but_for_digest input_key
-    (fn hash => read_text (HolbuildCache.blob_path root hash)) incoming resident
-  handle _ => false
-
 fun cache_entry_usable root input_key text =
   let
     val lines = cache_manifest_lines text
@@ -2840,7 +2880,6 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
           if old = manifest then HolbuildCache.touch_action root cache_key
           else if cache_entry_usable root cache_key old then
             if cache_manifest_outputs_equal cache_key old manifest then publish_same_outputs old
-            else if cache_entry_weaker_but_for_digest root cache_key manifest old then write_manifest manifest
             else cache_conflict_warning cache_key manifest_path subject old manifest
           else
             write_manifest manifest
@@ -2982,35 +3021,39 @@ fun checked_cache_entry allow_timeout_discrepancy {root, input_key, subject, exp
 
 (* Installs a checked cache entry's outputs at the given paths, its extra
    outputs where `extra_destination` puts each declaration, and its load
-   manifests with `write_manifests`. *)
-fun install_cache_entry copy root input_key subject
+   manifests with `write_manifests`.  COPY puts a blob at a path, SML_TEXT
+   gives the text of the .sml blob, which DST may hold after, OBJECT puts
+   an installed file's .hol/objs copy, and REFRESH marks the entry used
+   once its blobs are in place.  Returns the entry's proof timeout and the
+   .sml text written. *)
+fun install_cache_entry {copy, sml_text, object, refresh} input_key subject
                         {blobs = {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, parents, mldeps},
                          proof_timeout, manifest_text = _}
                         {outputs = {sig_path, sml_path, data_path}, extra_destination, write_manifests} =
   let
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
+    val _ = copy dat_hash data_path
+    val _ = object data_path
+    val _ = copy sig_hash sig_path
+    val _ = object sig_path
+    val text = replace_all cache_sml_token data_path (sml_text sml_hash sml_path)
   in
-    copy dat_hash data_path;
-    link_or_copy_file data_path (hfs_remapped_path data_path);
-    copy sig_hash sig_path;
-    link_or_copy_file sig_path (hfs_remapped_path sig_path);
-    copy sml_hash sml_path;
-    write_text sml_path (replace_all cache_sml_token data_path (read_text sml_path));
-    link_or_copy_file sml_path (hfs_remapped_path sml_path);
+    write_text sml_path text;
+    object sml_path;
     (case trace_hash of
          NONE => ()
        | SOME hash =>
            (copy hash trace_path;
-            link_or_copy_file trace_path (hfs_remapped_path trace_path)));
+            object trace_path));
     List.app
       (fn (declaration, hash) =>
           let val destination = extra_destination declaration
           in ensure_parent destination; copy hash destination end)
       extra_hashes;
     write_manifests {parents = parents, mldeps = mldeps};
-    HolbuildCache.touch_action root input_key;
+    refresh ();
     cache_trace ("cache hit: " ^ subject ^ " " ^ cache_key_role ^ "=" ^ input_key);
-    proof_timeout
+    {proof_timeout = proof_timeout, sml_text = text}
   end
 
 fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
@@ -3030,10 +3073,17 @@ fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan
        write_local_theory_manifests plan node metadata)
   in
     CacheRestored
-      (install_cache_entry (copy_blob verify_cache root) root input_key subject entry
-         {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
-          extra_destination = HolbuildBuildPlan.extra_output_path node,
-          write_manifests = write_manifests})
+      (#proof_timeout
+        (install_cache_entry
+           {copy = copy_blob verify_cache root,
+            sml_text = fn hash => fn dst => (copy_blob verify_cache root hash dst; read_text dst),
+            object = fn path => link_or_copy_file path (hfs_remapped_path path),
+            (* copy_blob doesn't refresh the blobs it copies. *)
+            refresh = fn () => HolbuildCache.touch_action root input_key}
+           input_key subject entry
+           {outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
+            extra_destination = HolbuildBuildPlan.extra_output_path node,
+            write_manifests = write_manifests}))
   end
   handle Error "cache entry not found" => CacheMiss
        | e => (remove_failed_cache_outputs project node;
@@ -3540,17 +3590,13 @@ fun bool_text true = "true"
    4: a theory's generated .uo lists its parents and ML dependencies in
    Holmake's load order, not parents by name and then ML dependencies, so a
    dependent's entry from before was built loading them in another order.
-   Still 4 since 0.14.100 merged DISK_THM into proved theorems' oracles in the
-   hash literal: that changed the literal only of theories with a proved
-   theorem that uses no theorem from disk, and a child of an entry from before
-   links against that entry's own literal, so the old entries stay sound and
-   aren't worth rebuilding every theory for.  An entry from before with a
-   weaker timeout contract gives way to a rebuild under a stronger one, in
-   the remote cache and in a local one, as the two differ only in the .dat
-   and the literal (HolbuildTheoryCacheManifest.weaker_but_for_digest).  The
-   cost left: when builds of two releases race to publish one key, the
-   loser's publish fails, and its retry restores the winner's entry. *)
-val theory_manifest_version = "4"
+   5: 0.14.100 merged DISK_THM into the oracles of a proved theorem that
+   uses no theorem from disk, in the hash literal, so an entry from before
+   carries another literal than a rebuild of its key: a child restored
+   against one misfits the other, and a stronger rebuild can't publish over
+   it.  tests/cases/theory-dat-reproducible pins the literal of such a
+   theorem with this version, so a digest change must bump it. *)
+val theory_manifest_version = "5"
 
 (* Final theory artifacts are semantic products of source bytes, resolved deps,
    toolchain, and declared action policy. Execution strategy is deliberately not
@@ -6333,16 +6379,20 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
           handle _ => false
         (* A local entry built against other parent outputs can sit beside a
            remote entry built against these, so once the local one is dropped
-           the remote one gets a try, unless the local one came from there; an
-           entry another build published meanwhile gets the try instead.  Only
-           one retry either way. *)
+           the remote one gets a try, the remote cache asked to check its copy
+           with its origin first: the local one may have come from there, and
+           the cache may still hold it after its origin replaced it.  An entry
+           another build published meanwhile gets the try instead.  Only one
+           retry either way. *)
         fun materialize retry existing =
           let
             (* Passes over replicas whose timeout contract is too weak for this build. *)
+            fun hydrate_remote () =
+              hydrate_remote_cache_key_using
+                (manifest_timeout_satisfies allow_timeout_discrepancy (tactic_timeout policy)) root input_key
             fun hydrate () =
               let
-                val hydrated = hydrate_remote_cache_key_using
-                  (manifest_timeout_satisfies allow_timeout_discrepancy (tactic_timeout policy)) root input_key
+                val hydrated = hydrate_remote ()
               in
                 (* The manifest can stay identical while hydration repairs its blobs. *)
                 case HolbuildCache.get_action root input_key of
@@ -6351,7 +6401,10 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
               end
             (* A failed copy may have met an entry another build just published. *)
             fun from_remote () =
-              if copied_from_remote input_key then CacheMiss else hydrate ()
+              (ignore (HolbuildRemoteCache.revalidating hydrate_remote);
+               case HolbuildCache.get_action root input_key of
+                   SOME text => if text <> existing then materialize false text else CacheMiss
+                 | NONE => CacheMiss)
             fun reject_parents () =
               (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                             input_key ^ " (parent outputs differ)");
@@ -11349,6 +11402,7 @@ fun fetch_spec_blob remote {hash, dst} =
           HolbuildCacheBackend.Hit =>
             (case HolbuildCache.publish_blob cache {hash = hash, src = dst} of
                  HolbuildCacheBackend.Conflict msg => warn ("could not keep blob " ^ hash ^ ": " ^ msg)
+               | HolbuildCacheBackend.AlreadyPresent => HolbuildCache.touch (HolbuildCache.blob_path cache hash)
                | _ => ())
         | HolbuildCacheBackend.Miss => raise ActionFailed (InputMissing ["blob " ^ hash], "blob " ^ hash ^ " is not in the cache")
         | HolbuildCacheBackend.Corrupt msg => raise action_failed InternalFailure ("cannot fetch blob " ^ hash ^ ": " ^ msg)
@@ -11359,10 +11413,25 @@ fun fetch_spec_blob remote {hash, dst} =
       | _ => fetch_remote ()
   end
 
+(* The text of blob HASH, as fetch_spec_blob would leave it at DST: read
+   once from the local cache when it holds it intact, without writing DST. *)
+fun fetch_spec_text remote {hash, dst} =
+  let
+    val blob = HolbuildCache.blob_path (cache_root ()) hash
+    fun fetched () = (fetch_spec_blob remote {hash = hash, dst = dst}; read_text dst)
+  in
+    case SOME (read_text blob) handle IO.Io _ => NONE of
+        SOME text =>
+          if HolbuildHash.string_sha256 text = hash then (HolbuildCache.touch blob; text)
+          else fetched ()
+      | NONE => fetched ()
+  end
+
 (* Restores a theory the action depends on, or the action's own entry, into
    the directory FILES, writing its load manifests with the spec's stems in
    the action root NAMED, where its files are loaded from.  Returns the
-   local cache manifest it restored and what its .uo was generated from. *)
+   local cache manifest it restored, what its .uo was generated from, its
+   .sig blob's hash and the .sml text written. *)
 fun restore_spec_theory_in remote {files, named} resolver {key, subject, stem, extra_outputs, requested_timeout} =
   let
     val cache = cache_root ()
@@ -11377,24 +11446,30 @@ fun restore_spec_theory_in remote {files, named} resolver {key, subject, stem, e
     val written = ref {parents = [] : string list, mldeps = [] : string list}
     fun write_manifests metadata =
       (written := metadata;
-       write_object_manifest (stem_path ^ ".ui") [in_root named stem ^ ".sig"];
-       write_object_manifest (stem_path ^ ".uo")
+       write_root_object_manifest (stem_path ^ ".ui") [in_root named stem ^ ".sig"];
+       write_root_object_manifest (stem_path ^ ".uo")
          (generated_theory_loads resolve metadata @ [in_root named stem ^ ".sml"]))
-  in
-    ignore
-      (install_cache_entry (fn hash => fn dst => fetch_spec_blob remote {hash = hash, dst = dst})
-         cache key subject entry
-         {outputs = {sig_path = stem_path ^ ".sig", sml_path = stem_path ^ ".sml", data_path = stem_path ^ ".dat"},
-          (* Apart from the sources, so a restored output never replaces an
-             input the action fetched by its hash; the build reads none. *)
-          extra_destination = fn decl =>
-            if escapes decl then raise Error ("cache entry " ^ key ^ " has an extra output outside the action root: " ^ decl)
-            else in_root files (normalize_path (String.concatWith "/" [".holbuild/action-extra", key, decl])),
-          write_manifests = write_manifests})
+    val {sml_text, ...} =
+      install_cache_entry
+        {copy = fn hash => fn dst => fetch_spec_blob remote {hash = hash, dst = dst},
+         sml_text = fn hash => fn dst => fetch_spec_text remote {hash = hash, dst = dst},
+         object = place_root_object,
+         (* The fetches refreshed every blob the entry names. *)
+         refresh = fn () => HolbuildCache.touch (HolbuildCache.action_manifest cache key)}
+        key subject entry
+        {outputs = {sig_path = stem_path ^ ".sig", sml_path = stem_path ^ ".sml", data_path = stem_path ^ ".dat"},
+         (* Apart from the sources, so a restored output never replaces an
+            input the action fetched by its hash; the build reads none. *)
+         extra_destination = fn decl =>
+           if escapes decl then raise Error ("cache entry " ^ key ^ " has an extra output outside the action root: " ^ decl)
+           else in_root files (normalize_path (String.concatWith "/" [".holbuild/action-extra", key, decl])),
+         write_manifests = write_manifests}
       handle e as ActionFailed (InputMissing _, _) =>
         (ignore (drop_cache_manifest_if_unchanged cache key manifest_text);
-         raise e);
-    {manifest_text = manifest_text, metadata = !written}
+         raise e)
+  in
+    {manifest_text = manifest_text, metadata = !written,
+     sig_hash = #sig_hash (#blobs entry), sml_text = sml_text}
   end
 
 fun restore_spec_theory remote root = restore_spec_theory_in remote {files = root, named = root}
@@ -11407,13 +11482,17 @@ fun records_parent recorded ({target, ...} : {target : string, stem : string, ke
 (* A worker's local copy of an entry goes out of date when the remote's entry
    for its key changes.  This drops the local copies of the spec's
    dependencies selected by wanted whose outputs differ from the remote's,
-   so that the next restore takes the remote's; true when it dropped one. *)
-fun drop_stale_dep_copies remote (spec : spec_deps) wanted =
-  let val checks = map (fn dep => (dep, ref false)) (List.filter wanted (#deps spec))
+   so that the next restore takes the remote's; true when it dropped one.
+   With revalidate, the remote cache checks each entry with its origin
+   first (HolbuildRemoteCache.revalidating). *)
+fun drop_stale_dep_copies revalidate remote (spec : spec_deps) wanted =
+  let
+    val checks = map (fn dep => (dep, ref false)) (List.filter wanted (#deps spec))
+    fun read f = if revalidate then HolbuildRemoteCache.revalidating f else f ()
   in
     parallel_all remote_probe_width
       (fn (dep, dropped) =>
-          dropped := HolbuildRemoteCache.required (fn () => drop_local_copy_if_stale remote (#key dep)))
+          dropped := HolbuildRemoteCache.required (fn () => read (fn () => drop_local_copy_if_stale remote (#key dep))))
       checks;
     List.exists (fn (_, dropped) => !dropped) checks
   end
@@ -11536,7 +11615,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       in
         if Resident.find resident path = SOME (Resident.Manifest sha) andalso present (objects path)
         then Resident.want resident path
-        else (ensure_parent path; write_object_manifest path lines; Resident.put resident path (Resident.Manifest sha))
+        else (ensure_parent path; write_root_object_manifest path lines; Resident.put resident path (Resident.Manifest sha))
       end
     val resolver = spec_resolver spec
     fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
@@ -11611,20 +11690,19 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       let
         val path = in_root root stem
         val _ = ensure_parent path
-        val {manifest_text = source_text, metadata = metadata as {parents, mldeps}} =
+        val {manifest_text = source_text, metadata = metadata as {parents, mldeps}, sig_hash, sml_text} =
           restore_spec_theory remote root resolver
             {key = key, subject = target, stem = stem, extra_outputs = NONE, requested_timeout = NONE}
-        val {sig_hash, ...} = cache_manifest_blobs_from_lines key (cache_manifest_lines source_text)
         (* Those of Resident.hashed_suffixes: the .sml has its .dat path
            written in, and the .ui and .uo are the manifests just written. *)
         val hashes =
-          [sig_hash, HolbuildHash.string_sha256 (read_text (path ^ ".sml")),
+          [sig_hash, HolbuildHash.string_sha256 sml_text,
            HolbuildHash.string_sha256 (manifest_text [path ^ ".sig"]),
            HolbuildHash.string_sha256 (manifest_text (uo_lines stem metadata))]
       in
         Resident.put resident path
           (Resident.Theory {target = target, key = key, source = HolbuildHash.string_sha256 source_text,
-                            parents = parents, mldeps = mldeps, dat_hash = hol_dat_hash (path ^ ".dat"),
+                            parents = parents, mldeps = mldeps, dat_hash = written_dat_hash (path ^ ".dat") sml_text,
                             dat_parents = Binarymap.listItems (parse_dat_parent_hashes (read_dat_header (path ^ ".dat"))),
                             hashes = hashes})
       end
@@ -11684,8 +11762,8 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             (#deps spec)
         end)
     fun restore_deps () = hydrate_step "hyddeps" restore_deps_now
-    fun refresh wanted =
-      hydrate_step "hydstale" (fn () => drop_stale_dep_copies remote spec wanted) andalso (restore_deps (); true)
+    fun refresh revalidate wanted =
+      hydrate_step "hydstale" (fn () => drop_stale_dep_copies revalidate remote spec wanted) andalso (restore_deps (); true)
     (* Every path an item writes: two items sharing one would let a kept
        item stand for files another replaced or removed. *)
     fun theory_files stem = List.concat (map (fn suffix => objects (in_root root stem ^ suffix)) theory_suffixes)
@@ -11725,12 +11803,14 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       (transfer_all fetch_file files;
        List.app write_lib (#libs spec)));
     restore_deps ();
-    ignore (refresh direct);
+    ignore (refresh false direct);
     case misfits () of
         [] => ()
       | first =>
-          (* The files change only if the refresh drops a copy. *)
-          case (if refresh (fn _ => true) then misfits () else first) of
+          (* The files change only if the refresh drops a copy.  The remote
+             cache may hold a copy its origin has since replaced, which the
+             local one matches: ask it to check. *)
+          case (if refresh true (fn _ => true) then misfits () else first) of
               [] => ()
             | found as {target, ...} :: rest =>
                 raise ActionFailed (InputMissing (map (fn {key, ...} => "theory " ^ key) found),
@@ -11776,19 +11856,25 @@ fun action_already_done remote root (spec : action_spec) =
   let
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
+    (* SOME fits once restored, NONE when the restore fails. *)
     fun restored () =
       (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
          {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
           extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
-       spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
+       SOME (spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path)))
+      handle e as HolbuildRemoteCache.Unavailable _ => raise e
+           | _ => NONE
+    (* The remote cache may hold a copy its origin has since replaced, which
+       the local one matches: on a parent misfit, ask it to check. *)
+    fun drop_stale misfit =
+      (if misfit then HolbuildRemoteCache.revalidating (fn () => drop_local_copy_if_stale remote (#input_key spec))
+       else drop_local_copy_if_stale remote (#input_key spec))
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | _ => false
   in
-    restored () orelse
-    ((drop_local_copy_if_stale remote (#input_key spec)
-      handle e as HolbuildRemoteCache.Unavailable _ => raise e
-           | _ => false) andalso
-     restored ())
+    case restored () of
+        SOME true => true
+      | first => drop_stale (first = SOME false) andalso restored () = SOME true
   end
 
 (* The remote's .dat for the action, given by its manifest, fetched into the
@@ -11845,35 +11931,21 @@ fun resident_differs_only_in_dat remote root (spec : action_spec) mine resident 
        | _ => false
 
 (* Whether the remote's entry for the action differs from the worker's, MINE,
-   only in its .dat and the hash literal of its Theory.sml, as one built
-   under another theory digest does, and has a weaker timeout contract.  MINE
-   records the restored parents, so it replaces the remote's, as an entry
-   with a stronger contract and the same outputs does. *)
-fun resident_weaker_but_for_digest remote root (spec : action_spec) mine resident =
-  let
-    val fetched = in_root root ".holbuild/resident.sml"
-    fun sml_text hash =
-      if HolbuildCache.verify_blob (cache_root ()) hash then
-        read_text (HolbuildCache.blob_path (cache_root ()) hash)
-      else
-        (ensure_parent fetched;
-         case HolbuildRemoteCache.required
-                (fn () => HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = fetched}) of
-             HolbuildCacheBackend.Hit => read_text fetched
-           | _ => raise Error ("the remote cache doesn't serve blob " ^ hash))
-  in
-    HolbuildTheoryCacheManifest.weaker_but_for_digest (#input_key spec) sml_text mine resident
-  end
-  handle e as HolbuildRemoteCache.Unavailable _ => raise e
-       | _ => false
+   only in its .dat and has a weaker timeout contract.  MINE records the
+   restored parents, so it replaces the remote's, as an entry with a stronger
+   contract and the same outputs does. *)
+fun resident_weaker_but_for_dat key mine resident =
+  cache_manifest_outputs_equal_but_dat key mine resident andalso
+  not (timeout_at_least_as_strong (cache_manifest_proof_timeout_text key resident)
+                                  (cache_manifest_proof_timeout_text key mine))
+  handle Error _ => false
 
 (* Uploads every blob of the local entry for the action, raising if one fails
    (the build's own publish only warns), then puts the action.  A different
    entry already there is replaced when it records parents other than the
-   restored ones or only its .dat and theory digest differ and its timeout
-   contract is weaker, and otherwise left for check_remote_publication to
-   judge.  Returns the entry read after putting a new one, which saves that
-   check a read. *)
+   restored ones or only its .dat differs and its timeout contract is weaker,
+   and otherwise left for check_remote_publication to judge.  Returns the
+   entry read after putting a new one, which saves that check a read. *)
 (* Uploads every blob of the local cache entry KEY, raising if one fails,
    and returns the entry. *)
 fun upload_entry_blobs remote key =
@@ -11912,8 +11984,8 @@ fun publish_action_entry remote root (spec : action_spec) =
                    if (cache_manifest_outputs_equal key resident manifest handle _ => false) then SOME resident
                    else if resident_misfits_parents remote root spec resident then
                      replace "its recorded parents differ from the cache's"
-                   else if resident_weaker_but_for_digest remote root spec manifest resident then
-                     replace "it differs only in its .dat and theory digest and has a weaker timeout contract"
+                   else if resident_weaker_but_for_dat key manifest resident then
+                     replace "it differs only in its .dat and has a weaker timeout contract"
                    else SOME resident
                  end
              | NONE => NONE)
@@ -12608,9 +12680,11 @@ fun merge_phases phases =
 
 (* The phases in the "holbuild hol-phases" lines a theory child prints: the
    proof runtime's at exit (proof_runtime.sml), and the preload's after it
-   saves the deps heap.  Only the names the runtime prints are taken, with
-   their values summed over the lines; a value that isn't a nonnegative
-   integer is dropped.  holload runs from CHILD_START, when the child that
+   saves the deps heap and after its loads (module_statistics_line).  Only
+   the names the runtime prints are taken, with their values summed over
+   the lines; a value that isn't a nonnegative integer is dropped.  Each
+   line in which HOL says it refused a theory's module counts one
+   holmodrefusedn.  holload runs from CHILD_START, when the child that
    wrote the log started, to its first runtime install (the least
    holloadend: a runtime loaded again later prints its line first), less
    the preload's save (holsave in a line without holloadend).  The log is the child's, so it is read in bounded pieces and a line
@@ -12621,7 +12695,7 @@ fun merge_phases phases =
    counts. *)
 val hol_log_phase_names =
   ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
-   "holcompiledn", "holreplayedn", "holrewoundn"]
+   "holcompiledn", "holreplayedn", "holrewoundn", "holmodhitn", "holmodmissn", "holmodwriten"]
 
 fun hol_log_phases log_file child_start =
   let
@@ -12638,6 +12712,9 @@ fun hol_log_phases log_file child_start =
     fun parse line =
       if String.isPrefix prefix line then
         SOME (List.mapPartial phase (String.tokens Char.isSpace (String.extract (line, size prefix, NONE))))
+      else if String.isPrefix "theory modules: " line andalso
+              String.isSuffix ": module refused, loading from .dat" line
+      then SOME [("holmodrefusedn", 1)]
       else NONE
     (* A line read so far: its first MAX_LINE characters, and whether it is
        longer. *)
@@ -15610,6 +15687,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         (* A run's script may load any theory under the root by name, so
            it starts from an empty one, and leaves no records. *)
         val _ = (empty_all (); resident := Resident.empty (); ensure_dir root)
+        val _ = HolbuildActionSandbox.action_write_dirs := NONE
         val _ = check_cancelled ()
         val spec = parse_run_spec spec_text
         val _ = input_key := #run_key spec
@@ -15934,7 +16012,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           phase "check" (fn () =>
             (* Outputs built against out-of-date local copies of the parents
                never reach the remote; the retry restores the remote's. *)
-            (if drop_stale_dep_copies remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
+            (if drop_stale_dep_copies false remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
              then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
              else ();
              phase "publish" (fn () => check_remote_publication remote root spec);

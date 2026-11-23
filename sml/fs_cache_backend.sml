@@ -221,12 +221,7 @@ fun existing_action_result cache policy key expected actual =
             val incoming = HolbuildTheoryCacheManifest.cache_manifest_contract key expected
           in
             if #non_timeout_text resident <> #non_timeout_text incoming then
-              (* The incoming blobs are copied before their action. *)
-              if (HolbuildTheoryCacheManifest.weaker_but_for_digest key
-                    (fn hash => read_text (blob_path cache hash)) expected actual
-                  handle _ => false) then
-                (write_action cache {key = key, text = expected}; HolbuildCacheBackend.Published)
-              else HolbuildCacheBackend.Conflict (action_manifest cache key)
+              HolbuildCacheBackend.Conflict (action_manifest cache key)
             else if HolbuildTheoryCacheManifest.timeout_at_least_as_strong
                       (#proof_timeout resident) (#proof_timeout incoming) then
               HolbuildCacheBackend.AlreadyPresent
@@ -269,18 +264,52 @@ fun verified_blobs cache hashes =
           in loop (List.drop (remaining, n)) (verify (List.take (remaining, n)) :: acc) end
   in loop hashes [] end
 
+(* Blobs up to this size are copied through memory, a theory's outputs
+   among them.  Without libcrypto, only those HolbuildHash would hash in
+   SML from a file too. *)
+fun memory_copy_limit () : Position.int =
+  if HolbuildHash.uses_libcrypto () then 16777216
+  else Position.fromInt HolbuildHash.external_hash_limit
+
+fun read_binary path =
+  let val input = BinIO.openIn path
+  in BinIO.inputAll input before BinIO.closeIn input
+     handle e => (BinIO.closeIn input; raise e)
+  end
+
+fun write_binary path bytes =
+  let
+    val _ = ensure_parent path
+    val tmp = temp_near path
+    val output = BinIO.openOut tmp
+      handle e => raise Error ("could not write " ^ path ^ ": " ^ General.exnMessage e)
+    fun close_output () = BinIO.closeOut output handle _ => ()
+  in
+    (BinIO.output (output, bytes);
+     BinIO.closeOut output;
+     rename_replace {old = tmp, new = path})
+    handle e => (close_output (); remove_file tmp; raise e)
+  end
+
 (* dst is a local filesystem path where the caller wants the blob materialized. *)
 fun fetch_blob cache {hash, dst} =
   let
     val blob = blob_path cache hash
-    fun corrupt detail = HolbuildCacheBackend.Corrupt (detail ^ ": " ^ hash)
+    fun mismatch () = (remove_file dst; HolbuildCacheBackend.Corrupt ("cache blob SHA256 mismatch: " ^ hash))
   in
     if not (path_exists blob) then HolbuildCacheBackend.Miss
+    else if FS.fileSize blob < memory_copy_limit () then
+      (* The bytes hashed are the bytes written, so the copy isn't read back. *)
+      let val bytes = read_binary blob
+      in
+        if HolbuildHash.string_sha256 (Byte.bytesToString bytes) = hash
+        then (write_binary dst bytes; HolbuildCacheBackend.Hit)
+        else mismatch ()
+      end
     else
       (* Hashing the copy alone checks the cached blob as well. *)
       (link_or_copy {src = blob, dst = dst};
-       if file_hash_matches dst hash then HolbuildCacheBackend.Hit
-       else (remove_file dst; corrupt "cache blob SHA256 mismatch"))
+       if file_hash_matches dst hash then HolbuildCacheBackend.Hit else mismatch ())
   end
   handle Error msg => HolbuildCacheBackend.Corrupt msg
        | e => HolbuildCacheBackend.Corrupt (General.exnMessage e)

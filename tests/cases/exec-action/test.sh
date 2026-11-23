@@ -26,7 +26,8 @@ cleanup() {
 trap cleanup EXIT
 
 remote_root=$tmpdir/remote
-start_remote_cache_server "$remote_root" "$tmpdir/server"
+control=$tmpdir/control
+start_remote_cache_server "$remote_root" "$tmpdir/server" "$control"
 use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project
@@ -414,6 +415,15 @@ PY
 link_hol_toolchain_cache "$tmpdir/worker-c"
 cp -r "$tmpdir/worker-b/actions" "$tmpdir/worker-b/blobs" "$tmpdir/worker-c/"
 printf 'corrupt dependency\n' > "$tmpdir/worker-c/blobs/$dep_dat"
+dep_sml=$(awk '$1 == "blob" && $2 == "sml" { print $3 }' "$tmpdir/worker-c/actions/$key_a/manifest")
+cp "$tmpdir/worker-c/blobs/$dep_sml" "$tmpdir/dep.sml"
+printf 'corrupt dependency\n' > "$tmpdir/worker-c/blobs/$dep_sml"
+# Installing a dependency refreshes its entry and every blob it names, for
+# the cache's LRU.
+dep_blobs=$(awk '$1 == "blob" { print $3 }' "$tmpdir/worker-c/actions/$key_a/manifest")
+for blob in $dep_blobs; do touch -d '3 days ago' "$tmpdir/worker-c/blobs/$blob"; done
+touch -d '3 days ago' "$tmpdir/worker-c/actions/$key_a/manifest"
+touch "$tmpdir/before-c"
 # When worker c compresses a theory module its writer wrote, to publish it
 # before storing it, a heap restore puts another copy of the module in the
 # store, as a sibling worker's can (fetch_heap_modules): the shim saves the
@@ -465,6 +475,10 @@ else
 fi
 expect c 0 "status=built"
 cmp "$tmpdir/dep.dat" "$tmpdir/worker-c/blobs/$dep_dat"
+cmp "$tmpdir/dep.sml" "$tmpdir/worker-c/blobs/$dep_sml"
+for refreshed in "$tmpdir/worker-c/actions/$key_a/manifest" $(printf "$tmpdir/worker-c/blobs/%s\n" $dep_blobs); do
+  [[ $refreshed -nt "$tmpdir/before-c" ]] || { echo "worker c didn't refresh $refreshed" >&2; exit 1; }
+done
 if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   [[ -n $(ls "$swapped") ]] || { echo "worker c compressed no theory module" >&2; exit 1; }
   # Each swapped module that was published was published with the bytes
@@ -1047,6 +1061,56 @@ rm "$tmpdir/worker-stale-own/actions/$key_n/manifest"
 worker stale-own "$spec_m"
 expect stale-own 0 "spec=$spec_m" "status=cached"
 
+# A cache in front of the remote's store (a host's bazel-remote over S3) can
+# keep serving an entry the store has since replaced: here the worker's own
+# MTheory, built against another NTheory than the remote's.  A worker that
+# finds such a copy doesn't fit its parents asks the cache to check it with
+# the store (the fixture then stops serving it), and takes the store's in the
+# same attempt.  stale_host NAME: a stale worker whose MTheory the cache
+# serves, holding no NTheory.
+key_m=$(key_for "$tmpdir/batch-m.txt" worker:MTheory)
+ac_m=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_m" | sha256sum | cut -d' ' -f1)
+stale_host() {
+  stale_worker "$1" MTheory
+  rm "$tmpdir/worker-$1/actions/$key_n/manifest"
+  python3 "$SCRIPT_DIR/../../fixtures/remote_cache_entry.py" \
+    "$tmpdir/worker-$1" "$key_m" "$remote_root/cas" "$control/ac-stale-$ac_m"
+}
+revalidated() {
+  [[ ! -e "$control/ac-stale-$ac_m" ]] || {
+    echo "worker $1 didn't ask the cache to check its copy of MTheory" >&2; cat "$tmpdir/$1.log" >&2; exit 1; }
+}
+# As a parent of the theory to build.
+cat > "$project/src/SScript.sml" <<'SML'
+Theory S
+Ancestors M
+
+Theorem s_thm: T
+Proof
+  simp[]
+QED
+SML
+hb action-spec --upload STheory > "$tmpdir/batch-s.txt"
+spec_s=$(spec_for "$tmpdir/batch-s.txt" worker:STheory)
+[[ -n $spec_s ]] || { cat "$tmpdir/batch-s.txt" >&2; exit 1; }
+rm "$project/src/SScript.sml"
+stale_host stale-host-dep
+worker stale-host-dep "$spec_s"
+expect stale-host-dep 0 "spec=$spec_s" "status=built"
+revalidated stale-host-dep
+# As the theory itself, which it then restores rather than builds; through
+# the curl command, as without libcurl.
+stale_host stale-host-own
+HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so worker stale-host-own "$spec_m"
+expect stale-host-own 0 "spec=$spec_m" "status=cached"
+revalidated stale-host-own
+# A worker whose copies fit asks for no check.
+rm -f "$control/no-cache-gets"
+worker fresh-own "$spec_m"
+expect fresh-own 0 "spec=$spec_m" "status=cached"
+[[ ! -e "$control/no-cache-gets" ]] || {
+  echo "a worker with no misfit asked the cache to check entries:" >&2; cat "$control/no-cache-gets" >&2; exit 1; }
+
 # Likewise for a parent the theory loads only through a project library's
 # implementation, behind its signature.
 cat > "$project/src/nLib.sig" <<'SML'
@@ -1102,24 +1166,8 @@ stale_worker replacement NTheory
 new_dat=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$tmpdir/worker-replacement/actions/$key_n/manifest")
 [[ $old_dat != "$new_dat" ]] || { echo "N did not produce replacement outputs" >&2; exit 1; }
 # Publish that independently checked replacement to the fixture cache.
-python3 - "$tmpdir/worker-replacement" "$remote_root" "$key_n" <<'PYTHON'
-import hashlib, pathlib, shutil, sys
-cache, remote = map(pathlib.Path, sys.argv[1:3])
-key = sys.argv[3]
-manifest = (cache / "actions" / key / "manifest").read_bytes()
-metadata = ["holbuild-remote-cache-action-v2",
-            "manifest-sha256 " + hashlib.sha256(manifest).hexdigest(),
-            "manifest-size " + str(len(manifest))]
-for line in manifest.decode().splitlines():
-    fields = line.split()
-    if fields[:1] == ["blob"]:
-        blob = fields[2]
-        src = cache / "blobs" / blob
-        shutil.copyfile(src, remote / "cas" / blob)
-        metadata.append("blob " + blob + " " + str(src.stat().st_size))
-ac = hashlib.sha256(("holbuild-remote-ac-v1\n" + key + "\n").encode()).hexdigest()
-(remote / "ac" / ac).write_bytes(("\n".join(metadata) + "\nmanifest-text-v1\n").encode() + manifest)
-PYTHON
+python3 "$SCRIPT_DIR/../../fixtures/remote_cache_entry.py" "$tmpdir/worker-replacement" "$key_n" "$remote_root/cas" \
+  "$remote_root/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_n" | sha256sum | cut -d' ' -f1)"
 worker stale-deps "$spec_r"
 expect stale-deps 0 "status=built"
 cmp "$tmpdir/worker-replacement/blobs/$new_dat" "$tmpdir/worker-stale-deps/blobs/$new_dat"

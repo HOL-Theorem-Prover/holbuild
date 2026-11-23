@@ -523,12 +523,24 @@ fun request args =
   request_once args
   handle CaDirectoryNeeded => (clear_ca_directory := false; request_once args)
 
-(* Downloads url into dst, decoding any content encoding. *)
-fun get {url, dst, timeout} =
+(* Downloads url into dst with the given extra request headers, decoding
+   any content encoding. *)
+fun get_with_headers {url, dst, headers, timeout} =
   request {url = url, timeout = timeout, files = fn run =>
     with_file dst "wb" (fn output =>
-      run {output = output,
-           set_options = fn easy => check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1))})}
+      let
+        val header_list = List.foldl (fn (h, l) => slist_append (l, h)) Foreign.Memory.null headers
+        fun set_options easy =
+          (check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1));
+           check "HTTPHEADER" (setopt_ptr (easy, CURLOPT_HTTPHEADER, header_list)))
+      in
+        (* The handle is closed before this frees the list. *)
+        run {output = output, set_options = set_options}
+        before slist_free_all header_list
+        handle e => (slist_free_all header_list; raise e)
+      end)}
+
+fun get {url, dst, timeout} = get_with_headers {url = url, dst = dst, headers = [], timeout = timeout}
 
 datatype encoding = Identity | Zstd | OtherEncoding
 
