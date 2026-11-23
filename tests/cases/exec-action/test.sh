@@ -414,6 +414,15 @@ PY
 link_hol_toolchain_cache "$tmpdir/worker-c"
 cp -r "$tmpdir/worker-b/actions" "$tmpdir/worker-b/blobs" "$tmpdir/worker-c/"
 printf 'corrupt dependency\n' > "$tmpdir/worker-c/blobs/$dep_dat"
+dep_sml=$(awk '$1 == "blob" && $2 == "sml" { print $3 }' "$tmpdir/worker-c/actions/$key_a/manifest")
+cp "$tmpdir/worker-c/blobs/$dep_sml" "$tmpdir/dep.sml"
+printf 'corrupt dependency\n' > "$tmpdir/worker-c/blobs/$dep_sml"
+# Installing a dependency refreshes its entry and every blob it names, for
+# the cache's LRU.
+dep_blobs=$(awk '$1 == "blob" { print $3 }' "$tmpdir/worker-c/actions/$key_a/manifest")
+for blob in $dep_blobs; do touch -d '3 days ago' "$tmpdir/worker-c/blobs/$blob"; done
+touch -d '3 days ago' "$tmpdir/worker-c/actions/$key_a/manifest"
+touch "$tmpdir/before-c"
 # When worker c compresses a theory module its writer wrote, to publish it
 # before storing it, a heap restore puts another copy of the module in the
 # store, as a sibling worker's can (fetch_heap_modules): the shim saves the
@@ -465,6 +474,10 @@ else
 fi
 expect c 0 "status=built"
 cmp "$tmpdir/dep.dat" "$tmpdir/worker-c/blobs/$dep_dat"
+cmp "$tmpdir/dep.sml" "$tmpdir/worker-c/blobs/$dep_sml"
+for refreshed in "$tmpdir/worker-c/actions/$key_a/manifest" $(printf "$tmpdir/worker-c/blobs/%s\n" $dep_blobs); do
+  [[ $refreshed -nt "$tmpdir/before-c" ]] || { echo "worker c didn't refresh $refreshed" >&2; exit 1; }
+done
 if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
   [[ -n $(ls "$swapped") ]] || { echo "worker c compressed no theory module" >&2; exit 1; }
   # Each swapped module that was published was published with the bytes

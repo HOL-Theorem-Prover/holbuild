@@ -179,6 +179,24 @@ fun write_object_manifest path lines =
   (write_manifest path lines;
    write_manifest (hfs_remapped_path path) lines)
 
+(* The .hol/objs copy of PATH, a file a hydrate installs in the action root.
+   A theory action's child writes only its write dirs, so the copy can be a
+   link; a run action's child may write the whole root, so it gets a copy. *)
+fun place_root_object path =
+  let val dst = hfs_remapped_path path
+  in
+    if Option.isSome (!HolbuildActionSandbox.action_write_dirs) then
+      (ensure_parent dst;
+       remove_file dst;
+       Posix.FileSys.link {old = path, new = dst}
+       handle OS.SysErr _ => copy_binary path dst)
+    else link_or_copy_file path dst
+  end
+
+fun write_root_object_manifest path lines =
+  (write_manifest path lines;
+   place_root_object path)
+
 val runtime_line = HolbuildToolchain.runtime_line
 
 fun load_theory_line name = "HolbuildRuntime.load " ^ HolbuildToolchain.sml_string name ^ ";"
@@ -2987,28 +3005,29 @@ fun checked_cache_entry allow_timeout_discrepancy {root, input_key, subject, exp
 (* Installs a checked cache entry's outputs at the given paths, its extra
    outputs where `extra_destination` puts each declaration, and its load
    manifests with `write_manifests`.  COPY puts a blob at a path, SML_TEXT
-   gives the text of the .sml blob, which DST may hold after, and REFRESH
-   marks the entry used once its blobs are in place.  Returns the entry's
-   proof timeout and the .sml text written. *)
-fun install_cache_entry {copy, sml_text, refresh} input_key subject
+   gives the text of the .sml blob, which DST may hold after, OBJECT puts
+   an installed file's .hol/objs copy, and REFRESH marks the entry used
+   once its blobs are in place.  Returns the entry's proof timeout and the
+   .sml text written. *)
+fun install_cache_entry {copy, sml_text, object, refresh} input_key subject
                         {blobs = {sig_hash, sml_hash, dat_hash, trace_hash, extra_hashes, parents, mldeps},
                          proof_timeout, manifest_text = _}
                         {outputs = {sig_path, sml_path, data_path}, extra_destination, write_manifests} =
   let
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
     val _ = copy dat_hash data_path
-    val _ = link_or_copy_file data_path (hfs_remapped_path data_path)
+    val _ = object data_path
     val _ = copy sig_hash sig_path
-    val _ = link_or_copy_file sig_path (hfs_remapped_path sig_path)
+    val _ = object sig_path
     val text = replace_all cache_sml_token data_path (sml_text sml_hash sml_path)
   in
     write_text sml_path text;
-    link_or_copy_file sml_path (hfs_remapped_path sml_path);
+    object sml_path;
     (case trace_hash of
          NONE => ()
        | SOME hash =>
            (copy hash trace_path;
-            link_or_copy_file trace_path (hfs_remapped_path trace_path)));
+            object trace_path));
     List.app
       (fn (declaration, hash) =>
           let val destination = extra_destination declaration
@@ -3041,6 +3060,7 @@ fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan
         (install_cache_entry
            {copy = copy_blob verify_cache root,
             sml_text = fn hash => fn dst => (copy_blob verify_cache root hash dst; read_text dst),
+            object = fn path => link_or_copy_file path (hfs_remapped_path path),
             (* copy_blob doesn't refresh the blobs it copies. *)
             refresh = fn () => HolbuildCache.touch_action root input_key}
            input_key subject entry
@@ -11388,13 +11408,14 @@ fun restore_spec_theory_in remote {files, named} resolver {key, subject, stem, e
     val written = ref {parents = [] : string list, mldeps = [] : string list}
     fun write_manifests metadata =
       (written := metadata;
-       write_object_manifest (stem_path ^ ".ui") [in_root named stem ^ ".sig"];
-       write_object_manifest (stem_path ^ ".uo")
+       write_root_object_manifest (stem_path ^ ".ui") [in_root named stem ^ ".sig"];
+       write_root_object_manifest (stem_path ^ ".uo")
          (generated_theory_loads resolve metadata @ [in_root named stem ^ ".sml"]))
     val {sml_text, ...} =
       install_cache_entry
         {copy = fn hash => fn dst => fetch_spec_blob remote {hash = hash, dst = dst},
          sml_text = fn hash => fn dst => fetch_spec_text remote {hash = hash, dst = dst},
+         object = place_root_object,
          (* The fetches refreshed every blob the entry names. *)
          refresh = fn () => HolbuildCache.touch (HolbuildCache.action_manifest cache key)}
         key subject entry
@@ -11552,7 +11573,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       in
         if Resident.find resident path = SOME (Resident.Manifest sha) andalso present (objects path)
         then Resident.want resident path
-        else (ensure_parent path; write_object_manifest path lines; Resident.put resident path (Resident.Manifest sha))
+        else (ensure_parent path; write_root_object_manifest path lines; Resident.put resident path (Resident.Manifest sha))
       end
     val resolver = spec_resolver spec
     fun resolve name = Option.map (fn (s, order) => (in_root root s, order)) (resolver name)
@@ -15625,6 +15646,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         (* A run's script may load any theory under the root by name, so
            it starts from an empty one, and leaves no records. *)
         val _ = (empty_all (); resident := Resident.empty (); ensure_dir root)
+        val _ = HolbuildActionSandbox.action_write_dirs := NONE
         val _ = check_cancelled ()
         val spec = parse_run_spec spec_text
         val _ = input_key := #run_key spec
