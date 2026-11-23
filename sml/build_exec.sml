@@ -12036,14 +12036,21 @@ fun publish_action_entry remote root (spec : action_spec) =
                  in
                    if (cache_manifest_outputs_equal key resident manifest handle _ => false) then SOME resident
                    else if remote_entry_lost_blob remote resident then
-                     (* Each node whose entry lost a blob takes the new one,
-                        best effort; a node with a restorable entry keeps it.
-                        The replace then writes the node read here as the
-                        other replaces do, so that an outage is reported. *)
-                     (HolbuildRemoteCache.repair_action_replicas remote
+                     (* Written only to the nodes whose entry lost a blob: another
+                        may hold a restorable entry, which must stay.  The
+                        writes are best effort, so one still there is reported
+                        as the cache being unavailable, not as a conflict. *)
+                     (warn ("replacing remote cache entry " ^ key ^ ": the cache no longer holds all of its blobs");
+                      HolbuildRemoteCache.repair_action_replicas remote
                         {key = key, text = manifest, attempts = remote_theory_publish_attempts,
                          should_replace = lost_blob};
-                      replace "the cache no longer holds all of its blobs")
+                      case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key) of
+                          SOME text =>
+                            if remote_entry_lost_blob remote text then
+                              raise HolbuildRemoteCache.Unavailable
+                                ("could not replace remote cache entry " ^ key ^ ", whose blobs the cache lost")
+                            else SOME text
+                        | NONE => NONE)
                    else if resident_misfits_parents remote root spec resident then
                      replace "its recorded parents differ from the cache's"
                    else if resident_weaker_but_for_dat key manifest resident then

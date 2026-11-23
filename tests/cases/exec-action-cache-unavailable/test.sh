@@ -351,7 +351,7 @@ fi
 # first ranked for A's entry holds the lost one, the other a restorable
 # entry with other outputs, which stays.
 main_pid=$server_pid main_url=$remote_url
-start_remote_cache_server "$tmpdir/remote-two" "$tmpdir/server-two"
+start_remote_cache_server "$tmpdir/remote-two" "$tmpdir/server-two" "$tmpdir/control-two"
 second_pid=$server_pid second_url=$remote_url
 server_pid=$main_pid remote_url=$main_url
 first=$(python3 - "$ac" "$remote_url" "$second_url" <<'PY'
@@ -361,22 +361,33 @@ print(max(nodes, key=lambda node: hashlib.sha256(f"{node}:{digest}".encode()).he
 PY
 )
 if [[ $first == "$remote_url" ]]; then
-  lost_root=$remote_root live_root=$tmpdir/remote-two
+  lost_root=$remote_root lost_control=$control live_root=$tmpdir/remote-two
 else
-  lost_root=$tmpdir/remote-two live_root=$remote_root
+  lost_root=$tmpdir/remote-two lost_control=$tmpdir/control-two live_root=$remote_root
 fi
 mkdir -p "$tmpdir/remote-two/ac"
 sig_entry "$lost_root/ac/$ac" "$lost_text" "$timeout"
 sig_entry "$live_root/ac/$ac" "$live_text" "$timeout"
 cp "$live_root/ac/$ac" "$tmpdir/live-entry"
+# live_entry_kept: the other node's entry is unchanged.
+live_entry_kept() {
+  cmp "$live_root/ac/$ac" "$tmpdir/live-entry" ||
+    { echo "the restorable entry on the other node was overwritten" >&2; exit 1; }
+}
+# A node refusing the write leaves the cache unavailable, not in conflict,
+# and the write goes to no other node.
+echo 507 > "$lost_control/ac-put-status"
+worker lost-blob-refused "$remote_url,$second_url"
+rm "$lost_control/ac-put-status"
+expect lost-blob-refused 3 unavailable "could not replace remote cache entry .*, whose blobs the cache lost"
+live_entry_kept
 worker lost-blob-ring "$remote_url,$second_url"
 lost_blob_built lost-blob-ring
 if grep -qx "blob sig $lost_sig" "$lost_root/ac/$ac"; then
   echo "the node whose entry lost a blob still holds it" >&2
   exit 1
 fi
-cmp "$live_root/ac/$ac" "$tmpdir/live-entry" ||
-  { echo "the restorable entry on the other node was overwritten" >&2; exit 1; }
+live_entry_kept
 kill "$second_pid"
 wait "$second_pid" 2>/dev/null || true
 second_pid=
