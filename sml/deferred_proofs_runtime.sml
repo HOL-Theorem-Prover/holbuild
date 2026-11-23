@@ -569,11 +569,13 @@ struct
      oracles resolved through LOOKUP, as Theory.export_theory would write
      it: the string table is rebuilt in the order HOL interns its strings,
      which the theorems' dependencies take part in, and every reference to
-     it renumbered.  HOL interns the strings of the types and terms and the
-     theorems' names, then each theorem's theory, dependencies' theories
-     and source location, then the strings of the theory data; the last
-     theorem name ends the first part.  Raises Fail on theory data of an
-     encoding whose string references holbuild can't find. *)
+     it renumbered.  HOL interns the strings of the exported types and
+     terms and the theorems' names, then each theorem's theory,
+     dependencies' theories and source location, then the strings of the
+     theory data.  A theorem may be named after a constant, so the first
+     part can end with a constant's string rather than a name.  Raises
+     Fail on theory data of an encoding whose string references holbuild
+     can't find. *)
   fun rewrite_data_observing observe lookup data =
     let
       open HOLsexp
@@ -623,7 +625,67 @@ struct
         if isSome (Binarymap.peek (d, s)) then (n, d, acc)
         else (n + 1, Binarymap.insert (d, s, n), s :: acc)
       fun interned start l = List.foldl intern start l
-      val first = List.foldl (fn ({name, ...}, m) => Int.max (m, int name + 1)) 0 theorems
+      (* The first part: the strings of the ids the exported types and
+         terms use, and the theorems' names.  The type, term and id tables
+         grow in step with the string table, each entry after those it
+         names, so the exported types' and terms' entries are a prefix of
+         each table, ending at the last entry the part before names; the
+         theory data's entries follow. *)
+      fun table tag =
+        case List.find (fn Cons (Symbol t, _) => t = tag | _ => false) types_terms of
+            SOME (Cons (_, l)) => Vector.fromList (items l)
+          | _ => fail tag
+      val type_table = table "type-table"
+      val term_table = table "term-table"
+      fun pair (Cons (a, b)) = (a, b)
+        | pair _ = fail "pair"
+      fun max_of l = List.foldl Int.max ~1 l
+      fun prefix_upto last = List.tabulate (last + 1, fn i => i)
+      (* Term.write_raw names a term table entry after %, U or B, and a
+         bound variable or an application count after $, u, b or @. *)
+      fun raw_term_entries (String s) =
+            let
+              fun digits i = if i < size s andalso Char.isDigit (String.sub (s, i)) then digits (i + 1) else i
+              fun scan i acc =
+                if i >= size s then acc
+                else
+                  let val j = digits (i + 1)
+                  in
+                    scan j (if j > i + 1 andalso Char.contains "%UB" (String.sub (s, i))
+                            then valOf (Int.fromString (String.substring (s, i + 1, j - i - 1))) :: acc
+                            else acc)
+                  end
+            in scan 0 [] end
+        | raw_term_entries _ = fail "term"
+      val (unnamed_types, named_types) = pair tys
+      val (unnamed_terms, named_terms) = pair tms
+      val last_term =
+        max_of (List.concat (map raw_term_entries
+                                 (items unnamed_terms @ map (#2 o pair) (items named_terms) @
+                                  List.concat (map (fn {terms, ...} => items terms) theorems))))
+      (* A term table entry's id and type: a variable's (name type), a
+         constant's (id type), and applications and abstractions of earlier
+         entries. *)
+      fun term_entry i =
+        case items (Vector.sub (term_table, i)) of
+            [String _, Integer ty] => (NONE, SOME ty)
+          | [Integer id, Integer ty] => (SOME id, SOME ty)
+          | [Symbol _, Integer _, Integer _] => (NONE, NONE)
+          | _ => fail "term table entry"
+      (* A type table entry's id: a type variable's name, or (id args...). *)
+      fun type_id i =
+        case Vector.sub (type_table, i) of
+            String _ => NONE
+          | t => (case items t of Integer id :: _ => SOME id | _ => fail "type table entry")
+      val term_entries = map term_entry (prefix_upto last_term)
+      val last_type =
+        max_of (map int (items unnamed_types @ map (#2 o pair) (items named_types)) @
+                List.mapPartial #2 term_entries)
+      val last_id = max_of (List.mapPartial type_id (prefix_upto last_type) @ List.mapPartial #1 term_entries)
+      val id_table = Vector.fromList ids
+      fun id_strings i = let val (a, b) = pair (Vector.sub (id_table, i)) in [int a, int b] end
+      val first =
+        1 + max_of (List.concat (map id_strings (prefix_upto last_id)) @ map (fn {name, ...} => int name) theorems)
       val prefix = List.tabulate (first, fn i => Vector.sub (old, i))
       val start = interned (0, Binarymap.mkDict String.compare, []) prefix
       val (_, _, added) = interned (0, #2 start, []) (List.concat (map thm_strings theorems))

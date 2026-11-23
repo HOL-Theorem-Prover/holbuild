@@ -323,6 +323,39 @@ require_grep "pipeline: committed: BTheory" "$log"
 require_no_grep "attempt failed" "$log"
 UNPIPELINED_FLAGS="" require_same_as_unpipelined restore CTheory A B C
 
+# A's only theorem is named after the constant it states, so HOL interns its
+# name with the constants', before the strings that come after the theorem
+# names in the exported string table.  The deferred build's rewrite of the
+# theory data still finds where they start.
+new_project samename
+cat > "$tmpdir/samename/src/ZScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "Z";
+Definition za_def:
+  za = T
+End
+Definition zb_def:
+  zb = T
+End
+val _ = export_theory();
+SML
+cat > "$tmpdir/samename/src/AScript.sml" <<SML
+open HolKernel Parse boolLib bossLib ZTheory;
+val _ = new_theory "A";
+Theorem za:
+  za /\\ zb
+Proof
+  $pause >> PURE_REWRITE_TAC [za_def, zb_def] >> CONJ_TAC >> ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+write_b_and_c samename
+build_pipelined samename CTheory
+log=$tmpdir/samename.log
+require_grep "pipeline: gate passed: ATheory" "$log"
+require_no_grep "attempt failed" "$log"
+require_same_as_unpipelined samename CTheory Z A B C
+
 # A deferred proof's step that runs out of time fails A's deferred build,
 # and A's build with its proofs in place fails the same way.
 new_project timeout
