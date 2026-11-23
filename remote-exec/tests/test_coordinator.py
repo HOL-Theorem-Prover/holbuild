@@ -1955,6 +1955,114 @@ async def test_a_kept_hosts_worker_that_does_not_come_back_from_its_result_leave
     assert child is not None and child.theory == "pkg:b"
 
 
+async def burst_hosts_with_a_child_to_claim_ahead(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> list[str]:
+    """A batch that loads ahead whose ``b`` waits on ``a``, which host-a's worker a0 runs. host-a's other worker a1
+    was just seen, so host-a has a slot for a claim ahead below the line; host-b's worker b0 has no lease."""
+    burst = ["high", "standard"]
+    await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    for worker in ["a0", "a1"]:
+        coordinator.report_worker("host-a", worker, burst)
+    coordinator.report_worker("host-b", "b0", burst)
+    parent = await coordinator.claim(burst, "a0", host_id="host-a")  # reads no claims ahead before ``a`` runs
+    assert parent is not None and parent.theory == "pkg:a"
+    return burst
+
+
+async def test_a_burst_host_above_the_scale_in_line_claims_nothing_ahead_the_hosts_below_it_have_workers_for(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """host-b's claim gets nothing, so its worker drops its task protection, and host-a's a1 takes ``b`` ahead."""
+    burst = await burst_hosts_with_a_child_to_claim_ahead(http, coordinator)
+    assert await coordinator.claim(burst, "b0", host_id="host-b", ahead=True) is None
+    child = await coordinator.claim(burst, "a1", host_id="host-a", ahead=True)
+    assert child is not None and child.theory == "pkg:b" and child.ahead_parents
+
+
+async def test_no_ahead_wake_goes_to_a_burst_host_above_the_scale_in_line(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only a wake ends the wait in time
+    burst = await burst_hosts_with_a_child_to_claim_ahead(http, coordinator)
+    tail = asyncio.create_task(coordinator.claim(burst, "b0", 30, host_id="host-b", ahead=True))
+    await wait_until(lambda: bool(coordinator.claim_waiters) or tail.done())
+    assert not tail.done()
+    coordinator._ahead_changed()
+    assert all(not w[2].done() for w in coordinator.claim_waiters) and len(coordinator.claim_waiters) == 1
+    tail.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await tail
+
+
+async def test_a_claim_woken_ahead_takes_nothing_ahead_once_the_line_moved_past_its_burst_host(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """host-b's claim was woken ahead while the line took it in; host-a's a1 came back before it ran."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)
+    burst = await burst_hosts_with_a_child_to_claim_ahead(http, coordinator)
+    tail = asyncio.create_task(coordinator.claim(burst, "b0", 0.5, host_id="host-b", ahead=True))
+    await wait_until(lambda: bool(coordinator.claim_waiters) or tail.done())
+    assert not tail.done()
+    waiter = coordinator.claim_waiters.pop()
+    waiter[2].set_result(("standard", True, None, None))
+    assert await asyncio.wait_for(tail, 10) is None
+
+
+async def test_the_line_for_claims_ahead_keeps_no_slot_of_idle_warm_workers(coordinator: Coordinator) -> None:
+    """Warm workers never claim ahead: counting their 7 idle slots, the standard line stops at full host-1, but the
+    line for claims ahead takes in host-2, whose workers can."""
+    burst = ["high", "standard"]
+    coordinator.settings.warm_workers = 7
+    for i in range(7):
+        coordinator.report_worker("warm", f"warm-w{i}", ["standard"])
+    for host, leases in [("host-1", 32), ("host-2", 3)]:
+        for i in range(32):
+            coordinator.report_worker(host, f"{host}-w{i}", burst)
+        for i in range(leases):
+            coordinator.lease_hosts[uuid4()] = (host, f"{host}-w{i}", burst)
+
+    assert "host-2" not in coordinator._kept_hosts(1)
+    assert coordinator._kept_hosts(1, ahead=True) == {"host-1", "host-2"}
+    assert not coordinator._above_line(coordinator._waiter_rank(burst, "host-2", 1), "standard", ahead=True)
+
+
+async def test_the_line_for_claims_ahead_takes_in_a_burst_host_for_the_actions_it_could_claim_ahead(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """``b``, ``c`` and ``d`` wait on ``a``, which host-a's a0 runs: host-a's free a1 can take one of them, so the
+    line for claims ahead takes in host-b for the others once a read of claims ahead has found them."""
+    burst = ["high", "standard"]
+    await submit(http, ["a", "b", "c", "d"], [("b", "a"), ("c", "a"), ("d", "a")], speculative_loading="4")
+    for worker in ["a0", "a1"]:
+        coordinator.report_worker("host-a", worker, burst)
+    coordinator.report_worker("host-b", "b0", burst)
+    parent = await coordinator.claim(burst, "a0", host_id="host-a")
+    assert parent is not None and parent.theory == "pkg:a"
+    assert await coordinator.claim(burst, "b0", host_id="host-b", ahead=True) is None  # no read has found them yet
+    assert coordinator._ahead_ready("standard") == 0
+    await coordinator._ahead_candidates()
+    assert coordinator._ahead_ready("standard") == 3
+    child = await coordinator.claim(burst, "b0", host_id="host-b", ahead=True)
+    assert child is not None and child.ahead_parents
+
+
+async def test_a_kept_hosts_worker_that_does_not_come_back_leaves_its_slot_to_a_tail_hosts_claim_ahead(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """host-a's a1 stays away past TURNAROUND_SECONDS, so host-a has no slot left for ``b``, and burst host-b's
+    claim, now below the line for claims ahead, takes it at its recheck."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 0.05)
+    burst = await burst_hosts_with_a_child_to_claim_ahead(http, coordinator)
+    tail = asyncio.create_task(coordinator.claim(burst, "b0", 30, host_id="host-b", ahead=True))
+    await asyncio.sleep(0.2)
+    assert not tail.done()
+    later = coordinator.clock() + timedelta(seconds=coordinator_module.TURNAROUND_SECONDS + 1)
+    coordinator.clock = lambda: later
+    child = await asyncio.wait_for(tail, 10)
+    assert child is not None and child.theory == "pkg:b"
+
+
 async def test_a_lease_while_the_ready_builds_are_counted_still_counts_off_them(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:

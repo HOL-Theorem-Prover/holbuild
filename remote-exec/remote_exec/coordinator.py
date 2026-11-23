@@ -1381,9 +1381,10 @@ class Coordinator:
         def undeferred(*, ahead_only: bool) -> list[str]:
             """The tiers this claim doesn't leave to better-ranked unwoken waiters (see _defers), of those that may
             claim ahead if ``ahead_only``."""
-            # An ahead wake bypassed better-ranked waiters that can't claim ahead, so it lifts only the ahead deferral.
+            # An ahead wake bypassed better-ranked waiters that can't claim ahead, so it lifts only the ahead deferral,
+            # but, from a burst host, not of the tiers whose scale-in line for claims ahead moved past it since.
             if woken.done() and ahead_only:
-                return tiers
+                return [tier for tier in tiers if not self._above_line(rank, tier, ahead=True)]
             # A build wake lifts it for builds, but, from a burst host, only of the tier it was woken for (see
             # _wake_claim) and the tiers whose scale-in line takes the host in.
             if woken.done() and not woken.result()[1]:
@@ -2353,19 +2354,23 @@ class Coordinator:
         elif result.status != "failed" or result.failure in RAN_FAILURES:
             self._ran_on(host_id, theory)
 
-    def _kept_hosts(self, ready: int = 0, tier: str = "standard") -> set[str]:
+    def _kept_hosts(self, ready: int = 0, tier: str = "standard", *, ahead: bool = False) -> set[str]:
         """The hosts below the scale-in line for work of ``tier``: in the order claims pack onto them (warm hosts,
         then by rank, fullest burst hosts first, and id), the hosts not quarantined whose workers seen lately could
         run the live leases and the ready builds (the last count's, or ``ready`` if more), and at least the warm
         workers. High work, which only burst workers take, has a line of its own counting only burst workers: their
-        leases and the ready high builds. A host's workers with no lease count only while they claim, or for
+        leases and the ready high builds. So do claims ``ahead``, which warm workers don't make: their line counts the
+        burst workers' leases, the ready builds of ``tier``'s line and the actions that may be claimed ahead (see
+        _ahead_ready), as a line with warm workers in it would keep their idle slots for work they never take, and
+        send no burst host claims ahead. A host's workers with no lease count only while they claim, or for
         ``TURNAROUND_SECONDS`` after they were last seen, as between a result and the next claim, so one that doesn't
         come back leaves no slot to wait for. A host short of memory counts only the workers it runs or that wait for
         a claim, as the others wait for memory. A host above the line is to empty, so locality never sends it work and
         its burst workers take no build a host below it could (see _defers, _wake_claim)."""
         now = self.clock()
         high = tier == "high"
-        leases = Counter(host for host, _, tiers in self.lease_hosts.values() if not high or "high" in tiers)
+        burst_only = high or ahead
+        leases = Counter(host for host, _, tiers in self.lease_hosts.values() if not burst_only or "high" in tiers)
         leased = {(host, worker) for host, worker, _ in self.lease_hosts.values()}
         waiting = Counter(
             w_rank.host_id for w_tiers, w_rank, w_woken, _ in self.claim_waiters if not w_woken.done() and tier in w_tiers
@@ -2374,14 +2379,14 @@ class Coordinator:
         for host_id, workers in self.host_workers.items():
             fresh = [
                 "high" in w_tiers for seen, w_tiers in workers.values()
-                if (now - seen).total_seconds() < HOST_REPORT_SECONDS and (not high or "high" in w_tiers)
+                if (now - seen).total_seconds() < HOST_REPORT_SECONDS and (not burst_only or "high" in w_tiers)
             ]
             if not fresh or self._quarantine(host_id) is not None:
                 continue
             report = self.hosts.get(host_id)
             rank = 0 if report is None else report[1].rank
             # A host reports its leases of all tiers.
-            reported = report[1].leases if report is not None and report[1].leases is not None and not high else 0
+            reported = report[1].leases if report is not None and report[1].leases is not None and not burst_only else 0
             busy = leases[host_id] + waiting[host_id]
             short = report is not None and bool(report[1].memory_short)
             free = sum(
@@ -2396,8 +2401,11 @@ class Coordinator:
                 continue
             # Fuller burst hosts first, so a partly drained one lies beyond the line and empties.
             hosts.append(((all(fresh), rank, -len(fresh) if all(fresh) else 0, host_id), slots))
-        if high:
-            budget = sum(leases[host_id] for (*_, host_id), _ in hosts) + max(ready, self.ready_high)
+        if burst_only:
+            demand = self.ready_high if high else self.ready_builds
+            if ahead:
+                demand += self._ahead_ready(tier)
+            budget = sum(leases[host_id] for (*_, host_id), _ in hosts) + max(ready, demand)
         else:
             budget = max(self.settings.warm_workers, len(self.lease_hosts) + max(ready, self.ready_builds))
         kept: set[str] = set()
@@ -2510,8 +2518,9 @@ class Coordinator:
         """Wake the best-ranked compatible claim, with FIFO ties, for an action of ``batch_id`` and ``theory`` made
         ready, if it is for one: of those on hosts below the scale-in line that take ``tier``, the best-ranked that
         hold the most of ``theory`` (see _local_entry), if more than the best-ranked claim's host. A build wake goes
-        to no burst host above the line (see _tail_host): the workers below it come back for the build. Only normal
-        wakes count newly ready work; changes for capable claims are recorded by _ahead_changed."""
+        to no burst host above the line (see _tail_host): the workers below it come back for the build; an ahead wake
+        to none above the line for claims ahead. Only normal wakes count newly ready work; changes for capable claims
+        are recorded by _ahead_changed."""
         if not ahead:
             self.made_ready += 1
         compatible = [
@@ -2519,15 +2528,15 @@ class Coordinator:
             if tier in w[0] and not w[2].done() and (w[3] or not ahead) and self._quarantine(w[1].host_id) is None
         ]
         kept: set[str] | None = None  # the line with the build made ready, computed once needed
-        if not ahead and any(self._known_burst(w[1]) for w in compatible):
-            kept = self._kept_hosts(1, tier)
+        if any(self._known_burst(w[1]) for w in compatible):
+            kept = self._kept_hosts(1, tier, ahead=ahead)
             compatible = [w for w in compatible if not self._tail_host(w[1], kept)]
         waiter = min(compatible, key=lambda w: w[1], default=None)
         if waiter is not None and theory is not None and self.settings.locality:
             level = self._level(waiter[1].host_id, theory)
             holders = [w for w in compatible if self._level(w[1].host_id, theory) > level]
             if holders and kept is None:
-                kept = self._kept_hosts(1, tier)
+                kept = self._kept_hosts(1, tier, ahead=ahead)
             holders = [w for w in holders if kept is not None and w[1].host_id in kept]
             best = max((self._level(w[1].host_id, theory) for w in holders), default=0)
             local = min((w for w in holders if self._level(w[1].host_id, theory) == best), key=lambda w: w[1], default=None)
@@ -2545,8 +2554,8 @@ class Coordinator:
         they can't take them all and a deferred claim sleeps until its recheck. A burst host above the scale-in line
         (see _tail_host) leaves builds to the hosts below it whether or not their workers wait now: one that just
         reported a result comes back for the next build, and the line takes in this host once there are more builds
-        than those hosts' workers can take, or they stay away."""
-        if not ahead_only and self._above_line(rank, tier):
+        than those hosts' workers can take, or they stay away. Claims ahead defer likewise to the line for them."""
+        if self._above_line(rank, tier, ahead=ahead_only):
             return True
         enough = 1 if ahead_only else max(1, self.claimable.get(tier, 0))
         better = 0
@@ -2569,10 +2578,22 @@ class Coordinator:
         which is to empty, so takes no build a host below it could."""
         return self._known_burst(rank) and rank.host_id not in kept
 
-    def _above_line(self, rank: ClaimRank, tier: str) -> bool:
+    def _ahead_ready(self, tier: str) -> int:
+        """The distinct actions the last read of claims ahead found that a claim of ``tier`` could take ahead, less
+        those claimed since and those of batches and tiers found with none left: of ``tier`` for high work, else of
+        any tier, as the line for standard work counts all ready builds. An action several batches hold counts once,
+        as single-flight leases it once."""
+        read = self.ahead_read
+        if read is None:
+            return 0
+        return len({
+            key for b, key, t, *_ in read.candidates if (tier != "high" or t == tier) and (b, t) not in read.exhausted
+        })
+
+    def _above_line(self, rank: ClaimRank, tier: str, *, ahead: bool = False) -> bool:
         """Whether the claim ranked ``rank`` comes from a burst host above the scale-in line for builds of ``tier``,
-        counting the build it would take, also before the sweep counted it."""
-        return self._known_burst(rank) and self._tail_host(rank, self._kept_hosts(1, tier))
+        or for claims ahead if ``ahead``, counting the action it would take, also before the sweep counted it."""
+        return self._known_burst(rank) and self._tail_host(rank, self._kept_hosts(1, tier, ahead=ahead))
 
     def _waiter_rank(self, tiers: list[str], host_id: str | None, host_rank: int) -> ClaimRank:
         """The rank of a claim of ``tiers`` from ``host_id`` as its host's workers are now; see _claim_rank."""

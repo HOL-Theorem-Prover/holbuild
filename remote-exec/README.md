@@ -544,7 +544,10 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   made ready, don't sleep out their recheck. A burst host above the
   scale-in line (below) takes no build: its claims defer whether or not a
   better-ranked claim waits, and no build wake goes to it; the line takes
-  it in once the hosts below can't run the builds. A waiting
+  it in once the hosts below can't run the builds. Claims ahead (see
+  Pipelining) have a line of their own, the same over burst workers only,
+  as standard-only workers never claim ahead: a burst host above it claims
+  nothing ahead and gets no ahead wake. A waiting
   standard-only worker still leaves high work available to burst
   workers. This packs work so excess tail hosts can drain for scale-in.
   Each process also remembers, per host, its last 2048 keys, the theories
@@ -560,7 +563,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   claims (only those, or the host's reported leases, on a host short of
   memory), can run the live leases and the ready
   builds, and at least `REMOTE_EXEC_WARM_WORKERS`; for high work, where the
-  hosts with a burst worker can run their leases and the ready high work.
+  hosts with a burst worker can run their leases and the ready high work;
+  for claims ahead, where they can run their leases, the ready builds and
+  the actions the last read of claims ahead found they could take.
   Hosts above it get no preference, so they still empty when demand falls.
   With `REMOTE_EXEC_LOCALITY` on, a claim from a kept host that holds less
   of the head batch's next build takes, of the next 8 batches with the same
