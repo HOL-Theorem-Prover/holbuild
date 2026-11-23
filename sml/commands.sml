@@ -115,6 +115,9 @@ fun build_help () = print
   \  --skip-proof-steps\n\
   \  --proof-scope root|all (default: root)\n\
   \  --tactic-timeout SECONDS\n\
+  \  --heavy-tactic-timeout SECONDS (default: twice the tactic timeout)\n\
+  \      The timeout of steps calling metis_tac or METIS_TAC; 0 leaves them\n\
+  \      untimed.\n\
   \  --trace-steps\n\
   \  --repl-on-failure\n\
   \  --retain-debug-artifacts\n\
@@ -455,6 +458,10 @@ fun tactic_timeout_value text =
   let val seconds = nonnegative_real "--tactic-timeout" text
   in if seconds <= 0.0 then NONE else SOME seconds end
 
+fun heavy_tactic_timeout_value text =
+  let val seconds = nonnegative_real "--heavy-tactic-timeout" text
+  in if seconds <= 0.0 then NONE else SOME seconds end
+
 fun proof_scope_value text =
   case text of
       "root" => HolbuildTacticTimeoutPolicy.ProofRoot
@@ -503,8 +510,22 @@ fun split_flags args =
                 (nonnegative_real "--checkpoint-seconds" (String.extract (y, size "--checkpoint-seconds=", NONE)))
                 acc ys
             else extract_checkpoint_seconds seconds (y :: acc) ys
-    val (checkpoint_seconds, build_args) =
+    val (checkpoint_seconds, args_without_checkpoint_seconds) =
       extract_checkpoint_seconds HolbuildBuildExec.default_checkpoint_seconds [] args_without_fail_fast
+    fun extract_heavy_tactic_timeout timeout acc xs =
+      case xs of
+          [] => (timeout, rev acc)
+        | "--heavy-tactic-timeout" :: n :: ys =>
+            extract_heavy_tactic_timeout (SOME (heavy_tactic_timeout_value n)) acc ys
+        | ["--heavy-tactic-timeout"] => raise Error "--heavy-tactic-timeout requires SECONDS"
+        | y :: ys =>
+            if String.isPrefix "--heavy-tactic-timeout=" y then
+              extract_heavy_tactic_timeout
+                (SOME (heavy_tactic_timeout_value (String.extract (y, size "--heavy-tactic-timeout=", NONE))))
+                acc ys
+            else extract_heavy_tactic_timeout timeout (y :: acc) ys
+    val (heavy_tactic_timeout, build_args) =
+      extract_heavy_tactic_timeout NONE [] args_without_checkpoint_seconds
     fun loop dry watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set execution_plan trace_steps repl_on_failure retain_debug_artifacts warn_unreachable rest =
       case rest of
           [] => ({dry_run = dry, watch = watch, force = force, use_cache = use_cache,
@@ -516,6 +537,7 @@ fun split_flags args =
                   proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
                   tactic_timeout = tactic_timeout,
                   tactic_timeout_set = tactic_timeout_set,
+                  heavy_tactic_timeout = heavy_tactic_timeout,
                   execution_plan = execution_plan,
                   trace_steps = trace_steps,
                   repl_on_failure = repl_on_failure,
@@ -609,7 +631,7 @@ fun plain_build_request targets =
     skip_checkpoints = true, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
     fail_fast = false, all_checkpoints = false, proof_steps = false, new_ir = false,
     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
-    tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
+    tactic_timeout = NONE, tactic_timeout_set = false, heavy_tactic_timeout = NONE, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
     allow_cache_timeout_discrepancy = false, promote_preload = true},
@@ -625,7 +647,7 @@ fun heap_build_request targets =
     skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
     fail_fast = false, all_checkpoints = false, proof_steps = false, new_ir = false,
     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
-    tactic_timeout = NONE, tactic_timeout_set = false, execution_plan = NONE,
+    tactic_timeout = NONE, tactic_timeout_set = false, heavy_tactic_timeout = NONE, execution_plan = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
     allow_cache_timeout_discrepancy = false, promote_preload = false},
@@ -1225,7 +1247,7 @@ datatype build_mode =
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int,
                    speculative_loading : int option}
 
-fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, checkpoint_seconds, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, promote_preload}, targets) =
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, checkpoint_seconds, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, heavy_tactic_timeout, execution_plan, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, promote_preload}, targets) =
   let
     val project =
       case prepared of
@@ -1236,7 +1258,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
     (* Tracing builds collect proof traces, so by default they skip the proof
        development artifacts, as --skip-checkpoints --skip-proof-steps would.
        An explicit debugging flag turns back on what it needs. *)
-    val debug_proof_steps = trace_steps orelse tactic_timeout_set orelse repl_on_failure orelse
+    val debug_proof_steps = trace_steps orelse tactic_timeout_set orelse Option.isSome heavy_tactic_timeout orelse repl_on_failure orelse
                             proof_scope = HolbuildTacticTimeoutPolicy.ProofAll
     val (skip_checkpoints, proof_steps, new_ir) =
       if trknl then
@@ -1264,6 +1286,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         raise Error "proof steps are required for proof IR; remove --skip-proof-steps"
       else if not proof_steps andalso tactic_timeout_set then
         raise Error "--tactic-timeout requires proof steps; remove --skip-proof-steps"
+      else if not proof_steps andalso Option.isSome heavy_tactic_timeout then
+        raise Error "--heavy-tactic-timeout requires proof steps; remove --skip-proof-steps"
       else if not proof_steps andalso proof_scope = HolbuildTacticTimeoutPolicy.ProofAll then
         raise Error "--proof-scope=all requires proof steps; remove --skip-proof-steps"
       else if not proof_steps andalso trace_steps then
@@ -1296,6 +1320,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        proof_steps = proof_steps,
        new_ir = new_ir,
        proof_scope = proof_scope,
+       heavy_tactic_timeout = heavy_tactic_timeout,
        node_tactic_timeouts =
          let
            (* Resolve all manifest entries even when CLI policy wins, so invalid
@@ -2558,15 +2583,16 @@ fun run_action_command tc cli_jobs args =
             else [flag]
     val rest = parse args
     val (flags as {dry_run, watch, trace_steps, repl_on_failure, execution_plan, use_cache,
-                   tactic_timeout_set, proof_scope, new_ir, ...}, targets) =
+                   tactic_timeout_set, heavy_tactic_timeout, proof_scope, new_ir, ...}, targets) =
       split_flags ("--skip-proof-steps" :: rest)
     val _ =
       if dry_run orelse watch orelse trace_steps orelse repl_on_failure orelse Option.isSome execution_plan then
         raise Error "run-action does not run builds: remove --dry-run, --watch, --trace-steps and --repl-on-failure"
       else if not use_cache then
         raise Error "run-action: a run's context comes from the cache, so --no-cache can't apply"
-      else if tactic_timeout_set orelse proof_scope = HolbuildTacticTimeoutPolicy.ProofAll orelse new_ir then
-        raise Error "run-action does not check proof steps: remove --tactic-timeout, --proof-scope=all and --new-ir"
+      else if tactic_timeout_set orelse Option.isSome heavy_tactic_timeout orelse
+              proof_scope = HolbuildTacticTimeoutPolicy.ProofAll orelse new_ir then
+        raise Error "run-action does not check proof steps: remove --tactic-timeout, --heavy-tactic-timeout, --proof-scope=all and --new-ir"
       else if !export_only andalso
               (!fetch_only orelse !remote_only orelse Option.isSome (!url) orelse
                Option.isSome (!outputs_dir) orelse Option.isSome (!profile)) then
@@ -2914,6 +2940,7 @@ fun default_build_options trknl project index entry_plan plan =
      proof_steps = true,
      new_ir = true,
      proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
+     heavy_tactic_timeout = NONE,
      node_tactic_timeouts =
        HolbuildTacticTimeoutPolicy.replace_timeouts
          (HolbuildTacticTimeoutPolicy.combine_timeouts
@@ -2964,6 +2991,7 @@ fun heap_build_options trknl =
    new_ir = false,
    proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
    node_tactic_timeouts = HolbuildTacticTimeoutPolicy.no_timeouts,
+   heavy_tactic_timeout = NONE,
    execution_plan = NONE,
    trace_steps = false,
    repl_on_failure = false,

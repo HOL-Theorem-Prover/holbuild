@@ -1130,8 +1130,11 @@ holbuild build --skip-checkpoints MyTheory
   Steps containing public `HolSmtLib` tactic names (such as `Z3_TAC`, `CVC_TAC`,
   or `z3_tac`) are automatically untimed, including under other structure
   qualifiers. Other work in the same step shares that exemption; separate steps
-  retain their limits. Steps containing `metis_tac` or `METIS_TAC` get at least
-  5 seconds the same way (a longer timeout applies to them too).
+  retain their limits. Steps containing `metis_tac` or `METIS_TAC`, matched the
+  same way, get twice the timeout (5 seconds at the 2.5 second default).
+- `--heavy-tactic-timeout SECONDS` sets the timeout of steps containing
+  `metis_tac` or `METIS_TAC` instead; `0` leaves them untimed. It applies only
+  where steps are timed at all.
   A step that times out runs once more with half the timeout; if that
   finishes, the step passes and the theory's build log says so
   (`holbuild tactic timeout retry passed: ...`). Otherwise it fails the build,
@@ -1710,6 +1713,7 @@ output sig|sml|dat <relpath>
 output extra <declaration>
 option proof-steps=<bool>
 option tactic-timeout=<seconds|none>
+option heavy-tactic-timeout=<seconds|none>  (only when it differs from twice the tactic timeout)
 option new-ir=<bool>
 option theorem-checkpoints=false   (only for a theory that saves none)
 option checkpoint-target=true      (only for a theory that saves checkpoints as it runs)

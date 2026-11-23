@@ -257,7 +257,7 @@ fun attempts () = length (String.tokens (fn c => c = #"\n") (D.read_all (path "a
 fun reset mode = (write "mode" mode; write "attempts" "");
 fun policy new_ir =
   B.CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false,
-                      checkpoint_seconds = 2.0, proof_steps = true, new_ir = new_ir, tactic_timeout = NONE,
+                      checkpoint_seconds = 2.0, proof_steps = true, new_ir = new_ir, tactic_timeout = NONE, heavy_tactic_timeout = NONE,
                       execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false,
                       promote_preload = false};
 val action =
