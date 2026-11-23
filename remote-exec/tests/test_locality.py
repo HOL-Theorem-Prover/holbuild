@@ -801,7 +801,7 @@ async def test_a_hold_of_a_theory_the_batch_no_longer_builds_next_is_replaced(
 
 def outranking(above: Callable[[str, int], list[str]]) -> Any:
     """Claims ahead that rank before ready builds of other batches by ``above``, and none of a build's own."""
-    return SimpleNamespace(above=above, deepest={}, deeper=lambda *_: False, read=None)
+    return SimpleNamespace(above=above, deepest={}, deeper=lambda *_: False, read=None, kept=lambda _: True)
 
 
 async def test_a_claim_with_a_hint_only_tier_claims_ahead_for_the_build_that_stopped_it(

@@ -869,19 +869,23 @@ class _AheadRead:
 class _Outranking:
     """The claims ahead a claim that may take them puts before a ready build (see Coordinator._outranked_by_ahead):
     ``best``, the highest priority of a candidate of each tier of ``ahead_tiers``, and ``deepest``, the place of
-    each batch and tier's deepest candidate in claim order, from ``read``."""
+    each batch and tier's deepest candidate in claim order, from ``read``. ``kept`` tells, when a claim ahead is
+    about to be made, whether the claim's host is still below the scale-in line for claims ahead of a tier."""
 
     tiers: list[str]
     ahead_tiers: list[str]
     read: _AheadRead
     best: dict[str, int]
     deepest: dict[tuple[UUID, str], tuple[int, int]]
+    kept: Callable[[str], bool]
 
     def above(self, tier: str, priority: int) -> list[str]:
-        """The tiers no later than ``tier`` with a candidate of a batch of a higher priority than ``priority``."""
+        """The tiers no later than ``tier`` with a candidate of a batch of a higher priority than ``priority``, of
+        those whose line for claims ahead still takes in the claim's host."""
         return [
             t for t in self.ahead_tiers
             if t in self.best and self.best[t] > priority and self.tiers.index(t) <= self.tiers.index(tier)
+            and self.kept(t)
         ]
 
     def deeper(self, batch_id: UUID, tier: str, ready: tuple[int, int] | None) -> bool:
@@ -1440,7 +1444,9 @@ class Coordinator:
                 hint_only = held_tiers.difference(eligible_tiers)
                 claim_tiers = [t for t in tiers if t in eligible_tiers or t in hint_only]
                 outranked = (
-                    self._outranked_by_ahead(read, tiers, ahead_tiers)
+                    self._outranked_by_ahead(
+                        read, tiers, ahead_tiers, lambda tier: not self._above_line(rank, tier, ahead=True)
+                    )
                     if read is not None and ahead_tiers and claim_tiers else None
                 )
                 claimed, held_until = (
@@ -1507,7 +1513,9 @@ class Coordinator:
         if batch_id is not None:
             await self._end_unheld([(claimed.attempt_token, batch_id)])
 
-    def _outranked_by_ahead(self, read: _AheadRead, tiers: list[str], ahead_tiers: list[str]) -> _Outranking | None:
+    def _outranked_by_ahead(
+        self, read: _AheadRead, tiers: list[str], ahead_tiers: list[str], kept: Callable[[str], bool]
+    ) -> _Outranking | None:
         """The actions of ``ahead_tiers`` that may be claimed ahead and rank before a ready build of ``tiers``:
         those of a batch of a higher priority than the build's, of a tier no later than its, and those of its own
         batch and tier with a deeper chain of dependents. Builds of a batch rank among themselves that way, deepest
@@ -1522,7 +1530,7 @@ class Coordinator:
                 deepest.setdefault((batch_id, tier), place)  # the read is best first
         if not best:
             return None
-        return _Outranking(tiers, ahead_tiers, read, best, deepest)
+        return _Outranking(tiers, ahead_tiers, read, best, deepest, kept)
 
     async def _claim(
         self,
@@ -1593,7 +1601,8 @@ class Coordinator:
                     if claimed is not None:
                         return claimed, None
                     ranking.running_priority -= 1
-                if (batch_id, tier) in outranked.deepest:
+                # The line for claims ahead may have moved past this host during the claim's awaits.
+                if (batch_id, tier) in outranked.deepest and outranked.kept(tier):
                     ready = ranking.depths.get((batch_id, tier))
                     if ready is None:  # a claim since the read took the batch's first ready build
                         async with self.engine.connect() as conn:
@@ -2380,8 +2389,9 @@ class Coordinator:
         leases = Counter(host for host, _, tiers in self.lease_hosts.values() if not burst_only or "high" in tiers)
         leased = {(host, worker) for host, worker, _ in self.lease_hosts.values()}
         waiting = Counter(
-            w_rank.host_id for w_tiers, w_rank, w_woken, _ in self.claim_waiters
+            w_rank.host_id for w_tiers, w_rank, w_woken, w_ahead in self.claim_waiters
             if not w_woken.done() and tier in w_tiers and (not burst_only or "high" in w_tiers)
+            and (w_ahead or not ahead)
         )
         hosts: list[tuple[tuple[bool, int, int, str], int]] = []
         for host_id, workers in self.host_workers.items():
