@@ -2178,12 +2178,16 @@ fun run_parked_child workdir (HolState heap) file_args log =
         let
           val _ = parked_children := more @ others
           val _ = HolbuildActionSandbox.outputs_validated := false
+          val t0 = Time.now ()
           val input = Unix.textOutstreamOf process
           val _ = TextIO.output (input, String.concatWith "\t" (FS.fullPath workdir :: file_args) ^ "\n")
           val _ = TextIO.closeOut input
           val status = finish (Unix.reap process)
           val _ = HolbuildActionSandbox.outputs_validated := true
         in
+          HolbuildStatus.message_stderr
+            ("holbuild: park: the child on " ^ Path.file heap ^ " ran for " ^
+             Real.fmt (StringCvt.FIX (SOME 3)) (Time.toReal (Time.- (Time.now (), t0))) ^ " s\n");
           OS.FileSys.rename {old = child_log, new = log};
           status
         end
@@ -15608,7 +15612,9 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
       let
         val _ = clear_served ()
         val _ = write_text (#source_file action) source
+        val t0 = Time.now ()
         val checkpoints = analyse source
+        val _ = park_note ("analysed in " ^ park_seconds t0 ^ " s")
         fun run () =
           ((park_serving := true; check source checkpoints; park_serving := false; ("pass", ""))
            handle Error msg => (park_serving := false; ("fail", msg))
