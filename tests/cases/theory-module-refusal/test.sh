@@ -142,7 +142,7 @@ structure E = HolbuildBuildExec;
 fun check message condition = if condition then () else raise Fail message;
 fun exists path = OS.FileSys.access (path, []);
 fun dep name = {target = "module-refusal:" ^ name ^ "Theory", stem = "src/" ^ name ^ "Theory", key = ""};
-fun toolchain holdir = {holdir = holdir, maxheap = NONE, kernel_variant = HolbuildToolchain.StandardKernel};
+fun toolchain holdir : HolbuildToolchain.t = {holdir = holdir, maxheap = NONE, kernel_variant = HolbuildToolchain.StandardKernel};
 val store = "$store";
 val tc =
   case List.find (fn holdir => E.module_store (toolchain holdir) = store) [$holdirs] of
