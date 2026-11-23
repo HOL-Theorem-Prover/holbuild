@@ -12027,21 +12027,23 @@ fun publish_action_entry remote root (spec : action_spec) =
           (case HolbuildRemoteCache.get_action remote key of
                SOME resident =>
                  let
-                   fun reread () = HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key)
                    fun replace why =
                      (warn ("replacing remote cache entry " ^ key ^ ": " ^ why);
                       ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest});
-                      reread ())
+                      HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key))
+                   fun lost_blob text =
+                     remote_entry_lost_blob remote text handle HolbuildRemoteCache.Unavailable _ => false
                  in
                    if (cache_manifest_outputs_equal key resident manifest handle _ => false) then SOME resident
                    else if remote_entry_lost_blob remote resident then
-                     (* Only on the nodes whose entry lost a blob: another may
-                        hold a restorable entry, which this must not overwrite. *)
-                     (warn ("replacing remote cache entry " ^ key ^ ": the cache no longer holds all of its blobs");
-                      HolbuildRemoteCache.repair_action_replicas remote
+                     (* Each node whose entry lost a blob takes the new one,
+                        best effort; a node with a restorable entry keeps it.
+                        The replace then writes the node read here as the
+                        other replaces do, so that an outage is reported. *)
+                     (HolbuildRemoteCache.repair_action_replicas remote
                         {key = key, text = manifest, attempts = remote_theory_publish_attempts,
-                         should_replace = remote_entry_lost_blob remote};
-                      reread ())
+                         should_replace = lost_blob};
+                      replace "the cache no longer holds all of its blobs")
                    else if resident_misfits_parents remote root spec resident then
                      replace "its recorded parents differ from the cache's"
                    else if resident_weaker_but_for_dat key manifest resident then
