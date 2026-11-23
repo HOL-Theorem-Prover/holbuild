@@ -15675,6 +15675,12 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
           SOME ({name, failed_prefix_path, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
             SOME (park_target_of_meta name (read_text (failed_prefix_path ^ ".meta")))
         | NONE => NONE
+    (* The theorem the build log names as failed, parked at its start: for a
+       failure that saves no failed prefix (an unsolved proof, say). *)
+    fun failed_theorem () =
+      Option.map (fn name => {theorem = name, step_count = 0, prefix_end = 0, path = ""})
+        (HolbuildTheoryDiagnostics.find_failed_theorem_name
+           (String.tokens (fn c => c = #"\n") (read_text build_log handle _ => "")))
     (* With no failed prefix from an earlier build, the source is built once
        the usual way to find where it fails. *)
     val initial =
@@ -15682,9 +15688,10 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
           SOME target => target
         | NONE =>
             (check source_text checkpoints handle Error _ => ();
-             case failed_target () of
-                 SOME target => target
-               | NONE => raise Error "park: the source does not fail in a proof")
+             case (failed_target (), failed_theorem ()) of
+                 (SOME target, _) => target
+               | (NONE, SOME target) => target
+               | (NONE, NONE) => raise Error "park: the source does not fail in a proof")
     val _ = remove_file socket
     val listener = UnixSock.Strm.socket ()
     val _ = Socket.bind (listener, UnixSock.toAddr socket)

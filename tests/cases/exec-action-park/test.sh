@@ -66,21 +66,26 @@ SML
 field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $col }' "$1"; }
 
 write_a 'FAIL_TAC "first failure"'
-(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload ATheory) > "$tmpdir/batch.txt"
-spec=$(field "$tmpdir/batch.txt" park:ATheory 4)
-[[ -n "$spec" ]] || { cat "$tmpdir/batch.txt" >&2; exit 1; }
 
 socket=$tmpdir/park.sock
-link_hol_toolchain_cache "$tmpdir/worker"
-HOLBUILD_CACHE=$tmpdir/worker "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" \
-  --share-heaps --cache-limit-gb 1000 --park "$socket" > "$tmpdir/park.log" 2>&1 &
-park_pid=$!
-for _ in $(seq 600); do
-  grep -q "park: listening on" "$tmpdir/park.log" && break
-  kill -0 "$park_pid" 2>/dev/null || { echo "the park server stopped" >&2; cat "$tmpdir/park.log" >&2; exit 1; }
-  sleep 0.5
-done
-grep -q "park: listening on" "$tmpdir/park.log" || { echo "the park server never listened" >&2; cat "$tmpdir/park.log" >&2; exit 1; }
+# serve NAME: a park server on A's current spec, from worker cache NAME.
+serve() {
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload ATheory) > "$tmpdir/batch-$1.txt"
+  local spec
+  spec=$(field "$tmpdir/batch-$1.txt" park:ATheory 4)
+  [[ -n "$spec" ]] || { cat "$tmpdir/batch-$1.txt" >&2; exit 1; }
+  link_hol_toolchain_cache "$tmpdir/$1"
+  HOLBUILD_CACHE=$tmpdir/$1 "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" \
+    --share-heaps --cache-limit-gb 1000 --park "$socket" > "$tmpdir/$1.log" 2>&1 &
+  park_pid=$!
+  for _ in $(seq 600); do
+    grep -q "park: listening on" "$tmpdir/$1.log" && break
+    kill -0 "$park_pid" 2>/dev/null || { echo "the park server stopped" >&2; cat "$tmpdir/$1.log" >&2; exit 1; }
+    sleep 0.5
+  done
+  grep -q "park: listening on" "$tmpdir/$1.log" || { echo "the park server never listened" >&2; cat "$tmpdir/$1.log" >&2; exit 1; }
+}
+serve park
 require_grep "park: prepared target at step 2 .* started 2 children" "$tmpdir/park.log"
 
 # check NAME STATUS: park-check of the current A must exit with STATUS.
@@ -117,3 +122,11 @@ require_grep "park: the script builds, stopping" "$tmpdir/park.log"
 
 # A server gone means the caller checks the usual way.
 check gone 2
+
+# A proof left unsolved from the start saves no failed prefix: the server
+# parks at the theorem's start, on the context before it.
+write_a 'ALL_TAC'
+serve unsolved-start
+require_grep "park: prepared target at step 0 .* started 1 children" "$tmpdir/unsolved-start.log"
+write_a 'ACCEPT_TAC TRUTH'
+check after-unsolved 0
