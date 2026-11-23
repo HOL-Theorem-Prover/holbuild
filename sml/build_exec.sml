@@ -7853,7 +7853,8 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     (* A node's rank: the longest chain of selected dependents below it,
        then its count of descendants.  A restore-only build runs no theory,
        so ranking it would only cost time (the descendant counts take
-       O(N * E / 8) up front): it takes ready nodes first come. *)
+       O(N * E / 8) up front): it takes ready nodes in ready-list order
+       (most recently readied first). *)
     val ranked = not (#restore_only options)
     val critical_depth = Array.array (node_count, ~1)
     fun depth id =
