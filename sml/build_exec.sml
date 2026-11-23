@@ -14781,19 +14781,22 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
    the entry another writer published is malformed or its module can't
    be fetched.  A store never replaces a module it has (install_module).
    The result: this writer's files that were stored, those whose module
-   another writer published was stored instead, and how many entries were
+   another writer published was stored instead, those not stored as the
+   store had a module of their name, and how many entries were
    published. *)
 fun converge_modules remote {store, staging, modules, deadline} =
   let
     val mutex = Mutex.mutex ()
     val installed = ref []
     val won = ref []
+    val present = ref []
     val published = ref 0
     fun count f = (Mutex.lock mutex; f (); Mutex.unlock mutex)
     fun published_one () = count (fn () => published := !published + 1)
     fun install_own file =
       if install_module store {src = Path.concat (staging, file), name = file}
-      then count (fn () => installed := file :: !installed) else ()
+      then count (fn () => installed := file :: !installed)
+      else count (fn () => present := file :: !present)
     fun manifest file sha = shared_manifest module_remote_header NONE [("file", sha, file)]
     fun lookup key = HolbuildRemoteCache.get_action remote key
     (* The SHA-256 of FILE's blob once the cache has it. *)
@@ -14910,7 +14913,7 @@ fun converge_modules remote {store, staging, modules, deadline} =
        parallel_all remote_probe_width
          (guarded (fn pending => read_back pending))
          (map (fn (pending as (file, _, _)) => (file, pending)) (!confirm)));
-    {installed = !installed, won = !won, published = !published}
+    {installed = !installed, won = !won, present = !present, published = !published}
   end
 
 (* The remote keys of the MISSING modules (expected_modules); the
@@ -15093,35 +15096,42 @@ fun theory_module_grants root tc (spec : action_spec) deps_heap =
         | NONE => loaded ()
   end
 
-(* What a module writer run did, for module_store_trace: none ran, or
-   the sandbox refused what it left, or it left REPORT
-   (module_writer_report, [] for none) and wrote OUTPUTS, the modules
-   (file names) of which were DISCARDED (theory not missing when it ran),
-   or INSTALLED, or replaced by the module another writer published first
-   (WON), or else found stored under the same name (EXISTING), or under
-   another (OTHER), or still ABSENT. *)
+(* What a module writer run did, for module_store_trace: none ran, and
+   why (`covered`: no expected module missing; `threshold`: fewer missing
+   than module_writer_min_missing; `locked`: another process writes the
+   store; `time`: too little left before the deadline; `failed`: an error
+   before it started), or the sandbox refused what it left, or it left
+   REPORT (module_writer_report, [] for none) and wrote OUTPUTS, the
+   modules (file names) of which were DISCARDED (theory not missing when
+   it ran), or INSTALLED, or replaced by the module another writer
+   published first (WON), or not installed as the store had one of its
+   name (EXISTING), or else found stored under another name (OTHER), or
+   still ABSENT. *)
 datatype module_writer_run =
-    WriterNotRun
+    WriterNotRun of string
   | WriterRefused
   | WriterRan of {report : string list, outputs : int, discarded : string list, installed : int,
                   existing : int, other : int, absent : string list, won : int}
 
 (* The trace of an action's module store on the worker's line after the
    result, for telling why expected modules weren't loaded or written:
-   the distinct base ids of the store's module FILES (before the writer
-   ran) with how many modules each has; HOL's base id and how many of the
-   EXPECTED modules (`<theory>-<.dat SHA-1>.pmo`) the store held under it
-   or only under another id, once a writer reported it; and what the
-   writer RUN did.  Examples are bounded, so the line stays short. *)
+   the distinct base ids of the store's module FILES when the writer's
+   gate last listed them, with how many modules each has; how many of the
+   EXPECTED modules (`<theory>-<.dat SHA-1>.pmo`) it held under no id; and
+   HOL's base id and how many it held under that id or only under
+   another, once a writer reported it; and what the writer RUN did.
+   Examples are bounded, and what the writer reported is checked, so the
+   line stays short and on one line. *)
 fun module_store_trace {files, expected, run} =
   let
     fun short id = String.substring (id, 0, Int.min (12, size id))
     fun clean text =
       let
-        val text = String.map (fn c => if Char.isSpace c orelse c = #"," orelse c = #";" then #"_" else c) text
+        val text = String.map (fn c => if Char.isGraph c andalso c <> #"," andalso c <> #";" then c else #"_") text
       in
         String.substring (text, 0, Int.min (80, size text))
       end
+    fun hex text = text <> "" andalso CharVector.all Char.isHexDigit text
     fun count key xs =
       List.foldl (fn (x, acc) =>
                      case List.find (fn (k, _) => k = key x) acc of
@@ -15138,23 +15148,22 @@ fun module_store_trace {files, expected, run} =
     val report = case run of WriterRan {report, ...} => report | _ => []
     fun fields line = String.tokens (fn c => c = #" ") line
     fun values key = List.mapPartial (fn line => case fields line of k :: rest => if k = key then SOME rest else NONE | [] => NONE) report
-    val base = case values "base" of [id] :: _ => SOME id | _ => NONE
-    val exact_foreign =
-      case base of
-          NONE => " modules_base=unavailable modules_exact=? modules_foreign=?"
-        | SOME id =>
-            let
-              fun set xs = Binaryset.addList (Binaryset.empty String.compare, xs)
-              val names = set files
-              val stored = set (List.mapPartial module_file_theory_part files)
-              val exact = List.filter (fn part => Binaryset.member (names, id ^ "-" ^ part)) expected
-              val foreign =
-                List.filter (fn part => Binaryset.member (stored, part) andalso
-                                        not (Binaryset.member (names, id ^ "-" ^ part))) expected
-            in
-              " modules_base=" ^ short id ^ " modules_exact=" ^ Int.toString (length exact) ^
-              " modules_foreign=" ^ Int.toString (length foreign)
-            end
+    val base = case values "base" of [id] :: _ => if hex id then SOME id else NONE | _ => NONE
+    fun set xs = Binaryset.addList (Binaryset.empty String.compare, xs)
+    val names = set files
+    val stored = set (List.mapPartial module_file_theory_part files)
+    val neither = List.filter (fn part => not (Binaryset.member (stored, part))) expected
+    val store_fields =
+      " modules_expected=" ^ Int.toString (length expected) ^ " modules_neither=" ^ Int.toString (length neither) ^
+      (case base of
+           NONE => " modules_base=unavailable modules_exact=? modules_foreign=?"
+         | SOME id =>
+             let
+               val exact = List.filter (fn part => Binaryset.member (names, id ^ "-" ^ part)) expected
+             in
+               " modules_base=" ^ short id ^ " modules_exact=" ^ Int.toString (length exact) ^
+               " modules_foreign=" ^ Int.toString (length expected - length exact - length neither)
+             end)
     (* A module file as its short base id and theory part. *)
     fun file f =
       case (module_file_base_id f, module_file_theory_part f) of
@@ -15165,12 +15174,11 @@ fun module_store_trace {files, expected, run} =
     fun examples (key, names) =
       if null names then NONE
       else SOME (key ^ ":" ^ String.concatWith "," (map clean (List.take (names, Int.min (3, length names)))))
-    val errors =
-      map (fn rest => case rest of name :: message => name ^ "(" ^ String.concatWith " " message ^ ")" | [] => "")
-          (values "error")
+    fun with_message (name :: message) = name ^ "(" ^ String.concatWith " " message ^ ")"
+      | with_message [] = ""
     val writer_fields =
       case run of
-          WriterNotRun => " modules_writer=none"
+          WriterNotRun why => " modules_writer=none:" ^ why
         | WriterRefused => " modules_writer=refused"
         | WriterRan {outputs, discarded, installed, existing, other, absent, won, ...} =>
             let
@@ -15178,16 +15186,23 @@ fun module_store_trace {files, expected, run} =
               val status =
                 case (report, values "status") of
                     ([], _) => "noreport"
-                  | (_, (s :: _) :: _) => s
+                  | (_, (s :: _) :: _) =>
+                      if List.exists (fn known => known = s) ["ineligible", "no-base-id", "failed"] then s else "?"
                   | _ => "ran"
-              fun number key = case values key of [n] :: _ => n | _ => "0"
+              fun number key =
+                case values key of
+                    [n] :: _ => if n <> "" andalso CharVector.all Char.isDigit n then n else "?"
+                  | _ => "0"
               val counts =
                 List.mapPartial (fn key => case length (values key) of 0 => NONE | n => SOME (key ^ ":" ^ Int.toString n))
                   outcomes
+              val failed = List.mapPartial (fn "failed" :: message => SOME (String.concatWith " " message) | _ => NONE)
+                             (values "status")
               val sample =
                 List.mapPartial examples
                   (map (fn key => (key, named key)) ["refused", "unreadable", "noncanonical", "noroots"] @
-                   [("error", errors), ("discarded", map file discarded), ("absent", map file absent)])
+                   [("error", map with_message (values "error")), ("failed", failed),
+                    ("discarded", map file discarded), ("absent", map file absent)])
             in
               " modules_writer=" ^ String.concatWith "," (status :: ("needed:" ^ number "needed") ::
                                                          ("unvisited:" ^ number "unvisited") :: counts) ^
@@ -15198,27 +15213,29 @@ fun module_store_trace {files, expected, run} =
               (if null sample then "" else " modules_examples=" ^ String.concatWith ";" sample)
             end
   in
-    ids_field ^ exact_foreign ^ writer_fields
+    ids_field ^ store_fields ^ writer_fields
   end
 
 fun write_missing_modules remote root tc wanted deadline =
   let
     val store = module_store (#holdir tc)
     val {expected, theories, base_theories} = expected_modules root tc wanted
-    val initial = map Path.file (HolbuildCache.children store)
-    val run = ref WriterNotRun
+    (* The store's files when the writer's gate last listed them, and
+       what the writer did, for module_store_trace. *)
+    val listing = ref []
+    val run = ref (WriterNotRun "failed")
     fun missing_modules () =
       let
+        val _ = listing := map Path.file (HolbuildCache.children store)
         val stored =
-          Binaryset.addList (Binaryset.empty String.compare,
-                             List.mapPartial (module_file_theory_part o Path.file)
-                               (HolbuildCache.children store))
+          Binaryset.addList (Binaryset.empty String.compare, List.mapPartial module_file_theory_part (!listing))
       in
         List.filter (fn (e, _) => not (Binaryset.member (stored, e))) expected
       end
     fun worth_writing missing =
       not (null missing) andalso
       not (isSome base_theories andalso length missing < module_writer_min_missing ())
+    fun not_worth missing = WriterNotRun (if null missing then "covered" else "threshold")
     (* HOL maps <dir>/xTheory.sml to <dir>/.hol/objs/xTheory.sml itself,
        so it is given the unmapped name of a toolchain theory. *)
     fun hol_name b =
@@ -15274,7 +15291,7 @@ fun write_missing_modules remote root tc wanted deadline =
        OUTPUT, which it does also for a child it killed or that failed:
        only then are the child's modules stored. *)
     fun write () =
-      if Time.< (Time.- (deadline, Time.now ()), module_writer_min_time) then false
+      if Time.< (Time.- (deadline, Time.now ()), module_writer_min_time) then (run := WriterNotRun "time"; false)
       else
         let
           val _ = HolbuildRemoveTree.remove_untrusted output
@@ -15323,26 +15340,27 @@ fun write_missing_modules remote root tc wanted deadline =
         fun store_written () =
           let
             val report_file = Path.concat (output, module_writer_report)
+            (* The child may have left anything under the report's name. *)
             val report =
-              if file_exists report_file then String.tokens (fn c => c = #"\n") (read_text report_file) else []
+              (if file_exists report_file then String.tokens (fn c => c = #"\n") (read_text report_file) else [])
+              handle IO.Io _ => [] | OS.SysErr _ => []
             val outputs = List.filter (isSome o module_file_theory_part) (map Path.file (HolbuildCache.children output))
             val (written, discarded) = List.partition (module_file_wanted (map #1 still)) outputs
             (* Without a remote key (its .dat couldn't be hashed) a module
                is only stored. *)
-            val unkeyed =
-              List.filter (fn file => install_module store {src = Path.concat (output, file), name = file})
+            val (unkeyed, unkeyed_present) =
+              List.partition (fn file => install_module store {src = Path.concat (output, file), name = file})
                 (List.filter (not o isSome o key_of) written)
             val result =
               converge_modules remote
                 {store = store, staging = output,
                  modules = List.mapPartial (fn file => Option.map (fn key => (file, key)) (key_of file)) written,
                  deadline = Time.+ (deadline, module_publish_grace)}
+            val existing = unkeyed_present @ #present result
             val stored = map Path.file (HolbuildCache.children store)
-            fun has name = List.exists (fn f => f = name) stored
             fun has_part part = List.exists (fn f => module_file_theory_part f = SOME part) stored
             fun member files f = List.exists (fn x => x = f) files
-            val unstored = List.filter (not o member (unkeyed @ #installed result @ #won result)) written
-            val (existing, unstored) = List.partition has unstored
+            val unstored = List.filter (not o member (unkeyed @ #installed result @ #won result @ existing)) written
             val (other, absent) = List.partition (fn f => has_part (valOf (module_file_theory_part f))) unstored
           in
             installed := unkeyed @ #installed result;
@@ -15358,20 +15376,21 @@ fun write_missing_modules remote root tc wanted deadline =
              check for missing modules, for a restore to store one. *)
           ((if write () then (test_pause "HOLBUILD_TEST_WRITER_PAUSE"; store_written ()) else ()) before clean ())
           handle e => (clean (); raise e)
-        else ()
+        else run := not_worth still
       end
   in
-    if not (worth_writing missing) then ()
+    if not (worth_writing missing) then run := not_worth missing
     else
       (case HolbuildFileLock.try_acquire_path
               {path = Path.concat (store, module_store_writer_lock), obsolete_kind = NONE} of
-           NONE => ()
+           NONE => run := WriterNotRun "locked"
          | SOME lock =>
-             ((if HolbuildFileLock.at_path lock then fill () else ()) before HolbuildFileLock.release lock)
+             ((if HolbuildFileLock.at_path lock then fill () else run := WriterNotRun "locked")
+              before HolbuildFileLock.release lock)
              handle e => (HolbuildFileLock.release lock; raise e))
       handle e => warn ("theory modules not written: " ^ General.exnMessage e);
     {installed = length (!installed), missing = length missing, probed = !probed, fetched = !fetched,
-     published = !published, trace = module_store_trace {files = initial, expected = expected_names, run = !run}}
+     published = !published, trace = module_store_trace {files = !listing, expected = expected_names, run = !run}}
   end
 
 (* The writer for an action's theories, given until DEADLINE: how long it

@@ -150,14 +150,18 @@ val _ = check "an unwanted file was stored"
 
 (* Every module stored: bool is a base theory. *)
 val _ = E.write_text (OS.Path.concat (store "hol1", "base-theories")) "min\nbool\n";
-val _ = fill "hol1";
+val {trace, ...} = fill_by "hol1" 100;
 val _ = check "a writer ran for a filled store" (runs "hol1" = 1);
+val _ = check ("the trace of a filled store: " ^ trace) (String.isSuffix " modules_writer=none:covered" trace);
 
 (* Fewer than 16 modules missing: the action loads them from .dat files. *)
 fun remove files = List.app (fn f => OS.FileSys.remove (OS.Path.concat (store "hol1", f))) files;
 val _ = remove (b :: List.take (ps, 14));
-val _ = fill "hol1";
+val {trace, ...} = fill_by "hol1" 100;
 val _ = check "a writer ran for 15 missing modules" (runs "hol1" = 1);
+val _ = check ("the trace of 15 missing modules: " ^ trace)
+          (String.isSubstring " modules_expected=18 modules_neither=15 modules_base=unavailable" trace andalso
+           String.isSuffix " modules_writer=none:threshold" trace);
 
 (* No writer while another process writes to the store. *)
 val _ = remove [List.nth (ps, 14)];
@@ -539,7 +543,8 @@ val {installed, trace, ...} = fill_by "hol9" 100;
 val _ = OS.FileSys.remove "$tmpdir/report";
 val _ = check ("the trace of a store with another base id: " ^ trace)
           (installed = 1 andalso
-           trace = " modules_ids=1:cd34x1 modules_base=ab12 modules_exact=0 modules_foreign=1" ^
+           trace = " modules_ids=1:cd34x1 modules_expected=19 modules_neither=18" ^
+                   " modules_base=ab12 modules_exact=0 modules_foreign=1" ^
                    " modules_writer=ran,needed:2,unvisited:0,written:2" ^
                    " modules_outputs=files:2,discarded:1,installed:1,existing:0,other:0,absent:0 modules_won=0" ^
                    " modules_examples=discarded:" ^ a);
@@ -549,10 +554,18 @@ val {trace, ...} = fill_by "hol9" 100;
 val _ = check ("the trace of a writer with no report: " ^ trace)
           (String.isSubstring (" modules_base=unavailable modules_exact=? modules_foreign=?" ^
                                " modules_writer=noreport,needed:0,unvisited:0 modules_outputs=files:0,") trace);
+(* What the writer reports is checked before it is printed. *)
+val _ = E.write_text "$tmpdir/report" "base zz\nstatus weird\nneeded 1x\nerror A bad\tmessage\n";
+val {trace, ...} = fill_by "hol9" 100;
+val _ = OS.FileSys.remove "$tmpdir/report";
+val _ = check ("the trace of a malformed report: " ^ trace)
+          (String.isSubstring " modules_base=unavailable " trace andalso
+           String.isSubstring " modules_writer=?,needed:?,unvisited:0,error:1 " trace andalso
+           String.isSubstring " modules_examples=error:A(bad_message)" trace);
 val holder = lock_store "hol9";
 val {trace, ...} = fill_by "hol9" 100;
 val _ = unlock holder;
-val _ = check ("the trace with no writer: " ^ trace) (String.isSuffix " modules_writer=none" trace);
+val _ = check ("the trace with no writer: " ^ trace) (String.isSuffix " modules_writer=none:locked" trace);
 
 (* The remote key of a module is the v1 store's. *)
 val _ = check "a module's remote key changed"
