@@ -1339,6 +1339,10 @@ class Reaper:
         if self.running is not None:
             self.running[1].set()
 
+    def busy(self) -> bool:
+        """Whether the exec-action it took over still runs."""
+        return self.running is not None and self.running[0].is_alive()
+
     def stop(self) -> None:
         """Stops the exec-action it holds, if any, and returns once it is reaped."""
         if self.running is None:
@@ -1785,6 +1789,11 @@ def main() -> None:
         # Set when ECS refused protection for a claim or the worker dropped it after PROTECTED_SPELL_SECONDS: the
         # worker then claims only once ECS protects it, so a task being stopped takes no action it would give back.
         protect_first = False
+        # A burst worker under ECS that ran an action and then waited out a claim for nothing exits, so its task
+        # goes: at once in a scale-in, else ECS starts a new one where binpack puts it, on the fullest host with room,
+        # so partly drained hosts empty and scale in. A new task runs no action before it may exit, so idle ones
+        # don't restart in a loop.
+        ran_action = False
         while not drain.stop.is_set():
             with phases.timed("idle"):
                 wait_for_disk(drain, coordinator, tiers, args.name, sweep, reaper=reaper, before_wait=unprotect)
@@ -1813,6 +1822,12 @@ def main() -> None:
                 protect_first = False
                 with phases.timed("lease"):
                     unprotect()
+                if (
+                    ran_action and protection.spells and tiers[0] != "standard" and not reaper.busy()
+                    and time.monotonic() - started >= args.claim_wait_seconds
+                ):
+                    print("no work after an action: exiting so the task can go or move", file=sys.stderr, flush=True)
+                    break
                 # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
                 with phases.timed("idle"):
                     drain.stop.wait(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
@@ -1831,6 +1846,7 @@ def main() -> None:
                 # coordinator is down.
                 print(f"action failed in the worker: {error}", file=sys.stderr)
                 unavailable = True
+            ran_action = True
             spell_over = protection.spells and time.monotonic() - protection.since > PROTECTED_SPELL_SECONDS
             if protection.on is not False and (unavailable or spell_over):
                 with phases.timed("lease"):

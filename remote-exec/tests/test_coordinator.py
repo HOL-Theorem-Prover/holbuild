@@ -2128,6 +2128,45 @@ async def test_the_line_for_claims_ahead_keeps_no_slot_of_idle_warm_workers(coor
     assert not coordinator._above_line(coordinator._waiter_rank(burst, "host-2", 1), "standard", ahead=True)
 
 
+def report_burst_hosts(coordinator: Coordinator, hosts: dict[str, tuple[int, int, int]]) -> None:
+    """Report burst hosts by id: their rank, workers and leases."""
+    burst = ["high", "standard"]
+    for host, (rank, workers, leases) in hosts.items():
+        coordinator.report_host(replace(busy(host, leases), rank=rank))
+        for i in range(workers):
+            coordinator.report_worker(host, f"{host}-w{i}", burst, ahead=True)
+        for i in range(leases):
+            coordinator.lease_hosts[uuid4()] = (host, f"{host}-w{i}", burst)
+
+
+async def test_on_demand_burst_hosts_past_the_fullest_rank_behind_spot(coordinator: Coordinator) -> None:
+    """On-Demand burst hosts (rank 0) beyond the one the fleet keeps On-Demand took workers Spot (rank 1) had no
+    hosts for: claims fill the fullest On-Demand host, then Spot, then the others, fullest first."""
+    burst = ["high", "standard"]
+    report_burst_hosts(
+        coordinator, {"od-c": (0, 2, 0), "od-b": (0, 6, 0), "od-a": (0, 8, 0), "spot": (1, 3, 0)}
+    )
+    ranks = sorted(["od-a", "od-b", "od-c", "spot"], key=lambda h: coordinator._waiter_rank(burst, h, int(h == "spot")))
+    assert ranks == ["od-a", "spot", "od-b", "od-c"]
+    coordinator.settings.on_demand_burst_hosts = 2
+    ranks = sorted(["od-a", "od-b", "od-c", "spot"], key=lambda h: coordinator._waiter_rank(burst, h, int(h == "spot")))
+    assert ranks == ["od-a", "od-b", "spot", "od-c"]
+    # Standard work still packs onto the hosts by their own rank.
+    assert coordinator._waiter_rank(["standard"], "od-c", 0).host_rank == 0
+
+
+async def test_idle_spot_workers_take_the_work_of_a_spilled_on_demand_host_which_lies_beyond_the_line(
+    coordinator: Coordinator,
+) -> None:
+    """Spot is back with 4 idle workers. The 3 builds the spilled On-Demand host od-b runs, and one more, fit on
+    them, so od-b lies beyond the scale-in line and empties, while the fullest On-Demand host keeps its rank."""
+    burst = ["high", "standard"]
+    report_burst_hosts(coordinator, {"od-a": (0, 8, 8), "od-b": (0, 6, 3), "spot": (1, 8, 4)})
+    assert coordinator._kept_hosts(1) == {"od-a", "spot"}
+    assert coordinator._above_line(coordinator._waiter_rank(burst, "od-b", 0), "standard")
+    assert not coordinator._above_line(coordinator._waiter_rank(burst, "spot", 1), "standard")
+
+
 async def test_the_line_for_claims_ahead_takes_in_a_burst_host_for_the_actions_it_could_claim_ahead(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
