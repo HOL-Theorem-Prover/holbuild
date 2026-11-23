@@ -1171,3 +1171,8 @@ python3 "$SCRIPT_DIR/../../fixtures/remote_cache_entry.py" "$tmpdir/worker-repla
 worker stale-deps "$spec_r"
 expect stale-deps 0 "status=built"
 cmp "$tmpdir/worker-replacement/blobs/$new_dat" "$tmpdir/worker-stale-deps/blobs/$new_dat"
+
+# Every line after a result says what the module writer did, or why none ran.
+untraced=$(grep -h "exec-action after the result (ms):" "$tmpdir"/*.log | grep -v " modules_writer=" || true)
+[[ -z $untraced ]] || { echo "an after-result line has no module writer field:" >&2; echo "$untraced" >&2; exit 1; }
+grep -q "exec-action after the result (ms):" "$tmpdir"/*.log || { echo "no after-result line" >&2; exit 1; }

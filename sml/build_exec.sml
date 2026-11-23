@@ -14731,11 +14731,12 @@ fun install_module store {src, name} =
    starting only requests that end by DEADLINE.  A module is installed
    only from an entry that lists one plain file named for it.  A miss or
    a failed fetch leaves the module to the writer, which looks again.  The
-   result: how many entries were looked up, and the modules with no
-   entry. *)
+   result: how many entries were looked up, how many modules were
+   installed, and the modules with no entry. *)
 fun fetch_published_modules remote {store, staging, wanted, deadline} =
   let
     val probes = ref 0
+    val installed = ref 0
     val unpublished = ref ([] : string list)
     val mutex = Mutex.mutex ()
     fun fetch (name, key) =
@@ -14759,7 +14760,10 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
                             whatever the module's size. *)
                          (case HolbuildRemoteCache.fetch_unlisted_blob_within
                                  HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp} of
-                              HolbuildCacheBackend.Hit => ignore (install_module store {src = tmp, name = file})
+                              HolbuildCacheBackend.Hit =>
+                                if install_module store {src = tmp, name = file}
+                                then (Mutex.lock mutex; installed := !installed + 1; Mutex.unlock mutex)
+                                else ()
                             | _ => ();
                           remove_file tmp)
                        end
@@ -14770,7 +14774,7 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
     ensure_dir staging;
     parallel_all remote_probe_width try wanted;
     HolbuildRemoveTree.remove_untrusted staging;
-    {probes = !probes, unpublished = !unpublished}
+    {probes = !probes, installed = !installed, unpublished = !unpublished}
   end
 
 (* Stores the modules the writer left in STAGING, each a (file, remote
@@ -14787,22 +14791,19 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
    the entry another writer published is malformed or its module can't
    be fetched.  A store never replaces a module it has (install_module).
    The result: this writer's files that were stored, those whose module
-   another writer published was stored instead, those not stored as the
-   store had a module of their name, and how many entries were
-   published. *)
+   another writer published was stored instead, and how many entries
+   were published. *)
 fun converge_modules remote {store, staging, modules, deadline} =
   let
     val mutex = Mutex.mutex ()
     val installed = ref []
     val won = ref []
-    val present = ref []
     val published = ref 0
     fun count f = (Mutex.lock mutex; f (); Mutex.unlock mutex)
     fun published_one () = count (fn () => published := !published + 1)
     fun install_own file =
       if install_module store {src = Path.concat (staging, file), name = file}
-      then count (fn () => installed := file :: !installed)
-      else count (fn () => present := file :: !present)
+      then count (fn () => installed := file :: !installed) else ()
     fun manifest file sha = shared_manifest module_remote_header NONE [("file", sha, file)]
     fun lookup key = HolbuildRemoteCache.get_action remote key
     (* The SHA-256 of FILE's blob once the cache has it. *)
@@ -14843,7 +14844,7 @@ fun converge_modules remote {store, staging, modules, deadline} =
                           HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp}) of
                      HolbuildCacheBackend.Hit =>
                        if install_module store {src = tmp, name = name} then count (fn () => won := file :: !won)
-                       else count (fn () => present := file :: !present)
+                       else ()
                    | HolbuildCacheBackend.Miss => heal (file, key)
                    | _ => ();
                  remove_file tmp)
@@ -14919,7 +14920,7 @@ fun converge_modules remote {store, staging, modules, deadline} =
        parallel_all remote_probe_width
          (guarded (fn pending => read_back pending))
          (map (fn (pending as (file, _, _)) => (file, pending)) (!confirm)));
-    {installed = !installed, won = !won, present = !present, published = !published}
+    {installed = !installed, won = !won, published = !published}
   end
 
 (* The remote keys of the MISSING modules (expected_modules); the
@@ -15108,17 +15109,17 @@ fun theory_module_grants root tc (spec : action_spec) deps_heap =
    store; `time`: too little left before the deadline; `failed`: an error
    before it started; fill_module_store also traces `unsupported`: no
    module writer for the HOL), or the sandbox refused what it left, or it left
-   REPORT (module_writer_report, [] for none) and wrote OUTPUTS, the
+   REPORT (module_writer_report, [] for none), KILLED whether it was
+   killed at its deadline, and wrote OUTPUTS, the
    modules (file names) of which were DISCARDED (theory not missing when
    it ran), or INSTALLED, or replaced by the module another writer
-   published first (WON), or not installed as the store had one of its
-   name (EXISTING), or else found stored under another name (OTHER), or
-   still ABSENT. *)
+   published first (WON), or found stored under its own name (EXISTING),
+   or else under another name (OTHER), or still ABSENT. *)
 datatype module_writer_run =
     WriterNotRun of string
   | WriterRefused
-  | WriterRan of {report : string list, outputs : int, discarded : string list, installed : int,
-                  existing : int, other : int, absent : string list, won : int}
+  | WriterRan of {report : string list, killed : bool, outputs : int, discarded : string list,
+                  installed : int, existing : int, other : int, absent : string list, won : int}
 
 (* The trace of an action's module store on the worker's line after the
    result, for telling why expected modules weren't loaded or written:
@@ -15187,13 +15188,15 @@ fun module_store_trace {files, expected, run} =
       case run of
           WriterNotRun why => " modules_writer=none:" ^ why
         | WriterRefused => " modules_writer=refused"
-        | WriterRan {outputs, discarded, installed, existing, other, absent, won, ...} =>
+        | WriterRan {killed, outputs, discarded, installed, existing, other, absent, won, ...} =>
             let
-              (* A writer killed at its deadline leaves no report. *)
+              (* The writer leaves its report once its theories are done:
+                 one killed at its deadline leaves none. *)
               val status =
-                case (report, values "status") of
-                    ([], _) => "noreport"
-                  | (_, (s :: _) :: _) =>
+                case (killed, report, values "status") of
+                    (true, _, _) => "killed"
+                  | (_, [], _) => "noreport"
+                  | (_, _, (s :: _) :: _) =>
                       if List.exists (fn known => known = s) ["ineligible", "no-base-id", "failed"] then s else "?"
                   | _ => "ran"
               fun number key =
@@ -15267,6 +15270,7 @@ fun write_missing_modules remote root tc wanted deadline =
       ", limit = " ^ Int.toString (module_writer_limit ()) ^ "};"
     val expected_names = map #1 expected
     val installed = ref []
+    val killed = ref false
     fun move_marker file =
       if file = module_store_unsupported orelse
          (file = module_store_base_theories andalso not (isSome base_theories))
@@ -15311,10 +15315,10 @@ fun write_missing_modules remote root tc wanted deadline =
           val _ = HolbuildActionSandbox.module_reads := (fn () => stored_modules store expected_names)
           val validated =
             (HolbuildActionSandbox.with_output_dirs [output] (fn () =>
-               ignore (HolbuildToolchain.run_in_dir_to_file_by root
-                         (HolbuildToolchain.hol_subcommand_argv tc "run" @
-                          ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
-                         log child_deadline));
+               killed := #timed_out (HolbuildToolchain.run_in_dir_to_file_by root
+                                       (HolbuildToolchain.hol_subcommand_argv tc "run" @
+                                        ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
+                                       log child_deadline));
              true)
             handle e => (warn ("theory modules not written: " ^ General.exnMessage e); false)
         in
@@ -15334,12 +15338,17 @@ fun write_missing_modules remote root tc wanted deadline =
       let
         val keys = remote_keys missing handle e => (warn ("theory modules not fetched: " ^ General.exnMessage e); [])
         val _ =
-          (probed := #probes (fetch_published_modules remote
-                                {store = store, staging = output, wanted = keys,
-                                 deadline = Time.- (deadline, module_writer_min_time)}))
+          let
+            val {probes, installed, ...} =
+              fetch_published_modules remote
+                {store = store, staging = output, wanted = keys,
+                 deadline = Time.- (deadline, module_writer_min_time)}
+          in
+            probed := probes;
+            fetched := installed
+          end
           handle e => warn ("theory modules not fetched: " ^ General.exnMessage e)
         val still = missing_modules ()
-        val _ = fetched := length missing - length still
         fun key_of file =
           Option.mapPartial
             (fn part => Option.map #2 (List.find (fn (wanted, _) => wanted = part) keys))
@@ -15362,25 +15371,28 @@ fun write_missing_modules remote root tc wanted deadline =
             val (written, discarded) = List.partition (module_file_wanted (map #1 still)) outputs
             (* Without a remote key (its .dat couldn't be hashed) a module
                is only stored. *)
-            val (unkeyed, unkeyed_present) =
-              List.partition (fn file => install_module store {src = Path.concat (output, file), name = file})
+            val unkeyed =
+              List.filter (fn file => install_module store {src = Path.concat (output, file), name = file})
                 (List.filter (not o isSome o key_of) written)
             val result =
               converge_modules remote
                 {store = store, staging = output,
                  modules = List.mapPartial (fn file => Option.map (fn key => (file, key)) (key_of file)) written,
                  deadline = Time.+ (deadline, module_publish_grace)}
-            val existing = unkeyed_present @ #present result
+            val _ = installed := unkeyed @ #installed result
+            val _ = fetched := !fetched + length (#won result)
+            val _ = published := #published result
             val stored = map Path.file (HolbuildCache.children store)
             fun has_part part = List.exists (fn f => module_file_theory_part f = SOME part) stored
             fun member files f = List.exists (fn x => x = f) files
-            val unstored = List.filter (not o member (unkeyed @ #installed result @ #won result @ existing)) written
+            (* Convergence may leave a module uninstalled (no time, a
+               failed fetch) whose name a restore stored meanwhile. *)
+            val (existing, unstored) =
+              List.partition (member stored)
+                (List.filter (not o member (!installed @ #won result)) written)
             val (other, absent) = List.partition (fn f => has_part (valOf (module_file_theory_part f))) unstored
           in
-            installed := unkeyed @ #installed result;
-            fetched := !fetched + length (#won result);
-            published := #published result;
-            run := WriterRan {report = report, outputs = length outputs, discarded = discarded,
+            run := WriterRan {report = report, killed = !killed, outputs = length outputs, discarded = discarded,
                               installed = length (!installed), existing = length existing,
                               other = length other, absent = absent, won = length (#won result)}
           end
@@ -16843,7 +16855,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        the publish, not for a cache scan or the writer.  The writer goes
        last: it only saves later actions loading time, and stops before the
        worker's kill. *)
-    val none = {ms = LargeInt.fromInt 0, installed = 0, missing = 0, probed = 0, fetched = 0, published = 0, trace = ""}
+    (* Why no writer ran: `cancelled`; `busy`: the previous action's work
+       after its result held the lock; `unscheduled`: this action set up
+       no writer (its outputs weren't validated, the HOL can't write
+       modules, or its writer couldn't be staged). *)
+    fun none why =
+      {ms = LargeInt.fromInt 0, installed = 0, missing = 0, probed = 0, fetched = 0, published = 0,
+       trace = " modules_writer=none:" ^ why}
     (* One exec-action of a worker at a time sweeps and writes modules after
        its result: the previous one may still be at it, until the worker
        stops it once it has this one's result. *)
@@ -16859,7 +16877,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             else (OS.Process.sleep (Time.fromMilliseconds 100); post_result_lock deadline)
     val post_result = if !cancelled then NONE else post_result_lock (Time.+ (t0, module_writer_budget))
     val {ms, installed, missing, probed, fetched, published, trace} =
-      if not (Option.isSome post_result) then none else
+      if not (Option.isSome post_result) then none (if !cancelled then "cancelled" else "busy") else
       let val {limit_bytes, reserve_bytes, min_free_bytes} = cache_cap
       in
         (* The checkpoint root is the next action's now: this sweep is
@@ -16869,10 +16887,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
            reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = true};
         case writer of
             SOME write =>
-              if !cancelled then none
+              if !cancelled then none "cancelled"
               else (HolbuildActionSandbox.enable (writer_root, writer_checkpoints);
                     write writer_root (Time.+ (t0, module_writer_budget)))
-          | NONE => none
+          | NONE => none (if !cancelled then "cancelled" else "unscheduled")
       end
     val _ = if Option.isSome writer then HolbuildRemoveTree.remove_untrusted writer_root else ()
     val _ = Option.app HolbuildFileLock.release post_result

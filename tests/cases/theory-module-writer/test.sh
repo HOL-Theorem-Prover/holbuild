@@ -234,8 +234,10 @@ val _ = writes [a, b];
 val _ = check "a writer started with 3 s left" (#installed (fill_by "hol4" 3) = 0 andalso runs "hol4" = 0);
 val _ = E.write_text "$tmpdir/hang" "";
 val t0 = Time.now ();
-val {installed, missing, published, ...} = fill_by "hol4" 6;
+val {installed, missing, published, trace, ...} = fill_by "hol4" 6;
 val _ = OS.FileSys.remove "$tmpdir/hang";
+val _ = check ("a writer killed at its deadline was not traced as killed: " ^ trace)
+          (String.isSubstring " modules_writer=killed," trace);
 val _ = check "the writer was not stopped at its deadline"
           (runs "hol4" = 1 andalso Time.< (Time.- (Time.now (), t0), Time.fromSeconds 15));
 val _ = check "a stopped writer's modules were not stored"
@@ -387,6 +389,14 @@ val {installed, fetched, published, ...} = fill_by "hol5" 100;
 val _ = check "a module was stored or uploaded under a malformed entry"
           (installed = 0 andalso fetched = 0 andalso published = 0 andalso not (stored "hol5" a) andalso
            cas_puts () = puts);
+(* A restore stores A's own name while the malformed entry keeps the
+   writer's module out: A counts as existing. *)
+val _ = remove_store "hol5";
+val _ = E.write_text "$tmpdir/plant" ("printf restored > " ^ OS.Path.concat (store "hol5", a) ^ "\n");
+val {installed, trace, ...} = fill_by "hol5" 100;
+val _ = check ("a module stored under its own name was not traced as existing: " ^ trace)
+          (installed = 0 andalso E.read_text (OS.Path.concat (store "hol5", a)) = "restored" andalso
+           String.isSubstring ",installed:0,existing:1,other:0,absent:0 " trace);
 val _ = E.copy_binary "$tmpdir/a-entry-saved" ("$tmpdir/remote/ac/" ^ a_entry);
 
 (* On a cache of two nodes, a writer stores the modules it published once
