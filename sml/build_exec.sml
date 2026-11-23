@@ -2246,10 +2246,14 @@ fun run_parked_child workdir (HolState heap) file_args log =
                                          (tail_text child_log handle _ => "no log")))
           val status = finish (Unix.reap process)
           val _ = HolbuildActionSandbox.outputs_validated := true
+          val ms = LargeInt.toString o Time.toMilliseconds
         in
+          (* The child writes its log last as it exits, so the log's time
+             tells its run from its exit. *)
           HolbuildStatus.message_stderr
             ("holbuild: park: the child on " ^ Path.file heap ^ " ran for " ^
-             Real.fmt (StringCvt.FIX (SOME 3)) (Time.toReal (Time.- (Time.now (), t0))) ^ " s\n");
+             Real.fmt (StringCvt.FIX (SOME 3)) (Time.toReal (Time.- (Time.now (), t0))) ^ " s (started at " ^
+             ms t0 ^ ", last wrote its log at " ^ ms (OS.FileSys.modTime child_log) ^ " ms)\n");
           OS.FileSys.rename {old = child_log, new = log};
           status
         end
@@ -12823,7 +12827,7 @@ fun merge_phases phases =
    report on the child's output, not that output, so no phases line there
    counts. *)
 val hol_log_phase_names =
-  ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
+  ["holloadend", "holsalvage", "holleaves", "holrewind", "holcompile", "holtactics", "holprint", "holsave",
    "holcompiledn", "holreplayedn", "holrewoundn", "holmodhitn", "holmodmissn", "holmodwriten"]
 
 fun hol_log_phases log_file child_start =

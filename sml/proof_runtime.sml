@@ -1188,7 +1188,8 @@ fun compile_tactic label program =
       SOME (_, make) => make
     | NONE =>
         if (add_hol_phase "holcompiledn" 1;
-            quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (fn () => (" ^ program ^ "));")) then
+            timed_hol_phase "holcompile" (fn () =>
+              quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (fn () => (" ^ program ^ "));"))) then
           !compiled_tactic_ref
         else raise Fail ("tactic fragment did not compile: " ^ label)
 
@@ -1197,7 +1198,8 @@ fun compile_list_tactic label program =
       SOME (_, make) => make
     | NONE =>
         if (add_hol_phase "holcompiledn" 1;
-            quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (fn () => (" ^ program ^ "));")) then
+            timed_hol_phase "holcompile" (fn () =>
+              quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (fn () => (" ^ program ^ "));"))) then
           !compiled_list_tactic_ref
         else raise Fail ("list tactic fragment did not compile: " ^ label)
 
