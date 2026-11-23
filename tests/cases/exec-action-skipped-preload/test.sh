@@ -8,9 +8,9 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 # exec-action --share-heaps: an edit that names a theory an earlier preload
-# already loads adds a preload HOL's loader skips, so the worker keeps the
-# shared heap and checkpoints; one that changes the order theories load in
-# loads afresh.
+# or hol.state already loads adds a preload HOL's loader skips, so the worker
+# keeps the shared heap and checkpoints; one that changes what loads, or the
+# order theories load in, loads afresh.
 
 tmpdir=$(make_temp_dir)
 server_pids=()
@@ -167,6 +167,15 @@ resumed() {
   fi
 }
 
+# not_restored VERSION: the sharing worker restored nothing shared.
+not_restored() {
+  if grep -q "restored shared" "$tmpdir/$1.log"; then
+    echo "version $1 restored state saved for another preload" >&2
+    cat "$tmpdir/$1.log" >&2
+    exit 1
+  fi
+}
+
 write_top "Mid" "FAIL_TAC \"seeded failure\""
 export_top v1
 run v1 1
@@ -190,8 +199,27 @@ resumed v3 "deps-loaded checkpoint"
 write_top "Mid" "ACCEPT_TAC BetaTheory.beta_thm"
 export_top v4
 run v4 0
-if grep -q "restored shared" "$tmpdir/v4.log"; then
-  echo "v4 restored state saved under another load order" >&2
-  cat "$tmpdir/v4.log" >&2
-  exit 1
-fi
+
+not_restored v4
+
+# hol.state loads optionTheory, so an import of it resumes from the heap of
+# loaded dependencies, and a fix naming it from the failed prefix.  The
+# import comes first: a heap saved with optionTheory in its preload would
+# serve the fix too.
+write_top "Mid" "FAIL_TAC \"seeded failure again\""
+export_top v5
+run v5 1
+write_top "Mid option" "ACCEPT_TAC (K TRUTH optionTheory.NOT_NONE_SOME)"
+export_top v6
+run v6 0
+resumed v6 "deps-loaded checkpoint"
+write_top "Mid" "ACCEPT_TAC (K TRUTH optionTheory.NOT_NONE_SOME)"
+export_top v7
+run v7 0
+resumed v7 "failed-prefix checkpoint in t3"
+
+# hol.state doesn't load bitTheory, so naming it loads afresh.
+write_top "Mid" "ACCEPT_TAC (K TRUTH bitTheory.BIT_ZERO)"
+export_top v8
+run v8 0
+not_restored v8
