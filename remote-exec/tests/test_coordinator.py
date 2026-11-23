@@ -1998,14 +1998,20 @@ async def test_no_ahead_wake_goes_to_a_burst_host_above_the_scale_in_line(
 async def test_a_claim_woken_ahead_takes_nothing_ahead_once_the_line_moved_past_its_burst_host(
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """host-b's claim was woken ahead while the line took it in; host-a's a1 came back before it ran."""
-    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)
+    """While host-a's a1 stays away past TURNAROUND_SECONDS, the line for claims ahead takes in host-b, so the ahead
+    wake goes to its waiting claim; a1 comes back before that claim runs, and the line leaves host-b again."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only a wake ends the wait in time
     burst = await burst_hosts_with_a_child_to_claim_ahead(http, coordinator)
     tail = asyncio.create_task(coordinator.claim(burst, "b0", 0.5, host_id="host-b", ahead=True))
     await wait_until(lambda: bool(coordinator.claim_waiters) or tail.done())
     assert not tail.done()
-    waiter = coordinator.claim_waiters.pop()
-    waiter[2].set_result(("standard", True, None, None))
+    waiter = coordinator.claim_waiters[0]
+    clock = coordinator.clock
+    later = clock() + timedelta(seconds=coordinator_module.TURNAROUND_SECONDS + 1)
+    coordinator.clock = lambda: later
+    coordinator._ahead_changed()
+    assert waiter[2].done()
+    coordinator.clock = clock
     assert await asyncio.wait_for(tail, 10) is None
 
 
@@ -2031,7 +2037,7 @@ async def test_the_line_for_claims_ahead_takes_in_a_burst_host_for_the_actions_i
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
     """``b``, ``c`` and ``d`` wait on ``a``, which host-a's a0 runs: host-a's free a1 can take one of them, so the
-    line for claims ahead takes in host-b for the others once a read of claims ahead has found them."""
+    line for claims ahead takes in host-b for the others, which its claim's read of claims ahead finds."""
     burst = ["high", "standard"]
     await submit(http, ["a", "b", "c", "d"], [("b", "a"), ("c", "a"), ("d", "a")], speculative_loading="4")
     for worker in ["a0", "a1"]:
@@ -2039,12 +2045,9 @@ async def test_the_line_for_claims_ahead_takes_in_a_burst_host_for_the_actions_i
     coordinator.report_worker("host-b", "b0", burst)
     parent = await coordinator.claim(burst, "a0", host_id="host-a")
     assert parent is not None and parent.theory == "pkg:a"
-    assert await coordinator.claim(burst, "b0", host_id="host-b", ahead=True) is None  # no read has found them yet
-    assert coordinator._ahead_ready("standard") == 0
-    await coordinator._ahead_candidates()
-    assert coordinator._ahead_ready("standard") == 3
     child = await coordinator.claim(burst, "b0", host_id="host-b", ahead=True)
     assert child is not None and child.ahead_parents
+    assert coordinator._ahead_ready("standard") == 2
 
 
 async def test_a_kept_hosts_worker_that_does_not_come_back_leaves_its_slot_to_a_tail_hosts_claim_ahead(

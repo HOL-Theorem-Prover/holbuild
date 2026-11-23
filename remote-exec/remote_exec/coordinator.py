@@ -1422,6 +1422,9 @@ class Coordinator:
                     continue
                 # Work made claimable during the attempt is retried at once, for workers that can take it.
                 seen = (self.made_ready, self.ahead_changes if ahead else 0)
+                # One read of claims ahead for the attempt, so the scale-in line for claims ahead counts the actions
+                # the attempt may claim ahead, not those of an older read (see _ahead_ready).
+                read = await self._ahead_candidates() if ahead else None
                 rank = self._waiter_rank(tiers, host_id, host_rank)  # as the host's workers are now
                 eligible_tiers = undeferred(ahead_only=False)
                 # A better-ranked waiter that can't claim ahead leaves the actions claimed ahead to this one.
@@ -1437,15 +1440,16 @@ class Coordinator:
                 hint_only = held_tiers.difference(eligible_tiers)
                 claim_tiers = [t for t in tiers if t in eligible_tiers or t in hint_only]
                 outranked = (
-                    await self._outranked_by_ahead(tiers, ahead_tiers) if ahead_tiers and claim_tiers else None
+                    self._outranked_by_ahead(read, tiers, ahead_tiers)
+                    if read is not None and ahead_tiers and claim_tiers else None
                 )
                 claimed, held_until = (
                     await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only, held_tiers, tiers)
                     if claim_tiers else (None, None)
                 )
                 # Builds left for their holders still rank before claims ahead.
-                if claimed is None and ahead_tiers and held_until is None:
-                    claimed = await self._claim_ahead(ahead_tiers, worker)
+                if claimed is None and read is not None and ahead_tiers and held_until is None:
+                    claimed = await self._claim_ahead(read, ahead_tiers, worker)
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
                     # Recorded before the answer, so the scale-in line counts a lease while it waits (as _claim
@@ -1501,14 +1505,13 @@ class Coordinator:
         if batch_id is not None:
             await self._end_unheld([(claimed.attempt_token, batch_id)])
 
-    async def _outranked_by_ahead(self, tiers: list[str], ahead_tiers: list[str]) -> _Outranking | None:
+    def _outranked_by_ahead(self, read: _AheadRead, tiers: list[str], ahead_tiers: list[str]) -> _Outranking | None:
         """The actions of ``ahead_tiers`` that may be claimed ahead and rank before a ready build of ``tiers``:
         those of a batch of a higher priority than the build's, of a tier no later than its, and those of its own
         batch and tier with a deeper chain of dependents. Builds of a batch rank among themselves that way, deepest
         first: such a child is on a longer chain than any ready build of its batch, and loads its ancestors while its
         parents finish their outlines, rather than after. Those of other batches of the same priority come after its
-        ready builds. None when nothing may be claimed ahead."""
-        read = await self._ahead_candidates()
+        ready builds, by ``read``. None when nothing may be claimed ahead."""
         best: dict[str, int] = {}
         deepest: dict[tuple[UUID, str], tuple[int, int]] = {}
         for batch_id, _, tier, priority, place, _ in read.candidates:
@@ -1584,7 +1587,7 @@ class Coordinator:
                     # claim's await, as _claim_build's are.
                     ranking.running_priority += 1
                     self._cap_priorities(ranking)
-                    claimed = await self._claim_ahead(above, worker, above=-priority)
+                    claimed = await self._claim_ahead(outranked.read, above, worker, above=-priority)
                     if claimed is not None:
                         return claimed, None
                     ranking.running_priority -= 1
@@ -1727,19 +1730,20 @@ class Coordinator:
             ahead_parents, self.settings.pipeline and bool(pipelined),
         )
 
-    async def _claim_ahead(self, tiers: list[str], worker: str, *, above: int | None = None) -> Claim | None:
+    async def _claim_ahead(
+        self, read: _AheadRead, tiers: list[str], worker: str, *, above: int | None = None
+    ) -> Claim | None:
         """Lease an action of ``tiers`` ahead of its parents: of the running batches with an ``ahead_cap``, the
         action whose chain of dependents is deepest of those whose unfinished parents all run, at most
         ``ahead_depth`` generations ahead (CLAIM_AHEAD_ACTION); of a batch with that many actions waiting ahead
         (WAITING_AHEAD), only one whose unfinished parents all published their outline. Its claim names its
         unfinished ancestors, ancestors first, whose outputs its worker waits for.
 
-        Candidates come from a read the claims of ``claim_ranking_seconds`` share; each batch is then locked, as
-        every writer of it does first, so its cap and the parents' states are rechecked against concurrent claims
+        Candidates come from ``read``, which the claims of ``claim_ranking_seconds`` share; each batch is then locked,
+        as every writer of it does first, so its cap and the parents' states are rechecked against concurrent claims
         and completions. A batch and tier found with nothing to claim are skipped until the next read. With
         ``above``, only batches of a higher priority are claimed from.
         """
-        read = await self._ahead_candidates()
         # Tier by tier, as a plain claim takes them, then in the read's order.
         for tier in tiers:
             for batch_id in dict.fromkeys(
@@ -1828,7 +1832,8 @@ class Coordinator:
                     ahead_parents,
                 )
             # Out of the shared read, so the next claim of this read orders the batches by what remains.
-            read.candidates = [c for c in read.candidates if (c[0], c[1]) != (batch_id, row.input_key)]
+            # Of every batch: single-flight leases a key once, so no other batch's claim may take it.
+            read.candidates = [c for c in read.candidates if c[1] != row.input_key]
             waiting += 0 if row.outlined else 1
             if waiting >= batch.ahead_cap:  # full: the claims waiting their turn take only those that won't wait
                 read.candidates = [c for c in read.candidates if c[0] != batch_id or c[5]]
