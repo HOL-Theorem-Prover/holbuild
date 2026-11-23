@@ -189,22 +189,28 @@ fun strip_group (Group (_, _, tactic)) = strip_group tactic
   | strip_group (RepairGroup (_, _, tactic, _)) = strip_group tactic
   | strip_group tactic = tactic
 
-(* ProofStepPlan gives FIRST_PROVE the Choice it gives FIRST, but native
-   FIRST_PROVE runs each alternative THEN NO_TAC.  TacticParse always groups
-   FIRST_PROVE, so its Choice has a source to tell the two apart. *)
+(* Native FIRST_PROVE runs each alternative THEN NO_TAC.  HOL before
+   550a0a9228 (HOL#2206) gives FIRST_PROVE the Choice it gives FIRST;
+   TacticParse always groups FIRST_PROVE, so its Choice has a source to tell
+   the two apart.  Later HOL already plans each alternative as a first-goal
+   solve Select, which solve_first keeps as it is. *)
 fun is_first_prove source span =
   case strip_group (TacticParse.parseTacticBlock
                       (HolbuildProofIrPlanner.parse_tactic_expr (source_text source span))) of
       FirstProve _ => true
     | _ => false
 
-fun solve_first steps =
-  let val (start_pos, end_pos) = plan_span "FIRST_PROVE alternative" steps
-  in [HolbuildProofIr.StepSelect
-        {start_pos = start_pos, end_pos = end_pos,
-         selector = HolbuildProofIr.SelectFirst,
-         mode = HolbuildProofIr.SelectSolve, body = steps}]
-  end
+fun solve_first (steps as [HolbuildProofIr.StepSelect
+                             {selector = HolbuildProofIr.SelectFirst,
+                              mode = HolbuildProofIr.SelectSolve, ...}]) =
+      steps
+  | solve_first steps =
+      let val (start_pos, end_pos) = plan_span "FIRST_PROVE alternative" steps
+      in [HolbuildProofIr.StepSelect
+            {start_pos = start_pos, end_pos = end_pos,
+             selector = HolbuildProofIr.SelectFirst,
+             mode = HolbuildProofIr.SelectSolve, body = steps}]
+      end
 
 fun convert_plan source plan = map (convert_step source) plan
 and convert_step source step =
