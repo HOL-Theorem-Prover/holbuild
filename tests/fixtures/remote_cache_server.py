@@ -19,6 +19,11 @@ control = pathlib.Path(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else No
 # A port to listen on, as a restarted server takes its predecessor's; by default any free one.
 port = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 
+# A cache this one fetches what it lacks from, read only: for trying
+# unreleased code on real builds without writing to that cache.
+read_through = os.environ.get("REMOTE_CACHE_READ_THROUGH")
+read_through_config = os.environ.get("REMOTE_CACHE_READ_THROUGH_CURL_CONFIG")
+
 action_put_lock = threading.Lock()
 action_put_count = 0
 
@@ -38,6 +43,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return None
         return root / relative
+
+    def fetch_missing(self, path: pathlib.Path) -> None:
+        """Copies PATH's object from the read-through cache, if it has one."""
+        if read_through is None or path.is_file():
+            return
+        relative = urllib.parse.urlparse(self.path).path
+        partial = path.with_name(f".{path.name}.{threading.get_ident()}.fetch")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        config = ["-K", read_through_config] if read_through_config else []
+        fetched = subprocess.run(
+            ["curl", "-fsS", "--compressed", *config, "-o", str(partial),
+             read_through.rstrip("/") + relative],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if fetched.returncode == 0 and partial.is_file():
+            os.replace(partial, path)
+        else:
+            partial.unlink(missing_ok=True)
 
     def record_request(self):
         path = urllib.parse.urlparse(self.path).path
@@ -186,6 +208,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.object_path()
         if path is None:
             return
+        self.fetch_missing(path)
         if not path.is_file():
             self.send_response(404)
             self.end_headers()
@@ -222,6 +245,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.object_path()
         if path is None:
             return
+        self.fetch_missing(path)
         self.send_response(200 if path.is_file() else 404)
         self.end_headers()
 
