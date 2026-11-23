@@ -132,8 +132,11 @@ check_timeout comment 1.0 '(fn g => ((* metis_tac *) slow_tac g))'
 check_timeout quotation 1.0 '(fn g => (ignore ``metis_tac:bool``; slow_tac g))'
 check_timeout identifier 1.0 'metis_tac_slow'
 check_timeout separate 1.0 'slow_tac >> X.metis_tac []'
-# The option doesn't extend ordinary steps.
+# The option doesn't extend ordinary steps, nor does 0 untime them.
 check_timeout ordinary_heavy_option 1.0 'slow_tac' --heavy-tactic-timeout 4
+check_timeout ordinary_heavy_untimed 1.0 'slow_tac' --heavy-tactic-timeout=0
+# A tactic timeout whose double overflows leaves metis steps untimed.
+check_passes huge_timeout "$over_budget" --tactic-timeout 1e308
 
 # A default spec has no heavy-tactic-timeout line; the option adds just that
 # line, keeps the input key, and the worker gives metis steps its budget.

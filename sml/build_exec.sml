@@ -5663,12 +5663,14 @@ fun effective_tactic_timeout proof_steps node_timeout =
 
 (* The budget of heavy steps (heavy_tactic_timeout) given the effective tactic
    timeout and --heavy-tactic-timeout (NONE when not given): twice the tactic
-   timeout by default, the option's value when given, and untimed wherever
-   steps are untimed. *)
+   timeout by default (untimed if that overflows), the option's value when
+   given, and untimed wherever steps are untimed. *)
 fun heavy_budget explicit tactic_timeout =
   case (tactic_timeout, explicit) of
       (NONE, _) => NONE
-    | (SOME seconds, NONE) => SOME (2.0 * seconds)
+    | (SOME seconds, NONE) =>
+        let val doubled = 2.0 * seconds
+        in if Real.isFinite doubled then SOME doubled else NONE end
     | (SOME _, SOME heavy) => heavy
 
 (* Whether NODE saves checkpoints as it runs (checkpoint_policy): it is one

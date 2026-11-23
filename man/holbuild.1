@@ -777,6 +777,18 @@ alternative.
 Also accepted as
 .BR \-\-tactic\-timeout=\fISECONDS .
 .TP
+.BI \-\-heavy\-tactic\-timeout " SECONDS"
+Set the per-step timeout of proof steps that call
+.B metis_tac
+or
+.BR METIS_TAC ;
+.B 0
+leaves them untimed.
+By default they get twice the tactic timeout.
+It applies only where steps are timed at all.
+Also accepted as
+.BR \-\-heavy\-tactic\-timeout=\fISECONDS .
+.TP
 .B \-\-trace\-steps
 Execute and record proof-step traces for theories in the proof scope,
 including up-to-date ones; skips checkpoint replay.
