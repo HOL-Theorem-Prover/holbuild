@@ -2288,7 +2288,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     handle e => (HolbuildToolchain.append_timing (submit_line "fail"); raise e)
                   (* Written once the batch is followed, so that an interrupt
                      during the write still cancels it. *)
-                  val submit_timing = submit_line "ok"
+                  val submit_timing =
+                    submit_line (case response of HolbuildRemoteExec.Refused _ => "refused" | _ => "ok")
                 in
                   case response of
                       HolbuildRemoteExec.Refused reason =>
