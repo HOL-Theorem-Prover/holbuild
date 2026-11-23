@@ -747,7 +747,8 @@ rejections retain the entry until a successful rebuild can publish. Other output
 conflicts still keep the first entry; remote publication and archive import
 still reject conflicts, except that a remote-exec worker replaces a remote
 entry whose recorded parents differ from the parents it restored from the
-remote cache, since no build can use it.
+remote cache, or one that names a blob the remote cache no longer holds
+(on each node whose entry does), since no build can use it.
 
 ### Persistent action root on workers
 

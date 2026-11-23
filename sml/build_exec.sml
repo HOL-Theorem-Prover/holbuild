@@ -12005,12 +12005,19 @@ fun resident_weaker_but_for_dat key mine resident =
                                   (cache_manifest_proof_timeout_text key mine))
   handle Error _ => false
 
+(* Whether the remote cache lost a blob ENTRY names, so that no build can
+   restore it (remote_entry_satisfies counts it a miss). *)
+fun remote_entry_lost_blob remote entry =
+  not (List.all (fn sha => HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.blob_present remote sha))
+                (HolbuildCacheTransfer.unique_blobs entry))
+
 (* Uploads every blob of the local entry for the action, raising if one fails
    (the build's own publish only warns), then puts the action.  A different
-   entry already there is replaced when it records parents other than the
-   restored ones or only its .dat differs and its timeout contract is weaker,
-   and otherwise left for check_remote_publication to judge.  Returns the
-   entry read after putting a new one, which saves that check a read. *)
+   entry already there is replaced, on each node holding one, when the cache
+   lost one of its blobs; and replaced when it records parents other than the
+   restored ones or only its .dat differs and its timeout contract is weaker;
+   and otherwise left for check_remote_publication to judge.  Returns the entry
+   read after putting a new one, which saves that check a read. *)
 (* Uploads every blob of the local cache entry KEY, raising if one fails,
    and returns the entry. *)
 fun upload_entry_blobs remote key =
@@ -12045,8 +12052,26 @@ fun publish_action_entry remote root (spec : action_spec) =
                      (warn ("replacing remote cache entry " ^ key ^ ": " ^ why);
                       ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest});
                       HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key))
+                   fun lost_blob text =
+                     remote_entry_lost_blob remote text handle HolbuildRemoteCache.Unavailable _ => false
                  in
                    if (cache_manifest_outputs_equal key resident manifest handle _ => false) then SOME resident
+                   else if remote_entry_lost_blob remote resident then
+                     (* Written only to the nodes whose entry lost a blob: another
+                        may hold a restorable entry, which must stay.  The
+                        writes are best effort, so one still there is reported
+                        as the cache being unavailable, not as a conflict. *)
+                     (warn ("replacing remote cache entry " ^ key ^ ": the cache no longer holds all of its blobs");
+                      HolbuildRemoteCache.repair_action_replicas remote
+                        {key = key, text = manifest, attempts = remote_theory_publish_attempts,
+                         should_replace = lost_blob};
+                      case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key) of
+                          SOME text =>
+                            if remote_entry_lost_blob remote text then
+                              raise HolbuildRemoteCache.Unavailable
+                                ("could not replace remote cache entry " ^ key ^ ", whose blobs the cache lost")
+                            else SOME text
+                        | NONE => NONE)
                    else if resident_misfits_parents remote root spec resident then
                      replace "its recorded parents differ from the cache's"
                    else if resident_weaker_but_for_dat key manifest resident then
