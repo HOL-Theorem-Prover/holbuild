@@ -211,4 +211,9 @@ for refused in "$tmpdir/action/input:inside a writable directory" "$tmpdir/home/
   require_grep "scratch input ${refused#*:}" "$tmpdir/scratch.err"
 done
 
+# A deep theory's thousands of module grants: the path checks decide as
+# Path's did, and the launch stays fast.
+mkdir -p "$tmpdir/paths"
+python3 -I "$ROOT/tests/fixtures/action_sandbox_paths.py" "$ROOT/sml/action_sandbox.py" "$tmpdir/paths"
+
 python3 "$ROOT/tests/fixtures/action_sandbox_probe.py" "$ROOT/sml/action_sandbox.py"
