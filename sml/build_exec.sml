@@ -13957,14 +13957,75 @@ fun unkeyed_dep_line line =
       | _ => line
   else line
 
+(* The modules a theory child on TC has loaded before its preload starts:
+   those its hol.state loaded.  Found by running TC once, the way a theory
+   child starts, and kept in the cache under TC's toolchain key, which
+   hashes bin/hol and hol.state.  Under the action sandbox the run is
+   confined to a work directory of its own, as the analyser's is, so it
+   isn't taken for the action's theory child (whose run validates the
+   action's outputs).  Empty, so that every preload is kept, when the run
+   fails. *)
+fun base_loaded_modules tc =
+  let
+    val cached = Path.concat(cache_root (), "toolchain-base-loaded/" ^ HolbuildToolchain.toolchain_key tc)
+    fun script dir =
+      let
+        val sml = Path.concat(dir, "probe.sml")
+      in
+        write_text sml
+          ("val _ = let val out = TextIO.openOut " ^
+           HolbuildToolchain.sml_string (Path.concat(dir, "loaded")) ^
+           " in List.app (fn m => TextIO.output (out, m ^ \"\\n\")) (Meta.loaded ()); " ^
+           "TextIO.closeOut out end;\n");
+        "cd " ^ HolbuildHash.quote dir ^ " && " ^
+        HolbuildToolchain.command
+          (HolbuildToolchain.theory_run_argv tc @
+           ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, sml]) ^
+        " > " ^ HolbuildHash.quote (Path.concat(dir, "log")) ^ " 2>&1"
+      end
+    fun result (dir, status) =
+      if HolbuildToolchain.success status then lines_of (read_text (Path.concat(dir, "loaded")))
+      else raise Error ("the toolchain's base state didn't run:\n" ^
+                        (read_text (Path.concat(dir, "log")) handle IO.Io _ => ""))
+    fun probe lease =
+      if HolbuildActionSandbox.active () then
+        HolbuildActionSandbox.shell {writable = [], readable = [#holdir tc], toolchain = false}
+          script (HolbuildProcessGroup.run_shell_inheriting lease) result
+      else
+        let
+          val dir = HolbuildTempPath.temporary "base-loaded"
+          fun remove () = HolbuildRemoveTree.remove_untrusted dir handle _ => ()
+        in
+          (FS.mkDir dir;
+           result (dir, HolbuildProcessGroup.run_shell_inheriting lease (script dir)) before remove ())
+          handle e => (remove (); raise e)
+        end
+  in
+    lines_of (read_text cached)
+    handle IO.Io _ =>
+      let
+        val modules = HolbuildMachineMemory.with_reservation probe
+        val tmp = cached ^ "." ^ HolbuildTempPath.suffix ()
+      in
+        if null modules then raise Error "the toolchain's base state reported no loaded modules" else ();
+        ensure_parent cached;
+        write_text tmp (String.concat (map (fn m => m ^ "\n") modules));
+        FS.rename {old = tmp, new = cached};
+        modules
+      end
+  end
+  handle e => (warn ("keeping every preload: " ^ General.exnMessage e); [])
+
 (* The spec's preloads that HOL's loader skips: Meta.load does nothing for a
-   module it has loaded, so a preload whose module an earlier one already
-   loaded through the load manifests restored in ROOT changes nothing.  A
-   proof that names a theory its ancestors load adds such a preload.  Only
-   project modules, named by path, are followed, so a preload reached only
-   through a HOL module is kept; so is every preload when a manifest can't
+   module it has loaded, so a preload of a module in BASE_LOADED (those the
+   child starts with, base_loaded_modules) changes nothing; with FOLLOW, so
+   does one an earlier preload already loaded through the load manifests
+   restored in ROOT.  A proof that names a theory hol.state or its
+   ancestors load adds such a preload.  Only project modules, named by
+   path, are followed, so a preload reached only through a HOL module
+   outside BASE_LOADED is kept; so is every preload when a manifest can't
    be read. *)
-fun skipped_preloads root (spec : action_spec) =
+fun skipped_preloads {base_loaded, follow} root (spec : action_spec) =
   let
     fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
     val lib_manifests =
@@ -13987,9 +14048,11 @@ fun skipped_preloads root (spec : action_spec) =
       | module (LoadObject stem) = in_root root stem
     fun preload (load, (loaded, skipped)) =
       if Binaryset.member (loaded, Path.file (module load)) then (loaded, load :: skipped)
-      else (visit (module load, loaded), skipped)
+      else if follow then (visit (module load, loaded), skipped)
+      else (loaded, skipped)
   in
-    rev (#2 (List.foldl preload (Binaryset.empty String.compare, []) (#loads spec)))
+    rev (#2 (List.foldl preload (Binaryset.addList (Binaryset.empty String.compare, base_loaded), [])
+                         (#loads spec)))
     handle IO.Io _ => []
   end
 
@@ -14008,10 +14071,10 @@ fun preload_dep_lines (spec : action_spec) load =
    the checkpoints above it) on the same dependency outputs, from the files
    restored in ROOT, hashed by DAT_HASH (a .dat) and FILE_HASHES (the rest).
    Those name ROOT, so both keys are for one action root, as the shared heap
-   key is.  With SKIP_LOADED, the context leaves out the preloads HOL's
-   loader skips (skipped_preloads), so an edit that adds one keeps the
-   context; the root's manifests must then be the dependencies' own.  NONE
-   when a file can't be read. *)
+   key is.  The context leaves out the preloads HOL's loader skips
+   (skipped_preloads with SKIP_LOADED), so an edit that adds one keeps the
+   context; with its follow, the root's manifests must be the dependencies'
+   own.  NONE when a file can't be read. *)
 fun spec_early_cutoff_with {dat_hash, file_hashes, skip_loaded} root (spec : action_spec) : early_cutoff option =
   let
     val text_lines = String.fields (fn c => c = #"\n") (#action_text spec)
@@ -14035,7 +14098,7 @@ fun spec_early_cutoff_with {dat_hash, file_hashes, skip_loaded} root (spec : act
       HolbuildHash.string_sha256
         (String.concatWith "\n"
            ("holbuild-remote-deps-output-v1" :: theory_lines @ library_lines @ lib_lines) ^ "\n")
-    val skipped = if skip_loaded then skipped_preloads root spec else []
+    val skipped = skipped_preloads skip_loaded root spec
     val skipped_lines = List.concat (map (preload_dep_lines spec) skipped)
     val dep_lines =
       List.filter (fn line => not (List.exists (fn s => s = line) skipped_lines))
@@ -15568,6 +15631,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        around its actions. *)
     val resident_marker = Path.concat(root, ".holbuild/resident")
     val resident = ref (Resident.empty ())
+    (* What the theory child starts with (base_loaded_modules), found
+       before any child runs: a load-ahead child holds the memory
+       reservation the probe would wait for. *)
+    val base_loaded = ref ([] : string list)
     val writable_dirs = map (fn dir => Path.concat(root, ".holbuild/" ^ dir)) ["stage", "logs", "tool-cache", "ahead"]
     (* Everything in the root but the trees the hydrate keeps and its marker:
        the writable directories and the files an action writes beside them. *)
@@ -15775,6 +15842,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val pipelined =
           pipeline andalso #pipeline spec andalso not forced andalso null (#extra_outputs spec) andalso
           (not (#proof_steps spec) orelse #new_ir spec) andalso has_context_tactics tc
+        val _ = base_loaded := base_loaded_modules tc
       in
         if forced orelse null ahead_parents then run_plain spec tc forced pipelined else run_ahead spec tc pipelined
       end
@@ -15799,7 +15867,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             let
               val {dat_hash, file_hashes} = resident_hashes (!resident)
               val cutoff =
-                spec_early_cutoff_with {dat_hash = dat_hash, file_hashes = file_hashes, skip_loaded = true}
+                spec_early_cutoff_with
+                  {dat_hash = dat_hash, file_hashes = file_hashes,
+                   skip_loaded = {base_loaded = !base_loaded, follow = true}}
                   root spec
               (* The action's own entry and the earlier build's are looked up
                  side by side. *)
@@ -16391,7 +16461,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   end)
                late;
              phases := ("outlined", LargeInt.fromInt (length (!outlined))) :: !phases;
-             spec_early_cutoff_with {dat_hash = hash_of, file_hashes = map hash_of, skip_loaded = false} root spec)
+             spec_early_cutoff_with
+               {dat_hash = hash_of, file_hashes = map hash_of,
+                skip_loaded = {base_loaded = !base_loaded, follow = false}}
+               root spec)
         fun continue_ahead () =
           let
             val cutoff =
@@ -16405,7 +16478,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                drop "stand-ins";
                wait_until poll ahead_poll_interval;
                (* The late parents' manifests in the root are stand-ins. *)
-               spec_early_cutoff_with {dat_hash = hash_of, file_hashes = map hash_of, skip_loaded = false}
+               spec_early_cutoff_with
+                 {dat_hash = hash_of, file_hashes = map hash_of,
+                  skip_loaded = {base_loaded = !base_loaded, follow = false}}
                  root spec)
             val built_action =
               spec_theory_action root spec (cutoff_context spec cutoff)
