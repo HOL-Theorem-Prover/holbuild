@@ -19,6 +19,7 @@ import stat
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 
@@ -296,6 +297,29 @@ def sanitized_environment(home: Path) -> dict[str, str]:
     return env
 
 
+def within(path: Path, root: Path) -> bool:
+    """Whether absolute PATH is ROOT or lies beneath it, as `path == root or
+    root in path.parents`, by its text: building and comparing each of
+    Path.parents took seconds at thousands of read grants."""
+    text, prefix = str(path), str(root)
+    if text == prefix:
+        return True
+    # "//" is its own root: "/" doesn't hold "//x".
+    return text.startswith(prefix if prefix.endswith("/") else prefix + "/") and not (
+        prefix == "/" and text.startswith("//"))
+
+
+def exposure(forbidden: list[Path]) -> Callable[[Path], bool]:
+    """Whether a path is a forbidden one, lies beneath one or holds one, by
+    set lookups and one prefix test per path, so thousands of read grants
+    cost milliseconds.  Unlike Path.parents, a forbidden "/" also holds a
+    "//" path, which only refuses more."""
+    names = {str(path) for path in forbidden}
+    holding = {str(parent) for path in forbidden for parent in path.parents}
+    beneath = tuple(name if name.endswith("/") else name + "/" for name in names)
+    return lambda path: (text := str(path)) in names or text in holding or text.startswith(beneath)
+
+
 @dataclass
 class Policy:
     writable: list[Path]
@@ -309,12 +333,18 @@ class Policy:
         for grant in self.writable + self.scratch:
             if not grant.exists():
                 raise SandboxError(f"sandbox grant does not exist: {grant}")
+        exposes = exposure(self.forbidden)
         for grant in self.readable + self.writable + self.scratch:
-            if self.exposes(grant):
+            if exposes(grant):
                 raise SandboxError(f"sandbox grant contains protected worker state: {grant}")
 
-    def exposes(self, grant: Path) -> bool:
-        return any(path == grant or grant in path.parents or path in grant.parents for path in self.forbidden)
+    def usable_scratch(self, scratch: list[Path], passed: set[Path]) -> list[Path]:
+        """The SCRATCH directories that hold no protected state, no read-only
+        grant (Landlock grants are a union, so it would become writable) and
+        none of the PASSED trees."""
+        exposes = exposure(self.forbidden)
+        return [path for path in scratch
+                if not exposes(path) and not any(within(read, path) for read in [*self.readable, *passed])]
 
     def validate_outputs(self) -> None:
         # With all descendants reaped, one no-follow walk validates every file
@@ -742,11 +772,24 @@ def signal_late_members(group: int, sig: int, signaled: dict[int, Process]) -> N
 
 def existing(paths: list[str]) -> list[Path]:
     """The resolved read grants that still exist: a theory module listed for
-    the action can be swept from its store before the helper starts."""
+    the action can be swept from its store before the helper starts.
+
+    As Path.resolve(strict=True), but each directory is resolved once: the
+    thousands of module grants share one store directory."""
     found: list[Path] = []
+    directories: dict[str, str] = {}
     for path in paths:
+        directory, name = os.path.split(path)
         try:
-            found.append(Path(path).resolve(strict=True))
+            if not os.path.isabs(path) or name in ("", ".", ".."):
+                found.append(Path(path).resolve(strict=True))
+                continue
+            if directory not in directories:
+                directories[directory] = os.path.realpath(directory, strict=True)
+            resolved = os.path.join(directories[directory], name)
+            if stat.S_ISLNK(os.lstat(resolved).st_mode):
+                resolved = os.path.realpath(resolved, strict=True)
+            found.append(Path(resolved))
         except FileNotFoundError:
             pass
     return found
@@ -798,16 +841,16 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
             # no tool cache; one elsewhere would expose worker state.
             if key == "HOLBUILD_TOOL_CACHE_DIR":
                 directory = Path(value).resolve(strict=True)
-                if not any(root == directory or root in directory.parents for root in policy.writable):
+                if not any(within(directory, root) for root in policy.writable):
                     raise SandboxError(f"tool cache directory outside the action tree: {value}")
             # The scratch input is a file the action may read but not change.
             elif key == "HOLBUILD_SCRATCH_INPUT":
                 file = Path(value).resolve(strict=True)
                 if not file.is_file():
                     raise SandboxError(f"scratch input is not a regular file: {value}")
-                if not any(root == file or root in file.parents for root in policy.readable):
+                if not any(within(file, root) for root in policy.readable):
                     raise SandboxError(f"scratch input outside the read grants: {value}")
-                if any(root == file or root in file.parents for root in policy.writable + policy.scratch):
+                if any(within(file, root) for root in policy.writable + policy.scratch):
                     raise SandboxError(f"scratch input inside a writable directory: {value}")
             elif not key.startswith("HOLBUILD_RUN_"):
                 raise SandboxError(f"unexpected action environment assignment: {key}")
@@ -972,15 +1015,12 @@ def main() -> int:
             [path.resolve() for path in (args.completed, options) if path is not None],
             toolchain=args.toolchain,
         )
-        # A scratch directory holding protected state, a read-only grant
-        # (Landlock grants are a union, so it would become writable) or a
+        # A scratch directory holding protected state, a read-only grant or a
         # --keep-read-only tree is left out rather than failing the action:
         # only tools needing it fail.
         passed = ({path for name in args.forbid for path in spellings(name)[1]} |
                   {path for name in args.keep_read_only for paths in spellings(name) for path in paths})
-        policy.scratch = [path for path in (Path(path).resolve(strict=True) for path in args.scratch)
-                          if not policy.exposes(path) and
-                          not any(read == path or path in read.parents for read in [*policy.readable, *passed])]
+        policy.scratch = policy.usable_scratch([Path(path).resolve(strict=True) for path in args.scratch], passed)
         if not policy.writable:
             raise SandboxError("missing private action directory")
         parent = os.environ.get("HOLBUILD_SANDBOX_PARENT")

@@ -463,6 +463,17 @@ z_module=$(find "$worker_modules" -name '*-Z-*.pmo' | head -n 1)
 cp "$z_module" "$tmpdir/Z.pmo"
 cp "$z_module" "$modules"
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+# While a deps heap exists, the children starting from it, or from a
+# checkpoint on it, may read only the theory modules it was saved with, not
+# every stored module of the theory's cone: C's heap was saved before Z's
+# module existed, so C's child can't read it.
+# c_check LINE: C's line after c_first, blank but for checks of a run.
+c_check() { sed -i "0,/^QED\$/{/^QED\$/{n;s|^.*\$|$1|}}" "$project/src/CScript.sml"; }
+# z_readable READABLE: C's child can (true) or can't (false) read Z's module.
+z_readable() {
+  c_check "val _ = if ((TextIO.closeIn (TextIO.openIn \"$z_module\"); true) handle IO.Io _ => false) = $1 then () else raise Fail \"C's child read Z's module: not $1\""
+}
+z_readable false
 edit_c changed
 exec_theory C changed
 require_grep 'restored shared' "$tmpdir/changed-C.log"
@@ -513,6 +524,11 @@ release_paused() {
   worker_pid=
   rm "$control/action-get-enable" "$control/action-get-key" "$control/action-get-release"
 }
+# Once the heap is gone, the retry's fresh preload may read the modules of
+# C's cone, Z's among them.
+mkdir -p "$(dirname "$z_module")"
+cp "$tmpdir/Z.pmo" "$z_module"
+z_readable true
 edit_c post-restore
 start_paused "$(c_tool_entry post-restore)" C post-restore shared post-restore
 cp "$tmpdir/Z.pmo" "$tmpdir/replacement.pmo"
@@ -523,6 +539,7 @@ require_grep 'Required module missing or changed' "$tmpdir/post-restore-C.log"
 phase post-restore-C 'rstmodrejn:1'
 phase post-restore-C 'rstdropn:1'
 require_grep '^status=built$' "$tmpdir/post-restore-C.result"
+c_check ''
 
 # A poisoned heap entry: C's, rewritten to name the other-ID copy of A's
 # module, as by a publish that hashed the store while another restore
