@@ -1846,6 +1846,8 @@ class Coordinator:
                     )
                 ).all()
                 ahead_parents = tuple(AheadParent(p.input_key, p.spec_sha256) for p in parents)
+                if not kept(tier):  # the line moved past this host while it waited for the batch's lock
+                    return None
                 claimed = await self._lease(
                     conn,
                     _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, batch.max_heap_mb),
@@ -2424,8 +2426,9 @@ class Coordinator:
                 and ((host_id, worker) in self.claiming or (now - seen).total_seconds() < TURNAROUND_SECONDS)
             )
             # No floor of one, nor the host's last report, which no result updates: a host whose workers all stay
-            # away leaves no slot to wait for, and isn't kept.
-            slots = max(reported, busy, 1) if short else max(leases[host_id] + free, busy)
+            # away leaves no slot to wait for, and isn't kept. Nor, for claims ahead, on a host short of memory: its
+            # workers that don't claim ahead hold no slot for them.
+            slots = max(reported, busy, 0 if ahead else 1) if short else max(leases[host_id] + free, busy)
             if not slots:
                 continue
             # Fuller burst hosts first, so a partly drained one lies beyond the line and empties.
