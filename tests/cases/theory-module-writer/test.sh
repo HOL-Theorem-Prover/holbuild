@@ -403,8 +403,11 @@ fun entry_puts () =
             (List.concat (map (fn log => String.tokens (fn c => c = #"\n") (E.read_text log))
                               ["$tmpdir/server/requests.log", "$tmpdir/server2/requests.log"])));
 val puts_before = entry_puts ();
-val {installed, fetched, published, ...} = fill6 ();
+val {installed, fetched, published, trace, ...} = fill6 ();
 val _ = check "the writer's entry was sent to a second node" (entry_puts () = puts_before + 1);
+val _ = check ("the trace doesn't show the module published first stored: " ^ trace)
+          (String.isSubstring " modules_outputs=files:1,discarded:0,installed:0,existing:0,other:0,absent:0 modules_won=1"
+                              trace);
 val _ = check "the writer's module was stored over the one published before its read back"
           (installed = 0 andalso fetched = 1 andalso published = 0 andalso
            E.read_text (OS.Path.concat (store "hol6", p16)) = winner);

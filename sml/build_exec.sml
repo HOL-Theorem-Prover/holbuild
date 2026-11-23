@@ -14780,13 +14780,14 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
    when the cache can't be asked or answer in time.  None is stored when
    the entry another writer published is malformed or its module can't
    be fetched.  A store never replaces a module it has (install_module).
-   The result: this writer's files that were stored, and how many modules
-   were fetched and how many entries published. *)
+   The result: this writer's files that were stored, those whose module
+   another writer published was stored instead, and how many entries were
+   published. *)
 fun converge_modules remote {store, staging, modules, deadline} =
   let
     val mutex = Mutex.mutex ()
     val installed = ref []
-    val fetched = ref 0
+    val won = ref []
     val published = ref 0
     fun count f = (Mutex.lock mutex; f (); Mutex.unlock mutex)
     fun published_one () = count (fn () => published := !published + 1)
@@ -14832,7 +14833,7 @@ fun converge_modules remote {store, staging, modules, deadline} =
                         HolbuildRemoteCache.fetch_unlisted_blob_within
                           HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp}) of
                      HolbuildCacheBackend.Hit =>
-                       if install_module store {src = tmp, name = name} then count (fn () => fetched := !fetched + 1)
+                       if install_module store {src = tmp, name = name} then count (fn () => won := file :: !won)
                        else ()
                    | HolbuildCacheBackend.Miss => heal (file, key)
                    | _ => ();
@@ -14909,7 +14910,7 @@ fun converge_modules remote {store, staging, modules, deadline} =
        parallel_all remote_probe_width
          (guarded (fn pending => read_back pending))
          (map (fn (pending as (file, _, _)) => (file, pending)) (!confirm)));
-    {installed = !installed, fetched = !fetched, published = !published}
+    {installed = !installed, won = !won, published = !published}
   end
 
 (* The remote keys of the MISSING modules (expected_modules); the
@@ -15096,9 +15097,9 @@ fun theory_module_grants root tc (spec : action_spec) deps_heap =
    the sandbox refused what it left, or it left REPORT
    (module_writer_report, [] for none) and wrote OUTPUTS, the modules
    (file names) of which were DISCARDED (theory not missing when it ran),
-   or INSTALLED, or found stored under the same name (EXISTING), or under
-   another (OTHER), or still ABSENT; and the store took WON modules
-   another writer published first. *)
+   or INSTALLED, or replaced by the module another writer published first
+   (WON), or else found stored under the same name (EXISTING), or under
+   another (OTHER), or still ABSENT. *)
 datatype module_writer_run =
     WriterNotRun
   | WriterRefused
@@ -15339,17 +15340,17 @@ fun write_missing_modules remote root tc wanted deadline =
             val stored = map Path.file (HolbuildCache.children store)
             fun has name = List.exists (fn f => f = name) stored
             fun has_part part = List.exists (fn f => module_file_theory_part f = SOME part) stored
-            val unstored =
-              List.filter (fn f => not (List.exists (fn i => i = f) (unkeyed @ #installed result))) written
+            fun member files f = List.exists (fn x => x = f) files
+            val unstored = List.filter (not o member (unkeyed @ #installed result @ #won result)) written
             val (existing, unstored) = List.partition has unstored
             val (other, absent) = List.partition (fn f => has_part (valOf (module_file_theory_part f))) unstored
           in
             installed := unkeyed @ #installed result;
-            fetched := !fetched + #fetched result;
+            fetched := !fetched + length (#won result);
             published := #published result;
             run := WriterRan {report = report, outputs = length outputs, discarded = discarded,
                               installed = length (!installed), existing = length existing,
-                              other = length other, absent = absent, won = #fetched result}
+                              other = length other, absent = absent, won = length (#won result)}
           end
       in
         if worth_writing still then
