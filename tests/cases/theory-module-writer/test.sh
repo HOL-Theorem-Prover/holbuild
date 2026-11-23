@@ -484,6 +484,21 @@ val _ = check "a prefetch didn't give a held lock up in time"
 val _ = unlock holder;
 val _ = prefetch ();
 val _ = check "16 missing modules were not prefetched" (List.all (stored "hol7") published16);
+(* Another writer fills the store while a prefetch waits for its lock:
+   with the lock, the prefetch finds nothing left to fetch. *)
+val saved16 = map (fn f => (f, E.read_text (OS.Path.concat (store "hol7", f)))) published16;
+val _ = remove7 published16;
+val holder = lock_store "hol7";
+val _ = Thread.fork (fn () =>
+          (OS.Process.sleep (Time.fromSeconds 2);
+           List.app (fn (f, bytes) => E.write_text (OS.Path.concat (store "hol7", f)) bytes) saved16;
+           unlock holder), []);
+val before_requests = requests ();
+val t0 = Time.now ();
+val _ = prefetch ();
+val _ = check "a prefetch didn't wait for the lock" (Time.>= (Time.- (Time.now (), t0), Time.fromSeconds 2));
+val _ = check "a prefetch fetched modules another writer stored while it waited"
+          (requests () = before_requests);
 
 (* With a cache, the writer's child is stopped in time for a stalled
    request before the publishing deadline, 10 s past the writer's. *)
