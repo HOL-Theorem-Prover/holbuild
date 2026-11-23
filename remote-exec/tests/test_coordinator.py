@@ -2155,6 +2155,18 @@ async def test_on_demand_burst_hosts_past_the_fullest_rank_behind_spot(coordinat
     assert coordinator._waiter_rank(["standard"], "od-c", 0).host_rank == 0
 
 
+async def test_a_burst_host_with_no_report_takes_no_on_demand_hosts_rank(coordinator: Coordinator) -> None:
+    """A host whose telemetry fails sends only its id and rank, which isn't stored: a full Spot host like that
+    doesn't take the On-Demand host's rank 0 from the fullest On-Demand host, nor push it behind Spot."""
+    burst = ["high", "standard"]
+    report_burst_hosts(coordinator, {"od-a": (0, 3, 0), "od-b": (0, 2, 0)})
+    for i in range(8):
+        coordinator.report_worker("spot", f"spot-w{i}", burst, ahead=True)
+    assert coordinator._waiter_rank(burst, "od-a", 0).host_rank == 0
+    assert coordinator._waiter_rank(burst, "od-b", 0).host_rank == 2
+    assert coordinator._waiter_rank(burst, "spot", 1).host_rank == 1
+
+
 async def test_idle_spot_workers_take_the_work_of_a_spilled_on_demand_host_which_lies_beyond_the_line(
     coordinator: Coordinator,
 ) -> None:

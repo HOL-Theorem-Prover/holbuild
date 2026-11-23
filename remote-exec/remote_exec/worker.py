@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any
+from typing import Any, Literal
 
 from remote_exec.auth import cache_discovery_token
 from remote_exec.cache import blob_key, cache_nodes, preferred_identities, ranked_nodes
@@ -1216,9 +1216,10 @@ class Lease:
 
 def claim_reporting(
     coordinator: Coordinator, tiers: list[str], worker: str, wait_s: float, phases: Phases
-) -> dict[str, Any] | None:
-    """``Coordinator.claim``, reporting ``phases`` with it, or None when the claim failed. The phases reported
-    start again once the coordinator answered, even with an error, since it has them then."""
+) -> dict[str, Any] | Literal[False] | None:
+    """``Coordinator.claim``, reporting ``phases`` with it: the action, None when the coordinator had none, or False
+    when the claim failed or the drain stopped it. The phases reported start again once the coordinator answered,
+    even with an error, since it has them then."""
     report = phases.take()
     try:
         with phases.timed("claim"):
@@ -1227,9 +1228,9 @@ def claim_reporting(
         print(f"claim failed: {error}", file=sys.stderr)
         if not isinstance(error, ClaimRefused):
             phases.put_back(report)
-        return None
+        return False
     except DrainStopped:
-        return None
+        return False
 
 
 def run_one(
@@ -1818,14 +1819,12 @@ def main() -> None:
                     continue
             started = time.monotonic()
             claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
-            if claim is None:
+            if not isinstance(claim, dict):
+                waited_out = claim is None and time.monotonic() - started >= args.claim_wait_seconds
                 protect_first = False
                 with phases.timed("lease"):
                     unprotect()
-                if (
-                    ran_action and protection.spells and tiers[0] != "standard" and not reaper.busy()
-                    and time.monotonic() - started >= args.claim_wait_seconds
-                ):
+                if ran_action and waited_out and protection.spells and tiers[0] != "standard" and not reaper.busy():
                     print("no work after an action: exiting so the task can go or move", file=sys.stderr, flush=True)
                     break
                 # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.

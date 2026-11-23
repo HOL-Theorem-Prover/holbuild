@@ -2656,7 +2656,8 @@ class Coordinator:
         """The rank each burst host of rank 0 (On-Demand) packs at: the ``on_demand_burst_hosts`` with the most
         workers seen lately (then by id) keep 0, ahead of Spot's 1; the others, On-Demand hosts started for workers
         Spot couldn't launch hosts for, get 2, so claims fill Spot first and they empty and scale in once Spot is
-        back. Hosts not quarantined whose workers seen lately all take high work."""
+        back. Hosts not quarantined whose workers seen lately all take high work, and with a stored report: one with
+        none (its telemetry failed) keeps the rank its claims carry."""
         on_demand: list[tuple[int, str]] = []
         for host_id, workers in self.host_workers.items():
             fresh = [
@@ -2665,7 +2666,7 @@ class Coordinator:
             ]
             report = self.hosts.get(host_id)
             if (
-                fresh and all(fresh) and (report is None or report[1].rank == 0)
+                fresh and all(fresh) and report is not None and report[1].rank == 0
                 and self._quarantine(host_id) is None
             ):
                 on_demand.append((-len(fresh), host_id))
