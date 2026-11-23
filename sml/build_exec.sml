@@ -15346,18 +15346,23 @@ fun restore_tool_cache remote store key dir =
     (* A cache in front of the remote's store (a host's bazel-remote over
        S3) can keep serving an entry the store has since replaced, so the
        entry is read again from the store.  The files whose blobs survive
-       are kept, and an entry that lost any is stale. *)
+       are kept, and an entry that lost any, or that the store no longer
+       holds, is stale.  An answer that is neither leaves the entry alone. *)
     fun heal () =
       (remove_tree dir; ensure_dir dir;
-       case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.get_action remote key) of
-           NONE => {files = [], stale = true}
-         | SOME text =>
+       case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.probe_action remote key) of
+           {found = SOME text, ...} =>
              let
                val files = map file (shared_manifest_entries text)
                val placed = List.mapPartial place_surviving files
              in
                restored placed (length placed < length files)
-             end)
+             end
+         | {found = NONE, missing = true} =>
+             (warn "not restoring the tool cache: the remote cache no longer holds its entry";
+              {files = [], stale = true})
+         | {found = NONE, missing = false} =>
+             raise Error "could not read its entry again from the remote cache")
   in
     case HolbuildRemoteCache.get_action remote key of
         NONE => {files = [], stale = false}

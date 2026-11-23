@@ -277,6 +277,21 @@ if grep -q "lost file\|published tool cache" "$tmpdir/v14.log"; then
   echo "worker v14 found the store's entry incomplete" >&2; cat "$tmpdir/v14.log" >&2; exit 1
 fi
 
+# A store's answer the worker can't read on that second look leaves the
+# entry as it was: only an entry the store lost blobs of, or holds no more,
+# is replaced.
+cp "$tmpdir/remote/ac/$tool_ac" "$tmpdir/entry-v13"
+printf 'not an entry\n' > "$tmpdir/remote/ac/$tool_ac"
+cp "$tmpdir/entry-v11" "$control/ac-stale-$tool_ac"
+write_t v15 ''
+export_t v15 --tool-cache probe
+worker v15 "$spec_t"
+expect v15 0 nothing
+require_grep "not restoring the tool cache: could not read its entry again" "$tmpdir/v15.log"
+[[ "$(cat "$tmpdir/remote/ac/$tool_ac")" == "not an entry" ]] || {
+  echo "worker v15 replaced an entry it could not read" >&2; cat "$tmpdir/v15.log" >&2; exit 1; }
+cp "$tmpdir/entry-v13" "$tmpdir/remote/ac/$tool_ac"
+
 # The option leaves checkpoint reuse alone: a worker sharing heaps resumes a
 # --tool-cache build of U from the theorem context a build without it shared.
 write_u() {
