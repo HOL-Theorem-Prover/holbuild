@@ -3536,7 +3536,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool, promote_preload : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, heavy_tactic_timeout : real option option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool, promote_preload : bool}
 
 (* checkpoint: the theory restores checkpoints and saves them at all.
    theorem_checkpoints: it also saves them per theorem and definition, and
@@ -3550,12 +3550,12 @@ type build_options = {use_cache : bool, verify_cache : bool, force : force_level
    of the heap --max-heap limits (write_plain_preload); only check's
    prebuild asks for it. *)
 datatype checkpoint_policy =
-  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool, promote_preload : bool}
+  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, heavy_tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool, promote_preload : bool}
 
 val default_checkpoint_seconds = 2.0
 
 val no_checkpoint_policy =
-  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false}
+  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, heavy_tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false}
 
 fun checkpoint_enabled (CheckpointPolicy {checkpoint, ...}) = checkpoint
 fun theorem_checkpoints_enabled (CheckpointPolicy {theorem_checkpoints, ...}) = theorem_checkpoints
@@ -3568,6 +3568,9 @@ fun checkpoint_seconds (CheckpointPolicy {checkpoint_seconds, ...}) = checkpoint
 fun proof_steps_enabled (CheckpointPolicy {proof_steps, ...}) = proof_steps
 fun proof_ir_enabled (CheckpointPolicy {new_ir, ...}) = new_ir
 fun tactic_timeout (CheckpointPolicy {tactic_timeout, ...}) = tactic_timeout
+(* The budget of steps naming a heavy automation tactic such as metis_tac
+   (proof_runtime.sml's step_budget). *)
+fun heavy_tactic_timeout (CheckpointPolicy {heavy_tactic_timeout, ...}) = heavy_tactic_timeout
 fun execution_plan (CheckpointPolicy {execution_plan, ...}) = execution_plan
 fun trace_steps (CheckpointPolicy {trace_steps, ...}) = trace_steps
 fun repl_on_failure (CheckpointPolicy {repl_on_failure, ...}) = repl_on_failure
@@ -4221,6 +4224,7 @@ fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker p
        share_failed_prefix = share_failed_prefix,
        checkpoint_seconds = checkpoint_seconds policy,
        tactic_timeout = tactic_timeout policy,
+       heavy_tactic_timeout = heavy_tactic_timeout policy,
        timeout_marker = timeout_marker,
        plan_theorem = execution_plan policy,
        trace_all = trace_steps policy,
@@ -4271,6 +4275,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker plan_only_marker 
        share_failed_prefix = false,
        checkpoint_seconds = checkpoint_seconds policy,
        tactic_timeout = tactic_timeout policy,
+       heavy_tactic_timeout = heavy_tactic_timeout policy,
        timeout_marker = SOME timeout_marker,
        plan_theorem = execution_plan policy,
        trace_all = trace_steps policy,
@@ -4334,6 +4339,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker plan_only_marker 
          share_failed_prefix = false,
          checkpoint_seconds = checkpoint_seconds policy,
          tactic_timeout = tactic_timeout policy,
+         heavy_tactic_timeout = heavy_tactic_timeout policy,
          timeout_marker = SOME timeout_marker,
          plan_theorem = execution_plan policy,
          trace_all = trace_steps policy,
@@ -5655,6 +5661,16 @@ fun force_node ({force, force_targets, ...} : build_options) project node =
 fun effective_tactic_timeout proof_steps node_timeout =
   if proof_steps then node_timeout else NONE
 
+(* The budget of heavy steps (heavy_tactic_timeout) given the effective tactic
+   timeout and --heavy-tactic-timeout (NONE when not given): twice the tactic
+   timeout by default, the option's value when given, and untimed wherever
+   steps are untimed. *)
+fun heavy_budget explicit tactic_timeout =
+  case (tactic_timeout, explicit) of
+      (NONE, _) => NONE
+    | (SOME seconds, NONE) => SOME (2.0 * seconds)
+    | (SOME _, SOME heavy) => heavy
+
 (* Whether NODE saves checkpoints as it runs (checkpoint_policy): it is one
    of the build's checkpoint targets (its targets, or every root-package
    theory when it has none), or every theory is under --all-checkpoints, or
@@ -5665,21 +5681,25 @@ fun checkpoint_target_node ({all_checkpoints, repl_on_failure, checkpoint_target
 (* An impure action never replays checkpoints: its script may compute
    different values on each run (a timestamp, a version string), and
    resuming past that code would restore the values of an earlier run. *)
-fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...} : build_options) project node =
+fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...} : build_options) project node =
   if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
+    let val timeout = effective_tactic_timeout proof_steps
+                        (HolbuildTacticTimeoutPolicy.timeout_of node_tactic_timeouts (HolbuildBuildPlan.key node))
+    in
     CheckpointPolicy {checkpoint = not skip_checkpoints andalso not (impure node),
                       theorem_checkpoints = not skip_checkpoints andalso not (impure node),
                       checkpoint_target = checkpoint_target_node options node,
                       checkpoint_seconds = checkpoint_seconds,
                       proof_steps = proof_steps,
                       new_ir = new_ir,
-                      tactic_timeout = effective_tactic_timeout proof_steps
-                                        (HolbuildTacticTimeoutPolicy.timeout_of node_tactic_timeouts (HolbuildBuildPlan.key node)),
+                      tactic_timeout = timeout,
+                      heavy_tactic_timeout = heavy_budget heavy_tactic_timeout timeout,
                       execution_plan = if proof_steps then execution_plan else NONE,
                       trace_steps = proof_steps andalso trace_steps,
                       repl_on_failure = repl_on_failure,
                       trknl = trknl,
                       promote_preload = promote_preload}
+    end
   else
     CheckpointPolicy {checkpoint = false,
                       theorem_checkpoints = false,
@@ -5688,6 +5708,7 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
                       proof_steps = false,
                       new_ir = false,
                       tactic_timeout = NONE,
+                      heavy_tactic_timeout = NONE,
                       execution_plan = NONE,
                       trace_steps = false,
                       repl_on_failure = false,
@@ -7387,10 +7408,11 @@ fun speculative_action root plan keys toolchain_key view key node : theory_actio
 
 (* A pipelined attempt keeps promote_preload: under check, a theory built
    ahead or outlined first loads the same ancestors as its plain build. *)
-fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, promote_preload, ...}) =
+fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, promote_preload, ...}) =
   CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false,
                     checkpoint_seconds = default_checkpoint_seconds, proof_steps = proof_steps,
-                    new_ir = new_ir, tactic_timeout = tactic_timeout, execution_plan = NONE,
+                    new_ir = new_ir, tactic_timeout = tactic_timeout,
+                    heavy_tactic_timeout = heavy_tactic_timeout, execution_plan = NONE,
                     trace_steps = false, repl_on_failure = false, trknl = false,
                     promote_preload = promote_preload}
 
@@ -7398,10 +7420,11 @@ fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, p
    so a checkpoint nothing shares would only cost the child time: under
    --share-deps-heap it saves the deps heap alone (SAVE_HEAP), and without
    sharing nothing.  Proof steps and their timeouts stay as the spec says. *)
-fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...}) =
+fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...}) =
   CheckpointPolicy {checkpoint = checkpoint andalso save_heap, theorem_checkpoints = false, checkpoint_target = checkpoint_target,
                     checkpoint_seconds = checkpoint_seconds, proof_steps = proof_steps,
-                    new_ir = new_ir, tactic_timeout = tactic_timeout, execution_plan = execution_plan,
+                    new_ir = new_ir, tactic_timeout = tactic_timeout,
+                    heavy_tactic_timeout = heavy_tactic_timeout, execution_plan = execution_plan,
                     trace_steps = trace_steps, repl_on_failure = repl_on_failure, trknl = trknl,
                     promote_preload = promote_preload}
 
@@ -9250,13 +9273,14 @@ fun build options tc project plan toolchain_key jobs =
 
 (* After remote execution, force and tracing have already been fulfilled. *)
 fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, checkpoint_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
-                           new_ir, proof_scope, node_tactic_timeouts, execution_plan, repl_on_failure,
+                           new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, execution_plan, repl_on_failure,
                            emit_output_hashes, allow_cache_timeout_discrepancy, trknl, fail_fast, all_checkpoints, promote_preload, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = ForceNone, force_targets = force_targets,
    checkpoint_targets = checkpoint_targets, skip_checkpoints = skip_checkpoints, checkpoint_seconds = checkpoint_seconds,
    proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
-   node_tactic_timeouts = node_tactic_timeouts, execution_plan = execution_plan,
+   node_tactic_timeouts = node_tactic_timeouts, heavy_tactic_timeout = heavy_tactic_timeout,
+   execution_plan = execution_plan,
    trace_steps = false, repl_on_failure = repl_on_failure,
    emit_output_hashes = emit_output_hashes,
    allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy, trknl = trknl,
@@ -9835,6 +9859,9 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
       [bool_option "proof-steps" (proof_steps_enabled policy),
        "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
        bool_option "new-ir" (proof_ir_enabled policy)] @
+      (if timeout_text (heavy_tactic_timeout policy) =
+          timeout_text (heavy_budget NONE (tactic_timeout policy)) then []
+       else ["option heavy-tactic-timeout=" ^ timeout_text (heavy_tactic_timeout policy)]) @
       (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
       (if checkpoint_target_enabled policy then [bool_option "checkpoint-target" true] else []) @
       (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
@@ -10984,7 +11011,8 @@ type action_spec =
    loads : theory_load list,
    outputs : {sig_path : string, sml_path : string, data_path : string},
    extra_outputs : string list,
-   proof_steps : bool, tactic_timeout : real option, new_ir : bool,
+   proof_steps : bool, tactic_timeout : real option,
+   heavy_tactic_timeout : real option option, new_ir : bool,
    theorem_checkpoints : bool, checkpoint_target : bool, skip_checkpoints : bool, promote_preload : bool,
    checkpoint_seconds : real, force : bool, trace_steps : bool,
    pipeline : bool, tool_cache : string option, scratch_input : string option, action_text : string}
@@ -11100,6 +11128,15 @@ fun parse_action_spec text : action_spec =
       case parse_timeout_text (value "option tactic-timeout") of
           SOME timeout => timeout
         | NONE => reject_spec "malformed option tactic-timeout"
+    (* A spec without the line, as default builds and older clients write,
+       means the default heavy budget (heavy_budget). *)
+    val heavy_tactic_timeout =
+      case List.find (fn (k, _) => k = "option heavy-tactic-timeout") (!values) of
+          NONE => NONE
+        | SOME (_, v) =>
+            (case parse_timeout_text v of
+                 SOME timeout => SOME timeout
+               | NONE => reject_spec "malformed option heavy-tactic-timeout")
   in
     {version = value "holbuild-version", runtime = value "holbuild-runtime",
      toolchain = (case !toolchain of SOME t => t | NONE => reject_spec "spec has no toolchain"),
@@ -11111,6 +11148,7 @@ fun parse_action_spec text : action_spec =
      extra_outputs = rev (!extra_outputs),
      proof_steps = spec_bool "proof-steps" (value "option proof-steps"),
      tactic_timeout = tactic_timeout,
+     heavy_tactic_timeout = heavy_tactic_timeout,
      new_ir = spec_bool "new-ir" (value "option new-ir"),
      theorem_checkpoints =
        (case List.find (fn (k, _) => k = "option theorem-checkpoints") (!values) of
@@ -11339,18 +11377,22 @@ fun spec_theory_action root (spec : action_spec) {deps_key, loads} : theory_acti
   end
 
 fun spec_policy (spec : action_spec) =
+  let val timeout = effective_tactic_timeout (#proof_steps spec) (#tactic_timeout spec)
+  in
   CheckpointPolicy {checkpoint = not (#skip_checkpoints spec),
                     theorem_checkpoints = not (#skip_checkpoints spec) andalso #theorem_checkpoints spec,
                     checkpoint_target = #checkpoint_target spec,
                     checkpoint_seconds = #checkpoint_seconds spec,
                     proof_steps = #proof_steps spec,
                     new_ir = #new_ir spec,
-                    tactic_timeout = effective_tactic_timeout (#proof_steps spec) (#tactic_timeout spec),
+                    tactic_timeout = timeout,
+                    heavy_tactic_timeout = heavy_budget (#heavy_tactic_timeout spec) timeout,
                     execution_plan = NONE,
                     trace_steps = #trace_steps spec,
                     repl_on_failure = false,
                     trknl = false,
                     promote_preload = #promote_preload spec}
+  end
 
 val no_space = HolbuildCacheTransfer.no_space
 (* A failed child's log is no evidence of a full disk either way: it is on

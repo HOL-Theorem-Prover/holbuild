@@ -11,6 +11,7 @@ type config = {checkpoint_enabled : bool,
                share_failed_prefix : bool,
                checkpoint_seconds : real,
                tactic_timeout : real option,
+               heavy_tactic_timeout : real option,
                timeout_marker : string option,
                plan_theorem : string option,
                trace_all : bool,
@@ -20,6 +21,7 @@ val checkpoint_enabled_ref = ref false
 val context_checkpoints_ref = ref false
 val share_failed_prefix_ref = ref false
 val tactic_timeout_ref = ref (NONE : real option)
+val heavy_tactic_timeout_ref = ref (NONE : real option)
 val tactic_timeout_marker_ref = ref (NONE : string option)
 val plan_theorem_ref = ref (NONE : string option)
 val trace_all_ref = ref false
@@ -308,16 +310,15 @@ fun retry_after_timeout label seconds first_attempt f x =
     y
   end
 
-(* The time budget of a step, given the configured one: NONE (untimed) when
-   the step names a public HolSmtLib tactic, whose solver run and proof replay
-   can exceed any step budget; at least long_step_seconds when it names a
-   long-running proof-search tactic such as metis, whose proofs (e.g. those
-   reconstructed from external provers) often need more than the default.
+(* The time budget of a step: NONE (untimed) when the step names a public
+   HolSmtLib tactic, whose solver run and proof replay can exceed any step
+   budget; the heavy budget when it names a long-running proof-search tactic
+   such as metis, whose proofs (e.g. those reconstructed from external
+   provers) often need more than the default; the tactic timeout otherwise.
    Names match under any structure qualifier, so re-exports count. Lower
    quotations first so HOL constants and string literals cannot accidentally
    change the budget. *)
-val long_step_seconds = 5.0
-fun step_budget program seconds =
+fun step_budget program =
   let
     val untimed_names = ["GENERIC_SMT_TAC", "CVC_ORACLE_TAC", "CVC_TAC", "YICES_TAC",
                          "Z3_ORACLE_TAC", "Z3_TAC", "cvco_tac", "cvc_tac", "z3_tac", "z3o_tac"]
@@ -344,7 +345,7 @@ fun step_budget program seconds =
     fun ident_char c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'" orelse c = #"."
     fun ident_end i = if i < n andalso ident_char (String.sub (text, i)) then ident_end (i + 1) else i
     fun scan i long =
-      if i >= n then SOME (if long then Real.max (seconds, long_step_seconds) else seconds)
+      if i >= n then if long then !heavy_tactic_timeout_ref else !tactic_timeout_ref
       else if at i "(*" then scan (comment (i + 2) 1) long
       else if at i "\"" then scan (string_end (i + 1)) long
       else if ident_char (String.sub (text, i)) then
@@ -360,7 +361,9 @@ fun step_budget program seconds =
   in scan 0 false end
 
 fun with_tactic_timeout label program f x =
-  case Option.mapPartial (step_budget program) (!tactic_timeout_ref) of
+  case (case (!tactic_timeout_ref, !heavy_tactic_timeout_ref) of
+            (NONE, NONE) => NONE
+          | _ => step_budget program) of
       NONE => f x
     | SOME seconds =>
         let
@@ -2560,7 +2563,7 @@ fun proof_ir_prover ctxt (g, tac) =
              drop_all();
              raise e)
 
-fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
+fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
   (hol_phases_ref := [("holloadend", Time.toMilliseconds (Time.now ()))];
    hol_phase_nested_ms_ref := 0;
    OS.Process.atExit print_hol_phases;
@@ -2568,6 +2571,7 @@ fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, chec
    context_checkpoints_ref := context_checkpoints;
    share_failed_prefix_ref := share_failed_prefix;
    tactic_timeout_ref := tactic_timeout;
+   heavy_tactic_timeout_ref := heavy_tactic_timeout;
    tactic_timeout_marker_ref := timeout_marker;
    plan_theorem_ref := plan_theorem;
    trace_all_ref := trace_all;
