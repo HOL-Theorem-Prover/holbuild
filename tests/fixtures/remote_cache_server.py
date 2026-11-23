@@ -19,8 +19,9 @@ control = pathlib.Path(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else No
 # A port to listen on, as a restarted server takes its predecessor's; by default any free one.
 port = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 
-# A cache this one fetches what it lacks from, read only: for trying
-# unreleased code on real builds without writing to that cache.
+# Caches this one fetches what it lacks from (comma-separated URLs, tried in
+# order), read only: for trying unreleased code on real builds without
+# writing to that cache.
 read_through = os.environ.get("REMOTE_CACHE_READ_THROUGH")
 read_through_config = os.environ.get("REMOTE_CACHE_READ_THROUGH_CURL_CONFIG")
 
@@ -52,14 +53,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         partial = path.with_name(f".{path.name}.{threading.get_ident()}.fetch")
         path.parent.mkdir(parents=True, exist_ok=True)
         config = ["-K", read_through_config] if read_through_config else []
-        fetched = subprocess.run(
-            ["curl", "-fsS", "--compressed", *config, "-o", str(partial),
-             read_through.rstrip("/") + relative],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        if fetched.returncode == 0 and partial.is_file():
-            os.replace(partial, path)
-        else:
-            partial.unlink(missing_ok=True)
+        for url in read_through.split(","):
+            fetched = subprocess.run(
+                ["curl", "-fsS", "--compressed", *config, "-o", str(partial),
+                 url.rstrip("/") + relative],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if fetched.returncode == 0 and partial.is_file():
+                os.replace(partial, path)
+                return
+        partial.unlink(missing_ok=True)
 
     def record_request(self):
         path = urllib.parse.urlparse(self.path).path

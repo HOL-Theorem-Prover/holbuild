@@ -29,7 +29,7 @@ sha=$(sha256sum "$tmpdir/object" | cut -d' ' -f1)
 curl -fsS -X PUT --data-binary "@$tmpdir/object" "$upstream_url/cas/$sha"
 : > "$tmpdir/upstream-state/requests.log"
 
-REMOTE_CACHE_READ_THROUGH=$upstream_url start_remote_cache_server "$tmpdir/local" "$tmpdir/local-state"
+REMOTE_CACHE_READ_THROUGH=http://127.0.0.1:1,$upstream_url start_remote_cache_server "$tmpdir/local" "$tmpdir/local-state"
 pids+=("$server_pid")
 
 curl -fsS -I "$remote_url/cas/$sha" > /dev/null
