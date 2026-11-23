@@ -15863,9 +15863,8 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
     fun answer sock (status, message) =
       park_send sock (status ^ "\n" ^ park_sized message ^
                       park_sized (if status = "fallback" then "" else (read_text build_log handle _ => "")))
-    (* Serves checks until idle; CURRENT is the source and checkpoints the
-       parked children were prepared from. *)
-    fun loop listener =
+    (* Serves checks until idle; TARGET is where the children are parked. *)
+    fun loop listener target =
       let
         val desc = Socket.sockDesc listener
         val ready =
@@ -15892,13 +15891,14 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
               handle e => (Socket.close sock handle _ => (); raise e)
             val _ = Socket.close sock handle _ => ()
           in
+            (* A failure that left no failed prefix (one at the end of a
+               proof, say) parks again where the children were. *)
             case outcome of
                 SOME ("fail", source, checkpoints) =>
-                  (case served_target checkpoints of
-                       SOME target => (prepare source checkpoints target; loop listener)
-                     | NONE => park_note "the check failed outside a proof, stopping")
+                  let val next = getOpt (served_target checkpoints, target)
+                  in prepare source checkpoints next; loop listener next end
               | SOME ("pass", _, _) => park_note "the script builds, stopping"
-              | _ => loop listener
+              | _ => loop listener target
           end
       end
     fun failed_target () =
@@ -15925,7 +15925,7 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
     val _ = prepare source_text checkpoints initial
     val _ = park_note ("listening on " ^ socket)
   in
-    (loop listener handle e => (stop_parked_children (); Socket.close listener; remove_file socket; raise e));
+    (loop listener initial handle e => (stop_parked_children (); Socket.close listener; remove_file socket; raise e));
     stop_parked_children ();
     Socket.close listener;
     remove_file socket
