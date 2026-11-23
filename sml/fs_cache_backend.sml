@@ -221,7 +221,12 @@ fun existing_action_result cache policy key expected actual =
             val incoming = HolbuildTheoryCacheManifest.cache_manifest_contract key expected
           in
             if #non_timeout_text resident <> #non_timeout_text incoming then
-              HolbuildCacheBackend.Conflict (action_manifest cache key)
+              (* The incoming blobs are copied before their action. *)
+              if (HolbuildTheoryCacheManifest.weaker_but_for_digest key
+                    (fn hash => read_text (blob_path cache hash)) expected actual
+                  handle _ => false) then
+                (write_action cache {key = key, text = expected}; HolbuildCacheBackend.Published)
+              else HolbuildCacheBackend.Conflict (action_manifest cache key)
             else if HolbuildTheoryCacheManifest.timeout_at_least_as_strong
                       (#proof_timeout resident) (#proof_timeout incoming) then
               HolbuildCacheBackend.AlreadyPresent

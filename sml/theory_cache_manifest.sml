@@ -245,4 +245,50 @@ fun cache_manifest_contract input_key text =
 fun timeout_at_least_as_strong candidate reference =
   timeout_satisfies reference candidate
 
+(* Where the hash literal of a generated Theory.sml starts: `hash =` and a
+   quoted SHA-1, the only such literal in the file. *)
+fun theory_sml_hash_literal_at text =
+  let
+    val (_, rest) = Substring.position "hash =" (Substring.full text)
+    val quoted = Substring.dropl Char.isSpace (Substring.triml (size "hash =") rest)
+  in
+    if Substring.isEmpty rest then NONE
+    else if Substring.size quoted > 41 andalso Substring.sub (quoted, 0) = #"\"" andalso
+            Substring.sub (quoted, 41) = #"\"" andalso
+            valid_sha1_text (Substring.string (Substring.slice (quoted, 1, SOME 40)))
+    then SOME (#2 (Substring.base quoted) + 1)
+    else NONE
+  end
+
+fun theory_sml_hash_literal text =
+  Option.map (fn i => String.substring (text, i, 40)) (theory_sml_hash_literal_at text)
+
+fun theory_sml_equal_but_hash_literal left right =
+  case (theory_sml_hash_literal_at left, theory_sml_hash_literal_at right) of
+      (SOME i, SOME j) =>
+        i = j andalso String.substring (left, 0, i) = String.substring (right, 0, i) andalso
+        String.extract (left, i + 40, NONE) = String.extract (right, i + 40, NONE)
+    | _ => false
+
+(* Whether the theory entry RESIDENT has a weaker timeout contract than
+   INCOMING and the same outputs but for its .dat and the hash literal of its
+   Theory.sml, whose text SML_TEXT reads by blob hash: the same build under
+   another theory digest, as from a holbuild release before the digest
+   changed.  INCOMING replaces it. *)
+fun weaker_but_for_digest input_key sml_text incoming resident =
+  let
+    val i = cache_manifest_blobs_from_lines input_key (cache_manifest_lines incoming)
+    val r = cache_manifest_blobs_from_lines input_key (cache_manifest_lines resident)
+  in
+    #sig_hash i = #sig_hash r andalso
+    #trace_hash i = #trace_hash r andalso
+    #extra_hashes i = #extra_hashes r andalso
+    #parents i = #parents r andalso
+    #mldeps i = #mldeps r andalso
+    not (timeout_at_least_as_strong (cache_manifest_proof_timeout (cache_manifest_lines resident))
+                                    (cache_manifest_proof_timeout (cache_manifest_lines incoming))) andalso
+    (#sml_hash i = #sml_hash r orelse
+     theory_sml_equal_but_hash_literal (sml_text (#sml_hash i)) (sml_text (#sml_hash r)))
+  end
+
 end
