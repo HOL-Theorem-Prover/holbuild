@@ -250,6 +250,10 @@ Proof
   simp[both_def, ZetaTheory.zeta_def, AlphaTheory.alpha_def]
 QED
 
+(* Uses no theorem from disk, so its oracle list is empty: how the digest
+   treats such a theorem shows in the outputs too. *)
+Theorem refl_thm = REFL ``b:bool``;
+
 val _ = export_theory ();
 SML
 }
