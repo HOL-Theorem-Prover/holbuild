@@ -338,8 +338,13 @@ class Policy:
             if exposes(grant):
                 raise SandboxError(f"sandbox grant contains protected worker state: {grant}")
 
-    def exposes(self, grant: Path) -> bool:
-        return exposure(self.forbidden)(grant)
+    def usable_scratch(self, scratch: list[Path], passed: set[Path]) -> list[Path]:
+        """The SCRATCH directories that hold no protected state, no read-only
+        grant (Landlock grants are a union, so it would become writable) and
+        none of the PASSED trees."""
+        exposes = exposure(self.forbidden)
+        return [path for path in scratch
+                if not exposes(path) and not any(within(read, path) for read in [*self.readable, *passed])]
 
     def validate_outputs(self) -> None:
         # With all descendants reaped, one no-follow walk validates every file
@@ -1010,15 +1015,12 @@ def main() -> int:
             [path.resolve() for path in (args.completed, options) if path is not None],
             toolchain=args.toolchain,
         )
-        # A scratch directory holding protected state, a read-only grant
-        # (Landlock grants are a union, so it would become writable) or a
+        # A scratch directory holding protected state, a read-only grant or a
         # --keep-read-only tree is left out rather than failing the action:
         # only tools needing it fail.
         passed = ({path for name in args.forbid for path in spellings(name)[1]} |
                   {path for name in args.keep_read_only for paths in spellings(name) for path in paths})
-        policy.scratch = [path for path in (Path(path).resolve(strict=True) for path in args.scratch)
-                          if not policy.exposes(path) and
-                          not any(within(read, path) for read in [*policy.readable, *passed])]
+        policy.scratch = policy.usable_scratch([Path(path).resolve(strict=True) for path in args.scratch], passed)
         if not policy.writable:
             raise SandboxError("missing private action directory")
         parent = os.environ.get("HOLBUILD_SANDBOX_PARENT")
