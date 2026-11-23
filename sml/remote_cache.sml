@@ -968,7 +968,9 @@ fun replace_action_everywhere cache {key, text} =
     handle e as Unavailable _ => raise e
          | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
-fun put_action cache policy {key, text} =
+(* put_action, which puts the entry, once no node holds one, only if FITS
+   () then (else Skipped). *)
+fun put_action_if fits cache policy {key, text} =
   if disabled () then HolbuildCacheBackend.Skipped
   else
     let
@@ -982,10 +984,12 @@ fun put_action cache policy {key, text} =
                | HolbuildCacheBackend.PutIfAbsentOrSame =>
                    if existing = text then HolbuildCacheBackend.AlreadyPresent
                    else HolbuildCacheBackend.Conflict (hd urls))
-        | NONE => publish_action_metadata cache key metadata
+        | NONE => if fits () then publish_action_metadata cache key metadata else HolbuildCacheBackend.Skipped
     end
   handle e as Unavailable _ => raise e
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+
+fun put_action cache policy entry = put_action_if (fn () => true) cache policy entry
 
 fun has_blob cache sha256 = Option.isSome (lookup_blob cache sha256)
 

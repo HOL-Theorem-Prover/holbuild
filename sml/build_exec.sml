@@ -4898,9 +4898,13 @@ fun with_deps_heap_capture store deps_loaded f =
     val _ = captured_deps_heap := NONE
     val _ = drop_heap_snapshot ()
     val watcher = Thread.fork (watch, [])
+    (* A child that stops between writing its refused list and its request
+       leaves them for nobody to take. *)
     fun stop () =
       (locked (fn () => finished := true);
-       while Thread.isActive watcher do OS.Process.sleep (Time.fromMilliseconds 10))
+       while Thread.isActive watcher do OS.Process.sleep (Time.fromMilliseconds 10);
+       remove_file refused handle _ => ();
+       remove_file request handle _ => ())
   in
     (f () handle e => (stop (); raise e)) before stop ()
   end
@@ -14627,8 +14631,11 @@ fun converge_modules remote {store, staging, modules, deadline} =
             else
               let val tmp = Path.concat (staging, name ^ ".published")
               in
-                (case HolbuildRemoteCache.fetch_unlisted_blob_within
-                        HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp} of
+                (* Every node is asked: only a blob none holds is lost, and
+                   healing replaces the entry. *)
+                (case HolbuildRemoteCache.required (fn () =>
+                        HolbuildRemoteCache.fetch_unlisted_blob_within
+                          HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp}) of
                      HolbuildCacheBackend.Hit =>
                        if install_module store {src = tmp, name = name} then count (fn () => fetched := !fetched + 1)
                        else ()
@@ -14654,8 +14661,8 @@ fun converge_modules remote {store, staging, modules, deadline} =
                     else
                       let val text = manifest file sha
                       in
-                        case HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsent
-                               {key = key, text = text} of
+                        case HolbuildRemoteCache.put_action_if (fn () => module_request_fits deadline)
+                               remote HolbuildCacheBackend.PutIfAbsent {key = key, text = text} of
                             HolbuildCacheBackend.Published =>
                               if length (HolbuildRemoteCache.action_urls remote key) <= 1
                               then (published_one (); install_own file; NONE)

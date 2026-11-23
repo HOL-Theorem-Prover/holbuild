@@ -78,12 +78,14 @@ cat > "$tmpdir/hold-lookups" <<SH
 sleep 16
 touch "$tmpdir/control/action-get-release"
 SH
-# drop-new-entry: removes from both nodes the first entry put after it starts.
+# drop-new-entry baseline: lists the entries on both nodes, run while the
+# fake HOL runs, before the writer puts any.  drop-new-entry: then removes
+# from both nodes the first entry put that the list lacks.
 cat > "$tmpdir/drop-new-entry" <<SH
 list() { ls "$tmpdir/remote/ac" "$tmpdir/remote2/ac" 2>/dev/null | grep -v -e : -e '^\$' | LC_ALL=C sort -u; }
-before=\$(list)
+[[ \${1:-} != baseline ]] || { list > "$tmpdir/entries-before"; exit; }
 for _ in \$(seq 3000); do
-  new=\$(LC_ALL=C comm -13 <(printf '%s\n' "\$before") <(list))
+  new=\$(LC_ALL=C comm -13 "$tmpdir/entries-before" <(list))
   [[ -n \$new ]] && break
   sleep 0.01
 done
@@ -409,11 +411,29 @@ val _ = List.app (fn node => OS.FileSys.remove ("$tmpdir/" ^ node ^ "/ac/" ^ p16
 val earlier = entries "$tmpdir/remote/ac" @ entries "$tmpdir/remote2/ac";
 fun fresh dir = List.filter (fn e => not (List.exists (fn x => x = e) earlier)) (entries dir);
 val _ = writes [p15];
-val _ = E.write_text "$tmpdir/plant" (detach "drop-new-entry");
+val _ = E.write_text "$tmpdir/plant" ("bash $tmpdir/drop-new-entry baseline\n" ^ detach "drop-new-entry");
 val {installed, fetched, published, ...} = fill6 ();
 val _ = check "a writer whose entry was gone at its read back did not store its module"
           (installed = 1 andalso fetched = 0 andalso published = 1 andalso stored "hol6" p15 andalso
            null (fresh "$tmpdir/remote/ac") andalso null (fresh "$tmpdir/remote2/ac"));
+
+(* P14's blob is only on the node a fetch asks second: the writer asks
+   both, and fetches P14's module rather than replacing its entry. *)
+val p14 = List.nth (ps, 13);
+val _ = writes [p14];
+val _ = check "a writer on two nodes did not publish P14" (#published (fill6 ()) = 1);
+val p14_bytes = E.read_text (OS.Path.concat (store "hol6", p14));
+val p14_sha = HolbuildHash.file_sha256 (OS.Path.concat (store "hol6", p14));
+val (first_node, second_node) =
+  if String.isPrefix "$remote2_url/cas/" (hd (HolbuildRemoteCache.cas_urls remote2 p14_sha))
+  then ("remote2", "remote") else ("remote", "remote2");
+val _ = E.write_text ("$tmpdir/" ^ second_node ^ "/cas/" ^ p14_sha) p14_bytes;
+val _ = OS.FileSys.remove ("$tmpdir/" ^ first_node ^ "/cas/" ^ p14_sha) handle OS.SysErr _ => ();
+val _ = OS.FileSys.remove (OS.Path.concat (store "hol6", p14));
+val {installed, fetched, published, ...} = fill6 ();
+val _ = check "a module whose blob one node lacks was not fetched from the other"
+          (installed = 0 andalso fetched = 1 andalso published = 0 andalso
+           E.read_text (OS.Path.concat (store "hol6", p14)) = p14_bytes);
 
 (* Before an action's first child, a new store fetches what another host
    published, once it has its base theories (from the v1 store) and lacks
