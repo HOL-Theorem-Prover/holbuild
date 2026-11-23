@@ -359,8 +359,8 @@ fun exec_action_help () = print
 
 fun park_check_help () = print
   "Usage:\n\
-  \  holbuild park-check SOCKET FILE\n\n\
-  \Prototype. Has the server an exec-action --park SOCKET started check FILE,\n\
+  \  holbuild park-check SOCKET SPEC FILE\n\n\
+  \Prototype. Has the server exec-action SPEC --park SOCKET started check FILE,\n\
   \a new version of the theory script it serves. Prints the build log; the\n\
   \server publishes nothing, so the usual build stays the check of record.\n\n\
   \Exit status: 0 the script builds; 1 it fails; 2 the server cannot check it\n\
@@ -1795,11 +1795,52 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       end
     (* Theories the remote cache lacks go to the coordinator as a batch; once
        it finishes, the ordinary build restores them from the remote cache. *)
+    (* Prototype parked checks (HOLBUILD_PARKED=1, one target): after a
+       remote build fails in a proof, a park server on this host keeps HOL
+       processes waiting at the failing step, and the next build whose only
+       change is the theory's script asks it instead of planning. *)
+    val parked_checks = OS.Process.getEnv "HOLBUILD_PARKED" = SOME "1" andalso length targets = 1
+    (* The plan record's inputs and where the park record for them is. *)
+    fun park_inputs () =
+      let
+        val graph = HolbuildProjectGraph.resolve {project = project, resolution = resolution}
+        val fingerprint = HolbuildPlanRecord.fingerprint
+                            {project = project, graph = graph, holdir = #holdir tc,
+                             kernel_variant = #kernel_variant tc, targets = targets}
+        val base = OS.Path.concat (OS.Path.concat (HolbuildProject.artifact_root project, ".holbuild/park"),
+                                   String.substring (HolbuildHash.string_sha256 fingerprint, 0, 16))
+      in
+        {graph = graph, fingerprint = fingerprint, base = base}
+      end
+    (* Raises the parked check's diagnostic when the server finds the script
+       still fails; otherwise the usual build runs. *)
+    fun try_parked_check () =
+      let
+        val {graph, fingerprint, base} = timed_phase "park.inputs" park_inputs
+      in
+        case HolbuildBuildExec.read_park_record base of
+            NONE => ()
+          | SOME record =>
+              let
+                val reason =
+                  case timed_phase "park.stat" (fn () =>
+                         HolbuildPlanRecord.changed_besides
+                           {dir = HolbuildPlanRecord.record_dir project, graph = graph, tc = tc,
+                            fingerprint = fingerprint} (#script record)) of
+                      SOME reason => (HolbuildBuildExec.forget_park base; reason)
+                    | NONE =>
+                        timed_phase "park.check" (fn () =>
+                          HolbuildBuildExec.parked_check (HolbuildProject.artifact_root project) base record)
+              in
+                HolbuildStatus.message_stderr ("holbuild: parked check: " ^ reason ^ "; building as usual\n")
+              end
+      end
     fun remote_build {url, remote_only, detach, attach, priority, speculative_loading} =
       let
         val _ =
           if Option.isSome (HolbuildRemoteCacheConfig.url ()) then ()
           else raise Error "--remote-exec needs a remote cache: pass --remote-cache URL"
+        val _ = if parked_checks then try_parked_check () else ()
         val ({index, entry_plan, plan, toolchain_key, components, ...}, build_options, keys) = plan_build_with true
         fun remote_build_plan (build_options, plan, keys, toolchain_key) attach =
           let
@@ -1813,6 +1854,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                the plan record: submit runs it once the batch is submitted,
                or found empty. *)
             val pending_record = ref (fn () => ())
+            (* The last batch exported, which names each action's spec. *)
+            val last_batch = ref ""
             (* The keys of the last export's theories that may be restored but aren't here. *)
             val prefetch_keys = ref []
             val node_with_input_key = HolbuildBuildExec.node_with_input_key plan keys
@@ -1831,6 +1874,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 deferred := held;
                 pending_record := record;
                 prefetch_keys := prefetch;
+                last_batch := batch;
                 batch
               end
             fun batch_keys batch =
@@ -1926,6 +1970,24 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                            shown andalso not (HolbuildStatus.json_mode ()))
                         end
                 val diagnosed = map diagnose failures
+                (* The one theory of a parked-checks build failed in a
+                   proof: a park server waits for its next version. *)
+                val _ =
+                  case failures of
+                      [{input_key, kind, ...}] =>
+                        if not parked_checks orelse (kind <> "proof" andalso kind <> "tactic-timeout") then ()
+                        else
+                          (case (node_with_input_key input_key,
+                                 List.find (fn fields => List.nth (fields, 1) = input_key handle Subscript => false)
+                                   (List.filter (fn fields => List.length fields >= 5 andalso hd fields = "action")
+                                      (map (String.tokens Char.isSpace) (String.tokens (fn c => c = #"\n") (!last_batch))))) of
+                               (SOME node, SOME fields) =>
+                                 HolbuildBuildExec.start_park_server (#base (park_inputs ()))
+                                   {spec_sha256 = List.nth (fields, 3), package = HolbuildBuildExec.package node,
+                                    logical = HolbuildBuildPlan.logical_name node,
+                                    script = HolbuildBuildExec.source_file node}
+                             | _ => ())
+                    | _ => ()
                 val later_errors = later ()
                 val _ = restore_finished_logs ()
                 fun report (SOME key, name, e, _) =
@@ -4426,12 +4488,12 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
      | "exec-action" :: rest =>
          (reject_json "exec-action"; reject_holdir holdir;
           exec_action_command maxheap jobs rest)
-     | ["park-check", socket, file] =>
+     | ["park-check", socket, spec, file] =>
          (reject_json "park-check";
           let
-            val (status, message, log) =
-              HolbuildBuildExec.park_check socket (read_text file)
-              handle e => ("fallback", General.exnMessage e, "")
+            val {status, message, log, ...} =
+              HolbuildBuildExec.park_check socket spec (read_text file)
+              handle e => {status = "fallback", message = General.exnMessage e, log = "", failure_log = "", source_file = ""}
           in
             print log;
             if message = "" then () else TextIO.output (TextIO.stdErr, "holbuild: park-check: " ^ message ^ "\n");

@@ -1083,6 +1083,43 @@ fun restore {dir, graph, tc, fingerprint, start_ns, targets_of} =
   end
 
 
+(* Why the record of FINGERPRINT in DIR does not still hold for every file
+   but SCRIPT, or NONE when it does: its toolchain, members and input
+   directories keep their stat, its directories their stat or else their
+   entries, and its files their stat or else their hash.  Without
+   rebuilding the plan. *)
+fun changed_besides {dir, graph, tc, fingerprint} script =
+  let
+    val record = decode (read_text (OS.Path.concat (dir, fingerprint)))
+    fun held recorded racy path =
+      not racy andalso (case stamp path of SOME st => same_stamp (st, recorded) | NONE => false)
+    val {hol, state, racy, ...} = #toolchain record
+    fun file_held ({path, stamp = recorded, racy, hash} : file) =
+      path = script orelse held recorded racy path orelse
+      (HolbuildHash.file_sha256 path = hash handle _ => false)
+    fun dir_held ({path, stamp = recorded, racy, entries} : dir) =
+      held recorded racy path orelse
+      ((SI.observed_entries path = entries) handle SI.Error _ => false)
+  in
+    if #fingerprint record <> fingerprint then SOME "the plan record names other inputs"
+    else if not (held hol racy (HolbuildToolchain.hol tc) andalso held state racy (HolbuildToolchain.base_state tc))
+    then SOME "the toolchain changed"
+    else if member_kinds graph <> #members record then SOME "a package member appeared or vanished"
+    else
+      case List.find (not o dir_held) (#dirs record) of
+          SOME {path, ...} => SOME ("directory changed: " ^ path)
+        | NONE =>
+            case List.find (not o file_held) (#files record) of
+                SOME {path, ...} => SOME ("file changed: " ^ path)
+              | NONE =>
+                  case List.find (fn ({path, stamp, racy} : stamped_dir) => not (held stamp racy path))
+                         (#input_dirs record) of
+                      SOME {path, ...} => SOME ("input directory changed: " ^ path)
+                    | NONE => NONE
+  end
+  handle Error msg => SOME msg
+       | IO.Io _ => SOME "no plan record for these inputs"
+
 (* How many of the plan's keys differ from those the record kept, whose
    sources are INDEX. *)
 fun changed_keys (record : t) index plan keys =

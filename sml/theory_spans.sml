@@ -127,6 +127,12 @@ fun scan_with_recovery source_path _ =
   in {boundaries = map parse_boundary (List.filter boundary_record records),
       errors = errors} end
 
+(* The script's loads, uses, extra dependencies and outputs and theory
+   mentions, as sorted analyser records. *)
+fun dependency_records source_path =
+  let val (records, _) = response_records ["deps"] source_path
+  in HolbuildDependencies.sort_unique (map P.join records) end
+
 fun scan_terminations_strict source_path _ =
   let val (records, _) = response_records ["terminations-strict"] source_path
   in map parse_termination (List.filter termination_record records) end

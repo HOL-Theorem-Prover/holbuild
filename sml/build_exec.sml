@@ -2189,7 +2189,10 @@ fun theory_child_env () =
 fun with_env env argv = if null env then argv else "env" :: env @ argv
 
 (* Starts a parked child from HEAP, its output going to LOG. *)
-fun start_parked_child tc heap log =
+(* The child starts in DIR, the action's root: HOL reads the project file
+   of the directory it starts in, and a confined child can read only the
+   action's. *)
+fun start_parked_child tc dir heap log =
   let
     val _ = ensure_parent log
     val wait_script = Path.concat (HolbuildRuntimePaths.runtime_root (), "sml/park_wait.sml")
@@ -2198,7 +2201,8 @@ fun start_parked_child tc heap log =
     fun start confined =
       HolbuildSpawn.with_launch_lock (fn () =>
         HolbuildProcessGroup.launch_shell (Posix.ProcEnv.getpid ()) NONE
-          ((if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
+          ("cd " ^ HolbuildToolchain.quote dir ^ " && " ^
+           (if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
            HolbuildToolchain.command confined ^ " > " ^ HolbuildToolchain.quote log ^ " 2>&1"))
     val (process, finish) =
       case !HolbuildActionSandbox.private_roots of
@@ -2210,13 +2214,17 @@ fun start_parked_child tc heap log =
     {heap = heap, process = process, log = log, finish = finish}
   end
 
-(* Ends a parked child that serves nothing: on end of input it exits. *)
-fun stop_parked_child ({process, finish, ...} : parked_child) =
-  (TextIO.closeOut (Unix.textOutstreamOf process) handle IO.Io _ => ();
-   ignore (finish (Unix.reap process)) handle _ => ())
-
+(* Ends the parked children that serve nothing: on end of input each
+   exits.  All inputs are closed before any is reaped, since a child started
+   after another can hold that one's input open. *)
 fun stop_parked_children () =
-  (List.app stop_parked_child (!parked_children); parked_children := [])
+  (List.app (fn ({process, ...} : parked_child) =>
+               TextIO.closeOut (Unix.textOutstreamOf process) handle IO.Io _ => ())
+            (!parked_children);
+   List.app (fn ({process, finish, ...} : parked_child) =>
+               ignore (finish (Unix.reap process)) handle _ => ())
+            (!parked_children);
+   parked_children := [])
 
 (* Runs FILES from WORKDIR in the parked child started from CONTEXT's heap,
    its output going to LOG. *)
@@ -2229,8 +2237,13 @@ fun run_parked_child workdir (HolState heap) file_args log =
           val _ = HolbuildActionSandbox.outputs_validated := false
           val t0 = Time.now ()
           val input = Unix.textOutstreamOf process
-          val _ = TextIO.output (input, String.concatWith "\t" (FS.fullPath workdir :: file_args) ^ "\n")
-          val _ = TextIO.closeOut input
+          (* A child that exited while parked can't serve: its log says why. *)
+          val _ = (TextIO.output (input, String.concatWith "\t" (FS.fullPath workdir :: file_args) ^ "\n");
+                   TextIO.closeOut input)
+                  handle IO.Io _ =>
+                    (ignore (finish (Unix.reap process)) handle _ => ();
+                     raise ParkFallback ("the child parked on " ^ Path.file heap ^ " exited: " ^
+                                         (tail_text child_log handle _ => "no log")))
           val status = finish (Unix.reap process)
           val _ = HolbuildActionSandbox.outputs_validated := true
         in
@@ -15728,7 +15741,7 @@ fun park_receive_line sock =
         else
           case Byte.bytesToString byte of
               "\n" => String.implode (rev acc)
-            | c => if length acc > 64 then raise Error "park: header line too long"
+            | c => if length acc > 128 then raise Error "park: header line too long"
                    else loop (String.sub (c, 0) :: acc)
       end
   in loop [] end
@@ -15752,21 +15765,56 @@ fun park_receive_sized sock =
 
 fun park_sized text = Int.toString (size text) ^ "\n" ^ text
 
+(* Runs F on a thread of its own: the function that waits for its result. *)
+fun park_beside f =
+  let
+    val result = ref NONE
+    val mutex = Mutex.mutex ()
+    val cv = ConditionVar.conditionVar ()
+    fun run () =
+      let val outcome = (let val value = f () in fn () => value end) handle e => (fn () => raise e)
+      in Mutex.lock mutex; result := SOME outcome; ConditionVar.broadcast cv; Mutex.unlock mutex end
+    val _ = Thread.fork (run, [])
+    fun wait () =
+      case !result of
+          SOME outcome => outcome
+        | NONE => (ConditionVar.wait (cv, mutex); wait ())
+  in
+    fn () => (Mutex.lock mutex; wait () before Mutex.unlock mutex) ()
+  end
+
 fun park_note text = HolbuildStatus.message_stderr ("holbuild: park: " ^ text ^ "\n")
 
 fun park_seconds t0 = Real.fmt (StringCvt.FIX (SOME 3)) (Time.toReal (Time.- (Time.now (), t0)))
 
 (* ANALYSE source, the source's checkpoints; CHECK source checkpoints, the
    check of source, which raises Error with the diagnostic if it fails. *)
-fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, source_text, checkpoints, analyse, check} =
+(* A park server's checks save the theory's deps-loaded state and every
+   context on their way, whatever the spec shares, so a waiting child for
+   an edit replays nothing finished before its theorem.  They stay in the
+   server's own checkpoint tree. *)
+fun park_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout,
+                                   heavy_tactic_timeout, execution_plan, trace_steps, repl_on_failure, trknl,
+                                   promote_preload, ...}) =
+  CheckpointPolicy {checkpoint = true, theorem_checkpoints = true, checkpoint_target = true,
+                    checkpoint_seconds = 0.0, proof_steps = proof_steps, new_ir = new_ir,
+                    tactic_timeout = tactic_timeout, heavy_tactic_timeout = heavy_tactic_timeout,
+                    execution_plan = execution_plan, trace_steps = trace_steps, repl_on_failure = repl_on_failure,
+                    trknl = trknl, promote_preload = promote_preload}
+
+fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoint_root, source_text, checkpoints, analyse, check} =
   let
     val park_dir = Path.concat (root, ".holbuild/logs/park")
     val served_dir = Path.concat (park_dir, "served")
     val target_file = Path.concat (park_dir, "target")
     val done_marker = Path.concat (park_dir, "prepared")
     val deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)
-    val build_log = current_build_log (current_log_dir root (#package action) (#logical action))
+    val log_dir = current_log_dir root (#package action) (#logical action)
+    val build_log = current_build_log log_dir
     val _ = ensure_dir served_dir
+    (* What the parked script depends on: an edit that changes it is not
+       checked here, since its action would differ. *)
+    val parked_deps = HolbuildTheorySpans.dependency_records (#source_file action)
     fun theorem_named checkpoints name =
       List.find (fn ({name = n, ...} : HolbuildTheoryCheckpoints.checkpoint) => n = name)
         (#theorem_checkpoints checkpoints)
@@ -15798,7 +15846,7 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
       (park_child_env := ["HOLBUILD_PARK_SERVED=" ^ served_dir];
        parked_children :=
          List.tabulate (length heaps, fn i =>
-           start_parked_child tc (List.nth (heaps, i)) (Path.concat (park_dir, "child-" ^ Int.toString i ^ ".log")));
+           start_parked_child tc root (List.nth (heaps, i)) (Path.concat (park_dir, "child-" ^ Int.toString i ^ ".log")));
        park_child_env := [])
       handle e => (park_child_env := []; raise e)
     (* The failed-prefix checkpoints a check saw are from before the edit, or
@@ -15839,38 +15887,72 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
     fun clear_served () =
       List.app (fn name => remove_file (Path.concat (served_dir, name)))
         ["failed.theorem", "failed.meta", "failed.prefix", "mismatch"]
-    (* The check of SOURCE in a parked child: its status, message and the
-       checkpoints of SOURCE. *)
-    fun serve source =
+    (* Whether an edit from PARKED_SOURCE to SOURCE keeps the failed prefix
+       TARGET parks on: the text before the theorem's tactic and after it
+       through QED is unchanged, and the new tactic starts with the steps
+       the prefix ran. *)
+    fun keeps_failed_prefix (target : park_target, parked_source, parked_checkpoints) source checkpoints =
+      case (theorem_named parked_checkpoints (#theorem target), theorem_named checkpoints (#theorem target)) of
+          (SOME (old : HolbuildTheoryCheckpoints.checkpoint), SOME (new : HolbuildTheoryCheckpoints.checkpoint)) =>
+            let
+              fun before text (theorem : HolbuildTheoryCheckpoints.checkpoint) =
+                String.substring (text, 0, #tactic_start theorem)
+              fun after text (theorem : HolbuildTheoryCheckpoints.checkpoint) =
+                String.substring (text, #tactic_end theorem, #theorem_stop theorem - #tactic_end theorem)
+            in
+              (before parked_source old = before source new andalso
+               after parked_source old = after source new andalso
+               String.isPrefix (String.substring (#tactic_text old, 0, #prefix_end target)) (#tactic_text new))
+              handle Subscript => false
+            end
+        | _ => false
+    (* The check of SOURCE in a parked child, PARKED being where the
+       children are parked: its status, message and the checkpoints of
+       SOURCE.  The script's dependencies are found beside the analysis. *)
+    fun serve parked source =
       let
         val _ = clear_served ()
         val _ = write_text (#source_file action) source
         val t0 = Time.now ()
+        val deps = park_beside (fn () => HolbuildTheorySpans.dependency_records (#source_file action))
         val checkpoints = analyse source
+        val same_deps = (deps () = parked_deps) handle Error _ => false | HolbuildTheoryCheckpoints.Error _ => false
         val _ = park_note ("analysed in " ^ park_seconds t0 ^ " s")
+        val _ = if keeps_failed_prefix parked source checkpoints then () else drop_failed_prefixes checkpoints
         fun run () =
           ((park_serving := true; check source checkpoints; park_serving := false; ("pass", ""))
            handle Error msg => (park_serving := false; ("fail", msg))
                 | ParkFallback msg => (park_serving := false; ("fallback", msg))
                 | e => (park_serving := false; raise e))
-        val result = run ()
         val mismatch = Path.concat (served_dir, "mismatch")
         val (status, message) =
-          if #1 result = "fail" andalso file_exists mismatch then
-            (* The edit doesn't keep the parked prefix: the context's child. *)
-            (park_note ("failed prefix not resumable: " ^ read_text mismatch);
-             clear_served ();
-             drop_failed_prefixes checkpoints;
-             run ())
-          else result
+          if not same_deps then ("fallback", "the edit changes what the theory depends on")
+          else
+            case run () of
+                result as ("fail", _) =>
+                  if file_exists mismatch then
+                    (* The edit doesn't keep the parked prefix: the context's child. *)
+                    (park_note ("failed prefix not resumable: " ^ read_text mismatch);
+                     clear_served ();
+                     drop_failed_prefixes checkpoints;
+                     run ())
+                  else result
+              | result => result
       in
         (status, message, checkpoints)
       end
+    (* The status line, then the message, build log, instrumented failure
+       log and the path of the script they name, each sized. *)
     fun answer sock (status, message) =
-      park_send sock (status ^ "\n" ^ park_sized message ^
-                      park_sized (if status = "fallback" then "" else (read_text build_log handle _ => "")))
-    (* Serves checks until idle; TARGET is where the children are parked. *)
-    fun loop listener target =
+      let fun log path = if status = "fallback" then "" else (read_text path handle _ => "")
+      in
+        park_send sock (status ^ "\n" ^ park_sized message ^ park_sized (log build_log) ^
+                        park_sized (log (current_checkpoint_failure_log log_dir)) ^
+                        park_sized (#source_file action))
+      end
+    (* Serves checks until idle; PARKED is where the children are parked:
+       the target, and the source and checkpoints they were prepared from. *)
+    fun loop listener (parked as (target, _, _)) =
       let
         val desc = Socket.sockDesc listener
         val ready =
@@ -15882,13 +15964,15 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
           let
             val (sock, _) = Socket.accept listener
             val t0 = Time.now ()
+            val request = park_receive_line sock handle Error _ => ""
             val outcome =
-              (if park_receive_line sock <> "holbuild-park-v1" then
-                 (answer sock ("fallback", "unknown request"); NONE)
+              (if request = "holbuild-park-v1 stop" then SOME ("stop", "", checkpoints)
+               else if request <> "holbuild-park-v1 " ^ spec_sha256 then
+                 (answer sock ("fallback", "the server is parked on another action"); NONE)
                else
                  let
                    val source = park_receive_sized sock
-                   val (status, message, checkpoints) = serve source
+                   val (status, message, checkpoints) = serve parked source
                  in
                    answer sock (status, message);
                    park_note (String.concat ["served ", status, " in ", park_seconds t0, " s"]);
@@ -15902,9 +15986,10 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
             case outcome of
                 SOME ("fail", source, checkpoints) =>
                   let val next = getOpt (served_target checkpoints, target)
-                  in prepare source checkpoints next; loop listener next end
+                  in prepare source checkpoints next; loop listener (next, source, checkpoints) end
               | SOME ("pass", _, _) => park_note "the script builds, stopping"
-              | _ => loop listener target
+              | SOME ("stop", _, _) => park_note "asked to stop"
+              | _ => loop listener parked
           end
       end
     fun failed_target () =
@@ -15920,6 +16005,37 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
       Option.map (fn name => {theorem = name, step_count = 0, prefix_end = 0, path = ""})
         (HolbuildTheoryDiagnostics.find_failed_theorem_name
            (String.tokens (fn c => c = #"\n") (read_text build_log handle _ => "")))
+    (* The theorem whose text holds the line of the first static error the
+       build log names in the script: one in a tactic, an undeclared
+       theorem name, say, fails before any step runs. *)
+    fun static_error_theorem () =
+      let
+        val marker = Path.file (#source_file action) ^ ":"
+        fun error_line line =
+          case String.fields (fn c => c = #":") line of
+              file :: n :: rest =>
+                if String.isSuffix (Path.file (#source_file action)) file andalso
+                   String.isPrefix " error" (String.concatWith ":" rest)
+                then Int.fromString n else NONE
+            | _ => NONE
+        val lines = String.tokens (fn c => c = #"\n") (read_text build_log handle _ => "")
+        fun offset_of_line n =
+          let fun go (i, k) = if k >= n orelse i >= size source_text then i
+                              else go (i + 1, if String.sub (source_text, i) = #"\n" then k + 1 else k)
+          in go (0, 1) end
+      in
+        case List.mapPartial (fn line => if String.isSubstring marker line then error_line line else NONE) lines of
+            n :: _ =>
+              let val at = offset_of_line n
+              in
+                Option.map (fn ({name, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
+                              {theorem = name, step_count = 0, prefix_end = 0, path = ""})
+                  (List.find (fn ({theorem_start, theorem_stop, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
+                                theorem_start <= at andalso at < theorem_stop)
+                             (#theorem_checkpoints checkpoints))
+              end
+          | [] => NONE
+      end
     (* With no failed prefix from an earlier build, the source is built once
        the usual way to find where it fails. *)
     val initial =
@@ -15927,10 +16043,9 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
           SOME target => target
         | NONE =>
             (check source_text checkpoints handle Error _ => ();
-             case (failed_target (), failed_theorem ()) of
-                 (SOME target, _) => target
-               | (NONE, SOME target) => target
-               | (NONE, NONE) => raise Error "park: the source does not fail in a proof")
+             case List.mapPartial (fn find => find ()) [failed_target, failed_theorem, static_error_theorem] of
+                 target :: _ => target
+               | [] => raise Error "park: the source does not fail in a proof")
     val _ = remove_file socket
     val listener = UnixSock.Strm.socket ()
     val _ = Socket.bind (listener, UnixSock.toAddr socket)
@@ -15938,30 +16053,142 @@ fun park_serve {socket, tc, root, action : theory_action, checkpoint_root, sourc
     val _ = prepare source_text checkpoints initial
     val _ = park_note ("listening on " ^ socket)
   in
-    (loop listener initial handle e => (stop_parked_children (); Socket.close listener; remove_file socket; raise e));
+    (loop listener (initial, source_text, checkpoints) handle e => (stop_parked_children (); Socket.close listener; remove_file socket; raise e));
     stop_parked_children ();
     Socket.close listener;
     remove_file socket
   end
 
-(* Asks the server on SOCKET to check SOURCE: its status (pass, fail or
-   fallback), message and build log. *)
-fun park_check socket source =
+(* Asks the server on SOCKET, parked on the action of SPEC_SHA256, to check
+   SOURCE: its status (pass, fail or fallback), message, build log,
+   instrumented failure log, and the path of the script they name. *)
+fun park_check socket spec_sha256 source =
   let
     val sock = UnixSock.Strm.socket ()
     fun close () = Socket.close sock handle _ => ()
   in
     (Socket.connect (sock, UnixSock.toAddr socket);
-     park_send sock ("holbuild-park-v1\n" ^ park_sized source);
+     park_send sock ("holbuild-park-v1 " ^ spec_sha256 ^ "\n" ^ park_sized source);
      let
        val status = park_receive_line sock
        val message = park_receive_sized sock
        val log = park_receive_sized sock
+       val failure_log = park_receive_sized sock
+       val source_file = park_receive_sized sock
      in
        close ();
-       (status, message, log)
+       {status = status, message = message, log = log, failure_log = failure_log, source_file = source_file}
      end)
     handle e => (close (); raise e)
+  end
+
+(* ---- Parked checks, client side (prototype, HOLBUILD_PARKED=1) ----
+   After a one-theory remote build fails in a proof, the client starts a
+   park server on this host for the failed action and remembers it in a
+   park record at BASE (.holbuild/park/<name>): the action's spec, package,
+   theory and script.  The next build whose only change is that script sends
+   it to the server instead of planning. *)
+
+(* TEXT split at each occurrence of SEP. *)
+fun park_split_on sep text =
+  let
+    fun loop start i acc =
+      if i + size sep > size text then rev (String.extract (text, start, NONE) :: acc)
+      else if String.substring (text, i, size sep) = sep then
+        loop (i + size sep) (i + size sep) (String.substring (text, start, i - start) :: acc)
+      else loop start (i + 1) acc
+  in loop 0 0 [] end
+
+type park_record = {spec_sha256 : string, package : string, logical : string, script : string}
+
+fun park_socket base = base ^ ".sock"
+
+fun read_park_record base : park_record option =
+  (case String.tokens (fn c => c = #"\n") (read_text base) of
+       [spec_sha256, package, logical, script] =>
+         SOME {spec_sha256 = spec_sha256, package = package, logical = logical, script = script}
+     | _ => NONE)
+  handle IO.Io _ => NONE
+
+(* Stops the park server BASE names, if one runs, and forgets it.  One
+   still preparing doesn't listen yet: it is ended by its process id, once
+   its command line shows it is that server. *)
+fun forget_park base =
+  let
+    val sock = UnixSock.Strm.socket ()
+    val stopped =
+      (Socket.connect (sock, UnixSock.toAddr (park_socket base));
+       park_send sock "holbuild-park-v1 stop\n";
+       true)
+      handle OS.SysErr _ => false
+    val _ = Socket.close sock handle _ => ()
+    fun end_preparing () =
+      case Int.fromString (read_text (base ^ ".pid")) of
+          SOME pid =>
+            if String.isSubstring (park_socket base) (read_text ("/proc/" ^ Int.toString pid ^ "/cmdline"))
+            then Posix.Process.kill (Posix.Process.K_PROC (Posix.Process.wordToPid (SysWord.fromInt pid)), Posix.Signal.kill)
+            else ()
+        | NONE => ()
+  in
+    if stopped then () else (end_preparing () handle IO.Io _ => () | OS.SysErr _ => ());
+    remove_file base
+  end
+
+(* Starts the park server for RECORD in the background, its log and process
+   id beside BASE.  The remote cache settings go to it through a script
+   rather than its command line; its cache limit is one it never reaches, so
+   it evicts nothing from the client's cache. *)
+fun start_park_server base ({spec_sha256, package, logical, script} : park_record) =
+  let
+    val run = base ^ ".run"
+    fun export name value =
+      case value of
+          SOME v => name ^ "=" ^ HolbuildHash.quote v ^ "; export " ^ name ^ "\n"
+        | NONE => ""
+    val _ = ensure_parent base
+    val _ = forget_park base
+    val _ = remove_file (park_socket base)
+    val _ = write_text base (String.concatWith "\n" [spec_sha256, package, logical, script] ^ "\n")
+    val _ = write_text run
+              (export "HOLBUILD_REMOTE_CACHE_URL" (HolbuildRemoteCacheConfig.url ()) ^
+               export "HOLBUILD_REMOTE_CACHE_CURL_CONFIG" (HolbuildRemoteCacheConfig.curl_config ()) ^
+               "echo $$ > " ^ HolbuildHash.quote (base ^ ".pid") ^ "\n" ^
+               "exec " ^ String.concatWith " " (map HolbuildHash.quote
+                 [HolbuildRuntimePaths.executable_path (), "exec-action", spec_sha256, "--park", park_socket base,
+                  "--cache-limit-gb", "1000000", "--cache-reserve-gb", "0"]) ^ "\n")
+    val _ = Posix.FileSys.chmod (run, Posix.FileSys.S.irwxu)
+  in
+    if OS.Process.isSuccess
+         (OS.Process.system ("setsid sh " ^ HolbuildHash.quote run ^ " < /dev/null >> " ^
+                             HolbuildHash.quote (base ^ ".log") ^ " 2>&1 &"))
+    then HolbuildStatus.message_stderr ("holbuild: parked check: started a park server for " ^ logical ^ "\n")
+    else remove_file base
+  end
+
+(* The parked check of RECORD's script, under the project at ROOT.  When the
+   server answers fail, writes its logs where a remote failure's go and
+   raises the diagnostic; otherwise forgets the server and says why the
+   usual build runs (a pass, so the build makes the theory, or a fallback). *)
+fun parked_check root base ({spec_sha256, package, logical, script} : park_record) =
+  let
+    val {status, message, log, failure_log, source_file} =
+      park_check (park_socket base) spec_sha256 (read_text script)
+      handle e => {status = "fallback", message = General.exnMessage e, log = "", failure_log = "", source_file = ""}
+    val log_dir = current_log_dir root package logical
+    (* The diagnostic names the script where the server keeps its copy. *)
+    fun local_paths text =
+      if source_file = "" then text
+      else String.concatWith script (park_split_on source_file text)
+  in
+    case status of
+        "fail" =>
+          (ensure_dir log_dir;
+           write_text (current_build_log log_dir) log;
+           if failure_log = "" then remove_file (current_checkpoint_failure_log log_dir)
+           else write_text (current_checkpoint_failure_log log_dir) failure_log;
+           raise Error (local_paths message))
+      | "pass" => (remove_file base; "the parked check of " ^ logical ^ " passed")
+      | _ => (forget_park base; message)
   end
 
 fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_only, toolchain, ahead_parents, pipeline, park} =
@@ -16463,11 +16690,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   NONE => ()
                 | SOME socket =>
                     (park_serve
-                       {socket = socket, tc = tc, root = root, action = action, checkpoint_root = checkpoint_root,
-                        source_text = source_text, checkpoints = checkpoints,
-                        analyse = fn source => action_checkpoints policy checkpoint_root action source,
+                       {socket = socket, spec_sha256 = spec_sha256, tc = tc, root = root, action = action, checkpoint_root = checkpoint_root,
+                        source_text = source_text,
+                        checkpoints = action_checkpoints (park_policy policy) checkpoint_root action source_text,
+                        analyse = fn source => action_checkpoints (park_policy policy) checkpoint_root action source,
                         check = fn source => fn checkpoints =>
-                          ignore (run_theory_action_checkpoints check_cancelled NONE false policy tc root
+                          ignore (run_theory_action_checkpoints check_cancelled NONE false (park_policy policy) tc root
                                     checkpoint_root (toolchain_base_context tc) action source checkpoints)};
                      HolbuildRemoveTree.remove_untrusted_strict checkpoint_root;
                      HolbuildRemoveTree.remove_untrusted_strict root;

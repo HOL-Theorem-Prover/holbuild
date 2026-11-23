@@ -71,7 +71,6 @@ socket=$tmpdir/park.sock
 # serve NAME: a park server on A's current spec, from worker cache NAME.
 serve() {
   (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload ATheory) > "$tmpdir/batch-$1.txt"
-  local spec
   spec=$(field "$tmpdir/batch-$1.txt" park:ATheory 4)
   [[ -n "$spec" ]] || { cat "$tmpdir/batch-$1.txt" >&2; exit 1; }
   link_hol_toolchain_cache "$tmpdir/$1"
@@ -88,10 +87,11 @@ serve() {
 serve park
 require_grep "park: prepared target at step 2 .* started 2 children" "$tmpdir/park.log"
 
-# check NAME STATUS: park-check of the current A must exit with STATUS.
+# check NAME STATUS [SPEC]: park-check of the current A, for SPEC (the
+# served one by default), must exit with STATUS.
 check() {
   local status=0
-  "$HOLBUILD_BIN" park-check "$socket" "$project/src/AScript.sml" > "$tmpdir/$1.out" 2> "$tmpdir/$1.err" || status=$?
+  "$HOLBUILD_BIN" park-check "$socket" "${3:-$spec}" "$project/src/AScript.sml" > "$tmpdir/$1.out" 2> "$tmpdir/$1.err" || status=$?
   [[ "$status" == "$2" ]] || {
     echo "park-check $1: wanted exit $2, got $status" >&2
     cat "$tmpdir/$1.out" "$tmpdir/$1.err" "$tmpdir/park.log" >&2
@@ -109,15 +109,38 @@ require_grep "second failure" "$tmpdir/second.out"
 write_a 'ALL_TAC'
 check unsolved 1
 
+# Edits the server cannot check from where it is parked, each answered
+# fallback without using a child: a request for another action, a new
+# theory mention, an edit above the theorem.
+check other-spec 2 0000000000000000000000000000000000000000000000000000000000000000
+require_grep "parked on another action" "$tmpdir/other-spec.err"
+write_a 'ACCEPT_TAC arithmeticTheory.ADD_0'
+check new-mention 2
+require_grep "changes what the theory depends on" "$tmpdir/new-mention.err"
+write_a 'FAIL_TAC "third failure"'
+sed -i 's/^  ACCEPT_TAC TRUTH$/  ACCEPT_TAC TRUTH >> ALL_TAC/' "$project/src/AScript.sml"
+check above 2
+require_grep "no child is parked" "$tmpdir/above.err"
+
+# An edit before the failing step: the failed prefix does not hold, the
+# context's child checks it.
+write_a 'FAIL_TAC "fourth failure"'
+sed -i 's/CONJ_TAC >- ACCEPT_TAC TRUTH/CONJ_TAC >- (ACCEPT_TAC TRUTH)/' "$project/src/AScript.sml"
+check before-step 1
+require_grep "fourth failure" "$tmpdir/before-step.out"
+
 write_a '(fn g => (counter := !counter + 1; if !counter = 1 then ACCEPT_TAC TRUTH g else raise Fail "dirty heap"))'
 check fixed 0
 wait "$park_pid" || { echo "the park server failed" >&2; cat "$tmpdir/park.log" >&2; exit 1; }
 park_pid=""
 require_grep "park: the script builds, stopping" "$tmpdir/park.log"
 [[ ! -e "$socket" ]] || { echo "the park server left its socket" >&2; exit 1; }
-# Every check ran from the failed prefix.
-[[ "$(grep -c 'park: served' "$tmpdir/park.log")" == 3 &&
-   "$(grep -c 'from: failed-prefix checkpoint in target' "$tmpdir/park.log")" == 3 ]] || {
+# The second and unsolved checks ran from the failed prefix; the one edited
+# before the failing step, and the fix, which undoes that edit, from the
+# context.
+[[ "$(grep -c 'park: served' "$tmpdir/park.log")" == 6 &&
+   "$(grep -c 'from: failed-prefix checkpoint in target' "$tmpdir/park.log")" == 2 &&
+   "$(grep -c 'failed prefix not resumable' "$tmpdir/park.log")" == 0 ]] || {
   cat "$tmpdir/park.log" >&2; exit 1; }
 
 # A server gone means the caller checks the usual way.
@@ -130,3 +153,13 @@ serve unsolved-start
 require_grep "park: prepared target at step 0 .* started 1 children" "$tmpdir/unsolved-start.log"
 write_a 'ACCEPT_TAC TRUTH'
 check after-unsolved 0
+wait "$park_pid" 2>/dev/null || true
+park_pid=""
+
+# A static error in the proof, an undeclared theorem name: no step runs, and
+# the server parks at the start of the theorem whose text holds the error.
+write_a 'ACCEPT_TAC no_such_theorem'
+serve static
+require_grep "park: prepared target at step 0 .* started 1 children" "$tmpdir/static.log"
+write_a 'ACCEPT_TAC TRUTH'
+check after-static 0

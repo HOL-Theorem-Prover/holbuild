@@ -2699,10 +2699,7 @@ fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, chec
    failed_prefix_resume_active_ref := false;
    failed_prefix_resumed_step_count_ref := NONE;
    proving_with_proof_ir_ref := false;
-   (* A prepare child saves every context on its way, so the waiting child
-      for an edit before the theorem it parks in replays nothing finished. *)
-   HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate
-     (if Option.isSome (OS.Process.getEnv "HOLBUILD_PARK") then 0.0 else checkpoint_seconds);
+   HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate checkpoint_seconds;
    HolbuildTacticCompat.install_prover proof_ir_prover;
    case tactic_timeout of
        NONE => ()
