@@ -164,11 +164,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
             # control/ac-stale-<key>: an entry a cache in front of the store
             # still serves after the store's was replaced, until a GET with
-            # Cache-Control: no-cache has it check its copy.
+            # Cache-Control: no-cache has it check its copy.  A
+            # control/ac-stale-next-<key> then takes its place: the store's
+            # entry was replaced again after that check.
             stale = control / f"ac-stale-{key}"
             if stale.exists():
                 if no_cache:
                     stale.unlink()
+                    following = control / f"ac-stale-next-{key}"
+                    if following.exists():
+                        following.rename(stale)
                 else:
                     data = stale.read_bytes()
                     self.send_response(200)

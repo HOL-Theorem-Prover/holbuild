@@ -13510,13 +13510,17 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 | NONE => first_window heap (List.drop (candidates, n))
             end
     (* Without an index (a heap published before there were any) every
-       candidate is probed. *)
+       candidate is probed.  Every build of the theory replaces the index,
+       so the cache is asked to check its copy: one in front of the store
+       may still hold an index from before the last build's publish. *)
     fun listed [] = []
       | listed candidates =
           let val count = Int.toString (length candidates)
           in
             case Option.mapPartial (shared_index_keys o #manifest)
-                                   (restore_step "rstprobe" (fn () => HolbuildRemoteCache.fetch_action remote index_key)) of
+                                   (restore_step "rstprobe" (fn () =>
+                                      HolbuildRemoteCache.revalidating (fn () =>
+                                        HolbuildRemoteCache.fetch_action remote index_key))) of
                 NONE =>
                   (add_restore_step "rstindexn" 0;
                    HolbuildStatus.message_stdout
@@ -13762,12 +13766,14 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* The checkpoints this build used go to the front of the index, so
        those every edit shares, early in the script, are the last to be
        dropped.  A heap published anew starts an index of its own: the
-       checkpoints listed before are chained to the heap it replaced. *)
+       checkpoints listed before are chained to the heap it replaced.  The
+       index read is checked with the store, as in the restore's. *)
     fun update_index heap used =
       let
         val old =
           if SOME heap <> restored_heap then NONE
-          else Option.mapPartial (shared_index_keys o #manifest) (HolbuildRemoteCache.fetch_action remote index_key)
+          else Option.mapPartial (shared_index_keys o #manifest)
+                 (HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.fetch_action remote index_key))
         fun add (key, (seen, kept)) =
           if Redblackset.member (seen, key) then (seen, kept) else (Redblackset.add (seen, key), key :: kept)
         val merged = rev (#2 (List.foldl add (Redblackset.empty String.compare, []) (used @ getOpt (old, []))))

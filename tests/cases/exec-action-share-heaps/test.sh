@@ -25,7 +25,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Two remote caches: the sharing worker's, and a cold worker's to compare.
-start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 server_pids+=("$server_pid")
 shared_url=$remote_url
 start_remote_cache_server "$tmpdir/remote-cold" "$tmpdir/server-cold"
@@ -243,15 +243,18 @@ fi
 # The index of the checkpoints published on each heap: a restore probes only
 # the checkpoints it lists, and probes every candidate without one.
 index_entries() { grep -lx "holbuild-shared-checkpoint-index-v1" "$tmpdir"/remote/ac/* || true; }
-# set_index KEY...: every index lists just KEYS.
-set_index() {
-  local manifest path
+# index_entry KEY...: an index entry listing just KEYS.
+index_entry() {
+  local manifest
   manifest="holbuild-shared-checkpoint-index-v1"$'\n'
   for key in "$@"; do manifest+="checkpoint=$key"$'\n'; done
-  for path in $(index_entries); do
-    printf 'holbuild-remote-cache-action-v2\nmanifest-sha256 %s\nmanifest-size %s\nmanifest-text-v1\n%s' \
-      "$(printf '%s' "$manifest" | sha256sum | cut -d' ' -f1)" "${#manifest}" "$manifest" > "$path"
-  done
+  printf 'holbuild-remote-cache-action-v2\nmanifest-sha256 %s\nmanifest-size %s\nmanifest-text-v1\n%s' \
+    "$(printf '%s' "$manifest" | sha256sum | cut -d' ' -f1)" "${#manifest}" "$manifest"
+}
+# set_index KEY...: every index lists just KEYS.
+set_index() {
+  local path
+  for path in $(index_entries); do index_entry "$@" > "$path"; done
 }
 # drop_checkpoint THEOREM: the cache loses every entry of THEOREM's context.
 drop_checkpoint() {
@@ -297,6 +300,32 @@ forget_local
 worker v3d "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v3d 0 "status=built"
 resumed v3d "theorem-context checkpoint after t4" "theorem_context checkpoint"
+
+# A cache in front of the store may still serve an index from before the
+# store's was replaced: the restore asks it to check its copy, and resumes
+# from a checkpoint the store's index lists.  The publish asks again (the
+# copy is stale again by then), so its index keeps the checkpoints the edit
+# didn't use.
+rm -f "$tmpdir/control/no-cache-gets"
+for path in $(index_entries); do
+  index_entry > "$tmpdir/control/ac-stale-${path##*/}"
+  index_entry > "$tmpdir/control/ac-stale-next-${path##*/}"
+  grep '^checkpoint=' "$path" > "$tmpdir/v3e-before-${path##*/}"
+done
+write_t "T \\/ F" "REFL_TAC" "ACCEPT_TAC TRUTH" "REWRITE_TAC [TRUTH]"
+export_t v3e
+forget_local
+worker v3e "$shared_url" "$shared" "$spec_t" --share-heaps
+expect v3e 0 "status=built"
+resumed v3e "theorem-context checkpoint after t4" "theorem_context checkpoint"
+for path in $(index_entries); do
+  [[ -s "$tmpdir/v3e-before-${path##*/}" ]] || { echo "v3d published an empty index" >&2; exit 1; }
+  if grep -vxFf "$path" "$tmpdir/v3e-before-${path##*/}"; then
+    echo "v3e's index dropped the checkpoints above" >&2; exit 1
+  fi
+  [[ "$(grep -cx "${path##*/}" "$tmpdir/control/no-cache-gets")" -ge 2 ]] || {
+    echo "v3e's restore and publish didn't both ask the cache to check its copy of the index" >&2; exit 1; }
+done
 
 # A failed proof shares its failed prefix, and the fixed proof resumes from it.
 write_t "T \\/ F" "FAIL_TAC \"seeded failure\""
