@@ -1208,7 +1208,9 @@ the default, and a worker resolves a missing one the same way. An SMT name anywh
 untimed. The half-timeout retry and the timeout report use the step's own budget. The
 default budget only grows with the configured timeout, so the rule above for reusing a
 success under another timeout still holds; `--heavy-tactic-timeout` is not part of
-that contract, as SMT steps are not.
+that contract, as SMT steps are not. Entries built by 0.15.0, which gave these steps at
+least 5 seconds instead, are reused as before, also by a build whose timeout is below 2.5
+seconds.
 
 A step that exceeds its timeout runs once more, at once and in the same process, with
 half the timeout. Each timed call computes its result from the proof state it was given

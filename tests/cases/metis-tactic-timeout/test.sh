@@ -176,3 +176,10 @@ diff "$specs/$(field "$tmpdir/batch-default.txt" metis-timeout:RemoteTheory 4)" 
 worker default failed
 require_grep "tactic timed out after 2.0s" "$tmpdir/worker-default.log"
 worker heavy built
+# An explicit 0 travels as "none" and leaves the worker's metis step untimed
+# (a changed source, so the built entry above doesn't serve it).
+write_slow '(fn g => (X.metis_tac [] g; sleep_tac 3.2 g))' Remote
+export_slow untimed --heavy-tactic-timeout 0
+grep -qx 'option heavy-tactic-timeout=none' "$specs/$(field "$tmpdir/batch-untimed.txt" metis-timeout:RemoteTheory 4)" || {
+  echo "--heavy-tactic-timeout 0 did not reach the spec as none" >&2; exit 1; }
+worker untimed built
