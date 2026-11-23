@@ -239,6 +239,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         request: Request,
         profile: str = "default",
         max_heap_mb: int | None = Query(default=None, gt=0, le=2147483647),
+        child_gc_percent: int | None = Query(default=None, ge=1, le=99),
         fail_fast: bool = False,
         priority: int = Query(default=0, ge=0, le=2147483647),
         action_class: Literal["build", "run"] = Query(default="build", alias="class"),
@@ -261,6 +262,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             return {"batch_id": await coordinator.submit(
                 batch, profile, action_class, max_heap_mb, fail_fast=fail_fast, priority=priority,
                 ahead_cap=speculative_loading, batch_id=batch_id,
+                child_gc_percent=child_gc_percent if action_class == "build" else None,
             )}
         finally:
             # Timed from before the body is read, so a slow upload or parse shows too.

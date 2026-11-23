@@ -2067,11 +2067,15 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
     val tool_env =
       (case !tool_cache_dir of SOME dir => ["HOLBUILD_TOOL_CACHE_DIR=" ^ dir] | NONE => []) @
       (case !scratch_input_path of SOME path => ["HOLBUILD_SCRATCH_INPUT=" ^ path] | NONE => [])
+    val hol_argv = HolbuildToolchain.theory_run_argv tc
+    val _ =
+      if List.exists (fn arg => arg = "--gcpercent") hol_argv then
+        HolbuildStatus.message_stderr ("holbuild: theory child argv: " ^ HolbuildToolchain.command hol_argv ^ "\n")
+      else ()
     val status =
       HolbuildToolchain.run_in_dir_to_file workdir
         ((if null tool_env then [] else "env" :: tool_env) @
-         HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @
-         hol_context_args context @ file_args)
+         hol_argv @ ["--noconfig"] @ hol_context_args context @ file_args)
         log
       handle HolbuildToolchain.Error msg =>
         if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.outputs_validated) then

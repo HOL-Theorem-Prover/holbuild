@@ -225,6 +225,7 @@ class Claim:
     theory: str
     lease_s: int
     max_heap_mb: int | None
+    child_gc_percent: int | None
     ahead_parents: tuple[AheadParent, ...] = ()  # empty unless the action was claimed ahead of these parents
     pipeline: bool = False  # build pipelined where the spec allows it; see Settings.pipeline
 
@@ -528,7 +529,7 @@ WITH run_capacity AS MATERIALIZED (
         SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run'
     ) < :run_slots AS available
 )
-SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb, b.priority, ready.theory,
+SELECT b.id AS batch_id, c.class AS action_class, t.tier, b.max_heap_mb, b.child_gc_percent, b.priority, ready.theory,
     ready.critical_depth, ready.descendant_count,
     (SELECT count(*) FROM actions r WHERE r.batch_id = b.id AND r.state = 'running') AS running,
     (SELECT max(l.last_claimed_at) FROM actions l WHERE l.batch_id = b.id) AS last_claimed_at,
@@ -924,12 +925,13 @@ RETURNING actions.input_key
 @dataclass
 class _Ranking:
     """The running batches with ready build actions, as CLAIM_CANDIDATES ranks them, read at ``at``: a heap of
-    (tier position, negated priority, running actions, ever claimed, last claim, created, batch, tier, heap limit),
+    (tier position, negated priority, running actions, ever claimed, last claim, created, batch, tier, heap limit,
+    child GC percent),
     the batches and tiers it ranked, and those found without an unlocked ready action since."""
 
     at: float
     forgotten: int  # Coordinator.rankings_forgotten when it was read
-    heap: list[tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]]
+    heap: list["RankEntry"]
     ranked: set[tuple[UUID, str]]  # the batches and tiers it ranked
     exhausted: set[tuple[UUID, str]]
     running_priority: int  # running builds of batches of a positive priority, and the claims of them since the read
@@ -946,13 +948,14 @@ _NEVER = datetime.min.replace(tzinfo=UTC)  # the last claim of a batch never cla
 
 @dataclass(frozen=True)
 class _Claimed:
-    """The action a claim locked, and its batch's heap limit."""
+    """The action a claim locked, and its batch's Poly/ML settings."""
 
     batch_id: UUID
     input_key: str
     spec_sha256: str
     theory: str
     max_heap_mb: int | None
+    child_gc_percent: int | None
     # The hold the claim took for the build, by its (batch, tier), put back if its lease fails.
     hold: "tuple[tuple[UUID, str], Hold] | None" = None
     tier: str = ""  # a build's, claimed from a shared ranking
@@ -1055,7 +1058,7 @@ Hint = tuple[UUID, str, str]
 # A build's hold for its holders (see Coordinator._held): when it began and ends, and its theory.
 Hold = tuple[float, float, str]
 # A shared ranking's entry; see _Ranking.
-RankEntry = tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]
+RankEntry = tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None, int | None]
 
 
 def _claim_rank(tiers: list[str], host_id: str | None, host_rank: int = 0, workers: int = 0) -> ClaimRank:
@@ -1200,6 +1203,7 @@ class Coordinator:
     async def submit(
         self, batch: Batch, profile: str, action_class: str = "build", max_heap_mb: int | None = None,
         *, fail_fast: bool = False, priority: int = 0, ahead_cap: int | None = None, batch_id: UUID | None = None,
+        child_gc_percent: int | None = None,
     ) -> UUID:
         """Store a batch; its actions without uncached parents become ready. With ``ahead_cap``, up to that many
         of its actions at once may be claimed ahead of their parents; see _claim_ahead.
@@ -1217,8 +1221,8 @@ class Coordinator:
         async with self.engine.begin() as conn:
             stored = await conn.scalar(
                 sa.text(
-                    "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority, ahead_cap) "
-                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority, :ahead_cap) "
+                    "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority, ahead_cap, child_gc_percent) "
+                    "VALUES (:id, :state, :profile, :max_heap_mb, :fail_fast, :priority, :ahead_cap, :child_gc_percent) "
                     "ON CONFLICT (id) DO NOTHING RETURNING id"
                 ),
                 {
@@ -1226,6 +1230,7 @@ class Coordinator:
                     "state": "running" if batch.actions else "done",
                     "profile": profile,
                     "max_heap_mb": max_heap_mb,
+                    "child_gc_percent": child_gc_percent,
                     "fail_fast": fail_fast,
                     "priority": priority,
                     "ahead_cap": ahead_cap,
@@ -1576,7 +1581,7 @@ class Coordinator:
                 # The next ready build ranks after an action that may be claimed ahead, by a ranking read since
                 # this claim started.
                 assert outranked is not None
-                _, priority, *_, batch_id, tier, _ = stopped
+                _, priority, *_, batch_id, tier, _, _ = stopped
                 # Capped by a concurrent claim since, claims ahead of other batches no longer outrank the build.
                 if not ranking.capped and (above := outranked.above(tier, -priority)):
                     # Only batches of a positive priority, above the build's, are claimed from: counted before the
@@ -1723,7 +1728,7 @@ class Coordinator:
         )
         return Claim(
             token, row.batch_id, row.spec_sha256, row.input_key, row.theory, self.settings.lease_seconds, row.max_heap_mb,
-            ahead_parents, self.settings.pipeline and bool(pipelined),
+            row.child_gc_percent, ahead_parents, self.settings.pipeline and bool(pipelined),
         )
 
     async def _claim_ahead(self, tiers: list[str], worker: str, *, above: int | None = None) -> Claim | None:
@@ -1783,7 +1788,8 @@ class Coordinator:
                 batch = (
                     await conn.execute(
                         sa.text(
-                            "SELECT ahead_cap, max_heap_mb FROM batches WHERE id = :id AND state = 'running' FOR UPDATE"
+                            "SELECT ahead_cap, max_heap_mb, child_gc_percent FROM batches "
+                            "WHERE id = :id AND state = 'running' FOR UPDATE"
                         ),
                         {"id": batch_id},
                     )
@@ -1822,7 +1828,9 @@ class Coordinator:
                 ahead_parents = tuple(AheadParent(p.input_key, p.spec_sha256) for p in parents)
                 claimed = await self._lease(
                     conn,
-                    _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, batch.max_heap_mb),
+                    _Claimed(
+                        batch_id, row.input_key, row.spec_sha256, row.theory, batch.max_heap_mb, batch.child_gc_percent
+                    ),
                     worker,
                     ahead_parents,
                 )
@@ -1922,7 +1930,10 @@ class Coordinator:
                 )
             ).first()
             if row is not None:
-                return _Claimed(candidate.batch_id, row.input_key, row.spec_sha256, row.theory, candidate.max_heap_mb)
+                return _Claimed(
+                    candidate.batch_id, row.input_key, row.spec_sha256, row.theory,
+                    candidate.max_heap_mb, candidate.child_gc_percent,
+                )
         return None
 
     async def _claim_build(
@@ -1973,7 +1984,7 @@ class Coordinator:
             entry = heapq.heappop(ranking.heap)
             if (entry[6], entry[7]) in ranking.exhausted:
                 continue
-            tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
+            tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb, child_gc_percent = entry
             # A hint is for the first candidate of its tier only, as a woken claim's, or one held for this host.
             hinted, fits = None, False
             if tier in hint_tiers:
@@ -2015,7 +2026,7 @@ class Coordinator:
                 heapq.heapify(ranking.heap)
                 self._wake_holders(ranking, entry, host_id, kept)
                 passed, entry = (batch_id, tier), local
-                tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb = entry
+                tier_position, priority, running, _, _, created_at, batch_id, tier, max_heap_mb, child_gc_percent = entry
             elif (until := self._held(ranking, entry, host_id, kept)) is not None:
                 held.append(entry)
                 held_until = until if held_until is None else min(held_until, until)
@@ -2023,7 +2034,8 @@ class Coordinator:
             put_back_held()
             heapq.heappush(
                 ranking.heap,
-                (tier_position, priority, running + 1, True, self.clock(), created_at, batch_id, tier, max_heap_mb),
+                (tier_position, priority, running + 1, True, self.clock(), created_at,
+                 batch_id, tier, max_heap_mb, child_gc_percent),
             )
             # The batch's next ready build is another one, whose theory and place the ranking don't know.
             theory = ranking.theories.pop((batch_id, tier), None)
@@ -2059,7 +2071,9 @@ class Coordinator:
                 if host_id is not None:
                     self._count_claim(row.theory, tier, host_id, kept)
                 taken = None if hold is None else ((batch_id, tier), hold)
-                claimed = _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb, taken, tier)
+                claimed = _Claimed(
+                    batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb, child_gc_percent, taken, tier
+                )
                 return claimed, None, None
             if passed is not None and (count := self.passed_over.get(passed)) is not None:
                 if count > 1:
@@ -2461,7 +2475,8 @@ class Coordinator:
         heap = [
             (
                 key.index(row.tier), -row.priority, row.running, row.last_claimed_at is not None,
-                row.last_claimed_at or _NEVER, row.created_at, row.batch_id, row.tier, row.max_heap_mb,
+                row.last_claimed_at or _NEVER, row.created_at, row.batch_id, row.tier,
+                row.max_heap_mb, row.child_gc_percent,
             )
             for row in rows
         ]

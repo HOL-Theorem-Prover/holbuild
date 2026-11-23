@@ -27,7 +27,26 @@ fun poly_runtime_args ({maxheap, ...} : t) =
 fun hol_subcommand_argv tc subcommand =
   hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ [subcommand]
 
-fun theory_run_argv tc = hol_subcommand_argv tc "run"
+(* This setting is per experiment action, outside the theory's inputs. *)
+fun experimental_child_gc_percent () =
+  case OS.Process.getEnv "HOLBUILD_EXPERIMENT_CHILD_GC_PERCENT" of
+      NONE => NONE
+    | SOME value =>
+        let
+          val message = "HOLBUILD_EXPERIMENT_CHILD_GC_PERCENT must be an integer from 1 to 99"
+        in
+          if size value > 2 orelse not (List.all Char.isDigit (String.explode value)) then raise Error message
+          else
+            case Int.fromString value of
+                SOME n => if n > 0 then SOME (Int.toString n) else raise Error message
+              | NONE => raise Error message
+        end
+
+fun theory_run_argv tc =
+  case experimental_child_gc_percent () of
+      NONE => hol_subcommand_argv tc "run"
+    | SOME percent =>
+        hol tc :: "--gcthreads=1" :: poly_runtime_args tc @ ["--gcpercent", percent, "run"]
 
 fun quote s =
   "'" ^ String.translate (fn #"'" => "'\\''" | c => str c) s ^ "'"

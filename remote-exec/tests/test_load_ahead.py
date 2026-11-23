@@ -439,7 +439,7 @@ async def test_concurrent_claims_ahead_of_one_batch_wait_for_its_lock_one_connec
 
     def lock(conn: Any, cursor: Any, statement: str, *_: Any) -> None:
         nonlocal most, locks
-        if statement.startswith("SELECT ahead_cap, max_heap_mb FROM batches"):
+        if statement.startswith("SELECT ahead_cap, max_heap_mb, child_gc_percent FROM batches"):
             holding.add(id(conn))
             most = max(most, len(holding))
             locks += 1

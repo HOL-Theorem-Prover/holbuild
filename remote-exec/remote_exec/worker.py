@@ -1419,12 +1419,17 @@ def execute(
         cooperate_dir = None if args.cooperate_dir is None else os.path.realpath(args.cooperate_dir)
         spans = ExecSpans()
         stepped = time.monotonic()
+        env = exec_action_env(version=version, discovery_config=releases.discovery_config)
+        gc_variable = "HOLBUILD_EXPERIMENT_CHILD_GC_PERCENT"
+        env.pop(gc_variable, None)
+        if (percent := claim.get("child_gc_percent")) is not None:
+            env[gc_variable] = str(percent)
         process = subprocess.Popen(
             exec_action_command(
                 args, holbuild, version, spec, result, claim.get("max_heap_mb"), ahead_parents,
                 pipeline=claim.get("pipeline", False),
             ),
-            env=exec_action_env(version=version, discovery_config=releases.discovery_config),
+            env=env,
             start_new_session=True
         )
         drained_out = lost = handed = False

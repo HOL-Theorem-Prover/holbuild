@@ -438,12 +438,13 @@ STATEMENTS = [
         22_000,
     ),
     Statement(
-        "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority, ahead_cap)",
+        "INSERT INTO batches (id, state, profile, max_heap_mb, fail_fast, priority, ahead_cap, child_gc_percent)",
         lambda f: {
             "id": uuid4(),
             "state": "running",
             "profile": "default",
             "max_heap_mb": None,
+            "child_gc_percent": None,
             "fail_fast": False,
             "priority": 2,
             "ahead_cap": 64,
@@ -502,7 +503,7 @@ STATEMENTS = [
         },
         100,
     ),
-    Statement("SELECT ahead_cap, max_heap_mb FROM batches", lambda f: {"id": f.fresh}, 100),
+    Statement("SELECT ahead_cap, max_heap_mb, child_gc_percent FROM batches", lambda f: {"id": f.fresh}, 100),
     Statement(
         cm.FINISH_PEERS,
         lambda f: {"logs": ["log"], "batch_id": f.steady, "keys": f.steady_arrival.keys("ready")[:1]},

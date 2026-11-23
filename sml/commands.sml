@@ -2263,6 +2263,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                              (if priority = 0 then [] else ["priority=" ^ Int.toString priority]) @
                              (case speculative_loading of
                                   SOME n => ["speculative_loading=" ^ Int.toString n]
+                                | NONE => []) @
+                             (case HolbuildToolchain.experimental_child_gc_percent () of
+                                  SOME n => ["child_gc_percent=" ^ n]
                                 | NONE => []) of
                             [] => ""
                           | params => "?" ^ String.concatWith "&" params)

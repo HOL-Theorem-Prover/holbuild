@@ -4333,17 +4333,21 @@ def test_cache_ring_identity_ignores_credentials_but_preserves_request_urls() ->
 
 
 @pytest.mark.parametrize("action_class", ["build", "run"])
-@pytest.mark.parametrize("max_heap_mb", [None, 4096, 16000])
-async def test_claim_carries_its_batch_heap_limit(
-    http: httpx.AsyncClient, action_class: str, max_heap_mb: int | None
+@pytest.mark.parametrize(("max_heap_mb", "child_gc_percent"), [(None, None), (4096, 20), (16000, 99)])
+async def test_claim_carries_its_batch_poly_settings(
+    http: httpx.AsyncClient, action_class: str, max_heap_mb: int | None, child_gc_percent: int | None
 ) -> None:
     params = {"class": action_class}
     if max_heap_mb is not None:
         params["max_heap_mb"] = str(max_heap_mb)
+    if child_gc_percent is not None:
+        params["child_gc_percent"] = str(child_gc_percent)
     await submit(http, ["A", "B"], **params)
     first, second = await claim(http), await claim(http)
     assert first is not None and second is not None
     assert first["max_heap_mb"] == second["max_heap_mb"] == max_heap_mb
+    expected_percent = child_gc_percent if action_class == "build" else None
+    assert first["child_gc_percent"] == second["child_gc_percent"] == expected_percent
 
 
 async def test_claim_names_its_batch(http: httpx.AsyncClient) -> None:
