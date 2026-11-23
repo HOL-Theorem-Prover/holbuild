@@ -14,10 +14,13 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 cleanup() {
-  if [[ -n "${server_pid:-}" ]]; then
-    kill "$server_pid" 2>/dev/null || true
-    wait "$server_pid" 2>/dev/null || true
-  fi
+  local pid
+  for pid in "${server_pid:-}" "${second_pid:-}"; do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
   cleanup_temp_dir "$tmpdir"
 }
 trap cleanup EXIT
@@ -290,18 +293,21 @@ require_grep '^status=built$' "$tmpdir/traced-log.result"
 require_grep '^log=[0-9a-f]* ' "$tmpdir/traced-log.result"
 spec=$spec_a
 
-# other_sig_resident TIMEOUT: the remote's entry names another .sig, whose
-# blob the cache holds only if the case put it there, and has proof-timeout
-# TIMEOUT.
-other_sig=$(printf 'other signature\n' | sha256sum | cut -d' ' -f1)
-other_sig_resident() {
-  python3 - "$remote_root/ac/$ac" "$other_sig" "$1" <<'PY'
+# sig_entry PATH TEXT TIMEOUT: writes at PATH the worker's own entry for A
+# with the .sig blob TEXT, which the cache holds only if the case put it
+# there, and proof-timeout TIMEOUT.
+cp "$remote_root/ac/$ac" "$tmpdir/own-a-entry"
+sig_entry() {
+  python3 - "$tmpdir/own-a-entry" "$1" "$2" "$3" <<'PY'
 import hashlib, re, sys
-path, sig, timeout = sys.argv[1:]
-head, manifest = open(path).read().split("manifest-text-v1\n", 1)
-manifest, n = re.subn(r"^blob sig \S+$", "blob sig " + sig, manifest, count=1, flags=re.M)
-if n != 1:
+own, path, text, timeout = sys.argv[1:]
+data = text.encode()
+sig = hashlib.sha256(data).hexdigest()
+head, manifest = open(own).read().split("manifest-text-v1\n", 1)
+old = re.search(r"^blob sig (\S+)$", manifest, re.M)
+if old is None:
     sys.exit("the entry has no sig blob")
+manifest = manifest.replace(f"blob sig {old.group(1)}\n", f"blob sig {sig}\n")
 manifest = re.sub(r"^proof-timeout=.*$", "proof-timeout=" + timeout, manifest, flags=re.M)
 out = []
 for line in head.split("\n"):
@@ -309,32 +315,76 @@ for line in head.split("\n"):
         line = "manifest-sha256 " + hashlib.sha256(manifest.encode()).hexdigest()
     elif line.startswith("manifest-size "):
         line = "manifest-size " + str(len(manifest.encode()))
+    elif line.startswith(f"blob {old.group(1)} "):
+        line = f"blob {sig} {len(data)}"
     out.append(line)
 open(path, "w").write("\n".join(out) + "manifest-text-v1\n" + manifest)
 PY
 }
-timeout=$(sed -n 's/^proof-timeout=//p' "$remote_root/ac/$ac")
+lost_text=$'lost signature\n' live_text=$'live signature\n'
+lost_sig=$(printf '%s' "$lost_text" | sha256sum | cut -d' ' -f1)
+printf '%s' "$live_text" > "$remote_root/cas/$(printf '%s' "$live_text" | sha256sum | cut -d' ' -f1)"
+timeout=$(sed -n 's/^proof-timeout=//p' "$tmpdir/own-a-entry")
+
+# lost_blob_built NAME: worker NAME built the action and replaced an entry
+# whose blob the cache lost.
+lost_blob_built() {
+  if [[ "$worker_status" != 0 ]] || ! grep -qx "status=built" "$tmpdir/$1.result"; then
+    echo "worker $1 did not replace an entry whose blob the cache lost" >&2
+    cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2 || true
+    exit 1
+  fi
+  require_grep "replacing remote cache entry .*: the cache no longer holds all of its blobs" "$tmpdir/$1.log"
+}
 
 # A remote entry with other outputs whose blob the cache lost restores
 # nowhere, so it is no conflict: a worker that builds the action replaces it.
-other_sig_resident "$timeout"
+sig_entry "$remote_root/ac/$ac" "$lost_text" "$timeout"
 worker lost-blob
-if [[ "$worker_status" != 0 ]] || ! grep -qx "status=built" "$tmpdir/lost-blob.result"; then
-  echo "an entry whose blob the cache lost was not replaced" >&2
-  cat "$tmpdir/lost-blob.result" "$tmpdir/lost-blob.log" >&2 || true
-  exit 1
-fi
-require_grep "replacing remote cache entry .*: the cache no longer holds all of its blobs" "$tmpdir/lost-blob.log"
-if grep -qx "blob sig $other_sig" "$remote_root/ac/$ac"; then
+lost_blob_built lost-blob
+if grep -qx "blob sig $lost_sig" "$remote_root/ac/$ac"; then
   echo "the remote still holds the entry whose blob the cache lost" >&2
   exit 1
 fi
 
+# With two nodes, only the one whose entry lost a blob is replaced: the
+# first ranked for A's entry holds the lost one, the other a restorable
+# entry with other outputs, which stays.
+main_pid=$server_pid main_url=$remote_url
+start_remote_cache_server "$tmpdir/remote-two" "$tmpdir/server-two"
+second_pid=$server_pid second_url=$remote_url
+server_pid=$main_pid remote_url=$main_url
+first=$(python3 - "$ac" "$remote_url" "$second_url" <<'PY'
+import hashlib, sys
+digest, *nodes = sys.argv[1:]
+print(max(nodes, key=lambda node: hashlib.sha256(f"{node}:{digest}".encode()).hexdigest()))
+PY
+)
+if [[ $first == "$remote_url" ]]; then
+  lost_root=$remote_root live_root=$tmpdir/remote-two
+else
+  lost_root=$tmpdir/remote-two live_root=$remote_root
+fi
+mkdir -p "$tmpdir/remote-two/ac"
+sig_entry "$lost_root/ac/$ac" "$lost_text" "$timeout"
+sig_entry "$live_root/ac/$ac" "$live_text" "$timeout"
+cp "$live_root/ac/$ac" "$tmpdir/live-entry"
+worker lost-blob-ring "$remote_url,$second_url"
+lost_blob_built lost-blob-ring
+if grep -qx "blob sig $lost_sig" "$lost_root/ac/$ac"; then
+  echo "the node whose entry lost a blob still holds it" >&2
+  exit 1
+fi
+cmp "$live_root/ac/$ac" "$tmpdir/live-entry" ||
+  { echo "the restorable entry on the other node was overwritten" >&2; exit 1; }
+kill "$second_pid"
+wait "$second_pid" 2>/dev/null || true
+second_pid=
+
 # A remote entry with other outputs the cache holds is a real conflict: a
 # worker that builds the action, here as the entry's timeout contract is
 # weaker, reports `publish`.
-printf 'other signature\n' > "$remote_root/cas/$other_sig"
-other_sig_resident none
+sig_entry "$remote_root/ac/$ac" "$live_text" none
 worker other
 if [[ "$worker_status" != 3 ]] || ! grep -qx "failure=publish" "$tmpdir/other.result"; then
   echo "a conflicting entry was not reported as a publish failure" >&2

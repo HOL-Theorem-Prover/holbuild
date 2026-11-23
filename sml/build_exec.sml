@@ -11992,10 +11992,10 @@ fun remote_entry_lost_blob remote entry =
 
 (* Uploads every blob of the local entry for the action, raising if one fails
    (the build's own publish only warns), then puts the action.  A different
-   entry already there is replaced, on every node, when the cache lost one of
-   its blobs; and replaced when it records parents other than the restored
-   ones or only its .dat differs and its timeout contract is weaker; and
-   otherwise left for check_remote_publication to judge.  Returns the entry
+   entry already there is replaced, on each node holding one, when the cache
+   lost one of its blobs; and replaced when it records parents other than the
+   restored ones or only its .dat differs and its timeout contract is weaker;
+   and otherwise left for check_remote_publication to judge.  Returns the entry
    read after putting a new one, which saves that check a read. *)
 (* Uploads every blob of the local cache entry KEY, raising if one fails,
    and returns the entry. *)
@@ -12027,16 +12027,21 @@ fun publish_action_entry remote root (spec : action_spec) =
           (case HolbuildRemoteCache.get_action remote key of
                SOME resident =>
                  let
-                   fun replace_with put why =
+                   fun reread () = HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key)
+                   fun replace why =
                      (warn ("replacing remote cache entry " ^ key ^ ": " ^ why);
-                      ignore (put remote {key = key, text = manifest});
-                      HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key))
-                   val replace = replace_with HolbuildRemoteCache.replace_action_unconditionally
+                      ignore (HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest});
+                      reread ())
                  in
                    if (cache_manifest_outputs_equal key resident manifest handle _ => false) then SOME resident
                    else if remote_entry_lost_blob remote resident then
-                     replace_with HolbuildRemoteCache.replace_action_everywhere
-                       "the cache no longer holds all of its blobs"
+                     (* Only on the nodes whose entry lost a blob: another may
+                        hold a restorable entry, which this must not overwrite. *)
+                     (warn ("replacing remote cache entry " ^ key ^ ": the cache no longer holds all of its blobs");
+                      HolbuildRemoteCache.repair_action_replicas remote
+                        {key = key, text = manifest, attempts = remote_theory_publish_attempts,
+                         should_replace = remote_entry_lost_blob remote};
+                      reread ())
                    else if resident_misfits_parents remote root spec resident then
                      replace "its recorded parents differ from the cache's"
                    else if resident_weaker_but_for_dat key manifest resident then
