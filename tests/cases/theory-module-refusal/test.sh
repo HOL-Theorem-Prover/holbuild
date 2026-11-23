@@ -151,11 +151,15 @@ val store = "$store";
 fun modules part = List.filter (String.isSubstring part) (map OS.Path.file (HolbuildCache.children store));
 
 (* The writer, allowed one module, writes D's after the refused ones. *)
-val {installed, ...} =
+val {installed, trace, ...} =
   E.fill_module_store (HolbuildRemoteCache.remote "$remote_url") "$project/.holbuild/obj" tc
     {deps = map dep ["A", "B", "C", "C2", "D"], loads = []} (Time.+ (Time.now (), Time.fromSeconds 120));
 val _ = check "the writer didn't store D's module after the refused ones"
           (installed = 1 andalso length (modules "-D-") = 1);
+val _ = check ("the trace doesn't show the refused modules and D's: " ^ trace)
+          (String.isSubstring ",written:1," trace andalso String.isSubstring "refused:" trace andalso
+           String.isSubstring " modules_outputs=files:1,discarded:0,installed:1," trace andalso
+           not (String.isSubstring "modules_base=unavailable" trace));
 
 (* The parent's capture of D's deps heap, from a child that lists the
    modules HOL refused, and then waits. *)
@@ -320,6 +324,7 @@ wait_for "$c2_path" "$both_1"
 touch "$tmpdir/writer/release"
 wait "$both_2"
 wait "$both_1"
+require_grep 'modules_outputs=files:[1-9][0-9]*,discarded:0,installed:[0-9]*,existing:[1-9]' "$tmpdir/both-2.log"
 resumed both-2
 resumed both-1
 [[ $(c_module C2) == "$c2_path" && $(sha256sum < "$c2_path") == "$c2_sha" ]] ||

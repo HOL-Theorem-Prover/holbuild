@@ -5,7 +5,8 @@
 # the modules the action wants, nor while another process holds the
 # store's writer lock.  A fake HOL stands in for the writer: it counts its
 # runs, records its output directory's file system and leaves the files
-# named in $tmpdir/writes there, each module with bytes of its own.  The worker cache cap's sweep leaves a
+# named in $tmpdir/writes there, each module with bytes of its own, and
+# $tmpdir/report as its report.  The worker cache cap's sweep leaves a
 # store alone while its writer runs.  No writer starts too close to its
 # deadline, and one killed at it still stores the modules it finished.  Where /dev/shm is another file
 # system, a store there stands for one a worker's containers share on a
@@ -26,7 +27,7 @@ remote2_url=$remote_url
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 
 sha() { sha1sum "$1" | cut -d' ' -f1; }
-for hol in hol1 hol2 hol3 hol4 hol5 hol6 hol7 hol8; do
+for hol in hol1 hol2 hol3 hol4 hol5 hol6 hol7 hol8 hol9; do
   mkdir -p "$tmpdir/$hol/bin" "$tmpdir/$hol/sigobj" "$tmpdir/$hol/tools-poly/poly"
   : > "$tmpdir/$hol/bin/hol.state"
   : > "$tmpdir/$hol/sigobj/boolTheory.uo"
@@ -40,6 +41,7 @@ stat -L -c %d "\$out" > "$tmpdir/$hol.output-device"
 while read -r file; do
   case \$file in *.pmo) date +%s%N > "\$out/\$file" ;; *) : > "\$out/\$file" ;; esac
 done < "$tmpdir/writes"
+[[ ! -e "$tmpdir/report" ]] || cp "$tmpdir/report" "\$out/writer-report"
 [[ ! -e "$tmpdir/plant" ]] || { bash "$tmpdir/plant"; rm "$tmpdir/plant"; }
 [[ ! -e "$tmpdir/hang" ]] || sleep 20
 SH
@@ -521,6 +523,33 @@ val _ = List.app (fn f => OS.FileSys.remove ("$tmpdir/control/" ^ f) handle OS.S
           ["action-get-enable", "action-get-count", "action-get-release"];
 val _ = check "a module with no time left to publish was not stored, or was uploaded"
           (installed = 1 andalso published = 0 andalso stored "hol8" (List.nth (ps, 0)) andalso cas_puts () = puts);
+
+(* The trace on the line after the result.  The store holds A's module
+   only under another base id: the writer, of base id ab12, writes A and
+   B, and only B, which the worker found missing, is stored. *)
+val _ = E.write_text "$tmpdir/hol9/tools-poly/poly/theory_modules.ML" "";
+val _ = OS.FileSys.mkDir (store "hol9");
+val _ = E.write_text (OS.Path.concat (store "hol9", "cd34-A-$a_sha.pmo")) "";
+val _ = writes [a, b];
+val _ = E.write_text "$tmpdir/report" "base ab12\nneeded 2\nwritten A\nwritten B\n";
+val {installed, trace, ...} = fill_by "hol9" 100;
+val _ = OS.FileSys.remove "$tmpdir/report";
+val _ = check ("the trace of a store with another base id: " ^ trace)
+          (installed = 1 andalso
+           trace = " modules_ids=1:cd34x1 modules_base=ab12 modules_exact=0 modules_foreign=1" ^
+                   " modules_writer=ran,needed:2,unvisited:0,written:2" ^
+                   " modules_outputs=files:2,discarded:1,installed:1,existing:0,other:0,absent:0 modules_won=0" ^
+                   " modules_examples=discarded:" ^ a);
+(* A writer that leaves no report, and none while another holds the lock. *)
+val _ = writes [];
+val {trace, ...} = fill_by "hol9" 100;
+val _ = check ("the trace of a writer with no report: " ^ trace)
+          (String.isSubstring (" modules_base=unavailable modules_exact=? modules_foreign=?" ^
+                               " modules_writer=noreport,needed:0,unvisited:0 modules_outputs=files:0,") trace);
+val holder = lock_store "hol9";
+val {trace, ...} = fill_by "hol9" 100;
+val _ = unlock holder;
+val _ = check ("the trace with no writer: " ^ trace) (String.isSuffix " modules_writer=none" trace);
 
 (* The remote key of a module is the v1 store's. *)
 val _ = check "a module's remote key changed"
