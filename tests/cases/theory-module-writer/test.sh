@@ -5,7 +5,8 @@
 # the modules the action wants, nor while another process holds the
 # store's writer lock.  A fake HOL stands in for the writer: it counts its
 # runs, records its output directory's file system and leaves the files
-# named in $tmpdir/writes there, each module with bytes of its own.  The worker cache cap's sweep leaves a
+# named in $tmpdir/writes there, each module with bytes of its own, and
+# $tmpdir/report as its report.  The worker cache cap's sweep leaves a
 # store alone while its writer runs.  No writer starts too close to its
 # deadline, and one killed at it still stores the modules it finished.  Where /dev/shm is another file
 # system, a store there stands for one a worker's containers share on a
@@ -26,7 +27,7 @@ remote2_url=$remote_url
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 
 sha() { sha1sum "$1" | cut -d' ' -f1; }
-for hol in hol1 hol2 hol3 hol4 hol5 hol6 hol7 hol8; do
+for hol in hol1 hol2 hol3 hol4 hol5 hol6 hol7 hol8 hol9; do
   mkdir -p "$tmpdir/$hol/bin" "$tmpdir/$hol/sigobj" "$tmpdir/$hol/tools-poly/poly"
   : > "$tmpdir/$hol/bin/hol.state"
   : > "$tmpdir/$hol/sigobj/boolTheory.uo"
@@ -40,6 +41,7 @@ stat -L -c %d "\$out" > "$tmpdir/$hol.output-device"
 while read -r file; do
   case \$file in *.pmo) date +%s%N > "\$out/\$file" ;; *) : > "\$out/\$file" ;; esac
 done < "$tmpdir/writes"
+[[ ! -e "$tmpdir/report" ]] || cp "$tmpdir/report" "\$out/writer-report"
 [[ ! -e "$tmpdir/plant" ]] || { bash "$tmpdir/plant"; rm "$tmpdir/plant"; }
 [[ ! -e "$tmpdir/hang" ]] || sleep 20
 SH
@@ -148,14 +150,18 @@ val _ = check "an unwanted file was stored"
 
 (* Every module stored: bool is a base theory. *)
 val _ = E.write_text (OS.Path.concat (store "hol1", "base-theories")) "min\nbool\n";
-val _ = fill "hol1";
+val {trace, ...} = fill_by "hol1" 100;
 val _ = check "a writer ran for a filled store" (runs "hol1" = 1);
+val _ = check ("the trace of a filled store: " ^ trace) (String.isSuffix " modules_writer=none:covered" trace);
 
 (* Fewer than 16 modules missing: the action loads them from .dat files. *)
 fun remove files = List.app (fn f => OS.FileSys.remove (OS.Path.concat (store "hol1", f))) files;
 val _ = remove (b :: List.take (ps, 14));
-val _ = fill "hol1";
+val {trace, ...} = fill_by "hol1" 100;
 val _ = check "a writer ran for 15 missing modules" (runs "hol1" = 1);
+val _ = check ("the trace of 15 missing modules: " ^ trace)
+          (String.isSubstring " modules_expected=18 modules_neither=15 modules_base=unavailable" trace andalso
+           String.isSuffix " modules_writer=none:threshold" trace);
 
 (* No writer while another process writes to the store. *)
 val _ = remove [List.nth (ps, 14)];
@@ -228,8 +234,10 @@ val _ = writes [a, b];
 val _ = check "a writer started with 3 s left" (#installed (fill_by "hol4" 3) = 0 andalso runs "hol4" = 0);
 val _ = E.write_text "$tmpdir/hang" "";
 val t0 = Time.now ();
-val {installed, missing, published, ...} = fill_by "hol4" 6;
+val {installed, missing, published, trace, ...} = fill_by "hol4" 6;
 val _ = OS.FileSys.remove "$tmpdir/hang";
+val _ = check ("a writer killed at its deadline was not traced as killed: " ^ trace)
+          (String.isSubstring " modules_writer=killed," trace);
 val _ = check "the writer was not stopped at its deadline"
           (runs "hol4" = 1 andalso Time.< (Time.- (Time.now (), t0), Time.fromSeconds 15));
 val _ = check "a stopped writer's modules were not stored"
@@ -328,6 +336,21 @@ val requests_after_put =
 val _ = check "an entry put on a cache of one node was read back"
           (not (List.exists (fn line => line = "GET /ac/" ^ a_entry) requests_after_put));
 
+(* Another host published A, and a restore put A in the store, while
+   this writer ran: the published module isn't stored over it. *)
+val _ = OS.FileSys.rename {old = "$tmpdir/remote/ac/" ^ a_entry, new = "$tmpdir/a-aside"};
+val _ = remove_store "hol5";
+val _ = writes [a];
+val _ = E.write_text "$tmpdir/plant"
+          ("mv $tmpdir/a-aside $tmpdir/remote/ac/" ^ a_entry ^ "\n" ^
+           "printf restored > " ^ OS.Path.concat (store "hol5", a) ^ "\n");
+val {installed, fetched, trace, ...} = fill_by "hol5" 100;
+val _ = check "a published module was stored over one a restore put in the store"
+          (installed = 0 andalso fetched = 0 andalso E.read_text (OS.Path.concat (store "hol5", a)) = "restored");
+val _ = check ("a published module the store had was not traced as existing: " ^ trace)
+          (String.isSubstring
+             " modules_outputs=files:1,discarded:0,installed:0,existing:1,other:0,absent:0 modules_won=0" trace);
+
 (* Another host publishes A while this writer uploads its module: the
    put conflicts, and the other host's module is stored. *)
 val _ = OS.FileSys.rename {old = "$tmpdir/remote/ac/" ^ a_entry, new = "$tmpdir/a-mine"};
@@ -366,6 +389,14 @@ val {installed, fetched, published, ...} = fill_by "hol5" 100;
 val _ = check "a module was stored or uploaded under a malformed entry"
           (installed = 0 andalso fetched = 0 andalso published = 0 andalso not (stored "hol5" a) andalso
            cas_puts () = puts);
+(* A restore stores A's own name while the malformed entry keeps the
+   writer's module out: A counts as existing. *)
+val _ = remove_store "hol5";
+val _ = E.write_text "$tmpdir/plant" ("printf restored > " ^ OS.Path.concat (store "hol5", a) ^ "\n");
+val {installed, trace, ...} = fill_by "hol5" 100;
+val _ = check ("a module stored under its own name was not traced as existing: " ^ trace)
+          (installed = 0 andalso E.read_text (OS.Path.concat (store "hol5", a)) = "restored" andalso
+           String.isSubstring ",installed:0,existing:1,other:0,absent:0 " trace);
 val _ = E.copy_binary "$tmpdir/a-entry-saved" ("$tmpdir/remote/ac/" ^ a_entry);
 
 (* On a cache of two nodes, a writer stores the modules it published once
@@ -401,8 +432,11 @@ fun entry_puts () =
             (List.concat (map (fn log => String.tokens (fn c => c = #"\n") (E.read_text log))
                               ["$tmpdir/server/requests.log", "$tmpdir/server2/requests.log"])));
 val puts_before = entry_puts ();
-val {installed, fetched, published, ...} = fill6 ();
+val {installed, fetched, published, trace, ...} = fill6 ();
 val _ = check "the writer's entry was sent to a second node" (entry_puts () = puts_before + 1);
+val _ = check ("the trace doesn't show the module published first stored: " ^ trace)
+          (String.isSubstring " modules_outputs=files:1,discarded:0,installed:0,existing:0,other:0,absent:0 modules_won=1"
+                              trace);
 val _ = check "the writer's module was stored over the one published before its read back"
           (installed = 0 andalso fetched = 1 andalso published = 0 andalso
            E.read_text (OS.Path.concat (store "hol6", p16)) = winner);
@@ -521,6 +555,42 @@ val _ = List.app (fn f => OS.FileSys.remove ("$tmpdir/control/" ^ f) handle OS.S
           ["action-get-enable", "action-get-count", "action-get-release"];
 val _ = check "a module with no time left to publish was not stored, or was uploaded"
           (installed = 1 andalso published = 0 andalso stored "hol8" (List.nth (ps, 0)) andalso cas_puts () = puts);
+
+(* The trace on the line after the result.  The store holds A's module
+   only under another base id: the writer, of base id ab12, writes A and
+   B, and only B, which the worker found missing, is stored. *)
+val _ = E.write_text "$tmpdir/hol9/tools-poly/poly/theory_modules.ML" "";
+val _ = OS.FileSys.mkDir (store "hol9");
+val _ = E.write_text (OS.Path.concat (store "hol9", "cd34-A-$a_sha.pmo")) "";
+val _ = writes [a, b];
+val _ = E.write_text "$tmpdir/report" "base ab12\nneeded 2\nwritten A\nwritten B\n";
+val {installed, trace, ...} = fill_by "hol9" 100;
+val _ = OS.FileSys.remove "$tmpdir/report";
+val _ = check ("the trace of a store with another base id: " ^ trace)
+          (installed = 1 andalso
+           trace = " modules_ids=1:cd34x1 modules_expected=19 modules_neither=18" ^
+                   " modules_base=ab12 modules_exact=0 modules_foreign=1" ^
+                   " modules_writer=ran,needed:2,unvisited:0,written:2" ^
+                   " modules_outputs=files:2,discarded:1,installed:1,existing:0,other:0,absent:0 modules_won=0" ^
+                   " modules_examples=discarded:" ^ a);
+(* A writer that leaves no report, and none while another holds the lock. *)
+val _ = writes [];
+val {trace, ...} = fill_by "hol9" 100;
+val _ = check ("the trace of a writer with no report: " ^ trace)
+          (String.isSubstring (" modules_base=unavailable modules_exact=? modules_foreign=?" ^
+                               " modules_writer=noreport,needed:0,unvisited:0 modules_outputs=files:0,") trace);
+(* What the writer reports is checked before it is printed. *)
+val _ = E.write_text "$tmpdir/report" "base zz\nstatus weird\nneeded 1x\nerror A bad\tmessage\n";
+val {trace, ...} = fill_by "hol9" 100;
+val _ = OS.FileSys.remove "$tmpdir/report";
+val _ = check ("the trace of a malformed report: " ^ trace)
+          (String.isSubstring " modules_base=unavailable " trace andalso
+           String.isSubstring " modules_writer=?,needed:?,unvisited:0,error:1 " trace andalso
+           String.isSubstring " modules_examples=error:A(bad_message)" trace);
+val holder = lock_store "hol9";
+val {trace, ...} = fill_by "hol9" 100;
+val _ = unlock holder;
+val _ = check ("the trace with no writer: " ^ trace) (String.isSuffix " modules_writer=none:locked" trace);
 
 (* The remote key of a module is the v1 store's. *)
 val _ = check "a module's remote key changed"
