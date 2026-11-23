@@ -1085,11 +1085,18 @@ stale_host stale-host-dep
 worker stale-host-dep "$spec_s"
 expect stale-host-dep 0 "spec=$spec_s" "status=built"
 revalidated stale-host-dep
-# As the theory itself, which it then restores rather than builds.
+# As the theory itself, which it then restores rather than builds; through
+# the curl command, as without libcurl.
 stale_host stale-host-own
-worker stale-host-own "$spec_m"
+HOLBUILD_TEST_LIBCURL=libholbuild-test-no-such-curl.so worker stale-host-own "$spec_m"
 expect stale-host-own 0 "spec=$spec_m" "status=cached"
 revalidated stale-host-own
+# A worker whose copies fit asks for no check.
+rm -f "$control/no-cache-gets"
+worker fresh-own "$spec_m"
+expect fresh-own 0 "spec=$spec_m" "status=cached"
+[[ ! -e "$control/no-cache-gets" ]] || {
+  echo "a worker with no misfit asked the cache to check entries:" >&2; cat "$control/no-cache-gets" >&2; exit 1; }
 
 # Likewise for a parent the theory loads only through a project library's
 # implementation, behind its signature.

@@ -555,3 +555,15 @@ if grep -q "BTheory built" "$persisted_log"; then
 fi
 [[ ! -e "$remote_control/ac-stale-$ac_b" ]] || {
   echo "the build didn't ask the cache to check its local copy of BTheory" >&2; exit 1; }
+# A build whose entries fit asks for no check.
+rm -f "$remote_control/no-cache-gets"
+fits_cache=$tmpdir/fallback-fits-cache
+link_hol_toolchain_cache "$fits_cache"
+rm -rf "$fallback_project/.holbuild"
+fits_log=$tmpdir/fits-restore.log
+(cd "$fallback_project" && HOLBUILD_CACHE="$fits_cache" \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 BTheory) > "$fits_log" 2>&1 ||
+  { cat "$fits_log" >&2; exit 1; }
+require_grep "BTheory restored from" "$fits_log"
+[[ ! -e "$remote_control/no-cache-gets" ]] || {
+  echo "a build with no misfit asked the cache to check entries:" >&2; cat "$remote_control/no-cache-gets" >&2; exit 1; }

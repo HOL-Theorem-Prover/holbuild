@@ -151,6 +151,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if control is not None and self.path.startswith("/ac/"):
             key = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
+            # control/no-cache-gets: the keys GETs with Cache-Control:
+            # no-cache asked for, one a line.
+            no_cache = "no-cache" in self.headers.get("Cache-Control", "").lower()
+            if no_cache:
+                with open(control / "no-cache-gets", "a") as log:
+                    log.write(key + "\n")
             for name in (f"ac-get-status-{key}", "ac-get-status"):
                 if (control / name).exists():
                     self.send_response(int((control / name).read_text()))
@@ -161,7 +167,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Cache-Control: no-cache has it check its copy.
             stale = control / f"ac-stale-{key}"
             if stale.exists():
-                if "no-cache" in self.headers.get("Cache-Control", "").lower():
+                if no_cache:
                     stale.unlink()
                 else:
                     data = stale.read_bytes()
