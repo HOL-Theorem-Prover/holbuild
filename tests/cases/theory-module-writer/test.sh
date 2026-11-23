@@ -115,7 +115,12 @@ fun store hol = E.module_store ("$tmpdir/" ^ hol);
 fun stored hol file = exists (OS.Path.concat (store hol, file));
 val a = "ab12-A-$a_sha.pmo";
 val b = "ab12-B-$b_sha.pmo";
-fun detach script = "setsid bash $tmpdir/" ^ script ^ " </dev/null >/dev/null 2>&1 &\n";
+(* Returns once the script runs, so it watches the cache before the fake
+   HOL ends and the writer's requests start. *)
+fun detach script =
+  "rm -f $tmpdir/helper-started\n" ^
+  "setsid bash -c 'touch $tmpdir/helper-started; exec bash $tmpdir/" ^ script ^ "' </dev/null >/dev/null 2>&1 &\n" ^
+  "for _ in \$(seq 3000); do [[ -e $tmpdir/helper-started ]] && break; sleep 0.01; done\n";
 fun script_has hol text = String.isSubstring text (E.read_text ("$tmpdir/" ^ hol ^ ".script"));
 
 (* A HOL without the module helper. *)
