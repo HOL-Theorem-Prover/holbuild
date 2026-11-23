@@ -379,3 +379,21 @@ struct
   fun export_theory_if_needed sig_path =
     if readable sig_path then () else export_theory ()
 end
+
+(* From HOL a58912a73f a HOL_ERR's message is a HOLmessage.message, which
+   Poly/ML's value printer shows as `?`, and HOL registers a printer for it
+   only in interactive sessions.  A failed proof is reported through
+   General.exnMessage (HOL's uncaught-exception line), so give the type a
+   printer here, quoting its text as the field printed while it was a
+   string.  A HOL without the type compiles nothing. *)
+val _ =
+  if Option.isSome (HolbuildRuntime.lookup_value ["HOLmessage"] "toString") then
+    let
+      val stream =
+        TextIO.openString
+          "val () = PolyML.addPrettyPrinter (fn _ => fn _ => fn (m : HOLmessage.message) => \
+          \PolyML.PrettyString (\"\\\"\" ^ String.toString (HOLmessage.toString m) ^ \"\\\"\"));"
+    in
+      PolyML.compiler (fn () => TextIO.input1 stream, []) ()
+    end
+  else ();
