@@ -123,6 +123,8 @@ check_timeout over_budget 2.0 "$over_budget"
 check_timeout scaled 1.0 '(fn g => (X.metis_tac [] g; slow_tac g))' --tactic-timeout 0.5
 check_passes heavy_option "$over_budget" --heavy-tactic-timeout 4
 check_passes heavy_untimed "$over_budget" --heavy-tactic-timeout=0
+# Where steps are untimed, the option times nothing.
+check_passes heavy_no_timer "$over_budget" --tactic-timeout 0 --heavy-tactic-timeout 0.5
 check_timeout heavy_lower 0.5 '(fn g => (X.metis_tac [] g; slow_tac g))' --heavy-tactic-timeout 0.5
 # Strings, comments, HOL terms and longer identifiers must not extend a budget,
 # and a metis call in a later planned step must not extend the earlier step's.

@@ -1203,8 +1203,8 @@ formats are unchanged; existing successful builds remain reusable.
 Steps containing `metis_tac` or `METIS_TAC`, matched the same way, get twice the
 theory's timeout: proof search, and replay of proofs found by external provers, often
 needs more than the default. `--heavy-tactic-timeout SECONDS` sets their budget instead
-(`0`: untimed) wherever steps are timed; a spec carries it only when it is given, and
-a worker resolves the default the same way. An SMT name anywhere in the step keeps it
+(`0`: untimed) wherever steps are timed; a spec carries it only when it differs from
+the default, and a worker resolves a missing one the same way. An SMT name anywhere in the step keeps it
 untimed. The half-timeout retry and the timeout report use the step's own budget. The
 default budget only grows with the configured timeout, so the rule above for reusing a
 success under another timeout still holds; `--heavy-tactic-timeout` is not part of

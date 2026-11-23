@@ -1713,7 +1713,7 @@ output sig|sml|dat <relpath>
 output extra <declaration>
 option proof-steps=<bool>
 option tactic-timeout=<seconds|none>
-option heavy-tactic-timeout=<seconds|none>  (only under --heavy-tactic-timeout)
+option heavy-tactic-timeout=<seconds|none>  (only when it differs from twice the tactic timeout)
 option new-ir=<bool>
 option theorem-checkpoints=false   (only for a theory that saves none)
 option checkpoint-target=true      (only for a theory that saves checkpoints as it runs)
