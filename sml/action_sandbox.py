@@ -825,7 +825,8 @@ def spellings(name: str) -> tuple[set[Path], set[Path]]:
     return found, passed
 
 
-def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = None) -> int:
+def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = None,
+        keep_stdin: bool = False) -> int:
     policy.validate()
     policy.validate_outputs()
     # CONFIG_PROC_CHILDREN is required by the verified descendant walk.
@@ -852,6 +853,12 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
                     raise SandboxError(f"scratch input outside the read grants: {value}")
                 if any(within(file, root) for root in policy.writable + policy.scratch):
                     raise SandboxError(f"scratch input inside a writable directory: {value}")
+            # A parked run's target file and the directory a served check
+            # writes its failure to, both the action's own.
+            elif key in ("HOLBUILD_PARK", "HOLBUILD_PARK_SERVED"):
+                path = Path(value).resolve(strict=True)
+                if not any(within(path, root) for root in policy.writable):
+                    raise SandboxError(f"{key} outside the action tree: {value}")
             elif not key.startswith("HOLBUILD_RUN_"):
                 raise SandboxError(f"unexpected action environment assignment: {key}")
             env[key] = value
@@ -888,8 +895,10 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
             for sig in signals:
                 signal.signal(sig, signal.SIG_DFL)
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-            null = os.open("/dev/null", os.O_RDONLY)
-            os.dup2(null, 0)
+            # A parked child waits on its stdin for the script to run.
+            if not keep_stdin:
+                null = os.open("/dev/null", os.O_RDONLY)
+                os.dup2(null, 0)
             for fd in os.listdir("/proc/self/fd"):
                 if int(fd) >= 3 and int(fd) != child_socket.fileno():
                     try:
@@ -983,6 +992,7 @@ def main() -> int:
     parser.add_argument("--keep-read-only", action="append", default=[])
     parser.add_argument("--completed", type=Path)
     parser.add_argument("--toolchain", action="store_true")
+    parser.add_argument("--keep-stdin", action="store_true")
     parser.add_argument("--validate-tree", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     argv = sys.argv[1:]
@@ -1028,7 +1038,8 @@ def main() -> int:
                                            not parent.isdecimal() or int(parent) <= 0):
             raise SandboxError("missing trusted sandbox launcher identity")
         argv = args.command[1:] if args.command[:1] == ["--"] else args.command
-        status = run(linux, policy, argv, parent=int(parent) if parent is not None else None)
+        status = run(linux, policy, argv, parent=int(parent) if parent is not None else None,
+                     keep_stdin=args.keep_stdin)
         if args.completed is not None:
             args.completed.write_text("validated\n")
         return status

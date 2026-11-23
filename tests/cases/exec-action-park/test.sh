@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOLBUILD_BIN=$1
+HOLDIR=$2
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../../lib.sh
+source "$SCRIPT_DIR/../../lib.sh"
+
+# exec-action --park serves the next versions of a script that fails in a
+# proof from a process parked before the failing step: a failing version
+# answers fail with its diagnostic, the fixed one pass, each from a fresh
+# process (nothing the failing step changed is left), and nothing is
+# published.
+
+tmpdir=$(make_temp_dir)
+server_pid=""
+park_pid=""
+cleanup() {
+  for pid in "$park_pid" "$server_pid"; do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  cleanup_temp_dir "$tmpdir"
+}
+trap cleanup EXIT
+
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
+use_case_cache "$tmpdir/cache"
+
+project=$tmpdir/project
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "park"
+
+[build]
+members = ["src"]
+TOML
+# write_a STEP: A's last theorem splits its goal, proves the first conjunct
+# and runs STEP on the second.
+write_a() {
+  cat > "$project/src/AScript.sml" <<SML
+Theory A
+Ancestors bool
+
+val counter = ref 0;
+
+Theorem first_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+
+Theorem target:
+  T /\\ T
+Proof
+  CONJ_TAC >- ACCEPT_TAC TRUTH >> $1
+QED
+SML
+}
+
+field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $col }' "$1"; }
+
+write_a 'FAIL_TAC "first failure"'
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload ATheory) > "$tmpdir/batch.txt"
+spec=$(field "$tmpdir/batch.txt" park:ATheory 4)
+[[ -n "$spec" ]] || { cat "$tmpdir/batch.txt" >&2; exit 1; }
+
+socket=$tmpdir/park.sock
+link_hol_toolchain_cache "$tmpdir/worker"
+HOLBUILD_CACHE=$tmpdir/worker "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" \
+  --share-heaps --cache-limit-gb 1000 --park "$socket" > "$tmpdir/park.log" 2>&1 &
+park_pid=$!
+for _ in $(seq 600); do
+  grep -q "park: listening on" "$tmpdir/park.log" && break
+  kill -0 "$park_pid" 2>/dev/null || { echo "the park server stopped" >&2; cat "$tmpdir/park.log" >&2; exit 1; }
+  sleep 0.5
+done
+grep -q "park: listening on" "$tmpdir/park.log" || { echo "the park server never listened" >&2; cat "$tmpdir/park.log" >&2; exit 1; }
+require_grep "park: prepared target at step 2 .* started 2 children" "$tmpdir/park.log"
+
+# check NAME STATUS: park-check of the current A must exit with STATUS.
+check() {
+  local status=0
+  "$HOLBUILD_BIN" park-check "$socket" "$project/src/AScript.sml" > "$tmpdir/$1.out" 2> "$tmpdir/$1.err" || status=$?
+  [[ "$status" == "$2" ]] || {
+    echo "park-check $1: wanted exit $2, got $status" >&2
+    cat "$tmpdir/$1.out" "$tmpdir/$1.err" "$tmpdir/park.log" >&2
+    exit 1
+  }
+}
+
+# The failing step bumps the counter; the next check must not see it.
+write_a '(fn g => (counter := !counter + 1; FAIL_TAC "second failure" g))'
+check second 1
+require_grep "second failure" "$tmpdir/second.out"
+
+write_a '(fn g => (counter := !counter + 1; if !counter = 1 then ACCEPT_TAC TRUTH g else raise Fail "dirty heap"))'
+check fixed 0
+wait "$park_pid" || { echo "the park server failed" >&2; cat "$tmpdir/park.log" >&2; exit 1; }
+park_pid=""
+require_grep "park: the script builds, stopping" "$tmpdir/park.log"
+[[ ! -e "$socket" ]] || { echo "the park server left its socket" >&2; exit 1; }
+# Both checks ran from the failed prefix.
+[[ "$(grep -c 'park: served' "$tmpdir/park.log")" == 2 &&
+   "$(grep -c 'from: failed-prefix checkpoint in target' "$tmpdir/park.log")" == 2 ]] || {
+  cat "$tmpdir/park.log" >&2; exit 1; }
+
+# A server gone means the caller checks the usual way.
+check gone 2
