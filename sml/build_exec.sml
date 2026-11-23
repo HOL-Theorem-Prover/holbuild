@@ -6333,11 +6333,11 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
           handle _ => false
         (* A local entry built against other parent outputs can sit beside a
            remote entry built against these, so once the local one is dropped
-           the remote one gets a try; when the local one came from there, the
-           remote cache is asked to check its copy with its origin first, as it
-           may hold one its origin has since replaced.  An entry another build
-           published meanwhile gets the try instead.  Only one retry either
-           way. *)
+           the remote one gets a try, the remote cache asked to check its copy
+           with its origin first: the local one may have come from there, and
+           the cache may still hold it after its origin replaced it.  An entry
+           another build published meanwhile gets the try instead.  Only one
+           retry either way. *)
         fun materialize retry existing =
           let
             (* Passes over replicas whose timeout contract is too weak for this build. *)
@@ -6355,12 +6355,10 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
               end
             (* A failed copy may have met an entry another build just published. *)
             fun from_remote () =
-              if not (copied_from_remote input_key) then hydrate ()
-              else
-                (ignore (HolbuildRemoteCache.revalidating hydrate_remote);
-                 case HolbuildCache.get_action root input_key of
-                     SOME text => if text <> existing then materialize false text else CacheMiss
-                   | NONE => CacheMiss)
+              (ignore (HolbuildRemoteCache.revalidating hydrate_remote);
+               case HolbuildCache.get_action root input_key of
+                   SOME text => if text <> existing then materialize false text else CacheMiss
+                 | NONE => CacheMiss)
             fun reject_parents () =
               (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                             input_key ^ " (parent outputs differ)");
@@ -11773,19 +11771,25 @@ fun action_already_done remote root (spec : action_spec) =
   let
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
+    (* SOME fits once restored, NONE when the restore fails. *)
     fun restored () =
       (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
          {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
           extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
-       spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
+       SOME (spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path)))
+      handle e as HolbuildRemoteCache.Unavailable _ => raise e
+           | _ => NONE
+    (* The remote cache may hold a copy its origin has since replaced, which
+       the local one matches: on a parent misfit, ask it to check. *)
+    fun drop_stale misfit =
+      (if misfit then HolbuildRemoteCache.revalidating (fn () => drop_local_copy_if_stale remote (#input_key spec))
+       else drop_local_copy_if_stale remote (#input_key spec))
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | _ => false
   in
-    restored () orelse
-    ((HolbuildRemoteCache.revalidating (fn () => drop_local_copy_if_stale remote (#input_key spec))
-      handle e as HolbuildRemoteCache.Unavailable _ => raise e
-           | _ => false) andalso
-     restored ())
+    case restored () of
+        SOME true => true
+      | first => drop_stale (first = SOME false) andalso restored () = SOME true
   end
 
 (* The remote's .dat for the action, given by its manifest, fetched into the

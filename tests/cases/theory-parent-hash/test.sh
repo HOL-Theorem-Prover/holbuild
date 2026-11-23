@@ -501,6 +501,9 @@ b_key=$(input_key BTheory)
 # below.
 python3 "$SCRIPT_DIR/../../fixtures/remote_cache_entry.py" "$local_cache" "$b_key" "$tmpdir/remote/cas" "$tmpdir/stale-b"
 rm -rf "$local_cache/actions/$a_key"
+# The same local cache as a later build will find it, for the last case.
+persisted_cache=$tmpdir/fallback-persisted-cache
+cp -a "$local_cache" "$persisted_cache"
 rm -rf "$fallback_project/.holbuild"
 fallback_log=$tmpdir/fallback-restore.log
 (cd "$fallback_project" && HOLBUILD_CACHE="$local_cache" HOLBUILD_CACHE_TRACE=1 \
@@ -535,3 +538,20 @@ if grep -q "BTheory built" "$stale_log"; then
 fi
 [[ ! -e "$remote_control/ac-stale-$ac_b" ]] || {
   echo "the build didn't ask the cache to check its copy of BTheory" >&2; exit 1; }
+
+# The same with the stale BTheory already in the local cache, as an earlier
+# build left it: dropping it, the build asks the cache to check its copy too.
+cp "$tmpdir/stale-b" "$remote_control/ac-stale-$ac_b"
+rm -rf "$fallback_project/.holbuild"
+persisted_log=$tmpdir/stale-persisted-restore.log
+(cd "$fallback_project" && HOLBUILD_CACHE="$persisted_cache" HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 BTheory) > "$persisted_log" 2>&1 ||
+  { cat "$persisted_log" >&2; exit 1; }
+require_grep "cache miss: BTheory .*(parent outputs differ)" "$persisted_log"
+require_grep "BTheory restored from" "$persisted_log"
+if grep -q "BTheory built" "$persisted_log"; then
+  echo "BTheory was rebuilt instead of restored from the remote's store" >&2
+  exit 1
+fi
+[[ ! -e "$remote_control/ac-stale-$ac_b" ]] || {
+  echo "the build didn't ask the cache to check its local copy of BTheory" >&2; exit 1; }
