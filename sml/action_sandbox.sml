@@ -237,8 +237,13 @@ fun with_output_dirs dirs f =
 
 (* Only the trusted supervisor can write this sibling of the private roots.
    A child exit status alone cannot attest to cleanup or output validation,
-   so EXECUTE's result counts only once the supervisor says so. *)
-fun confined grants argv execute =
+   so a child's result counts only once the supervisor says so.
+
+   confined_start starts the confined command with START, which returns at
+   once (a parked child keeps its stdin, given KEEP_STDIN), and gives what
+   START returned and a function that takes the child's result once it has
+   ended and returns it if the supervisor validated it. *)
+fun confined_start {keep_stdin} grants argv start =
   let
     val completed = OS.Path.concat
       (OS.FileSys.fullPath (HolbuildCacheConfig.cache_root ()), "sandbox-" ^ HolbuildTempPath.suffix ())
@@ -266,21 +271,29 @@ fun confined grants argv execute =
                 | lines => SOME ("HOL sandbox failed: " ^ String.concatWith "; " lines)
             else if Time.>= (Time.now (), deadline) then SOME unconfirmed
             else (OS.Process.sleep (Time.fromReal 0.01); await_completion deadline)
-    fun run () =
-      let
-        val _ = write completed "pending\n"
-        val _ = write options (String.concat (map (fn option => option ^ "\000") (grant_options grants)))
-        val result = execute (wrap {completed = completed, options = options} argv)
-      in
-        (* A timeout reaps the outer shell before its watcher signals the
-           supervisor. Allow the supervisor's bounded cleanup to finish. *)
-        case await_completion (Time.+ (Time.now (), Time.fromSeconds 6)) of
-            NONE => result
-          | SOME reason => raise Error reason
-      end
+    (* A timeout reaps the outer shell before its watcher signals the
+       supervisor. Allow the supervisor's bounded cleanup to finish. *)
+    fun finish result =
+      (case await_completion (Time.+ (Time.now (), Time.fromSeconds 6)) of
+           NONE => result
+         | SOME reason => raise Error reason)
+      before remove ()
+      handle e => (remove (); raise e)
+    val wrapped = wrap {completed = completed, options = options} argv
+    val wrapped =
+      if keep_stdin then
+        List.take (wrapped, 7) @ ["--keep-stdin"] @ List.drop (wrapped, 7)
+      else wrapped
   in
-    (run () before remove ()) handle e => (remove (); raise e)
+    (write completed "pending\n";
+     write options (String.concat (map (fn option => option ^ "\000") (grant_options grants)));
+     (start wrapped, finish))
+    handle e => (remove (); raise e)
   end
+
+fun confined grants argv execute =
+  let val (result, finish) = confined_start {keep_stdin = false} grants argv execute
+  in finish result end
 
 (* The checkpoint tree's states restored from the store are links to it:
    hard links, or symbolic ones where the store is on another mount.  A

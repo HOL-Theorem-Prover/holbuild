@@ -349,8 +349,22 @@ fun exec_action_help () = print
   \                     parent. A run that cannot go on as a plain build would\n\
   \                     fails as ahead-abandoned (exit status 3).\n\
   \--ahead-wait-seconds N\n\
-  \                     How long to wait for the parents (default: 14400).\n\n\
+  \                     How long to wait for the parents (default: 14400).\n\
+  \--park SOCKET        Prototype. For a theory that fails in a proof: keep HOL\n\
+  \                     processes waiting at the start of the failing step and\n\
+  \                     check the next versions of the script, sent with\n\
+  \                     park-check, from there. Publishes nothing; stops once\n\
+  \                     the script builds or after 120 s idle.\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
+
+fun park_check_help () = print
+  "Usage:\n\
+  \  holbuild park-check SOCKET FILE\n\n\
+  \Prototype. Has the server an exec-action --park SOCKET started check FILE,\n\
+  \a new version of the theory script it serves. Prints the build log; the\n\
+  \server publishes nothing, so the usual build stays the check of record.\n\n\
+  \Exit status: 0 the script builds; 1 it fails; 2 the server cannot check it\n\
+  \(check it the usual way).\n"
 
 fun run_action_help () = print
   "Usage:\n\
@@ -433,6 +447,7 @@ fun command_help command =
     | "export" => export_help ()
     | "action-spec" => action_spec_help ()
     | "exec-action" => exec_action_help ()
+    | "park-check" => park_check_help ()
     | "run-action" => run_action_help ()
     | "import" => import_help ()
     | "gc" => gc_help ()
@@ -4257,6 +4272,14 @@ fun exec_action_command maxheap jobs args =
                     else raise Error (label ^ " must be a non-negative integer")
         | NONE => raise Error (label ^ " must be a non-negative integer")
     val sweep_only = List.exists (fn arg => arg = "--sweep-only") args
+    (* --park SOCKET: serve the next checks of a theory that failed in a
+       proof (HolbuildBuildExec.park_serve). *)
+    val park = ref NONE
+    fun take_park [] = []
+      | take_park ("--park" :: socket :: xs) = (park := SOME socket; take_park xs)
+      | take_park ["--park"] = raise Error "--park requires SOCKET"
+      | take_park (x :: xs) = x :: take_park xs
+    val args = take_park args
     val pipeline = List.exists (fn arg => arg = "--pipeline") args
     val deps_heap_only = List.exists (fn arg => arg = "--share-deps-heap") args
     val args = List.filter (fn arg => arg <> "--sweep-only" andalso arg <> "--pipeline" andalso
@@ -4359,7 +4382,8 @@ fun exec_action_command maxheap jobs args =
        HolbuildBuildExec.exec_action
          {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, share_heaps = share,
           deps_heap_only = deps_heap_only,
-          toolchain = toolchain, ahead_parents = rev (!ahead_parents), pipeline = pipeline})
+          toolchain = toolchain, ahead_parents = rev (!ahead_parents),
+          pipeline = pipeline andalso not (Option.isSome (!park)), park = !park})
       handle e =>
         (HolbuildStatus.message_stderr
            ("holbuild: exec-action failed: " ^
@@ -4402,6 +4426,18 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
      | "exec-action" :: rest =>
          (reject_json "exec-action"; reject_holdir holdir;
           exec_action_command maxheap jobs rest)
+     | ["park-check", socket, file] =>
+         (reject_json "park-check";
+          let
+            val (status, message, log) =
+              HolbuildBuildExec.park_check socket (read_text file)
+              handle e => ("fallback", General.exnMessage e, "")
+          in
+            print log;
+            if message = "" then () else TextIO.output (TextIO.stdErr, "holbuild: park-check: " ^ message ^ "\n");
+            TextIO.flushOut TextIO.stdOut;
+            Posix.Process.exit (case status of "pass" => 0w0 | "fail" => 0w1 | _ => 0w2)
+          end)
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
      | [] => dispatch (effective_toolchain holdir maxheap jobs) jobs args
      | "build" :: rest =>

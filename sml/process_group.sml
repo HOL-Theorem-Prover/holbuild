@@ -224,7 +224,7 @@ fun copy_child_stdout process =
     loop ()
   end
 
-fun launch_shell parent_pid mutation_lease script : child_process =
+fun launch_shell parent_pid mutation_lease script =
   let
     (* Poly/ML implements Unix.execute in the runtime so the child reaches
        execve without returning to SML or allocating in a post-fork heap.

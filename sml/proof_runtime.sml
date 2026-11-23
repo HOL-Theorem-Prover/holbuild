@@ -419,6 +419,72 @@ fun path_component_text component =
 
 fun path_text path = String.concatWith "/" (map path_component_text path)
 
+(* Parked edit checks (holbuild park-serve) keep HOL children waiting at a
+   clean point, so the next check of an edit skips their startup and replay.
+
+   A prepare child, given HOLBUILD_PARK=FILE, stops in the theorem FILE
+   names: at its start when the step count is 0, else right after its
+   successful leaf of that count at that path, before the next step runs.
+   There it saves the theorem's failed-prefix checkpoint (as a failure
+   would, but with the failing step never run), writes the done marker and
+   exits.  It builds no leaf starting at or after the prefix end, since
+   building one can run code of the step that failed.
+
+   A served child, given HOLBUILD_PARK_SERVED=DIR, resumes a failed prefix
+   only as it was saved: one needing salvage or a rewind writes
+   DIR/mismatch and exits, as a rewind can't undo what the leaves after
+   the resume point changed outside the goal stack.  A failure writes the
+   failed-prefix texts to DIR/failed.{theorem,meta,prefix} instead of
+   saving a heap, which park-serve prepares cleanly again. *)
+type park_target = {theorem : string, step_count : int, prefix_end : int, path : string, done_marker : string}
+
+(* Read on use, not at load: the runtime is in heaps that later processes
+   load, and the environment is that of the process asking. *)
+val park_target_read = ref (NONE : (string * park_target) option)
+
+fun read_park_target file =
+  let
+    val input = TextIO.openIn file
+    val lines = String.fields (fn c => c = #"\n") (TextIO.inputAll input)
+    val _ = TextIO.closeIn input
+  in
+    case lines of
+        [theorem, step_count, prefix_end, path, done_marker, ""] =>
+          (case (Int.fromString step_count, Int.fromString prefix_end) of
+               (SOME step_count, SOME prefix_end) =>
+                 {theorem = theorem, step_count = step_count, prefix_end = prefix_end,
+                  path = path, done_marker = done_marker}
+             | _ => raise Fail ("HOLBUILD_PARK: bad counts in " ^ file))
+      | _ => raise Fail ("HOLBUILD_PARK: expected 5 lines in " ^ file)
+  end
+
+fun parked_theorem name =
+  case OS.Process.getEnv "HOLBUILD_PARK" of
+      NONE => NONE
+    | SOME file =>
+        let
+          val target =
+            case !park_target_read of
+                SOME (read, target) => if read = file then target else read_park_target file
+              | NONE => read_park_target file
+        in
+          park_target_read := SOME (file, target);
+          if #theorem target = name then SOME target else NONE
+        end
+
+fun park_served_dir () = OS.Process.getEnv "HOLBUILD_PARK_SERVED"
+
+fun park_exit (target : park_target) =
+  (write_text_file (#done_marker target) "parked\n";
+   OS.Process.exit OS.Process.failure)
+
+fun park_mismatch reason =
+  case park_served_dir () of
+      SOME dir =>
+        (write_text_file (OS.Path.concat (dir, "mismatch")) (reason ^ "\n");
+         OS.Process.exit OS.Process.failure)
+    | NONE => ()
+
 fun dynamic_event_text event =
   case event of
       HolbuildProofIr.ChoiceEvent (path, n) => "choice\t" ^ path_text path ^ "\t" ^ Int.toString n
@@ -750,9 +816,20 @@ fun advance_failed_prefix_checkpoint path ok_text depth =
 fun save_failed_prefix_checkpoint () = timed_hol_phase "holsave" (fn () =>
   case !theorem_info_ref of
       NONE => ()
-    | SOME (kind, _, _, _, _, failed_prefix_path, failed_prefix_ok, proof_attrs, depth) =>
+    | SOME (kind, name, _, _, _, failed_prefix_path, failed_prefix_ok, proof_attrs, depth) =>
         if not (kind = "theorem" orelse kind = "resume") orelse
            not (!checkpoint_enabled_ref) orelse not (null proof_attrs) then ()
+        else if Option.isSome (park_served_dir ()) then
+          if QUse.hadError () then ()
+          else
+            let
+              val dir = valOf (park_served_dir ())
+              val (meta_text, prefix_text) = failed_prefix_texts ()
+            in
+              write_text_file (OS.Path.concat (dir, "failed.meta")) meta_text;
+              write_text_file (OS.Path.concat (dir, "failed.prefix")) prefix_text;
+              write_text_file (OS.Path.concat (dir, "failed.theorem")) name
+            end
         else if !failed_prefix_resume_active_ref then
           (case !failed_prefix_resumed_step_count_ref of
                SOME resumed =>
@@ -776,6 +853,20 @@ fun save_failed_prefix_checkpoint () = timed_hol_phase "holsave" (fn () =>
             val _ = write_text_file (failed_prefix_path ^ ".prefix") prefix_text
           in () end)
 
+(* A prepare child's stop after a successful leaf: see park_target. *)
+fun park_after_leaf count path =
+  case !theorem_info_ref of
+      NONE => ()
+    | SOME (_, name, _, _, _, failed_prefix_path, _, _, _) =>
+        case parked_theorem name of
+            NONE => ()
+          | SOME target =>
+              if count <> #step_count target orelse path_text path <> #path target then ()
+              else
+                (save_failed_prefix_checkpoint ();
+                 if OS.FileSys.access (failed_prefix_path ^ ".ok", []) then park_exit target
+                 else OS.Process.exit OS.Process.failure)
+
 fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok) =
   let val depth = length (PolyML.SaveState.showHierarchy())
   in
@@ -789,6 +880,9 @@ fun begin_theorem (kind, name, tactic_text, context_path, context_ok,
                    failed_prefix_path, failed_prefix_ok, proof_attrs) =
   let val depth = length (PolyML.SaveState.showHierarchy())
   in
+    case parked_theorem name of
+        SOME target => if #step_count target = 0 then park_exit target else ()
+      | NONE => ();
     theorem_info_ref := SOME (kind, name, tactic_text, context_path, context_ok,
                               failed_prefix_path, failed_prefix_ok, proof_attrs, depth);
     context_info_ref := SOME (context_path, context_ok, depth)
@@ -1598,7 +1692,14 @@ fun construct_plan_leaves display_index steps =
     val compile_keys = ref no_keys
     fun construct (CompiledTactic make) = BuiltTactic (make ())
       | construct (CompiledListTactic make) = BuiltListTactic (make ())
+    (* A prepare child parks before the step that failed: see park_target. *)
+    val parked_prefix_end =
+      case !theorem_info_ref of
+          SOME (_, name, _, _, _, _, _, _, _) => Option.map #prefix_end (parked_theorem name)
+        | NONE => NONE
     fun build d proof_step start_pos end_pos label program kind compile =
+      if (case parked_prefix_end of SOME prefix_end => start_pos >= prefix_end | NONE => false) then ()
+      else
       let
         val key = leaf_key start_pos end_pos program
         val compile_key = kind ^ ":" ^ program
@@ -1739,7 +1840,8 @@ fun run_built_steps resume_after_path display_index steps =
                                           sig_text = sig_text,
                                           prefix_signature = prefix_signature,
                                           history_count = !history_step_count_ref} ::
-                                         !successful_leaf_snapshots_ref
+                                         !successful_leaf_snapshots_ref;
+        park_after_leaf count path
       end
     fun run_list _ _ _ [] = ()
       | run_list d path i (proof_step :: rest) =
@@ -2481,6 +2583,13 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
             else raise Fail (String.concat ["failed-prefix checkpoint history does not match metadata: heap=",
                                             Int.toString (!history_step_count_ref),
                                             " metadata=", Int.toString (#history_count metadata)])
+          val _ =
+            if not (Option.isSome (park_served_dir ())) then ()
+            else
+              ((validate_failed_prefix_metadata plan metadata
+                handle e => park_mismatch ("the plan does not keep the parked prefix: " ^ General.exnMessage e));
+               if leaf_rewind_count (#step_count metadata) = #step_count metadata then ()
+               else park_mismatch "the parked prefix needs a rewind")
           val resume_metadata =
             timed_hol_phase "holsalvage" (fn () =>
               rewind_past_shared_leaves plan (resumable_failed_prefix_metadata plan metadata))
@@ -2590,7 +2699,10 @@ fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, chec
    failed_prefix_resume_active_ref := false;
    failed_prefix_resumed_step_count_ref := NONE;
    proving_with_proof_ir_ref := false;
-   HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate checkpoint_seconds;
+   (* A prepare child saves every context on its way, so the waiting child
+      for an edit before the theorem it parks in replays nothing finished. *)
+   HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate
+     (if Option.isSome (OS.Process.getEnv "HOLBUILD_PARK") then 0.0 else checkpoint_seconds);
    HolbuildTacticCompat.install_prover proof_ir_prover;
    case tactic_timeout of
        NONE => ()
