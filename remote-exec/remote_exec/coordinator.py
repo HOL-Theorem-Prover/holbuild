@@ -869,8 +869,8 @@ class _AheadRead:
 class _Outranking:
     """The claims ahead a claim that may take them puts before a ready build (see Coordinator._outranked_by_ahead):
     ``best``, the highest priority of a candidate of each tier of ``ahead_tiers``, and ``deepest``, the place of
-    each batch and tier's deepest candidate in claim order, from ``read``. ``kept`` tells, when a claim ahead is
-    about to be made, whether the claim's host is still below the scale-in line for claims ahead of a tier."""
+    each batch and tier's deepest candidate in claim order, from ``read``; ``kept``, whether the claim's host is still
+    below the scale-in line for claims ahead of a tier (see Coordinator._claim_ahead_in)."""
 
     tiers: list[str]
     ahead_tiers: list[str]
@@ -880,12 +880,10 @@ class _Outranking:
     kept: Callable[[str], bool]
 
     def above(self, tier: str, priority: int) -> list[str]:
-        """The tiers no later than ``tier`` with a candidate of a batch of a higher priority than ``priority``, of
-        those whose line for claims ahead still takes in the claim's host."""
+        """The tiers no later than ``tier`` with a candidate of a batch of a higher priority than ``priority``."""
         return [
             t for t in self.ahead_tiers
             if t in self.best and self.best[t] > priority and self.tiers.index(t) <= self.tiers.index(tier)
-            and self.kept(t)
         ]
 
     def deeper(self, batch_id: UUID, tier: str, ready: tuple[int, int] | None) -> bool:
@@ -1099,6 +1097,7 @@ class Coordinator:
         self.made_ready = 0
         self.claim_waiters: list[tuple[list[str], ClaimRank, asyncio.Future[Wake], bool]] = []
         self.claiming: Counter[tuple[str, str]] = Counter()  # the claims under way, by host and worker
+        self.ahead_workers: set[tuple[str, str]] = set()  # the workers, by host, whose last claim could claim ahead
         self.rankings: dict[tuple[str, ...], _Ranking] = {}  # the build claims' shared rankings, by tiers
         self.ranking_reads: dict[tuple[str, ...], asyncio.Task[_Ranking]] = {}
         self.run_admission = asyncio.Lock()  # wait before checkout; the DB advisory lock still spans replicas
@@ -1443,21 +1442,23 @@ class Coordinator:
                     held_tiers = self._held_for(tiers, host_id)
                 hint_only = held_tiers.difference(eligible_tiers)
                 claim_tiers = [t for t in tiers if t in eligible_tiers or t in hint_only]
+
+                def kept(tier: str) -> bool:
+                    """Whether this host is still below the line for claims ahead of ``tier``, which may have moved
+                    past it during the claim's awaits; checked as each claim ahead is about to be made."""
+                    return not self._above_line(rank, tier, ahead=True)
+
                 outranked = (
-                    self._outranked_by_ahead(
-                        read, tiers, ahead_tiers, lambda tier: not self._above_line(rank, tier, ahead=True)
-                    )
+                    self._outranked_by_ahead(read, tiers, ahead_tiers, kept)
                     if read is not None and ahead_tiers and claim_tiers else None
                 )
                 claimed, held_until = (
                     await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only, held_tiers, tiers)
                     if claim_tiers else (None, None)
                 )
-                # Builds left for their holders still rank before claims ahead. The line for claims ahead may have moved
-                # past this host while it tried the builds.
+                # Builds left for their holders still rank before claims ahead.
                 if claimed is None and read is not None and ahead_tiers and held_until is None:
-                    ahead_tiers = [t for t in ahead_tiers if not self._above_line(rank, t, ahead=True)]
-                    claimed = await self._claim_ahead(read, ahead_tiers, worker) if ahead_tiers else None
+                    claimed = await self._claim_ahead(read, ahead_tiers, worker, kept=kept)
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
                     # Recorded before the answer, so the scale-in line counts a lease while it waits (as _claim
@@ -1597,12 +1598,13 @@ class Coordinator:
                     # claim's await, as _claim_build's are.
                     ranking.running_priority += 1
                     self._cap_priorities(ranking)
-                    claimed = await self._claim_ahead(outranked.read, above, worker, above=-priority)
+                    claimed = await self._claim_ahead(
+                        outranked.read, above, worker, kept=outranked.kept, above=-priority
+                    )
                     if claimed is not None:
                         return claimed, None
                     ranking.running_priority -= 1
-                # The line for claims ahead may have moved past this host during the claim's awaits.
-                if (batch_id, tier) in outranked.deepest and outranked.kept(tier):
+                if (batch_id, tier) in outranked.deepest:
                     ready = ranking.depths.get((batch_id, tier))
                     if ready is None:  # a claim since the read took the batch's first ready build
                         async with self.engine.connect() as conn:
@@ -1618,7 +1620,7 @@ class Coordinator:
                             ranking.running_priority += 1
                             self._cap_priorities(ranking)
                         claimed = await self._claim_ahead_in(
-                            outranked.read, batch_id, tier, worker, deeper_than=ready
+                            outranked.read, batch_id, tier, worker, kept=outranked.kept, deeper_than=ready
                         )
                         if claimed is not None:
                             return claimed, None
@@ -1742,7 +1744,7 @@ class Coordinator:
         )
 
     async def _claim_ahead(
-        self, read: _AheadRead, tiers: list[str], worker: str, *, above: int | None = None
+        self, read: _AheadRead, tiers: list[str], worker: str, *, kept: Callable[[str], bool], above: int | None = None
     ) -> Claim | None:
         """Lease an action of ``tiers`` ahead of its parents: of the running batches with an ``ahead_cap``, the
         action whose chain of dependents is deepest of those whose unfinished parents all run, at most
@@ -1762,13 +1764,20 @@ class Coordinator:
             ):
                 if (batch_id, tier) in read.exhausted:
                     continue
-                claimed = await self._claim_ahead_in(read, batch_id, tier, worker)
+                claimed = await self._claim_ahead_in(read, batch_id, tier, worker, kept=kept)
                 if claimed is not None:
                     return claimed
         return None
 
     async def _claim_ahead_in(
-        self, read: _AheadRead, batch_id: UUID, tier: str, worker: str, *, deeper_than: tuple[int, int] | None = None
+        self,
+        read: _AheadRead,
+        batch_id: UUID,
+        tier: str,
+        worker: str,
+        *,
+        kept: Callable[[str], bool],
+        deeper_than: tuple[int, int] | None = None,
     ) -> Claim | None:
         """Lease the best action of ``tier`` of ``batch_id`` that ``read`` found may be claimed ahead, if any still
         may, or mark the batch and tier exhausted in ``read``. With ``deeper_than``, only of those with a deeper
@@ -1778,9 +1787,10 @@ class Coordinator:
 
         This process's claims ahead of one batch take their turns in memory before the batch's row lock, which each
         would otherwise wait for holding a pooled connection: one big batch's claims filled the pool. A claim whose
-        turn comes finds in ``read`` what the claims before it took."""
+        turn comes finds in ``read`` what the claims before it took, and leases nothing if the scale-in line for claims
+        ahead moved past its host meanwhile (``kept``)."""
         async with self._ahead_turn(batch_id):
-            if (batch_id, tier) in read.exhausted:
+            if (batch_id, tier) in read.exhausted or not kept(tier):
                 return None
 
             def keys(*, outlined_only: bool) -> list[str]:
@@ -2410,6 +2420,7 @@ class Coordinator:
             free = sum(
                 1 for worker, (seen, w_tiers) in workers.items()
                 if tier in w_tiers and (not burst_only or "high" in w_tiers) and (host_id, worker) not in leased
+                and (not ahead or (host_id, worker) in self.ahead_workers)
                 and ((host_id, worker) in self.claiming or (now - seen).total_seconds() < TURNAROUND_SECONDS)
             )
             # No floor of one, nor the host's last report, which no result updates: a host whose workers all stay
@@ -2729,17 +2740,24 @@ class Coordinator:
             report = replace(report, cpu_idle_pct=previous[1].cpu_idle_pct)
         self.hosts[report.id] = (self.clock(), report)
 
-    def report_worker(self, host_id: str, worker: str, tiers: list[str], *, idle: bool = False) -> None:
+    def report_worker(
+        self, host_id: str, worker: str, tiers: list[str], *, idle: bool = False, ahead: bool | None = None
+    ) -> None:
         """Note that ``worker``, claiming ``tiers``, runs on reported host ``host_id``, for the autoscaler's count of
         the workers quarantined hosts hold, also before the host sent readings. An ``idle`` worker, claiming or
         waiting to claim, runs no action: the leases still noted for it ended without its result, as when their batch
-        was cancelled, and are forgotten."""
+        was cancelled, and are forgotten. A worker whose claim says whether it may claim ``ahead`` counts on the
+        scale-in line for claims ahead only if it may (see _kept_hosts)."""
         if idle:
             for token in [t for t, (h, w, _) in self.lease_hosts.items() if h == host_id and w == worker]:
                 del self.lease_hosts[token]
                 self.outlined_tokens.pop(token, None)
         if host_id in self.host_workers or len(self.host_workers) < MAX_HOSTS:
             self.host_workers.setdefault(host_id, {})[worker] = (self.clock(), tuple(tiers))
+            if ahead:
+                self.ahead_workers.add((host_id, worker))
+            elif ahead is not None:
+                self.ahead_workers.discard((host_id, worker))
 
     def _lease_host(self, token: UUID, host_id: str, worker: str, tiers: list[str]) -> None:
         self.lease_hosts[token] = (host_id, worker, tiers)
@@ -3446,6 +3464,7 @@ class Coordinator:
             for host, (at, report) in self.hosts.items()
             if (now - at).total_seconds() < HOST_REPORT_SECONDS or host in self.host_workers
         }
+        self.ahead_workers = {(h, w) for h, w in self.ahead_workers if w in self.host_workers.get(h, ())}
         known = self.hosts.keys() | self.host_workers.keys()
         # A host's theories and contexts outlast a quiet spell of its workers, as when they are replaced on the same
         # host, for HOST_KEYS_SECONDS; meanwhile it isn't below the scale-in line, so no work is left for it.
