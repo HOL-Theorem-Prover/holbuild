@@ -134,7 +134,7 @@ discarded_once() {
 deps_saved() { require_grep "holbuild checkpoint kind=deps_loaded share=$1 with_modules=$2 " "$b_log"; }
 
 # B's first preload loads A from its .dat, loading no module (a cold store,
-# or no theory modules), so its heap is shared and holds A, as without
+# or no theory modules), so its heap holds A, as without
 # saveChildWithModules.  It writes A's module.
 build "$tmpdir/first.log"
 deps_saved true false
@@ -154,8 +154,9 @@ if grep -q 'module-cache unsupported' "$b_log" ||
   skip 'theory module support'
 fi
 # The next fresh preload loads A's module, and the heap it saves refers to
-# it, if Poly/ML has saveChildWithModules; without it, the heap is saved
-# shared, holding A, as before.
+# it, if Poly/ML has saveChildWithModules; without it, the heap holds A,
+# as before.  Either way it is shared first: unshared, the ancestors that
+# load from their .dat make it several times larger.
 for ext in dat sig sml; do cp "$project/.holbuild/obj/src/BTheory.$ext" "$tmpdir/BTheory.$ext"; done
 rm -rf "$checkpoints/BScript.sml.deps" "$checkpoints/BScript.sml.theorems" "$HOLBUILD_CACHE/checkpoint-store"
 edit_b one
@@ -166,7 +167,7 @@ if ! "$HOLDIR/bin/hol" run --noconfig "$tmpdir/probe.sml" > /dev/null 2>&1; then
   deps_saved true false
   skip 'PolyML.SaveState.saveChildWithModules'
 fi
-deps_saved false true
+deps_saved true true
 needs_a "$(deps_heap)"
 
 # A resume from b_first's context, on that heap, after A's module went.
@@ -184,7 +185,7 @@ deps_saved true false
 rm -rf "$checkpoints" "$HOLBUILD_CACHE/checkpoint-store"
 edit_b prefix
 build "$tmpdir/prefix-heap.log"
-deps_saved false true
+deps_saved true true
 break_b
 if build "$tmpdir/broken.log" 2> /dev/null; then
   echo 'b_second built with a failing proof' >&2; exit 1
@@ -202,7 +203,7 @@ same_outputs
 rm -rf "$checkpoints" "$HOLBUILD_CACHE/checkpoint-store"
 edit_b store
 build "$tmpdir/stored.log"
-deps_saved false true
+deps_saved true true
 needs_a "$(deps_heap)"
 rm -rf "$checkpoints"
 find "$module_cache" -name '*-A-*.pmo' -delete

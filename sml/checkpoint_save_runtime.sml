@@ -233,21 +233,21 @@ fun save_with (save_child, with_modules) ({label, default_share, path, ok_text, 
 fun save_checkpoint args = save_with (PolyML.SaveState.saveChild, false) args
 
 (* The deps heap.  Once the dependencies loaded a theory module from its
-   file, it is saved with saveChildWithModules and needs no
-   shareCommonData pass: the modules, most of what the dependencies
-   loaded, stay in their files.  Otherwise it holds every ancestor, and is
-   compacted first, as with a runtime without the call.  Contexts and
-   failed prefixes saved on it with saveChild refer to its modules too. *)
+   file, it is saved with saveChildWithModules: the modules stay in their
+   files.  Either way it is compacted first: the ancestors loaded from
+   their .dat share much data, and unshared, large theories' heaps came
+   out about three times the size.  Contexts and failed prefixes saved on
+   it with saveChild refer to its modules too. *)
 fun save_deps_checkpoint ({label, path, ok_text, depth, modules} :
                           {label : string, path : string, ok_text : string, depth : int, modules : bool}) =
   let
-    fun args share = {label = label, default_share = share, path = path, ok_text = ok_text, depth = depth}
+    val args = {label = label, default_share = true, path = path, ok_text = ok_text, depth = depth}
   in
     case HolbuildRuntime.save_child_with_modules of
         SOME save_child =>
-          if HolbuildRuntime.deps_save_shares modules then save_checkpoint (args true)
-          else save_with (save_child, true) (args false)
-      | NONE => save_checkpoint (args true)
+          if HolbuildRuntime.saves_with_modules modules then save_with (save_child, true) args
+          else save_checkpoint args
+      | NONE => save_checkpoint args
   end
 
 

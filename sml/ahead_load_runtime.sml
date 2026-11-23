@@ -33,9 +33,7 @@
    little left to do.  Later waits don't share again: on a chain of late
    parents they last only as long as one parent's own hand-off.  A full GC
    follows the share: the share frees the duplicates but leaves them in the
-   heap, and the GC hands that space back while the child waits.  No wait
-   shares when the save won't (HolbuildRuntime.deps_save_shares): one that
-   refers to the theory modules loaded instead of copying them. *)
+   heap, and the GC hands that space back while the child waits. *)
 structure HolbuildAheadLoad =
 struct
   val dir = ref ""
@@ -49,8 +47,6 @@ struct
   val completed : string list ref = ref []
   (* Whether a wait step that has to wait still shares the heap. *)
   val share = ref false
-  (* Whether holbuild reads a deps heap saved with modules. *)
-  val modules = ref false
 
   (* Paths as the loader evaluates them, with HOL's path variables expanded;
      the steps' own files, in the marker directory, are left out. *)
@@ -84,10 +80,9 @@ struct
      TextIO.output (TextIO.stdErr, "holbuild: loading ahead abandoned: " ^ reason ^ "\n");
      OS.Process.exit OS.Process.failure)
 
-  fun start directory share_heap modules_readable =
+  fun start directory share_heap =
     (dir := directory;
      share := share_heap;
-     modules := modules_readable;
      write "base-loaded"
        (String.concat (map (fn m => "loaded " ^ m ^ "\n") (Meta.loaded ()) @
                        map (fn d => "path " ^ d ^ "\n") (!Meta.loadPath)));
@@ -176,7 +171,7 @@ struct
       val since = List.drop (rev (!recorded), position)
       (* Before waiting-P, so the timings count the share as loading. *)
       val _ =
-        if !share andalso not (exists ("arrived-" ^ parent)) andalso HolbuildRuntime.deps_save_shares (!modules) then
+        if !share andalso not (exists ("arrived-" ^ parent)) then
           (share := false; HolbuildRuntime.share_heap (); PolyML.fullGC ();
            write "shared" parent)
         else ()

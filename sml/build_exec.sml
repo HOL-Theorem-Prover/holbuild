@@ -427,10 +427,10 @@ fun promote_preload_threshold () =
    it (save_deps_checkpoint), as any saveChild promotes what it saves to
    permanent space.  So once the loads hold the threshold or more, this
    preload saves a transient child heap the same way, with or without
-   modules, and removes it at once: the promoted data stays in memory,
-   nothing reads the file.  A save that can't write its file leaves the
-   preload as it was.  The child's log says what was in use and whether it
-   was promoted.  A later saveChild here would name the removed file as its
+   modules, but shares common data only without them, and removes it at
+   once: the promoted data stays in memory, nothing reads the file.  A
+   save that can't write its file leaves the preload as it was.  The
+   child's log says what was in use and whether it was promoted.  A later saveChild here would name the removed file as its
    parent, so only a theory that saves no checkpoint promotes. *)
 fun write_promoting_preload load_lines path =
   let
@@ -445,7 +445,7 @@ fun write_promoting_preload load_lines path =
          "  fun seconds (a, b) = Real.fmt (StringCvt.FIX (SOME 3)) (Time.toReal (Time.- (b, a)))\n",
          "  fun promote () =\n",
          "    let\n",
-         "      val share = HolbuildRuntime.deps_save_shares true\n",
+         "      val share = not (HolbuildRuntime.saves_with_modules true)\n",
          "      val save = case HolbuildRuntime.save_child_with_modules of\n",
          "                     SOME save => if share then PolyML.SaveState.saveChild else save\n",
          "                   | NONE => PolyML.SaveState.saveChild\n",
@@ -7304,8 +7304,7 @@ fun write_ahead_preload {load_lines, dir, share, path} =
          module, and predicting a load manifest searches the path. *)
       "val _ = Meta.loadPath := List.filter (fn dir => not (String.isSubstring \"/.holbuild/checkpoints/\" (dir ^ \"/\") " ^
         "orelse String.isSubstring \"/.holbuild/logs/\" (dir ^ \"/\"))) (!Meta.loadPath);" ::
-      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^ Bool.toString share ^ " " ^
-        Bool.toString module_heaps_read ^ ";" ::
+      "val _ = HolbuildAheadLoad.start " ^ HolbuildToolchain.sml_string dir ^ " " ^ Bool.toString share ^ ";" ::
       "structure HolbuildAheadPlainRuntime = HolbuildRuntime;" ::
       "structure HolbuildRuntime = struct open HolbuildRuntime val load = HolbuildAheadLoad.load end;" ::
       (load_lines @

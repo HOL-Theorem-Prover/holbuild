@@ -48,13 +48,11 @@ struct
               SOME loaded => not (null ((RunCall.unsafeCast loaded : unit -> Word8Vector.vector list) ()))
             | NONE => false
 
-  (* Whether the deps heap's save (HolbuildCheckpointSaveRuntime.
-     save_deps_checkpoint) shares common data first, unless
-     HOLBUILD_SHARE_COMMON_DATA says otherwise: not when it saves the
-     heap with modules, which it does only where holbuild reads such a
-     state (MODULES). *)
-  fun deps_save_shares modules =
-    not (modules andalso Option.isSome save_child_with_modules andalso loaded_module_files ())
+  (* Whether a child heap saved now is saved with modules: only where
+     holbuild reads such a state (MODULES), the runtime has the call and
+     the process loaded a module from its file. *)
+  fun saves_with_modules modules =
+    modules andalso Option.isSome save_child_with_modules andalso loaded_module_files ()
 
   (* The size of the .dat beside a theory's .sml, where HOL's file system
      keeps it, or NONE for any other file. *)
