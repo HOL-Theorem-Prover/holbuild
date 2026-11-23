@@ -2093,6 +2093,23 @@ async def test_a_burst_host_short_of_memory_keeps_no_slot_for_claims_ahead_its_w
     assert child is not None and child.theory == "pkg:b" and child.ahead_parents
 
 
+async def test_a_burst_host_short_of_memory_keeps_a_slot_for_its_worker_claiming_ahead(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """host-b, short of memory and holding no lease, is the only host whose workers claim ahead: its worker b0, past
+    its wait for memory, claims and takes ``b``."""
+    burst = ["high", "standard"]
+    await submit(http, ["a", "b"], [("b", "a")], speculative_loading="4")
+    for host, workers, ahead in [("host-0", ["p0", "p1"], False), ("host-b", ["b0"], True)]:
+        for worker in workers:
+            coordinator.report_worker(host, worker, burst, ahead=ahead)
+    coordinator.report_host(HostReport("host-b", 50.0, 64 << 30, 2 << 30, 52 << 30, 50 << 30, 0, True))
+    parent = await coordinator.claim(burst, "p0", host_id="host-0")
+    assert parent is not None and parent.theory == "pkg:a"
+    child = await coordinator.claim(burst, "b0", 0.5, host_id="host-b", ahead=True)
+    assert child is not None and child.theory == "pkg:b" and child.ahead_parents
+
+
 async def test_the_line_for_claims_ahead_keeps_no_slot_of_idle_warm_workers(coordinator: Coordinator) -> None:
     """Warm workers never claim ahead: counting their 7 idle slots, the standard line stops at full host-1, but the
     line for claims ahead takes in host-2, whose workers can."""

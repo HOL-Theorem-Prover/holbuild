@@ -1855,8 +1855,11 @@ class Coordinator:
                     ahead_parents,
                 )
             # Out of the shared read, so the next claim of this read orders the batches by what remains.
-            # Of every batch: single-flight leases a key once, so no other batch's claim may take it.
-            read.candidates = [c for c in read.candidates if c[1] != row.input_key]
+            # Of every batch: single-flight leases a key once, so no other batch's claim may take it. Also out of a
+            # newer read made meanwhile, which the scale-in line for claims ahead counts (see _ahead_ready).
+            for shared in (read, self.ahead_read):
+                if shared is not None:
+                    shared.candidates = [c for c in shared.candidates if c[1] != row.input_key]
             waiting += 0 if row.outlined else 1
             if waiting >= batch.ahead_cap:  # full: the claims waiting their turn take only those that won't wait
                 read.candidates = [c for c in read.candidates if c[0] != batch_id or c[5]]
@@ -2419,16 +2422,23 @@ class Coordinator:
             reported = report[1].leases if report is not None and report[1].leases is not None and not burst_only else 0
             busy = leases[host_id] + waiting[host_id]
             short = report is not None and bool(report[1].memory_short)
-            free = sum(
-                1 for worker, (seen, w_tiers) in workers.items()
-                if tier in w_tiers and (not burst_only or "high" in w_tiers) and (host_id, worker) not in leased
-                and (not ahead or (host_id, worker) in self.ahead_workers)
-                and ((host_id, worker) in self.claiming or (now - seen).total_seconds() < TURNAROUND_SECONDS)
-            )
+            # Its workers that take the work and claim now, and those back from a result lately.
+            free, claiming = 0, 0
+            for worker, (seen, w_tiers) in workers.items():
+                if (
+                    tier in w_tiers and (not burst_only or "high" in w_tiers) and (host_id, worker) not in leased
+                    and (not ahead or (host_id, worker) in self.ahead_workers)
+                ):
+                    claiming += (host_id, worker) in self.claiming
+                    free += (host_id, worker) in self.claiming or (now - seen).total_seconds() < TURNAROUND_SECONDS
             # No floor of one, nor the host's last report, which no result updates: a host whose workers all stay
-            # away leaves no slot to wait for, and isn't kept. Nor, for claims ahead, on a host short of memory: its
-            # workers that don't claim ahead hold no slot for them.
-            slots = max(reported, busy, 0 if ahead else 1) if short else max(leases[host_id] + free, busy)
+            # away leaves no slot to wait for, and isn't kept. For claims ahead, a host short of memory counts the
+            # workers claiming ahead, which are past their wait for memory, rather than a floor of one, which its
+            # workers that don't claim ahead could hold.
+            if short:
+                slots = max(reported, busy, leases[host_id] + claiming if ahead else 1)
+            else:
+                slots = max(leases[host_id] + free, busy)
             if not slots:
                 continue
             # Fuller burst hosts first, so a partly drained one lies beyond the line and empties.
