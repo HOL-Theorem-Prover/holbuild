@@ -365,6 +365,10 @@ fun manifest_loads plan node =
    until the parent removes the request (with_deps_heap_capture). *)
 fun deps_heap_capture_request deps_loaded = deps_loaded ^ ".capture"
 
+(* Where that preload lists, before it asks, the modules HOL refused that
+   the deps heap may require (module_loader_line). *)
+fun deps_heap_refused_modules deps_loaded = deps_loaded ^ ".refused"
+
 (* The deps heap keeps only the toolchain's load path, not the project's
    directories HOL put there: other trees of the project resume from it.
    The save's time is printed as a holsave phase (hol_log_phases); the
@@ -376,6 +380,18 @@ fun write_preload capture load_lines deps_loaded deps_ok path =
   let
     val save = save_deps_heap_expr {label = "deps_loaded", output = deps_loaded, ok_text = deps_ok}
     val request = HolbuildToolchain.sml_string (deps_heap_capture_request deps_loaded)
+    val refused = HolbuildToolchain.sml_string (deps_heap_refused_modules deps_loaded)
+    (* A list left by an earlier run goes, even where the loader's lines
+       didn't compile. *)
+    val list_refused =
+      "val _ = OS.FileSys.remove " ^ refused ^ " handle OS.SysErr _ => ();\n" ^
+      "val _ = if Option.isSome (#lookupVal PolyML.globalNameSpace \"holbuild_unreleased_modules\") then " ^
+      "CompilerSpecific.quietbind " ^
+      HolbuildToolchain.sml_string
+        ("val _ = case !holbuild_unreleased_modules of [] => () | ids => " ^
+         "let val out = TextIO.openOut " ^ refused ^ " in " ^
+         "List.app (fn id => TextIO.output (out, id ^ \"\\n\")) ids; TextIO.closeOut out end;") ^
+      " else ();"
     val wait =
       "val _ = (TextIO.closeOut (TextIO.openOut " ^ request ^ "); " ^
       "while OS.FileSys.access (" ^ request ^ ", []) do OS.Process.sleep (Time.fromMilliseconds 5));"
@@ -386,7 +402,7 @@ fun write_preload capture load_lines deps_loaded deps_ok path =
                   "HolbuildCheckpointSaveRuntime.with_toolchain_load_path (fn () => " ^ save ^ "); " ^
                   "TextIO.output (TextIO.stdErr, \"holbuild hol-phases holsave=\" ^ " ^
                   "LargeInt.toString (LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))) ^ \"\\n\") end;"] @
-                 (if capture then [wait] else []))
+                 (if capture then [list_refused, wait] else []))
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -474,9 +490,16 @@ fun module_stores () =
    module writer runs that toolchain's code, so it must not be able to put
    a module where another toolchain loads from.  On a worker the HOL
    directory is named by the toolchain's repository, commit and kernel. *)
-fun module_store holdir =
-  Path.concat (module_stores (),
-               HolbuildHash.string_sha256 (Path.mkAbsolute {path = holdir, relativeTo = FS.getDir ()}))
+fun module_store_id holdir =
+  HolbuildHash.string_sha256 (Path.mkAbsolute {path = holdir, relativeTo = FS.getDir ()})
+
+(* The store, under the v2 prefix since one module file name stopped
+   holding modules of several ids, so that no host keeps a store of mixed
+   ids; the remote cache's entries keep the id alone (module_remote_key).
+   The v1 store (named by the id alone) is left to the cache cap. *)
+fun module_store holdir = Path.concat (module_stores (), "v2-" ^ module_store_id holdir)
+
+fun module_store_v1 holdir = Path.concat (module_stores (), module_store_id holdir)
 
 (* Held by the worker process whose writer is filling a store
    (write_missing_modules); the cache cap's sweep leaves that store alone. *)
@@ -491,10 +514,58 @@ fun if_meta_has values code =
   "[" ^ String.concatWith ", " (map HolbuildToolchain.sml_string values) ^ "] then " ^
   "CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string code ^ " else ();"
 
+(* Compiles [code] when HOL's module helper, once loaded, has the [values].
+   It restates some of the helper's functions; a helper they don't match
+   fails to compile them and keeps its own. *)
+fun if_theory_modules_has values code =
+  "val _ = case #lookupStruct PolyML.globalNameSpace \"TheoryModules\" of " ^
+  "NONE => () | SOME modules => " ^
+  "if List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents modules)) " ^
+  HolbuildToolchain.sml_list values ^ " then " ^
+  "(CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string code ^ " handle _ => ()) else ();"
+
+(* The ids, in hex, of the modules HOL refused that the loader below
+   couldn't release (unreleased_modules_line), which a deps heap saved
+   with modules would require. *)
+val unreleased_modules_line = "val holbuild_unreleased_modules = ref ([] : string list);"
+
+(* HOL's theory loader, except for a module HOL refuses (one whose
+   theory's .dat file, hence its file name, is unchanged, but whose
+   parents' kernel entries differ here).  HOL keeps such a module loaded,
+   so a deps heap saved with modules would require it, though nothing
+   uses it; and it writes the theory's module again, under the same name,
+   with another id, over the file other heaps require.  Here the module is
+   released before HOL loads the theory (its data stays, copied into the
+   process's heap), and HOL is told it found no module, so it loads the
+   theory from its .dat and leaves the file alone.  A module Poly/ML can't
+   release is recorded in holbuild_unreleased_modules.  RELEASE is the
+   function releasing it. *)
+fun module_loader_line release =
+  if_theory_modules_has ["found", "usable", "report_refused"]
+    ("val _ = let " ^
+     "val loader = !Meta.moduleSourceLoader " ^
+     "fun hex id = String.concat (map (fn b => StringCvt.padLeft #\"0\" 2 (Word8.toString b)) " ^
+     "(Word8Vector.foldr op:: [] id)) " ^
+     "fun release base = case List.find (fn (b, _) => b = base) (!TheoryModules.found) of " ^
+     "SOME (_, f as {module = SOME m, ...}) => " ^
+     "if TheoryModules.usable m then () " ^
+     "else ((" ^ release ^ " (#id m) " ^
+     "handle e as Interrupt => PolyML.Exception.reraise e " ^
+     "| _ => holbuild_unreleased_modules := hex (#id m) :: !holbuild_unreleased_modules); " ^
+     "TheoryModules.report_refused (#1 (#header f)); " ^
+     "TheoryModules.found := map (fn (b, g) => if b = base then " ^
+     "(b, {module = NONE, refused = false, header = #header f, dat_digest = #dat_digest f}) " ^
+     "else (b, g)) (!TheoryModules.found)) " ^
+     "| _ => () " ^
+     "in Meta.moduleSourceLoader := (fn use => fn file => " ^
+     "((if OS.Path.ext file <> SOME \"sig\" andalso String.isSuffix \"Theory.sml\" file " ^
+     "then release (OS.Path.base file) else ()); loader use file)) end;")
+
 (* The child policy's theory-module lines.  A sandboxed (remote) action
    only reads the host's modules: the worker writes them
    (fill_module_store).  quietbind runs only the first declaration of its
-   code, so each policy is one declaration. *)
+   code, so each policy is one declaration; the loader's runs once the
+   configuration has loaded HOL's module helper. *)
 fun module_policy {sandboxed, store, base_state} =
   let
     val configure =
@@ -502,10 +573,16 @@ fun module_policy {sandboxed, store, base_state} =
       HolbuildToolchain.sml_string store ^ ", base_state = " ^
       HolbuildToolchain.sml_string base_state ^ "}"
   in
-    if sandboxed then
-      if_meta_has ["configureTheoryModuleCache", "theoryModuleWriteLimit"]
-        ("val _ = (Meta.theoryModuleWriteLimit := 0; " ^ configure ^ ");")
-    else if_meta_has ["configureTheoryModuleCache"] ("val _ = " ^ configure ^ ";")
+    (if sandboxed then
+       if_meta_has ["configureTheoryModuleCache", "theoryModuleWriteLimit"]
+         ("val _ = (Meta.theoryModuleWriteLimit := 0; " ^ configure ^ ");")
+     else if_meta_has ["configureTheoryModuleCache"] ("val _ = " ^ configure ^ ";")) ^ "\n" ^
+    unreleased_modules_line ^ "\n" ^
+    module_loader_line
+      (* Tests make it fail (HOLBUILD_TEST_RELEASE_MODULE_FAILS). *)
+      (if OS.Process.getEnv "HOLBUILD_TEST_RELEASE_MODULE_FAILS" = SOME "1"
+       then "(fn _ => raise Fail \"releaseModule\")"
+       else "PolyML.SaveState.releaseModule")
   end
 
 (* Runs [call] on HOL's trace structure, ignoring an unknown trace.  The
@@ -3071,7 +3148,7 @@ fun heap_runtime_identity () =
   case !heap_runtime_identity_memo of
       SOME identity => identity
     | NONE =>
-        let val identity = runtime_files_identity "holbuild-heap-runtime-v1" heap_runtime_source_files
+        let val identity = runtime_files_identity "holbuild-heap-runtime-v2" heap_runtime_source_files
         in heap_runtime_identity_memo := SOME identity; identity end
 
 (* Context checkpoints also hold the theorem numbering HOL assigned so far.
@@ -4711,11 +4788,75 @@ fun take_attached_child () =
 val capture_deps_heap = ref false
 val captured_deps_heap = ref (NONE : string option)
 
+(* The theory modules the captured heap loads, linked from the host's store
+   into a private directory when the preload saved it, with the ids it
+   requires: the publication uploads these, as a restore may later replace
+   a module in the store (fetch_heap_modules). *)
+val captured_heap_modules = ref (NONE : {dir : string, modules : (string * string) list} option)
+
+fun drop_heap_snapshot () =
+  case !captured_heap_modules of
+      SOME {dir, ...} => (captured_heap_modules := NONE; HolbuildRemoveTree.remove_untrusted dir)
+    | NONE => ()
+
+(* Links the modules of HEAP, all in STORE, into a new directory there; NONE
+   if the heap names a file outside the store, which isn't published, or
+   one the store no longer has with the id the heap requires. *)
+fun snapshot_heap_modules store heap =
+  let val modules = saved_module_ids heap
+  in
+    case List.find (fn (_, path) => not (store_module_file store path)) modules of
+        SOME (_, path) =>
+          (warn ("not sharing the deps-loaded heap: " ^
+                 (if Path.dir path = store andalso heap_module_name (Path.file path)
+                  then "its theory module " ^ Path.file path ^ " is gone"
+                  else "it loads " ^ path ^ ", outside the theory module store"));
+           NONE)
+      | NONE =>
+      let
+        val dir = store_temp (Path.concat (store, ".heap-snapshot"))
+        val linked =
+          (ensure_dir dir;
+           map (fn (id, path) =>
+                  let val copy = Path.concat (dir, Path.file path)
+                  in Posix.FileSys.link {old = path, new = copy}; (id, copy) end)
+               modules)
+          handle e => (HolbuildRemoveTree.remove_untrusted dir; raise e)
+      in
+        case List.find (not o module_file_has_id) linked of
+            NONE => SOME {dir = dir, modules = linked}
+          | SOME (_, copy) =>
+              (warn ("not sharing the deps-loaded heap: its theory module " ^ Path.file copy ^
+                     " was replaced by one of another id");
+               HolbuildRemoveTree.remove_untrusted dir;
+               NONE)
+      end
+  end
+
+(* Tests hold a step at a point while the environment variable VAR names
+   a directory: its "reached" is written, then its "release" awaited. *)
+fun test_pause var =
+  case OS.Process.getEnv var of
+      NONE => ()
+    | SOME dir =>
+        let
+          val release = Path.concat (dir, "release")
+          fun wait () =
+            if file_exists release then () else (OS.Process.sleep (Time.fromMilliseconds 10); wait ())
+        in
+          write_text (Path.concat (dir, "reached")) ""; wait ()
+        end
+
+(* A module id as the preload lists it (write_preload). *)
+fun module_id_hex id =
+  String.concat (map (fn c => StringCvt.padLeft #"0" 2 (Int.fmt StringCvt.HEX (ord c))) (explode id))
+
 (* Runs F, the theory child's run, taking the deps heap when the preload
    asks (write_preload): its SHA-256, if it is a plain file, goes in
-   captured_deps_heap, and removing the request lets the child go on.  Only
-   the first request counts: script code could write the next. *)
-fun with_deps_heap_capture deps_loaded f =
+   captured_deps_heap, its modules in STORE in captured_heap_modules, and
+   removing the request lets the child go on.  Only the first request
+   counts: script code could write the next. *)
+fun with_deps_heap_capture store deps_loaded f =
   let
     val request = deps_heap_capture_request deps_loaded
     val mutex = Mutex.mutex ()
@@ -4726,16 +4867,51 @@ fun with_deps_heap_capture deps_loaded f =
     fun heap_sha () =
       if plain_file deps_loaded then SOME (HolbuildHash.file_sha256 deps_loaded) else NONE
       handle e => (warn ("could not hash the deps-loaded heap: " ^ General.exnMessage e); NONE)
-    fun take () = (captured_deps_heap := heap_sha (); remove_file request)
+    fun snapshot () =
+      snapshot_heap_modules store deps_loaded
+      handle e => (warn ("could not link the deps-loaded heap's theory modules: " ^ General.exnMessage e); NONE)
+    val refused = deps_heap_refused_modules deps_loaded
+    (* A heap that requires a module HOL refused isn't shared: its
+       theory's module in the store is another, or will be. *)
+    fun requires_refused () =
+      file_exists refused andalso
+      let val ids = String.tokens Char.isSpace (read_text refused)
+      in List.exists (fn (id, _) => List.exists (fn r => r = module_id_hex id) ids) (saved_module_ids deps_loaded)
+      end
+    (* Whatever fails, the request goes, so the child goes on.  Tests hold
+       it (HOLBUILD_TEST_CAPTURE_PAUSE) to change the heap's modules after
+       the preload saved it. *)
+    fun take () =
+      ((test_pause "HOLBUILD_TEST_CAPTURE_PAUSE";
+        if requires_refused () then
+          warn "not sharing the deps-loaded heap: it requires a theory module HOL refused"
+        else
+          (captured_deps_heap := heap_sha ();
+           if Option.isSome (!captured_deps_heap) then
+             (captured_heap_modules := snapshot ();
+              if Option.isSome (!captured_heap_modules) then ()
+              else captured_deps_heap := NONE)
+           else ()))
+       handle e =>
+         (warn ("not sharing the deps-loaded heap: " ^ General.exnMessage e);
+          captured_deps_heap := NONE;
+          drop_heap_snapshot () handle _ => ());
+      remove_file refused handle _ => ();
+      remove_file request handle _ => ())
     fun watch () =
       if locked (fn () => !finished) then ()
       else if requested () then take ()
       else (OS.Process.sleep (Time.fromMilliseconds 10); watch ())
     val _ = captured_deps_heap := NONE
+    val _ = drop_heap_snapshot ()
     val watcher = Thread.fork (watch, [])
+    (* A child that stops between writing its refused list and its request
+       leaves them for nobody to take. *)
     fun stop () =
       (locked (fn () => finished := true);
-       while Thread.isActive watcher do OS.Process.sleep (Time.fromMilliseconds 10))
+       while Thread.isActive watcher do OS.Process.sleep (Time.fromMilliseconds 10);
+       remove_file refused handle _ => ();
+       remove_file request handle _ => ())
   in
     (f () handle e => (stop (); raise e)) before stop ()
   end
@@ -4903,7 +5079,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
        validate_hol_context (#context run_spec);
        detail_time_phase "build.exec.node.child_run"
          (fn () =>
-             ((if captures then with_deps_heap_capture deps_loaded run_child else run_child ())
+             ((if captures then with_deps_heap_capture (module_store (#holdir tc)) deps_loaded run_child else run_child ())
               before remove_promote_scratch ())
              handle e => (remove_promote_scratch (); raise e)))
       handle Error msg =>
@@ -13349,23 +13525,12 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
              this upload failed, and for a repair if the cache later loses
              the heap's blob. *)
           fun release () = ignore (write_claim 0) handle HolbuildRemoteCache.Unavailable _ => ()
-          (* The theory modules the heap loads, linked from this host's store
-             where no restore can replace them, with the ids it requires. *)
+          (* The theory modules the heap loads, as linked when the preload
+             saved it. *)
           fun with_snapshot f =
-            let val dir = store_temp (Path.concat (module_store, ".heap-snapshot"))
-            in
-              (ensure_dir dir;
-               f (map (fn (id, path) =>
-                          let val copy = Path.concat (dir, Path.file path)
-                          in
-                            (Posix.FileSys.link {old = path, new = copy}
-                             handle OS.SysErr _ => copy_binary path copy);
-                            (id, copy)
-                          end)
-                      (saved_module_ids heap_file))
-               before HolbuildRemoveTree.remove_untrusted dir)
-              handle e => (HolbuildRemoveTree.remove_untrusted dir; raise e)
-            end
+            case !captured_heap_modules of
+                SOME {modules, ...} => f modules
+              | NONE => (warn "not publishing the shared deps-loaded heap: its theory modules weren't linked"; NONE)
           (* With the theory modules the heap loads, for the hosts that lack
              them (fetch_heap_modules). *)
           fun upload_modules modules =
@@ -13374,7 +13539,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 shared_manifest "holbuild-shared-heap-v1" NONE
                   (("heap", sha, "") :: map (fn (path, module) => ("module", module, Path.file path)) modules)
               (* The host that wrote a module usually published it
-                 (publish_modules), so only those the cache lacks are put.
+                 (converge_modules), so only those the cache lacks are put.
                  Each is probed, even one named by an entry this run read:
                  the cache may have lost it since.  A cache that doesn't
                  answer leaves the module to be put.  Not a required read: a
@@ -14196,8 +14361,11 @@ fun module_file_wanted expected file =
       SOME part => List.exists (fn e => e = part) expected
     | NONE => false
 
-(* The most theory modules one worker-run writer saves. *)
-val module_writer_limit = 64
+(* The most theory modules one worker-run writer saves; tests lower it. *)
+fun module_writer_limit () =
+  case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_TEST_MODULE_WRITER_LIMIT") of
+      SOME n => n
+    | NONE => 64
 
 (* How long a writer's HOL child may run.  The worker kills exec-action
    120 s after its result (POST_RESULT_SECONDS), so exec-action gives the
@@ -14216,7 +14384,11 @@ val writer_root_prefix = "module-writer-"
    sixteen theories from their .dat files instead of their modules, so an
    action that lacks only the few parents just built loads those from
    their .dat files. *)
-val module_writer_min_missing = 16
+fun module_writer_min_missing () =
+  (* Tests lower it (HOLBUILD_TEST_MODULE_MIN_MISSING). *)
+  case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_TEST_MODULE_MIN_MISSING") of
+      SOME n => n
+    | NONE => 16
 
 (* Files the module writer leaves in a toolchain's store beside its
    modules and its lock.  [module_store_unsupported]: the toolchain has
@@ -14228,13 +14400,84 @@ val module_writer_min_missing = 16
 val module_store_unsupported = "unsupported"
 val module_store_base_theories = "base-theories"
 
-(* The writer script: records whether the toolchain can write modules,
+(* HOL's module writer (TheoryModules.write_modules), except for a theory
+   whose module is stored but HOL refuses it (module_loader_line): HOL
+   writes that module again, under the same name, which the worker would
+   not store anyway (write_missing_modules), and counts it against the
+   writer's limit, so enough of them leave the missing modules after them
+   unwritten.  Here such a theory is only registered, from its .dat file. *)
+val module_writer_line =
+  if_theory_modules_has
+    ["eligible", "unchanged_bindings", "base_id_of", "absolute", "core_bindings", "sml_header",
+     "file_digest", "module_file", "exists", "mkdir", "module_roots", "save_module", "read_module",
+     "usable"]
+    ("val _ = let " ^
+     "fun write_modules {theories, directory, base_state, output, limit} = " ^
+     "case (TheoryModules.eligible () andalso TheoryModules.unchanged_bindings (), " ^
+     "TheoryModules.base_id_of base_state handle OS.SysErr _ => NONE) of " ^
+     "(true, SOME base_id) => " ^
+     "(let " ^
+     "val directory = TheoryModules.absolute directory; " ^
+     "val output = TheoryModules.absolute output; " ^
+     "val bindings = TheoryModules.core_bindings (); " ^
+     "fun entry sml = " ^
+     "let val base = OS.Path.base sml; " ^
+     "val (thy, hash) = case TheoryModules.sml_header (base ^ \".sml\") of SOME h => h " ^
+     "| NONE => raise Fail (\"no theory header in \" ^ sml) " ^
+     "in if TheoryReader.is_canonical thy then NONE " ^
+     "else let val dat_digest = TheoryModules.file_digest (base ^ \".dat\") " ^
+     "in SOME {base = base, thy = thy, hash = hash, dat_digest = dat_digest, " ^
+     "file = TheoryModules.module_file base_id (thy, dat_digest)} end end; " ^
+     "fun path (e : {base : string, thy : string, hash : string, dat_digest : string, file : string}) = " ^
+     "OS.Path.concat (directory, #file e); " ^
+     "fun missing e = not (TheoryModules.exists (path e)); " ^
+     "fun through_last_missing entries = " ^
+     "#2 (List.foldr (fn (e, (seen, acc)) => let val seen = seen orelse missing e " ^
+     "in (seen, if seen then e :: acc else acc) end) (false, []) entries); " ^
+     "fun decode e = TheoryReader.decode_thydata {thyname = #thy e, path = #base e ^ \".dat\", hash = #hash e}; " ^
+     "fun save (e, name, written) = " ^
+     "case decode e of " ^
+     "(data, true) => " ^
+     "(case TheoryModules.module_roots name (#dat_digest e) data bindings of " ^
+     "SOME roots => (TheoryModules.save_module (OS.Path.concat (output, #file e)) base_id roots; written + 1) " ^
+     "| NONE => written) " ^
+     "| _ => written; " ^
+     "fun theory (e, written) = " ^
+     "let val name = OS.Path.file (#base e) " ^
+     "in if missing e then save (e, name, written) " ^
+     "else case TheoryModules.read_module (path e) name (#thy e, #dat_digest e) of " ^
+     "SOME m => if TheoryModules.usable m " ^
+     "then (TheoryReader.register_kernel (#hash e) (#data m); written) " ^
+     "else ((PolyML.SaveState.releaseModule (#id m) handle x as Interrupt => PolyML.Exception.reraise x | _ => ()); " ^
+     "ignore (decode e); written) " ^
+     "| NONE => (ignore (decode e); written) end " ^
+     "handle x as Interrupt => PolyML.Exception.reraise x " ^
+     "| x => (TextIO.output (TextIO.stdErr, \"theory modules: \" ^ #thy e ^ \": \" ^ " ^
+     "General.exnMessage x ^ \"\\n\"); written); " ^
+     "fun loop ([], written) = written " ^
+     "| loop (e :: rest, written) = if written >= limit then written else loop (rest, theory (e, written)) " ^
+     "in case through_last_missing (List.mapPartial entry theories) of " ^
+     "[] => 0 " ^
+     "| needed => (TheoryModules.mkdir output; loop (needed, 0)) end " ^
+     "handle x as Interrupt => PolyML.Exception.reraise x " ^
+     "| x => (TextIO.output (TextIO.stdErr, \"theory modules: \" ^ General.exnMessage x ^ \"\\n\"); 0)) " ^
+     "| _ => 0 " ^
+     "in Meta.moduleWriter := SOME write_modules end;")
+
+(* The writer script: loads HOL's module helper and replaces its writer
+   (module_writer_line), records whether the toolchain can write modules,
    the base state's theories when [base_theories], and then writes the
    modules missing from the store.  quietbind runs only the first
    declaration of its text, so the recording and the call share one. *)
-fun module_writer_script {output, base_theories, call} =
+fun module_writer_script {output, base_state, base_theories, call} =
   let
     fun out file = HolbuildToolchain.sml_string (Path.concat (output, file))
+    (* Writes nothing, but loads the helper, through Meta. *)
+    val load_helper =
+      if_meta_has ["writeTheoryModules"]
+        ("val _ = Meta.writeTheoryModules {theories = [], directory = " ^ HolbuildToolchain.sml_string output ^
+         ", base_state = " ^ HolbuildToolchain.sml_string base_state ^
+         ", output = " ^ HolbuildToolchain.sml_string output ^ ", limit = 0};")
     val record_base =
       if base_theories then
         "val _ = let val out = TextIO.openOut " ^ out module_store_base_theories ^
@@ -14243,6 +14486,7 @@ fun module_writer_script {output, base_theories, call} =
         "TextIO.closeOut out end; "
       else ""
   in
+    load_helper ^ "\n" ^ module_writer_line ^ "\n" ^
     "val _ = let " ^
     "fun sub (ns : PolyML.NameSpace.nameSpace) name = " ^
     "Option.map PolyML.NameSpace.Structures.contents (#lookupStruct ns name); " ^
@@ -14267,7 +14511,7 @@ val module_remote_header = "holbuild-theory-module-v1"
 
 fun module_remote_key {toolchain, store, wanted, dat_sha256} =
   HolbuildHash.string_sha256
-    (String.concat [module_remote_header, "\ntoolchain=", toolchain, "\nstore=", Path.file store,
+    (String.concat [module_remote_header, "\ntoolchain=", toolchain, "\nstore=", store,
                     "\nmodule=", wanted, "\ndat-sha256=", dat_sha256, "\n"])
 
 (* Publishing may go on this long past the writer's deadline: the worker
@@ -14280,25 +14524,35 @@ val module_publish_grace = Time.fromSeconds 10
 fun module_request_fits deadline =
   Time.<= (Time.+ (Time.now (), Time.fromSeconds (Int.toLarge HolbuildRemoteCache.stall_timeout_seconds)), deadline)
 
+(* Puts the module file SRC in STORE as NAME, unless the store has a
+   module of that name: a name keeps the module it first held, whose id
+   the deps heaps saved with it require (a module HOL writes again gets
+   another id).  Whether SRC was put there. *)
+fun install_module store {src, name} =
+  (Posix.FileSys.link {old = src, new = Path.concat (store, name)}; true)
+  handle e as OS.SysErr (_, SOME err) => if err = Posix.Error.exist then false else raise e
+
 (* Fetches into STORE, by way of STAGING, the published ones of the
    WANTED modules, each a (`<theory>-<.dat SHA-1>.pmo`, remote key) pair,
    starting only requests that end by DEADLINE.  A module is installed
    only from an entry that lists one plain file named for it.  A miss or
-   a failed fetch leaves the module to the writer.  The result: how many
-   entries were looked up, and the keys of those whose blob the cache
-   answered 404 for (it expires a blob on its own, before the entry). *)
+   a failed fetch leaves the module to the writer, which looks again.  The
+   result: how many entries were looked up, and the modules with no
+   entry. *)
 fun fetch_published_modules remote {store, staging, wanted, deadline} =
   let
     val probes = ref 0
-    val stale = ref ([] : string list)
+    val unpublished = ref ([] : string list)
     val mutex = Mutex.mutex ()
     fun fetch (name, key) =
       if not (module_request_fits deadline) then ()
       else HolbuildRemoteCache.retrying_within deadline (fn () =>
         (Mutex.lock mutex; probes := !probes + 1; Mutex.unlock mutex;
-         case HolbuildRemoteCache.get_action remote key of
-             NONE => ()
-           | SOME text =>
+         case HolbuildRemoteCache.probe_action remote key of
+             {found = NONE, missing} =>
+               if missing then (Mutex.lock mutex; unpublished := name :: !unpublished; Mutex.unlock mutex)
+               else ()
+           | {found = SOME text, ...} =>
                case shared_manifest_entries text of
                    [("file", sha, file)] =>
                      if not (plain_file_name file andalso module_file_theory_part file = SOME name) then
@@ -14309,13 +14563,11 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
                        in
                          (* The usual stall budget, which module_request_fits allows for,
                             whatever the module's size. *)
-                         case HolbuildRemoteCache.fetch_unlisted_blob_within
-                                HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp} of
-                             HolbuildCacheBackend.Hit => FS.rename {old = tmp, new = Path.concat (store, file)}
-                           | HolbuildCacheBackend.Miss =>
-                               (remove_file tmp;
-                                Mutex.lock mutex; stale := key :: !stale; Mutex.unlock mutex)
-                           | _ => remove_file tmp
+                         (case HolbuildRemoteCache.fetch_unlisted_blob_within
+                                 HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp} of
+                              HolbuildCacheBackend.Hit => ignore (install_module store {src = tmp, name = file})
+                            | _ => ();
+                          remove_file tmp)
                        end
                  | _ => warn ("ignoring a malformed published theory module entry for " ^ name)))
     fun try item = fetch item handle e => warn ("theory module not fetched: " ^ General.exnMessage e)
@@ -14324,60 +14576,168 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
     ensure_dir staging;
     parallel_all remote_probe_width try wanted;
     HolbuildRemoveTree.remove_untrusted staging;
-    {probes = !probes, stale = !stale}
+    {probes = !probes, unpublished = !unpublished}
   end
 
-(* Publishes the module files in STORE, each a (file, remote key) pair,
-   starting only requests that end by DEADLINE.  Another writer may have
-   published the same module first, with other bytes: either is valid, so
-   its entry stays, and the module isn't uploaded.  An entry whose blob
-   the cache lost (one of STALE, from fetch_published_modules) is replaced,
-   on every node.  A heap restore (fetch_heap_modules) may rename
-   another copy over a module meanwhile, so each is pinned in the private
-   STAGING directory, and hashed and uploaded from there. *)
-fun publish_modules remote {store, staging, modules, stale, deadline} =
+(* Stores the modules the writer left in STAGING, each a (file, remote
+   key) pair, publishing each before it is stored, and starting only
+   requests that end by DEADLINE.  Writers on other hosts may give one
+   module another id, so the copy published first is the one every host
+   stores: a module another writer published is fetched and stored in
+   place of this writer's.  This writer's is stored once its entry is
+   put (where the cache has several nodes, once a read-back after
+   shared_heap_claim_settle finds it there, or finds none); when the
+   published entry's blob is lost (a 404 when this writer looks the entry
+   up), as the entry is replaced with it on every node; and
+   when the cache can't be asked or answer in time.  None is stored when
+   the entry another writer published is malformed or its module can't
+   be fetched.  A store never replaces a module it has (install_module).
+   The result: this writer's files that were stored, and how many modules
+   were fetched and how many entries published. *)
+fun converge_modules remote {store, staging, modules, deadline} =
   let
-    fun publish (file, key) =
-      if not (module_request_fits deadline) then false
-      else
-        let
-          val path = Path.concat (store, file)
-          val copy = Path.concat (staging, file)
-          val replace = List.exists (fn k => k = key) stale
-          fun upload () =
-            (replace orelse not (Option.isSome (HolbuildRemoteCache.get_action remote key))) andalso
-            let val sha = HolbuildHash.file_sha256 copy
-            in
-              module_request_fits deadline andalso
-              (case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = copy} of
-                   HolbuildCacheBackend.Published => ()
-                 | HolbuildCacheBackend.AlreadyPresent => ()
-                 | _ => raise Error ("could not upload " ^ file);
-               module_request_fits deadline andalso
-               (let val entry = {key = key, text = shared_manifest module_remote_header NONE [("file", sha, file)]}
-                in
-                  (if replace then HolbuildRemoteCache.replace_action_everywhere remote entry
-                   else HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsent entry)
-                  = HolbuildCacheBackend.Published
-                end))
-            end
-        in
-          (Posix.FileSys.link {old = path, new = copy} handle OS.SysErr _ => copy_binary path copy);
-          (HolbuildRemoteCache.retrying_within deadline upload before remove_file copy)
-          handle e => (remove_file copy; raise e)
-        end
-        handle e => (warn ("theory module not published: " ^ General.exnMessage e); false)
-    val published = ref 0
     val mutex = Mutex.mutex ()
-    fun one module =
-      if publish module then (Mutex.lock mutex; published := !published + 1; Mutex.unlock mutex) else ()
+    val installed = ref []
+    val fetched = ref 0
+    val published = ref 0
+    fun count f = (Mutex.lock mutex; f (); Mutex.unlock mutex)
+    fun published_one () = count (fn () => published := !published + 1)
+    fun install_own file =
+      if install_module store {src = Path.concat (staging, file), name = file}
+      then count (fn () => installed := file :: !installed) else ()
+    fun manifest file sha = shared_manifest module_remote_header NONE [("file", sha, file)]
+    fun lookup key = HolbuildRemoteCache.get_action remote key
+    (* The SHA-256 of FILE's blob once the cache has it. *)
+    fun upload file =
+      let
+        val path = Path.concat (staging, file)
+        val sha = HolbuildHash.file_sha256 path
+      in
+        case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
+            HolbuildCacheBackend.Published => SOME sha
+          | HolbuildCacheBackend.AlreadyPresent => SOME sha
+          | _ => NONE
+      end
+    fun heal (file, key) =
+      ((case (if module_request_fits deadline then upload file else NONE) of
+            SOME sha =>
+              if module_request_fits deadline andalso
+                 HolbuildRemoteCache.replace_action_everywhere remote {key = key, text = manifest file sha}
+                 = HolbuildCacheBackend.Published
+              then published_one () else ()
+          | NONE => ())
+       handle e => warn ("theory module not published: " ^ General.exnMessage e);
+       install_own file)
+    fun install_published (file, key) text =
+      (* A malformed entry still holds the key: nothing is stored. *)
+      case (shared_manifest_entries text handle Error _ => []) of
+          [("file", sha, name)] =>
+            if not (plain_file_name name andalso module_file_theory_part name = module_file_theory_part file) then
+              warn ("ignoring the published theory module " ^ HolbuildHash.quote name ^ " for " ^ file)
+            else if not (module_request_fits deadline) then ()
+            else
+              let val tmp = Path.concat (staging, name ^ ".published")
+              in
+                (* Every node is asked: only a blob none holds is lost, and
+                   healing replaces the entry. *)
+                (case HolbuildRemoteCache.required (fn () =>
+                        HolbuildRemoteCache.fetch_unlisted_blob_within
+                          HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp}) of
+                     HolbuildCacheBackend.Hit =>
+                       if install_module store {src = tmp, name = name} then count (fn () => fetched := !fetched + 1)
+                       else ()
+                   | HolbuildCacheBackend.Miss => heal (file, key)
+                   | _ => ();
+                 remove_file tmp)
+                handle e => (remove_file tmp; warn ("theory module not fetched: " ^ General.exnMessage e))
+              end
+        | _ => warn ("ignoring a malformed published theory module entry for " ^ file)
+    (* Publishes or fetches FILE's module, or stores this writer's; SOME
+       (file, key, entry) for an entry put on one of several nodes, which
+       a read-back confirms. *)
+    fun one (file, key) =
+      if not (module_request_fits deadline) then (install_own file; NONE)
+      else
+        case lookup key of
+            SOME text => (install_published (file, key) text; NONE)
+          | NONE =>
+              case (if module_request_fits deadline then upload file else NONE) of
+                  NONE => (install_own file; NONE)
+                | SOME sha =>
+                    if not (module_request_fits deadline) then (install_own file; NONE)
+                    else
+                      let val text = manifest file sha
+                      in
+                        case HolbuildRemoteCache.put_action_if (fn () => module_request_fits deadline)
+                               remote HolbuildCacheBackend.PutIfAbsent {key = key, text = text} of
+                            HolbuildCacheBackend.Published =>
+                              if length (HolbuildRemoteCache.action_urls remote key) <= 1
+                              then (published_one (); install_own file; NONE)
+                              else SOME (file, key, text)
+                          (* Another writer's entry (put_action names the
+                             node that holds it): its module is stored, or,
+                             with no time to fetch it or no answer, none.
+                             Any other conflict is a failed put. *)
+                          | HolbuildCacheBackend.Conflict at =>
+                              ((if at <> hd (HolbuildRemoteCache.action_urls remote key) then install_own file
+                                else if not (module_request_fits deadline) then ()
+                                else
+                                  case (lookup key
+                                        handle Thread.Interrupt => raise Thread.Interrupt
+                                             | e => (warn ("theory module not fetched: " ^ General.exnMessage e); NONE)) of
+                                      SOME winner => install_published (file, key) winner
+                                    | NONE => ());
+                               NONE)
+                          | _ => (install_own file; NONE)
+                      end
+    fun read_back (file, key, text) =
+      if not (module_request_fits deadline) then (published_one (); install_own file)
+      else
+        case HolbuildRemoteCache.required (fn () => lookup key) of
+            SOME found =>
+              if found = text then
+                (HolbuildRemoteCache.refresh_action_replicas remote key
+                   (HolbuildRemoteCache.action_metadata remote key text)
+                   (SOME (hd (HolbuildRemoteCache.action_urls remote key)));
+                 published_one ();
+                 install_own file)
+              else install_published (file, key) found
+          | NONE => (published_one (); install_own file)
+    fun guarded f (file, x) =
+      HolbuildRemoteCache.retrying_within deadline (fn () => f x)
+      handle e => (warn ("theory module not published: " ^ General.exnMessage e); install_own file)
+    val confirm = ref []
+    val _ =
+      transfer_all
+        (guarded (fn module =>
+                    case one module of
+                        SOME pending => count (fn () => confirm := pending :: !confirm)
+                      | NONE => ()))
+        (map (fn (module as (file, _)) => (file, module)) modules)
   in
-    HolbuildRemoveTree.remove_untrusted staging;
-    ensure_dir staging;
-    (transfer_all one modules before HolbuildRemoveTree.remove_untrusted staging)
-    handle e => (HolbuildRemoveTree.remove_untrusted staging; raise e);
-    !published
+    if null (!confirm) then ()
+    else
+      (OS.Process.sleep shared_heap_claim_settle;
+       parallel_all remote_probe_width
+         (guarded (fn pending => read_back pending))
+         (map (fn (pending as (file, _, _)) => (file, pending)) (!confirm)));
+    {installed = !installed, fetched = !fetched, published = !published}
   end
+
+(* The remote keys of the MISSING modules (expected_modules); the
+   toolchain is hashed only when some are missing. *)
+fun module_remote_keys tc [] = []
+  | module_remote_keys tc missing =
+      let
+        val toolchain = HolbuildToolchain.toolchain_key tc
+        val shas = HolbuildHash.files_sha256 (map #2 missing)
+      in
+        ListPair.mapEq
+          (fn ((wanted, _), sha) =>
+              (wanted, module_remote_key {toolchain = toolchain, store = module_store_id (#holdir tc),
+                                          wanted = wanted, dat_sha256 = sha}))
+          (missing, shas)
+      end
 
 (* Restore missing or mismatched modules from the heap manifest. These are
    the blobs saved with the heap, even if the action's .dat files changed.
@@ -14427,9 +14787,10 @@ fun fetch_heap_modules remote tc wanted =
    the store for the theories the action loads that another host
    published; then a sandboxed child that runs no project code writes the
    modules still missing, from their restored .dat files alone (HOL's
-   Meta.writeTheoryModules), and the worker moves into the store only
-   modules named for those theories' current .dat files, and publishes
-   them.  Each theory is given after its parents: the
+   Meta.writeTheoryModules), and the worker stores and publishes only
+   the modules still missing, named for those theories' current .dat
+   files, each as first published (converge_modules), never replacing a
+   stored one.  Each theory is given after its parents: the
    project's from the spec, the toolchain's beside their objects in its
    sigobj.  Neither starts when the toolchain's HOL has no module helper,
    when an earlier writer found it cannot write modules, when the store
@@ -14556,7 +14917,7 @@ fun write_missing_modules remote root tc wanted deadline =
       end
     fun worth_writing missing =
       not (null missing) andalso
-      not (isSome base_theories andalso length missing < module_writer_min_missing)
+      not (isSome base_theories andalso length missing < module_writer_min_missing ())
     (* HOL maps <dir>/xTheory.sml to <dir>/.hol/objs/xTheory.sml itself,
        so it is given the unmapped name of a toolchain theory. *)
     fun hol_name b =
@@ -14566,7 +14927,7 @@ fun write_missing_modules remote root tc wanted deadline =
         then Path.concat (Path.dir (Path.dir dir), Path.file b)
         else b
       end
-    (* Inside the store, so that the moves below are renames on its file
+    (* Inside the store, so that the modules are linked into it on its file
        system, however a worker's containers mount the stores.  The writer
        may write only here, and the store's lock keeps it to one writer. *)
     val output = Path.concat (store, ".writer")
@@ -14578,36 +14939,50 @@ fun write_missing_modules remote root tc wanted deadline =
       "], directory = " ^ HolbuildToolchain.sml_string store ^
       ", base_state = " ^ HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^
       ", output = " ^ HolbuildToolchain.sml_string output ^
-      ", limit = " ^ Int.toString module_writer_limit ^ "};"
+      ", limit = " ^ Int.toString (module_writer_limit ()) ^ "};"
     val expected_names = map #1 expected
     val installed = ref []
-    fun move file =
-      if module_file_wanted expected_names file then
-        (FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)};
-         installed := file :: !installed)
-      else if file = module_store_unsupported orelse
-              (file = module_store_base_theories andalso not (isSome base_theories))
+    fun move_marker file =
+      if file = module_store_unsupported orelse
+         (file = module_store_base_theories andalso not (isSome base_theories))
       then FS.rename {old = Path.concat (output, file), new = Path.concat (store, file)}
       else ()
+    (* With the remote cache on, the child ends in time for a publication
+       that stalls (module_request_fits) to end by the publish deadline,
+       when that leaves it module_writer_min_time. *)
     fun child_deadline () =
-      let val limit = Time.+ (Time.now (), module_writer_time)
-      in if Time.< (limit, deadline) then limit else deadline end
+      let
+        val now = Time.now ()
+        fun earliest (a, b) = if Time.< (a, b) then a else b
+        val limit = earliest (Time.+ (now, module_writer_time), deadline)
+        val publish_by =
+          Time.- (Time.+ (deadline, module_publish_grace),
+                  Time.fromSeconds (Int.toLarge HolbuildRemoteCache.stall_timeout_seconds + 2))
+      in
+        (* With fail_closed, an open breaker raises rather than says the
+           cache is off. *)
+        if not (HolbuildRemoteCache.disabled () handle HolbuildRemoteCache.Unavailable _ => true) andalso
+           Time.<= (Time.+ (now, module_writer_min_time), publish_by)
+        then earliest (limit, publish_by)
+        else limit
+      end
     (* An action root keeps no file of the writer's. *)
     fun clean () =
       (remove_file script; remove_file log; HolbuildRemoveTree.remove_untrusted output)
+    (* Whether the child ran and the sandbox validated what it left in
+       OUTPUT, which it does also for a child it killed or that failed:
+       only then are the child's modules stored. *)
     fun write () =
-      if Time.< (Time.- (deadline, Time.now ()), module_writer_min_time) then ()
+      if Time.< (Time.- (deadline, Time.now ()), module_writer_min_time) then false
       else
         let
           val _ = HolbuildRemoveTree.remove_untrusted output
           val _ = ensure_dir output
           val _ =
             write_text script
-              (module_writer_script {output = output, base_theories = not (isSome base_theories),
+              (module_writer_script {output = output, base_state = HolbuildToolchain.base_state tc,
+                                     base_theories = not (isSome base_theories),
                                      call = call})
-          (* Whether the sandbox validated what the child left, which it
-             does also for a child it killed or that failed: only then
-             are the child's modules stored. *)
           val _ = HolbuildActionSandbox.module_reads := (fn () => stored_modules store expected_names)
           val validated =
             (HolbuildActionSandbox.with_output_dirs [output] (fn () =>
@@ -14618,54 +14993,56 @@ fun write_missing_modules remote root tc wanted deadline =
              true)
             handle e => (warn ("theory modules not written: " ^ General.exnMessage e); false)
         in
-          (if validated then List.app (move o Path.file) (HolbuildCache.children output) else ();
-           clean ())
-          handle e => (clean (); raise e)
+          if validated then List.app (move_marker o Path.file) (HolbuildCache.children output) else ();
+          validated
         end
-    (* The remote keys of the MISSING modules; the toolchain is hashed only
-       when some are missing. *)
-    fun remote_keys missing =
-      let
-        val toolchain = HolbuildToolchain.toolchain_key tc
-        val shas = HolbuildHash.files_sha256 (map #2 missing)
-      in
-        ListPair.mapEq
-          (fn ((wanted, _), sha) =>
-              (wanted, module_remote_key {toolchain = toolchain, store = store, wanted = wanted, dat_sha256 = sha}))
-          (missing, shas)
-      end
+    val remote_keys = module_remote_keys tc
     val missing = missing_modules ()
     val probed = ref 0
     val fetched = ref 0
     val published = ref 0
     (* Fetch what another host published, write what is still missing,
-       and publish what the writer stored. *)
+       and store and publish what the writer wrote of that.  HOL writes
+       again a module it refused; the store keeps the one it has. *)
     fun fill () =
       let
         val keys = remote_keys missing handle e => (warn ("theory modules not fetched: " ^ General.exnMessage e); [])
-        val stale =
-          (let val {probes, stale} =
-                 fetch_published_modules remote
-                   {store = store, staging = output, wanted = keys,
-                    deadline = Time.- (deadline, module_writer_min_time)}
-           in probed := probes; stale end)
-          handle e => (warn ("theory modules not fetched: " ^ General.exnMessage e); [])
+        val _ =
+          (probed := #probes (fetch_published_modules remote
+                                {store = store, staging = output, wanted = keys,
+                                 deadline = Time.- (deadline, module_writer_min_time)}))
+          handle e => warn ("theory modules not fetched: " ^ General.exnMessage e)
         val still = missing_modules ()
         val _ = fetched := length missing - length still
+        fun key_of file =
+          Option.mapPartial
+            (fn part => Option.map #2 (List.find (fn (wanted, _) => wanted = part) keys))
+            (module_file_theory_part file)
+        fun store_written () =
+          let
+            val written =
+              List.filter (module_file_wanted (map #1 still)) (map Path.file (HolbuildCache.children output))
+            (* Without a remote key (its .dat couldn't be hashed) a module
+               is only stored. *)
+            val unkeyed =
+              List.filter (fn file => install_module store {src = Path.concat (output, file), name = file})
+                (List.filter (not o isSome o key_of) written)
+            val result =
+              converge_modules remote
+                {store = store, staging = output,
+                 modules = List.mapPartial (fn file => Option.map (fn key => (file, key)) (key_of file)) written,
+                 deadline = Time.+ (deadline, module_publish_grace)}
+          in
+            installed := unkeyed @ #installed result;
+            fetched := !fetched + #fetched result;
+            published := #published result
+          end
       in
         if worth_writing still then
-          (write ();
-           published :=
-             publish_modules remote
-               {store = store, staging = output,
-                modules = List.mapPartial
-                            (fn file =>
-                                Option.mapPartial
-                                  (fn part => Option.map (fn (_, key) => (file, key))
-                                                (List.find (fn (wanted, _) => wanted = part) keys))
-                                  (module_file_theory_part file))
-                            (!installed),
-                stale = stale, deadline = Time.+ (deadline, module_publish_grace)})
+          (* Tests hold the writer (HOLBUILD_TEST_WRITER_PAUSE) past its
+             check for missing modules, for a restore to store one. *)
+          ((if write () then (test_pause "HOLBUILD_TEST_WRITER_PAUSE"; store_written ()) else ()) before clean ())
+          handle e => (clean (); raise e)
         else ()
       end
   in
@@ -14692,19 +15069,115 @@ fun module_writer_supported holdir =
   file_exists (Path.concat (holdir, "tools-poly/poly/theory_modules.ML")) andalso
   not (path_exists (Path.concat (module_store holdir, module_store_unsupported)))
 
+(* A new store takes its base theories from the v1 store's
+   (module_store), which lists the same: they're the base state's. *)
+fun seed_module_store holdir =
+  let
+    val file = Path.concat (module_store holdir, module_store_base_theories)
+    val old = Path.concat (module_store_v1 holdir, module_store_base_theories)
+  in
+    if file_exists file orelse not (file_exists old) then ()
+    else
+      let val tmp = store_temp file
+      in
+        ensure_dir (module_store holdir);
+        (copy_binary old tmp; FS.rename {old = tmp, new = file})
+        handle e => (remove_file tmp; raise e)
+      end
+  end
+  handle e => warn ("theory module store not seeded: " ^ General.exnMessage e)
+
 fun fill_module_store remote root tc wanted deadline =
   let
     val t0 = Time.now ()
     val none = {installed = 0, missing = 0, probed = 0, fetched = 0, published = 0}
     val {installed, missing, probed, fetched, published} =
       (if module_writer_supported (#holdir tc)
-       then write_missing_modules remote root tc wanted deadline
+       then (seed_module_store (#holdir tc); write_missing_modules remote root tc wanted deadline)
        else none)
       handle e => (warn ("theory modules not written: " ^ General.exnMessage e); none)
   in
     {ms = Time.toMilliseconds (Time.- (Time.now (), t0)), installed = installed, missing = missing,
      probed = probed, fetched = fetched, published = published}
   end
+
+(* The modules of a store whose remote cache entries were looked up and
+   found missing (prefetch_modules), one `<theory>-<.dat SHA-1>.pmo` name
+   per line. *)
+val module_store_probed_missing = ".probed-missing"
+
+(* How long prefetch_modules waits for the store's writer lock, and has
+   for its requests: time for a stalled one (module_request_fits), and
+   then some. *)
+val module_prefetch_lock_wait = Time.fromSeconds 15
+val module_prefetch_time = Time.fromSeconds (Int.toLarge HolbuildRemoteCache.stall_timeout_seconds + 15)
+
+(* Before a theory action's first child, when it has no deps heap to
+   resume from: fetches the modules the store lacks of the theories it
+   loads (WANTED, as for fill_module_store) that another host published.
+   A new store (for a new toolchain, or under a new name) would otherwise
+   leave the action, and the deps heap it saves, without modules, until
+   the writer ran after enough results.  Only when the store has its base
+   theories and lacks module_writer_min_missing or more modules not
+   already found unpublished; it waits a little for the store's writer
+   lock, and goes on without it. *)
+fun prefetch_modules remote root tc wanted =
+  if not (module_writer_supported (#holdir tc)) then ()
+  else
+    let
+      val holdir = #holdir tc
+      val store = module_store holdir
+      val _ = seed_module_store holdir
+      val probed_file = Path.concat (store, module_store_probed_missing)
+      fun unprobed () =
+        let
+          val {expected, base_theories, ...} = expected_modules root tc wanted
+          val known =
+            Binaryset.addList
+              (Binaryset.empty String.compare,
+               List.mapPartial (module_file_theory_part o Path.file) (HolbuildCache.children store) @
+               (if file_exists probed_file then String.tokens Char.isSpace (read_text probed_file) else []))
+          val missing = List.filter (fn (e, _) => not (Binaryset.member (known, e))) expected
+        in
+          if isSome base_theories andalso length missing >= module_writer_min_missing () then missing else []
+        end
+      val give_up = Time.+ (Time.now (), module_prefetch_lock_wait)
+      fun acquire () =
+        case HolbuildFileLock.try_acquire_path
+               {path = Path.concat (store, module_store_writer_lock), obsolete_kind = NONE} of
+            SOME lock => SOME lock
+          | NONE =>
+              if Time.>= (Time.now (), give_up) then NONE
+              else (OS.Process.sleep (Time.fromMilliseconds 200); acquire ())
+      fun fetch () =
+        case unprobed () of
+            [] => ()
+          | missing =>
+              let
+                val {unpublished, ...} =
+                  fetch_published_modules remote
+                    {store = store, staging = store_temp (Path.concat (store, ".prefetch")),
+                     wanted = module_remote_keys tc missing,
+                     deadline = Time.+ (Time.now (), module_prefetch_time)}
+                val old = if file_exists probed_file then read_text probed_file else ""
+                val tmp = store_temp probed_file
+              in
+                if null unpublished then ()
+                else
+                  (write_text tmp (old ^ String.concat (map (fn name => name ^ "\n") unpublished));
+                   FS.rename {old = tmp, new = probed_file})
+                  handle e => (remove_file tmp; raise e)
+              end
+    in
+      if null (unprobed ()) then ()
+      else
+        case acquire () of
+            NONE => ()
+          | SOME lock =>
+              ((if HolbuildFileLock.at_path lock then fetch () else ()) before HolbuildFileLock.release lock)
+              handle e => (HolbuildFileLock.release lock; raise e)
+    end
+    handle e => warn ("theory modules not prefetched: " ^ General.exnMessage e)
 
 (* Tool caches (build --tool-cache NAME).  A theory child may keep files in
    HOLBUILD_TOOL_CACHE_DIR that a later action with the same dependencies and
@@ -15334,15 +15807,21 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                       before add_restore_steps ())
                      handle e => (add_restore_steps (); raise e))
                 | _ => nothing_restored
+            val _ =
+              if not (Option.isSome ahead) andalso not (Option.isSome (#heap restored))
+              then prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
+              else ()
             fun publish_shared () =
-              if not (!HolbuildActionSandbox.outputs_validated) then () else
-              case shared of
-                  SOME ctx =>
-                    (publishing_checkpoints := true;
-                     (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
-                      before publishing_checkpoints := false)
-                     handle e => (publishing_checkpoints := false; raise e))
-                | NONE => ()
+              ((if not (!HolbuildActionSandbox.outputs_validated) then () else
+                case shared of
+                    SOME ctx =>
+                      (publishing_checkpoints := true;
+                       (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
+                        before publishing_checkpoints := false)
+                       handle e => (publishing_checkpoints := false; raise e))
+                  | NONE => ())
+               before drop_heap_snapshot ())
+              handle e => (drop_heap_snapshot (); raise e)
             val tool_cache = case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec
             val _ = if Option.isSome ahead then () else stage_scratch_input spec
             fun publish_tools () =
@@ -15376,7 +15855,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             deferred :=
               (fn () =>
                  ((* A passing non-target has no checkpoint to share. *)
-                  if checkpoint_target_enabled policy then publish_shared () else ();
+                  if checkpoint_target_enabled policy then publish_shared () else drop_heap_snapshot ();
                   if !cancelled then () else
                   (publish_tools ();
                    (* After the publish: the checkpoints saved after
@@ -15545,6 +16024,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
              Path.file (#source_file action), "holbuild-export-theory.sml"]
         val outcome : exn option option ref = ref NONE
         val started = Time.now ()
+        val _ = prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
         (* Before the late parents arrive; the action's later children
            look again (build). *)
         val _ = HolbuildActionSandbox.module_reads := theory_module_grants root tc spec NONE
@@ -15963,10 +16443,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  what follows is off the client's path. *)
               (case result_file of
                    SOME path => write_text path text
-                 | NONE => print text);
+                 | NONE => print text)
+              handle e => (drop_heap_snapshot () handle _ => (); raise e);
               let
                 val t0 = Time.now ()
                 val _ = !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e)
+                (* An abandoned or unpublished run's snapshot goes too. *)
+                val _ = drop_heap_snapshot () handle _ => ()
                 val writer = if !cancelled then NONE else Option.mapPartial stage_writer (!write_modules)
               in
                 empty_root ();

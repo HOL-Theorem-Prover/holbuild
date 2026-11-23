@@ -817,6 +817,25 @@ fun get_action_using usable cache key = Option.map (remember_action cache) (fetc
 
 fun get_action cache key = get_action_using (fn _ => true) cache key
 
+(* The entry for KEY, as get_action finds it, and, with none, whether a
+   node answered that it holds none (a 404), not with an error or an
+   unusable entry. *)
+fun probe_action cache key =
+  let
+    val tmp = temp_path "action"
+    fun found () = SOME (remember_action cache (metadata_manifest (read_text tmp))) handle _ => NONE
+    val result =
+      case send_urls "GET" (action_urls cache key) tmp
+             (fn url => get_status {url = url, dst = tmp, timeout = stall_timeout_seconds}) of
+          SOME (_, HolbuildHttp.Response 200) => {found = found (), missing = false}
+        | SOME (_, HolbuildHttp.Response 404) => {found = NONE, missing = true}
+        | _ => {found = NONE, missing = false}
+  in
+    remove_file tmp; result
+  end
+  handle e as Unavailable _ => raise e
+       | _ => {found = NONE, missing = false}
+
 fun action_metadata cache key text =
   let
     val refs = HolbuildCacheTransfer.unique_blobs text
@@ -949,7 +968,9 @@ fun replace_action_everywhere cache {key, text} =
     handle e as Unavailable _ => raise e
          | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
 
-fun put_action cache policy {key, text} =
+(* put_action, which puts the entry, once no node holds one, only if FITS
+   () then (else Skipped). *)
+fun put_action_if fits cache policy {key, text} =
   if disabled () then HolbuildCacheBackend.Skipped
   else
     let
@@ -963,10 +984,12 @@ fun put_action cache policy {key, text} =
                | HolbuildCacheBackend.PutIfAbsentOrSame =>
                    if existing = text then HolbuildCacheBackend.AlreadyPresent
                    else HolbuildCacheBackend.Conflict (hd urls))
-        | NONE => publish_action_metadata cache key metadata
+        | NONE => if fits () then publish_action_metadata cache key metadata else HolbuildCacheBackend.Skipped
     end
   handle e as Unavailable _ => raise e
        | e => HolbuildCacheBackend.Conflict (General.exnMessage e)
+
+fun put_action cache policy entry = put_action_if (fn () => true) cache policy entry
 
 fun has_blob cache sha256 = Option.isSome (lookup_blob cache sha256)
 

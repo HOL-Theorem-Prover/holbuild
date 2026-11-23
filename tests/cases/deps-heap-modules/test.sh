@@ -20,6 +20,7 @@ worker_pid=
 cleanup() {
   if [[ -n "$worker_pid" ]]; then
     touch "$tmpdir/control/action-get-release"
+    [[ ! -d "$tmpdir/capture" ]] || touch "$tmpdir/capture/release"
     wait "$worker_pid" 2>/dev/null || true
   fi
   for pid in ${server_pids[@]+"${server_pids[@]}"}; do
@@ -586,7 +587,8 @@ cp -n "$tmpdir"/replica/ac/* "$tmpdir/remote/ac/"
 
 # C's run gives the poisoned heap up again, and A's module is replaced by
 # the other-ID copy while its publish reads the claim on C's heap: it
-# publishes no heap, and the entry stays as it was.
+# publishes the heap with the modules it linked when the preload saved it,
+# replacing the entry.
 cp "$tmpdir/C-poisoned.entry" "$c_heap_entry"
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 mkdir -p "$(dirname "$modules")"
@@ -598,9 +600,89 @@ mv "$tmpdir/replacement.pmo" "$modules"
 release_paused
 phase publish-swap-C 'rstmoddropn:1'
 require_grep '^status=built$' "$tmpdir/publish-swap-C.result"
-require_grep "not publishing the shared deps-loaded heap: its theory module .*-A-.*\.pmo was replaced by one of another id" \
-  "$tmpdir/publish-swap-C.log"
-cmp "$tmpdir/C-poisoned.entry" "$c_heap_entry"
+if grep -q 'not publishing the shared deps-loaded heap' "$tmpdir/publish-swap-C.log"; then
+  echo 'publish-swap-C published no heap' >&2; cat "$tmpdir/publish-swap-C.log" >&2; exit 1
+fi
+grep -qx "blob=$module_sha module ${modules##*/}" "$c_heap_entry" ||
+  { echo "C's republished heap doesn't load the copy of A's module its preload loaded" >&2; exit 1; }
+[[ -z $(find "$worker_modules" -name '*.heap-snapshot*') ]] ||
+  { echo 'publish-swap-C left its snapshot of the heap modules' >&2; exit 1; }
+cp "$tmpdir/C-poisoned.entry" "$c_heap_entry"
+
+# Again, but A's module is replaced, or gone, while the parent takes the
+# heap the preload saved, before it links the heap's modules: it
+# publishes no heap, and the child goes on.
+capture_paused() {
+  rm -rf "$tmpdir/capture"
+  mkdir "$tmpdir/capture"
+  HOLBUILD_TEST_CAPTURE_PAUSE=$tmpdir/capture exec_theory C "$1" &
+  worker_pid=$!
+  for _ in {1..6000}; do
+    [[ -e "$tmpdir/capture/reached" ]] && break
+    kill -0 "$worker_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  [[ -e "$tmpdir/capture/reached" ]] || { echo "$1-C did not reach the heap capture" >&2; exit 1; }
+}
+capture_released() {
+  touch "$tmpdir/capture/release"
+  for _ in {1..6000}; do
+    kill -0 "$worker_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$worker_pid" 2>/dev/null; then
+    kill "$worker_pid"
+    echo "the released worker did not finish" >&2
+    exit 1
+  fi
+  wait "$worker_pid"
+  worker_pid=
+}
+for change in swap removal; do
+  rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
+  mkdir -p "$(dirname "$modules")"
+  cp "$tmpdir/A.pmo" "$modules"
+  edit_c "capture-$change"
+  capture_paused "capture-$change"
+  if [[ $change == swap ]]; then
+    cp "$tmpdir/alternate-A.pmo" "$tmpdir/replacement.pmo"
+    mv "$tmpdir/replacement.pmo" "$modules"
+    expected="not sharing the deps-loaded heap: its theory module .*-A-.*\.pmo was replaced by one of another id"
+  else
+    rm "$modules"
+    expected="not sharing the deps-loaded heap: its theory module .*-A-.*\\.pmo is gone"
+  fi
+  capture_released
+  require_grep '^status=built$' "$tmpdir/capture-$change-C.result"
+  require_grep "$expected" "$tmpdir/capture-$change-C.log"
+  cmp "$tmpdir/C-poisoned.entry" "$c_heap_entry" ||
+    { echo "capture-$change-C published its heap" >&2; exit 1; }
+  [[ -z $(find "$worker_modules" -name '*.heap-snapshot*') ]] ||
+    { echo "capture-$change-C left a snapshot of the heap modules" >&2; exit 1; }
+done
+# A run whose result can't be written, once its capture took the heap,
+# publishes nothing and leaves no snapshot.
+rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
+mkdir -p "$(dirname "$modules")"
+cp "$tmpdir/A.pmo" "$modules"
+edit_c capture-unwritten
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload CTheory) > "$tmpdir/capture-unwritten.batch"
+spec=$(awk '$1 == "action" && $5 == "deps-modules:CTheory" { print $4 }' "$tmpdir/capture-unwritten.batch")
+[[ -n $spec ]] || { echo "C has no action: $(cat "$tmpdir/capture-unwritten.batch")" >&2; exit 1; }
+# A directory in the result's place.
+mkdir "$tmpdir/capture-unwritten.result"
+if HOLBUILD_CACHE=$worker "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" --share-heaps \
+     --cache-limit-gb 1000 --result "$tmpdir/capture-unwritten.result" > "$tmpdir/capture-unwritten.log" 2>&1; then
+  echo "capture-unwritten-C wrote no result, yet succeeded" >&2; exit 1
+fi
+if grep -q 'not sharing the deps-loaded heap' "$tmpdir/capture-unwritten.log"; then
+  echo "capture-unwritten-C did not take its heap:" >&2; cat "$tmpdir/capture-unwritten.log" >&2; exit 1
+fi
+cmp "$tmpdir/C-poisoned.entry" "$c_heap_entry" || { echo "capture-unwritten-C published its heap" >&2; exit 1; }
+[[ -z $(find "$worker_modules" -name '*.heap-snapshot*') ]] ||
+  { echo "capture-unwritten-C left a snapshot of the heap modules" >&2; exit 1; }
+rm -f "$modules"
+cp "$tmpdir/alternate-A.pmo" "$modules"
 
 # Warm: W already holds the copy the entry names, so it fetches nothing,
 # but gives the heap up all the same.  C's own heap loads that copy.
