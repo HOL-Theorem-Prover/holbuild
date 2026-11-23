@@ -10,7 +10,8 @@
 # store alone while its writer runs.  No writer starts too close to its
 # deadline, and one killed at it still stores the modules it finished.  Where /dev/shm is another file
 # system, a store there stands for one a worker's containers share on a
-# mount of its own: the writer writes on that file system.
+# mount of its own: the writer writes on that file system.  A HOL rebuilt
+# in its directory gets a store of its own.
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 source "$ROOT/tests/lib.sh"
@@ -27,7 +28,7 @@ remote2_url=$remote_url
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
 
 sha() { sha1sum "$1" | cut -d' ' -f1; }
-for hol in hol1 hol2 hol3 hol4 hol5 hol6 hol7 hol8 hol9; do
+for hol in hol1 hol2 hol3 hol4 hol5 hol6 hol7 hol8 hol9 hol10; do
   mkdir -p "$tmpdir/$hol/bin" "$tmpdir/$hol/sigobj" "$tmpdir/$hol/tools-poly/poly"
   : > "$tmpdir/$hol/bin/hol.state"
   : > "$tmpdir/$hol/sigobj/boolTheory.uo"
@@ -113,7 +114,7 @@ val remote = HolbuildRemoteCache.remote "$remote_url";
 fun fill_by hol seconds =
   E.fill_module_store remote "$tmpdir/root" (tc hol) wanted (Time.+ (Time.now (), Time.fromSeconds seconds));
 fun fill hol = ignore (fill_by hol 100);
-fun store hol = E.module_store ("$tmpdir/" ^ hol);
+fun store hol = E.module_store (tc hol);
 fun stored hol file = exists (OS.Path.concat (store hol, file));
 val a = "ab12-A-$a_sha.pmo";
 val b = "ab12-B-$b_sha.pmo";
@@ -475,12 +476,12 @@ val _ = check "a module whose blob one node lacks was not fetched from the other
            E.read_text (OS.Path.concat (store "hol6", p14)) = p14_bytes);
 
 (* Before an action's first child, a new store fetches what another host
-   published, once it has its base theories (from the v1 store) and lacks
+   published, once it has its base theories (from the v2 store) and lacks
    16 or more modules not found unpublished before; it records those found
    unpublished, and gives the store's lock up after a while. *)
 val _ = E.write_text "$tmpdir/hol7/tools-poly/poly/theory_modules.ML" "";
-val _ = OS.FileSys.mkDir (E.module_store_v1 "$tmpdir/hol7");
-val _ = E.write_text (OS.Path.concat (E.module_store_v1 "$tmpdir/hol7", "base-theories")) "bool\n";
+val _ = OS.FileSys.mkDir (E.module_store_v2 "$tmpdir/hol7");
+val _ = E.write_text (OS.Path.concat (E.module_store_v2 "$tmpdir/hol7", "base-theories")) "bool\n";
 val published16 = a :: b :: List.take (ps, 14);
 val _ = writes published16;
 val {published, ...} = fill_by "hol7" 100;
@@ -629,3 +630,31 @@ else
 fi
 (cd "$ROOT" && HOLBUILD_CACHE="$tmpdir/cache" \
   "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/writer.sml")
+
+# A HOL rebuilt in its directory has a base state of another id, so its
+# modules go in a store of their own: its writer stores A's module though
+# the first build's store holds A's under the old id.  Each build is used
+# by a process of its own, as each action is.
+cat > "$tmpdir/rebuilt.sml" <<SML
+use "sml/holbuild-script.sml";
+structure E = HolbuildBuildExec;
+fun check message condition = if condition then () else raise Fail message;
+val tc = {holdir = "$tmpdir/hol10", maxheap = NONE, kernel_variant = HolbuildToolchain.StandardKernel};
+val module = valOf (OS.Process.getEnv "MODULE");
+val {installed, ...} =
+  E.fill_module_store (HolbuildRemoteCache.remote "$remote_url") "$tmpdir/root" tc
+    {deps = [{target = "p:ATheory", stem = "src/ATheory", key = ""}], loads = []}
+    (Time.+ (Time.now (), Time.fromSeconds 100));
+val _ = check ("the writer did not store " ^ module)
+          (installed = 1 andalso OS.FileSys.access (OS.Path.concat (E.module_store tc, module), []));
+SML
+: > "$tmpdir/hol10/tools-poly/poly/theory_modules.ML"
+rm -f "$tmpdir/report"
+rebuilt() {
+  echo "$1" > "$tmpdir/writes"
+  (cd "$ROOT" && HOLBUILD_CACHE="$tmpdir/cache" MODULE=$1 \
+    "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/rebuilt.sml")
+}
+rebuilt "ab12-A-$a_sha.pmo"
+printf 'rebuilt\n' > "$tmpdir/hol10/bin/hol.state"
+rebuilt "cd34-A-$a_sha.pmo"
