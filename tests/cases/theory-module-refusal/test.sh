@@ -129,14 +129,10 @@ if grep -q -- '-C2\?-' <<< "$d_modules"; then
   echo "D's deps heap requires C's refused module: $d_modules" >&2; exit 1
 fi
 
-# The toolchain whose store this is.
-holdir=
-for candidate in "$HOLBUILD_CACHE"/hol-toolchains/*/hol; do
-  for path in "$candidate" "$(realpath "$candidate")"; do
-    [[ "v2-$(printf '%s' "$path" | sha256sum | cut -d' ' -f1)" == "$(basename "$store")" ]] && holdir=$path
-  done
-done
-[[ -n $holdir ]] || { echo "no toolchain has the store $store" >&2; exit 1; }
+# The toolchains whose store this may be.
+holdirs=$(for candidate in "$HOLBUILD_CACHE"/hol-toolchains/*/hol; do
+  printf '"%s"\n"%s"\n' "$candidate" "$(realpath "$candidate")"
+done | paste -sd,)
 
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 find "$store" -name '*-D-*.pmo' -delete
@@ -146,8 +142,12 @@ structure E = HolbuildBuildExec;
 fun check message condition = if condition then () else raise Fail message;
 fun exists path = OS.FileSys.access (path, []);
 fun dep name = {target = "module-refusal:" ^ name ^ "Theory", stem = "src/" ^ name ^ "Theory", key = ""};
-val tc = {holdir = "$holdir", maxheap = NONE, kernel_variant = HolbuildToolchain.StandardKernel};
+fun toolchain holdir = {holdir = holdir, maxheap = NONE, kernel_variant = HolbuildToolchain.StandardKernel};
 val store = "$store";
+val tc =
+  case List.find (fn holdir => E.module_store (toolchain holdir) = store) [$holdirs] of
+      SOME holdir => toolchain holdir
+    | NONE => raise Fail "no toolchain has the store $store";
 fun modules part = List.filter (String.isSubstring part) (map OS.Path.file (HolbuildCache.children store));
 
 (* The writer, allowed one module, writes D's after the refused ones. *)
