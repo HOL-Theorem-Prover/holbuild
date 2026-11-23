@@ -1988,7 +1988,7 @@ async def test_no_ahead_wake_goes_to_a_burst_host_above_the_scale_in_line(
     tail = asyncio.create_task(coordinator.claim(burst, "b0", 30, host_id="host-b", ahead=True))
     await wait_until(lambda: bool(coordinator.claim_waiters) or tail.done())
     assert not tail.done()
-    coordinator._ahead_changed()
+    coordinator._wake_claim("standard", ahead=True)  # as a claim passes on an ahead wake, with the read current
     assert all(not w[2].done() for w in coordinator.claim_waiters) and len(coordinator.claim_waiters) == 1
     tail.cancel()
     with contextlib.suppress(asyncio.CancelledError):
@@ -1999,7 +1999,8 @@ async def test_a_claim_woken_ahead_takes_nothing_ahead_once_the_line_moved_past_
     http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """While host-a's a1 stays away past TURNAROUND_SECONDS, the line for claims ahead takes in host-b, so the ahead
-    wake goes to its waiting claim; a1 comes back before that claim runs, and the line leaves host-b again."""
+    wake a claim passes on goes to its waiting claim; a1 comes back before that claim runs, and the line leaves host-b
+    again."""
     monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only a wake ends the wait in time
     burst = await burst_hosts_with_a_child_to_claim_ahead(http, coordinator)
     tail = asyncio.create_task(coordinator.claim(burst, "b0", 0.5, host_id="host-b", ahead=True))
@@ -2009,10 +2010,33 @@ async def test_a_claim_woken_ahead_takes_nothing_ahead_once_the_line_moved_past_
     clock = coordinator.clock
     later = clock() + timedelta(seconds=coordinator_module.TURNAROUND_SECONDS + 1)
     coordinator.clock = lambda: later
-    coordinator._ahead_changed()
+    coordinator._wake_claim("standard", ahead=True)
     assert waiter[2].done()
     coordinator.clock = clock
     assert await asyncio.wait_for(tail, 10) is None
+
+
+async def test_an_ahead_wake_for_a_change_since_the_last_read_goes_to_the_claim_whose_new_read_takes_in_its_host(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """host-b's claim waits while ``a`` is ready and no read has found claims ahead. Once a0 runs ``a``, ``b`` and
+    ``c`` may be claimed ahead: more than host-a's free a1 takes, so a read that counts them takes in host-b. The ahead
+    wake for that change goes to host-b's claim, which reads them and takes one, rather than to no claim as the
+    outdated read's line would have it."""
+    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only a wake ends the wait in time
+    burst = ["high", "standard"]
+    await submit(http, ["a", "b", "c"], [("b", "a"), ("c", "a")], speculative_loading="4")
+    for worker in ["a0", "a1"]:
+        coordinator.report_worker("host-a", worker, burst)
+    coordinator.report_worker("host-b", "b0", burst)
+    tail = asyncio.create_task(coordinator.claim(burst, "b0", 30, host_id="host-b", ahead=True))
+    await wait_until(lambda: bool(coordinator.claim_waiters) or tail.done())
+    assert not tail.done()
+    parent = await coordinator.claim(burst, "a0", host_id="host-a")
+    assert parent is not None and parent.theory == "pkg:a"
+    coordinator._ahead_changed()
+    child = await asyncio.wait_for(tail, 5)
+    assert child is not None and child.ahead_parents
 
 
 async def test_the_line_for_claims_ahead_keeps_no_slot_of_idle_warm_workers(coordinator: Coordinator) -> None:
@@ -2058,7 +2082,7 @@ async def test_a_kept_hosts_worker_that_does_not_come_back_leaves_its_slot_to_a_
     monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 0.05)
     burst = await burst_hosts_with_a_child_to_claim_ahead(http, coordinator)
     tail = asyncio.create_task(coordinator.claim(burst, "b0", 30, host_id="host-b", ahead=True))
-    await asyncio.sleep(0.2)
+    await wait_until(lambda: bool(coordinator.claim_waiters) or tail.done())
     assert not tail.done()
     later = coordinator.clock() + timedelta(seconds=coordinator_module.TURNAROUND_SECONDS + 1)
     coordinator.clock = lambda: later

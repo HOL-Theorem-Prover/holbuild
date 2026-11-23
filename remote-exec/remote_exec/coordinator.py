@@ -1447,9 +1447,11 @@ class Coordinator:
                     await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only, held_tiers, tiers)
                     if claim_tiers else (None, None)
                 )
-                # Builds left for their holders still rank before claims ahead.
+                # Builds left for their holders still rank before claims ahead. The line for claims ahead may have moved
+                # past this host while it tried the builds.
                 if claimed is None and read is not None and ahead_tiers and held_until is None:
-                    claimed = await self._claim_ahead(read, ahead_tiers, worker)
+                    ahead_tiers = [t for t in ahead_tiers if not self._above_line(rank, t, ahead=True)]
+                    claimed = await self._claim_ahead(read, ahead_tiers, worker) if ahead_tiers else None
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
                     # Recorded before the answer, so the scale-in line counts a lease while it waits (as _claim
@@ -2378,7 +2380,8 @@ class Coordinator:
         leases = Counter(host for host, _, tiers in self.lease_hosts.values() if not burst_only or "high" in tiers)
         leased = {(host, worker) for host, worker, _ in self.lease_hosts.values()}
         waiting = Counter(
-            w_rank.host_id for w_tiers, w_rank, w_woken, _ in self.claim_waiters if not w_woken.done() and tier in w_tiers
+            w_rank.host_id for w_tiers, w_rank, w_woken, _ in self.claim_waiters
+            if not w_woken.done() and tier in w_tiers and (not burst_only or "high" in w_tiers)
         )
         hosts: list[tuple[tuple[bool, int, int, str], int]] = []
         for host_id, workers in self.host_workers.items():
@@ -2396,7 +2399,7 @@ class Coordinator:
             short = report is not None and bool(report[1].memory_short)
             free = sum(
                 1 for worker, (seen, w_tiers) in workers.items()
-                if tier in w_tiers and (host_id, worker) not in leased
+                if tier in w_tiers and (not burst_only or "high" in w_tiers) and (host_id, worker) not in leased
                 and ((host_id, worker) in self.claiming or (now - seen).total_seconds() < TURNAROUND_SECONDS)
             )
             # No floor of one, nor the host's last report, which no result updates: a host whose workers all stay
@@ -2524,7 +2527,7 @@ class Coordinator:
         ready, if it is for one: of those on hosts below the scale-in line that take ``tier``, the best-ranked that
         hold the most of ``theory`` (see _local_entry), if more than the best-ranked claim's host. A build wake goes
         to no burst host above the line (see _tail_host): the workers below it come back for the build; an ahead wake
-        to none above the line for claims ahead. Only normal wakes count newly ready work; changes for capable claims
+        to none above the line for claims ahead, unless the read of claims ahead is outdated. Only normal wakes count newly ready work; changes for capable claims
         are recorded by _ahead_changed."""
         if not ahead:
             self.made_ready += 1
@@ -2533,7 +2536,11 @@ class Coordinator:
             if tier in w[0] and not w[2].done() and (w[3] or not ahead) and self._quarantine(w[1].host_id) is None
         ]
         kept: set[str] | None = None  # the line with the build made ready, computed once needed
-        if any(self._known_burst(w[1]) for w in compatible):
+        # An ahead wake for a change since the last read of claims ahead (see _ahead_changed) can't count the actions
+        # the change made claimable ahead, so it goes to the best-ranked waiter, whose claim reads them and checks
+        # the line for claims ahead before it claims (see claim).
+        outdated = ahead and (self.ahead_read is None or self.ahead_read.changes != self.ahead_changes)
+        if not outdated and any(self._known_burst(w[1]) for w in compatible):
             kept = self._kept_hosts(1, tier, ahead=ahead)
             compatible = [w for w in compatible if not self._tail_host(w[1], kept)]
         waiter = min(compatible, key=lambda w: w[1], default=None)
