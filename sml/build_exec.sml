@@ -387,6 +387,28 @@ fun deps_heap_capture_request deps_loaded = deps_loaded ^ ".capture"
    the deps heap may require (module_loader_line). *)
 fun deps_heap_refused_modules deps_loaded = deps_loaded ^ ".refused"
 
+(* Compiles [code] when HOL's module helper, once loaded, has the [values].
+   It restates some of the helper's functions; a helper they don't match
+   fails to compile them and keeps its own. *)
+fun if_theory_modules_has values code =
+  "val _ = case #lookupStruct PolyML.globalNameSpace \"TheoryModules\" of " ^
+  "NONE => () | SOME modules => " ^
+  "if List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents modules)) " ^
+  HolbuildToolchain.sml_list values ^ " then " ^
+  "(CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string code ^ " handle _ => ()) else ();"
+
+(* A preload's line after its loads (and after the deps heap's save, so
+   that the heap holds what it did without it): how many theories its
+   process loaded from their modules (hits), from their .dat files
+   (misses) and how many modules it wrote, as HOL's theory module cache
+   counts them, printed as holmodhitn, holmodmissn and holmodwriten phases
+   (hol_log_phases).  Without HOL's module cache it prints nothing. *)
+val module_statistics_line =
+  if_theory_modules_has ["statistics"]
+    ("val _ = let val {hits, misses, writes} = TheoryModules.statistics () in " ^
+     "TextIO.output (TextIO.stdErr, \"holbuild hol-phases holmodhitn=\" ^ Int.toString hits ^ " ^
+     "\" holmodmissn=\" ^ Int.toString misses ^ \" holmodwriten=\" ^ Int.toString writes ^ \"\\n\") end;")
+
 (* The deps heap keeps only the toolchain's load path, not the project's
    directories HOL put there: other trees of the project resume from it.
    The save's time is printed as a holsave phase (hol_log_phases); the
@@ -419,14 +441,15 @@ fun write_preload capture load_lines deps_loaded deps_ok path =
                   "val _ = let val start = Time.now () in " ^
                   "HolbuildCheckpointSaveRuntime.with_toolchain_load_path (fn () => " ^ save ^ "); " ^
                   "TextIO.output (TextIO.stdErr, \"holbuild hol-phases holsave=\" ^ " ^
-                  "LargeInt.toString (LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))) ^ \"\\n\") end;"] @
+                  "LargeInt.toString (LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))) ^ \"\\n\") end;",
+                  module_statistics_line] @
                  (if capture then [list_refused, wait] else []))
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
 
 fun write_plain_preload load_lines path =
-  write_text path (String.concatWith "\n" (runtime_line () :: load_lines) ^ "\n")
+  write_text path (String.concatWith "\n" (runtime_line () :: load_lines @ [module_statistics_line]) ^ "\n")
 
 (* Where a promoting preload saves its transient heap: in the stage, which
    the parent clears of it once the child has ended (run_theory_action). *)
@@ -488,7 +511,7 @@ fun write_promoting_preload load_lines path =
          "  if in_use < threshold then report \"not promoted\" else promote ()\n",
          "end;"]
   in
-    write_text path (String.concatWith "\n" (runtime_line () :: load_lines @ [promote]) ^ "\n")
+    write_text path (String.concatWith "\n" (runtime_line () :: load_lines @ [module_statistics_line, promote]) ^ "\n")
   end
 
 (* HOL's theory exporter enables generated HTML documentation by default.  A
@@ -531,16 +554,6 @@ fun if_meta_has values code =
   "if List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents meta)) " ^
   "[" ^ String.concatWith ", " (map HolbuildToolchain.sml_string values) ^ "] then " ^
   "CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string code ^ " else ();"
-
-(* Compiles [code] when HOL's module helper, once loaded, has the [values].
-   It restates some of the helper's functions; a helper they don't match
-   fails to compile them and keeps its own. *)
-fun if_theory_modules_has values code =
-  "val _ = case #lookupStruct PolyML.globalNameSpace \"TheoryModules\" of " ^
-  "NONE => () | SOME modules => " ^
-  "if List.all (Option.isSome o #lookupVal (PolyML.NameSpace.Structures.contents modules)) " ^
-  HolbuildToolchain.sml_list values ^ " then " ^
-  "(CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string code ^ " handle _ => ()) else ();"
 
 (* The ids, in hex, of the modules HOL refused that the loader below
    couldn't release (unreleased_modules_line), which a deps heap saved
@@ -12663,9 +12676,11 @@ fun merge_phases phases =
 
 (* The phases in the "holbuild hol-phases" lines a theory child prints: the
    proof runtime's at exit (proof_runtime.sml), and the preload's after it
-   saves the deps heap.  Only the names the runtime prints are taken, with
-   their values summed over the lines; a value that isn't a nonnegative
-   integer is dropped.  holload runs from CHILD_START, when the child that
+   saves the deps heap and after its loads (module_statistics_line).  Only
+   the names the runtime prints are taken, with their values summed over
+   the lines; a value that isn't a nonnegative integer is dropped.  Each
+   line in which HOL says it refused a theory's module counts one
+   holmodrefusedn.  holload runs from CHILD_START, when the child that
    wrote the log started, to its first runtime install (the least
    holloadend: a runtime loaded again later prints its line first), less
    the preload's save (holsave in a line without holloadend).  The log is the child's, so it is read in bounded pieces and a line
@@ -12676,7 +12691,7 @@ fun merge_phases phases =
    counts. *)
 val hol_log_phase_names =
   ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
-   "holcompiledn", "holreplayedn", "holrewoundn"]
+   "holcompiledn", "holreplayedn", "holrewoundn", "holmodhitn", "holmodmissn", "holmodwriten"]
 
 fun hol_log_phases log_file child_start =
   let
@@ -12693,6 +12708,9 @@ fun hol_log_phases log_file child_start =
     fun parse line =
       if String.isPrefix prefix line then
         SOME (List.mapPartial phase (String.tokens Char.isSpace (String.extract (line, size prefix, NONE))))
+      else if String.isPrefix "theory modules: " line andalso
+              String.isSuffix ": module refused, loading from .dat" line
+      then SOME [("holmodrefusedn", 1)]
       else NONE
     (* A line read so far: its first MAX_LINE characters, and whether it is
        longer. *)
