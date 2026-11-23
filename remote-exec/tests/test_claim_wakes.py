@@ -29,7 +29,7 @@ async def test_ahead_changes_retry_only_capable_inflight_claims(
             retried.set()
         return None, None
 
-    async def no_ahead(tiers: list[str], worker: str, **_: object) -> None:
+    async def no_ahead(read: object, tiers: list[str], worker: str, **_: object) -> None:
         return None
 
     monkeypatch.setattr(coordinator, "_claim", empty)
