@@ -377,7 +377,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         tiers = [body.tier, *(t for t in body.also_claim if t != body.tier)]
         if body.host is not None:
             coordinator.report_host(body.host)
-            coordinator.report_worker(body.host.id, body.worker, tiers, idle=True)
+            coordinator.report_worker(body.host.id, body.worker, tiers, idle=True, ahead=body.ahead)
         if body.phases is not None:
             coordinator.report_phases(body.phases)
         claimed = await coordinator.claim(
