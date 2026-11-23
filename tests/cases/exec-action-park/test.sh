@@ -99,15 +99,20 @@ write_a '(fn g => (counter := !counter + 1; FAIL_TAC "second failure" g))'
 check second 1
 require_grep "second failure" "$tmpdir/second.out"
 
+# A proof left unsolved fails after its last step, saving no failed prefix:
+# the server parks again where it was.
+write_a 'ALL_TAC'
+check unsolved 1
+
 write_a '(fn g => (counter := !counter + 1; if !counter = 1 then ACCEPT_TAC TRUTH g else raise Fail "dirty heap"))'
 check fixed 0
 wait "$park_pid" || { echo "the park server failed" >&2; cat "$tmpdir/park.log" >&2; exit 1; }
 park_pid=""
 require_grep "park: the script builds, stopping" "$tmpdir/park.log"
 [[ ! -e "$socket" ]] || { echo "the park server left its socket" >&2; exit 1; }
-# Both checks ran from the failed prefix.
-[[ "$(grep -c 'park: served' "$tmpdir/park.log")" == 2 &&
-   "$(grep -c 'from: failed-prefix checkpoint in target' "$tmpdir/park.log")" == 2 ]] || {
+# Every check ran from the failed prefix.
+[[ "$(grep -c 'park: served' "$tmpdir/park.log")" == 3 &&
+   "$(grep -c 'from: failed-prefix checkpoint in target' "$tmpdir/park.log")" == 3 ]] || {
   cat "$tmpdir/park.log" >&2; exit 1; }
 
 # A server gone means the caller checks the usual way.
