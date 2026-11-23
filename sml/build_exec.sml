@@ -6399,6 +6399,18 @@ fun early_cutoff_metadata deps_key dat_hash_cache allow_timeout_discrepancy poli
         then SOME text
         else NONE
 
+(* The theories a build that only restores couldn't restore, since it last
+   took them: each input key, and whether its entry didn't fit the parent
+   outputs here rather than missing. *)
+val restore_misses = ref ([] : (string * bool) list)
+val restore_misses_mutex = Mutex.mutex ()
+
+fun not_in_remote_cache name = name ^ " is not in the remote cache, and --remote-only builds nothing locally"
+
+fun take_restore_misses () =
+  (Mutex.lock restore_misses_mutex;
+   (!restore_misses before (restore_misses := []; Mutex.unlock restore_misses_mutex)))
+
 fun build_theory_node speculated dat_hash_cache (options : build_options) tc project base_context plan keys toolchain_key node input_key =
   let
     val policy = checkpoint_policy_for_node options project node
@@ -6410,6 +6422,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
     val _ = claim_extra_outputs project node (source_extra_output_paths plan node)
     fun invalidate_node_dat_hash () =
       invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
+    val parents_differ = ref false
     fun materialize_valid_cache () =
       let
         val root = cache_root ()
@@ -6452,6 +6465,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
             fun reject_parents () =
               (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                             input_key ^ " (parent outputs differ)");
+               parents_differ := true;
                remove_failed_cache_outputs project node;
                ignore (drop_cache_manifest_if_unchanged root input_key existing);
                if not retry then CacheMiss
@@ -6489,7 +6503,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
     fun build_from_source () =
       if #restore_only options then
         (HolbuildHolSharedCache.local_build_needed := true;
-         raise Error (logical_name node ^ " is not in the remote cache, and --remote-only builds nothing locally"))
+         raise Error (not_in_remote_cache (logical_name node)))
       else
       case speculated of
           SOME result =>
@@ -6511,7 +6525,13 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
        else
          case materialize_valid_cache () of
              CacheRestored built_timeout => restore_from_cache built_timeout
-           | CacheMiss => build_from_source ())
+           | CacheMiss =>
+               (if #restore_only options then
+                  (Mutex.lock restore_misses_mutex;
+                   restore_misses := (input_key, !parents_differ) :: !restore_misses;
+                   Mutex.unlock restore_misses_mutex)
+                else ();
+                build_from_source ()))
     fun reuse_outputs text =
       (remove_tree stage;
        if cache_allowed then

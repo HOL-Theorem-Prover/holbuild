@@ -3084,3 +3084,79 @@ for n in 1 2 3 4 5 6; do
 done
 [[ $(grep -c "resubmitting" "$tmpdir/many-resubmits.log") -eq 6 ]] || { cat "$tmpdir/many-resubmits.log" >&2; exit 1; }
 require_grep "TTheory restored from cache" "$tmpdir/many-resubmits.log"
+
+# A theory the export takes the remote cache to hold, because a cache node's
+# disk still answers HEAD for a blob its store lost, but whose restore then
+# misses: a --remote-only build resubmits it, forced, and its worker publishes
+# the blob again.  The pass that resubmits reports no failure.
+project=$tmpdir/restore-miss
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxmiss"
+[build]
+members = ["src"]
+TOML
+# lose_dat_a: ATheory's .dat blob gone from the remote store, still answering HEAD.
+lose_dat_a() {
+  key_a=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rxmiss/src/AScript.sml.key")
+  dat_a=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$HOLBUILD_CACHE/actions/$key_a/manifest")
+  [[ -n $dat_a ]] || { echo "no .dat blob for ATheory" >&2; exit 1; }
+  rm "$remote_root/cas/$dat_a"
+  echo 200 > "$tmpdir/cache-control/cas-head-status-$dat_a"
+}
+# fresh_client NAME: a fresh tree and client cache, as on another host.
+fresh_client() {
+  rm -r "$project/.holbuild"
+  HOLBUILD_CACHE=$tmpdir/$1-cache
+  link_hol_toolchain_cache "$HOLBUILD_CACHE"
+}
+write_theories restore-miss
+run restore-miss-base 0 build --remote-exec "$coordinator" --remote-only BTheory
+lose_dat_a
+fresh_client restore-miss
+run restore-miss 0 --json build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "nothing to build remotely" "$tmpdir/restore-miss.log"
+require_grep "1 theories the remote cache seemed to hold did not restore; resubmitting with 1 theories rebuilt or rechecked" \
+  "$tmpdir/restore-miss.log"
+batch=$(sed -n 's/.*holbuild: remote batch \(b[0-9]*\).*/\1/p' "$tmpdir/restore-miss.log")
+require_grep "^action $key_a .* rxmiss:ATheory$" "$state/$batch.batch"
+refute_grep "^action .* rxmiss:BTheory$" "$state/$batch.batch"
+[[ -f "$remote_root/cas/$dat_a" ]] || { echo "the resubmission did not publish ATheory's .dat again" >&2; exit 1; }
+json_events restore-miss $'node_finished ATheory\nnode_finished BTheory\nbuild_finished'
+
+# The same through a batch that finishes: the export sends the edited
+# BTheory and leaves out ATheory, whose restore after the batch misses.
+write_theories restore-miss-done
+run restore-miss-done-base 0 build --remote-exec "$coordinator" --remote-only ATheory
+lose_dat_a
+printf '(* edited *)\n' >> "$project/src/BScript.sml"
+fresh_client restore-miss-done
+run restore-miss-done 0 build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/restore-miss-done.log"
+require_grep "1 theories the remote cache seemed to hold did not restore; resubmitting with 1 theories rebuilt or rechecked" \
+  "$tmpdir/restore-miss-done.log"
+[[ -f "$remote_root/cas/$dat_a" ]] || { echo "the resubmission did not publish ATheory's .dat again" >&2; exit 1; }
+require_grep "BTheory restored from cache" "$tmpdir/restore-miss-done.log"
+
+# A theory whose remote entry doesn't fit its parent's, as when a
+# nondeterministic parent was built again: the restore rejects it, and the
+# one resubmission rebuilds it and the theory depending on it.
+project=$tmpdir/restore-misfit
+mkdir -p "$project/src"
+cp "$tmpdir/nondet/src/"*Script.sml "$project/src/"
+sed 's/^name = "rxnd"/name = "rxmf"/' "$tmpdir/nondet/holproject.toml" > "$project/holproject.toml"
+n_ac=$(hb action-spec PTheory | awk '$1 == "action" && $5 == "rxmf:NTheory" { print $3 }')
+[[ -n $n_ac ]] || { echo "no action for NTheory" >&2; exit 1; }
+run restore-misfit-base 0 build PTheory
+rm "$remote_root/ac/$n_ac"
+fresh_client restore-misfit-again
+run restore-misfit-again 0 build NTheory
+fresh_client restore-misfit
+run restore-misfit 0 build --remote-exec "$coordinator" --remote-only PTheory
+require_grep "nothing to build remotely" "$tmpdir/restore-misfit.log"
+require_grep "1 theories the remote cache seemed to hold did not restore; resubmitting with 2 theories rebuilt or rechecked" \
+  "$tmpdir/restore-misfit.log"
+[[ $(grep -c "resubmitting" "$tmpdir/restore-misfit.log") -eq 1 ]] || { cat "$tmpdir/restore-misfit.log" >&2; exit 1; }
+require_grep "PTheory restored from cache" "$tmpdir/restore-misfit.log"

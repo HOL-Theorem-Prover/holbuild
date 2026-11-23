@@ -28,6 +28,7 @@ type t = {
   active : active_node list ref,
   started_at : Time.time,
   ended : bool ref,
+  failed : bool ref,
   mutex : Mutex.mutex
 }
 
@@ -66,6 +67,19 @@ fun reporting_finished_only f =
     (f () before finished_only_ref := previous)
     handle e => (finished_only_ref := previous; raise e)
   end
+
+(* While set, builds report no failures, nor what failures skip, nor, once
+   a node failed, their end: a --remote-only restore that may resubmit what
+   it can't restore, whose misses are no failures if it does. *)
+val suppress_failures_ref = ref false
+fun suppressing_failures f =
+  let val previous = !suppress_failures_ref
+  in
+    suppress_failures_ref := true;
+    (f () before suppress_failures_ref := previous)
+    handle e => (suppress_failures_ref := previous; raise e)
+  end
+fun failures_suppressed () = finished_only () orelse !suppress_failures_ref
 
 fun hex_digit n =
   String.sub("0123456789abcdef", n)
@@ -506,6 +520,7 @@ fun create {total, jobs} =
        active = ref [],
        started_at = Time.now (),
        ended = ref false,
+       failed = ref false,
        mutex = Mutex.mutex ()}
   in
     current_status := SOME status;
@@ -562,11 +577,11 @@ fun finish_node status key label outcome =
 fun finish status =
   (with_lock status
      (fn () =>
-         let val {enabled, ended, total, finished, built, restored, restored_remote, up_to_date, ...} = status
+         let val {enabled, ended, failed, total, finished, built, restored, restored_remote, up_to_date, ...} = status
          in
            if !ended then ()
            else
-             (if finished_only () then ()
+             (if finished_only () orelse (failures_suppressed () andalso !failed) then ()
               else if json_mode () then
                 emit_json "build_finished"
                   [json_int_field "elapsed_ms" (elapsed_ms status),
@@ -661,18 +676,19 @@ fun cache_trace line =
 
 (* Whether a node's failure is printed in full on stderr as it happens.  The
    error the build then exits with names it in one line (failure_brief). *)
-fun failure_printed () = not (json_mode () orelse finished_only ())
+fun failure_printed () = not (json_mode () orelse failures_suppressed ())
 
 fun fail_with_debug_artifacts status key label msg artifacts =
   (with_lock status
      (fn () =>
-         let val {enabled, active, ended, finished, ...} = status
+         let val {enabled, active, ended, finished, failed, ...} = status
          in
            if !ended then ()
            else
              (active := remove_active key (!active);
               finished := !finished + 1;
-              if finished_only () then ()
+              failed := true;
+              if failures_suppressed () then ()
               else if json_mode () then
                 emit_json "node_failed"
                   (json_node_fields key label @
@@ -683,7 +699,7 @@ fun fail_with_debug_artifacts status key label msg artifacts =
                  TextIO.flushOut TextIO.stdOut)
               else ())
          end);
-   if finished_only () then () else !command_failure (label, msg);
+   if failures_suppressed () then () else !command_failure (label, msg);
    (* A diagnostic of several lines starts on a line of its own, as a remote
       one does, so that its "theorem: T (line N)" line stands alone. *)
    if failure_printed () then
@@ -706,7 +722,7 @@ fun fail status key label msg =
 
 fun skip status key label reason =
   (with_lock status (fn () => #finished status := !(#finished status) + 1);
-   if finished_only () then ()
+   if failures_suppressed () then ()
    else if json_mode () then
      emit_json "node_skipped" (json_node_fields key label @ [json_string_field "reason" reason])
    else message_stderr (label ^ " skipped because of " ^ reason ^ "\n"))
