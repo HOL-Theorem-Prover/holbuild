@@ -3466,7 +3466,14 @@ fun bool_text true = "true"
    after.
    4: a theory's generated .uo lists its parents and ML dependencies in
    Holmake's load order, not parents by name and then ML dependencies, so a
-   dependent's entry from before was built loading them in another order. *)
+   dependent's entry from before was built loading them in another order.
+   Still 4 since 0.14.100 merged DISK_THM into proved theorems' oracles in the
+   hash literal: that changed the literal only of theories with a proved
+   theorem that uses no theorem from disk, and a child of an entry from before
+   links against that entry's own literal, so the old entries stay sound and
+   aren't worth rebuilding every theory for.  The cost: rebuilding such a key
+   while an entry from before is resident (a stronger timeout contract, or a
+   race between releases) fails to publish, as their outputs differ. *)
 val theory_manifest_version = "4"
 
 (* Final theory artifacts are semantic products of source bytes, resolved deps,

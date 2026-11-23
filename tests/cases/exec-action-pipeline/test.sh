@@ -42,7 +42,8 @@ TOML
 
 # Proofs the outline stubs, slow enough for a child to take the outline
 # before the parent's final entry arrives, in steps short enough for the
-# tactic timeout.
+# tactic timeout.  a_imp uses no theorem from disk, so it is exported
+# without the DISK_THM oracle its outline stub carries.
 pause='(fn g => (OS.Process.sleep (Time.fromSeconds 2); ALL_TAC g))'
 cat > "$project/src/AScript.sml" <<SML
 Theory A
@@ -52,6 +53,12 @@ Theorem a_thm:
   T /\ T
 Proof
   $pause >> $pause >> $pause >> $pause >> CONJ_TAC >> ACCEPT_TAC TRUTH
+QED
+
+Theorem a_imp:
+  p ==> p
+Proof
+  DISCH_TAC >> FIRST_ASSUM ACCEPT_TAC
 QED
 SML
 cat > "$project/src/BScript.sml" <<'SML'

@@ -200,12 +200,45 @@ struct
                            (items "id-table" (tagged "id-table" ids)))
       val (tys, tms, thms) =
         case items "exports" (tagged "exports" exports) of [tys, tms, thms] => (tys, tms, thms) | _ => fail "exports"
-      (* (name-index ((dependencies...) oracles...) (class private location...) terms...) *)
+      (* A child reads every theorem of this theory with DISK_THM among its
+         oracles (HOL's Tag.read_disk_tag), so it can't tell whether the
+         export lists it.  An outline lists it for each theorem whose proof
+         it defers, while the proof itself may use no theorem from disk; so
+         a proved theorem's oracles get it merged in, in Tag.merge_oracle's
+         order.  Axioms and definitions, never deferred, keep their list
+         as written, which keeps most theories' digests as they were. *)
+      fun with_disk_thm oracles =
+        let
+          fun merge [] = [String "DISK_THM"]
+            | merge (l as String s :: rest) =
+                (case String.compare (s, "DISK_THM") of
+                     LESS => String s :: merge rest
+                   | EQUAL => l
+                   | GREATER => String "DISK_THM" :: l)
+            | merge _ = fail "oracle"
+        in
+          List (merge (items "oracles" oracles))
+        end
+      val proved = Integer 2
+      (* (name-index (((theory save-index) dependencies...) oracles...) (class private location...) terms...) *)
       fun thm (Cons(i, Cons(Cons(_, oracles), Cons(info, Cons(terms, Symbol "nil"))))) =
             (case items "theorem info" info of
-                 class :: private :: _ => List [str i, oracles, class, private, terms]
+                 class :: private :: _ =>
+                   List [str i, if class = proved then with_disk_thm oracles else oracles, class, private, terms]
                | _ => fail "theorem info")
         | thm _ = fail "theorem"
+      val theorems = items "theorems" thms
+      (* The save indices of this theory's axioms and definitions. *)
+      val unproved =
+        List.mapPartial
+          (fn Cons(_, Cons(Cons(dependencies, _), Cons(info, _))) =>
+                (case (items "theorem info" info, items "dependencies" dependencies) of
+                     (class :: _, self :: _) =>
+                       if class = proved then NONE
+                       else (case items "dependency" self of [_, save] => SOME save | _ => fail "dependency")
+                   | _ => fail "theorem")
+            | _ => fail "theorem")
+          theorems
       (* ThyDataSexp's encoding: shared strings and names by index, an integer
          as itself, and a theorem as
          (tag-th (theory save-index dependencies oracles) terms theory anonymous-index). *)
@@ -213,9 +246,13 @@ struct
         | thydata (Cons(Symbol "tag-knm", Cons(i as Integer _, j as Integer _))) =
             Cons(Symbol "tag-knm", Cons(str i, str j))
         | thydata (Cons(Symbol "tag-th",
-                        Cons(Cons(thy, Cons(Integer _, Cons(_, Cons(oracles, Symbol "nil")))),
+                        Cons(Cons(thy, Cons(save as Integer _, Cons(_, Cons(oracles, Symbol "nil")))),
                              Cons(terms, Cons(saved, Cons(Integer _, Symbol "nil")))))) =
-            Cons(Symbol "tag-th", List [thy, oracles, terms, saved])
+            Cons(Symbol "tag-th",
+                 List [thy,
+                       if thy = name andalso not (List.exists (fn i => i = save) unproved)
+                       then with_disk_thm oracles else oracles,
+                       terms, saved])
         | thydata (Cons(a, b)) = Cons(thydata a, thydata b)
         | thydata atom = atom
       (* GrammarAncestry's: theory names as bare string indices. *)
@@ -236,7 +273,7 @@ struct
       val loadable' = List (map entry (items "loadable-thydata" (tagged "loadable-thydata" loadable)))
     in
       List [name, List parents, ids', types, terms, tys, tms,
-            List (map thm (items "theorems" thms)), incorporate, loadable']
+            List (map thm theorems), incorporate, loadable']
     end
 
   (* An unambiguous flat text of DATA: atoms are length-prefixed. *)
