@@ -15309,7 +15309,6 @@ fun tool_cache_key (spec : action_spec) name =
                     "\ntoolchain=", action_text_value spec "toolchain"])
 
 fun tool_cache_failure (Error msg) = msg
-  | tool_cache_failure (MissingSharedBlob sha) = "the remote cache has no blob " ^ sha
   | tool_cache_failure e = General.exnMessage e
 
 fun tool_cache_listing dir =
@@ -15325,34 +15324,68 @@ fun tool_cache_listing dir =
   end
 
 (* The files the remote cache holds under KEY, placed in DIR, as
-   (name, sha256) pairs in name order. *)
+   (name, sha256) pairs in name order, and whether the entry is stale: it
+   names a blob the remote cache no longer holds, so the next publish
+   replaces it even if the files are unchanged. *)
 fun restore_tool_cache remote store key dir =
   let
-    (* The host store keeps the files under family KEY, so a worker fetches
-       each blob from the remote cache once. *)
-    fun place (role, sha, name) =
+    fun file (role, sha, name) =
       if role <> "file" orelse not (plain_file_name name) then
         raise Error ("malformed tool cache entry: " ^ role ^ " " ^ HolbuildHash.quote name)
-      else
-        (place_shared_blob remote store key {sha = sha, dst = Path.concat(dir, name), save = false};
-         (name, sha))
+      else (name, sha)
+    (* The host store keeps the files under family KEY, so a worker fetches
+       each blob from the remote cache once. *)
+    fun place (name, sha) =
+      place_shared_blob remote store key {sha = sha, dst = Path.concat(dir, name), save = false}
+    fun place_surviving (name, sha) =
+      (place (name, sha); SOME (name, sha))
+      handle MissingSharedBlob _ =>
+        (warn ("the tool cache lost file " ^ HolbuildHash.quote name ^ ": the remote cache has no blob " ^ sha);
+         NONE)
+    fun restored files stale =
+      (touch_dir (Path.concat(store, key));
+       HolbuildStatus.message_stdout
+         ("restored tool cache (" ^ Int.toString (length files) ^ " files)\n");
+       {files = files, stale = stale})
+    (* A cache in front of the remote's store (a host's bazel-remote over
+       S3) can keep serving an entry the store has since replaced, so the
+       entry is read again from the store.  The files whose blobs survive
+       are kept, and an entry that lost any, or that the store no longer
+       holds, is stale.  An answer that is neither leaves the entry alone. *)
+    fun heal () =
+      (remove_tree dir; ensure_dir dir;
+       case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.probe_action remote key) of
+           {found = SOME text, ...} =>
+             let
+               val files = map file (shared_manifest_entries text)
+               val placed = List.mapPartial place_surviving files
+             in
+               restored placed (length placed < length files)
+             end
+         | {found = NONE, missing = true} =>
+             (warn "not restoring the tool cache: the remote cache no longer holds its entry";
+              {files = [], stale = true})
+         | {found = NONE, missing = false} =>
+             raise Error "could not read its entry again from the remote cache")
   in
     case HolbuildRemoteCache.get_action remote key of
-        NONE => []
+        NONE => {files = [], stale = false}
       | SOME text =>
-          let val placed = map place (shared_manifest_entries text)
+          let val files = map file (shared_manifest_entries text)
           in
-            touch_dir (Path.concat(store, key));
-            HolbuildStatus.message_stdout
-              ("restored tool cache (" ^ Int.toString (length placed) ^ " files)\n");
-            placed
+            (List.app place files; restored files false)
+            handle MissingSharedBlob _ => heal ()
           end
   end
   handle e => (warn ("not restoring the tool cache: " ^ tool_cache_failure e);
-               remove_tree dir; ensure_dir dir; [])
+               remove_tree dir; ensure_dir dir; {files = [], stale = false})
 
-(* Publishes DIR's files under KEY unless they are the RESTORED ones. *)
-fun publish_tool_cache remote store key dir restored =
+(* Publishes DIR's files under KEY unless they are the RESTORED ones and
+   the entry isn't stale.  A publish uploads every file, restored ones too:
+   a host may have restored a file from its store after the remote cache
+   dropped its blob, and the upload renews the blob there with the entry
+   that names it. *)
+fun publish_tool_cache remote store key dir {files = restored, stale} =
   let
     fun file name =
       let val path = Path.concat(dir, name)
@@ -15371,16 +15404,14 @@ fun publish_tool_cache remote store key dir restored =
       else ()
     val entries = map (fn (name, path, _) => (name, path, HolbuildHash.file_sha256 path)) files
     fun upload (name, path, sha) =
-      if List.exists (fn entry => entry = (name, sha)) restored then ()
-      else
-        (case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
-             HolbuildCacheBackend.Published => ()
-           | HolbuildCacheBackend.AlreadyPresent => ()
-           | _ => raise Error ("could not upload " ^ name);
-         store_add store key {sha = sha, src = path, save = false})
+      (case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
+           HolbuildCacheBackend.Published => ()
+         | HolbuildCacheBackend.AlreadyPresent => ()
+         | _ => raise Error ("could not upload " ^ name);
+       store_add store key {sha = sha, src = path, save = false})
     val manifest = shared_manifest tool_cache_header NONE (map (fn (name, _, sha) => ("file", sha, name)) entries)
   in
-    if map (fn (name, _, sha) => (name, sha)) entries = restored then ()
+    if not stale andalso map (fn (name, _, sha) => (name, sha)) entries = restored then ()
     else
       (List.app upload entries;
        case HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest} of

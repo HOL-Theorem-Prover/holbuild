@@ -1935,11 +1935,17 @@ and gives the theory's HOL processes that directory as
 every theory with the same dependencies and toolchain shares the entry, on
 any worker. The worker keeps the entry's files in its host store
 (`<cache root>/checkpoint-store`), so it fetches each from the remote cache
-once. After HOL exits, built or failed, the worker publishes the directory
-again if its files changed: at most 16 regular files, 64 MiB in all, with
-names of letters, digits, `.`, `_` and `-`. An entry that can't be restored,
-or a directory that breaks these limits, only warns: the action goes on
-without the tool cache. The newest publication replaces the
+once. If the remote cache has lost a file's blob, the worker reads the
+entry again with `Cache-Control: no-cache` (a cache in front of the store may
+serve an entry the store has replaced), restores the files whose blobs are
+left, and warns for each lost one. After HOL exits, built or failed, the
+worker publishes the directory again if its files changed or the entry lost a
+blob, uploading every file, which renews each blob the entry names in a store
+that expires them (a later restore heals an entry whose blob expired first):
+at most 16 regular files, 64 MiB in all, with names of letters, digits,
+`.`, `_` and `-`. An entry that can't be restored otherwise, or a directory
+that breaks these limits, only warns: the action goes on without the tool
+cache. The newest publication replaces the
 entry, so a tool should write each file whole (to a temporary name, then
 renamed) and treat the directory as a cache it may find empty.
 

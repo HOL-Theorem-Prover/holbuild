@@ -22,7 +22,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
+control=$tmpdir/control
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$control"
 use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project
@@ -225,6 +226,71 @@ worker v10 "$spec_t"
 expect v10 0 v8
 require_grep "not publishing the tool cache: 2 files of 67108867 bytes exceed" "$tmpdir/v10.log"
 cmp -s "$tmpdir/entry-v8" "$tmpdir/remote/ac/$tool_ac" || { echo "the v10 action changed the entry" >&2; exit 1; }
+
+# A worker whose entry names a blob the remote cache lost keeps the files
+# whose blobs survive, and republishes the entry though T wrote nothing,
+# uploading every file so each blob lives as long as the entry.
+keep_held='val _ = print ("keep held: " ^ (let val input = TextIO.openIn (OS.Path.concat (tool_dir, "keep")) in TextIO.inputAll input before TextIO.closeIn input end handle IO.Io _ => "nothing") ^ "\n");'
+blob_sha() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+write_t v11 'val _ = tool_put "seen" "v11"; val _ = tool_put "keep" "kept";'
+export_t v11 --tool-cache probe
+worker v11 "$spec_t"
+expect v11 0 v8
+require_grep "published tool cache (2 files)" "$tmpdir/v11.log"
+cp "$tmpdir/remote/ac/$tool_ac" "$tmpdir/entry-v11"
+rm "$tmpdir/remote/cas/$(blob_sha v11)"
+write_t v12 "$keep_held"
+export_t v12 --tool-cache probe
+: > "$request_log"
+worker v12 "$spec_t"
+expect v12 0 nothing
+grep -qxF "keep held: kept" "$tmpdir/v12.hol" || {
+  echo "worker v12 dropped the file whose blob survived" >&2; cat "$tmpdir/v12.hol" "$tmpdir/v12.log" >&2; exit 1; }
+require_grep "the tool cache lost file .*seen.*: the remote cache has no blob $(blob_sha v11)" "$tmpdir/v12.log"
+require_grep "published tool cache (1 files)" "$tmpdir/v12.log"
+grep -qx "PUT /cas/$(blob_sha kept)" "$request_log" || {
+  echo "worker v12 republished the entry without uploading its blob" >&2; cat "$request_log" >&2; exit 1; }
+
+# A publish uploads the files it restored unchanged too: the host may have
+# restored them from its store after the remote cache dropped them.
+write_t v13 'val _ = tool_put "seen" "v13";'
+export_t v13 --tool-cache probe
+: > "$request_log"
+worker v13 "$spec_t"
+expect v13 0 nothing
+require_grep "published tool cache (2 files)" "$tmpdir/v13.log"
+grep -qx "PUT /cas/$(blob_sha kept)" "$request_log" || {
+  echo "worker v13 published the entry without uploading the file it restored" >&2; cat "$request_log" >&2; exit 1; }
+
+# A cache in front of the remote's store can keep serving an entry the store
+# has since replaced: here v11's, whose blob is lost.  The worker reads the
+# entry again from the store and restores its files whole.
+cp "$tmpdir/entry-v11" "$control/ac-stale-$tool_ac"
+write_t v14 "$keep_held"
+export_t v14 --tool-cache probe
+worker v14 "$spec_t"
+expect v14 0 v13
+grep -qxF "keep held: kept" "$tmpdir/v14.hol" || { cat "$tmpdir/v14.hol" >&2; exit 1; }
+[[ ! -e "$control/ac-stale-$tool_ac" ]] || {
+  echo "worker v14 didn't ask the cache to check its copy of the entry" >&2; cat "$tmpdir/v14.log" >&2; exit 1; }
+if grep -q "lost file\|published tool cache" "$tmpdir/v14.log"; then
+  echo "worker v14 found the store's entry incomplete" >&2; cat "$tmpdir/v14.log" >&2; exit 1
+fi
+
+# A store's answer the worker can't read on that second look leaves the
+# entry as it was: only an entry the store lost blobs of, or holds no more,
+# is replaced.
+cp "$tmpdir/remote/ac/$tool_ac" "$tmpdir/entry-v13"
+printf 'not an entry\n' > "$tmpdir/remote/ac/$tool_ac"
+cp "$tmpdir/entry-v11" "$control/ac-stale-$tool_ac"
+write_t v15 ''
+export_t v15 --tool-cache probe
+worker v15 "$spec_t"
+expect v15 0 nothing
+require_grep "not restoring the tool cache: could not read its entry again" "$tmpdir/v15.log"
+[[ "$(cat "$tmpdir/remote/ac/$tool_ac")" == "not an entry" ]] || {
+  echo "worker v15 replaced an entry it could not read" >&2; cat "$tmpdir/v15.log" >&2; exit 1; }
+cp "$tmpdir/entry-v13" "$tmpdir/remote/ac/$tool_ac"
 
 # The option leaves checkpoint reuse alone: a worker sharing heaps resumes a
 # --tool-cache build of U from the theorem context a build without it shared.

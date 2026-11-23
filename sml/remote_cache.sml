@@ -848,9 +848,11 @@ fun probe_action cache key =
   let
     val tmp = temp_path "action"
     fun found () = SOME (remember_action cache (metadata_manifest (read_text tmp))) handle _ => NONE
+    val get =
+      if reads_revalidate () then get_status_with_headers ["Cache-Control: no-cache"] else get_status
     val result =
       case send_urls "GET" (action_urls cache key) tmp
-             (fn url => get_status {url = url, dst = tmp, timeout = stall_timeout_seconds}) of
+             (fn url => get {url = url, dst = tmp, timeout = stall_timeout_seconds}) of
           SOME (_, HolbuildHttp.Response 200) => {found = found (), missing = false}
         | SOME (_, HolbuildHttp.Response 404) => {found = NONE, missing = true}
         | _ => {found = NONE, missing = false}
