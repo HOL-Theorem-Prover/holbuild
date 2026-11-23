@@ -6333,16 +6333,20 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
           handle _ => false
         (* A local entry built against other parent outputs can sit beside a
            remote entry built against these, so once the local one is dropped
-           the remote one gets a try, unless the local one came from there; an
-           entry another build published meanwhile gets the try instead.  Only
-           one retry either way. *)
+           the remote one gets a try, the remote cache asked to check its copy
+           with its origin first: the local one may have come from there, and
+           the cache may still hold it after its origin replaced it.  An entry
+           another build published meanwhile gets the try instead.  Only one
+           retry either way. *)
         fun materialize retry existing =
           let
             (* Passes over replicas whose timeout contract is too weak for this build. *)
+            fun hydrate_remote () =
+              hydrate_remote_cache_key_using
+                (manifest_timeout_satisfies allow_timeout_discrepancy (tactic_timeout policy)) root input_key
             fun hydrate () =
               let
-                val hydrated = hydrate_remote_cache_key_using
-                  (manifest_timeout_satisfies allow_timeout_discrepancy (tactic_timeout policy)) root input_key
+                val hydrated = hydrate_remote ()
               in
                 (* The manifest can stay identical while hydration repairs its blobs. *)
                 case HolbuildCache.get_action root input_key of
@@ -6351,7 +6355,10 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
               end
             (* A failed copy may have met an entry another build just published. *)
             fun from_remote () =
-              if copied_from_remote input_key then CacheMiss else hydrate ()
+              (ignore (HolbuildRemoteCache.revalidating hydrate_remote);
+               case HolbuildCache.get_action root input_key of
+                   SOME text => if text <> existing then materialize false text else CacheMiss
+                 | NONE => CacheMiss)
             fun reject_parents () =
               (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                             input_key ^ " (parent outputs differ)");
@@ -11389,13 +11396,17 @@ fun records_parent recorded ({target, ...} : {target : string, stem : string, ke
 (* A worker's local copy of an entry goes out of date when the remote's entry
    for its key changes.  This drops the local copies of the spec's
    dependencies selected by wanted whose outputs differ from the remote's,
-   so that the next restore takes the remote's; true when it dropped one. *)
-fun drop_stale_dep_copies remote (spec : spec_deps) wanted =
-  let val checks = map (fn dep => (dep, ref false)) (List.filter wanted (#deps spec))
+   so that the next restore takes the remote's; true when it dropped one.
+   With revalidate, the remote cache checks each entry with its origin
+   first (HolbuildRemoteCache.revalidating). *)
+fun drop_stale_dep_copies revalidate remote (spec : spec_deps) wanted =
+  let
+    val checks = map (fn dep => (dep, ref false)) (List.filter wanted (#deps spec))
+    fun read f = if revalidate then HolbuildRemoteCache.revalidating f else f ()
   in
     parallel_all remote_probe_width
       (fn (dep, dropped) =>
-          dropped := HolbuildRemoteCache.required (fn () => drop_local_copy_if_stale remote (#key dep)))
+          dropped := HolbuildRemoteCache.required (fn () => read (fn () => drop_local_copy_if_stale remote (#key dep))))
       checks;
     List.exists (fn (_, dropped) => !dropped) checks
   end
@@ -11666,8 +11677,8 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             (#deps spec)
         end)
     fun restore_deps () = hydrate_step "hyddeps" restore_deps_now
-    fun refresh wanted =
-      hydrate_step "hydstale" (fn () => drop_stale_dep_copies remote spec wanted) andalso (restore_deps (); true)
+    fun refresh revalidate wanted =
+      hydrate_step "hydstale" (fn () => drop_stale_dep_copies revalidate remote spec wanted) andalso (restore_deps (); true)
     (* Every path an item writes: two items sharing one would let a kept
        item stand for files another replaced or removed. *)
     fun theory_files stem = List.concat (map (fn suffix => objects (in_root root stem ^ suffix)) theory_suffixes)
@@ -11707,12 +11718,14 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       (transfer_all fetch_file files;
        List.app write_lib (#libs spec)));
     restore_deps ();
-    ignore (refresh direct);
+    ignore (refresh false direct);
     case misfits () of
         [] => ()
       | first =>
-          (* The files change only if the refresh drops a copy. *)
-          case (if refresh (fn _ => true) then misfits () else first) of
+          (* The files change only if the refresh drops a copy.  The remote
+             cache may hold a copy its origin has since replaced, which the
+             local one matches: ask it to check. *)
+          case (if refresh true (fn _ => true) then misfits () else first) of
               [] => ()
             | found as {target, ...} :: rest =>
                 raise ActionFailed (InputMissing (map (fn {key, ...} => "theory " ^ key) found),
@@ -11758,19 +11771,25 @@ fun action_already_done remote root (spec : action_spec) =
   let
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
+    (* SOME fits once restored, NONE when the restore fails. *)
     fun restored () =
       (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
          {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
           extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
-       spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path))
+       SOME (spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path)))
+      handle e as HolbuildRemoteCache.Unavailable _ => raise e
+           | _ => NONE
+    (* The remote cache may hold a copy its origin has since replaced, which
+       the local one matches: on a parent misfit, ask it to check. *)
+    fun drop_stale misfit =
+      (if misfit then HolbuildRemoteCache.revalidating (fn () => drop_local_copy_if_stale remote (#input_key spec))
+       else drop_local_copy_if_stale remote (#input_key spec))
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | _ => false
   in
-    restored () orelse
-    ((drop_local_copy_if_stale remote (#input_key spec)
-      handle e as HolbuildRemoteCache.Unavailable _ => raise e
-           | _ => false) andalso
-     restored ())
+    case restored () of
+        SOME true => true
+      | first => drop_stale (first = SOME false) andalso restored () = SOME true
   end
 
 (* The remote's .dat for the action, given by its manifest, fetched into the
@@ -15916,7 +15935,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           phase "check" (fn () =>
             (* Outputs built against out-of-date local copies of the parents
                never reach the remote; the retry restores the remote's. *)
-            (if drop_stale_dep_copies remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
+            (if drop_stale_dep_copies false remote (theory_spec_deps spec) (dat_records_parent (in_root root (#data_path (#outputs spec))))
              then raise ActionFailed (PublishFailure, "built against out-of-date local copies of its parents")
              else ();
              phase "publish" (fn () => check_remote_publication remote root spec);

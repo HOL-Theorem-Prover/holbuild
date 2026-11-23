@@ -473,7 +473,8 @@ done
 # remote entry built against the parent being restored.  Dropping the local
 # entry must fall back to the remote one rather than rebuild (which
 # --remote-only, the fleet's mode, can't do).
-start_remote_cache_server "$tmpdir/remote" "$tmpdir/remote-server"
+remote_control=$tmpdir/remote-control
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/remote-server" "$remote_control"
 fallback_project=$tmpdir/fallback-project
 cp -r "$nondet_project" "$fallback_project"
 rm -rf "$fallback_project/.holbuild"
@@ -489,10 +490,20 @@ rm -rf "$fallback_project/.holbuild"
   "$HOLBUILD_BIN" build --tactic-timeout 0 BTheory) > "$tmpdir/fallback-local.log" 2>&1
 require_grep "BTheory built" "$tmpdir/fallback-local.log"
 # Swap the local ATheory for the remote one; the local BTheory now disagrees.
-a_key=$(cd "$fallback_project" && HOLBUILD_CACHE="$local_cache" "$HOLBUILD_BIN" build --dry-run --tactic-timeout 0 BTheory |
-  awk '/^ATheory \(theory,/ {found = 1} found && /^  input_key:/ {print $2; exit}')
-[[ -n "$a_key" ]] || { echo "no ATheory input key in dry run" >&2; exit 1; }
+input_key() {
+  (cd "$fallback_project" && HOLBUILD_CACHE="$local_cache" "$HOLBUILD_BIN" build --dry-run --tactic-timeout 0 BTheory |
+    awk -v theory="$1" '$1 == theory && $2 == "(theory," {found = 1} found && /^  input_key:/ {print $2; exit}')
+}
+a_key=$(input_key ATheory)
+b_key=$(input_key BTheory)
+[[ -n "$a_key" && -n "$b_key" ]] || { echo "no ATheory or BTheory input key in dry run" >&2; exit 1; }
+# The local BTheory, as a cache in front of the remote's store would serve it
+# below.
+python3 "$SCRIPT_DIR/../../fixtures/remote_cache_entry.py" "$local_cache" "$b_key" "$tmpdir/remote/cas" "$tmpdir/stale-b"
 rm -rf "$local_cache/actions/$a_key"
+# The same local cache as a later build will find it, for the last case.
+persisted_cache=$tmpdir/fallback-persisted-cache
+cp -a "$local_cache" "$persisted_cache"
 rm -rf "$fallback_project/.holbuild"
 fallback_log=$tmpdir/fallback-restore.log
 (cd "$fallback_project" && HOLBUILD_CACHE="$local_cache" HOLBUILD_CACHE_TRACE=1 \
@@ -504,3 +515,55 @@ if grep -q "BTheory built" "$fallback_log"; then
   echo "BTheory was rebuilt instead of restored from the remote cache" >&2
   exit 1
 fi
+
+# A cache in front of the remote's store (a host's bazel-remote over S3) can
+# keep serving an entry the store has since replaced: here the BTheory built
+# against the local ATheory.  A build that copied it from there and finds it
+# doesn't fit its parents asks the cache to check its copy with the store
+# (the fixture then stops serving it) and restores the store's.
+ac_b=$(printf 'holbuild-remote-ac-v1\n%s\n' "$b_key" | sha256sum | cut -d' ' -f1)
+cp "$tmpdir/stale-b" "$remote_control/ac-stale-$ac_b"
+fresh_cache=$tmpdir/fallback-fresh-cache
+link_hol_toolchain_cache "$fresh_cache"
+rm -rf "$fallback_project/.holbuild"
+stale_log=$tmpdir/stale-remote-restore.log
+(cd "$fallback_project" && HOLBUILD_CACHE="$fresh_cache" HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 BTheory) > "$stale_log" 2>&1 ||
+  { cat "$stale_log" >&2; exit 1; }
+require_grep "cache miss: BTheory .*(parent outputs differ)" "$stale_log"
+require_grep "BTheory restored from" "$stale_log"
+if grep -q "BTheory built" "$stale_log"; then
+  echo "BTheory was rebuilt instead of restored from the remote's store" >&2
+  exit 1
+fi
+[[ ! -e "$remote_control/ac-stale-$ac_b" ]] || {
+  echo "the build didn't ask the cache to check its copy of BTheory" >&2; exit 1; }
+
+# The same with the stale BTheory already in the local cache, as an earlier
+# build left it: dropping it, the build asks the cache to check its copy too.
+cp "$tmpdir/stale-b" "$remote_control/ac-stale-$ac_b"
+rm -rf "$fallback_project/.holbuild"
+persisted_log=$tmpdir/stale-persisted-restore.log
+(cd "$fallback_project" && HOLBUILD_CACHE="$persisted_cache" HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 BTheory) > "$persisted_log" 2>&1 ||
+  { cat "$persisted_log" >&2; exit 1; }
+require_grep "cache miss: BTheory .*(parent outputs differ)" "$persisted_log"
+require_grep "BTheory restored from" "$persisted_log"
+if grep -q "BTheory built" "$persisted_log"; then
+  echo "BTheory was rebuilt instead of restored from the remote's store" >&2
+  exit 1
+fi
+[[ ! -e "$remote_control/ac-stale-$ac_b" ]] || {
+  echo "the build didn't ask the cache to check its local copy of BTheory" >&2; exit 1; }
+# A build whose entries fit asks for no check.
+rm -f "$remote_control/no-cache-gets"
+fits_cache=$tmpdir/fallback-fits-cache
+link_hol_toolchain_cache "$fits_cache"
+rm -rf "$fallback_project/.holbuild"
+fits_log=$tmpdir/fits-restore.log
+(cd "$fallback_project" && HOLBUILD_CACHE="$fits_cache" \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 0 BTheory) > "$fits_log" 2>&1 ||
+  { cat "$fits_log" >&2; exit 1; }
+require_grep "BTheory restored from" "$fits_log"
+[[ ! -e "$remote_control/no-cache-gets" ]] || {
+  echo "a build with no misfit asked the cache to check entries:" >&2; cat "$remote_control/no-cache-gets" >&2; exit 1; }
