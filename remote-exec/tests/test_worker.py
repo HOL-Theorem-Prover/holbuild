@@ -878,26 +878,32 @@ def scripted_main(
     tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch, fresh: list[bool], claims: int | list[bool],
     *, unavailable: bool = False, calls: list[float] | None = None, clears: list[bool] | None = None,
     timeouts: list[float] | None = None, drain: bool = False, spells: bool = True, unknown: bool = False,
-    unknown_before: bool = False,
+    unknown_before: bool = False, args: tuple[str, ...] = (), exits: bool = False, reaper_busy: list[bool] | None = None,
+    failed: bool = False,
 ) -> list[str]:
-    """Run ``worker.main`` on ``claims`` claims (or, as a list, claims that find work or not), each run as an
-    action that sets protection (with no answer, with ``unknown``; from an unknown state, with ``unknown_before``)
-    and reports the cache ``unavailable`` or not (after a SIGTERM, with ``drain``), and return the claims, runs
-    and protection calls in order."""
+    """Run ``worker.main`` with extra arguments ``args`` on ``claims`` claims (or, as a list, claims that find work
+    or not), each run as an action that sets protection (with no answer, with ``unknown``; from an unknown state,
+    with ``unknown_before``) and reports the cache ``unavailable`` or not (after a SIGTERM, with ``drain``), and
+    return the claims, runs and protection calls in order. With ``exits``, the worker exits before the claims run
+    out; ``reaper_busy`` says whether exec-action's work after a result still runs, at each check (not, once it
+    runs out). With ``failed``, the claims that find no work fail instead."""
     monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
-    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server))
+    monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server, *args))
     monkeypatch.setattr(worker, "HostTelemetry", lambda *_: None)
     monkeypatch.setattr(worker, "wait_for_disk", lambda *_, **_kwargs: None)
     monkeypatch.setattr(worker, "CLAIM_RETRY_SECONDS", 0.01)
     events: list[str] = []
     protection = ScriptedProtection(events, fresh, clears, spells=spells)
     monkeypatch.setattr(worker, "Protection", lambda *_: protection)
-    left = [claim() if work else None for work in ([True] * claims if isinstance(claims, int) else claims)]
+    works = [True] * claims if isinstance(claims, int) else claims
+    left = [claim() if work else (False if failed else None) for work in works]
 
-    def take(*_args: object) -> dict[str, object] | None:
+    def take(*_args: object) -> dict[str, object] | bool | None:
         events.append("claim")
         if not left:
+            if exits:
+                pytest.fail(f"the worker didn't exit: {events}")
             raise KeyboardInterrupt
         return left.pop(0)
 
@@ -913,9 +919,12 @@ def scripted_main(
             protection.on = None
         return refused or unavailable
 
+    if reaper_busy is not None:
+        busy = list(reaper_busy)
+        monkeypatch.setattr(worker.Reaper, "busy", lambda _self: bool(busy) and busy.pop(0))
     monkeypatch.setattr(worker, "claim_reporting", take)
     monkeypatch.setattr(worker, "run_one", run)
-    with pytest.raises(KeyboardInterrupt) if not drain else contextlib.nullcontext():
+    with pytest.raises(KeyboardInterrupt) if not drain and not exits else contextlib.nullcontext():
         worker.main()
     if calls is not None:
         calls.extend(protection.times)
@@ -954,6 +963,83 @@ def test_only_ecs_protection_is_dropped_between_actions_after_its_longest_spell(
     events = scripted_main(tmp_path, server, monkeypatch, [], 2, spells=False)
     assert events == ["claim", "run", "on:True", "claim", "run", "on:True", "claim", "off"]
     assert Protection(None, server.url).spells and not Protection("true", None).spells
+
+
+BURST_ARGS = ("--tier", "high", "--also-claim", "standard", "--claim-wait-seconds", "0")
+
+
+def test_a_burst_worker_that_ran_an_action_exits_once_a_claim_finds_nothing(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Its task goes in a scale-in, or ECS starts it again on the fullest host with room, so partly drained hosts empty.
+    events = scripted_main(tmp_path, server, monkeypatch, [], [True, False, True], args=BURST_ARGS, exits=True)
+    assert events == ["claim", "run", "on:True", "claim", "off"]
+
+
+def test_a_burst_worker_that_ran_no_action_keeps_claiming(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A task ECS started again doesn't exit before it has run an action, so idle tasks don't restart in a loop.
+    events = scripted_main(tmp_path, server, monkeypatch, [], [False, False], args=BURST_ARGS)
+    assert events == ["claim", "claim", "claim"]
+
+
+def test_only_a_burst_worker_under_ecs_protection_exits_once_a_claim_finds_nothing(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warm = ("--claim-wait-seconds", "0")
+    events = scripted_main(tmp_path, server, monkeypatch, [], [True, False], args=warm)
+    assert events == ["claim", "run", "on:True", "claim", "off", "claim"]
+    events = scripted_main(tmp_path, server, monkeypatch, [], [True, False], args=BURST_ARGS, spells=False)
+    assert events == ["claim", "run", "on:True", "claim", "off", "claim"]
+
+
+def test_a_burst_worker_whose_claim_failed_keeps_claiming(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A failed claim (a coordinator down, refusing or not answering in time) says nothing about the fleet's work.
+    events = scripted_main(tmp_path, server, monkeypatch, [], [True, False], args=BURST_ARGS, failed=True)
+    assert events == ["claim", "run", "on:True", "claim", "off", "claim"]
+
+
+def test_a_burst_worker_answered_nothing_before_its_wait_keeps_claiming_however_long_protection_takes_to_clear(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An empty answer before the wait is a coordinator that doesn't wait (a restart), not a fleet with no work for
+    # it; the time ECS takes to clear protection afterwards doesn't count.
+    set_protection = ScriptedProtection.set
+
+    def slow_clear(self: ScriptedProtection, *, enabled: bool, timeout: float = 30) -> bool:
+        if not enabled:
+            time.sleep(0.3)
+        return set_protection(self, enabled=enabled, timeout=timeout)
+
+    monkeypatch.setattr(ScriptedProtection, "set", slow_clear)
+    events = scripted_main(tmp_path, server, monkeypatch, [], [True, False], args=(*BURST_ARGS[:-1], "0.2"))
+    assert events == ["claim", "run", "on:True", "claim", "off", "claim"]
+
+
+def test_a_burst_worker_exits_only_once_exec_actions_work_after_its_result_is_done(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exiting would stop the cache cap's sweep and the module writer, so it waits for the next claim's.
+    events = scripted_main(
+        tmp_path, server, monkeypatch, [], [True, False, False, True], args=BURST_ARGS, exits=True,
+        reaper_busy=[True],
+    )
+    assert events == ["claim", "run", "on:True", "claim", "off", "claim"]
+
+
+def test_a_busy_burst_worker_still_drops_protection_after_its_longest_spell_and_exits_once_idle(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The hourly gap lets a rolling deployment stop a burst task that never runs dry.
+    monkeypatch.setattr(worker, "PROTECTED_SPELL_SECONDS", -1)
+    monkeypatch.setattr(worker, "SPELL_GAP_SECONDS", 0.01)
+    events = scripted_main(tmp_path, server, monkeypatch, [], [True, True, False], args=BURST_ARGS, exits=True)
+    assert events == [
+        "claim", "run", "on:True", "off", "on:True", "claim", "run", "on:True", "off", "on:True", "claim", "off"
+    ]
 
 
 def test_a_clear_that_failed_is_tried_again_while_the_worker_is_idle_and_as_it_exits(
@@ -2359,7 +2445,7 @@ def test_reported_phases_start_again_once_the_coordinator_answered_the_claim(
     phases = Phases()
     phases.add("hol", 2.0)
 
-    assert claim_reporting(Coordinator("http://127.0.0.1:9", "w"), ["standard"], "w", 0, phases) is None
+    assert claim_reporting(Coordinator("http://127.0.0.1:9", "w"), ["standard"], "w", 0, phases) is False
     assert phases.take()["hol"] == kept
 
 

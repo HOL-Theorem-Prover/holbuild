@@ -140,6 +140,7 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_RUN_FLOOR` | running run actions allowed ahead of ready builds, clamped to `REMOTE_EXEC_RUN_SLOTS` | 0 |
 | `REMOTE_EXEC_PRIORITY_CAP` | running builds of positive-priority batches past which their builds rank like priority-0 ones (see Claims); at least the fleet's worker count for strict priority | 128 |
 | `REMOTE_EXEC_WARM_WORKERS` | always-on standard-tier workers | 0 |
+| `REMOTE_EXEC_ON_DEMAND_BURST_HOSTS` | burst hosts of `--host-rank 0` that pack at rank 0, the fullest first; the others pack at rank 2, behind rank 1, so On-Demand hosts that took a Spot pool's (rank 1) workers while it was short empty once it is back (see Claims) | 1 |
 | `REMOTE_EXEC_LOCALITY` | steer builds to the hosts below the scale-in line that hold their checkpoints or dependency context (see Claims); `false` for the plain order | true |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
 | `REMOTE_EXEC_SCALE_DOWN_HOLD_S` | how long a higher burst worker count is kept after demand drops | 900 |
@@ -532,7 +533,9 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   Within the selected class, claims prefer the worker's tier over its
   `also_claim` tiers, in order.
   Within each coordinator process, waiting claims prefer standard-primary
-  workers for standard work, then hosts in ascending `--host-rank`, then
+  workers for standard work, then hosts in ascending `--host-rank` (a burst
+  host of rank 0 beyond the `REMOTE_EXEC_ON_DEMAND_BURST_HOSTS` with the most
+  live workers ranks 2), then
   burst hosts with more live workers, then host-id order, with FIFO ties,
   so a burst host that scale-in partly drained loses work to full ones and
   empties. Claims without a host report follow known hosts of the same
@@ -897,6 +900,15 @@ protection, so only the gap lets it stop the task; a clear there that failed
 is tried again, with another gap, at the next action's end). That costs a busy
 worker about 1/60 of its time.
 Other failures are logged and the action carries on.
+
+A worker under ECS protection that claims high work first (a burst worker)
+exits once it has run an action and a claim then waits its full
+`--claim-wait-seconds` for nothing, after any work exec-action does after its
+last result. In a scale-in its task then goes at once; otherwise ECS starts
+it again where the service's placement puts it (with `binpack`, on the
+fullest host with room), so the workers of partly drained hosts move onto
+full ones and the empty hosts scale in. A started task runs an action before
+it may exit, so idle workers don't restart in a loop.
 
 ## Wire format
 

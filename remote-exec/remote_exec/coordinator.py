@@ -150,6 +150,9 @@ class Settings(BaseSettings):
     # Coordinator._local_entry and _held. False claims and wakes as without it.
     locality: bool = True
     warm_workers: int = 0
+    # Burst hosts of rank 0 (On-Demand) that keep it; the others, which took workers Spot (rank 1) couldn't launch
+    # hosts for, rank 2, behind Spot, so they empty once Spot is back. See Coordinator._burst_ranks.
+    on_demand_burst_hosts: int = Field(default=1, ge=0)
     max_burst_workers: int = 0
     scale_down_hold_s: float = 900.0
     # The burst cache pool's own hold on the worker floor. Worker hosts get a further scale-in delay from their
@@ -2409,6 +2412,7 @@ class Coordinator:
             and (w_ahead or not ahead)
         )
         hosts: list[tuple[tuple[bool, int, int, str], int]] = []
+        ranks = self._burst_ranks(now)
         for host_id, workers in self.host_workers.items():
             fresh = [
                 "high" in w_tiers for seen, w_tiers in workers.values()
@@ -2417,7 +2421,7 @@ class Coordinator:
             if not fresh or self._quarantine(host_id) is not None:
                 continue
             report = self.hosts.get(host_id)
-            rank = 0 if report is None else report[1].rank
+            rank = ranks.get(host_id, 0 if report is None else report[1].rank)
             # A host reports its leases of all tiers.
             reported = report[1].leases if report is not None and report[1].leases is not None and not burst_only else 0
             busy = leases[host_id] + waiting[host_id]
@@ -2642,8 +2646,34 @@ class Coordinator:
         return self._known_burst(rank) and self._tail_host(rank, self._kept_hosts(1, tier, ahead=ahead))
 
     def _waiter_rank(self, tiers: list[str], host_id: str | None, host_rank: int) -> ClaimRank:
-        """The rank of a claim of ``tiers`` from ``host_id`` as its host's workers are now; see _claim_rank."""
+        """The rank of a claim of ``tiers`` from ``host_id`` as its host's workers are now, a burst host's of rank 0
+        as _burst_ranks has it; see _claim_rank."""
+        if host_rank == 0 and host_id is not None and tiers[0] != "standard":
+            host_rank = self._burst_ranks(self.clock()).get(host_id, 0)
         return _claim_rank(tiers, host_id, host_rank, len(self.host_workers.get(host_id or "", ())))
+
+    def _burst_ranks(self, now: datetime) -> dict[str, int]:
+        """The rank each burst host of rank 0 (On-Demand) packs at: the ``on_demand_burst_hosts`` with the most
+        workers seen lately (then by id) keep 0, ahead of Spot's 1; the others, On-Demand hosts started for workers
+        Spot couldn't launch hosts for, get 2, so claims fill Spot first and they empty and scale in once Spot is
+        back. Hosts not quarantined whose workers seen lately all take high work, and with a stored report: one with
+        none (its telemetry failed) keeps the rank its claims carry."""
+        on_demand: list[tuple[int, str]] = []
+        for host_id, workers in self.host_workers.items():
+            fresh = [
+                "high" in w_tiers for seen, w_tiers in workers.values()
+                if (now - seen).total_seconds() < HOST_REPORT_SECONDS
+            ]
+            report = self.hosts.get(host_id)
+            if (
+                fresh and all(fresh) and report is not None and report[1].rank == 0
+                and self._quarantine(host_id) is None
+            ):
+                on_demand.append((-len(fresh), host_id))
+        return {
+            host_id: 0 if i < self.settings.on_demand_burst_hosts else 2
+            for i, (_, host_id) in enumerate(sorted(on_demand))
+        }
 
     def _count_ready(self, counts: QueueCounts, leased: Counter[str]) -> None:
         """Note the ready builds of ``counts``: all of them, for the scale-in line, and by tier those a claim could

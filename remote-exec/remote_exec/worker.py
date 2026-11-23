@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any
+from typing import Any, Literal
 
 from remote_exec.auth import cache_discovery_token
 from remote_exec.cache import blob_key, cache_nodes, preferred_identities, ranked_nodes
@@ -1216,9 +1216,10 @@ class Lease:
 
 def claim_reporting(
     coordinator: Coordinator, tiers: list[str], worker: str, wait_s: float, phases: Phases
-) -> dict[str, Any] | None:
-    """``Coordinator.claim``, reporting ``phases`` with it, or None when the claim failed. The phases reported
-    start again once the coordinator answered, even with an error, since it has them then."""
+) -> dict[str, Any] | Literal[False] | None:
+    """``Coordinator.claim``, reporting ``phases`` with it: the action, None when the coordinator had none, or False
+    when the claim failed or the drain stopped it. The phases reported start again once the coordinator answered,
+    even with an error, since it has them then."""
     report = phases.take()
     try:
         with phases.timed("claim"):
@@ -1227,9 +1228,9 @@ def claim_reporting(
         print(f"claim failed: {error}", file=sys.stderr)
         if not isinstance(error, ClaimRefused):
             phases.put_back(report)
-        return None
+        return False
     except DrainStopped:
-        return None
+        return False
 
 
 def run_one(
@@ -1338,6 +1339,10 @@ class Reaper:
         """Has the exec-action it holds, if any, stopped, without waiting for it."""
         if self.running is not None:
             self.running[1].set()
+
+    def busy(self) -> bool:
+        """Whether the exec-action it took over still runs."""
+        return self.running is not None and self.running[0].is_alive()
 
     def stop(self) -> None:
         """Stops the exec-action it holds, if any, and returns once it is reaped."""
@@ -1785,6 +1790,11 @@ def main() -> None:
         # Set when ECS refused protection for a claim or the worker dropped it after PROTECTED_SPELL_SECONDS: the
         # worker then claims only once ECS protects it, so a task being stopped takes no action it would give back.
         protect_first = False
+        # A burst worker under ECS that ran an action and then waited out a claim for nothing exits, so its task
+        # goes: at once in a scale-in, else ECS starts a new one where binpack puts it, on the fullest host with room,
+        # so partly drained hosts empty and scale in. A new task runs no action before it may exit, so idle ones
+        # don't restart in a loop.
+        ran_action = False
         while not drain.stop.is_set():
             with phases.timed("idle"):
                 wait_for_disk(drain, coordinator, tiers, args.name, sweep, reaper=reaper, before_wait=unprotect)
@@ -1809,10 +1819,14 @@ def main() -> None:
                     continue
             started = time.monotonic()
             claim = claim_reporting(coordinator, tiers, args.name, args.claim_wait_seconds, phases)
-            if claim is None:
+            if not isinstance(claim, dict):
+                waited_out = claim is None and time.monotonic() - started >= args.claim_wait_seconds
                 protect_first = False
                 with phases.timed("lease"):
                     unprotect()
+                if ran_action and waited_out and protection.spells and tiers[0] != "standard" and not reaper.busy():
+                    print("no work after an action: exiting so the task can go or move", file=sys.stderr, flush=True)
+                    break
                 # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
                 with phases.timed("idle"):
                     drain.stop.wait(max(0.0, CLAIM_RETRY_SECONDS - (time.monotonic() - started)))
@@ -1831,6 +1845,7 @@ def main() -> None:
                 # coordinator is down.
                 print(f"action failed in the worker: {error}", file=sys.stderr)
                 unavailable = True
+            ran_action = True
             spell_over = protection.spells and time.monotonic() - protection.since > PROTECTED_SPELL_SECONDS
             if protection.on is not False and (unavailable or spell_over):
                 with phases.timed("lease"):
