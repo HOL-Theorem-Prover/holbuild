@@ -1200,6 +1200,14 @@ other work, that entire step is untimed; other planned steps keep their limits.
 Aliases with different names are not recognized. Timeout metadata and cache key
 formats are unchanged; existing successful builds remain reusable.
 
+Steps containing `metis_tac` or `METIS_TAC`, matched the same way, get a budget of at
+least 5 seconds: proof search, and replay of proofs found by external provers, often
+needs more than the default. A configured timeout above 5 seconds applies to them
+unchanged, one below it doesn't shorten theirs, and `0` still disables it. An SMT name
+anywhere in the step keeps it untimed. The half-timeout retry and the timeout report
+use the step's own budget. Since the budget only grows with the configured timeout, the
+rule above for reusing a success under another timeout still holds.
+
 A step that exceeds its timeout runs once more, at once and in the same process, with
 half the timeout. Each timed call computes its result from the proof state it was given
 and commits it to the proof history only on success, so the first attempt leaves the

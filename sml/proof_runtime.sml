@@ -308,13 +308,21 @@ fun retry_after_timeout label seconds first_attempt f x =
     y
   end
 
-(* Match public HolSmtLib tactic names, including re-exports under other
-   structures. Lower quotations first so HOL constants and string literals
-   cannot accidentally disable the timer. *)
-fun smt_tactic_step program =
+(* The time budget of a step, given the configured one: NONE (untimed) when
+   the step names a public HolSmtLib tactic, whose solver run and proof replay
+   can exceed any step budget; at least long_step_seconds when it names a
+   long-running proof-search tactic such as metis, whose proofs (e.g. those
+   reconstructed from external provers) often need more than the default.
+   Names match under any structure qualifier, so re-exports count. Lower
+   quotations first so HOL constants and string literals cannot accidentally
+   change the budget. *)
+val long_step_seconds = 5.0
+fun step_budget program seconds =
   let
-    val names = ["GENERIC_SMT_TAC", "CVC_ORACLE_TAC", "CVC_TAC", "YICES_TAC",
-                 "Z3_ORACLE_TAC", "Z3_TAC", "cvco_tac", "cvc_tac", "z3_tac", "z3o_tac"]
+    val untimed_names = ["GENERIC_SMT_TAC", "CVC_ORACLE_TAC", "CVC_TAC", "YICES_TAC",
+                         "Z3_ORACLE_TAC", "Z3_TAC", "cvco_tac", "cvc_tac", "z3_tac", "z3o_tac"]
+    val long_names = ["METIS_TAC", "metis_tac"]
+    fun member names name = List.exists (fn candidate => name = candidate) names
     val text = HOLSource.fromString {quietOpen = false, print = fn _ => ()} program
     val n = size text
     fun at i s = i + size s <= n andalso String.substring (text, i, size s) = s
@@ -335,24 +343,26 @@ fun smt_tactic_step program =
         | _ => string_end (i + 1)
     fun ident_char c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'" orelse c = #"."
     fun ident_end i = if i < n andalso ident_char (String.sub (text, i)) then ident_end (i + 1) else i
-    fun scan i =
-      if i >= n then false
-      else if at i "(*" then scan (comment (i + 2) 1)
-      else if at i "\"" then scan (string_end (i + 1))
+    fun scan i long =
+      if i >= n then SOME (if long then Real.max (seconds, long_step_seconds) else seconds)
+      else if at i "(*" then scan (comment (i + 2) 1) long
+      else if at i "\"" then scan (string_end (i + 1)) long
       else if ident_char (String.sub (text, i)) then
         let
           val stop = ident_end i
           val parts = String.fields (fn c => c = #".") (String.substring (text, i, stop - i))
           val name = List.last parts
-        in List.exists (fn candidate => name = candidate) names orelse scan stop end
-      else scan (i + 1)
-  in scan 0 end
+        in
+          if member untimed_names name then NONE
+          else scan stop (long orelse member long_names name)
+        end
+      else scan (i + 1) long
+  in scan 0 false end
 
 fun with_tactic_timeout label program f x =
-  case !tactic_timeout_ref of
+  case Option.mapPartial (step_budget program) (!tactic_timeout_ref) of
       NONE => f x
     | SOME seconds =>
-        if smt_tactic_step program then f x else
         let
           val first_attempt = Timer.startCPUTimer ()
           val wall = Timer.startRealTimer ()
