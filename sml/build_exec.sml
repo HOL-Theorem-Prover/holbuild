@@ -7851,7 +7851,10 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     val _ = register_nodes 0
 
     (* A node's rank: the longest chain of selected dependents below it,
-       then its count of descendants. *)
+       then its count of descendants.  A restore-only build runs no theory,
+       so ranking it would only cost time (the descendant counts take
+       O(N * E / 8) up front): it takes ready nodes first come. *)
+    val ranked = not (#restore_only options)
     val critical_depth = Array.array (node_count, ~1)
     fun depth id =
       if Array.sub (critical_depth, id) >= 0 then Array.sub (critical_depth, id)
@@ -7860,6 +7863,8 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
         in Array.update (critical_depth, id, d); d end
     val descendant_count = Array.array (node_count, 0)
     val _ =
+      if not ranked then ()
+      else
       let
         val width = (node_count + 7) div 8
         val sets = Array.array (node_count, NONE : Word8Array.array option)
@@ -7889,8 +7894,17 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
     fun outranks (a, b) =
       depth a > depth b orelse (depth a = depth b andalso Array.sub (descendant_count, a) > Array.sub (descendant_count, b))
 
+    fun first_matching matches skipped ids =
+      case ids of
+          [] => NONE
+        | id :: rest =>
+            if matches id then SOME (id, List.revAppend (skipped, rest))
+            else first_matching matches (id :: skipped) rest
+
     (* The best-ranked of IDS that MATCHES, and the others. *)
     fun best_matching matches ids =
+      if not ranked then first_matching matches [] ids
+      else
       case List.filter matches ids of
           [] => NONE
         | first :: rest =>
@@ -10181,12 +10195,15 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
           (* Read in parallel: each reads a theory's metadata, and on a busy
              host those files are often out of the page cache. *)
           val blobs_of = Array.array (length actions, NONE)
-          val _ = parallel_all remote_probe_width (fn (i, action) => Array.update (blobs_of, i, local_blobs action))
-                    (ListPair.zip (List.tabulate (length actions, fn i => i), actions))
+          val _ =
+            detail_time_phase "action_spec.export.built_here.keys" (fn () =>
+              parallel_all remote_probe_width (fn (i, action) => Array.update (blobs_of, i, local_blobs action))
+                (ListPair.zip (List.tabulate (length actions, fn i => i), actions)))
           val prepared = ListPair.zip (actions, Array.foldr op:: [] blobs_of)
           val blobs = unique_strings (List.concat (List.mapPartial #2 prepared))
-          val verified = Binaryset.addList
-            (Binaryset.empty String.compare, HolbuildCache.verified_blobs (cache_root ()) blobs)
+          val verified =
+            detail_time_phase "action_spec.export.built_here.verified_blobs" (fn () =>
+              Binaryset.addList (Binaryset.empty String.compare, HolbuildCache.verified_blobs (cache_root ()) blobs))
           fun built_here (_, NONE) = false
             | built_here (_, SOME hashes) = List.all (fn hash => Binaryset.member (verified, hash)) hashes
           val (here, other) = List.partition built_here prepared

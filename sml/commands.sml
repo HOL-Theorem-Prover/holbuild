@@ -1777,8 +1777,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             val prefetch_keys = ref []
             val node_with_input_key = HolbuildBuildExec.node_with_input_key plan keys
             fun record_pending () =
-              ((!pending_record ()) before pending_record := (fn () => ());
-               write_pending_plan ())
+              timed_phase "remote_exec.record_pending" (fn () =>
+                ((!pending_record ()) before pending_record := (fn () => ());
+                 write_pending_plan ()))
             fun export defer skip forced =
               let
                 val {batch, deferred = held, record, prefetch} =
@@ -1982,11 +1983,22 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 (* Whether a worker found a theory not to fit its parents in
                    the remote cache, rather than missing from it. *)
                 val misfit = ref false
+                val follow_start = Time.now ()
+                val failure_seen = ref false
+                fun note_first_failure () =
+                  if !failure_seen then ()
+                  else
+                    (failure_seen := true;
+                     HolbuildToolchain.append_timing
+                       (HolbuildToolchain.phase_line_milliseconds
+                          {name = "remote_exec.first_failure", status = "ok",
+                           ms = Time.toMilliseconds (Time.- (Time.now (), follow_start)), fields = []}))
                 fun on_change (key, state, failure, log, detail) =
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
                    if state = "cancelled" then () else seen := (key, log) :: List.filter (fn (k, _) => k <> key) (!seen);
                    if state = "done" then
                      (HolbuildBuildExec.expect_remote_entry key; add key; logs := (key, log) :: !logs)
+                   else if state = "failed" then note_first_failure ()
                    else ();
                    case detail of
                        SOME text =>
@@ -2002,7 +2014,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                      | _ => ())
                 fun follow_batch () =
                   let
-                    val result = HolbuildRemoteExec.follow url batch_id on_change
+                    val result = timed_phase "remote_exec.follow" (fn () => HolbuildRemoteExec.follow url batch_id on_change)
                     val settled = stop_all ()
                     val _ = #drain early_pool ()
                   in
@@ -2258,15 +2270,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                         (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
                                         tc project plan keys toolchain_key jobs)))
               else
-                case HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
-                       (case (if fail_fast then ["fail_fast=true"] else []) @
-                             (if priority = 0 then [] else ["priority=" ^ Int.toString priority]) @
-                             (case speculative_loading of
-                                  SOME n => ["speculative_loading=" ^ Int.toString n]
-                                | NONE => []) of
-                            [] => ""
-                          | params => "?" ^ String.concatWith "&" params)
-                       (#maxheap tc) batch of
+                case timed_phase "remote_exec.submit" (fn () =>
+                       HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
+                         (case (if fail_fast then ["fail_fast=true"] else []) @
+                               (if priority = 0 then [] else ["priority=" ^ Int.toString priority]) @
+                               (case speculative_loading of
+                                    SOME n => ["speculative_loading=" ^ Int.toString n]
+                                  | NONE => []) of
+                              [] => ""
+                            | params => "?" ^ String.concatWith "&" params)
+                         (#maxheap tc) batch) of
                     HolbuildRemoteExec.Refused reason => (record_pending (); fall_back reason)
                   | HolbuildRemoteExec.Ok batch_id =>
                       let
