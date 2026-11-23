@@ -2015,7 +2015,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 fun follow_batch () =
                   let
                     val result = timed_phase "remote_exec.follow" (fn () => HolbuildRemoteExec.follow url batch_id on_change)
-                    val settled = stop_all ()
+                    val settled = timed_phase "remote_exec.settled" stop_all
                     val _ = #drain early_pool ()
                   in
                     (result, rev (!logs), !seen, !misfit, settled, failure_spans, early)
@@ -2270,26 +2270,40 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                         (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
                                         tc project plan keys toolchain_key jobs)))
               else
-                case timed_phase "remote_exec.submit" (fn () =>
-                       HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
-                         (case (if fail_fast then ["fail_fast=true"] else []) @
-                               (if priority = 0 then [] else ["priority=" ^ Int.toString priority]) @
-                               (case speculative_loading of
-                                    SOME n => ["speculative_loading=" ^ Int.toString n]
-                                  | NONE => []) of
-                              [] => ""
-                            | params => "?" ^ String.concatWith "&" params)
-                         (#maxheap tc) batch) of
-                    HolbuildRemoteExec.Refused reason => (record_pending (); fall_back reason)
-                  | HolbuildRemoteExec.Ok batch_id =>
-                      let
-                        fun submitted () =
-                          (HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
-                           if detach then record_pending () else finish retried skip (SOME (batch_keys batch)) batch_id)
-                      in
-                        if detach then submitted ()
-                        else HolbuildRemoteExec.while_followed url batch_id submitted
-                      end
+                let
+                  val submit_start = Time.now ()
+                  fun submit_line status =
+                    HolbuildToolchain.phase_line
+                      {name = "remote_exec.submit", status = status, start = submit_start, finish = Time.now ()}
+                  val response =
+                    HolbuildRemoteExec.submit_with_query (remote_only orelse detach) url
+                      (case (if fail_fast then ["fail_fast=true"] else []) @
+                            (if priority = 0 then [] else ["priority=" ^ Int.toString priority]) @
+                            (case speculative_loading of
+                                 SOME n => ["speculative_loading=" ^ Int.toString n]
+                               | NONE => []) of
+                           [] => ""
+                         | params => "?" ^ String.concatWith "&" params)
+                      (#maxheap tc) batch
+                    handle e => (HolbuildToolchain.append_timing (submit_line "fail"); raise e)
+                  (* Written once the batch is followed, so that an interrupt
+                     during the write still cancels it. *)
+                  val submit_timing = submit_line "ok"
+                in
+                  case response of
+                      HolbuildRemoteExec.Refused reason =>
+                        (HolbuildToolchain.append_timing submit_timing; record_pending (); fall_back reason)
+                    | HolbuildRemoteExec.Ok batch_id =>
+                        let
+                          fun submitted () =
+                            (HolbuildToolchain.append_timing submit_timing;
+                             HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
+                             if detach then record_pending () else finish retried skip (SOME (batch_keys batch)) batch_id)
+                        in
+                          if detach then submitted ()
+                          else HolbuildRemoteExec.while_followed url batch_id submitted
+                        end
+                end
             (* Settles the deferred theories; those early cutoff can't reuse, and
                those that depend on them, go in the next batch, except those
                that are or depend on a theory with its input key in skip.  So
