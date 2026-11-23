@@ -334,6 +334,21 @@ val requests_after_put =
 val _ = check "an entry put on a cache of one node was read back"
           (not (List.exists (fn line => line = "GET /ac/" ^ a_entry) requests_after_put));
 
+(* Another host published A, and a restore put A in the store, while
+   this writer ran: the published module isn't stored over it. *)
+val _ = OS.FileSys.rename {old = "$tmpdir/remote/ac/" ^ a_entry, new = "$tmpdir/a-aside"};
+val _ = remove_store "hol5";
+val _ = writes [a];
+val _ = E.write_text "$tmpdir/plant"
+          ("mv $tmpdir/a-aside $tmpdir/remote/ac/" ^ a_entry ^ "\n" ^
+           "printf restored > " ^ OS.Path.concat (store "hol5", a) ^ "\n");
+val {installed, fetched, trace, ...} = fill_by "hol5" 100;
+val _ = check "a published module was stored over one a restore put in the store"
+          (installed = 0 andalso fetched = 0 andalso E.read_text (OS.Path.concat (store "hol5", a)) = "restored");
+val _ = check ("a published module the store had was not traced as existing: " ^ trace)
+          (String.isSubstring
+             " modules_outputs=files:1,discarded:0,installed:0,existing:1,other:0,absent:0 modules_won=0" trace);
+
 (* Another host publishes A while this writer uploads its module: the
    put conflicts, and the other host's module is stored. *)
 val _ = OS.FileSys.rename {old = "$tmpdir/remote/ac/" ^ a_entry, new = "$tmpdir/a-mine"};

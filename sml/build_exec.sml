@@ -14571,6 +14571,10 @@ val module_store_base_theories = "base-theories"
    by the message. *)
 val module_writer_report = "writer-report"
 
+(* The most of a writer's report that is read: a line for each of the
+   few thousand theories it may visit. *)
+val module_writer_report_bytes = 1024 * 1024
+
 (* HOL's module writer (TheoryModules.write_modules), except for a theory
    whose module is stored but HOL refuses it (module_loader_line): HOL
    writes that module again, under the same name, which the worker would
@@ -14588,6 +14592,8 @@ val module_writer_line =
      "let " ^
      "val lines = ref ([] : string list); " ^
      "fun note line = lines := line :: !lines; " ^
+     "fun message x = String.translate (fn c => if Char.isCntrl c then \" \" else String.str c) " ^
+     "(General.exnMessage x); " ^
      "fun report written = " ^
      "(let val out = TextIO.openOut (OS.Path.concat (TheoryModules.absolute output, " ^
      HolbuildToolchain.sml_string module_writer_report ^ ")) " ^
@@ -14637,7 +14643,7 @@ val module_writer_line =
      "| NONE => (ignore (decode e); outcome e \"unreadable\"; written) end " ^
      "handle x as Interrupt => PolyML.Exception.reraise x " ^
      "| x => (TextIO.output (TextIO.stdErr, \"theory modules: \" ^ #thy e ^ \": \" ^ " ^
-     "General.exnMessage x ^ \"\\n\"); note (\"error \" ^ #thy e ^ \" \" ^ General.exnMessage x); written); " ^
+     "General.exnMessage x ^ \"\\n\"); note (\"error \" ^ #thy e ^ \" \" ^ message x); written); " ^
      "fun loop ([], written) = written " ^
      "| loop (entries as e :: rest, written) = " ^
      "if written >= limit then (note (\"unvisited \" ^ Int.toString (length entries)); written) " ^
@@ -14647,7 +14653,7 @@ val module_writer_line =
      "| needed => (note (\"needed \" ^ Int.toString (length needed)); TheoryModules.mkdir output; loop (needed, 0)) end " ^
      "handle x as Interrupt => PolyML.Exception.reraise x " ^
      "| x => (TextIO.output (TextIO.stdErr, \"theory modules: \" ^ General.exnMessage x ^ \"\\n\"); " ^
-     "note (\"status failed \" ^ General.exnMessage x); 0)) " ^
+     "note (\"status failed \" ^ message x); 0)) " ^
      "| (false, _) => (note \"status ineligible\"; 0) " ^
      "| (true, NONE) => (note \"status no-base-id\"; 0)) end " ^
      "in Meta.moduleWriter := SOME write_modules end;")
@@ -14837,7 +14843,7 @@ fun converge_modules remote {store, staging, modules, deadline} =
                           HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp}) of
                      HolbuildCacheBackend.Hit =>
                        if install_module store {src = tmp, name = name} then count (fn () => won := file :: !won)
-                       else ()
+                       else count (fn () => present := file :: !present)
                    | HolbuildCacheBackend.Miss => heal (file, key)
                    | _ => ();
                  remove_file tmp)
@@ -15100,7 +15106,8 @@ fun theory_module_grants root tc (spec : action_spec) deps_heap =
    why (`covered`: no expected module missing; `threshold`: fewer missing
    than module_writer_min_missing; `locked`: another process writes the
    store; `time`: too little left before the deadline; `failed`: an error
-   before it started), or the sandbox refused what it left, or it left
+   before it started; fill_module_store also traces `unsupported`: no
+   module writer for the HOL), or the sandbox refused what it left, or it left
    REPORT (module_writer_report, [] for none) and wrote OUTPUTS, the
    modules (file names) of which were DISCARDED (theory not missing when
    it ran), or INSTALLED, or replaced by the module another writer
@@ -15191,7 +15198,7 @@ fun module_store_trace {files, expected, run} =
                   | _ => "ran"
               fun number key =
                 case values key of
-                    [n] :: _ => if n <> "" andalso CharVector.all Char.isDigit n then n else "?"
+                    [n] :: _ => if n <> "" andalso size n <= 9 andalso CharVector.all Char.isDigit n then n else "?"
                   | _ => "0"
               val counts =
                 List.mapPartial (fn key => case length (values key) of 0 => NONE | n => SOME (key ^ ":" ^ Int.toString n))
@@ -15340,9 +15347,16 @@ fun write_missing_modules remote root tc wanted deadline =
         fun store_written () =
           let
             val report_file = Path.concat (output, module_writer_report)
-            (* The child may have left anything under the report's name. *)
+            (* The child may have left anything under the report's name:
+               no more than module_writer_report_bytes of it is read. *)
             val report =
-              (if file_exists report_file then String.tokens (fn c => c = #"\n") (read_text report_file) else [])
+              (if file_exists report_file then
+                 let val input = TextIO.openIn report_file
+                 in
+                   String.tokens (fn c => c = #"\n")
+                     (TextIO.inputN (input, module_writer_report_bytes) before TextIO.closeIn input)
+                 end
+               else [])
               handle IO.Io _ => [] | OS.SysErr _ => []
             val outputs = List.filter (isSome o module_file_theory_part) (map Path.file (HolbuildCache.children output))
             val (written, discarded) = List.partition (module_file_wanted (map #1 still)) outputs
@@ -15424,12 +15438,13 @@ fun seed_module_store holdir =
 fun fill_module_store remote root tc wanted deadline =
   let
     val t0 = Time.now ()
-    val none = {installed = 0, missing = 0, probed = 0, fetched = 0, published = 0, trace = ""}
+    fun none why = {installed = 0, missing = 0, probed = 0, fetched = 0, published = 0,
+                    trace = " modules_writer=none:" ^ why}
     val {installed, missing, probed, fetched, published, trace} =
       (if module_writer_supported (#holdir tc)
        then (seed_module_store (#holdir tc); write_missing_modules remote root tc wanted deadline)
-       else none)
-      handle e => (warn ("theory modules not written: " ^ General.exnMessage e); none)
+       else none "unsupported")
+      handle e => (warn ("theory modules not written: " ^ General.exnMessage e); none "failed")
   in
     {ms = Time.toMilliseconds (Time.- (Time.now (), t0)), installed = installed, missing = missing,
      probed = probed, fetched = fetched, published = published, trace = trace}
