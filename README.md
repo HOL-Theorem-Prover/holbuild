@@ -1130,7 +1130,8 @@ holbuild build --skip-checkpoints MyTheory
   Steps containing public `HolSmtLib` tactic names (such as `Z3_TAC`, `CVC_TAC`,
   or `z3_tac`) are automatically untimed, including under other structure
   qualifiers. Other work in the same step shares that exemption; separate steps
-  retain their limits.
+  retain their limits. Steps containing `metis_tac` or `METIS_TAC` get at least
+  5 seconds the same way (a longer timeout applies to them too).
   A step that times out runs once more with half the timeout; if that
   finishes, the step passes and the theory's build log says so
   (`holbuild tactic timeout retry passed: ...`). Otherwise it fails the build,
