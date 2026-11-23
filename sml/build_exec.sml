@@ -1928,7 +1928,21 @@ fun hol_file_sha1 path =
 fun hol_files_sha1 paths =
   HolbuildHash.files_hash {command = "sha1sum", digits = 40, fallback = hol_file_sha1} paths
 
-val theory_sml_hash_literal = HolbuildTheoryCacheManifest.theory_sml_hash_literal
+(* The hash literal of a generated Theory.sml: `hash =` and a quoted
+   SHA-1, the only such literal in the file. *)
+fun theory_sml_hash_literal text =
+  let
+    val (_, rest) = Substring.position "hash =" (Substring.full text)
+    val quoted = Substring.dropl Char.isSpace (Substring.triml (size "hash =") rest)
+  in
+    if Substring.isEmpty rest then NONE
+    else if Substring.size quoted > 41 andalso Substring.sub (quoted, 0) = #"\"" andalso
+            Substring.sub (quoted, 41) = #"\"" andalso
+            HolbuildTheoryCacheManifest.valid_sha1_text
+              (Substring.string (Substring.slice (quoted, 1, SOME 40)))
+    then SOME (Substring.string (Substring.slice (quoted, 1, SOME 40)))
+    else NONE
+  end
 
 (* A theory's .dat is known by the hash its Theory.sml carries, which is
    what its children record for it and what HOL's link_parents compares:
@@ -2545,15 +2559,6 @@ fun cache_manifest_outputs_equal_but_dat input_key left right =
     #mldeps l = #mldeps r
   end
 
-(* Whether the theory entry RESIDENT gives way to INCOMING, the same build
-   under a stronger timeout contract and maybe another theory digest
-   (HolbuildTheoryCacheManifest.weaker_but_for_digest), reading each one's
-   Theory.sml from the cache at ROOT. *)
-fun cache_entry_weaker_but_for_digest root input_key incoming resident =
-  HolbuildTheoryCacheManifest.weaker_but_for_digest input_key
-    (fn hash => read_text (HolbuildCache.blob_path root hash)) incoming resident
-  handle _ => false
-
 fun cache_entry_usable root input_key text =
   let
     val lines = cache_manifest_lines text
@@ -2875,7 +2880,6 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
           if old = manifest then HolbuildCache.touch_action root cache_key
           else if cache_entry_usable root cache_key old then
             if cache_manifest_outputs_equal cache_key old manifest then publish_same_outputs old
-            else if cache_entry_weaker_but_for_digest root cache_key manifest old then write_manifest manifest
             else cache_conflict_warning cache_key manifest_path subject old manifest
           else
             write_manifest manifest
@@ -3586,17 +3590,13 @@ fun bool_text true = "true"
    4: a theory's generated .uo lists its parents and ML dependencies in
    Holmake's load order, not parents by name and then ML dependencies, so a
    dependent's entry from before was built loading them in another order.
-   Still 4 since 0.14.100 merged DISK_THM into proved theorems' oracles in the
-   hash literal: that changed the literal only of theories with a proved
-   theorem that uses no theorem from disk, and a child of an entry from before
-   links against that entry's own literal, so the old entries stay sound and
-   aren't worth rebuilding every theory for.  An entry from before with a
-   weaker timeout contract gives way to a rebuild under a stronger one, in
-   the remote cache and in a local one, as the two differ only in the .dat
-   and the literal (HolbuildTheoryCacheManifest.weaker_but_for_digest).  The
-   cost left: when builds of two releases race to publish one key, the
-   loser's publish fails, and its retry restores the winner's entry. *)
-val theory_manifest_version = "4"
+   5: 0.14.100 merged DISK_THM into the oracles of a proved theorem that
+   uses no theorem from disk, in the hash literal, so an entry from before
+   carries another literal than a rebuild of its key: a child restored
+   against one misfits the other, and a stronger rebuild can't publish over
+   it.  tests/cases/theory-dat-reproducible pins the literal of such a
+   theorem with this version, so a digest change must bump it. *)
+val theory_manifest_version = "5"
 
 (* Final theory artifacts are semantic products of source bytes, resolved deps,
    toolchain, and declared action policy. Execution strategy is deliberately not
@@ -11913,35 +11913,21 @@ fun resident_differs_only_in_dat remote root (spec : action_spec) mine resident 
        | _ => false
 
 (* Whether the remote's entry for the action differs from the worker's, MINE,
-   only in its .dat and the hash literal of its Theory.sml, as one built
-   under another theory digest does, and has a weaker timeout contract.  MINE
-   records the restored parents, so it replaces the remote's, as an entry
-   with a stronger contract and the same outputs does. *)
-fun resident_weaker_but_for_digest remote root (spec : action_spec) mine resident =
-  let
-    val fetched = in_root root ".holbuild/resident.sml"
-    fun sml_text hash =
-      if HolbuildCache.verify_blob (cache_root ()) hash then
-        read_text (HolbuildCache.blob_path (cache_root ()) hash)
-      else
-        (ensure_parent fetched;
-         case HolbuildRemoteCache.required
-                (fn () => HolbuildRemoteCache.fetch_blob remote {hash = hash, dst = fetched}) of
-             HolbuildCacheBackend.Hit => read_text fetched
-           | _ => raise Error ("the remote cache doesn't serve blob " ^ hash))
-  in
-    HolbuildTheoryCacheManifest.weaker_but_for_digest (#input_key spec) sml_text mine resident
-  end
-  handle e as HolbuildRemoteCache.Unavailable _ => raise e
-       | _ => false
+   only in its .dat and has a weaker timeout contract.  MINE records the
+   restored parents, so it replaces the remote's, as an entry with a stronger
+   contract and the same outputs does. *)
+fun resident_weaker_but_for_dat key mine resident =
+  cache_manifest_outputs_equal_but_dat key mine resident andalso
+  not (timeout_at_least_as_strong (cache_manifest_proof_timeout_text key resident)
+                                  (cache_manifest_proof_timeout_text key mine))
+  handle Error _ => false
 
 (* Uploads every blob of the local entry for the action, raising if one fails
    (the build's own publish only warns), then puts the action.  A different
    entry already there is replaced when it records parents other than the
-   restored ones or only its .dat and theory digest differ and its timeout
-   contract is weaker, and otherwise left for check_remote_publication to
-   judge.  Returns the entry read after putting a new one, which saves that
-   check a read. *)
+   restored ones or only its .dat differs and its timeout contract is weaker,
+   and otherwise left for check_remote_publication to judge.  Returns the
+   entry read after putting a new one, which saves that check a read. *)
 (* Uploads every blob of the local cache entry KEY, raising if one fails,
    and returns the entry. *)
 fun upload_entry_blobs remote key =
@@ -11980,8 +11966,8 @@ fun publish_action_entry remote root (spec : action_spec) =
                    if (cache_manifest_outputs_equal key resident manifest handle _ => false) then SOME resident
                    else if resident_misfits_parents remote root spec resident then
                      replace "its recorded parents differ from the cache's"
-                   else if resident_weaker_but_for_digest remote root spec manifest resident then
-                     replace "it differs only in its .dat and theory digest and has a weaker timeout contract"
+                   else if resident_weaker_but_for_dat key manifest resident then
+                     replace "it differs only in its .dat and has a weaker timeout contract"
                    else SOME resident
                  end
              | NONE => NONE)
