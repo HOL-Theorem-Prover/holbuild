@@ -270,8 +270,11 @@ fun verified_blobs cache hashes =
   in loop hashes [] end
 
 (* Blobs up to this size are copied through memory, a theory's outputs
-   among them. *)
-val memory_copy_limit : Position.int = 16777216
+   among them.  Without libcrypto, only those HolbuildHash would hash in
+   SML from a file too. *)
+fun memory_copy_limit () : Position.int =
+  if HolbuildHash.uses_libcrypto () then 16777216
+  else Position.fromInt HolbuildHash.external_hash_limit
 
 fun read_binary path =
   let val input = BinIO.openIn path
@@ -300,7 +303,7 @@ fun fetch_blob cache {hash, dst} =
     fun mismatch () = (remove_file dst; HolbuildCacheBackend.Corrupt ("cache blob SHA256 mismatch: " ^ hash))
   in
     if not (path_exists blob) then HolbuildCacheBackend.Miss
-    else if FS.fileSize blob <= memory_copy_limit then
+    else if FS.fileSize blob < memory_copy_limit () then
       (* The bytes hashed are the bytes written, so the copy isn't read back. *)
       let val bytes = read_binary blob
       in
