@@ -178,13 +178,15 @@ fun cli_status timeout options url =
       | _ => HolbuildHttp.Failed "the curl command failed"
   end
 
-fun get_status {url, dst, timeout} =
+fun get_status_with_headers headers {url, dst, timeout} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
-    HolbuildHttp.get {url = url, dst = dst, timeout = timeout}
+    HolbuildHttp.get_with_headers {url = url, dst = dst, headers = headers, timeout = timeout}
   else
     (* --compressed advertises curl-supported response encodings, including zstd
        when this curl build has zstd support, and streams decompressed bytes to dst. *)
-    cli_status timeout ["--compressed", "-o", dst] url
+    cli_status timeout (["--compressed", "-o", dst] @ List.concat (map (fn h => ["-H", h]) headers)) url
+
+fun get_status request = get_status_with_headers [] request
 
 (* Blob downloads take the body still zstd-encoded and decode it here on
    several threads (HolbuildZstd), since libcurl decodes on the one thread
@@ -375,6 +377,26 @@ fun required f =
     fun restore () = Thread.setLocal (required_tag, outer)
   in
     Thread.setLocal (required_tag, true);
+    (f () before restore ()) handle e => (restore (); raise e)
+  end
+
+(* Reads of action entries made inside `revalidating f`, on its thread, ask
+   the cache to check its copy with its origin first (Cache-Control:
+   no-cache).  An action key doesn't fix its bytes, so a cache in front of a
+   shared store (a per-host bazel-remote over S3, say) can keep serving an
+   entry the store has since replaced; a caller that found an entry that
+   doesn't fit its parents asks for the store's.  Per thread, like
+   `required`. *)
+val revalidating_tag : bool Universal.tag = Universal.tag ()
+
+fun reads_revalidate () = Option.getOpt (Thread.getLocal revalidating_tag, false)
+
+fun revalidating f =
+  let
+    val outer = reads_revalidate ()
+    fun restore () = Thread.setLocal (revalidating_tag, outer)
+  in
+    Thread.setLocal (revalidating_tag, true);
     (f () before restore ()) handle e => (restore (); raise e)
   end
 
@@ -793,8 +815,10 @@ fun fetch_action_using usable cache key =
     val tmp = temp_path "action"
     fun cleanup () = remove_file tmp
     fun usable_body path = usable (#manifest (metadata_manifest (read_text path))) handle _ => true
+    val get =
+      if reads_revalidate () then get_status_with_headers ["Cache-Control: no-cache"] else get_status
   in
-    case curl_get_urls_using usable_body {urls = action_urls cache key, dst = tmp} of
+    case curl_get_urls_by get usable_body {urls = action_urls cache key, dst = tmp, timeout = stall_timeout_seconds} of
         HolbuildCacheBackend.Hit =>
           let val action = metadata_manifest (read_text tmp)
           in

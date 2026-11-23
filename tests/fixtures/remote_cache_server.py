@@ -156,6 +156,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_response(int((control / name).read_text()))
                     self.end_headers()
                     return
+            # control/ac-stale-<key>: an entry a cache in front of the store
+            # still serves after the store's was replaced, until a GET with
+            # Cache-Control: no-cache has it check its copy.
+            stale = control / f"ac-stale-{key}"
+            if stale.exists():
+                if "no-cache" in self.headers.get("Cache-Control", "").lower():
+                    stale.unlink()
+                else:
+                    data = stale.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
         if control is not None and self.path.startswith("/cas/"):
             digest = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
             status = control / f"cas-get-status-{digest}"
