@@ -14874,32 +14874,34 @@ fun stored_modules store expected =
   end
 
 (* For HolbuildActionSandbox.module_reads: what the sandboxed theory
-   children of SPEC may read of their toolchain's store, the modules of the
-   theories they load and those their deps heap DEPS_LOADED, if any, was
-   saved with; found at the first launch, after the hydrate and restore.
-   Modules are optional, so on a failure the children load every theory
-   from its .dat file. *)
-fun theory_module_grants root tc (spec : action_spec) deps_loaded =
+   children of SPEC may read of their toolchain's store.  While their deps
+   heap, DEPS_LOADED for DEPS_KEY, exists they start from it or from a
+   checkpoint saved on it, and open only the modules it was saved with;
+   asked at each launch, since a failed load removes the heap and the
+   retry preloads afresh.  Otherwise they load their theories and get the
+   stored modules of those, found once: naming them reads and hashes every
+   .dat file of the cone, seconds for a deep theory.  Modules are
+   optional, so on a failure the children load every theory from its .dat
+   file. *)
+fun theory_module_grants root tc (spec : action_spec) deps_heap =
   let
     val store = module_store (#holdir tc)
-    fun find () =
-      let
-        val heap =
-          case deps_loaded of
-              SOME path =>
-                if file_exists path then List.filter (store_module_file store) (saved_modules path) else []
-            | NONE => []
-        val {expected, ...} = expected_modules root tc {deps = #deps spec, loads = #loads spec}
-      in
-        stored_modules store (map #1 expected) @ heap
-      end
-      handle e => (warn ("theory modules not granted: " ^ General.exnMessage e); [])
+    fun granted find = find () handle e => (warn ("theory modules not granted: " ^ General.exnMessage e); [])
+    fun theories () =
+      stored_modules store (map #1 (#expected (expected_modules root tc {deps = #deps spec, loads = #loads spec})))
     val found = ref NONE
-  in
-    fn () =>
+    fun loaded () =
       case !found of
           SOME paths => paths
-        | NONE => let val paths = find () in found := SOME paths; paths end
+        | NONE => let val paths = granted theories in found := SOME paths; paths end
+  in
+    fn () =>
+      case deps_heap of
+          SOME {deps_loaded, deps_key} =>
+            if deps_checkpoint_exists deps_loaded deps_key
+            then granted (fn () => List.filter (store_module_file store) (saved_modules deps_loaded))
+            else loaded ()
+        | NONE => loaded ()
   end
 
 fun write_missing_modules remote root tc wanted deadline =
@@ -15746,7 +15748,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val _ =
           HolbuildActionSandbox.module_reads :=
             theory_module_grants root tc spec
-              (SOME (deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)))
+              (SOME {deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action),
+                     deps_key = #deps_key action})
         (* A local entry that didn't restore must not stand in for this
            build's when the publication is checked, and, as in a local
            build, its theory's checkpoints may hold parents other than
