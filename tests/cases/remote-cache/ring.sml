@@ -341,7 +341,7 @@ val _ = RC.remove_file (stored second "ac" theory_ac);
 
 (* The local cache takes a stronger entry over one differing only in the .dat,
    never a weaker one or one with other outputs. *)
-val fs = HolbuildFSCacheBackend.filesystem (dir ^ "/dat-local-cache");
+val fs = HolbuildFSCacheBackend.filesystem (dir ^ "/dat-local-cache-" ^ env "RING_TRANSPORT");
 val _ = HolbuildFSCacheBackend.ensure_layout fs;
 fun put_local text =
   HolbuildFSCacheBackend.put_action fs CB.PutIfAbsentOrSame {key = theory_key, text = text};
