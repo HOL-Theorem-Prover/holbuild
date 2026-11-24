@@ -1398,9 +1398,10 @@ theories; declare such a file as an extra input instead.
 Planning a build discovers every source, analyses its dependencies and
 computes every action key. After it plans, holbuild writes what it found to
 a plan record in `.holbuild/plan/`, and the next build with the same
-non-file inputs (holbuild version, working directory, command line, requested targets,
-`HOLBUILD_*` environment, manifests and `.holconfig.toml`, package roots)
-starts from it: it checks each recorded file and directory with `stat`,
+non-file inputs (holbuild version, working directory, HOL directory and
+kernel, requested targets, `HOLBUILD_*` environment but the variables that
+only run a build, manifests and `.holconfig.toml`, package roots) starts
+from it, whatever its other options: it checks each recorded file and directory with `stat`,
 hashes again only the files whose size, modification time, change time or
 inode moved (and any recorded within a second of its last change), analyses
 again the sources whose content changed, and recomputes the keys of those

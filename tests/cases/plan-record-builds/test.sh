@@ -101,16 +101,38 @@ cache_miss_and_force() {
   require_grep "BTheory" "$tmpdir/edit.log"
   expect_build "from record" "$p" "$tmpdir/noop.log"
   require_grep "BTheory is up to date" "$tmpdir/noop.log"
+  # A --json build plans from the record too (out of check mode, whose own
+  # full plan would show in the timings).
+  if ! (cd "$p" && HOLBUILD_PLAN_RECORD=on HOLBUILD_TIMING_LOG=$tmpdir/json-timing.log \
+          "$HOLBUILD_BIN" --json build) > "$tmpdir/json.log" 2>&1; then
+    cat "$tmpdir/json.log" >&2
+    echo "--json build failed in $p" >&2
+    exit 1
+  fi
+  require_grep 'name=plan.record' "$tmpdir/json-timing.log"
+  require_no_grep 'name=build.plan' "$tmpdir/json-timing.log"
   # A theory whose key came from the record, missing from every cache.
   rm -rf "$tmpdir/cache/actions" "$p/.holbuild/obj/src/BTheory".* "$p/.holbuild/dep/record_builds/src/BScript.sml".*
   expect_build "from record (0 files rehashed, 0 keys changed)" "$p" "$tmpdir/miss.log"
   require_no_grep "BTheory is up to date" "$tmpdir/miss.log"
   require_no_grep "BTheory restored from cache" "$tmpdir/miss.log"
   require_file "$p/.holbuild/obj/src/BTheory.dat"
-  expect_build "full (no plan record" "$p" "$tmpdir/force1.log" --force
+  # Forcing changes what runs, not the plan.
+  expect_build "from record (0 files rehashed, 0 keys changed)" "$p" "$tmpdir/force1.log" --force
   expect_build "from record" "$p" "$tmpdir/force2.log" --force
   require_no_grep "BTheory is up to date" "$tmpdir/force2.log"
   require_no_grep "BTheory restored from cache" "$tmpdir/force2.log"
+}
+
+# A build plans from the record a dry run of the same targets wrote, which
+# alternating callers depend on.
+dry_run_then_build() {
+  local p=$tmpdir/dry-then-build
+  make_project "$p"
+  expect_build "full (no plan record" "$p" "$tmpdir/dry1.log" --dry-run
+  expect_build "from record (0 files rehashed, 0 keys changed)" "$p" "$tmpdir/dry2.log" -j2
+  require_grep "BTheory" "$tmpdir/dry2.log"
+  require_file "$p/.holbuild/obj/src/BTheory.dat"
 }
 
 warn_unreachable() {
@@ -147,7 +169,7 @@ root_tactic_timeouts() {
   require_grep "proof_timeout=1.0" "$p/.holbuild/dep/record_builds/src/AScript.sml.key"
   # A target that leaves out the root plans in full: the root's closure
   # gives the target its timeout.
-  expect_build "full (no plan record" "$p" "$tmpdir/root-timeout3.log" --dry-run ATheory
+  expect_build "full (a root with its own tactic timeout is not selected)" "$p" "$tmpdir/root-timeout3.log" --dry-run ATheory
   expect_build "full (a root with its own tactic timeout is not selected)" "$p" "$tmpdir/root-timeout4.log" --dry-run ATheory
 }
 
@@ -238,6 +260,7 @@ SML
 }
 
 cache_miss_and_force
+dry_run_then_build
 warn_unreachable
 tactic_timeouts
 root_tactic_timeouts
