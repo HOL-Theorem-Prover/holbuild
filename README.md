@@ -2338,7 +2338,8 @@ seemed to hold it, but whose entry then doesn't restore (the cache lost one of
 its blobs, or the entry doesn't fit the restored parents), is resubmitted the
 same way after the batch ends or with an empty batch, with every theory that
 depends on it when its entry doesn't fit. A theory of any batch the build
-submitted that doesn't restore still fails the build. A submission
+submitted that doesn't restore still fails the build, as does any miss after a
+batch followed with `--attach`. A submission
 answered 5xx, as a proxy in front of the coordinator answers while it
 restarts or the coordinator itself answers while it's overloaded, or 429,
 is retried, and an event stream that breaks is reattached; either is given up on once the coordinator stays unavailable for
