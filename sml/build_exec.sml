@@ -15956,8 +15956,10 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
                             remove_file marker;
                             write_child_policy tc policy_file;
                             write_text script (park_prefix source checkpoints boundary (#theorem_start theorem));
-                            TextIO.output (input, String.concatWith "\t" ["prerun", marker, FS.fullPath root,
-                                                                           policy_file, script] ^ "\n");
+                            (* From the stage, where a check runs its script. *)
+                            TextIO.output (input, String.concatWith "\t" ["prerun", Path.concat (FS.fullPath park_dir, "prerun.done"),
+                                                                           FS.fullPath (action_stage root action),
+                                                                           FS.fullPath policy_file, FS.fullPath script] ^ "\n");
                             TextIO.flushOut input;
                             prerun := SOME {boundary = boundary, position = #theorem_start theorem, marker = marker}
                           end
