@@ -745,8 +745,15 @@ fun advance_failed_prefix_checkpoint path ok_text depth =
        else raise e)
   end
 
+fun discard_failed_prefix path =
+  (HolbuildCheckpointSaveRuntime.discard_checkpoint path;
+   List.app (fn suffix => OS.FileSys.remove (path ^ suffix) handle OS.SysErr _ => ())
+       [".meta", ".prefix"])
+
 (* A resumed proof saves only when it got past the prefix it restored: one that
-   fails at the same step would save the same state again. *)
+   fails at the same step would save the same state again.  A first save that
+   can't write its files leaves none, as advance_failed_prefix_checkpoint
+   does. *)
 fun save_failed_prefix_checkpoint () = timed_hol_phase "holsave" (fn () =>
   case !theorem_info_ref of
       NONE => ()
@@ -762,9 +769,7 @@ fun save_failed_prefix_checkpoint () = timed_hol_phase "holsave" (fn () =>
              | NONE => ())
         else if QUse.hadError () then
           (* No checkpoint after a parse error: see HolbuildCheckpointSaveRuntime. *)
-          (HolbuildCheckpointSaveRuntime.discard_checkpoint failed_prefix_path;
-           List.app (fn suffix => OS.FileSys.remove (failed_prefix_path ^ suffix) handle OS.SysErr _ => ())
-               [".meta", ".prefix"])
+          discard_failed_prefix failed_prefix_path
         else
           let
             val (meta_text, prefix_text) = failed_prefix_texts ()
@@ -772,9 +777,15 @@ fun save_failed_prefix_checkpoint () = timed_hol_phase "holsave" (fn () =>
             val share = !share_failed_prefix_ref
             val _ = share_failed_prefix_ref := false
             val _ = save_checkpoint "failed_prefix" share failed_prefix_path failed_prefix_ok depth
-            val _ = write_text_file (failed_prefix_path ^ ".meta") meta_text
-            val _ = write_text_file (failed_prefix_path ^ ".prefix") prefix_text
-          in () end)
+          in
+            (write_text_file (failed_prefix_path ^ ".meta") meta_text;
+             write_text_file (failed_prefix_path ^ ".prefix") prefix_text)
+            handle e =>
+              if HolbuildCheckpointSaveRuntime.checkpoint_io_failure e then
+                (HolbuildCheckpointSaveRuntime.warn_checkpoint_failure "failed_prefix" failed_prefix_path e;
+                 discard_failed_prefix failed_prefix_path)
+              else raise e
+          end)
 
 fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok) =
   let val depth = length (PolyML.SaveState.showHierarchy())
@@ -1064,8 +1075,12 @@ fun report_step_failure_with_goals label goals e =
         (emit_step_failure_diagnostic label goals;
          raise e)
 
+(* A proof that fails outside a step (goals left at its end, say) saves a
+   failed-prefix checkpoint too, so an edit that only appends steps resumes
+   after the last one that ran. *)
 fun report_finish_failure name e =
   let
+    val _ = save_failed_prefix_checkpoint ()
     val _ =
       (ignore (print_finish_goal_state name)
        handle print_e =>
@@ -2007,9 +2022,7 @@ fun run_structural_steps_with_resume resume_after_path display_index steps =
           end
       | SOME _ => ());
    timed_hol_phase "holleaves" (fn () => construct_plan_leaves display_index steps);
-   timed_hol_phase "holtactics" (fn () => run_built_steps resume_after_path display_index steps);
-   reset_built_leaves ())
-  handle e => (reset_built_leaves (); raise e)
+   timed_hol_phase "holtactics" (fn () => run_built_steps resume_after_path display_index steps))
 
 fun run_structural_steps display_index steps = run_structural_steps_with_resume NONE display_index steps
 
@@ -2033,6 +2046,23 @@ fun run_steps steps =
    branch_tail_count_ref := [];
    reverse_group_lengths_ref := NONE;
    run_structural_steps 0 steps)
+
+(* Runs a proof's steps and returns its theorem.  The leaves stay built until
+   it returns: a failed-prefix checkpoint that report_finish_failure saves
+   needs their boundaries to resume. *)
+fun finish_proof name run top =
+  let
+    val th =
+      (run ()
+       handle e =>
+         if !failed_goal_state_printed_ref then raise e
+         else report_finish_failure name e;
+       top () handle e => report_finish_failure name e)
+  in
+    reset_built_leaves ();
+    th
+  end
+  handle e => (reset_built_leaves (); raise e)
 
 datatype 'a traced_result = TraceOk of 'a | TraceError of exn
 
@@ -2089,15 +2119,9 @@ fun proof_ir_prove name g original_tac tactic_text =
         val old_factories = !proof_factories_ref
         val _ = proof_factories_ref := factories
         val result = TraceOk (with_proof_ir_execution ctxt (fn () =>
-        let
-          val _ = init_history goal (HolbuildProofIr.display_step_count plan + 1)
-          val _ = run_steps plan
-                  handle e =>
-                    if !failed_goal_state_printed_ref then raise e
-                    else report_finish_failure name e
-        in
-          history_top_thm goal handle e => report_finish_failure name e
-        end)) handle e => TraceError e
+          (init_history goal (HolbuildProofIr.display_step_count plan + 1);
+           finish_proof name (fn () => run_steps plan) (fn () => history_top_thm goal))))
+          handle e => TraceError e
         val _ = proof_factories_ref := old_factories
       in
         case result of TraceOk th => th | TraceError e => raise e
@@ -2130,12 +2154,7 @@ fun termination_tactic name tactic_text plan original_tac =
         val _ = trace_plan name plan
         val _ = stop_after_plan_if_requested ()
         val _ = init_history g (HolbuildProofIr.display_step_count plan + 1)
-        val _ = run_steps plan
-                handle e =>
-                  if !failed_goal_state_printed_ref then raise e
-                  else report_finish_failure name e
-        val th = history_top_thm g
-                 handle e => report_finish_failure name e
+        val th = finish_proof name (fn () => run_steps plan) (fn () => history_top_thm g)
         val _ = drop_all ()
         val _ = theorem_info_ref := NONE
       in
@@ -2518,14 +2537,12 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = successful_branch_tail_counts_ref := #focus metadata
           val _ = dynamic_events_ref := rev (#events metadata)
           val _ = resume_events_ref := #events metadata
-          val _ =
-            (if #step_count metadata = 0 then run_structural_steps 0 plan
-             else run_steps_from_path (#path metadata) 0 plan)
-            handle e =>
-              if !failed_goal_state_printed_ref then raise e
-              else report_finish_failure name e
-          val th = history_top_thm (project_history goalStack.initial_goal)
-                   handle e => report_finish_failure name e
+          val th =
+            finish_proof name
+              (fn () =>
+                 if #step_count metadata = 0 then run_structural_steps 0 plan
+                 else run_steps_from_path (#path metadata) 0 plan)
+              (fn () => history_top_thm (project_history goalStack.initial_goal))
           val _ = drop_all()
           val _ = theorem_info_ref := NONE
         in th end)))

@@ -4242,6 +4242,7 @@ fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker s
        timeout_marker = timeout_marker,
        trace_all = trace_steps policy,
        new_ir = proof_ir_enabled policy,
+       runtime_installed = false,
        defer = case defer_proofs of
                    SOME groups => checkpoint_deferral groups source_text checkpoints
                  | NONE => (fn _ => HolbuildTheoryCheckpoints.Inline)}
@@ -4353,6 +4354,9 @@ fun failed_prefix_resume_source policy contexts timeout_marker source_name sourc
          timeout_marker = SOME timeout_marker,
          trace_all = trace_steps policy,
          new_ir = proof_ir_enabled policy,
+         (* The prelude installed the proof runtime; the suffix's theorems
+            share it with the resumed one. *)
+         runtime_installed = true,
          defer = fn _ => HolbuildTheoryCheckpoints.Inline}
   in
     String.concat
