@@ -10461,7 +10461,10 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
       List.foldl (fn ((node, _), set) =>
                      Binaryset.addList (set, map HolbuildBuildPlan.key (HolbuildBuildPlan.transitive_project_deps plan node)))
                  held uncached_actions
-    val deps_actions = List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions
+    (* A check-only theory a batch never loads, and one held back needs only
+       its verdict, no entry. *)
+    val deps_actions = List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node) andalso
+                                                    not (check_only_node options node)) here_actions
     (* Read once, without the lock, as writers replace the file by rename;
        and only by an export with something to look up, so a build with
        nothing to do reads none of it. *)
