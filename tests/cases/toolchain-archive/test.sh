@@ -368,6 +368,15 @@ with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT, pax_headers={}) a
         extra.mtime = 0
         output.addfile(extra, io.BytesIO(payload))
 
+    if mutation == "archive-blob-link":
+        extra = tarfile.TarInfo("./archive-blob")
+        extra.type = tarfile.SYMTYPE
+        extra.linkname = "/dev/null"
+        extra.uid = 0
+        extra.gid = 0
+        extra.mtime = 0
+        output.addfile(extra)
+
     if mutation == "traversal":
         extra = tarfile.TarInfo("../parent-escape")
         payload = b"escape"
@@ -419,6 +428,7 @@ fcntl.lockf(fd, fcntl.LOCK_SH)
 open(held, "w").close()
 while not os.path.exists(release):
     time.sleep(0.01)
+os.close(fd)
 os.remove(held)
 PY
 cat > "$tmpdir/reconcile.sml" <<'SML'
@@ -443,7 +453,9 @@ fun recorded () = read (entry_file "archive-blob");
 fun make_stale () =
   (write marker ""; write (entry_file "archive-blob") (env "ORIGINAL_BLOB" ^ "\n");
    OS.FileSys.remove stamp handle OS.SysErr _ => ());
-fun reconcile () = HolbuildHolSharedCache.reconcile_with_published k;
+(* Each call stands for a new action's process. *)
+fun reconcile () =
+  (HolbuildHolSharedCache.reconciled_keys := []; HolbuildHolSharedCache.reconcile_with_published k);
 val _ = HolbuildHttp.setup {user = NONE};
 val _ = HolbuildRemoteCacheConfig.set_url (env "RECONCILE_URL");
 val _ = HolbuildRemoteCacheConfig.setup_client ();
@@ -471,12 +483,20 @@ val _ = assert "did not install the remote's archive" (exists (entry_file "repub
 val _ = assert "did not record the remote's archive" (recorded () = env "REPUBLISHED_BLOB" ^ "\n");
 val _ = assert "replaced toolchain is incomplete" (exists (entry_file "build.ok"));
 val _ = assert "comparison not recorded" (exists stamp);
-val _ = assert "left the old toolchain behind"
-  (not (List.exists (fn name => String.isSubstring ".replaced." name)
-                    (let val d = OS.FileSys.openDir (HolbuildHolSharedCache.trash_dir ())
+val _ = assert "replaced toolchain has no analyser"
+  (HolbuildHolSharedCache.analyser_built k (HolbuildHolSharedCache.analyser_key ()));
+val _ = assert "left the old toolchain or a staged archive behind"
+  (not (List.exists (fn name => String.isPrefix ("." ^ k ^ ".") name)
+                    (let val d = OS.FileSys.openDir (OS.Path.dir (env "RECONCILE_ENTRY"))
                          fun names acc = case OS.FileSys.readDir d of NONE => acc | SOME n => names (n :: acc)
-                     in names [] before OS.FileSys.closeDir d end
-                     handle OS.SysErr _ => [])));
+                     in names [] before OS.FileSys.closeDir d end)));
+
+val _ = make_stale ();
+val _ = HolbuildHolSharedCache.reconcile_with_published k;
+val _ = assert "compared again in the same process" (exists marker andalso not (exists stamp));
+val _ = OS.FileSys.remove marker;
+val _ = write (entry_file "archive-blob") (env "REPUBLISHED_BLOB" ^ "\n");
+val _ = write stamp "";
 
 val _ = write marker "";
 val _ = reconcile ();
@@ -519,6 +539,7 @@ invalid_restore wrong-identity 'identity does not match'
 invalid_restore digest 'SHA256 mismatch'
 invalid_restore traversal 'could not extract tar archive'
 invalid_restore analysers 'archive contains analysers'
+invalid_restore archive-blob-link 'archive contains archive-blob'
 invalid_restore missing-executable 'failed final validation'
 invalid_restore missing-holmake 'failed final validation'
 invalid_restore corrupt-heap 'failed final validation'

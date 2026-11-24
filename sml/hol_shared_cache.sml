@@ -771,32 +771,23 @@ datatype restore_outcome = Restored | NotRestored | Rejected
 fun recorded_archive_blob k =
   SOME (trim (HolbuildFileLock.read_text (archive_blob_for_key k))) handle IO.Io _ => NONE
 
-(* Installs the remote's archive for entry K, moving the current entry to
-   ASIDE if one is given (HolbuildToolchainArchive.install_archive), and
-   checks it as a restore must.  NONE when the remote has no record. *)
-fun install_published remote k aside =
-  let val final = entry_dir_for_key k
-  in
-    case HolbuildToolchainArchive.restore
-           {remote = remote, identity = archive_identity k, final_dir = final, aside = aside} of
-        NONE => NONE
-      | SOME hash =>
-          ((* Anyone who can publish could have built it, so under exec-action
-              it must be as closed as a confined build's before anything runs it. *)
-           if not (HolbuildActionSandbox.active ()) then () else
-             (case HolbuildActionSandbox.closed_tree final of
-                  NONE => ()
-                | SOME why => raise HolbuildToolchainArchive.Rejected ("restored HOL toolchain is not closed: " ^ why));
-           signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_RENAMED";
-           wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_RENAMED_GATE";
-           if complete_toolchain_contents k then
-             (write_file (archive_blob_for_key k) (hash ^ "\n");
-              write_file (ok_for_key k) "ok\n";
-              SOME hash)
-           else
-             raise HolbuildToolchainArchive.Rejected
-                     "restored HOL toolchain failed final validation")
-  end
+(* Checks a toolchain just installed at entry K from the remote's archive
+   HASH as a restore must, and marks it complete. *)
+fun accept_installed k hash =
+  ((* Anyone who can publish could have built it, so under exec-action
+      it must be as closed as a confined build's before anything runs it. *)
+   if not (HolbuildActionSandbox.active ()) then () else
+     (case HolbuildActionSandbox.closed_tree (entry_dir_for_key k) of
+          NONE => ()
+        | SOME why => raise HolbuildToolchainArchive.Rejected ("restored HOL toolchain is not closed: " ^ why));
+   signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_RENAMED";
+   wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_RENAMED_GATE";
+   if complete_toolchain_contents k then
+     (write_file (archive_blob_for_key k) (hash ^ "\n");
+      write_file (ok_for_key k) "ok\n")
+   else
+     raise HolbuildToolchainArchive.Rejected
+             "restored HOL toolchain failed final validation")
 
 fun restore_entry k =
   let
@@ -804,8 +795,10 @@ fun restore_entry k =
     (* The analyser is not archived; finish_entry builds it for restored and
        locally built entries alike. *)
     fun restore url =
-      case install_published (HolbuildRemoteCache.remote url) k NONE of
-          SOME _ => Restored
+      case HolbuildToolchainArchive.restore
+             {remote = HolbuildRemoteCache.remote url, identity = archive_identity k,
+              final_dir = entry_dir_for_key k} of
+          SOME hash => (accept_installed k hash; Restored)
         | NONE => NotRestored
   in
     cleanup_restore_state k;
@@ -822,27 +815,6 @@ fun restore_entry k =
               case error of
                   HolbuildToolchainArchive.Rejected _ => Rejected
                 | _ => NotRestored))
-  end
-
-(* Replaces entry K by the remote's archive; false when the remote has no
-   record.  The old entry is kept until the new one has passed its checks,
-   and is put back if anything fails.  The caller holds the toolchain lock
-   and is the entry's only user. *)
-fun replace_with_published remote k =
-  let
-    val final = entry_dir_for_key k
-    val aside = Path.concat(trash_dir (), k ^ ".replaced." ^ HolbuildFileLock.current_pid_text ())
-    fun put_back () =
-      if path_exists aside then
-        ((if path_exists final then remove_tree (run_mutation k) final else ());
-         FS.rename {old = aside, new = final})
-      else ()
-  in
-    ensure_dir (trash_dir ());
-    (case install_published remote k (SOME aside) of
-         SOME _ => (remove_tree (run_mutation k) aside; true)
-       | NONE => false)
-    handle error => (put_back (); raise error)
   end
 
 (* A remote worker runs only on the toolchain bytes the remote holds, so that
@@ -877,11 +849,10 @@ fun publish_entry {replace} k =
               | error => (warn_publish (archive_error_message error); false))
 
 fun adopt_published_entry k =
-  case HolbuildRemoteCacheConfig.url () of
-      SOME url =>
-        if replace_with_published (HolbuildRemoteCache.remote url) k then ()
-        else die "could not restore the published HOL toolchain archive"
-    | NONE => ()
+  (remove_tree (run_mutation k) (entry_dir_for_key k);
+   case restore_entry k of
+       Restored => ()
+     | _ => die "could not restore the published HOL toolchain archive")
 
 (* false when the legacy entry's sources cannot be listed. *)
 fun generate_legacy_theory_toolchain req k =
@@ -931,27 +902,55 @@ fun finish_entry jobs req k =
     holdir_for_key k
   end
 
-(* F () while this process is entry K's only user: it takes the toolchain
-   lock and turns its own usage lease exclusive, without waiting for either;
-   NONE when another process holds one. *)
-fun with_sole_use k f =
-  case (try_acquire_lock_path (lock_dir k),
-        List.find (fn (held, _) => held = k) (!held_usage_leases)) of
-      (NONE, _) => NONE
-    | (SOME lock, NONE) => (HolbuildFileLock.release lock; NONE)
-    | (SOME lock, SOME (_, lease)) =>
-        let
-          val build_lock = ToolchainLock lock
-          fun sole () =
-            (HolbuildFileLock.write_text (lock_owner_path (lock_dir k)) (lock_owner_for "replace HOL toolchain");
-             if HolbuildFileLock.try_exclusive lease then
-               (SOME (f ()) before HolbuildFileLock.make_shared lease)
-               handle e => (HolbuildFileLock.make_shared lease; raise e)
-             else NONE)
+(* F () with this process's usage lease on K made exclusive, which needs no
+   other process to hold one; NONE, without waiting, when another does.  The
+   lease is shared again afterwards, never released in between (fcntl drops
+   a process's lock when it closes any descriptor of the file). *)
+fun with_exclusive_lease k f =
+  case List.find (fn (held, _) => held = k) (!held_usage_leases) of
+      NONE => NONE
+    | SOME (_, lease) =>
+        if HolbuildFileLock.try_exclusive lease then
+          (SOME (f ()) before HolbuildFileLock.make_shared lease)
+          handle e => (HolbuildFileLock.make_shared lease; raise e)
+        else NONE
+
+(* F () under entry K's toolchain lock; NONE, without waiting, when another
+   process holds it. *)
+fun with_toolchain_lock_now k f =
+  case try_acquire_lock_path (lock_dir k) of
+      NONE => NONE
+    | SOME lock =>
+        let val build_lock = ToolchainLock lock
         in
-          (sole () before release_lock build_lock)
+          (HolbuildFileLock.write_text (lock_owner_path (lock_dir k)) (lock_owner_for "replace HOL toolchain");
+           SOME (f ()) before release_lock build_lock)
           handle e => (release_lock build_lock; raise e)
         end
+
+(* Replaces entry K by the archive staged at STAGING_DIR and completes it as
+   finish_entry would.  The old entry waits beside it until then and is put
+   back if anything fails.  The caller is the entry's only user. *)
+fun replace_entry k {hash, staging_dir} =
+  let
+    val final = entry_dir_for_key k
+    val aside = HolbuildToolchainArchive.replaced_path final
+    fun put_back () =
+      if path_exists aside then
+        ((if path_exists final then remove_tree (run_mutation k) final else ());
+         FS.rename {old = aside, new = final})
+      else ()
+  in
+    (FS.rename {old = final, new = aside};
+     HolbuildToolchainArchive.install_staged {staging_dir = staging_dir, final_dir = final};
+     accept_installed k hash;
+     if hol_source_manifest_built k then () else generate_hol_source_manifest k;
+     if theory_toolchain_built k then ()
+     else raise HolbuildToolchainArchive.Rejected "restored HOL toolchain has no theory toolchain identity";
+     ignore (build_analyser k))
+    handle e => (put_back (); raise e);
+    remove_tree (run_mutation k) aside
+  end
 
 (* How long a remote worker trusts its last comparison of an entry with the
    remote's record. *)
@@ -970,28 +969,44 @@ fun warn_reconcile message =
    holds: the remote's archive can be replaced (by another worker's build
    after the store lost the old one) while this host keeps the entry it
    restored before.  Then, while no other process uses the entry, it is
-   replaced by the remote's archive.  When the entry is the remote's,
-   asking for the blob keeps a cache that renews what it serves from letting
-   the store expire it.  At most once per published_check_interval, which
-   restarts only once the comparison is done: a busy entry is compared again
-   by the next action.  A failure leaves the entry as it is. *)
+   replaced by the remote's archive, fetched and checked first so that new
+   users wait only for the swap.  When the entry is the remote's, asking for
+   the blob keeps a cache that renews what it serves from letting the store
+   expire it.  At most once per published_check_interval, which restarts
+   only once the comparison is done: a busy entry is compared again by the
+   next action.  Only a process's first use of the entry compares it, before
+   anything in the process runs on it.  A failure leaves the entry as it is. *)
+val reconciled_keys = ref ([] : string list)
+
 fun reconcile_with_published k =
   case HolbuildRemoteCacheConfig.url () of
       NONE => ()
     | SOME url =>
-        if not (!adopt_published_archive) orelse not (path_exists (ok_for_key k)) orelse
-           published_checked_recently k then ()
+        if not (!adopt_published_archive) orelse List.exists (fn seen => seen = k) (!reconciled_keys) orelse
+           not (path_exists (ok_for_key k)) orelse published_checked_recently k then ()
         else
           let
+            val _ = reconciled_keys := k :: !reconciled_keys
             val remote = HolbuildRemoteCache.remote url
+            val final = entry_dir_for_key k
+            fun idle () = Option.isSome (with_exclusive_lease k (fn () => ()))
+            fun replace () =
+              ((HolbuildToolchainArchive.cleanup_staging final;
+                if not (idle ()) then false
+                else
+                  case HolbuildToolchainArchive.stage
+                         {remote = remote, identity = archive_identity k, final_dir = final} of
+                      NONE => true
+                    | SOME staged => Option.isSome (with_exclusive_lease k (fn () => replace_entry k staged)))
+               before HolbuildToolchainArchive.cleanup_staging final)
+              handle e => (HolbuildToolchainArchive.cleanup_staging final; raise e)
             fun compare () =
               case HolbuildToolchainArchive.published_blob remote (archive_identity k) of
                   NONE => true
                 | SOME hash =>
                     if recorded_archive_blob k = SOME hash then
                       (ignore (HolbuildRemoteCache.blob_present remote hash); true)
-                    else
-                      Option.isSome (with_sole_use k (fn () => ignore (replace_with_published remote k)))
+                    else Option.getOpt (with_toolchain_lock_now k replace, false)
             val done = compare () handle error => (warn_reconcile (archive_error_message error); true)
           in
             if done then (write_file (published_check_path k) "" handle IO.Io _ => ()) else ()
@@ -1003,7 +1018,6 @@ fun ensure_built_with_kernel jobs req =
     val ak = analyser_key ()
     (* Lease before validating, so GC cannot remove the entry in between. *)
     val _ = hold_usage_lease k
-    (* A replaced entry lacks its analyser, which finish_entry builds. *)
     val _ = reconcile_with_published k
     (* --remote-only reads only files written with a complete entry and
        builds nothing against its checkout, so it skips the checkout's check

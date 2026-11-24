@@ -125,28 +125,34 @@ fun extract_archive {archive_path, staging_dir} =
     (fn () => HolbuildTar.extract
       {archive_path = archive_path, destination = staging_dir})
 
-(* With ASIDE, an entry at FINAL_DIR is moved there once the archive has
-   been extracted and checked, so a bad archive never costs the entry. *)
-fun install_archive {archive_path, identity, final_dir, aside} =
+(* Extracts and checks the archive in a new staging directory beside
+   FINAL_DIR, which it returns. *)
+fun stage_archive {archive_path, identity, final_dir} =
   let
     val staging_dir = staging_path final_dir
-    val extracted_marker = Path.concat(staging_dir, "build.ok")
-    fun cleanup () = remove_tree staging_dir handle _ => ()
+    (* lstat, so a member that is a link counts whatever it points at. *)
+    fun member name = (ignore (Posix.FileSys.lstat (Path.concat(staging_dir, name))); true)
+                      handle OS.SysErr _ => false
   in
-    (if path_exists final_dir andalso not (Option.isSome aside) then
-       die ("toolchain install path already exists: " ^ final_dir)
-     else ();
-     FS.mkDir staging_dir;
+    (FS.mkDir staging_dir;
      (extract_archive {archive_path = archive_path, staging_dir = staging_dir};
-      if path_exists extracted_marker then die "archive contains build.ok" else ();
-      if path_exists (Path.concat(staging_dir, "last-used")) then die "archive contains last-used" else ();
-      if path_exists (Path.concat(staging_dir, "analysers")) then die "archive contains analysers" else ();
+      List.app (fn name => if member name then die ("archive contains " ^ name) else ())
+        ["build.ok", "last-used", "archive-blob", "analysers"];
       validate_extracted_manifest {staging_dir = staging_dir, identity = identity})
      handle Error message => reject message;
-     Option.app (fn aside => if path_exists final_dir then FS.rename {old = final_dir, new = aside} else ()) aside;
-     FS.rename {old = staging_dir, new = final_dir})
-    handle e => (cleanup (); raise e)
+     staging_dir)
+    handle e => (remove_tree staging_dir handle _ => (); raise e)
   end
+
+(* Moves a staged archive to FINAL_DIR, which must not exist. *)
+fun install_staged {staging_dir, final_dir} =
+  (if path_exists final_dir then die ("toolchain install path already exists: " ^ final_dir) else ();
+   FS.rename {old = staging_dir, new = final_dir})
+  handle e => (remove_tree staging_dir handle _ => (); raise e)
+
+(* Where an entry replaced by a staged archive waits until the new one is
+   complete; cleanup_staging removes it with the staging directories. *)
+fun replaced_path final_dir = Path.concat(Path.dir final_dir, stage_prefix final_dir ^ "replaced")
 
 (* The record a cache in front of the store holds may be one the store has
    since replaced, so toolchain records are read from the store. *)
@@ -157,9 +163,9 @@ fun published_record remote identity =
 fun published_blob remote identity =
   Option.map parse_remote_record (published_record remote identity)
 
-(* Installs the remote's archive at FINAL_DIR (see install_archive for
-   ASIDE) and returns its blob hash; NONE when the remote has no record. *)
-fun restore {remote, identity, final_dir, aside} =
+(* Fetches the remote's archive for IDENTITY and stages it beside FINAL_DIR
+   (stage_archive); NONE when the remote has no record. *)
+fun stage {remote, identity, final_dir} =
   case published_record remote identity of
       NONE => NONE
     | SOME text =>
@@ -178,11 +184,20 @@ fun restore {remote, identity, final_dir, aside} =
         in
           ((FS.mkDir scratch_dir;
             fetch ();
-            install_archive {archive_path = archive_path, identity = identity, final_dir = final_dir, aside = aside};
-            cleanup ();
-            SOME hash)
+            SOME {hash = hash,
+                  staging_dir = stage_archive {archive_path = archive_path, identity = identity,
+                                               final_dir = final_dir}}
+            before cleanup ())
            handle e => (cleanup (); raise e))
         end
+
+(* Installs the remote's archive at FINAL_DIR and returns its blob hash;
+   NONE when the remote has no record. *)
+fun restore {remote, identity, final_dir} =
+  case stage {remote = remote, identity = identity, final_dir = final_dir} of
+      NONE => NONE
+    | SOME {hash, staging_dir} =>
+        (install_staged {staging_dir = staging_dir, final_dir = final_dir}; SOME hash)
 
 (* Another builder may have published since this one's restore missed, so
    look for the action before creating and uploading the archive.  replace
