@@ -878,8 +878,24 @@ fun restore_or_build_entry jobs req k =
          ignore (build_entry jobs req k);
          Publish {replace = outcome = Rejected}))
 
+(* A swap of entry K for the remote's archive (replace_entry) that a killed
+   process left unfinished: the old entry still waits at its replaced path
+   and the new one has no build.ok, so the old one goes back.  Under the
+   toolchain lock, before anything cleans the staging directories. *)
+fun recover_replaced k =
+  let
+    val final = entry_dir_for_key k
+    val aside = HolbuildToolchainArchive.replaced_path final
+  in
+    if path_exists aside andalso not (path_exists (ok_for_key k)) then
+      ((if path_exists final then remove_tree (run_mutation k) final else ());
+       FS.rename {old = aside, new = final})
+    else ()
+  end
+
 fun finish_entry jobs req k =
   let
+    val _ = recover_replaced k
     val publication =
       if validate_entry true req k then
         (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REVALIDATED";
@@ -931,7 +947,7 @@ fun with_toolchain_lock_now k f =
 (* Replaces entry K by the archive staged at STAGING_DIR and completes it as
    finish_entry would.  The old entry waits beside it until then and is put
    back if anything fails.  The caller is the entry's only user. *)
-fun replace_entry k {hash, staging_dir} =
+fun replace_entry req k {hash, staging_dir} =
   let
     val final = entry_dir_for_key k
     val aside = HolbuildToolchainArchive.replaced_path final
@@ -945,7 +961,7 @@ fun replace_entry k {hash, staging_dir} =
      HolbuildToolchainArchive.install_staged {staging_dir = staging_dir, final_dir = final};
      accept_installed k hash;
      if hol_source_manifest_built k then () else generate_hol_source_manifest k;
-     if theory_toolchain_built k then ()
+     if theory_toolchain_built k orelse generate_legacy_theory_toolchain req k then ()
      else raise HolbuildToolchainArchive.Rejected "restored HOL toolchain has no theory toolchain identity";
      ignore (build_analyser k))
     handle e => (put_back (); raise e);
@@ -978,7 +994,7 @@ fun warn_reconcile message =
    anything in the process runs on it.  A failure leaves the entry as it is. *)
 val reconciled_keys = ref ([] : string list)
 
-fun reconcile_with_published k =
+fun reconcile_with_published req k =
   case HolbuildRemoteCacheConfig.url () of
       NONE => ()
     | SOME url =>
@@ -997,7 +1013,7 @@ fun reconcile_with_published k =
                   case HolbuildToolchainArchive.stage
                          {remote = remote, identity = archive_identity k, final_dir = final} of
                       NONE => true
-                    | SOME staged => Option.isSome (with_exclusive_lease k (fn () => replace_entry k staged)))
+                    | SOME staged => Option.isSome (with_exclusive_lease k (fn () => replace_entry req k staged)))
                before HolbuildToolchainArchive.cleanup_staging final)
               handle e => (HolbuildToolchainArchive.cleanup_staging final; raise e)
             fun compare () =
@@ -1018,7 +1034,7 @@ fun ensure_built_with_kernel jobs req =
     val ak = analyser_key ()
     (* Lease before validating, so GC cannot remove the entry in between. *)
     val _ = hold_usage_lease k
-    val _ = reconcile_with_published k
+    val _ = reconcile_with_published req k
     (* --remote-only reads only files written with a complete entry and
        builds nothing against its checkout, so it skips the checkout's check
        here; finish_entry, which builds against the checkout, still checks. *)

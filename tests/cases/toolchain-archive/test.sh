@@ -426,10 +426,20 @@ path, held, release = sys.argv[1:4]
 fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
 fcntl.lockf(fd, fcntl.LOCK_SH)
 open(held, "w").close()
-while not os.path.exists(release):
+deadline = time.time() + 300
+while not os.path.exists(release) and time.time() < deadline:
     time.sleep(0.01)
 os.close(fd)
 os.remove(held)
+PY
+cat > "$tmpdir/lock_probe.py" <<'PY'
+import fcntl, os, sys
+path, mode = sys.argv[1:3]
+fd = os.open(path, os.O_RDWR)
+try:
+    fcntl.lockf(fd, (fcntl.LOCK_EX if mode == "exclusive" else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)
 PY
 cat > "$tmpdir/reconcile.sml" <<'SML'
 val _ = OS.FileSys.chDir (valOf (OS.Process.getEnv "HOLBUILD_ROOT"));
@@ -454,8 +464,13 @@ fun make_stale () =
   (write marker ""; write (entry_file "archive-blob") (env "ORIGINAL_BLOB" ^ "\n");
    OS.FileSys.remove stamp handle OS.SysErr _ => ());
 (* Each call stands for a new action's process. *)
+val req = {git = "", rev = "", kernel_variant = HolbuildHolToolchainConfig.StandardKernel};
 fun reconcile () =
-  (HolbuildHolSharedCache.reconciled_keys := []; HolbuildHolSharedCache.reconcile_with_published k);
+  (HolbuildHolSharedCache.reconciled_keys := []; HolbuildHolSharedCache.reconcile_with_published req k);
+(* Whether another process could take the usage lease in MODE now. *)
+fun lease_free mode =
+  OS.Process.isSuccess (OS.Process.system ("python3 " ^ env "RECONCILE_TMP" ^ "/lock_probe.py " ^
+                                           HolbuildHolSharedCache.usage_lease_path k ^ " " ^ mode));
 val _ = HolbuildHttp.setup {user = NONE};
 val _ = HolbuildRemoteCacheConfig.set_url (env "RECONCILE_URL");
 val _ = HolbuildRemoteCacheConfig.setup_client ();
@@ -476,6 +491,7 @@ val _ = assert "replaced a toolchain another process uses" (exists marker);
 val _ = assert "a deferred comparison counted as done" (not (exists stamp));
 val _ = write release "";
 val _ = wait_until "lease release" (fn () => not (exists held));
+val _ = assert "the busy check dropped this process's lease" (not (lease_free "exclusive"));
 
 val _ = reconcile ();
 val _ = assert "kept a toolchain the remote no longer holds" (not (exists marker));
@@ -483,6 +499,8 @@ val _ = assert "did not install the remote's archive" (exists (entry_file "repub
 val _ = assert "did not record the remote's archive" (recorded () = env "REPUBLISHED_BLOB" ^ "\n");
 val _ = assert "replaced toolchain is incomplete" (exists (entry_file "build.ok"));
 val _ = assert "comparison not recorded" (exists stamp);
+val _ = assert "the lease is not shared again after the swap"
+  (lease_free "shared" andalso not (lease_free "exclusive"));
 val _ = assert "replaced toolchain has no analyser"
   (HolbuildHolSharedCache.analyser_built k (HolbuildHolSharedCache.analyser_key ()));
 val _ = assert "left the old toolchain or a staged archive behind"
@@ -492,13 +510,9 @@ val _ = assert "left the old toolchain or a staged archive behind"
                      in names [] before OS.FileSys.closeDir d end)));
 
 val _ = make_stale ();
-val _ = HolbuildHolSharedCache.reconcile_with_published k;
+val _ = HolbuildHolSharedCache.reconcile_with_published req k;
 val _ = assert "compared again in the same process" (exists marker andalso not (exists stamp));
-val _ = OS.FileSys.remove marker;
-val _ = write (entry_file "archive-blob") (env "REPUBLISHED_BLOB" ^ "\n");
 val _ = write stamp "";
-
-val _ = write marker "";
 val _ = reconcile ();
 val _ = assert "compared again within the interval" (exists marker);
 
@@ -507,6 +521,15 @@ val _ = make_stale ();
 val _ = reconcile ();
 val _ = assert "a failed replacement lost the toolchain"
   (exists marker andalso exists (entry_file "build.ok") andalso recorded () = env "ORIGINAL_BLOB" ^ "\n");
+
+(* A swap killed after moving the old entry aside and before the new one
+   was marked complete: the old entry goes back. *)
+val aside = HolbuildToolchainArchive.replaced_path (env "RECONCILE_ENTRY");
+val _ = OS.FileSys.rename {old = env "RECONCILE_ENTRY", new = aside};
+val _ = OS.FileSys.mkDir (env "RECONCILE_ENTRY");
+val _ = HolbuildHolSharedCache.recover_replaced k;
+val _ = assert "an interrupted swap lost the old toolchain"
+  (exists marker andalso exists (entry_file "build.ok") andalso not (exists aside));
 val _ = OS.Process.exit OS.Process.success;
 SML
 reconcile_log=$tmpdir/reconcile.log
