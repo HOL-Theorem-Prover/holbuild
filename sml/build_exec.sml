@@ -2780,18 +2780,20 @@ fun remote_entry_expected key =
    Redblackset.member (!expected_remote_keys, key)
    before Mutex.unlock expected_remote_mutex)
 
-(* The keys of the check-only actions a remote batch this process follows
-   reported done: they passed, and left no entry to restore. *)
-val remote_verdict_keys = ref (Redblackset.empty String.compare)
+(* The input keys of the check-only theories this process found to pass:
+   those a remote batch it follows reported done, which left no entry to
+   restore, and those a check passed here without building, which wrote
+   nothing for a later export to find. *)
+val checked_verdict_keys = ref (Redblackset.empty String.compare)
 
-fun note_remote_verdict key =
+fun note_checked_verdict key =
   (Mutex.lock expected_remote_mutex;
-   remote_verdict_keys := Redblackset.add (!remote_verdict_keys, key);
+   checked_verdict_keys := Redblackset.add (!checked_verdict_keys, key);
    Mutex.unlock expected_remote_mutex)
 
-fun remote_verdict key =
+fun checked_verdict key =
   (Mutex.lock expected_remote_mutex;
-   Redblackset.member (!remote_verdict_keys, key)
+   Redblackset.member (!checked_verdict_keys, key)
    before Mutex.unlock expected_remote_mutex)
 
 (* Copies the remote entry for key into the local cache, from the first node
@@ -6568,32 +6570,29 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
          project plan keys input_key toolchain_key node;
        cache_trace ("early cutoff: " ^ logical_name node ^ " (dependency outputs unchanged)");
        HolbuildStatus.UpToDate)
-    (* build --check-only: the verdict alone, from a remote worker's pass,
-       outputs that are up to date or would be cut off, or a usable cache
-       entry, or else a build that installs nothing.  The outputs and their
-       metadata stay as they are. *)
+    (* build --check-only: the verdict alone, from a pass this build already
+       has (a remote worker's, or an earlier check's), outputs that are up to
+       date or would be cut off, or else a build that installs nothing.  The
+       outputs and their metadata stay as they are.  A cache entry gives no
+       verdict here: only restoring it shows it fits the parent outputs, so
+       --remote-exec has a worker check it instead. *)
     fun check_only_verdict () =
-      let val usable = manifest_timeout_satisfies allow_timeout_discrepancy (tactic_timeout policy)
-      in
-      if remote_verdict input_key then HolbuildStatus.Built
+      if checked_verdict input_key then HolbuildStatus.Built
       else if not forced andalso not (always_reexecute node) andalso
          (up_to_date dat_hash_cache (#emit_output_hashes options) allow_timeout_discrepancy
             policy project plan keys input_key toolchain_key node orelse
           Option.isSome (early_cutoff_metadata deps_output_key dat_hash_cache allow_timeout_discrepancy policy
                            project plan toolchain_key node))
-      then HolbuildStatus.UpToDate
-      else if cache_restore_allowed andalso
-              (case ensure_local_cache_entry_using usable (cache_root ()) input_key of
-                   SOME text => usable text
-                 | NONE => false)
-      then HolbuildStatus.Restored
+      then (note_checked_verdict input_key; HolbuildStatus.UpToDate)
       else if #restore_only options then
-        (HolbuildHolSharedCache.local_build_needed := true;
+        (Mutex.lock restore_misses_mutex;
+         restore_misses := (input_key, false) :: !restore_misses;
+         Mutex.unlock restore_misses_mutex;
+         HolbuildHolSharedCache.local_build_needed := true;
          raise Error (not_in_remote_cache (logical_name node)))
       else
         (build_theory dat_hash_cache cache_allowed policy tc project base_context plan keys toolchain_key node;
          HolbuildStatus.Built)
-      end
   in
     if checks_only policy then (remove_tree stage; check_only_verdict ())
     else if forced orelse always_reexecute node then restore_or_build ()
@@ -10358,8 +10357,13 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
     fun is_forced (node, action) =
       force_node options project node orelse trace_steps (checkpoint_policy_for_node options project node) orelse
       List.exists (fn key => key = #input_key action) forced
+    (* A check-only theory's verdict comes from its outputs, a pass this
+       build has, or a worker: a cache entry gives none, as only restoring it
+       shows it fits the parent outputs (check_only_verdict). *)
+    fun check_only (node, _) = check_only_node options node
     fun local_blobs (node, action) =
       if not local_resumable orelse is_forced (node, action) then NONE
+      else if check_only (node, action) andalso checked_verdict (#input_key action) then SOME []
       else if
         (case current_metadata (metadata_path project node) of
              SOME text =>
@@ -10368,6 +10372,7 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
                  (checkpoint_policy_for_node options project node) node text
            | NONE => false)
       then SOME []
+      else if check_only (node, action) then NONE
       else
         case HolbuildCache.get_action (cache_root ()) (#input_key action) of
             NONE => NONE
@@ -10409,7 +10414,7 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
     fun remote_check actions =
       detail_time_phase "action_spec.export.remote_check" (fn () =>
         failing "checking remote cache" "theories" (fn remote => fn (node, action) =>
-                    not (is_forced (node, action)) andalso
+                    not (is_forced (node, action)) andalso not (check_only (node, action)) andalso
                     remote_entry_satisfies remote options project plan node (#input_key action))
                 actions)
     (* Early cutoff aliases the entry of the theory's last build, so one
@@ -10546,7 +10551,8 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
      (* The cache entries the build may restore that aren't here, for
         start_remote_exec_prefetch. *)
      prefetch = List.mapPartial (fn (node, action) =>
-                                   if cache_enabled node andalso not (force_node options project node)
+                                   if cache_enabled node andalso not (force_node options project node) andalso
+                                      not (check_only_node options node)
                                    then SOME (#input_key action) else NONE)
                                 other_actions}
   end

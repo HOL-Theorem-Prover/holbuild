@@ -685,11 +685,13 @@ failures.
 .TP
 .B \-\-check\-only
 Build the targets no other target depends on for their verdict alone: each
-passes or fails as a plain build would, but writes and caches no outputs, here
-or on remote workers, and leaves its earlier outputs and their metadata as
-they were.
-Outputs that are up to date, would be cut off, or have a usable cache entry
-pass without a build.
+theory script runs, and its proofs pass or fail, as in a plain build, but
+nothing is exported, so a failure to export the theory or to write a declared
+extra output goes unnoticed.
+These targets write and cache no outputs, here or on remote workers, and leave
+their earlier outputs and their metadata as they were.
+Outputs that are up to date or would be cut off pass without a build; a cache
+entry does not, since only restoring it shows that it fits the parent outputs.
 What these targets load is built and cached as usual, and a proof that fails
 still saves its failed prefix, from which the next build resumes.
 Excludes

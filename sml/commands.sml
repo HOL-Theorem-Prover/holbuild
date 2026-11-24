@@ -2061,7 +2061,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                      ((case node_with_input_key key of
                            SOME node =>
                              if HolbuildBuildExec.check_only_node build_options node
-                             then HolbuildBuildExec.note_remote_verdict key
+                             then HolbuildBuildExec.note_checked_verdict key
                              else (HolbuildBuildExec.expect_remote_entry key; add key)
                          | NONE => (HolbuildBuildExec.expect_remote_entry key; add key));
                       logs := (key, log) :: !logs)

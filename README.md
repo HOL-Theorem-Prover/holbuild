@@ -321,12 +321,15 @@ the final diagnostic, and the build exits nonzero. Pass `build --fail-fast`
 to stop after the first failure and cancel unfinished work instead.
 
 `build --check-only` builds the targets no other target depends on for their
-verdict alone, locally or on remote workers: each passes or fails as a plain
-build would, but no outputs of it are written or cached, and its earlier
-outputs and their metadata stay as they were. Outputs that are up to date or
-would be cut off, and a usable cache entry, pass it without a build. What it
-loads is built and cached as usual, and a failed proof still saves its failed
-prefix, from which the next build or check resumes.
+verdict alone, locally or on remote workers: the theory script runs as in a
+plain build and its proofs pass or fail as there, but nothing is exported, so
+a failure to export the theory or to write a declared extra output goes
+unnoticed. No outputs of it are written or cached, and its earlier outputs and
+their metadata stay as they were. Outputs that are up to date or would be cut
+off pass it without a build; a cache entry doesn't, as only restoring it shows
+that it fits the parent outputs, so with `--remote-exec` a worker checks it.
+What it loads is built and cached as usual, and a failed proof still saves its
+failed prefix, from which the next build or check resumes.
 
 Keep-going applies within a resolved build plan. Setup or dependency-planning
 errors still stop the command. A theory that generates SML sources must finish
@@ -1774,8 +1777,9 @@ action-text
 - `check-only` defaults to false; with it, the worker runs the theory for its
   verdict alone: it exports nothing, and publishes no entry, early-cutoff pair,
   deps heap, context checkpoint or tool cache. A failed proof still publishes
-  its failed prefix. An entry or early-cutoff pair already in the cache passes
-  it without HOL, and it never loads ahead of its parents.
+  its failed prefix. An entry or early-cutoff pair already in the cache that
+  restores and fits the parent outputs passes it without HOL, and it never
+  loads ahead of its parents.
 
 ### Exporting script runs for remote execution
 

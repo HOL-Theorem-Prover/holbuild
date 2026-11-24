@@ -146,11 +146,39 @@ expect_build pass-built 0
 [[ "$(find "$project/.holbuild" -name 'TScript.sml.key' -exec sha256sum {} + | sort)" == "$t_metadata" ]] ||
   { echo "check-only changed T's metadata" >&2; exit 1; }
 
-# A target another target depends on is built in full.
-build both --check-only ATheory TTheory
-expect_build both 0
-build both-check --check-only TTheory ATheory
-expect_build both-check 0
+# T's cache entry from the plain build gives no verdict: only restoring it
+# shows that it fits A's outputs, so with T's outputs gone the check builds.
+write_t "ALL_TAC >> ACCEPT_TAC TRUTH"
+rm -f "${t_outputs[@]}"
+find "$project/.holbuild" -name 'TScript.sml.key' -delete
+build cached --check-only TTheory
+expect_build cached 0
+require_grep "TTheory built" "$tmpdir/cached.log"
+if grep -q "TTheory restored" "$tmpdir/cached.log"; then
+  echo "check-only restored T from its cache entry" >&2; cat "$tmpdir/cached.log" >&2; exit 1
+fi
+no_t_outputs cached
+
+# A target another target depends on is built in full, in either order: A,
+# changed, gets new outputs and a new cache entry; T still gets none.
+for order in "ATheory TTheory" "TTheory ATheory"; do
+  cat >> "$project/src/AScript.sml" <<SML
+
+Theorem a_${order%% *}:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+SML
+  a_dat=$(sha256sum "$obj/ATheory.dat")
+  before=$(entries)
+  # shellcheck disable=SC2086
+  build "both-${order%% *}" --check-only $order
+  expect_build "both-${order%% *}" 0
+  [[ "$(sha256sum "$obj/ATheory.dat")" != "$a_dat" ]] || { echo "check-only of $order left A unbuilt" >&2; exit 1; }
+  [[ "$(entries)" != "$before" ]] || { echo "check-only of $order cached no new entry of A" >&2; exit 1; }
+  no_t_outputs "both-${order%% *}"
+done
 
 for flag in --emit-output-hashes; do
   build "reject$flag" --check-only "$flag" TTheory
@@ -194,6 +222,14 @@ expect_worker() {
   done
 }
 published() { grep -lx "$1" "$tmpdir"/remote/ac/* 2>/dev/null || true; }
+# The module writer, which runs after a plain action's result where the
+# toolchain can write theory modules (as in the theory-modules job), is never
+# scheduled for a check-only one.
+no_modules() {
+  require_grep 'exec-action after the result (ms): .* modules_writer=none:unscheduled' "$tmpdir/$1.log"
+  [[ -z $(find "$worker_cache" -name '*.pmo' 2>/dev/null) ]] || {
+    echo "worker $1 wrote theory modules" >&2; find "$worker_cache" -name '*.pmo' >&2; exit 1; }
+}
 nothing_published() {
   if [[ -e "$tmpdir/remote/ac/$remote_key" ]]; then
     echo "worker $1 published T's entry" >&2; exit 1
@@ -212,11 +248,13 @@ worker share-pass
 grep -rqx "option check-only=true" "$tmpdir/remote" || { echo "no spec says check-only" >&2; exit 1; }
 expect_worker share-pass 0 "status=built"
 nothing_published share-pass
+no_modules share-pass
 
 write_t 'FAIL_TAC "remote failure"'
 worker share-fail
 expect_worker share-fail 1 "status=failed" "failure=proof"
 require_grep "remote failure" "$tmpdir/share-fail.log"
 nothing_published share-fail
+no_modules share-fail
 [[ -n "$(published holbuild-shared-failed-prefix-v1)" ]] || {
   echo "the failing check shared no failed prefix" >&2; cat "$tmpdir/share-fail.log" >&2; exit 1; }
