@@ -301,6 +301,44 @@ val _ = seed second "malformed manifest";
 val _ = assert "malformed secondary does not fail primary" (publish_timed () = CB.AlreadyPresent);
 val _ = assert "malformed secondary untouched" (manifest_at second = "malformed manifest");
 
+(* A worker's entry records the parents the cache holds, so a replica that
+   differs from it only in the .dat is the same entry: a weaker one is
+   repaired on every node, a stronger one stays.  A client's .dat may record
+   parents it built itself, so a client never puts it over another. *)
+val other_dat_text = "other dat";
+val other_dat = HolbuildHash.string_sha256 other_dat_text;
+val _ = RC.remember_blob replicas {sha256 = other_dat, size = Int.toString (size other_dat_text)};
+fun other_dat_manifest timeout =
+  String.concatWith "\n"
+    ["holbuild-cache-action-v4", "input_key=" ^ theory_key, "kind=theory",
+     "proof-timeout=" ^ timeout, "load-metadata-v1",
+     "blob sig " ^ digest, "blob sml " ^ digest, "blob dat " ^ other_dat, ""];
+fun publish_worker () =
+  #1 (HolbuildBuildExec.publish_theory_action true replicas (RC.get_action replicas theory_key)
+        {key = theory_key, text = theory_manifest "10.0"});
+val _ = seed first (theory_manifest "10.0");
+val _ = seed second (other_dat_manifest "none");
+val _ = seed third (other_dat_manifest "2.5");
+val _ = assert "a client leaves a weaker replica with another .dat"
+  (publish_timed () = CB.AlreadyPresent andalso manifest_at second = other_dat_manifest "none");
+val _ = assert "a worker repairs a weaker replica with another .dat"
+  (publish_worker () = CB.AlreadyPresent andalso manifest_at second = theory_manifest "10.0");
+val _ = assert "a stronger replica with another .dat stays" (manifest_at third = other_dat_manifest "2.5");
+val _ = seed first (other_dat_manifest "none");
+val _ = seed second (other_dat_manifest "none");
+val _ = RC.remove_file (stored third "ac" theory_ac);
+val _ = assert "a worker replaces weaker replicas with another .dat on every node"
+  (publish_worker () = CB.Published andalso
+   manifest_at first = theory_manifest "10.0" andalso manifest_at second = theory_manifest "10.0" andalso
+   not (RC.path_exists (stored third "ac" theory_ac)));
+val _ = seed first (other_dat_manifest "2.5");
+val _ = seed second (other_dat_manifest "none");
+val _ = assert "a worker leaves a stronger primary with another .dat"
+  (publish_worker () = CB.AlreadyPresent andalso manifest_at first = other_dat_manifest "2.5" andalso
+   manifest_at second = theory_manifest "10.0");
+val _ = RC.remove_file (stored first "ac" theory_ac);
+val _ = RC.remove_file (stored second "ac" theory_ac);
+
 (* An entry replaced in place (a checkpoint index) goes to every node: a node
    answers from its own disk, so one still holding the old entry would serve
    it.  A node failing that write doesn't fail the publication or trip the

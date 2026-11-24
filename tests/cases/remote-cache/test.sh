@@ -242,7 +242,7 @@ for cache in "$first_cache" "$second_cache" "$third_cache" "$fourth_cache" \
 done
 
 # Record each zstd command line so the test can check uploads use level 1;
-# the second build hydrating from these uploads checks they round-trip.
+# the later builds hydrating from these uploads check they round-trip.
 zstd_shim=$tmpdir/zstd-shim
 zstd_args=$tmpdir/zstd-args
 mkdir -p "$zstd_shim"
@@ -273,8 +273,13 @@ assert_remote_proof_timeout none
 second_log=$tmpdir/second.log
 (cd "$second" && HOLBUILD_CACHE="$second_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 180 ATheory) > "$second_log" 2>&1
-require_grep "remote cache \(hydrated\|prefetched\):" "$second_log"
-require_grep "insufficient tactic-timeout contract" "$second_log"
+# The entry is too weak for this build, which doesn't copy it.
+require_grep "entry passed over" "$second_log"
+if grep -q "remote cache \(hydrated\|prefetched\):\|insufficient tactic-timeout contract" "$second_log"; then
+  echo "a build copied a remote entry too weak for it" >&2
+  cat "$second_log" >&2
+  exit 1
+fi
 require_grep "ATheory built" "$second_log"
 require_grep "remote cache published:" "$second_log"
 assert_remote_proof_timeout 180.0
@@ -329,7 +334,7 @@ write_project "$fourth"
 fourth_log=$tmpdir/fourth.log
 (cd "$fourth" && HOLBUILD_CACHE="$fourth_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 60 ATheory) > "$fourth_log" 2>&1
-require_grep "insufficient tactic-timeout contract" "$fourth_log"
+require_grep "entry passed over" "$fourth_log"
 require_grep "ATheory built" "$fourth_log"
 assert_remote_proof_timeout 60.0
 

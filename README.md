@@ -1495,11 +1495,14 @@ that has the entry. Writes try the second node after a connection failure,
 timeout, 429 or 5xx. A theory's `/ac` read also tries the next node when the
 first one's entry was built under a weaker tactic-timeout contract than the
 build asks for, and then goes through the whole ring looking for a stronger
-one. When publishing or confirming an
+one; the build's prefetch takes the same stronger one, never a weaker one it
+could not restore. When publishing or confirming an
 existing timed theory, workers also strengthen older compatible manifests on
 reachable replicas, so a reader with a narrower cache view can restore the
-result. This repair preserves stronger contracts, does not create missing
-replicas, and never changes manifests whose outputs differ. Secondary repair
+result. A manifest is compatible when its outputs are the same, or differ only
+in the `.dat` (two builds whose proofs took different paths record different
+dependencies there). This repair preserves stronger contracts, does not create
+missing replicas, and never changes manifests whose other outputs differ. Secondary repair
 failures warn without failing successful primary publication; timeout checks
 still apply on every restore. A write whose nodes all failed without an HTTP response (an unresolvable
 name, no connection, a timeout) goes on down the ranking until a node answers,
@@ -2289,8 +2292,8 @@ in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 
 If a local cache entry has a weaker tactic-timeout contract than requested,
 restore refreshes it from the remote cache once. This picks up a stronger
-contract published by a worker without discarding the older entry when the
-remote has no usable replacement.
+contract published by a worker, also one whose `.dat` differs, without
+discarding the older entry when the remote has no usable replacement.
 
 When the batch ends, one line says how many of its theories the remote
 workers finished, built or found cached (`holbuild: remote execution: remote

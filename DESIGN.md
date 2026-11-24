@@ -748,7 +748,12 @@ conflicts still keep the first entry; remote publication and archive import
 still reject conflicts, except that a remote-exec worker replaces a remote
 entry whose recorded parents differ from the parents it restored from the
 remote cache, or one that names a blob the remote cache no longer holds
-(on each node whose entry does), since no build can use it.
+(on each node whose entry does), since no build can use it. An entry that
+differs only in its `.dat` (dependency records and locations) is the same
+entry ranked by its tactic-timeout contract: a stronger one replaces a weaker
+one in the local cache, and a worker's publish replaces it on each node
+holding a weaker one. A weaker one never replaces it, and a client's publish
+still conflicts, since a client's `.dat` may record parents it built locally.
 
 ### Persistent action root on workers
 

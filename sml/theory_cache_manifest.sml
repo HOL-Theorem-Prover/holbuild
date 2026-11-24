@@ -245,4 +245,31 @@ fun cache_manifest_contract input_key text =
 fun timeout_at_least_as_strong candidate reference =
   timeout_satisfies reference candidate
 
+(* Whether two theory entries have the same outputs but for the .dat, which
+   then differs only in what the digest in the .sml leaves out, such as the
+   dependency records of two builds whose proofs took different paths. *)
+fun cache_manifest_outputs_equal_but_dat input_key left right =
+  not (is_run_manifest left orelse is_run_manifest right) andalso
+  let
+    val l = cache_manifest_blobs_from_lines input_key (cache_manifest_lines left)
+    val r = cache_manifest_blobs_from_lines input_key (cache_manifest_lines right)
+  in
+    #sig_hash l = #sig_hash r andalso
+    #sml_hash l = #sml_hash r andalso
+    #trace_hash l = #trace_hash r andalso
+    #extra_hashes l = #extra_hashes r andalso
+    #parents l = #parents r andalso
+    #mldeps l = #mldeps r
+  end
+
+(* Whether INCOMING may replace RESIDENT, another entry for the same key:
+   it differs only in its .dat and has a strictly stronger timeout contract.
+   Either entry then serves the key's dependents, and the stronger one serves
+   more builds. *)
+fun stronger_but_for_dat input_key incoming resident =
+  cache_manifest_outputs_equal_but_dat input_key incoming resident andalso
+  not (timeout_at_least_as_strong (cache_manifest_proof_timeout_text input_key resident)
+                                  (cache_manifest_proof_timeout_text input_key incoming))
+  handle Error _ => false
+
 end
