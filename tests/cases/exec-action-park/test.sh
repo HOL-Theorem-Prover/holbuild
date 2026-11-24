@@ -155,9 +155,11 @@ parked_at 4 2
 # waited: the fix sees them run once.
 write_a '(fn g => (counter := !counter + 1; if !counter = 1 andalso !between = 1 then ACCEPT_TAC TRUTH g else raise Fail "dirty heap"))'
 check fixed 0
-# A served check saves no checkpoints on its way to the verdict.
+# A served check saves no checkpoints on its way to the verdict, and
+# exports no theory.
 require_grep "hol-phases" "$tmpdir/fixed.out"
 if grep -Eq "holsave=[1-9]" "$tmpdir/fixed.out"; then echo "the served check saved checkpoints" >&2; cat "$tmpdir/fixed.out" >&2; exit 1; fi
+if grep -q "Exporting theory" "$tmpdir/fixed.out"; then echo "the served check exported its theory" >&2; cat "$tmpdir/fixed.out" >&2; exit 1; fi
 wait "$park_pid" || { echo "the park server failed" >&2; cat "$tmpdir/park.log" >&2; exit 1; }
 park_pid=""
 require_grep "park: the script builds, stopping" "$tmpdir/park.log"

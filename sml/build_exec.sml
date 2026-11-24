@@ -5252,7 +5252,9 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
         | NONE =>
             run_hol_files_to_log tc stage stage
               (#context run_spec)
-              (child_policy :: (#files run_spec @ [theory_exporter]))
+              (* A served check's verdict is the script's: its theory is
+                 never installed, so it doesn't export it. *)
+              (child_policy :: (#files run_spec @ (if !park_serving then [] else [theory_exporter])))
               "holbuild-build.log"
               (SOME (current_build_log log_dir))
               "hol run failed while building theory script"
@@ -5319,10 +5321,12 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
             else ())
         staged_extra_outputs
     val generated_metadata =
-      read_generated_load_metadata {parents_report = parents_report,
-                                    mldeps_report = mldeps_report}
+      if !park_serving then {parents = [], mldeps = []}
+      else
+        read_generated_load_metadata {parents_report = parents_report,
+                                      mldeps_report = mldeps_report}
     val _ =
-      if speculative then ()
+      if speculative orelse !park_serving then ()
       else
         install_theory_stage check_cancelled cache_allowed policy
           {stage = stage, logical = logical, source_file = source_file, input_key = input_key,
