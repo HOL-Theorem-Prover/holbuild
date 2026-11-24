@@ -97,6 +97,9 @@ fun build_help () = print
   \Options:\n\
   \  --watch\n\
   \  --fail-fast  Stop after the first failure (default: finish independent work).\n\
+  \  --check-only\n\
+  \      Build the targets no other target depends on for their verdict alone:\n\
+  \      no outputs are written or cached, and earlier ones stay as they were.\n\
   \  --dry-run\n\
   \  --force[=theory|project|full]\n\
   \      Bypass cached outputs; valid checkpoints, including failed prefixes, may resume.\n\
@@ -134,6 +137,8 @@ fun build_help () = print
   \      remote worker, a read-only copy), for data a tool reads that must not\n\
   \      change what the build produces. No key covers it: outputs and\n\
   \      checkpoints are cached as if it were absent, so they must not depend on it.\n\
+  \      Given more than once, HOLBUILD_SCRATCH_INPUT holds the paths in order,\n\
+  \      separated by \":\".\n\
   \  --remote-exec URL [--remote-only] [--priority N] [--speculative-loading[=N]]\n\
   \      [--detach | --attach BATCH-ID]\n\n\
   \With --remote-exec, theories the remote cache lacks and that aren't\n\
@@ -498,6 +503,7 @@ fun split_flags args =
     val (all_checkpoints, args_without_all_checkpoints) =
       extract_flag "--all-checkpoints" args_without_allow_discrepancy
     val (fail_fast, args_without_fail_fast) = extract_flag "--fail-fast" args_without_all_checkpoints
+    val (check_only, args_without_check_only) = extract_flag "--check-only" args_without_fail_fast
     fun extract_checkpoint_seconds seconds acc xs =
       case xs of
           [] => (seconds, rev acc)
@@ -511,7 +517,7 @@ fun split_flags args =
                 acc ys
             else extract_checkpoint_seconds seconds (y :: acc) ys
     val (checkpoint_seconds, args_without_checkpoint_seconds) =
-      extract_checkpoint_seconds HolbuildBuildExec.default_checkpoint_seconds [] args_without_fail_fast
+      extract_checkpoint_seconds HolbuildBuildExec.default_checkpoint_seconds [] args_without_check_only
     fun extract_heavy_tactic_timeout timeout acc xs =
       case xs of
           [] => (timeout, rev acc)
@@ -544,7 +550,7 @@ fun split_flags args =
                   warn_unreachable = warn_unreachable,
                   emit_output_hashes = emit_output_hashes,
                   allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy,
-                  promote_preload = false}, [])
+                  promote_preload = false, check_only = check_only}, [])
         | "--dry-run" :: xs =>
             loop true watch force use_cache verify_cache no_stat_cache skip_checkpoints proof_steps new_ir proof_scope tactic_timeout tactic_timeout_set trace_steps repl_on_failure retain_debug_artifacts warn_unreachable xs
         | "--watch" :: xs =>
@@ -633,7 +639,7 @@ fun plain_build_request targets =
     tactic_timeout = NONE, tactic_timeout_set = false, heavy_tactic_timeout = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
-    allow_cache_timeout_discrepancy = false, promote_preload = true},
+    allow_cache_timeout_discrepancy = false, promote_preload = true, check_only = false},
    targets)
 
 (* heap, executable, run and repl build without proof steps, so no step
@@ -649,7 +655,7 @@ fun heap_build_request targets =
     tactic_timeout = NONE, tactic_timeout_set = false, heavy_tactic_timeout = NONE,
     trace_steps = false, repl_on_failure = false, retain_debug_artifacts = false,
     warn_unreachable = false, emit_output_hashes = false,
-    allow_cache_timeout_discrepancy = false, promote_preload = false},
+    allow_cache_timeout_discrepancy = false, promote_preload = false, check_only = false},
    targets)
 
 fun has_suffix suffix s =
@@ -1246,7 +1252,7 @@ datatype build_mode =
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int,
                    speculative_loading : int option}
 
-fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, checkpoint_seconds, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, heavy_tactic_timeout, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, promote_preload}, targets) =
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, checkpoint_seconds, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, heavy_tactic_timeout, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, promote_preload, check_only}, targets) =
   let
     val project =
       case prepared of
@@ -1293,6 +1299,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         raise Error "--trace-steps requires proof steps; remove --skip-proof-steps"
       else if not proof_steps andalso repl_on_failure then
         raise Error "--repl-on-failure requires proof steps; remove --skip-proof-steps"
+      else if check_only andalso emit_output_hashes then
+        raise Error "--check-only writes no outputs to hash; remove --emit-output-hashes"
+      else if check_only andalso trknl then
+        raise Error "--check-only writes no proof traces; remove --trknl"
+      else if check_only andalso repl_on_failure then
+        raise Error "--check-only saves no checkpoints for a REPL to start from; remove --repl-on-failure"
       else ()
     val _ =
       if proof_scope = HolbuildTacticTimeoutPolicy.ProofAll andalso
@@ -1305,13 +1317,16 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
           NONE => SOME 2.5
         | SOME timeout => timeout
     (* CHECKPOINT_TARGETS: the theories that save checkpoints as they run
-       (checkpoint_targets_for), whatever FORCE_TARGETS this pass forces. *)
-    fun build_options_for index entry_plan plan force_targets checkpoint_targets =
+       (checkpoint_targets_for), whatever FORCE_TARGETS this pass forces.
+       CHECK_ONLY_TARGETS: the theories built for their verdict alone
+       (check_only_targets_for). *)
+    fun build_options_for index entry_plan plan force_targets checkpoint_targets check_only_targets =
       {use_cache = use_cache,
        verify_cache = verify_cache,
        force = force,
        force_targets = force_targets,
        checkpoint_targets = checkpoint_targets,
+       check_only_targets = check_only_targets,
        fail_fast = fail_fast,
        all_checkpoints = all_checkpoints,
        skip_checkpoints = skip_checkpoints,
@@ -1392,6 +1407,21 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
     (* The build's targets, or every root-package theory when it has none. *)
     fun checkpoint_targets_for index targets =
       if null targets then HolbuildSourceIndex.root_package_targets index project else targets
+    (* Under --check-only, the targets no other target depends on: the
+       others are built in full, as what those load. *)
+    fun check_only_targets_for index plan targets =
+      if not check_only then []
+      else
+        let
+          val targets = checkpoint_targets_for index targets
+          fun selected node = List.exists (fn target => target = HolbuildBuildPlan.logical_name node) targets
+          val needed =
+            List.concat (map (HolbuildBuildPlan.transitive_project_deps plan)
+                             (List.filter selected (HolbuildBuildPlan.selected_nodes plan)))
+        in
+          List.filter (fn target => not (List.exists (fn dep => HolbuildBuildPlan.logical_name dep = target) needed))
+            targets
+        end
     (* The input keys of a plan, which the plan keeps for execution.  Only
        for plans whose theories that write SML sources are up to date: until
        those run, an extra input naming such a source may not exist. *)
@@ -1402,7 +1432,10 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        first use: every pass over the plan takes the same keys. *)
     fun with_options (planned as {index, targets, entry_plan, plan, ...}) =
       let
-        val options = timed_phase "build.options" (fn () => build_options_for index entry_plan plan targets (checkpoint_targets_for index targets))
+        val options =
+          timed_phase "build.options"
+            (fn () => build_options_for index entry_plan plan targets (checkpoint_targets_for index targets)
+                        (check_only_targets_for index plan targets))
         val known = ref NONE
         fun keys () =
           case !known of
@@ -1595,7 +1628,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             (fn () => HolbuildBuildExec.build options tc project plan toolchain_key jobs)
         val initial as ({index, entry_plan, plan, toolchain_key, components, ...}, initial_options, _) = plan_build ()
         fun build_owners owner_plan =
-          execute (build_options_for index entry_plan owner_plan [] (#checkpoint_targets initial_options), owner_plan, toolchain_key)
+          execute (build_options_for index entry_plan owner_plan [] (#checkpoint_targets initial_options) [], owner_plan, toolchain_key)
         fun replan () =
           if Option.isSome prepared orelse watch
           then with_options (prepare_plan (prepare_source_index "build" resolution project))
@@ -1859,7 +1892,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     | entry_targets => SOME (HolbuildBuildPlan.plan_targets components (#holdir tc) index entry_targets)
               in
                 timed_phase "build.execute"
-                  (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets (#checkpoint_targets build_options))
+                  (fn () => HolbuildBuildExec.build (build_options_for index entry_plan theory_plan targets (#checkpoint_targets build_options)
+                                                       (#check_only_targets build_options))
                               tc project theory_plan toolchain_key jobs)
               end
             (* Diagnose every final failure. A missing proof log retains the
@@ -2028,7 +2062,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   (logs := List.filter (fn (k, _) => k <> key) (!logs);
                    if state = "cancelled" then () else seen := (key, log) :: List.filter (fn (k, _) => k <> key) (!seen);
                    if state = "done" then
-                     (HolbuildBuildExec.expect_remote_entry key; add key; logs := (key, log) :: !logs)
+                     ((case node_with_input_key key of
+                           SOME node =>
+                             if HolbuildBuildExec.check_only_node build_options node
+                             then HolbuildBuildExec.note_checked_verdict key
+                             else (HolbuildBuildExec.expect_remote_entry key; add key)
+                         | NONE => (HolbuildBuildExec.expect_remote_entry key; add key));
+                      logs := (key, log) :: !logs)
                    else if state = "failed" then note_first_failure ()
                    else ();
                    case detail of
@@ -2272,11 +2312,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
                 | (HolbuildRemoteExec.Unreachable reason, progress) =>
                     if remote_only
-                    then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id ^
-                                    (if priority = 0 then "" else " --priority " ^ Int.toString priority) ^
-                                    (case speculative_loading of
-                                         SOME n => " --speculative-loading=" ^ Int.toString n
-                                       | NONE => ""))
+                    then fall_back (reason ^ "; " ^ finished progress ^
+                                    (* --check-only doesn't attach. *)
+                                    (if check_only then "" else
+                                     "; reattach with --attach " ^ batch_id ^
+                                     (if priority = 0 then "" else " --priority " ^ Int.toString priority) ^
+                                     (case speculative_loading of
+                                          SOME n => " --speculative-loading=" ^ Int.toString n
+                                        | NONE => "")))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
               end
             (* The restore after a batch finished, or after an export found
@@ -2439,7 +2482,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
            requested batch: a replan, if the owners rebuilt, queues its own. *)
         fun build_owners owner_plan =
           let
-            val owner_options = build_options_for index entry_plan owner_plan [] (#checkpoint_targets build_options)
+            val owner_options = build_options_for index entry_plan owner_plan [] (#checkpoint_targets build_options) []
             val requested_write = !pending_plan_write
             fun restore () = pending_plan_write := requested_write
           in
@@ -2567,9 +2610,19 @@ fun split_scratch_input_flag args =
           if not (Posix.FileSys.ST.isReg (Posix.FileSys.stat path)) then
             raise Error ("--scratch-input takes a regular file, not " ^ HolbuildHash.quote file)
           else
-            (HolbuildBuildExec.scratch_input_file := SOME path;
-             HolbuildBuildExec.scratch_input_path := SOME path;
-             split_scratch_input_flag rest)
+            let val files = !HolbuildBuildExec.scratch_input_files @ [path]
+            in
+              (* Children get the paths joined by ":". *)
+              case List.find (fn file => CharVector.exists (fn c => c = #":") file) files of
+                  SOME file =>
+                    if null (tl files) then ()
+                    else raise Error ("--scratch-input given more than once takes no path with \":\": " ^
+                                      HolbuildHash.quote file)
+                | NONE => ();
+              HolbuildBuildExec.scratch_input_files := files;
+              HolbuildBuildExec.scratch_input_paths := files;
+              split_scratch_input_flag rest
+            end
         end
     | ["--scratch-input"] => raise Error "--scratch-input requires FILE"
     | x :: rest => x :: split_scratch_input_flag rest
@@ -2659,12 +2712,12 @@ fun run_action_command tc cli_jobs args =
             then raise Error ("run-action: " ^ flag ^ " requires a value")
             else [flag]
     val rest = parse args
-    val (flags as {dry_run, watch, trace_steps, repl_on_failure, use_cache,
+    val (flags as {dry_run, watch, trace_steps, repl_on_failure, use_cache, check_only,
                    tactic_timeout_set, heavy_tactic_timeout, proof_scope, new_ir, ...}, targets) =
       split_flags ("--skip-proof-steps" :: rest)
     val _ =
-      if dry_run orelse watch orelse trace_steps orelse repl_on_failure then
-        raise Error "run-action does not run builds: remove --dry-run, --watch, --trace-steps and --repl-on-failure"
+      if dry_run orelse watch orelse trace_steps orelse repl_on_failure orelse check_only then
+        raise Error "run-action does not run builds: remove --dry-run, --watch, --trace-steps, --repl-on-failure and --check-only"
       else if not use_cache then
         raise Error "run-action: a run's context comes from the cache, so --no-cache can't apply"
       else if tactic_timeout_set orelse Option.isSome heavy_tactic_timeout orelse
@@ -2750,8 +2803,10 @@ fun build_watch tc cli_jobs parsed =
   let
     val resolution = resolution_for_toolchain tc
     val _ = HolbuildWatch.ensure_inotifywait ()
+    (* Each build checks a check-only theory afresh. *)
     fun attempt prepared =
-      (build_once_with_prepared tc cli_jobs prepared parsed; ())
+      (HolbuildBuildExec.forget_checked_verdicts ();
+       build_once_with_prepared tc cli_jobs prepared parsed; ())
       handle exn =>
         case build_iteration_error_message exn of
             SOME msg => warn ("build failed: " ^ msg)
@@ -2871,7 +2926,7 @@ fun build tc cli_jobs args =
     val (speculative_loading, args) = split_speculative_loading args
     val args = split_scratch_input_flag (split_tool_cache_flag args)
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
-    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, ...}, _) = split_flags args
+    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, check_only, ...}, _) = split_flags args
     val _ =
       if watch andalso HolbuildStatus.json_mode () then
         raise Error "--json does not support build --watch yet"
@@ -2888,6 +2943,10 @@ fun build tc cli_jobs args =
       else if Option.isSome url andalso
               (watch orelse dry_run orelse repl_on_failure) then
         raise Error "--remote-exec does not support --watch, --dry-run or --repl-on-failure"
+      (* A check-only pass is recorded from the batch's report alone, which
+         only a batch this build submits and follows is known to match. *)
+      else if check_only andalso (detach orelse Option.isSome attach) then
+        raise Error "--check-only takes its verdicts from the batch it submits: remove --detach or --attach"
       else if detach andalso Option.isSome attach then
         raise Error "--detach and --attach exclude each other"
       else ()
@@ -3012,7 +3071,7 @@ fun default_build_options trknl project index entry_plan plan =
     {use_cache = true,
      verify_cache = true,
      force = HolbuildBuildExec.ForceNone,
-     force_targets = [], checkpoint_targets = [],
+     force_targets = [], checkpoint_targets = [], check_only_targets = [],
      skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
      proof_steps = true,
      new_ir = true,
@@ -3061,7 +3120,7 @@ fun heap_build_options trknl =
   {use_cache = true,
    verify_cache = true,
    force = HolbuildBuildExec.ForceNone,
-   force_targets = [], checkpoint_targets = [],
+   force_targets = [], checkpoint_targets = [], check_only_targets = [],
    skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
    proof_steps = false,
    new_ir = false,

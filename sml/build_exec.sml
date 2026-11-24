@@ -733,10 +733,13 @@ fun withheld_outline stage =
 val pipeline_proof_threads = ref 1
 
 (* PIPELINED: whether the child defers its proofs (deferred_source), so it
-   publishes its outline after the export and then proves them. *)
-fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipelined} =
+   publishes its outline after the export and then proves them.  CHECK_ONLY:
+   the child exports nothing, and only reports its peak memory. *)
+fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipelined, check_only} =
   let
+    val peak_rss = peak_rss_report_line (Path.concat(Path.dir path, peak_rss_report_name))
     val lines =
+      if check_only then [peak_rss] else
       generated_metadata_report_lines {parents_report = parents_report,
                                        mldeps_report = mldeps_report} @
       [export_theory_if_needed_line sig_path] @
@@ -749,7 +752,7 @@ fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipeli
             HolbuildToolchain.sml_string (stage_finalized_marker (Path.dir path)) ^ " \"\";"]
        else
          ["val _ = HolbuildRuntime.normalize_theory_export " ^ HolbuildToolchain.sml_string sig_path ^ ";"]) @
-      [peak_rss_report_line (Path.concat(Path.dir path, peak_rss_report_name))]
+      [peak_rss]
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -2176,12 +2179,13 @@ fun exit_detail status log =
 val tool_cache_name : string option ref = ref NONE
 val tool_cache_dir : string option ref = ref NONE
 
-(* build --scratch-input FILE: a file theory children read through
-   HOLBUILD_SCRATCH_INPUT.  The client's FILE, which exported specs name by
-   its SHA-256, and the path children see (on a worker, its staged copy).
-   Nothing keys it: what it holds must not change what a build produces. *)
-val scratch_input_file : string option ref = ref NONE
-val scratch_input_path : string option ref = ref NONE
+(* build --scratch-input FILE, given once or more: files theory children
+   read through HOLBUILD_SCRATCH_INPUT, their paths in order, separated by
+   ":".  The client's FILEs, which exported specs name by their SHA-256, and
+   the paths children see (on a worker, the staged copies).  Nothing keys
+   them: what they hold must not change what a build produces. *)
+val scratch_input_files : string list ref = ref []
+val scratch_input_paths : string list ref = ref []
 
 (* A name safe as one path component: a tool cache's, or a file's in it. *)
 fun plain_file_name name =
@@ -2198,7 +2202,9 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
     val _ = last_child_start := SOME (Time.toMilliseconds (Time.now ()))
     val tool_env =
       (case !tool_cache_dir of SOME dir => ["HOLBUILD_TOOL_CACHE_DIR=" ^ dir] | NONE => []) @
-      (case !scratch_input_path of SOME path => ["HOLBUILD_SCRATCH_INPUT=" ^ path] | NONE => [])
+      (case !scratch_input_paths of
+           [] => []
+         | paths => ["HOLBUILD_SCRATCH_INPUT=" ^ String.concatWith ":" paths])
     val status =
       HolbuildToolchain.run_in_dir_to_file workdir
         ((if null tool_env then [] else "env" :: tool_env) @
@@ -2776,6 +2782,27 @@ fun remote_entry_expected key =
   (Mutex.lock expected_remote_mutex;
    Redblackset.member (!expected_remote_keys, key)
    before Mutex.unlock expected_remote_mutex)
+
+(* The input keys of the check-only theories this process found to pass:
+   those a remote batch it follows reported done, which left no entry to
+   restore, and those a check passed here without building, which wrote
+   nothing for a later export to find. *)
+val checked_verdict_keys = ref (Redblackset.empty String.compare)
+
+fun note_checked_verdict key =
+  (Mutex.lock expected_remote_mutex;
+   checked_verdict_keys := Redblackset.add (!checked_verdict_keys, key);
+   Mutex.unlock expected_remote_mutex)
+
+fun checked_verdict key =
+  (Mutex.lock expected_remote_mutex;
+   Redblackset.member (!checked_verdict_keys, key)
+   before Mutex.unlock expected_remote_mutex)
+
+fun forget_checked_verdicts () =
+  (Mutex.lock expected_remote_mutex;
+   checked_verdict_keys := Redblackset.empty String.compare;
+   Mutex.unlock expected_remote_mutex)
 
 (* Copies the remote entry for key into the local cache, from the first node
    whose manifest passes `usable`.  Returns false on a remote miss and raises
@@ -3554,7 +3581,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, heavy_tactic_timeout : real option option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool, promote_preload : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, check_only_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, heavy_tactic_timeout : real option option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool, promote_preload : bool}
 
 (* checkpoint: the theory restores checkpoints and saves them at all.
    theorem_checkpoints: it also saves them per theorem and definition, and
@@ -3566,14 +3593,16 @@ type build_options = {use_cache : bool, verify_cache : bool, force : force_level
    --checkpoint-seconds, the least time between two context saves.
    promote_preload: a theory without checkpoints moves a large preload out
    of the heap --max-heap limits (write_plain_preload); only check's
-   prebuild asks for it. *)
+   prebuild asks for it.  check_only: build --check-only runs the theory
+   for its verdict alone; it exports nothing, and installs, caches and
+   publishes no outputs. *)
 datatype checkpoint_policy =
-  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, heavy_tactic_timeout : real option, trace_steps : bool, repl_on_failure : bool, trknl : bool, promote_preload : bool}
+  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, heavy_tactic_timeout : real option, trace_steps : bool, repl_on_failure : bool, trknl : bool, promote_preload : bool, check_only : bool}
 
 val default_checkpoint_seconds = 2.0
 
 val no_checkpoint_policy =
-  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, heavy_tactic_timeout = NONE, trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false}
+  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, heavy_tactic_timeout = NONE, trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false, check_only = false}
 
 fun checkpoint_enabled (CheckpointPolicy {checkpoint, ...}) = checkpoint
 fun theorem_checkpoints_enabled (CheckpointPolicy {theorem_checkpoints, ...}) = theorem_checkpoints
@@ -3593,6 +3622,7 @@ fun trace_steps (CheckpointPolicy {trace_steps, ...}) = trace_steps
 fun repl_on_failure (CheckpointPolicy {repl_on_failure, ...}) = repl_on_failure
 fun trknl_enabled (CheckpointPolicy {trknl, ...}) = trknl
 fun promotes_preload (CheckpointPolicy {promote_preload, ...}) = promote_preload
+fun checks_only (CheckpointPolicy {check_only, ...}) = check_only
 
 fun bool_text true = "true"
   | bool_text false = "false"
@@ -4803,7 +4833,7 @@ fun install_theory_stage check_cancelled cache_allowed policy {stage, logical, s
 
 (* The files of a theory child's stage that don't depend on its parents'
    outputs: the extra inputs, the child policy and the theory exporter. *)
-fun prepare_theory_stage speculative tc root (action : theory_action) =
+fun prepare_theory_stage speculative check_only tc root (action : theory_action) =
   let
     val stage_root = stage_root_at root (#input_key action)
     val stage = action_stage root action
@@ -4830,7 +4860,7 @@ fun prepare_theory_stage speculative tc root (action : theory_action) =
        path = Path.concat(stage, "holbuild-export-theory.sml"),
        parents_report = SOME (Path.concat(stage, "holbuild-theory-parents.txt")),
        mldeps_report = SOME (Path.concat(stage, "holbuild-theory-mldeps.txt")),
-       pipelined = speculative}
+       pipelined = speculative, check_only = check_only}
   end
 
 (* Set for the next run_theory_action on the same thread: the theory child
@@ -5009,7 +5039,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
           (#extra_outputs action)
     (* A child started ahead of its parents runs in the stage already. *)
     val attached = take_attached_child ()
-    val _ = if Option.isSome attached then () else prepare_theory_stage speculative tc root action
+    val _ = if Option.isSome attached then () else prepare_theory_stage speculative (checks_only policy) tc root action
     val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
     val _ =
       if theorem_checkpoints_enabled policy then
@@ -5179,29 +5209,36 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
                NONE => ()
              | SOME output => HolbuildStatus.message_stdout ("proof step trace log: " ^ captured_output_path output ^ "\n"))
       else ()
-    val _ =
-      List.app
-        (fn (declaration, staged) =>
-            if not (file_exists staged) then
-              raise Error ("theory " ^ logical ^
-                           " did not produce declared extra output: " ^ declaration)
-            else if OS.FileSys.isDir staged then
-              raise Error ("declared extra output is not a file: " ^ declaration)
-            else ())
-        staged_extra_outputs
-    val generated_metadata =
-      read_generated_load_metadata {parents_report = parents_report,
-                                    mldeps_report = mldeps_report}
-    val _ =
-      if speculative then ()
-      else
-        install_theory_stage check_cancelled cache_allowed policy
-          {stage = stage, logical = logical, source_file = source_file, input_key = input_key,
-           outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
-           staged_extra_outputs = staged_extra_outputs,
-           generated_metadata = generated_metadata, log_dir = log_dir}
   in
-    generated_metadata
+    (* A check-only child exported nothing to check or install. *)
+    if checks_only policy then
+      (remove_file (current_checkpoint_failure_log log_dir); {parents = [], mldeps = []})
+    else
+      let
+        val _ =
+          List.app
+            (fn (declaration, staged) =>
+                if not (file_exists staged) then
+                  raise Error ("theory " ^ logical ^
+                               " did not produce declared extra output: " ^ declaration)
+                else if OS.FileSys.isDir staged then
+                  raise Error ("declared extra output is not a file: " ^ declaration)
+                else ())
+            staged_extra_outputs
+        val generated_metadata =
+          read_generated_load_metadata {parents_report = parents_report,
+                                        mldeps_report = mldeps_report}
+        val _ =
+          if speculative then ()
+          else
+            install_theory_stage check_cancelled cache_allowed policy
+              {stage = stage, logical = logical, source_file = source_file, input_key = input_key,
+               outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
+               staged_extra_outputs = staged_extra_outputs,
+               generated_metadata = generated_metadata, log_dir = log_dir}
+      in
+        generated_metadata
+      end
   end
 
 fun same_package_logical a b =
@@ -5677,12 +5714,21 @@ fun heavy_budget explicit tactic_timeout =
         in if Real.isFinite doubled then SOME doubled else NONE end
     | (SOME _, SOME heavy) => heavy
 
+(* Whether build --check-only runs NODE for its verdict alone: a theory
+   among the targets no other target depends on. *)
+fun check_only_node ({check_only_targets, ...} : build_options) node =
+  #kind (HolbuildBuildPlan.source_of node) = HolbuildSourceIndex.TheoryScript andalso
+  force_target_node check_only_targets node
+
 (* Whether NODE saves checkpoints as it runs (checkpoint_policy): it is one
    of the build's checkpoint targets (its targets, or every root-package
    theory when it has none), or every theory is under --all-checkpoints, or
-   under --repl-on-failure, whose REPL starts from wherever a build fails. *)
-fun checkpoint_target_node ({all_checkpoints, repl_on_failure, checkpoint_targets, ...} : build_options) node =
-  all_checkpoints orelse repl_on_failure orelse force_target_node checkpoint_targets node
+   under --repl-on-failure, whose REPL starts from wherever a build fails.
+   A check-only theory saves only a failed proof's prefix, as a passing
+   dependency does: nothing builds on it. *)
+fun checkpoint_target_node (options as {all_checkpoints, repl_on_failure, checkpoint_targets, ...} : build_options) node =
+  (all_checkpoints orelse repl_on_failure orelse force_target_node checkpoint_targets node) andalso
+  not (check_only_node options node)
 
 (* An impure action never replays checkpoints: its script may compute
    different values on each run (a timestamp, a version string), and
@@ -5703,7 +5749,8 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
                       trace_steps = proof_steps andalso trace_steps,
                       repl_on_failure = repl_on_failure,
                       trknl = trknl,
-                      promote_preload = promote_preload}
+                      promote_preload = promote_preload,
+                      check_only = check_only_node options node}
     end
   else
     CheckpointPolicy {checkpoint = false,
@@ -5717,7 +5764,8 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
                       trace_steps = false,
                       repl_on_failure = false,
                       trknl = trknl,
-                      promote_preload = promote_preload}
+                      promote_preload = promote_preload,
+                      check_only = check_only_node options node}
 
 (* Whether a cache entry's timeout contract serves NODE in this build. *)
 fun node_cache_usable (options : build_options) project node =
@@ -6276,7 +6324,8 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
     val stage = action_stage root action
     val extra_output_paths = source_extra_output_paths plan node
   in
-    claim_extra_outputs project node extra_output_paths;
+    if checks_only policy then remove_tree (stage_root_at root (#input_key action)) else
+    (claim_extra_outputs project node extra_output_paths;
     List.app
       (fn declaration =>
           let val destination = HolbuildBuildPlan.extra_output_path node declaration
@@ -6286,7 +6335,7 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
       (#extra_outputs action);
     record_materialized_extra_outputs project node extra_output_paths;
     write_local_theory_manifests plan node generated_metadata;
-    remove_tree (stage_root_at root (#input_key action))
+    remove_tree (stage_root_at root (#input_key action)))
   end
 
 (* Whether an alias goes to the remote cache at once.  Settling deferred
@@ -6385,6 +6434,32 @@ fun early_cutoff_metadata deps_key dat_hash_cache allow_timeout_discrepancy poli
         then SOME text
         else NONE
 
+(* Whether a cache's entry is one this build would restore: usable, and with
+   a timeout contract at least as strict as the one requested, whose blobs
+   the cache still holds. *)
+fun entry_satisfies (options : build_options) project plan node input_key blob_present text =
+  let
+    val lines = cache_manifest_lines text
+    val {extra_hashes, ...} = cache_manifest_blobs_from_lines input_key lines
+    val requested = tactic_timeout (checkpoint_policy_for_node options project node)
+  in
+    not (Option.isSome (transient_stage_mldep_in_manifest text)) andalso
+    map #1 extra_hashes = source_extra_output_declarations plan node andalso
+    cache_timeout_satisfies (#allow_cache_timeout_discrepancy options) requested
+      (cache_manifest_proof_timeout lines) andalso
+    List.all blob_present (HolbuildCacheTransfer.unique_blobs text)
+  end
+  handle _ => false
+
+(* Whether the local cache holds such an entry, its blobs intact. *)
+fun local_entry_satisfies options project plan node input_key =
+  let val root = cache_root ()
+  in
+    case HolbuildCache.get_action root input_key of
+        NONE => false
+      | SOME text => entry_satisfies options project plan node input_key (HolbuildCache.verify_blob root) text
+  end
+
 (* The theories a build that only restores couldn't restore, since it last
    took them: each input key, and whether its entry didn't fit the parent
    outputs here rather than missing. *)
@@ -6405,7 +6480,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
     val cache_allowed = #use_cache options andalso cache_enabled node
     val cache_restore_allowed = cache_allowed andalso not forced
     val allow_timeout_discrepancy = #allow_cache_timeout_discrepancy options
-    val _ = claim_extra_outputs project node (source_extra_output_paths plan node)
+    val _ = if checks_only policy then () else claim_extra_outputs project node (source_extra_output_paths plan node)
     fun invalidate_node_dat_hash () =
       invalidate_cached_file_hash dat_hash_cache (#data_path (theory_outputs node))
     val parents_differ = ref false
@@ -6529,8 +6604,50 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
          project plan keys input_key toolchain_key node;
        cache_trace ("early cutoff: " ^ logical_name node ^ " (dependency outputs unchanged)");
        HolbuildStatus.UpToDate)
+    (* build --check-only: the verdict alone, from a pass this build already
+       has (a remote worker's, or an earlier check's), outputs that are up to
+       date or would be cut off, a local cache entry that fits the parent
+       outputs, or else a build that installs nothing.  The outputs and their
+       metadata stay as they are.  An entry only the remote cache holds isn't
+       fetched for it: with --remote-exec a worker checks that one. *)
+    fun check_only_verdict () =
+      let
+        (* A local entry whose .dat records the parent outputs installed
+           here: what a restore would check, without installing anything. *)
+        fun cached_entry_fits () =
+          let val root = cache_root ()
+          in
+            local_entry_satisfies options project plan node input_key andalso
+            (case HolbuildCache.get_action root input_key of
+                 SOME text =>
+                   dat_parent_hashes_match dat_hash_cache plan node
+                     (HolbuildCache.blob_path root
+                        (#dat_hash (cache_manifest_blobs_from_lines input_key (cache_manifest_lines text))))
+               | NONE => false)
+          end
+          handle _ => false
+      in
+      if checked_verdict input_key then HolbuildStatus.Built
+      else if not forced andalso not (always_reexecute node) andalso
+         (Option.isSome (up_to_date_metadata dat_hash_cache allow_timeout_discrepancy policy project plan
+                           input_key node) orelse
+          Option.isSome (early_cutoff_metadata deps_output_key dat_hash_cache allow_timeout_discrepancy policy
+                           project plan toolchain_key node))
+      then (note_checked_verdict input_key; HolbuildStatus.UpToDate)
+      else if cache_restore_allowed andalso cached_entry_fits () then HolbuildStatus.Restored
+      else if #restore_only options then
+        (Mutex.lock restore_misses_mutex;
+         restore_misses := (input_key, false) :: !restore_misses;
+         Mutex.unlock restore_misses_mutex;
+         HolbuildHolSharedCache.local_build_needed := true;
+         raise Error (not_in_remote_cache (logical_name node)))
+      else
+        (build_theory dat_hash_cache cache_allowed policy tc project base_context plan keys toolchain_key node;
+         HolbuildStatus.Built)
+      end
   in
-    if forced orelse always_reexecute node then restore_or_build ()
+    if checks_only policy then (remove_tree stage; check_only_verdict ())
+    else if forced orelse always_reexecute node then restore_or_build ()
     else if up_to_date dat_hash_cache (#emit_output_hashes options) allow_timeout_discrepancy
               policy project plan keys input_key toolchain_key node then
       (remove_tree stage;
@@ -6950,7 +7067,8 @@ fun pipeline_enabled (options : build_options) =
    trace, and runs proof steps only through the proof IR, so a theory that
    needs more builds plain.  Of the theories that save checkpoints by
    default, only those the build doesn't name as targets are pipelined,
-   and none with --all-checkpoints. *)
+   and none with --all-checkpoints.  A check-only theory builds plain: its
+   outline would be an output. *)
 fun pipelinable (options : build_options) project plan node =
   let val policy = checkpoint_policy_for_node options project node
   in
@@ -6958,7 +7076,7 @@ fun pipelinable (options : build_options) project plan node =
      not (#all_checkpoints options orelse force_target_node (#force_targets options) node)) andalso
     (not (proof_steps_enabled policy) orelse proof_ir_enabled policy) andalso
     not (trace_steps policy) andalso
-    not (repl_on_failure policy) andalso not (trknl_enabled policy) andalso
+    not (repl_on_failure policy) andalso not (trknl_enabled policy) andalso not (checks_only policy) andalso
     null (source_extra_output_declarations plan node) andalso not (always_reexecute node)
   end
 
@@ -7449,19 +7567,19 @@ fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, h
                     new_ir = new_ir, tactic_timeout = tactic_timeout,
                     heavy_tactic_timeout = heavy_tactic_timeout,
                     trace_steps = false, repl_on_failure = false, trknl = false,
-                    promote_preload = promote_preload}
+                    promote_preload = promote_preload, check_only = false}
 
 (* An exec-action's checkpoint tree starts empty and is emptied after it,
    so a checkpoint nothing shares would only cost the child time: under
    --share-deps-heap it saves the deps heap alone (SAVE_HEAP), and without
    sharing nothing.  Proof steps and their timeouts stay as the spec says. *)
-fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, ...}) =
+fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, check_only, ...}) =
   CheckpointPolicy {checkpoint = checkpoint andalso save_heap, theorem_checkpoints = false, checkpoint_target = checkpoint_target,
                     checkpoint_seconds = checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout,
                     heavy_tactic_timeout = heavy_tactic_timeout,
                     trace_steps = trace_steps, repl_on_failure = repl_on_failure, trknl = trknl,
-                    promote_preload = promote_preload}
+                    promote_preload = promote_preload, check_only = check_only}
 
 fun signature_companion plan node =
   List.find
@@ -7559,7 +7677,7 @@ exception AheadAbandoned of string
 fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in, arrived}
                        (action : theory_action) stage log_dir run =
   let
-    val _ = (prepare_theory_stage true tc root action; remove_tree dir; ensure_dir dir)
+    val _ = (prepare_theory_stage true false tc root action; remove_tree dir; ensure_dir dir)
     fun marker name = Path.concat (dir, name)
     fun drop name = write_text (marker name) ""
     val _ =
@@ -9248,7 +9366,9 @@ fun build_checked (settled : settled option) failed (options : build_options) tc
             then Binaryset.add (cone, HolbuildBuildPlan.key node)
             else cone)
         (Binaryset.empty String.compare) (HolbuildBuildPlan.selected_nodes plan)
-    fun no_entry node = is_settled node orelse Binaryset.member (failed_cone, HolbuildBuildPlan.key node)
+    fun no_entry node =
+      is_settled node orelse Binaryset.member (failed_cone, HolbuildBuildPlan.key node) orelse
+      check_only_node options node
     val dat_hash_cache =
       case settled of
           SOME {dat_hash_cache, ...} => dat_hash_cache
@@ -9295,10 +9415,11 @@ fun build options tc project plan toolchain_key jobs =
 (* After remote execution, force and tracing have already been fulfilled. *)
 fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, checkpoint_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
                            new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, repl_on_failure,
-                           emit_output_hashes, allow_cache_timeout_discrepancy, trknl, fail_fast, all_checkpoints, promote_preload, ...} : build_options)
+                           emit_output_hashes, allow_cache_timeout_discrepancy, trknl, fail_fast, all_checkpoints, promote_preload,
+                           check_only_targets, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = ForceNone, force_targets = force_targets,
-   checkpoint_targets = checkpoint_targets, skip_checkpoints = skip_checkpoints, checkpoint_seconds = checkpoint_seconds,
+   checkpoint_targets = checkpoint_targets, check_only_targets = check_only_targets, skip_checkpoints = skip_checkpoints, checkpoint_seconds = checkpoint_seconds,
    proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
    node_tactic_timeouts = node_tactic_timeouts, heavy_tactic_timeout = heavy_tactic_timeout,
    trace_steps = false, repl_on_failure = repl_on_failure,
@@ -9663,23 +9784,6 @@ fun excluded_reason plan node =
               SOME name => SOME ("it loads " ^ name ^ " by path")
             | NONE => NONE
 
-(* Whether the remote cache holds an entry this build would restore: usable,
-   and with a timeout contract at least as strict as the one requested,
-   whose blobs the cache still holds. *)
-fun entry_satisfies (options : build_options) project plan node input_key blob_present text =
-  let
-    val lines = cache_manifest_lines text
-    val {extra_hashes, ...} = cache_manifest_blobs_from_lines input_key lines
-    val requested = tactic_timeout (checkpoint_policy_for_node options project node)
-  in
-    not (Option.isSome (transient_stage_mldep_in_manifest text)) andalso
-    map #1 extra_hashes = source_extra_output_declarations plan node andalso
-    cache_timeout_satisfies (#allow_cache_timeout_discrepancy options) requested
-      (cache_manifest_proof_timeout lines) andalso
-    List.all blob_present (HolbuildCacheTransfer.unique_blobs text)
-  end
-  handle _ => false
-
 (* Passes over replicas whose timeout contract is too weak, as a restore does. *)
 fun remote_entry_satisfies remote (options : build_options) project plan node input_key =
   let
@@ -9691,15 +9795,6 @@ fun remote_entry_satisfies remote (options : build_options) project plan node in
       | SOME text =>
           entry_satisfies options project plan node input_key
             (fn sha => HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.blob_present remote sha)) text
-  end
-
-(* The same for the local cache, whose blobs must also be intact. *)
-fun local_entry_satisfies options project plan node input_key =
-  let val root = cache_root ()
-  in
-    case HolbuildCache.get_action root input_key of
-        NONE => false
-      | SOME text => entry_satisfies options project plan node input_key (HolbuildCache.verify_blob root) text
   end
 
 (* Whether the remote cache holds an entry this build would restore,
@@ -9784,28 +9879,42 @@ fun export_file_hash seed =
     fun recorded path = locked (fn () => Redblackmap.peek (!hashes, path))
   in {hash = hash, recorded = recorded} end
 
-(* build --scratch-input's hash is kept from export to export, under git's
-   index scheme (export_file_hash), so an unchanged file isn't read again;
-   a missing or damaged record only means it is. *)
+(* build --scratch-input's hashes are kept from export to export, under
+   git's index scheme (export_file_hash), so an unchanged file isn't read
+   again; a missing or damaged record only means it is. *)
 fun scratch_input_stats root = in_root root ".holbuild/scratch-input-stats"
 
+(* The record's entries; a damaged record's numbers can overflow its parse. *)
+fun scratch_input_entries root =
+  Binarymap.listItems (!(#entries (HolbuildStatCache.load {path = scratch_input_stats root})))
+  handle Overflow => []
+
 fun scratch_input_seed root =
-  case !scratch_input_file of
-      NONE => []
-    | SOME file =>
-        (case Binarymap.peek (!(#entries (HolbuildStatCache.load {path = scratch_input_stats root})), file) of
-             SOME entry => [(file, entry)]
-           | NONE => [])
-        (* A damaged record's numbers can overflow its parse. *)
-        handle Overflow => []
+  if null (!scratch_input_files) then []
+  else
+    List.filter (fn (file, _) => List.exists (fn f => f = file) (!scratch_input_files))
+      (scratch_input_entries root)
+
+(* The most files the record holds: it keeps other builds' files too, so
+   builds that alternate between inputs each skip the rehash. *)
+val scratch_input_stats_limit = 8
 
 fun record_scratch_input_hash root recorded =
-  case Option.mapPartial recorded (!scratch_input_file) of
-      NONE => ()
-    | SOME entry =>
-        HolbuildStatCache.flush
-          (HolbuildStatCache.new_instance true (SOME (scratch_input_stats root))
-             (Binarymap.insert (HolbuildStatCache.empty_entries (), valOf (!scratch_input_file), entry)))
+  case List.mapPartial (fn file => Option.map (fn entry => (file, entry)) (recorded file))
+         (!scratch_input_files) of
+      [] => ()
+    | fresh =>
+        let
+          val others =
+            List.filter (fn (file, _) => not (List.exists (fn (f, _) => f = file) fresh))
+              (scratch_input_entries root)
+          val kept = List.take (others, Int.min (length others, Int.max (0, scratch_input_stats_limit - length fresh)))
+        in
+          HolbuildStatCache.flush
+            (HolbuildStatCache.new_instance true (SOME (scratch_input_stats root))
+               (List.foldl (fn ((file, entry), entries) => Binarymap.insert (entries, file, entry))
+                  (HolbuildStatCache.empty_entries ()) (kept @ fresh)))
+        end
         handle _ => ()
 
 fun file_line hash_file role path from =
@@ -9870,7 +9979,9 @@ fun dependency_spec_lines hash_file root plan keys token deps =
    checkpoint-target=true for a target (checkpoint_target_node), which
    saves checkpoints as it runs; without it a theory saves only a failed
    prefix.  PIPELINE: the client's options let the theory build pipelined
-   (pipelinable); a worker told to pipeline then does, where its HOL can. *)
+   (pipelinable); a worker told to pipeline then does, where its HOL can.
+   check-only=true: the worker reports the verdict alone (build
+   --check-only) and publishes no outputs. *)
 fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
                      {theorem_checkpoints, forced, skip_checkpoints, pipeline} (action : theory_action) node action_text =
   let
@@ -9913,18 +10024,19 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
       (if checkpoint_target_enabled policy then [bool_option "checkpoint-target" true] else []) @
       (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
       (if promotes_preload policy then [bool_option "promote-preload" true] else []) @
+      (if checks_only policy then [bool_option "check-only" true] else []) @
       (if Real.== (checkpoint_seconds policy, default_checkpoint_seconds) then []
        else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
       (if forced then [bool_option "force" true] else []) @
       (if trace_steps policy then [bool_option "trace-steps" true] else []) @
       (if pipeline then [bool_option "pipeline" true] else []) @
       (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []) @
-      (case !scratch_input_file of SOME file => ["option scratch-input=" ^ hash_file file] | NONE => []) @
+      map (fn file => "option scratch-input=" ^ hash_file file) (!scratch_input_files) @
       ["action-text"]
   in
     {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
      files = source :: map #from (#inputs action) @ library_files @
-             (case !scratch_input_file of SOME file => [file] | NONE => [])}
+             !scratch_input_files}
   end
 
 (* A theory waits for the nearest uncached theories it depends on, looking
@@ -10285,8 +10397,13 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
     fun is_forced (node, action) =
       force_node options project node orelse trace_steps (checkpoint_policy_for_node options project node) orelse
       List.exists (fn key => key = #input_key action) forced
+    (* A check-only theory's verdict comes from its outputs, a pass this
+       build has, or a worker: its parents may not be installed here yet,
+       so a cache entry can't be checked against them (check_only_verdict). *)
+    fun check_only (node, _) = check_only_node options node
     fun local_blobs (node, action) =
       if not local_resumable orelse is_forced (node, action) then NONE
+      else if check_only (node, action) andalso checked_verdict (#input_key action) then SOME []
       else if
         (case current_metadata (metadata_path project node) of
              SOME text =>
@@ -10295,6 +10412,7 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
                  (checkpoint_policy_for_node options project node) node text
            | NONE => false)
       then SOME []
+      else if check_only (node, action) then NONE
       else
         case HolbuildCache.get_action (cache_root ()) (#input_key action) of
             NONE => NONE
@@ -10336,7 +10454,7 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
     fun remote_check actions =
       detail_time_phase "action_spec.export.remote_check" (fn () =>
         failing "checking remote cache" "theories" (fn remote => fn (node, action) =>
-                    not (is_forced (node, action)) andalso
+                    not (is_forced (node, action)) andalso not (check_only (node, action)) andalso
                     remote_entry_satisfies remote options project plan node (#input_key action))
                 actions)
     (* Early cutoff aliases the entry of the theory's last build, so one
@@ -10383,7 +10501,10 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
       List.foldl (fn ((node, _), set) =>
                      Binaryset.addList (set, map HolbuildBuildPlan.key (HolbuildBuildPlan.transitive_project_deps plan node)))
                  held uncached_actions
-    val deps_actions = List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node)) here_actions
+    (* A check-only theory a batch never loads, and one held back needs only
+       its verdict, no entry. *)
+    val deps_actions = List.filter (fn (node, _) => Binaryset.member (batch_deps, HolbuildBuildPlan.key node) andalso
+                                                    not (check_only_node options node)) here_actions
     (* Read once, without the lock, as writers replace the file by rename;
        and only by an export with something to look up, so a build with
        nothing to do reads none of it. *)
@@ -10473,7 +10594,8 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
      (* The cache entries the build may restore that aren't here, for
         start_remote_exec_prefetch. *)
      prefetch = List.mapPartial (fn (node, action) =>
-                                   if cache_enabled node andalso not (force_node options project node)
+                                   if cache_enabled node andalso not (force_node options project node) andalso
+                                      not (check_only_node options node)
                                    then SOME (#input_key action) else NONE)
                                 other_actions}
   end
@@ -11065,8 +11187,9 @@ type action_spec =
    proof_steps : bool, tactic_timeout : real option,
    heavy_tactic_timeout : real option option, new_ir : bool,
    theorem_checkpoints : bool, checkpoint_target : bool, skip_checkpoints : bool, promote_preload : bool,
+   check_only : bool,
    checkpoint_seconds : real, force : bool, trace_steps : bool,
-   pipeline : bool, tool_cache : string option, scratch_input : string option, action_text : string}
+   pipeline : bool, tool_cache : string option, scratch_inputs : string list, action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
 fun split_spec_text section text =
@@ -11217,6 +11340,10 @@ fun parse_action_spec text : action_spec =
        (case List.find (fn (k, _) => k = "option promote-preload") (!values) of
             SOME (_, v) => spec_bool "promote-preload" v
           | NONE => false),
+     check_only =
+       (case List.find (fn (k, _) => k = "option check-only") (!values) of
+            SOME (_, v) => spec_bool "check-only" v
+          | NONE => false),
      checkpoint_seconds =
        (case List.find (fn (k, _) => k = "option checkpoint-seconds") (!values) of
             SOME (_, v) =>
@@ -11242,7 +11369,8 @@ fun parse_action_spec text : action_spec =
               if plain_file_name name then SOME name
               else reject_spec ("malformed option tool-cache: " ^ HolbuildHash.quote name)
           | NONE => NONE),
-     scratch_input = Option.map #2 (List.find (fn (k, _) => k = "option scratch-input") (!values)),
+     (* In the order the client gave them: values holds the lines reversed. *)
+     scratch_inputs = rev (List.mapPartial (fn (k, v) => if k = "option scratch-input" then SOME v else NONE) (!values)),
      action_text = action_text}
   end
 
@@ -11307,7 +11435,7 @@ fun verify_action_spec (spec : action_spec) =
     (* File hashes name blobs in the cache, so they must not be paths. *)
     check (List.all (sha256_text o #sha256) (#source spec :: #inputs spec @ #libraries spec))
       "a file's SHA-256 is malformed";
-    check (case #scratch_input spec of SOME sha => sha256_text sha | NONE => true)
+    check (List.all sha256_text (#scratch_inputs spec))
       "the scratch input's SHA-256 is malformed";
     check (text_hash = #input_key spec) "the action text does not hash to input-key";
     check (#action_text_sha256 spec = text_hash) "action-text-sha256 does not match the action text";
@@ -11432,7 +11560,7 @@ fun spec_policy (spec : action_spec) =
   in
   CheckpointPolicy {checkpoint = not (#skip_checkpoints spec),
                     theorem_checkpoints = not (#skip_checkpoints spec) andalso #theorem_checkpoints spec,
-                    checkpoint_target = #checkpoint_target spec,
+                    checkpoint_target = #checkpoint_target spec andalso not (#check_only spec),
                     checkpoint_seconds = #checkpoint_seconds spec,
                     proof_steps = #proof_steps spec,
                     new_ir = #new_ir spec,
@@ -11441,7 +11569,8 @@ fun spec_policy (spec : action_spec) =
                     trace_steps = #trace_steps spec,
                     repl_on_failure = false,
                     trknl = false,
-                    promote_preload = #promote_preload spec}
+                    promote_preload = #promote_preload spec,
+                    check_only = #check_only spec}
   end
 
 val no_space = HolbuildCacheTransfer.no_space
@@ -14228,29 +14357,37 @@ fun resident_hashes resident =
    the action's input key in the local cache.  False on a miss, and on any
    doubt: the entry's timeout contract, extra outputs, or recorded parents
    don't fit. *)
+(* The input key of the earlier build an early-cutoff pair entry names. *)
+fun earlier_build_key (spec : action_spec) text =
+  let
+    val old_key =
+      case String.tokens (fn c => c = #"\n") text of
+          [header, line] =>
+            if header = early_cutoff_header andalso String.isPrefix "input-key=" line
+            then String.extract(line, size "input-key=", NONE)
+            else ""
+        | _ => ""
+  in
+    if sha256_text old_key andalso old_key <> #input_key spec then SOME old_key else NONE
+  end
+
 fun reuse_earlier_build remote root (spec : action_spec) entry =
-  case entry of
+  case Option.mapPartial (earlier_build_key spec) entry of
       NONE => false
-    | SOME text =>
+    | SOME old_key =>
         let
           val cache = cache_root ()
           val new_key = #input_key spec
-          val old_key =
-            case String.tokens (fn c => c = #"\n") text of
-                [header, line] =>
-                  if header = early_cutoff_header andalso String.isPrefix "input-key=" line
-                  then String.extract(line, size "input-key=", NONE)
-                  else ""
-              | _ => ""
           val data_path = #data_path (#outputs spec)
         in
-          sha256_text old_key andalso old_key <> new_key andalso
           (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
              {key = old_key, subject = #package spec ^ ":" ^ #logical spec,
               stem = drop_suffix ".dat" data_path, extra_outputs = SOME (#extra_outputs spec),
               requested_timeout = #tactic_timeout spec};
            spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path)) andalso
-          (case HolbuildCache.get_action cache old_key of
+          (* A check-only action needs only the verdict, and no entry. *)
+          (#check_only spec orelse
+          case HolbuildCache.get_action cache old_key of
                NONE => false
              | SOME old_text =>
                  (HolbuildCache.remove_action cache new_key;
@@ -16025,24 +16162,26 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        blob, or across file systems, it is fetched and copied as any spec
        blob, and linked from the next action on. *)
     fun stage_scratch_input (spec : action_spec) =
-      case #scratch_input spec of
-          NONE => ()
-        | SOME sha =>
-            let
-              val path = FS.fullPath root ^ "/.holbuild/scratch/" ^ sha
-              val blob = HolbuildCache.blob_path cache sha
-              val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
-            in
-              ((ensure_parent path;
-                remove_file path;
-                Posix.FileSys.link {old = blob, new = path};
-                (* The staged name: a blob installed over the cache's
-                   name meanwhile would be another inode. *)
-                Posix.FileSys.chmod (path, read_only);
-                HolbuildCache.touch blob)
-               handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path});
-              scratch_input_path := SOME path
-            end
+      let
+        fun stage sha =
+          let
+            val path = FS.fullPath root ^ "/.holbuild/scratch/" ^ sha
+            val blob = HolbuildCache.blob_path cache sha
+            val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
+          in
+            ((ensure_parent path;
+              remove_file path;
+              Posix.FileSys.link {old = blob, new = path};
+              (* The staged name: a blob installed over the cache's
+                 name meanwhile would be another inode. *)
+              Posix.FileSys.chmod (path, read_only);
+              HolbuildCache.touch blob)
+             handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path});
+            path
+          end
+      in
+        scratch_input_paths := map stage (#scratch_inputs spec)
+      end
     val run_log = ref NONE
     fun build_log () =
       case !run_log of
@@ -16172,6 +16311,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
            what the spec shows is checked here too, so an ineligible spec builds plain. *)
         val pipelined =
           pipeline andalso #pipeline spec andalso not forced andalso null (#extra_outputs spec) andalso
+          not (#check_only spec) andalso
           (not (#proof_steps spec) orelse #new_ir spec) andalso has_context_tactics tc
         val _ = base_loaded := base_loaded_modules tc
       in
@@ -16225,7 +16365,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         if done then
           (* The entry may have come from the worker's local cache, so make
              sure the remote, where the result counts, holds it too. *)
-          (phase "check" (fn () => phase "publish" (fn () => check_remote_publication remote root spec));
+          ((if #check_only spec then ()
+            else phase "check" (fn () => phase "publish" (fn () => check_remote_publication remote root spec)));
            "cached")
         else if pipelined then
           or_plain (fn () => build spec tc forced cutoff NONE true) (fn () => build spec tc forced cutoff NONE false)
@@ -16294,11 +16435,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         (* A local entry that didn't restore must not stand in for this
            build's when the publication is checked, and, as in a local
            build, its theory's checkpoints may hold parents other than
-           the ones now restored. *)
+           the ones now restored.  A forced check-only action replaces no
+           entry, so it keeps the one it skipped. *)
         val _ =
           case HolbuildCache.get_action cache (#input_key spec) of
               SOME _ =>
-                (HolbuildCache.remove_action cache (#input_key spec);
+                ((if forced andalso #check_only spec then () else HolbuildCache.remove_action cache (#input_key spec));
                  if forced then () else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
             | NONE => ()
         val stage = action_stage root action
@@ -16352,8 +16494,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                       before add_restore_steps ())
                      handle e => (add_restore_steps (); raise e))
                 | _ => nothing_restored
+            (* It fills the host's module store for later actions, which a
+               check-only action leaves to them: it takes only the modules a
+               checkpoint it restores needs. *)
             val _ =
-              if not (Option.isSome ahead) andalso not (Option.isSome (#heap restored))
+              if not (Option.isSome ahead) andalso not (Option.isSome (#heap restored)) andalso
+                 not (#check_only spec)
               then prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
               else ()
             fun publish_shared () =
@@ -16390,15 +16536,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  deferred :=
                    (fn () =>
                       (publish_shared ();
-                       if !cancelled then () else publish_tools ()));
+                       if !cancelled orelse checks_only policy then () else publish_tools ()));
                  (* An abandoned load ahead is built plain later, which
                     writes the modules after its own result. *)
                  (case e of
                       ActionFailed (AheadAbandoned, _) => ()
-                    | _ => if outlined then () else set_write_modules ());
+                    | _ => if outlined orelse checks_only policy then () else set_write_modules ());
                  raise e)
           in
-            tools_first := (fn () => if !cancelled then () else publish_tools ());
+            tools_first := (fn () => if !cancelled orelse checks_only policy then () else publish_tools ());
             deferred :=
               (fn () =>
                  ((* A passing non-target has no checkpoint to share. *)
@@ -16442,7 +16588,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               {stage = stage, logical = #logical action, source_file = #source_file action,
                input_key = #input_key action, outputs = action_outputs root action, staged_extra_outputs = [],
                generated_metadata = generated_metadata, log_dir = log_dir}
-        val _ =
+        (* A check-only run's verdict is its result: it publishes no
+           outputs, and writes no modules from them. *)
+        val _ = if checks_only policy then () else
           phase "check" (fn () =>
             (* Outputs built against out-of-date local copies of the parents
                never reach the remote; the retry restores the remote's. *)
@@ -16453,7 +16601,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
              case cutoff of
                  SOME {pair_key, ...} => publish_early_cutoff remote pair_key (#input_key spec)
                | NONE => ()))
-        val _ = set_write_modules ()
+        val _ = if checks_only policy then () else set_write_modules ()
       in
         "built"
       end
@@ -16472,7 +16620,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 else ()
         val late = List.filter (fn (dep, _) => not (cached (#key dep))) named
       in
-        if null late then run_plain spec tc false pipelined else load_ahead spec tc late pipelined
+        if null late then run_plain spec tc false pipelined
+        else if #check_only spec then
+          raise ActionFailed (AheadAbandoned, "a check-only action does not load ahead of its parents")
+        else load_ahead spec tc late pipelined
       end
     (* PIPELINED: the action builds pipelined, so it may load a late
        parent's outline (see outline_action_key). *)
@@ -16529,7 +16680,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val action = spec_theory_action root spec (cutoff_context spec NONE)
         val stage = action_stage root action
         val dir = in_root root ".holbuild/ahead"
-        val _ = (prepare_theory_stage pipelined tc root action; remove_tree dir; ensure_dir dir)
+        val _ = (prepare_theory_stage pipelined false tc root action; remove_tree dir; ensure_dir dir)
         val dir = FS.fullPath dir
         val staging = ahead_staging
         val _ = List.app (fn dir => (HolbuildRemoveTree.remove_untrusted_strict dir; ensure_dir dir))
