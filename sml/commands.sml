@@ -354,7 +354,10 @@ fun exec_action_help () = print
   \                     processes waiting at the start of the failing step and\n\
   \                     check the next versions of the script, sent with\n\
   \                     park-check, from there. Publishes nothing; stops once\n\
-  \                     the script builds or after 120 s idle.\n\n\
+  \                     the script builds or after 120 s idle.\n\
+  \--probe-preload FILE With --park: also answer park-probe requests, in a\n\
+  \                     HOL process that used FILE once and stands where the\n\
+  \                     failing theorem's failing step starts.\n\n\
   \Global options: see `holbuild --help`. Full reference: man holbuild.\n"
 
 fun park_check_help () = print
@@ -365,6 +368,17 @@ fun park_check_help () = print
   \server publishes nothing, so the usual build stays the check of record.\n\n\
   \Exit status: 0 the script builds; 1 it fails; 2 the server cannot check it\n\
   \(check it the usual way).\n"
+
+fun park_probe_help () = print
+  "Usage:\n\
+  \  holbuild park-probe SOCKET SPEC SECONDS FILE\n\n\
+  \Prototype. Has the server exec-action SPEC --park SOCKET --probe-preload P\n\
+  \started use the SML in FILE, in a HOL process that used P once and ran the\n\
+  \theory's script into its failing theorem; HolbuildProofRuntime.failed_goals ()\n\
+  \holds the input goals of the step that failed. Prints what it printed.\n\
+  \The process is never trusted: check what a probe finds with park-check.\n\n\
+  \Exit status: 0 FILE ran; 1 it raised; 2 the server cannot probe (no preload,\n\
+  \the probe ran past SECONDS, the server is gone).\n"
 
 fun run_action_help () = print
   "Usage:\n\
@@ -448,6 +462,7 @@ fun command_help command =
     | "action-spec" => action_spec_help ()
     | "exec-action" => exec_action_help ()
     | "park-check" => park_check_help ()
+    | "park-probe" => park_probe_help ()
     | "run-action" => run_action_help ()
     | "import" => import_help ()
     | "gc" => gc_help ()
@@ -4335,13 +4350,19 @@ fun exec_action_command maxheap jobs args =
         | NONE => raise Error (label ^ " must be a non-negative integer")
     val sweep_only = List.exists (fn arg => arg = "--sweep-only") args
     (* --park SOCKET: serve the next checks of a theory that failed in a
-       proof (HolbuildBuildExec.park_serve). *)
+       proof (HolbuildBuildExec.park_serve); --probe-preload FILE: and
+       probes, in a sibling that used FILE. *)
     val park = ref NONE
+    val probe_preload = ref NONE
     fun take_park [] = []
       | take_park ("--park" :: socket :: xs) = (park := SOME socket; take_park xs)
       | take_park ["--park"] = raise Error "--park requires SOCKET"
+      | take_park ("--probe-preload" :: file :: xs) = (probe_preload := SOME (OS.FileSys.fullPath file); take_park xs)
+      | take_park ["--probe-preload"] = raise Error "--probe-preload requires FILE"
       | take_park (x :: xs) = x :: take_park xs
     val args = take_park args
+    val _ = if Option.isSome (!probe_preload) andalso not (Option.isSome (!park))
+            then raise Error "--probe-preload requires --park" else ()
     val pipeline = List.exists (fn arg => arg = "--pipeline") args
     val deps_heap_only = List.exists (fn arg => arg = "--share-deps-heap") args
     val args = List.filter (fn arg => arg <> "--sweep-only" andalso arg <> "--pipeline" andalso
@@ -4445,7 +4466,7 @@ fun exec_action_command maxheap jobs args =
          {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, share_heaps = share,
           deps_heap_only = deps_heap_only,
           toolchain = toolchain, ahead_parents = rev (!ahead_parents),
-          pipeline = pipeline andalso not (Option.isSome (!park)), park = !park})
+          pipeline = pipeline andalso not (Option.isSome (!park)), park = Option.map (fn socket => (socket, !probe_preload)) (!park)})
       handle e =>
         (HolbuildStatus.message_stderr
            ("holbuild: exec-action failed: " ^
@@ -4499,6 +4520,23 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
             if message = "" then () else TextIO.output (TextIO.stdErr, "holbuild: park-check: " ^ message ^ "\n");
             TextIO.flushOut TextIO.stdOut;
             Posix.Process.exit (case status of "pass" => 0w0 | "fail" => 0w1 | _ => 0w2)
+          end)
+     | ["park-probe", socket, spec, seconds, file] =>
+         (reject_json "park-probe";
+          let
+            val {status, message, output} =
+              case Int.fromString seconds of
+                  SOME n =>
+                    if n > 0 then
+                      HolbuildBuildExec.park_probe socket spec n (read_text file)
+                      handle e => {status = "fallback", message = General.exnMessage e, output = ""}
+                    else raise Error "park-probe: SECONDS must be positive"
+                | NONE => raise Error "park-probe: SECONDS must be positive"
+          in
+            print output;
+            if message = "" then () else TextIO.output (TextIO.stdErr, "holbuild: park-probe: " ^ message ^ "\n");
+            TextIO.flushOut TextIO.stdOut;
+            Posix.Process.exit (case status of "ok" => 0w0 | "error" => 0w1 | _ => 0w2)
           end)
      | "goalfrag-plan" :: _ => raise Error "goalfrag-plan has been removed; use execution-plan THEORY:THEOREM"
      | [] => dispatch (effective_toolchain holdir maxheap jobs) jobs args

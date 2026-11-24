@@ -48,6 +48,12 @@ val active_tactic_text_ref = ref ""
 val active_plan_ref = ref (NONE : HolbuildProofIr.step list option)
 val successful_step_count_ref = ref 0
 val successful_prefix_end_ref = ref 0
+(* The input goals of the last step that failed since install: what a
+   probe in park-serve's probe sibling works on (sml/park_probe.sml). *)
+val failed_goals_ref = ref ([] : (Term.term list * Term.term) list)
+
+fun failed_goals () = !failed_goals_ref
+
 (* Each frame records the branch it is in, the branches left, and the number of
    subgoals each earlier branch left; a resume needs those to restore goal order. *)
 datatype structural_frame = EachFrame of HolbuildProofIr.proof_path * int * int * int list
@@ -1144,6 +1150,7 @@ fun emit_step_failure_diagnostic label goals =
    combinator that chose it.  raise_body_timeout saves one where the outermost
    combinator started the body instead. *)
 fun report_step_failure_with_goals label goals e =
+  (failed_goals_ref := goals;
   case (e, !suppress_expected_failure_diagnostics_ref) of
       (TacticTimeout _, true) =>
         (print_step_failure_goal_state label goals;
@@ -1156,7 +1163,7 @@ fun report_step_failure_with_goals label goals e =
          raise e)
     | (_, false) =>
         (emit_step_failure_diagnostic label goals;
-         raise e)
+         raise e))
 
 fun report_finish_failure name e =
   let
@@ -2701,6 +2708,7 @@ fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, chec
    failed_prefix_resume_active_ref := false;
    failed_prefix_resumed_step_count_ref := NONE;
    proving_with_proof_ir_ref := false;
+   failed_goals_ref := [];
    HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate checkpoint_seconds;
    HolbuildTacticCompat.install_prover proof_ir_prover;
    case tactic_timeout of

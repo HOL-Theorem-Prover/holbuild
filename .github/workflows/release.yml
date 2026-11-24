@@ -15,6 +15,7 @@ on:
       - sml/driver_main.c
       - sml/action_sandbox.py
       - sml/park_wait.sml
+      - sml/park_probe.sml
       - sml/ahead_load_runtime.sml
       - sml/checkpoint_save_runtime.sml
       - sml/holbuild_runtime.sml
