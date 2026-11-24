@@ -242,8 +242,8 @@ grep -A3 -x "scratch input: one" "$tmpdir/u-both.hol" | grep -qx "scratch input:
 
 # Across file systems, as a worker container's action root beside a
 # host-mounted cache, the input is a read-only copy of the cache's blob.
-xdev=$(mktemp -d /dev/shm/holbuild-test.XXXXXX)
-if [[ "$(stat -c %d "$xdev")" != "$(stat -c %d "$worker_cache")" ]]; then
+if [[ -d /dev/shm && -w /dev/shm && "$(stat -c %d /dev/shm)" != "$(stat -c %d "$worker_cache")" ]]; then
+  xdev=$(mktemp -d /dev/shm/holbuild-test.XXXXXX)
   cp -a "$worker_cache/blobs/." "$xdev/"
   rm -rf "$worker_cache/blobs"
   ln -s "$xdev" "$worker_cache/blobs"
@@ -253,6 +253,8 @@ if [[ "$(stat -c %d "$xdev")" != "$(stat -c %d "$worker_cache")" ]]; then
   built u-xdev two
   grep -qx "scratch links: 1" "$tmpdir/u-xdev.hol" && grep -qx "scratch mode: 444" "$tmpdir/u-xdev.hol" || {
     echo "across file systems the input is not a read-only copy" >&2; cat "$tmpdir/u-xdev.hol" >&2; exit 1; }
+else
+  echo "skipping the cross-file-system scratch input check: no writable /dev/shm on another device"
 fi
 
 # Locally the child reads FILE itself, and every checkpoint U saves has the

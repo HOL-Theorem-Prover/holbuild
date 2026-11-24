@@ -16181,6 +16181,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               Posix.FileSys.chmod (path, read_only);
               HolbuildCache.touch blob)
              handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path}
+                  | IO.Io _ => fetch_spec_blob remote {hash = sha, dst = path}
                   | Error _ => fetch_spec_blob remote {hash = sha, dst = path});
             path
           end
