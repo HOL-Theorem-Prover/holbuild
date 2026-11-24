@@ -15749,8 +15749,8 @@ fun restore_tool_cache remote store key dir =
    the entry isn't stale.  A publish uploads every file, restored ones too:
    a host may have restored a file from its store after the remote cache
    dropped its blob, and the upload renews the blob there with the entry
-   that names it. *)
-fun publish_tool_cache remote store key dir {files = restored, stale} =
+   that names it.  STOP () says to stop before the next upload. *)
+fun publish_tool_cache stop remote store key dir {files = restored, stale} =
   let
     fun file name =
       let val path = Path.concat(dir, name)
@@ -15769,7 +15769,8 @@ fun publish_tool_cache remote store key dir {files = restored, stale} =
       else ()
     val entries = map (fn (name, path, _) => (name, path, HolbuildHash.file_sha256 path)) files
     fun upload (name, path, sha) =
-      (case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
+      (if stop () then raise Error "interrupted" else ();
+       case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
            HolbuildCacheBackend.Published => ()
          | HolbuildCacheBackend.AlreadyPresent => ()
          | _ => raise Error ("could not upload " ^ name);
@@ -15779,7 +15780,7 @@ fun publish_tool_cache remote store key dir {files = restored, stale} =
     if not stale andalso map (fn (name, _, sha) => (name, sha)) entries = restored then ()
     else
       (List.app upload entries;
-       case HolbuildRemoteCache.replace_action_unconditionally remote {key = key, text = manifest} of
+       case HolbuildRemoteCache.replace_action_everywhere remote {key = key, text = manifest} of
            HolbuildCacheBackend.Published =>
              HolbuildStatus.message_stdout
                ("published tool cache (" ^ Int.toString (length entries) ^ " files)\n")
@@ -15860,10 +15861,21 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
   let
     val cancelled = ref false
     val publishing_checkpoints = ref false
-    (* Publishing for later actions: shared checkpoints and the tool cache.
-       It runs after the result is written, since the client fetches
-       neither. *)
+    (* Publishing for later actions, which the client fetches neither. The
+       tool cache of a passing action goes first, before its result, since
+       the next build often starts as soon as the client has the result
+       and would miss the entry (publish_tools_now).  A failed action
+       publishes both before its result (share).  A passing action's
+       shared checkpoints, and anything left over, run after the result:
+       DEFERRED. *)
     val deferred = ref (fn () => ())
+    val tools_first = ref (fn () => ())
+    fun publish_tools_now () =
+      let val publish = !tools_first
+      in
+        tools_first := (fn () => ());
+        publish () handle e => warn ("tool cache publishing failed: " ^ General.exnMessage e)
+      end
     (* The theory-module writer, which runs last after the result, given
        until a deadline (see fill_module_store): the files it reads from the
        action root, and the writer given the root it finds them in. *)
@@ -16308,6 +16320,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val outlined = case ahead of SOME {outlined, ...} => outlined | NONE => false
         fun abandon_failure e =
           (deferred := (fn () => ());
+           tools_first := (fn () => ());
            raise ActionFailed (AheadAbandoned,
                                "built on an outline: " ^
                                (case e of ActionFailed (_, msg) => msg | _ => General.exnMessage e)))
@@ -16360,7 +16373,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               if not (!HolbuildActionSandbox.outputs_validated) then () else
               case tool_cache of
                   SOME (key, dir, restored) =>
-                    phase "toolpublish" (fn () => publish_tool_cache remote (share_store cache) key dir restored)
+                    phase "toolpublish" (fn () => publish_tool_cache (fn () => !cancelled) remote (share_store cache) key dir restored)
                 | NONE => ()
             val _ = set_attached_child (Option.map #join ahead)
             (* A pipelined run leaves its outputs in the stage. *)
@@ -16373,6 +16386,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 else run_hol ())
               handle e =>
                 (set_attached_child NONE;
+                 tools_first := (fn () => ());
                  deferred :=
                    (fn () =>
                       (publish_shared ();
@@ -16384,15 +16398,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                     | _ => if outlined then () else set_write_modules ());
                  raise e)
           in
+            tools_first := (fn () => if !cancelled then () else publish_tools ());
             deferred :=
               (fn () =>
                  ((* A passing non-target has no checkpoint to share. *)
                   if checkpoint_target_enabled policy then publish_shared () else drop_heap_snapshot ();
                   if !cancelled then () else
-                  (publish_tools ();
-                   (* After the publish: the checkpoints saved after
-                      resuming from a failed prefix are its children. *)
-                   remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints))));
+                  (* After the publish: the checkpoints saved after
+                     resuming from a failed prefix are its children. *)
+                  remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)));
             metadata
           end
           handle Error msg =>
@@ -16924,6 +16938,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 in
                   !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
                   deferred := (fn () => ());
+                  (* A run that failed after its HOL passed still holds its
+                     tool cache; it goes after the checkpoints. *)
+                  publish_tools_now ();
                   phases := ("share", Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
                 end
               val log = phase "log" upload_log
@@ -16954,6 +16971,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                       else NONE
                   | _ => failure
               val status = if Option.isSome failure then "failed" else status
+              (* A passing action's tool cache goes before its result, as a
+                 failed one's does. *)
+              val _ = if Option.isSome failure orelse !cancelled then () else publish_tools_now ()
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
               (* The log is read only once the sandbox validated the root it is in. *)
               val hol_phases =
@@ -16985,6 +17005,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               let
                 val t0 = Time.now ()
                 val _ = !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e)
+                (* After the checkpoints, as in share (): this is a passing
+                   action whose log upload failed, or one with no tool cache
+                   to publish. *)
+                val _ = publish_tools_now ()
                 (* An abandoned or unpublished run's snapshot goes too. *)
                 val _ = drop_heap_snapshot () handle _ => ()
                 val writer = if !cancelled then NONE else Option.mapPartial stage_writer (!write_modules)

@@ -230,6 +230,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200 if path.is_file() else 404)
         self.end_headers()
 
+    def note_watched_put(self):
+        """control/put-watch-<key>: a path; each PUT of /ac/<key> then appends to control/put-seen-<key> whether
+        that path existed when the PUT arrived."""
+        if control is None or not self.path.startswith("/ac/"):
+            return
+        key = urllib.parse.urlparse(self.path).path.rsplit("/", 1)[-1]
+        watch = control / f"put-watch-{key}"
+        if not watch.exists():
+            return
+        seen = "present" if pathlib.Path(watch.read_text().strip()).exists() else "absent"
+        with open(control / f"put-seen-{key}", "a") as log:
+            log.write(seen + "\n")
+
     def do_PUT(self):
         self.record_request()
         if not self.authorized():
@@ -238,6 +251,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path is None:
             return
         data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.note_watched_put()
         self.gate_cas_put(len(data))
         if self.cas_put_drop_once():
             self.close_connection = True
