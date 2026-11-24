@@ -745,8 +745,15 @@ fun advance_failed_prefix_checkpoint path ok_text depth =
        else raise e)
   end
 
+fun discard_failed_prefix path =
+  (HolbuildCheckpointSaveRuntime.discard_checkpoint path;
+   List.app (fn suffix => OS.FileSys.remove (path ^ suffix) handle OS.SysErr _ => ())
+       [".meta", ".prefix"])
+
 (* A resumed proof saves only when it got past the prefix it restored: one that
-   fails at the same step would save the same state again. *)
+   fails at the same step would save the same state again.  A first save that
+   can't write its files leaves none, as advance_failed_prefix_checkpoint
+   does. *)
 fun save_failed_prefix_checkpoint () = timed_hol_phase "holsave" (fn () =>
   case !theorem_info_ref of
       NONE => ()
@@ -762,9 +769,7 @@ fun save_failed_prefix_checkpoint () = timed_hol_phase "holsave" (fn () =>
              | NONE => ())
         else if QUse.hadError () then
           (* No checkpoint after a parse error: see HolbuildCheckpointSaveRuntime. *)
-          (HolbuildCheckpointSaveRuntime.discard_checkpoint failed_prefix_path;
-           List.app (fn suffix => OS.FileSys.remove (failed_prefix_path ^ suffix) handle OS.SysErr _ => ())
-               [".meta", ".prefix"])
+          discard_failed_prefix failed_prefix_path
         else
           let
             val (meta_text, prefix_text) = failed_prefix_texts ()
@@ -772,9 +777,15 @@ fun save_failed_prefix_checkpoint () = timed_hol_phase "holsave" (fn () =>
             val share = !share_failed_prefix_ref
             val _ = share_failed_prefix_ref := false
             val _ = save_checkpoint "failed_prefix" share failed_prefix_path failed_prefix_ok depth
-            val _ = write_text_file (failed_prefix_path ^ ".meta") meta_text
-            val _ = write_text_file (failed_prefix_path ^ ".prefix") prefix_text
-          in () end)
+          in
+            (write_text_file (failed_prefix_path ^ ".meta") meta_text;
+             write_text_file (failed_prefix_path ^ ".prefix") prefix_text)
+            handle e =>
+              if HolbuildCheckpointSaveRuntime.checkpoint_io_failure e then
+                (HolbuildCheckpointSaveRuntime.warn_checkpoint_failure "failed_prefix" failed_prefix_path e;
+                 discard_failed_prefix failed_prefix_path)
+              else raise e
+          end)
 
 fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok) =
   let val depth = length (PolyML.SaveState.showHierarchy())

@@ -223,15 +223,24 @@ fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed
    "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
    "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
 
+(* A process resuming from a heap that holds the save runtime starts its
+   share of the theory's CPU time here, as loading checkpoint_save_runtime.sml
+   does.  It doesn't load that file again: a second HolbuildCheckpointSaveRuntime
+   would have its own context gate, apart from the one the proof runtime the
+   heap holds was compiled against. *)
+val resume_theory_cpu_line =
+  "val _ = if Option.isSome (!HolbuildTheoryCpuState.carried) andalso \
+  \Bool.not (Option.isSome (!HolbuildTheoryCpuState.since)) \
+  \then HolbuildTheoryCpuState.since := SOME (HolbuildCheckpointSaveRuntime.process_cpu ()) else ();"
+
 (* A heap saved after the proof runtime was installed (a theorem-context
    checkpoint, say) already holds it: its key includes the runtime's identity,
-   so it is the same runtime, and the script only reinstalls it, as
-   runtime_reinstall_prelude does.  Otherwise the script compiles it. *)
+   so it is the same runtime, and the script only reinstalls it.  Otherwise
+   the script compiles it. *)
 fun runtime_prelude config =
   runtime_lines
-    (("val _ = if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HolbuildProofRuntime\") then HolbuildRuntime.use " ^
-        HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^
-        " else List.app HolbuildRuntime.use [" ^
+    (("val _ = if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HolbuildProofRuntime\") then () \
+       \else List.app HolbuildRuntime.use [" ^
         String.concatWith ", "
           (map HolbuildToolchain.sml_string
              [source_helper_path "sml/diagnostic_limits.sml",
@@ -240,12 +249,13 @@ fun runtime_prelude config =
               checkpoint_save_runtime_helper_path (),
               tactic_compat_runtime_helper_path (),
               proof_ir_runtime_helper_path ()]) ^ "];") ::
+     resume_theory_cpu_line ::
      runtime_install_lines config)
 
+(* For a script resumed from a failed-prefix checkpoint, whose heap holds the
+   proof runtime. *)
 fun runtime_reinstall_prelude config =
-  runtime_lines
-    (("HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";") ::
-     runtime_install_lines config)
+  runtime_lines (resume_theory_cpu_line :: runtime_install_lines config)
 
 (* HOL's source parser reads top-level `#(FILE="...")` and `#(LINE=...)`
    declarations as location pragmas.  Staged scripts use them so that the

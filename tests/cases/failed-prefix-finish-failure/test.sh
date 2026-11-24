@@ -9,7 +9,8 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 # A proof whose steps all run but leave goals saves a failed-prefix checkpoint,
 # in a Theorem and in a Resume block alike, so a step appended to it resumes
-# after the last one that ran.
+# after the last one that ran.  So does a >- branch its tactic leaves
+# unsolved.
 
 tmpdir=$(make_temp_dir)
 cleanup() { cleanup_temp_dir "$tmpdir"; }
@@ -130,3 +131,44 @@ fi
 require_grep "from: failed-prefix checkpoint in partial_right_" "$tmpdir/fixed.log"
 require_grep "ATheory built" "$tmpdir/fixed.log"
 expect_count 4 "fixed"
+
+# A >- branch left unsolved fails at its close; fixing the branch's last step
+# resumes after the steps before it.
+cat > "$project/src/BScript.sml" <<SML
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "B";
+fun counted_tac g =
+  let val out = TextIO.openAppend "$counter"
+  in TextIO.output(out, "x"); TextIO.closeOut out; ALL_TAC g end;
+Theorem branch:
+  1 = 1 /\\ 2 = 2
+Proof
+  CONJ_TAC >- (counted_tac >> ALL_TAC) >> ACCEPT_TAC (REFL \`\`2\`\`)
+QED
+val _ = export_theory();
+SML
+if (cd "$project" && "$HOLBUILD_BIN" build BTheory) >"$tmpdir/branch-seed.log" 2>&1; then
+  cat "$tmpdir/branch-seed.log" >&2
+  echo "expected the unsolved branch to fail" >&2
+  exit 1
+fi
+require_grep "^ *1 = 1" "$tmpdir/branch-seed.log"
+expect_count 5 "branch seed"
+require_file "$(find "$project/.holbuild/checkpoints" -name 'branch_failed_prefix.save.ok' -print -quit)"
+python3 - "$project/src/BScript.sml" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "counted_tac >> ALL_TAC"
+assert text.count(old) == 1
+path.write_text(text.replace(old, "counted_tac >> ACCEPT_TAC (REFL ``1``)"))
+PY
+if ! (cd "$project" && "$HOLBUILD_BIN" build BTheory) >"$tmpdir/branch-fixed.log" 2>&1; then
+  cat "$tmpdir/branch-fixed.log" >&2
+  echo "the branch failed to finish from its checkpoint" >&2
+  exit 1
+fi
+require_grep "from: failed-prefix checkpoint in branch" "$tmpdir/branch-fixed.log"
+require_grep "BTheory built" "$tmpdir/branch-fixed.log"
+expect_count 5 "branch fixed"

@@ -3185,7 +3185,7 @@ val heap_runtime_source_files =
    exported by holbuild with the same sources. *)
 val runtime_source_files =
   heap_runtime_source_files @
-  ["sml/proof_runtime.sml", "sml/proof_ir_types.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml", "sml/deferred_proofs_runtime.sml"] @
+  ["sml/proof_runtime.sml", "sml/tactic_compat_runtime.sml", "sml/diagnostic_limits.sml", "sml/deferred_proofs_runtime.sml"] @
   map (fn file => normalize_path (Path.concat("sml/analyser", file)))
       HolbuildHolSharedCache.analyser_source_files
 
