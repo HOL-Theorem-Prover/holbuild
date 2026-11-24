@@ -2300,10 +2300,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                               | e =>
                                   let
                                     val recorded = HolbuildBuildExec.take_restore_misses ()
-                                    val misses = List.filter (fn (key, _) => not (List.exists (fn k => k = key) batch_keys)) recorded
+                                    fun of_batch (key, _) = List.exists (fn k => k = key) batch_keys
+                                    val misses = List.filter (not o of_batch) recorded
                                     val missing = map (fn (key, _) => "theory " ^ key) misses
                                   in
-                                    if List.exists (fn item => not (List.exists (fn r => r = item) (List.concat retried))) missing
+                                    (* A theory of the batch that doesn't restore fails the build. *)
+                                    if not (List.exists of_batch recorded) andalso
+                                       List.exists (fn item => not (List.exists (fn r => r = item) (List.concat retried))) missing
                                     then
                                       let
                                         val _ = misfits := List.mapPartial (fn (key, misfit) => if misfit then SOME key else NONE) misses @

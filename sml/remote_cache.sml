@@ -1033,6 +1033,23 @@ fun blob_present cache sha256 =
   handle e as Unavailable _ => raise e
        | _ => true
 
+(* blob_present, by a GET: a node can answer HEAD for a blob its store lost. *)
+fun blob_served cache sha256 =
+  let
+    val tmp = temp_path "blob-check"
+    val result =
+      send_urls "GET" (cas_urls cache sha256) tmp
+        (fn url => get_status {url = url, dst = tmp, timeout = blob_stall_timeout cache sha256})
+      handle e => (remove_file tmp; raise e)
+  in
+    remove_file tmp;
+    case result of
+        SOME (_, HolbuildHttp.Response 404) => false
+      | _ => true
+  end
+  handle e as Unavailable _ => raise e
+       | _ => true
+
 fun verify_downloaded_blob path ({sha256, size} : blob_entry) =
   if Position.toString (FS.fileSize path) <> size then
     HolbuildCacheBackend.Corrupt ("downloaded blob size mismatch: " ^ sha256)

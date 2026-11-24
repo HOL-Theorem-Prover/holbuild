@@ -12026,9 +12026,10 @@ fun resident_weaker_but_for_dat key mine resident =
   handle Error _ => false
 
 (* Whether the remote cache lost a blob ENTRY names, so that no build can
-   restore it (remote_entry_satisfies counts it a miss). *)
+   restore it.  It GETs each blob, since a node can answer HEAD for one its
+   store lost, which is how remote_entry_satisfies took the entry for a hit. *)
 fun remote_entry_lost_blob remote entry =
-  not (List.all (fn sha => HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.blob_present remote sha))
+  not (List.all (fn sha => HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.blob_served remote sha))
                 (HolbuildCacheTransfer.unique_blobs entry))
 
 (* Uploads every blob of the local entry for the action, raising if one fails

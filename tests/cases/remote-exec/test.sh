@@ -3160,3 +3160,22 @@ require_grep "1 theories the remote cache seemed to hold did not restore; resubm
   "$tmpdir/restore-misfit.log"
 [[ $(grep -c "resubmitting" "$tmpdir/restore-misfit.log") -eq 1 ]] || { cat "$tmpdir/restore-misfit.log" >&2; exit 1; }
 require_grep "PTheory restored from cache" "$tmpdir/restore-misfit.log"
+
+# A nondeterministic theory whose .dat the remote store lost, still answering
+# HEAD: the forced rebuild has other outputs, and replaces the entry.
+project=$tmpdir/restore-lost-nondet
+mkdir -p "$project/src"
+cp "$tmpdir/nondet/src/"*Script.sml "$project/src/"
+sed 's/^name = "rxnd"/name = "rxln"/' "$tmpdir/nondet/holproject.toml" > "$project/holproject.toml"
+run restore-lost-nondet-base 0 build NTheory
+key_n=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rxln/src/NScript.sml.key")
+dat_n=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$HOLBUILD_CACHE/actions/$key_n/manifest")
+[[ -n $dat_n ]] || { echo "no .dat blob for NTheory" >&2; exit 1; }
+rm "$remote_root/cas/$dat_n"
+echo 200 > "$tmpdir/cache-control/cas-head-status-$dat_n"
+fresh_client restore-lost-nondet
+run restore-lost-nondet 0 build --remote-exec "$coordinator" --remote-only NTheory
+require_grep "1 theories the remote cache seemed to hold did not restore; resubmitting with 1 theories rebuilt or rechecked" \
+  "$tmpdir/restore-lost-nondet.log"
+require_grep "replacing remote cache entry $key_n: the cache no longer holds all of its blobs" "$tmpdir/worker.log"
+require_grep "NTheory restored from cache" "$tmpdir/restore-lost-nondet.log"
