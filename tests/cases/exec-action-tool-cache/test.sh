@@ -261,6 +261,12 @@ expect v13 0 nothing
 require_grep "published tool cache (2 files)" "$tmpdir/v13.log"
 grep -qx "PUT /cas/$(blob_sha kept)" "$request_log" || {
   echo "worker v13 published the entry without uploading the file it restored" >&2; cat "$request_log" >&2; exit 1; }
+# A passing action publishes its tool cache before its result, which the next
+# build may follow at once: the entry is no newer than the result.
+[[ "$tmpdir/remote/ac/$tool_ac" -nt "$tmpdir/entry-v11" ]] || {
+  echo "worker v13 didn't replace the entry" >&2; exit 1; }
+[[ ! "$tmpdir/remote/ac/$tool_ac" -nt "$tmpdir/v13.result" ]] || {
+  echo "worker v13 published its tool cache after its result" >&2; exit 1; }
 
 # A cache in front of the remote's store can keep serving an entry the store
 # has since replaced: here v11's, whose blob is lost.  The worker reads the
