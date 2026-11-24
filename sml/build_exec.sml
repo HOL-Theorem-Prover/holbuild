@@ -9851,6 +9851,8 @@ fun scratch_input_seed root =
         (case Binarymap.peek (!(#entries (HolbuildStatCache.load {path = scratch_input_stats root})), file) of
              SOME entry => [(file, entry)]
            | NONE => [])
+        (* A damaged record's numbers can overflow its parse. *)
+        handle Overflow => []
 
 fun record_scratch_input_hash root recorded =
   case Option.mapPartial recorded (!scratch_input_file) of

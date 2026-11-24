@@ -134,6 +134,7 @@ sed -i "s/$sha_one/$sha_two/" "$stats"
 [[ "$(scratch_option forged)" == "$sha_two" ]] || { echo "an unchanged scratch input was hashed again" >&2; exit 1; }
 touch "$tmpdir/one.txt"
 [[ "$(scratch_option touched)" == "$sha_one" ]] || { echo "a touched scratch input kept its old hash" >&2; exit 1; }
+if grep -q "$sha_one" "$stats"; then echo "a hash read within a second of a change was recorded" >&2; exit 1; fi
 
 # worker_command NAME SPEC [OPTION...]: exec-action of SPEC in the worker's
 # cache root, sharing heaps.
