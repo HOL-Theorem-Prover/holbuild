@@ -10,9 +10,10 @@ source "$SCRIPT_DIR/../../lib.sh"
 # exec-action --park --probe-preload answers park-probe requests in one HOL
 # process that used the preload once, in the context the failing theorem
 # starts in, and stands after the failing theorem's
-# failure, its failing step's input goals at hand.  It moves on when a
-# check fails in a later theorem, and is started again after a probe runs
-# out of time.
+# failure, the goals it failed on at hand: a step's input goals, or those
+# the proof's end left open.  It moves on when a check fails in a later
+# theorem, and is started again after a probe runs out of time.  It sees the
+# tool cache an earlier build of the theory's dependencies left.
 
 tmpdir=$(make_temp_dir)
 server_pid=""
@@ -41,11 +42,13 @@ name = "park"
 [build]
 members = ["src"]
 TOML
-# write_a STEP [LATER]: target's second conjunct gets STEP, later_thm LATER.
+# write_a STEP [LATER] [HEADER]: target's second conjunct gets STEP,
+# later_thm LATER; HEADER runs before both.
 write_a() {
   cat > "$project/src/AScript.sml" <<SML
 Theory A
 Ancestors bool
+${3:-}
 
 Theorem target:
   T /\\ ~F
@@ -71,6 +74,10 @@ val probe_hits = ref 0;
 val _ = probe_preloads := !probe_preloads + 1;
 (* Bound only once the script's header has run. *)
 val probe_theory = current_theory ();
+val probe_tool =
+  let val input = TextIO.openIn (OS.Path.concat (valOf (OS.Process.getEnv "HOLBUILD_TOOL_CACHE_DIR"), "seen"))
+  in TextIO.inputAll input before TextIO.closeIn input end
+  handle IO.Io _ => "nothing";
 val _ = let val out = TextIO.openOut "probe.pid"
         in TextIO.output (out, LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord (Posix.ProcEnv.getpid ()))));
            TextIO.closeOut out end;
@@ -80,6 +87,8 @@ val _ = Feedback.set_trace "Unicode" 0;
 val _ = probe_hits := !probe_hits + 1;
 val _ = print ("goal: " ^ Parse.term_to_string (#2 (hd (HolbuildProofRuntime.failed_goals ()))) ^ "\n");
 val _ = print ("theory: " ^ probe_theory ^ "\n");
+val _ = print ("goals: " ^ Int.toString (length (HolbuildProofRuntime.failed_goals ())) ^ "\n");
+val _ = print ("tool: " ^ probe_tool ^ "\n");
 val _ = print ("hits: " ^ Int.toString (!probe_hits) ^ " preloads: " ^ Int.toString (!probe_preloads) ^ "\n");
 SML
 cat > "$tmpdir/boom.sml" <<'SML'
@@ -89,10 +98,22 @@ cat > "$tmpdir/spin.sml" <<'SML'
 val _ = let fun spin n = spin (n + 1) in spin 0 end;
 SML
 
+# A build of another version of A, on the same dependencies, leaves its tool
+# cache in the remote cache.
+write_a 'FAIL_TAC "first failure"' '' 'val _ = let val out = TextIO.openOut (OS.Path.concat (valOf (OS.Process.getEnv "HOLBUILD_TOOL_CACHE_DIR"), "seen")) in TextIO.output (out, "earlier build"); TextIO.closeOut out end;'
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload --tool-cache probe ATheory) > "$tmpdir/batch-tool.txt"
+tool_spec=$(field "$tmpdir/batch-tool.txt" park:ATheory 4)
+[[ -n "$tool_spec" ]] || { cat "$tmpdir/batch-tool.txt" >&2; exit 1; }
+link_hol_toolchain_cache "$tmpdir/tool"
+status=0
+HOLBUILD_CACHE=$tmpdir/tool "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$tool_spec" \
+  --cache-limit-gb 1000 > "$tmpdir/tool.log" 2>&1 || status=$?
+[[ "$status" == 1 ]] || { echo "the tool cache build: wanted exit 1, got $status" >&2; cat "$tmpdir/tool.log" >&2; exit 1; }
+
 write_a 'FAIL_TAC "first failure"'
 
 socket=$tmpdir/park.sock
-(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload ATheory) > "$tmpdir/batch.txt"
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload --tool-cache probe ATheory) > "$tmpdir/batch.txt"
 spec=$(field "$tmpdir/batch.txt" park:ATheory 4)
 [[ -n "$spec" ]] || { cat "$tmpdir/batch.txt" >&2; exit 1; }
 link_hol_toolchain_cache "$tmpdir/park"
@@ -122,6 +143,7 @@ probe first "$tmpdir/goal.sml" 120 0
 require_grep "^goal: ~F$" "$tmpdir/first.out"
 require_grep "^hits: 1 preloads: 1$" "$tmpdir/first.out"
 require_grep "^theory: A$" "$tmpdir/first.out"
+require_grep "^tool: earlier build$" "$tmpdir/first.out"
 probe second "$tmpdir/goal.sml" 120 0
 require_grep "^hits: 2 preloads: 1$" "$tmpdir/second.out"
 # A probe that raises answers error; the process stays.
@@ -130,18 +152,39 @@ require_grep "probe boom" "$tmpdir/boom.err"
 probe after-boom "$tmpdir/goal.sml" 120 0
 require_grep "^hits: 3 preloads: 1$" "$tmpdir/after-boom.out"
 
+# fails NAME PREPARED: park-check of the script fails, and the server has
+# prepared PREPARED times.
+fails() {
+  local status=0
+  "$HOLBUILD_BIN" park-check "$socket" "$spec" "$project/src/AScript.sml" > "$tmpdir/$1.out" 2> "$tmpdir/$1.err" || status=$?
+  [[ "$status" == 1 ]] || { echo "park-check $1: wanted exit 1, got $status" >&2; cat "$tmpdir/$1.err" "$tmpdir/park.log" >&2; exit 1; }
+  for _ in $(seq 120); do
+    [[ "$(grep -c 'park: prepared' "$tmpdir/park.log")" -ge "$2" ]] && break
+    sleep 0.5
+  done
+}
+
 # A check that fails in a later theorem moves the process on to it.
 write_a 'REWRITE_TAC []' 'FAIL_TAC "later failure"'
-status=0
-"$HOLBUILD_BIN" park-check "$socket" "$spec" "$project/src/AScript.sml" > "$tmpdir/moved.out" 2> "$tmpdir/moved.err" || status=$?
-[[ "$status" == 1 ]] || { echo "park-check moved: wanted exit 1, got $status" >&2; cat "$tmpdir/moved.err" "$tmpdir/park.log" >&2; exit 1; }
-for _ in $(seq 120); do
-  [[ "$(grep -c 'park: prepared' "$tmpdir/park.log")" -ge 2 ]] && break
-  sleep 0.5
-done
+fails moved 2
 probe moved "$tmpdir/goal.sml" 120 0
 require_grep "^goal: ~(F /\\\\ T)$" "$tmpdir/moved.out"
+require_grep "^goals: 1$" "$tmpdir/moved.out"
 require_grep "^hits: 4 preloads: 1$" "$tmpdir/moved.out"
+
+# A proof that ends with goals open fails on them.
+write_a 'REWRITE_TAC []' 'ASM_CASES_TAC ``x:bool``'
+fails ended 3
+probe ended "$tmpdir/goal.sml" 120 0
+require_grep "^goal: ~(F /\\\\ T)$" "$tmpdir/ended.out"
+require_grep "^goals: 2$" "$tmpdir/ended.out"
+
+# A proof with a step that doesn't compile fails on the theorem's goal.
+write_a 'REWRITE_TAC []' 'REWRITE_TAC [no_such_theorem]'
+fails static 4
+probe static "$tmpdir/goal.sml" 120 0
+require_grep "^goal: ~(F /\\\\ T)$" "$tmpdir/static.out"
+require_grep "^goals: 1$" "$tmpdir/static.out"
 
 # A probe past its time ends the process; the next probe starts another.
 pid_file=$(find "$tmpdir/park" -name probe.pid | head -n 1)

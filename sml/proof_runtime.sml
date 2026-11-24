@@ -48,7 +48,8 @@ val active_tactic_text_ref = ref ""
 val active_plan_ref = ref (NONE : HolbuildProofIr.step list option)
 val successful_step_count_ref = ref 0
 val successful_prefix_end_ref = ref 0
-(* The input goals of the last step that failed since install: what a
+(* The goals of the last failure since install: the failing step's input
+   goals, or those a branch close or the proof's end left open.  What a
    probe in park-serve's probe sibling works on (sml/park_probe.sml). *)
 val failed_goals_ref = ref ([] : (Term.term list * Term.term) list)
 
@@ -1165,8 +1166,11 @@ fun report_step_failure_with_goals label goals e =
         (emit_step_failure_diagnostic label goals;
          raise e))
 
+(* A proof that fails at a branch close or its end, or before its first
+   step (a leaf that doesn't compile), fails on the goals the history holds. *)
 fun report_finish_failure name e =
   let
+    val _ = failed_goals_ref := (history_top_goals () handle _ => [])
     val _ =
       (ignore (print_finish_goal_state name)
        handle print_e =>

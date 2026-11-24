@@ -375,7 +375,10 @@ fun park_probe_help () = print
   \Prototype. Has the server exec-action SPEC --park SOCKET --probe-preload P\n\
   \started use the SML in FILE, in a HOL process that used P once and ran the\n\
   \theory's script into its failing theorem; HolbuildProofRuntime.failed_goals ()\n\
-  \holds the input goals of the step that failed. Prints what it printed.\n\
+  \holds the goals it failed on: the failing step's input goals, or those a\n\
+  \branch close or the proof's end left open. With the spec's tool cache, the\n\
+  \process sees it in HOLBUILD_TOOL_CACHE_DIR as restored; nothing written\n\
+  \there is published. Prints what it printed.\n\
   \The process is never trusted: check what a probe finds with park-check.\n\n\
   \Exit status: 0 FILE ran; 1 it raised; 2 the server cannot probe (no preload,\n\
   \the probe ran past SECONDS, the server is gone).\n"
