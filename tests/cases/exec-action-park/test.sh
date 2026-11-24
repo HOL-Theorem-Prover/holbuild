@@ -55,6 +55,9 @@ Proof
   ACCEPT_TAC TRUTH
 QED
 
+val between = ref 0;
+val _ = between := !between + 1;
+
 Theorem target:
   T /\\ T
 Proof
@@ -135,18 +138,22 @@ sed -i 's/CONJ_TAC >- ACCEPT_TAC TRUTH/CONJ_TAC >- (ACCEPT_TAC TRUTH)/' "$projec
 check before-step 1
 require_grep "fourth failure" "$tmpdir/before-step.out"
 
-write_a '(fn g => (counter := !counter + 1; if !counter = 1 then ACCEPT_TAC TRUTH g else raise Fail "dirty heap"))'
+# The context's child ran the declarations before the theorem once while it
+# waited: the fix sees them run once.
+write_a '(fn g => (counter := !counter + 1; if !counter = 1 andalso !between = 1 then ACCEPT_TAC TRUTH g else raise Fail "dirty heap"))'
 check fixed 0
 wait "$park_pid" || { echo "the park server failed" >&2; cat "$tmpdir/park.log" >&2; exit 1; }
 park_pid=""
 require_grep "park: the script builds, stopping" "$tmpdir/park.log"
+require_grep "park: the analyser server is ready" "$tmpdir/park.log"
 [[ ! -e "$socket" ]] || { echo "the park server left its socket" >&2; exit 1; }
 # The second and unsolved checks ran from the failed prefix; the one edited
 # before the failing step, and the fix, which undoes that edit, from the
 # context.
 [[ "$(grep -c 'park: served' "$tmpdir/park.log")" == 6 &&
    "$(grep -c 'from: failed-prefix checkpoint in target' "$tmpdir/park.log")" == 2 &&
-   "$(grep -c 'failed prefix not resumable' "$tmpdir/park.log")" == 0 ]] || {
+   "$(grep -c 'failed prefix not resumable' "$tmpdir/park.log")" == 0 &&
+   "$(grep -c "park: the context's child ran on to offset" "$tmpdir/park.log")" -ge 2 ]] || {
   cat "$tmpdir/park.log" >&2; exit 1; }
 
 # A server gone means the caller checks the usual way.

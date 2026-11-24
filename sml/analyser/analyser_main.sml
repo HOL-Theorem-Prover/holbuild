@@ -271,8 +271,36 @@ fun arg_value flag args =
     | x :: y :: rest => if x = flag then SOME y else arg_value flag (y :: rest)
     | _ :: rest => arg_value flag rest
 
+fun error_message e =
+  case e of
+      Error msg => msg
+    | D.Error msg => msg
+    | S.Error msg => msg
+    | PI.Error msg => msg
+    | e => General.exnMessage e
+
+(* --serve: answers requests until the end of its input.  For each line
+   "REQUEST\tRESPONSE\n" it writes RESPONSE as --request REQUEST --response
+   RESPONSE would, or RESPONSE.failed with the error; each appears whole. *)
+fun serve () =
+  case TextIO.inputLine TextIO.stdIn of
+      NONE => OS.Process.success
+    | SOME line =>
+        case String.tokens (fn c => c = #"\t" orelse c = #"\n") line of
+            [req, resp] =>
+              let
+                val (path, text) = (resp, response (parse_request req))
+                                   handle e => (resp ^ ".failed", error_message e ^ "\n")
+              in
+                write_file (path ^ ".tmp") text;
+                OS.FileSys.rename {old = path ^ ".tmp", new = path};
+                serve ()
+              end
+          | _ => (TextIO.output (TextIO.stdErr, "bad serve request: " ^ line); OS.Process.failure)
+
 fun main args =
   if member "--version" args then (print ("holbuild-hol-analyser " ^ P.analyser_format_version ^ "\n"); OS.Process.success)
+  else if member "--serve" args then serve ()
   else
     case (arg_value "--request" args, arg_value "--response" args) of
         (SOME req, SOME resp) =>

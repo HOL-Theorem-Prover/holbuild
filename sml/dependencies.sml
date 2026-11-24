@@ -401,10 +401,17 @@ fun analyser_failure {status, stderr, pressure, ...} =
   (if analyser_killed status then "; kill cause unknown" else "") ^ "\n" ^ pressure ^
   (if stderr = "" then "" else "\n" ^ stderr)
 
+(* A running analyser that answers REQUEST: its response, or NONE when it
+   can't; the requests then start an analyser each again. *)
+val analyser_server = ref (NONE : (string -> string option) option)
+
 (* Capture every attempt's stderr; CAPTURE_STDERR retains successful stderr
    for the caller instead of echoing it. A confined response is read only
    after sandbox validation, and confined calls never retry. *)
 fun run_analyser {analyser, request, capture_stderr} =
+  case Option.mapPartial (fn ask => ask request) (!analyser_server) of
+      SOME response => {status = OS.Process.success, output = "", stderr = "", pressure = "", response = SOME response}
+    | NONE =>
   HolbuildProcessGroup.with_cancellation_token (fn token =>
   let
     fun command dir =
