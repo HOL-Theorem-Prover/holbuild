@@ -320,6 +320,20 @@ publish no successful outputs. Every failure is reported as it happens and in
 the final diagnostic, and the build exits nonzero. Pass `build --fail-fast`
 to stop after the first failure and cancel unfinished work instead.
 
+`build --check-only` builds the targets no other target depends on for their
+verdict alone, locally or on remote workers: the theory script runs as in a
+plain build and its proofs pass or fail as there, but nothing is exported, so
+a failure to export the theory or to write a declared extra output goes
+unnoticed. No outputs of it are written or cached, and its earlier outputs and
+their metadata stay as they were. Outputs that are up to date or would be cut
+off, and a local cache entry whose `.dat` records the parent outputs installed
+here, pass it without a build; an entry only the remote cache holds isn't
+fetched, and with `--remote-exec` a worker checks it. What it loads is built
+and cached as usual, and a failed proof still saves its failed prefix, from
+which the next build or check resumes. It excludes `--emit-output-hashes`,
+`--trknl` and `--repl-on-failure`, and with `--remote-exec`, `--detach` and
+`--attach`: a check takes its verdicts from the batch it submits and follows.
+
 Keep-going applies within a resolved build plan. Setup or dependency-planning
 errors still stop the command. A theory that generates SML sources must finish
 before those sources and their consumers can be planned: if that preliminary
@@ -1729,6 +1743,7 @@ option theorem-checkpoints=false   (only for a theory that saves none)
 option checkpoint-target=true      (only for a theory that saves checkpoints as it runs)
 option skip-checkpoints=true      (when checkpoint reuse is disabled)
 option promote-preload=true       (only for a theory of `check`'s prebuild)
+option check-only=true            (only for a target of `build --check-only`)
 option force=true                 (only for a forced theory)
 option trace-steps=true            (only for a traced theory)
 option pipeline=true               (only for a theory that may build pipelined)
@@ -1768,6 +1783,12 @@ action-text
   pipelined, unless the spec shows the theory can't be (extra outputs, proof
   steps without the proof IR, a forced or traced run) or its HOL lacks the
   context-taking tactics; otherwise it builds plain.
+- `check-only` defaults to false; with it, the worker runs the theory for its
+  verdict alone: it exports nothing, and publishes no entry, early-cutoff pair,
+  deps heap, context checkpoint or tool cache. A failed proof still publishes
+  its failed prefix. An entry or early-cutoff pair already in the cache that
+  restores and fits the parent outputs passes it without HOL, and it never
+  loads ahead of its parents.
 
 ### Exporting script runs for remote execution
 
