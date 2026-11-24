@@ -326,11 +326,13 @@ plain build and its proofs pass or fail as there, but nothing is exported, so
 a failure to export the theory or to write a declared extra output goes
 unnoticed. No outputs of it are written or cached, and its earlier outputs and
 their metadata stay as they were. Outputs that are up to date or would be cut
-off pass it without a build; a cache entry doesn't, as only restoring it shows
-that it fits the parent outputs, so with `--remote-exec` a worker checks it.
-What it loads is built and cached as usual, and a failed proof still saves its
-failed prefix, from which the next build or check resumes. It excludes
-`--emit-output-hashes`, `--trknl` and `--repl-on-failure`.
+off, and a local cache entry whose `.dat` records the parent outputs installed
+here, pass it without a build; an entry only the remote cache holds isn't
+fetched, and with `--remote-exec` a worker checks it. What it loads is built
+and cached as usual, and a failed proof still saves its failed prefix, from
+which the next build or check resumes. It excludes `--emit-output-hashes`,
+`--trknl` and `--repl-on-failure`, and with `--remote-exec`, `--detach` and
+`--attach`: a check takes its verdicts from the batch it submits and follows.
 
 Keep-going applies within a resolved build plan. Setup or dependency-planning
 errors still stop the command. A theory that generates SML sources must finish

@@ -6434,6 +6434,32 @@ fun early_cutoff_metadata deps_key dat_hash_cache allow_timeout_discrepancy poli
         then SOME text
         else NONE
 
+(* Whether a cache's entry is one this build would restore: usable, and with
+   a timeout contract at least as strict as the one requested, whose blobs
+   the cache still holds. *)
+fun entry_satisfies (options : build_options) project plan node input_key blob_present text =
+  let
+    val lines = cache_manifest_lines text
+    val {extra_hashes, ...} = cache_manifest_blobs_from_lines input_key lines
+    val requested = tactic_timeout (checkpoint_policy_for_node options project node)
+  in
+    not (Option.isSome (transient_stage_mldep_in_manifest text)) andalso
+    map #1 extra_hashes = source_extra_output_declarations plan node andalso
+    cache_timeout_satisfies (#allow_cache_timeout_discrepancy options) requested
+      (cache_manifest_proof_timeout lines) andalso
+    List.all blob_present (HolbuildCacheTransfer.unique_blobs text)
+  end
+  handle _ => false
+
+(* Whether the local cache holds such an entry, its blobs intact. *)
+fun local_entry_satisfies options project plan node input_key =
+  let val root = cache_root ()
+  in
+    case HolbuildCache.get_action root input_key of
+        NONE => false
+      | SOME text => entry_satisfies options project plan node input_key (HolbuildCache.verify_blob root) text
+  end
+
 (* The theories a build that only restores couldn't restore, since it last
    took them: each input key, and whether its entry didn't fit the parent
    outputs here rather than missing. *)
@@ -6580,11 +6606,27 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
        HolbuildStatus.UpToDate)
     (* build --check-only: the verdict alone, from a pass this build already
        has (a remote worker's, or an earlier check's), outputs that are up to
-       date or would be cut off, or else a build that installs nothing.  The
-       outputs and their metadata stay as they are.  A cache entry gives no
-       verdict here: only restoring it shows it fits the parent outputs, so
-       --remote-exec has a worker check it instead. *)
+       date or would be cut off, a local cache entry that fits the parent
+       outputs, or else a build that installs nothing.  The outputs and their
+       metadata stay as they are.  An entry only the remote cache holds isn't
+       fetched for it: with --remote-exec a worker checks that one. *)
     fun check_only_verdict () =
+      let
+        (* A local entry whose .dat records the parent outputs installed
+           here: what a restore would check, without installing anything. *)
+        fun cached_entry_fits () =
+          let val root = cache_root ()
+          in
+            local_entry_satisfies options project plan node input_key andalso
+            (case HolbuildCache.get_action root input_key of
+                 SOME text =>
+                   dat_parent_hashes_match dat_hash_cache plan node
+                     (HolbuildCache.blob_path root
+                        (#dat_hash (cache_manifest_blobs_from_lines input_key (cache_manifest_lines text))))
+               | NONE => false)
+          end
+          handle _ => false
+      in
       if checked_verdict input_key then HolbuildStatus.Built
       else if not forced andalso not (always_reexecute node) andalso
          (Option.isSome (up_to_date_metadata dat_hash_cache allow_timeout_discrepancy policy project plan
@@ -6592,6 +6634,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
           Option.isSome (early_cutoff_metadata deps_output_key dat_hash_cache allow_timeout_discrepancy policy
                            project plan toolchain_key node))
       then (note_checked_verdict input_key; HolbuildStatus.UpToDate)
+      else if cache_restore_allowed andalso cached_entry_fits () then HolbuildStatus.Restored
       else if #restore_only options then
         (Mutex.lock restore_misses_mutex;
          restore_misses := (input_key, false) :: !restore_misses;
@@ -6601,6 +6644,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
       else
         (build_theory dat_hash_cache cache_allowed policy tc project base_context plan keys toolchain_key node;
          HolbuildStatus.Built)
+      end
   in
     if checks_only policy then (remove_tree stage; check_only_verdict ())
     else if forced orelse always_reexecute node then restore_or_build ()
@@ -9740,23 +9784,6 @@ fun excluded_reason plan node =
               SOME name => SOME ("it loads " ^ name ^ " by path")
             | NONE => NONE
 
-(* Whether the remote cache holds an entry this build would restore: usable,
-   and with a timeout contract at least as strict as the one requested,
-   whose blobs the cache still holds. *)
-fun entry_satisfies (options : build_options) project plan node input_key blob_present text =
-  let
-    val lines = cache_manifest_lines text
-    val {extra_hashes, ...} = cache_manifest_blobs_from_lines input_key lines
-    val requested = tactic_timeout (checkpoint_policy_for_node options project node)
-  in
-    not (Option.isSome (transient_stage_mldep_in_manifest text)) andalso
-    map #1 extra_hashes = source_extra_output_declarations plan node andalso
-    cache_timeout_satisfies (#allow_cache_timeout_discrepancy options) requested
-      (cache_manifest_proof_timeout lines) andalso
-    List.all blob_present (HolbuildCacheTransfer.unique_blobs text)
-  end
-  handle _ => false
-
 (* Passes over replicas whose timeout contract is too weak, as a restore does. *)
 fun remote_entry_satisfies remote (options : build_options) project plan node input_key =
   let
@@ -9768,15 +9795,6 @@ fun remote_entry_satisfies remote (options : build_options) project plan node in
       | SOME text =>
           entry_satisfies options project plan node input_key
             (fn sha => HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.blob_present remote sha)) text
-  end
-
-(* The same for the local cache, whose blobs must also be intact. *)
-fun local_entry_satisfies options project plan node input_key =
-  let val root = cache_root ()
-  in
-    case HolbuildCache.get_action root input_key of
-        NONE => false
-      | SOME text => entry_satisfies options project plan node input_key (HolbuildCache.verify_blob root) text
   end
 
 (* Whether the remote cache holds an entry this build would restore,
@@ -10380,8 +10398,8 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
       force_node options project node orelse trace_steps (checkpoint_policy_for_node options project node) orelse
       List.exists (fn key => key = #input_key action) forced
     (* A check-only theory's verdict comes from its outputs, a pass this
-       build has, or a worker: a cache entry gives none, as only restoring it
-       shows it fits the parent outputs (check_only_verdict). *)
+       build has, or a worker: its parents may not be installed here yet,
+       so a cache entry can't be checked against them (check_only_verdict). *)
     fun check_only (node, _) = check_only_node options node
     fun local_blobs (node, action) =
       if not local_resumable orelse is_forced (node, action) then NONE

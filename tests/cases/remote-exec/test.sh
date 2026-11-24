@@ -3348,3 +3348,10 @@ run check-cutoff 0 build --remote-exec "$coordinator" --check-only BTheory
 require_grep "early cutoff reused 1 of 1 deferred theories" "$tmpdir/check-cutoff.log"
 [[ $(grep -c 'holbuild: remote batch ' "$tmpdir/check-cutoff.log") == 1 ]] || {
   echo "the settled check-only theory went to another batch" >&2; cat "$tmpdir/check-cutoff.log" >&2; exit 1; }
+
+# A check takes its verdicts from the batch it submits and follows.
+for flag in --detach "--attach b1"; do
+  # shellcheck disable=SC2086
+  run "check-only-${flag%% *}" 1 build --remote-exec "$coordinator" --check-only $flag BTheory
+  require_grep "remove --detach or --attach" "$tmpdir/check-only-${flag%% *}.log"
+done

@@ -2312,11 +2312,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     abandon batch_id ("batch " ^ batch_id ^ " " ^ reason ^ "; " ^ finished progress)
                 | (HolbuildRemoteExec.Unreachable reason, progress) =>
                     if remote_only
-                    then fall_back (reason ^ "; " ^ finished progress ^ "; reattach with --attach " ^ batch_id ^
-                                    (if priority = 0 then "" else " --priority " ^ Int.toString priority) ^
-                                    (case speculative_loading of
-                                         SOME n => " --speculative-loading=" ^ Int.toString n
-                                       | NONE => ""))
+                    then fall_back (reason ^ "; " ^ finished progress ^
+                                    (* --check-only doesn't attach. *)
+                                    (if check_only then "" else
+                                     "; reattach with --attach " ^ batch_id ^
+                                     (if priority = 0 then "" else " --priority " ^ Int.toString priority) ^
+                                     (case speculative_loading of
+                                          SOME n => " --speculative-loading=" ^ Int.toString n
+                                        | NONE => "")))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
               end
             (* The restore after a batch finished, or after an export found
@@ -2923,7 +2926,7 @@ fun build tc cli_jobs args =
     val (speculative_loading, args) = split_speculative_loading args
     val args = split_scratch_input_flag (split_tool_cache_flag args)
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
-    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, ...}, _) = split_flags args
+    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, check_only, ...}, _) = split_flags args
     val _ =
       if watch andalso HolbuildStatus.json_mode () then
         raise Error "--json does not support build --watch yet"
@@ -2940,6 +2943,10 @@ fun build tc cli_jobs args =
       else if Option.isSome url andalso
               (watch orelse dry_run orelse repl_on_failure) then
         raise Error "--remote-exec does not support --watch, --dry-run or --repl-on-failure"
+      (* A check-only pass is recorded from the batch's report alone, which
+         only a batch this build submits and follows is known to match. *)
+      else if check_only andalso (detach orelse Option.isSome attach) then
+        raise Error "--check-only takes its verdicts from the batch it submits: remove --detach or --attach"
       else if detach andalso Option.isSome attach then
         raise Error "--detach and --attach exclude each other"
       else ()

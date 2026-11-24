@@ -690,15 +690,18 @@ nothing is exported, so a failure to export the theory or to write a declared
 extra output goes unnoticed.
 These targets write and cache no outputs, here or on remote workers, and leave
 their earlier outputs and their metadata as they were.
-Outputs that are up to date or would be cut off pass without a build; a cache
-entry does not, since only restoring it shows that it fits the parent outputs.
+Outputs that are up to date or would be cut off, and a local cache entry whose
+data records the parent outputs installed here, pass without a build; an entry
+only the remote cache holds is not fetched.
 What these targets load is built and cached as usual, and a proof that fails
 still saves its failed prefix, from which the next build resumes.
 Excludes
 .BR \-\-emit\-output\-hashes ,
-.B \-\-trknl
+.BR \-\-trknl ,
+.BR \-\-repl\-on\-failure ,
+.B \-\-detach
 and
-.BR \-\-repl\-on\-failure .
+.BR \-\-attach .
 .TP
 .B \-\-dry\-run
 Show what would be built without building.

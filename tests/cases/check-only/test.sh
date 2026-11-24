@@ -157,18 +157,17 @@ expect_build hashes-check 0
 [[ "$(find "$project/.holbuild" -name 'TScript.sml.key' -exec sha256sum {} + | sort)" == "$t_metadata" ]] ||
   { echo "check-only rewrote metadata with output hashes" >&2; exit 1; }
 
-# T's cache entry from the plain build gives no verdict: only restoring it
-# shows that it fits A's outputs, so with T's outputs gone the check builds.
+# With T's outputs gone, its cache entry from the plain build, whose .dat
+# records A's outputs as installed here, passes the check without a build,
+# and installs nothing.
 write_t "ALL_TAC >> ACCEPT_TAC TRUTH"
 rm -f "${t_outputs[@]}"
 find "$project/.holbuild" -name 'TScript.sml.key' -delete
 build cached --check-only TTheory
 expect_build cached 0
-require_grep "TTheory built" "$tmpdir/cached.log"
-if grep -q "TTheory restored" "$tmpdir/cached.log"; then
-  echo "check-only restored T from its cache entry" >&2; cat "$tmpdir/cached.log" >&2; exit 1
-fi
+require_grep "TTheory restored" "$tmpdir/cached.log"
 no_t_outputs cached
+[[ -z $(find "$project/.holbuild" -name 'TScript.sml.key') ]] || { echo "check-only wrote T's metadata" >&2; exit 1; }
 
 # A target another target depends on is built in full, in either order: A,
 # changed, gets new outputs and a new cache entry; T still gets none.
