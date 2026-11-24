@@ -16139,16 +16139,23 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     val peak = ref NONE
     (* Each phase's wall time, in the order they ran, for the result. *)
     val phases = ref ([] : (string * LargeInt.int) list)
+    (* The hydrate time inside the current hol phase: a light hydrate's
+       install before HOL starts from a fresh preload, which is not HOL's. *)
+    val hol_hydrate_ms = ref (0 : LargeInt.int)
     fun phase name f =
       let
         val _ = if name = "publish" orelse name = "log" then () else check_cancelled ()
         val t0 = Time.now ()
+        val _ = if name = "hol" then hol_hydrate_ms := 0 else ()
         fun record () =
           let val ended = Time.now ()
+              val ms = Time.toMilliseconds (Time.-(ended, t0))
+              val _ = if name = "hydrate" then hol_hydrate_ms := !hol_hydrate_ms + ms else ()
+              val excluded = if name = "hol" then !hol_hydrate_ms else 0
               val spans = if List.exists (fn n => n = name) ["hol", "publish", "log"] then
-                  [(name ^ "start", Time.toMilliseconds t0), (name ^ "end", Time.toMilliseconds ended)]
+                  [(name ^ "start", Time.toMilliseconds t0 + excluded), (name ^ "end", Time.toMilliseconds ended)]
                 else []
-          in phases := (name, Time.toMilliseconds (Time.-(ended, t0))) :: spans @ !phases end
+          in phases := (name, ms - excluded) :: spans @ !phases end
       in
         (f () before record ()) handle e => (record (); raise e)
       end

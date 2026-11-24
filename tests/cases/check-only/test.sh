@@ -338,3 +338,10 @@ worker stale-heap keep
 expect_worker stale-heap 0 "status=built"
 require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/stale-heap.log"
 hydrated stale-heap 1 1
+
+# A check that passes on the plain action's entry, without HOL, installs its
+# dependencies first, which checks they fit their parents.
+write_t "ALL_TAC >> ACCEPT_TAC TRUTH >> ALL_TAC"
+worker cached-pass
+expect_worker cached-pass 0 "status=cached"
+hydrated cached-pass 1 1
