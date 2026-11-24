@@ -35,7 +35,7 @@ val _ = (let
   val _ = write path #"a"
   val old_time = OS.FileSys.modTime path
   val _ = OS.Process.sleep (Time.fromSeconds 2)
-  val hash = HolbuildBuildExec.export_file_hash ()
+  val hash = #hash (HolbuildBuildExec.export_file_hash [])
   val first = hash path
   val _ = assert "stable file was not reused" (hash path = first andalso calls () = 1)
   val _ = write path #"b"
