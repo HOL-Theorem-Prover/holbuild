@@ -124,6 +124,17 @@ cache_miss_and_force() {
   require_no_grep "BTheory restored from cache" "$tmpdir/force2.log"
 }
 
+# A build plans from the record a dry run of the same targets wrote, which
+# alternating callers depend on.
+dry_run_then_build() {
+  local p=$tmpdir/dry-then-build
+  make_project "$p"
+  expect_build "full (no plan record" "$p" "$tmpdir/dry1.log" --dry-run
+  expect_build "from record (0 files rehashed, 0 keys changed)" "$p" "$tmpdir/dry2.log" -j2
+  require_grep "BTheory" "$tmpdir/dry2.log"
+  require_file "$p/.holbuild/obj/src/BTheory.dat"
+}
+
 warn_unreachable() {
   local p=$tmpdir/unreachable
   make_project "$p" 'roots = ["src/AScript.sml"]'
@@ -249,6 +260,7 @@ SML
 }
 
 cache_miss_and_force
+dry_run_then_build
 warn_unreachable
 tactic_timeouts
 root_tactic_timeouts

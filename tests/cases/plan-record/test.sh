@@ -61,15 +61,16 @@ TOML
   sleep 1.1
 }
 
-# Plans DIR with ARGS, after the global options in PLAN_GLOBAL, and prints
-# the line saying how it planned.
+# Global options for plan(), before the build command.
+plan_global=()
+
+# Plans DIR with ARGS, after the options in plan_global, and prints the line
+# saying how it planned.
 plan() {
   local dir=$1
   shift
   local log=$tmpdir/plan.log
-  local global
-  read -ra global <<< "${PLAN_GLOBAL:-}"
-  if ! (cd "$dir" && "$HOLBUILD_BIN" "${global[@]}" --verbose build --dry-run "$@") > "$log" 2>&1; then
+  if ! (cd "$dir" && "$HOLBUILD_BIN" "${plan_global[@]}" --verbose build --dry-run "$@") > "$log" 2>&1; then
     cat "$log" >&2
     echo "build --dry-run $* failed in $dir" >&2
     exit 1
@@ -344,7 +345,9 @@ options_outside_planning() {
   recorded_project "$p"
   local same="from record (0 files rehashed, 0 keys changed)"
   # Global options: jobs, heap, prefetching.
-  PLAN_GLOBAL="-j4 --max-heap 4000 --prefetch-concurrency 2" expect_plan "$same" "$p"
+  plan_global=(-j4 --max-heap 4000 --prefetch-concurrency 2)
+  expect_plan "$same" "$p"
+  plan_global=()
   # Execution options.
   expect_plan "$same" "$p" --allow-cache-timeout-discrepancy --force --no-cache --fail-fast --skip-checkpoints \
     --cooperate-dir "$tmpdir/cooperate" --child-charge 1536
@@ -369,7 +372,9 @@ options_outside_planning() {
   # So does the project: another one with the same sources and targets,
   # chosen from the same directory, plans in full.
   make_project "$tmpdir/options-other"
-  PLAN_GLOBAL="--source-dir $tmpdir/options-other" expect_plan "full (no plan record for these inputs)" "$p"
+  plan_global=(--source-dir "$tmpdir/options-other")
+  expect_plan "full (no plan record for these inputs)" "$p"
+  plan_global=()
 }
 
 targets_on_argv() {
@@ -402,9 +407,10 @@ target_switch() {
   # The newest record, A's, doesn't hold C; D's older one does.
   expect_plan "from record (0 files rehashed, 0 keys changed, sliced from other targets' plan)" "$p" CTheory
   expect_plan "from record (0 files rehashed, 0 keys changed)" "$p" CTheory
-  # The record's files are checked as for its own targets.
+  # The record's files are checked as for its own targets, whatever the
+  # options.
   printf '\n(* comment *)\n' >> "$p/src/AScript.sml"
-  expect_plan "from record (1 files rehashed, " "$p" BTheory
+  expect_plan "from record (1 files rehashed, " "$p" --skip-proof-steps BTheory
   require_grep "sliced from other targets' plan" "$tmpdir/plan.log"
   # Every record lists Lib.sml among its sources, but none plans it.
   expect_plan "full (no plan record for these inputs)" "$p" Lib
