@@ -101,6 +101,16 @@ cache_miss_and_force() {
   require_grep "BTheory" "$tmpdir/edit.log"
   expect_build "from record" "$p" "$tmpdir/noop.log"
   require_grep "BTheory is up to date" "$tmpdir/noop.log"
+  # A --json build plans from the record too (out of check mode, whose own
+  # full plan would show in the timings).
+  if ! (cd "$p" && HOLBUILD_PLAN_RECORD=on HOLBUILD_TIMING_LOG=$tmpdir/json-timing.log \
+          "$HOLBUILD_BIN" --json build) > "$tmpdir/json.log" 2>&1; then
+    cat "$tmpdir/json.log" >&2
+    echo "--json build failed in $p" >&2
+    exit 1
+  fi
+  require_grep 'name=plan.record' "$tmpdir/json-timing.log"
+  require_no_grep 'name=build.plan' "$tmpdir/json-timing.log"
   # A theory whose key came from the record, missing from every cache.
   rm -rf "$tmpdir/cache/actions" "$p/.holbuild/obj/src/BTheory".* "$p/.holbuild/dep/record_builds/src/BScript.sml".*
   expect_build "from record (0 files rehashed, 0 keys changed)" "$p" "$tmpdir/miss.log"

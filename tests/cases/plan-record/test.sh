@@ -366,6 +366,10 @@ options_outside_planning() {
   fi
   # The targets still count.
   expect_plan "from record (0 files rehashed, 0 keys changed, sliced from other targets' plan)" "$p" BTheory
+  # So does the project: another one with the same sources and targets,
+  # chosen from the same directory, plans in full.
+  make_project "$tmpdir/options-other"
+  PLAN_GLOBAL="--source-dir $tmpdir/options-other" expect_plan "full (no plan record for these inputs)" "$p"
 }
 
 targets_on_argv() {
