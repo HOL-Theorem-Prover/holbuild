@@ -40,8 +40,8 @@ name = "park"
 [build]
 members = ["src"]
 TOML
-# write_a STEP: A's last theorem splits its goal, proves the first conjunct
-# and runs STEP on the second.
+# write_a STEP [LATER]: A's theorem target splits its goal, proves the first
+# conjunct and runs STEP on the second; the last theorem runs LATER.
 write_a() {
   cat > "$project/src/AScript.sml" <<SML
 Theory A
@@ -59,6 +59,12 @@ Theorem target:
   T /\\ T
 Proof
   CONJ_TAC >- ACCEPT_TAC TRUTH >> $1
+QED
+
+Theorem later_thm:
+  T
+Proof
+  ${2:-ACCEPT_TAC TRUTH}
 QED
 SML
 }
@@ -163,3 +169,22 @@ serve static
 require_grep "park: prepared target at step 0 .* started 1 children" "$tmpdir/static.log"
 write_a 'ACCEPT_TAC TRUTH'
 check after-static 0
+wait "$park_pid" 2>/dev/null || true
+park_pid=""
+
+# An edit that fixes the failing theorem and leaves a later one unsolved,
+# which saves no failed prefix: the server parks again at the start of the
+# one that fails now.
+write_a 'FAIL_TAC "moved failure"'
+serve moved
+write_a 'ACCEPT_TAC TRUTH' 'ALL_TAC'
+check moved 1
+require_grep "later_thm" "$tmpdir/moved.out"
+# The server parks again after it answers.
+for _ in $(seq 120); do
+  [[ "$(grep -c 'park: prepared' "$tmpdir/moved.log")" -ge 2 ]] && break
+  sleep 0.5
+done
+require_grep "park: prepared later_thm at step 0 .* started 1 children" "$tmpdir/moved.log"
+write_a 'ACCEPT_TAC TRUTH'
+check after-moved 0

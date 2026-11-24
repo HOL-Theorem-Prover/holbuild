@@ -15954,6 +15954,44 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
                         park_sized (log (current_checkpoint_failure_log log_dir)) ^
                         park_sized (#source_file action))
       end
+    (* The theorem the build log names as failed, parked at its start: for a
+       failure that saves no failed prefix (an unsolved proof, say). *)
+    fun failed_theorem () =
+      Option.map (fn name => {theorem = hd (String.fields (fn c => c = #"[") name),
+                              step_count = 0, prefix_end = 0, path = ""})
+        (HolbuildTheoryDiagnostics.find_failed_theorem_name
+           (String.tokens (fn c => c = #"\n") (read_text build_log handle _ => "")))
+    (* The theorem of SOURCE whose text holds the line of the first static
+       error the build log names in the script: one in a tactic, an
+       undeclared theorem name, say, fails before any step runs. *)
+    fun static_error_theorem source checkpoints =
+      let
+        val marker = Path.file (#source_file action) ^ ":"
+        fun error_line line =
+          case String.fields (fn c => c = #":") line of
+              file :: n :: rest =>
+                if String.isSuffix (Path.file (#source_file action)) file andalso
+                   String.isPrefix " error" (String.concatWith ":" rest)
+                then Int.fromString n else NONE
+            | _ => NONE
+        val lines = String.tokens (fn c => c = #"\n") (read_text build_log handle _ => "")
+        fun offset_of_line n =
+          let fun go (i, k) = if k >= n orelse i >= size source then i
+                              else go (i + 1, if String.sub (source, i) = #"\n" then k + 1 else k)
+          in go (0, 1) end
+      in
+        case List.mapPartial (fn line => if String.isSubstring marker line then error_line line else NONE) lines of
+            n :: _ =>
+              let val at = offset_of_line n
+              in
+                Option.map (fn ({name, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
+                              {theorem = name, step_count = 0, prefix_end = 0, path = ""})
+                  (List.find (fn ({theorem_start, theorem_stop, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
+                                theorem_start <= at andalso at < theorem_stop)
+                             (#theorem_checkpoints checkpoints))
+              end
+          | [] => NONE
+      end
     (* Serves checks until idle; PARKED is where the children are parked:
        the target, and the source and checkpoints they were prepared from. *)
     fun loop listener (parked as (target, _, _)) =
@@ -15985,11 +16023,18 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
               handle e => (Socket.close sock handle _ => (); raise e)
             val _ = Socket.close sock handle _ => ()
           in
-            (* A failure that left no failed prefix (one at the end of a
-               proof, say) parks again where the children were. *)
+            (* A failure that left no failed prefix parks at the start of
+               the theorem the build log names, which can be another one
+               than before, or else where the children were. *)
             case outcome of
                 SOME ("fail", source, checkpoints) =>
-                  let val next = getOpt (served_target checkpoints, target)
+                  let
+                    val next =
+                      case List.mapPartial (fn find => find ())
+                             [fn () => served_target checkpoints, failed_theorem,
+                              fn () => static_error_theorem source checkpoints] of
+                          found :: _ => found
+                        | [] => target
                   in prepare source checkpoints next; loop listener (next, source, checkpoints) end
               | SOME ("pass", _, _) => park_note "the script builds, stopping"
               | SOME ("stop", _, _) => park_note "asked to stop"
@@ -16003,43 +16048,6 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
           SOME ({name, failed_prefix_path, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
             SOME (park_target_of_meta name (read_text (failed_prefix_path ^ ".meta")))
         | NONE => NONE
-    (* The theorem the build log names as failed, parked at its start: for a
-       failure that saves no failed prefix (an unsolved proof, say). *)
-    fun failed_theorem () =
-      Option.map (fn name => {theorem = name, step_count = 0, prefix_end = 0, path = ""})
-        (HolbuildTheoryDiagnostics.find_failed_theorem_name
-           (String.tokens (fn c => c = #"\n") (read_text build_log handle _ => "")))
-    (* The theorem whose text holds the line of the first static error the
-       build log names in the script: one in a tactic, an undeclared
-       theorem name, say, fails before any step runs. *)
-    fun static_error_theorem () =
-      let
-        val marker = Path.file (#source_file action) ^ ":"
-        fun error_line line =
-          case String.fields (fn c => c = #":") line of
-              file :: n :: rest =>
-                if String.isSuffix (Path.file (#source_file action)) file andalso
-                   String.isPrefix " error" (String.concatWith ":" rest)
-                then Int.fromString n else NONE
-            | _ => NONE
-        val lines = String.tokens (fn c => c = #"\n") (read_text build_log handle _ => "")
-        fun offset_of_line n =
-          let fun go (i, k) = if k >= n orelse i >= size source_text then i
-                              else go (i + 1, if String.sub (source_text, i) = #"\n" then k + 1 else k)
-          in go (0, 1) end
-      in
-        case List.mapPartial (fn line => if String.isSubstring marker line then error_line line else NONE) lines of
-            n :: _ =>
-              let val at = offset_of_line n
-              in
-                Option.map (fn ({name, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
-                              {theorem = name, step_count = 0, prefix_end = 0, path = ""})
-                  (List.find (fn ({theorem_start, theorem_stop, ...} : HolbuildTheoryCheckpoints.checkpoint) =>
-                                theorem_start <= at andalso at < theorem_stop)
-                             (#theorem_checkpoints checkpoints))
-              end
-          | [] => NONE
-      end
     (* With no failed prefix from an earlier build, the source is built once
        the usual way to find where it fails. *)
     val initial =
@@ -16047,7 +16055,8 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
           SOME target => target
         | NONE =>
             (check source_text checkpoints handle Error _ => ();
-             case List.mapPartial (fn find => find ()) [failed_target, failed_theorem, static_error_theorem] of
+             case List.mapPartial (fn find => find ())
+                    [failed_target, failed_theorem, fn () => static_error_theorem source_text checkpoints] of
                  target :: _ => target
                | [] => raise Error "park: the source does not fail in a proof")
     val _ = remove_file socket
