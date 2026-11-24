@@ -2584,6 +2584,8 @@ fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, chec
   (hol_phases_ref := [("holloadend", Time.toMilliseconds (Time.now ()))];
    hol_phase_nested_ms_ref := 0;
    OS.Process.atExit print_hol_phases;
+   (* A process resumed from a heap reports its source loads too. *)
+   ignore (HolbuildRuntime.timing_source_loads ());
    checkpoint_enabled_ref := checkpoint_enabled;
    context_checkpoints_ref := context_checkpoints;
    share_failed_prefix_ref := share_failed_prefix;

@@ -16596,7 +16596,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           Thread.fork
             (fn () =>
                 outcome :=
-                  SOME ((run_hol_files_to_log tc (source_load_context (#checkpoint_target spec) "cold")
+                  SOME ((run_hol_files_to_log tc (source_load_context (not pipelined andalso #checkpoint_target spec) "cold")
                            stage stage (toolchain_base_context tc) files "holbuild-build.log"
                            (SOME (current_build_log (current_log_dir root package (#logical spec))))
                            "hol run failed while building theory script";

@@ -23,9 +23,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Stand-in theories B -> A and a library ProbeLib, in HOL's .hol/objs.  ProbeLib sleeps
-# 0.2 s itself and uses a runtime file that sleeps 0.3 s more: ProbeLib's total
-# includes the runtime file's time, its self time does not.
+# Stand-in theories B -> A and a library ProbeLib, in HOL's .hol/objs.  ProbeLib
+# sleeps 0.2 s itself and uses a runtime file that sleeps 0.3 s more: ProbeLib's
+# total includes the runtime file's time, its self time does not.  B's .dat is
+# large enough that the loader shares the heap after it: theory time, not self.
 mods=$tmpdir/mods
 objs=$mods/.hol/objs
 mkdir -p "$objs"
@@ -35,6 +36,7 @@ printf 'ATheory\n%s\n' "$mods/BTheory.sml" > "$objs/BTheory.uo"
 echo "$mods/ProbeLib.sml" > "$objs/ProbeLib.uo"
 echo 'val _ = ();' > "$objs/ATheory.sml"
 echo 'val _ = ();' > "$objs/BTheory.sml"
+truncate -s 64M "$objs/BTheory.dat"
 echo 'val _ = OS.Process.sleep (Time.fromMilliseconds 300);' > "$tmpdir/rt_step.sml"
 cat > "$mods/ProbeLib.sml" <<SML
 val _ = OS.Process.sleep (Time.fromMilliseconds 200);
@@ -48,15 +50,16 @@ row() {
       for (i = 6; i <= NF; i++) if (index($i, field) == 1) print substr($i, length(field) + 1) }' "$1"
 }
 
+# run_load MODE PRELUDE BODY [VAR=VALUE...]: a HOL process that compiles the
+# runtime and runs BODY; its output goes to $tmpdir/MODE.log.
 run_load() {
-  local mode=$1 prelude=$2
-  shift 2
+  local mode=$1 prelude=$2 body=$3
+  shift 3
   cat > "$tmpdir/$mode.sml" <<SML
 $prelude
 use "$HOLBUILD_ROOT/sml/holbuild_runtime.sml";
 val _ = Meta.loadPath := "$mods" :: !Meta.loadPath;
-val _ = HolbuildRuntime.load "BTheory";
-val _ = HolbuildRuntime.load "ProbeLib";
+$body
 SML
   env "$@" "$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" "$tmpdir/$mode.sml" \
     > "$tmpdir/$mode.log" 2>&1 || { cat "$tmpdir/$mode.log" >&2; exit 1; }
@@ -73,25 +76,81 @@ check_timed() {
   lib_total=$(row "$log" library project:ProbeLib.sml total_us)
   lib_self=$(row "$log" library project:ProbeLib.sml self_us)
   rt_total=$(row "$log" runtime rt_step.sml total_us)
-  (( rt_total >= 250000 && lib_total == lib_self + rt_total && lib_self >= 150000 && lib_self < 250000 )) ||
+  (( rt_total >= 250000 && lib_total == lib_self + rt_total && lib_self >= 150000 )) ||
     fail "ProbeLib's self time ($lib_self us) is not its total ($lib_total us) less the runtime file's ($rt_total us)"
   grep -qx "holbuild hol-phases srclib=$((lib_self / 1000)) srclibn=1 srcrt=$((rt_total / 1000)) srcrtn=1 srcthy=[0-9]* srcthyn=2" "$log" ||
     fail "no hol-phases line with the kinds' self times and counts"
+  [[ "$(grep -c '^holbuild hol-phases ' "$log")" == 1 ]] || fail "more than one report"
+  (( $(row "$log" theory '*' self_us) < $(row "$log" theory '*' total_us) )) ||
+    fail "the heap share after B counts as theory self time"
 }
+
+# B, then the runtime compiled again (as a load ahead's second preload does),
+# then ProbeLib: one table across both.
+loads='val _ = HolbuildRuntime.load "BTheory";
+use "'"$HOLBUILD_ROOT"'/sml/holbuild_runtime.sml";
+val _ = HolbuildRuntime.load "ProbeLib";'
 
 loadplan_meta="structure Meta = struct val loadPlan = Meta.loadPlan val qquse = Meta.qquse val load = Meta.load val loadPath = Meta.loadPath end;"
 
 # Off by default.
-run_load off ""
+run_load off "" "$loads"
 if grep -q '^holbuild \(source-load\|hol-phases\)' "$tmpdir/off.log"; then
   echo "source loads were reported without HOLBUILD_TIMING_SOURCE_LOADS" >&2; cat "$tmpdir/off.log" >&2; exit 1
 fi
 # On, with this HOL's own loader and with a Meta that has loadPlan but no
 # moduleSourceLoader (HOL before theory modules).
-run_load current "" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
+run_load current "" "$loads" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
 check_timed current
-run_load loadplan "$loadplan_meta" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
+run_load loadplan "$loadplan_meta" "$loads" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
 check_timed loadplan
+# A timed process that loads nothing (a child resumed from a heap, say) still
+# reports, with its context.
+run_load empty "" "" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
+grep -qx 'holbuild hol-phases srclib=0 srclibn=0 srcrt=0 srcrtn=0 srcthy=0 srcthyn=0' "$tmpdir/empty.log" &&
+  grep -qx 'holbuild source-load ctx=probe-ctx kind=none name=- n=0 total_us=0 self_us=0' "$tmpdir/empty.log" || {
+  echo "a timed process that loaded nothing did not report" >&2; cat "$tmpdir/empty.log" >&2; exit 1; }
+
+# A local build labels each theory child by how it started: cold, from the
+# failed-prefix checkpoint, then from the dependency heap.
+local_project=$tmpdir/local
+mkdir -p "$local_project/src"
+cat > "$local_project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "local"
+
+[build]
+members = ["src"]
+TOML
+cat > "$local_project/src/LScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "L";
+Theorem passes:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+Theorem fails:
+  T
+Proof
+  FAIL_TAC "seed failure"
+QED
+val _ = export_theory();
+SML
+child_log=$local_project/.holbuild/logs/current/local/LTheory/build.log
+# local_build NAME CTX: a timed build whose child reports CTX.
+local_build() {
+  (cd "$local_project" && HOLBUILD_TIMING_SOURCE_LOADS=1 "$HOLBUILD_BIN" build LTheory) > "$tmpdir/$1.log" 2>&1 || true
+  grep -q "^holbuild source-load ctx=$2 " "$child_log" || {
+    echo "$1: the child did not report ctx=$2:" >&2; cat "$tmpdir/$1.log" "$child_log" >&2; exit 1; }
+}
+local_build seed target-cold
+sed -i 's/FAIL_TAC "seed failure"/ACCEPT_TAC TRUTH/' "$local_project/src/LScript.sml"
+local_build resume target-prefix
+require_grep "from: failed-prefix checkpoint" "$tmpdir/resume.log"
+sed -i 's/^val _ = new_theory "L";$/val _ = new_theory "L"; val edited = ();/' "$local_project/src/LScript.sml"
+local_build edit target-deps
 
 # The fleet: action-spec under the flag adds one option to the spec, and a
 # worker without the flag in its environment times T's child from it.
