@@ -329,7 +329,7 @@ fun run_context_load_path_dirs (project : HolbuildProject.t) packages =
 (* The holbuild runtime every HOL session holbuild starts loads first: the
    helpers holbuild's generated code calls, and HolbuildFingerprint, which
    scripts may call. *)
-val runtime_files = ["sml/holbuild_runtime.sml", "sml/sha256.sml", "sml/fingerprint_runtime.sml"]
+val runtime_files = ["sml/bounded_output.sml", "sml/holbuild_runtime.sml", "sml/sha256.sml", "sml/fingerprint_runtime.sml"]
 
 fun runtime_line () =
   String.concatWith " "

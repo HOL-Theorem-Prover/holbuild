@@ -14,6 +14,7 @@ val analyser_format_version = "holbuild-hol-analyser-v2"
 val analyser_protocol_version = "1"
 val analyser_source_files =
   ["../sha256.sml",
+   "../bounded_output.sml",
    "../spawn.sml",
    "../temp_path.sml",
    "../hash.sml",
@@ -476,7 +477,7 @@ fun release_lock (ToolchainLock lock) =
 
 fun write_file path text =
   let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+  in HolbuildBoundedOutput.text (out, text); TextIO.closeOut out end
 
 (* Every command that uses a toolchain holds a shared usage lease on it until
    the process exits, so toolchain GC never removes an entry in use. fcntl

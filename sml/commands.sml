@@ -812,7 +812,7 @@ fun proof_unit_names kind source =
 
 fun write_text_file path text =
   let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+  in HolbuildBoundedOutput.text (out, text); TextIO.closeOut out end
 
 fun run_analyser_for_proof_ir_text {name, tactic_start, tactic_end, tactic_text} =
   case HolbuildDependencies.current_analyser_path () of

@@ -115,7 +115,7 @@ fun write_text path text =
       handle e => raise Error ("could not write " ^ path ^ ": " ^ General.exnMessage e)
     fun close_output () = TextIO.closeOut output handle _ => ()
   in
-    (TextIO.output(output, text);
+    (HolbuildBoundedOutput.text (output, text);
      TextIO.closeOut output;
      rename_replace {old = tmp, new = path})
     handle e => (close_output (); remove_file tmp; raise e)
@@ -1723,7 +1723,7 @@ fun write_checkpoint_index_atomically (index as {dir, ...} : checkpoint_index) =
       handle e => raise Error ("could not write " ^ path ^ ": " ^ General.exnMessage e)
     fun close_output () = TextIO.closeOut output handle _ => ()
   in
-    (TextIO.output(output, checkpoint_index_text index);
+    (HolbuildBoundedOutput.text (output, checkpoint_index_text index);
      TextIO.closeOut output;
      rename_replace {old = tmp, new = path};
      remove_file (legacy_checkpoint_index_tmp_path dir);
@@ -8953,7 +8953,7 @@ fun write_text_atomic path text =
     fun close () = TextIO.closeOut out handle _ => ()
     fun remove_tmp () = FS.remove tmp handle _ => ()
   in
-    (TextIO.output(out, text);
+    (HolbuildBoundedOutput.text (out, text);
      TextIO.closeOut out;
      FS.rename {old = tmp, new = path}
        handle e => (remove_tmp ();

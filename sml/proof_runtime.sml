@@ -405,7 +405,7 @@ fun save_checkpoint label default_share path ok_text depth =
 
 fun write_text_file path text =
   let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+  in HolbuildBoundedOutput.text (out, text); TextIO.closeOut out end
 
 fun path_component_text component =
   case component of

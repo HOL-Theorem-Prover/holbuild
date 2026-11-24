@@ -20,7 +20,7 @@ fun read_all path =
 
 fun write_file path text =
   let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+  in HolbuildBoundedOutput.text (out, text); TextIO.closeOut out end
 
 fun member x xs = List.exists (fn y => x = y) xs
 

@@ -124,7 +124,7 @@ struct
   fun write_text path text =
     let
       val out = TextIO.openOut path
-      val _ = TextIO.output(out, text)
+      val _ = HolbuildBoundedOutput.text (out, text)
       val _ = TextIO.closeOut out
     in
       ()

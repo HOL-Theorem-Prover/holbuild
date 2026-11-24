@@ -350,7 +350,7 @@ fun parse_analyser_response response id_paths =
 
 fun write_file path text =
   let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+  in HolbuildBoundedOutput.text (out, text); TextIO.closeOut out end
 
 (* Keep shell exit 137 distinct from an observed signal: a program can also
    exit with that code itself. Both permit bounded retry of this parser. *)
