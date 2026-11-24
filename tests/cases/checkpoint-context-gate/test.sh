@@ -187,3 +187,49 @@ if (cd "$project" && "$HOLBUILD_BIN" build DTheory) > "$tmpdir/d-default.log" 2>
 fi
 [[ "$(definition_saves)" == 0 ]] || {
   echo "a default build saved $(definition_saves) definition contexts under 2 s" >&2; exit 1; }
+
+# A resume from a theorem context, whose heap holds the proof runtime, keeps
+# one gate: definition contexts follow the option as theorem contexts do.
+cat > "$project/src/EScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+
+val _ = new_theory "E";
+
+Theorem e_first:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+
+Definition e_one_def:
+  e_one n = if n = 0 then 0 else e_one (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[]
+End
+
+Definition e_two_def:
+  e_two n = if n = 0 then 0 else e_two (n - 1)
+Termination
+  WF_REL_TAC `measure I` >> simp[]
+End
+
+val _ = raise Fail "expected failure";
+
+val _ = export_theory ();
+SML
+e_definition_saves() {
+  find "$project/.holbuild/checkpoints" -path '*EScript.sml.decls/*' -name 'e_*_def_context.save' | wc -l
+}
+rm -rf "$project/.holbuild/checkpoints"
+if (cd "$project" && "$HOLBUILD_BIN" build --checkpoint-seconds 0 ETheory) > "$tmpdir/e-seed.log" 2>&1; then
+  echo "expected E to fail" >&2; exit 1
+fi
+[[ "$(e_definition_saves)" == 2 ]] || {
+  echo "--checkpoint-seconds 0 saved $(e_definition_saves) E definition contexts, wanted 2" >&2; exit 1; }
+find "$project/.holbuild/checkpoints" -path '*EScript.sml.decls/*' -name 'e_*_def_context.save*' -delete
+if (cd "$project" && "$HOLBUILD_BIN" build --checkpoint-seconds 0 ETheory) > "$tmpdir/e-resume.log" 2>&1; then
+  echo "expected E to fail" >&2; exit 1
+fi
+require_grep "from: theorem-context checkpoint after e_first" "$tmpdir/e-resume.log"
+[[ "$(e_definition_saves)" == 2 ]] || {
+  echo "a resume with --checkpoint-seconds 0 saved $(e_definition_saves) E definition contexts, wanted 2" >&2; exit 1; }

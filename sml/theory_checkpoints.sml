@@ -152,8 +152,6 @@ fun save_declaration_context_line timed ({safe_name, context_path, context_ok, .
 fun runtime_lines lines =
   String.concat (map (fn line => line ^ "\n") lines)
 
-val runtime_load_lines = []
-
 (* The goal is printed from inside the Termination tactic: deriving it with a
    second Defn.Hol_defn would advance HOL's theorem numbering, so the theory
    would differ from an uninstrumented build.  A definition that fails before
@@ -211,13 +209,7 @@ fun checkpoint_save_runtime_prelude checkpoint_seconds =
        Real.toString checkpoint_seconds ^ ";"]
 
 fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, trace_all, new_ir} =
-  ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (source_helper_path "sml/diagnostic_limits.sml") ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (sha256_runtime_helper_path ()) ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (tactic_compat_runtime_helper_path ()) ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_runtime_helper_path ()) ^ ";",
-   "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
+  ["val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
      (if checkpoint_enabled then "true" else "false") ^
      ", context_checkpoints = " ^ (if context_checkpoints then "true" else "false") ^
      ", share_failed_prefix = " ^ (if share_failed_prefix then "true" else "false") ^
@@ -231,29 +223,39 @@ fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed
    "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
    "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
 
+(* A process resuming from a heap that holds the save runtime starts its
+   share of the theory's CPU time here, as loading checkpoint_save_runtime.sml
+   does.  It doesn't load that file again: a second HolbuildCheckpointSaveRuntime
+   would have its own context gate, apart from the one the proof runtime the
+   heap holds was compiled against. *)
+val resume_theory_cpu_line =
+  "val _ = if Option.isSome (!HolbuildTheoryCpuState.carried) andalso \
+  \Bool.not (Option.isSome (!HolbuildTheoryCpuState.since)) \
+  \then HolbuildTheoryCpuState.since := SOME (HolbuildCheckpointSaveRuntime.process_cpu ()) else ();"
 
-fun runtime_prelude config = runtime_lines (runtime_load_lines @ runtime_install_lines config)
+(* A heap saved after the proof runtime was installed (a theorem-context
+   checkpoint, say) already holds it: its key includes the runtime's identity,
+   so it is the same runtime, and the script only reinstalls it.  Otherwise
+   the script compiles it. *)
+fun runtime_prelude config =
+  runtime_lines
+    (("val _ = if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HolbuildProofRuntime\") then () \
+       \else List.app HolbuildRuntime.use [" ^
+        String.concatWith ", "
+          (map HolbuildToolchain.sml_string
+             [source_helper_path "sml/diagnostic_limits.sml",
+              sha256_runtime_helper_path (),
+              proof_ir_helper_path (),
+              checkpoint_save_runtime_helper_path (),
+              tactic_compat_runtime_helper_path (),
+              proof_ir_runtime_helper_path ()]) ^ "];") ::
+     resume_theory_cpu_line ::
+     runtime_install_lines config)
 
-fun runtime_reinstall_prelude {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, trace_all, new_ir} =
-  let
-    val install =
-      ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
-       "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
-         (if checkpoint_enabled then "true" else "false") ^
-         ", context_checkpoints = " ^ (if context_checkpoints then "true" else "false") ^
-         ", share_failed_prefix = " ^ (if share_failed_prefix then "true" else "false") ^
-         ", checkpoint_seconds = " ^ Real.toString checkpoint_seconds ^
-         ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
-     ", heavy_tactic_timeout = " ^ option_real_sml heavy_tactic_timeout ^
-         ", timeout_marker = " ^ option_string_sml timeout_marker ^
-         ", plan_theorem = NONE : string option" ^
-         ", trace_all = " ^ (if trace_all then "true" else "false") ^
-         ", plan_only_marker = NONE : string option};",
-       "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
-       "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
-  in
-    runtime_lines install
-  end
+(* For a script resumed from a failed-prefix checkpoint, whose heap holds the
+   proof runtime. *)
+fun runtime_reinstall_prelude config =
+  runtime_lines (resume_theory_cpu_line :: runtime_install_lines config)
 
 (* HOL's source parser reads top-level `#(FILE="...")` and `#(LINE=...)`
    declarations as location pragmas.  Staged scripts use them so that the
@@ -318,7 +320,7 @@ datatype deferral =
    after the script has run, where later bindings would shadow the
    theorem's; a theorem without them is not deferred, nor is a group with
    a block without them (build_exec's checkpoint_deferral). *)
-fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, trace_all, new_ir, defer} :
+fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, trace_all, new_ir, runtime_installed, defer} :
                 {source : string, source_name : string, start_offset : int, checkpoints : checkpoint list,
                  declaration_checkpoints : declaration_checkpoint list,
                  terminations : termination list, save_checkpoints : bool,
@@ -327,6 +329,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                  tactic_timeout : real option, heavy_tactic_timeout : real option,
                  timeout_marker : string option,
                  trace_all : bool, new_ir : bool,
+                 runtime_installed : bool,
                  defer : checkpoint -> deferral}) =
   let
     val n = size source
@@ -368,6 +371,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
       (if not proof_runtime then
          if start_offset > 0 orelse not (null active_declaration_checkpoints)
          then checkpoint_save_runtime_prelude checkpoint_seconds else ""
+       else if runtime_installed then ""
        else runtime_prelude (runtime_config ())) ^
       termination_runtime_prelude active_terminations
     val position = ref start_position
