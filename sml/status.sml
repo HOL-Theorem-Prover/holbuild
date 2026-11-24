@@ -72,12 +72,13 @@ fun reporting_finished_only f =
    a node failed, their end: a --remote-only restore that may resubmit what
    it can't restore, whose misses are no failures if it does.  A node is
    reported started only once it finished, and its outcome is kept, so that
-   a later pass after a resubmission reports it neither again nor as
-   unchanged. *)
+   a later pass after a resubmission counts it from the start and reports
+   it neither again nor as unchanged. *)
 val suppress_failures_ref = ref false
-val carried_outcomes = ref ([] : (string * outcome) list)
-fun forget_carried_outcomes () = carried_outcomes := []
-fun carried_outcome key = Option.map #2 (List.find (fn (k, _) => k = key) (!carried_outcomes))
+val no_carried_outcomes : (string, outcome) Binarymap.dict = Binarymap.mkDict String.compare
+val carried_outcomes = ref no_carried_outcomes
+fun forget_carried_outcomes () = carried_outcomes := no_carried_outcomes
+fun carried key = Option.isSome (Binarymap.peek (!carried_outcomes, key))
 fun suppressing_failures f =
   let val previous = !suppress_failures_ref
   in
@@ -524,7 +525,7 @@ fun create {total, jobs} =
        jobs = jobs,
        width = ref (terminal_width ()),
        width_checked_at = ref (Time.now ()),
-       finished = ref 0,
+       finished = ref (Binarymap.numItems (!carried_outcomes)),
        built = ref 0,
        up_to_date = ref 0,
        restored = ref 0,
@@ -535,6 +536,7 @@ fun create {total, jobs} =
        failed = ref false,
        mutex = Mutex.mutex ()}
   in
+    Binarymap.app (fn (_, outcome) => tally status outcome) (!carried_outcomes);
     current_status := SOME status;
     status
   end
@@ -544,11 +546,11 @@ fun start_node status key label =
     (fn () =>
         let val {enabled, active, ended, ...} = status
         in
-          if !ended then ()
+          if !ended orelse carried key then ()
           else
             (active := {key = key, label = label, started_at = Time.now (),
                         thread = Thread.self (), waiting = false} :: remove_active key (!active);
-             if finished_only () orelse !suppress_failures_ref orelse Option.isSome (carried_outcome key) then ()
+             if finished_only () orelse !suppress_failures_ref then ()
              else if json_mode () then
                emit_json "node_started" (json_node_fields key label)
              else if enabled then redraw status
@@ -564,10 +566,14 @@ fun finish_node status key label outcome =
         let
           val {enabled, total, finished, active, ended, ...} = status
           val elapsed = active_elapsed_text (find_active key (!active))
-          fun report () =
-            (count_outcome status outcome;
+        in
+          if !ended orelse carried key then ()
+          else
+            (finished := !finished + 1;
+             active := remove_active key (!active);
+             count_outcome status outcome;
              if !suppress_failures_ref then
-               (carried_outcomes := (key, outcome) :: !carried_outcomes;
+               (carried_outcomes := Binarymap.insert (!carried_outcomes, key, outcome);
                 if json_mode () then emit_json "node_started" (json_node_fields key label)
                 else if verbose_mode () andalso not enabled then
                   TextIO.output (TextIO.stdOut, label ^ " started\n")
@@ -587,14 +593,6 @@ fun finish_node status key label outcome =
                   label ^ " " ^ outcome_text outcome ^
                   (if verbose_mode () then elapsed else "") ^ "\n");
                 TextIO.flushOut TextIO.stdOut))
-        in
-          if !ended then ()
-          else
-            (finished := !finished + 1;
-             active := remove_active key (!active);
-             case carried_outcome key of
-                 SOME earlier => tally status earlier
-               | NONE => report ())
         end)
 
 fun finish status =
@@ -604,7 +602,11 @@ fun finish status =
          in
            if !ended then ()
            else
-             (if finished_only () orelse (failures_suppressed () andalso !failed) then ()
+             (if finished_only () then ()
+              else if failures_suppressed () andalso !failed then
+                (* The status line is cleared; the pass after the resubmission draws its own. *)
+                if enabled then (TextIO.output (TextIO.stdOut, "\r" ^ clear_to_eol); TextIO.flushOut TextIO.stdOut)
+                else ()
               else if json_mode () then
                 emit_json "build_finished"
                   [json_int_field "elapsed_ms" (elapsed_ms status),
@@ -709,7 +711,8 @@ fun fail_with_debug_artifacts status key label msg artifacts =
            if !ended then ()
            else
              (active := remove_active key (!active);
-              finished := !finished + 1;
+              (* A suppressed failure isn't counted: the pass after the resubmission counts that node. *)
+              if !suppress_failures_ref then () else finished := !finished + 1;
               failed := true;
               if failures_suppressed () then ()
               else if json_mode () then
@@ -744,7 +747,7 @@ fun fail status key label msg =
   fail_with_debug_artifacts status key label msg no_debug_artifacts
 
 fun skip status key label reason =
-  (with_lock status (fn () => #finished status := !(#finished status) + 1);
+  (with_lock status (fn () => if !suppress_failures_ref then () else #finished status := !(#finished status) + 1);
    if failures_suppressed () then ()
    else if json_mode () then
      emit_json "node_skipped" (json_node_fields key label @ [json_string_field "reason" reason])
