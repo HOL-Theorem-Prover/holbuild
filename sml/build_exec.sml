@@ -4343,8 +4343,10 @@ fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker p
       {source = source_text, source_name = source_name, start_offset = start_offset, checkpoints = checkpoints,
        declaration_checkpoints = if context_checkpoints_enabled policy then declaration_checkpoints else [],
        terminations = terminations,
-       save_checkpoints = theorem_checkpoints_enabled policy,
-       context_checkpoints = context_checkpoints_enabled policy,
+       (* A served check saves nothing on its way to the verdict: the
+          prepare that parks the next edit's children saves what they need. *)
+       save_checkpoints = theorem_checkpoints_enabled policy andalso not (!park_serving),
+       context_checkpoints = context_checkpoints_enabled policy andalso not (!park_serving),
        share_failed_prefix = share_failed_prefix,
        checkpoint_seconds = checkpoint_seconds policy,
        tactic_timeout = tactic_timeout policy,
@@ -16102,9 +16104,13 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
                     val _ = write_text copy (read_text preload)
                     val log = Path.concat (probe_dir, "sibling.log")
                     val child = start_parked_child tc root "sml/park_probe.sml" (heap, true) log
+                    (* The preload runs where the theorem starts, in the
+                       context its proof sees, the script's header included. *)
+                    val context = probe_file ".sml"
+                    val _ = write_text context (probe_move source checkpoints boundary (#theorem_start theorem))
                   in
-                    case sibling_answer (sibling_use child [copy]) deadline of
-                        SOME "ok\n" => (sibling := SOME (move child source checkpoints boundary theorem); NONE)
+                    case sibling_answer (sibling_use child [context, copy]) deadline of
+                        SOME "ok\n" => (sibling := SOME (move child source checkpoints (#theorem_start theorem) theorem); NONE)
                       | answer =>
                           (kill_parked_child child;
                            SOME ("the preload " ^ (if Option.isSome answer then "failed" else "ran out of time") ^ ": " ^

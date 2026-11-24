@@ -8,7 +8,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 # exec-action --park --probe-preload answers park-probe requests in one HOL
-# process that used the preload once and stands after the failing theorem's
+# process that used the preload once, in the context the failing theorem
+# starts in, and stands after the failing theorem's
 # failure, its failing step's input goals at hand.  It moves on when a
 # check fails in a later theorem, and is started again after a probe runs
 # out of time.
@@ -46,12 +47,6 @@ write_a() {
 Theory A
 Ancestors bool
 
-Theorem first_thm:
-  T
-Proof
-  ACCEPT_TAC TRUTH
-QED
-
 Theorem target:
   T /\\ ~F
 Proof
@@ -74,6 +69,8 @@ cat > "$tmpdir/preload.sml" <<'SML'
 val probe_preloads = ref 0;
 val probe_hits = ref 0;
 val _ = probe_preloads := !probe_preloads + 1;
+(* Bound only once the script's header has run. *)
+val probe_theory = current_theory ();
 val _ = let val out = TextIO.openOut "probe.pid"
         in TextIO.output (out, LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord (Posix.ProcEnv.getpid ()))));
            TextIO.closeOut out end;
@@ -82,6 +79,7 @@ cat > "$tmpdir/goal.sml" <<'SML'
 val _ = Feedback.set_trace "Unicode" 0;
 val _ = probe_hits := !probe_hits + 1;
 val _ = print ("goal: " ^ Parse.term_to_string (#2 (hd (HolbuildProofRuntime.failed_goals ()))) ^ "\n");
+val _ = print ("theory: " ^ probe_theory ^ "\n");
 val _ = print ("hits: " ^ Int.toString (!probe_hits) ^ " preloads: " ^ Int.toString (!probe_preloads) ^ "\n");
 SML
 cat > "$tmpdir/boom.sml" <<'SML'
@@ -123,6 +121,7 @@ probe() {
 probe first "$tmpdir/goal.sml" 120 0
 require_grep "^goal: ~F$" "$tmpdir/first.out"
 require_grep "^hits: 1 preloads: 1$" "$tmpdir/first.out"
+require_grep "^theory: A$" "$tmpdir/first.out"
 probe second "$tmpdir/goal.sml" 120 0
 require_grep "^hits: 2 preloads: 1$" "$tmpdir/second.out"
 # A probe that raises answers error; the process stays.
