@@ -2332,13 +2332,13 @@ lost a theory or source the remote ledger says it holds: on a resubmission
 for either, the build forgets the ledger, and a batch missing a blob
 (`resubmit: ... blob <sha256>`) is resubmitted too, uploading its blobs again.
 A build resubmits again while a failed batch names a theory missing that no earlier
-resubmission was for, or the first missing blob, up to 5 times.
+resubmission was for, or the first missing blob, up to 32 times.
 Under `--remote-only`, a theory left out of the batch because the remote cache
 seemed to hold it, but whose entry then doesn't restore (the cache lost one of
 its blobs, or the entry doesn't fit the restored parents), is resubmitted the
 same way after the batch ends or with an empty batch, with every theory that
-depends on it when its entry doesn't fit. A theory of the batch itself that
-doesn't restore still fails the build. A submission
+depends on it when its entry doesn't fit. A theory of any batch the build
+submitted that doesn't restore still fails the build. A submission
 answered 5xx, as a proxy in front of the coordinator answers while it
 restarts or the coordinator itself answers while it's overloaded, or 429,
 is retried, and an event stream that breaks is reattached; either is given up on once the coordinator stays unavailable for
@@ -2358,7 +2358,7 @@ limit finds what the workers finished in the remote cache next time. With
 interrupted build's, the same way but then fails instead of building locally,
 and it never builds HOL or a theory
 locally: a HOL toolchain or a theory that doesn't restore from a cache is an
-error, unless the theory can be resubmitted (below). Such a `--remote-only` build exits with status 75 (`EX_TEMPFAIL`),
+error, unless the theory can be resubmitted, as above. Such a `--remote-only` build exits with status 75 (`EX_TEMPFAIL`),
 whenever it stops where a build without `--remote-only` would go on locally,
 so that a caller can tell this from an error and build locally itself. An
 error on the command line or in the project, a batch someone cancelled, or an
