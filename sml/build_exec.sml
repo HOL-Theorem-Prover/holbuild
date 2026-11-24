@@ -2188,16 +2188,20 @@ fun theory_child_env () =
 
 fun with_env env argv = if null env then argv else "env" :: env @ argv
 
-(* Starts a parked child from HEAP, its output going to LOG. *)
+(* Starts a parked child from HEAP, its output going to LOG.  With
+   RUNTIME, the child uses the proof runtime's sources before it waits, as
+   a script it serves from HEAP would first thing. *)
 (* The child starts in DIR, the action's root: HOL reads the project file
    of the directory it starts in, and a confined child can read only the
    action's. *)
-fun start_parked_child tc dir heap log =
+fun start_parked_child tc dir (heap, runtime) log =
   let
     val _ = ensure_parent log
     val wait_script = Path.concat (HolbuildRuntimePaths.runtime_root (), "sml/park_wait.sml")
+    val runtime_files = if runtime then HolbuildTheoryCheckpoints.runtime_files () else []
     val argv = with_env (theory_child_env ())
-                 (HolbuildToolchain.theory_run_argv tc @ ["--noconfig", "--holstate", heap, wait_script])
+                 (HolbuildToolchain.theory_run_argv tc @ ["--noconfig", "--holstate", heap] @
+                  runtime_files @ [wait_script])
     fun start confined =
       HolbuildSpawn.with_launch_lock (fn () =>
         HolbuildProcessGroup.launch_shell (Posix.ProcEnv.getpid ()) NONE
@@ -4319,6 +4323,7 @@ fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker p
        trace_all = trace_steps policy,
        plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy,
+       runtime_loaded = !park_serving,
        defer = case defer_proofs of
                    SOME groups => checkpoint_deferral groups source_text checkpoints
                  | NONE => (fn _ => HolbuildTheoryCheckpoints.Inline)}
@@ -4434,6 +4439,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker plan_only_marker 
          trace_all = trace_steps policy,
          plan_only_marker = plan_only_marker,
          new_ir = proof_ir_enabled policy,
+         runtime_loaded = false,
          defer = fn _ => HolbuildTheoryCheckpoints.Inline}
   in
     String.concat
@@ -15824,7 +15830,8 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
         (#theorem_checkpoints checkpoints)
     fun ok path = file_exists (path ^ ".ok")
     (* The heaps a check of an edit in TARGET's theorem resumes from: the
-       last context before it, and its failed prefix. *)
+       last context before it, and its failed prefix; each with whether a
+       script resumed from it starts by using the proof runtime's sources. *)
     fun parked_heaps checkpoints (target : park_target) =
       case theorem_named checkpoints (#theorem target) of
           NONE => []
@@ -15845,7 +15852,7 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
               val failed_prefix =
                 if #step_count target > 0 andalso ok (#failed_prefix_path theorem) then [#failed_prefix_path theorem]
                 else []
-            in failed_prefix @ context end
+            in map (fn heap => (heap, false)) failed_prefix @ map (fn heap => (heap, true)) context end
     fun start_children heaps =
       (park_child_env := ["HOLBUILD_PARK_SERVED=" ^ served_dir];
        parked_children :=
@@ -15880,7 +15887,7 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
            if prepared then "" else " (prepare failed)",
            " in ", Real.fmt (StringCvt.FIX (SOME 3)) (Time.toReal (Time.- (t1, t0))), " s, started ",
            Int.toString (length heaps), " children in ", park_seconds t1, " s: ",
-           String.concatWith " " heaps])
+           String.concatWith " " (map #1 heaps)])
       end
     fun served_target checkpoints =
       let val file = fn name => Path.concat (served_dir, "failed." ^ name)
