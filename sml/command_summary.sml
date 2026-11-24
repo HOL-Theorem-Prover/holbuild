@@ -37,9 +37,9 @@ fun best_effort f =
   f () handle IO.Io _ => () | OS.SysErr _ => () | PR.Unencodable _ => ()
 
 fun outcome result = locked (fn () =>
-  let val index = case result of J.Built => SOME 0 | J.Restored => SOME 1
-                  | J.RestoredRemote => SOME 2 | J.UpToDate => SOME 3 | J.Inspected => NONE
-  in Option.app (fn i => Array.update (counts, i, Array.sub (counts, i) + 1)) index end)
+  let val i = case result of J.Built => 0 | J.Restored => 1
+              | J.RestoredRemote => 2 | J.UpToDate => 3
+  in Array.update (counts, i, Array.sub (counts, i) + 1) end)
 
 (* These are diagnostic snapshots of the sources actually planned, not
    transitive action keys. Keep observations across changes of target. *)
