@@ -149,11 +149,12 @@ require_grep "park: the analyser server is ready" "$tmpdir/park.log"
 [[ ! -e "$socket" ]] || { echo "the park server left its socket" >&2; exit 1; }
 # The second and unsolved checks ran from the failed prefix; the one edited
 # before the failing step, and the fix, which undoes that edit, from the
-# context.
+# context, the fix after the context's child ran on to the theorem.  A check
+# from the failed prefix doesn't wait for that.
 [[ "$(grep -c 'park: served' "$tmpdir/park.log")" == 6 &&
    "$(grep -c 'from: failed-prefix checkpoint in target' "$tmpdir/park.log")" == 2 &&
    "$(grep -c 'failed prefix not resumable' "$tmpdir/park.log")" == 0 &&
-   "$(grep -c "park: the context's child ran on to offset" "$tmpdir/park.log")" -ge 2 ]] || {
+   "$(grep -c "park: the context's child ran on to offset" "$tmpdir/park.log")" -ge 1 ]] || {
   cat "$tmpdir/park.log" >&2; exit 1; }
 
 # A server gone means the caller checks the usual way.

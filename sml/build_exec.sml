@@ -16217,12 +16217,19 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
         val same_deps = (deps () = parked_deps) handle Error _ => false | HolbuildTheoryCheckpoints.Error _ => false
         val _ = park_note ("analysed in " ^ park_seconds t0 ^ " s (dependencies in " ^ !deps_seconds ^
                            " s, checkpoints in " ^ spans_seconds ^ " s)")
-        val _ = if keeps_failed_prefix parked source checkpoints then () else drop_failed_prefixes checkpoints
-        val offsets = if same_deps then prerun_offsets (#1 parked) (#2 parked) source checkpoints else []
-        val _ = List.app (fn (_, position) => park_note ("the context's child ran on to offset " ^
-                                                          Int.toString position)) offsets
+        val keeps = keeps_failed_prefix parked source checkpoints
+        val _ = if keeps then () else drop_failed_prefixes checkpoints
+        (* Only a check the context's child serves waits for its prerun:
+           one resumed from a failed prefix doesn't use it. *)
+        fun offsets () =
+          let val offsets = if same_deps then prerun_offsets (#1 parked) (#2 parked) source checkpoints else []
+          in
+            List.app (fn (_, position) => park_note ("the context's child ran on to offset " ^
+                                                     Int.toString position)) offsets;
+            offsets
+          end
         fun done () = (park_serving := false; park_resume_offsets := [])
-        fun run () =
+        fun run offsets =
           ((park_serving := true; park_resume_offsets := offsets; check source checkpoints; done (); ("pass", ""))
            handle Error msg => (done (); ("fail", msg))
                 | ParkFallback msg => (done (); ("fallback", msg))
@@ -16231,14 +16238,14 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
         val (status, message) =
           if not same_deps then ("fallback", "the edit changes what the theory depends on")
           else
-            case run () of
+            case run (if keeps then [] else offsets ()) of
                 result as ("fail", _) =>
                   if file_exists mismatch then
                     (* The edit doesn't keep the parked prefix: the context's child. *)
                     (park_note ("failed prefix not resumable: " ^ read_text mismatch);
                      clear_served ();
                      drop_failed_prefixes checkpoints;
-                     run ())
+                     run (offsets ()))
                   else result
               | result => result
       in
