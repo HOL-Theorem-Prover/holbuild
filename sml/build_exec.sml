@@ -16270,6 +16270,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val outlined = case ahead of SOME {outlined, ...} => outlined | NONE => false
         fun abandon_failure e =
           (deferred := (fn () => ());
+           tools_first := (fn () => ());
            raise ActionFailed (AheadAbandoned,
                                "built on an outline: " ^
                                (case e of ActionFailed (_, msg) => msg | _ => General.exnMessage e)))
@@ -16335,6 +16336,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 else run_hol ())
               handle e =>
                 (set_attached_child NONE;
+                 tools_first := (fn () => ());
                  deferred :=
                    (fn () =>
                       (publish_shared ();
@@ -16884,9 +16886,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               fun share () =
                 let val t0 = Time.now ()
                 in
-                  publish_tools_now ();
                   !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e);
                   deferred := (fn () => ());
+                  (* A run that failed after its HOL passed still holds its
+                     tool cache; it goes after the checkpoints. *)
+                  publish_tools_now ();
                   phases := ("share", Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
                 end
               val log = phase "log" upload_log
