@@ -441,7 +441,25 @@ try:
 except OSError:
     sys.exit(1)
 PY
-cat > "$tmpdir/reconcile.sml" <<'SML'
+# An action that starts while reconciliation holds the gate after staging:
+# takes a shared usage lease, then opens the gate.
+cat > "$tmpdir/late_action.py" <<'PY'
+import fcntl, os, sys, time
+event, path, held, release, gate = sys.argv[1:6]
+deadline = time.time() + 300
+while not os.path.exists(event) and time.time() < deadline:
+    time.sleep(0.01)
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+fcntl.lockf(fd, fcntl.LOCK_SH)
+open(held, "w").close()
+with open(gate, "w") as out:
+    out.write("go\n")
+while not os.path.exists(release) and time.time() < deadline:
+    time.sleep(0.01)
+os.close(fd)
+os.remove(held)
+PY
+cat > "$tmpdir/reconcile-prelude.sml" <<'SML'
 val _ = OS.FileSys.chDir (valOf (OS.Process.getEnv "HOLBUILD_ROOT"));
 use "sml/holbuild-script.sml";
 fun env name = valOf (OS.Process.getEnv name);
@@ -475,6 +493,14 @@ val _ = HolbuildHttp.setup {user = NONE};
 val _ = HolbuildRemoteCacheConfig.set_url (env "RECONCILE_URL");
 val _ = HolbuildRemoteCacheConfig.setup_client ();
 val _ = HolbuildHolSharedCache.hold_usage_lease k;
+SML
+cat > "$tmpdir/reconcile.sml" <<'SML'
+use (OS.Path.concat (valOf (OS.Process.getEnv "RECONCILE_TMP"), "reconcile-prelude.sml"));
+fun leftovers () =
+  List.exists (fn name => String.isPrefix ("." ^ k ^ ".") name)
+              (let val d = OS.FileSys.openDir (OS.Path.dir (env "RECONCILE_ENTRY"))
+                   fun names acc = case OS.FileSys.readDir d of NONE => acc | SOME n => names (n :: acc)
+               in names [] before OS.FileSys.closeDir d end);
 
 val _ = make_stale ();
 val _ = reconcile ();
@@ -493,6 +519,22 @@ val _ = write release "";
 val _ = wait_until "lease release" (fn () => not (exists held));
 val _ = assert "the busy check dropped this process's lease" (not (lease_free "exclusive"));
 
+(* An action that starts while the remote's archive is staged keeps the
+   toolchain it found. *)
+val staged_event = env "RECONCILE_TMP" ^ "/staged-event";
+val staged_gate = env "RECONCILE_TMP" ^ "/staged-gate";
+val _ = sh ("rm -f " ^ release ^ " " ^ staged_event ^ " " ^ staged_gate ^ " && mkfifo " ^ staged_gate);
+val _ = sh ("python3 " ^ env "RECONCILE_TMP" ^ "/late_action.py " ^ staged_event ^ " " ^
+            HolbuildHolSharedCache.usage_lease_path k ^ " " ^ held ^ " " ^ release ^ " " ^ staged_gate ^ " &");
+val _ = reconcile ();
+val _ = assert "replaced a toolchain an action took while it was staged"
+  (exists marker andalso recorded () = env "ORIGINAL_BLOB" ^ "\n" andalso exists (entry_file "build.ok"));
+val _ = assert "a swap deferred after staging counted as done" (not (exists stamp));
+val _ = assert "a deferred swap left a staged archive behind" (not (leftovers ()));
+val _ = write release "";
+val _ = wait_until "late action release" (fn () => not (exists held));
+val _ = sh ("rm -f " ^ staged_gate ^ " && touch " ^ staged_gate);
+
 val _ = reconcile ();
 val _ = assert "kept a toolchain the remote no longer holds" (not (exists marker));
 val _ = assert "did not install the remote's archive" (exists (entry_file "republished"));
@@ -503,11 +545,7 @@ val _ = assert "the lease is not shared again after the swap"
   (lease_free "shared" andalso not (lease_free "exclusive"));
 val _ = assert "replaced toolchain has no analyser"
   (HolbuildHolSharedCache.analyser_built k (HolbuildHolSharedCache.analyser_key ()));
-val _ = assert "left the old toolchain or a staged archive behind"
-  (not (List.exists (fn name => String.isPrefix ("." ^ k ^ ".") name)
-                    (let val d = OS.FileSys.openDir (OS.Path.dir (env "RECONCILE_ENTRY"))
-                         fun names acc = case OS.FileSys.readDir d of NONE => acc | SOME n => names (n :: acc)
-                     in names [] before OS.FileSys.closeDir d end)));
+val _ = assert "left the old toolchain or a staged archive behind" (not (leftovers ()));
 
 val _ = make_stale ();
 val _ = HolbuildHolSharedCache.reconcile_with_published req k;
@@ -521,24 +559,56 @@ val _ = make_stale ();
 val _ = reconcile ();
 val _ = assert "a failed replacement lost the toolchain"
   (exists marker andalso exists (entry_file "build.ok") andalso recorded () = env "ORIGINAL_BLOB" ^ "\n");
-
-(* A swap killed after moving the old entry aside and before the new one
-   was marked complete: the old entry goes back. *)
-val aside = HolbuildToolchainArchive.replaced_path (env "RECONCILE_ENTRY");
-val _ = OS.FileSys.rename {old = env "RECONCILE_ENTRY", new = aside};
-val _ = OS.FileSys.mkDir (env "RECONCILE_ENTRY");
-val _ = HolbuildHolSharedCache.recover_replaced k;
-val _ = assert "an interrupted swap lost the old toolchain"
-  (exists marker andalso exists (entry_file "build.ok") andalso not (exists aside));
 val _ = OS.Process.exit OS.Process.success;
 SML
 reconcile_log=$tmpdir/reconcile.log
+touch "$tmpdir/staged-gate"
 RECONCILE_ENTRY=$reconcile_entry RECONCILE_URL=$remote_url RECONCILE_TMP=$tmpdir \
   ORIGINAL_BLOB=$original_blob REPUBLISHED_BLOB=$republished_blob \
   CORRUPT_COMMAND="python3 $tmpdir/mutate_archive.py $original_archive $tmpdir/reconcile-corrupt.tar ${action_files[0]} $remote_root/cas corrupt-heap" \
+  HOLBUILD_TEST_TOOLCHAIN_STAGED="$tmpdir/staged-event" HOLBUILD_TEST_TOOLCHAIN_STAGED_GATE="$tmpdir/staged-gate" \
   "$real_poly" -q --error-exit --script "$tmpdir/reconcile.sml" > "$reconcile_log" 2>&1 ||
   { cat "$reconcile_log" >&2; exit 1; }
 require_grep 'could not compare the HOL toolchain' "$reconcile_log"
+
+# A swap killed once the new toolchain is complete but for build.ok leaves the
+# old one at its replaced path; the next build puts it back.  The old entry's
+# marker is beside its checkout, where a build's check of it doesn't look.
+rm -f "$reconcile_entry/hol/stale-build"
+touch "$reconcile_entry/old-entry"
+python3 "$tmpdir/mutate_archive.py" \
+  "$original_archive" "$tmpdir/republished.tar" "${action_files[0]}" "$remote_root/cas" republished
+cat > "$tmpdir/interrupted.sml" <<'SML'
+use (OS.Path.concat (valOf (OS.Process.getEnv "RECONCILE_TMP"), "reconcile-prelude.sml"));
+val _ = HolbuildHolSharedCache.adopt_published_archive := true;
+val _ = OS.FileSys.remove stamp handle OS.SysErr _ => ();
+val _ = write (entry_file "archive-blob") (env "ORIGINAL_BLOB" ^ "\n");
+val _ = reconcile ();
+val _ = assert "the swap was not interrupted" false;
+SML
+replace_event=$tmpdir/replace-event
+replace_gate=$tmpdir/replace-gate
+rm -f "$replace_event" "$replace_gate"
+mkfifo "$replace_gate"
+RECONCILE_ENTRY=$reconcile_entry RECONCILE_URL=$remote_url RECONCILE_TMP=$tmpdir ORIGINAL_BLOB=$original_blob \
+  HOLBUILD_TEST_TOOLCHAIN_REPLACE_COMPLETED="$replace_event" HOLBUILD_TEST_TOOLCHAIN_REPLACE_COMPLETED_GATE="$replace_gate" \
+  "$real_poly" -q --error-exit --script "$tmpdir/interrupted.sml" > "$tmpdir/interrupted.log" 2>&1 &
+interrupted_pid=$!
+# Staging and the analyser build come first.
+for _ in {1..30000}; do
+  [[ -e $replace_event ]] || ! kill -0 "$interrupted_pid" 2>/dev/null && break
+  sleep 0.01
+done
+[[ -e $replace_event ]] || { cat "$tmpdir/interrupted.log" >&2; exit 1; }
+kill -KILL "$interrupted_pid"
+wait "$interrupted_pid" || true
+rm -f "$replace_gate"
+replaced=$(dirname "$reconcile_entry")/.$(basename "$reconcile_entry").restore-replaced
+[[ -e $replaced/old-entry && ! -e $reconcile_entry/build.ok && ! -e $reconcile_entry/old-entry ]]
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" buildhol) > "$tmpdir/interrupted-build.log" 2>&1 ||
+  { cat "$tmpdir/interrupted-build.log" >&2; exit 1; }
+[[ -e $reconcile_entry/old-entry && -e $reconcile_entry/build.ok && ! -e $replaced ]]
+[[ $(< "$reconcile_entry/archive-blob") = "$original_blob" ]]
 cp "$original_action" "${action_files[0]}"
 
 invalid_restore() {

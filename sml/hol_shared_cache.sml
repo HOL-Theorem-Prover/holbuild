@@ -771,9 +771,9 @@ datatype restore_outcome = Restored | NotRestored | Rejected
 fun recorded_archive_blob k =
   SOME (trim (HolbuildFileLock.read_text (archive_blob_for_key k))) handle IO.Io _ => NONE
 
-(* Checks a toolchain just installed at entry K from the remote's archive
-   HASH as a restore must, and marks it complete. *)
-fun accept_installed k hash =
+(* Checks a toolchain just installed at entry K from the remote's archive as
+   a restore must. *)
+fun check_installed k =
   ((* Anyone who can publish could have built it, so under exec-action
       it must be as closed as a confined build's before anything runs it. *)
    if not (HolbuildActionSandbox.active ()) then () else
@@ -782,9 +782,7 @@ fun accept_installed k hash =
         | SOME why => raise HolbuildToolchainArchive.Rejected ("restored HOL toolchain is not closed: " ^ why));
    signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_RENAMED";
    wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_RENAMED_GATE";
-   if complete_toolchain_contents k then
-     (write_file (archive_blob_for_key k) (hash ^ "\n");
-      write_file (ok_for_key k) "ok\n")
+   if complete_toolchain_contents k then ()
    else
      raise HolbuildToolchainArchive.Rejected
              "restored HOL toolchain failed final validation")
@@ -798,7 +796,11 @@ fun restore_entry k =
       case HolbuildToolchainArchive.restore
              {remote = HolbuildRemoteCache.remote url, identity = archive_identity k,
               final_dir = entry_dir_for_key k} of
-          SOME hash => (accept_installed k hash; Restored)
+          SOME hash =>
+            (check_installed k;
+             write_file (archive_blob_for_key k) (hash ^ "\n");
+             write_file (ok_for_key k) "ok\n";
+             Restored)
         | NONE => NotRestored
   in
     cleanup_restore_state k;
@@ -945,12 +947,17 @@ fun with_toolchain_lock_now k f =
         end
 
 (* Replaces entry K by the archive staged at STAGING_DIR and completes it as
-   finish_entry would.  The old entry waits beside it until then and is put
-   back if anything fails.  The caller is the entry's only user. *)
+   finish_entry would.  The old entry waits beside it until the new one is
+   complete but for build.ok, and is put back if anything fails before
+   (by recover_replaced if the process dies).  It then goes to the trash,
+   which toolchain GC sweeps, before build.ok is written: a process killed
+   in between leaves an entry without build.ok, which the next use restores
+   from the remote.  The caller is the entry's only user. *)
 fun replace_entry req k {hash, staging_dir} =
   let
     val final = entry_dir_for_key k
     val aside = HolbuildToolchainArchive.replaced_path final
+    val trash = Path.concat(trash_dir (), k ^ "." ^ HolbuildFileLock.current_pid_text () ^ ".replaced")
     fun put_back () =
       if path_exists aside then
         ((if path_exists final then remove_tree (run_mutation k) final else ());
@@ -959,13 +966,20 @@ fun replace_entry req k {hash, staging_dir} =
   in
     (FS.rename {old = final, new = aside};
      HolbuildToolchainArchive.install_staged {staging_dir = staging_dir, final_dir = final};
-     accept_installed k hash;
+     check_installed k;
      if hol_source_manifest_built k then () else generate_hol_source_manifest k;
      if theory_toolchain_built k orelse generate_legacy_theory_toolchain req k then ()
      else raise HolbuildToolchainArchive.Rejected "restored HOL toolchain has no theory toolchain identity";
-     ignore (build_analyser k))
+     ignore (build_analyser k);
+     signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_REPLACE_COMPLETED";
+     wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_REPLACE_COMPLETED_GATE";
+     write_file (archive_blob_for_key k) (hash ^ "\n");
+     ensure_dir (trash_dir ());
+     if path_exists trash then remove_tree (run_mutation k) trash else ();
+     FS.rename {old = aside, new = trash})
     handle e => (put_back (); raise e);
-    remove_tree (run_mutation k) aside
+    write_file (ok_for_key k) "ok\n";
+    remove_tree (run_mutation k) trash
   end
 
 (* How long a remote worker trusts its last comparison of an entry with the
@@ -1013,7 +1027,11 @@ fun reconcile_with_published req k =
                   case HolbuildToolchainArchive.stage
                          {remote = remote, identity = archive_identity k, final_dir = final} of
                       NONE => true
-                    | SOME staged => Option.isSome (with_exclusive_lease k (fn () => replace_entry req k staged)))
+                    | SOME staged =>
+                        (signal_test_lock_event "HOLBUILD_TEST_TOOLCHAIN_STAGED";
+                         wait_test_gate "HOLBUILD_TEST_TOOLCHAIN_STAGED_GATE";
+                         (* An action may have taken the entry while it was staged. *)
+                         Option.isSome (with_exclusive_lease k (fn () => replace_entry req k staged))))
                before HolbuildToolchainArchive.cleanup_staging final)
               handle e => (HolbuildToolchainArchive.cleanup_staging final; raise e)
             fun compare () =
