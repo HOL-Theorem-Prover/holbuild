@@ -224,6 +224,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(int(status.read_text()))
                 self.end_headers()
                 return
+            # control/cas-cached-<digest>: a cache in front of the store
+            # still answers for a blob the store may have lost, until a HEAD
+            # with Cache-Control: no-cache has it ask the store.
+            no_cache = "no-cache" in self.headers.get("Cache-Control", "").lower()
+            if (control / f"cas-cached-{digest}").exists() and not no_cache:
+                self.send_response(200)
+                self.end_headers()
+                return
         path = self.object_path()
         if path is None:
             return

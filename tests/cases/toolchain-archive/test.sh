@@ -417,9 +417,6 @@ rm -rf "$cache/hol-toolchains"
 reconcile_entry=$(dirname "$(tail -n 1 "$tmpdir/reconcile-setup.log")")
 original_blob=$(grep -o 'blob=[0-9a-f]*' "$original_action" | cut -d= -f2)
 [[ $(< "$reconcile_entry/archive-blob") = "$original_blob" ]]
-python3 "$tmpdir/mutate_archive.py" \
-  "$original_archive" "$tmpdir/republished.tar" "${action_files[0]}" "$remote_root/cas" republished
-republished_blob=$(grep -o 'blob=[0-9a-f]*' "${action_files[0]}" | cut -d= -f2)
 cat > "$tmpdir/hold_lease.py" <<'PY'
 import fcntl, os, sys, time
 path, held, release = sys.argv[1:4]
@@ -494,6 +491,43 @@ val _ = HolbuildRemoteCacheConfig.set_url (env "RECONCILE_URL");
 val _ = HolbuildRemoteCacheConfig.setup_client ();
 val _ = HolbuildHolSharedCache.hold_usage_lease k;
 SML
+# When the store has lost the archive's blob (while a cache in front of it
+# still answers for it) or its record, the entry is published again, as the
+# same blob.
+cat > "$tmpdir/reconcile-republish.sml" <<'SML'
+use (OS.Path.concat (valOf (OS.Process.getEnv "RECONCILE_TMP"), "reconcile-prelude.sml"));
+val _ = HolbuildHolSharedCache.adopt_published_archive := true;
+val blob = env "ORIGINAL_BLOB";
+val blob_path = env "REMOTE_CAS" ^ "/" ^ blob;
+val _ = OS.FileSys.remove blob_path;
+val _ = write (env "SERVER_CONTROL" ^ "/cas-cached-" ^ blob) "";
+val _ = reconcile ();
+val _ = assert "did not publish again a toolchain whose blob the store lost" (exists blob_path);
+val _ = assert "publishing again changed the blob" (recorded () = blob ^ "\n");
+val _ = assert "comparison not recorded" (exists stamp);
+val _ = OS.FileSys.remove (env "REMOTE_ACTION");
+val _ = OS.FileSys.remove stamp;
+val _ = reconcile ();
+val _ = assert "did not publish again a toolchain the store has no record of"
+  (HolbuildToolchainArchive.published_blob (HolbuildRemoteCache.remote (env "RECONCILE_URL"))
+     (HolbuildHolSharedCache.archive_identity k) = SOME blob);
+val _ = assert "publishing again changed the recorded blob" (recorded () = blob ^ "\n");
+val _ = OS.Process.exit OS.Process.success;
+SML
+# Under exec-action nothing runs in a toolchain's checkout, so a worker's
+# entry keeps the bytes it was restored with; buildhol here checked the
+# checkout, which rewrote its git index, so that goes back as restored.
+tar -xf "$original_archive" -C "$reconcile_entry" ./hol/.git/index
+republish_log=$tmpdir/reconcile-republish.log
+RECONCILE_ENTRY=$reconcile_entry RECONCILE_URL=$remote_url RECONCILE_TMP=$tmpdir ORIGINAL_BLOB=$original_blob \
+  REMOTE_CAS=$remote_root/cas REMOTE_ACTION=${action_files[0]} SERVER_CONTROL=$server_control \
+  "$real_poly" -q --error-exit --script "$tmpdir/reconcile-republish.sml" > "$republish_log" 2>&1 ||
+  { cat "$republish_log" >&2; exit 1; }
+rm -f "$server_control/cas-cached-$original_blob"
+python3 "$tmpdir/mutate_archive.py" \
+  "$original_archive" "$tmpdir/republished.tar" "${action_files[0]}" "$remote_root/cas" republished
+republished_blob=$(grep -o 'blob=[0-9a-f]*' "${action_files[0]}" | cut -d= -f2)
+
 cat > "$tmpdir/reconcile.sml" <<'SML'
 use (OS.Path.concat (valOf (OS.Process.getEnv "RECONCILE_TMP"), "reconcile-prelude.sml"));
 fun leftovers () =
