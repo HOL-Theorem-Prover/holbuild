@@ -7826,7 +7826,6 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
        there is no dispatch window between them. *)
     val checkpoint_maintenance_owner = ref (NONE : int option)
     val checkpoint_maintenance_queue = ref ([] : int list)
-    val stopped = ref false
     val failures = ref ([] : (string * exn) list)
     val skipped = Array.array (node_count, false)
     val failed_prefix_priority = Array.array (node_count, NONE : bool option)
@@ -8334,7 +8333,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                   end
 
     fun next_work_locked () =
-            if !stopped orelse (#fail_fast options andalso not (null (!failures))) then NONE
+            if #fail_fast options andalso not (null (!failures)) then NONE
             else if Option.isSome (!checkpoint_maintenance_owner) then
               (ConditionVar.wait (cv, mutex); next_work_locked ())
             else
@@ -8474,8 +8473,6 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
       (Array.update (remaining_deps, child_id, Array.sub (remaining_deps, child_id) - 1);
        consider_locked child_id)
 
-    fun stop_requested () = with_lock (fn () => !stopped)
-
     fun finish_priority_focus id =
       if priority_focus_node id then priority_focus_remaining := !priority_focus_remaining - 1 else ()
 
@@ -8505,7 +8502,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
        finish_priority id;
        completed := !completed + 1;
        Array.update (committed, id, true);
-       if !stopped then () else List.app release_dependent (Array.sub (dependents, id)))
+       List.app release_dependent (Array.sub (dependents, id)))
 
     fun wait_for_no_checkpoint_maintenance_locked () =
       case !checkpoint_maintenance_owner of
@@ -8567,9 +8564,6 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
              advance_checkpoint_maintenance_locked id;
              signal ()))
 
-    fun finish_cancelled_after_stop id =
-      with_lock (fn () => (running := !running - 1; clear_active_node id; finish_priority id; signal ()))
-
     fun skip_descendants cause id =
       if Array.sub (skipped, id) then ()
       else
@@ -8612,7 +8606,7 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
       with_lock (fn () => (active := !active - 1; signal ()))
 
     fun speculation_stopped_locked () =
-      !stopped orelse (#fail_fast options andalso not (null (!failures)))
+      #fail_fast options andalso not (null (!failures))
 
     (* The first call for a theory checks whether it would build from source,
        outside the lock: the check may copy a remote cache entry. *)
@@ -8898,20 +8892,17 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                     end;
                     loop ())
                    handle e =>
-                     if stop_requested () then
-                       (finish_cancelled_after_stop id; worker_exit ())
-                     else
-                       let
-                         val msg = build_error_message e
-                         val artifacts = build_error_debug_artifacts e
-                       in
-                         (HolbuildStatus.fail_with_debug_artifacts
-                           status (HolbuildBuildPlan.key node) (HolbuildBuildPlan.logical_name node)
-                           msg artifacts
-                          handle IO.Io _ => ());
-                         finish_failure id (reported_failure e);
-                         loop ()
-                       end)
+                     let
+                       val msg = build_error_message e
+                       val artifacts = build_error_debug_artifacts e
+                     in
+                       (HolbuildStatus.fail_with_debug_artifacts
+                         status (HolbuildBuildPlan.key node) (HolbuildBuildPlan.logical_name node)
+                         msg artifacts
+                        handle IO.Io _ => ());
+                       finish_failure id (reported_failure e);
+                       loop ()
+                     end)
                 end
       in
         loop ()
