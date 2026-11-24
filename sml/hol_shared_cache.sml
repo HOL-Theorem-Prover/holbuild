@@ -1037,12 +1037,15 @@ fun reconcile_with_published req k =
                          Option.isSome (with_exclusive_lease k (fn () => replace_entry req k staged))))
                before HolbuildToolchainArchive.cleanup_staging final)
               handle e => (HolbuildToolchainArchive.cleanup_staging final; raise e)
-            (* Unlike publish_entry, a failed upload keeps the entry. *)
+            (* Unlike publish_entry, a failed upload keeps the entry; an
+               incomplete one is left for validate_entry to rebuild. *)
             fun republish () =
-              case HolbuildToolchainArchive.publish
-                     {remote = remote, identity = archive_identity k, entry_dir = final, replace = true} of
-                  SOME hash => write_file (archive_blob_for_key k) (hash ^ "\n")
-                | NONE => ()
+              if not (complete_toolchain_contents k) then ()
+              else
+                case HolbuildToolchainArchive.publish
+                       {remote = remote, identity = archive_identity k, entry_dir = final, replace = true} of
+                    SOME hash => write_file (archive_blob_for_key k) (hash ^ "\n")
+                  | NONE => ()
             (* Asked past any cache in front of the store, which then drops
                a copy the store lost, so that a publish uploads it again. *)
             fun stored hash =

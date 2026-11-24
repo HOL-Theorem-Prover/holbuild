@@ -493,7 +493,8 @@ val _ = HolbuildHolSharedCache.hold_usage_lease k;
 SML
 # When the store has lost the archive's blob (while a cache in front of it
 # still answers for it) or its record too, the entry is published again, as
-# the same blob; a record that can't be read is left alone.
+# the same blob; a record that can't be read, or an entry a restore would
+# reject, is left alone.
 cat > "$tmpdir/reconcile-republish.sml" <<'SML'
 use (OS.Path.concat (valOf (OS.Process.getEnv "RECONCILE_TMP"), "reconcile-prelude.sml"));
 val _ = HolbuildHolSharedCache.adopt_published_archive := true;
@@ -502,11 +503,19 @@ val blob_path = env "REMOTE_CAS" ^ "/" ^ blob;
 val cached = env "SERVER_CONTROL" ^ "/cas-cached-" ^ blob;
 val action = env "REMOTE_ACTION";
 val action_status = env "SERVER_CONTROL" ^ "/ac-get-status-" ^ OS.Path.file action;
-fun lose_blob () = (OS.FileSys.remove blob_path; write cached "");
+fun lose_blob () = ((OS.FileSys.remove blob_path handle OS.SysErr _ => ()); write cached "");
 fun names_blob () = exists action andalso String.isSubstring ("blob=" ^ blob) (read action);
 fun check_again () = OS.FileSys.remove stamp;
+val holmake = entry_file "hol/bin/Holmake";
+
+val _ = sh ("chmod a-x " ^ holmake);
+val _ = lose_blob ();
+val _ = reconcile ();
+val _ = assert "published again a toolchain a restore would reject" (not (exists blob_path));
+val _ = sh ("chmod a+x " ^ holmake);
 
 val _ = lose_blob ();
+val _ = check_again ();
 val _ = reconcile ();
 val _ = assert "did not ask past the cache" (not (exists cached));
 val _ = assert "did not publish again a toolchain whose blob the store lost" (exists blob_path);
