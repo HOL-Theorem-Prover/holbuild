@@ -152,8 +152,6 @@ fun save_declaration_context_line timed ({safe_name, context_path, context_ok, .
 fun runtime_lines lines =
   String.concat (map (fn line => line ^ "\n") lines)
 
-val runtime_load_lines = []
-
 (* The goal is printed from inside the Termination tactic: deriving it with a
    second Defn.Hol_defn would advance HOL's theorem numbering, so the theory
    would differ from an uninstrumented build.  A definition that fails before
@@ -211,13 +209,7 @@ fun checkpoint_save_runtime_prelude checkpoint_seconds =
        Real.toString checkpoint_seconds ^ ";"]
 
 fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
-  ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (source_helper_path "sml/diagnostic_limits.sml") ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (sha256_runtime_helper_path ()) ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (tactic_compat_runtime_helper_path ()) ^ ";",
-   "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_runtime_helper_path ()) ^ ";",
-   "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
+  ["val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
      (if checkpoint_enabled then "true" else "false") ^
      ", context_checkpoints = " ^ (if context_checkpoints then "true" else "false") ^
      ", share_failed_prefix = " ^ (if share_failed_prefix then "true" else "false") ^
@@ -231,29 +223,29 @@ fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed
    "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
    "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
 
+(* A heap saved after the proof runtime was installed (a theorem-context
+   checkpoint, say) already holds it: its key includes the runtime's identity,
+   so it is the same runtime, and the script only reinstalls it, as
+   runtime_reinstall_prelude does.  Otherwise the script compiles it. *)
+fun runtime_prelude config =
+  runtime_lines
+    (("val _ = if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HolbuildProofRuntime\") then HolbuildRuntime.use " ^
+        HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^
+        " else List.app HolbuildRuntime.use [" ^
+        String.concatWith ", "
+          (map HolbuildToolchain.sml_string
+             [source_helper_path "sml/diagnostic_limits.sml",
+              sha256_runtime_helper_path (),
+              proof_ir_helper_path (),
+              checkpoint_save_runtime_helper_path (),
+              tactic_compat_runtime_helper_path (),
+              proof_ir_runtime_helper_path ()]) ^ "];") ::
+     runtime_install_lines config)
 
-fun runtime_prelude config = runtime_lines (runtime_load_lines @ runtime_install_lines config)
-
-fun runtime_reinstall_prelude {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
-  let
-    val install =
-      ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
-       "val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
-         (if checkpoint_enabled then "true" else "false") ^
-         ", context_checkpoints = " ^ (if context_checkpoints then "true" else "false") ^
-         ", share_failed_prefix = " ^ (if share_failed_prefix then "true" else "false") ^
-         ", checkpoint_seconds = " ^ Real.toString checkpoint_seconds ^
-         ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
-     ", heavy_tactic_timeout = " ^ option_real_sml heavy_tactic_timeout ^
-         ", timeout_marker = " ^ option_string_sml timeout_marker ^
-         ", plan_theorem = " ^ option_string_sml plan_theorem ^
-         ", trace_all = " ^ (if trace_all then "true" else "false") ^
-         ", plan_only_marker = " ^ option_string_sml plan_only_marker ^ "};",
-       "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
-       "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
-  in
-    runtime_lines install
-  end
+fun runtime_reinstall_prelude config =
+  runtime_lines
+    (("HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";") ::
+     runtime_install_lines config)
 
 (* HOL's source parser reads top-level `#(FILE="...")` and `#(LINE=...)`
    declarations as location pragmas.  Staged scripts use them so that the
