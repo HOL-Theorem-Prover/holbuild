@@ -16158,9 +16158,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        local cache's blob itself, hard-linked: publish_blob checked its
        hash when it entered the cache, the linked file is made read-only, the
        sandbox lets no child chmod or link it, and nothing of holbuild's
-       writes through it (empty_writable only unlinks it).  Without the
-       blob, or across file systems, it is fetched and copied as any spec
-       blob, and linked from the next action on. *)
+       writes through it (empty_writable only unlinks it).  Across file
+       systems (a worker container's action root beside a host-mounted
+       cache) it is a read-only copy of that blob, not checked again.
+       Without the blob it is fetched and copied as any spec blob, and
+       linked or copied from the next action on. *)
     fun stage_scratch_input (spec : action_spec) =
       let
         fun stage sha =
@@ -16171,12 +16173,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           in
             ((ensure_parent path;
               remove_file path;
-              Posix.FileSys.link {old = blob, new = path};
+              Posix.FileSys.link {old = blob, new = path}
+              handle e as OS.SysErr (_, err) =>
+                if err = SOME Posix.Error.xdev then copy_binary blob path else raise e;
               (* The staged name: a blob installed over the cache's
                  name meanwhile would be another inode. *)
               Posix.FileSys.chmod (path, read_only);
               HolbuildCache.touch blob)
-             handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path});
+             handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path}
+                  | IO.Io _ => fetch_spec_blob remote {hash = sha, dst = path}
+                  | Error _ => fetch_spec_blob remote {hash = sha, dst = path});
             path
           end
       in
