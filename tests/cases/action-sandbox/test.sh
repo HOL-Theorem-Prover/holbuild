@@ -211,6 +211,21 @@ for refused in "$tmpdir/action/input:inside a writable directory" "$tmpdir/home/
   require_grep "scratch input ${refused#*:}" "$tmpdir/scratch.err"
 done
 
+# Source-load timing's flag and context reach the action, checked.
+timing_run() {
+  python3 -I "$ROOT/sml/action_sandbox.py" --write "$tmpdir/action" "${grants[@]}" \
+    -- env "HOLBUILD_TIMING_SOURCE_LOADS=$1" "HOLBUILD_SOURCE_LOAD_CONTEXT=$2" /bin/sh -c 'env > "$1"' sh "$tmpdir/action/env"
+}
+timing_run 1 target-cold
+require_grep '^HOLBUILD_TIMING_SOURCE_LOADS=1$' "$tmpdir/action/env"
+require_grep '^HOLBUILD_SOURCE_LOAD_CONTEXT=target-cold$' "$tmpdir/action/env"
+for refused in "true target-cold:source-load timing flag is not 1" "1 target_cold:source-load context is not"; do
+  if timing_run ${refused%%:*} 2> "$tmpdir/timing.err"; then
+    echo "the sandbox admitted source-load timing ${refused%%:*}" >&2; exit 1
+  fi
+  require_grep "${refused#*:}" "$tmpdir/timing.err"
+done
+
 # A deep theory's thousands of module grants: the path checks decide as
 # Path's did, and the launch stays fast.
 mkdir -p "$tmpdir/paths"

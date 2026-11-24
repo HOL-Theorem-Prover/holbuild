@@ -644,6 +644,21 @@ fun trace_line call =
   "(if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HOLFlags\") then \"HOLFlags\" else \"Feedback\") ^ " ^
   HolbuildToolchain.sml_string ("." ^ call ^ " handle _ => ());") ^ ");"
 
+(* Whether theory children time their source loads (holbuild_runtime.sml's
+   source-load timing): set by HOLBUILD_TIMING_SOURCE_LOADS=1 on the client,
+   whose exported specs carry it as option source-load-timing, and by that
+   option in exec-action. *)
+val source_load_timing_option = ref false
+fun timing_source_loads () =
+  !source_load_timing_option orelse OS.Process.getEnv "HOLBUILD_TIMING_SOURCE_LOADS" = SOME "1"
+
+(* A timed child whose heap already holds the runtime (a resume) starts its
+   source-load report here: it may compile no runtime and load nothing.  A
+   fresh child has no runtime yet, and starts it when it compiles one. *)
+val start_source_load_report_line =
+  "val _ = if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HolbuildRuntime\") " ^
+  "then CompilerSpecific.quietbind \"val _ = HolbuildRuntime.timing_source_loads ();\" else ();\n"
+
 (* A speculative child (pipelined builds) configures no theory module cache,
    so nothing it compiles is published there; a sandboxed one only reads
    it (module_policy). *)
@@ -663,7 +678,8 @@ fun write_child_policy_with {module_cache = use_module_cache} tc path =
        "(String.isSubstring \"/.holbuild/stage/\" (dir ^ \"/\"))) (!Meta.loadPath);\n" ^
        String.concat
          (map (fn trace => trace_line ("set_trace " ^ HolbuildToolchain.sml_string trace ^ " 0") ^ "\n")
-              child_policy_traces) ^ (if use_module_cache then module_cache else "") ^ "\n")
+              child_policy_traces) ^ (if use_module_cache then module_cache else "") ^ "\n" ^
+       (if timing_source_loads () then start_source_load_report_line else ""))
   end
 
 fun write_child_policy tc path = write_child_policy_with {module_cache = true} tc path
@@ -2187,12 +2203,18 @@ val tool_cache_dir : string option ref = ref NONE
 val scratch_input_files : string list ref = ref []
 val scratch_input_paths : string list ref = ref []
 
+(* A theory child's source-load context: whether it is a checkpoint target,
+   and whether it starts from the base state (cold), the deps heap (deps)
+   or a script prefix's checkpoint (prefix). *)
+fun source_load_context policy_target start =
+  (if policy_target then "target-" else "nontarget-") ^ start
+
 (* A name safe as one path component: a tool cache's, or a file's in it. *)
 fun plain_file_name name =
   name <> "" andalso name <> "." andalso name <> ".." andalso
   CharVector.all (fn c => Char.isAlphaNum c orelse c = #"." orelse c = #"_" orelse c = #"-") name
 
-fun run_hol_files_to_log tc stage workdir context files log_name current_log error_message =
+fun run_hol_files_to_log tc load_context stage workdir context files log_name current_log error_message =
   let
     val log = Path.concat(stage, log_name)
     val file_args = map (hol_run_file_arg workdir) files
@@ -2204,7 +2226,10 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
       (case !tool_cache_dir of SOME dir => ["HOLBUILD_TOOL_CACHE_DIR=" ^ dir] | NONE => []) @
       (case !scratch_input_paths of
            [] => []
-         | paths => ["HOLBUILD_SCRATCH_INPUT=" ^ String.concatWith ":" paths])
+         | paths => ["HOLBUILD_SCRATCH_INPUT=" ^ String.concatWith ":" paths]) @
+      (if timing_source_loads ()
+       then ["HOLBUILD_TIMING_SOURCE_LOADS=1", "HOLBUILD_SOURCE_LOAD_CONTEXT=" ^ load_context]
+       else [])
     val status =
       HolbuildToolchain.run_in_dir_to_file workdir
         ((if null tool_env then [] else "env" :: tool_env) @
@@ -5156,7 +5181,12 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
             if #files run_spec = [preload, staged_script] then join ()
             else raise Error "a child loading ahead needs a fresh preload"
         | NONE =>
-            run_hol_files_to_log tc stage stage
+            run_hol_files_to_log tc
+              (source_load_context (checkpoint_target_enabled policy)
+                 (if List.exists (fn file => file = preload) (#files run_spec) then "cold"
+                  else if hol_context_path (#context run_spec) = deps_loaded then "deps"
+                  else "prefix"))
+              stage stage
               (#context run_spec)
               (child_policy :: (#files run_spec @ [theory_exporter]))
               "holbuild-build.log"
@@ -7790,7 +7820,9 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
          [])
     val _ =
       child :=
-        SOME ((run_hol_files_to_log tc stage stage base_context files "holbuild-build.log"
+        (* Only a speculative child, whose policy has no checkpoint target,
+           loads ahead here. *)
+        SOME ((run_hol_files_to_log tc (source_load_context false "cold") stage stage base_context files "holbuild-build.log"
                  (SOME (current_build_log log_dir))
                  "hol run failed while building theory script";
                NONE)
@@ -10032,6 +10064,7 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
       (if pipeline then [bool_option "pipeline" true] else []) @
       (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []) @
       map (fn file => "option scratch-input=" ^ hash_file file) (!scratch_input_files) @
+      (if timing_source_loads () then [bool_option "source-load-timing" true] else []) @
       ["action-text"]
   in
     {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
@@ -11189,7 +11222,8 @@ type action_spec =
    theorem_checkpoints : bool, checkpoint_target : bool, skip_checkpoints : bool, promote_preload : bool,
    check_only : bool,
    checkpoint_seconds : real, force : bool, trace_steps : bool,
-   pipeline : bool, tool_cache : string option, scratch_inputs : string list, action_text : string}
+   pipeline : bool, tool_cache : string option, scratch_inputs : string list, source_load_timing : bool,
+   action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
 fun split_spec_text section text =
@@ -11371,6 +11405,10 @@ fun parse_action_spec text : action_spec =
           | NONE => NONE),
      (* In the order the client gave them: values holds the lines reversed. *)
      scratch_inputs = rev (List.mapPartial (fn (k, v) => if k = "option scratch-input" then SOME v else NONE) (!values)),
+     source_load_timing =
+       (case List.find (fn (k, _) => k = "option source-load-timing") (!values) of
+            SOME (_, v) => spec_bool "source-load-timing" v
+          | NONE => false),
      action_text = action_text}
   end
 
@@ -12913,7 +12951,8 @@ fun merge_phases phases =
    counts. *)
 val hol_log_phase_names =
   ["holloadend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
-   "holcompiledn", "holreplayedn", "holrewoundn", "holmodhitn", "holmodmissn", "holmodwriten"]
+   "holcompiledn", "holreplayedn", "holrewoundn", "holmodhitn", "holmodmissn", "holmodwriten",
+   "srclib", "srclibn", "srcrt", "srcrtn", "srcthy", "srcthyn"]
 
 fun hol_log_phases log_file child_start =
   let
@@ -16299,6 +16338,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val _ = verify_action_spec spec
         (* Names the build log, so only once the names are known safe. *)
         val _ = target := (#package spec, #logical spec)
+        val _ = source_load_timing_option := #source_load_timing spec
         val forced = #force spec orelse #trace_steps spec
         val _ = log_required := forced
         val _ = publish_builds_remotely := false
@@ -16735,7 +16775,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           Thread.fork
             (fn () =>
                 outcome :=
-                  SOME ((run_hol_files_to_log tc stage stage (toolchain_base_context tc) files "holbuild-build.log"
+                  SOME ((run_hol_files_to_log tc (source_load_context (not pipelined andalso #checkpoint_target spec) "cold")
+                           stage stage (toolchain_base_context tc) files "holbuild-build.log"
                            (SOME (current_build_log (current_log_dir root package (#logical spec))))
                            "hol run failed while building theory script";
                          NONE)
