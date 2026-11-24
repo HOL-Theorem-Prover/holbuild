@@ -112,7 +112,10 @@ grep -qx 'holbuild hol-phases srclib=0 srclibn=0 srcrt=0 srcrtn=0 srcthy=0 srcth
   echo "a timed process that loaded nothing did not report" >&2; cat "$tmpdir/empty.log" >&2; exit 1; }
 
 # A local build labels each theory child by how it started: cold, from the
-# failed-prefix checkpoint, then from the dependency heap.
+# failed-prefix checkpoint, then from the dependency heap.  L's first child
+# loads K, writing K's module where HOL has theory modules; a later cold
+# child loads K from it.
+use_case_cache "$tmpdir/cache"
 local_project=$tmpdir/local
 mkdir -p "$local_project/src"
 cat > "$local_project/holproject.toml" <<TOML
@@ -123,8 +126,20 @@ name = "local"
 [build]
 members = ["src"]
 TOML
-cat > "$local_project/src/LScript.sml" <<'SML'
+for name in K K2; do
+  cat > "$local_project/src/${name}Script.sml" <<SML
 open HolKernel Parse boolLib bossLib;
+val _ = new_theory "$name";
+Theorem ${name}_thm:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+done
+cat > "$local_project/src/LScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib KTheory;
 val _ = new_theory "L";
 Theorem passes:
   T
@@ -139,9 +154,12 @@ QED
 val _ = export_theory();
 SML
 child_log=$local_project/.holbuild/logs/current/local/LTheory/build.log
-# local_build NAME CTX: a timed build whose child reports CTX.
+# local_build NAME CTX [OPTION...]: a timed build whose child reports CTX.
 local_build() {
-  (cd "$local_project" && HOLBUILD_TIMING_SOURCE_LOADS=1 "$HOLBUILD_BIN" build LTheory) > "$tmpdir/$1.log" 2>&1 || true
+  local name=$1 ctx=$2
+  shift 2
+  (cd "$local_project" && HOLBUILD_TIMING_SOURCE_LOADS=1 "$HOLBUILD_BIN" build "$@" LTheory) > "$tmpdir/$name.log" 2>&1 || true
+  set -- "$name" "$ctx"
   grep -q "^holbuild source-load ctx=$2 " "$child_log" || {
     echo "$1: the child did not report ctx=$2:" >&2; cat "$tmpdir/$1.log" "$child_log" >&2; exit 1; }
 }
@@ -151,12 +169,25 @@ local_build resume target-prefix
 require_grep "from: failed-prefix checkpoint" "$tmpdir/resume.log"
 sed -i 's/^val _ = new_theory "L";$/val _ = new_theory "L"; val edited = ();/' "$local_project/src/LScript.sml"
 local_build edit target-deps
+# Without proof steps the script runs plain, with no proof runtime: it
+# reports all the same.
+sed -i 's/ val edited = ();$/ val edited = 1;/' "$local_project/src/LScript.sml"
+local_build plain target-deps --skip-proof-steps
+# A new ancestor: a cold child, which loads K from its module.
+sed -i 's/ KTheory;$/ KTheory K2Theory;/' "$local_project/src/LScript.sml"
+local_build ancestor target-cold
+hits=$(sed -n 's/^holbuild hol-phases holmodhitn=\([0-9]*\) .*/\1/p' "$child_log")
+if [[ "${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-}" == 1 && "${hits:-0}" -lt 1 ]]; then
+  echo "L's child loaded no theory from its module:" >&2; cat "$child_log" >&2; exit 1
+fi
+theories=$(awk '$1 == "holbuild" && $2 == "source-load" && $4 == "kind=theory" { sub("n=", "", $6); print $6 }' "$child_log")
+(( ${theories:-0} >= ${hits:-0} && ${theories:-0} >= 1 )) || {
+  echo "L's theory loads (${theories:-none}) do not count its module hits (${hits:-0}):" >&2; cat "$child_log" >&2; exit 1; }
 
 # The fleet: action-spec under the flag adds one option to the spec, and a
 # worker without the flag in its environment times T's child from it.
 control=$tmpdir/control
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$control"
-use_case_cache "$tmpdir/cache"
 project=$tmpdir/project
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML

@@ -644,6 +644,21 @@ fun trace_line call =
   "(if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HOLFlags\") then \"HOLFlags\" else \"Feedback\") ^ " ^
   HolbuildToolchain.sml_string ("." ^ call ^ " handle _ => ());") ^ ");"
 
+(* Whether theory children time their source loads (holbuild_runtime.sml's
+   source-load timing): set by HOLBUILD_TIMING_SOURCE_LOADS=1 on the client,
+   whose exported specs carry it as option source-load-timing, and by that
+   option in exec-action. *)
+val source_load_timing_option = ref false
+fun timing_source_loads () =
+  !source_load_timing_option orelse OS.Process.getEnv "HOLBUILD_TIMING_SOURCE_LOADS" = SOME "1"
+
+(* A timed child whose heap already holds the runtime (a resume) starts its
+   source-load report here: it may compile no runtime and load nothing.  A
+   fresh child has no runtime yet, and starts it when it compiles one. *)
+val start_source_load_report_line =
+  "val _ = if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HolbuildRuntime\") " ^
+  "then CompilerSpecific.quietbind \"val _ = HolbuildRuntime.timing_source_loads ();\" else ();\n"
+
 (* A speculative child (pipelined builds) configures no theory module cache,
    so nothing it compiles is published there; a sandboxed one only reads
    it (module_policy). *)
@@ -663,7 +678,8 @@ fun write_child_policy_with {module_cache = use_module_cache} tc path =
        "(String.isSubstring \"/.holbuild/stage/\" (dir ^ \"/\"))) (!Meta.loadPath);\n" ^
        String.concat
          (map (fn trace => trace_line ("set_trace " ^ HolbuildToolchain.sml_string trace ^ " 0") ^ "\n")
-              child_policy_traces) ^ (if use_module_cache then module_cache else "") ^ "\n")
+              child_policy_traces) ^ (if use_module_cache then module_cache else "") ^ "\n" ^
+       (if timing_source_loads () then start_source_load_report_line else ""))
   end
 
 fun write_child_policy tc path = write_child_policy_with {module_cache = true} tc path
@@ -2182,14 +2198,6 @@ val tool_cache_dir : string option ref = ref NONE
    Nothing keys it: what it holds must not change what a build produces. *)
 val scratch_input_file : string option ref = ref NONE
 val scratch_input_path : string option ref = ref NONE
-
-(* Whether theory children time their source loads (holbuild_runtime.sml's
-   source-load timing): set by HOLBUILD_TIMING_SOURCE_LOADS=1 on the client,
-   whose exported specs carry it as option source-load-timing, and by that
-   option in exec-action. *)
-val source_load_timing_option = ref false
-fun timing_source_loads () =
-  !source_load_timing_option orelse OS.Process.getEnv "HOLBUILD_TIMING_SOURCE_LOADS" = SOME "1"
 
 (* A theory child's source-load context: whether it is a checkpoint target,
    and whether it starts from the base state (cold), the deps heap (deps)
