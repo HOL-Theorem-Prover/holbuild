@@ -108,10 +108,22 @@ check() {
   }
 }
 
+# parked_at N STEP: the server parks for the Nth time at STEP of target.
+parked_at() {
+  for _ in $(seq 120); do
+    [[ "$(grep -c 'park: prepared' "$tmpdir/park.log")" -ge "$1" ]] && break
+    sleep 0.5
+  done
+  grep 'park: prepared' "$tmpdir/park.log" | sed -n "$1p" | grep -q "prepared target at step $2 " || {
+    echo "park $1 is not at step $2" >&2; cat "$tmpdir/park.log" >&2; exit 1; }
+}
+
 # The failing step bumps the counter; the next check must not see it.
 write_a '(fn g => (counter := !counter + 1; FAIL_TAC "second failure" g))'
 check second 1
 require_grep "second failure" "$tmpdir/second.out"
+# The check kept the failed prefix it failed at: the server parks there.
+parked_at 2 2
 
 # A proof left unsolved fails after its last step, saving no failed prefix:
 # the server parks again where it was.
@@ -137,6 +149,7 @@ write_a 'FAIL_TAC "fourth failure"'
 sed -i 's/CONJ_TAC >- ACCEPT_TAC TRUTH/CONJ_TAC >- (ACCEPT_TAC TRUTH)/' "$project/src/AScript.sml"
 check before-step 1
 require_grep "fourth failure" "$tmpdir/before-step.out"
+parked_at 4 2
 
 # The context's child ran the declarations before the theorem once while it
 # waited: the fix sees them run once.
@@ -191,6 +204,10 @@ serve moved
 write_a 'ACCEPT_TAC TRUTH' 'ALL_TAC'
 check moved 1
 require_grep "later_thm" "$tmpdir/moved.out"
+# Served from the failed prefix, the check saves no context after the
+# theorem it fixed.
+require_grep "from: failed-prefix checkpoint in target" "$tmpdir/moved.log"
+if grep -Eq "holsave=[1-9]" "$tmpdir/moved.out"; then echo "the served check saved checkpoints" >&2; cat "$tmpdir/moved.out" >&2; exit 1; fi
 # The server parks again after it answers.
 for _ in $(seq 120); do
   [[ "$(grep -c 'park: prepared' "$tmpdir/moved.log")" -ge 2 ]] && break
@@ -199,3 +216,6 @@ done
 require_grep "park: prepared later_thm at step 0 .* started 1 children" "$tmpdir/moved.log"
 write_a 'ACCEPT_TAC TRUTH'
 check after-moved 0
+# A pass stops the server: let it finish before the cleanup removes its cache.
+wait "$park_pid" 2>/dev/null || true
+park_pid=""

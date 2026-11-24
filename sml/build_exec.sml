@@ -4337,16 +4337,19 @@ fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker p
             SOME (_, position) => position
           | NONE => start_offset
       else start_offset
+    (* A served check saves no contexts on its way to the verdict: the
+       prepare that parks the next edit's children saves what they need.
+       It keeps the failed prefix it fails at, where the next edit is
+       served from. *)
+    val contexts = context_checkpoints_enabled policy andalso not (!park_serving)
   in
   if proof_steps_enabled policy then
     HolbuildTheoryCheckpoints.instrument
       {source = source_text, source_name = source_name, start_offset = start_offset, checkpoints = checkpoints,
-       declaration_checkpoints = if context_checkpoints_enabled policy then declaration_checkpoints else [],
+       declaration_checkpoints = if contexts then declaration_checkpoints else [],
        terminations = terminations,
-       (* A served check saves nothing on its way to the verdict: the
-          prepare that parks the next edit's children saves what they need. *)
-       save_checkpoints = theorem_checkpoints_enabled policy andalso not (!park_serving),
-       context_checkpoints = context_checkpoints_enabled policy andalso not (!park_serving),
+       save_checkpoints = theorem_checkpoints_enabled policy,
+       context_checkpoints = contexts,
        share_failed_prefix = share_failed_prefix,
        checkpoint_seconds = checkpoint_seconds policy,
        tactic_timeout = tactic_timeout policy,
@@ -4394,9 +4397,10 @@ fun failed_prefix_resume_message logical checkpoint step_count =
 
 (* CONTEXTS: whether the resumed run saves theorem and definition contexts:
    not on a failed prefix with no deps_loaded under it, since a context is
-   reused only on a current deps_loaded. *)
+   reused only on a current deps_loaded, and not in a served check. *)
 fun failed_prefix_resume_source policy contexts timeout_marker plan_only_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
   let
+    val contexts = contexts andalso not (!park_serving)
     val runtime_config =
       {checkpoint_enabled = theorem_checkpoints_enabled policy,
        context_checkpoints = (contexts andalso context_checkpoints_enabled policy),
