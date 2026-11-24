@@ -1112,8 +1112,8 @@ it, since the theorem-context checkpoint is the successor-ready state.
 Proof instrumentation is separable from PolyML checkpoint creation and
 retention. The command's requested proof-debugging policy applies to root-package
 nodes. Dependency-package nodes instead use plain proof execution with checkpoint
-creation, proof steps, tactic timeouts, execution-plan targeting, step tracing,
-and failure REPL disabled; developers who need those facilities build the
+creation, proof steps, tactic timeouts, step tracing, and failure REPL
+disabled; developers who need those facilities build the
 dependency as the root project. Kernel selection remains a toolchain property and
 is unchanged for dependency nodes. A tracing-kernel build (`--trknl`) defaults
 root-package nodes to the same plain policy, since it collects proof traces

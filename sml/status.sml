@@ -3,7 +3,7 @@ struct
 
 (* RestoredRemote is a restore whose entry this process copied from the remote
    cache; it counts towards from_cache as well. *)
-datatype outcome = Built | UpToDate | Restored | RestoredRemote | Inspected
+datatype outcome = Built | UpToDate | Restored | RestoredRemote
 
 val command_outcome = ref (fn (_ : outcome) => ())
 (* Told each failed node's label and diagnostic as the build finds it. *)
@@ -421,7 +421,6 @@ fun outcome_text Built = "built"
   | outcome_text UpToDate = "is up to date"
   | outcome_text Restored = "restored from cache"
   | outcome_text RestoredRemote = "restored from cache"
-  | outcome_text Inspected = "inspected"
 
 (* Theories this process built or restored, and heaps it exported: the work
    that leaves residue in a project, towards its next automatic GC. *)
@@ -437,14 +436,12 @@ fun tally ({built, up_to_date, restored, restored_remote, ...} : t) outcome =
     | UpToDate => up_to_date := !up_to_date + 1
     | Restored => restored := !restored + 1
     | RestoredRemote => (restored := !restored + 1; restored_remote := !restored_remote + 1)
-    | Inspected => ()
 
 fun count_outcome status outcome =
   (!command_outcome outcome;
    tally status outcome;
    case outcome of
        UpToDate => ()
-     | Inspected => ()
      | _ => count_project_work ())
 
 fun elapsed ({started_at, ...} : t) = Time.-(Time.now (), started_at)

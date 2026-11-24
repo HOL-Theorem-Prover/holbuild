@@ -1316,8 +1316,8 @@ theorem the script resumes. As with `Thm.tag` above, code that reaches `X`'s
 stub some other way (a lookup in a library or inside a structure) and branches
 on its hypotheses without failing outputs what it saw. A theory is not pipelined if it saves checkpoints and is a
 requested target or the build passes `--all-checkpoints`, if it declares
-extra outputs, or under `--trace-steps`, `--repl-on-failure`, a tracing
-kernel or an execution plan.
+extra outputs, or under `--trace-steps`, `--repl-on-failure` or a tracing
+kernel.
 
 A theory that would cut off early (its own inputs unchanged and its
 dependencies' outputs as at its last build) runs no HOL, so it isn't
@@ -2468,7 +2468,7 @@ Automatic GC keeps the default 7-day retention, skips a GC another process is
 running (or a project another holbuild is modifying), prints one line on
 stderr only when it removed something, prints nothing under `--quiet` or
 `--json`, and turns a failure into a warning without changing the command's
-exit status. `build --dry-run`, `--execution-plan`, `--watch`, `check`, `run`,
+exit status. `build --dry-run`, `--watch`, `check`, `run`,
 `repl` and fleet workers never run it. Change the thresholds or turn it off in
 `.holconfig.toml`'s `[gc]` (see Local configuration), or set
 `HOLBUILD_AUTO_GC=0`.
