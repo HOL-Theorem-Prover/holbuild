@@ -15717,8 +15717,8 @@ fun restore_tool_cache remote store key dir =
    the entry isn't stale.  A publish uploads every file, restored ones too:
    a host may have restored a file from its store after the remote cache
    dropped its blob, and the upload renews the blob there with the entry
-   that names it. *)
-fun publish_tool_cache remote store key dir {files = restored, stale} =
+   that names it.  STOP () says to stop before the next upload. *)
+fun publish_tool_cache stop remote store key dir {files = restored, stale} =
   let
     fun file name =
       let val path = Path.concat(dir, name)
@@ -15737,7 +15737,8 @@ fun publish_tool_cache remote store key dir {files = restored, stale} =
       else ()
     val entries = map (fn (name, path, _) => (name, path, HolbuildHash.file_sha256 path)) files
     fun upload (name, path, sha) =
-      (case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
+      (if stop () then raise Error "interrupted" else ();
+       case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
            HolbuildCacheBackend.Published => ()
          | HolbuildCacheBackend.AlreadyPresent => ()
          | _ => raise Error ("could not upload " ^ name);
@@ -16323,7 +16324,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               if not (!HolbuildActionSandbox.outputs_validated) then () else
               case tool_cache of
                   SOME (key, dir, restored) =>
-                    phase "toolpublish" (fn () => publish_tool_cache remote (share_store cache) key dir restored)
+                    phase "toolpublish" (fn () => publish_tool_cache (fn () => !cancelled) remote (share_store cache) key dir restored)
                 | NONE => ()
             val _ = set_attached_child (Option.map #join ahead)
             (* A pipelined run leaves its outputs in the stage. *)
@@ -16954,8 +16955,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               handle e => (drop_heap_snapshot () handle _ => (); raise e);
               let
                 val t0 = Time.now ()
-                val _ = publish_tools_now ()
                 val _ = !deferred () handle e => warn ("deferred publishing failed: " ^ General.exnMessage e)
+                (* After the checkpoints, as in share (): this is a passing
+                   action whose log upload failed, or one with no tool cache
+                   to publish. *)
+                val _ = publish_tools_now ()
                 (* An abandoned or unpublished run's snapshot goes too. *)
                 val _ = drop_heap_snapshot () handle _ => ()
                 val writer = if !cancelled then NONE else Option.mapPartial stage_writer (!write_modules)
