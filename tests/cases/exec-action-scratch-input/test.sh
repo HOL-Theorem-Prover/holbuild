@@ -122,6 +122,8 @@ scratch_option() {
   hb action-spec --scratch-input "$tmpdir/one.txt" UTheory > "$tmpdir/batch-$1.txt"
   sed -n 's/^option scratch-input=//p' "$specs/$(field "$tmpdir/batch-$1.txt" scratch:UTheory 4)"
 }
+# Only a file changed over a second before the export is recorded.
+while (( $(date +%s) - $(stat -c %Z "$tmpdir/one.txt") < 2 )); do sleep 0.2; done
 [[ "$(scratch_option first)" == "$sha_one" ]] || { echo "the scratch input's hash is wrong" >&2; exit 1; }
 require_grep "$sha_one" "$stats"
 sed -i "s/$sha_one/$sha_two/" "$stats"
