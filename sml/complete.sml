@@ -28,7 +28,7 @@ val hidden_valued = [("--holdir", Nothing)]
 val remote_valued = [("--remote-exec", Nothing)]
 
 val build_cache_flags =
-  ["--fail-fast", "--force", "--force=theory", "--force=project", "--force=full", "--no-cache",
+  ["--fail-fast", "--check-only", "--force", "--force=theory", "--force=project", "--force=full", "--no-cache",
    "--allow-cache-timeout-discrepancy", "--no-stat-cache", "--skip-checkpoints",
    "--all-checkpoints", "--skip-proof-steps", "--trace-steps", "--retain-debug-artifacts",
    "--emit-output-hashes", "--warn-unreachable", "--trknl"]

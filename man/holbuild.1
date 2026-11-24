@@ -683,6 +683,20 @@ Stop after the first failure and cancel unfinished work.
 The default is to finish independent work and skip only the dependents of
 failures.
 .TP
+.B \-\-check\-only
+Build the targets no other target depends on for their verdict alone: each
+passes or fails as a plain build would, but writes and caches no outputs, here
+or on remote workers, and leaves its earlier outputs and their metadata as
+they were.
+Outputs that are up to date, would be cut off, or have a usable cache entry
+pass without a build.
+What these targets load is built and cached as usual, and a proof that fails
+still saves its failed prefix, from which the next build resumes.
+Excludes
+.B \-\-emit\-output\-hashes
+and
+.BR \-\-trknl .
+.TP
 .B \-\-dry\-run
 Show what would be built without building.
 .TP
