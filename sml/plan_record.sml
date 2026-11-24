@@ -483,11 +483,16 @@ fun watched_dirs graph observed =
       observed
   end
 
+(* HOLBUILD_* variables read only to run, report or clean up a build, which
+   don't change its plan. *)
+val execution_env_prefixes =
+  ["HOLBUILD_TIMING_", "HOLBUILD_COMMAND_RECORD", "HOLBUILD_PLAN_RECORD=", "HOLBUILD_KEEP_BATCH_ON_INTERRUPT=",
+   "HOLBUILD_REMOTE_CACHE_", "HOLBUILD_REMOTE_EXEC_", "HOLBUILD_COOPERATE_", "HOLBUILD_AUTO_GC=",
+   "HOLBUILD_STATUS=", "HOLBUILD_CACHE_TRACE=", "HOLBUILD_ECHO_CHILD_LOGS="]
+
 fun recorded_env_var entry =
   String.isPrefix "HOLBUILD_" entry andalso
-  not (String.isPrefix "HOLBUILD_TIMING_" entry) andalso
-  not (String.isPrefix "HOLBUILD_COMMAND_RECORD" entry) andalso
-  not (String.isPrefix "HOLBUILD_PLAN_RECORD=" entry)
+  not (List.exists (fn prefix => String.isPrefix prefix entry) execution_env_prefixes)
 
 (* An argument naming a file names it through any links it follows, which
    no recorded stat covers. *)
@@ -495,22 +500,16 @@ fun argument_text arg =
   let val real = OS.FileSys.realPath arg handle OS.SysErr _ => arg
   in if real = arg then arg else arg ^ "\001" ^ real end
 
-(* ARGS without the last occurrence of each of VALUES, as targets follow
-   the options that may share their spelling. *)
-fun without_last values args =
-  let
-    fun drop_last _ [] = []
-      | drop_last value (arg :: rest) =
-          if arg = value andalso not (BP.member value rest) then rest else arg :: drop_last value rest
-  in
-    List.foldl (fn (value, args) => drop_last value args) args values
-  end
-
 (* Every planning input that is not a scanned file.  Packages are named by
    their resolved roots and identities, after $VAR expansion, and by their
    manifests' text.  The fingerprint is the hash of every input but the
    targets, a dash, and the hash of the targets, so the records of other
-   targets for the same inputs share its first part. *)
+   targets for the same inputs share its first part.
+
+   The command line counts only through its targets: the options that
+   change planning (--holdir, --source-dir, --offline) do so through the
+   holdir and packages hashed here, and the rest only shape execution,
+   whose options and keys each run computes afresh. *)
 fun fingerprint {project : HolbuildProject.t, graph, holdir, kernel_variant, targets} =
   let
     val target_args = map argument_text targets
@@ -529,7 +528,6 @@ fun fingerprint {project : HolbuildProject.t, graph, holdir, kernel_variant, tar
         ([format, HolbuildVersion.version, OS.FileSys.getDir (), holdir,
           HolbuildHolToolchainConfig.kernel_variant_name kernel_variant,
           getOpt (read_optional (OS.Path.concat (#root project, ".holconfig.toml")), "\001")] @
-         BP.canonical_list "argv" (without_last target_args (map argument_text (CommandLine.arguments ()))) @
          BP.canonical_list "env" (BP.sort_strings (List.filter recorded_env_var (Posix.ProcEnv.environ ()))) @
          List.concat (map (fn package => BP.canonical_list "package" (package_text package))
                           (HolbuildProjectGraph.packages graph))))

@@ -61,12 +61,15 @@ TOML
   sleep 1.1
 }
 
-# Plans DIR with ARGS and prints the line saying how it planned.
+# Plans DIR with ARGS, after the global options in PLAN_GLOBAL, and prints
+# the line saying how it planned.
 plan() {
   local dir=$1
   shift
   local log=$tmpdir/plan.log
-  if ! (cd "$dir" && "$HOLBUILD_BIN" --verbose build --dry-run "$@") > "$log" 2>&1; then
+  local global
+  read -ra global <<< "${PLAN_GLOBAL:-}"
+  if ! (cd "$dir" && "$HOLBUILD_BIN" "${global[@]}" --verbose build --dry-run "$@") > "$log" 2>&1; then
     cat "$log" >&2
     echo "build --dry-run $* failed in $dir" >&2
     exit 1
@@ -328,6 +331,40 @@ holbuild_env_var() {
   # Timing logs don't change planning.
   HOLBUILD_TIMING_LOG=$tmpdir/timing.log expect_plan "from record (0 files rehashed, 0 keys changed)" "$p"
   require_grep 'name=plan.record' "$tmpdir/timing.log"
+  # Nor do the variables that only run a build, which a caller may set on
+  # some of its builds and not others.
+  HOLBUILD_KEEP_BATCH_ON_INTERRUPT=1 HOLBUILD_AUTO_GC=0 \
+    expect_plan "from record (0 files rehashed, 0 keys changed)" "$p"
+}
+
+# Options choose how a build runs, not what it plans: a build differing from
+# the recorded one only in its options plans from the record.
+options_outside_planning() {
+  local p=$tmpdir/options
+  recorded_project "$p"
+  local same="from record (0 files rehashed, 0 keys changed)"
+  # Global options: jobs, heap, prefetching.
+  PLAN_GLOBAL="-j4 --max-heap 4000 --prefetch-concurrency 2" expect_plan "$same" "$p"
+  # Execution options.
+  expect_plan "$same" "$p" --allow-cache-timeout-discrepancy --force --no-cache --fail-fast --skip-checkpoints
+  # Options that change the actions' keys, which each run computes afresh.
+  expect_plan "$same" "$p" --tactic-timeout 8.0
+  expect_plan "$same" "$p" --tactic-timeout=132
+  expect_plan "$same" "$p" --skip-proof-steps
+  expect_plan "$same" "$p" --proof-scope=all --force=full --no-cache
+  echo scratch > "$tmpdir/scratch.txt"
+  expect_plan "$same" "$p" --tool-cache plan-record-test --scratch-input "$tmpdir/scratch.txt"
+  # Output: a quiet run without --verbose reads the record too (out of check
+  # mode, whose own full plan would show in the timings).
+  (cd "$p" && HOLBUILD_PLAN_RECORD=on HOLBUILD_TIMING_LOG=$tmpdir/quiet-timing.log \
+     "$HOLBUILD_BIN" --quiet -j2 build --dry-run) > /dev/null 2>&1
+  require_grep 'name=plan.record' "$tmpdir/quiet-timing.log"
+  if grep -q 'name=build.plan' "$tmpdir/quiet-timing.log"; then
+    echo "a quiet build planned in full" >&2
+    exit 1
+  fi
+  # The targets still count.
+  expect_plan "from record (0 files rehashed, 0 keys changed, sliced from other targets' plan)" "$p" BTheory
 }
 
 targets_on_argv() {
@@ -360,8 +397,6 @@ target_switch() {
   # The newest record, A's, doesn't hold C; D's older one does.
   expect_plan "from record (0 files rehashed, 0 keys changed, sliced from other targets' plan)" "$p" CTheory
   expect_plan "from record (0 files rehashed, 0 keys changed)" "$p" CTheory
-  # The other options must match.
-  expect_plan "full (no plan record for these inputs)" "$p" --skip-proof-steps BTheory
   # The record's files are checked as for its own targets.
   printf '\n(* comment *)\n' >> "$p/src/AScript.sml"
   expect_plan "from record (1 files rehashed, " "$p" BTheory
@@ -797,6 +832,7 @@ extra_inputs
 manifest_edit
 holconfig_edit
 holbuild_env_var
+options_outside_planning
 targets_on_argv
 target_switch
 stale_group_member
