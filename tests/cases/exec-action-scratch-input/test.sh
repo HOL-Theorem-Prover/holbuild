@@ -68,6 +68,10 @@ val _ =
                 let val input = TextIO.openIn path
                 in TextIO.inputAll input before TextIO.closeIn input end
             | NONE => "none\n"));
+val _ =
+  case OS.Process.getEnv "HOLBUILD_SCRATCH_INPUT" of
+      SOME path => print ("scratch links: " ^ Int.toString (Posix.FileSys.ST.nlink (Posix.FileSys.stat path)) ^ "\n")
+    | NONE => ();
 
 Theorem u2:
   T
@@ -196,9 +200,10 @@ done
 mv "$tmpdir/ac-A" "$tmpdir/remote/ac/$ac_A"
 wait "$u_pid" || true
 built u-two two
-# Staged again with the blob in the worker's cache, the input is a link to it.
-[[ "$(stat -c %a "$worker_cache/blobs/$sha_two")" == 444 ]] || {
-  echo "the restaged scratch input is not the cache's read-only blob" >&2; exit 1; }
+# Staged again with the blob in the worker's cache, the input is a
+# read-only link to it.
+grep -qx "scratch links: 2" "$tmpdir/u-two.hol" && [[ "$(stat -c %a "$worker_cache/blobs/$sha_two")" == 444 ]] || {
+  echo "the restaged scratch input is not the cache's read-only blob" >&2; cat "$tmpdir/u-two.hol" >&2; exit 1; }
 require_grep "loading ahead found a build to reuse; building plain" "$tmpdir/u-two.log"
 require_grep "from: theorem-context checkpoint after u1" "$tmpdir/u-two.log"
 

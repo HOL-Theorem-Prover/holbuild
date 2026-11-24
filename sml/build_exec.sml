@@ -16061,7 +16061,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     (* Outside the writable directories, so the child only reads it.  The
        file can be large and is the same for many actions, so it is the
        local cache's blob itself, hard-linked: publish_blob checked its
-       hash when it entered the cache, the link is made read-only, the
+       hash when it entered the cache, the linked file is made read-only, the
        sandbox lets no child chmod or link it, and nothing of holbuild's
        writes through it (empty_writable only unlinks it).  Without the
        blob, or across file systems, it is fetched and copied as any spec
@@ -16077,8 +16077,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             in
               ((ensure_parent path;
                 remove_file path;
-                Posix.FileSys.chmod (blob, read_only);
                 Posix.FileSys.link {old = blob, new = path};
+                (* The staged name: a blob installed over the cache's
+                   name meanwhile would be another inode. *)
+                Posix.FileSys.chmod (path, read_only);
                 HolbuildCache.touch blob)
                handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path});
               scratch_input_path := SOME path
