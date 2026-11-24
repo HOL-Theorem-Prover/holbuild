@@ -1805,11 +1805,17 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               timed_phase "remote_exec.record_pending" (fn () =>
                 ((!pending_record ()) before pending_record := (fn () => ());
                  write_pending_plan ()))
+            (* Whether a batch of this build finished: --force and --trace-steps
+               are then fulfilled, so later exports rebuild only what they force. *)
+            val batch_done = ref false
             fun export defer skip forced =
               let
+                val options =
+                  if !batch_done then HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options
+                  else build_options
                 val {batch, deferred = held, record, prefetch} =
                   timed_phase "action_spec.export"
-                    (fn () => HolbuildBuildExec.export_action_specs build_options tc project plan keys toolchain_key jobs
+                    (fn () => HolbuildBuildExec.export_action_specs options tc project plan keys toolchain_key jobs
                                 {upload = true, keep_specs = false, local_resumable = not detach, forced = forced, skip = skip,
                                  defer = defer, publish = !held_back, ledger = true})
               in
@@ -2137,6 +2143,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                         else SOME (key, SOME sha))
                        (HolbuildRemoteExec.late_logs url batch_id))
             val misfits = ref []
+            (* The input keys of every batch this build submitted. *)
+            val submitted_keys = ref ([] : string list)
+            (* The input keys of the "theory <key>" items of a resubmission. *)
+            fun theory_keys items =
+              List.mapPartial (fn item => if String.isPrefix "theory " item
+                                          then SOME (String.extract (item, 7, NONE)) else NONE) items
             fun carry_logs earlier later failed =
               Redblackmap.listItems
                 (List.foldl
@@ -2161,6 +2173,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
               case outcome of
                   (HolbuildRemoteExec.Done, progress) =>
                     let
+                      val _ = batch_done := true
                       val log_error =
                         (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key logs; NONE)
                         handle HolbuildBuildExec.Error reason => SOME reason
@@ -2172,11 +2185,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                             (HolbuildStatus.message_stderr ("holbuild: remote execution: " ^ finished progress ^ "\n");
                              if not (null (!deferred)) then submit_deferred retried settled []
                              else if not (null skip) then restore_after_failures NONE skip
-                             else
-                               timed_phase "build.execute"
-                                 (fn () => HolbuildBuildExec.build_checked settled []
-                                   (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
-                                   tc project plan keys toolchain_key jobs))
+                             else restore retried skip logs settled)
                     end
                 | (HolbuildRemoteExec.Failed (reason, failures), progress) =>
                   let
@@ -2190,9 +2199,6 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     val resubmit =
                       length retried < max_resubmissions andalso
                       List.exists (fn item => not (List.exists (fn r => r = item) (List.concat retried))) missing
-                    fun theory_keys items =
-                      List.mapPartial (fn item => if String.isPrefix "theory " item
-                                                  then SOME (String.extract (item, 7, NONE)) else NONE) items
                     val _ = if resubmit andalso misfit then misfits := theory_keys missing @ !misfits else ()
                     (* Every theory a resubmission was for is rebuilt again: a batch
                        that fails may have cancelled an earlier one's repair. *)
@@ -2273,27 +2279,94 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                        | NONE => ""))
                     else abandon batch_id (reason ^ "; " ^ finished progress)
               end
+            (* The restore after a batch finished, or after an export found
+               nothing to build.  Under --remote-only a theory the export left
+               out, taking the remote cache to hold it, may not restore after
+               all: a cache node can answer for a blob its store lost, and an
+               entry may not fit the parent outputs restored here, as when a
+               nondeterministic parent was built again.  Such theories are
+               resubmitted as finish resubmits a worker's misses, so the
+               restore reports no failure unless none is.  A theory of a batch
+               this build submitted that doesn't restore stays a failure, as
+               does any miss after an attached batch, whose theories no export
+               of this build chose.  LOGS are the worker logs so far, for the
+               batch after a resubmission to carry. *)
+            and restore retried skip logs settled =
+              let
+                fun restore_all () =
+                  timed_phase "build.execute"
+                    (fn () => HolbuildBuildExec.build_checked settled []
+                                (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
+                                tc project plan keys toolchain_key jobs)
+              in
+                if Option.isSome attach orelse not remote_only orelse length retried >= max_resubmissions then restore_all ()
+                else
+                  (ignore (HolbuildBuildExec.take_restore_misses ());
+                   HolbuildStatus.suppressing_failures restore_all
+                   handle Thread.Interrupt => raise Thread.Interrupt
+                        | e =>
+                            let
+                              val recorded = HolbuildBuildExec.take_restore_misses ()
+                              fun of_batch (key, _) = List.exists (fn k => k = key) (!submitted_keys)
+                              val misses = List.filter (not o of_batch) recorded
+                              val missing = map (fn (key, _) => "theory " ^ key) misses
+                            in
+                              (* A theory of a batch this build submitted that doesn't
+                                 restore fails the build. *)
+                              if not (List.exists of_batch recorded) andalso
+                                 List.exists (fn item => not (List.exists (fn r => r = item) (List.concat retried))) missing
+                              then
+                                let
+                                  val _ = misfits := List.mapPartial (fn (key, misfit) => if misfit then SOME key else NONE) misses @
+                                                     !misfits
+                                  val forced =
+                                    HolbuildBuildExec.theory_keys_depending_on build_options tc project plan keys toolchain_key
+                                      {missing = theory_keys (List.concat (missing :: retried)), misfits = !misfits}
+                                in
+                                  HolbuildStatus.message_stderr
+                                    ("holbuild: remote execution: " ^ Int.toString (length misses) ^
+                                     " theories the remote cache seemed to hold did not restore; resubmitting with " ^
+                                     Int.toString (length forced) ^ " theories rebuilt or rechecked\n");
+                                  HolbuildHolSharedCache.local_build_needed := false;
+                                  HolbuildBuildExec.forget_remote_ledger ();
+                                  HolbuildBuildExec.drop_local_cache_entries forced;
+                                  resubmitted_logs := logs;
+                                  export_and_submit (missing :: retried) false NONE skip forced
+                                end
+                              else
+                                (List.app (fn (key, _) =>
+                                             case node_with_input_key key of
+                                                 NONE => ()
+                                               | SOME node =>
+                                                   let val name = HolbuildBuildPlan.logical_name node
+                                                   in
+                                                     HolbuildStatus.report_remote_failure (HolbuildBuildPlan.key node) name
+                                                       (HolbuildBuildExec.not_in_remote_cache name) HolbuildStatus.no_debug_artifacts
+                                                   end)
+                                          recorded;
+                                 raise e)
+                            end)
+              end
             (* SETTLED: what earlier checks found up to date, with no batch since. *)
             and submit retried settled skip batch =
               if null (batch_keys batch) then
                 (record_pending ();
-                 (* A resubmission can find everything built already. *)
-                 (case carried_logs () of
-                      [] => ()
-                    | logs =>
-                        (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key logs;
-                         resubmitted_logs := []));
-                 if not (null (!deferred)) then submit_deferred retried settled skip
-                 else if not (null skip) then restore_after_failures settled skip
-                 else
-                   (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
-                    case settled of
-                        NONE => build_locally ()
-                      | SOME _ =>
-                          timed_phase "build.execute"
-                            (fn () => HolbuildBuildExec.build_checked settled []
-                                        (HolbuildBuildExec.remote_restore_options (#restore_only build_options) build_options)
-                                        tc project plan keys toolchain_key jobs)))
+                 let
+                   (* A resubmission can find everything built already. *)
+                   val logs = carried_logs ()
+                 in
+                   case logs of
+                       [] => ()
+                     | logs =>
+                         (HolbuildBuildExec.restore_remote_build_logs build_options tc project plan keys toolchain_key logs;
+                          resubmitted_logs := []);
+                   if not (null (!deferred)) then submit_deferred retried settled skip
+                   else if not (null skip) then restore_after_failures settled skip
+                   else
+                     (HolbuildStatus.message_stderr "holbuild: remote execution: nothing to build remotely\n";
+                      if remote_only orelse Option.isSome settled then restore retried skip logs settled
+                      else build_locally ())
+                 end)
               else
                 let
                   val submit_start = Time.now ()
@@ -2324,6 +2397,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                           fun submitted () =
                             (HolbuildToolchain.append_timing submit_timing;
                              HolbuildStatus.message_stderr ("holbuild: remote batch " ^ batch_id ^ "\n");
+                             submitted_keys := batch_keys batch @ !submitted_keys;
                              if detach then record_pending () else finish retried skip (SOME (batch_keys batch)) batch_id)
                         in
                           if detach then submitted ()
@@ -2354,9 +2428,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                   HolbuildRemoteExec.Ok batch => submit retried settled skip batch
                 | HolbuildRemoteExec.Refused reason => (record_pending (); fall_back reason)
           in
-            case attach of
-                SOME batch_id => finish [] [] NONE batch_id
-              | NONE => export_and_submit [] (not detach) NONE [] []
+            (* The outcomes a restore carried are this plan's alone. *)
+            ((case attach of
+                  SOME batch_id => finish [] [] NONE batch_id
+                | NONE => export_and_submit [] (not detach) NONE [] [])
+             handle e => (HolbuildStatus.forget_carried_outcomes (); raise e))
+            before HolbuildStatus.forget_carried_outcomes ()
           end
         (* The owners' batch leaves the requested plan's record write for the
            requested batch: a replan, if the owners rebuilt, queues its own. *)

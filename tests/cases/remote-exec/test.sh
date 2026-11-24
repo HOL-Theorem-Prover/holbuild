@@ -3084,3 +3084,154 @@ for n in 1 2 3 4 5 6; do
 done
 [[ $(grep -c "resubmitting" "$tmpdir/many-resubmits.log") -eq 6 ]] || { cat "$tmpdir/many-resubmits.log" >&2; exit 1; }
 require_grep "TTheory restored from cache" "$tmpdir/many-resubmits.log"
+
+# A theory the export takes the remote cache to hold, because a cache node's
+# disk still answers HEAD for a blob its store lost, but whose restore then
+# misses: a --remote-only build resubmits it, forced, and its worker publishes
+# the blob again.  The pass that resubmits reports no failure.
+project=$tmpdir/restore-miss
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxmiss"
+[build]
+members = ["src"]
+TOML
+# lose_dat_a: ATheory's .dat blob gone from the remote store, still answering HEAD.
+lose_dat_a() {
+  key_a=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rxmiss/src/AScript.sml.key")
+  dat_a=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$HOLBUILD_CACHE/actions/$key_a/manifest")
+  [[ -n $dat_a ]] || { echo "no .dat blob for ATheory" >&2; exit 1; }
+  rm "$remote_root/cas/$dat_a"
+  echo 200 > "$tmpdir/cache-control/cas-head-status-$dat_a"
+}
+# fresh_client NAME: a fresh tree and client cache, as on another host.
+fresh_client() {
+  rm -r "$project/.holbuild"
+  HOLBUILD_CACHE=$tmpdir/$1-cache
+  link_hol_toolchain_cache "$HOLBUILD_CACHE"
+}
+write_theories restore-miss
+run restore-miss-base 0 build --remote-exec "$coordinator" --remote-only BTheory
+lose_dat_a
+fresh_client restore-miss
+run restore-miss 0 --json build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "nothing to build remotely" "$tmpdir/restore-miss.log"
+require_grep "1 theories the remote cache seemed to hold did not restore; resubmitting with 1 theories rebuilt or rechecked" \
+  "$tmpdir/restore-miss.log"
+batch=$(sed -n 's/.*holbuild: remote batch \(b[0-9]*\).*/\1/p' "$tmpdir/restore-miss.log")
+require_grep "^action $key_a .* rxmiss:ATheory$" "$state/$batch.batch"
+refute_grep "^action .* rxmiss:BTheory$" "$state/$batch.batch"
+[[ -f "$remote_root/cas/$dat_a" ]] || { echo "the resubmission did not publish ATheory's .dat again" >&2; exit 1; }
+json_events restore-miss $'node_finished ATheory\nnode_finished BTheory\nbuild_finished'
+
+# The same through a batch that finishes: the export sends the edited
+# BTheory and leaves out ATheory, whose restore after the batch misses.
+write_theories restore-miss-done
+run restore-miss-done-base 0 build --remote-exec "$coordinator" --remote-only ATheory
+lose_dat_a
+printf '(* edited *)\n' >> "$project/src/BScript.sml"
+fresh_client restore-miss-done
+run restore-miss-done 0 build --remote-exec "$coordinator" --remote-only BTheory
+batches=($(sed -n 's/.*holbuild: remote batch \(b[0-9]*\).*/\1/p' "$tmpdir/restore-miss-done.log"))
+[[ ${#batches[@]} -eq 2 ]] || { cat "$tmpdir/restore-miss-done.log" >&2; exit 1; }
+require_grep "^action .* rxmiss:BTheory$" "$state/${batches[0]}.batch"
+refute_grep "^action .* rxmiss:ATheory$" "$state/${batches[0]}.batch"
+# The first batch finished before the restore missed ATheory.
+finished_at=$(grep -n "remote execution: remote workers finished 1 of 1 theories" "$tmpdir/restore-miss-done.log" | head -1 | cut -d: -f1)
+missed_at=$(grep -n "1 theories the remote cache seemed to hold did not restore; resubmitting with 1 theories rebuilt or rechecked" \
+  "$tmpdir/restore-miss-done.log" | cut -d: -f1)
+[[ -n $finished_at && -n $missed_at && $finished_at -lt $missed_at ]] || { cat "$tmpdir/restore-miss-done.log" >&2; exit 1; }
+[[ -f "$remote_root/cas/$dat_a" ]] || { echo "the resubmission did not publish ATheory's .dat again" >&2; exit 1; }
+require_grep "BTheory restored from cache" "$tmpdir/restore-miss-done.log"
+
+# A theory whose remote entry doesn't fit its parent's, as when a
+# nondeterministic parent was built again: the restore rejects it, and the
+# one resubmission rebuilds it and the theory depending on it.
+project=$tmpdir/restore-misfit
+mkdir -p "$project/src"
+cp "$tmpdir/nondet/src/"*Script.sml "$project/src/"
+sed 's/^name = "rxnd"/name = "rxmf"/' "$tmpdir/nondet/holproject.toml" > "$project/holproject.toml"
+n_ac=$(hb action-spec PTheory | awk '$1 == "action" && $5 == "rxmf:NTheory" { print $3 }')
+[[ -n $n_ac ]] || { echo "no action for NTheory" >&2; exit 1; }
+run restore-misfit-base 0 build PTheory
+rm "$remote_root/ac/$n_ac"
+fresh_client restore-misfit-again
+run restore-misfit-again 0 build NTheory
+fresh_client restore-misfit
+run restore-misfit 0 build --remote-exec "$coordinator" --remote-only PTheory
+require_grep "nothing to build remotely" "$tmpdir/restore-misfit.log"
+require_grep "1 theories the remote cache seemed to hold did not restore; resubmitting with 2 theories rebuilt or rechecked" \
+  "$tmpdir/restore-misfit.log"
+[[ $(grep -c "resubmitting" "$tmpdir/restore-misfit.log") -eq 1 ]] || { cat "$tmpdir/restore-misfit.log" >&2; exit 1; }
+require_grep "PTheory restored from cache" "$tmpdir/restore-misfit.log"
+
+# A nondeterministic theory whose .dat the remote store lost, still answering
+# HEAD: the forced rebuild has other outputs, and replaces the entry.
+project=$tmpdir/restore-lost-nondet
+mkdir -p "$project/src"
+cp "$tmpdir/nondet/src/"*Script.sml "$project/src/"
+sed 's/^name = "rxnd"/name = "rxln"/' "$tmpdir/nondet/holproject.toml" > "$project/holproject.toml"
+run restore-lost-nondet-base 0 build NTheory
+key_n=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rxln/src/NScript.sml.key")
+dat_n=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$HOLBUILD_CACHE/actions/$key_n/manifest")
+[[ -n $dat_n ]] || { echo "no .dat blob for NTheory" >&2; exit 1; }
+rm "$remote_root/cas/$dat_n"
+echo 200 > "$tmpdir/cache-control/cas-head-status-$dat_n"
+fresh_client restore-lost-nondet
+run restore-lost-nondet 0 build --remote-exec "$coordinator" --remote-only NTheory
+require_grep "1 theories the remote cache seemed to hold did not restore; resubmitting with 1 theories rebuilt or rechecked" \
+  "$tmpdir/restore-lost-nondet.log"
+require_grep "replacing remote cache entry $key_n: the cache no longer holds all of its blobs" "$tmpdir/worker.log"
+require_grep "NTheory restored from cache" "$tmpdir/restore-lost-nondet.log"
+
+# A restore that restores ATheory and then misses BTheory: the pass after the
+# resubmission reports ATheory neither again nor as unchanged.
+project=$tmpdir/restore-miss
+write_theories restore-miss-second
+run restore-miss-second-base 0 build --remote-exec "$coordinator" --remote-only BTheory
+key_b=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rxmiss/src/BScript.sml.key")
+dat_b=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$HOLBUILD_CACHE/actions/$key_b/manifest")
+[[ -n $dat_b ]] || { echo "no .dat blob for BTheory" >&2; exit 1; }
+rm "$remote_root/cas/$dat_b"
+echo 200 > "$tmpdir/cache-control/cas-head-status-$dat_b"
+fresh_client restore-miss-second
+run restore-miss-second 0 --json build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "1 theories the remote cache seemed to hold did not restore; resubmitting with 1 theories rebuilt or rechecked" \
+  "$tmpdir/restore-miss-second.log"
+json_events restore-miss-second $'node_finished ATheory\nnode_finished BTheory\nbuild_finished'
+[[ $(grep -c '"event":"node_started"' "$tmpdir/restore-miss-second.log") -eq 2 ]] ||
+  { cat "$tmpdir/restore-miss-second.log" >&2; exit 1; }
+require_grep '"event":"build_finished".*"from_cache":2,"unchanged":0' "$tmpdir/restore-miss-second.log"
+
+# ATheory misses, BTheory is skipped and the independent CTheory restores:
+# node_finished's count of finished theories only goes up, across the pass
+# that resubmits and the one after it, to the total.
+write_theories restore-miss-count
+cat > "$project/src/CScript.sml" <<SML
+Theory C
+Ancestors bool
+
+Theorem c_thm:
+  T
+Proof
+  simp[] (* restore-miss-count *)
+QED
+SML
+run restore-miss-count-base 0 build --remote-exec "$coordinator" --remote-only BTheory CTheory
+lose_dat_a
+fresh_client restore-miss-count
+run restore-miss-count 0 -j1 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
+require_grep "1 theories the remote cache seemed to hold did not restore; resubmitting with 1 theories rebuilt or rechecked" \
+  "$tmpdir/restore-miss-count.log"
+python3 - "$tmpdir/restore-miss-count.log" <<'PY'
+import json,sys
+events=[]
+for line in open(sys.argv[1]):
+    try: events.append(json.loads(line))
+    except ValueError: pass
+counts=[e['finished'] for e in events if e.get('event')=='node_finished']
+total={e['total'] for e in events if e.get('event')=='node_finished'}
+assert counts==[1,2,3] and total=={3}, (counts,total)
+PY
