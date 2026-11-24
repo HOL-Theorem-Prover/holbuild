@@ -318,9 +318,10 @@ workers do when they aren't running HOL:
   `--cooperate-dir`;
 - `complete`: reporting the result;
 - `after_result`: `exec-action` after its result is reported, publishing
-  shared checkpoints for later actions (a failed action's tool cache and
-  checkpoints are published before its result) and emptying the action's
-  directory, until it releases the action-root lock (`action.lock` in the
+  shared checkpoints for later actions (a failed action's checkpoints and
+  tool cache go before its result, except an interrupted action's and a
+  passing action's whose required log upload failed) and emptying the
+  action's directory, until it releases the action-root lock (`action.lock` in the
   worker's cache). It then refreshes the cache-cap measurement and writes
   theory modules in the background while the worker claims its next action;
   releases before 0.14.94 keep the lock, and the worker waits, until they
