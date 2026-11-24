@@ -6,7 +6,6 @@ structure FS = OS.FileSys
 
 exception Error of string
 exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
-exception ExecutionPlanPrinted
 exception RetryInvalidCheckpoint
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
@@ -3555,7 +3554,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, heavy_tactic_timeout : real option option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool, promote_preload : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, heavy_tactic_timeout : real option option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool, promote_preload : bool}
 
 (* checkpoint: the theory restores checkpoints and saves them at all.
    theorem_checkpoints: it also saves them per theorem and definition, and
@@ -3569,12 +3568,12 @@ type build_options = {use_cache : bool, verify_cache : bool, force : force_level
    of the heap --max-heap limits (write_plain_preload); only check's
    prebuild asks for it. *)
 datatype checkpoint_policy =
-  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, heavy_tactic_timeout : real option, execution_plan : string option, trace_steps : bool, repl_on_failure : bool, trknl : bool, promote_preload : bool}
+  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, heavy_tactic_timeout : real option, trace_steps : bool, repl_on_failure : bool, trknl : bool, promote_preload : bool}
 
 val default_checkpoint_seconds = 2.0
 
 val no_checkpoint_policy =
-  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, heavy_tactic_timeout = NONE, execution_plan = NONE, trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false}
+  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, heavy_tactic_timeout = NONE, trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false}
 
 fun checkpoint_enabled (CheckpointPolicy {checkpoint, ...}) = checkpoint
 fun theorem_checkpoints_enabled (CheckpointPolicy {theorem_checkpoints, ...}) = theorem_checkpoints
@@ -3590,14 +3589,10 @@ fun tactic_timeout (CheckpointPolicy {tactic_timeout, ...}) = tactic_timeout
 (* The budget of steps naming a heavy automation tactic such as metis_tac
    (proof_runtime.sml's step_budget). *)
 fun heavy_tactic_timeout (CheckpointPolicy {heavy_tactic_timeout, ...}) = heavy_tactic_timeout
-fun execution_plan (CheckpointPolicy {execution_plan, ...}) = execution_plan
 fun trace_steps (CheckpointPolicy {trace_steps, ...}) = trace_steps
 fun repl_on_failure (CheckpointPolicy {repl_on_failure, ...}) = repl_on_failure
 fun trknl_enabled (CheckpointPolicy {trknl, ...}) = trknl
 fun promotes_preload (CheckpointPolicy {promote_preload, ...}) = promote_preload
-
-fun execution_plan_only (CheckpointPolicy {execution_plan = SOME _, trace_steps = false, ...}) = true
-  | execution_plan_only _ = false
 
 fun bool_text true = "true"
   | bool_text false = "false"
@@ -4232,7 +4227,7 @@ fun checkpoint_deferral groups source_text (checkpoints : HolbuildTheoryCheckpoi
    which defers what proofs it can (proof_deferrals). *)
 (* SHARE_FAILED_PREFIX: the script runs from the toolchain's base state with
    no deps heap (proof_runtime.sml). *)
-fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker plan_only_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
+fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker source_name source_text start_offset checkpoints declaration_checkpoints terminations =
   if proof_steps_enabled policy then
     HolbuildTheoryCheckpoints.instrument
       {source = source_text, source_name = source_name, start_offset = start_offset, checkpoints = checkpoints,
@@ -4245,9 +4240,7 @@ fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker p
        tactic_timeout = tactic_timeout policy,
        heavy_tactic_timeout = heavy_tactic_timeout policy,
        timeout_marker = timeout_marker,
-       plan_theorem = execution_plan policy,
        trace_all = trace_steps policy,
-       plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy,
        defer = case defer_proofs of
                    SOME groups => checkpoint_deferral groups source_text checkpoints
@@ -4286,7 +4279,7 @@ fun failed_prefix_resume_message logical checkpoint step_count =
 (* CONTEXTS: whether the resumed run saves theorem and definition contexts:
    not on a failed prefix with no deps_loaded under it, since a context is
    reused only on a current deps_loaded. *)
-fun failed_prefix_resume_source policy contexts timeout_marker plan_only_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
+fun failed_prefix_resume_source policy contexts timeout_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
   let
     val runtime_config =
       {checkpoint_enabled = theorem_checkpoints_enabled policy,
@@ -4296,9 +4289,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker plan_only_marker 
        tactic_timeout = tactic_timeout policy,
        heavy_tactic_timeout = heavy_tactic_timeout policy,
        timeout_marker = SOME timeout_marker,
-       plan_theorem = execution_plan policy,
        trace_all = trace_steps policy,
-       plan_only_marker = plan_only_marker,
        new_ir = proof_ir_enabled policy}
     val prelude = HolbuildTheoryCheckpoints.runtime_reinstall_prelude runtime_config
     fun source_slice start stop = String.substring(source, start, stop - start)
@@ -4360,9 +4351,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker plan_only_marker 
          tactic_timeout = tactic_timeout policy,
          heavy_tactic_timeout = heavy_tactic_timeout policy,
          timeout_marker = SOME timeout_marker,
-         plan_theorem = execution_plan policy,
          trace_all = trace_steps policy,
-         plan_only_marker = plan_only_marker,
          new_ir = proof_ir_enabled policy,
          defer = fn _ => HolbuildTheoryCheckpoints.Inline}
   in
@@ -4631,7 +4620,7 @@ val dropped_checkpoints = ref 0
    exec-action's rstmodrejn. *)
 val rejected_heap_modules = ref 0
 
-fun write_theory_script capture defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker plan_only_marker =
+fun write_theory_script capture defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker =
   let
     val _ = resume_steps := []
     val source_name = #source_name action
@@ -4640,7 +4629,7 @@ fun write_theory_script capture defer_proofs policy root checkpoint_root base_co
   in
   if not (checkpoint_enabled policy) then
     ((if promotes_preload policy then write_promoting_preload else write_plain_preload) load_lines preload;
-     write_text staged_script (instrumented_source defer_proofs policy false (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints [] terminations);
+     write_text staged_script (instrumented_source defer_proofs policy false (SOME timeout_marker) source_name source_text 0 checkpoints [] terminations);
      {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
   else
     let
@@ -4657,7 +4646,7 @@ fun write_theory_script capture defer_proofs policy root checkpoint_root base_co
            List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints)
       fun run_from_deps_checkpoint () =
         (ensure_source_checkpoint_parents ();
-         write_text staged_script (instrumented_source NONE policy false (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source NONE policy false (SOME timeout_marker) source_name source_text 0 checkpoints declaration_checkpoints terminations);
          deps_loaded_resume_message logical;
          resume_steps := [("resdepsn", 1)];
          {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
@@ -4668,14 +4657,14 @@ fun write_theory_script capture defer_proofs policy root checkpoint_root base_co
          ensure_source_checkpoint_parents ();
          if saves_progress policy then write_preload capture load_lines deps_loaded deps_ok preload
          else write_plain_preload load_lines preload;
-         write_text staged_script (instrumented_source NONE policy (not (saves_progress policy)) (SOME timeout_marker) plan_only_marker source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text staged_script (instrumented_source NONE policy (not (saves_progress policy)) (SOME timeout_marker) source_name source_text 0 checkpoints declaration_checkpoints terminations);
          {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
         let
           val path = #failed_prefix_path checkpoint
           val _ = ensure_source_checkpoint_parents ()
           val contexts = deps_checkpoint_exists deps_loaded deps_key
-          val _ = write_text staged_script (failed_prefix_resume_source policy contexts timeout_marker plan_only_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
+          val _ = write_text staged_script (failed_prefix_resume_source policy contexts timeout_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
           val _ = failed_prefix_resume_message logical checkpoint step_count
           val _ = resume_steps := [("resfpn", 1), ("resstepn", LargeInt.fromInt step_count),
                                    ("resboundary", LargeInt.fromInt (#boundary checkpoint))] @
@@ -4686,7 +4675,7 @@ fun write_theory_script capture defer_proofs policy root checkpoint_root base_co
       fun run_from_replay {boundary, path, safe_name, kind, failure_checkpoints} =
         let
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (instrumented_source NONE policy false (SOME timeout_marker) plan_only_marker source_name source_text boundary checkpoints declaration_checkpoints terminations)
+          val _ = write_text staged_script (instrumented_source NONE policy false (SOME timeout_marker) source_name source_text boundary checkpoints declaration_checkpoints terminations)
           val _ = source_context_resume_message logical (#source_file action) source_text kind safe_name boundary
           val _ = resume_steps := [("resctxn", 1), ("resboundary", LargeInt.fromInt boundary)]
         in
@@ -5006,7 +4995,6 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val parents_report = Path.concat(stage, "holbuild-theory-parents.txt")
     val mldeps_report = Path.concat(stage, "holbuild-theory-mldeps.txt")
     val timeout_marker = Path.concat(stage, "holbuild-tactic-timeout.txt")
-    val plan_only_marker = Path.concat(stage, "holbuild-proof-ir-plan.txt")
     val log_dir = getOpt (speculative_log, current_log_dir root (#package action) logical)
     val checkpoint_base = action_checkpoint_base checkpoint_root action
     val deps_key = #deps_key action
@@ -5026,12 +5014,10 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
                  theorem_checkpoints
       else ()
     val _ = remove_file timeout_marker
-    val _ = remove_file plan_only_marker
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
     val capture = !capture_deps_heap andalso checkpoint_enabled policy andalso saves_progress policy
     val run_spec = write_theory_script capture (if speculative andalso proof_steps_enabled policy then SOME (has_suspension_pruning tc) else NONE) policy root checkpoint_root base_context action source_text
                                     theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
-                                    (if execution_plan_only policy then SOME plan_only_marker else NONE)
     (* A speculative child runs no checkpoints, so it starts from the
        preload, which then also loads the runtime its deferred proofs use. *)
     val _ =
@@ -5181,12 +5167,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
           end)
     val _ = check_cancelled ()
     val _ =
-      if execution_plan_only policy andalso file_exists plan_only_marker then
-        (HolbuildStatus.message_stdout (read_text build_log handle _ => "");
-         raise ExecutionPlanPrinted)
-      else if Option.isSome (execution_plan policy) then
-        HolbuildStatus.message_stdout (read_text build_log handle _ => "")
-      else if trace_steps policy then
+      if trace_steps policy then
         if HolbuildStatus.json_mode () then
           HolbuildStatus.message_stdout (read_text build_log handle _ => "")
         else
@@ -5702,7 +5683,7 @@ fun checkpoint_target_node ({all_checkpoints, repl_on_failure, checkpoint_target
 (* An impure action never replays checkpoints: its script may compute
    different values on each run (a timestamp, a version string), and
    resuming past that code would restore the values of an earlier run. *)
-fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...} : build_options) project node =
+fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, ...} : build_options) project node =
   if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
     let val timeout = effective_tactic_timeout proof_steps
                         (HolbuildTacticTimeoutPolicy.timeout_of node_tactic_timeouts (HolbuildBuildPlan.key node))
@@ -5715,7 +5696,6 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
                       new_ir = new_ir,
                       tactic_timeout = timeout,
                       heavy_tactic_timeout = heavy_budget heavy_tactic_timeout timeout,
-                      execution_plan = if proof_steps then execution_plan else NONE,
                       trace_steps = proof_steps andalso trace_steps,
                       repl_on_failure = repl_on_failure,
                       trknl = trknl,
@@ -5730,7 +5710,6 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
                       new_ir = false,
                       tactic_timeout = NONE,
                       heavy_tactic_timeout = NONE,
-                      execution_plan = NONE,
                       trace_steps = false,
                       repl_on_failure = false,
                       trknl = trknl,
@@ -6518,13 +6497,11 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
        invalidate_node_dat_hash ();
        write_metadata (#emit_output_hashes options) policy (tactic_timeout policy) project plan keys input_key toolchain_key node;
        HolbuildStatus.Built)
-      handle ExecutionPlanPrinted => (remove_tree stage; HolbuildStatus.Inspected)
     (* The metadata goes before the outputs are replaced, so outputs of an
        interrupted restore or build are never taken for those of the last one
-       (by the up-to-date check or early cutoff).  Printing the execution plan
-       replaces nothing. *)
+       (by the up-to-date check or early cutoff). *)
     fun restore_or_build () =
-      (if execution_plan_only policy then () else remove_file (metadata_path project node);
+      (remove_file (metadata_path project node);
        if not cache_restore_allowed then build_from_source ()
        else
          case materialize_valid_cache () of
@@ -6962,7 +6939,7 @@ fun pipeline_switched_on () = OS.Process.getEnv "HOLBUILD_PIPELINE" <> SOME "off
 fun pipeline_enabled (options : build_options) =
   pipeline_switched_on () andalso
   not (#restore_only options) andalso not (#trknl options) andalso not (#trace_steps options) andalso
-  not (Option.isSome (#execution_plan options)) andalso not (#repl_on_failure options)
+  not (#repl_on_failure options)
 
 (* Whether NODE's options let it build pipelined, locally or on remote
    workers: a pipelined build saves no checkpoints and writes no proof
@@ -6976,7 +6953,7 @@ fun pipelinable (options : build_options) project plan node =
     (not (theorem_checkpoints_enabled policy) orelse
      not (#all_checkpoints options orelse force_target_node (#force_targets options) node)) andalso
     (not (proof_steps_enabled policy) orelse proof_ir_enabled policy) andalso
-    not (trace_steps policy) andalso not (Option.isSome (execution_plan policy)) andalso
+    not (trace_steps policy) andalso
     not (repl_on_failure policy) andalso not (trknl_enabled policy) andalso
     null (source_extra_output_declarations plan node) andalso not (always_reexecute node)
   end
@@ -7466,7 +7443,7 @@ fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, h
   CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false,
                     checkpoint_seconds = default_checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout,
-                    heavy_tactic_timeout = heavy_tactic_timeout, execution_plan = NONE,
+                    heavy_tactic_timeout = heavy_tactic_timeout,
                     trace_steps = false, repl_on_failure = false, trknl = false,
                     promote_preload = promote_preload}
 
@@ -7474,11 +7451,11 @@ fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, h
    so a checkpoint nothing shares would only cost the child time: under
    --share-deps-heap it saves the deps heap alone (SAVE_HEAP), and without
    sharing nothing.  Proof steps and their timeouts stay as the spec says. *)
-fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, execution_plan, trace_steps, repl_on_failure, trknl, promote_preload, ...}) =
+fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, ...}) =
   CheckpointPolicy {checkpoint = checkpoint andalso save_heap, theorem_checkpoints = false, checkpoint_target = checkpoint_target,
                     checkpoint_seconds = checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout,
-                    heavy_tactic_timeout = heavy_tactic_timeout, execution_plan = execution_plan,
+                    heavy_tactic_timeout = heavy_tactic_timeout,
                     trace_steps = trace_steps, repl_on_failure = repl_on_failure, trknl = trknl,
                     promote_preload = promote_preload}
 
@@ -7807,16 +7784,13 @@ fun build_serial is_settled is_failed dat_hash_cache status (options : build_opt
       end
     fun loop [] = ()
       | loop (node :: rest) =
-          case one node of
-              SOME HolbuildStatus.Inspected => mark_checkpoint_budget_refresh_needed budget_state
-            | outcome =>
-                (case outcome of
-                     SOME outcome =>
-                       if outcome_may_create_checkpoints options project node outcome then
-                         refresh_checkpoint_budget_after_node budget_state project node []
-                       else ()
-                   | NONE => ();
-                 loop rest)
+          (case one node of
+               SOME outcome =>
+                 if outcome_may_create_checkpoints options project node outcome then
+                   refresh_checkpoint_budget_after_node budget_state project node []
+                 else ()
+             | NONE => ();
+           loop rest)
   in
     loop (HolbuildBuildPlan.selected_nodes plan);
     raise_build_failures (rev (!failures))
@@ -8593,27 +8567,6 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
              advance_checkpoint_maintenance_locked id;
              signal ()))
 
-    fun finish_inspected id =
-      let
-        val _ = mark_checkpoint_budget_refresh_needed budget_state
-        val first_stop =
-          with_lock
-            (fn () =>
-                let
-                  val _ = running := !running - 1
-                  val _ = clear_active_node id
-                  val _ = finish_priority id
-                  val _ = completed := !completed + 1
-                  val first = not (!stopped)
-                  val _ = stopped := true
-                in
-                  signal ();
-                  first
-                end)
-      in
-        if first_stop then HolbuildToolchain.cleanup_active_children () else ()
-      end
-
     fun finish_cancelled_after_stop id =
       with_lock (fn () => (running := !running - 1; clear_active_node id; finish_priority id; signal ()))
 
@@ -8927,24 +8880,22 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
         and build id may_checkpoint run =
                 let val node = Vector.sub (nodes, id)
                 in
-                  ((case run node of
-                        HolbuildStatus.Inspected => finish_inspected id
-                      | outcome =>
-                          let
-                            val _ = if pipelining then check_gate id else ()
-                            val collect_protected =
-                              may_checkpoint andalso checkpoints_possible andalso
-                              outcome_may_create_checkpoints options project node outcome
-                          in
-                            if collect_protected then
-                              let
-                                val protected = begin_checkpoint_maintenance id
-                                val _ = refresh_checkpoint_budget_after_node budget_state project node protected
-                              in
-                                finish_checkpoint_maintenance id
-                              end
-                            else finish_success id
-                          end;
+                  ((let
+                      val outcome = run node
+                      val _ = if pipelining then check_gate id else ()
+                      val collect_protected =
+                        may_checkpoint andalso checkpoints_possible andalso
+                        outcome_may_create_checkpoints options project node outcome
+                    in
+                      if collect_protected then
+                        let
+                          val protected = begin_checkpoint_maintenance id
+                          val _ = refresh_checkpoint_budget_after_node budget_state project node protected
+                        in
+                          finish_checkpoint_maintenance id
+                        end
+                      else finish_success id
+                    end;
                     loop ())
                    handle e =>
                      if stop_requested () then
@@ -9348,14 +9299,13 @@ fun build options tc project plan toolchain_key jobs =
 
 (* After remote execution, force and tracing have already been fulfilled. *)
 fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, checkpoint_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
-                           new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, execution_plan, repl_on_failure,
+                           new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, repl_on_failure,
                            emit_output_hashes, allow_cache_timeout_discrepancy, trknl, fail_fast, all_checkpoints, promote_preload, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = ForceNone, force_targets = force_targets,
    checkpoint_targets = checkpoint_targets, skip_checkpoints = skip_checkpoints, checkpoint_seconds = checkpoint_seconds,
    proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
    node_tactic_timeouts = node_tactic_timeouts, heavy_tactic_timeout = heavy_tactic_timeout,
-   execution_plan = execution_plan,
    trace_steps = false, repl_on_failure = repl_on_failure,
    emit_output_hashes = emit_output_hashes,
    allow_cache_timeout_discrepancy = allow_cache_timeout_discrepancy, trknl = trknl,
@@ -11465,7 +11415,6 @@ fun spec_policy (spec : action_spec) =
                     new_ir = #new_ir spec,
                     tactic_timeout = timeout,
                     heavy_tactic_timeout = heavy_budget (#heavy_tactic_timeout spec) timeout,
-                    execution_plan = NONE,
                     trace_steps = #trace_steps spec,
                     repl_on_failure = false,
                     trknl = false,

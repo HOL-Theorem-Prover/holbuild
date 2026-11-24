@@ -2468,7 +2468,7 @@ Automatic GC keeps the default 7-day retention, skips a GC another process is
 running (or a project another holbuild is modifying), prints one line on
 stderr only when it removed something, prints nothing under `--quiet` or
 `--json`, and turns a failure into a warning without changing the command's
-exit status. `build --dry-run`, `--execution-plan`, `--watch`, `check`, `run`,
+exit status. `build --dry-run`, `--watch`, `check`, `run`,
 `repl` and fleet workers never run it. Change the thresholds or turn it off in
 `.holconfig.toml`'s `[gc]` (see Local configuration), or set
 `HOLBUILD_AUTO_GC=0`.

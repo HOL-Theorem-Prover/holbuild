@@ -210,7 +210,7 @@ fun checkpoint_save_runtime_prelude checkpoint_seconds =
      "val _ = HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate " ^
        Real.toString checkpoint_seconds ^ ";"]
 
-fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
+fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, trace_all, new_ir} =
   ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (source_helper_path "sml/diagnostic_limits.sml") ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (sha256_runtime_helper_path ()) ^ ";",
    "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (proof_ir_helper_path ()) ^ ";",
@@ -225,16 +225,16 @@ fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed
      ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
      ", heavy_tactic_timeout = " ^ option_real_sml heavy_tactic_timeout ^
      ", timeout_marker = " ^ option_string_sml timeout_marker ^
-     ", plan_theorem = " ^ option_string_sml plan_theorem ^
+     ", plan_theorem = NONE : string option" ^
      ", trace_all = " ^ (if trace_all then "true" else "false") ^
-     ", plan_only_marker = " ^ option_string_sml plan_only_marker ^ "};",
+     ", plan_only_marker = NONE : string option};",
    "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
    "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
 
 
 fun runtime_prelude config = runtime_lines (runtime_load_lines @ runtime_install_lines config)
 
-fun runtime_reinstall_prelude {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir} =
+fun runtime_reinstall_prelude {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, trace_all, new_ir} =
   let
     val install =
       ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
@@ -246,9 +246,9 @@ fun runtime_reinstall_prelude {checkpoint_enabled, context_checkpoints, share_fa
          ", tactic_timeout = " ^ option_real_sml tactic_timeout ^
      ", heavy_tactic_timeout = " ^ option_real_sml heavy_tactic_timeout ^
          ", timeout_marker = " ^ option_string_sml timeout_marker ^
-         ", plan_theorem = " ^ option_string_sml plan_theorem ^
+         ", plan_theorem = NONE : string option" ^
          ", trace_all = " ^ (if trace_all then "true" else "false") ^
-         ", plan_only_marker = " ^ option_string_sml plan_only_marker ^ "};",
+         ", plan_only_marker = NONE : string option};",
        "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
        "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
   in
@@ -318,7 +318,7 @@ datatype deferral =
    after the script has run, where later bindings would shadow the
    theorem's; a theorem without them is not deferred, nor is a group with
    a block without them (build_exec's checkpoint_deferral). *)
-fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, defer} :
+fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, trace_all, new_ir, defer} :
                 {source : string, source_name : string, start_offset : int, checkpoints : checkpoint list,
                  declaration_checkpoints : declaration_checkpoint list,
                  terminations : termination list, save_checkpoints : bool,
@@ -326,8 +326,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                  checkpoint_seconds : real,
                  tactic_timeout : real option, heavy_tactic_timeout : real option,
                  timeout_marker : string option,
-                 plan_theorem : string option, trace_all : bool,
-                 plan_only_marker : string option, new_ir : bool,
+                 trace_all : bool, new_ir : bool,
                  defer : checkpoint -> deferral}) =
   let
     val n = size source
@@ -360,9 +359,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
        tactic_timeout = tactic_timeout,
        heavy_tactic_timeout = heavy_tactic_timeout,
        timeout_marker = timeout_marker,
-       plan_theorem = plan_theorem,
        trace_all = trace_all,
-       plan_only_marker = plan_only_marker,
        new_ir = new_ir}
     (* A resumed script loads the checkpoint runtime even with no checkpoint
        left to save: it carries the theory's CPU time over from the checkpoint. *)
