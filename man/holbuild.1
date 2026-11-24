@@ -683,6 +683,26 @@ Stop after the first failure and cancel unfinished work.
 The default is to finish independent work and skip only the dependents of
 failures.
 .TP
+.B \-\-check\-only
+Build the targets no other target depends on for their verdict alone: each
+theory script runs, and its proofs pass or fail, as in a plain build, but
+nothing is exported, so a failure to export the theory or to write a declared
+extra output goes unnoticed.
+These targets write and cache no outputs, here or on remote workers, and leave
+their earlier outputs and their metadata as they were.
+Outputs that are up to date or would be cut off, and a local cache entry whose
+data records the parent outputs installed here, pass without a build; an entry
+only the remote cache holds is not fetched.
+What these targets load is built and cached as usual, and a proof that fails
+still saves its failed prefix, from which the next build resumes.
+Excludes
+.BR \-\-emit\-output\-hashes ,
+.BR \-\-trknl ,
+.BR \-\-repl\-on\-failure ,
+.B \-\-detach
+and
+.BR \-\-attach .
+.TP
 .B \-\-dry\-run
 Show what would be built without building.
 .TP
@@ -842,6 +862,12 @@ the path of
 change what the build produces.
 No key covers it: outputs and checkpoints are cached as if it were absent,
 so they must not depend on it.
+Given more than once,
+.B HOLBUILD_SCRATCH_INPUT
+holds the paths in the order given, separated by
+.BR : ;
+no path may then contain a
+.BR : .
 .TP
 .BI \-\-remote\-exec " URL"
 Build the theories the remote cache lacks, and that are not built here for
