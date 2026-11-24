@@ -1943,7 +1943,9 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                         let val in_batch = Redblackset.addList (Redblackset.empty String.compare, batch_keys)
                         in List.filter (fn key => not (Redblackset.member (in_batch, key))) (!prefetch_keys) end
                     | NONE => []
-                val {add, drain, stop} = HolbuildBuildExec.start_remote_exec_prefetch build_options jobs outside_batch
+                val {add, drain, stop} =
+                  HolbuildBuildExec.start_remote_exec_prefetch build_options project node_with_input_key jobs
+                    outside_batch
                 (* What the restore after the batch would find up to date is
                    checked while it runs: on a busy host those reads are slow. *)
                 val settled =

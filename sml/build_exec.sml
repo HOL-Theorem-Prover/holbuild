@@ -2565,20 +2565,11 @@ fun cache_manifest_outputs_equal input_key left right =
       #extra_hashes left_blobs = #extra_hashes right_blobs
     end
 
-(* Whether two theory entries have the same outputs but for the .dat. *)
 fun cache_manifest_outputs_equal_but_dat input_key left right =
-  not (is_run_manifest left orelse is_run_manifest right) andalso
-  let
-    val l = cache_manifest_blobs_from_lines input_key (cache_manifest_lines left)
-    val r = cache_manifest_blobs_from_lines input_key (cache_manifest_lines right)
-  in
-    #sig_hash l = #sig_hash r andalso
-    #sml_hash l = #sml_hash r andalso
-    #trace_hash l = #trace_hash r andalso
-    #extra_hashes l = #extra_hashes r andalso
-    #parents l = #parents r andalso
-    #mldeps l = #mldeps r
-  end
+  HolbuildTheoryCacheManifest.cache_manifest_outputs_equal_but_dat input_key left right
+  handle HolbuildTheoryCacheManifest.Error msg => raise Error msg
+
+val stronger_but_for_dat = HolbuildTheoryCacheManifest.stronger_but_for_dat
 
 fun cache_entry_usable root input_key text =
   let
@@ -2649,8 +2640,12 @@ val remote_theory_publish_attempts = 3
 
 (* Publishes request over the remote's entry for its key as last read, held
    in SEEN, and leaves the entry it reads last there.  A miss is followed by
-   a PUT, without another read before it. *)
-fun publish_theory_action_seen seen remote (request as {key, text}) =
+   a PUT, without another read before it.  FITS_REMOTE_PARENTS says the
+   request's .dat records the parents the remote cache holds, as a worker's
+   does: then an entry that differs from it only in the .dat is the same
+   entry, ranked by its timeout contract.  A client's may record parents it
+   built itself, so its .dat is never put over another. *)
+fun publish_theory_action_seen fits_remote_parents seen remote (request as {key, text}) =
   let
     val incoming = cache_manifest_contract key text
     val initial_resident = !seen
@@ -2659,7 +2654,9 @@ fun publish_theory_action_seen seen remote (request as {key, text}) =
     fun compatible_contract resident_text =
       let val resident = cache_manifest_contract key resident_text
       in
-        if #non_timeout_text resident = #non_timeout_text incoming then resident
+        if #non_timeout_text resident = #non_timeout_text incoming orelse
+           (fits_remote_parents andalso cache_manifest_outputs_equal_but_dat key text resident_text) then
+          resident
         else raise Error "resident manifest differs outside proof-timeout"
       end
     fun attempt attempts resident =
@@ -2726,14 +2723,14 @@ fun publish_theory_action_seen seen remote (request as {key, text}) =
    last read, after the PUT.  Over a resident entry, publication may end
    without reading again, and replica repair writes after its last read, so
    then the caller reads itself. *)
-fun publish_theory_action remote resident request =
+fun publish_theory_action fits_remote_parents remote resident request =
   let
     val seen = ref resident
-    val result = publish_theory_action_seen seen remote request
+    val result = publish_theory_action_seen fits_remote_parents seen remote request
   in (result, if Option.isSome resident then NONE else !seen) end
 
 fun put_remote_theory_action remote _ (request as {key, ...}) =
-  #1 (publish_theory_action remote (HolbuildRemoteCache.get_action remote key) request)
+  #1 (publish_theory_action false remote (HolbuildRemoteCache.get_action remote key) request)
 
 fun remote_cache_destination remote : HolbuildCacheTransfer.destination =
   (* Publishing also records the blob size needed by action metadata.  A
@@ -2825,9 +2822,11 @@ fun hydrate_remote_cache_key_using usable root key =
             (warn ("remote cache entry unusable for " ^ key ^ ": " ^ General.exnMessage e);
              false)
 
-fun prefetch_remote_cache_key root url key =
+(* Copies the first replica whose manifest passes USABLE, as a restore would
+   take: a weaker one copied here would stand in the restore's way. *)
+fun prefetch_remote_cache_key usable root url key =
   if Option.isSome (HolbuildCache.get_action root key) then ()
-  else if copy_remote_cache_entry root url key then
+  else if copy_remote_cache_entry_using usable root url key then
     cache_trace ("remote cache prefetched: " ^ key)
   else ()
 
@@ -2838,8 +2837,6 @@ fun ensure_local_cache_entry_using usable root key =
         else if hydrate_remote_cache_key_using usable root key then HolbuildCache.get_action root key
         else SOME text
     | NONE => if hydrate_remote_cache_key_using usable root key then HolbuildCache.get_action root key else NONE
-
-fun ensure_local_cache_entry root key = ensure_local_cache_entry_using (fn _ => true) root key
 
 fun publish_remote_cache_key root key =
   case HolbuildRemoteCacheConfig.url () of
@@ -2901,6 +2898,7 @@ fun publish_cache_manifest root cache_key subject staged_sig published_sml stage
           if old = manifest then HolbuildCache.touch_action root cache_key
           else if cache_entry_usable root cache_key old then
             if cache_manifest_outputs_equal cache_key old manifest then publish_same_outputs old
+            else if stronger_but_for_dat cache_key manifest old then write_manifest manifest
             else cache_conflict_warning cache_key manifest_path subject old manifest
           else
             write_manifest manifest
@@ -5738,6 +5736,11 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
                       trknl = trknl,
                       promote_preload = promote_preload}
 
+(* Whether a cache entry's timeout contract serves NODE in this build. *)
+fun node_cache_usable (options : build_options) project node =
+  manifest_timeout_satisfies (#allow_cache_timeout_discrepancy options)
+    (tactic_timeout (checkpoint_policy_for_node options project node))
+
 fun proof_engine (CheckpointPolicy {proof_steps = false, ...}) = "plain_v1"
   | proof_engine (CheckpointPolicy {new_ir = true, ...}) = "proof_ir_v3"
   | proof_engine _ = "proof_steps_failed_fragment_span_v6"
@@ -6428,12 +6431,11 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
            the cache may still hold it after its origin replaced it.  An entry
            another build published meanwhile gets the try instead.  Only one
            retry either way. *)
+        (* Passes over replicas whose timeout contract is too weak for this build. *)
+        val usable = manifest_timeout_satisfies allow_timeout_discrepancy (tactic_timeout policy)
         fun materialize retry existing =
           let
-            (* Passes over replicas whose timeout contract is too weak for this build. *)
-            fun hydrate_remote () =
-              hydrate_remote_cache_key_using
-                (manifest_timeout_satisfies allow_timeout_discrepancy (tactic_timeout policy)) root input_key
+            fun hydrate_remote () = hydrate_remote_cache_key_using usable root input_key
             fun hydrate () =
               let
                 val hydrated = hydrate_remote ()
@@ -6474,7 +6476,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
                   else reject_parents ()
           end
       in
-        case ensure_local_cache_entry root input_key of
+        case ensure_local_cache_entry_using usable root input_key of
             NONE => (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                                   input_key ^ " (no manifest)"); CacheMiss)
           | SOME text => materialize true text
@@ -7203,7 +7205,8 @@ fun builds_from_source (options : build_options) project keys node =
     force_node options project node orelse
     (not (built_here_for project node input_key) andalso
      not (#use_cache options andalso cache_enabled node andalso
-          Option.isSome (ensure_local_cache_entry (cache_root ()) input_key)))
+          Option.isSome (ensure_local_cache_entry_using (node_cache_usable options project node)
+                                                        (cache_root ()) input_key)))
   end
 
 (* VIEW maps the load stem of each project library or theory a speculative
@@ -9080,7 +9083,7 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
             val nodes = List.filter (not o no_entry) (HolbuildBuildPlan.selected_nodes plan)
             fun prefetch node =
               case prefetch_key options project keys node of
-                  SOME key => prefetch_remote_cache_key root url key
+                  SOME key => prefetch_remote_cache_key (node_cache_usable options project node) root url key
                 | NONE => ()
             val limit = prefetch_limit jobs
             val _ = cache_trace ("remote cache prefetch threads: " ^ Int.toString (Int.min (limit, length nodes)))
@@ -9098,8 +9101,9 @@ fun start_remote_cache_prefetch (options : build_options) project plan keys jobs
    {add, drain, stop}: add copies the entry of one more key, as the batch
    finishes its action; drain waits for the copies added so far; stop drops
    the copies not yet started, which the build's own prefetch makes, and
-   waits for those in flight. *)
-fun start_remote_exec_prefetch (options : build_options) jobs keys =
+   waits for those in flight.  NODE_OF gives the plan's node of a key, whose
+   timeout contract the copy must serve. *)
+fun start_remote_exec_prefetch (options : build_options) project node_of jobs keys =
   let val none = {add = fn _ => (), drain = fn () => (), stop = fn () => ()}
   in
     case HolbuildRemoteCacheConfig.url () of
@@ -9107,8 +9111,13 @@ fun start_remote_exec_prefetch (options : build_options) jobs keys =
           if not (#use_cache options) then none
           else
             let
+              fun usable key =
+                case node_of key of
+                    SOME node => node_cache_usable options project node
+                  | NONE => (fn _ => true)
               val pool as {add, ...} =
-                start_background_pool (prefetch_limit jobs) (prefetch_remote_cache_key (cache_root ()) url)
+                start_background_pool (prefetch_limit jobs)
+                  (fn key => prefetch_remote_cache_key (usable key) (cache_root ()) url key)
             in
               List.app add keys;
               pool
@@ -11995,16 +12004,6 @@ fun resident_differs_only_in_dat remote root (spec : action_spec) mine resident 
   handle e as HolbuildRemoteCache.Unavailable _ => raise e
        | _ => false
 
-(* Whether the remote's entry for the action differs from the worker's, MINE,
-   only in its .dat and has a weaker timeout contract.  MINE records the
-   restored parents, so it replaces the remote's, as an entry with a stronger
-   contract and the same outputs does. *)
-fun resident_weaker_but_for_dat key mine resident =
-  cache_manifest_outputs_equal_but_dat key mine resident andalso
-  not (timeout_at_least_as_strong (cache_manifest_proof_timeout_text key resident)
-                                  (cache_manifest_proof_timeout_text key mine))
-  handle Error _ => false
-
 (* Whether the remote cache lost a blob ENTRY names, so that no build can
    restore it (remote_entry_satisfies counts it a miss). *)
 fun remote_entry_lost_blob remote entry =
@@ -12015,8 +12014,9 @@ fun remote_entry_lost_blob remote entry =
    (the build's own publish only warns), then puts the action.  A different
    entry already there is replaced, on each node holding one, when the cache
    lost one of its blobs; and replaced when it records parents other than the
-   restored ones or only its .dat differs and its timeout contract is weaker;
-   and otherwise left for check_remote_publication to judge.  Returns the entry
+   restored ones; and, on each node holding one, when only its .dat differs
+   and its timeout contract is weaker (publish_theory_action); and otherwise
+   left for check_remote_publication to judge.  Returns the entry
    read after putting a new one, which saves that check a read. *)
 (* Uploads every blob of the local cache entry KEY, raising if one fails,
    and returns the entry. *)
@@ -12044,7 +12044,7 @@ fun publish_action_entry remote root (spec : action_spec) =
     val key = #input_key spec
     val manifest = upload_entry_blobs remote key
   in
-    #2 (publish_theory_action remote
+    #2 (publish_theory_action true remote
           (case HolbuildRemoteCache.get_action remote key of
                SOME resident =>
                  let
@@ -12074,8 +12074,6 @@ fun publish_action_entry remote root (spec : action_spec) =
                         | NONE => NONE)
                    else if resident_misfits_parents remote root spec resident then
                      replace "its recorded parents differ from the cache's"
-                   else if resident_weaker_but_for_dat key manifest resident then
-                     replace "it differs only in its .dat and has a weaker timeout contract"
                    else SOME resident
                  end
              | NONE => NONE)

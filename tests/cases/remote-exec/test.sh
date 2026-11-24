@@ -3018,6 +3018,68 @@ ring_worker ring-built-worker built
 require_grep '^proof-timeout=2.5$' "${ranked_roots[0]}/ac/$ring_ac"
 require_grep '^proof-timeout=2.5$' "${ranked_roots[1]}/ac/$ring_ac"
 
+# The weaker replica can also differ from the stronger one in its .dat, as
+# two builds whose proofs took different paths record different dependencies.
+python3 - "$tmpdir/ring-strong-ac" "$tmpdir/ring-weak-dat-ac" "$remote_root/cas" "$second_root/cas" <<'PY'
+import hashlib
+import pathlib
+import re
+import sys
+
+strong, weak, *stores = map(pathlib.Path, sys.argv[1:])
+marker = b"manifest-text-v1\n"
+header, manifest = strong.read_bytes().split(marker, 1)
+dat = re.search(rb"(?m)^blob dat ([0-9a-f]{64})$", manifest).group(1)
+other = (stores[0] / dat.decode()).read_bytes() + b"\n"
+other_hash = hashlib.sha256(other).hexdigest().encode()
+for store in stores:
+    (store / other_hash.decode()).write_bytes(other)
+manifest = manifest.replace(b"blob dat " + dat, b"blob dat " + other_hash)
+manifest, count = re.subn(rb"(?m)^proof-timeout=2\.5$", b"proof-timeout=none", manifest)
+assert count == 1
+header, count = re.subn(rb"(?m)^blob " + dat + rb" \d+$", b"blob %s %d" % (other_hash, len(other)), header)
+assert count == 1
+header = re.sub(rb"(?m)^manifest-sha256 .*$", b"manifest-sha256 " + hashlib.sha256(manifest).hexdigest().encode(), header)
+header = re.sub(rb"(?m)^manifest-size .*$", b"manifest-size %d" % len(manifest), header)
+weak.write_bytes(header + marker + manifest)
+PY
+# ring_client NAME CACHE ARGS...: a --remote-only build of copy NAME with
+# cache CACHE that restores TimeoutTheory without a batch.
+ring_client() {
+  local name=$1 cache=$2
+  shift 2
+  write_ring_timeout "$name"
+  (cd "$tmpdir/$name" && HOLBUILD_CACHE=$tmpdir/$cache HOLBUILD_CACHE_TRACE=1 \
+    "$HOLBUILD_BIN" --remote-cache "$first_url,$second_url" build --remote-exec "$coordinator" \
+    --remote-only --tactic-timeout 2.5 "$@" TimeoutTheory) > "$tmpdir/$name.log" 2>&1 ||
+    { cat "$tmpdir/$name.log" >&2; exit 1; }
+  require_grep 'remote execution: nothing to build remotely' "$tmpdir/$name.log"
+  require_grep 'TimeoutTheory restored from cache' "$tmpdir/$name.log"
+  refute_grep 'remote batch\|Theory built\|conflict' "$tmpdir/$name.log"
+}
+cp "$tmpdir/ring-weak-dat-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-strong-ac" "${ranked_roots[1]}/ac/$ring_ac"
+# A build copies only the replica it can restore into its empty cache.
+ring_client ring-dat-client ring-dat-client-cache
+require_grep '^proof-timeout=2.5$' "$tmpdir/ring-dat-client-cache/actions/$ring_key/manifest"
+# One that takes the weaker replica leaves it in its cache, and the stronger
+# replica replaces it there for a build that can't use it.
+ring_client ring-dat-flagged ring-dat-flagged-cache --allow-cache-timeout-discrepancy
+require_grep '^proof-timeout=none$' "$tmpdir/ring-dat-flagged-cache/actions/$ring_key/manifest"
+ring_client ring-dat-upgrade ring-dat-flagged-cache
+require_grep '^proof-timeout=2.5$' "$tmpdir/ring-dat-flagged-cache/actions/$ring_key/manifest"
+# A worker repairs such a replica wherever it is, with the stronger replica
+# read first or with weaker ones only.
+cp "$tmpdir/ring-strong-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-weak-dat-ac" "${ranked_roots[1]}/ac/$ring_ac"
+ring_worker ring-dat-cached-worker
+require_grep '^proof-timeout=2.5$' "${ranked_roots[1]}/ac/$ring_ac"
+cp "$tmpdir/ring-weak-dat-ac" "${ranked_roots[0]}/ac/$ring_ac"
+cp "$tmpdir/ring-weak-dat-ac" "${ranked_roots[1]}/ac/$ring_ac"
+ring_worker ring-dat-built-worker built
+require_grep '^proof-timeout=2.5$' "${ranked_roots[0]}/ac/$ring_ac"
+require_grep '^proof-timeout=2.5$' "${ranked_roots[1]}/ac/$ring_ac"
+
 # The plan record written after the POST keeps the stamps taken when planning
 # hashed the inputs: an input whose link moves to an older file while the
 # batch is submitted is hashed again by the next plan, which check mode
