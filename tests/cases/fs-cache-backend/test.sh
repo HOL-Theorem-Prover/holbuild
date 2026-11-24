@@ -182,9 +182,19 @@ fun check_conflict_pair (old, incoming) =
               | _ => fail "incompatible resident theory manifest was accepted"
   in resident_is incoming end;
 fun check_conflict incoming = check_conflict_pair (strong, incoming);
+(* A manifest differing only in its .dat is the same entry ranked by its
+   contract: a stronger one replaces it, a weaker one does not. *)
+val other_dat_weak = replace_line "blob dat " ("blob dat " ^ HolbuildHash.string_sha256 "different output") weak;
+val _ = HolbuildFSCacheBackend.write_action cache {key = key, text = strong};
+val _ = case put other_dat_weak of HolbuildCacheBackend.Conflict _ => ()
+          | _ => fail "a weaker manifest with another .dat replaced a stronger one";
+val _ = resident_is strong;
+val _ = HolbuildFSCacheBackend.write_action cache {key = key, text = other_dat_weak};
+val _ = assert "a stronger manifest with another .dat did not replace a weaker one"
+  (put strong = HolbuildCacheBackend.Published);
+val _ = resident_is strong;
 val _ = List.app check_conflict
-  [replace_line "blob dat " ("blob dat " ^ HolbuildHash.string_sha256 "different output") weak,
-   replace_line "parent " "parent arithmetic" weak,
+  [replace_line "parent " "parent arithmetic" weak,
    replace_line "input_key=" ("input_key=" ^ HolbuildHash.string_sha256 "other action") weak,
    replace_line "kind=" "kind=library" weak,
    replace_line "holbuild-cache-action-" "holbuild-cache-action-v99" weak,

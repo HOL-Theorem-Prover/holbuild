@@ -6470,7 +6470,9 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
                    Refresh without dropping the usable weaker local entry. *)
                 CacheMiss =>
                   if cached_parents_differ existing then reject_parents ()
-                  else if retry then hydrate () else CacheMiss
+                  (* For an entry too weak for this build, the first lookup
+                     already asked the remote for a usable one. *)
+                  else if retry andalso usable existing then hydrate () else CacheMiss
               | restored as CacheRestored _ =>
                   if theory_parent_hashes_match dat_hash_cache plan node NONE then restored
                   else reject_parents ()
@@ -7205,8 +7207,14 @@ fun builds_from_source (options : build_options) project keys node =
     force_node options project node orelse
     (not (built_here_for project node input_key) andalso
      not (#use_cache options andalso cache_enabled node andalso
-          Option.isSome (ensure_local_cache_entry_using (node_cache_usable options project node)
-                                                        (cache_root ()) input_key)))
+          let val usable = node_cache_usable options project node
+          in
+            (* A weak local entry no replica could replace leaves the theory
+               to build. *)
+            case ensure_local_cache_entry_using usable (cache_root ()) input_key of
+                SOME text => usable text
+              | NONE => false
+          end))
   end
 
 (* VIEW maps the load stem of each project library or theory a speculative

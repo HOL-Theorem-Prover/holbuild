@@ -339,23 +339,6 @@ val _ = assert "a worker leaves a stronger primary with another .dat"
 val _ = RC.remove_file (stored first "ac" theory_ac);
 val _ = RC.remove_file (stored second "ac" theory_ac);
 
-(* The local cache takes a stronger entry over one differing only in the .dat,
-   never a weaker one or one with other outputs. *)
-val fs = HolbuildFSCacheBackend.filesystem (dir ^ "/dat-local-cache-" ^ env "RING_TRANSPORT");
-val _ = HolbuildFSCacheBackend.ensure_layout fs;
-fun put_local text =
-  HolbuildFSCacheBackend.put_action fs CB.PutIfAbsentOrSame {key = theory_key, text = text};
-fun local_manifest () = HolbuildFSCacheBackend.get_action fs theory_key;
-val _ = put_local (other_dat_manifest "none");
-val _ = assert "a stronger local entry replaces a weaker one with another .dat"
-  (put_local (theory_manifest "10.0") = CB.Published andalso local_manifest () = SOME (theory_manifest "10.0"));
-val _ = assert "a weaker local entry with another .dat does not replace a stronger one"
-  (put_local (other_dat_manifest "none") <> CB.Published andalso
-   local_manifest () = SOME (theory_manifest "10.0"));
-val _ = assert "a stronger local entry with other outputs does not replace one"
-  (put_local (theory_manifest "2.5" ^ "parent different\n") <> CB.Published andalso
-   local_manifest () = SOME (theory_manifest "10.0"));
-
 (* An entry replaced in place (a checkpoint index) goes to every node: a node
    answers from its own disk, so one still holding the old entry would serve
    it.  A node failing that write doesn't fail the publication or trip the
