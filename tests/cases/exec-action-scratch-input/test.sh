@@ -16,6 +16,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 server_pid=""
 background=()
+xdev=""
 cleanup() {
   for pid in "${background[@]}" "$server_pid"; do
     [[ -n "$pid" ]] || continue
@@ -23,6 +24,7 @@ cleanup() {
     wait "$pid" 2>/dev/null || true
   done
   cleanup_temp_dir "$tmpdir"
+  [[ -z "$xdev" ]] || rm -rf "$xdev"
 }
 trap cleanup EXIT
 
@@ -70,7 +72,9 @@ val _ =
           in
             print ("scratch input: " ^ TextIO.inputAll input);
             TextIO.closeIn input;
-            print ("scratch links: " ^ Int.toString (Posix.FileSys.ST.nlink (Posix.FileSys.stat path)) ^ "\n")
+            print ("scratch links: " ^ Int.toString (Posix.FileSys.ST.nlink (Posix.FileSys.stat path)) ^ "\n");
+            print ("scratch mode: " ^ SysWord.fmt StringCvt.OCT
+                     (SysWord.andb (Posix.FileSys.S.toWord (Posix.FileSys.ST.mode (Posix.FileSys.stat path)), 0wx1ff)) ^ "\n")
           end) (String.fields (fn c => c = #":") paths)
     | NONE => print "scratch input: none\n";
 
@@ -233,8 +237,23 @@ hb action-spec --upload --scratch-input "$tmpdir/one.txt" --scratch-input "$tmpd
   > "$tmpdir/batch-both.txt"
 worker_command u-both "$(field "$tmpdir/batch-both.txt" scratch:UTheory 4)"
 built u-both one
-grep -A2 -x "scratch input: one" "$tmpdir/u-both.hol" | grep -qx "scratch input: two" || {
+grep -A3 -x "scratch input: one" "$tmpdir/u-both.hol" | grep -qx "scratch input: two" || {
   echo "worker u-both: U did not read both inputs in order" >&2; cat "$tmpdir/u-both.hol" >&2; exit 1; }
+
+# Across file systems, as a worker container's action root beside a
+# host-mounted cache, the input is a read-only copy of the cache's blob.
+xdev=$(mktemp -d /dev/shm/holbuild-test.XXXXXX)
+if [[ "$(stat -c %d "$xdev")" != "$(stat -c %d "$worker_cache")" ]]; then
+  cp -a "$worker_cache/blobs/." "$xdev/"
+  rm -rf "$worker_cache/blobs"
+  ln -s "$xdev" "$worker_cache/blobs"
+  write_u 'ALL_TAC >> simp[]'
+  hb action-spec --upload --scratch-input "$tmpdir/two.txt" UTheory > "$tmpdir/batch-xdev.txt"
+  worker_command u-xdev "$(field "$tmpdir/batch-xdev.txt" scratch:UTheory 4)"
+  built u-xdev two
+  grep -qx "scratch links: 1" "$tmpdir/u-xdev.hol" && grep -qx "scratch mode: 444" "$tmpdir/u-xdev.hol" || {
+    echo "across file systems the input is not a read-only copy" >&2; cat "$tmpdir/u-xdev.hol" >&2; exit 1; }
+fi
 
 # Locally the child reads FILE itself, and every checkpoint U saves has the
 # key it has without the option.
