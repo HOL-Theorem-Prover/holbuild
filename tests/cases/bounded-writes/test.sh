@@ -52,6 +52,9 @@ val _ = List.app (fn name =>
           else fail (name ^ " wrote different text"))
         ["build-exec", "build-exec-atomic", "stat-cache", "remote-cache"]
 
+(* Without libcrypto, fetch_blob links a blob this size instead of copying it. *)
+val _ = if HolbuildHash.uses_libcrypto () then ()
+        else fail "bounded-writes needs libcrypto for fetch_blob to copy the blob"
 val cache = HolbuildFSCacheBackend.filesystem (path "cache")
 val _ = HolbuildFSCacheBackend.ensure_layout cache
 val hash = HolbuildHash.file_sha256 (path "blob")

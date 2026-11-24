@@ -332,7 +332,7 @@ fun json_fields fields = "{" ^ String.concatWith "," fields ^ "}\n"
 
 fun emit_json event fields =
   (Mutex.lock json_mutex;
-   (TextIO.output(TextIO.stdOut, json_fields (json_string_field "event" event :: fields));
+   (HolbuildBoundedOutput.text (TextIO.stdOut, json_fields (json_string_field "event" event :: fields));
     TextIO.flushOut TextIO.stdOut)
    before Mutex.unlock json_mutex)
   handle e => (Mutex.unlock json_mutex; raise e)
@@ -626,7 +626,7 @@ fun message_to stream_name stream text =
   if json_mode () then json_message stream_name text
   else
     case !current_status of
-        NONE => (TextIO.output (stream, text); TextIO.flushOut stream)
+        NONE => (HolbuildBoundedOutput.text (stream, text); TextIO.flushOut stream)
       | SOME status =>
           with_lock status
             (fn () =>
@@ -635,11 +635,11 @@ fun message_to stream_name stream text =
                   if enabled andalso not (!ended) then
                     (TextIO.output (TextIO.stdOut, "\r" ^ clear_to_eol);
                      TextIO.flushOut TextIO.stdOut;
-                     TextIO.output (stream, text);
+                     HolbuildBoundedOutput.text (stream, text);
                      TextIO.flushOut stream;
                      redraw status)
                   else
-                    (TextIO.output (stream, text); TextIO.flushOut stream)
+                    (HolbuildBoundedOutput.text (stream, text); TextIO.flushOut stream)
                 end)
 
 (* Marks the node built by the calling thread as waiting for machine memory
