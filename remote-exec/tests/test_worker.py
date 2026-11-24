@@ -879,20 +879,22 @@ def scripted_main(
     *, unavailable: bool = False, calls: list[float] | None = None, clears: list[bool] | None = None,
     timeouts: list[float] | None = None, drain: bool = False, spells: bool = True, unknown: bool = False,
     unknown_before: bool = False, args: tuple[str, ...] = (), exits: bool = False, reaper_busy: list[bool] | None = None,
-    failed: bool = False,
+    failed: bool = False, idle_exit: float = 0, empty_claim_seconds: float = 0,
 ) -> list[str]:
     """Run ``worker.main`` with extra arguments ``args`` on ``claims`` claims (or, as a list, claims that find work
     or not), each run as an action that sets protection (with no answer, with ``unknown``; from an unknown state,
     with ``unknown_before``) and reports the cache ``unavailable`` or not (after a SIGTERM, with ``drain``), and
     return the claims, runs and protection calls in order. With ``exits``, the worker exits before the claims run
     out; ``reaper_busy`` says whether exec-action's work after a result still runs, at each check (not, once it
-    runs out). With ``failed``, the claims that find no work fail instead."""
+    runs out). With ``failed``, the claims that find no work fail instead. A burst worker exits after ``idle_exit``
+    seconds without work; each claim that finds none takes ``empty_claim_seconds``."""
     monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server, *args))
     monkeypatch.setattr(worker, "HostTelemetry", lambda *_: None)
     monkeypatch.setattr(worker, "wait_for_disk", lambda *_, **_kwargs: None)
     monkeypatch.setattr(worker, "CLAIM_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(worker, "IDLE_EXIT_SECONDS", idle_exit)
     events: list[str] = []
     protection = ScriptedProtection(events, fresh, clears, spells=spells)
     monkeypatch.setattr(worker, "Protection", lambda *_: protection)
@@ -905,7 +907,10 @@ def scripted_main(
             if exits:
                 pytest.fail(f"the worker didn't exit: {events}")
             raise KeyboardInterrupt
-        return left.pop(0)
+        found = left.pop(0)
+        if not isinstance(found, dict):
+            time.sleep(empty_claim_seconds)
+        return found
 
     def run(coordinator, _args, _releases, protection, *_rest, **_kwargs) -> bool:
         events.append("run")
@@ -974,6 +979,19 @@ def test_a_burst_worker_that_ran_an_action_exits_once_a_claim_finds_nothing(
     # Its task goes in a scale-in, or ECS starts it again on the fullest host with room, so partly drained hosts empty.
     events = scripted_main(tmp_path, server, monkeypatch, [], [True, False, True], args=BURST_ARGS, exits=True)
     assert events == ["claim", "run", "on:True", "claim", "off"]
+
+
+def test_a_burst_worker_exits_only_once_its_claims_found_no_work_for_the_idle_exit_time(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A pause between waves is shorter, so the task that would serve the next wave stays.
+    events = scripted_main(
+        tmp_path, server, monkeypatch, [], [True, False, False, True], args=BURST_ARGS, exits=True, idle_exit=0.5,
+        empty_claim_seconds=0.3,
+    )
+    assert events == ["claim", "run", "on:True", "claim", "off", "claim"]
+    events = scripted_main(tmp_path, server, monkeypatch, [], [True, False, False], args=BURST_ARGS, idle_exit=60)
+    assert events == ["claim", "run", "on:True", "claim", "off", "claim", "claim"]
 
 
 def test_a_burst_worker_that_ran_no_action_keeps_claiming(

@@ -81,6 +81,9 @@ PROTECTION_MINUTES = 180
 PROTECTED_SPELL_SECONDS = 3600
 SPELL_GAP_SECONDS = 60
 CLAIM_RETRY_SECONDS = 5  # least time between two claims that found nothing
+# How long a burst worker finds no work after its last action before it exits (below). A pause between waves is
+# shorter, so a task that would serve the next wave stays; an empty host left that long is one ECS scales in.
+IDLE_EXIT_SECONDS = 600
 # Longest wait for a heartbeat or completion answer: above the coordinator's database pool timeout plus the work, so
 # a request it accepted is answered rather than given up on and repeated.
 REQUEST_TIMEOUT_S = 15.0
@@ -1790,11 +1793,11 @@ def main() -> None:
         # Set when ECS refused protection for a claim or the worker dropped it after PROTECTED_SPELL_SECONDS: the
         # worker then claims only once ECS protects it, so a task being stopped takes no action it would give back.
         protect_first = False
-        # A burst worker under ECS that ran an action and then waited out a claim for nothing exits, so its task
-        # goes: at once in a scale-in, else ECS starts a new one where binpack puts it, on the fullest host with room,
-        # so partly drained hosts empty and scale in. A new task runs no action before it may exit, so idle ones
-        # don't restart in a loop.
-        ran_action = False
+        # A burst worker under ECS whose claims have found no work for IDLE_EXIT_SECONDS since its last action exits,
+        # so its task goes: at once in a scale-in, else ECS starts a new one where binpack puts it, on the fullest
+        # host with room, so partly drained hosts empty and scale in. A new task runs an action before it may exit,
+        # so idle ones don't restart in a loop.
+        idle_since: float | None = None
         while not drain.stop.is_set():
             with phases.timed("idle"):
                 wait_for_disk(drain, coordinator, tiers, args.name, sweep, reaper=reaper, before_wait=unprotect)
@@ -1824,7 +1827,8 @@ def main() -> None:
                 protect_first = False
                 with phases.timed("lease"):
                     unprotect()
-                if ran_action and waited_out and protection.spells and tiers[0] != "standard" and not reaper.busy():
+                idle_long = idle_since is not None and time.monotonic() - idle_since >= IDLE_EXIT_SECONDS
+                if idle_long and waited_out and protection.spells and tiers[0] != "standard" and not reaper.busy():
                     print("no work after an action: exiting so the task can go or move", file=sys.stderr, flush=True)
                     break
                 # A claim that failed at once, or a coordinator that doesn't wait, isn't retried in a tight loop.
@@ -1845,7 +1849,7 @@ def main() -> None:
                 # coordinator is down.
                 print(f"action failed in the worker: {error}", file=sys.stderr)
                 unavailable = True
-            ran_action = True
+            idle_since = time.monotonic()
             spell_over = protection.spells and time.monotonic() - protection.since > PROTECTED_SPELL_SECONDS
             if protection.on is not False and (unavailable or spell_over):
                 with phases.timed("lease"):

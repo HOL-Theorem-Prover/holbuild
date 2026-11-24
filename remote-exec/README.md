@@ -902,9 +902,12 @@ worker about 1/60 of its time.
 Other failures are logged and the action carries on.
 
 A worker under ECS protection that claims high work first (a burst worker)
-exits once it has run an action and a claim then waits its full
-`--claim-wait-seconds` for nothing, after any work exec-action does after its
-last result. In a scale-in its task then goes at once; otherwise ECS starts
+exits once it has run an action and its claims have then found no work for 10
+minutes (the last one waiting its full `--claim-wait-seconds`), after any work
+exec-action does after its last result. A pause between waves is shorter, so
+the task that would serve the next wave stays; it still drops protection at
+its first empty claim, so a scale-in can stop it at once. Once it exits, its
+task goes at once in a scale-in; otherwise ECS starts
 it again where the service's placement puts it (with `binpack`, on the
 fullest host with room), so the workers of partly drained hosts move onto
 full ones and the empty hosts scale in. A started task runs an action before
