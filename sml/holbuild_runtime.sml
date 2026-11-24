@@ -80,13 +80,32 @@ struct
      max_library_rows libraries of most self time and the rest as one
      `other` row, and all theories as one row; or, having timed nothing,
      one `none` row.  A heap saved while timing keeps the table; a process
-     restoring it has another pid and starts afresh. *)
+     restoring it is another process (process_identity) and starts afresh. *)
   val max_library_rows = 64
   fun no_source_loads () : (string * string, int * LargeInt.int * LargeInt.int) Binarymap.dict =
     Binarymap.mkDict (fn ((k1, n1), (k2, n2)) =>
                         case String.compare (k1, k2) of EQUAL => String.compare (n1, n2) | order => order)
+  (* The process: its pid, and its start time, which tells a process that
+     restores a heap from the one that saved it even if the pid is reused. *)
+  fun process_identity () =
+    let
+      val pid = LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord (Posix.ProcEnv.getpid ())))
+      val start =
+        let
+          val input = TextIO.openIn "/proc/self/stat"
+          val stat = TextIO.inputAll input before TextIO.closeIn input
+          (* The fields after the command name, which ends at the last ')'. *)
+          val fields = String.tokens Char.isSpace
+                         (Substring.string (Substring.taker (fn c => c <> #")") (Substring.full stat)))
+        in
+          List.nth (fields, 19)
+        end
+        handle _ => ""
+    in
+      pid ^ ":" ^ start
+    end
   type source_load_state =
-    {pid : Posix.ProcEnv.pid option ref,
+    {process : string option ref,
      loads : (string * string, int * LargeInt.int * LargeInt.int) Binarymap.dict ref,
      (* The nested time of each timed load still running, innermost first. *)
      stack : LargeInt.int ref list ref,
@@ -99,13 +118,13 @@ struct
   val source_load_state : source_load_state =
     case lookup_value ["HolbuildRuntime"] "source_load_state" of
         SOME state => RunCall.unsafeCast state
-      | NONE => {pid = ref NONE, loads = ref (no_source_loads ()), stack = ref [], untimed_dir = ref ""}
+      | NONE => {process = ref NONE, loads = ref (no_source_loads ()), stack = ref [], untimed_dir = ref ""}
   val untimed_dir = #untimed_dir source_load_state
 
   fun label_text text = String.map (fn c => if Char.isGraph c andalso c <> #"=" then c else #"_") text
 
   fun report_source_loads () =
-    if !(#pid source_load_state) <> SOME (Posix.ProcEnv.getpid ()) then ()
+    if !(#process source_load_state) <> SOME (process_identity ()) then ()
     else
       let
         val rows = Binarymap.listItems (!(#loads source_load_state))
@@ -144,9 +163,9 @@ struct
      report when it first asks. *)
   fun timing_source_loads () =
     OS.Process.getEnv "HOLBUILD_TIMING_SOURCE_LOADS" = SOME "1" andalso
-    (if !(#pid source_load_state) = SOME (Posix.ProcEnv.getpid ()) then ()
+    (if !(#process source_load_state) = SOME (process_identity ()) then ()
      else
-       (#pid source_load_state := SOME (Posix.ProcEnv.getpid ());
+       (#process source_load_state := SOME (process_identity ());
         #loads source_load_state := no_source_loads ();
         #stack source_load_state := [];
         OS.Process.atExit report_source_loads);
