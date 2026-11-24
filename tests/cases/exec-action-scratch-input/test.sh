@@ -132,7 +132,8 @@ while (( $(date +%s) - $(stat -c %Z "$tmpdir/one.txt") < 2 )); do sleep 0.2; don
 require_grep "$sha_one" "$stats"
 sed -i "s/$sha_one/$sha_two/" "$stats"
 [[ "$(scratch_option forged)" == "$sha_two" ]] || { echo "an unchanged scratch input was hashed again" >&2; exit 1; }
-touch "$tmpdir/one.txt"
+# Dated ahead, it stays in the racy window however late the export starts.
+touch -d "+1 hour" "$tmpdir/one.txt"
 [[ "$(scratch_option touched)" == "$sha_one" ]] || { echo "a touched scratch input kept its old hash" >&2; exit 1; }
 if grep -q "$sha_one" "$stats"; then echo "a hash read within a second of a change was recorded" >&2; exit 1; fi
 
