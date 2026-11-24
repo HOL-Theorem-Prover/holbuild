@@ -1037,10 +1037,12 @@ fun reconcile_with_published req k =
                          Option.isSome (with_exclusive_lease k (fn () => replace_entry req k staged))))
                before HolbuildToolchainArchive.cleanup_staging final)
               handle e => (HolbuildToolchainArchive.cleanup_staging final; raise e)
-            (* Unlike publish_entry, a failed upload keeps the entry; an
-               incomplete one is left for validate_entry to rebuild. *)
+            (* Unlike publish_entry, a failed upload keeps the entry; one a
+               restore would reject is left for validate_entry.  Its checkout
+               isn't checked: git takes the mutation lease, which this
+               action's usage lease excludes, and no action can write it. *)
             fun republish () =
-              if not (complete_toolchain_contents k) then ()
+              if not (built (holdir_for_key k) andalso heap_loads k) then ()
               else
                 case HolbuildToolchainArchive.publish
                        {remote = remote, identity = archive_identity k, entry_dir = final, replace = true} of

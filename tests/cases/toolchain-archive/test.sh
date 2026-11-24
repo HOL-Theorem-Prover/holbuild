@@ -511,7 +511,8 @@ val holmake = entry_file "hol/bin/Holmake";
 val _ = sh ("chmod a-x " ^ holmake);
 val _ = lose_blob ();
 val _ = reconcile ();
-val _ = assert "published again a toolchain a restore would reject" (not (exists blob_path));
+val _ = assert "published again a toolchain a restore would reject"
+  (not (exists blob_path) andalso names_blob () andalso recorded () = blob ^ "\n");
 val _ = sh ("chmod a+x " ^ holmake);
 
 val _ = lose_blob ();
