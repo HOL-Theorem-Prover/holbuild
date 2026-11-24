@@ -16476,8 +16476,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                       before add_restore_steps ())
                      handle e => (add_restore_steps (); raise e))
                 | _ => nothing_restored
-            (* It writes the host's module store, which a check-only action
-               leaves alone. *)
+            (* It fills the host's module store for later actions, which a
+               check-only action leaves to them: it takes only the modules a
+               checkpoint it restores needs. *)
             val _ =
               if not (Option.isSome ahead) andalso not (Option.isSome (#heap restored)) andalso
                  not (#check_only spec)
