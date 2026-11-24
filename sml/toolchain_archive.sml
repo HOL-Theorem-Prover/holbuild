@@ -105,7 +105,7 @@ fun create_archive {entry_dir, identity, archive_path} =
           sources =
             [(manifest_dir, [internal_manifest_path]),
              (entry_dir, ["."])],
-          excludes = ["./build.ok", "./last-used", "./analysers", "*/.hol/locks", "*/.hol/locks/*"],
+          excludes = ["./build.ok", "./last-used", "./archive-blob", "./analysers", "*/.hol/locks", "*/.hol/locks/*"],
           hard_dereference = true});
      remove_tree manifest_dir)
     handle e => (cleanup (); raise e)
@@ -125,27 +125,49 @@ fun extract_archive {archive_path, staging_dir} =
     (fn () => HolbuildTar.extract
       {archive_path = archive_path, destination = staging_dir})
 
-fun install_archive {archive_path, identity, final_dir} =
+(* Extracts and checks the archive in a new staging directory beside
+   FINAL_DIR, which it returns. *)
+fun stage_archive {archive_path, identity, final_dir} =
   let
     val staging_dir = staging_path final_dir
-    val extracted_marker = Path.concat(staging_dir, "build.ok")
-    fun cleanup () = remove_tree staging_dir handle _ => ()
+    (* lstat, so a member that is a link counts whatever it points at. *)
+    fun member name = (ignore (Posix.FileSys.lstat (Path.concat(staging_dir, name))); true)
+                      handle OS.SysErr _ => false
   in
-    (if path_exists final_dir then die ("toolchain install path already exists: " ^ final_dir) else ();
-     FS.mkDir staging_dir;
+    (FS.mkDir staging_dir;
      (extract_archive {archive_path = archive_path, staging_dir = staging_dir};
-      if path_exists extracted_marker then die "archive contains build.ok" else ();
-      if path_exists (Path.concat(staging_dir, "last-used")) then die "archive contains last-used" else ();
-      if path_exists (Path.concat(staging_dir, "analysers")) then die "archive contains analysers" else ();
+      List.app (fn name => if member name then die ("archive contains " ^ name) else ())
+        ["build.ok", "last-used", "archive-blob", "analysers"];
       validate_extracted_manifest {staging_dir = staging_dir, identity = identity})
      handle Error message => reject message;
-     FS.rename {old = staging_dir, new = final_dir})
-    handle e => (cleanup (); raise e)
+     staging_dir)
+    handle e => (remove_tree staging_dir handle _ => (); raise e)
   end
 
-fun restore {remote, identity, final_dir} =
-  case HolbuildRemoteCache.get_action remote identity of
-      NONE => false
+(* Moves a staged archive to FINAL_DIR, which must not exist. *)
+fun install_staged {staging_dir, final_dir} =
+  (if path_exists final_dir then die ("toolchain install path already exists: " ^ final_dir) else ();
+   FS.rename {old = staging_dir, new = final_dir})
+  handle e => (remove_tree staging_dir handle _ => (); raise e)
+
+(* Where an entry replaced by a staged archive waits until the new one is
+   complete; cleanup_staging removes it with the staging directories. *)
+fun replaced_path final_dir = Path.concat(Path.dir final_dir, stage_prefix final_dir ^ "replaced")
+
+(* The record a cache in front of the store holds may be one the store has
+   since replaced, so toolchain records are read from the store. *)
+fun published_record remote identity =
+  HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.get_action remote identity)
+
+(* The archive blob the remote's record for IDENTITY names, if it has one. *)
+fun published_blob remote identity =
+  Option.map parse_remote_record (published_record remote identity)
+
+(* Fetches the remote's archive for IDENTITY and stages it beside FINAL_DIR
+   (stage_archive); NONE when the remote has no record. *)
+fun stage {remote, identity, final_dir} =
+  case published_record remote identity of
+      NONE => NONE
     | SOME text =>
         let
           val hash = parse_remote_record text
@@ -162,15 +184,25 @@ fun restore {remote, identity, final_dir} =
         in
           ((FS.mkDir scratch_dir;
             fetch ();
-            install_archive {archive_path = archive_path, identity = identity, final_dir = final_dir};
-            cleanup ();
-            true)
+            SOME {hash = hash,
+                  staging_dir = stage_archive {archive_path = archive_path, identity = identity,
+                                               final_dir = final_dir}}
+            before cleanup ())
            handle e => (cleanup (); raise e))
         end
 
+(* Installs the remote's archive at FINAL_DIR and returns its blob hash;
+   NONE when the remote has no record. *)
+fun restore {remote, identity, final_dir} =
+  case stage {remote = remote, identity = identity, final_dir = final_dir} of
+      NONE => NONE
+    | SOME {hash, staging_dir} =>
+        (install_staged {staging_dir = staging_dir, final_dir = final_dir}; SOME hash)
+
 (* Another builder may have published since this one's restore missed, so
    look for the action before creating and uploading the archive.  replace
-   overwrites an action whose archive this builder rejected (see Rejected). *)
+   overwrites an action whose archive this builder rejected (see Rejected).
+   Returns the archive's blob hash when the remote's record names it. *)
 fun publish {remote, identity, entry_dir, replace} =
   let
     val archive_path = temp_path "publish"
@@ -185,9 +217,8 @@ fun publish {remote, identity, entry_dir, replace} =
       if replace then HolbuildRemoteCache.replace_action_unconditionally remote request
       else HolbuildRemoteCache.put_action remote HolbuildCacheBackend.PutIfAbsentOrSame request
   in
-    if HolbuildRemoteCache.disabled () then HolbuildCacheBackend.Skipped
-    else if not replace andalso Option.isSome (HolbuildRemoteCache.get_action remote identity) then
-      HolbuildCacheBackend.AlreadyPresent
+    if HolbuildRemoteCache.disabled () then NONE
+    else if not replace andalso Option.isSome (published_record remote identity) then NONE
     else
       ((create_archive {entry_dir = entry_dir, identity = identity, archive_path = archive_path};
         let
@@ -199,12 +230,11 @@ fun publish {remote, identity, entry_dir, replace} =
                 (* HTTP has no compare-and-swap: two builders can both see no
                    record and both put one, so only a record that still names
                    this archive counts as ours. *)
-                (case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote identity) of
-                     SOME text =>
-                       if (parse_remote_record text = hash handle _ => false) then HolbuildCacheBackend.Published
-                       else HolbuildCacheBackend.AlreadyPresent
-                   | NONE => HolbuildCacheBackend.AlreadyPresent)
-            | result as HolbuildCacheBackend.AlreadyPresent => result
+                (case HolbuildRemoteCache.required (fn () => published_record remote identity) of
+                     SOME text => if (parse_remote_record text = hash handle _ => false) then SOME hash else NONE
+                   | NONE => NONE)
+            (* A record equal to this one names this archive. *)
+            | HolbuildCacheBackend.AlreadyPresent => SOME hash
             | HolbuildCacheBackend.Skipped => die "remote cache skipped toolchain action publication"
             | HolbuildCacheBackend.Conflict detail => die ("remote cache rejected toolchain action: " ^ detail)
         end before cleanup ())

@@ -859,6 +859,12 @@ the path of
 change what the build produces.
 No key covers it: outputs and checkpoints are cached as if it were absent,
 so they must not depend on it.
+Given more than once,
+.B HOLBUILD_SCRATCH_INPUT
+holds the paths in the order given, separated by
+.BR : ;
+no path may then contain a
+.BR : .
 .TP
 .BI \-\-remote\-exec " URL"
 Build the theories the remote cache lacks, and that are not built here for

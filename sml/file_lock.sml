@@ -85,6 +85,11 @@ fun acquire_shared_path_wait {path} = acquire_path_wait Posix.IO.F_RDLCK path
 (* Blocks until no other process holds any lock on the path. *)
 fun acquire_exclusive_path_wait {path} = acquire_path_wait Posix.IO.F_WRLCK path
 fun release (FileLock {fd, ...}) = close_fd fd
+(* Turns a held lock exclusive in place, without waiting: false while another
+   process holds one on the path.  A failed attempt keeps the lock held. *)
+fun try_exclusive (FileLock {fd, ...}) = try_lock_fd fd
+(* Turns a held lock back to shared in place; it is never released between. *)
+fun make_shared (FileLock {fd, ...}) = wait_lock_fd Posix.IO.F_RDLCK fd
 (* Whether the locked file is still the one at the lock's path: a remover may
    have unlinked it between this process opening it and locking it. *)
 fun at_path (FileLock {fd, path}) =

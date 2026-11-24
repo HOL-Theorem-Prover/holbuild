@@ -1405,6 +1405,12 @@ outputs and checkpoints built with one FILE, or none, are reused with another.
 A script whose outputs depend on what FILE holds builds wrongly cached
 theories; declare such a file as an extra input instead.
 
+The option may be given more than once, for files that change at different
+rates: `HOLBUILD_SCRATCH_INPUT` then holds their paths in the order given,
+separated by `:`, and no path may contain a `:`. Each file is hashed, uploaded
+and staged on its own, so one that stays the same costs little while another
+changes.
+
 ### The plan record
 
 Planning a build discovers every source, analyses its dependencies and
@@ -1978,12 +1984,12 @@ renamed) and treat the directory as a cache it may find empty.
 
 A theory exported with `--scratch-input FILE` (see "Giving a tool a file it
 reads") names FILE by its SHA-256 in the spec's `option scratch-input` line,
-and the client uploads FILE with the spec's sources. Before HOL starts, the
-worker fetches it, through its host blob store like a source, to
-`.holbuild/scratch/<sha256>` under the action root, outside the directories the
-action may write, and gives the theory's HOL processes its path as
-`HOLBUILD_SCRATCH_INPUT`. A missing blob fails the action like a missing
-source.
+one line per FILE in the order given, and the client uploads each FILE with the
+spec's sources. Before HOL starts, the worker fetches each, through its host
+blob store like a source, to `.holbuild/scratch/<sha256>` under the action
+root, outside the directories the action may write, and gives the theory's HOL
+processes their paths as `HOLBUILD_SCRATCH_INPUT`. A missing blob fails the
+action like a missing source.
 
 With `--ahead-parent INPUT_KEY:SPEC-SHA256`, given once per dependency that
 another worker is still building from that spec (a late parent), the worker

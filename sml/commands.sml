@@ -137,6 +137,8 @@ fun build_help () = print
   \      remote worker, a read-only copy), for data a tool reads that must not\n\
   \      change what the build produces. No key covers it: outputs and\n\
   \      checkpoints are cached as if it were absent, so they must not depend on it.\n\
+  \      Given more than once, HOLBUILD_SCRATCH_INPUT holds the paths in order,\n\
+  \      separated by \":\".\n\
   \  --remote-exec URL [--remote-only] [--priority N] [--speculative-loading[=N]]\n\
   \      [--detach | --attach BATCH-ID]\n\n\
   \With --remote-exec, theories the remote cache lacks and that aren't\n\
@@ -2605,9 +2607,19 @@ fun split_scratch_input_flag args =
           if not (Posix.FileSys.ST.isReg (Posix.FileSys.stat path)) then
             raise Error ("--scratch-input takes a regular file, not " ^ HolbuildHash.quote file)
           else
-            (HolbuildBuildExec.scratch_input_file := SOME path;
-             HolbuildBuildExec.scratch_input_path := SOME path;
-             split_scratch_input_flag rest)
+            let val files = !HolbuildBuildExec.scratch_input_files @ [path]
+            in
+              (* Children get the paths joined by ":". *)
+              case List.find (fn file => CharVector.exists (fn c => c = #":") file) files of
+                  SOME file =>
+                    if null (tl files) then ()
+                    else raise Error ("--scratch-input given more than once takes no path with \":\": " ^
+                                      HolbuildHash.quote file)
+                | NONE => ();
+              HolbuildBuildExec.scratch_input_files := files;
+              HolbuildBuildExec.scratch_input_paths := files;
+              split_scratch_input_flag rest
+            end
         end
     | ["--scratch-input"] => raise Error "--scratch-input requires FILE"
     | x :: rest => x :: split_scratch_input_flag rest

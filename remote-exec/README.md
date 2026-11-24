@@ -310,16 +310,18 @@ workers do when they aren't running HOL:
 - `release`: finding and, on first use, building the action's holbuild release;
 - `before_hol`, `hol`, `after_hol`: running `exec-action`, split at the start
   of its first HOL child and the end of its last (fetching and restoring
-  inputs before, publishing outputs and uploading the log after, until its
-  result). A HOL child is a
+  inputs before, publishing outputs, uploading the log and, for a passing
+  action, publishing its tool cache after, until its result). A HOL child is a
   descendant of `exec-action` holding a `--cooperate-dir` lease, which the
   worker looks for every second;
 - `exec`: all of `exec-action` until its result, for a worker without
   `--cooperate-dir`;
 - `complete`: reporting the result;
 - `after_result`: `exec-action` after its result is reported, publishing
-  shared checkpoints and tools for later actions and emptying the action's
-  directory, until it releases the action-root lock (`action.lock` in the
+  shared checkpoints for later actions (a failed action's checkpoints and
+  tool cache go before its result, except an interrupted action's and a
+  passing action's whose required log upload failed) and emptying the
+  action's directory, until it releases the action-root lock (`action.lock` in the
   worker's cache). It then refreshes the cache-cap measurement and writes
   theory modules in the background while the worker claims its next action;
   releases before 0.14.94 keep the lock, and the worker waits, until they
