@@ -10,7 +10,8 @@ source "$SCRIPT_DIR/../../lib.sh"
 # build --scratch-input FILE: theory children read FILE through
 # HOLBUILD_SCRATCH_INPUT, here and on a worker, and nothing keys it: the
 # action, its dependencies and every checkpoint before the target are the
-# same with and without it, and whatever FILE holds.
+# same with and without it, and whatever FILE holds.  Given more than once,
+# the variable holds the paths in order, separated by ":".
 
 tmpdir=$(make_temp_dir)
 server_pid=""
@@ -62,16 +63,16 @@ Proof
 QED
 
 val _ =
-  print ("scratch input: " ^
-         (case OS.Process.getEnv "HOLBUILD_SCRATCH_INPUT" of
-              SOME path =>
-                let val input = TextIO.openIn path
-                in TextIO.inputAll input before TextIO.closeIn input end
-            | NONE => "none\n"));
-val _ =
   case OS.Process.getEnv "HOLBUILD_SCRATCH_INPUT" of
-      SOME path => print ("scratch links: " ^ Int.toString (Posix.FileSys.ST.nlink (Posix.FileSys.stat path)) ^ "\n")
-    | NONE => ();
+      SOME paths =>
+        List.app (fn path =>
+          let val input = TextIO.openIn path
+          in
+            print ("scratch input: " ^ TextIO.inputAll input);
+            TextIO.closeIn input;
+            print ("scratch links: " ^ Int.toString (Posix.FileSys.ST.nlink (Posix.FileSys.stat path)) ^ "\n")
+          end) (String.fields (fn c => c = #":") paths)
+    | NONE => print "scratch input: none\n";
 
 Theorem u2:
   T
@@ -115,6 +116,19 @@ if hb action-spec --scratch-input "$tmpdir/fifo" UTheory > "$tmpdir/fifo.log" 2>
 fi
 require_grep "\-\-scratch-input takes a regular file" "$tmpdir/fifo.log"
 
+# Given twice, each file gets its own line, in order, and is uploaded.
+hb action-spec --upload --scratch-input "$tmpdir/two.txt" --scratch-input "$tmpdir/one.txt" UTheory \
+  > "$tmpdir/batch-both.txt"
+[[ "$(sed -n 's/^option scratch-input=//p' "$specs/$(field "$tmpdir/batch-both.txt" scratch:UTheory 4)")" == \
+   "$(sha256sum "$tmpdir/two.txt" "$tmpdir/one.txt" | cut -d' ' -f1)" ]] || {
+  echo "two scratch inputs are not named in order" >&2; exit 1; }
+mkdir "$tmpdir/a:b"
+cp "$tmpdir/one.txt" "$tmpdir/a:b/one.txt"
+if hb action-spec --scratch-input "$tmpdir/two.txt" --scratch-input "$tmpdir/a:b/one.txt" UTheory > "$tmpdir/colon.log" 2>&1; then
+  echo "a path with a colon was accepted beside another scratch input" >&2; exit 1
+fi
+require_grep "takes no path with" "$tmpdir/colon.log"
+
 # An unchanged input keeps its hash from export to export, by git's index
 # scheme: the record is believed while the file's stat matches (a forged
 # one shows it), and a touched file is hashed again.  Without --upload, as
@@ -127,11 +141,15 @@ scratch_option() {
   sed -n 's/^option scratch-input=//p' "$specs/$(field "$tmpdir/batch-$1.txt" scratch:UTheory 4)"
 }
 # Only a file changed over a second before the export is recorded.
-while (( $(date +%s) - $(stat -c %Z "$tmpdir/one.txt") < 2 )); do sleep 0.2; done
+while (( $(date +%s) - $(stat -c %Z "$tmpdir/two.txt") < 2 )); do sleep 0.2; done
 [[ "$(scratch_option first)" == "$sha_one" ]] || { echo "the scratch input's hash is wrong" >&2; exit 1; }
 require_grep "$sha_one" "$stats"
 sed -i "s/$sha_one/$sha_two/" "$stats"
 [[ "$(scratch_option forged)" == "$sha_two" ]] || { echo "an unchanged scratch input was hashed again" >&2; exit 1; }
+# Another build's input joins the record rather than replacing it.
+hb action-spec --scratch-input "$tmpdir/two.txt" UTheory > /dev/null
+[[ "$(scratch_option kept)" == "$sha_two" ]] || { echo "another input's export dropped this one's record" >&2; exit 1; }
+[[ "$(grep -c "$sha_two" "$stats")" == 2 ]] || { echo "the other input was not recorded beside it" >&2; cat "$stats" >&2; exit 1; }
 # Dated ahead, it stays in the racy window however late the export starts.
 touch -d "+1 hour" "$tmpdir/one.txt"
 [[ "$(scratch_option touched)" == "$sha_one" ]] || { echo "a touched scratch input kept its old hash" >&2; exit 1; }
@@ -208,6 +226,15 @@ grep -qx "scratch links: 2" "$tmpdir/u-two.hol" && [[ "$(stat -c %a "$worker_cac
   echo "the restaged scratch input is not the cache's read-only blob" >&2; cat "$tmpdir/u-two.hol" >&2; exit 1; }
 require_grep "loading ahead found a build to reuse; building plain" "$tmpdir/u-two.log"
 require_grep "from: theorem-context checkpoint after u1" "$tmpdir/u-two.log"
+
+# Two inputs: the worker stages both and the child reads them in order.
+write_u 'ACCEPT_TAC TRUTH ORELSE simp[]'
+hb action-spec --upload --scratch-input "$tmpdir/one.txt" --scratch-input "$tmpdir/two.txt" UTheory \
+  > "$tmpdir/batch-both.txt"
+worker_command u-both "$(field "$tmpdir/batch-both.txt" scratch:UTheory 4)"
+built u-both one
+grep -A2 -x "scratch input: one" "$tmpdir/u-both.hol" | grep -qx "scratch input: two" || {
+  echo "worker u-both: U did not read both inputs in order" >&2; cat "$tmpdir/u-both.hol" >&2; exit 1; }
 
 # Locally the child reads FILE itself, and every checkpoint U saves has the
 # key it has without the option.
