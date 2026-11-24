@@ -1301,6 +1301,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         raise Error "--check-only writes no outputs to hash; remove --emit-output-hashes"
       else if check_only andalso trknl then
         raise Error "--check-only writes no proof traces; remove --trknl"
+      else if check_only andalso repl_on_failure then
+        raise Error "--check-only saves no checkpoints for a REPL to start from; remove --repl-on-failure"
       else ()
     val _ =
       if proof_scope = HolbuildTacticTimeoutPolicy.ProofAll andalso
@@ -2786,8 +2788,10 @@ fun build_watch tc cli_jobs parsed =
   let
     val resolution = resolution_for_toolchain tc
     val _ = HolbuildWatch.ensure_inotifywait ()
+    (* Each build checks a check-only theory afresh. *)
     fun attempt prepared =
-      (build_once_with_prepared tc cli_jobs prepared parsed; ())
+      (HolbuildBuildExec.forget_checked_verdicts ();
+       build_once_with_prepared tc cli_jobs prepared parsed; ())
       handle exn =>
         case build_iteration_error_message exn of
             SOME msg => warn ("build failed: " ^ msg)

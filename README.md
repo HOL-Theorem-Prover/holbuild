@@ -329,7 +329,8 @@ their metadata stay as they were. Outputs that are up to date or would be cut
 off pass it without a build; a cache entry doesn't, as only restoring it shows
 that it fits the parent outputs, so with `--remote-exec` a worker checks it.
 What it loads is built and cached as usual, and a failed proof still saves its
-failed prefix, from which the next build or check resumes.
+failed prefix, from which the next build or check resumes. It excludes
+`--emit-output-hashes`, `--trknl` and `--repl-on-failure`.
 
 Keep-going applies within a resolved build plan. Setup or dependency-planning
 errors still stop the command. A theory that generates SML sources must finish

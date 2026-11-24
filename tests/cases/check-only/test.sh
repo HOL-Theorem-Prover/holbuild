@@ -146,6 +146,17 @@ expect_build pass-built 0
 [[ "$(find "$project/.holbuild" -name 'TScript.sml.key' -exec sha256sum {} + | sort)" == "$t_metadata" ]] ||
   { echo "check-only changed T's metadata" >&2; exit 1; }
 
+# Metadata a build with output hashes wrote stays as it is too.
+build hashes --emit-output-hashes TTheory
+expect_build hashes 0
+grep -rq 'output-sha256=' --include='TScript.sml.key' "$project/.holbuild" ||
+  { echo "the build with output hashes recorded none" >&2; exit 1; }
+t_metadata=$(find "$project/.holbuild" -name 'TScript.sml.key' -exec sha256sum {} + | sort)
+build hashes-check --check-only TTheory
+expect_build hashes-check 0
+[[ "$(find "$project/.holbuild" -name 'TScript.sml.key' -exec sha256sum {} + | sort)" == "$t_metadata" ]] ||
+  { echo "check-only rewrote metadata with output hashes" >&2; exit 1; }
+
 # T's cache entry from the plain build gives no verdict: only restoring it
 # shows that it fits A's outputs, so with T's outputs gone the check builds.
 write_t "ALL_TAC >> ACCEPT_TAC TRUTH"
@@ -180,7 +191,7 @@ SML
   no_t_outputs "both-${order%% *}"
 done
 
-for flag in --emit-output-hashes; do
+for flag in --emit-output-hashes --repl-on-failure; do
   build "reject$flag" --check-only "$flag" TTheory
   expect_build "reject$flag" 1
   require_grep "remove $flag" "$tmpdir/reject$flag.log"
@@ -193,9 +204,11 @@ start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 url=$remote_url
 worker_cache=$tmpdir/worker
 field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $col }' "$1"; }
+# worker NAME [plain]: runs T's check-only action (its plain one with plain).
 worker() {
-  local name=$1 spec
-  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" action-spec --upload --check-only TTheory) \
+  local name=$1 spec check=(--check-only)
+  [[ ${2:-} == plain ]] && check=()
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" action-spec --upload "${check[@]}" TTheory) \
     > "$tmpdir/$name.batch"
   spec=$(field "$tmpdir/$name.batch" checkonly:TTheory 4)
   remote_key=$(field "$tmpdir/$name.batch" checkonly:TTheory 3)
@@ -258,3 +271,17 @@ nothing_published share-fail
 no_modules share-fail
 [[ -n "$(published holbuild-shared-failed-prefix-v1)" ]] || {
   echo "the failing check shared no failed prefix" >&2; cat "$tmpdir/share-fail.log" >&2; exit 1; }
+
+# Theory modules a plain action published are fetched by none: a plain
+# worker publishes A's module where the toolchain writes them, and a
+# check-only one, on a fresh host, writes and fetches none.
+write_t "ALL_TAC >> ACCEPT_TAC TRUTH >> ALL_TAC"
+worker plain-modules plain
+expect_worker plain-modules 0 "status=built"
+if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
+  require_grep 'modules_published=[1-9]' "$tmpdir/plain-modules.log"
+fi
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH >> ALL_TAC"
+worker share-modules
+expect_worker share-modules 0 "status=built"
+no_modules share-modules

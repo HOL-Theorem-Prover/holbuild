@@ -2796,6 +2796,11 @@ fun checked_verdict key =
    Redblackset.member (!checked_verdict_keys, key)
    before Mutex.unlock expected_remote_mutex)
 
+fun forget_checked_verdicts () =
+  (Mutex.lock expected_remote_mutex;
+   checked_verdict_keys := Redblackset.empty String.compare;
+   Mutex.unlock expected_remote_mutex)
+
 (* Copies the remote entry for key into the local cache, from the first node
    whose manifest passes `usable`.  Returns false on a remote miss and raises
    if the entry is unusable. *)
@@ -6579,8 +6584,8 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
     fun check_only_verdict () =
       if checked_verdict input_key then HolbuildStatus.Built
       else if not forced andalso not (always_reexecute node) andalso
-         (up_to_date dat_hash_cache (#emit_output_hashes options) allow_timeout_discrepancy
-            policy project plan keys input_key toolchain_key node orelse
+         (Option.isSome (up_to_date_metadata dat_hash_cache allow_timeout_discrepancy policy project plan
+                           input_key node) orelse
           Option.isSome (early_cutoff_metadata deps_output_key dat_hash_cache allow_timeout_discrepancy policy
                            project plan toolchain_key node))
       then (note_checked_verdict input_key; HolbuildStatus.UpToDate)
@@ -16380,11 +16385,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         (* A local entry that didn't restore must not stand in for this
            build's when the publication is checked, and, as in a local
            build, its theory's checkpoints may hold parents other than
-           the ones now restored. *)
+           the ones now restored.  A forced check-only action replaces no
+           entry, so it keeps the one it skipped. *)
         val _ =
           case HolbuildCache.get_action cache (#input_key spec) of
               SOME _ =>
-                (HolbuildCache.remove_action cache (#input_key spec);
+                ((if forced andalso #check_only spec then () else HolbuildCache.remove_action cache (#input_key spec));
                  if forced then () else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
             | NONE => ()
         val stage = action_stage root action
@@ -16437,8 +16443,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                       before add_restore_steps ())
                      handle e => (add_restore_steps (); raise e))
                 | _ => nothing_restored
+            (* It writes the host's module store, which a check-only action
+               leaves alone. *)
             val _ =
-              if not (Option.isSome ahead) andalso not (Option.isSome (#heap restored))
+              if not (Option.isSome ahead) andalso not (Option.isSome (#heap restored)) andalso
+                 not (#check_only spec)
               then prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
               else ()
             fun publish_shared () =
