@@ -2139,6 +2139,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
             val misfits = ref []
             (* The input keys of every batch this build submitted. *)
             val submitted_keys = ref ([] : string list)
+            val _ = HolbuildStatus.forget_carried_outcomes ()
             (* The input keys of the "theory <key>" items of a resubmission. *)
             fun theory_keys items =
               List.mapPartial (fn item => if String.isPrefix "theory " item
@@ -2295,7 +2296,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 if not exported orelse not remote_only orelse length retried >= max_resubmissions then restore_all ()
                 else
                   (ignore (HolbuildBuildExec.take_restore_misses ());
-                   HolbuildStatus.suppressing_failures restore_all
+                   (HolbuildStatus.suppressing_failures restore_all before HolbuildStatus.forget_carried_outcomes ())
                    handle Thread.Interrupt => raise Thread.Interrupt
                         | e =>
                             let
@@ -2337,6 +2338,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                                        (HolbuildBuildExec.not_in_remote_cache name) HolbuildStatus.no_debug_artifacts
                                                    end)
                                           recorded;
+                                 HolbuildStatus.forget_carried_outcomes ();
                                  raise e)
                             end)
               end

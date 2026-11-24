@@ -3179,3 +3179,22 @@ require_grep "1 theories the remote cache seemed to hold did not restore; resubm
   "$tmpdir/restore-lost-nondet.log"
 require_grep "replacing remote cache entry $key_n: the cache no longer holds all of its blobs" "$tmpdir/worker.log"
 require_grep "NTheory restored from cache" "$tmpdir/restore-lost-nondet.log"
+
+# A restore that restores ATheory and then misses BTheory: the pass after the
+# resubmission reports ATheory neither again nor as unchanged.
+project=$tmpdir/restore-miss
+write_theories restore-miss-second
+run restore-miss-second-base 0 build --remote-exec "$coordinator" --remote-only BTheory
+key_b=$(awk -F= '/^input_key=/ { print $2; exit }' "$project/.holbuild/dep/rxmiss/src/BScript.sml.key")
+dat_b=$(awk '$1 == "blob" && $2 == "dat" { print $3 }' "$HOLBUILD_CACHE/actions/$key_b/manifest")
+[[ -n $dat_b ]] || { echo "no .dat blob for BTheory" >&2; exit 1; }
+rm "$remote_root/cas/$dat_b"
+echo 200 > "$tmpdir/cache-control/cas-head-status-$dat_b"
+fresh_client restore-miss-second
+run restore-miss-second 0 --json build --remote-exec "$coordinator" --remote-only BTheory
+require_grep "1 theories the remote cache seemed to hold did not restore; resubmitting with 1 theories rebuilt or rechecked" \
+  "$tmpdir/restore-miss-second.log"
+json_events restore-miss-second $'node_finished ATheory\nnode_finished BTheory\nbuild_finished'
+[[ $(grep -c '"event":"node_started"' "$tmpdir/restore-miss-second.log") -eq 2 ]] ||
+  { cat "$tmpdir/restore-miss-second.log" >&2; exit 1; }
+require_grep '"event":"build_finished".*"from_cache":2,"unchanged":0' "$tmpdir/restore-miss-second.log"

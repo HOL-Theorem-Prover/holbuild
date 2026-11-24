@@ -70,8 +70,14 @@ fun reporting_finished_only f =
 
 (* While set, builds report no failures, nor what failures skip, nor, once
    a node failed, their end: a --remote-only restore that may resubmit what
-   it can't restore, whose misses are no failures if it does. *)
+   it can't restore, whose misses are no failures if it does.  A node is
+   reported started only once it finished, and its outcome is kept, so that
+   a later pass after a resubmission reports it neither again nor as
+   unchanged. *)
 val suppress_failures_ref = ref false
+val carried_outcomes = ref ([] : (string * outcome) list)
+fun forget_carried_outcomes () = carried_outcomes := []
+fun carried_outcome key = Option.map #2 (List.find (fn (k, _) => k = key) (!carried_outcomes))
 fun suppressing_failures f =
   let val previous = !suppress_failures_ref
   in
@@ -424,15 +430,21 @@ val project_work_lock = Mutex.mutex ()
 fun count_project_work () =
   (Mutex.lock project_work_lock; project_work := !project_work + 1; Mutex.unlock project_work_lock)
 
-fun count_outcome ({built, up_to_date, restored, restored_remote, ...} : t) outcome =
-  (!command_outcome outcome;
-   case outcome of
-      Built => (built := !built + 1; count_project_work ())
+fun tally ({built, up_to_date, restored, restored_remote, ...} : t) outcome =
+  case outcome of
+      Built => built := !built + 1
     | UpToDate => up_to_date := !up_to_date + 1
-    | Restored => (restored := !restored + 1; count_project_work ())
-    | RestoredRemote =>
-        (restored := !restored + 1; restored_remote := !restored_remote + 1; count_project_work ())
-    | Inspected => ())
+    | Restored => restored := !restored + 1
+    | RestoredRemote => (restored := !restored + 1; restored_remote := !restored_remote + 1)
+    | Inspected => ()
+
+fun count_outcome status outcome =
+  (!command_outcome outcome;
+   tally status outcome;
+   case outcome of
+       UpToDate => ()
+     | Inspected => ()
+     | _ => count_project_work ())
 
 fun elapsed ({started_at, ...} : t) = Time.-(Time.now (), started_at)
 
@@ -536,7 +548,7 @@ fun start_node status key label =
           else
             (active := {key = key, label = label, started_at = Time.now (),
                         thread = Thread.self (), waiting = false} :: remove_active key (!active);
-             if finished_only () then ()
+             if finished_only () orelse !suppress_failures_ref orelse Option.isSome (carried_outcome key) then ()
              else if json_mode () then
                emit_json "node_started" (json_node_fields key label)
              else if enabled then redraw status
@@ -552,12 +564,15 @@ fun finish_node status key label outcome =
         let
           val {enabled, total, finished, active, ended, ...} = status
           val elapsed = active_elapsed_text (find_active key (!active))
-        in
-          if !ended then ()
-          else
-            (finished := !finished + 1;
-             count_outcome status outcome;
-             active := remove_active key (!active);
+          fun report () =
+            (count_outcome status outcome;
+             if !suppress_failures_ref then
+               (carried_outcomes := (key, outcome) :: !carried_outcomes;
+                if json_mode () then emit_json "node_started" (json_node_fields key label)
+                else if verbose_mode () andalso not enabled then
+                  TextIO.output (TextIO.stdOut, label ^ " started\n")
+                else ())
+             else ();
              if json_mode () then
                emit_json "node_finished"
                  (json_node_fields key label @
@@ -572,6 +587,14 @@ fun finish_node status key label outcome =
                   label ^ " " ^ outcome_text outcome ^
                   (if verbose_mode () then elapsed else "") ^ "\n");
                 TextIO.flushOut TextIO.stdOut))
+        in
+          if !ended then ()
+          else
+            (finished := !finished + 1;
+             active := remove_active key (!active);
+             case carried_outcome key of
+                 SOME earlier => tally status earlier
+               | NONE => report ())
         end)
 
 fun finish status =
