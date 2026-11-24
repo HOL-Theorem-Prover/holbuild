@@ -1316,8 +1316,8 @@ theorem the script resumes. As with `Thm.tag` above, code that reaches `X`'s
 stub some other way (a lookup in a library or inside a structure) and branches
 on its hypotheses without failing outputs what it saw. A theory is not pipelined if it saves checkpoints and is a
 requested target or the build passes `--all-checkpoints`, if it declares
-extra outputs, or under `--trace-steps`, `--repl-on-failure`, a tracing
-kernel or an execution plan.
+extra outputs, or under `--trace-steps`, `--repl-on-failure` or a tracing
+kernel.
 
 A theory that would cut off early (its own inputs unchanged and its
 dependencies' outputs as at its last build) runs no HOL, so it isn't
