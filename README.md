@@ -1788,9 +1788,10 @@ action-text
   deps heap, context checkpoint or tool cache. A failed proof still publishes
   its failed prefix. An entry or early-cutoff pair already in the cache that
   restores and fits the parent outputs passes it without HOL, and it never
-  loads ahead of its parents. Its dependencies are installed only when it
-  would start from a fresh preload rather than a checkpoint: a heap that loaded
-  them spares the install.
+  loads ahead of its parents. Unless it is forced, or a dependency's `.sml`
+  carries no `.dat` hash, its dependencies are installed only when it would
+  start from a fresh preload rather than a checkpoint, or passes on a cached
+  entry or early-cutoff pair: a heap that loaded them spares the install.
 
 ### Exporting script runs for remote execution
 

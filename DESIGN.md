@@ -798,11 +798,17 @@ late parents) are emptied and recorded as scratch, which the next hydrate
 removes or reinstalls. Extra outputs lie under their theory's key in
 `.holbuild/action-extra`; the hydrate removes those of every key it doesn't
 record, as an early cutoff restores the action's own under its earlier key.
+The hydrate deletes the record file before it changes
+the tree and writes it back once it passed, so a worker stopped part way
+starts from an empty root. Script runs put every object directory under the
+root on `loadPath`, so they start from an empty root, leave no records, and the root is removed
+after them. The
+cache cap doesn't count the root: it holds one spec's dependencies.
 
 A check-only action's hydrate is light: the stale check, the kept items and
 the removal of the rest run as above, but the dependencies not kept aren't
 installed. Their records, as an install would write them, come from their
-local cache manifests and `.sml` blobs (the `.dat` hash from the hash the
+cache manifests (the remote's read without copying its blobs) and `.sml` blobs (the `.dat` hash from the hash the
 `.sml` carries; a theory whose `.sml` carries none makes the hydrate install
 them all), and the early cutoff, the parent checks and the preload skip read
 them, so the context key is the one the installed files would give. The
@@ -811,13 +817,8 @@ them, past HOL's own parent check. HOL reads no dependency file once it
 resumes from one, since the preload that saved it loaded every dependency the
 script loads. When the run would start from a fresh preload instead, the worker
 installs them all first and checks the context key against the files
-(`internal` if it changed).
-The hydrate deletes the record file before it changes
-the tree and writes it back once it passed, so a worker stopped part way
-starts from an empty root. Script runs put every object directory under the
-root on `loadPath`, so they start from an empty root, leave no records, and the root is removed
-after them. The
-cache cap doesn't count the root: it holds one spec's dependencies.
+(`internal` if it changed); so it does before passing the action on its cached
+entry or an early-cutoff pair, which no heap vouches for.
 
 ## Global cache
 

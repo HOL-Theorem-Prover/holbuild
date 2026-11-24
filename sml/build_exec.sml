@@ -12003,10 +12003,17 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
         fun record {target, stem, key} =
           let
             val path = in_root root stem
-            val {blobs = {sig_hash, sml_hash, parents, mldeps, ...}, manifest_text = source_text, ...} =
-              checked_cache_entry false
-                {root = cache, input_key = key, subject = target, expected_extra_outputs = NONE,
-                 requested_timeout = NONE, require_trace = false}
+            (* The remote's manifest is read, not copied with its blobs, as
+               checked_cache_entry would copy them. *)
+            val source_text =
+              case HolbuildCache.get_action cache key of
+                  SOME text => text
+                | NONE =>
+                    case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key) of
+                        SOME text => text
+                      | NONE => raise Error ("cache entry " ^ key ^ " not found")
+            val {sig_hash, sml_hash, parents, mldeps, ...} =
+              cache_manifest_blobs_from_lines key (cache_manifest_lines source_text)
             val fetched = in_root root (".holbuild/light-" ^ sml_hash)
             val sml_text =
               replace_all cache_sml_token (path ^ ".dat")
@@ -16457,8 +16464,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
       in
         if done then
           (* The entry may have come from the worker's local cache, so make
-             sure the remote, where the result counts, holds it too. *)
-          ((if #check_only spec then ()
+             sure the remote, where the result counts, holds it too.  A
+             light hydrate's dependencies are installed first, which checks
+             that each fits its parents, as no heap vouches for them here. *)
+          (install_light spec tc cutoff;
+           (if #check_only spec then ()
             else phase "check" (fn () => phase "publish" (fn () => check_remote_publication remote root spec)));
            "cached")
         else if pipelined then
@@ -16473,33 +16483,32 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        the records' hashes: the context the build restored, and publishes
        a failed prefix under, is keyed by those. *)
     and build_light spec tc forced cutoff =
-      let
-        fun install () =
-          if not (Option.isSome (!light_records)) then ()
-          else
-            let
-              val _ = light_records := NONE
-              val _ = hydrate_steps := []
-              val _ =
-                (phase "hydrate" (fn () => ignore (hydrate_action_root remote root (!resident) spec false))
-                 before add_hydrate_steps ())
-                handle e => (add_hydrate_steps (); raise e)
-              val {dat_hash, file_hashes} = resident_hashes [!resident]
-              val installed =
-                spec_early_cutoff_with
-                  {dat_hash = dat_hash, file_hashes = file_hashes,
-                   skip_loaded = {base_loaded = !base_loaded, follow = true, known_manifest = fn _ => NONE}}
-                  root spec
-            in
-              if Option.map #deps_key installed = Option.map #deps_key cutoff then ()
-              else raise action_failed InternalFailure "the dependencies installed differ from the records the build started from";
-              set_module_grants tc spec (spec_theory_action root spec (cutoff_context spec cutoff))
-            end
-      in
-        (before_fresh_preload := install;
-         build spec tc forced cutoff NONE false before before_fresh_preload := (fn () => ()))
-        handle e => (before_fresh_preload := (fn () => ()); raise e)
-      end
+      (before_fresh_preload := (fn () => install_light spec tc cutoff);
+       build spec tc forced cutoff NONE false before before_fresh_preload := (fn () => ()))
+      handle e => (before_fresh_preload := (fn () => ()); raise e)
+    (* Installs the dependencies a light hydrate left out, whose files must
+       give the records' hashes; and the build's module grants then. *)
+    and install_light spec tc cutoff =
+      if not (Option.isSome (!light_records)) then ()
+      else
+        let
+          val _ = light_records := NONE
+          val _ = hydrate_steps := []
+          val _ =
+            (phase "hydrate" (fn () => ignore (hydrate_action_root remote root (!resident) spec false))
+             before add_hydrate_steps ())
+            handle e => (add_hydrate_steps (); raise e)
+          val {dat_hash, file_hashes} = resident_hashes [!resident]
+          val installed =
+            spec_early_cutoff_with
+              {dat_hash = dat_hash, file_hashes = file_hashes,
+               skip_loaded = {base_loaded = !base_loaded, follow = true, known_manifest = fn _ => NONE}}
+              root spec
+        in
+          if Option.map #deps_key installed = Option.map #deps_key cutoff then ()
+          else raise action_failed InternalFailure "the dependencies installed differ from the records the build started from";
+          set_module_grants tc spec (spec_theory_action root spec (cutoff_context spec cutoff))
+        end
     (* The theory modules the build's sandbox may read. *)
     and set_module_grants tc spec action =
       HolbuildActionSandbox.module_reads :=

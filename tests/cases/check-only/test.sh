@@ -203,7 +203,8 @@ start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 url=$remote_url
 worker_cache=$tmpdir/worker
 field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $col }' "$1"; }
-# worker NAME [plain]: runs T's check-only action (its plain one with plain).
+# worker NAME [plain|keep]: runs T's check-only action (its plain one with
+# plain) on a fresh worker cache (the last one with keep).
 worker() {
   local name=$1 spec check=(--check-only)
   [[ ${2:-} == plain ]] && check=()
@@ -212,8 +213,10 @@ worker() {
   spec=$(field "$tmpdir/$name.batch" checkonly:TTheory 4)
   remote_key=$(field "$tmpdir/$name.batch" checkonly:TTheory 3)
   [[ -n "$spec" ]] || { cat "$tmpdir/$name.batch" >&2; exit 1; }
-  rm -rf "$worker_cache"
-  link_hol_toolchain_cache "$worker_cache"
+  if [[ ${2:-} != keep ]]; then
+    rm -rf "$worker_cache"
+    link_hol_toolchain_cache "$worker_cache"
+  fi
   set +e
   HOLBUILD_CACHE=$worker_cache "$HOLBUILD_BIN" --remote-cache "$url" exec-action "$spec" --share-heaps \
     --cache-limit-gb 1000 --result "$tmpdir/$name.result" > "$tmpdir/$name.log" 2>&1
@@ -317,3 +320,21 @@ expect_worker share-modules 0 "status=built"
 no_modules share-modules
 # The plain action shared its deps heap, which the check resumes from.
 hydrated share-modules 1 0
+
+# A heap HOL can't resume from, found in the worker's store, is discarded,
+# and the check goes on from a fresh preload, with A installed first.  As in
+# tests/cases/shared-deps-heap, bytes 72-75 of the header hold the parent's
+# time stamp, which Poly/ML checks when it loads the state.
+rm -rf "$worker_cache/action" "$worker_cache/checkpoints"
+heaps=$(find "$worker_cache/checkpoint-store" -type f -size +100k ! -name "*.pmo")
+[[ -n "$heaps" ]] || { echo "the worker's store holds no heap" >&2; exit 1; }
+for heap in $heaps; do
+  cp "$heap" "$tmpdir/stale"
+  printf '\xff\xff\xff\xff' | dd of="$tmpdir/stale" bs=1 seek=72 conv=notrunc status=none
+  mv "$tmpdir/stale" "$heap"
+done
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH >> ALL_TAC >> ALL_TAC"
+worker stale-heap keep
+expect_worker stale-heap 0 "status=built"
+require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/stale-heap.log"
+hydrated stale-heap 1 1
