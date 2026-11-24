@@ -111,6 +111,24 @@ if hb action-spec --scratch-input "$tmpdir/fifo" UTheory > "$tmpdir/fifo.log" 2>
 fi
 require_grep "\-\-scratch-input takes a regular file" "$tmpdir/fifo.log"
 
+# An unchanged input keeps its hash from export to export, by git's index
+# scheme: the record is believed while the file's stat matches (a forged
+# one shows it), and a touched file is hashed again.  Without --upload, as
+# the forged hash would name the wrong bytes.
+stats=$project/.holbuild/scratch-input-stats
+sha_one=$(sha256sum "$tmpdir/one.txt" | cut -d' ' -f1)
+sha_two=$(sha256sum "$tmpdir/two.txt" | cut -d' ' -f1)
+scratch_option() {
+  hb action-spec --scratch-input "$tmpdir/one.txt" UTheory > "$tmpdir/batch-$1.txt"
+  sed -n 's/^option scratch-input=//p' "$specs/$(field "$tmpdir/batch-$1.txt" scratch:UTheory 4)"
+}
+[[ "$(scratch_option first)" == "$sha_one" ]] || { echo "the scratch input's hash is wrong" >&2; exit 1; }
+require_grep "$sha_one" "$stats"
+sed -i "s/$sha_one/$sha_two/" "$stats"
+[[ "$(scratch_option forged)" == "$sha_two" ]] || { echo "an unchanged scratch input was hashed again" >&2; exit 1; }
+touch "$tmpdir/one.txt"
+[[ "$(scratch_option touched)" == "$sha_one" ]] || { echo "a touched scratch input kept its old hash" >&2; exit 1; }
+
 # worker_command NAME SPEC [OPTION...]: exec-action of SPEC in the worker's
 # cache root, sharing heaps.
 worker_cache=$tmpdir/worker
@@ -176,6 +194,9 @@ done
 mv "$tmpdir/ac-A" "$tmpdir/remote/ac/$ac_A"
 wait "$u_pid" || true
 built u-two two
+# Staged again with the blob in the worker's cache, the input is a link to it.
+[[ "$(stat -c %a "$worker_cache/blobs/$sha_two")" == 444 ]] || {
+  echo "the restaged scratch input is not the cache's read-only blob" >&2; exit 1; }
 require_grep "loading ahead found a build to reuse; building plain" "$tmpdir/u-two.log"
 require_grep "from: theorem-context checkpoint after u1" "$tmpdir/u-two.log"
 

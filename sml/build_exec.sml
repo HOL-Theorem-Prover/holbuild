@@ -9799,11 +9799,13 @@ fun library_manifest root plan node =
 
 (* One export can name a shared library thousands of times. Reuse only
    identities outside the filesystem's racy timestamp window; this table is
-   discarded after export and never substitutes for a planned source hash. *)
-fun export_file_hash () =
+   discarded after export and never substitutes for a planned source hash.
+   SEED holds hashes an earlier export recorded the same way, reused while
+   the file's stat still matches; RECORDED gives what this one holds. *)
+fun export_file_hash seed =
   let
     val start_ns = Time.toNanoseconds (Time.now ())
-    val hashes = ref (Redblackmap.mkDict String.compare)
+    val hashes = ref (Redblackmap.fromList String.compare seed)
     val mutex = Mutex.mutex ()
     fun locked f =
       (Mutex.lock mutex;
@@ -9834,7 +9836,30 @@ fun export_file_hash () =
                     if HolbuildStatCache.same_ident (ident, recorded) then digest else compute ()
                 | NONE => compute ()
             end
-  in hash end
+    fun recorded path = locked (fn () => Redblackmap.peek (!hashes, path))
+  in {hash = hash, recorded = recorded} end
+
+(* build --scratch-input's hash is kept from export to export, under git's
+   index scheme (export_file_hash), so an unchanged file isn't read again;
+   a missing or damaged record only means it is. *)
+fun scratch_input_stats root = in_root root ".holbuild/scratch-input-stats"
+
+fun scratch_input_seed root =
+  case !scratch_input_file of
+      NONE => []
+    | SOME file =>
+        (case Binarymap.peek (!(#entries (HolbuildStatCache.load {path = scratch_input_stats root})), file) of
+             SOME entry => [(file, entry)]
+           | NONE => [])
+
+fun record_scratch_input_hash root recorded =
+  case Option.mapPartial recorded (!scratch_input_file) of
+      NONE => ()
+    | SOME entry =>
+        HolbuildStatCache.flush
+          (HolbuildStatCache.new_instance true (SOME (scratch_input_stats root))
+             (Binarymap.insert (HolbuildStatCache.empty_entries (), valOf (!scratch_input_file), entry)))
+        handle _ => ()
 
 fun file_line hash_file role path from =
   String.concatWith " "
@@ -10265,7 +10290,8 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
 fun export_action_specs (options : build_options) tc project plan keys toolchain_key jobs
       {upload, keep_specs, local_resumable, forced, skip, defer, publish, ledger} =
   let
-    val hash_file = export_file_hash ()
+    val root = project_artifact_root project
+    val {hash = hash_file, recorded} = export_file_hash (scratch_input_seed root)
     val _ = if upload then HolbuildOffline.require_online "upload action specs" else ()
     val remote =
       case HolbuildRemoteCacheConfig.url () of
@@ -10288,7 +10314,6 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
        (set := Binaryset.add (!set, item); Mutex.unlock ledger_mutex)
        handle e => (Mutex.unlock ledger_mutex; raise e))
     fun learn item = if ledger then add learned item else ()
-    val root = project_artifact_root project
     val config_lines = build_config_lines_for_node options project
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc (fn _ => toolchain_key)
     val theories = List.filter is_theory_node (HolbuildBuildPlan.selected_nodes plan)
@@ -10489,6 +10514,7 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
        else ())
       handle e => (remove_specs (); raise e)
     val _ = remove_specs ()
+    val _ = record_scratch_input_hash root recorded
     (* The caller records the ledger once the batch is submitted: it waits
        for the ledger's lock, which other builds hold to rewrite it. *)
     fun record () =
@@ -10698,7 +10724,7 @@ fun plan_runs tc project planned jobs {keep_specs}
       if HolbuildToolchain.kernel_variant_tracing (#kernel_variant tc) then
         raise Error "run-action: tracing-kernel actions key on the exact HOL executable and stay local"
       else ()
-    val hash_file = export_file_hash ()
+    val hash_file = #hash (export_file_hash [])
     val root = project_artifact_root project
     val action_toolchain_key = HolbuildToolchain.action_toolchain_key tc HolbuildToolchain.toolchain_key
     val toolchain_line = spec_toolchain_line tc project
@@ -16032,14 +16058,29 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               tool_cache_dir := SOME dir;
               SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
             end
-    (* Outside the writable directories, so the child only reads it. *)
+    (* Outside the writable directories, so the child only reads it.  The
+       file can be large and is the same for many actions, so it is the
+       local cache's blob itself, hard-linked: publish_blob checked its
+       hash when it entered the cache, the link is made read-only, the
+       sandbox lets no child chmod or link it, and nothing of holbuild's
+       writes through it (empty_writable only unlinks it).  Without the
+       blob, or across file systems, it is fetched and copied as any spec
+       blob, and linked from the next action on. *)
     fun stage_scratch_input (spec : action_spec) =
       case #scratch_input spec of
           NONE => ()
         | SOME sha =>
-            let val path = FS.fullPath root ^ "/.holbuild/scratch/" ^ sha
+            let
+              val path = FS.fullPath root ^ "/.holbuild/scratch/" ^ sha
+              val blob = HolbuildCache.blob_path cache sha
+              val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
             in
-              fetch_spec_blob remote {hash = sha, dst = path};
+              ((ensure_parent path;
+                remove_file path;
+                Posix.FileSys.chmod (blob, read_only);
+                Posix.FileSys.link {old = blob, new = path};
+                HolbuildCache.touch blob)
+               handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path});
               scratch_input_path := SOME path
             end
     val run_log = ref NONE
