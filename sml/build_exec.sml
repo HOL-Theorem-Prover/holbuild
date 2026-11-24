@@ -2176,12 +2176,13 @@ fun exit_detail status log =
 val tool_cache_name : string option ref = ref NONE
 val tool_cache_dir : string option ref = ref NONE
 
-(* build --scratch-input FILE: a file theory children read through
-   HOLBUILD_SCRATCH_INPUT.  The client's FILE, which exported specs name by
-   its SHA-256, and the path children see (on a worker, its staged copy).
-   Nothing keys it: what it holds must not change what a build produces. *)
-val scratch_input_file : string option ref = ref NONE
-val scratch_input_path : string option ref = ref NONE
+(* build --scratch-input FILE, given once or more: files theory children
+   read through HOLBUILD_SCRATCH_INPUT, their paths in order, separated by
+   ":".  The client's FILEs, which exported specs name by their SHA-256, and
+   the paths children see (on a worker, the staged copies).  Nothing keys
+   them: what they hold must not change what a build produces. *)
+val scratch_input_files : string list ref = ref []
+val scratch_input_paths : string list ref = ref []
 
 (* A name safe as one path component: a tool cache's, or a file's in it. *)
 fun plain_file_name name =
@@ -2198,7 +2199,9 @@ fun run_hol_files_to_log tc stage workdir context files log_name current_log err
     val _ = last_child_start := SOME (Time.toMilliseconds (Time.now ()))
     val tool_env =
       (case !tool_cache_dir of SOME dir => ["HOLBUILD_TOOL_CACHE_DIR=" ^ dir] | NONE => []) @
-      (case !scratch_input_path of SOME path => ["HOLBUILD_SCRATCH_INPUT=" ^ path] | NONE => [])
+      (case !scratch_input_paths of
+           [] => []
+         | paths => ["HOLBUILD_SCRATCH_INPUT=" ^ String.concatWith ":" paths])
     val status =
       HolbuildToolchain.run_in_dir_to_file workdir
         ((if null tool_env then [] else "env" :: tool_env) @
@@ -9784,28 +9787,42 @@ fun export_file_hash seed =
     fun recorded path = locked (fn () => Redblackmap.peek (!hashes, path))
   in {hash = hash, recorded = recorded} end
 
-(* build --scratch-input's hash is kept from export to export, under git's
-   index scheme (export_file_hash), so an unchanged file isn't read again;
-   a missing or damaged record only means it is. *)
+(* build --scratch-input's hashes are kept from export to export, under
+   git's index scheme (export_file_hash), so an unchanged file isn't read
+   again; a missing or damaged record only means it is. *)
 fun scratch_input_stats root = in_root root ".holbuild/scratch-input-stats"
 
+(* The record's entries; a damaged record's numbers can overflow its parse. *)
+fun scratch_input_entries root =
+  Binarymap.listItems (!(#entries (HolbuildStatCache.load {path = scratch_input_stats root})))
+  handle Overflow => []
+
 fun scratch_input_seed root =
-  case !scratch_input_file of
-      NONE => []
-    | SOME file =>
-        (case Binarymap.peek (!(#entries (HolbuildStatCache.load {path = scratch_input_stats root})), file) of
-             SOME entry => [(file, entry)]
-           | NONE => [])
-        (* A damaged record's numbers can overflow its parse. *)
-        handle Overflow => []
+  if null (!scratch_input_files) then []
+  else
+    List.filter (fn (file, _) => List.exists (fn f => f = file) (!scratch_input_files))
+      (scratch_input_entries root)
+
+(* The most files the record holds: it keeps other builds' files too, so
+   builds that alternate between inputs each skip the rehash. *)
+val scratch_input_stats_limit = 8
 
 fun record_scratch_input_hash root recorded =
-  case Option.mapPartial recorded (!scratch_input_file) of
-      NONE => ()
-    | SOME entry =>
-        HolbuildStatCache.flush
-          (HolbuildStatCache.new_instance true (SOME (scratch_input_stats root))
-             (Binarymap.insert (HolbuildStatCache.empty_entries (), valOf (!scratch_input_file), entry)))
+  case List.mapPartial (fn file => Option.map (fn entry => (file, entry)) (recorded file))
+         (!scratch_input_files) of
+      [] => ()
+    | fresh =>
+        let
+          val others =
+            List.filter (fn (file, _) => not (List.exists (fn (f, _) => f = file) fresh))
+              (scratch_input_entries root)
+          val kept = List.take (others, Int.min (length others, Int.max (0, scratch_input_stats_limit - length fresh)))
+        in
+          HolbuildStatCache.flush
+            (HolbuildStatCache.new_instance true (SOME (scratch_input_stats root))
+               (List.foldl (fn ((file, entry), entries) => Binarymap.insert (entries, file, entry))
+                  (HolbuildStatCache.empty_entries ()) (kept @ fresh)))
+        end
         handle _ => ()
 
 fun file_line hash_file role path from =
@@ -9919,12 +9936,12 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
       (if trace_steps policy then [bool_option "trace-steps" true] else []) @
       (if pipeline then [bool_option "pipeline" true] else []) @
       (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []) @
-      (case !scratch_input_file of SOME file => ["option scratch-input=" ^ hash_file file] | NONE => []) @
+      map (fn file => "option scratch-input=" ^ hash_file file) (!scratch_input_files) @
       ["action-text"]
   in
     {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
      files = source :: map #from (#inputs action) @ library_files @
-             (case !scratch_input_file of SOME file => [file] | NONE => [])}
+             !scratch_input_files}
   end
 
 (* A theory waits for the nearest uncached theories it depends on, looking
@@ -11066,7 +11083,7 @@ type action_spec =
    heavy_tactic_timeout : real option option, new_ir : bool,
    theorem_checkpoints : bool, checkpoint_target : bool, skip_checkpoints : bool, promote_preload : bool,
    checkpoint_seconds : real, force : bool, trace_steps : bool,
-   pipeline : bool, tool_cache : string option, scratch_input : string option, action_text : string}
+   pipeline : bool, tool_cache : string option, scratch_inputs : string list, action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
 fun split_spec_text section text =
@@ -11242,7 +11259,8 @@ fun parse_action_spec text : action_spec =
               if plain_file_name name then SOME name
               else reject_spec ("malformed option tool-cache: " ^ HolbuildHash.quote name)
           | NONE => NONE),
-     scratch_input = Option.map #2 (List.find (fn (k, _) => k = "option scratch-input") (!values)),
+     (* In the order the client gave them: values holds the lines reversed. *)
+     scratch_inputs = rev (List.mapPartial (fn (k, v) => if k = "option scratch-input" then SOME v else NONE) (!values)),
      action_text = action_text}
   end
 
@@ -11307,7 +11325,7 @@ fun verify_action_spec (spec : action_spec) =
     (* File hashes name blobs in the cache, so they must not be paths. *)
     check (List.all (sha256_text o #sha256) (#source spec :: #inputs spec @ #libraries spec))
       "a file's SHA-256 is malformed";
-    check (case #scratch_input spec of SOME sha => sha256_text sha | NONE => true)
+    check (List.all sha256_text (#scratch_inputs spec))
       "the scratch input's SHA-256 is malformed";
     check (text_hash = #input_key spec) "the action text does not hash to input-key";
     check (#action_text_sha256 spec = text_hash) "action-text-sha256 does not match the action text";
@@ -16013,24 +16031,26 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        blob, or across file systems, it is fetched and copied as any spec
        blob, and linked from the next action on. *)
     fun stage_scratch_input (spec : action_spec) =
-      case #scratch_input spec of
-          NONE => ()
-        | SOME sha =>
-            let
-              val path = FS.fullPath root ^ "/.holbuild/scratch/" ^ sha
-              val blob = HolbuildCache.blob_path cache sha
-              val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
-            in
-              ((ensure_parent path;
-                remove_file path;
-                Posix.FileSys.link {old = blob, new = path};
-                (* The staged name: a blob installed over the cache's
-                   name meanwhile would be another inode. *)
-                Posix.FileSys.chmod (path, read_only);
-                HolbuildCache.touch blob)
-               handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path});
-              scratch_input_path := SOME path
-            end
+      let
+        fun stage sha =
+          let
+            val path = FS.fullPath root ^ "/.holbuild/scratch/" ^ sha
+            val blob = HolbuildCache.blob_path cache sha
+            val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
+          in
+            ((ensure_parent path;
+              remove_file path;
+              Posix.FileSys.link {old = blob, new = path};
+              (* The staged name: a blob installed over the cache's
+                 name meanwhile would be another inode. *)
+              Posix.FileSys.chmod (path, read_only);
+              HolbuildCache.touch blob)
+             handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path});
+            path
+          end
+      in
+        scratch_input_paths := map stage (#scratch_inputs spec)
+      end
     val run_log = ref NONE
     fun build_log () =
       case !run_log of
