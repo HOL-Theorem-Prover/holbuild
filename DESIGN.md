@@ -856,8 +856,10 @@ hard-links the local cache's blob into the action root and makes it read-only.
 Its hash was checked when it entered the cache; the staged path lies outside
 every sandbox write and scratch root, and the sandbox grants no cross-directory
 link and refuses chmod outside those roots, so the action can only read it;
-holbuild only unlinks it when it empties the root. Without the blob, or across
-file systems, it is fetched and copied like any other spec blob.
+holbuild only unlinks it when it empties the root. Across file systems (a
+worker container's action root beside a host-mounted cache) it is a read-only
+copy of that blob, not hashed again. Without the blob it is fetched and copied
+like any other spec blob.
 
 Cache-to-cache transfers verify a resident filesystem blob before fetching it
 again. A missing or corrupt blob is fetched into a transfer-owned temporary
