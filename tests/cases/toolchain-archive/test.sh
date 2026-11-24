@@ -492,25 +492,40 @@ val _ = HolbuildRemoteCacheConfig.setup_client ();
 val _ = HolbuildHolSharedCache.hold_usage_lease k;
 SML
 # When the store has lost the archive's blob (while a cache in front of it
-# still answers for it) or its record, the entry is published again, as the
-# same blob.
+# still answers for it) or its record too, the entry is published again, as
+# the same blob; a record that can't be read is left alone.
 cat > "$tmpdir/reconcile-republish.sml" <<'SML'
 use (OS.Path.concat (valOf (OS.Process.getEnv "RECONCILE_TMP"), "reconcile-prelude.sml"));
 val _ = HolbuildHolSharedCache.adopt_published_archive := true;
 val blob = env "ORIGINAL_BLOB";
 val blob_path = env "REMOTE_CAS" ^ "/" ^ blob;
-val _ = OS.FileSys.remove blob_path;
-val _ = write (env "SERVER_CONTROL" ^ "/cas-cached-" ^ blob) "";
+val cached = env "SERVER_CONTROL" ^ "/cas-cached-" ^ blob;
+val action = env "REMOTE_ACTION";
+val action_status = env "SERVER_CONTROL" ^ "/ac-get-status-" ^ OS.Path.file action;
+fun lose_blob () = (OS.FileSys.remove blob_path; write cached "");
+fun names_blob () = exists action andalso String.isSubstring ("blob=" ^ blob) (read action);
+fun check_again () = OS.FileSys.remove stamp;
+
+val _ = lose_blob ();
 val _ = reconcile ();
+val _ = assert "did not ask past the cache" (not (exists cached));
 val _ = assert "did not publish again a toolchain whose blob the store lost" (exists blob_path);
-val _ = assert "publishing again changed the blob" (recorded () = blob ^ "\n");
+val _ = assert "publishing again changed the blob" (recorded () = blob ^ "\n" andalso names_blob ());
 val _ = assert "comparison not recorded" (exists stamp);
-val _ = OS.FileSys.remove (env "REMOTE_ACTION");
-val _ = OS.FileSys.remove stamp;
+
+val _ = OS.FileSys.remove action;
+val _ = write action_status "403";
+val _ = check_again ();
 val _ = reconcile ();
+val _ = assert "published again over a record it could not read" (not (exists action));
+val _ = OS.FileSys.remove action_status;
+
+val _ = lose_blob ();
+val _ = check_again ();
+val _ = reconcile ();
+val _ = assert "did not ask past the cache before publishing a lost record" (not (exists cached));
 val _ = assert "did not publish again a toolchain the store has no record of"
-  (HolbuildToolchainArchive.published_blob (HolbuildRemoteCache.remote (env "RECONCILE_URL"))
-     (HolbuildHolSharedCache.archive_identity k) = SOME blob);
+  (exists blob_path andalso names_blob ());
 val _ = assert "publishing again changed the recorded blob" (recorded () = blob ^ "\n");
 val _ = OS.Process.exit OS.Process.success;
 SML

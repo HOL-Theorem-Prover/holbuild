@@ -159,10 +159,6 @@ fun replaced_path final_dir = Path.concat(Path.dir final_dir, stage_prefix final
 fun published_record remote identity =
   HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.get_action remote identity)
 
-(* The archive blob the remote's record for IDENTITY names, if it has one. *)
-fun published_blob remote identity =
-  Option.map parse_remote_record (published_record remote identity)
-
 (* Fetches the remote's archive for IDENTITY and stages it beside FINAL_DIR
    (stage_archive); NONE when the remote has no record. *)
 fun stage {remote, identity, final_dir} =

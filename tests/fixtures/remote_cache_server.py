@@ -226,12 +226,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             # control/cas-cached-<digest>: a cache in front of the store
             # still answers for a blob the store may have lost, until a HEAD
-            # with Cache-Control: no-cache has it ask the store.
+            # with Cache-Control: no-cache has it ask the store, and drop
+            # its copy (the control file) if the store lacks the blob.
             no_cache = "no-cache" in self.headers.get("Cache-Control", "").lower()
-            if (control / f"cas-cached-{digest}").exists() and not no_cache:
+            cached = control / f"cas-cached-{digest}"
+            if cached.exists() and not no_cache:
                 self.send_response(200)
                 self.end_headers()
                 return
+            if cached.exists() and not (root / "cas" / digest).is_file():
+                cached.unlink()
         path = self.object_path()
         if path is None:
             return

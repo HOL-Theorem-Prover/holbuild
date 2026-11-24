@@ -1043,15 +1043,26 @@ fun reconcile_with_published req k =
                      {remote = remote, identity = archive_identity k, entry_dir = final, replace = true} of
                   SOME hash => write_file (archive_blob_for_key k) (hash ^ "\n")
                 | NONE => ()
+            (* Asked past any cache in front of the store, which then drops
+               a copy the store lost, so that a publish uploads it again. *)
+            fun stored hash =
+              HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.blob_present remote hash)
+            val recorded = recorded_archive_blob k
+            (* Only a store that answered that it holds no record, or no
+               blob, is put the entry again; an unreadable record is left. *)
             fun compare () =
-              case HolbuildToolchainArchive.published_blob remote (archive_identity k) of
-                  NONE => Option.isSome (with_toolchain_lock_now k republish)
-                | SOME hash =>
-                    if recorded_archive_blob k <> SOME hash then
-                      Option.getOpt (with_toolchain_lock_now k replace, false)
-                    else if HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.blob_present remote hash) then
-                      true
-                    else Option.isSome (with_toolchain_lock_now k republish)
+              case HolbuildRemoteCache.revalidating (fn () =>
+                     HolbuildRemoteCache.probe_action remote (archive_identity k)) of
+                  {found = SOME text, ...} =>
+                    let val hash = HolbuildToolchainArchive.parse_remote_record text
+                    in
+                      if recorded <> SOME hash then Option.getOpt (with_toolchain_lock_now k replace, false)
+                      else stored hash orelse Option.isSome (with_toolchain_lock_now k republish)
+                    end
+                | {found = NONE, missing = true} =>
+                    (Option.app (ignore o stored) recorded;
+                     Option.isSome (with_toolchain_lock_now k republish))
+                | {found = NONE, missing = false} => true
             val done = compare () handle error => (warn_reconcile (archive_error_message error); true)
           in
             if done then (write_file (published_check_path k) "" handle IO.Io _ => ()) else ()
