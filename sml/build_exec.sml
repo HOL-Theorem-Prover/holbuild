@@ -16221,6 +16221,7 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
         val _ = if keeps then () else drop_failed_prefixes checkpoints
         (* Only a check the context's child serves waits for its prerun:
            one resumed from a failed prefix doesn't use it. *)
+        val from_failed_prefix = keeps andalso #step_count (#1 parked) > 0
         fun offsets () =
           let val offsets = if same_deps then prerun_offsets (#1 parked) (#2 parked) source checkpoints else []
           in
@@ -16238,7 +16239,7 @@ fun park_serve {socket, spec_sha256, tc, root, action : theory_action, checkpoin
         val (status, message) =
           if not same_deps then ("fallback", "the edit changes what the theory depends on")
           else
-            case run (if keeps then [] else offsets ()) of
+            case run (if from_failed_prefix then [] else offsets ()) of
                 result as ("fail", _) =>
                   if file_exists mismatch then
                     (* The edit doesn't keep the parked prefix: the context's child. *)
