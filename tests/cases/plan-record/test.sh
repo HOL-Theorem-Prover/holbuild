@@ -346,7 +346,8 @@ options_outside_planning() {
   # Global options: jobs, heap, prefetching.
   PLAN_GLOBAL="-j4 --max-heap 4000 --prefetch-concurrency 2" expect_plan "$same" "$p"
   # Execution options.
-  expect_plan "$same" "$p" --allow-cache-timeout-discrepancy --force --no-cache --fail-fast --skip-checkpoints
+  expect_plan "$same" "$p" --allow-cache-timeout-discrepancy --force --no-cache --fail-fast --skip-checkpoints \
+    --cooperate-dir "$tmpdir/cooperate" --child-charge 1536
   # Options that change the actions' keys, which each run computes afresh.
   expect_plan "$same" "$p" --tactic-timeout 8.0
   expect_plan "$same" "$p" --tactic-timeout=132
