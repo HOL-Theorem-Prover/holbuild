@@ -48,7 +48,7 @@ fun counted_tac g =
 Theorem finish:
   1 = 1 /\\ 2 = 2
 Proof
-  counted_tac >> CONJ_TAC >> counted_tac
+  counted_tac >> CONJ_TAC >- ACCEPT_TAC (REFL \`\`1\`\`) >> counted_tac
 QED
 Theorem partial:
   T /\\ (3 = 3 /\\ 4 = 4)
@@ -56,7 +56,7 @@ Proof
   CONJ_TAC >- ACCEPT_TAC TRUTH >- suspend "right"
 QED
 Resume partial[right]:
-  counted_tac >> CONJ_TAC >> counted_tac
+  counted_tac >> CONJ_TAC >- ACCEPT_TAC (REFL \`\`3\`\`) >> counted_tac
 QED
 Finalise partial
 val _ = export_theory();
@@ -93,10 +93,10 @@ expect_count() {
 finish_end=$'counted_tac\nQED\nTheorem partial'
 resume_end=$'counted_tac\nQED\nFinalise'
 
-# finish ends with both conjuncts open.
+# finish ends with its second conjunct open.
 expect_failure "$tmpdir/finish-seed.log" "finish"
 require_grep "^ *2 = 2" "$tmpdir/finish-seed.log"
-expect_count 3 "finish seed"
+expect_count 2 "finish seed"
 require_file "$(find "$project/.holbuild/checkpoints" -name 'finish_failed_prefix.save.ok' -print -quit)"
 
 # A failing step appended to it resumes after the last step and fails on the
@@ -104,22 +104,22 @@ require_file "$(find "$project/.holbuild/checkpoints" -name 'finish_failed_prefi
 edit "$finish_end" $'counted_tac >> FAIL_TAC "after finish"\nQED\nTheorem partial'
 expect_failure "$tmpdir/finish-step.log" "after finish"
 require_grep "from: failed-prefix checkpoint in finish" "$tmpdir/finish-step.log"
-require_grep "^ *1 = 1" "$tmpdir/finish-step.log"
-expect_count 3 "finish appended step"
+require_grep "^ *2 = 2" "$tmpdir/finish-step.log"
+expect_count 2 "finish appended step"
 
-# The Resume block then ends with both of its conjuncts open.
+# The Resume block then ends with its second conjunct open.
 edit 'FAIL_TAC "after finish"' 'REWRITE_TAC []'
 expect_failure "$tmpdir/resume-seed.log" "partial"
 require_grep "from: failed-prefix checkpoint in finish" "$tmpdir/resume-seed.log"
 require_grep "^ *4 = 4" "$tmpdir/resume-seed.log"
-expect_count 6 "Resume seed"
+expect_count 4 "Resume seed"
 require_file "$(find "$project/.holbuild/checkpoints" -name 'partial_right_*failed_prefix.save.ok' -print -quit)"
 
 edit "$resume_end" $'counted_tac >> FAIL_TAC "after resume"\nQED\nFinalise'
 expect_failure "$tmpdir/resume-step.log" "after resume"
 require_grep "from: failed-prefix checkpoint in partial_right_" "$tmpdir/resume-step.log"
-require_grep "^ *3 = 3" "$tmpdir/resume-step.log"
-expect_count 6 "Resume appended step"
+require_grep "^ *4 = 4" "$tmpdir/resume-step.log"
+expect_count 4 "Resume appended step"
 
 edit 'FAIL_TAC "after resume"' 'REWRITE_TAC []'
 if ! (cd "$project" && "$HOLBUILD_BIN" build ATheory) >"$tmpdir/fixed.log" 2>&1; then
@@ -129,4 +129,4 @@ if ! (cd "$project" && "$HOLBUILD_BIN" build ATheory) >"$tmpdir/fixed.log" 2>&1;
 fi
 require_grep "from: failed-prefix checkpoint in partial_right_" "$tmpdir/fixed.log"
 require_grep "ATheory built" "$tmpdir/fixed.log"
-expect_count 6 "fixed"
+expect_count 4 "fixed"

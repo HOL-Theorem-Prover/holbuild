@@ -310,7 +310,7 @@ datatype deferral =
    after the script has run, where later bindings would shadow the
    theorem's; a theorem without them is not deferred, nor is a group with
    a block without them (build_exec's checkpoint_deferral). *)
-fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, defer} :
+fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker, new_ir, runtime_installed, defer} :
                 {source : string, source_name : string, start_offset : int, checkpoints : checkpoint list,
                  declaration_checkpoints : declaration_checkpoint list,
                  terminations : termination list, save_checkpoints : bool,
@@ -320,6 +320,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
                  timeout_marker : string option,
                  plan_theorem : string option, trace_all : bool,
                  plan_only_marker : string option, new_ir : bool,
+                 runtime_installed : bool,
                  defer : checkpoint -> deferral}) =
   let
     val n = size source
@@ -363,6 +364,7 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
       (if not proof_runtime then
          if start_offset > 0 orelse not (null active_declaration_checkpoints)
          then checkpoint_save_runtime_prelude checkpoint_seconds else ""
+       else if runtime_installed then ""
        else runtime_prelude (runtime_config ())) ^
       termination_runtime_prelude active_terminations
     val position = ref start_position
