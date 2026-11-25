@@ -175,12 +175,32 @@ local_build() {
   grep -qs "^holbuild source-load ctx=$ctx " "$child_log" || {
     echo "$name: the child did not report ctx=$ctx:" >&2; cat "$tmpdir/$name.log" >&2; cat "$child_log" >&2 || true; exit 1; }
 }
+
+# Count evaluations, including repeats of any given source. Match the start
+# context so a discarded attempt cannot count toward the successful resume.
+runtime_count() {
+  awk -v ctx="ctx=$1" -v name="name=$2" '
+    $1 == "holbuild" && $2 == "source-load" && $3 == ctx && $4 == "kind=runtime" &&
+      (name == "name=*" || $5 == name) { sub(/^n=/, "", $6); count += $6 }
+    END { print count + 0 }' "$child_log"
+}
+
 local_build seed target-cold 1
+require_grep "seed failure" "$tmpdir/seed.log"
+cold_save=$(runtime_count target-cold checkpoint_save_runtime.sml)
 sed -i 's/FAIL_TAC "seed failure"/ACCEPT_TAC TRUTH/' "$local_project/src/LScript.sml"
 local_build resume target-prefix 0
 require_grep "from: failed-prefix checkpoint" "$tmpdir/resume.log"
+prefix_runtime=$(runtime_count target-prefix '*')
 sed -i 's/^val _ = new_theory "L";$/val _ = new_theory "L"; val edited = ();/' "$local_project/src/LScript.sml"
 local_build edit target-deps 0
+deps_save=$(runtime_count target-deps checkpoint_save_runtime.sml)
+deps_sha256=$(runtime_count target-deps sha256.sml)
+echo "Runtime evaluations: cold save=$cold_save, failed-prefix all=$prefix_runtime, deps save=$deps_save sha256=$deps_sha256"
+if (( cold_save != 1 || prefix_runtime != 0 || deps_save != 0 || deps_sha256 != 0 )); then
+  echo "Expected one cold save-runtime evaluation and no redundant evaluations on resume" >&2
+  exit 1
+fi
 # Without proof steps the script runs plain, with no proof runtime: it
 # reports all the same.
 sed -i 's/ val edited = ();$/ val edited = 1;/' "$local_project/src/LScript.sml"
