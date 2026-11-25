@@ -187,26 +187,18 @@ fun proof_ir_runtime_helper_path () =
       SOME path => path
     | NONE => OS.Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/proof_runtime.sml")
 
-fun source_helper_path relative =
-  OS.Path.concat(HolbuildRuntimePaths.runtime_root (), relative)
+fun use_runtime path = "HolbuildRuntime.use " ^ HolbuildToolchain.sml_string path
 
-fun sha256_runtime_helper_path () = source_helper_path "sml/sha256.sml"
+fun use_runtime_source relative =
+  use_runtime (OS.Path.concat(HolbuildRuntimePaths.runtime_root (), relative))
 
-fun proof_ir_helper_path () = source_helper_path "sml/proof_ir_types.sml"
+fun if_structure_missing name body =
+  "if Option.isSome (#lookupStruct PolyML.globalNameSpace " ^
+  HolbuildToolchain.sml_string name ^ ") then () else " ^ body
 
-fun tactic_compat_runtime_helper_path () =
-  source_helper_path "sml/tactic_compat_runtime.sml"
-
-fun checkpoint_save_runtime_helper_path () =
-  OS.Path.concat(HolbuildRuntimePaths.runtime_root (), "sml/checkpoint_save_runtime.sml")
-
-(* For a script that doesn't install the proof runtime: the save runtime
-   alone, its context gate started at the build's checkpoint_seconds. *)
-fun checkpoint_save_runtime_prelude checkpoint_seconds =
-  runtime_lines
-    ["HolbuildRuntime.use " ^ HolbuildToolchain.sml_string (checkpoint_save_runtime_helper_path ()) ^ ";",
-     "val _ = HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate " ^
-       Real.toString checkpoint_seconds ^ ";"]
+fun use_checkpoint_save_runtime () =
+  if_structure_missing "HolbuildCheckpointSaveRuntime"
+    (use_runtime_source "sml/checkpoint_save_runtime.sml")
 
 fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, trace_all, new_ir} =
   ["val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
@@ -233,24 +225,35 @@ val resume_theory_cpu_line =
   \Bool.not (Option.isSome (!HolbuildTheoryCpuState.since)) \
   \then HolbuildTheoryCpuState.since := SOME (HolbuildCheckpointSaveRuntime.process_cpu ()) else ();"
 
+(* For a script that doesn't install the proof runtime: the save runtime
+   alone, its context gate started at the build's checkpoint_seconds. *)
+fun checkpoint_save_runtime_prelude checkpoint_seconds =
+  runtime_lines
+    ["val _ = " ^ use_checkpoint_save_runtime () ^ ";",
+     resume_theory_cpu_line,
+     "val _ = HolbuildCheckpointSaveRuntime.reset_context_checkpoint_gate " ^
+       Real.toString checkpoint_seconds ^ ";"]
+
 (* A heap saved after the proof runtime was installed (a theorem-context
    checkpoint, say) already holds it: its key includes the runtime's identity,
    so it is the same runtime, and the script only reinstalls it.  Otherwise
-   the script compiles it. *)
+   the script compiles it against the save runtime already in the heap when
+   available, so proof and declaration checkpoints share one context gate. *)
 fun runtime_prelude config =
-  runtime_lines
-    (("val _ = if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HolbuildProofRuntime\") then () \
-       \else List.app HolbuildRuntime.use [" ^
-        String.concatWith ", "
-          (map HolbuildToolchain.sml_string
-             [source_helper_path "sml/diagnostic_limits.sml",
-              sha256_runtime_helper_path (),
-              proof_ir_helper_path (),
-              checkpoint_save_runtime_helper_path (),
-              tactic_compat_runtime_helper_path (),
-              proof_ir_runtime_helper_path ()]) ^ "];") ::
-     resume_theory_cpu_line ::
-     runtime_install_lines config)
+  let
+    val loads =
+      [use_runtime_source "sml/diagnostic_limits.sml",
+       if_structure_missing "HolbuildSha256" (use_runtime_source "sml/sha256.sml"),
+       use_runtime_source "sml/proof_ir_types.sml",
+       use_checkpoint_save_runtime (),
+       use_runtime_source "sml/tactic_compat_runtime.sml",
+       use_runtime (proof_ir_runtime_helper_path ())]
+    val load_line =
+      "val _ = " ^
+      if_structure_missing "HolbuildProofRuntime" ("(" ^ String.concatWith "; " loads ^ ")") ^ ";"
+  in
+    runtime_lines (load_line :: resume_theory_cpu_line :: runtime_install_lines config)
+  end
 
 (* For a script resumed from a failed-prefix checkpoint, whose heap holds the
    proof runtime. *)
@@ -364,15 +367,15 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
        timeout_marker = timeout_marker,
        trace_all = trace_all,
        new_ir = new_ir}
-    (* A resumed script loads the checkpoint runtime even with no checkpoint
-       left to save: it carries the theory's CPU time over from the checkpoint. *)
     val proof_runtime = not (null active_checkpoints andalso null active_terminations)
     fun prelude () =
-      (if not proof_runtime then
-         if start_offset > 0 orelse not (null active_declaration_checkpoints)
-         then checkpoint_save_runtime_prelude checkpoint_seconds else ""
-       else if runtime_installed then ""
-       else runtime_prelude (runtime_config ())) ^
+      (if runtime_installed then ""
+       else if proof_runtime then runtime_prelude (runtime_config ())
+       (* Even with no checkpoints left to save, a resume starts its share
+          of the theory's CPU time. *)
+       else if start_offset > 0 orelse not (null active_declaration_checkpoints)
+       then checkpoint_save_runtime_prelude checkpoint_seconds
+       else "") ^
       termination_runtime_prelude active_terminations
     val position = ref start_position
     fun resume_at offset =
