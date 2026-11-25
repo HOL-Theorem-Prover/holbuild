@@ -752,7 +752,8 @@ Do not create checkpoints.
 .B \-\-no\-checkpoint\-saves
 Resume from saved checkpoints and failed prefixes as usual, here and on remote
 workers, but save, remove and publish none: the project's checkpoints, the
-host's deps heap store and the shared heaps stay as they were.
+host's deps heap store and the shared heaps stay as they were, and no
+automatic GC runs after it.
 For throwaway builds, such as experiments or scratch copies, that must not
 replace a project's resume state.
 A checkpoint that cannot be resumed is kept, and the theory runs again

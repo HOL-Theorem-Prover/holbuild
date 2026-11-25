@@ -2935,7 +2935,11 @@ fun build tc cli_jobs args =
     val (speculative_loading, args) = split_speculative_loading args
     val args = split_scratch_input_flag (split_tool_cache_flag args)
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
-    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, check_only, ...}, _) = split_flags args
+    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, check_only, no_checkpoint_saves, ...}, _) =
+      split_flags args
+    (* Automatic GC evicts and reindexes checkpoints, which a build under
+       --no-checkpoint-saves leaves as they were. *)
+    val gc_after = not dry_run andalso not no_checkpoint_saves
     val _ =
       if watch andalso HolbuildStatus.json_mode () then
         raise Error "--json does not support build --watch yet"
@@ -2966,12 +2970,12 @@ fun build tc cli_jobs args =
              (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach, priority = priority,
                           speculative_loading = speculative_loading})
              tc cli_jobs NONE parsed;
-           if detach then () else auto_gc (SOME o load_project))
+           if detach orelse not gc_after then () else auto_gc (SOME o load_project))
       | NONE =>
           if watch then build_watch tc cli_jobs parsed
           else
             (build_once tc cli_jobs parsed;
-             if dry_run then () else auto_gc (SOME o load_project))
+             if gc_after then auto_gc (SOME o load_project) else ())
   end
 
 fun chomp text =

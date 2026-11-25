@@ -115,12 +115,21 @@ require_grep "from: deps-loaded checkpoint" "$tmpdir/miss.log"
 expect_unchanged "$saved" miss
 
 # A passing resume keeps the failed prefix it resumed from, and saves no
-# context after it.
+# context after it. Nor does it run the automatic project and cache GC, which
+# evict checkpoints: a threshold that collects after every build, and an
+# abandoned staging directory a project GC would remove, show none ran.
+printf '[gc]\nproject_builds = 1\n' > "$project/.holconfig.toml"
+mkdir -p "$project/.holbuild/stage/abandoned"
+: > "$project/.holbuild/stage/abandoned/leftover"
+touch -d '10 days ago' "$project/.holbuild/stage/abandoned"
 write_a "ACCEPT_TAC TRUTH" 'ALL_TAC >> REFL_TAC'
 build pass --no-checkpoint-saves
 [[ "$build_status" = 0 ]] || { cat "$tmpdir/pass.log" >&2; echo "the passing build failed" >&2; exit 1; }
 require_grep "from: failed-prefix checkpoint in second" "$tmpdir/pass.log"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
+require_file "$project/.holbuild/stage/abandoned/leftover"
+! grep -q "automatic" "$tmpdir/pass.log" || { cat "$tmpdir/pass.log" >&2; echo "automatic gc ran" >&2; exit 1; }
+rm -r "$project/.holconfig.toml" "$project/.holbuild/stage/abandoned"
 expect_unchanged "$saved" pass
 
 # With the tree's deps heap gone, a run from a fresh preload neither takes the

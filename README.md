@@ -1182,9 +1182,9 @@ holbuild build --skip-checkpoints MyTheory
 - `--no-checkpoint-saves` resumes from saved checkpoints and failed prefixes
   as usual, locally and on remote workers, but saves, removes and publishes
   none: the project's checkpoint tree, the host's deps heap store and the
-  shared heaps stay as they were, and no checkpoint budget eviction runs. It
-  is for throwaway builds, such as experiments or scratch copies, that must
-  not replace a project's resume state. A checkpoint that cannot be resumed
+  shared heaps stay as they were, and neither checkpoint budget eviction nor
+  automatic GC runs. It is for throwaway builds, such as experiments or
+  scratch copies, that must not replace a project's resume state. A checkpoint that cannot be resumed
   is kept, and the theory runs again restoring none. With
   `--skip-checkpoints` nothing is restored either; it combines with
   `--check-only`, and excludes `--repl-on-failure`, whose REPL starts from the
