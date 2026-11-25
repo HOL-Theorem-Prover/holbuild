@@ -12015,9 +12015,13 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             val {sig_hash, sml_hash, parents, mldeps, ...} =
               cache_manifest_blobs_from_lines key (cache_manifest_lines source_text)
             val fetched = in_root root (".holbuild/light-" ^ sml_hash)
+            (* A local manifest whose blob is gone is dropped, as the full
+               restore drops it, so a retry finds the remote's entry. *)
             val sml_text =
               replace_all cache_sml_token (path ^ ".dat")
                 (fetch_spec_text remote {hash = sml_hash, dst = fetched} before remove_file fetched)
+              handle e as ActionFailed (InputMissing _, _) =>
+                (ignore (drop_cache_manifest_if_unchanged cache key source_text); raise e)
             val ui = [path ^ ".sig"]
             val uo = uo_lines stem {parents = parents, mldeps = mldeps}
           in
@@ -16140,7 +16144,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     (* Each phase's wall time, in the order they ran, for the result. *)
     val phases = ref ([] : (string * LargeInt.int) list)
     (* The hydrate time inside the current hol phase: a light hydrate's
-       install before HOL starts from a fresh preload, which is not HOL's. *)
+       install before HOL starts from a fresh preload, which is not HOL's
+       and is left out of the phase's time, not its span. *)
     val hol_hydrate_ms = ref (0 : LargeInt.int)
     fun phase name f =
       let
@@ -16153,7 +16158,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               val _ = if name = "hydrate" then hol_hydrate_ms := !hol_hydrate_ms + ms else ()
               val excluded = if name = "hol" then !hol_hydrate_ms else 0
               val spans = if List.exists (fn n => n = name) ["hol", "publish", "log"] then
-                  [(name ^ "start", Time.toMilliseconds t0 + excluded), (name ^ "end", Time.toMilliseconds ended)]
+                  [(name ^ "start", Time.toMilliseconds t0), (name ^ "end", Time.toMilliseconds ended)]
                 else []
           in phases := (name, ms - excluded) :: spans @ !phases end
       in
