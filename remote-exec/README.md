@@ -26,7 +26,8 @@ a container image with both.
 - **Worker loop** (`remote_exec/worker.py`): claims an action, runs `holbuild
   exec-action` on it with the holbuild release that exported it, heartbeats
   while it runs, and reports the result record. It runs one action at a time,
-  under a name no other worker shares (`--name`, by default `host:pid`), so a
+  under a name no other worker shares (`--name`, by default
+  `<boot8>/<host>:<pid>`), so a
   lease of that name it isn't running, one whose claim's answer never reached
   it, ends as soon as it claims or heartbeats again, without counting as an
   attempt.
@@ -52,6 +53,15 @@ seconds the process used and the CPU time per response:
 ```text
 2203 responses in 60 s, 25.9 CPU-s, 11.8 ms each: GET /v1/cache/members 200 950, POST /v1/work/claim 200 330, ...
 ```
+
+It also logs a `claim contention` line for a build claim from the shared ranking that is `slow` (a build with
+dependents claimed over 15 s after it became ready, when that time is known), `passed` (the best candidate of another
+batch the claim could have taken is deeper than the build it took; once per batch and tier every 15 s) or a 1%
+`sample` of claims another batch contested. It names the claiming host (`boot8`) and worker, the tier and wait, the
+build and its competitor as `batch8,theory,p<priority>,r<running>,a<waiting ahead>,d<critical depth>` (`a?` when
+that count wasn't read), the ranking's running priority builds, cap and whether it was capped when the claim chose,
+and each kept host's `boot8:memory_short:cpu_idle_pct:workers`. The waiting-ahead counts are read after the claim
+commits, on a connection of their own; nothing in the line changes how claims are made.
 
 Without the image, from this directory: `uv sync`, then `uv run alembic
 upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090`.
@@ -165,10 +175,14 @@ docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_
 to hosts of lower rank first, so hosts of higher rank (an interruptible spot
 pool, say) empty first and scale in.
 
-A worker's name in its leases is `--name`, by default `host:pid`. When
-`REMOTE_EXEC_IMAGE` names the image the worker runs as
-`<repository>@sha256:<digest>`, the default name ends in `@` and the digest's
-first 12 hex digits, so a lease says which image ran the action.
+A worker's name in its leases is `--name`, by default
+`<boot8>/<host>:<pid>[@<img12>]`. `<boot8>` is the first 8 characters of the
+host's boot id (`/proc/sys/kernel/random/boot_id`), the id the worker reports
+its host by, so an action's worker names the host it ran on; when the boot id
+can't be read, the name is `<host>:<pid>[@<img12>]`. When `REMOTE_EXEC_IMAGE`
+names the image the worker runs as `<repository>@sha256:<digest>`, the default
+name ends in `@` and the digest's first 12 hex digits (`<img12>`), so a lease
+says which image ran the action.
 
 On `SIGTERM`, a worker stops claiming and gives its running action up to
 `--drain-seconds` (20 by default) to finish and report its result. At the
