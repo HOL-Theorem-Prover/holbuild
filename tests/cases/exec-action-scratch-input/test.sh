@@ -86,7 +86,12 @@ val _ =
                  ("rename", fn () => OS.FileSys.rename {old = path, new = path ^ ".moved"}),
                  ("remove", fn () => OS.FileSys.remove path),
                  ("move dir", fn () => OS.FileSys.rename {old = dir, new = dir ^ ".moved"})]
+              fun names stream =
+                case OS.FileSys.readDir stream of
+                    NONE => (OS.FileSys.closeDir stream; [])
+                  | SOME name => name :: names stream
             in
+              print ("scratch dir: " ^ String.concatWith " " (names (OS.FileSys.openDir dir)) ^ "\n");
               print ("scratch tamper: " ^
                      String.concatWith " " (map (fn (what, f) => what ^ (if denied f then "=denied" else "=allowed")) tries) ^ "\n")
             end
@@ -252,7 +257,7 @@ hb action-spec --upload --scratch-input "$tmpdir/one.txt" --scratch-input "$tmpd
   > "$tmpdir/batch-both.txt"
 worker_command u-both "$(field "$tmpdir/batch-both.txt" scratch:UTheory 4)"
 built u-both one
-grep -A4 -x "scratch input: one" "$tmpdir/u-both.hol" | grep -qx "scratch input: two" || {
+grep -A5 -x "scratch input: one" "$tmpdir/u-both.hol" | grep -qx "scratch input: two" || {
   echo "worker u-both: U did not read both inputs in order" >&2; cat "$tmpdir/u-both.hol" >&2; exit 1; }
 
 # Across file systems, as a worker container's action root beside a
@@ -262,51 +267,59 @@ if [[ -d /dev/shm && -w /dev/shm && "$(stat -c %d /dev/shm)" != "$(stat -c %d "$
   cp -a "$worker_cache/blobs/." "$xdev/"
   rm -rf "$worker_cache/blobs"
   ln -s "$xdev" "$worker_cache/blobs"
-  # As in a new container: the root holds no staged input yet.
-  rm -rf "$worker_cache/action/.holbuild/scratch"
+  # As in a new container: nothing is kept yet.
+  rm -rf "$worker_cache/action-scratch"
   write_u 'ALL_TAC >> simp[]'
   hb action-spec --upload --scratch-input "$tmpdir/two.txt" UTheory > "$tmpdir/batch-xdev.txt"
   worker_command u-xdev "$(field "$tmpdir/batch-xdev.txt" scratch:UTheory 4)"
   built u-xdev two
-  grep -qx "scratch links: 1" "$tmpdir/u-xdev.hol" && grep -qx "scratch mode: 444" "$tmpdir/u-xdev.hol" || {
-    echo "across file systems the input is not a read-only copy" >&2; cat "$tmpdir/u-xdev.hol" >&2; exit 1; }
+  # The input is a link to the worker's read-only copy, kept outside the
+  # root, which is emptied after the action.
+  kept=$worker_cache/action-scratch/$sha_two
+  grep -qx "scratch links: 2" "$tmpdir/u-xdev.hol" && grep -qx "scratch mode: 444" "$tmpdir/u-xdev.hol" &&
+    [[ "$(stat -c %a "$kept")" == 444 ]] || {
+    echo "across file systems the input is not a link to a read-only copy" >&2; cat "$tmpdir/u-xdev.hol" >&2; exit 1; }
+  [[ ! -e "$worker_cache/action/.holbuild/scratch" ]] || {
+    echo "the root kept its staged input" >&2; ls -la "$worker_cache/action/.holbuild/scratch" >&2; exit 1; }
   grep -qx "scratch tamper: append=denied rename=denied remove=denied move dir=denied" "$tmpdir/u-xdev.hol" || {
     echo "the child could change the staged input" >&2; grep "scratch tamper" "$tmpdir/u-xdev.hol" >&2; exit 1; }
   copies() { sed -n 's/.*[=,]scratchcopyn:\([0-9]*\).*/\1/p' "$tmpdir/$1.result"; }
   [[ "$(copies u-xdev)" == 1 ]] || { echo "u-xdev did not count its copy" >&2; cat "$tmpdir/u-xdev.result" >&2; exit 1; }
-  # The copy stays for the next action with the input, which reuses it.
-  staged=$worker_cache/action/.holbuild/scratch/$sha_two
-  inode=$(stat -c %i "$staged")
+  # The next action with the input links the same copy.
+  inode=$(stat -c %i "$kept")
   write_u 'ALL_TAC >> ALL_TAC >> simp[]'
   hb action-spec --upload --scratch-input "$tmpdir/two.txt" UTheory > "$tmpdir/batch-kept.txt"
   worker_command u-kept "$(field "$tmpdir/batch-kept.txt" scratch:UTheory 4)"
   built u-kept two
-  [[ "$(stat -c %i "$staged")" == "$inode" && "$(copies u-kept)" == 0 ]] || {
-    echo "the staged input was copied again" >&2; cat "$tmpdir/u-kept.result" >&2; exit 1; }
+  [[ "$(stat -c %i "$kept")" == "$inode" && "$(copies u-kept)" == 0 ]] || {
+    echo "the kept input was copied again" >&2; cat "$tmpdir/u-kept.result" >&2; exit 1; }
   # One left writable, as by a copy interrupted before its chmod, is copied
-  # again.  The directory keeps at most eight staged files, this action's and
-  # then the latest used; anything else in it goes, a link but not its target.
-  chmod 644 "$staged"
-  scratch_dir=$(dirname "$staged")
+  # again.  At most eight copies are kept, this action's and then the latest
+  # used; anything else goes, a link but not its target.  The child sees
+  # only its own input.
+  chmod 644 "$kept"
+  store=$(dirname "$kept")
   for i in 1 2 3 4 5 6 7 8 9; do
     name=$(printf '%064d' "$i")
-    printf 'old %s\n' "$i" > "$scratch_dir/$name"
-    chmod 444 "$scratch_dir/$name"
-    touch -d "-$((10 - i)) minutes" "$scratch_dir/$name"
+    printf 'old %s\n' "$i" > "$store/$name"
+    chmod 444 "$store/$name"
+    touch -d "-$((10 - i)) minutes" "$store/$name"
   done
-  printf 'partial\n' > "$scratch_dir/.$sha_two.1.tmp"
+  printf 'partial\n' > "$store/.$sha_two.1.tmp"
   printf 'outside\n' > "$tmpdir/outside.txt"
-  ln -s "$tmpdir/outside.txt" "$scratch_dir/$(printf 'a%063d' 0)"
-  mkdir "$scratch_dir/$(printf 'b%063d' 0)"
+  ln -s "$tmpdir/outside.txt" "$store/$(printf 'a%063d' 0)"
+  mkdir "$store/$(printf 'b%063d' 0)"
   write_u 'ALL_TAC >> ALL_TAC >> ALL_TAC >> simp[]'
   hb action-spec --upload --scratch-input "$tmpdir/two.txt" UTheory > "$tmpdir/batch-pruned.txt"
   worker_command u-pruned "$(field "$tmpdir/batch-pruned.txt" scratch:UTheory 4)"
   built u-pruned two
-  [[ "$(stat -c %a "$staged")" == 444 && "$(copies u-pruned)" == 1 ]] || {
-    echo "a writable staged input was reused" >&2; cat "$tmpdir/u-pruned.result" >&2; exit 1; }
+  [[ "$(stat -c %a "$kept")" == 444 && "$(copies u-pruned)" == 1 ]] || {
+    echo "a writable kept input was reused" >&2; cat "$tmpdir/u-pruned.result" >&2; exit 1; }
+  grep -qx "scratch dir: $sha_two" "$tmpdir/u-pruned.hol" || {
+    echo "the child saw other inputs" >&2; grep "scratch dir" "$tmpdir/u-pruned.hol" >&2; exit 1; }
   expected=$(printf '%s\n' "$sha_two" $(for i in 3 4 5 6 7 8 9; do printf '%064d ' "$i"; done) | sort)
-  [[ "$(ls -A "$scratch_dir" | sort)" == "$expected" ]] || {
-    echo "the staged inputs were not pruned to eight:" >&2; ls -lA "$scratch_dir" >&2; exit 1; }
+  [[ "$(ls -A "$store" | sort)" == "$expected" ]] || {
+    echo "the kept inputs were not pruned to eight:" >&2; ls -lA "$store" >&2; exit 1; }
   [[ -f "$tmpdir/outside.txt" ]] || { echo "pruning followed a link" >&2; exit 1; }
 else
   echo "skipping the cross-file-system scratch input check: no writable /dev/shm on another device"
