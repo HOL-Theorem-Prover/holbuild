@@ -160,7 +160,7 @@ fun runtime_lines lines =
    marker clears the goal once the definition returns successfully. *)
 val termination_runtime_lines =
   ["structure HolbuildTerminationDiagnosticsRuntime = struct",
-   "fun print_line text = (TextIO.output(TextIO.stdOut, text ^ \"\\n\"); TextIO.flushOut TextIO.stdOut)",
+   "fun print_line text = HolbuildBoundedOutput.print (text ^ \"\\n\")",
    "fun assumptions_text [] = \"\"",
    "  | assumptions_text asms = String.concat (map (fn tm => \"asm: \" ^ Parse.term_to_string tm ^ \"\\n\") asms)",
    "fun goal_text (asms, concl) = assumptions_text asms ^ \"goal: \" ^ Parse.term_to_string concl",

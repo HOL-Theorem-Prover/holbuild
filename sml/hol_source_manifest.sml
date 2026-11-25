@@ -42,7 +42,7 @@ fun read_lines path =
 
 fun write_file path text =
   let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+  in HolbuildBoundedOutput.text (out, text); TextIO.closeOut out end
 
 fun command_output run_command command =
   let

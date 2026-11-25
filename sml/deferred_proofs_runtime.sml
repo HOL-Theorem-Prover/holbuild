@@ -505,7 +505,7 @@ struct
       fun retry (item as {name, ...} : item, msg) =
         if count <= 1 then raise failure name msg
         else
-          (TextIO.output (TextIO.stdErr, "deferred proof of " ^ name ^ " failed, retrying alone: " ^ msg ^ "\n");
+          (HolbuildBoundedOutput.text (TextIO.stdErr, "deferred proof of " ^ name ^ " failed, retrying alone: " ^ msg ^ "\n");
            prove item
            handle e => raise failure name (Feedback.exn_to_string e ^ " (first run: " ^ msg ^ ")"))
       val running = ref count

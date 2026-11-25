@@ -121,7 +121,7 @@ fun save ({file, entries, ...} : t) =
           val tmp = path ^ ".tmp"
           val output = TextIO.openOut tmp
         in
-          (TextIO.output (output, text); TextIO.closeOut output; OS.FileSys.rename {old = tmp, new = path})
+          (HolbuildBoundedOutput.text (output, text); TextIO.closeOut output; OS.FileSys.rename {old = tmp, new = path})
           handle e => (TextIO.closeOut output handle _ => (); remove_file tmp; raise e)
         end
 

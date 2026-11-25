@@ -23,6 +23,7 @@ on:
       - sml/tactic_compat_runtime.sml
       - sml/diagnostic_limits.sml
       - sml/sha256.sml
+      - sml/bounded_output.sml
       - sml/spawn.sml
       - sml/temp_path.sml
       - sml/hash.sml

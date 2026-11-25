@@ -111,7 +111,7 @@ fun split_status output =
 
 fun write_text path text =
   let val out = TextIO.openOut path
-  in (TextIO.output (out, text); TextIO.closeOut out) handle e => (TextIO.closeOut out; raise e) end
+  in (HolbuildBoundedOutput.text (out, text); TextIO.closeOut out) handle e => (TextIO.closeOut out; raise e) end
 
 (* A random batch id in UUID form, for the coordinator to store a batch under. *)
 fun new_batch_id () =

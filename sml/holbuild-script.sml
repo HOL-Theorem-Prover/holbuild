@@ -76,6 +76,7 @@ use_hol("src/portableML/Redblackmap.sig");
 use_hol("src/portableML/Redblackmap.sml");
 
 use "sml/sha256.sml";
+use "sml/bounded_output.sml";
 
 use "sml/spawn.sml";
 use "sml/temp_path.sml";

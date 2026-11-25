@@ -51,7 +51,7 @@ fun write_text path text =
       handle e => raise Error ("could not write " ^ path ^ ": " ^ General.exnMessage e)
     fun close () = TextIO.closeOut output handle _ => ()
   in
-    (TextIO.output(output, text); TextIO.closeOut output)
+    (HolbuildBoundedOutput.text (output, text); TextIO.closeOut output)
     handle e => (close (); raise e)
   end
 

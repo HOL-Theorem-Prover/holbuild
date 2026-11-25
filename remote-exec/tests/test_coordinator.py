@@ -659,9 +659,11 @@ async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
     assert cache.asked == [ac_key("a"), ac_key("a")]
 
 
-async def wait_until(condition: Callable[[], bool]) -> None:
-    while not condition():
-        await asyncio.sleep(0.01)
+async def wait_until(condition: Callable[[], bool], timeout: float | None = None) -> None:
+    """Wait for ``condition``; with ``timeout``, fail if it doesn't hold within that many seconds."""
+    async with asyncio.timeout(timeout):
+        while not condition():
+            await asyncio.sleep(0.01)
 
 
 async def test_a_release_asks_the_cache_about_its_parents_at_once(
@@ -2153,6 +2155,59 @@ async def test_on_demand_burst_hosts_past_the_fullest_rank_behind_spot(coordinat
     assert ranks == ["od-a", "od-b", "spot", "od-c"]
     # Standard work still packs onto the hosts by their own rank.
     assert coordinator._waiter_rank(["standard"], "od-c", 0).host_rank == 0
+
+
+async def test_a_claim_that_finds_nothing_tells_a_burst_worker_whether_its_host_fills_after_spot(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """od-b is an On-Demand host beyond the one the fleet keeps, so its burst workers exit at once when idle; those of
+    od-a and of Spot wait out their idle time, as do od-b's workers that claim standard work first."""
+    report_burst_hosts(coordinator, {"od-a": (0, 8, 0), "od-b": (0, 2, 0), "spot": (1, 3, 0)})
+    spilled = {}
+    for host, rank, tier in [("od-a", 0, "high"), ("od-b", 0, "high"), ("spot", 1, "high"), ("od-b", 0, "standard")]:
+        also = ["standard"] if tier == "high" else ["high"]  # od-b still ranks 2 with a worker taking both
+        body = {"tier": tier, "also_claim": also, "worker": f"{host}-{tier}", "host": {"id": host, "rank": rank}}
+        response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+        assert response.status_code == 204, response.text
+        spilled[host, tier] = response.headers.get("Holbuild-Spilled")
+    assert coordinator.spilled("od-b")
+    assert spilled == {("od-a", "high"): None, ("od-b", "high"): "1", ("spot", "high"): None, ("od-b", "standard"): None}
+
+
+async def test_a_claim_that_finds_nothing_counts_its_worker_free_until_it_claims_again(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """The wait outlasts TURNAROUND_SECONDS: seen only as the claim came, the idle worker would leave no slot on the
+    scale-in line between its claims, from the end of its wait (as the end of the claim ends unheld leases) on."""
+    now = coordinator.clock()
+    coordinator.clock = lambda: now
+    body = {"tier": "high", "also_claim": ["standard"], "worker": "w", "wait_s": 1, "host": {"id": "spot", "rank": 1}}
+    seen_at_release: list[datetime] = []
+    release_unheld = coordinator.release_unheld
+
+    async def releasing(*args: Any) -> None:
+        seen_at_release.append(coordinator.host_workers["spot"]["w"][0])
+        await release_unheld(*args)
+
+    coordinator.release_unheld = releasing  # type: ignore[method-assign]
+    waiting = asyncio.create_task(http.post("/v1/work/claim", json=body, headers=WORKER))
+    await wait_until(lambda: bool(coordinator.claim_waiters), timeout=5)
+    now += timedelta(seconds=coordinator_module.TURNAROUND_SECONDS + 10)
+    assert (await waiting).status_code == 204
+    assert seen_at_release == [now] and coordinator.host_workers["spot"]["w"][0] == now
+
+
+async def test_a_claim_that_finds_nothing_after_its_worker_gave_up_on_it_keeps_the_workers_new_lease(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """The worker stopped waiting for this claim and its next one took a lease, which stays noted for its host."""
+    body = {"tier": "high", "also_claim": ["standard"], "worker": "w", "wait_s": 1, "host": {"id": "spot", "rank": 1}}
+    waiting = asyncio.create_task(http.post("/v1/work/claim", json=body, headers=WORKER))
+    await wait_until(lambda: bool(coordinator.claim_waiters), timeout=5)
+    token = uuid4()
+    coordinator.lease_hosts[token] = ("spot", "w", ["high", "standard"])
+    assert (await waiting).status_code == 204
+    assert token in coordinator.lease_hosts
 
 
 async def test_a_burst_host_with_no_report_takes_no_on_demand_hosts_rank(coordinator: Coordinator) -> None:

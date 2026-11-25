@@ -2652,6 +2652,10 @@ class Coordinator:
             host_rank = self._burst_ranks(self.clock()).get(host_id, 0)
         return _claim_rank(tiers, host_id, host_rank, len(self.host_workers.get(host_id or "", ())))
 
+    def spilled(self, host_id: str) -> bool:
+        """Whether burst host ``host_id`` is an On-Demand host claims fill after Spot (rank 2, see _burst_ranks)."""
+        return self._burst_ranks(self.clock()).get(host_id) == 2
+
     def _burst_ranks(self, now: datetime) -> dict[str, int]:
         """The rank each burst host of rank 0 (On-Demand) packs at: the ``on_demand_burst_hosts`` with the most
         workers seen lately (then by id) keep 0, ahead of Spot's 1; the others, On-Demand hosts started for workers

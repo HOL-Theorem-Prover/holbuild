@@ -151,7 +151,7 @@ struct
             ["holbuild source-load", "ctx=" ^ context, "kind=" ^ kind, "name=" ^ name, "n=" ^ Int.toString n,
              "total_us=" ^ LargeInt.toString total, "self_us=" ^ LargeInt.toString self] ^ "\n"
       in
-        TextIO.output (TextIO.stdErr,
+        HolbuildBoundedOutput.text (TextIO.stdErr,
           String.concat
             (("holbuild hol-phases " ^
               String.concatWith " " (map phases [("srclib", "library"), ("srcrt", "runtime"), ("srcthy", "theory")]) ^
@@ -197,8 +197,9 @@ struct
         val start = Time.now ()
         fun finish () =
           let
-            val total = Time.toMicroseconds (Time.- (Time.now (), start))
-            val self = total - !nested
+            (* At zero when the wall clock steps back. *)
+            val total = LargeInt.max (0, Time.toMicroseconds (Time.- (Time.now (), start)))
+            val self = LargeInt.max (0, total - !nested)
             val _ = stack := (case !stack of _ :: outer => outer | [] => [])
             val _ = case !stack of outer :: _ => outer := !outer + total | [] => ()
             val loads = #loads source_load_state
@@ -211,18 +212,23 @@ struct
       end
 
   (* A file the loader evaluates: a theory's (its initialization, from its
-     module or its source), a HOL library's by its path under HOLDIR, or a
-     project library's by its file name alone, the action root's path being
-     local to the machine. *)
+     module or its source), a HOL library's by its path under HOLDIR (or under
+     the hol package's staged sources, where a worker stages the HOL
+     libraries a project builds itself), or a project library's by its file
+     name alone, the action root's path being local to the machine. *)
+  val staged_hol_sources = "/.holbuild/action-src/hol/"
   fun time_source_file path f =
     let
       val expanded = holpathdb.subst_pathvars path handle _ => path
       val file = OS.Path.file expanded
       val holdir = Systeml.HOLDIR ^ "/"
+      val (_, staged) = Substring.position staged_hol_sources (Substring.full expanded)
       val label =
         if String.isSuffix "Theory.sml" file orelse String.isSuffix "Theory.sig" file then ("theory", "*")
         else if String.isPrefix holdir expanded then
           ("library", "hol:" ^ label_text (String.extract (expanded, size holdir, NONE)))
+        else if not (Substring.isEmpty staged) then
+          ("library", "hol:" ^ label_text (Substring.string (Substring.triml (size staged_hol_sources) staged)))
         else ("library", "project:" ^ label_text file)
     in
       if !untimed_dir <> "" andalso String.isPrefix (!untimed_dir ^ "/") expanded then f ()
@@ -295,7 +301,7 @@ struct
   fun write_text path text =
     let
       val out = TextIO.openOut path
-      val _ = TextIO.output(out, text)
+      val _ = HolbuildBoundedOutput.text (out, text)
       val _ = TextIO.closeOut out
     in
       ()
@@ -471,7 +477,7 @@ struct
   fun theory_data_digest dat_path =
     let
       fun as_written why =
-        (TextIO.output (TextIO.stdErr,
+        (HolbuildBoundedOutput.text (TextIO.stdErr,
                         "holbuild: warning: hashing " ^ dat_path ^ " as written: " ^ why ^ "\n");
          SHA1.sha1_file {filename = dat_path})
       (* Not HOLsexp.fromFile: HOLFileSys would remap the path again. *)

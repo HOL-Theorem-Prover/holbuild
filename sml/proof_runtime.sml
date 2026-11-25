@@ -154,7 +154,7 @@ fun timed_hol_phase name f =
   end
 
 fun print_hol_phases () =
-  TextIO.output (TextIO.stdErr,
+  HolbuildBoundedOutput.text (TextIO.stdErr,
     String.concat ("holbuild hol-phases" ::
                    map (fn (name, n) => " " ^ name ^ "=" ^ LargeInt.toString n) (rev (!hol_phases_ref))) ^ "\n")
 
@@ -163,7 +163,7 @@ fun write_timeout_marker label seconds =
       NONE => ()
     | SOME path =>
         let val out = TextIO.openOut path
-        in TextIO.output(out, String.concat [label, "\t", Real.toString seconds, "\n"]);
+        in HolbuildBoundedOutput.text (out, String.concat [label, "\t", Real.toString seconds, "\n"]);
            TextIO.closeOut out
         end
 
@@ -302,7 +302,7 @@ fun retry_after_timeout label seconds first_attempt f x =
                 raise TacticTimeout (timeout_message label seconds))
            | FunctionInterrupted => raise tactic_interrupted label
   in
-    TextIO.output (TextIO.stdErr,
+    HolbuildBoundedOutput.text (TextIO.stdErr,
       String.concat ["holbuild tactic timeout retry passed: ", display_label label,
                      " (budget ", Real.toString seconds, "s; retry ",
                      fmt_ms (Time.toReal (Timer.checkRealTimer retry)), " ms wall; GC during first attempt ",
@@ -386,7 +386,7 @@ fun with_tactic_timeout label program f x =
                     | NONE => ("unknown", "atomic")
                 val status = case result of TimeoutResult _ => "ok" | TimeoutException _ => "failed"
               in
-                TextIO.output (TextIO.stdErr,
+                HolbuildBoundedOutput.text (TextIO.stdErr,
                   String.concat ["holbuild slow-proof-step\t", display_label name,
                     "\t", index, "\t", kind, "\t", status,
                     "\t", fmt_ms elapsed, "\t", fmt_ms seconds,
@@ -405,7 +405,7 @@ fun save_checkpoint label default_share path ok_text depth =
 
 fun write_text_file path text =
   let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+  in HolbuildBoundedOutput.text (out, text); TextIO.closeOut out end
 
 fun path_component_text component =
   case component of
@@ -1009,7 +1009,7 @@ fun diagnostic_fragment_label label =
 
 fun print_goal_state label goals = timed_hol_phase "holprint" (fn () =>
   (failed_goal_state_printed_ref := true;
-   TextIO.output(TextIO.stdErr, with_cached_grammar_term_printer (fn () =>
+   HolbuildBoundedOutput.text (TextIO.stdErr, with_cached_grammar_term_printer (fn () =>
     String.concat ["\nholbuild goal state at failed fragment: ", diagnostic_fragment_label label,
                    failed_theorem_line (),
                    failed_step_end_line (),
@@ -1048,7 +1048,7 @@ fun print_finish_goal_state name =
 fun print_step_failure_goal_state label goals =
   print_goal_state label goals
   handle print_e =>
-    TextIO.output(TextIO.stdErr,
+    HolbuildBoundedOutput.text (TextIO.stdErr,
       String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"])
 
 fun emit_step_failure_diagnostic label goals =
@@ -1084,7 +1084,7 @@ fun report_finish_failure name e =
     val _ =
       (ignore (print_finish_goal_state name)
        handle print_e =>
-         TextIO.output(TextIO.stdErr,
+         HolbuildBoundedOutput.text (TextIO.stdErr,
            String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"]))
   in
     raise e
@@ -1454,16 +1454,16 @@ fun plan_enabled () =
 fun current_goal_count () = length (history_top_goals()) handle _ => ~1
 
 fun trace_line parts =
-  if trace_enabled () then TextIO.output(TextIO.stdErr, String.concat parts) else ()
+  if trace_enabled () then HolbuildBoundedOutput.text (TextIO.stdErr, String.concat parts) else ()
 
 fun trace_plan theorem_name plan =
   if plan_enabled () then
-    (TextIO.output(TextIO.stdErr,
+    (HolbuildBoundedOutput.text (TextIO.stdErr,
        String.concat ["holbuild proof-ir plan theorem=", theorem_name,
                       " steps=", Int.toString (length plan), "\n"]);
      List.app
        (fn (index, proof_step) =>
-          TextIO.output(TextIO.stdErr,
+          HolbuildBoundedOutput.text (TextIO.stdErr,
             String.concat ["holbuild proof-ir plan step=", Int.toString index,
                            " theorem=", theorem_name,
                            " kind=", HolbuildProofIr.step_kind proof_step,
@@ -2611,7 +2611,7 @@ fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, chec
    HolbuildTacticCompat.install_prover proof_ir_prover;
    case tactic_timeout of
        NONE => ()
-     | SOME seconds => TextIO.output (TextIO.stdErr,
+     | SOME seconds => HolbuildBoundedOutput.text (TextIO.stdErr,
          "holbuild slow-proof-steps v1 coverage=executed limit_ms=" ^ fmt_ms seconds ^ "\n"))
 
 end

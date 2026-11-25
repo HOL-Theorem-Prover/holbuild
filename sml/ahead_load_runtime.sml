@@ -81,7 +81,7 @@ struct
 
   fun abandon reason =
     (write "abandoned" reason;
-     TextIO.output (TextIO.stdErr, "holbuild: loading ahead abandoned: " ^ reason ^ "\n");
+     HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: loading ahead abandoned: " ^ reason ^ "\n");
      OS.Process.exit OS.Process.failure)
 
   fun start directory share_heap modules_readable =

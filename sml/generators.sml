@@ -40,7 +40,7 @@ fun write_text path text =
   let val _ = ensure_parent path
       val output = TextIO.openOut path
   in
-    TextIO.output(output, text);
+    HolbuildBoundedOutput.text (output, text);
     TextIO.closeOut output
   end
   handle e => die ("could not write " ^ path ^ ": " ^ General.exnMessage e)

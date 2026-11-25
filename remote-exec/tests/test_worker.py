@@ -175,6 +175,7 @@ class Server:
     queued_claims: list[dict[str, object]] = field(default_factory=list)  # next_claim's successors, in order
     claim_started: threading.Event = field(default_factory=threading.Event)
     hold_claim: threading.Event | None = None
+    spilled: bool = False  # whether a claim finding no work says the host is one claims fill after Spot
     protection_reply: dict[str, object] = field(default_factory=dict)
     protection_status: int = 200
 
@@ -187,8 +188,10 @@ def server() -> Iterator[Server]:
         def body(self) -> str:
             return self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
 
-        def reply(self, status: int, body: str = "") -> None:
+        def reply(self, status: int, body: str = "", headers: dict[str, str] | None = None) -> None:
             self.send_response(status)
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
             with contextlib.suppress(BrokenPipeError, ConnectionResetError):
                 self.end_headers()
@@ -228,7 +231,9 @@ def server() -> Iterator[Server]:
                 if state.hold_claim is not None:
                     state.hold_claim.wait(15)
                 claimed, state.next_claim = state.next_claim, state.queued_claims.pop(0) if state.queued_claims else None
-                return self.reply(204) if claimed is None else self.reply(200, json.dumps(claimed))
+                if claimed is None:
+                    return self.reply(204, headers={"Holbuild-Spilled": "1"} if state.spilled else None)
+                return self.reply(200, json.dumps(claimed))
             if self.path == "/v1/work/report":
                 state.reports.append(json.loads(body))
                 return self.reply(state.report_status)
@@ -879,7 +884,7 @@ def scripted_main(
     *, unavailable: bool = False, calls: list[float] | None = None, clears: list[bool] | None = None,
     timeouts: list[float] | None = None, drain: bool = False, spells: bool = True, unknown: bool = False,
     unknown_before: bool = False, args: tuple[str, ...] = (), exits: bool = False, reaper_busy: list[bool] | None = None,
-    failed: bool = False, idle_exit: float = 0, empty_claim_seconds: float = 0,
+    failed: bool = False, idle_exit: float = 0, empty_claim_seconds: float = 0, spilled: bool = False,
 ) -> list[str]:
     """Run ``worker.main`` with extra arguments ``args`` on ``claims`` claims (or, as a list, claims that find work
     or not), each run as an action that sets protection (with no answer, with ``unknown``; from an unknown state,
@@ -887,7 +892,7 @@ def scripted_main(
     return the claims, runs and protection calls in order. With ``exits``, the worker exits before the claims run
     out; ``reaper_busy`` says whether exec-action's work after a result still runs, at each check (not, once it
     runs out). With ``failed``, the claims that find no work fail instead. A burst worker exits after ``idle_exit``
-    seconds without work; each claim that finds none takes ``empty_claim_seconds``."""
+    seconds without work; each claim that finds none takes ``empty_claim_seconds`` and says the host is ``spilled``."""
     monkeypatch.setenv("REMOTE_EXEC_WORKER_TOKEN", "w")
     monkeypatch.setenv("HOLBUILD_CACHE", str(tmp_path / "cache"))
     monkeypatch.setattr(worker, "parse_args", lambda: worker_args(tmp_path, server, *args))
@@ -910,6 +915,7 @@ def scripted_main(
         found = left.pop(0)
         if not isinstance(found, dict):
             time.sleep(empty_claim_seconds)
+            _args[0].spilled = spilled
         return found
 
     def run(coordinator, _args, _releases, protection, *_rest, **_kwargs) -> bool:
@@ -992,6 +998,25 @@ def test_a_burst_worker_exits_only_once_its_claims_found_no_work_for_the_idle_ex
     assert events == ["claim", "run", "on:True", "claim", "off", "claim"]
     events = scripted_main(tmp_path, server, monkeypatch, [], [True, False, False], args=BURST_ARGS, idle_exit=60)
     assert events == ["claim", "run", "on:True", "claim", "off", "claim", "claim"]
+
+
+def test_a_burst_worker_on_a_host_claims_fill_after_spot_exits_at_its_first_claim_that_finds_nothing(
+    tmp_path: Path, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Waiting out its idle time there, it would catch stray work and keep the On-Demand host up.
+    events = scripted_main(
+        tmp_path, server, monkeypatch, [], [True, False, True], args=BURST_ARGS, exits=True, idle_exit=60,
+        spilled=True,
+    )
+    assert events == ["claim", "run", "on:True", "claim", "off"]
+
+
+def test_a_claim_that_finds_nothing_tells_whether_the_host_is_one_claims_fill_after_spot(server: Server) -> None:
+    coordinator = Coordinator(server.url, "w")
+    server.spilled = True
+    assert coordinator.claim(["high", "standard"], "w", 0, {}) is None and coordinator.spilled
+    server.spilled = False
+    assert coordinator.claim(["high", "standard"], "w", 0, {}) is None and not coordinator.spilled
 
 
 def test_a_burst_worker_that_ran_no_action_keeps_claiming(
