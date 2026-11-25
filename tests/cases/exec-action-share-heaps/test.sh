@@ -129,11 +129,12 @@ field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $co
 shared=$tmpdir/worker-shared
 cold=$tmpdir/worker-cold
 
-# export VERSION: T's spec in both remote caches, and A built in both.
+# export VERSION [OPTION...]: T's spec in both remote caches, and A built in both.
 export_t() {
   local version=$1 url
+  shift
   for url in "$shared_url" "$cold_url"; do
-    (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" action-spec --upload TTheory) \
+    (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" action-spec --upload "$@" TTheory) \
       > "$tmpdir/batch-$version-${url##*:}.txt"
   done
   batch=$tmpdir/batch-$version-${shared_url##*:}.txt
@@ -172,7 +173,7 @@ forget_local() { rm -rf "$shared/checkpoints" "$shared/checkpoint-store"; }
 resumed() {
   require_grep "restored shared $3" "$tmpdir/$1.log"
   require_grep "from: $2" "$tmpdir/$1.log"
-  if grep -q "discarding" "$tmpdir/$1.log"; then
+  if grep -qE "discarding|not resuming from" "$tmpdir/$1.log"; then
     echo "version $1: the build discarded the restored state" >&2
     cat "$tmpdir/$1.log" >&2
     exit 1
@@ -386,6 +387,58 @@ v4b_steps=$(restored_steps v4b)
   cat "$tmpdir/v4b.log" >&2
   exit 1
 }
+
+# A spec of build --no-checkpoint-saves: the worker resumes from the shared
+# failed prefix, and shares nothing, neither the later prefix a failure past
+# it would nor the contexts after it of a pass, nor, on a miss, the failed
+# prefix and contexts of a run from the deps heap.
+shared_state() { grep -lE '^holbuild-shared-' "$tmpdir"/remote/ac/* | sort | xargs sha256sum; }
+for version in v4c v4d v4e; do
+  case "$version" in
+    v4c) write_t "T \\/ F" "ALL_TAC >> ALL_TAC >> FAIL_TAC \"unshared failure\"" ;;
+    v4d) write_t "T \\/ F" "ALL_TAC >> rw[]" ;;
+    v4e) write_t "F \\/ T" "FAIL_TAC \"missed failure\"" ;;
+  esac
+  export_t "$version" --no-checkpoint-saves
+  grep -qx "option no-checkpoint-saves=true" "$project/.holbuild/action-specs/$spec_t" || {
+    echo "$version: the spec doesn't carry --no-checkpoint-saves" >&2; exit 1; }
+  before=$(shared_state)
+  forget_local
+  worker "$version" "$shared_url" "$shared" "$spec_t" --share-heaps
+  case "$version" in
+    v4c)
+      expect v4c 1 "status=failed" "failure=proof"
+      require_grep "unshared failure" "$tmpdir/v4c.log"
+      resumed v4c "failed-prefix checkpoint in t3" "failed_prefix checkpoint" ;;
+    v4d)
+      expect v4d 0 "status=built"
+      resumed v4d "failed-prefix checkpoint in t3" "failed_prefix checkpoint" ;;
+    v4e)
+      expect v4e 1 "status=failed" "failure=proof"
+      require_grep "missed failure" "$tmpdir/v4e.log"
+      resumed v4e "deps-loaded checkpoint" "deps-loaded heap" ;;
+  esac
+  # The worker's checkpoint tree is private to the action.
+  [[ ! -e "$shared/checkpoints" ]] || { echo "$version: the private checkpoint tree outlived the action" >&2; exit 1; }
+  [[ "$(shared_state)" = "$before" ]] || {
+    echo "$version: a worker under --no-checkpoint-saves shared checkpoints:" >&2
+    diff <(printf '%s\n' "$before") <(shared_state) >&2 || true
+    exit 1
+  }
+done
+
+# With no shared heap to restore (the cold remote has none), a sharing worker
+# under the flag runs from a fresh preload and still shares nothing, where it
+# would share its deps heap, contexts and failed prefix.
+rm -rf "$cold/checkpoints"
+worker v4f "$cold_url" "$cold" "$spec_t" --share-heaps
+expect v4f 1 "status=failed" "failure=proof"
+require_grep "missed failure" "$tmpdir/v4f.log"
+! grep -q "restored shared" "$tmpdir/v4f.log" || { cat "$tmpdir/v4f.log" >&2; echo "v4f restored shared state" >&2; exit 1; }
+if grep -qlE '^holbuild-shared-' "$tmpdir"/remote-cold/ac/*; then
+  echo "v4f: a worker under --no-checkpoint-saves shared checkpoints with no shared heap to restore" >&2
+  exit 1
+fi
 
 write_t "T \\/ F" "rw[]"
 export_t v5
