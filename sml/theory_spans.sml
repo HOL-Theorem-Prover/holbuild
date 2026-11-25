@@ -23,7 +23,7 @@ fun run wants source_path =
     val result as {output, response, ...} =
       HolbuildDependencies.run_analyser {analyser = analyser (), request = request, capture_stderr = true}
   in
-    print output;
+    HolbuildBoundedOutput.print output;
     case response of
         SOME text => String.tokens (fn c => c = #"\n") text
       | NONE => raise HolbuildTheoryCheckpoints.Error ("holbuild-hol-analyser failed for " ^ source_path ^

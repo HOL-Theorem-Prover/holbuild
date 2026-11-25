@@ -11,6 +11,10 @@ source "$SCRIPT_DIR/../../lib.sh"
 # so no single write(2) or pwrite64(2) of a file may exceed 64 KiB: multi-MiB
 # text through the whole-text writers, a multi-MiB cache blob restored by
 # fetch_blob, and a decoded zstd blob of 1 MiB frames.
+if [[ $(uname -s) != Linux ]]; then
+  echo 'SKIP bounded-writes (traces Linux write sizes with strace)'
+  exit 0
+fi
 command -v strace > /dev/null || { echo "strace is required" >&2; exit 1; }
 
 tmpdir=$(make_temp_dir)

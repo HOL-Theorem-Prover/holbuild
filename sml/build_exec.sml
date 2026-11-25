@@ -17123,7 +17123,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   val _ = ensure_parent path
                   val out = TextIO.openAppend path
                 in
-                  TextIO.output (out, "\n" ^ line ^ "\n");
+                  HolbuildBoundedOutput.text (out, "\n" ^ line ^ "\n");
                   TextIO.closeOut out
                 end
                 handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e)

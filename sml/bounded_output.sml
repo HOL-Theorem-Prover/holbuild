@@ -21,7 +21,8 @@ fun text (out, s) =
     loop 0
   end
 
-fun print s = text (TextIO.stdOut, s)
+(* As print, which flushes stdout after each write. *)
+fun print s = (text (TextIO.stdOut, s); TextIO.flushOut TextIO.stdOut)
 
 fun binary (out, bytes) =
   let

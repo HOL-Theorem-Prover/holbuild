@@ -302,7 +302,7 @@ fun retry_after_timeout label seconds first_attempt f x =
                 raise TacticTimeout (timeout_message label seconds))
            | FunctionInterrupted => raise tactic_interrupted label
   in
-    TextIO.output (TextIO.stdErr,
+    HolbuildBoundedOutput.text (TextIO.stdErr,
       String.concat ["holbuild tactic timeout retry passed: ", display_label label,
                      " (budget ", Real.toString seconds, "s; retry ",
                      fmt_ms (Time.toReal (Timer.checkRealTimer retry)), " ms wall; GC during first attempt ",
@@ -386,7 +386,7 @@ fun with_tactic_timeout label program f x =
                     | NONE => ("unknown", "atomic")
                 val status = case result of TimeoutResult _ => "ok" | TimeoutException _ => "failed"
               in
-                TextIO.output (TextIO.stdErr,
+                HolbuildBoundedOutput.text (TextIO.stdErr,
                   String.concat ["holbuild slow-proof-step\t", display_label name,
                     "\t", index, "\t", kind, "\t", status,
                     "\t", fmt_ms elapsed, "\t", fmt_ms seconds,
@@ -1454,7 +1454,7 @@ fun plan_enabled () =
 fun current_goal_count () = length (history_top_goals()) handle _ => ~1
 
 fun trace_line parts =
-  if trace_enabled () then TextIO.output(TextIO.stdErr, String.concat parts) else ()
+  if trace_enabled () then HolbuildBoundedOutput.text (TextIO.stdErr, String.concat parts) else ()
 
 fun trace_plan theorem_name plan =
   if plan_enabled () then
@@ -1463,7 +1463,7 @@ fun trace_plan theorem_name plan =
                       " steps=", Int.toString (length plan), "\n"]);
      List.app
        (fn (index, proof_step) =>
-          TextIO.output(TextIO.stdErr,
+          HolbuildBoundedOutput.text (TextIO.stdErr,
             String.concat ["holbuild proof-ir plan step=", Int.toString index,
                            " theorem=", theorem_name,
                            " kind=", HolbuildProofIr.step_kind proof_step,
