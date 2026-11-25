@@ -16808,7 +16808,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           case HolbuildCache.get_action cache (#input_key spec) of
               SOME _ =>
                 ((if forced andalso #check_only spec then () else HolbuildCache.remove_action cache (#input_key spec));
-                 if forced then () else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
+                 if forced orelse not (checkpoint_saves_enabled (spec_policy spec)) then ()
+                 else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
             | NONE => ()
         val stage = action_stage root action
         val policy =
@@ -16919,7 +16920,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               (fn () =>
                  ((* A passing non-target has no checkpoint to share. *)
                   if checkpoint_target_enabled policy then publish_shared () else drop_heap_snapshot ();
-                  if !cancelled then () else
+                  if !cancelled orelse not (checkpoint_saves_enabled policy) then () else
                   (* After the publish: the checkpoints saved after
                      resuming from a failed prefix are its children. *)
                   remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)));

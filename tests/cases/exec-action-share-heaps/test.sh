@@ -416,16 +416,29 @@ for version in v4c v4d v4e; do
     v4e)
       expect v4e 1 "status=failed" "failure=proof"
       require_grep "missed failure" "$tmpdir/v4e.log"
-      if grep -q "from: failed-prefix checkpoint" "$tmpdir/v4e.log"; then
-        echo "v4e: resumed a failed prefix behind an edit" >&2; exit 1
-      fi ;;
+      resumed v4e "deps-loaded checkpoint" "deps-loaded heap" ;;
   esac
+  # The worker's checkpoint tree is private to the action.
+  [[ ! -e "$shared/checkpoints" ]] || { echo "$version: the private checkpoint tree outlived the action" >&2; exit 1; }
   [[ "$(shared_state)" = "$before" ]] || {
     echo "$version: a worker under --no-checkpoint-saves shared checkpoints:" >&2
     diff <(printf '%s\n' "$before") <(shared_state) >&2 || true
     exit 1
   }
 done
+
+# With no shared heap to restore (the cold remote has none), a sharing worker
+# under the flag runs from a fresh preload and still shares nothing, where it
+# would share its deps heap, contexts and failed prefix.
+rm -rf "$cold/checkpoints"
+worker v4f "$cold_url" "$cold" "$spec_t" --share-heaps
+expect v4f 1 "status=failed" "failure=proof"
+require_grep "missed failure" "$tmpdir/v4f.log"
+! grep -q "restored shared" "$tmpdir/v4f.log" || { cat "$tmpdir/v4f.log" >&2; echo "v4f restored shared state" >&2; exit 1; }
+if grep -qlE '^holbuild-shared-' "$tmpdir"/remote-cold/ac/*; then
+  echo "v4f: a worker under --no-checkpoint-saves shared checkpoints with no shared heap to restore" >&2
+  exit 1
+fi
 
 write_t "T \\/ F" "rw[]"
 export_t v5
