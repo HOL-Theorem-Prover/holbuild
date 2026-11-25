@@ -274,6 +274,7 @@ short_missing=$(sed -n 's/^missing=//p' "$short_entry")
   { echo "the heap saved with an empty store isn't marked short:" >&2; cat "$short_entry" >&2; exit 1; }
 phase short-B "depsmissn:$short_missing"
 phase short-B 'rstdepskb:[1-9][0-9]*'
+cp "$short_entry" "$tmpdir/short.entry"
 exec_theory Z z unshared
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 server_log=$tmpdir/server/requests.log
@@ -786,3 +787,31 @@ resumed proof-edit-B 'theorem-context checkpoint after b_first'
 # name.
 [[ $(find "$worker_modules" -name '*-A-*.pmo' | wc -l) == 2 ]] ||
   { echo "A's proof-only change didn't change ATheory.dat" >&2; exit 1; }
+
+# A cache in front of the store still serves B's short heap entry after
+# the store's was replaced: the run reads the store's past it, and resumes
+# on the replacement.
+heap_key=${short_entry##*/}
+export HOLBUILD_TEST_MODULE_MIN_MISSING=1
+cp "$tmpdir/short.entry" "$tmpdir/control/ac-stale-$heap_key"
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_b stale-short
+exec_theory B stale-short
+grep -qx "$heap_key" "$tmpdir/control/no-cache-gets" && [[ ! -e "$tmpdir/control/ac-stale-$heap_key" ]] ||
+  { echo "stale-short-B didn't read the heap entry past the cache's copy" >&2; exit 1; }
+resumed stale-short-B 'theorem-context checkpoint after b_first'
+# A host declines a short heap once: the store's entry is short again, and
+# the second run on W restores it as it is.
+for run in redeclined kept; do
+  cp "$tmpdir/short.entry" "$short_entry"
+  rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+  edit_b "$run"
+  exec_theory B "$run"
+done
+phase redeclined-B 'rstheapdeclinen:1'
+if grep -qE '^phase-ms=(.*,)?rstheapdeclinen:' "$tmpdir/kept-B.result"; then
+  echo "kept-B declined a heap W had declined already" >&2; cat "$tmpdir/kept-B.result" >&2; exit 1
+fi
+require_grep 'restored shared' "$tmpdir/kept-B.log"
+[[ $(wc -l < "$(find "$worker" -name .declined-heaps)") -eq 1 ]] ||
+  { echo "W recorded the declined heap again" >&2; exit 1; }

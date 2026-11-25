@@ -517,8 +517,8 @@ val _ = check "a store lacking 15 modules, besides 2 unpublished, was prefetched
    again with their time. *)
 val late = List.nth (published16, 14);
 val _ = E.write_text probed
-          (String.concat (map (fn file => valOf (E.module_file_theory_part file) ^ " 0\n")
-                              (late :: List.drop (ps, 14))));
+          (valOf (E.module_file_theory_part late) ^ "\n" ^
+           String.concat (map (fn file => valOf (E.module_file_theory_part file) ^ " 0\n") (List.drop (ps, 14))));
 val _ = prefetch ();
 val _ = check "modules found unpublished long ago were not looked up again" (requests () > before_requests);
 val _ = check "a module published since it was found unpublished long ago was not fetched" (stored "hol7" late);

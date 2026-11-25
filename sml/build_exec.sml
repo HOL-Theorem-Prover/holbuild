@@ -13985,12 +13985,22 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       case captured of
           SOME {missing, cone} => missing < module_writer_min_missing () andalso cone >= module_writer_min_missing ()
         | NONE => false
+    (* A heap entry naming a blob the cache lost counts as absent only
+       while the store's copy still names one: another worker may have
+       replaced it since. *)
+    fun names_lost text =
+      List.exists (fn (_, sha, _) => member sha missing) (shared_manifest_entries text) handle Error _ => true
     fun heap_present () =
-      not (member heap_key stale) andalso
-      (case read_heap_entry remote (#modules ctx) heap_key of
-           NONE => false
-         | found as SOME text =>
-             found <> poisoned andalso not (complete andalso (short_heap_entry (#modules ctx) text handle Error _ => false)))
+      let
+        val lost = member heap_key stale
+        fun read () = read_heap_entry remote (#modules ctx) heap_key
+      in
+        case (if lost then HolbuildRemoteCache.revalidating read else read ()) of
+            NONE => false
+          | found as SOME text =>
+              not (lost andalso names_lost text) andalso found <> poisoned andalso
+              not (complete andalso (short_heap_entry (#modules ctx) text handle Error _ => false))
+      end
     (* Every checkpoint's manifest names its whole spine, so the same files
        come up for each candidate; none changes while this runs.  A restored
        state still linked to the store is the blob it was restored from: the
@@ -14235,9 +14245,11 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       handle _ => false
     (* While HEAP is the published heap, an entry chained to another, as
        one published before the heap entry was replaced, is never
-       restored.  A run on a heap replaced since leaves the entries alone. *)
+       restored.  A run on a heap replaced since leaves the entries alone;
+       the heap entry is read past any cache's stale copy, since a replaced
+       short heap may still be served there. *)
     fun current heap =
-      case HolbuildRemoteCache.fetch_action remote heap_key of
+      case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.fetch_action remote heap_key) of
           SOME action => on_heap heap (#manifest action)
         | NONE => false
     fun probe heap (c, key, absent) =
@@ -16972,8 +16984,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                    own instead preloaded nothing: it isn't spent. *)
                 val _ = if captured then record_heap_decline () else declining_heap := NONE
                 val deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)
+                (* A restored heap rejected at load isn't the one the
+                   action ran on. *)
                 val missing =
                   if captured then Option.map #missing (captured_missing ())
+                  else if !rejected_heap_modules > 0 then NONE
                   else Option.mapPartial heap_entry_missing (#entry restored)
                 val kb =
                   if captured orelse Option.isSome (#heap restored)
