@@ -1611,8 +1611,17 @@ def drain_seconds(text: str) -> float:
 
 def worker_name(image: str | None) -> str:
     """The default worker name: ``host:pid``, then ``@`` and the first 12 hex digits of the digest when ``image``
-    (``REMOTE_EXEC_IMAGE``) names one as ``<repository>@sha256:<digest>``, so a lease says which image ran an action."""
+    (``REMOTE_EXEC_IMAGE``) names one as ``<repository>@sha256:<digest>``, so a lease says which image ran an action.
+    It starts with the first 8 characters of the host's boot id and ``/`` when the boot id can be read, so an action's
+    worker names the host (``/v1/queue`` ``hosts[].id``) it ran on: containers have hostnames of their own."""
     name = f"{socket.gethostname()}:{os.getpid()}"
+    try:
+        with open(BOOT_ID) as file:
+            boot = file.read().strip()[:8]
+    except OSError:
+        boot = ""
+    if boot:
+        name = f"{boot}/{name}"
     _, found, digest = (image or "").partition("@sha256:")
     return f"{name}@{digest[:12]}" if found and digest else name
 
@@ -1693,8 +1702,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--name", default=worker_name(os.environ.get("REMOTE_EXEC_IMAGE")),
-        help="worker name in leases (default: host:pid, then @ and the image digest's first 12 hex digits when "
-        "REMOTE_EXEC_IMAGE names the image as <repository>@sha256:<digest>)",
+        help="worker name in leases (default: the host's boot id's first 8 characters and /, then host:pid, then @ "
+        "and the image digest's first 12 hex digits when REMOTE_EXEC_IMAGE names the image as "
+        "<repository>@sha256:<digest>)",
     )
     parser.add_argument(
         "--drain-seconds", type=drain_seconds, default=20.0,

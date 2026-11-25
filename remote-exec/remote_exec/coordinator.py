@@ -12,6 +12,7 @@ import heapq
 import json
 import logging
 import os
+import random
 import shlex
 import time
 from collections import Counter, defaultdict, deque
@@ -35,6 +36,8 @@ from remote_exec.formats import Batch, Result
 from remote_exec.membership import REFRESH_SECONDS, Membership
 
 logger = logging.getLogger(__name__)
+# Under uvicorn's own logger, which uvicorn sends to stderr at INFO, as app.py's request summary.
+claims_logger = logging.getLogger("uvicorn.claims")
 
 CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
 # How long a cache entry found is taken to still be there without asking the cache again.
@@ -85,6 +88,14 @@ HOST_KEYS_SECONDS = 1800
 MAX_THEORY_DEPS = 10_000
 LOCALITY_WINDOW = 8
 LOCALITY_HOLD_SECONDS = 0.5
+# Claim contention lines (see Coordinator._contention): a claimed build of a positive critical depth ready this
+# long, a deeper candidate of another batch passed over (once per batch and tier this often), and this share of the
+# claims another batch's candidate contested, so a replay of the lines has a denominator.
+CONTENTION_WAIT_SECONDS = 15.0
+CONTENTION_SAMPLE = 0.01
+# At most this many contention lines read their batches' waiting-ahead counts at once, each on a connection of its
+# own, so the lines take few of the connections claims need; more are logged without them.
+CONTENTION_PENDING = 4
 
 PHASE_WINDOW_SECONDS = 600
 MAX_PHASE_REPORTS = 100_000
@@ -564,9 +575,23 @@ ORDER BY
 # its lease expires, the action is claimed again. An expired lease stops holding at once, before the sweep deletes it.
 # An unclaimed action has no lease in its own batch, so every live lease of its key is another batch's; uncorrelated,
 # the lease keys are read once per statement into a hash, rather than once per ready action probed. A build claim
-# then rechecks its key (Coordinator._lock_unleased), and skips the keys in :taken.
+# then rechecks its key (Coordinator._lock_unleased), and skips the keys in :taken. For the claim contention line
+# (Coordinator._contention), ``ready_s`` is how long a build of a positive critical depth, never claimed before, has
+# been ready: since its parents' latest result, or its batch's submission if it has no parents, so it includes the
+# release's check of their entries in the cache before the build was marked ready; read by key. It is
+# null when a parent is done with no result time (found in the cache, or built by another batch: FINISH_PEERS), since
+# when that parent became done isn't recorded, and for a build claimed before (retried), whose earlier attempt isn't.
 CLAIM_ACTION = sa.text("""
-SELECT input_key, spec_sha256, theory FROM actions
+SELECT input_key, spec_sha256, theory, critical_depth,
+CASE WHEN class = 'build' AND critical_depth > 0 AND last_claimed_at IS NULL THEN (
+    SELECT CAST(extract(epoch FROM now() - CASE
+        WHEN count(*) = 0 THEN (SELECT created_at FROM batches WHERE id = actions.batch_id)
+        WHEN count(p.finished_at) = count(*) THEN max(p.finished_at)
+    END) AS double precision)
+    FROM edges e JOIN actions p ON p.batch_id = e.batch_id AND p.input_key = e.parent_key
+    WHERE e.batch_id = actions.batch_id AND e.input_key = actions.input_key
+) END AS ready_s
+FROM actions
 WHERE batch_id = :batch_id AND state = 'ready' AND class = :class AND tier = :tier
 AND (class = 'run' OR input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()))
 AND input_key <> ALL(CAST(:taken AS text[]))
@@ -961,6 +986,7 @@ class _Claimed:
     # The hold the claim took for the build, by its (batch, tier), put back if its lease fails.
     hold: "tuple[tuple[UUID, str], Hold] | None" = None
     tier: str = ""  # a build's, claimed from a shared ranking
+    contention: "_Contention | None" = None  # logged once its lease commits; see Coordinator._contention
 
 
 # Lock a built action :key of batch :batch_id and its children, in key order, returning nothing. A build's result holds
@@ -1063,6 +1089,54 @@ Hold = tuple[float, float, str]
 RankEntry = tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]
 
 
+class Competitor(NamedTuple):
+    """The best candidate of another batch a build claim left in its ranking (see Coordinator._competitor): its
+    entry, and the theory and critical depth of its batch's first ready build when the claim chose."""
+
+    entry: RankEntry
+    theory: str
+    depth: int
+
+
+@dataclass(frozen=True)
+class _Contention:
+    """A claim contention line (see Coordinator._contention), as the claim saw it, but for its batches'
+    waiting-ahead counts, which are read once the claim's lease commits: why it is logged, the claiming host and
+    worker, the tier, how long the build was ready, the claimed build and its best competitor as (batch, theory,
+    priority, running, critical depth, tier), the ranking's builds of a positive priority running and whether it was
+    capped when the claim chose, and the kept hosts' headroom."""
+
+    reasons: str
+    host: str
+    worker: str
+    tier: str
+    wait: str
+    winner: tuple[UUID, str, int, int, int, str]
+    competitor: tuple[UUID, str, int, int, int, str] | None
+    running_priority: int
+    capped: bool
+    kept: str
+
+    def line(self, priority_cap: int, ahead: list[int] | None) -> str:
+        """The line, with ``ahead``, the winner's and competitor's waiting-ahead counts, or ``?`` without them."""
+
+        def build(place: tuple[UUID, str, int, int, int, str], count: int | None) -> str:
+            batch, theory, priority, running, depth, tier = place
+            return (
+                f"{str(batch)[:8]},{theory},p{priority},r{running},a{'?' if count is None else count},d{depth}"
+                + ("" if tier == self.tier else f",{tier}")
+            )
+
+        counts: list[int | None] = list(ahead) if ahead is not None else [None, None]
+        other = "-" if self.competitor is None else build(self.competitor, counts[1])
+        return (
+            f"claim contention {self.reasons} host={self.host} worker={self.worker} tier={self.tier} "
+            f"wait_s={self.wait} winner={build(self.winner, counts[0])} competitor={other} "
+            f"running_priority={self.running_priority} priority_cap={priority_cap} capped={int(self.capped)} "
+            f"kept={self.kept}"
+        )
+
+
 def _claim_rank(tiers: list[str], host_id: str | None, host_rank: int = 0, workers: int = 0) -> ClaimRank:
     """The rank of a claim of ``tiers`` from ``host_id`` of ``host_rank``, which runs ``workers`` live workers."""
     burst = tiers[0] != "standard"
@@ -1152,6 +1226,9 @@ class Coordinator:
         self.host_keys: dict[str, dict[str, None]] = {}
         self.keys_seen: dict[str, datetime] = {}
         self.passed_over: dict[tuple[UUID, str], int] = {}
+        # When the claim contention line last logged a batch and tier passed over; see _contention.
+        self.contention_logged: dict[tuple[UUID, str], float] = {}
+        self.contention_logs: set[asyncio.Task[None]] = set()  # lines reading their counts; see _log_contention
         self.holds: dict[tuple[UUID, str], Hold] = {}
         self.ready_builds = 0
         self.ready_high = 0  # high-tier builds ready at that count
@@ -1196,10 +1273,10 @@ class Coordinator:
     async def aclose(self) -> None:
         if self.scale_task is not None:
             await self.scale_task
-        for releaser in self.releasers.values():
-            releaser.cancel()
+        for task in [*self.releasers.values(), *self.contention_logs]:
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await releaser
+                await task
         await self.cache.aclose()
         await self.engine.dispose()
 
@@ -1573,7 +1650,8 @@ class Coordinator:
                 async with self.engine.begin() as conn:
                     # Never lock a batch after an action: batch writers take those locks in the opposite order.
                     row, held_until, stopped = await self._claim_build(
-                        conn, ranking, outranked, host_id, hint, hint_only=hint_only, held_tiers=held_tiers
+                        conn, ranking, outranked, host_id, hint, hint_only=hint_only, held_tiers=held_tiers,
+                        worker=worker,
                     )
                     if row is not None:
                         claimed = await self._lease(conn, row, worker)
@@ -1587,6 +1665,8 @@ class Coordinator:
                 if host_id is not None and worker_tiers is not None:
                     self._lease_host(claimed.attempt_token, host_id, worker, worker_tiers)
                 self._leased_build(ranking, row.tier)
+                if row.contention is not None:
+                    self._log_contention(row.contention)
                 return claimed, None
             if held_until is not None:
                 return None, held_until
@@ -1970,6 +2050,7 @@ class Coordinator:
         *,
         hint_only: frozenset[str] = frozenset(),
         held_tiers: frozenset[str] = frozenset(),
+        worker: str = "",
     ) -> tuple[_Claimed | None, float | None, RankEntry | None]:
         """Lock a ready build from the shared ranking, without refreshing it inside the transaction.
 
@@ -1989,12 +2070,19 @@ class Coordinator:
         the next one, as a swap passes over the chosen one, waking a claim on a host it is held for (_wake_holders).
         When only such candidates are left, it returns no build and when the first of their holds ends. Of tiers
         ``hint_only``, it takes only a build held for ``host_id``: the claim defers them to better-ranked claims.
+
+        A build ``worker`` locks may carry a contention line, with its best competitor left in the ranking
+        (_contention), for _claim to log once the lease commits.
         """
-        kept = functools.cache(
-            lambda tier: self._kept_hosts(
+        def kept_lines(tier: str) -> set[str]:
+            return self._kept_hosts(
                 (len(ranking.heap) if tier != "high" else sum(e[7] == "high" for e in ranking.heap)) + 1, tier
             )
-        )
+
+        kept = functools.cache(kept_lines)
+        # The contention line's competitor reads lines of its own, so that only the steps that use the claim's
+        # draw them, from the heap and fleet as they are when they first ask.
+        competitor_kept = functools.cache(kept_lines)
         held: list[RankEntry] = []  # taken out of the heap only until this claim awaits or returns
         held_until: float | None = None
         hint_tiers = set(held_tiers) if hint is None else {hint[1]}
@@ -2055,6 +2143,9 @@ class Coordinator:
                 held.append(entry)
                 held_until = until if held_until is None else min(held_until, until)
                 continue
+            # Before the builds this claim passed over for their holds are back: it could take none of them.
+            competitor = self._competitor(ranking, batch_id, host_id, hint_only, competitor_kept)
+            chosen = (ranking.running_priority, ranking.capped)  # as the claim chose, before it counts
             put_back_held()
             heapq.heappush(
                 ranking.heap,
@@ -2093,8 +2184,13 @@ class Coordinator:
                     self.locality.held_ms_total += round((asyncio.get_running_loop().time() - hold[0]) * 1000)
                 if host_id is not None:
                     self._count_claim(row.theory, tier, host_id, kept)
+                contention = self._contention(
+                    kept, worker, host_id, (priority, running, batch_id, tier), row, competitor, chosen
+                )
                 taken = None if hold is None else ((batch_id, tier), hold)
-                claimed = _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb, taken, tier)
+                claimed = _Claimed(
+                    batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb, taken, tier, contention
+                )
                 return claimed, None, None
             if passed is not None and (count := self.passed_over.get(passed)) is not None:
                 if count > 1:
@@ -2108,6 +2204,120 @@ class Coordinator:
             ranking.exhausted.add((batch_id, tier))
         put_back_held()
         return None, held_until, None
+
+    def _competitor(
+        self,
+        ranking: "_Ranking",
+        batch_id: UUID,
+        host_id: str | None,
+        hint_only: frozenset[str],
+        kept: Callable[[str], set[str]],
+    ) -> Competitor | None:
+        """The best candidate of another batch than ``batch_id`` in ``ranking``'s heap whose first ready build the
+        ranking knows (one not claimed from since the read), or None, for a claim from ``host_id``: not one it would
+        leave for a hold, another host's (see _held), or, of tiers ``hint_only``, any but its own (_held_here). Only
+        the heap's top three are looked at, which hold its two best entries, so a candidate claimed from or exhausted
+        since can hide the next one."""
+        for entry in sorted(ranking.heap[:3]):
+            key = (entry[6], entry[7])
+            theory, depth = ranking.theories.get(key), ranking.depths.get(key)
+            if entry[6] == batch_id or theory is None or depth is None or key in ranking.exhausted:
+                continue
+            if entry[7] in hint_only and not self._held_here(ranking, key, host_id, kept):
+                continue
+            if self._leaves(ranking, entry, host_id, kept) and not self._hold_ended(ranking, key):
+                continue
+            return Competitor(entry, theory, depth[0])
+        return None
+
+    def _contention(
+        self,
+        kept: Callable[[str], set[str]],
+        worker: str,
+        host_id: str | None,
+        winner: tuple[int, int, UUID, str],
+        row: sa.Row[Any],
+        competitor: Competitor | None,
+        chosen: tuple[int, bool],
+    ) -> _Contention | None:
+        """The line to log for the build ``row`` ``worker`` locked, of ``winner``'s (negated priority, running,
+        batch, tier), with its best ``competitor`` (see _competitor) and the ranking's (running_priority, capped)
+        ``chosen`` when the claim chose: when the build was ready CONTENTION_WAIT_SECONDS with a positive critical
+        depth (``slow``), the competitor is deeper (``passed``, once per its batch and tier each
+        CONTENTION_WAIT_SECONDS), or by a CONTENTION_SAMPLE chance when there is one (``sample``); else None. For
+        replays of claim order against hosts and sleepers; changes nothing it reads."""
+        priority, running, batch_id, tier = winner
+        reasons = []
+        if row.ready_s is not None and row.ready_s > CONTENTION_WAIT_SECONDS:
+            reasons.append("slow")
+        if competitor is not None:
+            *_, c_batch, c_tier, _ = competitor.entry
+            if competitor.depth > max(0, row.critical_depth):
+                now = asyncio.get_running_loop().time()
+                last = self.contention_logged.get((c_batch, c_tier))
+                if last is None or now - last >= CONTENTION_WAIT_SECONDS:
+                    self.contention_logged.pop((c_batch, c_tier), None)
+                    self.contention_logged[(c_batch, c_tier)] = now
+                    if len(self.contention_logged) > MAX_LEASE_HOSTS:
+                        del self.contention_logged[next(iter(self.contention_logged))]
+                    reasons.append("passed")
+            if random.random() < CONTENTION_SAMPLE:
+                reasons.append("sample")
+        if not reasons:
+            return None
+        hosts = []
+        at = self.clock()
+        for kept_id in sorted(kept(tier)):
+            report = self.hosts.get(kept_id)
+            short = "?" if report is None else int(report[1].memory_short)
+            idle = "?" if report is None or report[1].cpu_idle_pct is None else report[1].cpu_idle_pct
+            # Its workers seen lately, as _kept_hosts counts them: the others may have gone.
+            live = sum(
+                (at - seen).total_seconds() < HOST_REPORT_SECONDS
+                for seen, _ in self.host_workers.get(kept_id, {}).values()
+            )
+            hosts.append(f"{kept_id[:8]}:{short}:{idle}:{live}")
+        other = None
+        if competitor is not None:
+            _, c_priority, c_running, *_, c_batch, c_tier, _ = competitor.entry
+            other = (c_batch, competitor.theory, -c_priority, c_running, competitor.depth, c_tier)
+        return _Contention(
+            "+".join(reasons),
+            "-" if host_id is None else host_id[:8],
+            worker or "-",
+            tier,
+            "-" if row.ready_s is None else f"{row.ready_s:.1f}",
+            (batch_id, row.theory, -priority, running, row.critical_depth, tier),
+            other,
+            *chosen,
+            ";".join(hosts) or "-",
+        )
+
+    def _log_contention(self, contention: _Contention) -> None:
+        """Log ``contention`` in the background, once it has read its batches' waiting-ahead counts on a connection
+        of its own; without them while CONTENTION_PENDING lines are reading theirs. Nothing about it can fail or
+        delay the claim it describes."""
+        if len(self.contention_logs) >= CONTENTION_PENDING:
+            claims_logger.info(contention.line(self.settings.priority_cap, None))
+            return
+        task = asyncio.get_running_loop().create_task(self._log_counted(contention))
+        self.contention_logs.add(task)
+        task.add_done_callback(self.contention_logs.discard)
+
+    async def _log_counted(self, contention: _Contention) -> None:
+        batches = [contention.winner[0]] + ([] if contention.competitor is None else [contention.competitor[0]])
+        outlined = list(self.outlined_tokens)
+        try:
+            async with self.engine.connect() as conn:
+                ahead = [
+                    await conn.scalar(COUNT_WAITING_AHEAD, {"batch_id": batch, "outlined": outlined})
+                    for batch in batches
+                ]
+        except DATABASE_UNAVAILABLE:
+            logger.warning("claim contention line logged without its counts", exc_info=True)
+            claims_logger.info(contention.line(self.settings.priority_cap, None))
+            return
+        claims_logger.info(contention.line(self.settings.priority_cap, ahead))
 
     def _cap_priorities(self, ranking: "_Ranking") -> None:
         """Cap ``ranking`` once batches of a positive priority run ``priority_cap`` builds: rank their builds like
@@ -2197,11 +2407,9 @@ class Coordinator:
         passes it over (_hold_ended). The hold ends with that time only, so no build waits longer, and needs a known
         theory: a batch's next build after a claim from it has none until the next ranking read."""
         head = (entry[6], entry[7])
-        if not self.settings.locality or host_id is None or (theory := ranking.theories.get(head)) is None:
+        if not self._leaves(ranking, entry, host_id, kept):
             return None
-        mine = self._level(host_id, theory)
-        if mine == 2 or self._best_level(theory, entry[7], host_id, kept) <= mine:
-            return None
+        theory = ranking.theories[head]
         loop = asyncio.get_running_loop()
         now = loop.time()
         # A hold another process's claim ended leaves the batch's next build, of another theory, a hold of its own.
@@ -2214,6 +2422,17 @@ class Coordinator:
             return None
         self._wake_holders(ranking, entry, host_id, kept)
         return hold[1]
+
+    def _leaves(
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
+    ) -> bool:
+        """Whether a claim from ``host_id`` leaves candidate ``entry`` to a kept host holding more of its theory,
+        while the hold that starts or has started (see _held) lasts."""
+        theory = ranking.theories.get((entry[6], entry[7]))
+        if not self.settings.locality or host_id is None or theory is None:
+            return False
+        mine = self._level(host_id, theory)
+        return mine != 2 and self._best_level(theory, entry[7], host_id, kept) > mine
 
     def _hold_ended(self, ranking: "_Ranking", head: tuple[UUID, str]) -> bool:
         """Whether the build of ``head`` that ``ranking`` knows was held for a holder (see _held) and its hold has

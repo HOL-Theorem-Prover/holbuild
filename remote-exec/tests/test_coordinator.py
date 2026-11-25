@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import time
 from collections import Counter, deque
 from dataclasses import asdict, replace
@@ -4847,3 +4848,135 @@ async def test_a_request_that_raised_counts_as_a_500() -> None:
     with pytest.raises(RuntimeError):
         await CountResponses(failing, counts)({"type": "http", "method": "GET"}, None, None)  # type: ignore[arg-type]
     assert counts == {("GET", "-", 500): 1}
+
+
+async def contention_lines(coordinator: Coordinator, caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The claim contention lines logged, once those still reading their counts are."""
+    await asyncio.gather(*coordinator.contention_logs)
+    return [r.getMessage() for r in caplog.records if r.name == "uvicorn.claims"]
+
+
+async def test_a_deeper_build_of_another_batch_passed_over_is_logged_once_with_the_kept_hosts(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 0.0)
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await submit(http, ["a1", "a2"], priority="1")
+    batch_b = await submit(http, ["p", "c"], [("c", "p")])
+    host = {**asdict(busy("1f2e3d4c-host", 0)), "disk_free": 100 << 30}
+    body = {"tier": "standard", "worker": "1f2e3d4c/w1", "host": host}
+    # A worker of the host not seen lately, which the line doesn't count.
+    coordinator.host_workers.setdefault("1f2e3d4c-host", {})["1f2e3d4c/gone"] = (
+        coordinator.clock() - timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS), ("standard",)
+    )
+    for name in ["a1", "a2"]:
+        response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+        assert response.json()["theory"] == f"pkg:{name}", response.text
+    # The second claim passes over p again within CONTENTION_WAIT_SECONDS: one line.
+    (line,) = await contention_lines(coordinator, caplog)
+    assert line.startswith("claim contention passed host=1f2e3d4c worker=1f2e3d4c/w1 tier=standard wait_s=- ")
+    assert ",pkg:a1,p1,r0,a0,d0 " in line
+    assert f" competitor={batch_b[:8]},pkg:p,p0,r0,a0,d1 " in line
+    # The ranking as the claim chose a1, before it counted.
+    assert " running_priority=0 priority_cap=128 capped=0 kept=1f2e3d4c:0:50.0:1" in line
+
+
+async def test_a_deep_build_claimed_long_after_its_parent_finished_is_logged_with_its_wait(
+    http: httpx.AsyncClient,
+    cache: FakeCache,
+    coordinator: Coordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 0.0)
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await submit(http, ["p", "c", "g"], [("c", "p"), ("g", "c")])
+    await build(http, cache, "p")  # ready at once: no line
+    assert await contention_lines(coordinator, caplog) == []
+    async with coordinator.engine.begin() as conn:
+        # The wait counts from the parent's result, not from the batch's submission.
+        await conn.execute(sa.text("UPDATE batches SET created_at = now() - interval '1 hour'"))
+        await conn.execute(sa.text(
+            "UPDATE actions SET finished_at = now() - interval '30 seconds' WHERE theory = 'pkg:p'"
+        ))
+    await claim_named(http, "c", worker="w1")
+    (line,) = await contention_lines(coordinator, caplog)
+    assert line.startswith("claim contention slow host=- worker=w1 tier=standard wait_s=")
+    assert 29 < float(line.split("wait_s=")[1].split()[0]) < 60
+    # Running as the shared ranking counts it, the claim of p included.
+    assert ",pkg:c,p0,r1,a0,d1 competitor=- " in line
+
+
+@pytest.mark.parametrize("unknown", ["retried", "parent without a result time"])
+async def test_a_build_whose_ready_time_is_not_recorded_is_logged_with_no_wait(
+    http: httpx.AsyncClient,
+    cache: FakeCache,
+    coordinator: Coordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    unknown: str,
+) -> None:
+    """A build claimed before, or with a parent another batch built or the cache had, may have become ready long
+    after its parents' latest result: its wait isn't known, so it is never logged as slow."""
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 0.0)
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await submit(http, ["p", "c", "g"], [("c", "p"), ("g", "c")])
+    await build(http, cache, "p")
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE batches SET created_at = now() - interval '1 hour'"))
+        if unknown == "retried":
+            await conn.execute(sa.text(
+                "UPDATE actions SET finished_at = now() - interval '30 seconds' WHERE theory = 'pkg:p'"
+            ))
+            await conn.execute(sa.text(
+                "UPDATE actions SET last_claimed_at = now() - interval '20 seconds' WHERE theory = 'pkg:c'"
+            ))
+        else:
+            await conn.execute(sa.text("UPDATE actions SET finished_at = NULL WHERE theory = 'pkg:p'"))
+    await claim_named(http, "c")
+    assert await contention_lines(coordinator, caplog) == []
+
+
+async def test_a_sample_of_contested_claims_is_logged(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await submit(http, ["a"])
+    await submit(http, ["b"])
+    await submit(http, ["only"])
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 0.0)
+    await claim(http)
+    assert await contention_lines(coordinator, caplog) == []
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 1.0)
+    await claim(http)
+    (line,) = await contention_lines(coordinator, caplog)
+    assert line.startswith("claim contention sample ")
+    # A claim no other batch contests isn't sampled.
+    await claim(http)
+    assert len(await contention_lines(coordinator, caplog)) == 1
+
+
+async def test_a_contention_line_whose_counts_fail_leaves_its_claim_leased(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 1.0)
+    monkeypatch.setattr(coordinator_module, "COUNT_WAITING_AHEAD", sa.text("SELECT no_such_column FROM actions"))
+    await submit(http, ["a"])
+    await submit(http, ["b"])
+    assert await claim(http) is not None
+    (line,) = await contention_lines(coordinator, caplog)
+    assert line.count(",a?,") == 2, line
+
+
+async def test_contention_lines_past_the_pending_limit_are_logged_without_their_counts(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 1.0)
+    monkeypatch.setattr(coordinator_module, "CONTENTION_PENDING", 0)
+    await submit(http, ["a"])
+    await submit(http, ["b"])
+    assert await claim(http) is not None
+    (line,) = await contention_lines(coordinator, caplog)
+    assert line.count(",a?,") == 2, line

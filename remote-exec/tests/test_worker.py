@@ -3021,8 +3021,11 @@ def test_worker_refreshes_bootstrap_membership_after_memory_and_claim_waits(
     assert events == ["memory", "claim", "refresh", "run"]
 
 
-def test_the_default_worker_name_carries_the_image_digest_the_task_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_default_worker_name_carries_the_image_digest_the_task_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     args = ["--coordinator", "http://coordinator.test", "--remote-cache", "http://cache.test", "--cache-limit-gb", "1"]
+    monkeypatch.setattr(worker, "BOOT_ID", str(tmp_path / "boot_id"))
     plain = f"{socket.gethostname()}:{os.getpid()}"
     monkeypatch.delenv("REMOTE_EXEC_IMAGE", raising=False)
     assert parse_args(args).name == plain
@@ -3031,3 +3034,16 @@ def test_the_default_worker_name_carries_the_image_digest_the_task_runs(monkeypa
     assert parse_args([*args, "--name", "w1"]).name == "w1"
     monkeypatch.setenv("REMOTE_EXEC_IMAGE", "holbuild-remote-exec:latest")
     assert parse_args(args).name == plain
+
+
+def test_the_default_worker_name_starts_with_its_host_s_boot_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args = ["--coordinator", "http://coordinator.test", "--remote-cache", "http://cache.test", "--cache-limit-gb", "1"]
+    (tmp_path / "boot_id").write_text("1f2e3d4c-5b6a-4978-8695-a4b3c2d1e0f9\n")
+    monkeypatch.setattr(worker, "BOOT_ID", str(tmp_path / "boot_id"))
+    monkeypatch.setenv("REMOTE_EXEC_IMAGE", "holbuild-remote-exec@sha256:" + "ab12" * 16)
+    name = parse_args(args).name
+    assert name == f"1f2e3d4c/{socket.gethostname()}:{os.getpid()}@ab12ab12ab12"
+    assert name.endswith("@ab12ab12ab12")
+    assert parse_args([*args, "--name", "w1"]).name == "w1"
