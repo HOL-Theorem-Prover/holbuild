@@ -1980,7 +1980,7 @@ left, and warns for each lost one. After HOL exits, built or failed, the
 worker publishes the directory again if its files changed or the entry lost a
 blob, uploading every file, which renews each blob the entry names in a store
 that expires them (a later restore heals an entry whose blob expired first):
-at most 16 regular files, 64 MiB in all, with names of letters, digits,
+at most 16 regular files, 256 MiB in all, with names of letters, digits,
 `.`, `_` and `-`. An entry that can't be restored otherwise, or a directory
 that breaks these limits, only warns: the action goes on without the tool
 cache. The newest publication replaces the
