@@ -129,11 +129,12 @@ field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $co
 shared=$tmpdir/worker-shared
 cold=$tmpdir/worker-cold
 
-# export VERSION: T's spec in both remote caches, and A built in both.
+# export VERSION [OPTION...]: T's spec in both remote caches, and A built in both.
 export_t() {
   local version=$1 url
+  shift
   for url in "$shared_url" "$cold_url"; do
-    (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" action-spec --upload TTheory) \
+    (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" action-spec --upload "$@" TTheory) \
       > "$tmpdir/batch-$version-${url##*:}.txt"
   done
   batch=$tmpdir/batch-$version-${shared_url##*:}.txt
@@ -386,6 +387,36 @@ v4b_steps=$(restored_steps v4b)
   cat "$tmpdir/v4b.log" >&2
   exit 1
 }
+
+# A spec of build --no-checkpoint-saves: the worker resumes from the shared
+# failed prefix, and shares nothing, neither the later prefix a failure past
+# it would nor the contexts after it of a pass.
+shared_state() { grep -lE '^holbuild-shared-' "$tmpdir"/remote/ac/* | sort | xargs sha256sum; }
+for version in v4c v4d; do
+  if [[ "$version" = v4c ]]; then
+    write_t "T \\/ F" "ALL_TAC >> ALL_TAC >> FAIL_TAC \"unshared failure\""
+  else
+    write_t "T \\/ F" "ALL_TAC >> rw[]"
+  fi
+  export_t "$version" --no-checkpoint-saves
+  grep -qx "option no-checkpoint-saves=true" "$project/.holbuild/action-specs/$spec_t" || {
+    echo "$version: the spec doesn't carry --no-checkpoint-saves" >&2; exit 1; }
+  before=$(shared_state)
+  forget_local
+  worker "$version" "$shared_url" "$shared" "$spec_t" --share-heaps
+  if [[ "$version" = v4c ]]; then
+    expect v4c 1 "status=failed" "failure=proof"
+    require_grep "unshared failure" "$tmpdir/v4c.log"
+  else
+    expect v4d 0 "status=built"
+  fi
+  resumed "$version" "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
+  [[ "$(shared_state)" = "$before" ]] || {
+    echo "$version: a worker under --no-checkpoint-saves shared checkpoints:" >&2
+    diff <(printf '%s\n' "$before") <(shared_state) >&2 || true
+    exit 1
+  }
+done
 
 write_t "T \\/ F" "rw[]"
 export_t v5

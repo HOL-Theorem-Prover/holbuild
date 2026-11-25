@@ -256,7 +256,7 @@ fun write name text = D.write_file (path name) text;
 fun attempts () = length (String.tokens (fn c => c = #"\n") (D.read_all (path "attempts")));
 fun reset mode = (write "mode" mode; write "attempts" "");
 fun policy new_ir =
-  B.CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false,
+  B.CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_saves = true, checkpoint_target = false,
                       checkpoint_seconds = 2.0, proof_steps = true, new_ir = new_ir, tactic_timeout = NONE, heavy_tactic_timeout = NONE,
                       trace_steps = false, repl_on_failure = false, trknl = false,
                       promote_preload = false, check_only = false};

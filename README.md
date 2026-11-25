@@ -1179,6 +1179,16 @@ holbuild build --skip-checkpoints MyTheory
   remote execution, the log limit uses the worker's environment.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
+- `--no-checkpoint-saves` resumes from saved checkpoints and failed prefixes
+  as usual, locally and on remote workers, but saves, removes and publishes
+  none: the project's checkpoint tree, the host's deps heap store and the
+  shared heaps stay as they were, and no checkpoint budget eviction runs. It
+  is for throwaway builds, such as experiments or scratch copies, that must
+  not replace a project's resume state. A checkpoint that cannot be resumed
+  is kept, and the theory runs again restoring none. With
+  `--skip-checkpoints` nothing is restored either; it combines with
+  `--check-only`, and excludes `--repl-on-failure`, whose REPL starts from the
+  checkpoints a failure saves. No cache or action key depends on it.
 - Checkpoints are restored in every theory included by `--proof-scope`
   (root-package theories by default). The build's requested targets (the
   default targets when none are given, or every root-package theory when
@@ -1744,6 +1754,7 @@ option checkpoint-target=true      (only for a theory that saves checkpoints as 
 option skip-checkpoints=true      (when checkpoint reuse is disabled)
 option promote-preload=true       (only for a theory of `check`'s prebuild)
 option check-only=true            (only for a target of `build --check-only`)
+option no-checkpoint-saves=true   (only under `build --no-checkpoint-saves`)
 option force=true                 (only for a forced theory)
 option trace-steps=true            (only for a traced theory)
 option pipeline=true               (only for a theory that may build pipelined)
@@ -1792,6 +1803,9 @@ action-text
   carries no `.dat` hash, its dependencies are installed only when it would
   start from a fresh preload rather than a checkpoint, or passes on a cached
   entry or early-cutoff pair: a heap that loaded them spares the install.
+- `no-checkpoint-saves` defaults to false; with it, the worker restores
+  shared checkpoints as usual, but its run saves none, and it publishes no
+  deps heap, checkpoint, failed prefix or checkpoint index.
 
 ### Exporting script runs for remote execution
 
