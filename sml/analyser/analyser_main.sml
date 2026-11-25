@@ -277,11 +277,11 @@ fun main args =
     case (arg_value "--request" args, arg_value "--response" args) of
         (SOME req, SOME resp) =>
           ((write_file resp (response (parse_request req)); OS.Process.success)
-           handle Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
-                | D.Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
-                | S.Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
-                | PI.Error msg => (TextIO.output(TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
-                | e => (TextIO.output(TextIO.stdErr, General.exnMessage e ^ "\n"); OS.Process.failure))
-      | _ => (TextIO.output(TextIO.stdErr, "usage: holbuild-hol-analyser --request FILE --response FILE\n"); OS.Process.failure)
+           handle Error msg => (HolbuildBoundedOutput.text (TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
+                | D.Error msg => (HolbuildBoundedOutput.text (TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
+                | S.Error msg => (HolbuildBoundedOutput.text (TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
+                | PI.Error msg => (HolbuildBoundedOutput.text (TextIO.stdErr, msg ^ "\n"); OS.Process.failure)
+                | e => (HolbuildBoundedOutput.text (TextIO.stdErr, General.exnMessage e ^ "\n"); OS.Process.failure))
+      | _ => (HolbuildBoundedOutput.text (TextIO.stdErr, "usage: holbuild-hol-analyser --request FILE --response FILE\n"); OS.Process.failure)
 
 end

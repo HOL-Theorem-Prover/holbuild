@@ -4121,7 +4121,7 @@ fun check_stored_data tc cli_jobs build_mode selections {project, index, compone
             in summaries := Redblackmap.insert (!summaries, thy, summary); summary end
     fun qualified thy name = thy ^ "Theory." ^ name
     fun count n noun = Int.toString n ^ " " ^ noun ^ (if n = 1 then "" else "s")
-    fun out s = (TextIO.output (TextIO.stdOut, s ^ "\n"); TextIO.flushOut TextIO.stdOut)
+    fun out s = (HolbuildBoundedOutput.text (TextIO.stdOut, s ^ "\n"); TextIO.flushOut TextIO.stdOut)
     fun check (logical_name, {theory = _, theorem}) =
       let
         val thy = HolbuildBuildExec.theory_name_from_logical logical_name

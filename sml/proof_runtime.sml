@@ -154,7 +154,7 @@ fun timed_hol_phase name f =
   end
 
 fun print_hol_phases () =
-  TextIO.output (TextIO.stdErr,
+  HolbuildBoundedOutput.text (TextIO.stdErr,
     String.concat ("holbuild hol-phases" ::
                    map (fn (name, n) => " " ^ name ^ "=" ^ LargeInt.toString n) (rev (!hol_phases_ref))) ^ "\n")
 
@@ -163,7 +163,7 @@ fun write_timeout_marker label seconds =
       NONE => ()
     | SOME path =>
         let val out = TextIO.openOut path
-        in TextIO.output(out, String.concat [label, "\t", Real.toString seconds, "\n"]);
+        in HolbuildBoundedOutput.text (out, String.concat [label, "\t", Real.toString seconds, "\n"]);
            TextIO.closeOut out
         end
 
@@ -1048,7 +1048,7 @@ fun print_finish_goal_state name =
 fun print_step_failure_goal_state label goals =
   print_goal_state label goals
   handle print_e =>
-    TextIO.output(TextIO.stdErr,
+    HolbuildBoundedOutput.text (TextIO.stdErr,
       String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"])
 
 fun emit_step_failure_diagnostic label goals =
@@ -1084,7 +1084,7 @@ fun report_finish_failure name e =
     val _ =
       (ignore (print_finish_goal_state name)
        handle print_e =>
-         TextIO.output(TextIO.stdErr,
+         HolbuildBoundedOutput.text (TextIO.stdErr,
            String.concat ["holbuild failed to print goal state: ", General.exnMessage print_e, "\n"]))
   in
     raise e
@@ -1458,7 +1458,7 @@ fun trace_line parts =
 
 fun trace_plan theorem_name plan =
   if plan_enabled () then
-    (TextIO.output(TextIO.stdErr,
+    (HolbuildBoundedOutput.text (TextIO.stdErr,
        String.concat ["holbuild proof-ir plan theorem=", theorem_name,
                       " steps=", Int.toString (length plan), "\n"]);
      List.app
@@ -2611,7 +2611,7 @@ fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, chec
    HolbuildTacticCompat.install_prover proof_ir_prover;
    case tactic_timeout of
        NONE => ()
-     | SOME seconds => TextIO.output (TextIO.stdErr,
+     | SOME seconds => HolbuildBoundedOutput.text (TextIO.stdErr,
          "holbuild slow-proof-steps v1 coverage=executed limit_ms=" ^ fmt_ms seconds ^ "\n"))
 
 end

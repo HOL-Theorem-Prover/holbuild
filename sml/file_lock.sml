@@ -15,7 +15,7 @@ fun remove_obsolete_lock_dir kind path =
       NONE => ()
     | SOME st =>
         if Posix.FileSys.ST.isDir st then
-          ((TextIO.output(TextIO.stdErr, "holbuild: warning: removing obsolete directory " ^ kind ^ " lock: " ^ path ^ "\n");
+          ((HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: warning: removing obsolete directory " ^ kind ^ " lock: " ^ path ^ "\n");
             let
               val dir = FS.openDir path
               fun names acc = case FS.readDir dir of NONE => acc | SOME name => names (name :: acc)

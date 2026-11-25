@@ -153,7 +153,7 @@ fun curl_config_user () =
 val libcurl_ready : bool option ref = ref NONE
 
 fun fall_back reason =
-  (TextIO.output (TextIO.stdErr, "holbuild: remote cache: using the curl command, since " ^ reason ^ "\n");
+  (HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: remote cache: using the curl command, since " ^ reason ^ "\n");
    false)
 
 fun setup_libcurl () =

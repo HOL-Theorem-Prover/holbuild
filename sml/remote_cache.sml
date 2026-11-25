@@ -156,7 +156,7 @@ fun warn_restore_once message =
     val _ = Mutex.unlock restore_warning_mutex
   in
     if emit then
-      (TextIO.output (TextIO.stdErr, "holbuild: warning: remote cache restore failed: " ^ message ^ "\n");
+      (HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: warning: remote cache restore failed: " ^ message ^ "\n");
        TextIO.flushOut TextIO.stdErr)
     else ()
   end
@@ -304,7 +304,7 @@ fun record_transport_outcome (generation, probe) result =
   in
     case (tripped, recovered, result) of
         (true, _, HolbuildHttp.Failed message) =>
-          (TextIO.output (TextIO.stdErr,
+          (HolbuildBoundedOutput.text (TextIO.stdErr,
              "holbuild: warning: remote cache disabled for 60 seconds after " ^
              (if probe then "a recovery probe failed"
               else Int.toString max_consecutive_transport_failures ^
@@ -312,7 +312,7 @@ fun record_transport_outcome (generation, probe) result =
              "; the last: " ^ message ^ "\n");
            TextIO.flushOut TextIO.stdErr)
       | (_, true, _) =>
-          (TextIO.output (TextIO.stdErr, "holbuild: remote cache available again\n");
+          (HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: remote cache available again\n");
            TextIO.flushOut TextIO.stdErr)
       | _ => ()
   end
@@ -624,7 +624,7 @@ fun retrying_one_node method urls attempt =
                 case delays of
                     delay :: rest =>
                       if transient result andalso !retry_one_node andalso fits delay then
-                        (TextIO.output (TextIO.stdErr,
+                        (HolbuildBoundedOutput.text (TextIO.stdErr,
                            "holbuild: remote cache " ^ method ^ " " ^ redact_userinfo url ^ " " ^
                            (case result of
                                 HolbuildHttp.Failed message => "got no answer: " ^ message

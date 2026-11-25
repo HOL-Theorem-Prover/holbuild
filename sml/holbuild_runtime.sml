@@ -471,7 +471,7 @@ struct
   fun theory_data_digest dat_path =
     let
       fun as_written why =
-        (TextIO.output (TextIO.stdErr,
+        (HolbuildBoundedOutput.text (TextIO.stdErr,
                         "holbuild: warning: hashing " ^ dat_path ^ " as written: " ^ why ^ "\n");
          SHA1.sha1_file {filename = dat_path})
       (* Not HOLsexp.fromFile: HOLFileSys would remap the path again. *)

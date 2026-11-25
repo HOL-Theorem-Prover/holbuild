@@ -20,7 +20,7 @@ command -v strace > /dev/null || { echo "strace is required" >&2; exit 1; }
 tmpdir=$(make_temp_dir)
 cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT
-mkdir -p "$tmpdir/out/text" "$tmpdir/out/blob" "$tmpdir/out/zstd" "$tmpdir/cache"
+mkdir -p "$tmpdir"/out/{build-exec,build-exec-atomic,stat-cache,remote-cache,blob,zstd} "$tmpdir/cache"
 
 python3 - "$SCRIPT_DIR/../../fixtures" "$tmpdir" <<'PY'
 import os
@@ -47,18 +47,19 @@ fun fail message = (TextIO.output (TextIO.stdErr, message ^ "\n");
                     OS.Process.exit OS.Process.failure)
 
 val text = CharVector.tabulate (3 * 1048576 + 17, fn i => Char.chr (97 + i mod 26))
-val _ = HolbuildBuildExec.write_text (path "out/text/build-exec") text
-val _ = HolbuildBuildExec.write_text_atomic (path "out/text/build-exec-atomic") text
-val _ = HolbuildStatCache.write_text_atomically (path "out/text/stat-cache") text
-val _ = HolbuildRemoteCache.write_text (path "out/text/remote-cache") text
+val _ = HolbuildBuildExec.write_text (path "out/build-exec/file") text
+val _ = HolbuildBuildExec.write_text_atomic (path "out/build-exec-atomic/file") text
+val _ = HolbuildStatCache.write_text_atomically (path "out/stat-cache/file") text
+val _ = HolbuildRemoteCache.write_text (path "out/remote-cache/file") text
 val _ = List.app (fn name =>
-          if HolbuildBuildExec.read_text (path ("out/text/" ^ name)) = text then ()
+          if HolbuildBuildExec.read_text (path ("out/" ^ name ^ "/file")) = text then ()
           else fail (name ^ " wrote different text"))
         ["build-exec", "build-exec-atomic", "stat-cache", "remote-cache"]
 
 (* Without libcrypto, fetch_blob links a blob this size instead of copying it. *)
 val _ = if HolbuildHash.uses_libcrypto () then ()
-        else fail "bounded-writes needs libcrypto for fetch_blob to copy the blob"
+        else (print "SKIP bounded-writes (fetch_blob copies blobs only with libcrypto)\n";
+              OS.Process.exit OS.Process.success)
 val cache = HolbuildFSCacheBackend.filesystem (path "cache")
 val _ = HolbuildFSCacheBackend.ensure_layout cache
 val hash = HolbuildHash.file_sha256 (path "blob")
@@ -85,6 +86,10 @@ BOUNDED_WRITES_DIR="$tmpdir" strace -f -qq -s 0 -y -e trace=write,pwrite64 -o "$
   cat "$tmpdir/check.log" >&2
   exit 1
 }
+if grep -q "^SKIP" "$tmpdir/check.log"; then
+  grep "^SKIP" "$tmpdir/check.log"
+  exit 0
+fi
 require_grep "bounded writes wrote" "$tmpdir/check.log"
 
 python3 - "$tmpdir/out" "$tmpdir/strace.log" <<'PY'
@@ -104,7 +109,7 @@ for line in open(log):
     largest[group] = max(largest.get(group, 0), size)
     written[group] = written.get(group, 0) + size
 failed = False
-for group in ["text", "blob", "zstd"]:
+for group in ["build-exec", "build-exec-atomic", "stat-cache", "remote-cache", "blob", "zstd"]:
     if written.get(group, 0) < 3 << 20:
         print(f"{group}: traced only {written.get(group, 0)} bytes of writes", file=sys.stderr)
         failed = True

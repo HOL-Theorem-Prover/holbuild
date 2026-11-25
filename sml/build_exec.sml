@@ -12546,7 +12546,7 @@ fun gc_checkpoint_store days =
         in
           (* stderr: gc's stdout is its one summary line. *)
           if removed = 0 then ()
-          else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^
+          else HolbuildBoundedOutput.text (TextIO.stdErr, "checkpoint store gc: removed families=" ^
                                              Int.toString removed ^ "\n")
         end)
     else ()

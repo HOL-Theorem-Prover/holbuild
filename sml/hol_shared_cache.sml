@@ -736,12 +736,12 @@ fun complete_toolchain_contents k =
   end
 
 fun warn_restore message =
-  TextIO.output(TextIO.stdErr,
+  HolbuildBoundedOutput.text (TextIO.stdErr,
     "holbuild: warning: remote HOL toolchain restore failed; building locally: " ^
     message ^ "\n")
 
 fun warn_publish message =
-  TextIO.output(TextIO.stdErr,
+  HolbuildBoundedOutput.text (TextIO.stdErr,
     "holbuild: warning: could not publish HOL toolchain to remote cache: " ^
     message ^ "\n")
 
@@ -992,7 +992,7 @@ fun published_checked_recently k =
   handle OS.SysErr _ => false
 
 fun warn_reconcile message =
-  TextIO.output(TextIO.stdErr,
+  HolbuildBoundedOutput.text (TextIO.stdErr,
     "holbuild: warning: could not compare the HOL toolchain with the remote's archive: " ^
     message ^ "\n")
 
