@@ -2175,15 +2175,23 @@ async def test_a_claim_that_finds_nothing_counts_its_worker_free_until_it_claims
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
     """The wait outlasts TURNAROUND_SECONDS: seen only as the claim came, the idle worker would leave no slot on the
-    scale-in line between its claims."""
+    scale-in line between its claims, from the end of its wait (as the end of the claim ends unheld leases) on."""
     now = coordinator.clock()
     coordinator.clock = lambda: now
     body = {"tier": "high", "also_claim": ["standard"], "worker": "w", "wait_s": 0.2, "host": {"id": "spot", "rank": 1}}
+    seen_at_release: list[datetime] = []
+    release_unheld = coordinator.release_unheld
+
+    async def releasing(*args: Any) -> None:
+        seen_at_release.append(coordinator.host_workers["spot"]["w"][0])
+        await release_unheld(*args)
+
+    coordinator.release_unheld = releasing  # type: ignore[method-assign]
     waiting = asyncio.create_task(http.post("/v1/work/claim", json=body, headers=WORKER))
     await wait_until(lambda: bool(coordinator.claim_waiters))
     now += timedelta(seconds=coordinator_module.TURNAROUND_SECONDS + 10)
     assert (await waiting).status_code == 204
-    assert coordinator.host_workers["spot"]["w"][0] == now
+    assert seen_at_release == [now] and coordinator.host_workers["spot"]["w"][0] == now
 
 
 async def test_a_burst_host_with_no_report_takes_no_on_demand_hosts_rank(coordinator: Coordinator) -> None:

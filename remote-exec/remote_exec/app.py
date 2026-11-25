@@ -386,6 +386,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             host_rank=0 if body.host is None else body.host.rank,
             ahead=body.ahead,
         )
+        if claimed is None and body.host is not None:
+            # Seen again as the wait ends, so until its next claim the worker still counts as a free slot on the
+            # scale-in line (see Coordinator._kept_hosts), as it did while it waited.
+            coordinator.report_worker(body.host.id, body.worker, tiers, idle=True, ahead=body.ahead)
         # After the claim, so claims arriving together still share their reads. Its worker's next claim comes 30 s
         # after this one arrived at the soonest, which dwarfs any skew between this clock and the database's.
         await coordinator.release_unheld(body.worker, None if claimed is None else str(claimed.attempt_token), arrived)
@@ -395,14 +399,9 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                 await coordinator.give_back(claimed)
             return Response(status_code=204)
         if claimed is None:
-            if body.host is None:
-                return Response(status_code=204)
-            # Seen again as the wait ends, so between this claim and the next the worker still counts as a free slot
-            # on the scale-in line (see Coordinator._kept_hosts), as it did while it waited.
-            coordinator.report_worker(body.host.id, body.worker, tiers, idle=True, ahead=body.ahead)
             # A burst worker on a host claims fill after Spot exits at once rather than after its idle time, so the
             # host empties (see worker.py).
-            spilled = tiers[0] != "standard" and coordinator.spilled(body.host.id)
+            spilled = body.host is not None and tiers[0] != "standard" and coordinator.spilled(body.host.id)
             return Response(status_code=204, headers={"Holbuild-Spilled": "1"} if spilled else None)
         return asdict(claimed)
 
