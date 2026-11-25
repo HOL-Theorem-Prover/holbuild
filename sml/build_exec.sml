@@ -15985,7 +15985,7 @@ fun prefetch_modules remote root tc wanted =
    fails the action: the child starts empty, or the cache keeps its entry. *)
 val tool_cache_header = "holbuild-tool-cache-v1"
 val tool_cache_max_files = 16
-val tool_cache_max_bytes = 64 * 1024 * 1024
+val tool_cache_max_bytes = 256 * 1024 * 1024
 
 fun tool_cache_key (spec : action_spec) name =
   HolbuildHash.string_sha256
