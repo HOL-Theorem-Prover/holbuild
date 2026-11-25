@@ -285,6 +285,9 @@ phase publish-B 'rstheapdeclinen:1'
 phase publish-B 'depsmissn:0'
 grep -qx 'missing=0' "$short_entry" ||
   { echo "the short heap's entry wasn't replaced:" >&2; cat "$short_entry" "$tmpdir/publish-B.log" >&2; exit 1; }
+declined=$(find "$worker" -name .declined-heaps)
+[[ -n "$declined" && $(wc -l < "$declined") -eq 1 ]] ||
+  { echo "the preload over the declined heap wasn't recorded once:" >&2; cat $declined >&2; exit 1; }
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 modules=$(for heap in $published; do heap_modules "$heap"; done | { grep -- '-A-' || true; } | sort -u)
 [[ -n "$modules" ]] || { echo "no published heap loads A's module" >&2; exit 1; }

@@ -511,14 +511,20 @@ val before_requests = requests ();
 val _ = prefetch ();
 val _ = check "a store lacking 15 modules, besides 2 unpublished, was prefetched"
           (requests () = before_requests);
-(* Found unpublished over 10 minutes ago, or before lines had a time, the
-   two count as missing again: another host may have published them. *)
+(* Found unpublished over 10 minutes ago, or before lines had a time,
+   modules count as missing again: one published since it was found
+   unpublished is fetched, and the two still unpublished are recorded
+   again with their time. *)
+val late = List.nth (published16, 14);
 val _ = E.write_text probed
-          (String.concat (map (fn line => hd (String.tokens Char.isSpace line) ^ " 0\n") (probed_lines ())));
+          (String.concat (map (fn file => valOf (E.module_file_theory_part file) ^ " 0\n")
+                              (late :: List.drop (ps, 14))));
 val _ = prefetch ();
 val _ = check "modules found unpublished long ago were not looked up again" (requests () > before_requests);
-val _ = check "the unpublished modules weren't recorded again, with their time"
-          (length (probed_lines ()) = 2 andalso
+val _ = check "a module published since it was found unpublished long ago was not fetched" (stored "hol7" late);
+val _ = check "the unpublished modules weren't recorded again, alone, with their time"
+          (E.sort_strings (map (hd o String.tokens Char.isSpace) (probed_lines ())) =
+           E.sort_strings (List.mapPartial E.module_file_theory_part (List.drop (ps, 14))) andalso
            List.all (fn line => case String.tokens Char.isSpace line of [_, t] => t <> "0" | _ => false)
                     (probed_lines ()));
 val _ = remove7 (List.take (published16, 15));
