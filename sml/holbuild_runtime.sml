@@ -174,6 +174,9 @@ struct
      that holds it starts when the proof runtime installs. *)
   val _ = timing_source_loads ()
 
+  (* The microseconds from START to STOP: zero when the wall clock steps back. *)
+  fun elapsed_us (start, stop) = LargeInt.max (0, Time.toMicroseconds (Time.- (stop, start)))
+
   (* F's time, counted as part of the timed load running (if any) but not
      its self time. *)
   fun outside_self_time f =
@@ -182,7 +185,7 @@ struct
       | nested :: _ =>
           let
             val start = Time.now ()
-            fun finish () = nested := !nested + Time.toMicroseconds (Time.- (Time.now (), start))
+            fun finish () = nested := !nested + elapsed_us (start, Time.now ())
           in
             (f () before finish ()) handle e => (finish (); PolyML.Exception.reraise e)
           end
@@ -197,8 +200,7 @@ struct
         val start = Time.now ()
         fun finish () =
           let
-            (* At zero when the wall clock steps back. *)
-            val total = LargeInt.max (0, Time.toMicroseconds (Time.- (Time.now (), start)))
+            val total = elapsed_us (start, Time.now ())
             val self = LargeInt.max (0, total - !nested)
             val _ = stack := (case !stack of _ :: outer => outer | [] => [])
             val _ = case !stack of outer :: _ => outer := !outer + total | [] => ()
@@ -213,23 +215,44 @@ struct
 
   (* A file the loader evaluates: a theory's (its initialization, from its
      module or its source), a HOL library's by its path under HOLDIR (or under
-     the hol package's staged sources, where a worker stages the HOL
-     libraries a project builds itself), or a project library's by its file
-     name alone, the action root's path being local to the machine. *)
+     the hol package's staged sources in this action's root, where a worker
+     stages the HOL libraries a project builds itself), or a project library's
+     by its file name alone, the action root's path being local to the
+     machine. *)
   val staged_hol_sources = "/.holbuild/action-src/hol/"
+  (* A theory child runs in a stage directory under its action root. *)
+  val action_stage_dirs = "/.holbuild/stage/"
+  (* PATH's part under the staged HOL sources of the action root this process
+     runs in; NONE for a path elsewhere, a project's own among them. *)
+  fun staged_hol_path path =
+    let val (prefix, staged) = Substring.position staged_hol_sources (Substring.full path)
+    in
+      if Substring.isEmpty staged then NONE
+      else
+        let
+          val root = Substring.string prefix
+          val (action_root, stage) = Substring.position action_stage_dirs (Substring.full (OS.FileSys.getDir ()))
+          val action_root = Substring.string action_root
+        in
+          if not (Substring.isEmpty stage) andalso
+             (action_root = root orelse action_root = OS.FileSys.fullPath root handle _ => false)
+          then SOME (Substring.string (Substring.triml (size staged_hol_sources) staged))
+          else NONE
+        end
+    end
   fun time_source_file path f =
     let
       val expanded = holpathdb.subst_pathvars path handle _ => path
       val file = OS.Path.file expanded
       val holdir = Systeml.HOLDIR ^ "/"
-      val (_, staged) = Substring.position staged_hol_sources (Substring.full expanded)
       val label =
         if String.isSuffix "Theory.sml" file orelse String.isSuffix "Theory.sig" file then ("theory", "*")
         else if String.isPrefix holdir expanded then
           ("library", "hol:" ^ label_text (String.extract (expanded, size holdir, NONE)))
-        else if not (Substring.isEmpty staged) then
-          ("library", "hol:" ^ label_text (Substring.string (Substring.triml (size staged_hol_sources) staged)))
-        else ("library", "project:" ^ label_text file)
+        else
+          case staged_hol_path expanded of
+              SOME under => ("library", "hol:" ^ label_text under)
+            | NONE => ("library", "project:" ^ label_text file)
     in
       if !untimed_dir <> "" andalso String.isPrefix (!untimed_dir ^ "/") expanded then f ()
       else time_source_load label f
