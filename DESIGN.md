@@ -850,14 +850,16 @@ Cache blobs are materialized by an in-process copy. Reflink clones only help on
 copy-on-write filesystems and cost a `cp` process per blob, which is slower than
 copying small theory files.
 
-The one blob linked rather than copied is a build's `--scratch-input` on a
-worker: it can be large and is the same for many actions, so `exec-action`
+The blobs linked rather than copied are a build's `--scratch-input` files on a
+worker: each can be large and is the same for many actions, so `exec-action`
 hard-links the local cache's blob into the action root and makes it read-only.
 Its hash was checked when it entered the cache; the staged path lies outside
 every sandbox write and scratch root, and the sandbox grants no cross-directory
 link and refuses chmod outside those roots, so the action can only read it;
-holbuild only unlinks it when it empties the root. Without the blob, or across
-file systems, it is fetched and copied like any other spec blob.
+holbuild only unlinks it when it empties the root. Across file systems (a
+worker container's action root beside a host-mounted cache) it is a read-only
+copy of that blob, not hashed again. Without the blob it is fetched and copied
+like any other spec blob.
 
 Cache-to-cache transfers verify a resident filesystem blob before fetching it
 again. A missing or corrupt blob is fetched into a transfer-owned temporary
@@ -870,9 +872,11 @@ Action-spec and run-spec export share file hashes across specs and source upload
 within that export. Reuse requires unchanged device, inode, size, mtime and ctime;
 files timestamped within a second of the export's start are rehashed. Library
 and context-script hashes must still match the plan. The table is not persisted
-between exports, except the `--scratch-input` file's entry: kept in
-`.holbuild/scratch-input-stats` under the same rule, it spares an unchanged
-input another read on the next export. Run planning computes identities first; only runs selected for
+between exports, except the `--scratch-input` files' entries: kept in
+`.holbuild/scratch-input-stats` under the same rule, with up to eight files
+from earlier exports beside the current ones, they spare an unchanged input
+another read on a later export, including builds that alternate between
+inputs. Run planning computes identities first; only runs selected for
 export construct context metadata. Fetch-only calls and cache hits avoid that
 work. Run exports upload their sources on every call rather than
 using the persistent upload ledger, since they have no missing-input resubmission.

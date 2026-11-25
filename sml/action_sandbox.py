@@ -12,6 +12,7 @@ import errno
 import os
 from pathlib import Path
 import platform
+import re
 import select
 import socket
 import signal
@@ -843,15 +844,24 @@ def run(linux: Linux, policy: Policy, argv: list[str], *, parent: int | None = N
                 directory = Path(value).resolve(strict=True)
                 if not any(within(directory, root) for root in policy.writable):
                     raise SandboxError(f"tool cache directory outside the action tree: {value}")
-            # The scratch input is a file the action may read but not change.
+            # Each scratch input is a file the action may read but not change.
             elif key == "HOLBUILD_SCRATCH_INPUT":
-                file = Path(value).resolve(strict=True)
-                if not file.is_file():
-                    raise SandboxError(f"scratch input is not a regular file: {value}")
-                if not any(within(file, root) for root in policy.readable):
-                    raise SandboxError(f"scratch input outside the read grants: {value}")
-                if any(within(file, root) for root in policy.writable + policy.scratch):
-                    raise SandboxError(f"scratch input inside a writable directory: {value}")
+                for path in value.split(":"):
+                    file = Path(path).resolve(strict=True)
+                    if not file.is_file():
+                        raise SandboxError(f"scratch input is not a regular file: {path}")
+                    if not any(within(file, root) for root in policy.readable):
+                        raise SandboxError(f"scratch input outside the read grants: {path}")
+                    if any(within(file, root) for root in policy.writable + policy.scratch):
+                        raise SandboxError(f"scratch input inside a writable directory: {path}")
+            # Source-load timing (holbuild_runtime.sml): a flag and a label
+            # its report prints.
+            elif key == "HOLBUILD_TIMING_SOURCE_LOADS":
+                if value != "1":
+                    raise SandboxError(f"source-load timing flag is not 1: {value!r}")
+            elif key == "HOLBUILD_SOURCE_LOAD_CONTEXT":
+                if not re.fullmatch(r"[a-z-]+", value):
+                    raise SandboxError(f"source-load context is not lowercase letters and dashes: {value!r}")
             elif not key.startswith("HOLBUILD_RUN_"):
                 raise SandboxError(f"unexpected action environment assignment: {key}")
             env[key] = value
