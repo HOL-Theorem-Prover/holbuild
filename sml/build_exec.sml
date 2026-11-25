@@ -16506,16 +16506,19 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         let
           val _ = light_records := NONE
           val _ = hydrate_steps := []
-          val _ =
-            (phase "hydrate" (fn () => ignore (hydrate_action_root remote root (!resident) spec false))
-             before add_hydrate_steps ())
-            handle e => (add_hydrate_steps (); raise e)
-          val {dat_hash, file_hashes} = resident_hashes [!resident]
+          fun install () =
+            let
+              val _ = hydrate_action_root remote root (!resident) spec false
+              val {dat_hash, file_hashes} = resident_hashes [!resident]
+            in
+              spec_early_cutoff_with
+                {dat_hash = dat_hash, file_hashes = file_hashes,
+                 skip_loaded = {base_loaded = !base_loaded, follow = true, known_manifest = fn _ => NONE}}
+                root spec
+            end
           val installed =
-            spec_early_cutoff_with
-              {dat_hash = dat_hash, file_hashes = file_hashes,
-               skip_loaded = {base_loaded = !base_loaded, follow = true, known_manifest = fn _ => NONE}}
-              root spec
+            (phase "hydrate" install before add_hydrate_steps ())
+            handle e => (add_hydrate_steps (); raise e)
         in
           if Option.map #deps_key installed = Option.map #deps_key cutoff then ()
           else raise action_failed InternalFailure "the dependencies installed differ from the records the build started from";
