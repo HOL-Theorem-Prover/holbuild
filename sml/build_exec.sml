@@ -4915,6 +4915,10 @@ fun take_attached_child () =
 val capture_deps_heap = ref false
 val captured_deps_heap = ref (NONE : string option)
 
+(* Whether a preload of the action saved a deps heap and asked for its
+   capture, whether or not the capture then succeeded. *)
+val preloaded_deps_heap = ref false
+
 (* The theory modules the captured heap loads, linked from the host's store
    into a private directory when the preload saved it, with the ids it
    requires: the publication uploads these, as a restore may later replace
@@ -5009,7 +5013,8 @@ fun with_deps_heap_capture store deps_loaded f =
        it (HOLBUILD_TEST_CAPTURE_PAUSE) to change the heap's modules after
        the preload saved it. *)
     fun take () =
-      ((test_pause "HOLBUILD_TEST_CAPTURE_PAUSE";
+      ((preloaded_deps_heap := true;
+        test_pause "HOLBUILD_TEST_CAPTURE_PAUSE";
         if requires_refused () then
           warn "not sharing the deps-loaded heap: it requires a theory module HOL refused"
         else
@@ -16938,6 +16943,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val _ = dropped_checkpoints := 0
         val _ = rejected_heap_modules := 0
         val _ = discarded_deps_heap := false
+        val _ = preloaded_deps_heap := false
         (* Built on a late parent's outline, the run is the load ahead's:
            whatever stops it, nothing of it is published, and the action
            builds again plain. *)
@@ -16980,7 +16986,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                           (fn entry => not (#check_only spec) andalso checkpoint_target_enabled policy andalso
                                        declines_short_heap root tc {deps = #deps spec, loads = #loads spec} entry))
                       before add_restore_steps ())
-                     handle e => (add_restore_steps (); raise e))
+                     handle e => (add_restore_steps (); release_heap_decline (); raise e))
                 | _ => nothing_restored
             (* How many of its cone's expected modules the heap this run's
                preload saved doesn't load, and how many the cone expects. *)
@@ -17000,7 +17006,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 val captured = Option.isSome (!captured_deps_heap)
                 (* A decline whose action restored a failed prefix of its
                    own instead preloaded nothing: it isn't spent. *)
-                val _ = if captured then declining_heap := NONE else release_heap_decline ()
+                val _ = if !preloaded_deps_heap then declining_heap := NONE else release_heap_decline ()
                 val deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)
                 (* A restored heap discarded at load isn't the one the
                    action ran on. *)
@@ -17009,7 +17015,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   else if !discarded_deps_heap then NONE
                   else Option.mapPartial heap_entry_missing (#entry restored)
                 val kb =
-                  if captured orelse Option.isSome (#heap restored)
+                  if !preloaded_deps_heap orelse Option.isSome (#heap restored)
                   then SOME (file_kb deps_loaded) handle OS.SysErr _ => NONE
                   else NONE
                 fun count name = Option.map (fn n => (name, LargeInt.fromInt n))
@@ -17020,11 +17026,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               end
             (* It fills the host's module store for later actions, which a
                check-only action leaves to them: it takes only the modules a
-               checkpoint it restores needs. *)
+               checkpoint it restores needs.  A decline is given back if the
+               run fails before HOL starts. *)
             val _ =
               if not (Option.isSome ahead) andalso not (Option.isSome (#heap restored)) andalso
                  not (#check_only spec)
               then prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
+                   handle e => (release_heap_decline (); raise e)
               else ()
             fun publish_shared () =
               ((if not (!HolbuildActionSandbox.outputs_validated) then () else
@@ -17037,8 +17045,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   | NONE => ())
                before drop_heap_snapshot ())
               handle e => (drop_heap_snapshot (); raise e)
-            val tool_cache = case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec
-            val _ = if Option.isSome ahead then () else stage_scratch_input spec
+            val tool_cache =
+              (case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec)
+              handle e => (release_heap_decline (); raise e)
+            val _ = (if Option.isSome ahead then () else stage_scratch_input spec)
+                    handle e => (release_heap_decline (); raise e)
             fun publish_tools () =
               if not (!HolbuildActionSandbox.outputs_validated) then () else
               case tool_cache of
