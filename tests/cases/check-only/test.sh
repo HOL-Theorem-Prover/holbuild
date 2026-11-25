@@ -46,11 +46,12 @@ Proof
 QED
 SML
 
-# write_t STEP: theory T, on A, whose second theorem's last step is STEP.
+# write_t STEP [PARENT]: theory T, on A (or PARENT), whose second theorem's
+# last step is STEP.
 write_t() {
   cat > "$project/src/TScript.sml" <<SML
 Theory T
-Ancestors A
+Ancestors ${2:-A}
 
 Theorem t1:
   T
@@ -345,3 +346,48 @@ write_t "ALL_TAC >> ACCEPT_TAC TRUTH >> ALL_TAC"
 worker cached-pass
 expect_worker cached-pass 0 "status=cached"
 hydrated cached-pass 1 1
+
+# T on B, on A: A is a dependency T doesn't load directly.
+cat > "$project/src/BScript.sml" <<'SML'
+Theory B
+Ancestors A
+
+Theorem b:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+SML
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" build --force-theory BTheory) > "$tmpdir/publish-b.log" 2>&1 ||
+  { cat "$tmpdir/publish-b.log" >&2; exit 1; }
+write_t "ALL_TAC >> ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" B
+worker chain
+expect_worker chain 0 "status=built"
+hydrated chain 2 2
+
+# On the same host, the copies the action root keeps are neither recorded
+# again nor installed.
+write_t "ALL_TAC >> ALL_TAC >> ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" B
+worker warm-kept keep
+expect_worker warm-kept 0 "status=built"
+hydrated warm-kept 0 0
+
+# A kept copy of A missing its .dat is removed and recorded again.  Its local
+# cache entry, which names a transient stage mldep, is one the light hydrate
+# can't use: it is dropped, as a full restore drops it, so the retry restores
+# A from the remote's entry.  A failed hydrate saves no records, so the retry
+# keeps no copy: it records and installs both dependencies.
+a_key=$(cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory | awk '/input_key:/ {print $2; exit}')
+a_manifest=$worker_cache/actions/$a_key/manifest
+require_file "$a_manifest"
+printf 'mldep /stale/.holbuild/stage/%s/ATheory\n' "$a_key" >> "$a_manifest"
+a_dat=$(find "$worker_cache/action" -name ATheory.dat)
+[[ -n "$a_dat" ]] || { echo "the worker's action root holds no ATheory.dat" >&2; exit 1; }
+rm -f $a_dat
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH >> ALL_TAC >> ALL_TAC >> ALL_TAC" B
+worker transient keep
+expect_worker transient 3 "status=failed" "failure=input-missing" "missing=theory $a_key"
+[[ ! -e "$a_manifest" ]] || { echo "the light hydrate kept A's unusable cache entry" >&2; exit 1; }
+worker transient-retry keep
+expect_worker transient-retry 0 "status=built"
+hydrated transient-retry 2 2

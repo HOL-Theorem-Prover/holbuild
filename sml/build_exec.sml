@@ -12050,6 +12050,13 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                     case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key) of
                         SOME text => text
                       | NONE => raise Error ("cache entry " ^ key ^ " not found")
+            (* As checked_cache_entry does, a manifest with a transient stage
+               mldep is dropped, so a retry finds the remote's entry. *)
+            val _ =
+              case transient_stage_mldep_in_manifest source_text of
+                  SOME dep => transient_cache_manifest_error cache key (HolbuildCache.action_manifest cache key)
+                                source_text dep
+                | NONE => ()
             val {sig_hash, sml_hash, parents, mldeps, ...} =
               cache_manifest_blobs_from_lines key (cache_manifest_lines source_text)
             val fetched = in_root root (".holbuild/light-" ^ sml_hash)
