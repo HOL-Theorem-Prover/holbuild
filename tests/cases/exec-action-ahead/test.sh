@@ -369,11 +369,25 @@ spec_B_strict=$(spec_for "$tmpdir/batch-strict.txt" "ahead:BTheory")
 }
 worker strict "$spec_B_strict" --ahead-parent "$key_A:$spec_A"
 expect strict 0 "status=built"
+cp "$tmpdir/ac-B-weak" "$tmpdir/remote/ac/$ac_B"
+# Nor, once the late parent arrives, to start over plain.
+ac_A=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_A" | sha256sum | cut -d' ' -f1)
+mv "$tmpdir/remote/ac/$ac_A" "$tmpdir/ac-A"
+worker_start strict-ahead "$spec_B_strict" --ahead-parent "$key_A:$spec_A"
+await_marker strict-ahead waiting-ATheory
+mv "$tmpdir/ac-A" "$tmpdir/remote/ac/$ac_A"
+worker_wait strict-ahead
+expect strict-ahead 0 "status=built"
+ahead_phases strict-ahead || { echo "no load-ahead timings:" >&2; cat "$tmpdir/strict-ahead.result" >&2; exit 1; }
+if grep -q 'loading ahead found a build to reuse' "$tmpdir/strict-ahead.log"; then
+  echo "a load ahead took an entry too weak for the action as a build to reuse" >&2
+  cat "$tmpdir/strict-ahead.log" >&2
+  exit 1
+fi
 mv "$tmpdir/ac-B-weak" "$tmpdir/remote/ac/$ac_B"
 
 # A load ahead that finds the action built by the time its parent arrives
 # builds plain, hydrating a second time; its result names each phase once.
-ac_A=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_A" | sha256sum | cut -d' ' -f1)
 mv "$tmpdir/remote/ac/$ac_A" "$tmpdir/ac-A"
 mv "$tmpdir/remote/ac/$ac_B" "$tmpdir/ac-B"
 worker_start reuse "$spec_B" --ahead-parent "$key_A:$spec_A"

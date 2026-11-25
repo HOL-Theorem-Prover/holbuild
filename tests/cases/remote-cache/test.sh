@@ -293,6 +293,8 @@ assert_remote_proof_timeout 180.0
 # the store's entry.
 strong_ac=$(basename "$(remote_theory_action_path)")
 cp "$weak_action" "$remote_control/ac-stale-$strong_ac"
+# The second build's lookups passed over the weak entry and asked again.
+rm -f "$remote_control/no-cache-gets"
 revalidated_log=$tmpdir/revalidated.log
 (cd "$first" && HOLBUILD_CACHE="$first_cache" HOLBUILD_CACHE_TRACE=1 \
   "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 180 ATheory) > "$revalidated_log" 2>&1
