@@ -67,19 +67,185 @@ struct
       else NONE
     end
 
+  (* Source-load timing, a diagnostic: a process whose environment has
+     HOLBUILD_TIMING_SOURCE_LOADS=1 times each source file the loader
+     evaluates, and each holbuild runtime file it uses.  A row per label
+     keeps the count, the total time (inclusive) and the self time: the
+     total less the timed loads the file made while it ran and any heap
+     sharing around a theory (share_around_theory), which is loader
+     overhead.  At exit the process prints the self time and count of each
+     kind as hol-phases (srclib, srcrt, srcthy, in ms; srclibn, srcrtn,
+     srcthyn) and a `holbuild source-load` line per row, with
+     HOLBUILD_SOURCE_LOAD_CONTEXT as ctx: every runtime file, the
+     max_library_rows libraries of most self time and the rest as one
+     `other` row, and all theories as one row; or, having timed nothing,
+     one `none` row.  A heap saved while timing keeps the table; a process
+     restoring it is another process (process_identity) and starts afresh. *)
+  val max_library_rows = 64
+  fun no_source_loads () : (string * string, int * LargeInt.int * LargeInt.int) Binarymap.dict =
+    Binarymap.mkDict (fn ((k1, n1), (k2, n2)) =>
+                        case String.compare (k1, k2) of EQUAL => String.compare (n1, n2) | order => order)
+  (* The process: its pid, and its start time, which tells a process that
+     restores a heap from the one that saved it even if the pid is reused. *)
+  fun process_identity () =
+    let
+      val pid = LargeInt.toString (SysWord.toLargeInt (Posix.Process.pidToWord (Posix.ProcEnv.getpid ())))
+      val start =
+        let
+          val input = TextIO.openIn "/proc/self/stat"
+          val stat = TextIO.inputAll input before TextIO.closeIn input
+          (* The fields after the command name, which ends at the last ')'. *)
+          val fields = String.tokens Char.isSpace
+                         (Substring.string (Substring.taker (fn c => c <> #")") (Substring.full stat)))
+        in
+          List.nth (fields, 19)
+        end
+        handle _ => ""
+    in
+      pid ^ ":" ^ start
+    end
+  type source_load_state =
+    {process : string option ref,
+     loads : (string * string, int * LargeInt.int * LargeInt.int) Binarymap.dict ref,
+     (* The nested time of each timed load still running, innermost first. *)
+     stack : LargeInt.int ref list ref,
+     (* The directory of a load ahead's step files (ahead_load_runtime.sml),
+        which wait for late parents rather than load a library: not timed. *)
+     untimed_dir : string ref}
+  (* A process that compiles this file again (a load ahead's two preloads
+     each do) keeps the table of the structure this one replaces, which is
+     still the one bound while this one compiles: one table, one report. *)
+  val source_load_state : source_load_state =
+    case lookup_value ["HolbuildRuntime"] "source_load_state" of
+        SOME state => RunCall.unsafeCast state
+      | NONE => {process = ref NONE, loads = ref (no_source_loads ()), stack = ref [], untimed_dir = ref ""}
+  val untimed_dir = #untimed_dir source_load_state
+
+  fun label_text text = String.map (fn c => if Char.isGraph c andalso c <> #"=" then c else #"_") text
+
+  fun report_source_loads () =
+    if !(#process source_load_state) <> SOME (process_identity ()) then ()
+    else
+      let
+        val rows = Binarymap.listItems (!(#loads source_load_state))
+        val _ = #loads source_load_state := no_source_loads ()
+        fun of_kind kind = List.filter (fn ((k, _), _) => k = kind) rows
+        val libraries =
+          Listsort.sort (fn ((_, (_, _, a)), (_, (_, _, b))) => LargeInt.compare (b, a)) (of_kind "library")
+        fun fold_rows kind name rows =
+          ((kind, name),
+           List.foldl (fn ((_, (n, total, self)), (n', total', self')) => (n + n', total + total', self + self'))
+                      (0, 0, 0) rows)
+        val shown =
+          of_kind "runtime" @
+          (if length libraries <= max_library_rows then libraries
+           else List.take (libraries, max_library_rows) @
+                [fold_rows "library" "other" (List.drop (libraries, max_library_rows))]) @
+          (case of_kind "theory" of [] => [] | theories => [fold_rows "theory" "*" theories])
+        fun phases (name, kind) =
+          let val (_, (n, _, self)) = fold_rows kind "" (of_kind kind)
+          in name ^ "=" ^ LargeInt.toString (self div 1000) ^ " " ^ name ^ "n=" ^ Int.toString n end
+        val context = label_text (getOpt (OS.Process.getEnv "HOLBUILD_SOURCE_LOAD_CONTEXT", "other"))
+        fun row ((kind, name), (n, total, self)) =
+          String.concatWith " "
+            ["holbuild source-load", "ctx=" ^ context, "kind=" ^ kind, "name=" ^ name, "n=" ^ Int.toString n,
+             "total_us=" ^ LargeInt.toString total, "self_us=" ^ LargeInt.toString self] ^ "\n"
+      in
+        HolbuildBoundedOutput.text (TextIO.stdErr,
+          String.concat
+            (("holbuild hol-phases " ^
+              String.concatWith " " (map phases [("srclib", "library"), ("srcrt", "runtime"), ("srcthy", "theory")]) ^
+              "\n") :: map row (if null shown then [(("none", "-"), (0, 0, 0))] else shown)));
+        TextIO.flushOut TextIO.stdErr
+      end
+
+  (* Whether this process times source loads, starting its table and its
+     report when it first asks. *)
+  fun timing_source_loads () =
+    OS.Process.getEnv "HOLBUILD_TIMING_SOURCE_LOADS" = SOME "1" andalso
+    (if !(#process source_load_state) = SOME (process_identity ()) then ()
+     else
+       (#process source_load_state := SOME (process_identity ());
+        #loads source_load_state := no_source_loads ();
+        #stack source_load_state := [];
+        OS.Process.atExit report_source_loads);
+     true)
+  (* A process compiling this file starts here; one resuming from a heap
+     that holds it starts when the proof runtime installs. *)
+  val _ = timing_source_loads ()
+
+  (* F's time, counted as part of the timed load running (if any) but not
+     its self time. *)
+  fun outside_self_time f =
+    case !(#stack source_load_state) of
+        [] => f ()
+      | nested :: _ =>
+          let
+            val start = Time.now ()
+            fun finish () = nested := !nested + Time.toMicroseconds (Time.- (Time.now (), start))
+          in
+            (f () before finish ()) handle e => (finish (); PolyML.Exception.reraise e)
+          end
+
+  fun time_source_load label f =
+    if not (timing_source_loads ()) then f ()
+    else
+      let
+        val stack = #stack source_load_state
+        val nested = ref (0 : LargeInt.int)
+        val _ = stack := nested :: !stack
+        val start = Time.now ()
+        fun finish () =
+          let
+            val total = Time.toMicroseconds (Time.- (Time.now (), start))
+            val self = total - !nested
+            val _ = stack := (case !stack of _ :: outer => outer | [] => [])
+            val _ = case !stack of outer :: _ => outer := !outer + total | [] => ()
+            val loads = #loads source_load_state
+            val (n, total', self') = getOpt (Binarymap.peek (!loads, label), (0, 0, 0))
+          in
+            loads := Binarymap.insert (!loads, label, (n + 1, total' + total, self' + self))
+          end
+      in
+        (f () before finish ()) handle e => (finish (); PolyML.Exception.reraise e)
+      end
+
+  (* A file the loader evaluates: a theory's (its initialization, from its
+     module or its source), a HOL library's by its path under HOLDIR, or a
+     project library's by its file name alone, the action root's path being
+     local to the machine. *)
+  fun time_source_file path f =
+    let
+      val expanded = holpathdb.subst_pathvars path handle _ => path
+      val file = OS.Path.file expanded
+      val holdir = Systeml.HOLDIR ^ "/"
+      val label =
+        if String.isSuffix "Theory.sml" file orelse String.isSuffix "Theory.sig" file then ("theory", "*")
+        else if String.isPrefix holdir expanded then
+          ("library", "hol:" ^ label_text (String.extract (expanded, size holdir, NONE)))
+        else ("library", "project:" ^ label_text file)
+    in
+      if !untimed_dir <> "" andalso String.isPrefix (!untimed_dir ^ "/") expanded then f ()
+      else time_source_load label f
+    end
+
   (* USE, sharing the heap around a theory as the comment above says. *)
-  fun use_with_large_theory_sharing use path =
+  fun share_around_theory use path =
     case theory_dat_size path of
         NONE => use path
       | SOME size =>
           (if !unshared_dat_bytes > 0 andalso
               (size >= large_single_dat orelse !unshared_dat_bytes + size >= large_cumulative_dat)
-           then share_heap () else ();
+           then outside_self_time share_heap else ();
            use path;
            unshared_dat_bytes := !unshared_dat_bytes + size;
            (* Anything loaded before was shared above, so only a large
               theory can bring the count to a share here. *)
-           if size >= large_single_dat then share_heap () else ())
+           if size >= large_single_dat then outside_self_time share_heap else ())
+
+  (* share_around_theory, timed. *)
+  fun use_with_large_theory_sharing use path =
+    time_source_file path (fn () => share_around_theory use path)
 
   (* How a preload loads a module: sharing through
      use_with_large_theory_sharing, on whichever loader this HOL has.  A HOL
@@ -88,7 +254,9 @@ struct
      Names Meta may lack are compiled only once Meta is known to have them,
      at the first load: a file is bound only once all of it has run, so
      this structure can't be named while it loads.  The source loader is
-     wrapped for one load at a time, as the child policy may replace it. *)
+     wrapped for one load at a time, as the child policy may replace it.
+     It times each file it is given, so a theory loaded from its module
+     counts too. *)
   val loader : (string -> unit) option ref = ref NONE
   fun meta_has names =
     case #lookupStruct PolyML.globalNameSpace "Meta" of
@@ -101,7 +269,8 @@ struct
         ("val _ = HolbuildRuntime.loader := SOME (fn module => " ^
          "let val source = !Meta.moduleSourceLoader " ^
          "in Meta.moduleSourceLoader := " ^
-         "(fn use => source (HolbuildRuntime.use_with_large_theory_sharing use)); " ^
+         "(fn use => fn file => HolbuildRuntime.time_source_file file " ^
+         "(fn () => source (HolbuildRuntime.share_around_theory use) file)); " ^
          "(Meta.load module handle e => (Meta.moduleSourceLoader := source; PolyML.Exception.reraise e)); " ^
          "Meta.moduleSourceLoader := source end);")
     else if meta_has ["loadPlan", "qquse"] then
@@ -112,7 +281,9 @@ struct
     case !loader of
         SOME load => load module
       | NONE => (choose_loader (); valOf (!loader) module)
-  val use = use
+  (* holbuild uses its runtime files through this. *)
+  val plain_use = use
+  fun use path = time_source_load ("runtime", label_text (OS.Path.file path)) (fn () => plain_use path)
   val print = TextIO.print
   val export_theory = Theory.export_theory
   val restore_prover = Tactical.restore_prover
@@ -124,7 +295,7 @@ struct
   fun write_text path text =
     let
       val out = TextIO.openOut path
-      val _ = TextIO.output(out, text)
+      val _ = HolbuildBoundedOutput.text (out, text)
       val _ = TextIO.closeOut out
     in
       ()
@@ -300,7 +471,7 @@ struct
   fun theory_data_digest dat_path =
     let
       fun as_written why =
-        (TextIO.output (TextIO.stdErr,
+        (HolbuildBoundedOutput.text (TextIO.stdErr,
                         "holbuild: warning: hashing " ^ dat_path ^ " as written: " ^ why ^ "\n");
          SHA1.sha1_file {filename = dat_path})
       (* Not HOLsexp.fromFile: HOLFileSys would remap the path again. *)

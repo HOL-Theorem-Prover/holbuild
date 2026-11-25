@@ -50,7 +50,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y inotify-tools
+          sudo apt-get install -y inotify-tools strace
 
       - name: Configure holbuild test cache
         run: echo "HOLBUILD_CACHE=$HOME/.cache/holbuild" >> "$GITHUB_ENV"
@@ -197,7 +197,7 @@ jobs:
         run: >-
           tests/run.sh theory-modules basic-theory checkpoint-extra-inputs
           checkpoint-recovery exec-action exec-action-share-heaps exec-action-share-heaps-forged deps-heap-modules
-          preload-large-theory-sharing pipeline-suspend-groups check-promote-modules theory-module-refusal
+          preload-large-theory-sharing source-load-timing pipeline-suspend-groups check-promote-modules theory-module-refusal
           check-only
 
       - name: Save theory-module HOL toolchain cache

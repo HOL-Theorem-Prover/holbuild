@@ -908,7 +908,11 @@ exits once it has run an action and its claims have then found no work for 10
 minutes (the last one waiting its full `--claim-wait-seconds`), after any work
 exec-action does after its last result. A pause between waves is shorter, so
 the task that would serve the next wave stays; it still drops protection at
-its first empty claim, so a scale-in can stop it at once. Once it exits, its
+its first empty claim, so a scale-in can stop it at once. On an On-Demand
+burst host that claims fill after Spot (one started while Spot was short; the
+coordinator says so on a claim that finds no work), it exits at that first
+empty claim instead, since a task waiting out its idle time there keeps
+catching stray work and holds the host up. Once it exits, its
 task goes at once in a scale-in; otherwise ECS starts
 it again where the service's placement puts it (with `binpack`, on the
 fullest host with room), so the workers of partly drained hosts move onto
@@ -1095,7 +1099,9 @@ when that is under a second old)
   `batch_id` is the batch the action belongs to, which the worker names in its log; `ahead_parents` lists the ancestors still building when the action was claimed ahead of them, each after its
   own such ancestors, and is empty for any other claim; `pipeline` asks the worker to build the action
   pipelined (see "Pipelining")
-- 204 when nothing became ready for the tier within `wait_s`
+- 204 when nothing became ready for the tier within `wait_s`, with
+  `Holbuild-Spilled: 1` when the claim's first tier isn't `standard` and the
+  host it reported is an On-Demand burst host that claims fill after Spot
 
 `POST /v1/work/<attempt_token>/heartbeat`, with no body or `{"host": <report>}`
 

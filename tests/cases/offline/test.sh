@@ -246,7 +246,7 @@ val _ = HolbuildRemoteCacheConfig.setup_client ();
 val _ = assert "configured remote not suppressed" (HolbuildRemoteCacheConfig.url () = NONE);
 val _ = denied "HTTP setup" (fn () => HolbuildHttp.setup {user = NONE});
 val _ = denied "libcurl GET" (fn () => ignore (HolbuildHttp.get {url=url, dst=tmp ^ "/get", timeout=1}));
-val _ = denied "libcurl HEAD" (fn () => ignore (HolbuildHttp.head {url=url, timeout=1}));
+val _ = denied "libcurl HEAD" (fn () => ignore (HolbuildHttp.head {url=url, headers=[], timeout=1}));
 val _ = denied "libcurl PUT" (fn () => ignore (HolbuildHttp.put {url=url, src=tmp ^ "/version", headers=[], timeout=1}));
 val _ = HolbuildRemoteCacheConfig.libcurl_ready := SOME false;
 val _ = assert "curl CLI"

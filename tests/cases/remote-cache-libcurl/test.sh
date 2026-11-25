@@ -384,7 +384,7 @@ fun accepted () = accepted_at url
 
 val accepted_before = accepted ()
 val _ = assert "a HEAD answered with Content-Length -1 returns its status"
-               (HolbuildHttp.head {url = url ^ "/negative-length", timeout = 30} = HolbuildHttp.Response 200)
+               (HolbuildHttp.head {url = url ^ "/negative-length", headers = [], timeout = 30} = HolbuildHttp.Response 200)
 val _ = assert "a GET after it on the same handle reads its body by its length"
                (HolbuildHttp.get {url = url ^ "/fast", dst = dir ^ "/after-head.out", timeout = 30}
                 = HolbuildHttp.Response 200
@@ -467,7 +467,7 @@ fun open_fds () =
 fun walker () =
   (List.app (fn _ =>
      List.app (fn server =>
-       if HolbuildHttp.head {url = server ^ "/fast", timeout = 30} = HolbuildHttp.Response 200 then ()
+       if HolbuildHttp.head {url = server ^ "/fast", headers = [], timeout = 30} = HolbuildHttp.Response 200 then ()
        else record (fn () => failures := server :: !failures))
        ring)
      [1, 2]

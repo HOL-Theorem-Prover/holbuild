@@ -96,7 +96,7 @@ local
       fun loop done =
         if done = size then ()
         else
-          let val n = pwrite (fd, at (buffer, done), size - done, offset + done)
+          let val n = pwrite (fd, at (buffer, done), Int.min (HolbuildBoundedOutput.max_write, size - done), offset + done)
           in
             if n > 0 then loop (done + n)
             else raise OS.SysErr ("could not write the decoded zstd output", NONE)

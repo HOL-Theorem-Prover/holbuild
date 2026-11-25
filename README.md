@@ -2731,6 +2731,10 @@ Repository tests resolve the schema 2 HOL toolchain cache automatically:
 make test
 ```
 
+On Linux the suite needs `strace`, which the `bounded-writes` case uses to
+check the size of every file write; the case skips without OpenSSL 3's
+`libcrypto`, without which holbuild links cached blobs instead of copying them.
+
 The runner sets `HOLBUILD_PLAN_RECORD=check` unless it is already set, so
 every build in the suite that plans from a plan record is also checked
 against full planning.

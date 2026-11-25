@@ -818,7 +818,7 @@ fun proof_unit_names kind source =
 
 fun write_text_file path text =
   let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+  in HolbuildBoundedOutput.text (out, text); TextIO.closeOut out end
 
 fun run_analyser_for_proof_ir_text {name, tactic_start, tactic_end, tactic_text} =
   case HolbuildDependencies.current_analyser_path () of
@@ -941,7 +941,7 @@ fun analyser_proof_ir_plan_for_unit (unit : execution_plan_unit) =
   end
 
 fun print_static_execution_plan project new_ir source theorem unit_opt =
-  (print (let
+  (HolbuildBoundedOutput.print (let
             val unit = case unit_opt of SOME value => value | NONE => raise Error "internal error: missing proof-IR unit"
             val plan = analyser_proof_ir_plan_for_unit unit
           in
@@ -1652,7 +1652,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       let val ({plan, toolchain_key, ...}, build_options, keys) = plan_build ()
       in
         timed_phase "action_spec.export"
-          (fn () => print (#batch (HolbuildBuildExec.export_action_specs build_options tc project plan (keys ()) toolchain_key jobs
+          (fn () => HolbuildBoundedOutput.print (#batch (HolbuildBuildExec.export_action_specs build_options tc project plan (keys ()) toolchain_key jobs
                              {upload = upload, keep_specs = true, local_resumable = false, forced = [], skip = [], defer = false,
                               publish = [], ledger = false})))
       end
@@ -4121,7 +4121,7 @@ fun check_stored_data tc cli_jobs build_mode selections {project, index, compone
             in summaries := Redblackmap.insert (!summaries, thy, summary); summary end
     fun qualified thy name = thy ^ "Theory." ^ name
     fun count n noun = Int.toString n ^ " " ^ noun ^ (if n = 1 then "" else "s")
-    fun out s = (TextIO.output (TextIO.stdOut, s ^ "\n"); TextIO.flushOut TextIO.stdOut)
+    fun out s = (HolbuildBoundedOutput.text (TextIO.stdOut, s ^ "\n"); TextIO.flushOut TextIO.stdOut)
     fun check (logical_name, {theory = _, theorem}) =
       let
         val thy = HolbuildBuildExec.theory_name_from_logical logical_name

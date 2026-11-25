@@ -92,7 +92,7 @@ fun write_text path text =
       handle e => raise Error ("could not write " ^ path ^ ": " ^ General.exnMessage e)
     fun close () = TextIO.closeOut output handle _ => ()
   in
-    (TextIO.output(output, text); TextIO.closeOut output)
+    (HolbuildBoundedOutput.text (output, text); TextIO.closeOut output)
     handle e => (close (); raise e)
   end
 
@@ -156,7 +156,7 @@ fun warn_restore_once message =
     val _ = Mutex.unlock restore_warning_mutex
   in
     if emit then
-      (TextIO.output (TextIO.stdErr, "holbuild: warning: remote cache restore failed: " ^ message ^ "\n");
+      (HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: warning: remote cache restore failed: " ^ message ^ "\n");
        TextIO.flushOut TextIO.stdErr)
     else ()
   end
@@ -226,12 +226,6 @@ fun get_status_parallel_decode (request as {url, dst, timeout}) =
              get_status request)
         | _ => (remove (); result)
     end
-
-fun head_status url =
-  if HolbuildRemoteCacheConfig.uses_libcurl () then
-    HolbuildHttp.head {url = url, timeout = stall_timeout_seconds}
-  else
-    cli_status stall_timeout_seconds ["-I", "--ignore-content-length", "-o", "/dev/null"] url
 
 fun put_status_within timeout headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
@@ -310,7 +304,7 @@ fun record_transport_outcome (generation, probe) result =
   in
     case (tripped, recovered, result) of
         (true, _, HolbuildHttp.Failed message) =>
-          (TextIO.output (TextIO.stdErr,
+          (HolbuildBoundedOutput.text (TextIO.stdErr,
              "holbuild: warning: remote cache disabled for 60 seconds after " ^
              (if probe then "a recovery probe failed"
               else Int.toString max_consecutive_transport_failures ^
@@ -318,7 +312,7 @@ fun record_transport_outcome (generation, probe) result =
              "; the last: " ^ message ^ "\n");
            TextIO.flushOut TextIO.stdErr)
       | (_, true, _) =>
-          (TextIO.output (TextIO.stdErr, "holbuild: remote cache available again\n");
+          (HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: remote cache available again\n");
            TextIO.flushOut TextIO.stdErr)
       | _ => ()
   end
@@ -398,6 +392,18 @@ fun revalidating f =
   in
     Thread.setLocal (revalidating_tag, true);
     (f () before restore ()) handle e => (restore (); raise e)
+  end
+
+(* A HEAD inside `revalidating` asks the cache to check with its origin
+   that it still holds the entry or blob. *)
+fun head_status url =
+  let val headers = if reads_revalidate () then ["Cache-Control: no-cache"] else []
+  in
+    if HolbuildRemoteCacheConfig.uses_libcurl () then
+      HolbuildHttp.head {url = url, headers = headers, timeout = stall_timeout_seconds}
+    else
+      cli_status stall_timeout_seconds
+        (["-I", "--ignore-content-length", "-o", "/dev/null"] @ List.concat (map (fn h => ["-H", h]) headers)) url
   end
 
 (* A read's probes past its first nodes run on the caller's thread and on
@@ -618,7 +624,7 @@ fun retrying_one_node method urls attempt =
                 case delays of
                     delay :: rest =>
                       if transient result andalso !retry_one_node andalso fits delay then
-                        (TextIO.output (TextIO.stdErr,
+                        (HolbuildBoundedOutput.text (TextIO.stdErr,
                            "holbuild: remote cache " ^ method ^ " " ^ redact_userinfo url ^ " " ^
                            (case result of
                                 HolbuildHttp.Failed message => "got no answer: " ^ message
