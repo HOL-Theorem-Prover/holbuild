@@ -1001,12 +1001,15 @@ fun warn_reconcile message =
    after the store lost the old one) while this host keeps the entry it
    restored before.  Then, while no other process uses the entry, it is
    replaced by the remote's archive, fetched and checked first so that new
-   users wait only for the swap.  When the entry is the remote's, asking for
-   the blob keeps a cache that renews what it serves from letting the store
-   expire it.  At most once per published_check_interval, which restarts
-   only once the comparison is done: a busy entry is compared again by the
-   next action.  Only a process's first use of the entry compares it, before
-   anything in the process runs on it.  A failure leaves the entry as it is. *)
+   users wait only for the swap.  When the entry is the remote's but the
+   store has lost its record or its blob (asked past any cache in front of
+   it), the entry is published again, so that a host restoring it later gets
+   these bytes rather than building its own: archiving is deterministic, so
+   it is the same blob.  At most once per published_check_interval, which
+   restarts only once the comparison is done: a busy entry is compared again
+   by the next action.  Only a process's first use of the entry compares it,
+   before anything in the process runs on it.  A failure leaves the entry as
+   it is. *)
 val reconciled_keys = ref ([] : string list)
 
 fun reconcile_with_published req k =
@@ -1035,13 +1038,37 @@ fun reconcile_with_published req k =
                          Option.isSome (with_exclusive_lease k (fn () => replace_entry req k staged))))
                before HolbuildToolchainArchive.cleanup_staging final)
               handle e => (HolbuildToolchainArchive.cleanup_staging final; raise e)
+            (* Unlike publish_entry, a failed upload keeps the entry; one a
+               restore would reject is left for validate_entry.  Its checkout
+               isn't checked: git takes the mutation lease, which this
+               action's usage lease excludes, and no action can write it. *)
+            fun republish () =
+              if not (built (holdir_for_key k) andalso heap_loads k) then ()
+              else
+                case HolbuildToolchainArchive.publish
+                       {remote = remote, identity = archive_identity k, entry_dir = final, replace = true} of
+                    SOME hash => write_file (archive_blob_for_key k) (hash ^ "\n")
+                  | NONE => ()
+            (* Asked past any cache in front of the store, which then drops
+               a copy the store lost, so that a publish uploads it again. *)
+            fun stored hash =
+              HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.blob_present remote hash)
+            val recorded = recorded_archive_blob k
+            (* Only a store that answered that it holds no record, or no
+               blob, is put the entry again; an unreadable record is left. *)
             fun compare () =
-              case HolbuildToolchainArchive.published_blob remote (archive_identity k) of
-                  NONE => true
-                | SOME hash =>
-                    if recorded_archive_blob k = SOME hash then
-                      (ignore (HolbuildRemoteCache.blob_present remote hash); true)
-                    else Option.getOpt (with_toolchain_lock_now k replace, false)
+              case HolbuildRemoteCache.revalidating (fn () =>
+                     HolbuildRemoteCache.probe_action remote (archive_identity k)) of
+                  {found = SOME text, ...} =>
+                    let val hash = HolbuildToolchainArchive.parse_remote_record text
+                    in
+                      if recorded <> SOME hash then Option.getOpt (with_toolchain_lock_now k replace, false)
+                      else stored hash orelse Option.isSome (with_toolchain_lock_now k republish)
+                    end
+                | {found = NONE, missing = true} =>
+                    (Option.app (ignore o stored) recorded;
+                     Option.isSome (with_toolchain_lock_now k republish))
+                | {found = NONE, missing = false} => true
             val done = compare () handle error => (warn_reconcile (archive_error_message error); true)
           in
             if done then (write_file (published_check_path k) "" handle IO.Io _ => ()) else ()

@@ -3297,3 +3297,61 @@ counts=[e['finished'] for e in events if e.get('event')=='node_finished']
 total={e['total'] for e in events if e.get('event')=='node_finished'}
 assert counts==[1,2,3] and total=={3}, (counts,total)
 PY
+
+# build --check-only: the workers check BTheory and publish nothing of it,
+# and the client installs nothing of it; ATheory, which it loads, is built
+# and restored as usual.  A failed proof fails the check as it fails a build.
+project=$tmpdir/check-only
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxcheck"
+[build]
+members = ["src"]
+TOML
+write_theories check-only
+run check-only 0 build --remote-exec "$coordinator" --remote-only --check-only BTheory
+require_grep "holbuild: remote rxcheck:BTheory: done" "$tmpdir/check-only.log"
+batch=$(sed -n 's/.*holbuild: remote batch \(b[0-9]*\).*/\1/p' "$tmpdir/check-only.log")
+key_b=$(awk '$1 == "action" && $5 == "rxcheck:BTheory" { print $3 }' "$state/$batch.batch")
+[[ -n $key_b ]] || { cat "$state/$batch.batch" >&2; exit 1; }
+[[ ! -e "$remote_root/ac/$key_b" ]] || { echo "the check-only worker published BTheory" >&2; exit 1; }
+[[ -f "$project/.holbuild/obj/src/ATheory.dat" ]] || { echo "ATheory was not restored" >&2; exit 1; }
+[[ ! -e "$project/.holbuild/obj/src/BTheory.dat" ]] || { echo "the client installed BTheory" >&2; exit 1; }
+sed -i 's/ACCEPT_TAC a_thm/FAIL_TAC "check-only failure"/' "$project/src/BScript.sml"
+run check-only-fail 1 build --remote-exec "$coordinator" --remote-only --check-only BTheory
+require_grep "check-only failure" "$tmpdir/check-only-fail.log"
+
+# A cache entry gives the client no verdict: with BTheory's entry in the
+# remote cache but no outputs here, the check still goes to a worker, which
+# checks the entry against the parents it restores, and the client fetches
+# nothing of it.
+input_b=$(awk '$1 == "action" && $5 == "rxcheck:BTheory" { print $2 }' "$state/$batch.batch")
+write_theories check-only
+run check-only-publish 0 build --remote-exec "$coordinator" --remote-only BTheory
+[[ -e "$remote_root/ac/$key_b" ]] || { echo "the plain build published no BTheory" >&2; exit 1; }
+rm -f "$project/.holbuild/obj/src"/BTheory.*
+find "$project/.holbuild" -name 'BScript.sml.key' -delete
+rm -rf "${HOLBUILD_CACHE:?}/actions/$input_b"
+run check-only-cached 0 build --remote-exec "$coordinator" --remote-only --check-only BTheory
+require_grep "holbuild: remote rxcheck:BTheory: done" "$tmpdir/check-only-cached.log"
+[[ ! -e "$HOLBUILD_CACHE/actions/$input_b" ]] || { echo "the check fetched BTheory's entry" >&2; exit 1; }
+[[ ! -e "$project/.holbuild/obj/src/BTheory.dat" ]] || { echo "the client installed BTheory" >&2; exit 1; }
+
+# A check-only theory that early cutoff settles once its dependencies' batch
+# ends passes without going to a second batch.
+write_theories check-cutoff
+run check-cutoff-plain 0 build --remote-exec "$coordinator" BTheory
+sed -i 's/(\* check-cutoff \*)/(* check-cutoff, changed *)/' "$project/src/AScript.sml"
+run check-cutoff 0 build --remote-exec "$coordinator" --check-only BTheory
+require_grep "early cutoff reused 1 of 1 deferred theories" "$tmpdir/check-cutoff.log"
+[[ $(grep -c 'holbuild: remote batch ' "$tmpdir/check-cutoff.log") == 1 ]] || {
+  echo "the settled check-only theory went to another batch" >&2; cat "$tmpdir/check-cutoff.log" >&2; exit 1; }
+
+# A check takes its verdicts from the batch it submits and follows.
+for flag in --detach "--attach b1"; do
+  # shellcheck disable=SC2086
+  run "check-only-${flag%% *}" 1 build --remote-exec "$coordinator" --check-only $flag BTheory
+  require_grep "remove --detach or --attach" "$tmpdir/check-only-${flag%% *}.log"
+done

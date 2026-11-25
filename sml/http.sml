@@ -577,14 +577,22 @@ fun get_zstd {url, dst, timeout} =
    A HEAD's Content-Length is ignored: only the status matters, and
    bazel-remote answers -1 for a blob it has only in its S3 backend, which
    libcurl otherwise rejects. *)
-fun head {url, timeout} =
+fun head {url, headers, timeout} =
   request {url = url, timeout = timeout, files = fn run =>
     with_file "/dev/null" "wb" (fn sink =>
-      run {output = sink,
-           set_options = fn easy => (check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1));
-                                     check "NOBODY" (setopt_long (easy, CURLOPT_NOBODY, 1));
-                                     check "IGNORE_CONTENT_LENGTH"
-                                       (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 1)))})}
+      let
+        val header_list = List.foldl (fn (h, l) => slist_append (l, h)) Foreign.Memory.null headers
+        fun set_options easy =
+          (check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1));
+           check "NOBODY" (setopt_long (easy, CURLOPT_NOBODY, 1));
+           check "IGNORE_CONTENT_LENGTH" (setopt_long (easy, CURLOPT_IGNORE_CONTENT_LENGTH, 1));
+           check "HTTPHEADER" (setopt_ptr (easy, CURLOPT_HTTPHEADER, header_list)))
+      in
+        (* The handle is closed before this frees the list. *)
+        run {output = sink, set_options = set_options}
+        before slist_free_all header_list
+        handle e => (slist_free_all header_list; raise e)
+      end)}
 
 (* Uploads src to url with PUT and the given extra request headers; the
    response body is discarded. *)

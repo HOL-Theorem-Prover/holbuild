@@ -86,6 +86,7 @@ struct
 
   fun start directory share_heap modules_readable =
     (dir := directory;
+     HolbuildRuntime.untimed_dir := directory;
      share := share_heap;
      modules := modules_readable;
      write "base-loaded"
@@ -99,7 +100,7 @@ struct
     (write "finishing" "";
      await "ready";
      !restore ();
-     dir := ""; recorded := []; count := 0; entries := []; completed := []; share := false;
+     dir := ""; HolbuildRuntime.untimed_dir := ""; recorded := []; count := 0; entries := []; completed := []; share := false;
      loader := (fn _ => ()); restore := (fn () => ()))
 
   fun enter parent = entries := (parent, Meta.loaded (), !count) :: !entries

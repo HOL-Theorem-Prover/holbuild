@@ -227,12 +227,6 @@ fun get_status_parallel_decode (request as {url, dst, timeout}) =
         | _ => (remove (); result)
     end
 
-fun head_status url =
-  if HolbuildRemoteCacheConfig.uses_libcurl () then
-    HolbuildHttp.head {url = url, timeout = stall_timeout_seconds}
-  else
-    cli_status stall_timeout_seconds ["-I", "--ignore-content-length", "-o", "/dev/null"] url
-
 fun put_status_within timeout headers {url, src} =
   if HolbuildRemoteCacheConfig.uses_libcurl () then
     HolbuildHttp.put {url = url, src = src, headers = headers, timeout = timeout}
@@ -398,6 +392,18 @@ fun revalidating f =
   in
     Thread.setLocal (revalidating_tag, true);
     (f () before restore ()) handle e => (restore (); raise e)
+  end
+
+(* A HEAD inside `revalidating` asks the cache to check with its origin
+   that it still holds the entry or blob. *)
+fun head_status url =
+  let val headers = if reads_revalidate () then ["Cache-Control: no-cache"] else []
+  in
+    if HolbuildRemoteCacheConfig.uses_libcurl () then
+      HolbuildHttp.head {url = url, headers = headers, timeout = stall_timeout_seconds}
+    else
+      cli_status stall_timeout_seconds
+        (["-I", "--ignore-content-length", "-o", "/dev/null"] @ List.concat (map (fn h => ["-H", h]) headers)) url
   end
 
 (* A read's probes past its first nodes run on the caller's thread and on

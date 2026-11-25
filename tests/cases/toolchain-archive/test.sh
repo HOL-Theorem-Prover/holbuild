@@ -417,9 +417,6 @@ rm -rf "$cache/hol-toolchains"
 reconcile_entry=$(dirname "$(tail -n 1 "$tmpdir/reconcile-setup.log")")
 original_blob=$(grep -o 'blob=[0-9a-f]*' "$original_action" | cut -d= -f2)
 [[ $(< "$reconcile_entry/archive-blob") = "$original_blob" ]]
-python3 "$tmpdir/mutate_archive.py" \
-  "$original_archive" "$tmpdir/republished.tar" "${action_files[0]}" "$remote_root/cas" republished
-republished_blob=$(grep -o 'blob=[0-9a-f]*' "${action_files[0]}" | cut -d= -f2)
 cat > "$tmpdir/hold_lease.py" <<'PY'
 import fcntl, os, sys, time
 path, held, release = sys.argv[1:4]
@@ -494,6 +491,68 @@ val _ = HolbuildRemoteCacheConfig.set_url (env "RECONCILE_URL");
 val _ = HolbuildRemoteCacheConfig.setup_client ();
 val _ = HolbuildHolSharedCache.hold_usage_lease k;
 SML
+# When the store has lost the archive's blob (while a cache in front of it
+# still answers for it) or its record too, the entry is published again, as
+# the same blob; a record that can't be read, or an entry a restore would
+# reject, is left alone.
+cat > "$tmpdir/reconcile-republish.sml" <<'SML'
+use (OS.Path.concat (valOf (OS.Process.getEnv "RECONCILE_TMP"), "reconcile-prelude.sml"));
+val _ = HolbuildHolSharedCache.adopt_published_archive := true;
+val blob = env "ORIGINAL_BLOB";
+val blob_path = env "REMOTE_CAS" ^ "/" ^ blob;
+val cached = env "SERVER_CONTROL" ^ "/cas-cached-" ^ blob;
+val action = env "REMOTE_ACTION";
+val action_status = env "SERVER_CONTROL" ^ "/ac-get-status-" ^ OS.Path.file action;
+fun lose_blob () = ((OS.FileSys.remove blob_path handle OS.SysErr _ => ()); write cached "");
+fun names_blob () = exists action andalso String.isSubstring ("blob=" ^ blob) (read action);
+fun check_again () = OS.FileSys.remove stamp;
+val holmake = entry_file "hol/bin/Holmake";
+
+val _ = sh ("chmod a-x " ^ holmake);
+val _ = lose_blob ();
+val _ = reconcile ();
+val _ = assert "published again a toolchain a restore would reject"
+  (not (exists blob_path) andalso names_blob () andalso recorded () = blob ^ "\n");
+val _ = sh ("chmod a+x " ^ holmake);
+
+val _ = lose_blob ();
+val _ = check_again ();
+val _ = reconcile ();
+val _ = assert "did not ask past the cache" (not (exists cached));
+val _ = assert "did not publish again a toolchain whose blob the store lost" (exists blob_path);
+val _ = assert "publishing again changed the blob" (recorded () = blob ^ "\n" andalso names_blob ());
+val _ = assert "comparison not recorded" (exists stamp);
+
+val _ = OS.FileSys.remove action;
+val _ = write action_status "403";
+val _ = check_again ();
+val _ = reconcile ();
+val _ = assert "published again over a record it could not read" (not (exists action));
+val _ = OS.FileSys.remove action_status;
+
+val _ = lose_blob ();
+val _ = check_again ();
+val _ = reconcile ();
+val _ = assert "did not ask past the cache before publishing a lost record" (not (exists cached));
+val _ = assert "did not publish again a toolchain the store has no record of"
+  (exists blob_path andalso names_blob ());
+val _ = assert "publishing again changed the recorded blob" (recorded () = blob ^ "\n");
+val _ = OS.Process.exit OS.Process.success;
+SML
+# Under exec-action nothing runs in a toolchain's checkout, so a worker's
+# entry keeps the bytes it was restored with; buildhol here checked the
+# checkout, which rewrote its git index, so that goes back as restored.
+tar -xf "$original_archive" -C "$reconcile_entry" ./hol/.git/index
+republish_log=$tmpdir/reconcile-republish.log
+RECONCILE_ENTRY=$reconcile_entry RECONCILE_URL=$remote_url RECONCILE_TMP=$tmpdir ORIGINAL_BLOB=$original_blob \
+  REMOTE_CAS=$remote_root/cas REMOTE_ACTION=${action_files[0]} SERVER_CONTROL=$server_control \
+  "$real_poly" -q --error-exit --script "$tmpdir/reconcile-republish.sml" > "$republish_log" 2>&1 ||
+  { cat "$republish_log" >&2; exit 1; }
+rm -f "$server_control/cas-cached-$original_blob"
+python3 "$tmpdir/mutate_archive.py" \
+  "$original_archive" "$tmpdir/republished.tar" "${action_files[0]}" "$remote_root/cas" republished
+republished_blob=$(grep -o 'blob=[0-9a-f]*' "${action_files[0]}" | cut -d= -f2)
+
 cat > "$tmpdir/reconcile.sml" <<'SML'
 use (OS.Path.concat (valOf (OS.Process.getEnv "RECONCILE_TMP"), "reconcile-prelude.sml"));
 fun leftovers () =

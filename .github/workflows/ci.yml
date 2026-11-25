@@ -197,7 +197,8 @@ jobs:
         run: >-
           tests/run.sh theory-modules basic-theory checkpoint-extra-inputs
           checkpoint-recovery exec-action exec-action-share-heaps exec-action-share-heaps-forged deps-heap-modules
-          preload-large-theory-sharing pipeline-suspend-groups check-promote-modules theory-module-refusal
+          preload-large-theory-sharing source-load-timing pipeline-suspend-groups check-promote-modules theory-module-refusal
+          check-only
 
       - name: Save theory-module HOL toolchain cache
         if: steps.module-hol-toolchain-cache.outputs.cache-hit != 'true'
