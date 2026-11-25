@@ -17030,7 +17030,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             val shared_key = shared_heap_key tc root built_action
             val hit =
               action_built remote spec orelse
-              (case cutoff of SOME {pair_key, ...} => cached pair_key | NONE => false) orelse
+              (* Only an earlier build's key: a record naming the action's
+                 own key is what action_built judged. *)
+              (case cutoff of
+                   SOME {pair_key, ...} =>
+                     Option.isSome (Option.mapPartial (earlier_build_key spec)
+                                      (HolbuildRemoteCache.get_action remote pair_key))
+                 | NONE => false) orelse
               (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
                (cached shared_key orelse
                 not deps_heap_only andalso resumes_from_checkpoints (spec_policy spec) built_action andalso

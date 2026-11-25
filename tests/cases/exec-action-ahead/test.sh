@@ -369,8 +369,11 @@ spec_B_strict=$(spec_for "$tmpdir/batch-strict.txt" "ahead:BTheory")
 }
 worker strict "$spec_B_strict" --ahead-parent "$key_A:$spec_A"
 expect strict 0 "status=built"
-cp "$tmpdir/ac-B-weak" "$tmpdir/remote/ac/$ac_B"
-# Nor, once the late parent arrives, to start over plain.
+# Nor, once the late parent arrives, to start over plain, also where a weak
+# build of the same inputs left its early cutoff record, naming this key.
+rm "$tmpdir/remote/ac/$ac_B"
+worker strict-ahead "$spec_B"
+expect strict-ahead 0 "status=built"
 ac_A=$(printf 'holbuild-remote-ac-v1\n%s\n' "$key_A" | sha256sum | cut -d' ' -f1)
 mv "$tmpdir/remote/ac/$ac_A" "$tmpdir/ac-A"
 worker_start strict-ahead "$spec_B_strict" --ahead-parent "$key_A:$spec_A"
