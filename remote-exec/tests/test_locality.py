@@ -328,6 +328,32 @@ async def test_a_build_held_for_another_host_is_no_competitor_of_the_claim_that_
     assert await contention_lines(coordinator, caplog) == []
 
 
+async def test_a_build_a_claim_would_leave_for_another_host_is_no_competitor_of_the_build_it_takes_first(
+    http: httpx.AsyncClient,
+    cache: FakeCache,
+    coordinator: Coordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A claim from cold host-3 takes ``a1``, of a higher priority, before it reaches ``b1``, which it would leave to
+    host-1: ``b1`` contests nothing, until host-1 claims and only ``b1`` is left."""
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 1.0)
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await submit_as(http, "b1", "b")
+    await submit_as(http, "a1", "a", priority=1)
+
+    cold = await claim_on(http, "host-3")
+
+    assert cold is not None and cold["theory"] == "pkg:a"
+    assert await contention_lines(coordinator, caplog) == []
+    await submit_as(http, "c1", "c")
+    warm = await claim_on(http, "host-1")
+    assert warm is not None and warm["theory"] == "pkg:b"
+    (line,) = await contention_lines(coordinator, caplog)
+    assert ",pkg:c,p0," in line, line
+
+
 @pytest.mark.parametrize("locality", [True, False])
 async def test_a_cold_host_leaves_a_build_its_kept_holder_holds_and_takes_the_next(
     http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, locality: bool

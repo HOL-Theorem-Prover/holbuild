@@ -381,6 +381,10 @@ STATEMENTS = [
     Statement(
         cm.CLAIM_ACTION, lambda f: {"batch_id": f.fresh, "class": "build", "tier": "standard", "taken": []}, 2_900
     ),
+    # A batch past its roots: the build it takes has done parents, whose result times its wait is read from.
+    Statement(
+        cm.CLAIM_ACTION, lambda f: {"batch_id": f.steady, "class": "build", "tier": "standard", "taken": []}, 2_900
+    ),
     Statement(cm.FIRST_READY_PLACE, lambda f: {"batch_id": f.fresh, "tier": "standard"}, 2_900),
     Statement(cm.LOCK_KEY, lambda f: {"key": f.arrival.keys("ready")[0]}, 100),
     Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("ready")[0]}, 2_100),

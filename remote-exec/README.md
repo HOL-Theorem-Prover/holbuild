@@ -55,13 +55,14 @@ seconds the process used and the CPU time per response:
 ```
 
 It also logs a `claim contention` line for a build claim from the shared ranking that is `slow` (a build with
-dependents claimed over 15 s after it became ready, when that time is known), `passed` (the best candidate of another
-batch the claim could have taken is deeper than the build it took; once per batch and tier every 15 s) or a 1%
+dependents claimed over 15 s after its parents' latest result, or its batch's submission if it has none, when that
+time is known; this includes the release's cache check before it was marked ready), `passed` (the best candidate of
+another batch the claim could have taken is deeper than the build it took; once per batch and tier every 15 s) or a 1%
 `sample` of claims another batch contested. It names the claiming host (`boot8`) and worker, the tier and wait, the
-build and its competitor as `batch8,theory,p<priority>,r<running>,a<waiting ahead>,d<critical depth>` (`a?` when
-that count wasn't read), the ranking's running priority builds, cap and whether it was capped when the claim chose,
-and each kept host's `boot8:memory_short:cpu_idle_pct:workers`. The waiting-ahead counts are read after the claim
-commits, on a connection of their own; nothing in the line changes how claims are made.
+build and its competitor as `batch8,theory,p<priority>,r<running>,a<waiting ahead>,d<critical depth>` (`a?` when that
+count wasn't read), the ranking's running priority builds, cap and whether it was capped when the claim chose, and
+each kept host's `boot8:memory_short:cpu_idle_pct:workers`. The waiting-ahead counts are read after the claim commits,
+on a connection of their own (at most 4 at a time); nothing in the line changes how claims are made.
 
 Without the image, from this directory: `uv sync`, then `uv run alembic
 upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090`.

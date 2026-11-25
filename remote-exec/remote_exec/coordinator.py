@@ -577,7 +577,8 @@ ORDER BY
 # the lease keys are read once per statement into a hash, rather than once per ready action probed. A build claim
 # then rechecks its key (Coordinator._lock_unleased), and skips the keys in :taken. For the claim contention line
 # (Coordinator._contention), ``ready_s`` is how long a build of a positive critical depth, never claimed before, has
-# been ready: since its parents' latest result, or its batch's submission if it has no parents; read by key. It is
+# been ready: since its parents' latest result, or its batch's submission if it has no parents, so it includes the
+# release's check of their entries in the cache before the build was marked ready; read by key. It is
 # null when a parent is done with no result time (found in the cache, or built by another batch: FINISH_PEERS), since
 # when that parent became done isn't recorded, and for a build claimed before (retried), whose earlier attempt isn't.
 CLAIM_ACTION = sa.text("""
@@ -2139,7 +2140,7 @@ class Coordinator:
                 held_until = until if held_until is None else min(held_until, until)
                 continue
             # Before the builds this claim passed over for their holds are back: it could take none of them.
-            competitor = self._competitor(ranking, batch_id)
+            competitor = self._competitor(ranking, batch_id, host_id, hint_only, kept)
             chosen = (ranking.running_priority, ranking.capped)  # as the claim chose, before it counts
             put_back_held()
             heapq.heappush(
@@ -2200,15 +2201,29 @@ class Coordinator:
         put_back_held()
         return None, held_until, None
 
-    def _competitor(self, ranking: "_Ranking", batch_id: UUID) -> Competitor | None:
+    def _competitor(
+        self,
+        ranking: "_Ranking",
+        batch_id: UUID,
+        host_id: str | None,
+        hint_only: frozenset[str],
+        kept: Callable[[str], set[str]],
+    ) -> Competitor | None:
         """The best candidate of another batch than ``batch_id`` in ``ranking``'s heap whose first ready build the
-        ranking knows (one not claimed from since the read), or None. Only the heap's top three are looked at, which
-        hold its two best entries, so a candidate claimed from or exhausted since can hide the next one."""
+        ranking knows (one not claimed from since the read), or None, for a claim from ``host_id``: not one it would
+        leave for a hold, another host's (see _held), or, of tiers ``hint_only``, any but its own (_held_here). Only
+        the heap's top three are looked at, which hold its two best entries, so a candidate claimed from or exhausted
+        since can hide the next one."""
         for entry in sorted(ranking.heap[:3]):
             key = (entry[6], entry[7])
             theory, depth = ranking.theories.get(key), ranking.depths.get(key)
-            if entry[6] != batch_id and theory is not None and depth is not None and key not in ranking.exhausted:
-                return Competitor(entry, theory, depth[0])
+            if entry[6] == batch_id or theory is None or depth is None or key in ranking.exhausted:
+                continue
+            if entry[7] in hint_only and not self._held_here(ranking, key, host_id, kept):
+                continue
+            if self._leaves(ranking, entry, host_id, kept) and not self._hold_ended(ranking, key):
+                continue
+            return Competitor(entry, theory, depth[0])
         return None
 
     def _contention(
@@ -2382,11 +2397,9 @@ class Coordinator:
         passes it over (_hold_ended). The hold ends with that time only, so no build waits longer, and needs a known
         theory: a batch's next build after a claim from it has none until the next ranking read."""
         head = (entry[6], entry[7])
-        if not self.settings.locality or host_id is None or (theory := ranking.theories.get(head)) is None:
+        if not self._leaves(ranking, entry, host_id, kept):
             return None
-        mine = self._level(host_id, theory)
-        if mine == 2 or self._best_level(theory, entry[7], host_id, kept) <= mine:
-            return None
+        theory = ranking.theories[head]
         loop = asyncio.get_running_loop()
         now = loop.time()
         # A hold another process's claim ended leaves the batch's next build, of another theory, a hold of its own.
@@ -2399,6 +2412,17 @@ class Coordinator:
             return None
         self._wake_holders(ranking, entry, host_id, kept)
         return hold[1]
+
+    def _leaves(
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
+    ) -> bool:
+        """Whether a claim from ``host_id`` leaves candidate ``entry`` to a kept host holding more of its theory,
+        while the hold that starts or has started (see _held) lasts."""
+        theory = ranking.theories.get((entry[6], entry[7]))
+        if not self.settings.locality or host_id is None or theory is None:
+            return False
+        mine = self._level(host_id, theory)
+        return mine != 2 and self._best_level(theory, entry[7], host_id, kept) > mine
 
     def _hold_ended(self, ranking: "_Ranking", head: tuple[UUID, str]) -> bool:
         """Whether the build of ``head`` that ``ranking`` knows was held for a holder (see _held) and its hold has
