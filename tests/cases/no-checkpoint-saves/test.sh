@@ -76,6 +76,13 @@ expect_failure() {
   require_grep "$message" "$tmpdir/$name.log"
 }
 
+# resumed NAME FROM: the run resumed from FROM, and loaded it.
+resumed() {
+  require_grep "from: $2" "$tmpdir/$1.log"
+  ! grep -q "not resuming from" "$tmpdir/$1.log" || {
+    cat "$tmpdir/$1.log" >&2; echo "$1: the checkpoint didn't load" >&2; exit 1; }
+}
+
 expect_unchanged() {
   [[ "$(snapshot)" = "$1" ]] || {
     echo "$2: --no-checkpoint-saves changed the checkpoints:" >&2
@@ -102,7 +109,7 @@ saved=$(snapshot)
 write_a "ACCEPT_TAC TRUTH" 'ALL_TAC >> FAIL_TAC "hit failure"'
 build hit --no-checkpoint-saves
 expect_failure hit "hit failure"
-require_grep "from: failed-prefix checkpoint in second" "$tmpdir/hit.log"
+resumed hit "failed-prefix checkpoint in second"
 require_grep "restoring proof-ir prefix with $steps successful leaf steps" "$tmpdir/hit.log"
 expect_unchanged "$saved" hit
 
@@ -111,7 +118,7 @@ expect_unchanged "$saved" hit
 write_a "simp[]" 'FAIL_TAC "miss failure"'
 build miss --no-checkpoint-saves
 expect_failure miss "miss failure"
-require_grep "from: deps-loaded checkpoint" "$tmpdir/miss.log"
+resumed miss "deps-loaded checkpoint"
 expect_unchanged "$saved" miss
 
 # A passing resume keeps the failed prefix it resumed from, and saves no
@@ -125,7 +132,7 @@ touch -d '10 days ago' "$project/.holbuild/stage/abandoned"
 write_a "ACCEPT_TAC TRUTH" 'ALL_TAC >> REFL_TAC'
 build pass --no-checkpoint-saves
 [[ "$build_status" = 0 ]] || { cat "$tmpdir/pass.log" >&2; echo "the passing build failed" >&2; exit 1; }
-require_grep "from: failed-prefix checkpoint in second" "$tmpdir/pass.log"
+resumed pass "failed-prefix checkpoint in second"
 require_file "$project/.holbuild/obj/src/ATheory.dat"
 require_file "$project/.holbuild/stage/abandoned/leftover"
 ! grep -q "automatic" "$tmpdir/pass.log" || { cat "$tmpdir/pass.log" >&2; echo "automatic gc ran" >&2; exit 1; }

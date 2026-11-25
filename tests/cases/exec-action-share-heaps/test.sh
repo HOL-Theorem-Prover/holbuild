@@ -173,7 +173,7 @@ forget_local() { rm -rf "$shared/checkpoints" "$shared/checkpoint-store"; }
 resumed() {
   require_grep "restored shared $3" "$tmpdir/$1.log"
   require_grep "from: $2" "$tmpdir/$1.log"
-  if grep -q "discarding" "$tmpdir/$1.log"; then
+  if grep -qE "discarding|not resuming from" "$tmpdir/$1.log"; then
     echo "version $1: the build discarded the restored state" >&2
     cat "$tmpdir/$1.log" >&2
     exit 1
