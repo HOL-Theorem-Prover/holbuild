@@ -30,7 +30,13 @@ trap cleanup EXIT
 mods=$tmpdir/mods
 objs=$mods/.hol/objs
 mkdir -p "$objs"
-for name in ATheory BTheory ProbeLib; do : > "$objs/$name.ui"; done
+# StagedLib sits where a worker stages the HOL libraries a project builds in
+# its hol package, outside HOLDIR: labelled by its path under HOL's tree.
+staged=$tmpdir/stage/.holbuild/action-src/hol/src/probe
+mkdir -p "$staged"
+echo 'val _ = ();' > "$staged/StagedLib.sml"
+echo "$staged/StagedLib.sml" > "$objs/StagedLib.uo"
+for name in ATheory BTheory ProbeLib StagedLib; do : > "$objs/$name.ui"; done
 echo "$mods/ATheory.sml" > "$objs/ATheory.uo"
 printf 'ATheory\n%s\n' "$mods/BTheory.sml" > "$objs/BTheory.uo"
 echo "$mods/ProbeLib.sml" > "$objs/ProbeLib.uo"
@@ -105,6 +111,9 @@ run_load current "" "$loads" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD
 check_timed current
 run_load loadplan "$loadplan_meta" "$loads" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
 check_timed loadplan
+run_load staged "" 'val _ = HolbuildRuntime.load "StagedLib";' HOLBUILD_TIMING_SOURCE_LOADS=1
+[[ "$(row "$tmpdir/staged.log" library hol:src/probe/StagedLib.sml n)" == 1 ]] || {
+  echo "a staged HOL library is not labelled by its path under HOL's tree" >&2; cat "$tmpdir/staged.log" >&2; exit 1; }
 # A timed process that loads nothing (a child resumed from a heap, say) still
 # reports, with its context.
 run_load empty "" "" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
@@ -155,16 +164,17 @@ QED
 val _ = export_theory();
 SML
 child_log=$local_project/.holbuild/logs/current/local/LTheory/build.log
-# local_build NAME CTX STATUS [OPTION...]: a timed build whose child reports CTX.
+# local_build NAME CTX STATUS [OPTION...]: a timed build exiting with STATUS
+# whose child, run afresh, reports CTX.
 local_build() {
-  local name=$1 ctx=$2 expected_status=$3 status=0
+  local name=$1 ctx=$2 want=$3 status=0
   shift 3
+  rm -f "$child_log"
   (cd "$local_project" && HOLBUILD_TIMING_SOURCE_LOADS=1 "$HOLBUILD_BIN" build "$@" LTheory) > "$tmpdir/$name.log" 2>&1 || status=$?
-  if [[ "$status" != "$expected_status" ]] || ! grep -q "^holbuild source-load ctx=$ctx " "$child_log"; then
-    echo "$name: expected exit $expected_status and source loads for $ctx, got exit $status" >&2
-    cat "$tmpdir/$name.log" "$child_log" >&2
-    exit 1
-  fi
+  [[ "$status" == "$want" ]] || {
+    echo "$name: the build exited $status, not $want:" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
+  grep -qs "^holbuild source-load ctx=$ctx " "$child_log" || {
+    echo "$name: the child did not report ctx=$ctx:" >&2; cat "$tmpdir/$name.log" >&2; cat "$child_log" >&2 || true; exit 1; }
 }
 
 # Count evaluations, including repeats of any given source. Match the start
@@ -204,8 +214,10 @@ if [[ "${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-}" == 1 && "${hits:-0}" -lt 1 ]];
   echo "L's child loaded no theory from its module:" >&2; cat "$child_log" >&2; exit 1
 fi
 theories=$(awk '$1 == "holbuild" && $2 == "source-load" && $4 == "kind=theory" { sub("n=", "", $6); print $6 }' "$child_log")
-(( ${theories:-0} >= ${hits:-0} && ${theories:-0} >= 1 )) || {
-  echo "L's theory loads (${theories:-none}) do not count its module hits (${hits:-0}):" >&2; cat "$child_log" >&2; exit 1; }
+# K and K2 count a .sig and a .sml each, whether from a module or the source:
+# a module hit left untimed would leave 2.
+[[ "${theories:-}" == 4 ]] || {
+  echo "L's theory loads (${theories:-none}) are not K's and K2's .sig and .sml (module hits: ${hits:-0}):" >&2; cat "$child_log" >&2; exit 1; }
 
 # The fleet: action-spec under the flag adds one option to the spec, and a
 # worker without the flag in its environment times T's child from it.
