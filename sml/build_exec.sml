@@ -8,6 +8,11 @@ exception Error of string
 exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
 exception RetryInvalidCheckpoint
 
+(* Run before a theory child starts from a fresh preload, not from a
+   checkpoint: a worker's check-only action installs its dependencies then
+   (exec_action, build_light). *)
+val before_fresh_preload = ref (fn () => ())
+
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
 fun warn msg = HolbuildStatus.message_stderr ("holbuild: warning: " ^ msg ^ "\n")
@@ -5077,6 +5082,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val capture = !capture_deps_heap andalso checkpoint_enabled policy andalso saves_progress policy
     val run_spec = write_theory_script capture (if speculative andalso proof_steps_enabled policy then SOME (has_suspension_pruning tc) else NONE) policy root checkpoint_root base_context action source_text
                                     theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
+    val _ = if not (Option.isSome attached) andalso #files run_spec = [preload, staged_script] then !before_fresh_preload () else ()
     (* A speculative child runs no checkpoints, so it starts from the
        preload, which then also loads the runtime its deferred proofs use. *)
     val _ =
@@ -11757,11 +11763,14 @@ fun parent_hashes_match by_name dat_hash recorded =
                List.all (fn {stem, ...} => dat_hash stem = SOME hash) (getOpt (Binarymap.peek (by_name, name), [])))
            recorded
 
-fun spec_parent_hashes_match root (spec : spec_deps) data_path =
+(* KNOWN gives the hash of a .dat the root lacks, by its path. *)
+fun spec_parent_hashes_match known root (spec : spec_deps) data_path =
   let val dat_hashes = new_file_hash_cache ()
   in
     parent_hashes_match (deps_by_parent_name spec)
-      (fn stem => cached_file_hash dat_hashes (in_root root (stem ^ ".dat")))
+      (fn stem =>
+          let val path = in_root root (stem ^ ".dat")
+          in case known path of SOME hash => SOME hash | NONE => cached_file_hash dat_hashes path end)
       (Binarymap.listItems (parse_dat_parent_hashes (read_dat_header data_path)))
   end
 
@@ -11824,8 +11833,16 @@ fun remove_resident root (path, entry) =
    root on workers"): an item installed from what the spec names is kept,
    and an item the spec doesn't name is removed, so the root ends as an
    empty one would.  SCRATCH names the stems, with their keys, the action
-   writes besides its dependencies; they are emptied for it. *)
-fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) direct =
+   writes besides its dependencies; they are emptied for it.
+
+   With LIGHT, for a check-only action, which reads no dependency file when
+   it resumes from a heap that loaded them: the dependencies not kept are
+   removed and not installed, and their records, as an install would write
+   them, are returned with their load manifests' lines, for the early
+   cutoff and the parent checks; or, when one's .dat hash isn't known
+   without its .dat, all are installed and NONE returned, as it is without
+   LIGHT. *)
+fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) direct light =
   let
     val cache = cache_root ()
     fun library {path, sha256, ...} = {hash = sha256, dst = in_root root path}
@@ -12003,6 +12020,77 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             (#deps spec)
         end)
     fun restore_deps () = hydrate_step "hyddeps" restore_deps_now
+    (* The direct dependencies' stale local copies go first, as the
+       refresh after an install would drop them. *)
+    fun light_deps_now () =
+      let
+        val _ = hydrate_step "hydstale" (fn () => drop_stale_dep_copies false remote spec direct)
+        val checks = map (fn dep => (dep, ref false)) (#deps spec)
+        val _ = hydrate_step "hydcheck" (fn () =>
+                  (load_known ();
+                   transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks))
+        val stale = map #1 (List.filter (! o #2) checks)
+        val records = Resident.empty ()
+        val unknown = ref false
+        val manifests = ref (Binarymap.mkDict String.compare)
+        val manifests_lock = Mutex.mutex ()
+        fun add_manifest (file, lines) =
+          (Mutex.lock manifests_lock;
+           manifests := Binarymap.insert (!manifests, file, lines);
+           Mutex.unlock manifests_lock)
+        fun record {target, stem, key} =
+          let
+            val path = in_root root stem
+            (* The remote's manifest is read, not copied with its blobs, as
+               checked_cache_entry would copy them. *)
+            val source_text =
+              case HolbuildCache.get_action cache key of
+                  SOME text => text
+                | NONE =>
+                    case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key) of
+                        SOME text => text
+                      | NONE => raise Error ("cache entry " ^ key ^ " not found")
+            (* As checked_cache_entry does, a manifest with a transient stage
+               mldep is dropped, so a retry finds the remote's entry. *)
+            val _ =
+              case transient_stage_mldep_in_manifest source_text of
+                  SOME dep => transient_cache_manifest_error cache key (HolbuildCache.action_manifest cache key)
+                                source_text dep
+                | NONE => ()
+            val {sig_hash, sml_hash, parents, mldeps, ...} =
+              cache_manifest_blobs_from_lines key (cache_manifest_lines source_text)
+            val fetched = in_root root (".holbuild/light-" ^ sml_hash)
+            (* A local manifest whose blob is gone is dropped, as the full
+               restore drops it, so a retry finds the remote's entry. *)
+            val sml_text =
+              replace_all cache_sml_token (path ^ ".dat")
+                (fetch_spec_text remote {hash = sml_hash, dst = fetched} before remove_file fetched)
+              handle e as ActionFailed (InputMissing _, _) =>
+                (ignore (drop_cache_manifest_if_unchanged cache key source_text); raise e)
+            val ui = [path ^ ".sig"]
+            val uo = uo_lines stem {parents = parents, mldeps = mldeps}
+          in
+            case theory_sml_hash_literal sml_text of
+                NONE => unknown := true
+              | SOME dat_hash =>
+                  (Resident.put records path
+                     (Resident.Theory {target = target, key = key, source = HolbuildHash.string_sha256 source_text,
+                                       parents = parents, mldeps = mldeps, dat_hash = dat_hash, dat_parents = [],
+                                       hashes = [sig_hash, HolbuildHash.string_sha256 sml_text,
+                                                 HolbuildHash.string_sha256 (manifest_text ui),
+                                                 HolbuildHash.string_sha256 (manifest_text uo)]});
+                   add_manifest (path ^ ".ui", ui);
+                   add_manifest (path ^ ".uo", uo))
+          end
+        fun manifest file = Binarymap.peek (!manifests, file)
+      in
+        hydrate_count "hydlightn" (length stale);
+        List.app (fn dep as {stem, ...} =>
+                    (restorable remove_old dep; Resident.forget resident (in_root root stem)))
+                 stale;
+        hydrate_step "hydlight" (fn () => restorable_all record stale);
+        if !unknown then NONE else SOME {records = records, manifest = manifest}
+      end
     fun refresh revalidate wanted =
       hydrate_step "hydstale" (fn () => drop_stale_dep_copies revalidate remote spec wanted) andalso (restore_deps (); true)
     (* Every path an item writes: two items sharing one would let a kept
@@ -12043,7 +12131,11 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
     hydrate_step "hydfiles" (fn () =>
       (transfer_all fetch_file files;
        List.app write_lib (#libs spec)));
-    restore_deps ();
+    let
+      val light_records = if light then hydrate_step "hyddeps" light_deps_now else NONE
+    in
+    if Option.isSome light_records then () else
+    (restore_deps ();
     ignore (refresh false direct);
     case misfits () of
         [] => ()
@@ -12056,10 +12148,12 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             | found as {target, ...} :: rest =>
                 raise ActionFailed (InputMissing (map (fn {key, ...} => "theory " ^ key) found),
                                     "dependency " ^ target ^ " does not match its parents in the cache" ^
-                                    (if null rest then "" else " (and " ^ Int.toString (length rest) ^ " more)"));
+                                    (if null rest then "" else " (and " ^ Int.toString (length rest) ^ " more)")));
     Resident.save resident;
     (* A stale or missing record only means a manifest is hashed again. *)
-    hydrate_step "hydcheck" (fn () => HolbuildStatCache.flush seen handle _ => ())
+    hydrate_step "hydcheck" (fn () => HolbuildStatCache.flush seen handle _ => ());
+    light_records
+    end
   end
 
 (* The stems of the project objects the build loads: the ones its preload
@@ -12080,7 +12174,7 @@ fun spec_loaded_stems (spec : action_spec) =
 (* The stem of the action's own outputs, with its key, for hydrate_spec_deps. *)
 fun own_scratch (spec : action_spec) = (drop_suffix ".dat" (#data_path (#outputs spec)), #input_key spec)
 
-fun hydrate_action_root remote root resident (spec : action_spec) =
+fun hydrate_action_root remote root resident (spec : action_spec) light =
   let
     val package = #package spec
     fun file {path, sha256, ...} = {hash = sha256, dst = in_root root (action_source_path package path)}
@@ -12088,12 +12182,13 @@ fun hydrate_action_root remote root resident (spec : action_spec) =
     hydrate_spec_deps remote root resident [own_scratch spec]
       (map file (#source spec :: #inputs spec)) (theory_spec_deps spec)
       (fn {stem, ...} => List.exists (fn loaded => loaded = stem) (spec_loaded_stems spec))
+      light
   end
 
 (* Step 4: the action's own entry restores with full validation, the
    remote's when the local copy doesn't fit the restored parents and differs
    from it. *)
-fun action_already_done remote root (spec : action_spec) =
+fun action_already_done known remote root (spec : action_spec) =
   let
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
@@ -12102,7 +12197,7 @@ fun action_already_done remote root (spec : action_spec) =
       (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
          {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
           extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
-       SOME (spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path)))
+       SOME (spec_parent_hashes_match known root (theory_spec_deps spec) (in_root root data_path)))
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | _ => NONE
     (* The remote cache may hold a copy its origin has since replaced, which
@@ -12150,7 +12245,7 @@ fun resident_misfits_parents remote root (spec : action_spec) resident =
         SOME path =>
           let val recorded = dat_records_parent path
           in
-            not (spec_parent_hashes_match root (theory_spec_deps spec) path) andalso
+            not (spec_parent_hashes_match (fn _ => NONE) root (theory_spec_deps spec) path) andalso
             List.all (fn dep => not (recorded dep) orelse as_remote (#key dep)) (#deps spec)
           end
       | NONE => false
@@ -12166,7 +12261,7 @@ fun resident_misfits_parents remote root (spec : action_spec) resident =
 fun resident_differs_only_in_dat remote root (spec : action_spec) mine resident =
   cache_manifest_outputs_equal_but_dat (#input_key spec) mine resident andalso
   (case fetch_resident_dat remote root spec resident of
-       SOME path => spec_parent_hashes_match root (theory_spec_deps spec) path
+       SOME path => spec_parent_hashes_match (fn _ => NONE) root (theory_spec_deps spec) path
      | NONE => false)
   handle e as HolbuildRemoteCache.Unavailable _ => raise e
        | _ => false
@@ -14293,7 +14388,7 @@ fun base_loaded_modules tc =
    path, are followed, so a preload reached only through a HOL module
    outside BASE_LOADED is kept; so is every preload when a manifest can't
    be read. *)
-fun skipped_preloads {base_loaded, follow} root (spec : action_spec) =
+fun skipped_preloads {base_loaded, follow, known_manifest} root (spec : action_spec) =
   let
     fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
     val lib_manifests =
@@ -14302,8 +14397,11 @@ fun skipped_preloads {base_loaded, follow} root (spec : action_spec) =
       case List.find (fn (path, _) => path = file) lib_manifests of
           SOME (_, lines) => lines
         | NONE =>
-            String.tokens (fn c => c = #"\n")
-              (read_text (if file_exists file then file else hfs_remapped_path file))
+            case known_manifest file of
+                SOME lines => lines
+              | NONE =>
+                  String.tokens (fn c => c = #"\n")
+                    (read_text (if file_exists file then file else hfs_remapped_path file))
     fun is_file entry = has_suffix ".sml" entry orelse has_suffix ".sig" entry
     fun visit (entry, loaded) =
       if is_file entry orelse not (Path.isAbsolute entry) orelse
@@ -14386,12 +14484,15 @@ fun spec_early_cutoff_with {dat_hash, file_hashes, skip_loaded} root (spec : act
   end
   handle e => (warn ("no early cutoff: " ^ General.exnMessage e); NONE)
 
-(* The hashes spec_early_cutoff_with reads, from the action root's records;
-   a file they don't cover is hashed. *)
-fun resident_hashes resident =
+(* The hashes spec_early_cutoff_with reads, from the first of RECORDS
+   (the action root's, and those of a light hydrate) to cover a file; a
+   file none covers is hashed. *)
+fun resident_hashes records =
   let
     fun hash compute path =
-      case Resident.file_hash resident path of SOME hash => hash | NONE => compute path
+      case List.mapPartial (fn resident => Resident.file_hash resident path) records of
+          hash :: _ => hash
+        | [] => compute path
   in
     {dat_hash = hash hol_dat_hash, file_hashes = map (hash HolbuildHash.file_sha256)}
   end
@@ -14415,7 +14516,7 @@ fun earlier_build_key (spec : action_spec) text =
     if sha256_text old_key andalso old_key <> #input_key spec then SOME old_key else NONE
   end
 
-fun reuse_earlier_build remote root (spec : action_spec) entry =
+fun reuse_earlier_build known remote root (spec : action_spec) entry =
   case Option.mapPartial (earlier_build_key spec) entry of
       NONE => false
     | SOME old_key =>
@@ -14428,7 +14529,7 @@ fun reuse_earlier_build remote root (spec : action_spec) entry =
              {key = old_key, subject = #package spec ^ ":" ^ #logical spec,
               stem = drop_suffix ".dat" data_path, extra_outputs = SOME (#extra_outputs spec),
               requested_timeout = #tactic_timeout spec};
-           spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path)) andalso
+           spec_parent_hashes_match known root (theory_spec_deps spec) (in_root root data_path)) andalso
           (* A check-only action needs only the verdict, and no entry. *)
           (#check_only spec orelse
           case HolbuildCache.get_action cache old_key of
@@ -14693,7 +14794,7 @@ fun exec_run (hol_phase, publish_phase) check_cancelled remote root tc (spec : r
       map (fn {path, sha256, ...} => {hash = sha256, dst = in_root root path}) (#context_scripts spec @ #inputs spec)
     val deps = run_spec_deps spec
     val _ = check_cancelled ()
-    val _ = hydrate_spec_deps remote root (Resident.empty ()) [] files deps (fn _ => false)
+    val _ = hydrate_spec_deps remote root (Resident.empty ()) [] files deps (fn _ => false) false
     val _ = check_cancelled ()
     val _ = (ensure_dir output_dir; ensure_dir scratch)
     fun load name =
@@ -16093,16 +16194,24 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     val peak = ref NONE
     (* Each phase's wall time, in the order they ran, for the result. *)
     val phases = ref ([] : (string * LargeInt.int) list)
+    (* The hydrate time inside the current hol phase: a light hydrate's
+       install before HOL starts from a fresh preload, which is not HOL's
+       and is left out of the phase's time, not its span. *)
+    val hol_hydrate_ms = ref (0 : LargeInt.int)
     fun phase name f =
       let
         val _ = if name = "publish" orelse name = "log" then () else check_cancelled ()
         val t0 = Time.now ()
+        val _ = if name = "hol" then hol_hydrate_ms := 0 else ()
         fun record () =
           let val ended = Time.now ()
+              val ms = Time.toMilliseconds (Time.-(ended, t0))
+              val _ = if name = "hydrate" then hol_hydrate_ms := !hol_hydrate_ms + ms else ()
+              val excluded = if name = "hol" then !hol_hydrate_ms else 0
               val spans = if List.exists (fn n => n = name) ["hol", "publish", "log"] then
                   [(name ^ "start", Time.toMilliseconds t0), (name ^ "end", Time.toMilliseconds ended)]
                 else []
-          in phases := (name, Time.toMilliseconds (Time.-(ended, t0))) :: spans @ !phases end
+          in phases := (name, ms - excluded) :: spans @ !phases end
       in
         (f () before record ()) handle e => (record (); raise e)
       end
@@ -16110,6 +16219,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     val log_required = ref false
     (* Why the pipelined attempt was given up for a plain build, if it was. *)
     val fallback = ref NONE
+    (* The records of the dependencies a light hydrate didn't install,
+       until they are. *)
+    val light_records = ref (NONE : HolbuildActionResident.t option)
     (* A late parent's entry restores here, outside what the child may write;
        its outline in the other, and this action's own outline is copied to
        the third before it is published. *)
@@ -16441,16 +16553,23 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     and run_plain spec tc forced pipelined =
       let
         val _ = hydrate_steps := []
-        val _ = (phase "hydrate" (fn () => hydrate_action_root remote root (!resident) spec) before add_hydrate_steps ())
-                handle e => (add_hydrate_steps (); raise e)
+        (* A check-only action resuming from a heap reads no dependency file:
+           they are installed only when it doesn't (build_light). *)
+        val light =
+          (phase "hydrate" (fn () => hydrate_action_root remote root (!resident) spec (#check_only spec andalso not forced))
+           before add_hydrate_steps ())
+          handle e => (add_hydrate_steps (); raise e)
+        val _ = light_records := Option.map #records light
+        fun known path = Option.mapPartial (fn records => Resident.file_hash records path) (!light_records)
         val (done, cutoff) =
           phase "cutoff" (fn () =>
             let
-              val {dat_hash, file_hashes} = resident_hashes (!resident)
+              val {dat_hash, file_hashes} = resident_hashes (!resident :: (case light of SOME {records, ...} => [records] | NONE => []))
               val cutoff =
                 spec_early_cutoff_with
                   {dat_hash = dat_hash, file_hashes = file_hashes,
-                   skip_loaded = {base_loaded = !base_loaded, follow = true}}
+                   skip_loaded = {base_loaded = !base_loaded, follow = true,
+                                  known_manifest = case light of SOME {manifest, ...} => manifest | NONE => (fn _ => NONE)}}
                   root spec
               (* The action's own entry and the earlier build's are looked up
                  side by side. *)
@@ -16464,24 +16583,70 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 if forced then ()
                 else
                   parallel_all 2 (fn look_up => look_up ())
-                    [fn () => done := action_already_done remote root spec,
+                    [fn () => done := action_already_done known remote root spec,
                      fn () => Option.app look_up_earlier cutoff]
             in
               (* A failed pair lookup raises here, as it did inside
                  reuse_earlier_build, whose handler covers only its last case. *)
-              (!done orelse (not forced andalso reuse_earlier_build remote root spec (!earlier ())), cutoff)
+              (!done orelse (not forced andalso reuse_earlier_build known remote root spec (!earlier ())), cutoff)
             end)
       in
         if done then
           (* The entry may have come from the worker's local cache, so make
-             sure the remote, where the result counts, holds it too. *)
-          ((if #check_only spec then ()
+             sure the remote, where the result counts, holds it too.  A
+             light hydrate's dependencies are installed first, which checks
+             that each fits its parents, as no heap vouches for them here. *)
+          (install_light spec tc cutoff;
+           (if #check_only spec then ()
             else phase "check" (fn () => phase "publish" (fn () => check_remote_publication remote root spec)));
            "cached")
         else if pipelined then
           or_plain (fn () => build spec tc forced cutoff NONE true) (fn () => build spec tc forced cutoff NONE false)
+        else if Option.isSome light then build_light spec tc forced cutoff
         else build spec tc forced cutoff NONE false
       end
+    (* A build on a light hydrate: the dependencies are installed before
+       HOL starts from a fresh preload, which loads them.  A run resuming
+       from a checkpoint reads none: the preload that saved its heap loaded
+       every dependency the script loads.  The installed files must give
+       the records' hashes: the context the build restored, and publishes
+       a failed prefix under, is keyed by those. *)
+    and build_light spec tc forced cutoff =
+      (before_fresh_preload := (fn () => install_light spec tc cutoff);
+       build spec tc forced cutoff NONE false before before_fresh_preload := (fn () => ()))
+      handle e => (before_fresh_preload := (fn () => ()); raise e)
+    (* Installs the dependencies a light hydrate left out, whose files must
+       give the records' hashes; and the build's module grants then. *)
+    and install_light spec tc cutoff =
+      if not (Option.isSome (!light_records)) then ()
+      else
+        let
+          val _ = light_records := NONE
+          val _ = hydrate_steps := []
+          fun install () =
+            let
+              val _ = hydrate_action_root remote root (!resident) spec false
+              val {dat_hash, file_hashes} = resident_hashes [!resident]
+            in
+              spec_early_cutoff_with
+                {dat_hash = dat_hash, file_hashes = file_hashes,
+                 skip_loaded = {base_loaded = !base_loaded, follow = true, known_manifest = fn _ => NONE}}
+                root spec
+            end
+          val installed =
+            (phase "hydrate" install before add_hydrate_steps ())
+            handle e => (add_hydrate_steps (); raise e)
+        in
+          if Option.map #deps_key installed = Option.map #deps_key cutoff then ()
+          else raise action_failed InternalFailure "the dependencies installed differ from the records the build started from";
+          set_module_grants tc spec (spec_theory_action root spec (cutoff_context spec cutoff))
+        end
+    (* The theory modules the build's sandbox may read. *)
+    and set_module_grants tc spec action =
+      HolbuildActionSandbox.module_reads :=
+        theory_module_grants root tc spec
+          (SOME {deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action),
+                 deps_key = #deps_key action})
     (* Publishes the outline the pipelined theory child in STAGE published
        there, for children loading ahead of the theory.  A failure costs
        them only the wait for its entry. *)
@@ -16537,11 +16702,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                               fill_module_store remote writer_root tc {deps = #deps spec, loads = #loads spec}}
         val action =
           spec_theory_action root spec (cutoff_context spec cutoff)
-        val _ =
-          HolbuildActionSandbox.module_reads :=
-            theory_module_grants root tc spec
-              (SOME {deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action),
-                     deps_key = #deps_key action})
+        val _ = set_module_grants tc spec action
         (* A local entry that didn't restore must not stand in for this
            build's when the publication is checked, and, as in a local
            build, its theory's checkpoints may hold parents other than
@@ -16751,7 +16912,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                (own_scratch spec :: map (fn ({stem, key, ...}, _) => (stem, key)) late)
                (map file (#source spec :: #inputs spec))
                {libraries = #libraries spec, deps = present, libs = #libs spec, orders = #orders spec}
-               (fn {stem, ...} => List.exists (fn loaded => loaded = stem) (spec_loaded_stems spec)))
+               (fn {stem, ...} => List.exists (fn loaded => loaded = stem) (spec_loaded_stems spec)) false)
            before add_hydrate_steps ())
           handle e => (add_hydrate_steps (); raise e)
         (* A dependency built on an earlier build of a late parent names it
@@ -17058,7 +17219,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
              phases := ("outlined", LargeInt.fromInt (length (!outlined))) :: !phases;
              spec_early_cutoff_with
                {dat_hash = hash_of, file_hashes = map hash_of,
-                skip_loaded = {base_loaded = !base_loaded, follow = false}}
+                skip_loaded = {base_loaded = !base_loaded, follow = false, known_manifest = fn _ => NONE}}
                root spec)
         fun continue_ahead () =
           let
@@ -17075,7 +17236,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                (* The late parents' manifests in the root are stand-ins. *)
                spec_early_cutoff_with
                  {dat_hash = hash_of, file_hashes = map hash_of,
-                  skip_loaded = {base_loaded = !base_loaded, follow = false}}
+                  skip_loaded = {base_loaded = !base_loaded, follow = false, known_manifest = fn _ => NONE}}
                  root spec)
             val built_action =
               spec_theory_action root spec (cutoff_context spec cutoff)

@@ -46,11 +46,12 @@ Proof
 QED
 SML
 
-# write_t STEP: theory T, on A, whose second theorem's last step is STEP.
+# write_t STEP [PARENT]: theory T, on A (or PARENT), whose second theorem's
+# last step is STEP.
 write_t() {
   cat > "$project/src/TScript.sml" <<SML
 Theory T
-Ancestors A
+Ancestors ${2:-A}
 
 Theorem t1:
   T
@@ -203,7 +204,8 @@ start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
 url=$remote_url
 worker_cache=$tmpdir/worker
 field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $col }' "$1"; }
-# worker NAME [plain]: runs T's check-only action (its plain one with plain).
+# worker NAME [plain|keep]: runs T's check-only action (its plain one with
+# plain) on a fresh worker cache (the last one with keep).
 worker() {
   local name=$1 spec check=(--check-only)
   [[ ${2:-} == plain ]] && check=()
@@ -212,8 +214,10 @@ worker() {
   spec=$(field "$tmpdir/$name.batch" checkonly:TTheory 4)
   remote_key=$(field "$tmpdir/$name.batch" checkonly:TTheory 3)
   [[ -n "$spec" ]] || { cat "$tmpdir/$name.batch" >&2; exit 1; }
-  rm -rf "$worker_cache"
-  link_hol_toolchain_cache "$worker_cache"
+  if [[ ${2:-} != keep ]]; then
+    rm -rf "$worker_cache"
+    link_hol_toolchain_cache "$worker_cache"
+  fi
   set +e
   HOLBUILD_CACHE=$worker_cache "$HOLBUILD_BIN" --remote-cache "$url" exec-action "$spec" --share-heaps \
     --cache-limit-gb 1000 --result "$tmpdir/$name.result" > "$tmpdir/$name.log" 2>&1
@@ -234,6 +238,21 @@ expect_worker() {
   done
 }
 published() { grep -lx "$1" "$tmpdir"/remote/ac/* 2>/dev/null || true; }
+# hydrated NAME LIGHT INSTALLED: the worker's hydrate left LIGHT
+# dependencies uninstalled, and installed INSTALLED (0: none).
+hydrated() {
+  local phases
+  phases=$(sed -n 's/^phase-ms=//p' "$tmpdir/$1.result" | tr , '\n')
+  grep -qx "hydlightn:$2" <<<"$phases" || {
+    echo "worker $1 left not $2 dependencies uninstalled:" >&2; cat "$tmpdir/$1.result" >&2; exit 1; }
+  if [[ $3 == 0 ]]; then
+    ! grep -q "^hydinstn:[1-9]" <<<"$phases" || {
+      echo "worker $1 installed a dependency:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1; }
+  else
+    grep -qx "hydinstn:$3" <<<"$phases" || {
+      echo "worker $1 installed not $3 dependencies:" >&2; cat "$tmpdir/$1.result" >&2; exit 1; }
+  fi
+}
 # The module writer, which runs after a plain action's result where the
 # toolchain can write theory modules (as in the theory-modules job), is never
 # scheduled for a check-only one.
@@ -261,6 +280,9 @@ grep -rqx "option check-only=true" "$tmpdir/remote" || { echo "no spec says chec
 expect_worker share-pass 0 "status=built"
 nothing_published share-pass
 no_modules share-pass
+# With no heap to resume from, HOL starts from a fresh preload, which loads
+# A: it is installed first.
+hydrated share-pass 1 1
 
 write_t 'FAIL_TAC "remote failure"'
 worker share-fail
@@ -270,6 +292,19 @@ nothing_published share-fail
 no_modules share-fail
 [[ -n "$(published holbuild-shared-failed-prefix-v1)" ]] || {
   echo "the failing check shared no failed prefix" >&2; cat "$tmpdir/share-fail.log" >&2; exit 1; }
+
+# A check that resumes from the failed prefix, on a fresh host, installs no
+# dependency: the heap has A loaded, and HOL reads no file of it.
+write_t "ALL_TAC >> ACCEPT_TAC TRUTH"
+worker resume-light
+expect_worker resume-light 0 "status=built"
+hydrated resume-light 1 0
+nothing_published resume-light
+write_t 'ALL_TAC >> FAIL_TAC "resumed failure"'
+worker resume-light-fail
+expect_worker resume-light-fail 1 "status=failed" "failure=proof"
+require_grep "resumed failure" "$tmpdir/resume-light-fail.log"
+hydrated resume-light-fail 1 0
 
 # Theory modules a plain action published are fetched by none: a plain
 # worker publishes A's module where the toolchain writes them, and a
@@ -284,3 +319,75 @@ write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH >> ALL_TAC"
 worker share-modules
 expect_worker share-modules 0 "status=built"
 no_modules share-modules
+# The plain action shared its deps heap, which the check resumes from.
+hydrated share-modules 1 0
+
+# A heap HOL can't resume from, found in the worker's store, is discarded,
+# and the check goes on from a fresh preload, with A installed first.  As in
+# tests/cases/shared-deps-heap, bytes 72-75 of the header hold the parent's
+# time stamp, which Poly/ML checks when it loads the state.
+rm -rf "$worker_cache/action" "$worker_cache/checkpoints"
+heaps=$(find "$worker_cache/checkpoint-store" -type f -size +100k ! -name "*.pmo")
+[[ -n "$heaps" ]] || { echo "the worker's store holds no heap" >&2; exit 1; }
+for heap in $heaps; do
+  cp "$heap" "$tmpdir/stale"
+  printf '\xff\xff\xff\xff' | dd of="$tmpdir/stale" bs=1 seek=72 conv=notrunc status=none
+  mv "$tmpdir/stale" "$heap"
+done
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH >> ALL_TAC >> ALL_TAC"
+worker stale-heap keep
+expect_worker stale-heap 0 "status=built"
+require_grep 'discarding invalid checkpoint after HOL state load failure' "$tmpdir/stale-heap.log"
+hydrated stale-heap 1 1
+
+# A check that passes on the plain action's entry, without HOL, installs its
+# dependencies first, which checks they fit their parents.
+write_t "ALL_TAC >> ACCEPT_TAC TRUTH >> ALL_TAC"
+worker cached-pass
+expect_worker cached-pass 0 "status=cached"
+hydrated cached-pass 1 1
+
+# T on B, on A: A is a dependency T doesn't load directly.
+cat > "$project/src/BScript.sml" <<'SML'
+Theory B
+Ancestors A
+
+Theorem b:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+SML
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" build --force-theory BTheory) > "$tmpdir/publish-b.log" 2>&1 ||
+  { cat "$tmpdir/publish-b.log" >&2; exit 1; }
+write_t "ALL_TAC >> ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" B
+worker chain
+expect_worker chain 0 "status=built"
+hydrated chain 2 2
+
+# On the same host, the copies the action root keeps are neither recorded
+# again nor installed.
+write_t "ALL_TAC >> ALL_TAC >> ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" B
+worker warm-kept keep
+expect_worker warm-kept 0 "status=built"
+hydrated warm-kept 0 0
+
+# A kept copy of A missing its .dat is removed and recorded again.  Its local
+# cache entry, which names a transient stage mldep, is one the light hydrate
+# can't use: it is dropped, as a full restore drops it, so the retry restores
+# A from the remote's entry.  A failed hydrate saves no records, so the retry
+# keeps no copy: it records and installs both dependencies.
+a_key=$(cd "$project" && "$HOLBUILD_BIN" build --dry-run ATheory | awk '/input_key:/ {print $2; exit}')
+a_manifest=$worker_cache/actions/$a_key/manifest
+require_file "$a_manifest"
+printf 'mldep /stale/.holbuild/stage/%s/ATheory\n' "$a_key" >> "$a_manifest"
+a_dat=$(find "$worker_cache/action" -name ATheory.dat)
+[[ -n "$a_dat" ]] || { echo "the worker's action root holds no ATheory.dat" >&2; exit 1; }
+rm -f $a_dat
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH >> ALL_TAC >> ALL_TAC >> ALL_TAC" B
+worker transient keep
+expect_worker transient 3 "status=failed" "failure=input-missing" "missing=theory $a_key"
+[[ ! -e "$a_manifest" ]] || { echo "the light hydrate kept A's unusable cache entry" >&2; exit 1; }
+worker transient-retry keep
+expect_worker transient-retry 0 "status=built"
+hydrated transient-retry 2 2
