@@ -2074,11 +2074,15 @@ class Coordinator:
         A build ``worker`` locks may carry a contention line, with its best competitor left in the ranking
         (_contention), for _claim to log once the lease commits.
         """
-        kept = functools.cache(
-            lambda tier: self._kept_hosts(
+        def kept_lines(tier: str) -> set[str]:
+            return self._kept_hosts(
                 (len(ranking.heap) if tier != "high" else sum(e[7] == "high" for e in ranking.heap)) + 1, tier
             )
-        )
+
+        kept = functools.cache(kept_lines)
+        # The contention line's competitor reads lines of its own, so that only the steps that use the claim's
+        # draw them, from the heap and fleet as they are when they first ask.
+        competitor_kept = functools.cache(kept_lines)
         held: list[RankEntry] = []  # taken out of the heap only until this claim awaits or returns
         held_until: float | None = None
         hint_tiers = set(held_tiers) if hint is None else {hint[1]}
@@ -2140,7 +2144,7 @@ class Coordinator:
                 held_until = until if held_until is None else min(held_until, until)
                 continue
             # Before the builds this claim passed over for their holds are back: it could take none of them.
-            competitor = self._competitor(ranking, batch_id, host_id, hint_only, kept)
+            competitor = self._competitor(ranking, batch_id, host_id, hint_only, competitor_kept)
             chosen = (ranking.running_priority, ranking.capped)  # as the claim chose, before it counts
             put_back_held()
             heapq.heappush(
@@ -2262,11 +2266,17 @@ class Coordinator:
         if not reasons:
             return None
         hosts = []
+        at = self.clock()
         for kept_id in sorted(kept(tier)):
             report = self.hosts.get(kept_id)
             short = "?" if report is None else int(report[1].memory_short)
             idle = "?" if report is None or report[1].cpu_idle_pct is None else report[1].cpu_idle_pct
-            hosts.append(f"{kept_id[:8]}:{short}:{idle}:{len(self.host_workers.get(kept_id, ()))}")
+            # Its workers seen lately, as _kept_hosts counts them: the others may have gone.
+            live = sum(
+                (at - seen).total_seconds() < HOST_REPORT_SECONDS
+                for seen, _ in self.host_workers.get(kept_id, {}).values()
+            )
+            hosts.append(f"{kept_id[:8]}:{short}:{idle}:{live}")
         other = None
         if competitor is not None:
             _, c_priority, c_running, *_, c_batch, c_tier, _ = competitor.entry

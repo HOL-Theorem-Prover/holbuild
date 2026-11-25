@@ -4865,6 +4865,10 @@ async def test_a_deeper_build_of_another_batch_passed_over_is_logged_once_with_t
     batch_b = await submit(http, ["p", "c"], [("c", "p")])
     host = {**asdict(busy("1f2e3d4c-host", 0)), "disk_free": 100 << 30}
     body = {"tier": "standard", "worker": "1f2e3d4c/w1", "host": host}
+    # A worker of the host not seen lately, which the line doesn't count.
+    coordinator.host_workers.setdefault("1f2e3d4c-host", {})["1f2e3d4c/gone"] = (
+        coordinator.clock() - timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS), ("standard",)
+    )
     for name in ["a1", "a2"]:
         response = await http.post("/v1/work/claim", json=body, headers=WORKER)
         assert response.json()["theory"] == f"pkg:{name}", response.text
