@@ -154,28 +154,50 @@ QED
 val _ = export_theory();
 SML
 child_log=$local_project/.holbuild/logs/current/local/LTheory/build.log
-# local_build NAME CTX [OPTION...]: a timed build whose child reports CTX.
+# local_build NAME CTX STATUS [OPTION...]: a timed build whose child reports CTX.
 local_build() {
-  local name=$1 ctx=$2
-  shift 2
-  (cd "$local_project" && HOLBUILD_TIMING_SOURCE_LOADS=1 "$HOLBUILD_BIN" build "$@" LTheory) > "$tmpdir/$name.log" 2>&1 || true
-  set -- "$name" "$ctx"
-  grep -q "^holbuild source-load ctx=$2 " "$child_log" || {
-    echo "$1: the child did not report ctx=$2:" >&2; cat "$tmpdir/$1.log" "$child_log" >&2; exit 1; }
+  local name=$1 ctx=$2 expected_status=$3 status=0
+  shift 3
+  (cd "$local_project" && HOLBUILD_TIMING_SOURCE_LOADS=1 "$HOLBUILD_BIN" build "$@" LTheory) > "$tmpdir/$name.log" 2>&1 || status=$?
+  if [[ "$status" != "$expected_status" ]] || ! grep -q "^holbuild source-load ctx=$ctx " "$child_log"; then
+    echo "$name: expected exit $expected_status and source loads for $ctx, got exit $status" >&2
+    cat "$tmpdir/$name.log" "$child_log" >&2
+    exit 1
+  fi
 }
-local_build seed target-cold
+
+# Count evaluations, including repeats of any given source. Match the start
+# context so a discarded attempt cannot count toward the successful resume.
+runtime_count() {
+  awk -v ctx="ctx=$1" -v name="name=$2" '
+    $1 == "holbuild" && $2 == "source-load" && $3 == ctx && $4 == "kind=runtime" &&
+      (name == "name=*" || $5 == name) { sub(/^n=/, "", $6); count += $6 }
+    END { print count + 0 }' "$child_log"
+}
+
+local_build seed target-cold 1
+require_grep "seed failure" "$tmpdir/seed.log"
+cold_save=$(runtime_count target-cold checkpoint_save_runtime.sml)
 sed -i 's/FAIL_TAC "seed failure"/ACCEPT_TAC TRUTH/' "$local_project/src/LScript.sml"
-local_build resume target-prefix
+local_build resume target-prefix 0
 require_grep "from: failed-prefix checkpoint" "$tmpdir/resume.log"
+prefix_runtime=$(runtime_count target-prefix '*')
 sed -i 's/^val _ = new_theory "L";$/val _ = new_theory "L"; val edited = ();/' "$local_project/src/LScript.sml"
-local_build edit target-deps
+local_build edit target-deps 0
+deps_save=$(runtime_count target-deps checkpoint_save_runtime.sml)
+deps_sha256=$(runtime_count target-deps sha256.sml)
+echo "Runtime evaluations: cold save=$cold_save, failed-prefix all=$prefix_runtime, deps save=$deps_save sha256=$deps_sha256"
+if (( cold_save != 1 || prefix_runtime != 0 || deps_save != 0 || deps_sha256 != 0 )); then
+  echo "Expected one cold save-runtime evaluation and no redundant evaluations on resume" >&2
+  exit 1
+fi
 # Without proof steps the script runs plain, with no proof runtime: it
 # reports all the same.
 sed -i 's/ val edited = ();$/ val edited = 1;/' "$local_project/src/LScript.sml"
-local_build plain target-deps --skip-proof-steps
+local_build plain target-deps 0 --skip-proof-steps
 # A new ancestor: a cold child, which loads K from its module.
 sed -i 's/ KTheory;$/ KTheory K2Theory;/' "$local_project/src/LScript.sml"
-local_build ancestor target-cold
+local_build ancestor target-cold 0
 hits=$(sed -n 's/^holbuild hol-phases holmodhitn=\([0-9]*\) .*/\1/p' "$child_log")
 if [[ "${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-}" == 1 && "${hits:-0}" -lt 1 ]]; then
   echo "L's child loaded no theory from its module:" >&2; cat "$child_log" >&2; exit 1
