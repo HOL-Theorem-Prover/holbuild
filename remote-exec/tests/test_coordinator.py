@@ -2155,6 +2155,37 @@ async def test_on_demand_burst_hosts_past_the_fullest_rank_behind_spot(coordinat
     assert coordinator._waiter_rank(["standard"], "od-c", 0).host_rank == 0
 
 
+async def test_a_claim_that_finds_nothing_tells_a_burst_worker_whether_its_host_fills_after_spot(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """od-b is an On-Demand host beyond the one the fleet keeps, so its burst workers exit at once when idle; those of
+    od-a and of Spot wait out their idle time, as do od-b's workers that claim standard work only."""
+    report_burst_hosts(coordinator, {"od-a": (0, 8, 0), "od-b": (0, 2, 0), "spot": (1, 3, 0)})
+    spilled = {}
+    for host, rank, tier in [("od-a", 0, "high"), ("od-b", 0, "high"), ("spot", 1, "high"), ("od-b", 0, "standard")]:
+        also = ["standard"] if tier == "high" else []
+        body = {"tier": tier, "also_claim": also, "worker": f"{host}-w0", "host": {"id": host, "rank": rank}}
+        response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+        assert response.status_code == 204, response.text
+        spilled[host, tier] = response.headers.get("Holbuild-Spilled")
+    assert spilled == {("od-a", "high"): None, ("od-b", "high"): "1", ("spot", "high"): None, ("od-b", "standard"): None}
+
+
+async def test_a_claim_that_finds_nothing_counts_its_worker_free_until_it_claims_again(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """The wait outlasts TURNAROUND_SECONDS: seen only as the claim came, the idle worker would leave no slot on the
+    scale-in line between its claims."""
+    now = coordinator.clock()
+    coordinator.clock = lambda: now
+    body = {"tier": "high", "also_claim": ["standard"], "worker": "w", "wait_s": 0.2, "host": {"id": "spot", "rank": 1}}
+    waiting = asyncio.create_task(http.post("/v1/work/claim", json=body, headers=WORKER))
+    await wait_until(lambda: bool(coordinator.claim_waiters))
+    now += timedelta(seconds=coordinator_module.TURNAROUND_SECONDS + 10)
+    assert (await waiting).status_code == 204
+    assert coordinator.host_workers["spot"]["w"][0] == now
+
+
 async def test_a_burst_host_with_no_report_takes_no_on_demand_hosts_rank(coordinator: Coordinator) -> None:
     """A host whose telemetry fails sends only its id and rank, which isn't stored: a full Spot host like that
     doesn't take the On-Demand host's rank 0 from the fullest On-Demand host, nor push it behind Spot."""
