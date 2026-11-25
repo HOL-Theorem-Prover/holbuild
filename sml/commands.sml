@@ -941,7 +941,7 @@ fun analyser_proof_ir_plan_for_unit (unit : execution_plan_unit) =
   end
 
 fun print_static_execution_plan project new_ir source theorem unit_opt =
-  (print (let
+  (HolbuildBoundedOutput.print (let
             val unit = case unit_opt of SOME value => value | NONE => raise Error "internal error: missing proof-IR unit"
             val plan = analyser_proof_ir_plan_for_unit unit
           in
@@ -1652,7 +1652,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       let val ({plan, toolchain_key, ...}, build_options, keys) = plan_build ()
       in
         timed_phase "action_spec.export"
-          (fn () => print (#batch (HolbuildBuildExec.export_action_specs build_options tc project plan (keys ()) toolchain_key jobs
+          (fn () => HolbuildBoundedOutput.print (#batch (HolbuildBuildExec.export_action_specs build_options tc project plan (keys ()) toolchain_key jobs
                              {upload = upload, keep_specs = true, local_resumable = false, forced = [], skip = [], defer = false,
                               publish = [], ledger = false})))
       end

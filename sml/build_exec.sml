@@ -17198,7 +17198,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  what follows is off the client's path. *)
               (case result_file of
                    SOME path => write_text path text
-                 | NONE => print text)
+                 | NONE => HolbuildBoundedOutput.print text)
               handle e => (drop_heap_snapshot () handle _ => (); raise e);
               let
                 val t0 = Time.now ()

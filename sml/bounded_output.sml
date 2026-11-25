@@ -21,6 +21,8 @@ fun text (out, s) =
     loop 0
   end
 
+fun print s = text (TextIO.stdOut, s)
+
 fun binary (out, bytes) =
   let
     val total = Word8Vector.length bytes

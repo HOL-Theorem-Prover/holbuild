@@ -1009,7 +1009,7 @@ fun diagnostic_fragment_label label =
 
 fun print_goal_state label goals = timed_hol_phase "holprint" (fn () =>
   (failed_goal_state_printed_ref := true;
-   TextIO.output(TextIO.stdErr, with_cached_grammar_term_printer (fn () =>
+   HolbuildBoundedOutput.text (TextIO.stdErr, with_cached_grammar_term_printer (fn () =>
     String.concat ["\nholbuild goal state at failed fragment: ", diagnostic_fragment_label label,
                    failed_theorem_line (),
                    failed_step_end_line (),

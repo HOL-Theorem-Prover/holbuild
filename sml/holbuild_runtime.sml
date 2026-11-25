@@ -151,7 +151,7 @@ struct
             ["holbuild source-load", "ctx=" ^ context, "kind=" ^ kind, "name=" ^ name, "n=" ^ Int.toString n,
              "total_us=" ^ LargeInt.toString total, "self_us=" ^ LargeInt.toString self] ^ "\n"
       in
-        TextIO.output (TextIO.stdErr,
+        HolbuildBoundedOutput.text (TextIO.stdErr,
           String.concat
             (("holbuild hol-phases " ^
               String.concatWith " " (map phases [("srclib", "library"), ("srcrt", "runtime"), ("srcthy", "theory")]) ^
