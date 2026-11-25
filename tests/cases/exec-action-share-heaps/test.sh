@@ -390,27 +390,36 @@ v4b_steps=$(restored_steps v4b)
 
 # A spec of build --no-checkpoint-saves: the worker resumes from the shared
 # failed prefix, and shares nothing, neither the later prefix a failure past
-# it would nor the contexts after it of a pass.
+# it would nor the contexts after it of a pass, nor, on a miss, the failed
+# prefix and contexts of a run from the deps heap.
 shared_state() { grep -lE '^holbuild-shared-' "$tmpdir"/remote/ac/* | sort | xargs sha256sum; }
-for version in v4c v4d; do
-  if [[ "$version" = v4c ]]; then
-    write_t "T \\/ F" "ALL_TAC >> ALL_TAC >> FAIL_TAC \"unshared failure\""
-  else
-    write_t "T \\/ F" "ALL_TAC >> rw[]"
-  fi
+for version in v4c v4d v4e; do
+  case "$version" in
+    v4c) write_t "T \\/ F" "ALL_TAC >> ALL_TAC >> FAIL_TAC \"unshared failure\"" ;;
+    v4d) write_t "T \\/ F" "ALL_TAC >> rw[]" ;;
+    v4e) write_t "F \\/ T" "FAIL_TAC \"missed failure\"" ;;
+  esac
   export_t "$version" --no-checkpoint-saves
   grep -qx "option no-checkpoint-saves=true" "$project/.holbuild/action-specs/$spec_t" || {
     echo "$version: the spec doesn't carry --no-checkpoint-saves" >&2; exit 1; }
   before=$(shared_state)
   forget_local
   worker "$version" "$shared_url" "$shared" "$spec_t" --share-heaps
-  if [[ "$version" = v4c ]]; then
-    expect v4c 1 "status=failed" "failure=proof"
-    require_grep "unshared failure" "$tmpdir/v4c.log"
-  else
-    expect v4d 0 "status=built"
-  fi
-  resumed "$version" "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
+  case "$version" in
+    v4c)
+      expect v4c 1 "status=failed" "failure=proof"
+      require_grep "unshared failure" "$tmpdir/v4c.log"
+      resumed v4c "failed-prefix checkpoint in t3" "failed_prefix checkpoint" ;;
+    v4d)
+      expect v4d 0 "status=built"
+      resumed v4d "failed-prefix checkpoint in t3" "failed_prefix checkpoint" ;;
+    v4e)
+      expect v4e 1 "status=failed" "failure=proof"
+      require_grep "missed failure" "$tmpdir/v4e.log"
+      if grep -q "from: failed-prefix checkpoint" "$tmpdir/v4e.log"; then
+        echo "v4e: resumed a failed prefix behind an edit" >&2; exit 1
+      fi ;;
+  esac
   [[ "$(shared_state)" = "$before" ]] || {
     echo "$version: a worker under --no-checkpoint-saves shared checkpoints:" >&2
     diff <(printf '%s\n' "$before") <(shared_state) >&2 || true
