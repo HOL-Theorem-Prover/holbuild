@@ -386,10 +386,11 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             host_rank=0 if body.host is None else body.host.rank,
             ahead=body.ahead,
         )
-        if claimed is None and body.host is not None:
+        if claimed is None and body.host is not None and not await request.is_disconnected():
             # Seen again as the wait ends, so until its next claim the worker still counts as a free slot on the
-            # scale-in line (see Coordinator._kept_hosts), as it did while it waited.
-            coordinator.report_worker(body.host.id, body.worker, tiers, idle=True, ahead=body.ahead)
+            # scale-in line (see Coordinator._kept_hosts), as it did while it waited. Not idle: a claim its worker gave
+            # up on can end after the worker's next claim took a lease, whose bookkeeping must stay.
+            coordinator.report_worker(body.host.id, body.worker, tiers, ahead=body.ahead)
         # After the claim, so claims arriving together still share their reads. Its worker's next claim comes 30 s
         # after this one arrived at the soonest, which dwarfs any skew between this clock and the database's.
         await coordinator.release_unheld(body.worker, None if claimed is None else str(claimed.attempt_token), arrived)
