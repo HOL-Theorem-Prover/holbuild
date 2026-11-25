@@ -31,12 +31,19 @@ mods=$tmpdir/mods
 objs=$mods/.hol/objs
 mkdir -p "$objs"
 # StagedLib sits where a worker stages the HOL libraries a project builds in
-# its hol package, outside HOLDIR: labelled by its path under HOL's tree.
-staged=$tmpdir/stage/.holbuild/action-src/hol/src/probe
-mkdir -p "$staged"
+# its hol package, outside HOLDIR: labelled by its path under HOL's tree, when
+# the process runs in a stage directory of that action root.  ElsewhereLib has
+# a path with the same directories under another root: a project's own.
+action_root=$tmpdir/stage
+staged=$action_root/.holbuild/action-src/hol/src/probe
+stage_dir=$action_root/.holbuild/stage/key
+elsewhere=$tmpdir/elsewhere/.holbuild/action-src/hol/src/probe
+mkdir -p "$staged" "$stage_dir" "$elsewhere"
 echo 'val _ = ();' > "$staged/StagedLib.sml"
+echo 'val _ = ();' > "$elsewhere/ElsewhereLib.sml"
 echo "$staged/StagedLib.sml" > "$objs/StagedLib.uo"
-for name in ATheory BTheory ProbeLib StagedLib; do : > "$objs/$name.ui"; done
+echo "$elsewhere/ElsewhereLib.sml" > "$objs/ElsewhereLib.uo"
+for name in ATheory BTheory ProbeLib StagedLib ElsewhereLib; do : > "$objs/$name.ui"; done
 echo "$mods/ATheory.sml" > "$objs/ATheory.uo"
 printf 'ATheory\n%s\n' "$mods/BTheory.sml" > "$objs/BTheory.uo"
 echo "$mods/ProbeLib.sml" > "$objs/ProbeLib.uo"
@@ -56,8 +63,9 @@ row() {
       for (i = 6; i <= NF; i++) if (index($i, field) == 1) print substr($i, length(field) + 1) }' "$1"
 }
 
-# run_load MODE PRELUDE BODY [VAR=VALUE...]: a HOL process that compiles the
-# runtime and runs BODY; its output goes to $tmpdir/MODE.log.
+# run_load MODE PRELUDE BODY [VAR=VALUE...]: a HOL process, in $load_dir, that
+# compiles the runtime and runs BODY; its output goes to $tmpdir/MODE.log.
+load_dir=$tmpdir
 run_load() {
   local mode=$1 prelude=$2 body=$3
   shift 3
@@ -68,7 +76,7 @@ use "$HOLBUILD_ROOT/sml/holbuild_runtime.sml";
 val _ = Meta.loadPath := "$mods" :: !Meta.loadPath;
 $body
 SML
-  env "$@" "$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" "$tmpdir/$mode.sml" \
+  (cd "$load_dir" && env "$@" "$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" "$tmpdir/$mode.sml") \
     > "$tmpdir/$mode.log" 2>&1 || { cat "$tmpdir/$mode.log" >&2; exit 1; }
 }
 
@@ -111,9 +119,21 @@ run_load current "" "$loads" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD
 check_timed current
 run_load loadplan "$loadplan_meta" "$loads" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
 check_timed loadplan
-run_load staged "" 'val _ = HolbuildRuntime.load "StagedLib";' HOLBUILD_TIMING_SOURCE_LOADS=1
+load_dir=$stage_dir
+run_load staged "" 'val _ = HolbuildRuntime.load "StagedLib"; val _ = HolbuildRuntime.load "ElsewhereLib";' HOLBUILD_TIMING_SOURCE_LOADS=1
 [[ "$(row "$tmpdir/staged.log" library hol:src/probe/StagedLib.sml n)" == 1 ]] || {
   echo "a staged HOL library is not labelled by its path under HOL's tree" >&2; cat "$tmpdir/staged.log" >&2; exit 1; }
+[[ "$(row "$tmpdir/staged.log" library project:ElsewhereLib.sml n)" == 1 ]] || {
+  echo "a library outside this action root is labelled as a staged HOL library" >&2; cat "$tmpdir/staged.log" >&2; exit 1; }
+# Outside a stage directory no root is known: nothing is staged HOL.
+load_dir=$tmpdir
+run_load unstaged "" 'val _ = HolbuildRuntime.load "StagedLib";' HOLBUILD_TIMING_SOURCE_LOADS=1
+[[ "$(row "$tmpdir/unstaged.log" library project:StagedLib.sml n)" == 1 ]] || {
+  echo "a library is labelled as a staged HOL library outside an action stage" >&2; cat "$tmpdir/unstaged.log" >&2; exit 1; }
+# The time of a heap share is never negative when the wall clock steps back.
+run_load clock "" 'val _ = if HolbuildRuntime.elapsed_us (Time.fromSeconds 5, Time.fromSeconds 3) = 0 andalso
+                             HolbuildRuntime.elapsed_us (Time.fromSeconds 3, Time.fromSeconds 5) = 2000000
+                          then () else raise Fail "elapsed_us";'
 # A timed process that loads nothing (a child resumed from a heap, say) still
 # reports, with its context.
 run_load empty "" "" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
