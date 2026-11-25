@@ -16235,8 +16235,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             val blob = HolbuildCache.blob_path cache sha
             val copy = Path.concat (scratch_store, sha)
             fun link old = (ensure_parent path; remove_file path; Posix.FileSys.link {old = old, new = path})
+            (* Set when this input is copied or fetched, counted once. *)
+            val fetched = ref false
             fun keep_copy () =
-              (copied := !copied + 1;
+              (fetched := true;
                ensure_dir scratch_store;
                copy_binary blob copy
                handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = copy}
@@ -16251,9 +16253,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               handle OS.SysErr _ => ((if kept copy blob then () else keep_copy ()); link copy);
               HolbuildCache.touch copy;
               HolbuildCache.touch blob)
-             handle OS.SysErr _ => (copied := !copied + 1; fetch_spec_blob remote {hash = sha, dst = path})
-                  | IO.Io _ => (copied := !copied + 1; fetch_spec_blob remote {hash = sha, dst = path})
-                  | Error _ => (copied := !copied + 1; fetch_spec_blob remote {hash = sha, dst = path}));
+             handle OS.SysErr _ => (fetched := true; fetch_spec_blob remote {hash = sha, dst = path})
+                  | IO.Io _ => (fetched := true; fetch_spec_blob remote {hash = sha, dst = path})
+                  | Error _ => (fetched := true; fetch_spec_blob remote {hash = sha, dst = path}));
+            if !fetched then copied := !copied + 1 else ();
             path
           end
         (* The store keeps this action's inputs and then the most recently
@@ -16279,15 +16282,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             List.app (fn name => HolbuildRemoveTree.remove_untrusted (Path.concat (scratch_store, name)))
               (List.filter (fn name => not (List.exists (fn k => k = name) keep)) names)
           end
-        fun distinct [] = []
-          | distinct (x :: xs) = x :: distinct (List.filter (fn y => y <> x) xs)
       in
         case #scratch_inputs spec of
             [] => scratch_input_paths := []
           | inputs =>
               phase "scratch" (fn () =>
                 (scratch_input_paths := map stage inputs;
-                 prune (distinct inputs);
+                 prune (unique_strings inputs);
                  phases := ("scratchcopyn", LargeInt.fromInt (!copied)) :: !phases))
       end
     val run_log = ref NONE
