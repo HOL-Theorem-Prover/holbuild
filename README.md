@@ -2106,7 +2106,9 @@ their parents; two of them are counts, not times: `hydstatn` the cache
 manifests trusted on their recorded stat, `hydinstn` the dependencies the
 check sent to `hydinst`), `cutoff` (whether an earlier build stands), `analyse`
 (the script's proof steps and checkpoints), `restore` (shared
-checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
+checkpoints), `toolrestore` (the tool cache), `scratch` (staging the
+`--scratch-input` files, followed by the count `scratchcopyn` of those copied
+or fetched, 0 when each was linked), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
 checks) and `log`; stderr ends with the same times and `wall`.
 `peak-rss-mb` is the HOL process's peak resident memory, reported once the

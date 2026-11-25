@@ -12672,6 +12672,9 @@ fun cache_root_id path =
         SysWord.toString (Posix.FileSys.devToWord dev) ^ ":" ^
         SysWord.toString (Posix.FileSys.inoToWord ino)
 
+(* Where exec_action keeps copies of scratch inputs for later actions. *)
+fun scratch_store_dir cache = Path.concat (cache, "action-scratch")
+
 fun worker_cache_roots cache =
   let
     fun tree path = {id = fn () => cache_root_id path, measure = fn () => cache_root_bytes path}
@@ -12696,8 +12699,9 @@ fun worker_cache_roots cache =
 (* Evict least recently used families until the cache leaves reserve_bytes of
    room under limit_bytes. An action reuses a recent shared scan while the
    cache stays within limit_bytes, so the reserve absorbs growth between
-   evictions instead of every action waiting on one; private checkpoints are
-   always measured locally. Zero reserves scan live.  With refresh, as after
+   evictions instead of every action waiting on one; private checkpoints and
+   kept scratch inputs are always measured locally. Zero reserves scan live.
+   With refresh, as after
    an action's result, scan only when the stamp is past half its life and no other process holds
    gc.lock, so that busy hosts keep the stamp fresh and actions seldom wait
    on a scan.
@@ -12708,7 +12712,8 @@ fun worker_cache_roots cache =
    the stamp is fresh when files the cap can't evict hold the disk below it. *)
 fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes, min_free_bytes, refresh} =
   let
-    fun private_bytes () = cache_root_bytes checkpoint_root
+    (* This worker's own: its checkpoints and the scratch inputs it keeps. *)
+    fun private_bytes () = cache_root_bytes checkpoint_root + cache_root_bytes (scratch_store_dir cache)
     val roots = worker_cache_roots cache
     fun root_ids () = map (fn {id, ...} => id ()) roots
     fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
@@ -16209,7 +16214,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        after, so an interrupted one is not reused.  Without the blob, the
        copy is fetched; when all that fails, the input is fetched into the
        root as any spec blob. *)
-    val scratch_store = Path.concat (cache, "action-scratch")
+    val scratch_store = scratch_store_dir cache
     val scratch_keep_limit = 8
     fun stage_scratch_input (spec : action_spec) =
       let
@@ -16253,7 +16258,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           end
         (* The store keeps this action's inputs and then the most recently
            used, up to scratch_keep_limit files; anything else in it goes,
-           each entry by its own name, links unfollowed. *)
+           each entry by its own name, links unfollowed.  An action's own
+           inputs beyond the limit go too: their links in the root keep
+           them for the action. *)
         fun prune current =
           let
             val names = HolbuildBuildPlan.list_dir scratch_store handle HolbuildBuildPlan.Error _ => []
@@ -16265,7 +16272,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               HolbuildBuildPlan.sort_pairs (fn (a, b) => Real.compare (#2 b, #2 a))
                 (map (fn name => (name, mtime name))
                      (List.filter (fn name => staged name andalso not (List.exists (fn c => c = name) current)) names))
-            val room = Int.max (0, scratch_keep_limit - length current)
+            val current = List.take (current, Int.min (scratch_keep_limit, length current))
+            val room = scratch_keep_limit - length current
             val keep = current @ map #1 (List.take (others, Int.min (room, length others)))
           in
             List.app (fn name => HolbuildRemoveTree.remove_untrusted (Path.concat (scratch_store, name)))

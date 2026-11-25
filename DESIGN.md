@@ -857,9 +857,15 @@ Its hash was checked when it entered the cache; the staged path lies outside
 every sandbox write and scratch root, and the sandbox grants no cross-directory
 link and refuses chmod outside those roots, so the action can only read it;
 holbuild only unlinks it when it empties the root. Across file systems (a
-worker container's action root beside a host-mounted cache) it is a read-only
-copy of that blob, not hashed again. Without the blob it is fetched and copied
-like any other spec blob.
+worker container's action root beside a host-mounted cache), or without the
+blob, it is a hard link to a read-only copy of that blob, not hashed again,
+kept in `action-scratch` beside the action root, where no action can read.
+Later actions link the same copy while it is a read-only regular file of the
+blob's size, so a worker copies an input once; the root is emptied around each
+action as before, so an action sees only the inputs its spec names. The store
+keeps at most eight copies (the action's inputs, then the most recently used),
+counts toward the worker's cache cap, and is emptied when the worker is short
+of disk.
 
 Cache-to-cache transfers verify a resident filesystem blob before fetching it
 again. A missing or corrupt blob is fetched into a transfer-owned temporary
