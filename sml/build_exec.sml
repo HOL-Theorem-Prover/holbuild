@@ -17225,6 +17225,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
            outline the child loaded (export_mismatch); and CUTOFF, the deps
            context the outlines gave, for these.  Any of it failing
            abandons the action, which builds again plain. *)
+        (* finalswait: the time the child, its run done, waited for the
+           final entries of the parents it loaded from outlines, also when
+           a wait gives the attempt up. *)
+        val finals_waited = ref (0 : LargeInt.int)
         fun finals cutoff =
           if null (!outlined) then cutoff
           else
@@ -17236,6 +17240,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                        if cached key then ()
                        else if Time.>= (Time.now (), deadline) then abandon ("the entry of " ^ target ^ " did not arrive in time")
                        else (OS.Process.sleep ahead_poll_interval; await ()))
+                    fun timed_await () =
+                      let
+                        val t0 = Time.now ()
+                        fun record () = finals_waited := !finals_waited + Time.toMilliseconds (Time.- (Time.now (), t0))
+                      in
+                        (await () before record ()) handle e => (record (); raise e)
+                      end
                     fun files dir =
                       let val staged = in_root dir stem
                       in
@@ -17245,15 +17256,16 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   in
                     if not (is_outlined key) then ()
                     else
-                      (await ();
+                      (timed_await ();
                        if restore_late staging dep key then ()
                        else abandon ("dependency " ^ target ^ " does not match its parents");
                        case export_mismatch (files staging) (files outline_staging) of
                            SOME why => abandon ("the outline of " ^ target ^ " failed the gate: " ^ why)
                          | NONE => place staging stem)
                   end)
-               late;
-             phases := ("outlined", LargeInt.fromInt (length (!outlined))) :: !phases;
+               late
+             handle e => (phases := ("finalswait", !finals_waited) :: !phases; raise e);
+             phases := ("finalswait", !finals_waited) :: ("outlined", LargeInt.fromInt (length (!outlined))) :: !phases;
              spec_early_cutoff_with
                {dat_hash = hash_of, file_hashes = map hash_of,
                 skip_loaded = {base_loaded = !base_loaded, follow = false, known_manifest = fn _ => NONE}}
