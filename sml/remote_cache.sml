@@ -815,14 +815,23 @@ fun metadata_text manifest blobs =
 
 (* An action's metadata, without recording its blobs as present: a caller
    that may not use the manifest records them with remember_action.  The
-   lookup passes over a node whose manifest fails `usable`, as for a 404. *)
+   lookup passes over a node whose manifest fails `usable`, as for a 404.
+   A lookup that passed over one and found nothing better, a miss or a
+   failure, asks once more, revalidating: a cache in front of the shared
+   store may still serve an entry the store has since replaced with a
+   usable one. *)
 fun fetch_action_using usable cache key =
   let
     val tmp = temp_path "action"
     fun cleanup () = remove_file tmp
-    fun usable_body path = usable (#manifest (metadata_manifest (read_text path))) handle _ => true
+    val passed_over = ref false
+    fun usable_body path =
+      let val ok = usable (#manifest (metadata_manifest (read_text path))) handle _ => true
+      in if ok then () else passed_over := true; ok end
     val get =
       if reads_revalidate () then get_status_with_headers ["Cache-Control: no-cache"] else get_status
+    fun again () = !passed_over andalso not (reads_revalidate ())
+    fun revalidated () = revalidating (fn () => fetch_action_using usable cache key)
   in
     case curl_get_urls_by get usable_body {urls = action_urls cache key, dst = tmp, timeout = stall_timeout_seconds} of
         HolbuildCacheBackend.Hit =>
@@ -831,9 +840,9 @@ fun fetch_action_using usable cache key =
             cleanup ();
             SOME action
           end
-      | HolbuildCacheBackend.Miss => (cleanup (); NONE)
+      | HolbuildCacheBackend.Miss => (cleanup (); if again () then revalidated () else NONE)
       | HolbuildCacheBackend.Corrupt message =>
-          (cleanup (); warn_restore_once message; NONE)
+          (cleanup (); if again () then revalidated () else (warn_restore_once message; NONE))
   end
   handle e as Unavailable _ => raise e
        | _ => NONE

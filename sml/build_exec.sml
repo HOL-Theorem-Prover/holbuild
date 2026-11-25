@@ -12185,6 +12185,13 @@ fun hydrate_action_root remote root resident (spec : action_spec) light =
       light
   end
 
+(* Whether the remote holds an entry for the action that its restore would
+   take: one meeting its timeout contract.  A weaker one, which a build
+   with other proof options left, is replaced by building. *)
+fun action_built remote (spec : action_spec) =
+  Option.isSome (HolbuildRemoteCache.get_action_using
+                   (manifest_timeout_satisfies false (#tactic_timeout spec)) remote (#input_key spec))
+
 (* Step 4: the action's own entry restores with full validation, the
    remote's when the local copy doesn't fit the restored parents and differs
    from it. *)
@@ -16887,7 +16894,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             | NONE => reject_spec ("ahead parent " ^ key ^ " is not a dependency of the action")
         val named = map (fn {input_key, spec_sha256} => (dependency input_key, spec_sha256)) ahead_parents
         fun cached key = Option.isSome (HolbuildRemoteCache.get_action remote key)
-        val _ = if cached (#input_key spec) then raise ActionFailed (AheadAbandoned, "the action is built already")
+        val _ = if action_built remote spec then raise ActionFailed (AheadAbandoned, "the action is built already")
                 else ()
         val late = List.filter (fn (dep, _) => not (cached (#key dep))) named
       in
@@ -17247,8 +17254,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                from an empty root. *)
             val shared_key = shared_heap_key tc root built_action
             val hit =
-              cached (#input_key spec) orelse
-              (case cutoff of SOME {pair_key, ...} => cached pair_key | NONE => false) orelse
+              action_built remote spec orelse
+              (* Only an earlier build's key: a record naming the action's
+                 own key is what action_built judged. *)
+              (case cutoff of
+                   SOME {pair_key, ...} =>
+                     Option.isSome (Option.mapPartial (earlier_build_key spec)
+                                      (HolbuildRemoteCache.get_action remote pair_key))
+                 | NONE => false) orelse
               (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
                (cached shared_key orelse
                 not deps_heap_only andalso resumes_from_checkpoints (spec_policy spec) built_action andalso
