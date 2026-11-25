@@ -261,11 +261,30 @@ resumed() {
   fi
 }
 worker_modules=$worker/theory-modules
+# B's first run on W, whose store is empty, publishes a heap that loads
+# none of its cone's modules, and says how many it lacks.  With a store
+# that has them, the next B on W declines that heap, preloads afresh and
+# replaces it.  (The cone is small: tests lower the threshold to 1.)
+export HOLBUILD_TEST_MODULE_MIN_MISSING=1
+edit_b short
+exec_theory B short
+short_entry=$(grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote/ac/*)
+short_missing=$(sed -n 's/^missing=//p' "$short_entry")
+[[ ${short_missing:-0} -ge 1 ]] && ! grep -q ' module ' "$short_entry" ||
+  { echo "the heap saved with an empty store isn't marked short:" >&2; cat "$short_entry" >&2; exit 1; }
+phase short-B "depsmissn:$short_missing"
+phase short-B 'rstdepskb:[1-9][0-9]*'
 exec_theory Z z unshared
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 server_log=$tmpdir/server/requests.log
 z_requests=$(wc -l < "$server_log")
+edit_b publish
 exec_theory B publish
+unset HOLBUILD_TEST_MODULE_MIN_MISSING
+phase publish-B 'rstheapdeclinen:1'
+phase publish-B 'depsmissn:0'
+grep -qx 'missing=0' "$short_entry" ||
+  { echo "the short heap's entry wasn't replaced:" >&2; cat "$short_entry" "$tmpdir/publish-B.log" >&2; exit 1; }
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 modules=$(for heap in $published; do heap_modules "$heap"; done | { grep -- '-A-' || true; } | sort -u)
 [[ -n "$modules" ]] || { echo "no published heap loads A's module" >&2; exit 1; }
