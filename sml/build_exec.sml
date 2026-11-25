@@ -4684,6 +4684,10 @@ val dropped_checkpoints = ref 0
    exec-action's rstmodrejn. *)
 val rejected_heap_modules = ref 0
 
+(* Whether the child, since the action started, discarded the deps heap
+   after failing to load it or a module it loads. *)
+val discarded_deps_heap = ref false
+
 fun write_theory_script capture defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker =
   let
     val _ = resume_steps := []
@@ -5136,10 +5140,15 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     fun discard_loaded_checkpoint_after_load_failure msg =
       if Option.isSome (find_substring "Required module missing or changed" msg) then
         (rejected_heap_modules := !rejected_heap_modules + 1;
+         discarded_deps_heap := true;
          remove_deps_checkpoint_family checkpoint_base deps_key deps_loaded)
       else
-        remove_loaded_checkpoint_descendants checkpoint_base deps_key deps_loaded theorem_checkpoints declaration_checkpoints
-          (hol_context_path (#context run_spec))
+        let val loaded = hol_context_path (#context run_spec)
+        in
+          if loaded = deps_loaded then discarded_deps_heap := true else ();
+          remove_loaded_checkpoint_descendants checkpoint_base deps_key deps_loaded theorem_checkpoints
+            declaration_checkpoints loaded
+        end
     fun discard_failed_prefix_after_resume_failure msg =
       case #failed_prefix_context run_spec of
           NONE => false
@@ -15595,21 +15604,35 @@ fun cone_module_names root tc wanted =
 fun count_store_missing store names =
   store_missing_modules := SOME (length (unstored_modules (map Path.file (HolbuildCache.children store)) names))
 
-(* The deps heaps a host declined (declines_short_heap), `<heap key>
-   <heap SHA-256>` per line, in its toolchain's module store. *)
+(* The deps heaps a host declined (declines_short_heap), a file
+   `<heap key>-<heap SHA-256>` each, in a directory of its toolchain's
+   module store. *)
 val module_store_declined_heaps = ".declined-heaps"
 
 (* Whether a restore declines the published deps heap HEAP, whose entry
    ENTRY is under KEY, to preload afresh: the entry is short
    (short_heap_entry), the toolchain writes modules, the cone expects at
    least module_writer_min_missing modules, of which this host's store now
-   lacks fewer, and the host hasn't declined that heap before.  The
-   preload then saves a heap that loads them, which replaces the entry
-   (publish_shared_checkpoints).  The decline waits in declining_heap
-   until the run has preloaded (record_heap_decline): declining only once
-   bounds what a heap that comes out short again (HOL refused a module)
-   costs, as the host goes on restoring the published one. *)
-val declining_heap = ref (NONE : {record : string, line : string} option)
+   lacks fewer, and no action on the host has declined that heap before.
+   The preload then saves a heap that loads them, which replaces the entry
+   (publish_shared_checkpoints).  The decline is reserved at once, by
+   creating its file exclusively, so that of the actions restoring the
+   heap at the same time only one preloads; it stays unless the run
+   preloads nothing (release_heap_decline).  Declining only once bounds
+   what a heap that comes out short again (HOL refused a module) costs, as
+   the host goes on restoring the published one. *)
+val declining_heap = ref (NONE : string option)
+
+fun reserve_heap_decline path =
+  let
+    val mode = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.iwusr,
+                                      Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
+  in
+    ensure_dir (Path.dir path);
+    Posix.IO.close (Posix.FileSys.createf (path, Posix.FileSys.O_WRONLY, Posix.FileSys.O.excl, mode));
+    true
+  end
+  handle e as OS.SysErr (_, SOME err) => if err = Posix.Error.exist then false else raise e
 
 fun declines_short_heap root tc wanted {key, heap, entry} =
   module_writer_supported tc andalso short_heap_entry true entry andalso
@@ -15617,29 +15640,23 @@ fun declines_short_heap root tc wanted {key, heap, entry} =
     val store = module_store tc
     val names = cone_module_names root tc wanted
     val _ = count_store_missing store names
-    val record = Path.concat (store, module_store_declined_heaps)
-    val line = key ^ " " ^ heap
-    val declined =
-      List.exists (fn l => l = line) (if file_exists record then metadata_lines (read_text record) else [])
+    val record = Path.concat (Path.concat (store, module_store_declined_heaps), key ^ "-" ^ heap)
     val min = module_writer_min_missing ()
   in
-    length names >= min andalso valOf (!store_missing_modules) < min andalso not declined andalso
-    (declining_heap := SOME {record = record, line = line};
+    length names >= min andalso valOf (!store_missing_modules) < min andalso reserve_heap_decline record andalso
+    (declining_heap := SOME record;
      add_restore_step "rstheapdeclinen" 1;
      HolbuildStatus.message_stdout "declined the shared deps-loaded heap: it lacks theory modules this host has\n";
      true)
   end
   handle e => (warn ("kept the shared deps-loaded heap: " ^ General.exnMessage e); false)
 
-(* Records the restore's decline, if any, once the run has preloaded:
-   appended, so that actions recording at once each keep their line. *)
-fun record_heap_decline () =
+(* Gives the restore's decline, if any, back, for a run that preloaded
+   nothing: a later action on the host may decline the heap. *)
+fun release_heap_decline () =
   case !declining_heap before declining_heap := NONE of
       NONE => ()
-    | SOME {record, line} =>
-        let val out = TextIO.openAppend record
-        in TextIO.output (out, line ^ "\n") before TextIO.closeOut out end
-        handle e => warn ("the declined deps heap was not recorded: " ^ General.exnMessage e)
+    | SOME record => remove_file record
 
 (* For HolbuildActionSandbox.module_reads: what the sandboxed theory
    children of SPEC may read of their toolchain's store.  While their deps
@@ -16920,6 +16937,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val _ = if isSome ahead then () else last_child_start := NONE
         val _ = dropped_checkpoints := 0
         val _ = rejected_heap_modules := 0
+        val _ = discarded_deps_heap := false
         (* Built on a late parent's outline, the run is the load ahead's:
            whatever stops it, nothing of it is published, and the action
            builds again plain. *)
@@ -16982,13 +17000,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 val captured = Option.isSome (!captured_deps_heap)
                 (* A decline whose action restored a failed prefix of its
                    own instead preloaded nothing: it isn't spent. *)
-                val _ = if captured then record_heap_decline () else declining_heap := NONE
+                val _ = if captured then declining_heap := NONE else release_heap_decline ()
                 val deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)
-                (* A restored heap rejected at load isn't the one the
+                (* A restored heap discarded at load isn't the one the
                    action ran on. *)
                 val missing =
                   if captured then Option.map #missing (captured_missing ())
-                  else if !rejected_heap_modules > 0 then NONE
+                  else if !discarded_deps_heap then NONE
                   else Option.mapPartial heap_entry_missing (#entry restored)
                 val kb =
                   if captured orelse Option.isSome (#heap restored)
