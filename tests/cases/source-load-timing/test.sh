@@ -57,6 +57,7 @@ run_load() {
   shift 3
   cat > "$tmpdir/$mode.sml" <<SML
 $prelude
+use "$HOLBUILD_ROOT/sml/bounded_output.sml";
 use "$HOLBUILD_ROOT/sml/holbuild_runtime.sml";
 val _ = Meta.loadPath := "$mods" :: !Meta.loadPath;
 $body

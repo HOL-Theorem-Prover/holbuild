@@ -214,7 +214,7 @@ fun copy_child_stdout process =
     val input = Unix.textInstreamOf process
     fun output text =
       (Mutex.lock child_output_mutex;
-       (TextIO.output(TextIO.stdOut, text); TextIO.flushOut TextIO.stdOut)
+       (HolbuildBoundedOutput.text (TextIO.stdOut, text); TextIO.flushOut TextIO.stdOut)
        before Mutex.unlock child_output_mutex)
       handle e => (Mutex.unlock child_output_mutex; raise e)
     fun loop () =

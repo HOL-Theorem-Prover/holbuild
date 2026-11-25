@@ -78,7 +78,7 @@ fun write_text_atomically path text =
     val out = TextIO.openOut tmp
     fun close () = TextIO.closeOut out handle _ => ()
   in
-    (TextIO.output(out, text);
+    (HolbuildBoundedOutput.text (out, text);
      TextIO.closeOut out;
      rename_file tmp path)
     handle e => (close (); remove_file tmp; raise e)

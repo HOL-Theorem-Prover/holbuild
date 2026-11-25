@@ -151,7 +151,7 @@ struct
             ["holbuild source-load", "ctx=" ^ context, "kind=" ^ kind, "name=" ^ name, "n=" ^ Int.toString n,
              "total_us=" ^ LargeInt.toString total, "self_us=" ^ LargeInt.toString self] ^ "\n"
       in
-        TextIO.output (TextIO.stdErr,
+        HolbuildBoundedOutput.text (TextIO.stdErr,
           String.concat
             (("holbuild hol-phases " ^
               String.concatWith " " (map phases [("srclib", "library"), ("srcrt", "runtime"), ("srcthy", "theory")]) ^
@@ -295,7 +295,7 @@ struct
   fun write_text path text =
     let
       val out = TextIO.openOut path
-      val _ = TextIO.output(out, text)
+      val _ = HolbuildBoundedOutput.text (out, text)
       val _ = TextIO.closeOut out
     in
       ()
@@ -471,7 +471,7 @@ struct
   fun theory_data_digest dat_path =
     let
       fun as_written why =
-        (TextIO.output (TextIO.stdErr,
+        (HolbuildBoundedOutput.text (TextIO.stdErr,
                         "holbuild: warning: hashing " ^ dat_path ^ " as written: " ^ why ^ "\n");
          SHA1.sha1_file {filename = dat_path})
       (* Not HOLsexp.fromFile: HOLFileSys would remap the path again. *)

@@ -48,7 +48,7 @@ fun write_text path text =
       handle e => raise Error ("could not write " ^ path ^ ": " ^ General.exnMessage e)
     fun close_output () = TextIO.closeOut output handle _ => ()
   in
-    (TextIO.output(output, text);
+    (HolbuildBoundedOutput.text (output, text);
      TextIO.closeOut output;
      rename_replace {old = tmp, new = path})
     handle e => (close_output (); remove_file tmp; raise e)
@@ -287,7 +287,7 @@ fun write_binary path bytes =
       handle e => raise Error ("could not write " ^ path ^ ": " ^ General.exnMessage e)
     fun close_output () = BinIO.closeOut output handle _ => ()
   in
-    (BinIO.output (output, bytes);
+    (HolbuildBoundedOutput.binary (output, bytes);
      BinIO.closeOut output;
      rename_replace {old = tmp, new = path})
     handle e => (close_output (); remove_file tmp; raise e)

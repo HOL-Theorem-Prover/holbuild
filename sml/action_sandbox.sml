@@ -246,7 +246,7 @@ fun confined grants argv execute =
     fun remove () = List.app (fn path => OS.FileSys.remove path handle OS.SysErr _ => ()) [completed, options]
     fun write path text =
       let val output = TextIO.openOut path
-      in (TextIO.output(output, text); TextIO.closeOut output)
+      in (HolbuildBoundedOutput.text (output, text); TextIO.closeOut output)
          handle e => (TextIO.closeOut output; raise e)
       end
     fun completion () =

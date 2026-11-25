@@ -166,7 +166,7 @@ fun show_progress (Progress {stage, total, in_place, started, scanned, removed, 
                " scanned, " ^ Int.toString (!removed) ^ " removed, " ^ elapsed ^ "s"
   in
     shown := true;
-    TextIO.output (TextIO.stdErr,
+    HolbuildBoundedOutput.text (TextIO.stdErr,
                    if in_place then "\r" ^ text ^ HolbuildStatus.clear_to_eol ^ (if final then "\n" else "")
                    else text ^ "\n");
     TextIO.flushOut TextIO.stdErr

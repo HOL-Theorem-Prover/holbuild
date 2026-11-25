@@ -54,6 +54,7 @@ use_hol("tools/Holmake/deps/Holdep.sig");
 use_hol("tools/Holmake/deps/Holdep.sml");
 
 use_root "sml/sha256.sml";
+use_root "sml/bounded_output.sml";
 use_root "sml/spawn.sml";
 use_root "sml/temp_path.sml";
 use_root "sml/hash.sml";

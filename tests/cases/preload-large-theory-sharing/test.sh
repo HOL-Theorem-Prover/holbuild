@@ -48,6 +48,7 @@ run_load() {
 structure PolyML = struct open PolyML
   fun shareCommonData x = (TextIO.print "share\\n"; PolyML.shareCommonData x) end;
 $prelude
+use "$HOLBUILD_ROOT/sml/bounded_output.sml";
 use "$HOLBUILD_ROOT/sml/holbuild_runtime.sml";
 val _ = Meta.loadPath := "$mods" :: !Meta.loadPath;
 val _ = HolbuildRuntime.load "FTheory";
