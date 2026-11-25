@@ -19,13 +19,7 @@ link_hol_toolchain_cache "$import_cache"
 dep_repo=$tmpdir/dep-repo
 mkdir -p "$dep_repo/src"
 cat > "$dep_repo/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "dep"
@@ -44,13 +38,7 @@ dep_rev=$(init_git_repo "$dep_repo")
 project=$tmpdir/project
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [dependencies.dep]
 git = "$dep_repo"

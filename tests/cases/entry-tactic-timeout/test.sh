@@ -16,13 +16,7 @@ project=$tmpdir/project
 mkdir -p "$project/src"
 
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "entry-timeouts"
@@ -100,13 +94,7 @@ require_file "$project/.holbuild/obj/src/BTheory.dat"
 root_groups_project=$tmpdir/root-groups
 mkdir -p "$root_groups_project/gen"
 cat > "$root_groups_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "root-groups-timeout"
@@ -144,13 +132,7 @@ require_grep "tactic timed out after 0.1s while building GroupTheory: slow_tac" 
 roots_group_project=$tmpdir/roots-group
 mkdir -p "$roots_group_project/gen"
 cat > "$roots_group_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "roots-group-timeout"
@@ -199,13 +181,7 @@ require_grep "tactic timed out after 0.1s while building BetaTheory: slow_tac" "
 heap_project=$tmpdir/heap
 mkdir -p "$heap_project/src"
 cat > "$heap_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "heap-timeout"

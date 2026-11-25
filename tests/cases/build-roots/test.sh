@@ -18,13 +18,7 @@ use_case_cache "$tmpdir/cache"
 project=$tmpdir/project
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "build-roots"
@@ -70,13 +64,7 @@ require_grep "roots: src/MainScript.sml" "$tmpdir/context.log"
 missing_root=$tmpdir/missing-root
 mkdir -p "$missing_root/src"
 cat > "$missing_root/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "missing-root"
@@ -148,13 +136,7 @@ mkdir -p "$dot/.hidden" "$dot/noaccess" "$symlink_target"
 ln -s "$symlink_target" "$dot/linked-dir"
 chmod 000 "$dot/noaccess"
 cat > "$dot/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "build-roots-dot"

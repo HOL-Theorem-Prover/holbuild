@@ -15,13 +15,7 @@ use_case_cache "$tmpdir/cache"
 project=$tmpdir/project
 mkdir -p "$project/src/nested"
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "ignore-subprojects"
@@ -33,13 +27,7 @@ cat > "$project/src/Keep.sml" <<'SML'
 val keep = 1;
 SML
 cat > "$project/src/nested/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "nested"
@@ -63,13 +51,7 @@ mkdir -p "$explicit/src/nested"
 cp "$project/src/nested/holproject.toml" "$explicit/src/nested/holproject.toml"
 cp "$project/src/nested/Nested.sml" "$explicit/src/nested/Nested.sml"
 cat > "$explicit/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "explicit-subproject-member"

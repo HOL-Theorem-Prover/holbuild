@@ -42,13 +42,7 @@ git = "https://github.com/HOL-Theorem-Prover/HOL.git"
 TOML
   else
     cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [actions.A]
 cache = $cache

@@ -16,13 +16,7 @@ make_project() {
   local project=$1
   mkdir -p "$project/src"
   cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "concurrent"
@@ -102,13 +96,7 @@ parent_sensitive_a1=$tmpdir/parent-sensitive-a1
 parent_sensitive_a2=$tmpdir/parent-sensitive-a2
 mkdir -p "$parent_sensitive_source/src" "$parent_sensitive_a1" "$parent_sensitive_a2"
 cat > "$parent_sensitive_source/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "parentsensitive"

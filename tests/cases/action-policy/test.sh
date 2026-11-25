@@ -17,13 +17,7 @@ make_theory_project() {
   local action_stanza=$2
   mkdir -p "$project/src"
   cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "$(basename "$project")"
@@ -80,13 +74,7 @@ require_grep "extra_dep=extra.txt@" "$compat_project/.holbuild/dep/extra_inputs_
 source_extra_project="$tmpdir/source_extra_policy"
 mkdir -p "$source_extra_project/src" "$source_extra_project/data"
 cat > "$source_extra_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "source_extra_policy"
@@ -131,13 +119,7 @@ fi
 manifest_stage_project="$tmpdir/manifest_stage_policy"
 mkdir -p "$manifest_stage_project/src/a" "$manifest_stage_project/data"
 cat > "$manifest_stage_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "manifest_stage_policy"
@@ -178,13 +160,7 @@ fi
 manifest_dir_project="$tmpdir/manifest_dir_policy"
 mkdir -p "$manifest_dir_project/src" "$manifest_dir_project/.holbuild"
 cat > "$manifest_dir_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "manifest_dir_policy"
