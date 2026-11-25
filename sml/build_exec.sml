@@ -14871,10 +14871,17 @@ val module_writer_report_bytes = 1024 * 1024
    not store anyway (write_missing_modules), and counts it against the
    writer's limit, so enough of them leave the missing modules after them
    unwritten.  Here such a theory is only registered, from its .dat file.
+   It reads each theory's name and hash from its Theory.sml itself, not
+   with HOL's sml_header, which in HOLs up to now reads only the first
+   4 KiB, where the opens may not have ended, and wants `thyname = "` on
+   one line, a line HOL's printer breaks for a name of 55 characters or
+   more.  A theory whose header it can't read is skipped with an error,
+   not the whole list; its descendants then have no canonical data, so
+   they get no module either.
    It reports what it did with each theory (module_writer_report). *)
 val module_writer_line =
   if_theory_modules_has
-    ["eligible", "unchanged_bindings", "base_id_of", "absolute", "core_bindings", "sml_header",
+    ["eligible", "unchanged_bindings", "base_id_of", "absolute", "core_bindings",
      "file_digest", "module_file", "exists", "mkdir", "module_roots", "save_module", "read_module",
      "usable", "hex"]
     ("val _ = let " ^
@@ -14898,11 +14905,30 @@ val module_writer_line =
      "val directory = TheoryModules.absolute directory; " ^
      "val output = TheoryModules.absolute output; " ^
      "val bindings = TheoryModules.core_bindings (); " ^
+     "fun header sml = " ^
+     "let val input = HOLFileSys.openIn sml; " ^
+     "fun read lines = case TextIO.inputLine input of NONE => lines " ^
+     "| SOME line => if String.isSubstring \"path = path\" line then line :: lines " ^
+     "else read (line :: lines); " ^
+     "val text = String.concat (rev (read [])) before HOLFileSys.closeIn input; " ^
+     "fun literal key = " ^
+     "let val (_, rest) = Substring.position key (Substring.full text); " ^
+     "val rest = Substring.dropl Char.isSpace (Substring.triml (size key) rest) " ^
+     "in case Substring.getc rest of " ^
+     "SOME (#\"\\\"\", rest) => " ^
+     "let val (value, close) = Substring.splitl (fn c => c <> #\"\\\"\") rest " ^
+     "in if Substring.isEmpty close then NONE else SOME (Substring.string value) end " ^
+     "| _ => NONE end " ^
+     "in case (literal \"thyname =\", literal \"hash =\") of " ^
+     "(SOME thy, SOME hash) => SOME (thy, hash) | _ => NONE end " ^
+     "handle IO.Io _ => NONE | OS.SysErr _ => NONE; " ^
      "fun entry sml = " ^
-     "let val base = OS.Path.base sml; " ^
-     "val (thy, hash) = case TheoryModules.sml_header (base ^ \".sml\") of SOME h => h " ^
-     "| NONE => raise Fail (\"no theory header in \" ^ sml) " ^
-     "in if TheoryReader.is_canonical thy then NONE " ^
+     "let val base = OS.Path.base sml " ^
+     "in case header (base ^ \".sml\") of " ^
+     "NONE => (TextIO.output (TextIO.stdErr, \"theory modules: no theory header in \" ^ sml ^ \"\\n\"); " ^
+     "note (\"error \" ^ OS.Path.file base ^ \" no theory header\"); NONE) " ^
+     "| SOME (thy, hash) => " ^
+     "if TheoryReader.is_canonical thy then NONE " ^
      "else let val dat_digest = TheoryModules.file_digest (base ^ \".dat\") " ^
      "in SOME {base = base, thy = thy, hash = hash, dat_digest = dat_digest, " ^
      "file = TheoryModules.module_file base_id (thy, dat_digest)} end end; " ^
@@ -15551,9 +15577,13 @@ fun write_missing_modules remote root tc wanted deadline =
     val output = Path.concat (store, ".writer")
     val script = in_root root ".holbuild/theory-module-writer.sml"
     val log = in_root root ".holbuild/theory-module-writer.log"
+    (* Tests put a theory whose header can't be read first
+       (HOLBUILD_TEST_WRITER_THEORY). *)
+    val test_theories = case OS.Process.getEnv "HOLBUILD_TEST_WRITER_THEORY" of SOME f => [f] | NONE => []
     val call =
       "val _ = Meta.writeTheoryModules {theories = [" ^
-      String.concatWith ", " (map (fn (_, b) => HolbuildToolchain.sml_string (hol_name b ^ ".sml")) theories) ^
+      String.concatWith ", " (map HolbuildToolchain.sml_string
+                                (test_theories @ map (fn (_, b) => hol_name b ^ ".sml") theories)) ^
       "], directory = " ^ HolbuildToolchain.sml_string store ^
       ", base_state = " ^ HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^
       ", output = " ^ HolbuildToolchain.sml_string output ^
