@@ -36,8 +36,6 @@ type declaration_checkpoint = {name : string, safe_name : string,
                                context_path : string, context_ok : string,
                                deps_key : string, checkpoint_key : string}
 
-fun is_ident c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'"
-
 fun starts_with text i needle =
   let val n = size text
       val m = size needle
@@ -55,33 +53,6 @@ fun skip_comment text i =
   in
     loop (i + 2) 1
   end
-
-fun skip_ws_comments text i =
-  let
-    val n = size text
-    fun loop j =
-      if j >= n then n
-      else if Char.isSpace (String.sub(text, j)) then loop (j + 1)
-      else if starts_with text j "(*" then loop (skip_comment text j)
-      else j
-  in
-    loop i
-  end
-
-fun statement_boundary text i =
-  let val j = skip_ws_comments text i
-  in if j < size text andalso String.sub(text, j) = #";" then j + 1 else i end
-
-fun safe_name name =
-  let
-    fun safe c = if is_ident c then c else #"_"
-    val s = String.map safe name
-  in
-    if s = "" then "unnamed" else s
-  end
-
-fun prefix_hash text boundary =
-  HolbuildToolchain.hash_text (String.substring(text, 0, boundary))
 
 fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
                          failed_prefix_path, failed_prefix_ok,

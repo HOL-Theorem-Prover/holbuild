@@ -57,14 +57,6 @@ val analyser_gc_percent = 30
 fun analyser_runtime_args () =
   ["--minheap", Int.toString analyser_min_heap_mb, "--gcpercent", Int.toString analyser_gc_percent]
 
-fun has_suffix suffix s =
-  let
-    val n = size s
-    val m = size suffix
-  in
-    n >= m andalso String.substring(s, n - m, m) = suffix
-  end
-
 fun is_word_start c = Char.isAlpha c orelse c = #"_"
 fun is_word_char c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'"
 
@@ -81,10 +73,6 @@ fun insert_sorted item items =
           | GREATER => x :: insert_sorted item xs
 
 fun sort_unique items = List.foldl (fn (item, acc) => insert_sorted item acc) [] items
-
-fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
-
-fun absolute_path path = Path.isAbsolute path handle Path.InvalidArc => false
 
 fun read_all path =
   let
@@ -182,8 +170,6 @@ fun scan_word text start =
   in
     (String.substring(text, start, stop - start), stop)
   end
-
-fun theory_name s = has_suffix "Theory" s andalso size s > size "Theory"
 
 (* The dependency facts of a script's text in one pass: the literal after
    each `load` or `use`, and the literals of each `holbuild_extra_deps` or
@@ -701,19 +687,5 @@ fun prefetch_cached_with_hash requests =
   end
 
 fun extract path = extract_uncached path
-
-fun describe ({loads, uses, extra_deps, extra_outputs, holdep_mentions} : t) =
-  let
-    fun line label values =
-      case values of
-          [] => ()
-        | _ => print ("  " ^ label ^ ": " ^ String.concatWith ", " values ^ "\n")
-  in
-    line "loads" loads;
-    line "uses" uses;
-    line "extra deps" extra_deps;
-    line "extra outputs" extra_outputs;
-    line "Holdep mentions" holdep_mentions
-  end
 
 end

@@ -15,13 +15,7 @@ use_case_cache "$tmpdir/cache"
 project=$tmpdir/project
 mkdir -p "$project/data" "$project/scripts" "$project/src"
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "generated_source"
@@ -144,13 +138,7 @@ dep_project=$tmpdir/generator-dependency
 consumer_project=$tmpdir/generator-consumer
 mkdir -p "$dep_project/src" "$consumer_project/src"
 cat > "$dep_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "generator-dependency"
@@ -171,13 +159,7 @@ QED
 SML
 dep_rev=$(init_git_repo "$dep_project")
 cat > "$consumer_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [dependencies.generator-dependency]
 git = "$dep_project"
@@ -206,13 +188,7 @@ fi
 data_project=$tmpdir/generated-data-project
 mkdir -p "$data_project/src"
 cat > "$data_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "generated_data"
@@ -261,13 +237,7 @@ require_file "$data_project/.holbuild/obj/src/BTheory.dat"
 bad_project=$tmpdir/bad-project
 mkdir -p "$bad_project/scripts"
 cat > "$bad_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "bad_generated_source"
@@ -293,13 +263,7 @@ require_grep "did not produce declared output: gen/MissingScript.sml" "$bad_log"
 unknown_dep_project=$tmpdir/unknown-dep-project
 mkdir -p "$unknown_dep_project"
 cat > "$unknown_dep_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "unknown_dep"
@@ -323,13 +287,7 @@ require_grep "generator gen depends on unknown generator missing" "$unknown_dep_
 cycle_project=$tmpdir/cycle-project
 mkdir -p "$cycle_project"
 cat > "$cycle_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "cycle"
@@ -361,13 +319,7 @@ require_grep "generator dependency cycle" "$cycle_log"
 order_project=$tmpdir/order-project
 mkdir -p "$order_project/scripts" "$order_project/data" "$order_project/src"
 cat > "$order_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "generator_order"
