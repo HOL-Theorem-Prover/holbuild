@@ -12672,6 +12672,9 @@ fun cache_root_id path =
         SysWord.toString (Posix.FileSys.devToWord dev) ^ ":" ^
         SysWord.toString (Posix.FileSys.inoToWord ino)
 
+(* Where exec_action keeps copies of scratch inputs for later actions. *)
+fun scratch_store_dir cache = Path.concat (cache, "action-scratch")
+
 fun worker_cache_roots cache =
   let
     fun tree path = {id = fn () => cache_root_id path, measure = fn () => cache_root_bytes path}
@@ -12696,8 +12699,9 @@ fun worker_cache_roots cache =
 (* Evict least recently used families until the cache leaves reserve_bytes of
    room under limit_bytes. An action reuses a recent shared scan while the
    cache stays within limit_bytes, so the reserve absorbs growth between
-   evictions instead of every action waiting on one; private checkpoints are
-   always measured locally. Zero reserves scan live.  With refresh, as after
+   evictions instead of every action waiting on one; private checkpoints and
+   kept scratch inputs are always measured locally. Zero reserves scan live.
+   With refresh, as after
    an action's result, scan only when the stamp is past half its life and no other process holds
    gc.lock, so that busy hosts keep the stamp fresh and actions seldom wait
    on a scan.
@@ -12708,7 +12712,8 @@ fun worker_cache_roots cache =
    the stamp is fresh when files the cap can't evict hold the disk below it. *)
 fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes, min_free_bytes, refresh} =
   let
-    fun private_bytes () = cache_root_bytes checkpoint_root
+    (* This worker's own: its checkpoints and the scratch inputs it keeps. *)
+    fun private_bytes () = cache_root_bytes checkpoint_root + cache_root_bytes (scratch_store_dir cache)
     val roots = worker_cache_roots cache
     fun root_ids () = map (fn {id, ...} => id ()) roots
     fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
@@ -16197,35 +16202,94 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        local cache's blob itself, hard-linked: publish_blob checked its
        hash when it entered the cache, the linked file is made read-only, the
        sandbox lets no child chmod or link it, and nothing of holbuild's
-       writes through it (empty_writable only unlinks it).  Across file
-       systems (a worker container's action root beside a host-mounted
-       cache) it is a read-only copy of that blob, not checked again.
-       Without the blob it is fetched and copied as any spec blob, and
-       linked or copied from the next action on. *)
+       writes through it (empty_writable only unlinks it).
+       Across file systems (a worker container's action root beside a
+       host-mounted cache), or without the blob, it is a link to a read-only
+       copy of that blob kept beside the root, in scratch_store, which no
+       child can read: an action sees only the inputs its spec names.  A
+       later action links the kept copy again while it is a read-only
+       regular file of the blob's size:
+       only holbuild writes there, a copy reaches its name only whole
+       (copy_binary and fetch_blob rename it there) and is made read-only
+       after, so an interrupted one is not reused.  Without the blob, the
+       copy is fetched; when all that fails, the input is fetched into the
+       root as any spec blob. *)
+    val scratch_store = scratch_store_dir cache
+    val scratch_keep_limit = 8
     fun stage_scratch_input (spec : action_spec) =
       let
+        val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
+        val copied = ref 0
+        fun kept copy blob =
+          let
+            val st = Posix.FileSys.lstat copy
+          in
+            Posix.FileSys.ST.isReg st andalso
+            Posix.FileSys.S.toWord (Posix.FileSys.ST.mode st) mod 0w4096 = Posix.FileSys.S.toWord read_only andalso
+            Posix.FileSys.ST.size st = Posix.FileSys.ST.size (Posix.FileSys.stat blob)
+          end
+          handle OS.SysErr _ => false
         fun stage sha =
           let
             val path = FS.fullPath root ^ "/.holbuild/scratch/" ^ sha
             val blob = HolbuildCache.blob_path cache sha
-            val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
+            val copy = Path.concat (scratch_store, sha)
+            fun link old = (ensure_parent path; remove_file path; Posix.FileSys.link {old = old, new = path})
+            (* Set when this input is copied or fetched, counted once. *)
+            val fetched = ref false
+            fun keep_copy () =
+              (fetched := true;
+               ensure_dir scratch_store;
+               copy_binary blob copy
+               handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = copy}
+                    | IO.Io _ => fetch_spec_blob remote {hash = sha, dst = copy}
+                    | Error _ => fetch_spec_blob remote {hash = sha, dst = copy};
+               Posix.FileSys.chmod (copy, read_only))
           in
-            ((ensure_parent path;
-              remove_file path;
-              Posix.FileSys.link {old = blob, new = path}
-              handle e as OS.SysErr (_, err) =>
-                if err = SOME Posix.Error.xdev then copy_binary blob path else raise e;
-              (* The staged name: a blob installed over the cache's
-                 name meanwhile would be another inode. *)
-              Posix.FileSys.chmod (path, read_only);
+            ((link blob
+              (* The staged name: a blob installed over the cache's name
+                 meanwhile would be another inode. *)
+              before Posix.FileSys.chmod (path, read_only)
+              handle OS.SysErr _ => ((if kept copy blob then () else keep_copy ()); link copy);
+              HolbuildCache.touch copy;
               HolbuildCache.touch blob)
-             handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path}
-                  | IO.Io _ => fetch_spec_blob remote {hash = sha, dst = path}
-                  | Error _ => fetch_spec_blob remote {hash = sha, dst = path});
+             handle OS.SysErr _ => (fetched := true; fetch_spec_blob remote {hash = sha, dst = path})
+                  | IO.Io _ => (fetched := true; fetch_spec_blob remote {hash = sha, dst = path})
+                  | Error _ => (fetched := true; fetch_spec_blob remote {hash = sha, dst = path}));
+            if !fetched then copied := !copied + 1 else ();
             path
           end
+        (* The store keeps this action's inputs and then the most recently
+           used, up to scratch_keep_limit files; anything else in it goes,
+           each entry by its own name, links unfollowed.  An action's own
+           inputs beyond the limit go too: their links in the root keep
+           them for the action. *)
+        fun prune current =
+          let
+            val names = HolbuildBuildPlan.list_dir scratch_store handle HolbuildBuildPlan.Error _ => []
+            fun staged name =
+              HolbuildHash.valid_sha256 name andalso
+              (Posix.FileSys.ST.isReg (Posix.FileSys.lstat (Path.concat (scratch_store, name))) handle OS.SysErr _ => false)
+            fun mtime name = Time.toReal (FS.modTime (Path.concat (scratch_store, name))) handle OS.SysErr _ => 0.0
+            val others =
+              HolbuildBuildPlan.sort_pairs (fn (a, b) => Real.compare (#2 b, #2 a))
+                (map (fn name => (name, mtime name))
+                     (List.filter (fn name => staged name andalso not (List.exists (fn c => c = name) current)) names))
+            val current = List.take (current, Int.min (scratch_keep_limit, length current))
+            val room = scratch_keep_limit - length current
+            val keep = current @ map #1 (List.take (others, Int.min (room, length others)))
+          in
+            List.app (fn name => HolbuildRemoveTree.remove_untrusted (Path.concat (scratch_store, name)))
+              (List.filter (fn name => not (List.exists (fn k => k = name) keep)) names)
+          end
       in
-        scratch_input_paths := map stage (#scratch_inputs spec)
+        case #scratch_inputs spec of
+            [] => scratch_input_paths := []
+          | inputs =>
+              phase "scratch" (fn () =>
+                (scratch_input_paths := map stage inputs;
+                 prune (unique_strings inputs);
+                 phases := ("scratchcopyn", LargeInt.fromInt (!copied)) :: !phases))
       end
     val run_log = ref NONE
     fun build_log () =
