@@ -16653,7 +16653,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
       end
     (* Ahead of the late parents the claim named: built plain when none is
        late any more, and given up when the action is built already, since
-       the coordinator then finds it in the cache once its parents are. *)
+       the coordinator then finds it in the cache once its parents are.  An
+       entry too weak for the action's timeout contract isn't built already:
+       the action replaces it. *)
     and run_ahead spec tc pipelined =
       let
         fun dependency key =
@@ -16661,10 +16663,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               SOME dep => dep
             | NONE => reject_spec ("ahead parent " ^ key ^ " is not a dependency of the action")
         val named = map (fn {input_key, spec_sha256} => (dependency input_key, spec_sha256)) ahead_parents
-        fun cached key = Option.isSome (HolbuildRemoteCache.get_action remote key)
-        val _ = if cached (#input_key spec) then raise ActionFailed (AheadAbandoned, "the action is built already")
+        fun cached usable key = Option.isSome (HolbuildRemoteCache.get_action_using usable remote key)
+        val _ = if cached (manifest_timeout_satisfies false (#tactic_timeout spec)) (#input_key spec)
+                then raise ActionFailed (AheadAbandoned, "the action is built already")
                 else ()
-        val late = List.filter (fn (dep, _) => not (cached (#key dep))) named
+        (* A parent restores whatever its timeout contract. *)
+        val late = List.filter (fn (dep, _) => not (cached (fn _ => true) (#key dep))) named
       in
         if null late then run_plain spec tc false pipelined
         else if #check_only spec then
