@@ -1014,9 +1014,10 @@ names are supplied by the worker, defaulting to its hostname and process ID.
 These fields retain only the latest attempt, not its retry history.
 `held_by` and `held_since` are set while a ready build waits behind another
 batch's live lease of the same input key and spec (single-flight): that
-batch, and when it last claimed the key. Status and event streams read them
-on every read, so a hold that starts or ends, or a holder that claims again,
-after the action became ready reaches the stream on its next read.
+batch, and when it last claimed the key. Each status read and each event
+stream poll reports the hold as that read finds it: a later hold, a hold's end
+or the holder's next claim reaches the stream on its next poll, and a hold
+that starts and ends between two polls is never sent.
 `interruptions` counts the claims of the action given back without counting
 an attempt, up to `REMOTE_EXEC_MAX_INTERRUPTIONS`: those that ended
 `unavailable` (a worker drained or scaled in, or the cache was out) and those
