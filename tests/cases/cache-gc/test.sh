@@ -104,15 +104,42 @@ env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRE
   "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/post-drain-gc.log" 2>&1
 ! grep -q 'cache gc: locks:' "$tmpdir/post-drain-gc.log" ||
   { echo "GC scanned drained legacy lock directory" >&2; exit 1; }
+: > "$cache/locks/action-marker-check.lock"
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/marker-check-gc.log" 2>&1
+require_file "$cache/locks/action-marker-check.lock"
+! grep -q 'cache gc: locks:' "$tmpdir/marker-check-gc.log" ||
+  { echo "GC scanned after the drained marker" >&2; exit 1; }
+rm "$cache/locks/action-marker-check.lock"
 
 # A new obsolete action-lock directory changes locks/ link count and must make
-# the flat-lock stage run again despite the drained marker.
+# the flat-lock stage run again despite the drained marker. A held flat lock
+# in that rescan clears the marker so a later pass cannot skip it.
 mkdir "$cache/locks/action-obsolete-dir"
 touch -d '10 days ago' "$cache/locks/action-obsolete-dir"
+: > "$cache/locks/action-held-rescan.lock"
+python3 -c '
+import fcntl, os, sys, time
+with open(sys.argv[1], "r+") as lock:
+    fcntl.lockf(lock, fcntl.LOCK_EX)
+    open(sys.argv[2], "w").close()
+    time.sleep(120)
+' "$cache/locks/action-held-rescan.lock" "$tmpdir/legacy-rescan-held-ready" &
+legacy_holder=$!
+for _ in $(seq 100); do [[ -e "$tmpdir/legacy-rescan-held-ready" ]] && break; sleep 0.1; done
+require_file "$tmpdir/legacy-rescan-held-ready"
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
   "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/subdir-gc.log" 2>&1
 [[ ! -e "$cache/locks/action-obsolete-dir" ]] || { echo "obsolete action-lock directory survived" >&2; exit 1; }
+require_file "$cache/locks/action-held-rescan.lock"
+[[ ! -s "$cache/locks/gc.lock" ]] || { echo "drain marker survived a rescan with a held lock" >&2; exit 1; }
 require_grep 'cache gc: locks:' "$tmpdir/subdir-gc.log"
+kill "$legacy_holder"; wait "$legacy_holder" 2>/dev/null || true
+legacy_holder=
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/rescan-drain-gc.log" 2>&1
+[[ ! -e "$cache/locks/action-held-rescan.lock" ]] || { echo "rescan-held action lock survived after release" >&2; exit 1; }
+[[ -s "$cache/locks/gc.lock" ]] || { echo "drain marker missing after rescan lock release" >&2; exit 1; }
 kill "$holder"; wait "$holder" 2>/dev/null || true
 holder=
 require_file "$cache/action-locks/ab/ab-held.lock"

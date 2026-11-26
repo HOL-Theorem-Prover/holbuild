@@ -295,7 +295,7 @@ fun is_regular_entry path =
 (* Legacy action locks were flat in locks/. Since 0.14.87 they are dead, so
    regular files can be removed under their own fcntl lock. A nonempty gc.lock
    records that a conventional locks/ directory was drained. *)
-fun remove_obsolete_action_lock_dirs cutoff dir gc_lock_path mark_drained =
+fun remove_obsolete_action_lock_dirs cutoff dir gc_lock_path mark_drained clear_marker =
   let
     fun conventional_links () =
       (Posix.FileSys.ST.nlink (Posix.FileSys.stat dir) = 2 handle OS.SysErr _ => false)
@@ -316,7 +316,8 @@ fun remove_obsolete_action_lock_dirs cutoff dir gc_lock_path mark_drained =
           else
             ((removed, survived orelse entry_exists path), false)
         val (removed, survived) = gc_stage "locks" paths step (0, false)
-        val _ = if not survived andalso conventional_links () then mark_drained () else ()
+        val _ = if survived then clear_marker ()
+                else if conventional_links () then mark_drained () else ()
       in
         removed
       end
@@ -387,6 +388,9 @@ val flat_action_locks_drained = "holbuild-flat-action-locks-drained-v1\n"
 
 fun mark_flat_action_locks_drained (GcLock lock) =
   HolbuildFileLock.write_held lock flat_action_locks_drained
+
+fun clear_flat_action_locks_drained (GcLock lock) =
+  HolbuildFileLock.truncate_held lock
 
 fun gc_lock_owner () =
   String.concatWith "\n"
@@ -482,7 +486,8 @@ fun collect_root root days gc_lock : gc_counts =
     val modules = remove_stale_children "theory modules" cutoff (theory_modules_dir root)
     val analysis = remove_stale_children "analysis" cutoff (analysis_dir root)
     val locks = remove_obsolete_action_lock_dirs cutoff (locks_dir root) (gc_lock_path root)
-                  (fn () => mark_flat_action_locks_drained gc_lock) +
+                  (fn () => mark_flat_action_locks_drained gc_lock)
+                  (fn () => clear_flat_action_locks_drained gc_lock) +
                 remove_stale_action_locks cutoff (action_locks_dir root)
     val blob_paths = children (blobs_dir root)
     val candidates = stale_blob_candidates cutoff blob_paths

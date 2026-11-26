@@ -13,6 +13,15 @@ fun write_text path text = let val f = TextIO.openOut path fun close () = TextIO
 fun write_held (FileLock {fd, ...}) text =
   (ignore (Posix.IO.lseek (fd, Position.fromInt 0, Posix.IO.SEEK_SET));
    ignore (Posix.IO.writeVec (fd, Word8VectorSlice.full (Byte.stringToBytes text))))
+local
+  open Foreign
+  val ftruncate_call =
+    buildCall2 (getSymbol (loadExecutable ()) "ftruncate", (cInt, cLong), cInt)
+in
+  fun truncate_held (FileLock {fd, ...}) =
+    if ftruncate_call (SysWord.toInt (Posix.FileSys.fdToWord fd), 0) = 0 then ()
+    else raise Error "could not truncate held lock descriptor"
+end
 fun remove_file path = FS.remove path handle OS.SysErr _ => ()
 fun remove_tree path = HolbuildRemoveTree.remove path handle HolbuildRemoveTree.Error msg => raise Error msg
 fun remove_obsolete_lock_dir kind path =
