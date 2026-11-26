@@ -533,12 +533,17 @@ WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)
 ORDER BY theory, input_key
 """)
 
-# This batch's actions of :keys, read by primary key; see Coordinator.changes.
+# This batch's actions of :keys, a primary key probe per key; see Coordinator.changes. As `input_key = ANY(:keys)`,
+# PostgreSQL 17 scans the whole batch for a few hundred keys; OFFSET 0 keeps the planner from making the probe a join
+# it can reorder.
 ACTIONS_OF_KEYS = sa.text(f"""
-SELECT {ACTION_COLUMNS}
-FROM actions
-WHERE batch_id = (SELECT CAST(:batch_id AS uuid)) AND input_key = ANY(CAST(:keys AS text[]))
-ORDER BY theory, input_key
+SELECT a.* FROM unnest(CAST(:keys AS text[])) k (input_key) CROSS JOIN LATERAL (
+    SELECT {ACTION_COLUMNS}
+    FROM actions
+    WHERE batch_id = (SELECT CAST(:batch_id AS uuid)) AND input_key = k.input_key
+    OFFSET 0
+) a
+ORDER BY a.theory, a.input_key
 """)
 # This batch's ready builds that single-flight holds back behind another batch's live lease of the same key and spec
 # (see CLAIM_ACTION), each with the holding batch and when it claimed the key. It starts from the live leases, as
