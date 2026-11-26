@@ -46,15 +46,8 @@ export HOLBUILD_TEST_HOL_REV="$test_hol_rev"
 
 write_toolchain_manifest() {
   local manifest=$1
-  local hol_git=${HOLBUILD_TEST_HOL_GIT:-https://github.com/HOL-Theorem-Prover/HOL.git}
   cat > "$manifest" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "$hol_git"
-rev = "$test_hol_rev"
+$(write_schema2_prelude)
 
 [project]
 name = "holbuild-test-toolchain"

@@ -121,7 +121,7 @@ fun save ({file, entries, ...} : t) =
           val tmp = path ^ ".tmp"
           val output = TextIO.openOut tmp
         in
-          (TextIO.output (output, text); TextIO.closeOut output; OS.FileSys.rename {old = tmp, new = path})
+          (HolbuildBoundedOutput.text (output, text); TextIO.closeOut output; OS.FileSys.rename {old = tmp, new = path})
           handle e => (TextIO.closeOut output handle _ => (); remove_file tmp; raise e)
         end
 
@@ -136,6 +136,10 @@ fun put (t as {entries, wanted, ...} : t) path entry =
   locked t (fn () => (entries := Binarymap.insert (!entries, path, entry); wanted := Binaryset.add (!wanted, path)))
 
 fun theory t path = case find t path of SOME (Theory theory) => SOME theory | _ => NONE
+
+(* Drops the record at PATH, whose files are gone. *)
+fun forget (t as {entries, ...} : t) path =
+  locked t (fn () => entries := #1 (Binarymap.remove (!entries, path)) handle Binarymap.NotFound => ())
 
 (* The keys of the recorded theories and scratch stems. *)
 fun keys (t as {entries, ...} : t) =

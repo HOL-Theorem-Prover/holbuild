@@ -261,11 +261,41 @@ resumed() {
   fi
 }
 worker_modules=$worker/theory-modules
+# B's first run on W, whose store is empty, publishes a heap that loads
+# none of its cone's modules, and says how many it lacks.  With a store
+# that has them, the next B on W declines that heap, preloads afresh and
+# replaces it.  (The cone is small: tests lower the threshold to 1.)
+export HOLBUILD_TEST_MODULE_MIN_MISSING=1
+edit_b short
+exec_theory B short
+short_entry=$(grep -lx 'holbuild-shared-heap-v1' "$tmpdir"/remote/ac/*)
+short_missing=$(sed -n 's/^missing=//p' "$short_entry")
+[[ ${short_missing:-0} -ge 1 ]] && ! grep -q ' module ' "$short_entry" ||
+  { echo "the heap saved with an empty store isn't marked short:" >&2; cat "$short_entry" >&2; exit 1; }
+phase short-B "depsmissn:$short_missing"
+phase short-B 'rstdepskb:[1-9][0-9]*'
+cp "$short_entry" "$tmpdir/short.entry"
+# The checkpoint entries chained to the short heap, as published then.
+short_heap=$(awk '$1 ~ /^blob=/ && $2 == "heap" { print substr($1, 6) }' "$tmpdir/short.entry")
+mkdir "$tmpdir/short-checkpoints"
+for entry in $(grep -lx "blob=$short_heap heap.*" "$tmpdir"/remote/ac/*); do
+  [[ $entry == "$short_entry" ]] || cp "$entry" "$tmpdir/short-checkpoints/"
+done
+[[ -n $(ls "$tmpdir/short-checkpoints") ]] || { echo "no checkpoint entry names the short heap" >&2; exit 1; }
 exec_theory Z z unshared
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 server_log=$tmpdir/server/requests.log
 z_requests=$(wc -l < "$server_log")
+edit_b publish
 exec_theory B publish
+unset HOLBUILD_TEST_MODULE_MIN_MISSING
+phase publish-B 'rstheapdeclinen:1'
+phase publish-B 'depsmissn:0'
+grep -qx 'missing=0' "$short_entry" ||
+  { echo "the short heap's entry wasn't replaced:" >&2; cat "$short_entry" "$tmpdir/publish-B.log" >&2; exit 1; }
+declined() { find "$worker" -path '*/.declined-heaps/*' -type f; }
+[[ $(declined | wc -l) -eq 1 ]] ||
+  { echo "the preload over the declined heap wasn't recorded once:" >&2; declined >&2; exit 1; }
 published=$(find "$worker/checkpoint-store" -type f -name '[0-9a-f]*' -size +1M)
 modules=$(for heap in $published; do heap_modules "$heap"; done | { grep -- '-A-' || true; } | sort -u)
 [[ -n "$modules" ]] || { echo "no published heap loads A's module" >&2; exit 1; }
@@ -764,3 +794,38 @@ resumed proof-edit-B 'theorem-context checkpoint after b_first'
 # name.
 [[ $(find "$worker_modules" -name '*-A-*.pmo' | wc -l) == 2 ]] ||
   { echo "A's proof-only change didn't change ATheory.dat" >&2; exit 1; }
+
+# A cache in front of the store still serves B's short heap entry, and
+# the checkpoint entries chained to it, after the store's were replaced:
+# the run reads the store's past them, and resumes on the replacement.
+heap_key=${short_entry##*/}
+export HOLBUILD_TEST_MODULE_MIN_MISSING=1
+cp "$tmpdir/short.entry" "$tmpdir/control/ac-stale-$heap_key"
+for entry in "$tmpdir"/short-checkpoints/*; do
+  cp "$entry" "$tmpdir/control/ac-stale-${entry##*/}"
+done
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+edit_b stale-short
+exec_theory B stale-short
+grep -qx "$heap_key" "$tmpdir/control/no-cache-gets" && [[ ! -e "$tmpdir/control/ac-stale-$heap_key" ]] ||
+  { echo "stale-short-B didn't read the heap entry past the cache's copy" >&2; exit 1; }
+resumed stale-short-B 'theorem-context checkpoint after b_first'
+if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/stale-short-B.result"; then
+  echo "stale-short-B rejected a checkpoint entry the cache served stale" >&2; cat "$tmpdir/stale-short-B.log" >&2; exit 1
+fi
+rm -f "$tmpdir"/control/ac-stale-*
+# A host declines a short heap once: the store's entry is short again, and
+# the second run on W restores it as it is.
+for run in redeclined kept; do
+  cp "$tmpdir/short.entry" "$short_entry"
+  rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+  edit_b "$run"
+  exec_theory B "$run"
+done
+phase redeclined-B 'rstheapdeclinen:1'
+if grep -qE '^phase-ms=(.*,)?rstheapdeclinen:' "$tmpdir/kept-B.result"; then
+  echo "kept-B declined a heap W had declined already" >&2; cat "$tmpdir/kept-B.result" >&2; exit 1
+fi
+require_grep 'restored shared' "$tmpdir/kept-B.log"
+[[ $(declined | wc -l) -eq 1 ]] ||
+  { echo "W recorded the declined heap again:" >&2; declined >&2; exit 1; }

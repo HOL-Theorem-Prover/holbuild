@@ -254,6 +254,11 @@ expect b 0 "status=built"
 grep -qE '^phase-ms=(.*,)?outlined:1(,|$)' "$tmpdir/b.result" || {
   echo "B did not start on A's outline:" >&2; cat "$tmpdir/b.result" "$tmpdir/b.log" >&2; exit 1
 }
+# How long B, its run done, waited for A's final entry: some time, since
+# A's proof pauses well past B's run.
+grep -qE '^phase-ms=(.*,)?finalswait:[1-9][0-9]*(,|$)' "$tmpdir/b.result" || {
+  echo "B's result lacks its wait for A's final entry:" >&2; cat "$tmpdir/b.result" >&2; exit 1
+}
 
 # P starts on O's outline, which lacks the oracle O's proof makes: P is
 # given up and publishes nothing.  Q, also on O's outline, is given up when
@@ -274,6 +279,8 @@ expect o 0 "status=built"
 worker_wait p
 expect p 3 "status=failed" "failure=ahead-abandoned"
 require_grep 'the outline of pipe:OTheory failed the gate: digest differs' "$tmpdir/p.log"
+# Given up after its wait for O's final entry, P still reports the wait.
+phase p finalswait || { echo "P's result lacks its wait for O's final entry:" >&2; cat "$tmpdir/p.result" >&2; exit 1; }
 [[ ! -e "$tmpdir/remote/ac/$(ac_of "$key_P")" ]] || { echo "P published on a failed gate" >&2; exit 1; }
 worker plain-p "$spec_P"
 expect plain-p 0 "status=built"

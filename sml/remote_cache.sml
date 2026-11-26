@@ -92,7 +92,7 @@ fun write_text path text =
       handle e => raise Error ("could not write " ^ path ^ ": " ^ General.exnMessage e)
     fun close () = TextIO.closeOut output handle _ => ()
   in
-    (TextIO.output(output, text); TextIO.closeOut output)
+    (HolbuildBoundedOutput.text (output, text); TextIO.closeOut output)
     handle e => (close (); raise e)
   end
 
@@ -156,7 +156,7 @@ fun warn_restore_once message =
     val _ = Mutex.unlock restore_warning_mutex
   in
     if emit then
-      (TextIO.output (TextIO.stdErr, "holbuild: warning: remote cache restore failed: " ^ message ^ "\n");
+      (HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: warning: remote cache restore failed: " ^ message ^ "\n");
        TextIO.flushOut TextIO.stdErr)
     else ()
   end
@@ -304,7 +304,7 @@ fun record_transport_outcome (generation, probe) result =
   in
     case (tripped, recovered, result) of
         (true, _, HolbuildHttp.Failed message) =>
-          (TextIO.output (TextIO.stdErr,
+          (HolbuildBoundedOutput.text (TextIO.stdErr,
              "holbuild: warning: remote cache disabled for 60 seconds after " ^
              (if probe then "a recovery probe failed"
               else Int.toString max_consecutive_transport_failures ^
@@ -312,7 +312,7 @@ fun record_transport_outcome (generation, probe) result =
              "; the last: " ^ message ^ "\n");
            TextIO.flushOut TextIO.stdErr)
       | (_, true, _) =>
-          (TextIO.output (TextIO.stdErr, "holbuild: remote cache available again\n");
+          (HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: remote cache available again\n");
            TextIO.flushOut TextIO.stdErr)
       | _ => ()
   end
@@ -624,7 +624,7 @@ fun retrying_one_node method urls attempt =
                 case delays of
                     delay :: rest =>
                       if transient result andalso !retry_one_node andalso fits delay then
-                        (TextIO.output (TextIO.stdErr,
+                        (HolbuildBoundedOutput.text (TextIO.stdErr,
                            "holbuild: remote cache " ^ method ^ " " ^ redact_userinfo url ^ " " ^
                            (case result of
                                 HolbuildHttp.Failed message => "got no answer: " ^ message
@@ -815,14 +815,23 @@ fun metadata_text manifest blobs =
 
 (* An action's metadata, without recording its blobs as present: a caller
    that may not use the manifest records them with remember_action.  The
-   lookup passes over a node whose manifest fails `usable`, as for a 404. *)
+   lookup passes over a node whose manifest fails `usable`, as for a 404.
+   A lookup that passed over one and found nothing better, a miss or a
+   failure, asks once more, revalidating: a cache in front of the shared
+   store may still serve an entry the store has since replaced with a
+   usable one. *)
 fun fetch_action_using usable cache key =
   let
     val tmp = temp_path "action"
     fun cleanup () = remove_file tmp
-    fun usable_body path = usable (#manifest (metadata_manifest (read_text path))) handle _ => true
+    val passed_over = ref false
+    fun usable_body path =
+      let val ok = usable (#manifest (metadata_manifest (read_text path))) handle _ => true
+      in if ok then () else passed_over := true; ok end
     val get =
       if reads_revalidate () then get_status_with_headers ["Cache-Control: no-cache"] else get_status
+    fun again () = !passed_over andalso not (reads_revalidate ())
+    fun revalidated () = revalidating (fn () => fetch_action_using usable cache key)
   in
     case curl_get_urls_by get usable_body {urls = action_urls cache key, dst = tmp, timeout = stall_timeout_seconds} of
         HolbuildCacheBackend.Hit =>
@@ -831,9 +840,9 @@ fun fetch_action_using usable cache key =
             cleanup ();
             SOME action
           end
-      | HolbuildCacheBackend.Miss => (cleanup (); NONE)
+      | HolbuildCacheBackend.Miss => (cleanup (); if again () then revalidated () else NONE)
       | HolbuildCacheBackend.Corrupt message =>
-          (cleanup (); warn_restore_once message; NONE)
+          (cleanup (); if again () then revalidated () else (warn_restore_once message; NONE))
   end
   handle e as Unavailable _ => raise e
        | _ => NONE

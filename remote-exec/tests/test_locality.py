@@ -2,6 +2,7 @@
 (deps-key) the host holds; see Coordinator._local_entry."""
 
 import asyncio
+import logging
 from collections.abc import Callable
 from datetime import timedelta
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from conftest import FakeCache
-from test_coordinator import CLIENT, WORKER, ac_key, complete, input_key, result, spec, submit
+from test_coordinator import CLIENT, WORKER, ac_key, complete, contention_lines, input_key, result, spec, submit
 
 from remote_exec import coordinator as coordinator_module
 from remote_exec.coordinator import Coordinator, HostReport, _claim_rank
@@ -304,6 +305,53 @@ async def test_claims_count_what_their_host_held_of_the_theory(
     assert {k: queue["locality"][k] for k in ["hit_theory", "hit_deps", "missed_held", "unheld"]} == {
         "hit_theory": 1, "hit_deps": 1, "missed_held": 1, "unheld": 1
     }
+
+
+async def test_a_build_held_for_another_host_is_no_competitor_of_the_claim_that_left_it(
+    http: httpx.AsyncClient,
+    cache: FakeCache,
+    coordinator: Coordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A claim from cold host-3 can't take ``b1``, held for host-1, so no contention line names it."""
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 1.0)
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await submit_as(http, "b1", "b")
+    await submit_as(http, "a1", "a")
+    assert await contention_lines(coordinator, caplog) == []
+
+    cold = await claim_on(http, "host-3")
+
+    assert cold is not None and cold["theory"] == "pkg:a"
+    assert await contention_lines(coordinator, caplog) == []
+
+
+async def test_a_build_a_claim_would_leave_for_another_host_is_no_competitor_of_the_build_it_takes_first(
+    http: httpx.AsyncClient,
+    cache: FakeCache,
+    coordinator: Coordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A claim from cold host-3 takes ``a1``, of a higher priority, before it reaches ``b1``, which it would leave to
+    host-1: ``b1`` contests nothing, until host-1 claims and only ``b1`` is left."""
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 1.0)
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await run_on(http, cache, "host-1", "b0", "b", D1)
+    await submit_as(http, "b1", "b")
+    await submit_as(http, "a1", "a", priority=1)
+
+    cold = await claim_on(http, "host-3")
+
+    assert cold is not None and cold["theory"] == "pkg:a"
+    assert await contention_lines(coordinator, caplog) == []
+    await submit_as(http, "c1", "c")
+    warm = await claim_on(http, "host-1")
+    assert warm is not None and warm["theory"] == "pkg:b"
+    (line,) = await contention_lines(coordinator, caplog)
+    assert ",pkg:c,p0," in line, line
 
 
 @pytest.mark.parametrize("locality", [True, False])

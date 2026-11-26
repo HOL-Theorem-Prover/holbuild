@@ -1179,6 +1179,16 @@ holbuild build --skip-checkpoints MyTheory
   remote execution, the log limit uses the worker's environment.
 - `--skip-proof-steps` opts out of proof-step execution.
 - `--skip-checkpoints` disables checkpoint `.save`/`.ok` creation.
+- `--no-checkpoint-saves` resumes from saved checkpoints and failed prefixes
+  as usual, locally and on remote workers, but saves, removes and publishes
+  none: the project's checkpoint tree, the host's deps heap store and the
+  shared heaps stay as they were, and neither checkpoint budget eviction nor
+  automatic GC runs. It is for throwaway builds, such as experiments or
+  scratch copies, that must not replace a project's resume state. A checkpoint that cannot be resumed
+  is kept, and the theory runs again restoring none. With
+  `--skip-checkpoints` nothing is restored either; it combines with
+  `--check-only`, and excludes `--repl-on-failure`, whose REPL starts from the
+  checkpoints a failure saves. No cache or action key depends on it.
 - Checkpoints are restored in every theory included by `--proof-scope`
   (root-package theories by default). The build's requested targets (the
   default targets when none are given, or every root-package theory when
@@ -1744,6 +1754,7 @@ option checkpoint-target=true      (only for a theory that saves checkpoints as 
 option skip-checkpoints=true      (when checkpoint reuse is disabled)
 option promote-preload=true       (only for a theory of `check`'s prebuild)
 option check-only=true            (only for a target of `build --check-only`)
+option no-checkpoint-saves=true   (only under `build --no-checkpoint-saves`)
 option force=true                 (only for a forced theory)
 option trace-steps=true            (only for a traced theory)
 option pipeline=true               (only for a theory that may build pipelined)
@@ -1788,7 +1799,13 @@ action-text
   deps heap, context checkpoint or tool cache. A failed proof still publishes
   its failed prefix. An entry or early-cutoff pair already in the cache that
   restores and fits the parent outputs passes it without HOL, and it never
-  loads ahead of its parents.
+  loads ahead of its parents. Unless it is forced, or a dependency's `.sml`
+  carries no `.dat` hash, its dependencies are installed only when it would
+  start from a fresh preload rather than a checkpoint, or passes on a cached
+  entry or early-cutoff pair: a heap that loaded them spares the install.
+- `no-checkpoint-saves` defaults to false; with it, the worker restores
+  shared checkpoints as usual, but its run saves none, and it publishes no
+  deps heap, checkpoint, failed prefix or checkpoint index.
 
 ### Exporting script runs for remote execution
 
@@ -1977,7 +1994,7 @@ left, and warns for each lost one. After HOL exits, built or failed, the
 worker publishes the directory again if its files changed or the entry lost a
 blob, uploading every file, which renews each blob the entry names in a store
 that expires them (a later restore heals an entry whose blob expired first):
-at most 16 regular files, 64 MiB in all, with names of letters, digits,
+at most 16 regular files, 256 MiB in all, with names of letters, digits,
 `.`, `_` and `-`. An entry that can't be restored otherwise, or a directory
 that breaks these limits, only warns: the action goes on without the tool
 cache. The newest publication replaces the
@@ -2106,7 +2123,9 @@ their parents; two of them are counts, not times: `hydstatn` the cache
 manifests trusted on their recorded stat, `hydinstn` the dependencies the
 check sent to `hydinst`), `cutoff` (whether an earlier build stands), `analyse`
 (the script's proof steps and checkpoints), `restore` (shared
-checkpoints), `toolrestore` (the tool cache), `hol`, `publish` (shared
+checkpoints), `toolrestore` (the tool cache), `scratch` (staging the
+`--scratch-input` files, followed by the count `scratchcopyn` of those copied
+or fetched, 0 when each was linked), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
 checks) and `log`; stderr ends with the same times and `wall`.
 `peak-rss-mb` is the HOL process's peak resident memory, reported once the
@@ -2464,7 +2483,9 @@ The coordinator's protocol, in what holbuild uses of it:
   interrupted attempt, keeps the log an earlier attempt uploaded. An action
   retried after a failure is printed as
   `waiting (<failure>), attempts <n>, tier <tier>, log /cas/<sha>`, and
-  likewise when ready and running. A stream may start over: it
+  likewise when ready and running. A ready build that another batch's build of
+  the same input key and spec holds back carries `held_by` and `held_since`;
+  holbuild prints `held by batch <held_by> since <held_since>` once per hold. A stream may start over: it
   sends every action's current state first.
   A skipped dependent uses the existing action state `cancelled` with
   `last_failure` beginning `skipped because of `; its reason names the failed
@@ -2563,7 +2584,7 @@ writes:
 holbuild --remote-cache https://cache.example.org run-action \
   --remote-exec https://exec.example.org [--remote-only] --outputs-dir out \
   [--profile P] --script run.sml [--support F]... [--load L]... --output N... \
-  [--option timeout=SECONDS] [--closure] TARGET...
+  [--option timeout=SECONDS] [--closure] [--held FILE] TARGET...
 ```
 
 The project write lock covers planning, cache checks, and spec export. It
@@ -2606,7 +2627,7 @@ output names, so the same run is done once. The command:
 6. Prints one line per run on stdout, in the targets' order:
 
    ```text
-   <context> <run_key> done|cached|failed <class>|missing
+   <context> <run_key> done|cached|failed <class>|missing|held
    ```
 
    `failed` gives the run's failure class: `script` (the script raised or
@@ -2627,10 +2648,15 @@ submitting anything, so it needs no `--remote-exec`. Runs never execute
 locally: without `--remote-exec` or one of `--fetch-only` and
 `--export-only`, the command is a usage error.
 
+`--held FILE` names run keys, one per line, whose outputs the caller already
+has, such as a cache of earlier fetches: those runs print `held` and are
+neither checked in the remote cache, submitted nor fetched, so `D` gets no
+directory for them.
+
 Exit status:
 
-- 0 when every run ended `done`, `cached` or `failed` (a failed script is a
-  result); with `--fetch-only`, also when some are `missing`.
+- 0 when every run ended `done`, `cached`, `failed` (a failed script is a
+  result) or `held`; with `--fetch-only`, also when some are `missing`.
 - 75 (`EX_TEMPFAIL`) when the coordinator can't take or finish the batch:
   the export or upload fails, the submission is refused or the coordinator
   unreachable, the event stream is lost (the batch is left running, so its
@@ -2727,6 +2753,10 @@ Repository tests resolve the schema 2 HOL toolchain cache automatically:
 ```sh
 make test
 ```
+
+On Linux the suite needs `strace`, which the `bounded-writes` case uses to
+check the size of every file write; the case skips without OpenSSL 3's
+`libcrypto`, without which holbuild links cached blobs instead of copying them.
 
 The runner sets `HOLBUILD_PLAN_RECORD=check` unless it is already set, so
 every build in the suite that plans from a plan record is also checked

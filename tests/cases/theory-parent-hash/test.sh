@@ -130,13 +130,7 @@ grep -q "parent-hash parser unit tests passed" "$tmpdir/parent-hash-parser-test.
 project=$tmpdir/project
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "parenthash"
@@ -314,13 +308,7 @@ require_grep "BTheory built" "$replaced_child_log"
 ordering_project=$tmpdir/ordering-project
 mkdir -p "$ordering_project/src"
 cat > "$ordering_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "ordering-parent-hash"
@@ -380,13 +368,7 @@ PY
 nondet_project=$tmpdir/nondet-project
 mkdir -p "$nondet_project/src"
 cat > "$nondet_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "nondet-parent-hash"

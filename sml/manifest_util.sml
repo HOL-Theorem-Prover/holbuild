@@ -3,7 +3,7 @@ struct
 
 exception Error of string
 fun die msg = raise Error msg
-fun warn msg = TextIO.output(TextIO.stdErr, "holbuild: warning: " ^ msg ^ "\n")
+fun warn msg = HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: warning: " ^ msg ^ "\n")
 
 structure Path = OS.Path
 structure FS = OS.FileSys

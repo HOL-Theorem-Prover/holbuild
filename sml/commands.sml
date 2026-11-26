@@ -107,6 +107,9 @@ fun build_help () = print
   \  --allow-cache-timeout-discrepancy\n\
   \  --no-stat-cache\n\
   \  --skip-checkpoints\n\
+  \  --no-checkpoint-saves\n\
+  \      Resume from checkpoints as usual, but save, remove and publish none, so\n\
+  \      the project's checkpoints stay as they were. Excludes --repl-on-failure.\n\
   \  --checkpoint-seconds SECONDS (default: 2)\n\
   \      Save a theorem or definition context only once SECONDS, and ten times\n\
   \      the last such save's duration, have passed since that save; 0 saves\n\
@@ -370,8 +373,8 @@ fun run_action_help () = print
   \outputs are fetched into D/PACKAGE/THEORY (D/HOL/THEORY for a toolchain\n\
   \theory), beside KEY (the run key) and CONTEXT. Failed runs fetch LOG when\n\
   \available; a missing log warns without changing the run failure. A line is\n\
-  \printed: `CONTEXT RUN-KEY done|cached|failed CLASS|missing`. Runs never\n\
-  \execute locally.\n\n\
+  \printed: `CONTEXT RUN-KEY done|cached|failed CLASS|missing|held`. Runs\n\
+  \never execute locally.\n\n\
   \A TARGET is a project theory (a logical name as build takes, or\n\
   \PACKAGE:NAME), a theory of the HOL toolchain (hol:bool or hol:boolTheory),\n\
   \or hol:* for every theory of the toolchain. A project theory must be built\n\
@@ -387,9 +390,11 @@ fun run_action_help () = print
   \--remote-only   Exit 75, not 1, when no --remote-exec is given.\n\
   \--fetch-only    Fetch what the remote cache holds; submit nothing.\n\
   \--export-only   Only write and upload each run's spec and print\n\
-  \                `CONTEXT RUN-KEY SPEC-SHA256`.\n\n\
-  \Exits 0 when every run ended (done, cached, failed or, with --fetch-only,\n\
-  \missing), 75 when the coordinator can't take or finish the batch or an\n\
+  \                `CONTEXT RUN-KEY SPEC-SHA256`.\n\
+  \--held FILE     Run keys, one per line, whose outputs the caller already\n\
+  \                has: those runs are held, neither run nor fetched.\n\n\
+  \Exits 0 when every run ended (done, cached, failed, held or, with\n\
+  \--fetch-only, missing), 75 when the coordinator can't take or finish the batch or an\n\
   \ended run can't be fetched, and 1 on errors, a cancelled batch, or a\n\
   \TARGET that isn't built.\n\n\
   \Takes build's cache options. Needs --remote-cache.\n\n\
@@ -504,6 +509,8 @@ fun split_flags args =
       extract_flag "--all-checkpoints" args_without_allow_discrepancy
     val (fail_fast, args_without_fail_fast) = extract_flag "--fail-fast" args_without_all_checkpoints
     val (check_only, args_without_check_only) = extract_flag "--check-only" args_without_fail_fast
+    val (no_checkpoint_saves, args_without_no_checkpoint_saves) =
+      extract_flag "--no-checkpoint-saves" args_without_check_only
     fun extract_checkpoint_seconds seconds acc xs =
       case xs of
           [] => (seconds, rev acc)
@@ -517,7 +524,7 @@ fun split_flags args =
                 acc ys
             else extract_checkpoint_seconds seconds (y :: acc) ys
     val (checkpoint_seconds, args_without_checkpoint_seconds) =
-      extract_checkpoint_seconds HolbuildBuildExec.default_checkpoint_seconds [] args_without_check_only
+      extract_checkpoint_seconds HolbuildBuildExec.default_checkpoint_seconds [] args_without_no_checkpoint_saves
     fun extract_heavy_tactic_timeout timeout acc xs =
       case xs of
           [] => (timeout, rev acc)
@@ -538,6 +545,7 @@ fun split_flags args =
                   verify_cache = verify_cache,
                   no_stat_cache = no_stat_cache,
                   skip_checkpoints = skip_checkpoints,
+                  no_checkpoint_saves = no_checkpoint_saves,
                   checkpoint_seconds = checkpoint_seconds,
                   fail_fast = fail_fast, all_checkpoints = all_checkpoints,
                   proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
@@ -633,7 +641,7 @@ fun split_flags args =
 fun plain_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = true, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
+    skip_checkpoints = true, no_checkpoint_saves = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
     fail_fast = false, all_checkpoints = false, proof_steps = false, new_ir = false,
     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
     tactic_timeout = NONE, tactic_timeout_set = false, heavy_tactic_timeout = NONE,
@@ -649,7 +657,7 @@ fun plain_build_request targets =
 fun heap_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
+    skip_checkpoints = false, no_checkpoint_saves = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
     fail_fast = false, all_checkpoints = false, proof_steps = false, new_ir = false,
     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
     tactic_timeout = NONE, tactic_timeout_set = false, heavy_tactic_timeout = NONE,
@@ -818,7 +826,7 @@ fun proof_unit_names kind source =
 
 fun write_text_file path text =
   let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+  in HolbuildBoundedOutput.text (out, text); TextIO.closeOut out end
 
 fun run_analyser_for_proof_ir_text {name, tactic_start, tactic_end, tactic_text} =
   case HolbuildDependencies.current_analyser_path () of
@@ -941,7 +949,7 @@ fun analyser_proof_ir_plan_for_unit (unit : execution_plan_unit) =
   end
 
 fun print_static_execution_plan project new_ir source theorem unit_opt =
-  (print (let
+  (HolbuildBoundedOutput.print (let
             val unit = case unit_opt of SOME value => value | NONE => raise Error "internal error: missing proof-IR unit"
             val plan = analyser_proof_ir_plan_for_unit unit
           in
@@ -1248,11 +1256,11 @@ datatype build_mode =
   | ExportActionSpecs of {upload : bool}
   | ExportRunSpecs of HolbuildBuildExec.run_request
   | RemoteRun of {request : HolbuildBuildExec.run_request, url : string option, fetch_only : bool,
-                  outputs_dir : string, profile : string option}
+                  outputs_dir : string, profile : string option, held : string list}
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int,
                    speculative_loading : int option}
 
-fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, checkpoint_seconds, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, heavy_tactic_timeout, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, promote_preload, check_only}, targets) =
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, no_checkpoint_saves, checkpoint_seconds, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, heavy_tactic_timeout, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, promote_preload, check_only}, targets) =
   let
     val project =
       case prepared of
@@ -1287,6 +1295,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         raise Error "--json does not support --repl-on-failure"
       else if skip_checkpoints andalso repl_on_failure then
         raise Error "--repl-on-failure requires checkpoints; remove --skip-checkpoints"
+      else if no_checkpoint_saves andalso repl_on_failure then
+        raise Error "--repl-on-failure starts from the checkpoints a failure saves; remove --no-checkpoint-saves"
       else if not proof_steps andalso new_ir then
         raise Error "proof steps are required for proof IR; remove --skip-proof-steps"
       else if not proof_steps andalso tactic_timeout_set then
@@ -1330,6 +1340,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        fail_fast = fail_fast,
        all_checkpoints = all_checkpoints,
        skip_checkpoints = skip_checkpoints,
+       no_checkpoint_saves = no_checkpoint_saves,
        checkpoint_seconds = checkpoint_seconds,
        proof_steps = proof_steps,
        new_ir = new_ir,
@@ -1652,7 +1663,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
       let val ({plan, toolchain_key, ...}, build_options, keys) = plan_build ()
       in
         timed_phase "action_spec.export"
-          (fn () => print (#batch (HolbuildBuildExec.export_action_specs build_options tc project plan (keys ()) toolchain_key jobs
+          (fn () => HolbuildBoundedOutput.print (#batch (HolbuildBuildExec.export_action_specs build_options tc project plan (keys ()) toolchain_key jobs
                              {upload = upload, keep_specs = true, local_resumable = false, forced = [], skip = [], defer = false,
                               publish = [], ledger = false})))
       end
@@ -1677,12 +1688,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
     (* Runs the request's runs the remote cache lacks on remote workers, as
        one batch, then fetches every run's outputs into outputs_dir and
        prints a line per run.  A run never runs here. *)
-    fun remote_run {request, url, fetch_only, outputs_dir, profile} () =
+    fun remote_run {request, url, fetch_only, outputs_dir, profile, held} () =
       let
         val outputs = #outputs request
         fun run_keys runs = Binaryset.addList (Binaryset.empty String.compare,
                                                map (fn ({run_key, ...} : HolbuildBuildExec.run) => run_key) runs)
         fun has keys ({run_key, ...} : HolbuildBuildExec.run) = Binaryset.member (keys, run_key)
+        val held_keys = Binaryset.addList (Binaryset.empty String.compare, held)
         (* Why the runs didn't all end, and whether a later try may succeed. *)
         val stopped : (string * bool) option ref = ref NONE
         val (remote, runs, uncached, {exported, refused}) =
@@ -1698,7 +1710,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     HolbuildBuildExec.failing_on_pool remote jobs "checking remote cache" "runs"
                       (fn remote => fn ({run_key, ...} : HolbuildBuildExec.run) =>
                           HolbuildBuildExec.run_already_done remote run_key outputs)
-                      runs
+                      (List.filter (not o has held_keys) runs)
                 val exported =
                   case (uncached, url) of
                       ([], _) => {exported = [], refused = []}
@@ -1760,12 +1772,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val ended =
           map (fn run =>
                   (run,
-                   if fetch_only orelse not (has uncached_keys run) then "cached"
+                   if has held_keys run then "held"
+                   else if fetch_only orelse not (has uncached_keys run) then "cached"
                    else if has refused_keys run then "missing"
                    else ended_as run))
               runs
         val to_fetch = List.mapPartial (fn (run, status) =>
-                                           if status <> "missing" then SOME run else NONE)
+                                           if status <> "missing" andalso status <> "held" then SOME run
+                                           else NONE)
                                        ended
         (* A fetch that raises (an output directory it can't write, say)
            counts as not fetched; its error is raised once every line is out. *)
@@ -2662,6 +2676,7 @@ fun run_action_command tc cli_jobs args =
     val loads = ref []
     val outputs = ref []
     val timeout = ref NONE
+    val held = ref NONE
     fun push r x = r := !r @ [x]
     fun once flag r value =
       case !r of
@@ -2684,7 +2699,7 @@ fun run_action_command tc cli_jobs args =
       else raise Error ("run-action: --profile takes letters, digits, '.', '_' and '-', got " ^
                         HolbuildHash.quote text)
     val valued = ["--script", "--support", "--load", "--output", "--option", "--remote-exec",
-                  "--outputs-dir", "--profile"]
+                  "--outputs-dir", "--profile", "--held"]
     fun parse args =
       case args of
           [] => []
@@ -2704,6 +2719,7 @@ fun run_action_command tc cli_jobs args =
                    | "--option" => timeout := SOME (timeout_option value)
                    | "--remote-exec" => once flag url value
                    | "--outputs-dir" => once flag outputs_dir value
+                   | "--held" => once flag held value
                    | _ => once flag profile (profile_name value);
                parse rest)
             else flag :: parse (value :: rest)
@@ -2725,8 +2741,8 @@ fun run_action_command tc cli_jobs args =
         raise Error "run-action does not check proof steps: remove --tactic-timeout, --heavy-tactic-timeout, --proof-scope=all and --new-ir"
       else if !export_only andalso
               (!fetch_only orelse !remote_only orelse Option.isSome (!url) orelse
-               Option.isSome (!outputs_dir) orelse Option.isSome (!profile)) then
-        raise Error "run-action --export-only takes none of --fetch-only, --remote-exec, --remote-only, --outputs-dir and --profile"
+               Option.isSome (!outputs_dir) orelse Option.isSome (!profile) orelse Option.isSome (!held)) then
+        raise Error "run-action --export-only takes none of --fetch-only, --remote-exec, --remote-only, --outputs-dir, --profile and --held"
       else if not (!export_only orelse !fetch_only orelse Option.isSome (!url)) then
         if !remote_only then
           (HolbuildHolSharedCache.local_build_needed := true;
@@ -2750,7 +2766,12 @@ fun run_action_command tc cli_jobs args =
       else
         RemoteRun {request = request, url = !url, fetch_only = !fetch_only,
                    outputs_dir = OS.Path.mkAbsolute {path = valOf (!outputs_dir), relativeTo = OS.FileSys.getDir ()},
-                   profile = !profile}
+                   profile = !profile,
+                   held = case !held of
+                              NONE => []
+                            | SOME path =>
+                                String.tokens Char.isSpace (read_text path)
+                                handle IO.Io _ => raise Error ("run-action: could not read --held " ^ path)}
   in
     build_once_with_prepared_mode mode tc cli_jobs NONE
       (flags, HolbuildBuildExec.run_planning_targets request)
@@ -2926,7 +2947,11 @@ fun build tc cli_jobs args =
     val (speculative_loading, args) = split_speculative_loading args
     val args = split_scratch_input_flag (split_tool_cache_flag args)
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
-    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, check_only, ...}, _) = split_flags args
+    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, check_only, no_checkpoint_saves, ...}, _) =
+      split_flags args
+    (* Automatic GC evicts and reindexes checkpoints, which a build under
+       --no-checkpoint-saves leaves as they were. *)
+    val gc_after = not dry_run andalso not no_checkpoint_saves
     val _ =
       if watch andalso HolbuildStatus.json_mode () then
         raise Error "--json does not support build --watch yet"
@@ -2957,12 +2982,12 @@ fun build tc cli_jobs args =
              (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach, priority = priority,
                           speculative_loading = speculative_loading})
              tc cli_jobs NONE parsed;
-           if detach then () else auto_gc (SOME o load_project))
+           if detach orelse not gc_after then () else auto_gc (SOME o load_project))
       | NONE =>
           if watch then build_watch tc cli_jobs parsed
           else
             (build_once tc cli_jobs parsed;
-             if dry_run then () else auto_gc (SOME o load_project))
+             if gc_after then auto_gc (SOME o load_project) else ())
   end
 
 fun chomp text =
@@ -3072,7 +3097,7 @@ fun default_build_options trknl project index entry_plan plan =
      verify_cache = true,
      force = HolbuildBuildExec.ForceNone,
      force_targets = [], checkpoint_targets = [], check_only_targets = [],
-     skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
+     skip_checkpoints = false, no_checkpoint_saves = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
      proof_steps = true,
      new_ir = true,
      proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
@@ -3121,7 +3146,7 @@ fun heap_build_options trknl =
    verify_cache = true,
    force = HolbuildBuildExec.ForceNone,
    force_targets = [], checkpoint_targets = [], check_only_targets = [],
-   skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
+   skip_checkpoints = false, no_checkpoint_saves = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
    proof_steps = false,
    new_ir = false,
    proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
@@ -4121,7 +4146,7 @@ fun check_stored_data tc cli_jobs build_mode selections {project, index, compone
             in summaries := Redblackmap.insert (!summaries, thy, summary); summary end
     fun qualified thy name = thy ^ "Theory." ^ name
     fun count n noun = Int.toString n ^ " " ^ noun ^ (if n = 1 then "" else "s")
-    fun out s = (TextIO.output (TextIO.stdOut, s ^ "\n"); TextIO.flushOut TextIO.stdOut)
+    fun out s = (HolbuildBoundedOutput.text (TextIO.stdOut, s ^ "\n"); TextIO.flushOut TextIO.stdOut)
     fun check (logical_name, {theory = _, theorem}) =
       let
         val thy = HolbuildBuildExec.theory_name_from_logical logical_name

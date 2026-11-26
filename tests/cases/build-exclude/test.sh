@@ -15,13 +15,7 @@ use_case_cache "$tmpdir/cache"
 project=$tmpdir/project
 mkdir -p "$project/src/a" "$project/src/b" "$project/deprecated/src/a"
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "exclude"
@@ -83,13 +77,7 @@ if grep -q "selftest\|Generated\|MachineOnly" "$tmpdir/local-glob-dry.log"; then
 fi
 
 cat > "$project/deprecated/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "deprecated-exclude"

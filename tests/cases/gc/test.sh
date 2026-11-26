@@ -25,13 +25,7 @@ mkdir -p \
   "$cache/theory-modules"
 
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "gc"
@@ -86,13 +80,7 @@ index_budget_project=$tmpdir/index-budget-project
 index_budget_family="$index_budget_project/.holbuild/checkpoints/index-budget/src/OldScript.sml"
 mkdir -p "$index_budget_project/.holbuild/checkpoints/index-budget/src/OldScript.sml.deps/old"
 cat > "$index_budget_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "index-budget"
@@ -130,13 +118,7 @@ drift_prefix="$drift_actual_family.theorems/key/proof/prefix/actual_failed_prefi
 drift_indexed_save="$drift_indexed_family.deps/key/deps_loaded.save"
 mkdir -p "$(dirname "$drift_prefix")" "$(dirname "$drift_indexed_save")"
 cat > "$drift_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "index-drift"
@@ -181,13 +163,7 @@ delete_failure_project=$tmpdir/delete-failure-project
 delete_failure_family="$delete_failure_project/.holbuild/checkpoints/delete-failure/src/UndeletableScript.sml"
 mkdir -p "$delete_failure_family.deps/old"
 cat > "$delete_failure_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "delete-failure"
@@ -220,13 +196,7 @@ clean_only_project=$tmpdir/clean-only-project
 clean_only_cache=$tmpdir/clean-only-cache
 mkdir -p "$clean_only_project/.holbuild/stage/old" "$clean_only_cache/tmp/old"
 cat > "$clean_only_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "gc-clean-only"
@@ -254,13 +224,7 @@ mkdir -p \
   "$budget_family.deps/old-deps-key" \
   "$budget_family.theorems/old-deps-key/proof_ir_v3/old-prefix"
 cat > "$budget_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "checkpoint-budget"
@@ -302,13 +266,7 @@ fi
 failure_index_project=$tmpdir/failure-index-project
 mkdir -p "$failure_index_project/src"
 cat > "$failure_index_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "checkpoint-failure-index"
@@ -335,13 +293,7 @@ deep_watch_family="$deep_watch_project/.holbuild/checkpoints/deep-watch/deep/nes
 deep_watch_marker="$deep_watch_family.deps/key/deps_loaded.save.ok"
 mkdir -p "$deep_watch_project/deep/nested" "$(dirname "$deep_watch_family")"
 cat > "$deep_watch_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "deep-watch"
@@ -384,13 +336,7 @@ mid_project=$tmpdir/mid-budget-project
 mid_family="$mid_project/.holbuild/checkpoints/mid-budget-generated/src/generated"
 mkdir -p "$mid_project/src"
 cat > "$mid_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "mid-budget"
@@ -436,13 +382,7 @@ protected_slow_family="$protected_project/.holbuild/checkpoints/protected-active
 protected_live="$protected_slow_family.deps/live/deps_loaded.save"
 mkdir -p "$protected_project/src" "$protected_slow_family.deps/seed"
 cat > "$protected_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "protected-active"
@@ -497,13 +437,7 @@ dependency_live="$dependency_family.deps/live/deps_loaded.save"
 dependency_slow_started=$tmpdir/evict-completed-dependency-slow-started
 mkdir -p "$dependency_project/src" "$dependency_family.deps/seed"
 cat > "$dependency_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "evict-completed-dependency"
@@ -572,13 +506,7 @@ gate_started=$tmpdir/checkpoint-maintenance-dependent-started
 gate_live="$gate_family.deps/live/deps_loaded.save"
 mkdir -p "$gate_project/src" "$gate_family.deps/seed"
 cat > "$gate_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "checkpoint-maintenance-gate"
@@ -663,13 +591,7 @@ protected_empty_old_family="$protected_empty_project/.holbuild/checkpoints/prote
 protected_empty_live_dir="$protected_empty_slow_family.deps/live"
 mkdir -p "$protected_empty_project/src" "$protected_empty_old_family.deps/old"
 cat > "$protected_empty_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "protected-empty-active"
@@ -721,13 +643,7 @@ fi
 scan_project=$tmpdir/scan-project
 mkdir -p "$scan_project/src"
 cat > "$scan_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "scan-project"
@@ -772,13 +688,7 @@ fi
 perf_scan_project=$tmpdir/perf-scan-project
 mkdir -p "$perf_scan_project/src1" "$perf_scan_project/src2"
 cat > "$perf_scan_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "perf-scan-project"

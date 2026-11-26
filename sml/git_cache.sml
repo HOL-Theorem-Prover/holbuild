@@ -99,7 +99,7 @@ fun with_lock path f =
       (case HolbuildFileLock.try_acquire_path {path = path, obsolete_kind = NONE} of
            SOME lock => lock
          | NONE =>
-             (TextIO.output(TextIO.stdErr, "holbuild: waiting for another holbuild process" ^
+             (HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: waiting for another holbuild process" ^
                                            holder_text path ^ " to release " ^ path ^ "\n");
               TextIO.flushOut TextIO.stdErr;
               HolbuildFileLock.acquire_exclusive_path_wait {path = path}))
@@ -364,7 +364,7 @@ fun publish_checkout {tmp, dest, lease} =
            handle e => (HolbuildFileLock.release lock; raise e))
 
 fun warn_fallback msg =
-  (TextIO.output(TextIO.stdErr, "holbuild: cannot use a shared dependency checkout, cloning instead: " ^ msg ^ "\n");
+  (HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: cannot use a shared dependency checkout, cloning instead: " ^ msg ^ "\n");
    TextIO.flushOut TextIO.stdErr)
 
 (* Makes .holbuild/src/<name> hold git at rev. With shared, it links to the

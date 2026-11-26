@@ -483,11 +483,12 @@ takes none of
 .BR \-\-fetch\-only ,
 .BR \-\-remote\-exec ,
 .BR \-\-remote\-only ,
-.B \-\-outputs\-dir
+.BR \-\-outputs\-dir ,
+.B \-\-profile
 and
-.BR \-\-profile .
+.BR \-\-held .
 .IP
-Exits 0 when every run ended (done, cached, failed or, with
+Exits 0 when every run ended (done, cached, failed, held or, with
 .BR \-\-fetch\-only ,
 missing), 75 when the coordinator cannot take or finish the batch or an
 ended run cannot be fetched, and 1 on errors, a cancelled batch, or a target
@@ -535,6 +536,12 @@ Fetch what the remote cache holds; submit nothing.
 .B \-\-export\-only
 Only write and upload each run's spec, and print
 .IR "CONTEXT RUN\-KEY SPEC\-SHA256" .
+.TP
+.BI \-\-held " FILE"
+Run keys, one per line, whose outputs the caller already has: those runs
+print
+.I held
+and are neither run nor fetched.
 .RE
 .
 .SH GLOBAL OPTIONS
@@ -748,6 +755,22 @@ Hash every source file instead of trusting an unchanged file status.
 .TP
 .B \-\-skip\-checkpoints
 Do not create checkpoints.
+.TP
+.B \-\-no\-checkpoint\-saves
+Resume from saved checkpoints and failed prefixes as usual, here and on remote
+workers, but save, remove and publish none: the project's checkpoints, the
+host's deps heap store and the shared heaps stay as they were, and no
+automatic GC runs after it.
+For throwaway builds, such as experiments or scratch copies, that must not
+replace a project's resume state.
+A checkpoint that cannot be resumed is kept, and the theory runs again
+restoring none.
+No cache or action key depends on it.
+With
+.B \-\-skip\-checkpoints
+nothing is restored either.
+Excludes
+.BR \-\-repl\-on\-failure .
 .TP
 .BI \-\-checkpoint\-seconds " SECONDS"
 Save a theorem or definition context checkpoint only once

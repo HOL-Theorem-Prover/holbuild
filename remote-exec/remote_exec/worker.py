@@ -248,6 +248,9 @@ class Coordinator:
         self.host = host
         self.drain = drain or Drain()
         self.load_ahead = load_ahead
+        # Whether the last claim, finding no work, said the worker's host is an On-Demand burst host that claims
+        # fill after Spot, which is to empty.
+        self.spilled = False
 
     def post(self, path: str, body: bytes, content_type: str, timeout: float = 30) -> tuple[int, Any]:
         request = urllib.request.Request(
@@ -271,6 +274,8 @@ class Coordinator:
             payload = response.read()
             if isinstance(response, urllib.error.HTTPError):
                 return response.code, payload.decode(errors="replace")
+            if path == "/v1/work/claim":
+                self.spilled = response.headers.get("Holbuild-Spilled") == "1"
             return response.status, json.loads(payload) if payload else None
 
     def post_reporting(self, path: str, body: dict[str, Any], timeout: float = 30) -> tuple[int, Any]:
@@ -288,6 +293,7 @@ class Coordinator:
         body = {
             "tier": tiers[0], "also_claim": tiers[1:], "worker": worker, "wait_s": wait_s, "phases": phases,
         } | ({"ahead": True} if self.load_ahead else {})
+        self.spilled = False
         status, response = self.post_reporting("/v1/work/claim", body, 30 + wait_s)
         if status == 204:
             return None
@@ -827,9 +833,9 @@ def wait_for_disk(
 ) -> None:
     """Return once the host's disk has room for an action (``disk_shortfall``), or the worker drains, so that a
     worker on a full disk doesn't claim action after action only to fail each at once while other hosts could run
-    them. First the worker deletes what its own actions left in its cache root: the action sandboxes, temp files
-    and the parked theories releases 0.14.79-0.14.83 left, which no other worker shares and no action of its own
-    uses between claims, and the record of what its action root holds, which would no longer be true. It stops
+    them. First the worker deletes what its own actions left in its cache root: the action sandboxes, temp files,
+    the copies of scratch inputs kept for later actions and the parked theories releases 0.14.79-0.14.83 left,
+    which no other worker shares and no action of its own uses between claims, and the record of what its action root holds, which would no longer be true. It stops
     the exec-action still running after its result, if any, and deletes the module writers' roots
     (``module-writer-<pid>``), which a writer killed before it was done leaves. Each poll it
     still waits it runs ``sweep``, the cache's own eviction of checkpoints and shared entries, and reports the host,
@@ -851,7 +857,7 @@ def wait_for_disk(
         for records in ("action-resident", "parked-records", "parked-stats"):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(os.path.join(cache, records))
-        for directory in ("action", "parked", "action-parked", "tmp"):
+        for directory in ("action", "action-scratch", "parked", "action-parked", "tmp"):
             remove_children(os.path.join(cache, directory))
     logged = False
     while disk_shortfall() is not None:
@@ -1605,8 +1611,17 @@ def drain_seconds(text: str) -> float:
 
 def worker_name(image: str | None) -> str:
     """The default worker name: ``host:pid``, then ``@`` and the first 12 hex digits of the digest when ``image``
-    (``REMOTE_EXEC_IMAGE``) names one as ``<repository>@sha256:<digest>``, so a lease says which image ran an action."""
+    (``REMOTE_EXEC_IMAGE``) names one as ``<repository>@sha256:<digest>``, so a lease says which image ran an action.
+    It starts with the first 8 characters of the host's boot id and ``/`` when the boot id can be read, so an action's
+    worker names the host (``/v1/queue`` ``hosts[].id``) it ran on: containers have hostnames of their own."""
     name = f"{socket.gethostname()}:{os.getpid()}"
+    try:
+        with open(BOOT_ID) as file:
+            boot = file.read().strip()[:8]
+    except OSError:
+        boot = ""
+    if boot:
+        name = f"{boot}/{name}"
     _, found, digest = (image or "").partition("@sha256:")
     return f"{name}@{digest[:12]}" if found and digest else name
 
@@ -1687,8 +1702,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--name", default=worker_name(os.environ.get("REMOTE_EXEC_IMAGE")),
-        help="worker name in leases (default: host:pid, then @ and the image digest's first 12 hex digits when "
-        "REMOTE_EXEC_IMAGE names the image as <repository>@sha256:<digest>)",
+        help="worker name in leases (default: the host's boot id's first 8 characters and /, then host:pid, then @ "
+        "and the image digest's first 12 hex digits when REMOTE_EXEC_IMAGE names the image as "
+        "<repository>@sha256:<digest>)",
     )
     parser.add_argument(
         "--drain-seconds", type=drain_seconds, default=20.0,
@@ -1795,8 +1811,10 @@ def main() -> None:
         protect_first = False
         # A burst worker under ECS whose claims have found no work for IDLE_EXIT_SECONDS since its last action exits,
         # so its task goes: at once in a scale-in, else ECS starts a new one where binpack puts it, on the fullest
-        # host with room, so partly drained hosts empty and scale in. A new task runs an action before it may exit,
-        # so idle ones don't restart in a loop.
+        # host with room, so partly drained hosts empty and scale in. On a host the coordinator fills after Spot
+        # (an On-Demand host started while Spot was short), it exits at its first claim that finds no work, as a
+        # task waiting there out its idle time keeps catching stray work and holds the host. A new task runs an
+        # action before it may exit, so idle ones don't restart in a loop.
         idle_since: float | None = None
         while not drain.stop.is_set():
             with phases.timed("idle"):
@@ -1827,7 +1845,9 @@ def main() -> None:
                 protect_first = False
                 with phases.timed("lease"):
                     unprotect()
-                idle_long = idle_since is not None and time.monotonic() - idle_since >= IDLE_EXIT_SECONDS
+                idle_long = idle_since is not None and (
+                    coordinator.spilled or time.monotonic() - idle_since >= IDLE_EXIT_SECONDS
+                )
                 if idle_long and waited_out and protection.spells and tiers[0] != "standard" and not reaper.busy():
                     print("no work after an action: exiting so the task can go or move", file=sys.stderr, flush=True)
                     break

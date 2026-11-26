@@ -805,6 +805,21 @@ root on `loadPath`, so they start from an empty root, leave no records, and the 
 after them. The
 cache cap doesn't count the root: it holds one spec's dependencies.
 
+A check-only action's hydrate is light: the stale check, the kept items and
+the removal of the rest run as above, but the dependencies not kept aren't
+installed. Their records, as an install would write them, come from their
+cache manifests (the remote's read without copying its blobs) and `.sml` blobs (the `.dat` hash from the hash the
+`.sml` carries; a theory whose `.sml` carries none makes the hydrate install
+them all), and the early cutoff, the parent checks and the preload skip read
+them, so the context key is the one the installed files would give. The
+dependencies' parent-fit check is skipped: a heap keyed by that context loaded
+them, past HOL's own parent check. HOL reads no dependency file once it
+resumes from one, since the preload that saved it loaded every dependency the
+script loads. When the run would start from a fresh preload instead, the worker
+installs them all first and checks the context key against the files
+(`internal` if it changed); so it does before passing the action on its cached
+entry or an early-cutoff pair, which no heap vouches for.
+
 ## Global cache
 
 The global cache is optional and immutable:
@@ -857,9 +872,15 @@ Its hash was checked when it entered the cache; the staged path lies outside
 every sandbox write and scratch root, and the sandbox grants no cross-directory
 link and refuses chmod outside those roots, so the action can only read it;
 holbuild only unlinks it when it empties the root. Across file systems (a
-worker container's action root beside a host-mounted cache) it is a read-only
-copy of that blob, not hashed again. Without the blob it is fetched and copied
-like any other spec blob.
+worker container's action root beside a host-mounted cache), or without the
+blob, it is a hard link to a read-only copy of that blob, not hashed again,
+kept in `action-scratch` beside the action root, where no action can read.
+Later actions link the same copy while it is a read-only regular file of the
+blob's size, so a worker copies an input once; the root is emptied around each
+action as before, so an action sees only the inputs its spec names. The store
+keeps at most eight copies (the action's inputs, then the most recently used),
+counts toward the worker's cache cap, and is emptied when the worker is short
+of disk.
 
 Cache-to-cache transfers verify a resident filesystem blob before fetching it
 again. A missing or corrupt blob is fetched into a transfer-owned temporary

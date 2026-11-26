@@ -24,13 +24,7 @@ make_project() {
   local name=$2
   mkdir -p "$p/src"
   cat > "$p/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "$name"

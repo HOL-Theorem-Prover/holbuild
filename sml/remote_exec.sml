@@ -111,7 +111,7 @@ fun split_status output =
 
 fun write_text path text =
   let val out = TextIO.openOut path
-  in (TextIO.output (out, text); TextIO.closeOut out) handle e => (TextIO.closeOut out; raise e) end
+  in (HolbuildBoundedOutput.text (out, text); TextIO.closeOut out) handle e => (TextIO.closeOut out; raise e) end
 
 (* A random batch id in UUID form, for the coordinator to store a batch under. *)
 fun new_batch_id () =
@@ -288,6 +288,9 @@ fun follow url batch_id (on_change : string * string * string option * string op
     val details = ref ([] : (string * string option) list)
     (* Actions that ran more than once: an earlier attempt failed. *)
     val retried : string list ref = ref []
+    (* The hold last printed for each action: the batch whose build of the
+       same key and spec holds it back, and when that batch claimed it. *)
+    val holds : (string * (string * string option)) list ref = ref []
     fun name key = Option.getOpt (Option.map #2 (List.find (fn (k, _) => k = key) (!names)), key)
     (* An action the deadline stopped failed with its batch. *)
     fun failures () =
@@ -354,7 +357,21 @@ fun follow url batch_id (on_change : string * string * string option * string op
                     missed requeue. Only state progress resets stream retries. *)
                  if Option.map (fn (_, (s, _, _)) => s) previous = SOME state then ()
                  else (changed := true; report_action line);
-                 on_change (key, state, failure, log, detail))
+                 on_change (key, state, failure, log, detail));
+              (* A hold starts or its holder claims again without a state
+                 change, so it isn't one for the stream retries. *)
+              case (state, json_string_field "held_by" line) of
+                  ("ready", SOME holder) =>
+                    let val hold = (holder, json_string_field "held_since" line)
+                    in
+                      if List.exists (fn h => h = (key, hold)) (!holds) then ()
+                      else
+                        (holds := (key, hold) :: List.filter (fn (k, _) => k <> key) (!holds);
+                         HolbuildStatus.message_stderr
+                           ("holbuild: remote " ^ name key ^ ": held by batch " ^ holder ^
+                            (case #2 hold of SOME since => " since " ^ since | NONE => "") ^ "\n"))
+                    end
+                | _ => ()
             end
         | SOME "batch" =>
             outcome :=

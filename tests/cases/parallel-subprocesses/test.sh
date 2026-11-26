@@ -15,13 +15,7 @@ use_case_cache "$tmpdir/cache"
 project=$tmpdir/project
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "parallel_subprocesses"
@@ -81,13 +75,7 @@ done
 fail_project=$tmpdir/fail-project
 mkdir -p "$fail_project/src"
 cat > "$fail_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "parallel_failure_cleanup"
@@ -136,13 +124,7 @@ fi
 exit_project=$tmpdir/parallel-exit-project
 mkdir -p "$exit_project/src"
 cat > "$exit_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "parallel_exit"

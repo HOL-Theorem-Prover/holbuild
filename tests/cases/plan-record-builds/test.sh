@@ -17,19 +17,11 @@ trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 export HOLBUILD_PLAN_RECORD=check
 
-hol_rev=$(holbuild_pinned_hol_rev)
-
 make_project() {
   local dir=$1 extra=${2:-}
   mkdir -p "$dir/src"
   cat > "$dir/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$hol_rev"
+$(write_schema2_prelude)
 
 [project]
 name = "record_builds"

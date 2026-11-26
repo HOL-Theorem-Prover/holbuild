@@ -3355,3 +3355,30 @@ for flag in --detach "--attach b1"; do
   run "check-only-${flag%% *}" 1 build --remote-exec "$coordinator" --check-only $flag BTheory
   require_grep "remove --detach or --attach" "$tmpdir/check-only-${flag%% *}.log"
 done
+
+# A ready build that another batch's build of the same key and spec holds back
+# is printed held once per hold, after its ready line: a repeated hold isn't
+# printed again, and the holder's claim again is a new hold.
+write_theories held
+run held-detach 0 build --remote-exec "$coordinator" --detach BTheory
+batch=$(sed -n 's/.*holbuild: remote batch \(b[0-9]*\).*/\1/p' "$tmpdir/held-detach.log")
+held_key=$(awk '$1 == "action" && $5 == "rxcheck:BTheory" { print $2 }' "$state/$batch.batch")
+[[ -n $held_key ]] || { cat "$state/$batch.batch" >&2; exit 1; }
+held() { # STATE SINCE: BTheory's event, held since SINCE
+  printf '{"type": "action", "input_key": "%s", "theory": "rxcheck:BTheory", "state": "%s", "tier": "standard", "attempts": 0, "last_failure": null, "log_sha256": null, "held_by": "holder", "held_since": "%s"}\n' \
+    "$held_key" "$1" "$2"
+}
+{
+  held ready 2026-01-01T00:00:00+00:00
+  held ready 2026-01-01T00:00:00+00:00
+  held ready 2026-01-01T01:00:00+00:00
+  echo '{"type": "batch", "state": "cancelled", "failure": null}'
+} > "$state/$batch.events"
+run held 1 build --remote-exec "$coordinator" --remote-only --attach "$batch" BTheory
+rm "$state/$batch.events"
+grep '^holbuild: remote rxcheck:BTheory: ' "$tmpdir/held.log" > "$tmpdir/held.lines" || true
+diff - "$tmpdir/held.lines" <<LINES || { cat "$tmpdir/held.log" >&2; exit 1; }
+holbuild: remote rxcheck:BTheory: ready
+holbuild: remote rxcheck:BTheory: held by batch holder since 2026-01-01T00:00:00+00:00
+holbuild: remote rxcheck:BTheory: held by batch holder since 2026-01-01T01:00:00+00:00
+LINES

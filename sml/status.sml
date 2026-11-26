@@ -332,7 +332,7 @@ fun json_fields fields = "{" ^ String.concatWith "," fields ^ "}\n"
 
 fun emit_json event fields =
   (Mutex.lock json_mutex;
-   (TextIO.output(TextIO.stdOut, json_fields (json_string_field "event" event :: fields));
+   (HolbuildBoundedOutput.text (TextIO.stdOut, json_fields (json_string_field "event" event :: fields));
     TextIO.flushOut TextIO.stdOut)
    before Mutex.unlock json_mutex)
   handle e => (Mutex.unlock json_mutex; raise e)
@@ -507,7 +507,7 @@ fun redraw (status as {enabled, ended, width, ...} : t) =
   if not enabled orelse !ended then ()
   else
     (refresh_width_if_stale status;
-     TextIO.output (TextIO.stdOut, "\r" ^ fit (!width) (line status) ^ clear_to_eol);
+     HolbuildBoundedOutput.text (TextIO.stdOut, "\r" ^ fit (!width) (line status) ^ clear_to_eol);
      TextIO.flushOut TextIO.stdOut)
 
 fun with_lock ({mutex, ...} : t) f =
@@ -552,7 +552,7 @@ fun start_node status key label =
                emit_json "node_started" (json_node_fields key label)
              else if enabled then redraw status
              else if verbose_mode () then
-               (TextIO.output (TextIO.stdOut, label ^ " started\n");
+               (HolbuildBoundedOutput.text (TextIO.stdOut, label ^ " started\n");
                 TextIO.flushOut TextIO.stdOut)
              else ())
         end)
@@ -573,7 +573,7 @@ fun finish_node status key label outcome =
                (carried_outcomes := Binarymap.insert (!carried_outcomes, key, outcome);
                 if json_mode () then emit_json "node_started" (json_node_fields key label)
                 else if verbose_mode () andalso not enabled then
-                  TextIO.output (TextIO.stdOut, label ^ " started\n")
+                  HolbuildBoundedOutput.text (TextIO.stdOut, label ^ " started\n")
                 else ())
              else ();
              if json_mode () then
@@ -586,7 +586,7 @@ fun finish_node status key label outcome =
              else if quiet_mode () then ()
              else if outcome = UpToDate andalso not (verbose_mode ()) then ()
              else
-               (TextIO.output (TextIO.stdOut,
+               (HolbuildBoundedOutput.text (TextIO.stdOut,
                   label ^ " " ^ outcome_text outcome ^
                   (if verbose_mode () then elapsed else "") ^ "\n");
                 TextIO.flushOut TextIO.stdOut))
@@ -602,7 +602,7 @@ fun finish status =
              (if finished_only () then ()
               else if failures_suppressed () andalso !failed then
                 (* The status line is cleared; the pass after the resubmission draws its own. *)
-                if enabled then (TextIO.output (TextIO.stdOut, "\r" ^ clear_to_eol); TextIO.flushOut TextIO.stdOut)
+                if enabled then (HolbuildBoundedOutput.text (TextIO.stdOut, "\r" ^ clear_to_eol); TextIO.flushOut TextIO.stdOut)
                 else ()
               else if json_mode () then
                 emit_json "build_finished"
@@ -613,10 +613,10 @@ fun finish status =
                    json_int_field "unchanged" (!up_to_date),
                    json_int_field "from_remote" (!restored_remote)]
               else if enabled then
-                (TextIO.output (TextIO.stdOut, "\r" ^ fit (!(#width status)) (final_line status) ^ clear_to_eol ^ "\n");
+                (HolbuildBoundedOutput.text (TextIO.stdOut, "\r" ^ fit (!(#width status)) (final_line status) ^ clear_to_eol ^ "\n");
                  TextIO.flushOut TextIO.stdOut)
               else if !finished = total then
-                (TextIO.output (TextIO.stdOut, finish_text status); TextIO.flushOut TextIO.stdOut)
+                (HolbuildBoundedOutput.text (TextIO.stdOut, finish_text status); TextIO.flushOut TextIO.stdOut)
               else ();
               ended := true)
          end);
@@ -626,20 +626,20 @@ fun message_to stream_name stream text =
   if json_mode () then json_message stream_name text
   else
     case !current_status of
-        NONE => (TextIO.output (stream, text); TextIO.flushOut stream)
+        NONE => (HolbuildBoundedOutput.text (stream, text); TextIO.flushOut stream)
       | SOME status =>
           with_lock status
             (fn () =>
                 let val {enabled, ended, ...} = status
                 in
                   if enabled andalso not (!ended) then
-                    (TextIO.output (TextIO.stdOut, "\r" ^ clear_to_eol);
+                    (HolbuildBoundedOutput.text (TextIO.stdOut, "\r" ^ clear_to_eol);
                      TextIO.flushOut TextIO.stdOut;
-                     TextIO.output (stream, text);
+                     HolbuildBoundedOutput.text (stream, text);
                      TextIO.flushOut stream;
                      redraw status)
                   else
-                    (TextIO.output (stream, text); TextIO.flushOut stream)
+                    (HolbuildBoundedOutput.text (stream, text); TextIO.flushOut stream)
                 end)
 
 (* Marks the node built by the calling thread as waiting for machine memory
@@ -663,7 +663,7 @@ fun set_waiting_for_memory detail =
                  [json_string_field "detail" text])
             else if quiet_mode () then ()
             else
-              (TextIO.output (TextIO.stdOut,
+              (HolbuildBoundedOutput.text (TextIO.stdOut,
                  Option.getOpt (Option.map #2 label, "holbuild") ^
                  " waiting for machine memory: " ^ text ^ "\n");
                TextIO.flushOut TextIO.stdOut)
@@ -718,7 +718,7 @@ fun fail_with_debug_artifacts status key label msg artifacts =
                    json_failure_field_for_node key msg @
                    json_debug_artifacts_fields artifacts)
               else if enabled then
-                (TextIO.output (TextIO.stdOut, "\r" ^ clear_to_eol);
+                (HolbuildBoundedOutput.text (TextIO.stdOut, "\r" ^ clear_to_eol);
                  TextIO.flushOut TextIO.stdOut)
               else ())
          end);

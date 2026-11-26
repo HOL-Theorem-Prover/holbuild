@@ -29,7 +29,7 @@ val remote_valued = [("--remote-exec", Nothing)]
 
 val build_cache_flags =
   ["--fail-fast", "--check-only", "--force", "--force=theory", "--force=project", "--force=full", "--no-cache",
-   "--allow-cache-timeout-discrepancy", "--no-stat-cache", "--skip-checkpoints",
+   "--allow-cache-timeout-discrepancy", "--no-stat-cache", "--skip-checkpoints", "--no-checkpoint-saves",
    "--all-checkpoints", "--skip-proof-steps", "--trace-steps", "--retain-debug-artifacts",
    "--emit-output-hashes", "--warn-unreachable", "--trknl"]
 val build_cache_valued =
@@ -74,7 +74,8 @@ fun command name : command =
         {flags = ["--remote-only", "--closure", "--fetch-only", "--export-only"],
          valued = remote_valued @
                   map (fn option => (option, Nothing))
-                    ["--outputs-dir", "--profile", "--script", "--support", "--load", "--output", "--option"],
+                    ["--outputs-dir", "--profile", "--script", "--support", "--load", "--output", "--option",
+                     "--held"],
          operands = Theories}
     | _ => {flags = [], valued = [], operands = Nothing}
 

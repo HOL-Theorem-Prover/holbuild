@@ -57,14 +57,6 @@ val analyser_gc_percent = 30
 fun analyser_runtime_args () =
   ["--minheap", Int.toString analyser_min_heap_mb, "--gcpercent", Int.toString analyser_gc_percent]
 
-fun has_suffix suffix s =
-  let
-    val n = size s
-    val m = size suffix
-  in
-    n >= m andalso String.substring(s, n - m, m) = suffix
-  end
-
 fun is_word_start c = Char.isAlpha c orelse c = #"_"
 fun is_word_char c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'"
 
@@ -81,10 +73,6 @@ fun insert_sorted item items =
           | GREATER => x :: insert_sorted item xs
 
 fun sort_unique items = List.foldl (fn (item, acc) => insert_sorted item acc) [] items
-
-fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
-
-fun absolute_path path = Path.isAbsolute path handle Path.InvalidArc => false
 
 fun read_all path =
   let
@@ -182,8 +170,6 @@ fun scan_word text start =
   in
     (String.substring(text, start, stop - start), stop)
   end
-
-fun theory_name s = has_suffix "Theory" s andalso size s > size "Theory"
 
 (* The dependency facts of a script's text in one pass: the literal after
    each `load` or `use`, and the literals of each `holbuild_extra_deps` or
@@ -350,7 +336,7 @@ fun parse_analyser_response response id_paths =
 
 fun write_file path text =
   let val out = TextIO.openOut path
-  in TextIO.output(out, text); TextIO.closeOut out end
+  in HolbuildBoundedOutput.text (out, text); TextIO.closeOut out end
 
 (* Keep shell exit 137 distinct from an observed signal: a program can also
    exit with that code itself. Both permit bounded retry of this parser. *)
@@ -455,14 +441,14 @@ fun run_analyser {analyser, request, capture_stderr} =
         val output = output ^ attempt_output
       in
         if not (HolbuildActionSandbox.active ()) andalso analyser_killed status andalso retries < 2 then
-          (TextIO.output (TextIO.stdErr, analyser_failure outcome ^
+          (HolbuildBoundedOutput.text (TextIO.stdErr, analyser_failure outcome ^
              "\nretrying analyser (" ^ Int.toString (retries + 1) ^ "/2)\n");
            HolbuildProcessGroup.require_uncancelled token;
            OS.Process.sleep (Time.fromReal (0.1 * Real.fromInt (retries + 1)));
            run (retries + 1) output)
         else
           (if OS.Process.isSuccess status andalso not capture_stderr
-           then TextIO.output (TextIO.stdErr, stderr) else ();
+           then HolbuildBoundedOutput.text (TextIO.stdErr, stderr) else ();
            {status = status, output = output, stderr = stderr, response = response, pressure = pressure})
       end
   in
@@ -474,8 +460,8 @@ fun analyser_response analyser request =
   let val outcome as {output, response, ...} =
         run_analyser {analyser = analyser, request = request, capture_stderr = false}
   in
-    print output;
-    if isSome response then () else TextIO.output (TextIO.stdErr, analyser_failure outcome ^ "\n");
+    HolbuildBoundedOutput.print output;
+    if isSome response then () else HolbuildBoundedOutput.text (TextIO.stdErr, analyser_failure outcome ^ "\n");
     response
   end
 
@@ -508,7 +494,7 @@ fun analyse_files analyser files =
 
 fun run_analyser_batch analyser files =
   let val (output, outcome) = analyse_files analyser files
-  in print output; outcome_value outcome end
+  in HolbuildBoundedOutput.print output; outcome_value outcome end
 
 (* Starting an analyser costs about as much as analysing two or three
    files, so each extra process gets at least this many. *)
@@ -551,7 +537,7 @@ fun run_analyser_parallel analyser files =
           if !pending = 0 then () else (ConditionVar.wait (cv, mutex); wait ())
         val _ = (Mutex.lock mutex; wait (); Mutex.unlock mutex)
         val outcomes = Array.foldr (fn (result, acc) => valOf result :: acc) [] results
-        val _ = List.app (print o #1) outcomes
+        val _ = List.app (HolbuildBoundedOutput.print o #1) outcomes
         val by_id =
           List.foldl (fn ((id, deps), dict) => Binarymap.insert (dict, id, deps))
             (Binarymap.mkDict String.compare)
@@ -701,19 +687,5 @@ fun prefetch_cached_with_hash requests =
   end
 
 fun extract path = extract_uncached path
-
-fun describe ({loads, uses, extra_deps, extra_outputs, holdep_mentions} : t) =
-  let
-    fun line label values =
-      case values of
-          [] => ()
-        | _ => print ("  " ^ label ^ ": " ^ String.concatWith ", " values ^ "\n")
-  in
-    line "loads" loads;
-    line "uses" uses;
-    line "extra deps" extra_deps;
-    line "extra outputs" extra_outputs;
-    line "Holdep mentions" holdep_mentions
-  end
 
 end

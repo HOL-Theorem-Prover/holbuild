@@ -31,7 +31,7 @@ val _ = PolyML.SaveState.saveChild (deps, length (PolyML.SaveState.showHierarchy
 val _ = BE.write_text (deps ^ ".ok") (BE.deps_checkpoint_ok_text "deps");
 val ctx : BE.shared_context =
   {store = dir ^ "/store", checkpoint_root = tree, heap_key = env "HEAP_KEY", index_key = "index", standalone_key = "standalone", base_state = base,
-   deps_key = "deps", deps_loaded = deps, requested_timeout = NONE, candidates = [], module_store = "", heap_only = false};
+   deps_key = "deps", deps_loaded = deps, requested_timeout = NONE, candidates = [], module_store = "", heap_only = false, modules = false};
 val _ = HolbuildRemoteCacheConfig.set_url url;
 val _ = RC.fail_closed := true;
 val _ = BE.write_text (dir ^ "/heap.sha") (HolbuildHash.file_sha256 deps);
@@ -41,4 +41,4 @@ val _ = BE.captured_deps_heap := SOME (HolbuildHash.file_sha256 deps);
 val _ = BE.ensure_dir (tree ^ "/modules");
 val _ = BE.captured_heap_modules := SOME {dir = tree ^ "/modules", modules = []};
 val _ = BE.publish_shared_checkpoints (RC.remote url) ctx
-  {heap = NONE, files = [], stale = [], missing = [], poisoned = NONE};
+  {heap = NONE, files = [], stale = [], missing = [], poisoned = NONE, entry = NONE} NONE;

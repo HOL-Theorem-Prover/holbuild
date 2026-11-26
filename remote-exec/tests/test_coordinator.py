@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import time
 from collections import Counter, deque
 from dataclasses import asdict, replace
@@ -659,9 +660,11 @@ async def test_a_check_begun_before_an_input_went_missing_is_not_remembered(
     assert cache.asked == [ac_key("a"), ac_key("a")]
 
 
-async def wait_until(condition: Callable[[], bool]) -> None:
-    while not condition():
-        await asyncio.sleep(0.01)
+async def wait_until(condition: Callable[[], bool], timeout: float | None = None) -> None:
+    """Wait for ``condition``; with ``timeout``, fail if it doesn't hold within that many seconds."""
+    async with asyncio.timeout(timeout):
+        while not condition():
+            await asyncio.sleep(0.01)
 
 
 async def test_a_release_asks_the_cache_about_its_parents_at_once(
@@ -1092,24 +1095,31 @@ async def test_one_release_finishes_the_copies_of_several_builds_in_a_batch_each
     assert (logs["pkg:a"], logs["pkg:b"]) == ("a" * 64, "b" * 64)
 
 
-async def test_a_copy_with_another_spec_wakes_a_waiting_claim_rather_than_being_done_with_a_build(
-    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+async def test_a_copy_with_another_spec_is_claimed_while_the_build_runs_and_not_done_by_it(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache
 ) -> None:
-    """A forced or traced build has the same keys as a plain one, but its own spec: it must run itself."""
-    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only the wake can end the wait in time
+    """A forced, traced or untimed build has the same keys as a plain one, but its own spec: the plain build can't
+    finish it, so it doesn't wait for it, as a timed build once waited hours on an untimed one."""
+
+    async def submit_forced(text: str) -> str:
+        response = await http.post("/v1/batches", content="holbuild-action-batch-v1\n" + text, headers=CLIENT)
+        assert response.status_code == 201, response.text
+        return response.json()["batch_id"]
+
     await submit(http, ["a"])
     token = await claim_named(http, "a")
-    forced = f"holbuild-action-batch-v1\naction {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
-    response = await http.post("/v1/batches", content=forced, headers=CLIENT)
-    assert response.status_code == 201, response.text
-    waiting = asyncio.create_task(coordinator.claim(["standard"], "w2", 30))
-    await asyncio.sleep(0.5)
-    assert not waiting.done()
+    forced_a = f"action {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
+    ready = await submit_forced(forced_a)
+    second = await claim_named(http, "a")
+    assert second != token
+    waiting = await submit_forced(
+        f"action {input_key('p')} {ac_key('p')} {spec('p')} pkg:p\n{forced_a}edge {input_key('a')} {input_key('p')}\n"
+    )
 
     cache.keys.add(ac_key("a"))
     assert (await complete(http, token, result("a", "built"))).status_code == 200
-    assert (await asyncio.wait_for(waiting, 10)).theory == "pkg:a"
-    assert await states(http, response.json()["batch_id"]) == {"a": "running"}
+    await coordinator.release()
+    assert (await states(http, ready), await states(http, waiting)) == ({"a": "running"}, {"p": "ready", "a": "waiting"})
 
 
 async def test_a_held_action_wakes_a_waiting_claim_once_its_leader_fails(
@@ -1146,6 +1156,75 @@ async def test_a_held_action_is_claimed_once_its_leaders_lease_expires(
     assert await claim(http) is None  # now the follower's lease holds the leader's retry
 
 
+async def test_a_held_ready_build_names_the_batch_holding_it_and_when_that_batch_claimed_it(
+    http: httpx.AsyncClient,
+) -> None:
+    leader = await submit(http, ["a"])
+    await claim_named(http, "a")
+    follower = await submit(http, ["a", "b"])
+    forced = f"holbuild-action-batch-v1\naction {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
+    response = await http.post("/v1/batches", content=forced, headers=CLIENT)
+    assert response.status_code == 201, response.text
+
+    claimed_at = (await batch(http, leader))["actions"][0]["last_claimed_at"]
+    held = {a["theory"]: (a["held_by"], a["held_since"]) for a in (await batch(http, follower))["actions"]}
+    assert held == {"pkg:a": (leader, claimed_at), "pkg:b": (None, None)}
+    # A copy with another spec isn't held; nor is the leader's own copy.
+    for other in (response.json()["batch_id"], leader):
+        assert [(a["held_by"], a["held_since"]) for a in (await batch(http, other))["actions"]] == [(None, None)]
+
+
+async def test_a_hold_that_starts_ends_or_is_claimed_again_after_ready_reaches_the_event_stream(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither the leader's claim, nor the expiry of its lease, nor its claim again writes the held copy's row."""
+    coordinator.settings.claim_ranking_seconds = 0
+    follower = await submit(http, ["a"])
+    reads = 0
+    changes = coordinator.changes
+
+    async def counted(batch_id: UUID, since: int, held: Any = ()) -> Any:
+        nonlocal reads
+        reads += 1
+        return await changes(batch_id, since, held)
+
+    async def follow() -> list[dict[str, Any]]:
+        async with http.stream("GET", f"/v1/batches/{follower}/events", headers=CLIENT) as response:
+            return [json.loads(line) async for line in response.aiter_lines() if line]
+
+    async def polled() -> None:
+        start = reads
+        async with asyncio.timeout(5):
+            while reads < start + 2:  # a poll that began after the write
+                assert not stream.done()
+                await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(coordinator, "changes", counted)
+    stream = asyncio.create_task(follow())
+    await polled()
+    leader = await submit(http, ["a"], priority="1")  # claimed ahead of the follower's older copy
+    await claim_named(http, "a")
+    await polled()
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
+    await polled()
+    expired = await coordinator.get(UUID(follower))  # an expired lease holds nothing, before the sweep deletes it
+    assert expired is not None and (expired.actions[0].held_by, expired.actions[0].held_since) == (None, None)
+    await coordinator.sweep()
+    await claim_named(http, "a")
+    await polled()
+    assert (await http.post(f"/v1/batches/{follower}/cancel", headers=CLIENT)).status_code == 200
+
+    async with asyncio.timeout(5):
+        events = [(e["state"], e["held_by"], e["held_since"]) for e in await stream if e["type"] == "action"]
+    claimed_at = (await batch(http, leader))["actions"][0]["last_claimed_at"]
+    assert [state for state, _, _ in events] == ["ready", "ready", "ready", "ready", "cancelled"]
+    assert events[0][1:] == events[2][1:] == events[4][1:] == (None, None)
+    assert events[1][1] == events[3][1] == leader
+    assert datetime.fromisoformat(events[1][2]) < datetime.fromisoformat(events[3][2])
+    assert datetime.fromisoformat(events[3][2]) == datetime.fromisoformat(claimed_at)
+
+
 async def test_a_held_build_leaves_the_idle_run_fallback_to_a_ready_run(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
@@ -1176,7 +1255,7 @@ async def test_a_key_another_batch_s_claim_is_leasing_is_passed_over_for_the_nex
 
     async with remote_exec_engine.connect() as other, other.begin():
         # Another batch's claim of "a", between its lock of the key and its commit.
-        await other.execute(coordinator_module.LOCK_KEY, {"key": input_key("a")})
+        await other.execute(coordinator_module.LOCK_KEY, {"key": input_key("a"), "spec": spec("a")})
         await claim_named(http, "b")
         assert await claim(http) is None
 
@@ -2153,6 +2232,59 @@ async def test_on_demand_burst_hosts_past_the_fullest_rank_behind_spot(coordinat
     assert ranks == ["od-a", "od-b", "spot", "od-c"]
     # Standard work still packs onto the hosts by their own rank.
     assert coordinator._waiter_rank(["standard"], "od-c", 0).host_rank == 0
+
+
+async def test_a_claim_that_finds_nothing_tells_a_burst_worker_whether_its_host_fills_after_spot(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """od-b is an On-Demand host beyond the one the fleet keeps, so its burst workers exit at once when idle; those of
+    od-a and of Spot wait out their idle time, as do od-b's workers that claim standard work first."""
+    report_burst_hosts(coordinator, {"od-a": (0, 8, 0), "od-b": (0, 2, 0), "spot": (1, 3, 0)})
+    spilled = {}
+    for host, rank, tier in [("od-a", 0, "high"), ("od-b", 0, "high"), ("spot", 1, "high"), ("od-b", 0, "standard")]:
+        also = ["standard"] if tier == "high" else ["high"]  # od-b still ranks 2 with a worker taking both
+        body = {"tier": tier, "also_claim": also, "worker": f"{host}-{tier}", "host": {"id": host, "rank": rank}}
+        response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+        assert response.status_code == 204, response.text
+        spilled[host, tier] = response.headers.get("Holbuild-Spilled")
+    assert coordinator.spilled("od-b")
+    assert spilled == {("od-a", "high"): None, ("od-b", "high"): "1", ("spot", "high"): None, ("od-b", "standard"): None}
+
+
+async def test_a_claim_that_finds_nothing_counts_its_worker_free_until_it_claims_again(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """The wait outlasts TURNAROUND_SECONDS: seen only as the claim came, the idle worker would leave no slot on the
+    scale-in line between its claims, from the end of its wait (as the end of the claim ends unheld leases) on."""
+    now = coordinator.clock()
+    coordinator.clock = lambda: now
+    body = {"tier": "high", "also_claim": ["standard"], "worker": "w", "wait_s": 1, "host": {"id": "spot", "rank": 1}}
+    seen_at_release: list[datetime] = []
+    release_unheld = coordinator.release_unheld
+
+    async def releasing(*args: Any) -> None:
+        seen_at_release.append(coordinator.host_workers["spot"]["w"][0])
+        await release_unheld(*args)
+
+    coordinator.release_unheld = releasing  # type: ignore[method-assign]
+    waiting = asyncio.create_task(http.post("/v1/work/claim", json=body, headers=WORKER))
+    await wait_until(lambda: bool(coordinator.claim_waiters), timeout=5)
+    now += timedelta(seconds=coordinator_module.TURNAROUND_SECONDS + 10)
+    assert (await waiting).status_code == 204
+    assert seen_at_release == [now] and coordinator.host_workers["spot"]["w"][0] == now
+
+
+async def test_a_claim_that_finds_nothing_after_its_worker_gave_up_on_it_keeps_the_workers_new_lease(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    """The worker stopped waiting for this claim and its next one took a lease, which stays noted for its host."""
+    body = {"tier": "high", "also_claim": ["standard"], "worker": "w", "wait_s": 1, "host": {"id": "spot", "rank": 1}}
+    waiting = asyncio.create_task(http.post("/v1/work/claim", json=body, headers=WORKER))
+    await wait_until(lambda: bool(coordinator.claim_waiters), timeout=5)
+    token = uuid4()
+    coordinator.lease_hosts[token] = ("spot", "w", ["high", "standard"])
+    assert (await waiting).status_code == 204
+    assert token in coordinator.lease_hosts
 
 
 async def test_a_burst_host_with_no_report_takes_no_on_demand_hosts_rank(coordinator: Coordinator) -> None:
@@ -3465,9 +3597,9 @@ async def test_events_keep_a_quiet_stream_alive_with_blank_lines(
     polls: list[int] = []
     changes = coordinator.changes
 
-    async def counted(batch: UUID, since: int) -> Any:
+    async def counted(batch: UUID, since: int, held: Any = ()) -> Any:
         polls.append(since)
-        return await changes(batch, since)
+        return await changes(batch, since, held)
 
     monkeypatch.setattr(coordinator, "changes", counted)
     transport = httpx.ASGITransport(app=create_app(coordinator, settings))
@@ -3555,8 +3687,8 @@ async def test_event_streams_of_a_large_batch_poll_only_its_changes(
     reads: list[int] = []
     changes = coordinator.changes
 
-    async def counted(batch: UUID, since: int) -> Any:
-        changed = await changes(batch, since)
+    async def counted(batch: UUID, since: int, held: Any = ()) -> Any:
+        changed = await changes(batch, since, held)
         reads.append(0 if changed is None else len(changed[0].actions))
         return changed
 
@@ -3587,11 +3719,11 @@ async def test_an_event_stream_outlives_a_failed_read_and_resumes_where_it_was(
     sinces: list[int] = []
     changes = coordinator.changes
 
-    async def flaky(batch: UUID, since: int) -> Any:
+    async def flaky(batch: UUID, since: int, held: Any = ()) -> Any:
         sinces.append(since)
         if len(sinces) == 2:  # the stream's first read after the response started
             raise sa.exc.TimeoutError("QueuePool limit of size 50 overflow 0 reached")
-        return await changes(batch, since)
+        return await changes(batch, since, held)
 
     monkeypatch.setattr(coordinator, "changes", flaky)
     batch_id = await submit(http, ["a"])
@@ -3628,13 +3760,13 @@ async def test_an_event_stream_keeps_alive_while_its_reads_keep_failing(
     changes = coordinator.changes
     calls = 0
 
-    async def slow_failure(batch: UUID, since: int) -> Any:
+    async def slow_failure(batch: UUID, since: int, held: Any = ()) -> Any:
         nonlocal calls
         calls += 1
         if calls > 1 and failing:
             await asyncio.sleep(0.06)
             raise sa.exc.TimeoutError("QueuePool limit of size 50 overflow 0 reached")
-        return await changes(batch, since)
+        return await changes(batch, since, held)
 
     monkeypatch.setattr(coordinator, "changes", slow_failure)
     async with httpx.AsyncClient(
@@ -3667,10 +3799,10 @@ async def test_a_write_wakes_its_batchs_event_streams_and_idle_streams_wait_for_
     reads = 0
     changes = coordinator.changes
 
-    async def counted(batch: UUID, since: int) -> Any:
+    async def counted(batch: UUID, since: int, held: Any = ()) -> Any:
         nonlocal reads
         reads += 1
-        return await changes(batch, since)
+        return await changes(batch, since, held)
 
     monkeypatch.setattr(coordinator, "changes", counted)
     async with httpx.AsyncClient(
@@ -3707,9 +3839,9 @@ async def test_a_stream_reads_a_burst_of_writes_at_once_but_steady_writes_at_the
     reads: list[float] = []
     changes = coordinator.changes
 
-    async def counted(batch: UUID, since: int) -> Any:
+    async def counted(batch: UUID, since: int, held: Any = ()) -> Any:
         reads.append(time.monotonic())
-        return await changes(batch, since)
+        return await changes(batch, since, held)
 
     monkeypatch.setattr(coordinator, "changes", counted)
     async with httpx.AsyncClient(
@@ -4792,3 +4924,135 @@ async def test_a_request_that_raised_counts_as_a_500() -> None:
     with pytest.raises(RuntimeError):
         await CountResponses(failing, counts)({"type": "http", "method": "GET"}, None, None)  # type: ignore[arg-type]
     assert counts == {("GET", "-", 500): 1}
+
+
+async def contention_lines(coordinator: Coordinator, caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The claim contention lines logged, once those still reading their counts are."""
+    await asyncio.gather(*coordinator.contention_logs)
+    return [r.getMessage() for r in caplog.records if r.name == "uvicorn.claims"]
+
+
+async def test_a_deeper_build_of_another_batch_passed_over_is_logged_once_with_the_kept_hosts(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 0.0)
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await submit(http, ["a1", "a2"], priority="1")
+    batch_b = await submit(http, ["p", "c"], [("c", "p")])
+    host = {**asdict(busy("1f2e3d4c-host", 0)), "disk_free": 100 << 30}
+    body = {"tier": "standard", "worker": "1f2e3d4c/w1", "host": host}
+    # A worker of the host not seen lately, which the line doesn't count.
+    coordinator.host_workers.setdefault("1f2e3d4c-host", {})["1f2e3d4c/gone"] = (
+        coordinator.clock() - timedelta(seconds=coordinator_module.HOST_REPORT_SECONDS), ("standard",)
+    )
+    for name in ["a1", "a2"]:
+        response = await http.post("/v1/work/claim", json=body, headers=WORKER)
+        assert response.json()["theory"] == f"pkg:{name}", response.text
+    # The second claim passes over p again within CONTENTION_WAIT_SECONDS: one line.
+    (line,) = await contention_lines(coordinator, caplog)
+    assert line.startswith("claim contention passed host=1f2e3d4c worker=1f2e3d4c/w1 tier=standard wait_s=- ")
+    assert ",pkg:a1,p1,r0,a0,d0 " in line
+    assert f" competitor={batch_b[:8]},pkg:p,p0,r0,a0,d1 " in line
+    # The ranking as the claim chose a1, before it counted.
+    assert " running_priority=0 priority_cap=128 capped=0 kept=1f2e3d4c:0:50.0:1" in line
+
+
+async def test_a_deep_build_claimed_long_after_its_parent_finished_is_logged_with_its_wait(
+    http: httpx.AsyncClient,
+    cache: FakeCache,
+    coordinator: Coordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 0.0)
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await submit(http, ["p", "c", "g"], [("c", "p"), ("g", "c")])
+    await build(http, cache, "p")  # ready at once: no line
+    assert await contention_lines(coordinator, caplog) == []
+    async with coordinator.engine.begin() as conn:
+        # The wait counts from the parent's result, not from the batch's submission.
+        await conn.execute(sa.text("UPDATE batches SET created_at = now() - interval '1 hour'"))
+        await conn.execute(sa.text(
+            "UPDATE actions SET finished_at = now() - interval '30 seconds' WHERE theory = 'pkg:p'"
+        ))
+    await claim_named(http, "c", worker="w1")
+    (line,) = await contention_lines(coordinator, caplog)
+    assert line.startswith("claim contention slow host=- worker=w1 tier=standard wait_s=")
+    assert 29 < float(line.split("wait_s=")[1].split()[0]) < 60
+    # Running as the shared ranking counts it, the claim of p included.
+    assert ",pkg:c,p0,r1,a0,d1 competitor=- " in line
+
+
+@pytest.mark.parametrize("unknown", ["retried", "parent without a result time"])
+async def test_a_build_whose_ready_time_is_not_recorded_is_logged_with_no_wait(
+    http: httpx.AsyncClient,
+    cache: FakeCache,
+    coordinator: Coordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    unknown: str,
+) -> None:
+    """A build claimed before, or with a parent another batch built or the cache had, may have become ready long
+    after its parents' latest result: its wait isn't known, so it is never logged as slow."""
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 0.0)
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await submit(http, ["p", "c", "g"], [("c", "p"), ("g", "c")])
+    await build(http, cache, "p")
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(sa.text("UPDATE batches SET created_at = now() - interval '1 hour'"))
+        if unknown == "retried":
+            await conn.execute(sa.text(
+                "UPDATE actions SET finished_at = now() - interval '30 seconds' WHERE theory = 'pkg:p'"
+            ))
+            await conn.execute(sa.text(
+                "UPDATE actions SET last_claimed_at = now() - interval '20 seconds' WHERE theory = 'pkg:c'"
+            ))
+        else:
+            await conn.execute(sa.text("UPDATE actions SET finished_at = NULL WHERE theory = 'pkg:p'"))
+    await claim_named(http, "c")
+    assert await contention_lines(coordinator, caplog) == []
+
+
+async def test_a_sample_of_contested_claims_is_logged(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    await submit(http, ["a"])
+    await submit(http, ["b"])
+    await submit(http, ["only"])
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 0.0)
+    await claim(http)
+    assert await contention_lines(coordinator, caplog) == []
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 1.0)
+    await claim(http)
+    (line,) = await contention_lines(coordinator, caplog)
+    assert line.startswith("claim contention sample ")
+    # A claim no other batch contests isn't sampled.
+    await claim(http)
+    assert len(await contention_lines(coordinator, caplog)) == 1
+
+
+async def test_a_contention_line_whose_counts_fail_leaves_its_claim_leased(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 1.0)
+    monkeypatch.setattr(coordinator_module, "COUNT_WAITING_AHEAD", sa.text("SELECT no_such_column FROM actions"))
+    await submit(http, ["a"])
+    await submit(http, ["b"])
+    assert await claim(http) is not None
+    (line,) = await contention_lines(coordinator, caplog)
+    assert line.count(",a?,") == 2, line
+
+
+async def test_contention_lines_past_the_pending_limit_are_logged_without_their_counts(
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="uvicorn.claims")
+    monkeypatch.setattr(coordinator_module, "CONTENTION_SAMPLE", 1.0)
+    monkeypatch.setattr(coordinator_module, "CONTENTION_PENDING", 0)
+    await submit(http, ["a"])
+    await submit(http, ["b"])
+    assert await claim(http) is not None
+    (line,) = await contention_lines(coordinator, caplog)
+    assert line.count(",a?,") == 2, line

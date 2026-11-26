@@ -16,13 +16,7 @@ project=$tmpdir/project
 mkdir -p "$project/src"
 
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "status-redraw"
@@ -104,13 +98,7 @@ require_grep "ATheory is up to date in " "$verbose_up_to_date_log"
 plain_build_project=$tmpdir/plain-build-project
 mkdir -p "$plain_build_project/src"
 cat > "$plain_build_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "status-redraw-plain-build"
@@ -160,13 +148,7 @@ fi
 message_project=$tmpdir/message-project
 mkdir -p "$message_project/src"
 cat > "$message_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "status-redraw-message"

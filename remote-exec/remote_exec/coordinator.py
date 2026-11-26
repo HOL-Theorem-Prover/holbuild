@@ -12,10 +12,11 @@ import heapq
 import json
 import logging
 import os
+import random
 import shlex
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Iterator
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NamedTuple, Self
@@ -35,6 +36,8 @@ from remote_exec.formats import Batch, Result
 from remote_exec.membership import REFRESH_SECONDS, Membership
 
 logger = logging.getLogger(__name__)
+# Under uvicorn's own logger, which uvicorn sends to stderr at INFO, as app.py's request summary.
+claims_logger = logging.getLogger("uvicorn.claims")
 
 CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
 # How long a cache entry found is taken to still be there without asking the cache again.
@@ -85,6 +88,14 @@ HOST_KEYS_SECONDS = 1800
 MAX_THEORY_DEPS = 10_000
 LOCALITY_WINDOW = 8
 LOCALITY_HOLD_SECONDS = 0.5
+# Claim contention lines (see Coordinator._contention): a claimed build of a positive critical depth ready this
+# long, a deeper candidate of another batch passed over (once per batch and tier this often), and this share of the
+# claims another batch's candidate contested, so a replay of the lines has a denominator.
+CONTENTION_WAIT_SECONDS = 15.0
+CONTENTION_SAMPLE = 0.01
+# At most this many contention lines read their batches' waiting-ahead counts at once, each on a connection of its
+# own, so the lines take few of the connections claims need; more are logged without them.
+CONTENTION_PENDING = 4
 
 PHASE_WINDOW_SECONDS = 600
 MAX_PHASE_REPORTS = 100_000
@@ -247,6 +258,10 @@ class ActionStatus:
     finished_at: datetime | None  # the latest accepted result's time; lease expiry and cancellation set none
     worker: str | None
     timings: dict[str, int] | None  # the last result's, in milliseconds; see formats.Result
+    # A ready build held back behind another batch's live lease of its key and spec (single-flight): that batch, and
+    # when it claimed the key.
+    held_by: UUID | None = None
+    held_since: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -509,14 +524,58 @@ RELEASABLE_BATCH = sa.text(RELEASABLE.format(batch=" AND a.batch_id = :batch_id"
 
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
-CHANGED_ACTIONS = sa.text("""
-SELECT input_key, theory, state, tier, attempts, interruptions, last_failure, log_sha256, failure_detail,
-       last_claimed_at, finished_at, worker, CAST(timings AS text)
+ACTION_COLUMNS = """input_key, theory, state, tier, attempts, interruptions, last_failure, log_sha256, failure_detail,
+       last_claimed_at, finished_at, worker, CAST(timings AS text)"""
+CHANGED_ACTIONS = sa.text(f"""
+SELECT {ACTION_COLUMNS}
 FROM actions
 WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)
 ORDER BY theory, input_key
 """)
 
+# This batch's actions of :keys, a primary key probe per key; see Coordinator.changes. As `input_key = ANY(:keys)`,
+# PostgreSQL 17 scans the whole batch for a few hundred keys; OFFSET 0 keeps the planner from making the probe a join
+# it can reorder.
+ACTIONS_OF_KEYS = sa.text(f"""
+SELECT a.* FROM unnest(CAST(:keys AS text[])) k (input_key) CROSS JOIN LATERAL (
+    SELECT {ACTION_COLUMNS}
+    FROM actions
+    WHERE batch_id = (SELECT CAST(:batch_id AS uuid)) AND input_key = k.input_key
+    OFFSET 0
+) a
+ORDER BY a.theory, a.input_key
+""")
+# This batch's ready builds that single-flight holds back behind another batch's live lease of the same key and spec
+# (see CLAIM_ACTION), each with the holding batch and when it claimed the key. It starts from the live leases, as
+# leases have no index leading with input_key, and reads both copies of each lease's key by primary key in the target
+# list, so the planner can't put a join with actions first.
+HELD_READY_ACTIONS = sa.text("""
+SELECT input_key, held_by, held_since FROM (
+    SELECT l.input_key, l.batch_id AS held_by, (
+        SELECT h.last_claimed_at FROM actions h WHERE h.batch_id = l.batch_id AND h.input_key = l.input_key
+    ) AS held_since, (
+        SELECT a.state = 'ready' AND a.class = 'build' AND a.spec_sha256 = (
+            SELECT h.spec_sha256 FROM actions h WHERE h.batch_id = l.batch_id AND h.input_key = l.input_key
+        )
+        FROM actions a WHERE a.batch_id = (SELECT CAST(:batch_id AS uuid)) AND a.input_key = l.input_key
+    ) AS held
+    FROM leases l
+    WHERE l.expires_at > now() AND l.batch_id <> (SELECT CAST(:batch_id AS uuid))
+) live
+WHERE held
+ORDER BY input_key, held_since, held_by
+""")
+
+
+# The (key, spec) of every live lease. A ready build copy with both is held back (single-flight): only a copy with the
+# lease's spec is done when it succeeds, so one with another spec is claimed at once rather than waiting for nothing,
+# as a timed build would on an untimed one of the same key. Leases have no spec: it is read from the lease's action by
+# primary key, in the target list, so the planner can't put a join with actions first. As the operand of NOT IN it is
+# an uncorrelated subquery, read once per statement into a hash.
+LEASED_SPECS = (
+    "(SELECT l.input_key, (SELECT la.spec_sha256 FROM actions la WHERE la.batch_id = l.batch_id "
+    "AND la.input_key = l.input_key) FROM leases l WHERE l.expires_at > now())"
+)
 
 # The ready action to claim next is found in two steps; see Coordinator.claim. CLAIM_CANDIDATES ranks the running
 # batches with a ready action of an accepted class and tier, one row per batch, class and tier, best first; each
@@ -525,7 +584,7 @@ ORDER BY theory, input_key
 # CLAIM_ACTION then locks a candidate's first ready action in the order of actions_ready_order, skipping those other
 # claims hold; the first candidate with one wins. Together they take the first unlocked action in the order (class,
 # tier, batch rank, critical depth, descendants, theory, key).
-CLAIM_CANDIDATES = sa.text("""
+CLAIM_CANDIDATES = sa.text(f"""
 WITH run_capacity AS MATERIALIZED (
     SELECT 'run' = ANY(CAST(:classes AS text[])) AND (
         SELECT count(*) FROM actions WHERE state = 'running' AND class = 'run'
@@ -544,7 +603,7 @@ CROSS JOIN (SELECT DISTINCT unnest(CAST(:tiers AS text[]))) t (tier)
 CROSS JOIN LATERAL (
     SELECT a.theory, a.critical_depth, a.descendant_count FROM actions a
     WHERE a.batch_id = b.id AND a.state = 'ready' AND a.class = c.class AND a.tier = t.tier
-    AND (a.class = 'run' OR a.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()))
+    AND (a.class = 'run' OR (a.input_key, a.spec_sha256) NOT IN {LEASED_SPECS})
     ORDER BY a.critical_depth DESC, a.descendant_count DESC, a.theory, a.input_key
     LIMIT 1
 ) ready
@@ -559,36 +618,62 @@ ORDER BY
     b.created_at,
     b.id
 """)
-# A build action whose key another batch's live lease is building is held back (single-flight), here and in
-# CLAIM_CANDIDATES: once that build succeeds, Coordinator.complete marks the action done as well; once it fails or
-# its lease expires, the action is claimed again. An expired lease stops holding at once, before the sweep deletes it.
-# An unclaimed action has no lease in its own batch, so every live lease of its key is another batch's; uncorrelated,
-# the lease keys are read once per statement into a hash, rather than once per ready action probed. A build claim
-# then rechecks its key (Coordinator._lock_unleased), and skips the keys in :taken.
-CLAIM_ACTION = sa.text("""
-SELECT input_key, spec_sha256, theory FROM actions
+# A build action whose key and spec another batch's live lease is building is held back (single-flight; see
+# LEASED_SPECS), here and in CLAIM_CANDIDATES: once that build succeeds, Coordinator.complete marks the action done as
+# well; once it fails or its lease expires, the action is claimed again. An expired lease stops holding at once, before
+# the sweep deletes it. An unclaimed action has no lease in its own batch, so every live lease of its key is another
+# batch's. A build claim then rechecks its key and spec (Coordinator._lock_unleased), and skips the keys in :taken. For
+# the claim contention line (Coordinator._contention), ``ready_s`` is how long a build of a positive critical depth,
+# never claimed before, has been ready: since its parents' latest result, or its batch's submission if it has no
+# parents, so it includes the release's check of their entries in the cache before the build was marked ready; read by
+# key. It is null when a parent is done with no result time (found in the cache, or built by another batch:
+# FINISH_PEERS), since when that parent became done isn't recorded, and for a build claimed before (retried), whose
+# earlier attempt isn't.
+CLAIM_ACTION = sa.text(f"""
+SELECT input_key, spec_sha256, theory, critical_depth,
+CASE WHEN class = 'build' AND critical_depth > 0 AND last_claimed_at IS NULL THEN (
+    SELECT CAST(extract(epoch FROM now() - CASE
+        WHEN count(*) = 0 THEN (SELECT created_at FROM batches WHERE id = actions.batch_id)
+        WHEN count(p.finished_at) = count(*) THEN max(p.finished_at)
+    END) AS double precision)
+    FROM edges e JOIN actions p ON p.batch_id = e.batch_id AND p.input_key = e.parent_key
+    WHERE e.batch_id = actions.batch_id AND e.input_key = actions.input_key
+) END AS ready_s
+FROM actions
 WHERE batch_id = :batch_id AND state = 'ready' AND class = :class AND tier = :tier
-AND (class = 'run' OR input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()))
+AND (class = 'run' OR (input_key, spec_sha256) NOT IN {LEASED_SPECS})
 AND input_key <> ALL(CAST(:taken AS text[]))
 ORDER BY critical_depth DESC, descendant_count DESC, theory, input_key
 LIMIT 1 FOR UPDATE SKIP LOCKED
 """)
 # Where CLAIM_ACTION would take a batch's first ready build of a tier, as (critical depth, descendants), without
 # locking it; see Coordinator._outranked_by_ahead.
-FIRST_READY_PLACE = sa.text("""
+FIRST_READY_PLACE = sa.text(f"""
 SELECT critical_depth, descendant_count FROM actions
 WHERE batch_id = :batch_id AND state = 'ready' AND class = 'build' AND tier = :tier
-AND input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
+AND (input_key, spec_sha256) NOT IN {LEASED_SPECS}
 ORDER BY critical_depth DESC, descendant_count DESC, theory, input_key
 LIMIT 1
 """)
-# Two claims of one key from different batches may both pass the statement's check, each in a snapshot without the
-# other's lease. So a build claim then takes a lock on its key, which it holds until it commits, and checks for a
-# live lease again in a later statement, whose snapshot sees every lease of a claim that held the lock before; one
-# whose lock is held or whose key has a live lease skips the key. The lock never waits, so claims that tried several
-# keys can't deadlock; a lock of one 64-bit key never matches run admission's lock of two 32-bit ones.
-LOCK_KEY = sa.text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))")
-KEY_LEASED = sa.text("SELECT EXISTS (SELECT 1 FROM leases WHERE input_key = :key AND expires_at > now())")
+# Whether a build of :tiers is ready that no lease holds back (see CLAIM_ACTION) and no other claim holds; a run
+# admission that waited lets it go first.
+READY_BUILD = sa.text(
+    "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'build' "
+    "AND tier = ANY(CAST(:tiers AS text[])) "
+    f"AND (input_key, spec_sha256) NOT IN {LEASED_SPECS} "
+    "FOR UPDATE SKIP LOCKED)"
+)
+# Two claims of one key and spec from different batches may both pass the statement's check, each in a snapshot
+# without the other's lease. So a build claim then takes a lock on its key and spec, which it holds until it commits,
+# and checks for a live lease of both again in a later statement, whose snapshot sees every lease of a claim that held
+# the lock before; one whose lock is held or that finds such a lease skips the key. The lock never waits, so claims
+# that tried several keys can't deadlock; a lock of one 64-bit key never matches run admission's lock of two 32-bit
+# ones.
+LOCK_KEY = sa.text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key || ':' || :spec, 0))")
+KEY_LEASED = sa.text(
+    "SELECT EXISTS (SELECT 1 FROM leases l WHERE l.input_key = :key AND l.expires_at > now() "
+    "AND (SELECT a.spec_sha256 FROM actions a WHERE a.batch_id = l.batch_id AND a.input_key = l.input_key) = :spec)"
+)
 
 # Loading ahead: in a batch with an ``ahead_cap``, a waiting build action may be claimed before its parents are done
 # when each parent that isn't done is running, up to ``ahead_depth`` generations ahead: generation 0 is a running
@@ -716,17 +801,17 @@ WITH RECURSIVE outlined AS MATERIALIZED ({OUTLINED_LEASES}), capped AS MATERIALI
     GROUP BY r.batch_id, e.input_key
 )
 SELECT (c.a).batch_id, (c.a).input_key, (c.a).tier, b.priority, (c.a).critical_depth, (c.a).descendant_count,
-    c.outlined_parents = c.running_parents AS outlined
+    c.outlined_parents = c.running_parents AS outlined, (c.a).spec_sha256
 FROM children c JOIN ahead_batches b ON b.id = c.batch_id
 WHERE (c.a).state = 'waiting' AND (c.a).class = 'build' AND (c.a).ahead <> 'abandoned'
 AND (c.a).remaining_deps = c.running_parents AND (b.under_cap OR c.outlined_parents = c.running_parents)
-AND (c.a).input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
+AND ((c.a).input_key, (c.a).spec_sha256) NOT IN {LEASED_SPECS}
 ORDER BY b.priority DESC, (c.a).critical_depth DESC, (c.a).descendant_count DESC,
     c.outlined_parents = c.running_parents DESC, (c.a).theory, (c.a).input_key
 """)
 
 # Lock the best of a batch's candidates ``keys`` of ``tier`` that may still be claimed ahead, but not one whose key
-# another batch's live lease is building (single-flight; see CLAIM_ACTION) or in :taken: one with an unfinished
+# and spec another batch's live lease is building (single-flight; see CLAIM_ACTION) or in :taken: one with an unfinished
 # ancestor in its walk that isn't running, or one :depth generations up that still waits for parents and published
 # no outline; with :outlined_only, at its batch's cap, also one with an unfinished parent that published none. Of
 # those as deep, one whose unfinished parents all published their outline goes first, as in AHEAD_CANDIDATES; its
@@ -750,7 +835,7 @@ AND (c).input_key NOT IN (
     SELECT root FROM ancestors
     WHERE state <> 'running' OR (generation = :depth AND remaining_deps > 0 AND NOT outlined)
 )
-AND (c).input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now())
+AND ((c).input_key, (c).spec_sha256) NOT IN {LEASED_SPECS}
 AND (c).input_key <> ALL(CAST(:taken AS text[]))
 AND NOT (
     CAST(:outlined_only AS boolean)
@@ -857,14 +942,14 @@ RETURNING attempt_token
 
 @dataclass
 class _AheadRead:
-    """AHEAD_CANDIDATES read from ``at``, as (batch, input key, tier, priority, (critical depth, descendants),
-    whether its unfinished parents all published their outline), best first, which the claims ahead share, less those
+    """AHEAD_CANDIDATES read from ``at``, as (batch, input key, tier, priority, (critical depth, descendants), whether
+    its unfinished parents all published their outline, spec), best first, which the claims ahead share, less those
     they claimed and those of a batch since found at its cap that would wait, and the batches and tiers found since
     with nothing left to claim ahead; with Coordinator.ahead_changes when it began."""
 
     at: float
     changes: int
-    candidates: list[tuple[UUID, str, str, int, tuple[int, int], bool]]
+    candidates: list[tuple[UUID, str, str, int, tuple[int, int], bool, str]]
     exhausted: set[tuple[UUID, str]]
 
 
@@ -905,16 +990,16 @@ class _AheadTurn:
     claims: int = 0
 
 
-# The unfinished, unclaimed build actions of other running batches with the same key as a build whose lease just ended;
-# see CLAIM_ACTION. With their spec, since a forced or traced build has the same keys as a plain one: only a copy with
-# the same spec is done with the build, the others are just no longer held. Read by primary key, a probe per running
-# batch: no index leads with input_key.
+# The unfinished, unclaimed build actions of other running batches with the same key and spec as a build whose lease
+# just ended, which the lease held back; see CLAIM_ACTION. Copies with another spec (a forced, traced or untimed build
+# has the same keys as a plain one) weren't held. Read by primary key, a probe per running batch: no index leads with
+# input_key.
 PEERS = sa.text("""
-SELECT batch_id, tier, state, spec_sha256,
+SELECT batch_id, tier, state,
     (SELECT ahead_cap IS NOT NULL FROM batches WHERE id = actions.batch_id) AS ahead_batch
 FROM actions
 WHERE batch_id = ANY(ARRAY(SELECT id FROM batches WHERE state = 'running' AND id <> :batch_id))
-AND input_key = :input_key AND class = 'build' AND state IN ('waiting', 'ready')
+AND input_key = :input_key AND spec_sha256 = :spec_sha256 AND class = 'build' AND state IN ('waiting', 'ready')
 """)
 # Mark done the copies of :keys in batch :batch_id, each with its log of :logs, that no claim took; see
 # Coordinator._finish_peers.
@@ -961,6 +1046,7 @@ class _Claimed:
     # The hold the claim took for the build, by its (batch, tier), put back if its lease fails.
     hold: "tuple[tuple[UUID, str], Hold] | None" = None
     tier: str = ""  # a build's, claimed from a shared ranking
+    contention: "_Contention | None" = None  # logged once its lease commits; see Coordinator._contention
 
 
 # Lock a built action :key of batch :batch_id and its children, in key order, returning nothing. A build's result holds
@@ -1014,12 +1100,12 @@ FINISH_IF_DONE = sa.text(
 # burst_demand: they hold a worker but no burst worker should start for them alone. Not those that published their
 # outline or start on their parents' outlines: they work while their parents finish.
 # Both also count, as state ``claimable``, the ready builds a claim could take, for the deferral of claims
-# (Coordinator._defers): one per key, as single-flight leases a key once, and none whose key another batch's live
+# (Coordinator._defers): one per key and spec, as single-flight leases those once, and none another batch's live
 # lease holds back, as CLAIM_ACTION takes none.
 COUNT_CLAIMABLE = (
-    "SELECT 'claimable', c.tier, c.class, false, count(DISTINCT c.input_key) FROM actions c "
+    "SELECT 'claimable', c.tier, c.class, false, count(DISTINCT (c.input_key, c.spec_sha256)) FROM actions c "
     "WHERE c.state = 'ready' AND c.class = 'build' "
-    "AND c.input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()) GROUP BY c.tier, c.class"
+    f"AND (c.input_key, c.spec_sha256) NOT IN {LEASED_SPECS} GROUP BY c.tier, c.class"
 )
 COUNT_UNFINISHED = sa.text(
     "SELECT a.state, a.tier, a.class, b.priority > 0, count(*) FROM actions a "
@@ -1061,6 +1147,54 @@ Hint = tuple[UUID, str, str]
 Hold = tuple[float, float, str]
 # A shared ranking's entry; see _Ranking.
 RankEntry = tuple[int, int, int, bool, datetime, datetime, UUID, str, int | None]
+
+
+class Competitor(NamedTuple):
+    """The best candidate of another batch a build claim left in its ranking (see Coordinator._competitor): its
+    entry, and the theory and critical depth of its batch's first ready build when the claim chose."""
+
+    entry: RankEntry
+    theory: str
+    depth: int
+
+
+@dataclass(frozen=True)
+class _Contention:
+    """A claim contention line (see Coordinator._contention), as the claim saw it, but for its batches'
+    waiting-ahead counts, which are read once the claim's lease commits: why it is logged, the claiming host and
+    worker, the tier, how long the build was ready, the claimed build and its best competitor as (batch, theory,
+    priority, running, critical depth, tier), the ranking's builds of a positive priority running and whether it was
+    capped when the claim chose, and the kept hosts' headroom."""
+
+    reasons: str
+    host: str
+    worker: str
+    tier: str
+    wait: str
+    winner: tuple[UUID, str, int, int, int, str]
+    competitor: tuple[UUID, str, int, int, int, str] | None
+    running_priority: int
+    capped: bool
+    kept: str
+
+    def line(self, priority_cap: int, ahead: list[int] | None) -> str:
+        """The line, with ``ahead``, the winner's and competitor's waiting-ahead counts, or ``?`` without them."""
+
+        def build(place: tuple[UUID, str, int, int, int, str], count: int | None) -> str:
+            batch, theory, priority, running, depth, tier = place
+            return (
+                f"{str(batch)[:8]},{theory},p{priority},r{running},a{'?' if count is None else count},d{depth}"
+                + ("" if tier == self.tier else f",{tier}")
+            )
+
+        counts: list[int | None] = list(ahead) if ahead is not None else [None, None]
+        other = "-" if self.competitor is None else build(self.competitor, counts[1])
+        return (
+            f"claim contention {self.reasons} host={self.host} worker={self.worker} tier={self.tier} "
+            f"wait_s={self.wait} winner={build(self.winner, counts[0])} competitor={other} "
+            f"running_priority={self.running_priority} priority_cap={priority_cap} capped={int(self.capped)} "
+            f"kept={self.kept}"
+        )
 
 
 def _claim_rank(tiers: list[str], host_id: str | None, host_rank: int = 0, workers: int = 0) -> ClaimRank:
@@ -1152,6 +1286,9 @@ class Coordinator:
         self.host_keys: dict[str, dict[str, None]] = {}
         self.keys_seen: dict[str, datetime] = {}
         self.passed_over: dict[tuple[UUID, str], int] = {}
+        # When the claim contention line last logged a batch and tier passed over; see _contention.
+        self.contention_logged: dict[tuple[UUID, str], float] = {}
+        self.contention_logs: set[asyncio.Task[None]] = set()  # lines reading their counts; see _log_contention
         self.holds: dict[tuple[UUID, str], Hold] = {}
         self.ready_builds = 0
         self.ready_high = 0  # high-tier builds ready at that count
@@ -1196,10 +1333,10 @@ class Coordinator:
     async def aclose(self) -> None:
         if self.scale_task is not None:
             await self.scale_task
-        for releaser in self.releasers.values():
-            releaser.cancel()
+        for task in [*self.releasers.values(), *self.contention_logs]:
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await releaser
+                await task
         await self.cache.aclose()
         await self.engine.dispose()
 
@@ -1293,16 +1430,20 @@ class Coordinator:
         changed = await self.changes(batch_id, 0)
         return None if changed is None else changed[0]
 
-    async def changes(self, batch_id: UUID, since: int) -> tuple[BatchStatus, int] | None:
+    async def changes(
+        self, batch_id: UUID, since: int, held_before: Collection[str] = ()
+    ) -> tuple[BatchStatus, int] | None:
         """The batch with only the actions written by transactions numbered ``since`` or later, and the ``since``
-        to pass next time; ``since`` 0 gives every action.
+        to pass next time; ``since`` 0 gives every action. Every ready build that single-flight holds back behind
+        another batch's lease is in it too, changed or not, with ``held_by`` and ``held_since``, and so is each action
+        of ``held_before`` (those the caller last read held), so that a hold that ended is read too.
 
         The next ``since`` is the oldest transaction still running on the server when this one read, so an action
         written by a transaction that commits later is read next time, maybe again. A long transaction anywhere on
         the server holds ``since`` back, so polls reread what changed since it began until it ends.
         """
         async with self.engine.connect() as conn:
-            await conn.execution_options(isolation_level="REPEATABLE READ")  # both reads see one snapshot
+            await conn.execution_options(isolation_level="REPEATABLE READ")  # every read sees one snapshot
             batch = (
                 await conn.execute(
                     sa.text(
@@ -1314,9 +1455,25 @@ class Coordinator:
             ).first()
             if batch is None:
                 return None
-            actions = await conn.execute(CHANGED_ACTIONS, {"batch_id": batch_id, "since": str(since)})
-            status = BatchStatus(batch_id, batch.state, batch.failure, [ActionStatus(*row[:-1], json.loads(row[-1]) if row[-1] is not None else None) for row in actions])
-            return status, int(batch.xmin)
+            rows = list(await conn.execute(CHANGED_ACTIONS, {"batch_id": batch_id, "since": str(since)}))
+            held: dict[str, tuple[UUID, datetime | None]] = {}
+            for key, held_by, held_since in await conn.execute(HELD_READY_ACTIONS, {"batch_id": batch_id}):
+                held.setdefault(key, (held_by, held_since))
+            # A hold that starts, changes or ends after an action became ready writes nothing to its row, so the
+            # held actions, and those held before, are read again here for a follower to see it.
+            unchanged = (held.keys() | set(held_before)) - {row.input_key for row in rows}
+            if unchanged:
+                rows += await conn.execute(ACTIONS_OF_KEYS, {"batch_id": batch_id, "keys": sorted(unchanged)})
+                rows.sort(key=lambda row: (row.theory, row.input_key))
+            actions = [
+                ActionStatus(
+                    *row[:-1],
+                    json.loads(row[-1]) if row[-1] is not None else None,
+                    *held.get(row.input_key, (None, None)),
+                )
+                for row in rows
+            ]
+            return BatchStatus(batch_id, batch.state, batch.failure, actions), int(batch.xmin)
 
     @contextlib.contextmanager
     def watch(self, batch_id: UUID) -> Iterator[asyncio.Event]:
@@ -1528,7 +1685,7 @@ class Coordinator:
         ready builds, by ``read``. None when nothing may be claimed ahead."""
         best: dict[str, int] = {}
         deepest: dict[tuple[UUID, str], tuple[int, int]] = {}
-        for batch_id, _, tier, priority, place, _ in read.candidates:
+        for batch_id, _, tier, priority, place, *_ in read.candidates:
             if tier in ahead_tiers and (batch_id, tier) not in read.exhausted:
                 best[tier] = max(best.get(tier, priority), priority)
                 deepest.setdefault((batch_id, tier), place)  # the read is best first
@@ -1573,7 +1730,8 @@ class Coordinator:
                 async with self.engine.begin() as conn:
                     # Never lock a batch after an action: batch writers take those locks in the opposite order.
                     row, held_until, stopped = await self._claim_build(
-                        conn, ranking, outranked, host_id, hint, hint_only=hint_only, held_tiers=held_tiers
+                        conn, ranking, outranked, host_id, hint, hint_only=hint_only, held_tiers=held_tiers,
+                        worker=worker,
                     )
                     if row is not None:
                         claimed = await self._lease(conn, row, worker)
@@ -1587,6 +1745,8 @@ class Coordinator:
                 if host_id is not None and worker_tiers is not None:
                     self._lease_host(claimed.attempt_token, host_id, worker, worker_tiers)
                 self._leased_build(ranking, row.tier)
+                if row.contention is not None:
+                    self._log_contention(row.contention)
                 return claimed, None
             if held_until is not None:
                 return None, held_until
@@ -1685,15 +1845,7 @@ class Coordinator:
         async with self.run_admission, self.engine.begin() as conn:
             await conn.execute(sa.text("SELECT pg_advisory_xact_lock(1752132706, 1)"))
             # A build made ready during the wait still precedes a fallback run. Rank it outside this transaction.
-            if builds_first and await conn.scalar(
-                sa.text(
-                    "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'build' "
-                    "AND tier = ANY(CAST(:tiers AS text[])) "
-                    "AND input_key NOT IN (SELECT input_key FROM leases WHERE expires_at > now()) "
-                    "FOR UPDATE SKIP LOCKED)"
-                ),
-                params,
-            ):
+            if builds_first and await conn.scalar(READY_BUILD, params):
                 return None, True
             # A preceding admission may have filled the floor/cap; don't rank every batch again in that case.
             if not await conn.scalar(available, params):
@@ -1798,7 +1950,7 @@ class Coordinator:
 
             def keys(*, outlined_only: bool) -> list[str]:
                 return [
-                    key for b, key, t, _, place, outlined in read.candidates
+                    key for b, key, t, _, place, outlined, _ in read.candidates
                     if (b, t) == (batch_id, tier) and (deeper_than is None or place > deeper_than)
                     and (outlined or not outlined_only)
                 ][:AHEAD_CLAIM_KEYS]
@@ -1858,11 +2010,13 @@ class Coordinator:
                     ahead_parents,
                 )
             # Out of the shared read, so the next claim of this read orders the batches by what remains.
-            # Of every batch: single-flight leases a key once, so no other batch's claim may take it. Also out of a
-            # newer read made meanwhile, which the scale-in line for claims ahead counts (see _ahead_ready).
+            # Of every batch: single-flight leases a key and spec once, so no other batch's claim may take it. Also
+            # out of a newer read made meanwhile, which the scale-in line for claims ahead counts (see _ahead_ready).
             for shared in (read, self.ahead_read):
                 if shared is not None:
-                    shared.candidates = [c for c in shared.candidates if c[1] != row.input_key]
+                    shared.candidates = [
+                        c for c in shared.candidates if (c[1], c[6]) != (row.input_key, row.spec_sha256)
+                    ]
             waiting += 0 if row.outlined else 1
             if waiting >= batch.ahead_cap:  # full: the claims waiting their turn take only those that won't wait
                 read.candidates = [c for c in read.candidates if c[0] != batch_id or c[5]]
@@ -1912,7 +2066,7 @@ class Coordinator:
                 [
                     (
                         row.batch_id, row.input_key, row.tier, row.priority, (row.critical_depth, row.descendant_count),
-                        row.outlined,
+                        row.outlined, row.spec_sha256,
                     )
                     for row in rows
                 ],
@@ -1936,8 +2090,8 @@ class Coordinator:
         while True:
             row = (await conn.execute(statement, {**params, "taken": taken})).first()
             if row is None or (
-                await conn.scalar(LOCK_KEY, {"key": row.input_key})
-                and not await conn.scalar(KEY_LEASED, {"key": row.input_key})
+                await conn.scalar(LOCK_KEY, {"key": row.input_key, "spec": row.spec_sha256})
+                and not await conn.scalar(KEY_LEASED, {"key": row.input_key, "spec": row.spec_sha256})
             ):
                 return row
             taken.append(row.input_key)
@@ -1970,6 +2124,7 @@ class Coordinator:
         *,
         hint_only: frozenset[str] = frozenset(),
         held_tiers: frozenset[str] = frozenset(),
+        worker: str = "",
     ) -> tuple[_Claimed | None, float | None, RankEntry | None]:
         """Lock a ready build from the shared ranking, without refreshing it inside the transaction.
 
@@ -1989,12 +2144,19 @@ class Coordinator:
         the next one, as a swap passes over the chosen one, waking a claim on a host it is held for (_wake_holders).
         When only such candidates are left, it returns no build and when the first of their holds ends. Of tiers
         ``hint_only``, it takes only a build held for ``host_id``: the claim defers them to better-ranked claims.
+
+        A build ``worker`` locks may carry a contention line, with its best competitor left in the ranking
+        (_contention), for _claim to log once the lease commits.
         """
-        kept = functools.cache(
-            lambda tier: self._kept_hosts(
+        def kept_lines(tier: str) -> set[str]:
+            return self._kept_hosts(
                 (len(ranking.heap) if tier != "high" else sum(e[7] == "high" for e in ranking.heap)) + 1, tier
             )
-        )
+
+        kept = functools.cache(kept_lines)
+        # The contention line's competitor reads lines of its own, so that only the steps that use the claim's
+        # draw them, from the heap and fleet as they are when they first ask.
+        competitor_kept = functools.cache(kept_lines)
         held: list[RankEntry] = []  # taken out of the heap only until this claim awaits or returns
         held_until: float | None = None
         hint_tiers = set(held_tiers) if hint is None else {hint[1]}
@@ -2055,6 +2217,9 @@ class Coordinator:
                 held.append(entry)
                 held_until = until if held_until is None else min(held_until, until)
                 continue
+            # Before the builds this claim passed over for their holds are back: it could take none of them.
+            competitor = self._competitor(ranking, batch_id, host_id, hint_only, competitor_kept)
+            chosen = (ranking.running_priority, ranking.capped)  # as the claim chose, before it counts
             put_back_held()
             heapq.heappush(
                 ranking.heap,
@@ -2093,8 +2258,13 @@ class Coordinator:
                     self.locality.held_ms_total += round((asyncio.get_running_loop().time() - hold[0]) * 1000)
                 if host_id is not None:
                     self._count_claim(row.theory, tier, host_id, kept)
+                contention = self._contention(
+                    kept, worker, host_id, (priority, running, batch_id, tier), row, competitor, chosen
+                )
                 taken = None if hold is None else ((batch_id, tier), hold)
-                claimed = _Claimed(batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb, taken, tier)
+                claimed = _Claimed(
+                    batch_id, row.input_key, row.spec_sha256, row.theory, max_heap_mb, taken, tier, contention
+                )
                 return claimed, None, None
             if passed is not None and (count := self.passed_over.get(passed)) is not None:
                 if count > 1:
@@ -2108,6 +2278,120 @@ class Coordinator:
             ranking.exhausted.add((batch_id, tier))
         put_back_held()
         return None, held_until, None
+
+    def _competitor(
+        self,
+        ranking: "_Ranking",
+        batch_id: UUID,
+        host_id: str | None,
+        hint_only: frozenset[str],
+        kept: Callable[[str], set[str]],
+    ) -> Competitor | None:
+        """The best candidate of another batch than ``batch_id`` in ``ranking``'s heap whose first ready build the
+        ranking knows (one not claimed from since the read), or None, for a claim from ``host_id``: not one it would
+        leave for a hold, another host's (see _held), or, of tiers ``hint_only``, any but its own (_held_here). Only
+        the heap's top three are looked at, which hold its two best entries, so a candidate claimed from or exhausted
+        since can hide the next one."""
+        for entry in sorted(ranking.heap[:3]):
+            key = (entry[6], entry[7])
+            theory, depth = ranking.theories.get(key), ranking.depths.get(key)
+            if entry[6] == batch_id or theory is None or depth is None or key in ranking.exhausted:
+                continue
+            if entry[7] in hint_only and not self._held_here(ranking, key, host_id, kept):
+                continue
+            if self._leaves(ranking, entry, host_id, kept) and not self._hold_ended(ranking, key):
+                continue
+            return Competitor(entry, theory, depth[0])
+        return None
+
+    def _contention(
+        self,
+        kept: Callable[[str], set[str]],
+        worker: str,
+        host_id: str | None,
+        winner: tuple[int, int, UUID, str],
+        row: sa.Row[Any],
+        competitor: Competitor | None,
+        chosen: tuple[int, bool],
+    ) -> _Contention | None:
+        """The line to log for the build ``row`` ``worker`` locked, of ``winner``'s (negated priority, running,
+        batch, tier), with its best ``competitor`` (see _competitor) and the ranking's (running_priority, capped)
+        ``chosen`` when the claim chose: when the build was ready CONTENTION_WAIT_SECONDS with a positive critical
+        depth (``slow``), the competitor is deeper (``passed``, once per its batch and tier each
+        CONTENTION_WAIT_SECONDS), or by a CONTENTION_SAMPLE chance when there is one (``sample``); else None. For
+        replays of claim order against hosts and sleepers; changes nothing it reads."""
+        priority, running, batch_id, tier = winner
+        reasons = []
+        if row.ready_s is not None and row.ready_s > CONTENTION_WAIT_SECONDS:
+            reasons.append("slow")
+        if competitor is not None:
+            *_, c_batch, c_tier, _ = competitor.entry
+            if competitor.depth > max(0, row.critical_depth):
+                now = asyncio.get_running_loop().time()
+                last = self.contention_logged.get((c_batch, c_tier))
+                if last is None or now - last >= CONTENTION_WAIT_SECONDS:
+                    self.contention_logged.pop((c_batch, c_tier), None)
+                    self.contention_logged[(c_batch, c_tier)] = now
+                    if len(self.contention_logged) > MAX_LEASE_HOSTS:
+                        del self.contention_logged[next(iter(self.contention_logged))]
+                    reasons.append("passed")
+            if random.random() < CONTENTION_SAMPLE:
+                reasons.append("sample")
+        if not reasons:
+            return None
+        hosts = []
+        at = self.clock()
+        for kept_id in sorted(kept(tier)):
+            report = self.hosts.get(kept_id)
+            short = "?" if report is None else int(report[1].memory_short)
+            idle = "?" if report is None or report[1].cpu_idle_pct is None else report[1].cpu_idle_pct
+            # Its workers seen lately, as _kept_hosts counts them: the others may have gone.
+            live = sum(
+                (at - seen).total_seconds() < HOST_REPORT_SECONDS
+                for seen, _ in self.host_workers.get(kept_id, {}).values()
+            )
+            hosts.append(f"{kept_id[:8]}:{short}:{idle}:{live}")
+        other = None
+        if competitor is not None:
+            _, c_priority, c_running, *_, c_batch, c_tier, _ = competitor.entry
+            other = (c_batch, competitor.theory, -c_priority, c_running, competitor.depth, c_tier)
+        return _Contention(
+            "+".join(reasons),
+            "-" if host_id is None else host_id[:8],
+            worker or "-",
+            tier,
+            "-" if row.ready_s is None else f"{row.ready_s:.1f}",
+            (batch_id, row.theory, -priority, running, row.critical_depth, tier),
+            other,
+            *chosen,
+            ";".join(hosts) or "-",
+        )
+
+    def _log_contention(self, contention: _Contention) -> None:
+        """Log ``contention`` in the background, once it has read its batches' waiting-ahead counts on a connection
+        of its own; without them while CONTENTION_PENDING lines are reading theirs. Nothing about it can fail or
+        delay the claim it describes."""
+        if len(self.contention_logs) >= CONTENTION_PENDING:
+            claims_logger.info(contention.line(self.settings.priority_cap, None))
+            return
+        task = asyncio.get_running_loop().create_task(self._log_counted(contention))
+        self.contention_logs.add(task)
+        task.add_done_callback(self.contention_logs.discard)
+
+    async def _log_counted(self, contention: _Contention) -> None:
+        batches = [contention.winner[0]] + ([] if contention.competitor is None else [contention.competitor[0]])
+        outlined = list(self.outlined_tokens)
+        try:
+            async with self.engine.connect() as conn:
+                ahead = [
+                    await conn.scalar(COUNT_WAITING_AHEAD, {"batch_id": batch, "outlined": outlined})
+                    for batch in batches
+                ]
+        except DATABASE_UNAVAILABLE:
+            logger.warning("claim contention line logged without its counts", exc_info=True)
+            claims_logger.info(contention.line(self.settings.priority_cap, None))
+            return
+        claims_logger.info(contention.line(self.settings.priority_cap, ahead))
 
     def _cap_priorities(self, ranking: "_Ranking") -> None:
         """Cap ``ranking`` once batches of a positive priority run ``priority_cap`` builds: rank their builds like
@@ -2197,11 +2481,9 @@ class Coordinator:
         passes it over (_hold_ended). The hold ends with that time only, so no build waits longer, and needs a known
         theory: a batch's next build after a claim from it has none until the next ranking read."""
         head = (entry[6], entry[7])
-        if not self.settings.locality or host_id is None or (theory := ranking.theories.get(head)) is None:
+        if not self._leaves(ranking, entry, host_id, kept):
             return None
-        mine = self._level(host_id, theory)
-        if mine == 2 or self._best_level(theory, entry[7], host_id, kept) <= mine:
-            return None
+        theory = ranking.theories[head]
         loop = asyncio.get_running_loop()
         now = loop.time()
         # A hold another process's claim ended leaves the batch's next build, of another theory, a hold of its own.
@@ -2214,6 +2496,17 @@ class Coordinator:
             return None
         self._wake_holders(ranking, entry, host_id, kept)
         return hold[1]
+
+    def _leaves(
+        self, ranking: "_Ranking", entry: RankEntry, host_id: str | None, kept: Callable[[str], set[str]]
+    ) -> bool:
+        """Whether a claim from ``host_id`` leaves candidate ``entry`` to a kept host holding more of its theory,
+        while the hold that starts or has started (see _held) lasts."""
+        theory = ranking.theories.get((entry[6], entry[7]))
+        if not self.settings.locality or host_id is None or theory is None:
+            return False
+        mine = self._level(host_id, theory)
+        return mine != 2 and self._best_level(theory, entry[7], host_id, kept) > mine
 
     def _hold_ended(self, ranking: "_Ranking", head: tuple[UUID, str]) -> bool:
         """Whether the build of ``head`` that ``ranking`` knows was held for a holder (see _held) and its hold has
@@ -2631,13 +2924,14 @@ class Coordinator:
     def _ahead_ready(self, tier: str) -> int:
         """The distinct actions the last read of claims ahead found that a claim of ``tier`` could take ahead, less
         those claimed since and those of batches and tiers found with none left: of ``tier`` for high work, else of
-        any tier, as the line for standard work counts all ready builds. An action several batches hold counts once,
-        as single-flight leases it once."""
+        any tier, as the line for standard work counts all ready builds. An action several batches hold with one
+        spec counts once, as single-flight leases it once."""
         read = self.ahead_read
         if read is None:
             return 0
         return len({
-            key for b, key, t, *_ in read.candidates if (tier != "high" or t == tier) and (b, t) not in read.exhausted
+            (key, spec) for b, key, t, *_, spec in read.candidates
+            if (tier != "high" or t == tier) and (b, t) not in read.exhausted
         })
 
     def _above_line(self, rank: ClaimRank, tier: str, *, ahead: bool = False) -> bool:
@@ -2651,6 +2945,10 @@ class Coordinator:
         if host_rank == 0 and host_id is not None and tiers[0] != "standard":
             host_rank = self._burst_ranks(self.clock()).get(host_id, 0)
         return _claim_rank(tiers, host_id, host_rank, len(self.host_workers.get(host_id or "", ())))
+
+    def spilled(self, host_id: str) -> bool:
+        """Whether burst host ``host_id`` is an On-Demand host claims fill after Spot (rank 2, see _burst_ranks)."""
+        return self._burst_ranks(self.clock()).get(host_id) == 2
 
     def _burst_ranks(self, now: datetime) -> dict[str, int]:
         """The rank each burst host of rank 0 (On-Demand) packs at: the ``on_demand_burst_hosts`` with the most
@@ -2725,12 +3023,17 @@ class Coordinator:
 
     async def _peers(self, batch_id: UUID, action: sa.Row[Any]) -> list[sa.Row[Any]]:
         """The waiting and ready copies of build ``action`` of ``batch_id``, whose lease just ended, in other
-        running batches, with their batch, tier, state, spec and ahead opt-in; see PEERS. Read once the lease's deletion
-        committed, so a batch submitted meanwhile is either found or was never held."""
+        running batches with its spec, with their batch, tier, state and ahead opt-in; see PEERS. Read once the lease's
+        deletion committed, so a batch submitted meanwhile is either found or was never held."""
         if action.action_class != "build":
             return []
         async with self.engine.connect() as conn:
-            return list(await conn.execute(PEERS, {"batch_id": batch_id, "input_key": action.input_key}))
+            return list(
+                await conn.execute(
+                    PEERS,
+                    {"batch_id": batch_id, "input_key": action.input_key, "spec_sha256": action.spec_sha256},
+                )
+            )
 
     def _wake_peers(self, peers: list[sa.Row[Any]]) -> None:
         """Have claims take the ``peers`` now that the lease holding them back ended: the ready ones as if just made
@@ -3130,8 +3433,8 @@ class Coordinator:
         if unblocked:
             self._ahead_changed()
         peers = await self._peers(batch_id, action)
-        done = [] if result.status == "failed" else [peer for peer in peers if peer.spec_sha256 == action.spec_sha256]
-        self._wake_peers([peer for peer in peers if peer not in done])
+        done = [] if result.status == "failed" else peers
+        self._wake_peers([] if done else peers)
         # Marked done by a release, a transaction per batch for all the keys completed meanwhile: one per copy here
         # held the worker's request through up to a dozen batch locks, which the copies' releases also take.
         for peer in done:

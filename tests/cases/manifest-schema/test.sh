@@ -404,13 +404,7 @@ TOML
 expect_context_failure empty_project_name "project.name must not be empty"
 
 cat > "$tmpdir/bad_type/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = 123
@@ -418,13 +412,7 @@ TOML
 expect_context_failure bad_type "name must be a string"
 
 cat > "$tmpdir/bad_project_name/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "../bad"

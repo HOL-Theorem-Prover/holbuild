@@ -219,12 +219,13 @@ expect v9 0 v8
 require_grep "not publishing the tool cache: not a plain file" "$tmpdir/v9.log"
 cmp -s "$tmpdir/entry-v8" "$tmpdir/remote/ac/$tool_ac" || { echo "the v9 action changed the entry" >&2; exit 1; }
 
-# Nor are files over the size limit.
-write_t v10 'val _ = tool_put "seen" "v10"; val _ = tool_put "big" (CharVector.tabulate (64 * 1024 * 1024, fn _ => #"x"));'
+# Nor are files over the size limit.  "big" is sparse: it ends one byte past
+# 256 MiB without the test writing them all.
+write_t v10 'val _ = tool_put "seen" "v10"; val big = Posix.FileSys.creat (OS.Path.concat (tool_dir, "big"), Posix.FileSys.S.irwxu); val _ = Posix.IO.lseek (big, Position.fromInt (256 * 1024 * 1024), Posix.IO.SEEK_SET); val _ = Posix.IO.writeVec (big, Word8VectorSlice.full (Byte.stringToBytes "x")); val _ = Posix.IO.close big;'
 export_t v10 --tool-cache probe
 worker v10 "$spec_t"
 expect v10 0 v8
-require_grep "not publishing the tool cache: 2 files of 67108867 bytes exceed" "$tmpdir/v10.log"
+require_grep "not publishing the tool cache: 2 files of 268435460 bytes exceed the limit of 16 files of 268435456 bytes" "$tmpdir/v10.log"
 cmp -s "$tmpdir/entry-v8" "$tmpdir/remote/ac/$tool_ac" || { echo "the v10 action changed the entry" >&2; exit 1; }
 
 # A worker whose entry names a blob the remote cache lost keeps the files

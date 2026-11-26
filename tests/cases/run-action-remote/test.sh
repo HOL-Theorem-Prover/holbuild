@@ -208,9 +208,23 @@ run fetch 0 --fetch-only --script "$runner/run.sml" rr:CTheory
 [[ $(< "$out/rr/CTheory/first") == rr:CTheory ]]
 script other.sml other
 run fetch-missing 0 --fetch-only --script "$runner/other.sml" rr:CTheory
-line fetch-missing rr:CTheory missing > /dev/null
+other_run=$(line fetch-missing rr:CTheory missing)
 [[ $(posts) == "$before" ]]
 require_grep '^proof_timeout=none$' "$metadata"
+
+# --held runs are neither fetched nor, with a coordinator, submitted.
+rm -rf "$out"
+printf '%s\n' "$c_run" > "$tmpdir/held"
+run held-fetch 0 --fetch-only --held "$tmpdir/held" --script "$runner/run.sml" rr:CTheory hol:bool
+[[ $(line held-fetch rr:CTheory held) == "$c_run" ]]
+line held-fetch HOL:boolTheory cached > /dev/null
+[[ ! -e "$out/rr/CTheory" ]]
+[[ $(< "$out/HOL/boolTheory/first") == HOL:boolTheory ]]
+printf '%s\n' "$other_run" > "$tmpdir/held"
+run held-run 0 --remote-exec "$coordinator" --held "$tmpdir/held" --script "$runner/other.sml" rr:CTheory
+[[ $(line held-run rr:CTheory held) == "$other_run" ]]
+[[ $(posts) == "$before" ]]
+[[ ! -e "$out/rr/CTheory" ]]
 
 # Outputs that can't be written are an error, not a missing run; every
 # target still gets its line.

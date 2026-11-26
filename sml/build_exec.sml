@@ -8,6 +8,11 @@ exception Error of string
 exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
 exception RetryInvalidCheckpoint
 
+(* Run before a theory child starts from a fresh preload, not from a
+   checkpoint: a worker's check-only action installs its dependencies then
+   (exec_action, build_light). *)
+val before_fresh_preload = ref (fn () => ())
+
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
 fun warn msg = HolbuildStatus.message_stderr ("holbuild: warning: " ^ msg ^ "\n")
@@ -115,7 +120,7 @@ fun write_text path text =
       handle e => raise Error ("could not write " ^ path ^ ": " ^ General.exnMessage e)
     fun close_output () = TextIO.closeOut output handle _ => ()
   in
-    (TextIO.output(output, text);
+    (HolbuildBoundedOutput.text (output, text);
      TextIO.closeOut output;
      rename_replace {old = tmp, new = path})
     handle e => (close_output (); remove_file tmp; raise e)
@@ -1742,7 +1747,7 @@ fun write_checkpoint_index_atomically (index as {dir, ...} : checkpoint_index) =
       handle e => raise Error ("could not write " ^ path ^ ": " ^ General.exnMessage e)
     fun close_output () = TextIO.closeOut output handle _ => ()
   in
-    (TextIO.output(output, checkpoint_index_text index);
+    (HolbuildBoundedOutput.text (output, checkpoint_index_text index);
      TextIO.closeOut output;
      rename_replace {old = tmp, new = path};
      remove_file (legacy_checkpoint_index_tmp_path dir);
@@ -3024,7 +3029,9 @@ fun write_local_theory_manifests plan node generated_metadata =
     write_object_manifest script_uo (script_loads @ [source_file node])
   end
 
-fun remove_failed_cache_outputs project node =
+(* Also the theory's checkpoints, unless KEEP_CHECKPOINTS (build
+   --no-checkpoint-saves). *)
+fun remove_failed_cache_outputs keep_checkpoints project node =
   let
     val {sig_path, sml_path, data_path, script_uo, theory_ui, theory_uo} = theory_outputs node
     val trace_path = drop_suffix ".dat" data_path ^ ".tr.gz"
@@ -3043,7 +3050,7 @@ fun remove_failed_cache_outputs project node =
        trace_path, hfs_remapped_path trace_path]
   in
     List.app remove_file (manifest_paths @ payload_paths);
-    remove_checkpoint_family (checkpoint_base project node)
+    if keep_checkpoints then () else remove_checkpoint_family (checkpoint_base project node)
   end
 
 datatype theory_cache_restore = CacheMiss | CacheRestored of real option
@@ -3126,7 +3133,7 @@ fun install_cache_entry {copy, sml_text, object, refresh} input_key subject
     {proof_timeout = proof_timeout, sml_text = text}
   end
 
-fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
+fun materialize_theory_cache keep_checkpoints verify_cache allow_timeout_discrepancy project plan input_key requested_timeout require_trace node =
   let
     val root = cache_root ()
     val subject = logical_name node
@@ -3156,7 +3163,7 @@ fun materialize_theory_cache verify_cache allow_timeout_discrepancy project plan
             write_manifests = write_manifests}))
   end
   handle Error "cache entry not found" => CacheMiss
-       | e => (remove_failed_cache_outputs project node;
+       | e => (remove_failed_cache_outputs keep_checkpoints project node;
                cache_trace ("cache miss: " ^ logical_name node ^ " " ^
                             cache_key_role ^ "=" ^ input_key ^
                             " (" ^ General.exnMessage e ^ ")");
@@ -3173,7 +3180,7 @@ fun metadata_path (project : HolbuildProject.t) node =
 
 fun clean_theory_node project plan node =
   (clean_registered_extra_outputs project plan node;
-   remove_failed_cache_outputs project node;
+   remove_failed_cache_outputs false project node;
    remove_file (metadata_path project node);
    remove_file (HolbuildBuildPlan.dependency_cache_path (HolbuildBuildPlan.source_of node)))
 
@@ -3606,7 +3613,7 @@ fun best_failed_prefix_checkpoint requested_timeout checkpoints =
 
 datatype force_level = ForceNone | ForceTargets | ForceProject | ForceAll
 
-type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, check_only_targets : string list, skip_checkpoints : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, heavy_tactic_timeout : real option option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool, promote_preload : bool}
+type build_options = {use_cache : bool, verify_cache : bool, force : force_level, force_targets : string list, checkpoint_targets : string list, check_only_targets : string list, skip_checkpoints : bool, no_checkpoint_saves : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, proof_scope : HolbuildTacticTimeoutPolicy.proof_scope, node_tactic_timeouts : HolbuildTacticTimeoutPolicy.timeouts, heavy_tactic_timeout : real option option, trace_steps : bool, repl_on_failure : bool, emit_output_hashes : bool, allow_cache_timeout_discrepancy : bool, trknl : bool, restore_only : bool, fail_fast : bool, all_checkpoints : bool, promote_preload : bool}
 
 (* checkpoint: the theory restores checkpoints and saves them at all.
    theorem_checkpoints: it also saves them per theorem and definition, and
@@ -3620,21 +3627,27 @@ type build_options = {use_cache : bool, verify_cache : bool, force : force_level
    of the heap --max-heap limits (write_plain_preload); only check's
    prebuild asks for it.  check_only: build --check-only runs the theory
    for its verdict alone; it exports nothing, and installs, caches and
-   publishes no outputs. *)
+   publishes no outputs.  checkpoint_saves: false under build
+   --no-checkpoint-saves, which restores checkpoints as checkpoint says but
+   saves, removes and publishes none. *)
 datatype checkpoint_policy =
-  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, heavy_tactic_timeout : real option, trace_steps : bool, repl_on_failure : bool, trknl : bool, promote_preload : bool, check_only : bool}
+  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_saves : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, heavy_tactic_timeout : real option, trace_steps : bool, repl_on_failure : bool, trknl : bool, promote_preload : bool, check_only : bool}
 
 val default_checkpoint_seconds = 2.0
 
 val no_checkpoint_policy =
-  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, heavy_tactic_timeout = NONE, trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false, check_only = false}
+  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_saves = true, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, heavy_tactic_timeout = NONE, trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false, check_only = false}
 
 fun checkpoint_enabled (CheckpointPolicy {checkpoint, ...}) = checkpoint
 fun theorem_checkpoints_enabled (CheckpointPolicy {theorem_checkpoints, ...}) = theorem_checkpoints
+fun checkpoint_saves_enabled (CheckpointPolicy {checkpoint_saves, ...}) = checkpoint_saves
+(* Whether the theory saves a failed proof's prefix. *)
+fun theorem_saves_enabled policy = theorem_checkpoints_enabled policy andalso checkpoint_saves_enabled policy
 (* Whether the theory saves its deps_loaded state, and its theorem and
    definition contexts, as it runs. *)
 fun checkpoint_target_enabled (CheckpointPolicy {checkpoint_target, ...}) = checkpoint_target
-fun saves_progress policy = checkpoint_enabled policy andalso checkpoint_target_enabled policy
+fun saves_progress policy =
+  checkpoint_enabled policy andalso checkpoint_target_enabled policy andalso checkpoint_saves_enabled policy
 fun context_checkpoints_enabled policy = theorem_checkpoints_enabled policy andalso saves_progress policy
 fun checkpoint_seconds (CheckpointPolicy {checkpoint_seconds, ...}) = checkpoint_seconds
 fun proof_steps_enabled (CheckpointPolicy {proof_steps, ...}) = proof_steps
@@ -3648,6 +3661,15 @@ fun repl_on_failure (CheckpointPolicy {repl_on_failure, ...}) = repl_on_failure
 fun trknl_enabled (CheckpointPolicy {trknl, ...}) = trknl
 fun promotes_preload (CheckpointPolicy {promote_preload, ...}) = promote_preload
 fun checks_only (CheckpointPolicy {check_only, ...}) = check_only
+
+(* POLICY restoring and saving no checkpoints. *)
+fun without_checkpoints (CheckpointPolicy {checkpoint_saves, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, check_only, ...}) =
+  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_saves = checkpoint_saves,
+                    checkpoint_target = checkpoint_target, checkpoint_seconds = checkpoint_seconds,
+                    proof_steps = proof_steps, new_ir = new_ir, tactic_timeout = tactic_timeout,
+                    heavy_tactic_timeout = heavy_tactic_timeout, trace_steps = trace_steps,
+                    repl_on_failure = repl_on_failure, trknl = trknl,
+                    promote_preload = promote_preload, check_only = check_only}
 
 fun bool_text true = "true"
   | bool_text false = "false"
@@ -4288,7 +4310,7 @@ fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker s
       {source = source_text, source_name = source_name, start_offset = start_offset, checkpoints = checkpoints,
        declaration_checkpoints = if context_checkpoints_enabled policy then declaration_checkpoints else [],
        terminations = terminations,
-       save_checkpoints = theorem_checkpoints_enabled policy,
+       save_checkpoints = theorem_saves_enabled policy,
        context_checkpoints = context_checkpoints_enabled policy,
        share_failed_prefix = share_failed_prefix,
        checkpoint_seconds = checkpoint_seconds policy,
@@ -4338,7 +4360,7 @@ fun failed_prefix_resume_message logical checkpoint step_count =
 fun failed_prefix_resume_source policy contexts timeout_marker source_name source checkpoints declaration_checkpoints terminations checkpoint metadata_text =
   let
     val runtime_config =
-      {checkpoint_enabled = theorem_checkpoints_enabled policy,
+      {checkpoint_enabled = theorem_saves_enabled policy,
        context_checkpoints = (contexts andalso context_checkpoints_enabled policy),
        share_failed_prefix = false,
        checkpoint_seconds = checkpoint_seconds policy,
@@ -4400,7 +4422,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker source_name sourc
          checkpoints = checkpoints,
          declaration_checkpoints = if (contexts andalso context_checkpoints_enabled policy) then declaration_checkpoints else [],
          terminations = terminations,
-         save_checkpoints = theorem_checkpoints_enabled policy,
+         save_checkpoints = theorem_saves_enabled policy,
          context_checkpoints = (contexts andalso context_checkpoints_enabled policy),
          share_failed_prefix = false,
          checkpoint_seconds = checkpoint_seconds policy,
@@ -4679,6 +4701,11 @@ val dropped_checkpoints = ref 0
    exec-action's rstmodrejn. *)
 val rejected_heap_modules = ref 0
 
+(* Whether the child, since the action started, gave up the deps heap
+   after failing to load it or a module it loads: the retry doesn't run
+   on it. *)
+val discarded_deps_heap = ref false
+
 fun write_theory_script capture defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker =
   let
     val _ = resume_steps := []
@@ -4697,7 +4724,7 @@ fun write_theory_script capture defer_proofs policy root checkpoint_root base_co
       val deps_loaded = deps_loaded_path base deps_key
       val deps_ok = deps_checkpoint_ok_text deps_key
       fun ensure_source_checkpoint_parents () =
-        if not (theorem_checkpoints_enabled policy) then ()
+        if not (theorem_saves_enabled policy) then ()
         else
           (List.app (fn {context_path, failed_prefix_path, ...} =>
                        (ensure_parent context_path; ensure_parent failed_prefix_path))
@@ -4712,7 +4739,7 @@ fun write_theory_script capture defer_proofs policy root checkpoint_root base_co
       (* A theory that isn't a target saves no deps heap: its failed
          prefix, if any, is then a child of the base state. *)
       fun run_from_fresh_preload () =
-        (remove_deps_checkpoint_descendants base deps_key;
+        ((if checkpoint_saves_enabled policy then remove_deps_checkpoint_descendants base deps_key else ());
          ensure_source_checkpoint_parents ();
          if saves_progress policy then write_preload capture load_lines deps_loaded deps_ok preload
          else write_plain_preload load_lines preload;
@@ -4906,6 +4933,10 @@ fun take_attached_child () =
 val capture_deps_heap = ref false
 val captured_deps_heap = ref (NONE : string option)
 
+(* Whether a preload of the action saved a deps heap and asked for its
+   capture, whether or not the capture then succeeded. *)
+val preloaded_deps_heap = ref false
+
 (* The theory modules the captured heap loads, linked from the host's store
    into a private directory when the preload saved it, with the ids it
    requires: the publication uploads these, as a restore may later replace
@@ -5000,7 +5031,8 @@ fun with_deps_heap_capture store deps_loaded f =
        it (HOLBUILD_TEST_CAPTURE_PAUSE) to change the heap's modules after
        the preload saved it. *)
     fun take () =
-      ((test_pause "HOLBUILD_TEST_CAPTURE_PAUSE";
+      ((preloaded_deps_heap := true;
+        test_pause "HOLBUILD_TEST_CAPTURE_PAUSE";
         if requires_refused () then
           warn "not sharing the deps-loaded heap: it requires a theory module HOL refused"
         else
@@ -5065,9 +5097,9 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     (* A child started ahead of its parents runs in the stage already. *)
     val attached = take_attached_child ()
     val _ = if Option.isSome attached then () else prepare_theory_stage speculative (checks_only policy) tc root action
-    val _ = if checkpoint_enabled policy then ensure_parent deps_loaded else ()
+    val _ = if checkpoint_enabled policy andalso checkpoint_saves_enabled policy then ensure_parent deps_loaded else ()
     val _ =
-      if theorem_checkpoints_enabled policy then
+      if theorem_saves_enabled policy then
         List.app (fn {context_path, failed_prefix_path, ...} =>
                     (ensure_parent context_path; ensure_parent failed_prefix_path))
                  theorem_checkpoints
@@ -5077,6 +5109,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val capture = !capture_deps_heap andalso checkpoint_enabled policy andalso saves_progress policy
     val run_spec = write_theory_script capture (if speculative andalso proof_steps_enabled policy then SOME (has_suspension_pruning tc) else NONE) policy root checkpoint_root base_context action source_text
                                     theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
+    val _ = if not (Option.isSome attached) andalso #files run_spec = [preload, staged_script] then !before_fresh_preload () else ()
     (* A speculative child runs no checkpoints, so it starts from the
        preload, which then also loads the runtime its deferred proofs use. *)
     val _ =
@@ -5124,16 +5157,27 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
                 (with_detail ("tactic timed out while building " ^ logical))
                 failure_output
       end
+    (* Under --no-checkpoint-saves a checkpoint that can't be resumed stays,
+       and the retry restores none (run_theory_action_checkpoints). *)
+    val discards = checkpoint_saves_enabled policy
+    val discarding = if discards then "discarding" else "not resuming from"
     (* A theory module that a deps heap loads is missing or has another id
        (the store was swept, or written again): that heap and every state
        saved on it are discarded, and the retry preloads afresh. *)
     fun discard_loaded_checkpoint_after_load_failure msg =
       if Option.isSome (find_substring "Required module missing or changed" msg) then
         (rejected_heap_modules := !rejected_heap_modules + 1;
-         remove_deps_checkpoint_family checkpoint_base deps_key deps_loaded)
+         discarded_deps_heap := true;
+         if discards then remove_deps_checkpoint_family checkpoint_base deps_key deps_loaded else ())
       else
-        remove_loaded_checkpoint_descendants checkpoint_base deps_key deps_loaded theorem_checkpoints declaration_checkpoints
-          (hol_context_path (#context run_spec))
+        let val loaded = hol_context_path (#context run_spec)
+        in
+          if loaded = deps_loaded then discarded_deps_heap := true else ();
+          if discards then
+            remove_loaded_checkpoint_descendants checkpoint_base deps_key deps_loaded theorem_checkpoints
+              declaration_checkpoints loaded
+          else ()
+        end
     fun discard_failed_prefix_after_resume_failure msg =
       case #failed_prefix_context run_spec of
           NONE => false
@@ -5155,9 +5199,9 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
                     "failed-prefix proof path is not present in current proof-ir plan",
                     "invalid proof-ir failed-prefix metadata",
                     "proof-ir dynamic replay mismatch"] then
-                (remove_checkpoint path;
+                (if discards then remove_checkpoint path else ();
                  dropped_checkpoints := !dropped_checkpoints + 1;
-                 warn ("discarding failed-prefix checkpoint after failed resume: " ^ path);
+                 warn (discarding ^ " failed-prefix checkpoint after failed resume: " ^ path);
                  true)
               else false
             end
@@ -5211,7 +5255,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
             val _ = dropped_checkpoints := !dropped_checkpoints + 1
             val module_error =
               List.find (String.isSubstring "Required module missing or changed") (String.tokens (fn c => c = #"\n") msg)
-            val _ = warn ("discarding invalid checkpoint after HOL state load failure: " ^ invalid ^
+            val _ = warn (discarding ^ " invalid checkpoint after HOL state load failure: " ^ invalid ^
                           (case module_error of SOME line => " (" ^ line ^ ")" | NONE => ""))
           in
             raise RetryInvalidCheckpoint
@@ -5763,13 +5807,14 @@ fun checkpoint_target_node (options as {all_checkpoints, repl_on_failure, checkp
 (* An impure action never replays checkpoints: its script may compute
    different values on each run (a timestamp, a version string), and
    resuming past that code would restore the values of an earlier run. *)
-fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, ...} : build_options) project node =
+fun checkpoint_policy_for_node (options as {skip_checkpoints, no_checkpoint_saves, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, ...} : build_options) project node =
   if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
     let val timeout = effective_tactic_timeout proof_steps
                         (HolbuildTacticTimeoutPolicy.timeout_of node_tactic_timeouts (HolbuildBuildPlan.key node))
     in
     CheckpointPolicy {checkpoint = not skip_checkpoints andalso not (impure node),
                       theorem_checkpoints = not skip_checkpoints andalso not (impure node),
+                      checkpoint_saves = not no_checkpoint_saves,
                       checkpoint_target = checkpoint_target_node options node,
                       checkpoint_seconds = checkpoint_seconds,
                       proof_steps = proof_steps,
@@ -5785,6 +5830,7 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, checkpoint_seconds
   else
     CheckpointPolicy {checkpoint = false,
                       theorem_checkpoints = false,
+                      checkpoint_saves = not no_checkpoint_saves,
                       checkpoint_target = checkpoint_target_node options node,
                       checkpoint_seconds = default_checkpoint_seconds,
                       proof_steps = false,
@@ -6095,7 +6141,9 @@ fun action_checkpoints policy checkpoint_root (action : theory_action) source_te
 
 (* Runs a theory action in action root `root` with the plan above, keeping
    its checkpoints in checkpoint root `checkpoint_root`, again after
-   discarding a checkpoint HOL could not resume from.  Returns the generated
+   discarding a checkpoint HOL could not resume from (under
+   --no-checkpoint-saves, which discards none, once more restoring no
+   checkpoint).  Returns the generated
    theory's load metadata, and leaves the stage to the caller, as
    `run_theory_action`, and the failed-prefix checkpoints a successful run
    made obsolete too: checkpoints saved after resuming from one are its
@@ -6107,7 +6155,11 @@ fun run_theory_action_checkpoints check_cancelled speculative_log cache_allowed 
       run_theory_action check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context action source_text
                         theorem_checkpoints declaration_checkpoints termination_diagnostics
       handle RetryInvalidCheckpoint =>
-        if retries_left <= 0 then raise RetryInvalidCheckpoint
+        if not (checkpoint_saves_enabled policy) then
+          run_theory_action check_cancelled speculative_log cache_allowed (without_checkpoints policy) tc root
+                            checkpoint_root base_context action source_text
+                            theorem_checkpoints declaration_checkpoints termination_diagnostics
+        else if retries_left <= 0 then raise RetryInvalidCheckpoint
         else run (retries_left - 1)
   in
     run (length theorem_checkpoints + length declaration_checkpoints + 1)
@@ -6121,7 +6173,7 @@ fun build_theory_action cache_allowed policy tc root checkpoint_root base_contex
       run_theory_action_checkpoints (fn () => ()) NONE cache_allowed policy tc root checkpoint_root base_context action source_text
         checkpoints
   in
-    remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints);
+    if checkpoint_saves_enabled policy then remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints) else ();
     generated_metadata
   end
 
@@ -6333,8 +6385,11 @@ fun build_theory dat_hash_cache cache_allowed policy tc project base_context pla
     val action = theory_action root plan keys toolchain_key
                    (dependency_context_key toolchain_key plan keys node) node
     val checkpoint_root = default_checkpoint_root root
+    (* Placing a stored heap writes the checkpoint tree, and publishing
+       one replaces the store's: neither under --no-checkpoint-saves. *)
     val heap_context =
-      if cache_allowed andalso checkpoint_enabled policy then local_heap_context dat_hash_cache toolchain_key plan keys node
+      if cache_allowed andalso checkpoint_enabled policy andalso checkpoint_saves_enabled policy then
+        local_heap_context dat_hash_cache toolchain_key plan keys node
       else NONE
     val placed =
       Option.mapPartial
@@ -6556,7 +6611,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
               (cache_trace ("cache miss: " ^ logical_name node ^ " " ^ cache_key_role ^ "=" ^
                             input_key ^ " (parent outputs differ)");
                parents_differ := true;
-               remove_failed_cache_outputs project node;
+               remove_failed_cache_outputs (#no_checkpoint_saves options) project node;
                ignore (drop_cache_manifest_if_unchanged root input_key existing);
                if not retry then CacheMiss
                else
@@ -6564,7 +6619,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
                      NONE => from_remote ()
                    | SOME text => if text = existing then CacheMiss else materialize false text)
           in
-            case materialize_theory_cache (#verify_cache options) allow_timeout_discrepancy
+            case materialize_theory_cache (#no_checkpoint_saves options) (#verify_cache options) allow_timeout_discrepancy
                    project plan input_key (tactic_timeout policy) (trknl_enabled policy) node of
                 (* A worker may have strengthened the remote timeout contract,
                    or another replica may hold a stronger one, also when the
@@ -6770,7 +6825,9 @@ fun outcome_may_create_checkpoints options project node outcome =
   case outcome of
       HolbuildStatus.Built =>
         (case #kind (HolbuildBuildPlan.source_of node) of
-             HolbuildSourceIndex.TheoryScript => checkpoint_enabled (checkpoint_policy_for_node options project node)
+             HolbuildSourceIndex.TheoryScript =>
+               let val policy = checkpoint_policy_for_node options project node
+               in checkpoint_enabled policy andalso checkpoint_saves_enabled policy end
            | _ => false)
     | _ => false
 
@@ -7591,8 +7648,8 @@ fun speculative_action root plan keys toolchain_key view key node : theory_actio
 
 (* A pipelined attempt keeps promote_preload: under check, a theory built
    ahead or outlined first loads the same ancestors as its plain build. *)
-fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, promote_preload, ...}) =
-  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_target = false,
+fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, promote_preload, checkpoint_saves, ...}) =
+  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_saves = checkpoint_saves, checkpoint_target = false,
                     checkpoint_seconds = default_checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout,
                     heavy_tactic_timeout = heavy_tactic_timeout,
@@ -7603,8 +7660,8 @@ fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, h
    so a checkpoint nothing shares would only cost the child time: under
    --share-deps-heap it saves the deps heap alone (SAVE_HEAP), and without
    sharing nothing.  Proof steps and their timeouts stay as the spec says. *)
-fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, check_only, ...}) =
-  CheckpointPolicy {checkpoint = checkpoint andalso save_heap, theorem_checkpoints = false, checkpoint_target = checkpoint_target,
+fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_saves, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, check_only, ...}) =
+  CheckpointPolicy {checkpoint = checkpoint andalso save_heap, theorem_checkpoints = false, checkpoint_saves = checkpoint_saves, checkpoint_target = checkpoint_target,
                     checkpoint_seconds = checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout,
                     heavy_tactic_timeout = heavy_tactic_timeout,
@@ -7941,7 +7998,7 @@ fun build_serial is_settled is_failed dat_hash_cache status (options : build_opt
           (case one node of
                SOME outcome =>
                  if outcome_may_create_checkpoints options project node outcome then
-                   refresh_checkpoint_budget_after_node budget_state project node []
+                   Option.app (fn state => refresh_checkpoint_budget_after_node state project node []) budget_state
                  else ()
              | NONE => ();
            loop rest)
@@ -8059,7 +8116,9 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
 
     fun node_may_create_checkpoints node =
       case #kind (HolbuildBuildPlan.source_of node) of
-          HolbuildSourceIndex.TheoryScript => checkpoint_enabled (checkpoint_policy_for_node options project node)
+          HolbuildSourceIndex.TheoryScript =>
+            let val policy = checkpoint_policy_for_node options project node
+            in checkpoint_enabled policy andalso checkpoint_saves_enabled policy end
         | _ => false
 
     val checkpoints_possible = List.exists node_may_create_checkpoints selected
@@ -9038,7 +9097,8 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                       if collect_protected then
                         let
                           val protected = begin_checkpoint_maintenance id
-                          val _ = refresh_checkpoint_budget_after_node budget_state project node protected
+                          val _ = Option.app (fn state => refresh_checkpoint_budget_after_node state project node protected)
+                                    budget_state
                         in
                           finish_checkpoint_maintenance id
                         end
@@ -9107,7 +9167,7 @@ fun write_text_atomic path text =
     fun close () = TextIO.closeOut out handle _ => ()
     fun remove_tmp () = FS.remove tmp handle _ => ()
   in
-    (TextIO.output(out, text);
+    (HolbuildBoundedOutput.text (out, text);
      TextIO.closeOut out;
      FS.rename {old = tmp, new = path}
        handle e => (remove_tmp ();
@@ -9370,13 +9430,20 @@ fun build_checked (settled : settled option) failed (options : build_options) tc
   let
     val cpu_pressure_start =
       if HolbuildStatus.cache_trace_enabled () then cpu_pressure_total_us () else NONE
-    val budget_state = create_checkpoint_budget_state project
-    val _ = register_checkpoint_budget_bases budget_state
-              (map (checkpoint_base project) (HolbuildBuildPlan.selected_nodes plan))
-    val _ = enforce_checkpoint_budget_state_excluding budget_state []
+    (* A build under --no-checkpoint-saves evicts no checkpoints. *)
+    val budget_state =
+      if #no_checkpoint_saves options then NONE
+      else SOME (create_checkpoint_budget_state project)
+    val _ =
+      Option.app
+        (fn state =>
+            (register_checkpoint_budget_bases state
+               (map (checkpoint_base project) (HolbuildBuildPlan.selected_nodes plan));
+             enforce_checkpoint_budget_state_excluding state []))
+        budget_state
     (* A build that only restores adds nothing to the store; it leaves
        sweeping it to the builds that do. *)
-    val _ = if #restore_only options then () else sweep_local_heap_store ()
+    val _ = if #restore_only options orelse #no_checkpoint_saves options then () else sweep_local_heap_store ()
     val base_context = toolchain_base_context tc
     val _ = dump_keys_if_requested (build_config_lines_for_node options project) toolchain_key plan keys
     (* Only for the input key it was checked for. *)
@@ -9427,13 +9494,18 @@ fun build_checked (settled : settled option) failed (options : build_options) tc
     in
       (run (); HolbuildStatus.finish status;
        trace_cpu_pressure_delta cpu_pressure_start;
-       finalize_checkpoint_budget_state_excluding
-         budget_state (!(#refreshed budget_state)) [];
-       clear_checkpoint_index_dirty budget_state)
+       Option.app
+         (fn state =>
+             (finalize_checkpoint_budget_state_excluding state (!(#refreshed state)) [];
+              clear_checkpoint_index_dirty state))
+         budget_state)
       handle e => (HolbuildStatus.finish status;
                    trace_cpu_pressure_delta cpu_pressure_start;
-                   finalize_checkpoint_budget_state_excluding budget_state true [];
-                   clear_checkpoint_index_dirty budget_state;
+                   Option.app
+                     (fn state =>
+                         (finalize_checkpoint_budget_state_excluding state true [];
+                          clear_checkpoint_index_dirty state))
+                     budget_state;
                    raise e)
     end
   end
@@ -9445,13 +9517,14 @@ fun build options tc project plan toolchain_key jobs =
     toolchain_key jobs
 
 (* After remote execution, force and tracing have already been fulfilled. *)
-fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, checkpoint_targets, skip_checkpoints, checkpoint_seconds, proof_steps,
+fun remote_restore_options restore_only ({use_cache, verify_cache, force_targets, checkpoint_targets, skip_checkpoints, no_checkpoint_saves, checkpoint_seconds, proof_steps,
                            new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, repl_on_failure,
                            emit_output_hashes, allow_cache_timeout_discrepancy, trknl, fail_fast, all_checkpoints, promote_preload,
                            check_only_targets, ...} : build_options)
     : build_options =
   {use_cache = use_cache, verify_cache = verify_cache, force = ForceNone, force_targets = force_targets,
-   checkpoint_targets = checkpoint_targets, check_only_targets = check_only_targets, skip_checkpoints = skip_checkpoints, checkpoint_seconds = checkpoint_seconds,
+   checkpoint_targets = checkpoint_targets, check_only_targets = check_only_targets, skip_checkpoints = skip_checkpoints,
+   no_checkpoint_saves = no_checkpoint_saves, checkpoint_seconds = checkpoint_seconds,
    proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
    node_tactic_timeouts = node_tactic_timeouts, heavy_tactic_timeout = heavy_tactic_timeout,
    trace_steps = false, repl_on_failure = repl_on_failure,
@@ -10013,7 +10086,9 @@ fun dependency_spec_lines hash_file root plan keys token deps =
    prefix.  PIPELINE: the client's options let the theory build pipelined
    (pipelinable); a worker told to pipeline then does, where its HOL can.
    check-only=true: the worker reports the verdict alone (build
-   --check-only) and publishes no outputs. *)
+   --check-only) and publishes no outputs.  no-checkpoint-saves=true: the
+   worker restores shared checkpoints as usual but saves and publishes
+   none (build --no-checkpoint-saves). *)
 fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
                      {theorem_checkpoints, forced, skip_checkpoints, pipeline} (action : theory_action) node action_text =
   let
@@ -10057,6 +10132,7 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
       (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
       (if promotes_preload policy then [bool_option "promote-preload" true] else []) @
       (if checks_only policy then [bool_option "check-only" true] else []) @
+      (if checkpoint_saves_enabled policy then [] else [bool_option "no-checkpoint-saves" true]) @
       (if Real.== (checkpoint_seconds policy, default_checkpoint_seconds) then []
        else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
       (if forced then [bool_option "force" true] else []) @
@@ -11220,7 +11296,7 @@ type action_spec =
    proof_steps : bool, tactic_timeout : real option,
    heavy_tactic_timeout : real option option, new_ir : bool,
    theorem_checkpoints : bool, checkpoint_target : bool, skip_checkpoints : bool, promote_preload : bool,
-   check_only : bool,
+   check_only : bool, no_checkpoint_saves : bool,
    checkpoint_seconds : real, force : bool, trace_steps : bool,
    pipeline : bool, tool_cache : string option, scratch_inputs : string list, source_load_timing : bool,
    action_text : string}
@@ -11377,6 +11453,10 @@ fun parse_action_spec text : action_spec =
      check_only =
        (case List.find (fn (k, _) => k = "option check-only") (!values) of
             SOME (_, v) => spec_bool "check-only" v
+          | NONE => false),
+     no_checkpoint_saves =
+       (case List.find (fn (k, _) => k = "option no-checkpoint-saves") (!values) of
+            SOME (_, v) => spec_bool "no-checkpoint-saves" v
           | NONE => false),
      checkpoint_seconds =
        (case List.find (fn (k, _) => k = "option checkpoint-seconds") (!values) of
@@ -11598,6 +11678,7 @@ fun spec_policy (spec : action_spec) =
   in
   CheckpointPolicy {checkpoint = not (#skip_checkpoints spec),
                     theorem_checkpoints = not (#skip_checkpoints spec) andalso #theorem_checkpoints spec,
+                    checkpoint_saves = not (#no_checkpoint_saves spec),
                     checkpoint_target = #checkpoint_target spec andalso not (#check_only spec),
                     checkpoint_seconds = #checkpoint_seconds spec,
                     proof_steps = #proof_steps spec,
@@ -11757,11 +11838,14 @@ fun parent_hashes_match by_name dat_hash recorded =
                List.all (fn {stem, ...} => dat_hash stem = SOME hash) (getOpt (Binarymap.peek (by_name, name), [])))
            recorded
 
-fun spec_parent_hashes_match root (spec : spec_deps) data_path =
+(* KNOWN gives the hash of a .dat the root lacks, by its path. *)
+fun spec_parent_hashes_match known root (spec : spec_deps) data_path =
   let val dat_hashes = new_file_hash_cache ()
   in
     parent_hashes_match (deps_by_parent_name spec)
-      (fn stem => cached_file_hash dat_hashes (in_root root (stem ^ ".dat")))
+      (fn stem =>
+          let val path = in_root root (stem ^ ".dat")
+          in case known path of SOME hash => SOME hash | NONE => cached_file_hash dat_hashes path end)
       (Binarymap.listItems (parse_dat_parent_hashes (read_dat_header data_path)))
   end
 
@@ -11824,8 +11908,16 @@ fun remove_resident root (path, entry) =
    root on workers"): an item installed from what the spec names is kept,
    and an item the spec doesn't name is removed, so the root ends as an
    empty one would.  SCRATCH names the stems, with their keys, the action
-   writes besides its dependencies; they are emptied for it. *)
-fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) direct =
+   writes besides its dependencies; they are emptied for it.
+
+   With LIGHT, for a check-only action, which reads no dependency file when
+   it resumes from a heap that loaded them: the dependencies not kept are
+   removed and not installed, and their records, as an install would write
+   them, are returned with their load manifests' lines, for the early
+   cutoff and the parent checks; or, when one's .dat hash isn't known
+   without its .dat, all are installed and NONE returned, as it is without
+   LIGHT. *)
+fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) direct light =
   let
     val cache = cache_root ()
     fun library {path, sha256, ...} = {hash = sha256, dst = in_root root path}
@@ -12003,6 +12095,77 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             (#deps spec)
         end)
     fun restore_deps () = hydrate_step "hyddeps" restore_deps_now
+    (* The direct dependencies' stale local copies go first, as the
+       refresh after an install would drop them. *)
+    fun light_deps_now () =
+      let
+        val _ = hydrate_step "hydstale" (fn () => drop_stale_dep_copies false remote spec direct)
+        val checks = map (fn dep => (dep, ref false)) (#deps spec)
+        val _ = hydrate_step "hydcheck" (fn () =>
+                  (load_known ();
+                   transfer_all (fn (dep, stale) => stale := not (restorable kept dep)) checks))
+        val stale = map #1 (List.filter (! o #2) checks)
+        val records = Resident.empty ()
+        val unknown = ref false
+        val manifests = ref (Binarymap.mkDict String.compare)
+        val manifests_lock = Mutex.mutex ()
+        fun add_manifest (file, lines) =
+          (Mutex.lock manifests_lock;
+           manifests := Binarymap.insert (!manifests, file, lines);
+           Mutex.unlock manifests_lock)
+        fun record {target, stem, key} =
+          let
+            val path = in_root root stem
+            (* The remote's manifest is read, not copied with its blobs, as
+               checked_cache_entry would copy them. *)
+            val source_text =
+              case HolbuildCache.get_action cache key of
+                  SOME text => text
+                | NONE =>
+                    case HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote key) of
+                        SOME text => text
+                      | NONE => raise Error ("cache entry " ^ key ^ " not found")
+            (* As checked_cache_entry does, a manifest with a transient stage
+               mldep is dropped, so a retry finds the remote's entry. *)
+            val _ =
+              case transient_stage_mldep_in_manifest source_text of
+                  SOME dep => transient_cache_manifest_error cache key (HolbuildCache.action_manifest cache key)
+                                source_text dep
+                | NONE => ()
+            val {sig_hash, sml_hash, parents, mldeps, ...} =
+              cache_manifest_blobs_from_lines key (cache_manifest_lines source_text)
+            val fetched = in_root root (".holbuild/light-" ^ sml_hash)
+            (* A local manifest whose blob is gone is dropped, as the full
+               restore drops it, so a retry finds the remote's entry. *)
+            val sml_text =
+              replace_all cache_sml_token (path ^ ".dat")
+                (fetch_spec_text remote {hash = sml_hash, dst = fetched} before remove_file fetched)
+              handle e as ActionFailed (InputMissing _, _) =>
+                (ignore (drop_cache_manifest_if_unchanged cache key source_text); raise e)
+            val ui = [path ^ ".sig"]
+            val uo = uo_lines stem {parents = parents, mldeps = mldeps}
+          in
+            case theory_sml_hash_literal sml_text of
+                NONE => unknown := true
+              | SOME dat_hash =>
+                  (Resident.put records path
+                     (Resident.Theory {target = target, key = key, source = HolbuildHash.string_sha256 source_text,
+                                       parents = parents, mldeps = mldeps, dat_hash = dat_hash, dat_parents = [],
+                                       hashes = [sig_hash, HolbuildHash.string_sha256 sml_text,
+                                                 HolbuildHash.string_sha256 (manifest_text ui),
+                                                 HolbuildHash.string_sha256 (manifest_text uo)]});
+                   add_manifest (path ^ ".ui", ui);
+                   add_manifest (path ^ ".uo", uo))
+          end
+        fun manifest file = Binarymap.peek (!manifests, file)
+      in
+        hydrate_count "hydlightn" (length stale);
+        List.app (fn dep as {stem, ...} =>
+                    (restorable remove_old dep; Resident.forget resident (in_root root stem)))
+                 stale;
+        hydrate_step "hydlight" (fn () => restorable_all record stale);
+        if !unknown then NONE else SOME {records = records, manifest = manifest}
+      end
     fun refresh revalidate wanted =
       hydrate_step "hydstale" (fn () => drop_stale_dep_copies revalidate remote spec wanted) andalso (restore_deps (); true)
     (* Every path an item writes: two items sharing one would let a kept
@@ -12043,7 +12206,11 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
     hydrate_step "hydfiles" (fn () =>
       (transfer_all fetch_file files;
        List.app write_lib (#libs spec)));
-    restore_deps ();
+    let
+      val light_records = if light then hydrate_step "hyddeps" light_deps_now else NONE
+    in
+    if Option.isSome light_records then () else
+    (restore_deps ();
     ignore (refresh false direct);
     case misfits () of
         [] => ()
@@ -12056,10 +12223,12 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             | found as {target, ...} :: rest =>
                 raise ActionFailed (InputMissing (map (fn {key, ...} => "theory " ^ key) found),
                                     "dependency " ^ target ^ " does not match its parents in the cache" ^
-                                    (if null rest then "" else " (and " ^ Int.toString (length rest) ^ " more)"));
+                                    (if null rest then "" else " (and " ^ Int.toString (length rest) ^ " more)")));
     Resident.save resident;
     (* A stale or missing record only means a manifest is hashed again. *)
-    hydrate_step "hydcheck" (fn () => HolbuildStatCache.flush seen handle _ => ())
+    hydrate_step "hydcheck" (fn () => HolbuildStatCache.flush seen handle _ => ());
+    light_records
+    end
   end
 
 (* The stems of the project objects the build loads: the ones its preload
@@ -12080,7 +12249,7 @@ fun spec_loaded_stems (spec : action_spec) =
 (* The stem of the action's own outputs, with its key, for hydrate_spec_deps. *)
 fun own_scratch (spec : action_spec) = (drop_suffix ".dat" (#data_path (#outputs spec)), #input_key spec)
 
-fun hydrate_action_root remote root resident (spec : action_spec) =
+fun hydrate_action_root remote root resident (spec : action_spec) light =
   let
     val package = #package spec
     fun file {path, sha256, ...} = {hash = sha256, dst = in_root root (action_source_path package path)}
@@ -12088,12 +12257,20 @@ fun hydrate_action_root remote root resident (spec : action_spec) =
     hydrate_spec_deps remote root resident [own_scratch spec]
       (map file (#source spec :: #inputs spec)) (theory_spec_deps spec)
       (fn {stem, ...} => List.exists (fn loaded => loaded = stem) (spec_loaded_stems spec))
+      light
   end
+
+(* Whether the remote holds an entry for the action that its restore would
+   take: one meeting its timeout contract.  A weaker one, which a build
+   with other proof options left, is replaced by building. *)
+fun action_built remote (spec : action_spec) =
+  Option.isSome (HolbuildRemoteCache.get_action_using
+                   (manifest_timeout_satisfies false (#tactic_timeout spec)) remote (#input_key spec))
 
 (* Step 4: the action's own entry restores with full validation, the
    remote's when the local copy doesn't fit the restored parents and differs
    from it. *)
-fun action_already_done remote root (spec : action_spec) =
+fun action_already_done known remote root (spec : action_spec) =
   let
     val {sig_path, sml_path, data_path} = #outputs spec
     val stem = drop_suffix ".dat" data_path
@@ -12102,7 +12279,7 @@ fun action_already_done remote root (spec : action_spec) =
       (restore_spec_theory remote root (spec_resolver (theory_spec_deps spec))
          {key = #input_key spec, subject = #package spec ^ ":" ^ #logical spec, stem = stem,
           extra_outputs = SOME (#extra_outputs spec), requested_timeout = #tactic_timeout spec};
-       SOME (spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path)))
+       SOME (spec_parent_hashes_match known root (theory_spec_deps spec) (in_root root data_path)))
       handle e as HolbuildRemoteCache.Unavailable _ => raise e
            | _ => NONE
     (* The remote cache may hold a copy its origin has since replaced, which
@@ -12150,7 +12327,7 @@ fun resident_misfits_parents remote root (spec : action_spec) resident =
         SOME path =>
           let val recorded = dat_records_parent path
           in
-            not (spec_parent_hashes_match root (theory_spec_deps spec) path) andalso
+            not (spec_parent_hashes_match (fn _ => NONE) root (theory_spec_deps spec) path) andalso
             List.all (fn dep => not (recorded dep) orelse as_remote (#key dep)) (#deps spec)
           end
       | NONE => false
@@ -12166,7 +12343,7 @@ fun resident_misfits_parents remote root (spec : action_spec) resident =
 fun resident_differs_only_in_dat remote root (spec : action_spec) mine resident =
   cache_manifest_outputs_equal_but_dat (#input_key spec) mine resident andalso
   (case fetch_resident_dat remote root spec resident of
-       SOME path => spec_parent_hashes_match root (theory_spec_deps spec) path
+       SOME path => spec_parent_hashes_match (fn _ => NONE) root (theory_spec_deps spec) path
      | NONE => false)
   handle e as HolbuildRemoteCache.Unavailable _ => raise e
        | _ => false
@@ -12546,7 +12723,7 @@ fun gc_checkpoint_store days =
         in
           (* stderr: gc's stdout is its one summary line. *)
           if removed = 0 then ()
-          else TextIO.output (TextIO.stdErr, "checkpoint store gc: removed families=" ^
+          else HolbuildBoundedOutput.text (TextIO.stdErr, "checkpoint store gc: removed families=" ^
                                              Int.toString removed ^ "\n")
         end)
     else ()
@@ -12672,6 +12849,9 @@ fun cache_root_id path =
         SysWord.toString (Posix.FileSys.devToWord dev) ^ ":" ^
         SysWord.toString (Posix.FileSys.inoToWord ino)
 
+(* Where exec_action keeps copies of scratch inputs for later actions. *)
+fun scratch_store_dir cache = Path.concat (cache, "action-scratch")
+
 fun worker_cache_roots cache =
   let
     fun tree path = {id = fn () => cache_root_id path, measure = fn () => cache_root_bytes path}
@@ -12696,8 +12876,9 @@ fun worker_cache_roots cache =
 (* Evict least recently used families until the cache leaves reserve_bytes of
    room under limit_bytes. An action reuses a recent shared scan while the
    cache stays within limit_bytes, so the reserve absorbs growth between
-   evictions instead of every action waiting on one; private checkpoints are
-   always measured locally. Zero reserves scan live.  With refresh, as after
+   evictions instead of every action waiting on one; private checkpoints and
+   kept scratch inputs are always measured locally. Zero reserves scan live.
+   With refresh, as after
    an action's result, scan only when the stamp is past half its life and no other process holds
    gc.lock, so that busy hosts keep the stamp fresh and actions seldom wait
    on a scan.
@@ -12708,7 +12889,8 @@ fun worker_cache_roots cache =
    the stamp is fresh when files the cap can't evict hold the disk below it. *)
 fun enforce_worker_cache_cap {cache, checkpoint_root, limit_bytes, reserve_bytes, min_free_bytes, refresh} =
   let
-    fun private_bytes () = cache_root_bytes checkpoint_root
+    (* This worker's own: its checkpoints and the scratch inputs it keeps. *)
+    fun private_bytes () = cache_root_bytes checkpoint_root + cache_root_bytes (scratch_store_dir cache)
     val roots = worker_cache_roots cache
     fun root_ids () = map (fn {id, ...} => id ()) roots
     fun sum sizes = List.foldl (op +) (0 : Position.int) sizes
@@ -13337,6 +13519,17 @@ fun shared_manifest header kind entries =
              "blob=" ^ sha ^ " " ^ role ^ (if arg = "" then "" else " " ^ arg) ^ "\n")
          entries)
 
+(* The fewest missing modules a writer starts for once the store has its
+   base theories.  A writer costs about as much to start as loading
+   sixteen theories from their .dat files instead of their modules, so an
+   action that lacks only the few parents just built loads those from
+   their .dat files. *)
+fun module_writer_min_missing () =
+  (* Tests lower it (HOLBUILD_TEST_MODULE_MIN_MISSING). *)
+  case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_TEST_MODULE_MIN_MISSING") of
+      SOME n => n
+    | NONE => 16
+
 fun shared_manifest_entries text =
   List.mapPartial
     (fn line =>
@@ -13348,6 +13541,50 @@ fun shared_manifest_entries text =
                 else raise Error ("malformed shared checkpoint manifest line: " ^ line)
             | _ => raise Error ("malformed shared checkpoint manifest line: " ^ line))
     (String.tokens (fn c => c = #"\n") text)
+
+(* Files the module writer leaves in a toolchain's store beside its
+   modules and its lock.  [module_store_unsupported]: the toolchain has
+   HOL's module helper but its runtime or Meta cannot write modules, so no
+   writer runs again for it (the store, named by the HOL directory, is per
+   Poly/ML runtime).  [module_store_base_theories]: the theories of the
+   toolchain's base state, one per line; they are in the state, so HOL
+   writes no module for them. *)
+val module_store_unsupported = "unsupported"
+val module_store_base_theories = "base-theories"
+
+(* Whether the toolchain's HOL can write theory modules, as far as is known
+   before trying. *)
+fun module_writer_supported tc =
+  file_exists (Path.concat (#holdir tc, "tools-poly/poly/theory_modules.ML")) andalso
+  not (path_exists (Path.concat (module_store tc, module_store_unsupported)))
+
+(* A deps heap entry's `missing=` line: how many of the modules its cone
+   expects the heap doesn't load, when its publisher knew.  Readers before
+   it take only `blob=` lines. *)
+fun heap_entry_missing text = Option.mapPartial Int.fromString (metadata_value "missing" (metadata_lines text))
+
+(* A deps heap entry saved short of its cone's modules: one that lacks
+   module_writer_min_missing or more, or, for a toolchain that writes
+   modules (MODULES), one that loads none and doesn't say, as published
+   before entries said.  A host whose store has since got the modules
+   saves a heap that loads them, and replaces it. *)
+fun short_heap_entry modules text =
+  case heap_entry_missing text of
+      SOME n => n >= module_writer_min_missing ()
+    | NONE => modules andalso not (List.exists (fn (role, _, _) => role = "module") (shared_manifest_entries text))
+
+(* The deps heap entry TEXT got under KEY, or, if it is short, the entry
+   read again checked with the store, as a cache in front of it may still
+   serve one another host has since replaced. *)
+fun fresh_heap_entry remote modules key text =
+  if (short_heap_entry modules text handle Error _ => false) then
+    (case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.get_action remote key) of
+         NONE => SOME text
+       | fresh => fresh)
+  else SOME text
+
+fun read_heap_entry remote modules key =
+  Option.mapPartial (fresh_heap_entry remote modules key) (HolbuildRemoteCache.get_action remote key)
 
 (* Which of a theory's checkpoints are published on a heap, most recently
    used first, so that a restore probes those rather than every boundary
@@ -13389,7 +13626,7 @@ fun shared_standalone_key heap_key (action : theory_action) =
 type shared_context =
   {store : string, checkpoint_root : string, heap_key : string, index_key : string, standalone_key : string,
    base_state : string, deps_key : string, deps_loaded : string, requested_timeout : real option,
-   candidates : shared_candidate list, module_store : string, heap_only : bool}
+   candidates : shared_candidate list, module_store : string, modules : bool, heap_only : bool}
 
 (* HEAP_ONLY (exec-action --share-deps-heap): the deps heap is shared, and
    no checkpoint the script saved: a script checkpoint's state, a failed
@@ -13407,7 +13644,7 @@ fun shared_context heap_only cache checkpoint_root tc root policy (action : theo
      deps_loaded = deps_loaded_path base (#deps_key action),
      requested_timeout = tactic_timeout policy,
      candidates = if heap_only then [] else shared_candidates policy base checkpoints,
-     module_store = module_store tc, heap_only = heap_only}
+     module_store = module_store tc, modules = module_writer_supported tc, heap_only = heap_only}
   end
 
 fun heap_parent_ok base_state heap =
@@ -13429,12 +13666,14 @@ fun tree_path root rel =
    blobs, which the publish replaces. *)
 (* POISONED: the heap entry, when it was found naming a module of another
    id than its heap loads, or a module blob the cache lost, which the
-   publish replaces unless it changed. *)
+   publish replaces unless it changed.  ENTRY: the entry of the heap
+   restored. *)
 type shared_restore =
   {heap : string option, files : (string * string) list, stale : string list, missing : string list,
-   poisoned : string option}
+   poisoned : string option, entry : string option}
 
-val nothing_restored : shared_restore = {heap = NONE, files = [], stale = [], missing = [], poisoned = NONE}
+val nothing_restored : shared_restore =
+  {heap = NONE, files = [], stale = [], missing = [], poisoned = NONE, entry = NONE}
 
 (* A module file, against the heap entry's digest and the heap's id. *)
 datatype heap_module_state = ModuleMatches | ModuleWrong | ModulePoisoned
@@ -13445,11 +13684,13 @@ datatype heap_module_state = ModuleMatches | ModuleWrong | ModulePoisoned
    is restored: a linked checkpoint would sit where it saves. *)
 (* FETCH_MODULES installs (digest, filename, id) triples from the heap
    entry into this host's module store, and returns the files whose blob
-   has another id and the digests of the blobs the cache has lost. *)
+   has another id and the digests of the blobs the cache has lost.
+   DECLINES says whether the run leaves the published heap and its
+   checkpoints, to preload afresh (declines_short_heap). *)
 fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
                                               deps_key, deps_loaded, module_store,
                                               requested_timeout, candidates, ...} : shared_context) resumes
-                               fetch_modules =
+                               fetch_modules declines =
   let
     val stale = ref ([] : string list)
     val missing = ref ([] : string list)
@@ -13674,10 +13915,22 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               val restored =
                 restore_entry (candidate_key c) (fn () =>
                   let
-                    val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
-                    val (heap, _) = single "heap" entries
+                    fun on_published {blobs = _, manifest} =
+                      #1 (single "heap" (shared_manifest_entries manifest)) = published_heap
+                    (* A cache in front of the store may still serve an entry
+                       chained to a heap the store has since replaced, so the
+                       store's own is asked for before the entry is rejected. *)
+                    val current =
+                      if on_published action then SOME action
+                      else HolbuildRemoteCache.revalidating (fn () =>
+                             HolbuildRemoteCache.fetch_action remote (candidate_key c))
                   in
-                    if heap <> published_heap then NONE else restore_chain (candidate_key c) (SOME heap) c entries
+                    case current of
+                        SOME found =>
+                          if not (on_published found) then NONE
+                          else restore_chain (candidate_key c) (SOME published_heap) c
+                                 (shared_manifest_entries (HolbuildRemoteCache.remember_action remote found))
+                      | NONE => NONE
                   end)
             in
               if modules_given_up () then NONE else counting_rejection (#kind c) (candidate_key c) restored
@@ -13770,9 +14023,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* No other checkpoint is published without its heap. *)
     val {heap, files} =
       or_standalone
-        (case (case restore_step "rstprobe" (fn () => HolbuildRemoteCache.get_action remote heap_key) of
+        (case (case restore_step "rstprobe" (fn () => read_heap_entry remote (#modules ctx) heap_key) of
                   NONE => restore_step "rstwait" (fn () =>
-                            await_shared_heap remote heap_key (Time.+ (Time.now (), shared_heap_wait)))
+                            Option.mapPartial (fresh_heap_entry remote (#modules ctx) heap_key)
+                              (await_shared_heap remote heap_key (Time.+ (Time.now (), shared_heap_wait))))
                 | found => found) of
             NONE => no_files
           | SOME text =>
@@ -13785,32 +14039,55 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                     handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
                   NONE => no_files
                 | SOME heap =>
-                    case first_window heap (if resumes then listed candidates else []) of
-                        SOME restored => restored
-                      | NONE => if modules_given_up () then no_files else try_heap heap)
+                    if declines {key = heap_key, heap = heap, entry = text} then no_files
+                    else
+                      case first_window heap (if resumes then listed candidates else []) of
+                          SOME restored => restored
+                        | NONE => if modules_given_up () then no_files else try_heap heap)
   in
-    {heap = heap, files = files, stale = !stale, missing = !missing, poisoned = !poisoned}
+    {heap = heap, files = files, stale = !stale, missing = !missing, poisoned = !poisoned,
+     entry = if Option.isSome heap then !heap_entry else NONE}
   end
   handle e => (warn ("shared checkpoint restore failed: " ^ General.exnMessage e);
                remove_tree (#checkpoint_root ctx); nothing_restored)
 
 (* After the run, successful or not: the heap if this run saved it, then,
-   if the heap under them is the published one, the new checkpoints. *)
+   if the heap under them is the published one, the new checkpoints.
+   CAPTURED: how many of its cone's expected modules the heap this run's
+   preload saved doesn't load, and how many the cone expects, when known. *)
 fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
                                               deps_key, deps_loaded, candidates, module_store, ...} : shared_context)
-                               ({heap = restored_heap, files = restored, stale, missing, poisoned} : shared_restore) =
+                               ({heap = restored_heap, files = restored, stale, missing, poisoned, ...} : shared_restore)
+                               (captured : {missing : int, cone : int} option) =
   let
     fun member x xs = List.exists (fn y => y = x) xs
     (* An entry naming a blob the cache lost is replaced, as if absent. *)
     fun present key = not (member key stale) andalso Option.isSome (HolbuildRemoteCache.get_action remote key)
     (* So is a heap entry the restore found naming a module of another id
        than its heap loads, or a module blob the cache lost, unless another
-       worker has replaced it since. *)
+       worker has replaced it since; and a short one (short_heap_entry) by
+       a heap that loads all but fewer than module_writer_min_missing of a
+       cone expecting at least as many. *)
+    val complete =
+      case captured of
+          SOME {missing, cone} => missing < module_writer_min_missing () andalso cone >= module_writer_min_missing ()
+        | NONE => false
+    (* A heap entry naming a blob the cache lost counts as absent only
+       while the store's copy still names one: another worker may have
+       replaced it since. *)
+    fun names_lost text =
+      List.exists (fn (_, sha, _) => member sha missing) (shared_manifest_entries text) handle Error _ => true
     fun heap_present () =
-      not (member heap_key stale) andalso
-      (case HolbuildRemoteCache.get_action remote heap_key of
-           NONE => false
-         | found => found <> poisoned)
+      let
+        val lost = member heap_key stale
+        fun read () = read_heap_entry remote (#modules ctx) heap_key
+      in
+        case (if lost then HolbuildRemoteCache.revalidating read else read ()) of
+            NONE => false
+          | found as SOME text =>
+              not (lost andalso names_lost text) andalso found <> poisoned andalso
+              not (complete andalso (short_heap_entry (#modules ctx) text handle Error _ => false))
+      end
     (* Every checkpoint's manifest names its whole spine, so the same files
        come up for each candidate; none changes while this runs.  A restored
        state still linked to the store is the blob it was restored from: the
@@ -13906,7 +14183,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             let
               val manifest =
                 shared_manifest "holbuild-shared-heap-v1" NONE
-                  (("heap", sha, "") :: map (fn (path, module) => ("module", module, Path.file path)) modules)
+                  (("heap", sha, "") :: map (fn (path, module) => ("module", module, Path.file path)) modules) ^
+                (case captured of SOME {missing, ...} => "missing=" ^ Int.toString missing ^ "\n" | NONE => "")
               (* The host that wrote a module usually published it
                  (converge_modules), so only those the cache lacks are put.
                  Each is probed, even one named by an entry this run read:
@@ -14054,9 +14332,11 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       handle _ => false
     (* While HEAP is the published heap, an entry chained to another, as
        one published before the heap entry was replaced, is never
-       restored.  A run on a heap replaced since leaves the entries alone. *)
+       restored.  A run on a heap replaced since leaves the entries alone;
+       the heap entry is read past any cache's stale copy, since a replaced
+       short heap may still be served there. *)
     fun current heap =
-      case HolbuildRemoteCache.fetch_action remote heap_key of
+      case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.fetch_action remote heap_key) of
           SOME action => on_heap heap (#manifest action)
         | NONE => false
     fun probe heap (c, key, absent) =
@@ -14288,7 +14568,7 @@ fun base_loaded_modules tc =
    path, are followed, so a preload reached only through a HOL module
    outside BASE_LOADED is kept; so is every preload when a manifest can't
    be read. *)
-fun skipped_preloads {base_loaded, follow} root (spec : action_spec) =
+fun skipped_preloads {base_loaded, follow, known_manifest} root (spec : action_spec) =
   let
     fun lib_load load = if CharVector.exists (fn c => c = #"/") load then in_root root load else load
     val lib_manifests =
@@ -14297,8 +14577,11 @@ fun skipped_preloads {base_loaded, follow} root (spec : action_spec) =
       case List.find (fn (path, _) => path = file) lib_manifests of
           SOME (_, lines) => lines
         | NONE =>
-            String.tokens (fn c => c = #"\n")
-              (read_text (if file_exists file then file else hfs_remapped_path file))
+            case known_manifest file of
+                SOME lines => lines
+              | NONE =>
+                  String.tokens (fn c => c = #"\n")
+                    (read_text (if file_exists file then file else hfs_remapped_path file))
     fun is_file entry = has_suffix ".sml" entry orelse has_suffix ".sig" entry
     fun visit (entry, loaded) =
       if is_file entry orelse not (Path.isAbsolute entry) orelse
@@ -14381,12 +14664,15 @@ fun spec_early_cutoff_with {dat_hash, file_hashes, skip_loaded} root (spec : act
   end
   handle e => (warn ("no early cutoff: " ^ General.exnMessage e); NONE)
 
-(* The hashes spec_early_cutoff_with reads, from the action root's records;
-   a file they don't cover is hashed. *)
-fun resident_hashes resident =
+(* The hashes spec_early_cutoff_with reads, from the first of RECORDS
+   (the action root's, and those of a light hydrate) to cover a file; a
+   file none covers is hashed. *)
+fun resident_hashes records =
   let
     fun hash compute path =
-      case Resident.file_hash resident path of SOME hash => hash | NONE => compute path
+      case List.mapPartial (fn resident => Resident.file_hash resident path) records of
+          hash :: _ => hash
+        | [] => compute path
   in
     {dat_hash = hash hol_dat_hash, file_hashes = map (hash HolbuildHash.file_sha256)}
   end
@@ -14410,7 +14696,7 @@ fun earlier_build_key (spec : action_spec) text =
     if sha256_text old_key andalso old_key <> #input_key spec then SOME old_key else NONE
   end
 
-fun reuse_earlier_build remote root (spec : action_spec) entry =
+fun reuse_earlier_build known remote root (spec : action_spec) entry =
   case Option.mapPartial (earlier_build_key spec) entry of
       NONE => false
     | SOME old_key =>
@@ -14423,7 +14709,7 @@ fun reuse_earlier_build remote root (spec : action_spec) entry =
              {key = old_key, subject = #package spec ^ ":" ^ #logical spec,
               stem = drop_suffix ".dat" data_path, extra_outputs = SOME (#extra_outputs spec),
               requested_timeout = #tactic_timeout spec};
-           spec_parent_hashes_match root (theory_spec_deps spec) (in_root root data_path)) andalso
+           spec_parent_hashes_match known root (theory_spec_deps spec) (in_root root data_path)) andalso
           (* A check-only action needs only the verdict, and no entry. *)
           (#check_only spec orelse
           case HolbuildCache.get_action cache old_key of
@@ -14688,7 +14974,7 @@ fun exec_run (hol_phase, publish_phase) check_cancelled remote root tc (spec : r
       map (fn {path, sha256, ...} => {hash = sha256, dst = in_root root path}) (#context_scripts spec @ #inputs spec)
     val deps = run_spec_deps spec
     val _ = check_cancelled ()
-    val _ = hydrate_spec_deps remote root (Resident.empty ()) [] files deps (fn _ => false)
+    val _ = hydrate_spec_deps remote root (Resident.empty ()) [] files deps (fn _ => false) false
     val _ = check_cancelled ()
     val _ = (ensure_dir output_dir; ensure_dir scratch)
     fun load name =
@@ -14809,11 +15095,14 @@ fun module_file_wanted expected file =
       SOME part => List.exists (fn e => e = part) expected
     | NONE => false
 
-(* The most theory modules one worker-run writer saves; tests lower it. *)
+(* The most theory modules one worker-run writer saves; tests lower it.
+   High enough that module_writer_time, not the count, ends a writer on a
+   deep cone: fleet writers install about one module per 200 ms, fetches
+   included, so a 60 s child stores about 300. *)
 fun module_writer_limit () =
   case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_TEST_MODULE_WRITER_LIMIT") of
       SOME n => n
-    | NONE => 64
+    | NONE => 512
 
 (* How long a writer's HOL child may run.  The worker kills exec-action
    120 s after its result (POST_RESULT_SECONDS), so exec-action gives the
@@ -14826,27 +15115,6 @@ val module_writer_min_time = Time.fromSeconds 5
 (* The module writer's root after the result, in the cache root, named
    for its exec-action's process. *)
 val writer_root_prefix = "module-writer-"
-
-(* The fewest missing modules a writer starts for once the store has its
-   base theories.  A writer costs about as much to start as loading
-   sixteen theories from their .dat files instead of their modules, so an
-   action that lacks only the few parents just built loads those from
-   their .dat files. *)
-fun module_writer_min_missing () =
-  (* Tests lower it (HOLBUILD_TEST_MODULE_MIN_MISSING). *)
-  case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_TEST_MODULE_MIN_MISSING") of
-      SOME n => n
-    | NONE => 16
-
-(* Files the module writer leaves in a toolchain's store beside its
-   modules and its lock.  [module_store_unsupported]: the toolchain has
-   HOL's module helper but its runtime or Meta cannot write modules, so no
-   writer runs again for it (the store, named by the HOL directory, is per
-   Poly/ML runtime).  [module_store_base_theories]: the theories of the
-   toolchain's base state, one per line; they are in the state, so HOL
-   writes no module for them. *)
-val module_store_unsupported = "unsupported"
-val module_store_base_theories = "base-theories"
 
 (* The file the writer below leaves in its output for write_missing_modules:
    one line per fact, a key then its value.  `status`: `ineligible` (HOL
@@ -14871,10 +15139,17 @@ val module_writer_report_bytes = 1024 * 1024
    not store anyway (write_missing_modules), and counts it against the
    writer's limit, so enough of them leave the missing modules after them
    unwritten.  Here such a theory is only registered, from its .dat file.
+   It reads each theory's name and hash from its Theory.sml itself, not
+   with HOL's sml_header, which in HOLs up to now reads only the first
+   4 KiB, where the opens may not have ended, and wants `thyname = "` on
+   one line, a line HOL's printer breaks for a name of 55 characters or
+   more.  A theory whose header it can't read is skipped with an error,
+   not the whole list; its descendants then have no canonical data, so
+   they get no module either.
    It reports what it did with each theory (module_writer_report). *)
 val module_writer_line =
   if_theory_modules_has
-    ["eligible", "unchanged_bindings", "base_id_of", "absolute", "core_bindings", "sml_header",
+    ["eligible", "unchanged_bindings", "base_id_of", "absolute", "core_bindings",
      "file_digest", "module_file", "exists", "mkdir", "module_roots", "save_module", "read_module",
      "usable", "hex"]
     ("val _ = let " ^
@@ -14898,11 +15173,30 @@ val module_writer_line =
      "val directory = TheoryModules.absolute directory; " ^
      "val output = TheoryModules.absolute output; " ^
      "val bindings = TheoryModules.core_bindings (); " ^
+     "fun header sml = " ^
+     "let val input = HOLFileSys.openIn sml; " ^
+     "fun read lines = case TextIO.inputLine input of NONE => lines " ^
+     "| SOME line => if String.isSubstring \"path = path\" line then line :: lines " ^
+     "else read (line :: lines); " ^
+     "val text = String.concat (rev (read [])) before HOLFileSys.closeIn input; " ^
+     "fun literal key = " ^
+     "let val (_, rest) = Substring.position key (Substring.full text); " ^
+     "val rest = Substring.dropl Char.isSpace (Substring.triml (size key) rest) " ^
+     "in case Substring.getc rest of " ^
+     "SOME (#\"\\\"\", rest) => " ^
+     "let val (value, close) = Substring.splitl (fn c => c <> #\"\\\"\") rest " ^
+     "in if Substring.isEmpty close then NONE else SOME (Substring.string value) end " ^
+     "| _ => NONE end " ^
+     "in case (literal \"thyname =\", literal \"hash =\") of " ^
+     "(SOME thy, SOME hash) => SOME (thy, hash) | _ => NONE end " ^
+     "handle IO.Io _ => NONE | OS.SysErr _ => NONE; " ^
      "fun entry sml = " ^
-     "let val base = OS.Path.base sml; " ^
-     "val (thy, hash) = case TheoryModules.sml_header (base ^ \".sml\") of SOME h => h " ^
-     "| NONE => raise Fail (\"no theory header in \" ^ sml) " ^
-     "in if TheoryReader.is_canonical thy then NONE " ^
+     "let val base = OS.Path.base sml " ^
+     "in case header (base ^ \".sml\") of " ^
+     "NONE => (TextIO.output (TextIO.stdErr, \"theory modules: no theory header in \" ^ sml ^ \"\\n\"); " ^
+     "note (\"error \" ^ OS.Path.file base ^ \" no theory header\"); NONE) " ^
+     "| SOME (thy, hash) => " ^
+     "if TheoryReader.is_canonical thy then NONE " ^
      "else let val dat_digest = TheoryModules.file_digest (base ^ \".dat\") " ^
      "in SOME {base = base, thy = thy, hash = hash, dat_digest = dat_digest, " ^
      "file = TheoryModules.module_file base_id (thy, dat_digest)} end end; " ^
@@ -15362,6 +15656,86 @@ fun stored_modules store expected =
     List.filter is_wanted (HolbuildCache.children store)
   end
 
+(* The EXPECTED names (expected_modules) of which no file of LISTING, a
+   store's file names, is a module under any id. *)
+fun unstored_modules listing expected =
+  let
+    val stored = Binaryset.addList (Binaryset.empty String.compare, List.mapPartial module_file_theory_part listing)
+  in
+    List.filter (fn name => not (Binaryset.member (stored, name))) expected
+  end
+
+(* The expected module names (expected_modules) of the action's theories,
+   once found, by a fresh launch's grants (theory_module_grants) or a
+   restore's look at a short heap (declines_short_heap); and how many of
+   them the host's store lacks, for the action's modstoremissn. *)
+val cone_modules = ref (NONE : string list option)
+val store_missing_modules = ref (NONE : int option)
+
+fun cone_module_names root tc wanted =
+  case !cone_modules of
+      SOME names => names
+    | NONE =>
+        let val names = map #1 (#expected (expected_modules root tc wanted))
+        in cone_modules := SOME names; names end
+
+fun count_store_missing store names =
+  store_missing_modules := SOME (length (unstored_modules (map Path.file (HolbuildCache.children store)) names))
+
+(* The deps heaps a host declined (declines_short_heap), a file
+   `<heap key>-<heap SHA-256>` each, in a directory of its toolchain's
+   module store. *)
+val module_store_declined_heaps = ".declined-heaps"
+
+(* Whether a restore declines the published deps heap HEAP, whose entry
+   ENTRY is under KEY, to preload afresh: the entry is short
+   (short_heap_entry), the toolchain writes modules, the cone expects at
+   least module_writer_min_missing modules, of which this host's store now
+   lacks fewer, and no action on the host has declined that heap before.
+   The preload then saves a heap that loads them, which replaces the entry
+   (publish_shared_checkpoints).  The decline is reserved at once, by
+   creating its file exclusively, so that of the actions restoring the
+   heap at the same time only one preloads; it stays unless the run
+   preloads nothing (release_heap_decline).  Declining only once bounds
+   what a heap that comes out short again (HOL refused a module) costs, as
+   the host goes on restoring the published one. *)
+val declining_heap = ref (NONE : string option)
+
+fun reserve_heap_decline path =
+  let
+    val mode = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.iwusr,
+                                      Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
+  in
+    ensure_dir (Path.dir path);
+    Posix.IO.close (Posix.FileSys.createf (path, Posix.FileSys.O_WRONLY, Posix.FileSys.O.excl, mode));
+    true
+  end
+  handle e as OS.SysErr (_, SOME err) => if err = Posix.Error.exist then false else raise e
+
+fun declines_short_heap root tc wanted {key, heap, entry} =
+  module_writer_supported tc andalso short_heap_entry true entry andalso
+  let
+    val store = module_store tc
+    val names = cone_module_names root tc wanted
+    val _ = count_store_missing store names
+    val record = Path.concat (Path.concat (store, module_store_declined_heaps), key ^ "-" ^ heap)
+    val min = module_writer_min_missing ()
+  in
+    length names >= min andalso valOf (!store_missing_modules) < min andalso reserve_heap_decline record andalso
+    (declining_heap := SOME record;
+     add_restore_step "rstheapdeclinen" 1;
+     HolbuildStatus.message_stdout "declined the shared deps-loaded heap: it lacks theory modules this host has\n";
+     true)
+  end
+  handle e => (warn ("kept the shared deps-loaded heap: " ^ General.exnMessage e); false)
+
+(* Gives the restore's decline, if any, back, for a run that preloaded
+   nothing: a later action on the host may decline the heap. *)
+fun release_heap_decline () =
+  case !declining_heap before declining_heap := NONE of
+      NONE => ()
+    | SOME record => remove_file record
+
 (* For HolbuildActionSandbox.module_reads: what the sandboxed theory
    children of SPEC may read of their toolchain's store.  While their deps
    heap, DEPS_LOADED for DEPS_KEY, exists they start from it or from a
@@ -15377,7 +15751,8 @@ fun theory_module_grants root tc (spec : action_spec) deps_heap =
     val store = module_store tc
     fun granted find = find () handle e => (warn ("theory modules not granted: " ^ General.exnMessage e); [])
     fun theories () =
-      stored_modules store (map #1 (#expected (expected_modules root tc {deps = #deps spec, loads = #loads spec})))
+      let val names = cone_module_names root tc {deps = #deps spec, loads = #loads spec}
+      in count_store_missing store names; stored_modules store names end
     val found = ref NONE
     fun loaded () =
       case !found of
@@ -15527,10 +15902,9 @@ fun write_missing_modules remote root tc wanted deadline =
     fun missing_modules () =
       let
         val _ = listing := map Path.file (HolbuildCache.children store)
-        val stored =
-          Binaryset.addList (Binaryset.empty String.compare, List.mapPartial module_file_theory_part (!listing))
+        val names = Binaryset.addList (Binaryset.empty String.compare, unstored_modules (!listing) (map #1 expected))
       in
-        List.filter (fn (e, _) => not (Binaryset.member (stored, e))) expected
+        List.filter (fn (e, _) => Binaryset.member (names, e)) expected
       end
     fun worth_writing missing =
       not (null missing) andalso
@@ -15551,9 +15925,13 @@ fun write_missing_modules remote root tc wanted deadline =
     val output = Path.concat (store, ".writer")
     val script = in_root root ".holbuild/theory-module-writer.sml"
     val log = in_root root ".holbuild/theory-module-writer.log"
+    (* Tests put a theory whose header can't be read first
+       (HOLBUILD_TEST_WRITER_THEORY). *)
+    val test_theories = case OS.Process.getEnv "HOLBUILD_TEST_WRITER_THEORY" of SOME f => [f] | NONE => []
     val call =
       "val _ = Meta.writeTheoryModules {theories = [" ^
-      String.concatWith ", " (map (fn (_, b) => HolbuildToolchain.sml_string (hol_name b ^ ".sml")) theories) ^
+      String.concatWith ", " (map HolbuildToolchain.sml_string
+                                (test_theories @ map (fn (_, b) => hol_name b ^ ".sml") theories)) ^
       "], directory = " ^ HolbuildToolchain.sml_string store ^
       ", base_state = " ^ HolbuildToolchain.sml_string (HolbuildToolchain.base_state tc) ^
       ", output = " ^ HolbuildToolchain.sml_string output ^
@@ -15713,12 +16091,6 @@ fun write_missing_modules remote root tc wanted deadline =
    took, how many modules it stored of how many missing, how many entries it
    looked up in the remote cache, and how many modules it fetched and
    published. *)
-(* Whether the toolchain's HOL can write theory modules, as far as is known
-   before trying. *)
-fun module_writer_supported tc =
-  file_exists (Path.concat (#holdir tc, "tools-poly/poly/theory_modules.ML")) andalso
-  not (path_exists (Path.concat (module_store tc, module_store_unsupported)))
-
 (* A new store takes its base theories from the v2 store's (module_store),
    which lists the same: they're the HOL's base theories, whichever build
    of its base state. *)
@@ -15755,8 +16127,23 @@ fun fill_module_store remote root tc wanted deadline =
 
 (* The modules of a store whose remote cache entries were looked up and
    found missing (prefetch_modules), one `<theory>-<.dat SHA-1>.pmo` name
-   per line. *)
+   and the time it was looked up, in seconds, per line.  A line older than
+   module_probed_missing_life, or with no time, counts for nothing: another
+   host may have published the module since. *)
 val module_store_probed_missing = ".probed-missing"
+val module_probed_missing_life = Time.fromSeconds 600
+
+(* The lines of the probed-missing file TEXT still in force at NOW. *)
+fun probed_missing_lines now text =
+  let
+    val oldest = Time.toSeconds (Time.- (now, module_probed_missing_life))
+    fun fresh line =
+      case String.tokens Char.isSpace line of
+          [_, seconds] => (case LargeInt.fromString seconds of SOME t => t >= oldest | NONE => false)
+        | _ => false
+  in
+    List.filter fresh (String.tokens (fn c => c = #"\n") text)
+  end
 
 (* How long prefetch_modules waits for the store's writer lock, and has
    for its requests: time for a stalled one (module_request_fits), and
@@ -15780,6 +16167,8 @@ fun prefetch_modules remote root tc wanted =
       val store = module_store tc
       val _ = seed_module_store tc
       val probed_file = Path.concat (store, module_store_probed_missing)
+      fun probed () =
+        if file_exists probed_file then probed_missing_lines (Time.now ()) (read_text probed_file) else []
       fun unprobed () =
         let
           val {expected, base_theories, ...} = expected_modules root tc wanted
@@ -15787,7 +16176,7 @@ fun prefetch_modules remote root tc wanted =
             Binaryset.addList
               (Binaryset.empty String.compare,
                List.mapPartial (module_file_theory_part o Path.file) (HolbuildCache.children store) @
-               (if file_exists probed_file then String.tokens Char.isSpace (read_text probed_file) else []))
+               map (hd o String.tokens Char.isSpace) (probed ()))
           val missing = List.filter (fn (e, _) => not (Binaryset.member (known, e))) expected
         in
           if isSome base_theories andalso length missing >= module_writer_min_missing () then missing else []
@@ -15810,12 +16199,15 @@ fun prefetch_modules remote root tc wanted =
                     {store = store, staging = store_temp (Path.concat (store, ".prefetch")),
                      wanted = module_remote_keys tc missing,
                      deadline = Time.+ (Time.now (), module_prefetch_time)}
-                val old = if file_exists probed_file then read_text probed_file else ""
+                val now = LargeInt.toString (Time.toSeconds (Time.now ()))
                 val tmp = store_temp probed_file
               in
-                if null unpublished then ()
+                (* Rewritten whenever there is a record: it drops the
+                   expired lines. *)
+                if null unpublished andalso not (file_exists probed_file) then ()
                 else
-                  (write_text tmp (old ^ String.concat (map (fn name => name ^ "\n") unpublished));
+                  (write_text tmp (String.concat (map (fn line => line ^ "\n") (probed ()) @
+                                                  map (fn name => name ^ " " ^ now ^ "\n") unpublished));
                    FS.rename {old = tmp, new = probed_file})
                   handle e => (remove_file tmp; raise e)
               end
@@ -15842,7 +16234,7 @@ fun prefetch_modules remote root tc wanted =
    fails the action: the child starts empty, or the cache keeps its entry. *)
 val tool_cache_header = "holbuild-tool-cache-v1"
 val tool_cache_max_files = 16
-val tool_cache_max_bytes = 64 * 1024 * 1024
+val tool_cache_max_bytes = 256 * 1024 * 1024
 
 fun tool_cache_key (spec : action_spec) name =
   HolbuildHash.string_sha256
@@ -16088,16 +16480,24 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     val peak = ref NONE
     (* Each phase's wall time, in the order they ran, for the result. *)
     val phases = ref ([] : (string * LargeInt.int) list)
+    (* The hydrate time inside the current hol phase: a light hydrate's
+       install before HOL starts from a fresh preload, which is not HOL's
+       and is left out of the phase's time, not its span. *)
+    val hol_hydrate_ms = ref (0 : LargeInt.int)
     fun phase name f =
       let
         val _ = if name = "publish" orelse name = "log" then () else check_cancelled ()
         val t0 = Time.now ()
+        val _ = if name = "hol" then hol_hydrate_ms := 0 else ()
         fun record () =
           let val ended = Time.now ()
+              val ms = Time.toMilliseconds (Time.-(ended, t0))
+              val _ = if name = "hydrate" then hol_hydrate_ms := !hol_hydrate_ms + ms else ()
+              val excluded = if name = "hol" then !hol_hydrate_ms else 0
               val spans = if List.exists (fn n => n = name) ["hol", "publish", "log"] then
                   [(name ^ "start", Time.toMilliseconds t0), (name ^ "end", Time.toMilliseconds ended)]
                 else []
-          in phases := (name, Time.toMilliseconds (Time.-(ended, t0))) :: spans @ !phases end
+          in phases := (name, ms - excluded) :: spans @ !phases end
       in
         (f () before record ()) handle e => (record (); raise e)
       end
@@ -16105,6 +16505,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     val log_required = ref false
     (* Why the pipelined attempt was given up for a plain build, if it was. *)
     val fallback = ref NONE
+    (* The records of the dependencies a light hydrate didn't install,
+       until they are. *)
+    val light_records = ref (NONE : HolbuildActionResident.t option)
     (* A late parent's entry restores here, outside what the child may write;
        its outline in the other, and this action's own outline is copied to
        the third before it is published. *)
@@ -16197,35 +16600,94 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        local cache's blob itself, hard-linked: publish_blob checked its
        hash when it entered the cache, the linked file is made read-only, the
        sandbox lets no child chmod or link it, and nothing of holbuild's
-       writes through it (empty_writable only unlinks it).  Across file
-       systems (a worker container's action root beside a host-mounted
-       cache) it is a read-only copy of that blob, not checked again.
-       Without the blob it is fetched and copied as any spec blob, and
-       linked or copied from the next action on. *)
+       writes through it (empty_writable only unlinks it).
+       Across file systems (a worker container's action root beside a
+       host-mounted cache), or without the blob, it is a link to a read-only
+       copy of that blob kept beside the root, in scratch_store, which no
+       child can read: an action sees only the inputs its spec names.  A
+       later action links the kept copy again while it is a read-only
+       regular file of the blob's size:
+       only holbuild writes there, a copy reaches its name only whole
+       (copy_binary and fetch_blob rename it there) and is made read-only
+       after, so an interrupted one is not reused.  Without the blob, the
+       copy is fetched; when all that fails, the input is fetched into the
+       root as any spec blob. *)
+    val scratch_store = scratch_store_dir cache
+    val scratch_keep_limit = 8
     fun stage_scratch_input (spec : action_spec) =
       let
+        val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
+        val copied = ref 0
+        fun kept copy blob =
+          let
+            val st = Posix.FileSys.lstat copy
+          in
+            Posix.FileSys.ST.isReg st andalso
+            Posix.FileSys.S.toWord (Posix.FileSys.ST.mode st) mod 0w4096 = Posix.FileSys.S.toWord read_only andalso
+            Posix.FileSys.ST.size st = Posix.FileSys.ST.size (Posix.FileSys.stat blob)
+          end
+          handle OS.SysErr _ => false
         fun stage sha =
           let
             val path = FS.fullPath root ^ "/.holbuild/scratch/" ^ sha
             val blob = HolbuildCache.blob_path cache sha
-            val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
+            val copy = Path.concat (scratch_store, sha)
+            fun link old = (ensure_parent path; remove_file path; Posix.FileSys.link {old = old, new = path})
+            (* Set when this input is copied or fetched, counted once. *)
+            val fetched = ref false
+            fun keep_copy () =
+              (fetched := true;
+               ensure_dir scratch_store;
+               copy_binary blob copy
+               handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = copy}
+                    | IO.Io _ => fetch_spec_blob remote {hash = sha, dst = copy}
+                    | Error _ => fetch_spec_blob remote {hash = sha, dst = copy};
+               Posix.FileSys.chmod (copy, read_only))
           in
-            ((ensure_parent path;
-              remove_file path;
-              Posix.FileSys.link {old = blob, new = path}
-              handle e as OS.SysErr (_, err) =>
-                if err = SOME Posix.Error.xdev then copy_binary blob path else raise e;
-              (* The staged name: a blob installed over the cache's
-                 name meanwhile would be another inode. *)
-              Posix.FileSys.chmod (path, read_only);
+            ((link blob
+              (* The staged name: a blob installed over the cache's name
+                 meanwhile would be another inode. *)
+              before Posix.FileSys.chmod (path, read_only)
+              handle OS.SysErr _ => ((if kept copy blob then () else keep_copy ()); link copy);
+              HolbuildCache.touch copy;
               HolbuildCache.touch blob)
-             handle OS.SysErr _ => fetch_spec_blob remote {hash = sha, dst = path}
-                  | IO.Io _ => fetch_spec_blob remote {hash = sha, dst = path}
-                  | Error _ => fetch_spec_blob remote {hash = sha, dst = path});
+             handle OS.SysErr _ => (fetched := true; fetch_spec_blob remote {hash = sha, dst = path})
+                  | IO.Io _ => (fetched := true; fetch_spec_blob remote {hash = sha, dst = path})
+                  | Error _ => (fetched := true; fetch_spec_blob remote {hash = sha, dst = path}));
+            if !fetched then copied := !copied + 1 else ();
             path
           end
+        (* The store keeps this action's inputs and then the most recently
+           used, up to scratch_keep_limit files; anything else in it goes,
+           each entry by its own name, links unfollowed.  An action's own
+           inputs beyond the limit go too: their links in the root keep
+           them for the action. *)
+        fun prune current =
+          let
+            val names = HolbuildBuildPlan.list_dir scratch_store handle HolbuildBuildPlan.Error _ => []
+            fun staged name =
+              HolbuildHash.valid_sha256 name andalso
+              (Posix.FileSys.ST.isReg (Posix.FileSys.lstat (Path.concat (scratch_store, name))) handle OS.SysErr _ => false)
+            fun mtime name = Time.toReal (FS.modTime (Path.concat (scratch_store, name))) handle OS.SysErr _ => 0.0
+            val others =
+              HolbuildBuildPlan.sort_pairs (fn (a, b) => Real.compare (#2 b, #2 a))
+                (map (fn name => (name, mtime name))
+                     (List.filter (fn name => staged name andalso not (List.exists (fn c => c = name) current)) names))
+            val current = List.take (current, Int.min (scratch_keep_limit, length current))
+            val room = scratch_keep_limit - length current
+            val keep = current @ map #1 (List.take (others, Int.min (room, length others)))
+          in
+            List.app (fn name => HolbuildRemoveTree.remove_untrusted (Path.concat (scratch_store, name)))
+              (List.filter (fn name => not (List.exists (fn k => k = name) keep)) names)
+          end
       in
-        scratch_input_paths := map stage (#scratch_inputs spec)
+        case #scratch_inputs spec of
+            [] => scratch_input_paths := []
+          | inputs =>
+              phase "scratch" (fn () =>
+                (scratch_input_paths := map stage inputs;
+                 prune (unique_strings inputs);
+                 phases := ("scratchcopyn", LargeInt.fromInt (!copied)) :: !phases))
       end
     val run_log = ref NONE
     fun build_log () =
@@ -16377,16 +16839,23 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     and run_plain spec tc forced pipelined =
       let
         val _ = hydrate_steps := []
-        val _ = (phase "hydrate" (fn () => hydrate_action_root remote root (!resident) spec) before add_hydrate_steps ())
-                handle e => (add_hydrate_steps (); raise e)
+        (* A check-only action resuming from a heap reads no dependency file:
+           they are installed only when it doesn't (build_light). *)
+        val light =
+          (phase "hydrate" (fn () => hydrate_action_root remote root (!resident) spec (#check_only spec andalso not forced))
+           before add_hydrate_steps ())
+          handle e => (add_hydrate_steps (); raise e)
+        val _ = light_records := Option.map #records light
+        fun known path = Option.mapPartial (fn records => Resident.file_hash records path) (!light_records)
         val (done, cutoff) =
           phase "cutoff" (fn () =>
             let
-              val {dat_hash, file_hashes} = resident_hashes (!resident)
+              val {dat_hash, file_hashes} = resident_hashes (!resident :: (case light of SOME {records, ...} => [records] | NONE => []))
               val cutoff =
                 spec_early_cutoff_with
                   {dat_hash = dat_hash, file_hashes = file_hashes,
-                   skip_loaded = {base_loaded = !base_loaded, follow = true}}
+                   skip_loaded = {base_loaded = !base_loaded, follow = true,
+                                  known_manifest = case light of SOME {manifest, ...} => manifest | NONE => (fn _ => NONE)}}
                   root spec
               (* The action's own entry and the earlier build's are looked up
                  side by side. *)
@@ -16400,24 +16869,72 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 if forced then ()
                 else
                   parallel_all 2 (fn look_up => look_up ())
-                    [fn () => done := action_already_done remote root spec,
+                    [fn () => done := action_already_done known remote root spec,
                      fn () => Option.app look_up_earlier cutoff]
             in
               (* A failed pair lookup raises here, as it did inside
                  reuse_earlier_build, whose handler covers only its last case. *)
-              (!done orelse (not forced andalso reuse_earlier_build remote root spec (!earlier ())), cutoff)
+              (!done orelse (not forced andalso reuse_earlier_build known remote root spec (!earlier ())), cutoff)
             end)
       in
         if done then
           (* The entry may have come from the worker's local cache, so make
-             sure the remote, where the result counts, holds it too. *)
-          ((if #check_only spec then ()
+             sure the remote, where the result counts, holds it too.  A
+             light hydrate's dependencies are installed first, which checks
+             that each fits its parents, as no heap vouches for them here. *)
+          (install_light spec tc cutoff;
+           (if #check_only spec then ()
             else phase "check" (fn () => phase "publish" (fn () => check_remote_publication remote root spec)));
            "cached")
         else if pipelined then
           or_plain (fn () => build spec tc forced cutoff NONE true) (fn () => build spec tc forced cutoff NONE false)
+        else if Option.isSome light then build_light spec tc forced cutoff
         else build spec tc forced cutoff NONE false
       end
+    (* A build on a light hydrate: the dependencies are installed before
+       HOL starts from a fresh preload, which loads them.  A run resuming
+       from a checkpoint reads none: the preload that saved its heap loaded
+       every dependency the script loads.  The installed files must give
+       the records' hashes: the context the build restored, and publishes
+       a failed prefix under, is keyed by those. *)
+    and build_light spec tc forced cutoff =
+      (before_fresh_preload := (fn () => install_light spec tc cutoff);
+       build spec tc forced cutoff NONE false before before_fresh_preload := (fn () => ()))
+      handle e => (before_fresh_preload := (fn () => ()); raise e)
+    (* Installs the dependencies a light hydrate left out, whose files must
+       give the records' hashes; and the build's module grants then. *)
+    and install_light spec tc cutoff =
+      if not (Option.isSome (!light_records)) then ()
+      else
+        let
+          val _ = light_records := NONE
+          val _ = hydrate_steps := []
+          fun install () =
+            let
+              val _ = hydrate_action_root remote root (!resident) spec false
+              val {dat_hash, file_hashes} = resident_hashes [!resident]
+            in
+              spec_early_cutoff_with
+                {dat_hash = dat_hash, file_hashes = file_hashes,
+                 skip_loaded = {base_loaded = !base_loaded, follow = true, known_manifest = fn _ => NONE}}
+                root spec
+            end
+          val installed =
+            (phase "hydrate" install before add_hydrate_steps ())
+            handle e => (add_hydrate_steps (); raise e)
+        in
+          if Option.map #deps_key installed = Option.map #deps_key cutoff then ()
+          else raise action_failed InternalFailure "the dependencies installed differ from the records the build started from";
+          set_module_grants tc spec (spec_theory_action root spec (cutoff_context spec cutoff))
+        end
+    (* The theory modules the build's sandbox may read. *)
+    and set_module_grants tc spec action =
+      (cone_modules := NONE;
+       store_missing_modules := NONE;
+       HolbuildActionSandbox.module_reads :=
+        theory_module_grants root tc spec
+          (SOME {deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action),
+                 deps_key = #deps_key action}))
     (* Publishes the outline the pipelined theory child in STAGE published
        there, for children loading ahead of the theory.  A failure costs
        them only the wait for its entry. *)
@@ -16473,11 +16990,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                               fill_module_store remote writer_root tc {deps = #deps spec, loads = #loads spec}}
         val action =
           spec_theory_action root spec (cutoff_context spec cutoff)
-        val _ =
-          HolbuildActionSandbox.module_reads :=
-            theory_module_grants root tc spec
-              (SOME {deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action),
-                     deps_key = #deps_key action})
+        val _ = set_module_grants tc spec action
         (* A local entry that didn't restore must not stand in for this
            build's when the publication is checked, and, as in a local
            build, its theory's checkpoints may hold parents other than
@@ -16487,7 +17000,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           case HolbuildCache.get_action cache (#input_key spec) of
               SOME _ =>
                 ((if forced andalso #check_only spec then () else HolbuildCache.remove_action cache (#input_key spec));
-                 if forced then () else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
+                 if forced orelse not (checkpoint_saves_enabled (spec_policy spec)) then ()
+                 else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
             | NONE => ()
         val stage = action_stage root action
         val policy =
@@ -16502,6 +17016,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val _ = if isSome ahead then () else last_child_start := NONE
         val _ = dropped_checkpoints := 0
         val _ = rejected_heap_modules := 0
+        val _ = discarded_deps_heap := false
+        val _ = preloaded_deps_heap := false
         (* Built on a late parent's outline, the run is the load ahead's:
            whatever stops it, nothing of it is published, and the action
            builds again plain. *)
@@ -16534,33 +17050,84 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               case (shared, ahead) of
                   (SOME ctx, NONE) =>
                     (restore_steps := [];
+                     declining_heap := NONE;
                      (phase "restore" (fn () =>
                         restore_shared_checkpoints remote ctx (resumes_from_checkpoints policy action)
-                          (fetch_heap_modules remote tc))
+                          (fetch_heap_modules remote tc)
+                          (* A check-only action, lightly hydrated, has
+                             no store to judge, and a non-target, or a run
+                             under --no-checkpoint-saves, publishes no
+                             heap: they restore it. *)
+                          (fn entry => not (#check_only spec) andalso saves_progress policy andalso
+                                       declines_short_heap root tc {deps = #deps spec, loads = #loads spec} entry))
                       before add_restore_steps ())
-                     handle e => (add_restore_steps (); raise e))
+                     handle e => (add_restore_steps (); release_heap_decline (); raise e))
                 | _ => nothing_restored
+            (* How many of its cone's expected modules the heap this run's
+               preload saved doesn't load, and how many the cone expects. *)
+            fun captured_missing () =
+              case (!cone_modules, !captured_heap_modules) of
+                  (SOME names, SOME {modules, ...}) =>
+                    SOME {missing = length (unstored_modules (map (Path.file o #2) modules) names),
+                          cone = length names}
+                | _ => NONE
+            (* The deps heap the run started from, the one its preload
+               saved or else the one restored: how many of its cone's
+               modules it doesn't load (depsmissn), when known, and its
+               size (rstdepskb); and how many of the cone's modules the
+               host's store lacked when it was looked at (modstoremissn). *)
+            fun deps_heap_phases () =
+              let
+                val captured = Option.isSome (!captured_deps_heap)
+                (* A decline whose action restored a failed prefix of its
+                   own instead preloaded nothing: it isn't spent. *)
+                val _ = if !preloaded_deps_heap then declining_heap := NONE else release_heap_decline ()
+                val deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)
+                (* A restored heap discarded at load isn't the one the
+                   action ran on. *)
+                val missing =
+                  if captured then Option.map #missing (captured_missing ())
+                  else if !discarded_deps_heap then NONE
+                  else Option.mapPartial heap_entry_missing (#entry restored)
+                val kb =
+                  if !preloaded_deps_heap orelse Option.isSome (#heap restored)
+                  then SOME (file_kb deps_loaded) handle OS.SysErr _ => NONE
+                  else NONE
+                fun count name = Option.map (fn n => (name, LargeInt.fromInt n))
+              in
+                phases := List.mapPartial (fn p => p)
+                            [count "depsmissn" missing, Option.map (fn kb => ("rstdepskb", kb)) kb,
+                             count "modstoremissn" (!store_missing_modules)] @ !phases
+              end
             (* It fills the host's module store for later actions, which a
                check-only action leaves to them: it takes only the modules a
-               checkpoint it restores needs. *)
+               checkpoint it restores needs.  A decline is given back if the
+               run fails before HOL starts. *)
             val _ =
               if not (Option.isSome ahead) andalso not (Option.isSome (#heap restored)) andalso
                  not (#check_only spec)
               then prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
+                   handle e => (release_heap_decline (); raise e)
               else ()
+            (* Under --no-checkpoint-saves the action restores shared
+               checkpoints but publishes none, nor refreshes an index. *)
             fun publish_shared () =
-              ((if not (!HolbuildActionSandbox.outputs_validated) then () else
+              ((if not (!HolbuildActionSandbox.outputs_validated) orelse
+                   not (checkpoint_saves_enabled policy) then () else
                 case shared of
                     SOME ctx =>
                       (publishing_checkpoints := true;
-                       (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
+                       (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored (captured_missing ()))
                         before publishing_checkpoints := false)
                        handle e => (publishing_checkpoints := false; raise e))
                   | NONE => ())
                before drop_heap_snapshot ())
               handle e => (drop_heap_snapshot (); raise e)
-            val tool_cache = case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec
-            val _ = if Option.isSome ahead then () else stage_scratch_input spec
+            val tool_cache =
+              (case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec)
+              handle e => (release_heap_decline (); raise e)
+            val _ = (if Option.isSome ahead then () else stage_scratch_input spec)
+                    handle e => (release_heap_decline (); raise e)
             fun publish_tools () =
               if not (!HolbuildActionSandbox.outputs_validated) then () else
               case tool_cache of
@@ -16577,7 +17144,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 if pipelined then with_outline_watch stage (fn () => publish_outline action policy stage) run_hol
                 else run_hol ())
               handle e =>
-                (set_attached_child NONE;
+                (deps_heap_phases ();
+                 set_attached_child NONE;
                  tools_first := (fn () => ());
                  deferred :=
                    (fn () =>
@@ -16590,12 +17158,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                     | _ => if outlined orelse checks_only policy then () else set_write_modules ());
                  raise e)
           in
+            deps_heap_phases ();
             tools_first := (fn () => if !cancelled orelse checks_only policy then () else publish_tools ());
             deferred :=
               (fn () =>
                  ((* A passing non-target has no checkpoint to share. *)
                   if checkpoint_target_enabled policy then publish_shared () else drop_heap_snapshot ();
-                  if !cancelled then () else
+                  if !cancelled orelse not (checkpoint_saves_enabled policy) then () else
                   (* After the publish: the checkpoints saved after
                      resuming from a failed prefix are its children. *)
                   remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)));
@@ -16662,7 +17231,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             | NONE => reject_spec ("ahead parent " ^ key ^ " is not a dependency of the action")
         val named = map (fn {input_key, spec_sha256} => (dependency input_key, spec_sha256)) ahead_parents
         fun cached key = Option.isSome (HolbuildRemoteCache.get_action remote key)
-        val _ = if cached (#input_key spec) then raise ActionFailed (AheadAbandoned, "the action is built already")
+        val _ = if action_built remote spec then raise ActionFailed (AheadAbandoned, "the action is built already")
                 else ()
         val late = List.filter (fn (dep, _) => not (cached (#key dep))) named
       in
@@ -16687,7 +17256,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                (own_scratch spec :: map (fn ({stem, key, ...}, _) => (stem, key)) late)
                (map file (#source spec :: #inputs spec))
                {libraries = #libraries spec, deps = present, libs = #libs spec, orders = #orders spec}
-               (fn {stem, ...} => List.exists (fn loaded => loaded = stem) (spec_loaded_stems spec)))
+               (fn {stem, ...} => List.exists (fn loaded => loaded = stem) (spec_loaded_stems spec)) false)
            before add_hydrate_steps ())
           handle e => (add_hydrate_steps (); raise e)
         (* A dependency built on an earlier build of a late parent names it
@@ -16963,6 +17532,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
            outline the child loaded (export_mismatch); and CUTOFF, the deps
            context the outlines gave, for these.  Any of it failing
            abandons the action, which builds again plain. *)
+        (* finalswait: the time the child, its run done, waited for the
+           final entries of the parents it loaded from outlines, also when
+           a wait gives the attempt up. *)
+        val finals_waited = ref (0 : LargeInt.int)
         fun finals cutoff =
           if null (!outlined) then cutoff
           else
@@ -16974,6 +17547,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                        if cached key then ()
                        else if Time.>= (Time.now (), deadline) then abandon ("the entry of " ^ target ^ " did not arrive in time")
                        else (OS.Process.sleep ahead_poll_interval; await ()))
+                    fun timed_await () =
+                      let
+                        val t0 = Time.now ()
+                        fun record () = finals_waited := !finals_waited + Time.toMilliseconds (Time.- (Time.now (), t0))
+                      in
+                        (await () before record ()) handle e => (record (); raise e)
+                      end
                     fun files dir =
                       let val staged = in_root dir stem
                       in
@@ -16983,18 +17563,19 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   in
                     if not (is_outlined key) then ()
                     else
-                      (await ();
+                      (timed_await ();
                        if restore_late staging dep key then ()
                        else abandon ("dependency " ^ target ^ " does not match its parents");
                        case export_mismatch (files staging) (files outline_staging) of
                            SOME why => abandon ("the outline of " ^ target ^ " failed the gate: " ^ why)
                          | NONE => place staging stem)
                   end)
-               late;
-             phases := ("outlined", LargeInt.fromInt (length (!outlined))) :: !phases;
+               late
+             handle e => (phases := ("finalswait", !finals_waited) :: !phases; raise e);
+             phases := ("finalswait", !finals_waited) :: ("outlined", LargeInt.fromInt (length (!outlined))) :: !phases;
              spec_early_cutoff_with
                {dat_hash = hash_of, file_hashes = map hash_of,
-                skip_loaded = {base_loaded = !base_loaded, follow = false}}
+                skip_loaded = {base_loaded = !base_loaded, follow = false, known_manifest = fn _ => NONE}}
                root spec)
         fun continue_ahead () =
           let
@@ -17011,7 +17592,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                (* The late parents' manifests in the root are stand-ins. *)
                spec_early_cutoff_with
                  {dat_hash = hash_of, file_hashes = map hash_of,
-                  skip_loaded = {base_loaded = !base_loaded, follow = false}}
+                  skip_loaded = {base_loaded = !base_loaded, follow = false, known_manifest = fn _ => NONE}}
                  root spec)
             val built_action =
               spec_theory_action root spec (cutoff_context spec cutoff)
@@ -17022,8 +17603,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                from an empty root. *)
             val shared_key = shared_heap_key tc root built_action
             val hit =
-              cached (#input_key spec) orelse
-              (case cutoff of SOME {pair_key, ...} => cached pair_key | NONE => false) orelse
+              action_built remote spec orelse
+              (* Only an earlier build's key: a record naming the action's
+                 own key is what action_built judged. *)
+              (case cutoff of
+                   SOME {pair_key, ...} =>
+                     Option.isSome (Option.mapPartial (earlier_build_key spec)
+                                      (HolbuildRemoteCache.get_action remote pair_key))
+                 | NONE => false) orelse
               (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
                (cached shared_key orelse
                 not deps_heap_only andalso resumes_from_checkpoints (spec_policy spec) built_action andalso
@@ -17123,7 +17710,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   val _ = ensure_parent path
                   val out = TextIO.openAppend path
                 in
-                  TextIO.output (out, "\n" ^ line ^ "\n");
+                  HolbuildBoundedOutput.text (out, "\n" ^ line ^ "\n");
                   TextIO.closeOut out
                 end
                 handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e)
@@ -17198,7 +17785,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  what follows is off the client's path. *)
               (case result_file of
                    SOME path => write_text path text
-                 | NONE => print text)
+                 | NONE => HolbuildBoundedOutput.print text)
               handle e => (drop_heap_snapshot () handle _ => (); raise e);
               let
                 val t0 = Time.now ()

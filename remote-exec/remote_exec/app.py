@@ -295,6 +295,9 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         async def lines() -> AsyncIterator[str]:
             # Each read gets only the actions written since the last one, maybe some again, so `seen` drops repeats.
             seen: dict[str, ActionStatus] = {}
+            # The actions last sent held, read again each time so that the end of a hold, which writes nothing to
+            # them, is sent too.
+            held: set[str] = set()
             batch, since = first
             actions = batch.actions
             last_line = last_read = time.monotonic()
@@ -305,6 +308,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                     for action in actions:
                         if seen.get(action.input_key) != action:
                             seen[action.input_key] = action
+                            if action.held_by is None:
+                                held.discard(action.input_key)
+                            else:
+                                held.add(action.input_key)
                             yield json.dumps(jsonable_encoder({"type": "action", **vars(action)})) + "\n"
                             last_line = time.monotonic()
                     if batch.state != "running":
@@ -337,7 +344,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                                           credit + (now - last_read) / settings.events_poll_seconds) - 1.0)
                     last_read = now
                     try:
-                        changed = await coordinator.changes(batch_id, since)
+                        changed = await coordinator.changes(batch_id, since, held)
                     except DATABASE_UNAVAILABLE as error:
                         # Ending the stream would make its client follow the batch again from the start; the next
                         # read from the same `since` gets what this one missed.
@@ -386,6 +393,11 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
             host_rank=0 if body.host is None else body.host.rank,
             ahead=body.ahead,
         )
+        if claimed is None and body.host is not None and not await request.is_disconnected():
+            # Seen again as the wait ends, so until its next claim the worker still counts as a free slot on the
+            # scale-in line (see Coordinator._kept_hosts), as it did while it waited. Not idle: a claim its worker gave
+            # up on can end after the worker's next claim took a lease, whose bookkeeping must stay.
+            coordinator.report_worker(body.host.id, body.worker, tiers, ahead=body.ahead)
         # After the claim, so claims arriving together still share their reads. Its worker's next claim comes 30 s
         # after this one arrived at the soonest, which dwarfs any skew between this clock and the database's.
         await coordinator.release_unheld(body.worker, None if claimed is None else str(claimed.attempt_token), arrived)
@@ -395,7 +407,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                 await coordinator.give_back(claimed)
             return Response(status_code=204)
         if claimed is None:
-            return Response(status_code=204)
+            # A burst worker on a host claims fill after Spot exits at once rather than after its idle time, so the
+            # host empties (see worker.py).
+            spilled = body.host is not None and tiers[0] != "standard" and coordinator.spilled(body.host.id)
+            return Response(status_code=204, headers={"Holbuild-Spilled": "1"} if spilled else None)
         return asdict(claimed)
 
     @app.post("/v1/work/report", status_code=204, dependencies=worker)

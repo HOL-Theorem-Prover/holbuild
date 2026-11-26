@@ -15,13 +15,7 @@ use_case_cache "$tmpdir/cache"
 project=$tmpdir/project
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "termination-diagnostics"
@@ -74,13 +68,7 @@ fi
 success_project=$tmpdir/success-project
 mkdir -p "$success_project/src"
 cat > "$success_project/holproject.toml" <<TOML
-[holbuild]
-schema = 2
-minimum_version = "0.10.0"
-
-[dependencies.hol]
-git = "https://github.com/HOL-Theorem-Prover/HOL.git"
-rev = "$(holbuild_pinned_hol_rev)"
+$(write_schema2_prelude)
 
 [project]
 name = "termination-success"

@@ -211,7 +211,8 @@ PY
 }
 
 remote_root=$tmpdir/remote
-start_remote_cache_server "$remote_root" "$tmpdir/server"
+remote_control=$tmpdir/control
+start_remote_cache_server "$remote_root" "$tmpdir/server" "$remote_control"
 
 # The fixture replaces an object rather than rewriting it, so a GET that has it open while a
 # PUT replaces it still reads the whole old object.
@@ -269,6 +270,8 @@ if [[ -r /proc/pressure/cpu ]]; then
   require_grep "system cpu pressure some delta: [0-9]*us" "$first_log"
 fi
 assert_remote_proof_timeout none
+weak_action=$tmpdir/weak-action
+cp "$(remote_theory_action_path)" "$weak_action"
 
 second_log=$tmpdir/second.log
 (cd "$second" && HOLBUILD_CACHE="$second_cache" HOLBUILD_CACHE_TRACE=1 \
@@ -283,6 +286,26 @@ fi
 require_grep "ATheory built" "$second_log"
 require_grep "remote cache published:" "$second_log"
 assert_remote_proof_timeout 180.0
+
+# A cache in front of the store can still serve the weak entry the second
+# build replaced there.  A build holding that weak entry locally, too weak for
+# its timeout, asks the cache to check its copy with the store and restores
+# the store's entry.
+strong_ac=$(basename "$(remote_theory_action_path)")
+cp "$weak_action" "$remote_control/ac-stale-$strong_ac"
+# The second build's lookups passed over the weak entry and asked again.
+rm -f "$remote_control/no-cache-gets"
+revalidated_log=$tmpdir/revalidated.log
+(cd "$first" && HOLBUILD_CACHE="$first_cache" HOLBUILD_CACHE_TRACE=1 \
+  "$HOLBUILD_BIN" --remote-cache "$remote_url" build --tactic-timeout 180 ATheory) > "$revalidated_log" 2>&1
+require_grep "ATheory restored from cache" "$revalidated_log"
+require_grep "^$strong_ac\$" "$remote_control/no-cache-gets"
+if grep -q "ATheory built" "$revalidated_log"; then
+  echo "a build rebuilt an entry the store holds past a stale weak copy" >&2
+  cat "$revalidated_log" >&2
+  exit 1
+fi
+rm -f "$remote_control/no-cache-gets"
 
 equal_action=$(remote_theory_action_path)
 equal_action_before=$tmpdir/equal-action.before

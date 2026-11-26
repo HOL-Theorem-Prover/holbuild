@@ -85,6 +85,7 @@ use "$HOLBUILD_ROOT/vendor/hol/tools-poly/poly/Binarymap.sig";
 use "$HOLBUILD_ROOT/vendor/hol/tools-poly/poly/Binarymap.sml";
 structure HolbuildHash = struct fun quote s = "'" ^ s ^ "'" end;
 structure HolbuildProcessGroup = struct exception Error of string end;
+use "$HOLBUILD_ROOT/sml/bounded_output.sml";
 use "$HOLBUILD_ROOT/sml/hol_toolchain_config.sml";
 use "$HOLBUILD_ROOT/sml/builtin_manifests.sml";
 use "$HOLBUILD_ROOT/sml/hol_source_manifest.sml";

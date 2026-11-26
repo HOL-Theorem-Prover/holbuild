@@ -30,7 +30,20 @@ trap cleanup EXIT
 mods=$tmpdir/mods
 objs=$mods/.hol/objs
 mkdir -p "$objs"
-for name in ATheory BTheory ProbeLib; do : > "$objs/$name.ui"; done
+# StagedLib sits where a worker stages the HOL libraries a project builds in
+# its hol package, outside HOLDIR: labelled by its path under HOL's tree, when
+# the process runs in a stage directory of that action root.  ElsewhereLib has
+# a path with the same directories under another root: a project's own.
+action_root=$tmpdir/stage
+staged=$action_root/.holbuild/action-src/hol/src/probe
+stage_dir=$action_root/.holbuild/stage/key
+elsewhere=$tmpdir/elsewhere/.holbuild/action-src/hol/src/probe
+mkdir -p "$staged" "$stage_dir" "$elsewhere"
+echo 'val _ = ();' > "$staged/StagedLib.sml"
+echo 'val _ = ();' > "$elsewhere/ElsewhereLib.sml"
+echo "$staged/StagedLib.sml" > "$objs/StagedLib.uo"
+echo "$elsewhere/ElsewhereLib.sml" > "$objs/ElsewhereLib.uo"
+for name in ATheory BTheory ProbeLib StagedLib ElsewhereLib; do : > "$objs/$name.ui"; done
 echo "$mods/ATheory.sml" > "$objs/ATheory.uo"
 printf 'ATheory\n%s\n' "$mods/BTheory.sml" > "$objs/BTheory.uo"
 echo "$mods/ProbeLib.sml" > "$objs/ProbeLib.uo"
@@ -50,18 +63,20 @@ row() {
       for (i = 6; i <= NF; i++) if (index($i, field) == 1) print substr($i, length(field) + 1) }' "$1"
 }
 
-# run_load MODE PRELUDE BODY [VAR=VALUE...]: a HOL process that compiles the
-# runtime and runs BODY; its output goes to $tmpdir/MODE.log.
+# run_load MODE PRELUDE BODY [VAR=VALUE...]: a HOL process, in $load_dir, that
+# compiles the runtime and runs BODY; its output goes to $tmpdir/MODE.log.
+load_dir=$tmpdir
 run_load() {
   local mode=$1 prelude=$2 body=$3
   shift 3
   cat > "$tmpdir/$mode.sml" <<SML
 $prelude
+use "$HOLBUILD_ROOT/sml/bounded_output.sml";
 use "$HOLBUILD_ROOT/sml/holbuild_runtime.sml";
 val _ = Meta.loadPath := "$mods" :: !Meta.loadPath;
 $body
 SML
-  env "$@" "$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" "$tmpdir/$mode.sml" \
+  (cd "$load_dir" && env "$@" "$HOLDIR/bin/hol" run --noconfig --holstate "$HOLDIR/bin/hol.state" "$tmpdir/$mode.sml") \
     > "$tmpdir/$mode.log" 2>&1 || { cat "$tmpdir/$mode.log" >&2; exit 1; }
 }
 
@@ -104,6 +119,21 @@ run_load current "" "$loads" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD
 check_timed current
 run_load loadplan "$loadplan_meta" "$loads" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
 check_timed loadplan
+load_dir=$stage_dir
+run_load staged "" 'val _ = HolbuildRuntime.load "StagedLib"; val _ = HolbuildRuntime.load "ElsewhereLib";' HOLBUILD_TIMING_SOURCE_LOADS=1
+[[ "$(row "$tmpdir/staged.log" library hol:src/probe/StagedLib.sml n)" == 1 ]] || {
+  echo "a staged HOL library is not labelled by its path under HOL's tree" >&2; cat "$tmpdir/staged.log" >&2; exit 1; }
+[[ "$(row "$tmpdir/staged.log" library project:ElsewhereLib.sml n)" == 1 ]] || {
+  echo "a library outside this action root is labelled as a staged HOL library" >&2; cat "$tmpdir/staged.log" >&2; exit 1; }
+# Outside a stage directory no root is known: nothing is staged HOL.
+load_dir=$tmpdir
+run_load unstaged "" 'val _ = HolbuildRuntime.load "StagedLib";' HOLBUILD_TIMING_SOURCE_LOADS=1
+[[ "$(row "$tmpdir/unstaged.log" library project:StagedLib.sml n)" == 1 ]] || {
+  echo "a library is labelled as a staged HOL library outside an action stage" >&2; cat "$tmpdir/unstaged.log" >&2; exit 1; }
+# The time of a heap share is never negative when the wall clock steps back.
+run_load clock "" 'val _ = if HolbuildRuntime.elapsed_us (Time.fromSeconds 5, Time.fromSeconds 3) = 0 andalso
+                             HolbuildRuntime.elapsed_us (Time.fromSeconds 3, Time.fromSeconds 5) = 2000000
+                          then () else raise Fail "elapsed_us";'
 # A timed process that loads nothing (a child resumed from a heap, say) still
 # reports, with its context.
 run_load empty "" "" HOLBUILD_TIMING_SOURCE_LOADS=1 HOLBUILD_SOURCE_LOAD_CONTEXT=probe-ctx
@@ -154,35 +184,60 @@ QED
 val _ = export_theory();
 SML
 child_log=$local_project/.holbuild/logs/current/local/LTheory/build.log
-# local_build NAME CTX [OPTION...]: a timed build whose child reports CTX.
+# local_build NAME CTX STATUS [OPTION...]: a timed build exiting with STATUS
+# whose child, run afresh, reports CTX.
 local_build() {
-  local name=$1 ctx=$2
-  shift 2
-  (cd "$local_project" && HOLBUILD_TIMING_SOURCE_LOADS=1 "$HOLBUILD_BIN" build "$@" LTheory) > "$tmpdir/$name.log" 2>&1 || true
-  set -- "$name" "$ctx"
-  grep -q "^holbuild source-load ctx=$2 " "$child_log" || {
-    echo "$1: the child did not report ctx=$2:" >&2; cat "$tmpdir/$1.log" "$child_log" >&2; exit 1; }
+  local name=$1 ctx=$2 want=$3 status=0
+  shift 3
+  rm -f "$child_log"
+  (cd "$local_project" && HOLBUILD_TIMING_SOURCE_LOADS=1 "$HOLBUILD_BIN" build "$@" LTheory) > "$tmpdir/$name.log" 2>&1 || status=$?
+  [[ "$status" == "$want" ]] || {
+    echo "$name: the build exited $status, not $want:" >&2; cat "$tmpdir/$name.log" >&2; exit 1; }
+  grep -qs "^holbuild source-load ctx=$ctx " "$child_log" || {
+    echo "$name: the child did not report ctx=$ctx:" >&2; cat "$tmpdir/$name.log" >&2; cat "$child_log" >&2 || true; exit 1; }
 }
-local_build seed target-cold
+
+# Count evaluations, including repeats of any given source. Match the start
+# context so a discarded attempt cannot count toward the successful resume.
+runtime_count() {
+  awk -v ctx="ctx=$1" -v name="name=$2" '
+    $1 == "holbuild" && $2 == "source-load" && $3 == ctx && $4 == "kind=runtime" &&
+      (name == "name=*" || $5 == name) { sub(/^n=/, "", $6); count += $6 }
+    END { print count + 0 }' "$child_log"
+}
+
+local_build seed target-cold 1
+require_grep "seed failure" "$tmpdir/seed.log"
+cold_save=$(runtime_count target-cold checkpoint_save_runtime.sml)
 sed -i 's/FAIL_TAC "seed failure"/ACCEPT_TAC TRUTH/' "$local_project/src/LScript.sml"
-local_build resume target-prefix
+local_build resume target-prefix 0
 require_grep "from: failed-prefix checkpoint" "$tmpdir/resume.log"
+prefix_runtime=$(runtime_count target-prefix '*')
 sed -i 's/^val _ = new_theory "L";$/val _ = new_theory "L"; val edited = ();/' "$local_project/src/LScript.sml"
-local_build edit target-deps
+local_build edit target-deps 0
+deps_save=$(runtime_count target-deps checkpoint_save_runtime.sml)
+deps_sha256=$(runtime_count target-deps sha256.sml)
+echo "Runtime evaluations: cold save=$cold_save, failed-prefix all=$prefix_runtime, deps save=$deps_save sha256=$deps_sha256"
+if (( cold_save != 1 || prefix_runtime != 0 || deps_save != 0 || deps_sha256 != 0 )); then
+  echo "Expected one cold save-runtime evaluation and no redundant evaluations on resume" >&2
+  exit 1
+fi
 # Without proof steps the script runs plain, with no proof runtime: it
 # reports all the same.
 sed -i 's/ val edited = ();$/ val edited = 1;/' "$local_project/src/LScript.sml"
-local_build plain target-deps --skip-proof-steps
+local_build plain target-deps 0 --skip-proof-steps
 # A new ancestor: a cold child, which loads K from its module.
 sed -i 's/ KTheory;$/ KTheory K2Theory;/' "$local_project/src/LScript.sml"
-local_build ancestor target-cold
+local_build ancestor target-cold 0
 hits=$(sed -n 's/^holbuild hol-phases holmodhitn=\([0-9]*\) .*/\1/p' "$child_log")
 if [[ "${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-}" == 1 && "${hits:-0}" -lt 1 ]]; then
   echo "L's child loaded no theory from its module:" >&2; cat "$child_log" >&2; exit 1
 fi
 theories=$(awk '$1 == "holbuild" && $2 == "source-load" && $4 == "kind=theory" { sub("n=", "", $6); print $6 }' "$child_log")
-(( ${theories:-0} >= ${hits:-0} && ${theories:-0} >= 1 )) || {
-  echo "L's theory loads (${theories:-none}) do not count its module hits (${hits:-0}):" >&2; cat "$child_log" >&2; exit 1; }
+# K and K2 count a .sig and a .sml each, whether from a module or the source:
+# a module hit left untimed would leave 2.
+[[ "${theories:-}" == 4 ]] || {
+  echo "L's theory loads (${theories:-none}) are not K's and K2's .sig and .sml (module hits: ${hits:-0}):" >&2; cat "$child_log" >&2; exit 1; }
 
 # The fleet: action-spec under the flag adds one option to the spec, and a
 # worker without the flag in its environment times T's child from it.

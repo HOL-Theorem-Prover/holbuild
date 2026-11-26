@@ -302,7 +302,7 @@ fun string_sha256_large text =
       val result =
         (let
            val output = BinIO.openOut path
-           val _ = (BinIO.output (output, Byte.stringToBytes text);
+           val _ = (HolbuildBoundedOutput.binary (output, Byte.stringToBytes text);
                     BinIO.closeOut output)
                    handle e => (BinIO.closeOut output; raise e)
          in

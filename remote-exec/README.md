@@ -26,7 +26,8 @@ a container image with both.
 - **Worker loop** (`remote_exec/worker.py`): claims an action, runs `holbuild
   exec-action` on it with the holbuild release that exported it, heartbeats
   while it runs, and reports the result record. It runs one action at a time,
-  under a name no other worker shares (`--name`, by default `host:pid`), so a
+  under a name no other worker shares (`--name`, by default
+  `<boot8>/<host>:<pid>`), so a
   lease of that name it isn't running, one whose claim's answer never reached
   it, ends as soon as it claims or heartbeats again, without counting as an
   attempt.
@@ -52,6 +53,16 @@ seconds the process used and the CPU time per response:
 ```text
 2203 responses in 60 s, 25.9 CPU-s, 11.8 ms each: GET /v1/cache/members 200 950, POST /v1/work/claim 200 330, ...
 ```
+
+It also logs a `claim contention` line for a build claim from the shared ranking that is `slow` (a build with
+dependents claimed over 15 s after its parents' latest result, or its batch's submission if it has none, when that
+time is known; this includes the release's cache check before it was marked ready), `passed` (the best candidate of
+another batch the claim could have taken is deeper than the build it took; once per batch and tier every 15 s) or a 1%
+`sample` of claims another batch contested. It names the claiming host (`boot8`) and worker, the tier and wait, the
+build and its competitor as `batch8,theory,p<priority>,r<running>,a<waiting ahead>,d<critical depth>` (`a?` when that
+count wasn't read), the ranking's running priority builds, cap and whether it was capped when the claim chose, and
+each kept host's `boot8:memory_short:cpu_idle_pct:workers`. The waiting-ahead counts are read after the claim commits,
+on a connection of their own (at most 4 at a time); nothing in the line changes how claims are made.
 
 Without the image, from this directory: `uv sync`, then `uv run alembic
 upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090`.
@@ -165,10 +176,14 @@ docker run -e REMOTE_EXEC_WORKER_TOKEN=... -e HOLBUILD_REMOTE_CACHE_CURL_CONFIG_
 to hosts of lower rank first, so hosts of higher rank (an interruptible spot
 pool, say) empty first and scale in.
 
-A worker's name in its leases is `--name`, by default `host:pid`. When
-`REMOTE_EXEC_IMAGE` names the image the worker runs as
-`<repository>@sha256:<digest>`, the default name ends in `@` and the digest's
-first 12 hex digits, so a lease says which image ran the action.
+A worker's name in its leases is `--name`, by default
+`<boot8>/<host>:<pid>[@<img12>]`. `<boot8>` is the first 8 characters of the
+host's boot id (`/proc/sys/kernel/random/boot_id`), the id the worker reports
+its host by, so an action's worker names the host it ran on; when the boot id
+can't be read, the name is `<host>:<pid>[@<img12>]`. When `REMOTE_EXEC_IMAGE`
+names the image the worker runs as `<repository>@sha256:<digest>`, the default
+name ends in `@` and the digest's first 12 hex digits (`<img12>`), so a lease
+says which image ran the action.
 
 On `SIGTERM`, a worker stops claiming and gives its running action up to
 `--drain-seconds` (20 by default) to finish and report its result. At the
@@ -636,15 +651,16 @@ This recovery preserves manifest, timeout, parent-hash and load-order checks.
   the one with the most dependents, then by theory name, so the critical
   path starts first and the ready frontier widens fastest. An expired lease returns the
   action to waiting (see Retries), or fails it once it has been claimed `MAX_ATTEMPTS` times.
-  A build action whose input key another batch's live lease is building is
-  not claimed (single-flight across batches). When that build succeeds, the
-  coordinator marks the waiting and ready copies of the action (same key and
-  spec, so not a forced or traced copy of a plain build) in other running
-  batches done, with its log, and releases their children; copies with
-  another spec, and every copy once the build fails or its lease expires,
-  are claimable again and waiting claims are woken. A build claim locks its key
-  until it commits and rechecks for a live lease, so two batches claiming one
-  key at the same moment lease it once.
+  A build action whose input key and spec another batch's live lease is
+  building is not claimed (single-flight across batches). A copy with another
+  spec (a forced, traced or untimed copy of a plain build) is not held: that
+  build can't finish it. When that build succeeds, the coordinator marks the
+  waiting and ready copies of the action with its spec in other running
+  batches done, with its log, and releases their children; once it fails or
+  its lease expires, they are claimable again and waiting claims are woken. A
+  build claim locks its key and spec until it commits and rechecks for a live
+  lease, so two batches claiming one key and spec at the same moment lease it
+  once.
   A heartbeat or completion with an expired token is refused, and the
   completion is dropped. A batch that ends (cancelled, or failed for good)
   revokes its leases: their heartbeats are refused at once, and for a lease's
@@ -908,7 +924,11 @@ exits once it has run an action and its claims have then found no work for 10
 minutes (the last one waiting its full `--claim-wait-seconds`), after any work
 exec-action does after its last result. A pause between waves is shorter, so
 the task that would serve the next wave stays; it still drops protection at
-its first empty claim, so a scale-in can stop it at once. Once it exits, its
+its first empty claim, so a scale-in can stop it at once. On an On-Demand
+burst host that claims fill after Spot (one started while Spot was short; the
+coordinator says so on a claim that finds no work), it exits at that first
+empty claim instead, since a task waiting out its idle time there keeps
+catching stray work and holds the host up. Once it exits, its
 task goes at once in a scale-in; otherwise ECS starts
 it again where the service's placement puts it (with `binpack`, on the
 fullest host with room), so the workers of partly drained hosts move onto
@@ -919,7 +939,9 @@ it may exit, so idle workers don't restart in a loop.
 
 Every request carries `Authorization: Bearer <token>`: the client token for
 `/v1/batches…` and `/v1/queue`, the worker token for `/v1/work…`. A wrong or missing token
-gets 401. Errors are JSON `{"detail": "<message>"}`. Any route answers 503
+gets 401. The client token can follow or cancel any batch by its id, and a held
+action's `held_by` names another client's batch: clients that share the token
+are trusted alike. Errors are JSON `{"detail": "<message>"}`. Any route answers 503
 `{"detail": "database busy"}`, with `Retry-After`, when no database connection
 came free within `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` (3 s). Keep it under the
 workers' 15 s wait for a heartbeat or completion answer: past that a worker
@@ -969,7 +991,9 @@ for it. holbuild sends one random id with every attempt of a submission.
         "last_claimed_at": "<ISO 8601 timestamp>|null",
         "finished_at": "<ISO 8601 timestamp>|null",
         "worker": "<worker name>|null",
-        "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null
+        "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null,
+        "held_by": "<batch_id>|null",
+        "held_since": "<ISO 8601 timestamp>|null"
       }
     ]
   }
@@ -988,6 +1012,12 @@ included). Unclaimed actions have null fields; claims an older
 coordinator made have a timestamp without a worker or finish time. Worker
 names are supplied by the worker, defaulting to its hostname and process ID.
 These fields retain only the latest attempt, not its retry history.
+`held_by` and `held_since` are set while a ready build waits behind another
+batch's live lease of the same input key and spec (single-flight): that
+batch, and when it last claimed the key. Each status read and each event
+stream poll reports the hold as that read finds it: a later hold, a hold's end
+or the holder's next claim reaches the stream on its next poll, and a hold
+that starts and ends between two polls is never sent.
 `interruptions` counts the claims of the action given back without counting
 an attempt, up to `REMOTE_EXEC_MAX_INTERRUPTIONS`: those that ended
 `unavailable` (a worker drained or scaled in, or the cache was out) and those
@@ -1021,7 +1051,7 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   stream with nothing to send for `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` sends
   an empty line, which clients skip, so a proxy doesn't close it as idle:
   ```json
-  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "interruptions": 0, "last_failure": null, "log_sha256": null, "failure_detail": null, "last_claimed_at": null, "finished_at": null, "worker": null, "timings": null}
+  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "interruptions": 0, "last_failure": null, "log_sha256": null, "failure_detail": null, "last_claimed_at": null, "finished_at": null, "worker": null, "timings": null, "held_by": null, "held_since": null}
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the
@@ -1095,7 +1125,9 @@ when that is under a second old)
   `batch_id` is the batch the action belongs to, which the worker names in its log; `ahead_parents` lists the ancestors still building when the action was claimed ahead of them, each after its
   own such ancestors, and is empty for any other claim; `pipeline` asks the worker to build the action
   pipelined (see "Pipelining")
-- 204 when nothing became ready for the tier within `wait_s`
+- 204 when nothing became ready for the tier within `wait_s`, with
+  `Holbuild-Spilled: 1` when the claim's first tier isn't `standard` and the
+  host it reported is an On-Demand burst host that claims fill after Spot
 
 `POST /v1/work/<attempt_token>/heartbeat`, with no body or `{"host": <report>}`
 
