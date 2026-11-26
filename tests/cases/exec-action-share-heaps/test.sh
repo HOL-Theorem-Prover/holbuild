@@ -168,6 +168,17 @@ same_outputs() {
 # Only the remote cache holds what an earlier run shared.
 forget_local() { rm -rf "$shared/checkpoints" "$shared/checkpoint-store"; }
 
+# heap_line VERSION WHAT: the deps heap's key and result in the worker's
+# lookup or publish line, which the worker prints once.
+heap_line() {
+  local found
+  found=$(sed -n "s/^holbuild shared-heap $2 theory=share:[^ ]* heap=\([0-9a-f]\{64\}\) result=\([a-z-]*\)\$/\1 \2/p" \
+            "$tmpdir/$1.log")
+  [[ $(printf '%s\n' "$found" | grep -c .) == 1 ]] || {
+    echo "version $1: not one shared-heap $2 line:" >&2; cat "$tmpdir/$1.log" >&2; exit 1; }
+  echo "$found"
+}
+
 # resumed VERSION FROM KIND: the sharing worker restored a KIND checkpoint,
 # resumed from it as FROM, and kept it.
 resumed() {
@@ -200,6 +211,18 @@ tail -n +"$((before_v1 + 1))" "$requests" | awk '$1 == "PUT" { exit } $1 == "GET
   fi
 done
 [[ -d "$shared/checkpoint-store" ]] || { echo "v1 added nothing to the store" >&2; exit 1; }
+# The worker's log names the heap it looked up and published, under the key
+# the cache holds it at, so a later miss joins to the publish.
+read -r heap_v1 lookup_v1 < <(heap_line v1 lookup)
+read -r published_key published_v1 < <(heap_line v1 publish)
+[[ "$lookup_v1 $published_v1 $published_key" == "miss published $heap_v1" ]] || {
+  echo "v1 logged lookup $lookup_v1 and publish $published_v1 of $published_key, not a miss and a publish of $heap_v1" >&2
+  exit 1; }
+require_grep '^holbuild-shared-heap-v1$' \
+  "$tmpdir/remote/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "$heap_v1" | sha256sum | cut -d' ' -f1)"
+# A dependency that passed, not a target, publishes nothing, and says so.
+grep -qE '^holbuild shared-heap publish theory=share:[^ ]* heap=[0-9a-f]{64} result=non-target$' \
+  "$tmpdir/a-shared-v1.log" || { echo "A logged no non-target publish:" >&2; cat "$tmpdir/a-shared-v1.log" >&2; exit 1; }
 [[ ! -e "$shared/checkpoints" ]] || { echo "the private checkpoint tree outlived the action" >&2; exit 1; }
 
 # An edit of the first theorem resumes from the shared heap alone.
@@ -210,6 +233,7 @@ forget_local
 HOLBUILD_CACHE_TRACE=1 worker v2 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v2 0 "status=built"
 resumed v2 "deps-loaded checkpoint" "deps-loaded heap"
+[[ "$(heap_line v2 lookup)" == "$heap_v1 hit" ]] || { echo "v2 logged no hit on the heap v1 published" >&2; exit 1; }
 # The restore took its blobs zstd-encoded and decoded them itself.
 require_grep "remote cache decode .* zstd threads=4" "$tmpdir/v2.log"
 if grep -q "remote cache decode .* \(identity\|fallback\)" "$tmpdir/v2.log"; then

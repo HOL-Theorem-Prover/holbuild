@@ -38,6 +38,8 @@ from remote_exec.membership import REFRESH_SECONDS, Membership
 logger = logging.getLogger(__name__)
 # Under uvicorn's own logger, which uvicorn sends to stderr at INFO, as app.py's request summary.
 claims_logger = logging.getLogger("uvicorn.claims")
+# Each memory failure's attempt, and what became of the retries; see _log_memory.
+memory_logger = logging.getLogger("uvicorn.memory")
 
 CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
 # How long a cache entry found is taken to still be there without asking the cache again.
@@ -74,6 +76,9 @@ RAN_FAILURES = frozenset({"proof", "timeout", "tactic-timeout", "memory"})
 PROBE_SECONDS = 60
 # Leases whose host the coordinator remembers at most, the oldest forgotten first.
 MAX_LEASE_HOSTS = 10_000
+# The exec-action phases that say which checkpoint an attempt resumed from: none, the deps heap, a context
+# checkpoint or a failed prefix, at which boundary and step.
+RESUME_PHASES = ("resdepsn", "resctxn", "resfpn", "resboundary", "resstepn")
 # Running batches whose missing inputs the coordinator remembers at most, the oldest forgotten first.
 MAX_MISSING_BATCHES = 1_000
 # The highest --host-rank a worker may report (worker.py checks the same bound at start).
@@ -292,6 +297,17 @@ class QueueCounts:
 
 # What a host report's counts and sizes may be: JSON's exact integers.
 Amount = Annotated[int, Field(ge=0, le=2**53)]
+
+
+@dataclass(frozen=True)
+class MemoryAttempt:
+    """What an attempt that failed for memory ran under and got done: what its evidence showed, its ``--max-heap``,
+    the checkpoint it resumed from (RESUME_PHASES) and how many shared checkpoints it published."""
+
+    cause: str | None
+    max_heap_mb: int | None
+    resumed: tuple[int, ...]
+    published: int
 
 
 @dataclass(frozen=True)
@@ -1208,6 +1224,10 @@ class Coordinator:
         # claim; and the workers that last claimed, reported or heartbeat from each host, when, and whether they are
         # burst workers. See _quarantine.
         self.lease_hosts: dict[UUID, tuple[str, str, list[str]]] = {}
+        # Also in memory, oldest first: each action's latest attempt that failed for memory, while it is retried, and
+        # how many retries the shadow rule would have withheld (see _log_memory). Only logged: no retry depends on them.
+        self.memory_attempts: dict[tuple[UUID, str], tuple[int, MemoryAttempt]] = {}
+        self.memory_withheld = 0
         # The attempt tokens of the leases whose action published its outline (see outlined), oldest first.
         self.outlined_tokens: dict[UUID, None] = {}
         # Per running batch, oldest first, the inputs each of its actions last found missing that the batch doesn't
@@ -3337,6 +3357,9 @@ class Coordinator:
                 )
         if action.action_class == "run":
             self._runs_changed()  # a run slot came free, or the run is ready again
+        self._log_memory(
+            batch_id, action.input_key, action.theory, action.tier, action.attempts, result, leased, token
+        )
         for peak in peaks:
             await self._record_peak(*peak)
         if built:
@@ -3361,6 +3384,83 @@ class Coordinator:
             self.peers_done.setdefault(peer.batch_id, {})[action.input_key] = (result.log_sha256, peer.ahead_batch)
             self.request_release(peer.batch_id)
         return True
+
+    def _log_memory(
+        self,
+        batch_id: UUID,
+        input_key: str,
+        theory: str,
+        tier: str,
+        attempt: int,
+        result: Result,
+        leased: tuple[str, str, list[str]] | None,
+        token: UUID,
+    ) -> None:
+        """Log an attempt that failed for memory: what its evidence showed, the cap and tier it ran under, its host's
+        last report and the other leases there, and the checkpoint it resumed from and published; and, for an
+        action retried after such a failure, how its next result came out. A shadow line marks a retry that the
+        rule under trial would withhold: one after two attempts that Poly/ML ran out of store under the same cap,
+        resuming from the same checkpoint, the second publishing none. It only logs: every retry still runs."""
+        key = (batch_id, input_key)
+        previous = self.memory_attempts.pop(key, None)
+        if result.failure != "memory":
+            if previous is not None and result.failure not in ("declined", "unavailable"):
+                memory_logger.info(
+                    "memory retry outcome batch=%s theory=%s attempt=%d after=%d status=%s failure=%s",
+                    batch_id, theory, attempt, previous[0], result.status, result.failure or "-",
+                )
+            elif previous is not None:
+                self._remember_memory(key, previous)  # interrupted: the next attempt is the retry
+            return
+        timings = result.timings or {}
+        current = MemoryAttempt(
+            result.memory_cause,
+            result.max_heap_mb,
+            tuple(timings.get(name, 0) for name in RESUME_PHASES),
+            timings.get("pubckptn", 0),
+        )
+        retried = attempt < self.settings.max_attempts
+        host_id, worker = (leased[0], leased[1]) if leased is not None else ("-", "-")
+        report = self.hosts.get(host_id)
+        host = report[1] if report is not None else None
+
+        def mb(amount: int | None) -> str:
+            return "-" if amount is None else str(amount // (1 << 20))
+
+        others = sum(1 for other, (h, _, _) in self.lease_hosts.items() if h == host_id and other != token)
+        memory_logger.info(
+            "memory attempt batch=%s theory=%s attempt=%d/%d retry=%s tier=%s cause=%s max_heap_mb=%s host=%s "
+            "worker=%s host_age_s=%s mem_available_mb=%s mem_total_mb=%s leases_mb=%s memory_short=%s "
+            "other_leases=%d resumed=%s published=%d",
+            batch_id, theory, attempt, self.settings.max_attempts, int(retried), tier, current.cause or "-",
+            "-" if current.max_heap_mb is None else current.max_heap_mb, host_id[:8], worker,
+            "-" if report is None else round((self.clock() - report[0]).total_seconds()),
+            mb(host.mem_available if host else None), mb(host.mem_total if host else None),
+            mb(host.leases if host else None), "-" if host is None else int(bool(host.memory_short)),
+            others, ",".join(map(str, current.resumed)), current.published,
+        )
+        if not retried:
+            return
+        if (
+            previous is not None
+            and previous[1].cause == current.cause == "poly-out-of-store"
+            and current.max_heap_mb is not None
+            and previous[1].max_heap_mb == current.max_heap_mb
+            and previous[1].resumed == current.resumed
+            and current.published == 0
+        ):
+            self.memory_withheld += 1
+            memory_logger.info(
+                "memory shadow would-withhold batch=%s theory=%s attempt=%d max_heap_mb=%d resumed=%s withheld=%d",
+                batch_id, theory, attempt + 1, current.max_heap_mb, ",".join(map(str, current.resumed)),
+                self.memory_withheld,
+            )
+        self._remember_memory(key, (attempt, current))
+
+    def _remember_memory(self, key: tuple[UUID, str], attempt: tuple[int, MemoryAttempt]) -> None:
+        self.memory_attempts[key] = attempt
+        if len(self.memory_attempts) > MAX_LEASE_HOSTS:
+            del self.memory_attempts[next(iter(self.memory_attempts))]
 
     def request_release(self, batch_id: UUID | None = None) -> None:
         """Have ``release`` run for ``batch_id``, or every batch, in the background, so neither a worker's

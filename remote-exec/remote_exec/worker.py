@@ -1047,15 +1047,25 @@ def runs_hol(pid: int, cooperate_dir: str) -> bool:
 DRAINING = "the worker is draining"
 
 
-def with_deps_key(record: str, deps_key: str | None) -> str:
-    """``record`` with the spec's ``deps-key`` added, when the worker read one."""
-    if deps_key is None:
+def with_claim_fields(record: str, deps_key: str | None, max_heap_mb: int) -> str:
+    """``record`` with the spec's ``deps-key`` added, when the worker read one, and, for a memory failure, the
+    ``max-heap-mb`` exec-action ran under, which tells the coordinator's memory lines whether retries ran under the
+    same cap."""
+    added = "" if deps_key is None else f"deps-key={deps_key}\n"
+    if "failure=memory" in record.splitlines():
+        added += f"max-heap-mb={max_heap_mb}\n"
+    if not added:
         return record
     separator = "" if record.endswith("\n") else "\n"
-    return f"{record}{separator}deps-key={deps_key}\n"
+    return f"{record}{separator}{added}"
 
 
-def failed_record(spec_sha256: str, failure: str, detail: str | None = None) -> str:
+def effective_max_heap(args: argparse.Namespace, max_heap_mb: int | None) -> int:
+    """The ``--max-heap`` exec-action runs under: the claim's, or else the worker's default."""
+    return args.max_heap if max_heap_mb is None else max_heap_mb
+
+
+def failed_record(spec_sha256: str, failure: str, detail: str | None = None, *, memory_cause: str | None = None) -> str:
     """A result record the worker writes itself: ``spec-rejected`` for an action it won't run, which fails it
     finally like exec-action's own; ``unavailable`` for one whose spec the cache couldn't give (no answer, 429 or
     5xx, or a transfer cut short), that was interrupted (``recordless_failure``) or that the host's disk had no room
@@ -1063,8 +1073,10 @@ def failed_record(spec_sha256: str, failure: str, detail: str | None = None) -> 
     because ECS refused it scale-in protection, retried without counting anything; ``memory`` for one whose
     exec-action was SIGKILLed; or ``internal`` for any other error in the worker, such as exec-action failing without
     a record, which is retried. ``detail`` says why, for the client:
-    the record has no log."""
+    the record has no log. ``memory_cause`` is the record's ``memory-cause``."""
     record = f"holbuild-action-result-v1\nspec={spec_sha256}\ninput-key=\nstatus=failed\nfailure={failure}\n"
+    if memory_cause is not None:
+        record += f"memory-cause={memory_cause}\n"
     return record if detail is None else f"{record}detail={sanitize_detail(detail)}\n"
 
 
@@ -1114,7 +1126,7 @@ def exec_action_command(
     ahead_parents: list[dict[str, str]], *, pipeline: bool = False,
 ) -> list[str]:
     command = [holbuild, "--remote-cache", args.remote_cache]
-    command += ["--max-heap", str(args.max_heap if max_heap_mb is None else max_heap_mb)]
+    command += ["--max-heap", str(effective_max_heap(args, max_heap_mb))]
     if args.cooperate_dir is not None:
         command += ["--cooperate-dir", args.cooperate_dir]
     command += ["exec-action", spec, "--cache-limit-gb", str(args.cache_limit_gb)]
@@ -1278,7 +1290,13 @@ def run_one(
             lease.completing.set()
             try:
                 with phases.timed("complete"):
-                    coordinator.complete(token, with_deps_key(record, claim.get("deps_key")), claim["lease_s"])
+                    coordinator.complete(
+                        token,
+                        with_claim_fields(
+                            record, claim.get("deps_key"), effective_max_heap(args, claim.get("max_heap_mb"))
+                        ),
+                        claim["lease_s"],
+                    )
             finally:
                 lease.done.set()
 
@@ -1556,7 +1574,10 @@ def execute(
                 failure, detail = recordless
                 print(f"{claim['theory']}: exec-action exited {process.returncode} without a result record, "
                       f"reporting {failure}", file=sys.stderr, flush=True)
-                return failed_record(spec, failure, detail)
+                # Not knowing which process the kernel killed, nor why, the cause stays unknown.
+                return failed_record(
+                    spec, failure, detail, memory_cause="sigkill-unknown" if failure == "memory" else None
+                )
             raise RuntimeError(f"exec-action exited {process.returncode} without a result record")
     print(f"{claim['theory']}: exit {process.returncode}", file=sys.stderr, flush=True)
     return record
