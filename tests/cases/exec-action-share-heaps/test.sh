@@ -393,6 +393,9 @@ shared_entries() {
   echo "v4 published no failed prefix" >&2; exit 1; }
 [[ -z "$(shared_entries "$tmpdir/v4.result")" ]] || {
   echo "v4 published its failed prefix after its result:" >&2; shared_entries "$tmpdir/v4.result" >&2; exit 1; }
+# Its record counts the checkpoint entries it published.
+grep -qE "^phase-ms=(.*,)?pubckptn:[1-9][0-9]*(,|\$)" "$tmpdir/v4.result" || {
+  echo "v4's record counts no published checkpoint:" >&2; cat "$tmpdir/v4.result" >&2; exit 1; }
 require_grep "exec-action after the result (ms): .* modules_ms=" "$tmpdir/v4.log"
 # A resume that gets past the shared failed prefix and fails later shares
 # the later prefix in its place, and the next resume starts from that.

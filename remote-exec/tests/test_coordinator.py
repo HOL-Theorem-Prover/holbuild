@@ -2951,6 +2951,23 @@ async def test_peak_above_the_standard_tier_places_the_next_batch_high(
     await claim_named(http, "a", "high")
 
 
+async def test_a_memory_retry_interrupted_without_using_an_attempt_logs_its_outcome_once_one_counts(
+    http: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="uvicorn.memory")
+    batch_id = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    first = result("a", "failed", "memory", memory_cause="poly-out-of-store", max_heap_mb="12000")
+    assert (await complete(http, token, first)).status_code == 200
+    # Five refunded interruptions, then one that uses the retry's attempt.
+    for _ in range(5 + 1):
+        token = await claim_named(http, "a", "high")
+        assert (await complete(http, token, result("a", "failed", "unavailable"))).status_code == 200
+    assert [line for line in memory_lines(caplog) if line.startswith("memory retry outcome")] == [
+        f"memory retry outcome batch={batch_id} theory=pkg:a attempt=2 after=1 status=failed failure=unavailable"
+    ]
+
+
 @pytest.mark.parametrize("failure", ["publish", "toolchain", "internal"])
 async def test_infrastructure_failures_retry_up_to_max_attempts(http: httpx.AsyncClient, failure: str) -> None:
     batch_id = await submit(http, ["a"])

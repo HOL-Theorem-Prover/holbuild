@@ -3437,8 +3437,15 @@ class Coordinator:
                 )
         if action.action_class == "run":
             self._runs_changed()  # a run slot came free, or the run is ready again
+        # As above: a result that cost no attempt interrupted the attempt rather than ending it.
+        counted = not (
+            result.failure == "declined"
+            or (result.failure == "unavailable" and action.interruptions < self.settings.max_interruptions)
+            or (result.failure == "ahead-abandoned" and action.ahead == "ahead")
+        )
         self._log_memory(
-            batch_id, action.input_key, action.theory, action.tier, action.attempts, result, leased, token
+            batch_id, action.input_key, action.theory, action.tier, action.attempts, result, leased, token,
+            counted=counted,
         )
         for peak in peaks:
             await self._record_peak(*peak)
@@ -3475,17 +3482,20 @@ class Coordinator:
         result: Result,
         leased: tuple[str, str, list[str]] | None,
         token: UUID,
+        *,
+        counted: bool,
     ) -> None:
         """Log an attempt that failed for memory: what its evidence showed, the cap and tier it ran under, its host's
         last report and the other leases there, and the checkpoint it resumed from and published; and, for an
         action retried after such a failure, how its next result came out. A shadow line marks a retry that the
         rule under trial would withhold: one after two attempts that Poly/ML ran out of store under the same cap,
         resuming from the same checkpoint, the second publishing none. It is counted when that retry is queued, so a
-        batch that ends before the retry starts still counts it. It only logs: every retry still runs."""
+        batch that ends before the retry starts still counts it. It only logs: every retry still runs. ``counted``: whether
+        the result cost an attempt; one that didn't leaves the retry to the next."""
         key = (batch_id, input_key)
         previous = self.memory_attempts.pop(key, None)
         if previous is not None:
-            if result.failure in ("declined", "unavailable"):
+            if not counted:
                 self._remember_memory(key, previous)  # interrupted: the next attempt is the retry
                 return
             memory_logger.info(

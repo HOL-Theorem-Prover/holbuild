@@ -14091,7 +14091,8 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           {heap = SOME heap, files = [(deps_loaded, heap)]})
        else (lookup := "stale"; warn "shared deps-loaded heap failed validation"; wipe (); no_files))
       handle MissingSharedBlob sha => (lookup := "stale"; missing_blob heap_key sha; wipe (); no_files)
-           | e => (lookup := "stale"; warn ("could not restore the shared heap: " ^ General.exnMessage e);
+           | e => (lookup := (case e of HolbuildRemoteCache.Unavailable _ => "unavailable" | _ => "stale");
+                   warn ("could not restore the shared heap: " ^ General.exnMessage e);
                    wipe (); no_files)
     (* Without a usable heap, a theory that saves none (not a target) may
        have published a failed prefix of its own. *)
@@ -17727,14 +17728,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                      Option.isSome (Option.mapPartial (earlier_build_key spec)
                                       (HolbuildRemoteCache.get_action remote pair_key))
                  | NONE => false)
-            val shared_hit =
-              not built andalso probes_shared andalso
-               (cached shared_key orelse
-                not deps_heap_only andalso resumes_from_checkpoints (spec_policy spec) built_action andalso
-                (* Only a restore that checks its key= line records its blobs. *)
-                Option.isSome (HolbuildRemoteCache.fetch_action remote
-                                 (shared_standalone_key shared_key built_action)))
-            val hit = built orelse shared_hit
+            val heap_hit = not built andalso probes_shared andalso cached shared_key
+            val hit =
+              built orelse heap_hit orelse
+              (probes_shared andalso not deps_heap_only andalso
+               resumes_from_checkpoints (spec_policy spec) built_action andalso
+               (* Only a restore that checks its key= line records its blobs. *)
+               Option.isSome (HolbuildRemoteCache.fetch_action remote
+                                (shared_standalone_key shared_key built_action)))
             (* The root's records still hold: the child wrote none of it,
                and the stems written here are the hydrate's scratch. *)
             fun restart () =
@@ -17770,12 +17771,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                             | (NONE, SOME (SOME e)) => raise e
                             | _ => ())})
                 pipelined
-            (* Probed only when no build was found to reuse.  On a hit the plain
-               build that follows reports its own lookup too. *)
+            (* Probed only when no build was found to reuse.  The line is
+               the heap's: a failed prefix published without one is a miss.
+               On a hit the plain build that follows reports its own lookup. *)
             val _ =
               if probes_shared andalso not built then
                 shared_heap_line "lookup" (#package built_action ^ ":" ^ #logical built_action) shared_key
-                  (if shared_hit then "hit" else "miss")
+                  (if heap_hit then "hit" else "miss")
               else ()
           in
             (* What a hit takes may not be what the parents' outlines
