@@ -392,8 +392,10 @@ STATEMENTS = [
         cm.CLAIM_ACTION, lambda f: {"batch_id": f.steady, "class": "build", "tier": "standard", "taken": []}, 2_900
     ),
     Statement(cm.FIRST_READY_PLACE, lambda f: {"batch_id": f.fresh, "tier": "standard"}, 2_900),
-    Statement(cm.LOCK_KEY, lambda f: {"key": f.arrival.keys("ready")[0]}, 100),
-    Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("ready")[0]}, 2_100),
+    Statement(cm.LOCK_KEY, lambda f: {"key": f.arrival.keys("ready")[0], "spec": "s"}, 100),
+    Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("ready")[0], "spec": "s"}, 2_100),
+    # A leased key, whose lease's action is read for its spec.
+    Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("running")[0], "spec": "s"}, 2_100),
     Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2, "outlined": f.outlined()}, 120_000),
     Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2, "outlined": f.outlined_plain()}, 120_000),
     Statement(
@@ -428,7 +430,11 @@ STATEMENTS = [
     ),
     Statement(cm.REFRESH_AHEAD_CHILDREN, lambda f: {"batch_id": f.fresh, "key": f.parent_of_ahead()}, 1_100),
     Statement(cm.REVOKE_AHEAD, lambda f: {"batch_id": f.fresh, "keys": [f.parent_of_ahead()]}, 12_000),
-    Statement(cm.PEERS, lambda f: {"batch_id": f.fresh, "input_key": f.steady_arrival.keys("waiting")[0]}, 13_000),
+    Statement(
+        cm.PEERS,
+        lambda f: {"batch_id": f.fresh, "input_key": f.steady_arrival.keys("waiting")[0], "spec_sha256": "s"},
+        13_000,
+    ),
     Statement(cm.FINISH_IF_DONE, lambda f: {"id": f.fresh}, 14_000),
     Statement(cm.LOCK_BUILT, lambda f: {"batch_id": f.fresh, "key": f.arrival.keys("running")[0]}, 400),
     Statement(cm.FIRST_UNFINISHED, lambda f: {"id": f.fresh}, 14_000),
@@ -490,11 +496,7 @@ STATEMENTS = [
         100,
     ),
     Statement("SELECT pg_advisory_xact_lock(1752132706, 1)", lambda f: {}, 100),
-    Statement(
-        "SELECT EXISTS (SELECT 1 FROM actions WHERE state = 'ready' AND class = 'build'",
-        lambda f: {"tiers": ["standard"]},
-        1_100,
-    ),
+    Statement(cm.READY_BUILD, lambda f: {"tiers": ["standard"]}, 1_100),
     # leases
     Statement(
         "UPDATE actions SET state = 'running', attempts = attempts + 1",
