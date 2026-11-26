@@ -2582,7 +2582,7 @@ writes:
 holbuild --remote-cache https://cache.example.org run-action \
   --remote-exec https://exec.example.org [--remote-only] --outputs-dir out \
   [--profile P] --script run.sml [--support F]... [--load L]... --output N... \
-  [--option timeout=SECONDS] [--closure] TARGET...
+  [--option timeout=SECONDS] [--closure] [--held FILE] TARGET...
 ```
 
 The project write lock covers planning, cache checks, and spec export. It
@@ -2625,7 +2625,7 @@ output names, so the same run is done once. The command:
 6. Prints one line per run on stdout, in the targets' order:
 
    ```text
-   <context> <run_key> done|cached|failed <class>|missing
+   <context> <run_key> done|cached|failed <class>|missing|held
    ```
 
    `failed` gives the run's failure class: `script` (the script raised or
@@ -2646,10 +2646,15 @@ submitting anything, so it needs no `--remote-exec`. Runs never execute
 locally: without `--remote-exec` or one of `--fetch-only` and
 `--export-only`, the command is a usage error.
 
+`--held FILE` names run keys, one per line, whose outputs the caller already
+has, such as a cache of earlier fetches: those runs print `held` and are
+neither checked in the remote cache, submitted nor fetched, so `D` gets no
+directory for them.
+
 Exit status:
 
-- 0 when every run ended `done`, `cached` or `failed` (a failed script is a
-  result); with `--fetch-only`, also when some are `missing`.
+- 0 when every run ended `done`, `cached`, `failed` (a failed script is a
+  result) or `held`; with `--fetch-only`, also when some are `missing`.
 - 75 (`EX_TEMPFAIL`) when the coordinator can't take or finish the batch:
   the export or upload fails, the submission is refused or the coordinator
   unreachable, the event stream is lost (the batch is left running, so its

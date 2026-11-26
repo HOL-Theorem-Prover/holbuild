@@ -74,7 +74,8 @@ fun command name : command =
         {flags = ["--remote-only", "--closure", "--fetch-only", "--export-only"],
          valued = remote_valued @
                   map (fn option => (option, Nothing))
-                    ["--outputs-dir", "--profile", "--script", "--support", "--load", "--output", "--option"],
+                    ["--outputs-dir", "--profile", "--script", "--support", "--load", "--output", "--option",
+                     "--held"],
          operands = Theories}
     | _ => {flags = [], valued = [], operands = Nothing}
 

@@ -483,11 +483,12 @@ takes none of
 .BR \-\-fetch\-only ,
 .BR \-\-remote\-exec ,
 .BR \-\-remote\-only ,
-.B \-\-outputs\-dir
+.BR \-\-outputs\-dir ,
+.B \-\-profile
 and
-.BR \-\-profile .
+.BR \-\-held .
 .IP
-Exits 0 when every run ended (done, cached, failed or, with
+Exits 0 when every run ended (done, cached, failed, held or, with
 .BR \-\-fetch\-only ,
 missing), 75 when the coordinator cannot take or finish the batch or an
 ended run cannot be fetched, and 1 on errors, a cancelled batch, or a target
@@ -535,6 +536,12 @@ Fetch what the remote cache holds; submit nothing.
 .B \-\-export\-only
 Only write and upload each run's spec, and print
 .IR "CONTEXT RUN\-KEY SPEC\-SHA256" .
+.TP
+.BI \-\-held " FILE"
+Run keys, one per line, whose outputs the caller already has: those runs
+print
+.I held
+and are neither run nor fetched.
 .RE
 .
 .SH GLOBAL OPTIONS
