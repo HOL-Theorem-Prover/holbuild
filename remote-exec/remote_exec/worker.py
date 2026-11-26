@@ -99,7 +99,7 @@ POST_RESULT_SECONDS = 120.0
 WRITER_ROOT_PREFIX = "module-writer-"
 DRAIN_CHECKPOINT_PUBLISH_SECONDS = 8
 # What exec-action runs with besides holbuild's own HOLBUILD_* settings: what curl, git and the locale read, and where
-# HOL's libraries find external solvers (the action sandbox passes the same SOLVER_ENV on to HOL). The rest of the
+# HOL's libraries find external solvers (exec-action passes the same SOLVER_ENV on to HOL). The rest of the
 # worker's environment, its coordinator token above all, stays out of the builds' environment.
 SOLVER_ENV = (
     "HOL4_Z3_EXECUTABLE", "HOL4_CVC_EXECUTABLE", "HOL4_CSDP_EXECUTABLE", "HOL4_EPROVER_EXECUTABLE",
@@ -754,7 +754,7 @@ def free_bytes(path: str) -> int:
 def disk_paths() -> list[str]:
     """Where an action needs disk: the temp dir, where the worker keeps its scratch, ``TMPDIR`` (else /tmp), where
     exec-action keeps its own (``tempfile`` falls back from an unwritable one), and the ``HOLBUILD_CACHE`` root, where
-    exec-action's sandboxes and stores are."""
+    exec-action's action roots and stores are."""
     paths = (tempfile.gettempdir(), os.environ.get("TMPDIR", "/tmp"), os.environ.get("HOLBUILD_CACHE"))
     return list(dict.fromkeys(path for path in paths if path))
 
@@ -833,7 +833,7 @@ def wait_for_disk(
 ) -> None:
     """Return once the host's disk has room for an action (``disk_shortfall``), or the worker drains, so that a
     worker on a full disk doesn't claim action after action only to fail each at once while other hosts could run
-    them. First the worker deletes what its own actions left in its cache root: the action sandboxes, temp files,
+    them. First the worker deletes what its own actions left in its cache root: the action roots, temp files,
     the copies of scratch inputs kept for later actions and the parked theories releases 0.14.79-0.14.83 left,
     which no other worker shares and no action of its own uses between claims, and the record of what its action root holds, which would no longer be true. It stops
     the exec-action still running after its result, if any, and deletes the module writers' roots
@@ -1522,7 +1522,7 @@ def execute(
             if not handed and process.poll() is None and not timed_out:
                 drain.publish_seconds = DRAIN_CHECKPOINT_PUBLISH_SECONDS
                 # Signal only the driver: it stops HOL, uploads the log, writes its record and then publishes
-                # the sandbox-validated saves. Killing its group here loses them.
+                # the saves. Killing its group here loses them.
                 with contextlib.suppress(ProcessLookupError):
                     process.send_signal(signal.SIGTERM)
                 deadline = time.monotonic() + CHECKPOINT_PUBLISH_SECONDS

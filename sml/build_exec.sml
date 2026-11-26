@@ -617,19 +617,19 @@ fun module_loader_line release =
      "((if OS.Path.ext file <> SOME \"sig\" andalso String.isSuffix \"Theory.sml\" file " ^
      "then release (OS.Path.base file) else ()); loader use file)) end;")
 
-(* The child policy's theory-module lines.  A sandboxed (remote) action
-   only reads the host's modules: the worker writes them
-   (fill_module_store).  quietbind runs only the first declaration of its
-   code, so each policy is one declaration; the loader's runs once the
-   configuration has loaded HOL's module helper. *)
-fun module_policy {sandboxed, store, base_state} =
+(* The child policy's theory-module lines.  A remote action only reads the
+   host's modules: the worker writes them (fill_module_store).  quietbind
+   runs only the first declaration of its code, so each policy is one
+   declaration; the loader's runs once the configuration has loaded HOL's
+   module helper. *)
+fun module_policy {remote, store, base_state} =
   let
     val configure =
       "Meta.configureTheoryModuleCache {directory = " ^
       HolbuildToolchain.sml_string store ^ ", base_state = " ^
       HolbuildToolchain.sml_string base_state ^ "}"
   in
-    (if sandboxed then
+    (if remote then
        if_meta_has ["configureTheoryModuleCache", "theoryModuleWriteLimit"]
          ("val _ = (Meta.theoryModuleWriteLimit := 0; " ^ configure ^ ");")
      else if_meta_has ["configureTheoryModuleCache"] ("val _ = " ^ configure ^ ";")) ^ "\n" ^
@@ -665,13 +665,13 @@ val start_source_load_report_line =
   "then CompilerSpecific.quietbind \"val _ = HolbuildRuntime.timing_source_loads ();\" else ();\n"
 
 (* A speculative child (pipelined builds) configures no theory module cache,
-   so nothing it compiles is published there; a sandboxed one only reads
+   so nothing it compiles is published there; a remote one only reads
    it (module_policy). *)
 fun write_child_policy_with {module_cache = use_module_cache} tc path =
   let
     val store = module_store tc
     val module_cache =
-      module_policy {sandboxed = HolbuildActionSandbox.active (), store = store,
+      module_policy {remote = HolbuildActionSandbox.active (), store = store,
                      base_state = HolbuildToolchain.base_state tc}
   in
     (* The cache sweeps evict the stores used least recently, and reading
@@ -2274,7 +2274,7 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
          hol_context_args context @ file_args)
         log
       handle HolbuildToolchain.Error msg =>
-        if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.outputs_validated) then
+        if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.child_completed) then
           raise HolbuildActionSandbox.Error msg
         else raise Error msg
     val _ = last_child_status := SOME status
@@ -4630,8 +4630,7 @@ val noted_store_mount = ref false
 
 (* A Poly/ML state from the store, hard-linked; across file systems, where a
    store on its own mount puts it, symbolically linked, which is safe while
-   this process leases the state's family.  A sandboxed child may only read
-   either (HolbuildActionSandbox.checkpoint_grants). *)
+   this process leases the state's family. *)
 fun place_state stored dst =
   (remove_file dst;
    Posix.FileSys.link {old = stored, new = dst}
@@ -13369,7 +13368,7 @@ fun exception_failure e =
    each published heap and the checkpoints built on it, one directory per
    heap, and never writes one in place.  The action's checkpoint tree is its
    own: emptied before and after the action and filled from the store, its
-   Poly/ML states and records by copies. The sandbox never receives writable
+   Poly/ML states and records by copies. The child never receives writable
    inodes belonging to the store or another action. *)
 
 (* A blob a shared entry names that the remote cache no longer holds. *)
@@ -14637,11 +14636,8 @@ fun unkeyed_dep_line line =
 (* The modules a theory child on TC has loaded before its preload starts:
    those its hol.state loaded.  Found by running TC once, the way a theory
    child starts, and kept in the cache under TC's toolchain key, which
-   hashes bin/hol and hol.state.  Under the action sandbox the run is
-   confined to a work directory of its own, as the analyser's is, so it
-   isn't taken for the action's theory child (whose run validates the
-   action's outputs).  Empty, so that every preload is kept, when the run
-   fails. *)
+   hashes bin/hol and hol.state.  Empty, so that every preload is kept,
+   when the run fails. *)
 fun base_loaded_modules tc =
   let
     val cached = Path.concat(cache_root (), "toolchain-base-loaded/" ^ HolbuildToolchain.toolchain_key tc)
@@ -14665,18 +14661,15 @@ fun base_loaded_modules tc =
       else raise Error ("the toolchain's base state didn't run:\n" ^
                         (read_text (Path.concat(dir, "log")) handle IO.Io _ => ""))
     fun probe lease =
-      if HolbuildActionSandbox.active () then
-        HolbuildActionSandbox.shell {writable = [], readable = [#holdir tc], toolchain = false}
-          script (HolbuildProcessGroup.run_shell_inheriting lease) result
-      else
-        let
-          val dir = HolbuildTempPath.temporary "base-loaded"
-          fun remove () = HolbuildRemoveTree.remove_untrusted dir handle _ => ()
-        in
-          (FS.mkDir dir;
-           result (dir, HolbuildProcessGroup.run_shell_inheriting lease (script dir)) before remove ())
-          handle e => (remove (); raise e)
-        end
+      let
+        val dir = HolbuildTempPath.temporary "base-loaded"
+        fun remove () = HolbuildRemoveTree.remove_untrusted dir handle _ => ()
+        val run = HolbuildProcessGroup.run_shell_inheriting lease
+      in
+        (FS.mkDir dir;
+         result (dir, run (HolbuildActionSandbox.child_shell (script dir))) before remove ())
+        handle e => (remove (); raise e)
+      end
   in
     lines_of (read_text cached)
     handle IO.Io _ =>
@@ -15748,7 +15741,7 @@ fun fetch_heap_modules remote tc wanted =
    policy), so that no action can plant one another loads.  After a
    theory action's result, the worker fetches the modules missing from
    the store for the theories the action loads that another host
-   published; then a sandboxed child that runs no project code writes the
+   published; then a child that runs no project code writes the
    modules still missing, from their restored .dat files alone (HOL's
    Meta.writeTheoryModules), and the worker stores and publishes only
    the modules still missing, named for those theories' current .dat
@@ -15824,18 +15817,6 @@ fun expected_modules root tc {deps, loads} =
     {expected = expected, theories = theories, base_theories = base_theories}
   end
 
-(* The modules STORE holds of the EXPECTED names (expected_modules). *)
-fun stored_modules store expected =
-  let
-    val wanted = Binaryset.addList (Binaryset.empty String.compare, expected)
-    fun is_wanted path =
-      case module_file_theory_part (Path.file path) of
-          SOME part => Binaryset.member (wanted, part) andalso store_module_file store path
-        | NONE => false
-  in
-    List.filter is_wanted (HolbuildCache.children store)
-  end
-
 (* The EXPECTED names (expected_modules) of which no file of LISTING, a
    store's file names, is a module under any id. *)
 fun unstored_modules listing expected =
@@ -15846,8 +15827,9 @@ fun unstored_modules listing expected =
   end
 
 (* The expected module names (expected_modules) of the action's theories,
-   once found, by a fresh launch's grants (theory_module_grants) or a
-   restore's look at a short heap (declines_short_heap); and how many of
+   once found, by a restore's look at a short heap (declines_short_heap) or
+   a published heap's count (captured_missing); and how many of
+
    them the host's store lacks, for the action's modstoremissn. *)
 val cone_modules = ref (NONE : string list option)
 val store_missing_modules = ref (NONE : int option)
@@ -15916,44 +15898,12 @@ fun release_heap_decline () =
       NONE => ()
     | SOME record => remove_file record
 
-(* For HolbuildActionSandbox.module_reads: what the sandboxed theory
-   children of SPEC may read of their toolchain's store.  While their deps
-   heap, DEPS_LOADED for DEPS_KEY, exists they start from it or from a
-   checkpoint saved on it, and open only the modules it was saved with;
-   asked at each launch, since a failed load removes the heap and the
-   retry preloads afresh.  Otherwise they load their theories and get the
-   stored modules of those, found once: naming them reads and hashes every
-   .dat file of the cone, seconds for a deep theory.  Modules are
-   optional, so on a failure the children load every theory from its .dat
-   file. *)
-fun theory_module_grants root tc (spec : action_spec) deps_heap =
-  let
-    val store = module_store tc
-    fun granted find = find () handle e => (warn ("theory modules not granted: " ^ General.exnMessage e); [])
-    fun theories () =
-      let val names = cone_module_names root tc {deps = #deps spec, loads = #loads spec}
-      in count_store_missing store names; stored_modules store names end
-    val found = ref NONE
-    fun loaded () =
-      case !found of
-          SOME paths => paths
-        | NONE => let val paths = granted theories in found := SOME paths; paths end
-  in
-    fn () =>
-      case deps_heap of
-          SOME {deps_loaded, deps_key} =>
-            if deps_checkpoint_exists deps_loaded deps_key
-            then granted (fn () => List.filter (store_module_file store) (saved_modules deps_loaded))
-            else loaded ()
-        | NONE => loaded ()
-  end
-
 (* What a module writer run did, for module_store_trace: none ran, and
    why (`covered`: no expected module missing; `threshold`: fewer missing
    than module_writer_min_missing; `locked`: another process writes the
    store; `time`: too little left before the deadline; `failed`: an error
    before it started; fill_module_store also traces `unsupported`: no
-   module writer for the HOL), or the sandbox refused what it left, or it left
+   module writer for the HOL), or its run failed, or it left
    REPORT (module_writer_report, [] for none), KILLED whether it was
    killed at its deadline, and wrote OUTPUTS, the
    modules (file names) of which were DISCARDED (theory not missing when
@@ -16145,9 +16095,8 @@ fun write_missing_modules remote root tc wanted deadline =
     (* An action root keeps no file of the writer's. *)
     fun clean () =
       (remove_file script; remove_file log; HolbuildRemoveTree.remove_untrusted output)
-    (* Whether the child ran and the sandbox validated what it left in
-       OUTPUT, which it does also for a child it killed or that failed:
-       only then are the child's modules stored. *)
+    (* Whether the child ran, also one killed or that failed: only then
+       are the modules it left in OUTPUT stored. *)
     fun write () =
       if Time.< (Time.- (deadline, Time.now ()), module_writer_min_time) then (run := WriterNotRun "time"; false)
       else
@@ -16159,20 +16108,19 @@ fun write_missing_modules remote root tc wanted deadline =
               (module_writer_script {output = output, base_state = HolbuildToolchain.base_state tc,
                                      base_theories = not (isSome base_theories),
                                      call = call})
-          val _ = HolbuildActionSandbox.module_reads := (fn () => stored_modules store expected_names)
-          val validated =
-            (HolbuildActionSandbox.with_output_dirs [output] (fn () =>
-               killed := #timed_out (HolbuildToolchain.run_in_dir_to_file_by root
-                                       (HolbuildToolchain.hol_subcommand_argv tc "run" @
-                                        ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
-                                       log child_deadline));
+          val ran =
+            (killed := #timed_out (HolbuildToolchain.run_in_dir_to_file_by root
+                                     (HolbuildToolchain.hol_subcommand_argv tc "run" @
+                                      ["--noconfig", "--holstate", HolbuildToolchain.base_state tc, script])
+                                     log child_deadline);
              true)
             handle e => (warn ("theory modules not written: " ^ General.exnMessage e); false)
         in
-          if validated then List.app (move_marker o Path.file) (HolbuildCache.children output)
+          if ran then List.app (move_marker o Path.file) (HolbuildCache.children output)
           else run := WriterRefused;
-          validated
+          ran
         end
+
     val remote_keys = module_remote_keys tc
     val missing = missing_modules ()
     val probed = ref 0
@@ -16414,9 +16362,8 @@ fun prefetch_modules remote root tc wanted =
    or not the build succeeded.  The directory is flat and holds at most
    tool_cache_max_files files of tool_cache_max_bytes in all; a tool writes
    each file whole (to a temporary name, then renamed), as a failed build's
-   files are published too.  The sandbox's output validation has already
-   failed the action if the child left a link or special file.  Neither step
-   fails the action: the child starts empty, or the cache keeps its entry. *)
+   files are published too; a link or special file there fails the
+   publish.  Neither step fails the action: the child starts empty, or the cache keeps its entry. *)
 val tool_cache_header = "holbuild-tool-cache-v1"
 val tool_cache_max_files = 16
 val tool_cache_max_bytes = 256 * 1024 * 1024
@@ -16549,7 +16496,7 @@ fun publish_tool_cache stop remote store key dir {files = restored, stale} =
    has put the parent's real files in place (sml/ahead_load_runtime.sml says
    how the child checks them).  Everything exec-action decides is computed
    from files the child can't write: the late parents are restored in a
-   staging directory outside the sandbox's roots, and the dependencies
+   staging directory outside the action root, and the dependencies
    present at the start are hashed before the child starts. *)
 
 (* How long exec-action waits for its late parents; --ahead-wait-seconds.
@@ -16572,38 +16519,20 @@ val ahead_poll_interval = Time.fromSeconds 2
    plain build might not builds again plain in the same action. *)
 fun outline_action_key input_key = HolbuildHash.string_sha256 ("holbuild-outline-v1\n" ^ input_key ^ "\n")
 
-(* How long the outline's copy may take: the child may swap a file for one
-   whose read blocks, such as a FIFO, after the copy checked it. *)
-val outline_copy_seconds = 120
-
-(* Copies into SNAPSHOT the outline that the theory child in STAGE, under
-   action root ROOT, published, and its load metadata, while the child may
-   still write the stage.  The copy runs confined like the child, so it
-   reads only what the child could, whatever the child put in place of the
-   files; it takes only regular files, from the outline's own directory,
-   and is killed if it outlasts outline_copy_seconds. *)
-fun snapshot_outline root stage logical snapshot =
+(* Copies into SNAPSHOT the outline that the theory child in STAGE
+   published, and its load metadata, while the child may still write the
+   stage. *)
+fun snapshot_outline stage logical snapshot =
   let
     val names = [logical ^ ".dat", logical ^ ".sig", logical ^ ".sml",
                  "holbuild-theory-parents.txt", "holbuild-theory-mldeps.txt"]
     val sources =
       map (fn name => Path.concat (stage_outline_dir stage, name)) (List.take (names, 3)) @
       map (fn name => Path.concat (stage, name)) (List.drop (names, 3))
-    val q = HolbuildActionSandbox.quote
-    fun is kind path = "test " ^ kind ^ " " ^ q path ^ " -a ! -h " ^ q path ^ " || exit 1; "
-    fun script work =
-      is "-d" (stage_outline_dir stage) ^ String.concat (map (is "-f") sources) ^
-      String.concatWith " "
-        (["exec timeout -s KILL", Int.toString outline_copy_seconds, "cp --"] @ map q sources @ [q work])
-    fun keep (work, status) =
-      if OS.Process.isSuccess status then
-        (HolbuildRemoveTree.remove_untrusted_strict snapshot;
-         ensure_dir snapshot;
-         List.app (fn name => copy_binary (Path.concat (work, name)) (Path.concat (snapshot, name))) names)
-      else raise Error "could not copy the outline"
   in
-    HolbuildActionSandbox.shell {writable = [], readable = [root], toolchain = false} script
-      HolbuildProcessGroup.run_shell keep
+    HolbuildRemoveTree.remove_untrusted_strict snapshot;
+    ensure_dir snapshot;
+    ListPair.appEq (fn (src, name) => copy_binary src (Path.concat (snapshot, name))) (sources, names)
   end
 
 (* Runs one ActionSpec, writes its result record and returns the exit code.
@@ -16639,8 +16568,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        HolbuildRemoteCache.refresh_replicas := false;
        HolbuildRemoteCache.retry_one_node := false;
        if !publishing_checkpoints then () else HolbuildToolchain.cleanup_active_children ())
-    (* Keep the driver alive while the sandbox reaps HOL and validates the
-       saved checkpoints. The worker bounds this cleanup with a hard stop. *)
+    (* Keep the driver alive while it stops HOL and cleans up. The worker
+       bounds this cleanup with a hard stop. *)
     val _ = Signal.signal (Posix.Signal.term, Signal.SIG_HANDLE cancel)
     val _ = Signal.signal (Posix.Signal.int, Signal.SIG_HANDLE cancel)
     fun check_cancelled () =
@@ -16656,10 +16585,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     val root = Path.concat(cache, "action")
     val checkpoint_root = Path.concat(cache, "checkpoints")
     val _ = HolbuildActionSandbox.enable (root, checkpoint_root)
-    val _ = HolbuildActionSandbox.module_reads := (fn () => [])
-    val _ = HolbuildActionSandbox.scratch_reads := []
     val _ = HolbuildActionSandbox.result_file :=
-              (* Not normalized: the sandbox resolves ".." after links as open does. *)
               Option.map (fn file => if Path.isAbsolute file then file else FS.getDir () ^ "/" ^ file) result_file
     val input_key = ref ""
     val target = ref ("", "")
@@ -16784,18 +16710,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     (* A theory child reads each scratch input in place, the local cache's
        blob itself, through .holbuild/scratch/<sha> in the root, which it
        may only read: a hard link, or across file systems (a worker
-       container's root beside a host-mounted cache) a symbolic link, with a
-       sandbox grant on that one blob (scratch_reads), so the child can
-       neither list the cache nor open another blob there.  The blob's hash
-       was checked when it entered the cache, it is read-only and no child
-       writes there.  A blob the cache lacks is fetched beside its name and
-       linked there: a link, unlike a rename, never replaces a blob another
-       action's child may already be granted.  Should that fail, the input
-       is fetched into the root as any spec blob.  scratch_blobs keeps each
-       blob staged in place, touched again after each wait for a parent so
-       cache eviction takes it last; scratch_symlinked keeps each one read
-       across file systems and its identity, so a failure after it left
-       the cache is retried rather than reported. *)
+       container's root beside a host-mounted cache) a symbolic link.  The
+       blob's hash was checked when it entered the cache, it is read-only
+       and no child writes there.  A blob the cache lacks is fetched beside
+       its name and linked there: a link, unlike a rename, never replaces a
+       blob another action's child may already be reading.  Should that
+       fail, the input is fetched into the root as any spec blob.
+       scratch_blobs keeps each blob staged in place, touched again after
+       each wait for a parent so cache eviction takes it last;
+       scratch_symlinked keeps each one read across file systems and its
+       identity, so a failure after it left the cache is retried rather
+       than reported. *)
     val scratch_blobs : string list ref = ref []
     val scratch_symlinked : (string * (Posix.FileSys.dev * Posix.FileSys.ino) option) list ref = ref []
     fun scratch_input_lost () = List.exists (fn (path, id) => file_id path <> id) (!scratch_symlinked)
@@ -16836,8 +16761,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                            | id => id
               in
                 Posix.FileSys.symlink {old = target, new = path};
-                scratch_symlinked := (target, id) :: !scratch_symlinked;
-                HolbuildActionSandbox.scratch_reads := target :: !HolbuildActionSandbox.scratch_reads
+                scratch_symlinked := (target, id) :: !scratch_symlinked
               end
             fun in_place () =
               (if HolbuildCache.is_regular_entry blob then () else (fetched := true; fetch_into_cache sha blob);
@@ -16861,7 +16785,6 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
       in
         scratch_blobs := [];
         scratch_symlinked := [];
-        HolbuildActionSandbox.scratch_reads := [];
         case #scratch_inputs spec of
             [] => scratch_input_paths := []
           | inputs =>
@@ -16889,7 +16812,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           | HolbuildCacheBackend.Skipped => log_failed "the cache skipped it"
       end
     fun upload_log () =
-      if not (!HolbuildActionSandbox.outputs_validated) then NONE else
+      if not (!HolbuildActionSandbox.child_completed) then NONE else
       let val path = build_log ()
       in
         if not (file_exists path) then NONE
@@ -16988,7 +16911,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           phase "toolchain" (fn () => toolchain (#toolchain spec))
           handle e as HolbuildRemoteCache.Unavailable _ => raise e
                | e as ActionFailed _ => raise e
-               (* The sandbox, not the toolchain, failed: retryable. *)
+               (* The host's trust check or a launch, not the toolchain, failed: retryable. *)
                | HolbuildActionSandbox.Error msg => raise action_failed InternalFailure msg
                | e => raise action_failed ToolchainFailure (General.exnMessage e)
         val _ =
@@ -17082,7 +17005,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        build spec tc forced cutoff NONE false before before_fresh_preload := (fn () => ()))
       handle e => (before_fresh_preload := (fn () => ()); raise e)
     (* Installs the dependencies a light hydrate left out, whose files must
-       give the records' hashes; and the build's module grants then. *)
+       give the records' hashes, and forgets the cone's modules found
+       before they were installed. *)
     and install_light spec tc cutoff =
       if not (Option.isSome (!light_records)) then ()
       else
@@ -17105,16 +17029,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         in
           if Option.map #deps_key installed = Option.map #deps_key cutoff then ()
           else raise action_failed InternalFailure "the dependencies installed differ from the records the build started from";
-          set_module_grants tc spec (spec_theory_action root spec (cutoff_context spec cutoff))
+          cone_modules := NONE;
+          store_missing_modules := NONE
         end
-    (* The theory modules the build's sandbox may read. *)
-    and set_module_grants tc spec action =
-      (cone_modules := NONE;
-       store_missing_modules := NONE;
-       HolbuildActionSandbox.module_reads :=
-        theory_module_grants root tc spec
-          (SOME {deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action),
-                 deps_key = #deps_key action}))
     (* Publishes the outline the pipelined theory child in STAGE published
        there, for children loading ahead of the theory.  A failure costs
        them only the wait for its entry. *)
@@ -17123,7 +17040,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val logical = #logical action
         val key = outline_action_key (#input_key action)
         fun file name = Path.concat (outline_snapshot, name)
-        val _ = snapshot_outline root stage logical outline_snapshot
+        val _ = snapshot_outline stage logical outline_snapshot
         val published_sml = file "published.sml"
         val _ = copy_rewriting_path {src = file (logical ^ ".sml"), dst = published_sml,
                                      replacements = stage_dat_replacements stage logical
@@ -17157,7 +17074,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
            on the host find the modules.  By now a load ahead has its late
            parents in the root too. *)
         fun set_write_modules () =
-          if not (!HolbuildActionSandbox.outputs_validated) orelse not (module_writer_supported tc) then ()
+          if not (!HolbuildActionSandbox.child_completed) orelse not (module_writer_supported tc) then ()
           else
             write_modules :=
               (* holbuild reads a theory's files by their names, HOL by
@@ -17170,7 +17087,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                               fill_module_store remote writer_root tc {deps = #deps spec, loads = #loads spec}}
         val action =
           spec_theory_action root spec (cutoff_context spec cutoff)
-        val _ = set_module_grants tc spec action
+        val _ = (cone_modules := NONE; store_missing_modules := NONE)
         (* A local entry that didn't restore must not stand in for this
            build's when the publication is checked, and, as in a local
            build, its theory's checkpoints may hold parents other than
@@ -17247,11 +17164,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             (* How many of its cone's expected modules the heap this run's
                preload saved doesn't load, and how many the cone expects. *)
             fun captured_missing () =
-              case (!cone_modules, !captured_heap_modules) of
-                  (SOME names, SOME {modules, ...}) =>
-                    SOME {missing = length (unstored_modules (map (Path.file o #2) modules) names),
-                          cone = length names}
-                | _ => NONE
+              case !captured_heap_modules of
+                  SOME {modules, ...} =>
+                    (let val names = cone_module_names root tc {deps = #deps spec, loads = #loads spec}
+                     in SOME {missing = length (unstored_modules (map (Path.file o #2) modules) names),
+                              cone = length names}
+                     end
+                     handle e => (warn ("theory modules not counted: " ^ General.exnMessage e); NONE))
+                | NONE => NONE
+
             (* The deps heap the run started from, the one its preload
                saved or else the one restored: how many of its cone's
                modules it doesn't load (depsmissn), when known, and its
@@ -17299,7 +17220,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                       (verdict ^ " checkpoints=" ^ Int.toString (!published_checkpoints))
                 | NONE => ()
             fun publish_shared () =
-              ((if not (!HolbuildActionSandbox.outputs_validated) then publish_line "unvalidated"
+              ((if not (!HolbuildActionSandbox.child_completed) then publish_line "unvalidated"
                 else if not (checkpoint_saves_enabled policy) then publish_line "no-checkpoint-saves" else
                 case shared of
                     SOME ctx =>
@@ -17317,7 +17238,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             val _ = (if Option.isSome ahead then () else stage_scratch_input spec)
                     handle e => (release_heap_decline (); raise e)
             fun publish_tools () =
-              if not (!HolbuildActionSandbox.outputs_validated) then () else
+              if not (!HolbuildActionSandbox.child_completed) then () else
               case tool_cache of
                   SOME (key, dir, restored) =>
                     phase "toolpublish" (fn () => publish_tool_cache (fn () => !cancelled) remote (share_store cache) key dir restored)
@@ -17363,7 +17284,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             (* The child's exporter may have recorded its peak before
                a later step failed. *)
             (peak := peak_rss_mb stage;
-             if not (!HolbuildActionSandbox.outputs_validated) then
+             if not (!HolbuildActionSandbox.child_completed) then
                raise action_failed InternalFailure msg
              else
              let
@@ -17530,9 +17451,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val outcome : exn option option ref = ref NONE
         val started = Time.now ()
         val _ = prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
-        (* Before the late parents arrive; the action's later children
-           look again (build). *)
-        val _ = HolbuildActionSandbox.module_reads := theory_module_grants root tc spec NONE
+
         val _ =
           Thread.fork
             (fn () =>
@@ -17924,7 +17843,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 end
                 handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e)
               val _ =
-                if not (!HolbuildActionSandbox.outputs_validated) then () else
+                if not (!HolbuildActionSandbox.child_completed) then () else
                 (Option.app (fn msg => append_to_log ("holbuild: pipeline: building plain: " ^ msg)) (!fallback);
                  Option.app (fn (_, msg) => append_to_log ("holbuild: exec-action failed: " ^ msg)) failure)
               fun share () =
@@ -17969,9 +17888,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  failed one's does. *)
               val _ = if Option.isSome failure orelse !cancelled then () else publish_tools_now ()
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
-              (* The log is read only once the sandbox validated the root it is in. *)
+              (* The log is read only once the child has returned. *)
               val hol_phases =
-                if !HolbuildActionSandbox.outputs_validated then hol_log_phases (build_log ()) (!last_child_start)
+                if !HolbuildActionSandbox.child_completed then hol_log_phases (build_log ()) (!last_child_start)
                 else []
               fun count (name, n) = if !n > 0 then [(name, LargeInt.fromInt (!n))] else []
               val drops = count ("rstdropn", dropped_checkpoints) @ count ("rstmodrejn", rejected_heap_modules) @

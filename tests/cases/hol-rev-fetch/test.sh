@@ -10,7 +10,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 # A HOL toolchain pinned to a commit that no branch or tag holds, which a
 # clone therefore leaves out but the server still serves by hash, as GitHub
 # serves one from its fork network. exec-action's hardened fetch is checked in
-# exec-action-toolchain-sandbox.
+# exec-action-toolchain-bootstrap.
 
 tmpdir=$(make_temp_dir)
 trap 'cleanup_temp_dir "$tmpdir"' EXIT

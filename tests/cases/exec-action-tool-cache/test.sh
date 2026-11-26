@@ -211,7 +211,7 @@ require_grep "restored tool cache (1 files)" "$tmpdir/v8.log"
 cp "$tmpdir/remote/ac/$tool_ac" "$tmpdir/entry-v8"
 
 # A directory or a symbolic link is not published, and the entry stays as it
-# was.  The sandbox may refuse the link; the directory it allows.
+# was.
 write_t v9 'val _ = tool_put "seen" "v9"; val _ = OS.FileSys.mkDir (OS.Path.concat (tool_dir, "sub")); val _ = Posix.FileSys.symlink {old = "seen", new = OS.Path.concat (tool_dir, "link")} handle OS.SysErr _ => ();'
 export_t v9 --tool-cache probe
 worker v9 "$spec_t"

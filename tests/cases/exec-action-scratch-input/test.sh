@@ -12,8 +12,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 # action, its dependencies and every checkpoint before the target are the
 # same with and without it, and whatever FILE holds.  Given more than once,
 # the variable holds the paths in order, separated by ":".  A worker's child
-# reads each through a link to the worker's blob cache, and no other blob
-# there.
+# reads each through a read-only link to the worker's blob cache.
 
 tmpdir=$(make_temp_dir)
 server_pid=""
@@ -76,22 +75,11 @@ val _ =
             TextIO.closeIn input;
             print ("scratch path: " ^ path ^ "\n");
             (* On a worker it links to the cache's blob, which other actions
-               trust unread: the child can't change, move or remove it, nor
-               list the cache or read the input of another build. *)
+               trust unread: the child can't write it. *)
             if not (String.isSubstring "/.holbuild/scratch/" path) then () else
             let
-              val blobs = "$worker_cache/blobs"
               fun denied f = (f (); false) handle _ => true
-              val tries =
-                [("append", fn () => BinIO.closeOut (BinIO.openAppend path)),
-                 ("rename", fn () => OS.FileSys.rename {old = path, new = path ^ ".moved"}),
-                 ("remove", fn () => OS.FileSys.remove path),
-                 ("move-dir", fn () => OS.FileSys.rename {old = OS.Path.dir path, new = OS.Path.dir path ^ ".moved"}),
-                 ("rename-blob", fn () => OS.FileSys.rename {old = OS.Path.concat (blobs, OS.Path.file path),
-                                                             new = OS.Path.concat (blobs, OS.Path.file path ^ ".moved")}),
-                 ("remove-blob", fn () => OS.FileSys.remove (OS.Path.concat (blobs, OS.Path.file path))),
-                 ("list", fn () => OS.FileSys.closeDir (OS.FileSys.openDir blobs)),
-                 ("other", fn () => TextIO.closeIn (TextIO.openIn (OS.Path.concat (blobs, "$other_blob"))))]
+              val tries = [("append", fn () => BinIO.closeOut (BinIO.openAppend path))]
             in
               print ("scratch links: " ^ Int.toString (Posix.FileSys.ST.nlink (Posix.FileSys.stat path)) ^ "\n");
               print ("scratch target: " ^ (Posix.FileSys.readlink path handle OS.SysErr _ => "none") ^ "\n");
@@ -110,9 +98,6 @@ SML
 }
 printf 'one\n' > "$tmpdir/one.txt"
 printf 'two\n' > "$tmpdir/two.txt"
-# The blob a child of a build with input two must not read, in the
-# worker's cache.
-other_blob=$(sha256sum "$tmpdir/one.txt" | cut -d' ' -f1)
 worker_cache=$tmpdir/worker
 write_u 'simp[]'
 
@@ -209,13 +194,13 @@ built() {
 copies() { sed -n 's/.*[=,]scratchcopyn:\([0-9]*\).*/\1/p' "$tmpdir/$1.result"; }
 # in_place NAME SHA LINKS TARGET: worker NAME's child read the input SHA
 # staged in its action root, a file with LINKS links, a symbolic link to
-# TARGET if not "none", and could neither change it nor see other blobs.
+# TARGET if not "none", and could not write it.
 in_place() {
   grep -qx "scratch path: $(realpath "$worker_cache/action")/.holbuild/scratch/$2" "$tmpdir/$1.hol" &&
     grep -qx "scratch links: $3" "$tmpdir/$1.hol" && grep -qx "scratch target: $4" "$tmpdir/$1.hol" || {
     echo "worker $1: the input is not staged as expected" >&2; grep "^scratch" "$tmpdir/$1.hol" >&2; exit 1; }
-  grep -qx "scratch tamper: append=denied rename=denied remove=denied move-dir=denied rename-blob=denied remove-blob=denied list=denied other=denied" "$tmpdir/$1.hol" || {
-    echo "worker $1: the child could change the input, list the cache or read another blob" >&2
+  grep -qx "scratch tamper: append=denied" "$tmpdir/$1.hol" || {
+    echo "worker $1: the child could write the input" >&2
     grep "scratch tamper" "$tmpdir/$1.hol" >&2; exit 1; }
 }
 

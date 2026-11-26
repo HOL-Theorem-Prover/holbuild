@@ -54,10 +54,10 @@ toolchain, so a fresh worker fetches the modules another one wrote. Checkpoint-f
 garbage collection and worker cache limits include the module files; deleting
 them only causes source loading and regeneration.
 
-Remote execution isolates submitted HOL code from worker credentials and shared
-writable caches. Worker hosts need Linux Landlock and libseccomp; see
-[action isolation](remote-exec/README.md#action-isolation) for prerequisites,
-the trust boundary and the client upgrade requirement.
+Remote execution keeps worker credentials out of HOL's environment and gives
+each action a home and temporary directory of its own, but doesn't confine
+submitted HOL code; see [action isolation](remote-exec/README.md#action-isolation)
+for the trust boundary and the client upgrade requirement.
 
 ## Install
 
@@ -1383,10 +1383,9 @@ uses it.
 An analyser failure reports its exit status or signal and stderr. On systems
 with cgroup v2, it also reports available `memory.events` counters before and
 after the attempt. These counters cover a shared group; they do not identify
-the analyser as an OOM victim or establish why it was killed. Outside the
-action sandbox, SIGKILL or exit status 137 retries at most twice, after 100 ms
-and 200 ms, with fresh temporary files. Caller cancellation, other failures
-and sandboxed calls do not retry. Exit status 137 is compatible with a shell
+the analyser as an OOM victim or establish why it was killed. SIGKILL or exit
+status 137 retries at most twice, after 100 ms and 200 ms, with fresh temporary
+files. Caller cancellation and other failures do not retry. Exit status 137 is compatible with a shell
 reporting SIGKILL, but can also be an explicit program exit.
 
 ### Keeping a tool's files between builds
@@ -2006,11 +2005,10 @@ A theory exported with `--scratch-input FILE` (see "Giving a tool a file it
 reads") names FILE by its SHA-256 in the spec's `option scratch-input` line,
 one line per FILE in the order given, and the client uploads each FILE with the
 spec's sources. Before HOL starts, the worker fetches each one its local
-cache lacks into that cache, links it to `.holbuild/scratch/<sha256>` under the
-action root, outside the directories the action may write, and gives the
-theory's HOL processes those paths as `HOLBUILD_SCRATCH_INPUT`. Across file
-systems the link is symbolic, and the sandbox lets them read that blob and no
-other in the cache. A missing blob fails the action like a missing source.
+cache lacks into that cache, links the read-only blob to
+`.holbuild/scratch/<sha256>` under the action root, and gives the theory's HOL
+processes those paths as `HOLBUILD_SCRATCH_INPUT`. Across file systems the
+link is symbolic. A missing blob fails the action like a missing source.
 
 With `--ahead-parent INPUT_KEY:SPEC-SHA256`, given once per dependency that
 another worker is still building from that spec (a late parent), the worker

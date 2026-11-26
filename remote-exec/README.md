@@ -208,8 +208,8 @@ The driver gets up to 8 additional seconds after the natural-finish drain
 window to upload the build log so far and publish completed checkpoints (with
 `--share-heaps`). Lease loss gives it up to 15 seconds, also bounded by the
 drain deadline plus 8 seconds if a drain starts meanwhile. Only the driver
-receives the initial termination signal: it stops HOL, waits for sandbox cleanup
-and output validation, uploads the log, writes its result, then publishes
+receives the initial termination signal: it stops HOL, uploads the log,
+writes its result, then publishes
 committed checkpoints. The worker reads the result once the driver exits or is
 killed, so a publication that outlasts the window loses only the checkpoints
 left. Repeated signals do not interrupt publication. The worker
@@ -278,8 +278,8 @@ libraries read (`HOL4_Z3_EXECUTABLE`, `HOL4_CVC_EXECUTABLE`,
 `HOLBUILD_REMOTE_EXEC_*`, `HOLBUILD_REMOTE_CACHE_DISCOVERY_TOKEN` and inherited
 discovery curl configs; with discovery enabled it receives only the worker's
 generated read-only discovery config (see below). The worker token stays out
-of the builds' environment and discovery files. Submitted HOL code is confined
-separately from trusted worker processes, as described below. Outside the image,
+of the builds' environment and discovery files. Action isolation, below, says
+what submitted HOL code can reach. Outside the image,
 `python3 -m remote_exec.worker` runs the worker; it uses only the standard
 library and `curl`. A batch can override the worker's `--max-heap` default
 (12000 MB); `--also-claim standard` lets them take standard-tier work when no
@@ -361,62 +361,36 @@ workers do when they aren't running HOL:
 
 ## Action isolation
 
-Workers require Linux on x86_64 or aarch64, Landlock ABI 1 or newer,
-Python 3, pidfds, `/proc` child lists and `libseccomp.so.2` with notification
-support. Root workers need `CAP_SETPCAP` to drop their bounding capabilities
-and lock securebits; non-root workers need no added capabilities. The supplied
-image includes the userspace dependencies. The container's seccomp profile must permit Landlock and
-stacking a notifying seccomp filter. `holbuild sandbox-check` exercises these
-requirements; workers reject a release whose check fails. Releases before
-0.13.58 are rejected because their HOL launch path has no mandatory sandbox.
+Workers require Linux on x86_64 or aarch64. `holbuild sandbox-check` runs
+before a release's first action, and workers reject a release whose check
+fails. Releases before 0.13.58 are rejected. Releases before 0.15.15 run HOL
+under their own Landlock and seccomp confinement, which needs Landlock ABI 1
+or newer, Python 3, pidfds, `/proc` child lists and `libseccomp.so.2` with
+notification support; the supplied image includes the userspace dependencies.
 Upgrade submitting clients before replacing workers with this version.
-`--min-release VERSION` (or `REMOTE_EXEC_MIN_RELEASE`) raises that floor for one deployment. Before 0.14.92,
-an action may read the whole theory-modules store, which holds modules of
-every build its container (or, if shared, its host) ran; from 0.14.92 it may
-read only the module files its own dependencies need. So workers of tenants
-who must not read each other's theories and share a host's theory-modules
-store take `--min-release 0.14.92`.
+`--min-release VERSION` (or `REMOTE_EXEC_MIN_RELEASE`) raises that floor for
+one deployment.
 
-The worker and `exec-action` remain trusted: they fetch inputs, manage memory
-leases and publish results. Each HOL process runs with a Landlock filesystem
-policy and a seccomp syscall filter. It receives read access to its selected
-HOL toolchain, holbuild runtime, Poly/ML and system runtime files, and write
-access to fresh action, checkpoint, home and temporary directories. Shared
-cache files are copied into these directories. The directories are removed
-after the action, including when shared heaps are disabled. Worker-private
-checkpoint and compiled-module state is not retained across actions. The child receives
-no cache credentials, worker token, inherited lease descriptors or Linux
-capabilities. Its `PATH` excludes the worker Python virtualenv's `bin`
-directory, including directory aliases, so `python3` can use the system
-installation while the worker virtualenv stays inaccessible. Other `PATH`
-entries are preserved and remain subject to the filesystem read policy.
-It may also write `/tmp`, where Poly/ML creates temporary files
-whatever `TMPDIR` says (HOL's SAT and SMT interfaces use them), unless
-protected worker state lies beneath it, holbuild's own temporary files
-under `TMPDIR` included; the image therefore sets `TMPDIR` to `/var/tmp` so
-the worker keeps its credential, result and temporary files elsewhere.
-Actions on one worker may see each other's files in `/tmp`. Cross-process
-inspection, metadata changes, links and special-file creation are denied. A trusted signal supervisor permits process and group
-signals only to verified descendants of the current action, using pidfds;
-thread signals stay within the requesting process. Subprocess groups, sessions
-and timeouts work without granting access to worker or sibling processes.
-The supervisor stops descendants to a fixed point, then kills and reaps them
-before validating and harvesting regular, unlinked output files. Cleanup uses
-bounded process-tree scans rather than one atomic process-group signal; failure
-to complete cleanup fails the action and does not harvest outputs. This does
-not provide resource isolation against fork storms. Unsupported confinement
-fails closed.
-
-The action can read its own process directory under `/proc`, without a general
-`/proc` grant. The supervisor holds that directory open through cleanup because
-procfs can otherwise recreate its inode after dentry eviction, losing the
-inode-based Landlock grant. The action inherits no descriptor for this pin.
+The worker and `exec-action` are trusted: they fetch inputs, manage memory
+leases and publish results. HOL and the programs it runs are not confined:
+they run as the worker's user and can reach whatever it can. Each action's
+child gets a home and temporary directory of its own, `HOME` and `TMPDIR`
+(also `TMP` and `TEMP`) under `.holbuild/sandbox-home` in the action root,
+emptied with the root before the next action; `HOLBUILD_ACTION_ROOT` names
+the root. Its environment has no `HOLBUILD_REMOTE_*` or `REMOTE_EXEC_*`
+variable, so no cache credential or worker token. Files the worker's caches
+share between actions (cache blobs, theory modules, shared checkpoint heaps
+and toolchains) are read-only, so that no action changes one by accident.
+These guard against mistakes, not against a hostile submitter: run workers
+only for submitters who trust each other. Actions on one worker see each
+other's files in `/tmp`, where Poly/ML creates temporary files whatever
+`TMPDIR` says; the image sets `TMPDIR` to `/var/tmp` so that the worker keeps
+its credential, result and temporary files elsewhere.
 
 The child inherits only executable lookup, locale, timezone, certificate lookup,
-those solver locations and `HOLBUILD_RUN_*` settings; a solver outside the
-system directories needs its directory in `HOLBUILD_ACTION_READ_DIRS`. Other
-operator environment overrides use their runtime defaults. Cancellation kills the owned process tree, so buffered log
-tails may be lost. Mediated signals identify the supervisor as their sender.
+those solver locations and `HOLBUILD_RUN_*` settings. Other operator
+environment overrides use their runtime defaults. Cancellation kills the owned
+process tree, so buffered log tails may be lost.
 
 `--share-heaps` publishes heaps by dependency context and checkpoints by script
 prefix in the remote cache. Dependency heaps are shared even for older action
@@ -436,28 +410,10 @@ passes `--share-heaps` to older releases may publish there. Neither provides ten
 authorization for shared cache entries, and `build --tool-cache` directories
 are shared by name, dependency key and toolchain whatever the mode.
 
-The supervisor confirms cleanup and output validation through a completion
-file outside the child's filesystem grants. Without that confirmation, the
-worker treats the run as an infrastructure failure and publishes no checkpoints.
-The child must confirm confinement setup; exit status 125 is reserved for
-infrastructure failures, including a failure to execute HOL.
-The supervisor watches its parent through a pidfd and runs in its own process
-group, so an outer timeout's forced group shutdown does not interrupt cleanup.
-The launcher supplies its identity before starting the supervisor, which
-refuses to start HOL if it has already lost that parent.
-
-Everything the selected HOL toolchain runs is confined the same way:
-configuring and building HOL, loading its heap, listing its sources with
-Holmake and `git`, and compiling and running the dependency analyser. A HOL
-build may write only its own tree. Within it, the supervisor applies its mode
-changes, never setuid or setgid, and its links may not point outside. The
-repository's `.git` directory is out of its reach while it builds. The worker
-clones the exact commit without user or system Git configuration, hooks,
-submodules or credential prompts, and checks that the checkout is that
-commit. A built toolchain is checked like action outputs before it is used:
-no links out of the tree, hard links, special or setuid files, and every
-directory listable. A toolchain restored from the remote cache is checked the
-same way before anything in it runs.
+The worker builds the selected HOL toolchain itself: it clones the exact
+commit without user or system Git configuration, hooks, submodules or
+credential prompts, checks that the checkout is that commit, and keeps the
+repository's `.git` directory out of the build's tree while it builds.
 
 Workers accept a toolchain only from a trusted repository. The default
 approves commits on `develop` and `master` in the canonical HOL repository.
@@ -469,20 +425,14 @@ revision objects. Proven ancestry is reused from a worker-owned Git graph;
 a branch history rewrite takes effect when the next unknown revision triggers
 a refresh. Use protected branches for these trust roots. The entry `*`
 accepts any `https://` repository at a full commit hash, with no branch
-check, since no step runs the toolchain's code outside the sandbox; such
-toolchains still cost worker time to build.
-The worker enables `*` only for clients from 0.14.0 onward, which confine
-toolchain execution. For older clients it removes `*`, preserving any explicit
-repository entries. If only `*` was configured, older clients use their
+check; such toolchains still cost worker time to build.
+The worker enables `*` only for clients from 0.14.0 onward. For older clients
+it removes `*`, preserving any explicit repository entries. If only `*` was configured, older clients use their
 canonical HOL defaults. Empty values remain invalid.
-Trust is worker configuration, not an action spec option. Administrators can grant additional read-only runtime directories
-with colon-separated `HOLBUILD_ACTION_READ_DIRS`; do not include credentials
-or shared writable state in these directories.
+Trust is worker configuration, not an action spec option.
 
-This boundary protects worker credentials and shared filesystem state. It
-does not restrict network egress or replace authorization on the remote cache.
-The trusted HOL parser and compiler used before execution remain part of the
-worker's trusted code.
+None of this restricts network egress or replaces authorization on the
+remote cache.
 
 ## Batches and actions
 
@@ -1240,8 +1190,7 @@ nothing, so the fleet sees no work: start from a tree without them.
 The fleet starts with no HOL toolchain, and `--remote-only` won't build one.
 `--toolchain <cache>/hol-toolchains/<key>` (repeatable) uses one already built
 in another holbuild cache: its `hol/` tree is read in place, since HOL bakes in
-its absolute paths, and granted to actions through `HOLBUILD_ACTION_READ_DIRS`;
-its locks, `last-used` marker and analysers stay private to the run, so the run
+its absolute paths; its locks, `last-used` marker and analysers stay private to the run, so the run
 holds no lease on it: seed from an entry in current use, which that cache's
 garbage collection won't retire mid-run. `holbuild buildhol` in the project
 prints the path of the one it uses.
@@ -1251,16 +1200,15 @@ and the Postgres tools) start from an empty environment, so none of the
 caller's settings or config files (a deployed fleet's `REMOTE_EXEC_*`, curl's,
 libpq's, uv's) reach them: of the caller's environment, only `PATH` passes, `uv`
 also keeps `HOME` and `UV_CACHE_DIR` for its cache, and the workers also get
-`HOLBUILD_ACTION_READ_DIRS` and the `HOL4_*` solver settings, which stand in
+the `HOL4_*` solver settings, which stand in
 for the worker image's. Their `HOME` is a private directory in the run
 directory. Inside a Slurm allocation, its memory (`--mem` or `--mem-per-cpu`)
 is the workers' admission budget.
 
 The run directory (`--dir`, else a new one in `~/.cache/holbuild-local-fleet`)
 must be new or empty, a plain path of at most 89 characters (Postgres's socket
-is in it), and not under `/tmp`, and is made readable by its owner only; the workers' `TMPDIR`
-is inside it: as in the image, the action sandbox lets HOL write `/tmp` only
-when no worker state is there. The services and workers run in sessions of
+is in it), and is made readable by its owner only; the workers' `TMPDIR`
+is inside it. The services and workers run in sessions of
 their own, so a terminal's Ctrl-C reaches only the launcher, and `127.0.0.1` is
 added to the command's `no_proxy`. On exit, interrupt or termination the command's
 process group is stopped (TERM, then KILL after 10 s), then the workers, which drain while the coordinator and cache still
@@ -1320,7 +1268,7 @@ endpoint accepts this token; it cannot claim work, heartbeat, report results,
 submit batches or inspect the queue. The worker bearer is never written to
 this file, and `HOLBUILD_REMOTE_EXEC_*` settings are excluded from the child
 environment. Cache credentials remain separate and stay in trusted worker and
-`exec-action` processes; the HOL sandbox does not receive them.
+`exec-action` processes; HOL does not receive them.
 
 Upgrade the coordinator before workers so it accepts derived discovery tokens.
 Older coordinators reject them, leaving child discovery on the permanent cache

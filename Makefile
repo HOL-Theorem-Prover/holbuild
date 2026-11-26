@@ -10,7 +10,7 @@ BASHCOMPDIR ?= $(PREFIX)/share/bash-completion/completions
 ZSHCOMPDIR ?= $(PREFIX)/share/zsh/site-functions
 FISHCOMPDIR ?= $(PREFIX)/share/fish/vendor_completions.d
 VENDORED_HOL_FILES := $(shell sed 's|^|vendor/hol/|' vendor/hol/FILES)
-RUNTIME_SOURCES := sml/action_sandbox.py sml/ahead_load_runtime.sml sml/checkpoint_save_runtime.sml sml/holbuild_runtime.sml sml/deferred_proofs_runtime.sml \
+RUNTIME_SOURCES := sml/ahead_load_runtime.sml sml/checkpoint_save_runtime.sml sml/holbuild_runtime.sml sml/deferred_proofs_runtime.sml \
 	sml/fingerprint_runtime.sml sml/proof_runtime.sml sml/tactic_compat_runtime.sml sml/diagnostic_limits.sml sml/sha256.sml sml/bounded_output.sml \
 	sml/spawn.sml sml/temp_path.sml sml/hash.sml sml/proof_ir_types.sml sml/proof_ir.sml \
 	$(wildcard sml/analyser/*.sml)
@@ -40,7 +40,7 @@ bin/holbuild: sml/holbuild-script.sml sml/sha256.sml sml/bounded_output.sml sml/
 # links one input, so both objects go in an archive, from which the linker takes
 # that main before reaching libpolymain's. Merging them with ld -r instead made
 # GNU ld's LTO plugin crash in some final links.
-bin/holbuild: sml/action_sandbox.sml sml/action_resident.sml sml/action_sandbox.py sml/process_group.sml sml/tactic_timeout_policy.sml sml/command_summary.sml sml/driver_main.c
+bin/holbuild: sml/action_sandbox.sml sml/action_resident.sml sml/process_group.sml sml/tactic_timeout_policy.sml sml/command_summary.sml sml/driver_main.c
 	@mkdir -p bin
 	echo 'val () = use "sml/holbuild-script.sml"; val () = PolyML.export("$@.ml.o", main);' | \
 		HOLBUILD_COMPILE_DATADIR="$(abspath $(DATADIR))" $(POLY) -q --error-exit --gcthreads=1

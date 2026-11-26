@@ -18,11 +18,11 @@ use "sml/holbuild-script.sml";
 structure E = HolbuildBuildExec;
 fun check message condition = if condition then () else raise Fail message;
 
-fun policy sandboxed = E.module_policy {sandboxed = sandboxed, store = "/s", base_state = "/b"};
+fun policy remote = E.module_policy {remote = remote, store = "/s", base_state = "/b"};
 fun has text s = String.isSubstring text s;
 val limit = "Meta.theoryModuleWriteLimit := 0";
-val _ = check "a sandboxed action can write modules" (has limit (policy true));
-val _ = check "a sandboxed action's limit is not capability-checked"
+val _ = check "a remote action can write modules" (has limit (policy true));
+val _ = check "a remote action's limit is not capability-checked"
           (has "[\"configureTheoryModuleCache\", \"theoryModuleWriteLimit\"] then" (policy true));
 val _ = check "a local child cannot write modules" (not (has limit (policy false)));
 val _ = check "the store is not configured"

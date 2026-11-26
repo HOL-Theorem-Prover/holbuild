@@ -169,13 +169,11 @@ fun run_in_dir_to_file dir argv output =
     (fn lease =>
         timed_system "run_in_dir_to_file" argv (SOME output)
           (fn () =>
-              HolbuildActionSandbox.launch argv (fn confined =>
+              HolbuildActionSandbox.launch argv (fn argv =>
                 HolbuildProcessGroup.run_shell_inheriting lease
                   ("cd " ^ quote dir ^ " && " ^
-                   (if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
-                   command confined ^ " > " ^ quote output ^ " 2>&1"))))
+                   command argv ^ " > " ^ quote output ^ " 2>&1"))))
   handle HolbuildMachineMemory.Error msg => raise Error msg
-       | HolbuildActionSandbox.Error msg => raise Error msg
 
 (* As run_in_dir_to_file, killing the child at the time DEADLINE () gives
    once the memory reservation is granted. *)
@@ -189,17 +187,15 @@ fun run_in_dir_to_file_by dir argv output deadline =
               (fn () =>
                   let
                     val result =
-                      HolbuildActionSandbox.launch argv (fn confined =>
+                      HolbuildActionSandbox.launch argv (fn argv =>
                         HolbuildProcessGroup.run_shell_inheriting_until lease (deadline ())
                           ("cd " ^ quote dir ^ " && " ^
-                           (if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
-                           command confined ^ " > " ^ quote output ^ " 2>&1"))
+                           command argv ^ " > " ^ quote output ^ " 2>&1"))
                   in
                     timed_out := #timed_out result;
                     #status result
                   end))
       handle HolbuildMachineMemory.Error msg => raise Error msg
-           | HolbuildActionSandbox.Error msg => raise Error msg
   in
     {status = status, timed_out = !timed_out}
   end

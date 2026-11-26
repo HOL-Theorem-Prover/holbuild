@@ -26,7 +26,7 @@ RUN apt-get update \
 COPY --from=polyml /opt/polyml /opt/polyml
 COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /usr/local/bin/uv
 # The worker's temporary files (the cache credential, action results) stay out
-# of /tmp, which sandboxed HOL processes may write: Poly/ML puts its own there.
+# of /tmp, which HOL processes write: Poly/ML puts its own there.
 # Releases built on demand link this Poly/ML's runtime library, so they are kept
 # apart from those other images built on a host that keeps the directory.
 ARG POLYML_TAG

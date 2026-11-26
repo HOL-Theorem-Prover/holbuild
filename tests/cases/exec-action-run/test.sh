@@ -273,26 +273,6 @@ hol_first=$(output_blob "$hol_key" first)
 [[ $(sed -n 3p "$hol_first") == */boolScript.sml ]] || { cat "$hol_first" >&2; exit 1; }
 printf '0\n' | cmp - "$(output_blob "$hol_key" second)"
 
-# A run reads no theory module: it can neither list the worker's module
-# stores nor open a module in one, even by its exact name.
-modules=$tmpdir/worker-modules/theory-modules
-mkdir -p "$modules/store"
-module=$modules/store/0a-otherTheory-0123456789abcdef0123456789abcdef01234567.pmo
-echo module > "$module"
-cat > "$runner/modules.sml" <<SML
-fun refuses name f =
-  if (f (); true) handle OS.SysErr _ => false | IO.Io _ => false
-  then raise Fail ("sandbox allowed " ^ name) else ();
-val _ = refuses "listing the module stores" (fn () => OS.FileSys.closeDir (OS.FileSys.openDir "$modules"));
-val _ = refuses "listing a module store" (fn () => OS.FileSys.closeDir (OS.FileSys.openDir "$modules/store"));
-val _ = refuses "reading a module" (fn () => TextIO.closeIn (TextIO.openIn "$module"));
-val dir = valOf (OS.Process.getEnv "HOLBUILD_RUN_OUTPUT_DIR");
-val _ = List.app (fn name => TextIO.closeOut (TextIO.openOut (OS.Path.concat (dir, name)))) ["first", "second"];
-SML
-read -r key spec < <(export_run modules.sml hol:bool)
-worker modules "$spec"
-expect modules 0 status=built
-
 # A script that raises, or leaves an output unwritten, fails as script, a
 # final failure, and nothing is cached.
 for script in raise one; do
