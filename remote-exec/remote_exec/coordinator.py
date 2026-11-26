@@ -258,6 +258,10 @@ class ActionStatus:
     finished_at: datetime | None  # the latest accepted result's time; lease expiry and cancellation set none
     worker: str | None
     timings: dict[str, int] | None  # the last result's, in milliseconds; see formats.Result
+    # A ready build held back behind another batch's live lease of its key and spec (single-flight): that batch, and
+    # when it claimed the key.
+    held_by: UUID | None = None
+    held_since: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -520,12 +524,41 @@ RELEASABLE_BATCH = sa.text(RELEASABLE.format(batch=" AND a.batch_id = :batch_id"
 
 
 # The actions of a batch written by transactions numbered :since or later; see Coordinator.changes.
-CHANGED_ACTIONS = sa.text("""
-SELECT input_key, theory, state, tier, attempts, interruptions, last_failure, log_sha256, failure_detail,
-       last_claimed_at, finished_at, worker, CAST(timings AS text)
+ACTION_COLUMNS = """input_key, theory, state, tier, attempts, interruptions, last_failure, log_sha256, failure_detail,
+       last_claimed_at, finished_at, worker, CAST(timings AS text)"""
+CHANGED_ACTIONS = sa.text(f"""
+SELECT {ACTION_COLUMNS}
 FROM actions
 WHERE batch_id = :batch_id AND changed_xid >= CAST(CAST(:since AS text) AS xid8)
 ORDER BY theory, input_key
+""")
+
+# This batch's actions of :keys, read by primary key; see Coordinator.changes.
+ACTIONS_OF_KEYS = sa.text(f"""
+SELECT {ACTION_COLUMNS}
+FROM actions
+WHERE batch_id = (SELECT CAST(:batch_id AS uuid)) AND input_key = ANY(CAST(:keys AS text[]))
+ORDER BY theory, input_key
+""")
+# This batch's ready builds that single-flight holds back behind another batch's live lease of the same key and spec
+# (see CLAIM_ACTION), each with the holding batch and when it claimed the key. It starts from the live leases, as
+# leases have no index leading with input_key, and reads both copies of each lease's key by primary key in the target
+# list, so the planner can't put a join with actions first.
+HELD_READY_ACTIONS = sa.text("""
+SELECT input_key, held_by, held_since FROM (
+    SELECT l.input_key, l.batch_id AS held_by, (
+        SELECT h.last_claimed_at FROM actions h WHERE h.batch_id = l.batch_id AND h.input_key = l.input_key
+    ) AS held_since, (
+        SELECT a.state = 'ready' AND a.class = 'build' AND a.spec_sha256 = (
+            SELECT h.spec_sha256 FROM actions h WHERE h.batch_id = l.batch_id AND h.input_key = l.input_key
+        )
+        FROM actions a WHERE a.batch_id = (SELECT CAST(:batch_id AS uuid)) AND a.input_key = l.input_key
+    ) AS held
+    FROM leases l
+    WHERE l.expires_at > now() AND l.batch_id <> (SELECT CAST(:batch_id AS uuid))
+) live
+WHERE held
+ORDER BY input_key, held_since, held_by
 """)
 
 
@@ -1372,14 +1405,15 @@ class Coordinator:
 
     async def changes(self, batch_id: UUID, since: int) -> tuple[BatchStatus, int] | None:
         """The batch with only the actions written by transactions numbered ``since`` or later, and the ``since``
-        to pass next time; ``since`` 0 gives every action.
+        to pass next time; ``since`` 0 gives every action. Every ready build that single-flight holds back behind
+        another batch's lease is in it too, changed or not, with ``held_by`` and ``held_since``.
 
         The next ``since`` is the oldest transaction still running on the server when this one read, so an action
         written by a transaction that commits later is read next time, maybe again. A long transaction anywhere on
         the server holds ``since`` back, so polls reread what changed since it began until it ends.
         """
         async with self.engine.connect() as conn:
-            await conn.execution_options(isolation_level="REPEATABLE READ")  # both reads see one snapshot
+            await conn.execution_options(isolation_level="REPEATABLE READ")  # every read sees one snapshot
             batch = (
                 await conn.execute(
                     sa.text(
@@ -1391,9 +1425,23 @@ class Coordinator:
             ).first()
             if batch is None:
                 return None
-            actions = await conn.execute(CHANGED_ACTIONS, {"batch_id": batch_id, "since": str(since)})
-            status = BatchStatus(batch_id, batch.state, batch.failure, [ActionStatus(*row[:-1], json.loads(row[-1]) if row[-1] is not None else None) for row in actions])
-            return status, int(batch.xmin)
+            rows = list(await conn.execute(CHANGED_ACTIONS, {"batch_id": batch_id, "since": str(since)}))
+            held: dict[str, tuple[UUID, datetime | None]] = {}
+            for key, held_by, held_since in await conn.execute(HELD_READY_ACTIONS, {"batch_id": batch_id}):
+                held.setdefault(key, (held_by, held_since))
+            # A hold that starts or changes after an action became ready writes nothing to its row, so the held
+            # actions are read again here for a follower to see it.
+            unchanged = held.keys() - {row.input_key for row in rows}
+            if unchanged:
+                rows += await conn.execute(ACTIONS_OF_KEYS, {"batch_id": batch_id, "keys": sorted(unchanged)})
+                rows.sort(key=lambda row: (row.theory, row.input_key))
+            actions = [
+                ActionStatus(
+                    *row[:-1], json.loads(row[-1]) if row[-1] is not None else None, *held.get(row.input_key, (None, None))
+                )
+                for row in rows
+            ]
+            return BatchStatus(batch_id, batch.state, batch.failure, actions), int(batch.xmin)
 
     @contextlib.contextmanager
     def watch(self, batch_id: UUID) -> Iterator[asyncio.Event]:

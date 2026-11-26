@@ -2483,7 +2483,9 @@ The coordinator's protocol, in what holbuild uses of it:
   interrupted attempt, keeps the log an earlier attempt uploaded. An action
   retried after a failure is printed as
   `waiting (<failure>), attempts <n>, tier <tier>, log /cas/<sha>`, and
-  likewise when ready and running. A stream may start over: it
+  likewise when ready and running. A ready build that another batch's build of
+  the same input key and spec holds back carries `held_by` and `held_since`;
+  holbuild prints `held by batch <held_by> since <held_since>` once per hold. A stream may start over: it
   sends every action's current state first.
   A skipped dependent uses the existing action state `cancelled` with
   `last_failure` beginning `skipped because of `; its reason names the failed

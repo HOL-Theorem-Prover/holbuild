@@ -988,7 +988,9 @@ for it. holbuild sends one random id with every attempt of a submission.
         "last_claimed_at": "<ISO 8601 timestamp>|null",
         "finished_at": "<ISO 8601 timestamp>|null",
         "worker": "<worker name>|null",
-        "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null
+        "timings": {"<phase>": <ms>, ..., "wall": <ms>}|null,
+        "held_by": "<batch_id>|null",
+        "held_since": "<ISO 8601 timestamp>|null"
       }
     ]
   }
@@ -1007,6 +1009,11 @@ included). Unclaimed actions have null fields; claims an older
 coordinator made have a timestamp without a worker or finish time. Worker
 names are supplied by the worker, defaulting to its hostname and process ID.
 These fields retain only the latest attempt, not its retry history.
+`held_by` and `held_since` are set while a ready build waits behind another
+batch's live lease of the same input key and spec (single-flight): that
+batch, and when it last claimed the key. Status and event streams read them
+on every read, so a hold that starts, or a holder that claims again, after the
+action became ready reaches the stream on its next read.
 `interruptions` counts the claims of the action given back without counting
 an attempt, up to `REMOTE_EXEC_MAX_INTERRUPTIONS`: those that ended
 `unavailable` (a worker drained or scaled in, or the cache was out) and those
@@ -1040,7 +1047,7 @@ nested phase durations. Do not add their totals to obtain elapsed wall time.
   stream with nothing to send for `REMOTE_EXEC_EVENTS_KEEPALIVE_SECONDS` sends
   an empty line, which clients skip, so a proxy doesn't close it as idle:
   ```json
-  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "interruptions": 0, "last_failure": null, "log_sha256": null, "failure_detail": null, "last_claimed_at": null, "finished_at": null, "worker": null, "timings": null}
+  {"type": "action", "input_key": "…", "theory": "…", "state": "…", "tier": "…", "attempts": 1, "interruptions": 0, "last_failure": null, "log_sha256": null, "failure_detail": null, "last_claimed_at": null, "finished_at": null, "worker": null, "timings": null, "held_by": null, "held_since": null}
   {"type": "batch", "state": "done|failed|cancelled", "failure": "<message>|null"}
   ```
   A client detaches by closing the connection and reattaches by opening the

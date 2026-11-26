@@ -1149,6 +1149,69 @@ async def test_a_held_action_is_claimed_once_its_leaders_lease_expires(
     assert await claim(http) is None  # now the follower's lease holds the leader's retry
 
 
+async def test_a_held_ready_build_names_the_batch_holding_it_and_when_that_batch_claimed_it(
+    http: httpx.AsyncClient,
+) -> None:
+    leader = await submit(http, ["a"])
+    await claim_named(http, "a")
+    follower = await submit(http, ["a", "b"])
+    forced = f"holbuild-action-batch-v1\naction {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
+    response = await http.post("/v1/batches", content=forced, headers=CLIENT)
+    assert response.status_code == 201, response.text
+
+    claimed_at = (await batch(http, leader))["actions"][0]["last_claimed_at"]
+    held = {a["theory"]: (a["held_by"], a["held_since"]) for a in (await batch(http, follower))["actions"]}
+    assert held == {"pkg:a": (leader, claimed_at), "pkg:b": (None, None)}
+    # A copy with another spec isn't held; nor is the leader's own copy.
+    for other in (response.json()["batch_id"], leader):
+        assert [(a["held_by"], a["held_since"]) for a in (await batch(http, other))["actions"]] == [(None, None)]
+
+
+async def test_a_hold_that_starts_or_is_claimed_again_after_ready_reaches_the_event_stream(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+) -> None:
+    """Neither the leader's claim nor its claim again after its lease expired writes the held copy's row."""
+    coordinator.settings.claim_ranking_seconds = 0
+    follower = await submit(http, ["a"])
+    reads = 0
+    changes = coordinator.changes
+
+    async def counted(batch_id: UUID, since: int) -> Any:
+        nonlocal reads
+        reads += 1
+        return await changes(batch_id, since)
+
+    async def polled() -> None:
+        start = reads
+        while reads < start + 2:  # a poll that began after the write
+            await asyncio.sleep(0.01)
+
+    async def follow() -> list[dict[str, Any]]:
+        async with http.stream("GET", f"/v1/batches/{follower}/events", headers=CLIENT) as response:
+            return [json.loads(line) async for line in response.aiter_lines() if line]
+
+    coordinator.changes = counted  # type: ignore[method-assign]
+    stream = asyncio.create_task(follow())
+    await polled()
+    leader = await submit(http, ["a"], priority="1")  # claimed ahead of the follower's older copy
+    await claim_named(http, "a")
+    await polled()
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
+    await coordinator.sweep()
+    await claim_named(http, "a")
+    await polled()
+    assert (await http.post(f"/v1/batches/{follower}/cancel", headers=CLIENT)).status_code == 200
+
+    events = [(e["state"], e["held_by"], e["held_since"]) for e in await stream if e["type"] == "action"]
+    claimed_at = (await batch(http, leader))["actions"][0]["last_claimed_at"]
+    assert [state for state, _, _ in events] == ["ready", "ready", "ready", "cancelled"]
+    assert events[0][1:] == (None, None)
+    assert events[1][1] == events[2][1] == leader
+    assert datetime.fromisoformat(events[1][2]) < datetime.fromisoformat(events[2][2])
+    assert datetime.fromisoformat(events[2][2]) == datetime.fromisoformat(claimed_at)
+
+
 async def test_a_held_build_leaves_the_idle_run_fallback_to_a_ready_run(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:

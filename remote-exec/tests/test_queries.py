@@ -375,6 +375,9 @@ STATEMENTS = [
     Statement(cm.RELEASABLE_ALL, lambda f: {}, 13_000),
     Statement(cm.RELEASABLE_BATCH, lambda f: {"batch_id": f.fresh}, 13_000),
     Statement(cm.CHANGED_ACTIONS, lambda f: {"batch_id": f.fresh, "since": str(f.since)}, 100),
+    Statement(cm.ACTIONS_OF_KEYS, lambda f: {"batch_id": f.fresh, "keys": f.arrival.keys("ready")[:20]}, 100),
+    # Every live lease of the fresh batch, whose copies in the steady batch are done.
+    Statement(cm.HELD_READY_ACTIONS, lambda f: {"batch_id": f.steady}, 1_900),
     Statement(
         cm.CLAIM_CANDIDATES, lambda f: {"tiers": ["standard"], "classes": ["build", "run"], "run_slots": 30}, 16_000
     ),
