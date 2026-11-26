@@ -388,6 +388,8 @@ STATEMENTS = [
     Statement(cm.FIRST_READY_PLACE, lambda f: {"batch_id": f.fresh, "tier": "standard"}, 2_900),
     Statement(cm.LOCK_KEY, lambda f: {"key": f.arrival.keys("ready")[0], "spec": "s"}, 100),
     Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("ready")[0], "spec": "s"}, 2_100),
+    # A leased key, whose lease's action is read for its spec.
+    Statement(cm.KEY_LEASED, lambda f: {"key": f.arrival.keys("running")[0], "spec": "s"}, 2_100),
     Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2, "outlined": f.outlined()}, 120_000),
     Statement(cm.AHEAD_CANDIDATES, lambda f: {"depth": 2, "outlined": f.outlined_plain()}, 120_000),
     Statement(

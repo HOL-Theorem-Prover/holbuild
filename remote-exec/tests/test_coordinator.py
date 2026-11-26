@@ -1096,21 +1096,30 @@ async def test_one_release_finishes_the_copies_of_several_builds_in_a_batch_each
 
 
 async def test_a_copy_with_another_spec_is_claimed_while_the_build_runs_and_not_done_by_it(
-    http: httpx.AsyncClient, cache: FakeCache
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache
 ) -> None:
     """A forced, traced or untimed build has the same keys as a plain one, but its own spec: the plain build can't
     finish it, so it doesn't wait for it, as a timed build once waited hours on an untimed one."""
+
+    async def submit_forced(text: str) -> str:
+        response = await http.post("/v1/batches", content="holbuild-action-batch-v1\n" + text, headers=CLIENT)
+        assert response.status_code == 201, response.text
+        return response.json()["batch_id"]
+
     await submit(http, ["a"])
     token = await claim_named(http, "a")
-    forced = f"holbuild-action-batch-v1\naction {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
-    response = await http.post("/v1/batches", content=forced, headers=CLIENT)
-    assert response.status_code == 201, response.text
+    forced_a = f"action {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
+    ready = await submit_forced(forced_a)
     second = await claim_named(http, "a")
     assert second != token
+    waiting = await submit_forced(
+        f"action {input_key('p')} {ac_key('p')} {spec('p')} pkg:p\n{forced_a}edge {input_key('a')} {input_key('p')}\n"
+    )
 
     cache.keys.add(ac_key("a"))
     assert (await complete(http, token, result("a", "built"))).status_code == 200
-    assert await states(http, response.json()["batch_id"]) == {"a": "running"}
+    await coordinator.release()
+    assert (await states(http, ready), await states(http, waiting)) == ({"a": "running"}, {"p": "ready", "a": "waiting"})
 
 
 async def test_a_held_action_wakes_a_waiting_claim_once_its_leader_fails(
