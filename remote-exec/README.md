@@ -842,14 +842,16 @@ demand = min(MAX_BURST_WORKERS, max(0, active - WARM_WORKERS, high) + waiting_ah
 A build's dependency graph narrows and widens: a few theories everything else
 waits on run alone, then many become ready together. Following the queue
 exactly would stop burst workers at every narrow point and start them again
-seconds later. So the target is the highest demand of the last
+seconds later. So the target is the highest held target from the last
 `REMOTE_EXEC_SCALE_DOWN_HOLD_S` seconds: it rises at once when demand is within
 `REMOTE_EXEC_SCALE_UP_FREE_WORKERS`, and falls only after demand has stayed
 lower for that long. Demand above that allowance must remain sustained for
 `REMOTE_EXEC_SCALE_UP_HOLD_S` seconds before the target rises further. Each
-scale check records its demand in the database, and a recovery within the
-scale-down hold carries an earned target across the recent dip samples, so a
-restarted coordinator keeps holding the target after older samples are pruned.
+scale check records its demand and earned target in the database. A recovery
+within the scale-down hold carries the earned target across recent dip samples,
+so a restarted coordinator keeps holding it after older observations are
+pruned. Earned-target markers are negative companion rows in `burst_demand` and
+are ignored by the cache pool's positive-demand query.
 
 Nonempty batch submissions request a background scale check immediately after
 making root actions ready. Concurrent requests are coalesced, and intake and
