@@ -15423,6 +15423,17 @@ val module_publish_grace = Time.fromSeconds 10
 fun module_request_fits deadline =
   Time.<= (Time.+ (Time.now (), Time.fromSeconds (Int.toLarge HolbuildRemoteCache.stall_timeout_seconds)), deadline)
 
+fun module_transfer_fits bounded deadline =
+  if bounded then Time.< (Time.now (), deadline) else module_request_fits deadline
+
+fun with_module_deadline bounded deadline f =
+  HolbuildHttp.with_deadline (if bounded then SOME deadline else NONE)
+    (fn () => HolbuildRemoteCache.retrying_within deadline f)
+
+(* Reserve one settle and a confirmation wave, even if the last transfer stalls. *)
+fun module_confirmation_reserve deadline =
+  Time.- (deadline, Time.+ (shared_heap_claim_settle, Time.fromSeconds 2))
+
 (* Puts the module file SRC in STORE as NAME, unless the store has a
    module of that name: a name keeps the module it first held, whose id
    the deps heaps saved with it require (a module HOL writes again gets
@@ -15479,15 +15490,16 @@ fun install_downloaded_module store (file as {src, ...}) =
 fun fetch_published_modules remote {store, staging, wanted, deadline} =
   let
     val remote_required = !HolbuildRemoteCache.fail_closed
+    val probe_by = if remote_required then module_confirmation_reserve deadline else deadline
     val probes = ref 0
     val installed = ref 0
     val unpublished = ref ([] : string list)
     val observed = ref []
     val mutex = Mutex.mutex ()
     fun count f = (Mutex.lock mutex; f (); Mutex.unlock mutex)
-    fun fits () = module_request_fits deadline
+    fun fits limit = module_transfer_fits remote_required limit
     fun fetch name text =
-      case download_published_module remote staging name fits text of
+      case download_published_module remote staging name (fn () => fits deadline) text of
           DownloadedModule file =>
             if install_downloaded_module store file then count (fn () => installed := !installed + 1) else ()
         | _ => ()
@@ -15502,19 +15514,18 @@ fun fetch_published_modules remote {store, staging, wanted, deadline} =
           | _ => ()
       end
     fun confirm (name, key) =
-      case HolbuildRemoteCache.required (fn () => revalidate_module_action remote key) of
-          SOME text => fetch name text
-        | NONE => ()
-    fun try work item =
-      if not (fits ()) then ()
-      else HolbuildRemoteCache.retrying_within deadline (fn () => work item)
+      HolbuildRemoteCache.required (fn () =>
+        case revalidate_module_action remote key of SOME text => fetch name text | NONE => ())
+    fun try limit work item =
+      if not (fits limit) then ()
+      else with_module_deadline remote_required limit (fn () => work item)
            handle Thread.Interrupt => raise Thread.Interrupt
                 | e => warn ("theory module not fetched: " ^ General.exnMessage e)
   in
     HolbuildRemoveTree.remove_untrusted staging;
     ensure_dir staging;
-    parallel_all remote_probe_width (try probe) wanted;
-    settle_module_actions (try confirm) (!observed);
+    parallel_all remote_probe_width (try probe_by probe) wanted;
+    settle_module_actions (try deadline confirm) (!observed);
     HolbuildRemoveTree.remove_untrusted staging;
     {probes = !probes, installed = !installed, unpublished = !unpublished}
   end
@@ -15527,13 +15538,8 @@ datatype module_confirmation = WrittenModule | ObservedModule of {src : string, 
 fun converge_modules remote {store, staging, modules, deadline} =
   let
     val remote_required = !HolbuildRemoteCache.fail_closed
-    (* Leave time to settle and read back entries, even if the last upload
-       stalls. For each request, the transport uses the time still left. *)
-    val publish_by =
-      if remote_required then Time.- (deadline, Time.+ (shared_heap_claim_settle, Time.fromSeconds 2))
-      else deadline
-    fun fits limit =
-      if remote_required then Time.< (Time.now (), limit) else module_request_fits limit
+    val publish_by = if remote_required then module_confirmation_reserve deadline else deadline
+    fun fits limit = module_transfer_fits remote_required limit
     val mutex = Mutex.mutex ()
     val installed = ref []
     val won = ref []
@@ -15560,19 +15566,6 @@ fun converge_modules remote {store, staging, modules, deadline} =
       if remote_required orelse length (HolbuildRemoteCache.action_urls remote key) > 1
       then SOME (file, key, text, WrittenModule)
       else (published_one (); install_own file; NONE)
-    fun heal (file, key) =
-      case (if fits publish_by then upload file else NONE) of
-          SOME sha =>
-            let val text = manifest file sha
-            in
-              if fits publish_by andalso
-                 HolbuildRemoteCache.replace_action_everywhere remote {key = key, text = text}
-                 = HolbuildCacheBackend.Published
-              then if remote_required then SOME (file, key, text, WrittenModule)
-                   else (published_one (); install_own file; NONE)
-              else (local_fallback file; NONE)
-            end
-        | NONE => (local_fallback file; NONE)
     fun download limit file text =
       case module_file_theory_part file of
           SOME wanted => HolbuildRemoteCache.required (fn () =>
@@ -15580,18 +15573,44 @@ fun converge_modules remote {store, staging, modules, deadline} =
         | NONE => UnusableModuleEntry
     fun install_winner file downloaded =
       if install_downloaded_module store downloaded then count (fn () => won := file :: !won) else ()
-    fun take_existing (module as (file, key)) text =
+    fun take_existing (file, key) text repair =
       case download publish_by file text of
           DownloadedModule downloaded =>
             if remote_required then SOME (file, key, text, ObservedModule downloaded)
             else (install_winner file downloaded; NONE)
-        | MissingModuleBlob => heal module
+        | MissingModuleBlob => repair ()
         | UnusableModuleEntry => NONE
+    fun heal (module as (file, key)) broken =
+      let
+        fun replace sha =
+          let val text = manifest file sha
+          in
+            if fits publish_by andalso
+               HolbuildRemoteCache.replace_action_everywhere remote {key = key, text = text}
+               = HolbuildCacheBackend.Published
+            then if remote_required then SOME (file, key, text, WrittenModule)
+                 else (published_one (); install_own file; NONE)
+            else (local_fallback file; NONE)
+          end
+      in
+        case (if fits publish_by then upload file else NONE) of
+            SOME sha =>
+              if not remote_required then replace sha
+              else if not (fits publish_by) then NONE
+              else
+                (* Uploading the blob can outlast another worker's repair. *)
+                (case HolbuildRemoteCache.required (fn () => lookup key) of
+                     SOME current =>
+                       if current = broken then replace sha else take_existing module current (fn () => NONE)
+                   | NONE => NONE)
+          | NONE => (local_fallback file; NONE)
+      end
+    fun use_existing module text = take_existing module text (fn () => heal module text)
     fun one (module as (file, key)) =
       if not (fits publish_by) then (local_fallback file; NONE)
       else
         case lookup key of
-            SOME text => take_existing module text
+            SOME text => use_existing module text
           | NONE =>
               case (if fits publish_by then upload file else NONE) of
                   NONE => (local_fallback file; NONE)
@@ -15608,7 +15627,7 @@ fun converge_modules remote {store, staging, modules, deadline} =
                               if at <> hd (HolbuildRemoteCache.action_urls remote key)
                               then (local_fallback file; NONE)
                               else if not (fits publish_by) then NONE
-                              else (case lookup key of SOME winner => take_existing module winner | NONE => NONE)
+                              else (case lookup key of SOME winner => use_existing module winner | NONE => NONE)
                           | _ => (local_fallback file; NONE)
                     end
     fun read_back (file, key, text, pending) =
@@ -15639,12 +15658,9 @@ fun converge_modules remote {store, staging, modules, deadline} =
           | WrittenModule => latest ()
       end
     fun guarded limit f file =
-      let val http_deadline = if remote_required then SOME limit else NONE
-      in
-        HolbuildHttp.with_deadline http_deadline (fn () => HolbuildRemoteCache.retrying_within limit f)
-        handle Thread.Interrupt => raise Thread.Interrupt
-             | e => (warn ("theory module not published: " ^ General.exnMessage e); local_fallback file)
-      end
+      with_module_deadline remote_required limit f
+      handle Thread.Interrupt => raise Thread.Interrupt
+           | e => (warn ("theory module not published: " ^ General.exnMessage e); local_fallback file)
     val confirm = ref []
     val _ =
       transfer_all (fn module as (file, _) =>

@@ -728,8 +728,9 @@ val read_between_writes = "$tmpdir/read-between-writes";
 val _ = E.write_text (staged1 ^ "/" ^ file) "first module";
 val _ = E.write_text (staged2 ^ "/" ^ file) "second module";
 val _ = E.write_text (reader_stage ^ "/" ^ file) "reader module";
-fun enable control phase = E.write_text (control ^ "action-put-1-" ^ phase ^ "-enable") "";
-fun release control phase = E.write_text (control ^ "action-put-1-" ^ phase ^ "-release") "";
+fun put_gate control sequence phase = control ^ "action-put-" ^ Int.toString sequence ^ "-" ^ phase;
+fun enable control sequence phase = E.write_text (put_gate control sequence phase ^ "-enable") "";
+fun release control sequence phase = E.write_text (put_gate control sequence phase ^ "-release") "";
 fun await_event event =
   let
     val limit = deadline 10
@@ -738,12 +739,12 @@ fun await_event event =
       else if Time.< (Time.now (), limit) then (OS.Process.sleep (Time.fromMilliseconds 10); wait ())
       else raise Fail ("worker did not reach " ^ event)
   in wait () end;
-fun await control phase = await_event (control ^ "action-put-1-" ^ phase ^ "-event");
-val _ = List.app (fn control => (enable control "before"; enable control "after")) [control1, control2];
+fun await control sequence phase = await_event (put_gate control sequence phase ^ "-event");
+val _ = List.app (fn control => (enable control 1 "before"; enable control 1 "after")) [control1, control2];
 val _ = E.write_text (control2 ^ "download-enable") "";
 fun interleave () =
-  (await control1 "before"; await control2 "before";
-   release control1 "before"; await control1 "after";
+  (await control1 1 "before"; await control2 1 "before";
+   release control1 1 "before"; await control1 1 "after";
    E.copy_binary action first_action;
    E.copy_binary action stale;
    E.write_text read_between_writes "";
@@ -751,9 +752,9 @@ fun interleave () =
    check "the third worker did not read the first module between writes"
      (String.isSubstring ("GET /cas/" ^ HolbuildHash.string_sha256 "first module" ^ "\n")
        (E.read_text "$tmpdir/host2/requests.log"));
-   release control2 "before"; await control2 "after";
+   release control2 1 "before"; await control2 1 "after";
    E.write_text (control2 ^ "download-release") "";
-   release control1 "after"; release control2 "after");
+   release control1 1 "after"; release control2 1 "after");
 val until = deadline 60;
 val interleaved = ref false;
 val _ = E.parallel_all 4 (fn f => f ()) [
@@ -774,9 +775,47 @@ val _ = E.copy_binary first_action stale;
 val prefetch_store = dir "prefetch-store";
 val {installed, ...} = E.fetch_published_modules host1
   {store = prefetch_store, staging = dir "prefetch-stage",
-   wanted = [(valOf (E.module_file_theory_part file), race)], deadline = deadline 60};
+   wanted = [(valOf (E.module_file_theory_part file), race)], deadline = deadline 15};
 val _ = check "prefetch installed the stale host-cache module"
   (installed = 1 andalso E.read_text (prefetch_store ^ "/" ^ file) = "second module" andalso not (exists stale));
+
+(* Both workers see a broken entry. The first confirms and installs its
+   repair while the second's blob upload is still in flight. *)
+val repair = HolbuildHash.string_sha256 "repairing module";
+val repair_action = "$tmpdir/upstream/ac/" ^ Cache.remote_action_key repair;
+val repair_store1 = dir "repair-store1";
+val repair_store2 = dir "repair-store2";
+val _ = E.copy_binary first_action repair_action;
+val _ = OS.FileSys.remove ("$tmpdir/upstream/cas/" ^ HolbuildHash.string_sha256 "first module");
+val _ = E.write_text (staged1 ^ "/" ^ file) "first repair";
+val _ = E.write_text (staged2 ^ "/" ^ file) "second repair";
+val _ = E.write_text (control2 ^ "cas-put-enable") "";
+val repair_until = deadline 60;
+val _ = E.parallel_all 2 (fn f => f ()) [
+  fn () => ignore (install host2 repair_store2 staged2 [(file, repair)] repair_until),
+  fn () =>
+    (await_event (control2 ^ "cas-put-count");
+     check "the first worker did not confirm its repair"
+       (#published (install host1 repair_store1 staged1 [(file, repair)] repair_until) = 1);
+     E.write_text (control2 ^ "cas-put-release") "")];
+val _ = check "the second worker overwrote a confirmed repair"
+  (E.read_text (repair_store1 ^ "/" ^ file) = "first repair" andalso
+   E.read_text (repair_store2 ^ "/" ^ file) = "first repair");
+
+(* The action PUT has succeeded but becomes unreadable before the worker
+   can confirm it. The published bytes alone do not permit installation. *)
+val unconfirmed = HolbuildHash.string_sha256 "unconfirmed module";
+val unconfirmed_key = Cache.remote_action_key unconfirmed;
+val unconfirmed_store = dir "unconfirmed-store";
+val _ = enable control1 3 "after";
+val _ = E.parallel_all 2 (fn f => f ()) [
+  fn () => ignore (install host1 unconfirmed_store staged1 [(file, unconfirmed)] (deadline 15)),
+  fn () =>
+    (await control1 3 "after";
+     E.write_text (control1 ^ "ac-get-status-" ^ unconfirmed_key) "404";
+     release control1 3 "after")];
+val _ = check "the worker stored a module after the read-back missed"
+  (exists ("$tmpdir/upstream/ac/" ^ unconfirmed_key) andalso not (exists (unconfirmed_store ^ "/" ^ file)));
 
 (* A stopped deep writer gets a useful publish window even with less than
    the 30 s stall timeout left. The fixture supplies the 512 finished files. *)
@@ -818,6 +857,8 @@ fun check_stalled_lookup theory =
   end;
 val _ = if HolbuildRemoteCacheConfig.uses_libcurl () then check_stalled_lookup "B" else ();
 val _ = HolbuildRemoteCacheConfig.libcurl_ready := SOME false;
+val _ = E.write_text "$tmpdir/writer.curl" "max-time = 30\n";
+val _ = HolbuildRemoteCacheConfig.local_curl_config := SOME "$tmpdir/writer.curl";
 val _ = check_stalled_lookup "C";
 SML
 (cd "$ROOT" && HOLBUILD_CACHE="$tmpdir/cache" \
