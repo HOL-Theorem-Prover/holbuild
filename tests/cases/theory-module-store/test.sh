@@ -38,16 +38,17 @@ val _ = check "two toolchains share a module store"
 val _ = check "a toolchain's store is outside the stores directory"
           (OS.Path.dir (E.module_store (tc "h1")) = E.module_stores ());
 
-(* The v4 and v3 stores use the exact toolchain key; v2 uses HOLDIR alone. *)
+(* The v5, v4 and v3 stores use the exact toolchain key; v2 uses HOLDIR alone. *)
 val exact_id = HolbuildHash.string_sha256 (h1 ^ "\n" ^ HolbuildToolchain.toolchain_key (tc "h1"));
 val _ = check "unexpected store paths"
-          (E.module_store (tc "h1") = OS.Path.concat (E.module_stores (), "v4-" ^ exact_id) andalso
-           E.module_store_v3 (tc "h1") = OS.Path.concat (E.module_stores (), "v3-" ^ exact_id) andalso
+          (E.module_store (tc "h1") = OS.Path.concat (E.module_stores (), "v5-" ^ exact_id) andalso
+           E.exact_module_store "v4-" (tc "h1") = OS.Path.concat (E.module_stores (), "v4-" ^ exact_id) andalso
+           E.legacy_exact_module_store_prefixes = ["v4-", "v3-"] andalso
            E.module_store_v2 h1 = OS.Path.concat (E.module_stores (), "v2-" ^ E.module_store_id h1));
 val _ = check "the remote key of a module changed"
           (E.module_remote_key {toolchain = "t", store = E.module_store_id "/h1", wanted = "w", dat_sha256 = "d"} =
            HolbuildHash.string_sha256
-             ("holbuild-theory-module-v1\ntoolchain=t\nstore=" ^ HolbuildHash.string_sha256 "/h1" ^
+             ("holbuild-theory-module-v2\ntoolchain=t\nstore=" ^ HolbuildHash.string_sha256 "/h1" ^
               "\nmodule=w\ndat-sha256=d\n"));
 
 val sha = "0123456789abcdef0123456789abcdef01234567";
@@ -75,21 +76,22 @@ val _ = E.write_child_policy (tc "h1") policy_file;
 val _ = check "a child using the store left it looking unused"
           (Time.> (OS.FileSys.modTime store, Time.zeroTime));
 
-(* A warm host seeds only the marker, favouring v3 when both exist. *)
+(* A warm host seeds only the marker, favouring v4, then v3, then v2. *)
 fun base_theories dir = OS.Path.concat (dir, "base-theories");
 fun seed_legacy dir text =
   (OS.FileSys.mkDir dir; E.write_text (base_theories dir) text);
-val v3 = E.module_store_v3 (tc "h1");
+val v4 = E.exact_module_store "v4-" (tc "h1");
 val _ = seed_legacy (E.module_store_v2 h1) "min\n";
-val _ = seed_legacy v3 "min\nbool\n";
+val _ = seed_legacy (E.exact_module_store "v3-" (tc "h1")) "min\nv3\n";
+val _ = seed_legacy v4 "min\nbool\n";
 val legacy_module = hd expected;
-val _ = E.write_text (OS.Path.concat (v3, legacy_module)) "legacy module";
+val _ = E.write_text (OS.Path.concat (v4, legacy_module)) "legacy module";
 val _ = E.seed_module_store (tc "h1");
-val _ = check "the v3 marker did not take precedence"
+val _ = check "the v4 marker did not take precedence"
           (E.read_text (base_theories store) = "min\nbool\n");
 val _ = check "seeding copied a legacy module"
           (not (E.file_exists (OS.Path.concat (store, legacy_module))));
-val _ = E.write_text (base_theories v3) "changed\n";
+val _ = E.write_text (base_theories v4) "changed\n";
 val _ = E.seed_module_store (tc "h1");
 val _ = check "seeding overwrote the current store's base theories"
           (E.read_text (base_theories store) = "min\nbool\n");
