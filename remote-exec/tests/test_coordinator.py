@@ -1095,23 +1095,21 @@ async def test_one_release_finishes_the_copies_of_several_builds_in_a_batch_each
     assert (logs["pkg:a"], logs["pkg:b"]) == ("a" * 64, "b" * 64)
 
 
-async def test_a_copy_with_another_spec_wakes_a_waiting_claim_rather_than_being_done_with_a_build(
-    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+async def test_a_copy_with_another_spec_is_claimed_while_the_build_runs_and_not_done_by_it(
+    http: httpx.AsyncClient, cache: FakeCache
 ) -> None:
-    """A forced or traced build has the same keys as a plain one, but its own spec: it must run itself."""
-    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only the wake can end the wait in time
+    """A forced, traced or untimed build has the same keys as a plain one, but its own spec: the plain build can't
+    finish it, so it doesn't wait for it, as a timed build once waited hours on an untimed one."""
     await submit(http, ["a"])
     token = await claim_named(http, "a")
     forced = f"holbuild-action-batch-v1\naction {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
     response = await http.post("/v1/batches", content=forced, headers=CLIENT)
     assert response.status_code == 201, response.text
-    waiting = asyncio.create_task(coordinator.claim(["standard"], "w2", 30))
-    await asyncio.sleep(0.5)
-    assert not waiting.done()
+    second = await claim_named(http, "a")
+    assert second != token
 
     cache.keys.add(ac_key("a"))
     assert (await complete(http, token, result("a", "built"))).status_code == 200
-    assert (await asyncio.wait_for(waiting, 10)).theory == "pkg:a"
     assert await states(http, response.json()["batch_id"]) == {"a": "running"}
 
 
@@ -1179,7 +1177,7 @@ async def test_a_key_another_batch_s_claim_is_leasing_is_passed_over_for_the_nex
 
     async with remote_exec_engine.connect() as other, other.begin():
         # Another batch's claim of "a", between its lock of the key and its commit.
-        await other.execute(coordinator_module.LOCK_KEY, {"key": input_key("a")})
+        await other.execute(coordinator_module.LOCK_KEY, {"key": input_key("a"), "spec": spec("a")})
         await claim_named(http, "b")
         assert await claim(http) is None
 
