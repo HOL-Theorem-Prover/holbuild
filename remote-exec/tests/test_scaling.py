@@ -119,6 +119,20 @@ def test_held_target_drops_a_short_spike_without_scaling_above_free_workers() ->
     assert held_target(samples, samples[-1][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 80
 
 
+def test_held_target_ignores_samples_after_now() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    samples = [
+        (start, 80),
+        (start + timedelta(seconds=180), 80),
+        (start + timedelta(seconds=220), 120),
+    ]
+
+    assert (
+        held_target(samples, start + timedelta(seconds=200), down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540)
+        == 80
+    )
+
+
 def test_held_target_holds_a_high_target_across_a_brief_dip() -> None:
     start = datetime(2026, 1, 1, tzinfo=UTC)
     samples = [
@@ -128,9 +142,46 @@ def test_held_target_holds_a_high_target_across_a_brief_dip() -> None:
         (start + timedelta(seconds=220), 120),
     ]
 
-    assert held_target(samples, samples[2][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 120
+    assert (
+        held_target(samples[:3], samples[2][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540)
+        == 120
+    )
     assert held_target(samples, samples[3][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 120
     assert held_target(samples[:3], start + timedelta(seconds=241), down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 80
+
+
+async def test_scale_preserves_an_earned_target_after_its_samples_age_out(
+    coordinator: Coordinator,
+) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = start
+    demand = 120
+    settings = coordinator.settings.model_copy(
+        update={
+            "max_burst_workers": 540,
+            "scale_down_hold_s": 60.0,
+            "scale_up_hold_s": 180.0,
+            "scale_up_free_workers": 96,
+        }
+    )
+    scaled = Coordinator(coordinator.engine, coordinator.cache, settings)
+    scaled.clock = lambda: now
+    scaled._burst_demand = lambda counts: demand
+
+    for seconds in range(0, 1201, 5):
+        now = start + timedelta(seconds=seconds)
+        demand = 80 if seconds >= 300 and seconds % 40 == 0 else 120
+        await scaled.scale()
+
+    assert (await scaled.queue()).desired_burst_workers == 120
+
+    for seconds in range(1205, 1266, 5):
+        now = start + timedelta(seconds=seconds)
+        demand = 80
+        await scaled.scale()
+
+    assert (await scaled.queue()).desired_burst_workers == 80
+    await scaled.released()
 
 
 def scaled_coordinator(coordinator: Coordinator, tmp_path: Path, script: str) -> tuple[Coordinator, Path]:

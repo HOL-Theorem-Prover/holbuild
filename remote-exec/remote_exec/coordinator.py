@@ -454,16 +454,15 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int,
     return min(demand, max_burst_workers)
 
 
-def held_target(
+def sample_targets(
     samples: Sequence[tuple[datetime, int]],
-    now: datetime,
     *,
     down_hold_s: float,
     up_hold_s: float,
     free_workers: int,
     cap: int,
-) -> int:
-    """Return the burst target held by recent demand samples."""
+) -> list[tuple[datetime, int]]:
+    """Compute the held target at each burst-demand sample."""
     targets: list[tuple[datetime, int]] = []
     for i, (at, workers) in enumerate(samples):
         held = max(
@@ -478,8 +477,29 @@ def held_target(
             starts = [j for j in range(i + 1) if samples[j][0] <= cutoff]
             sustained = min(samples[j][1] for j in range(starts[-1], i + 1)) if starts else 0
         targets.append((at, min(cap, max(free, sustained))))
+    return targets
+
+
+def held_target(
+    samples: Sequence[tuple[datetime, int]],
+    now: datetime,
+    *,
+    down_hold_s: float,
+    up_hold_s: float,
+    free_workers: int,
+    cap: int,
+) -> int:
+    """Return the burst target held by recent demand samples."""
+    samples = [(at, workers) for at, workers in samples if at <= now]
+    targets = sample_targets(
+        samples,
+        down_hold_s=down_hold_s,
+        up_hold_s=up_hold_s,
+        free_workers=free_workers,
+        cap=cap,
+    )
     return max(
-        (target for at, target in targets if (now - at).total_seconds() <= down_hold_s),
+        (target for at, target in targets if 0 <= (now - at).total_seconds() <= down_hold_s),
         default=0,
     )
 
@@ -1157,7 +1177,8 @@ COUNT_CLAIMABLE = (
 )
 BURST_DEMAND = sa.text(
     "SELECT at, workers FROM burst_demand "
-    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold) ORDER BY at"
+    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold) "
+    "AND at <= CAST(:now AS timestamptz) ORDER BY at"
 )
 COUNT_UNFINISHED = sa.text(
     "SELECT a.state, a.tier, a.class, b.priority > 0, count(*) FROM actions a "
@@ -4102,13 +4123,37 @@ class Coordinator:
                     (row.at, row.workers)
                     for row in await conn.execute(BURST_DEMAND, self._burst_demand_params(now))
                 ]
-                desired = held_target(
+                targets = sample_targets(
                     samples,
-                    now,
                     down_hold_s=self.settings.scale_down_hold_s,
                     up_hold_s=self.settings.scale_up_hold_s,
                     free_workers=self.settings.scale_up_free_workers,
                     cap=self.settings.max_burst_workers,
+                )
+                if (
+                    self.settings.scale_up_hold_s > 0
+                    and targets
+                    and targets[-1][1] > self.settings.scale_up_free_workers
+                ):
+                    await conn.execute(
+                        sa.text(
+                            "UPDATE burst_demand SET workers = :workers "
+                            "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold) "
+                            "AND at < CAST(:now AS timestamptz) AND workers < :workers"
+                        ),
+                        {
+                            "now": now,
+                            "hold": self.settings.scale_down_hold_s,
+                            "workers": targets[-1][1],
+                        },
+                    )
+                desired = max(
+                    (
+                        target
+                        for at, target in targets
+                        if 0 <= (now - at).total_seconds() <= self.settings.scale_down_hold_s
+                    ),
+                    default=0,
                 )
             last = self.scaler
             if self.settings.scale_cmd is None or (last is not None and last.error is None and last.workers == desired):

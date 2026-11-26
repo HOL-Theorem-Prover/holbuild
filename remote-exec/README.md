@@ -847,8 +847,9 @@ seconds later. So the target is the highest demand of the last
 `REMOTE_EXEC_SCALE_UP_FREE_WORKERS`, and falls only after demand has stayed
 lower for that long. Demand above that allowance must remain sustained for
 `REMOTE_EXEC_SCALE_UP_HOLD_S` seconds before the target rises further. Each
-scale check records its raw demand in the database, so a restarted coordinator
-keeps holding the target.
+scale check records its demand in the database, and a recovery within the
+scale-down hold carries an earned target across the recent dip samples, so a
+restarted coordinator keeps holding the target after older samples are pruned.
 
 Nonempty batch submissions request a background scale check immediately after
 making root actions ready. Concurrent requests are coalesced, and intake and
