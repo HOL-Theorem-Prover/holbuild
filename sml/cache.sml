@@ -287,7 +287,9 @@ fun remove_stale_children stage cutoff dir =
     0
 
 fun entry_exists path =
-  ((Posix.FileSys.lstat path; true) handle OS.SysErr _ => false)
+  ((Posix.FileSys.lstat path; true)
+   handle e as OS.SysErr (_, SOME err) =>
+            if err = Posix.Error.noent then false else raise e)
 
 fun is_regular_entry path =
   Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false

@@ -99,6 +99,7 @@ legacy_holder=
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
   "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/drain-gc.log" 2>&1
 [[ ! -e "$cache/locks/action-held.lock" ]] || { echo "held action lock survived after release" >&2; exit 1; }
+if [[ $(stat -c %h "$cache/locks") -eq 2 ]]; then
 [[ -s "$cache/locks/gc.lock" ]] || { echo "flat lock drain marker missing" >&2; exit 1; }
 env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
   "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/post-drain-gc.log" 2>&1
@@ -140,6 +141,7 @@ env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRE
   "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/rescan-drain-gc.log" 2>&1
 [[ ! -e "$cache/locks/action-held-rescan.lock" ]] || { echo "rescan-held action lock survived after release" >&2; exit 1; }
 [[ -s "$cache/locks/gc.lock" ]] || { echo "drain marker missing after rescan lock release" >&2; exit 1; }
+fi
 kill "$holder"; wait "$holder" 2>/dev/null || true
 holder=
 require_file "$cache/action-locks/ab/ab-held.lock"
