@@ -553,18 +553,21 @@ fun module_store_key tc =
           in module_store_keys := (toolchain, key) :: !module_store_keys; key end
   end
 
-(* The v3 and v4 stores use the HOL directory and the exact toolchain key:
-   rebuilding HOL in the same directory can change its base state id.
-   The v4 prefix isolates the store from older workers that can still
-   replace modules in v3.  Remote lookups keep using module_remote_key. *)
+(* The v3, v4 and v5 stores use the HOL directory and the exact toolchain
+   key: rebuilding HOL in the same directory can change its base state id.
+   Each new prefix isolates the store from older workers that can still
+   replace modules in the previous ones.  Remote lookups keep using
+   module_remote_key. *)
 fun exact_module_store prefix tc =
   Path.concat (module_stores (),
                prefix ^ HolbuildHash.string_sha256
                           (Path.mkAbsolute {path = #holdir tc, relativeTo = FS.getDir ()} ^ "\n" ^
                            module_store_key tc))
 
-fun module_store tc = exact_module_store "v4-" tc
-fun module_store_v3 tc = exact_module_store "v3-" tc
+fun module_store tc = exact_module_store "v5-" tc
+
+(* Older exact stores' prefixes, newest first. *)
+val legacy_exact_module_store_prefixes = ["v4-", "v3-"]
 fun module_store_v2 holdir = Path.concat (module_stores (), "v2-" ^ module_store_id holdir)
 
 (* Held by the worker process whose writer is filling a store
@@ -3303,7 +3306,7 @@ fun heap_runtime_identity () =
   case !heap_runtime_identity_memo of
       SOME identity => identity
     | NONE =>
-        let val identity = runtime_files_identity "holbuild-heap-runtime-v4" heap_runtime_source_files
+        let val identity = runtime_files_identity "holbuild-heap-runtime-v5" heap_runtime_source_files
         in heap_runtime_identity_memo := SOME identity; identity end
 
 (* Context checkpoints also hold the theorem numbering HOL assigned so far.
@@ -15419,7 +15422,7 @@ fun module_writer_script {output, base_state, base_theories, call} =
    the store (named by the HOL directory, whose module helper writes the
    modules) and by the theory's .dat.  The entry lists the one module
    file, under the name HOL gave it. *)
-val module_remote_header = "holbuild-theory-module-v1"
+val module_remote_header = "holbuild-theory-module-v2"
 
 fun module_remote_key {toolchain, store, wanted, dat_sha256} =
   HolbuildHash.string_sha256
@@ -16267,9 +16270,10 @@ fun write_missing_modules remote root tc wanted deadline =
      published = !published, trace = module_store_trace {files = !listing, expected = expected_names, run = !run}}
   end
 
-(* A new store takes just the base-theories list from v3, or from v2 if
-   there is no v3 list.  This lets the first preload fetch modules from
-   the remote cache without inheriting older workers' module files. *)
+(* A new store takes just the base-theories list from the newest older
+   store that has one (v4, v3, then v2).  This lets the first preload fetch
+   modules from the remote cache without inheriting older workers' module
+   files. *)
 fun seed_module_store tc =
   let
     val store = module_store tc
@@ -16279,7 +16283,9 @@ fun seed_module_store tc =
     if file_exists file then ()
     else
       case List.find file_exists
-             [base_theories (module_store_v3 tc), base_theories (module_store_v2 (#holdir tc))] of
+             (map (fn prefix => base_theories (exact_module_store prefix tc))
+                  legacy_exact_module_store_prefixes @
+              [base_theories (module_store_v2 (#holdir tc))]) of
           NONE => ()
         | SOME old =>
             let val tmp = store_temp file

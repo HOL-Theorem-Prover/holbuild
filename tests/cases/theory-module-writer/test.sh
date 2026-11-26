@@ -621,7 +621,7 @@ val _ = check ("the trace with no writer: " ^ trace) (String.isSuffix " modules_
 val _ = check "a module's remote key changed"
           (E.module_remote_keys (tc "hol1") [("w", "$tmpdir/root/src/ATheory.dat")] =
            [("w", HolbuildHash.string_sha256
-                    ("holbuild-theory-module-v1\ntoolchain=" ^ HolbuildToolchain.toolchain_key (tc "hol1") ^
+                    ("holbuild-theory-module-v2\ntoolchain=" ^ HolbuildToolchain.toolchain_key (tc "hol1") ^
                      "\nstore=" ^ HolbuildHash.string_sha256 "$tmpdir/hol1" ^ "\nmodule=w\ndat-sha256=" ^
                      HolbuildHash.file_sha256 "$tmpdir/root/src/ATheory.dat" ^ "\n"))]);
 
