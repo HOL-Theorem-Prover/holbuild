@@ -1200,8 +1200,10 @@ async def test_a_hold_that_starts_ends_or_is_claimed_again_after_ready_reaches_t
     await polled()
     async with remote_exec_engine.begin() as connection:
         await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
-    await coordinator.sweep()
     await polled()
+    expired = await coordinator.get(UUID(follower))  # an expired lease holds nothing, before the sweep deletes it
+    assert expired is not None and (expired.actions[0].held_by, expired.actions[0].held_since) == (None, None)
+    await coordinator.sweep()
     await claim_named(http, "a")
     await polled()
     assert (await http.post(f"/v1/batches/{follower}/cancel", headers=CLIENT)).status_code == 200

@@ -378,7 +378,8 @@ STATEMENTS = [
     Statement(cm.RELEASABLE_ALL, lambda f: {}, 13_000),
     Statement(cm.RELEASABLE_BATCH, lambda f: {"batch_id": f.fresh}, 13_000),
     Statement(cm.CHANGED_ACTIONS, lambda f: {"batch_id": f.fresh, "since": str(f.since)}, 100),
-    Statement(cm.ACTIONS_OF_KEYS, lambda f: {"batch_id": f.fresh, "keys": f.arrival.keys("ready")[:20]}, 100),
+    # A follower held behind every plain lease of the fresh batch, which an event stream rereads on each poll.
+    Statement(cm.ACTIONS_OF_KEYS, lambda f: {"batch_id": f.follower, "keys": f.arrival.keys("running")}, 1_600),
     Statement(cm.HELD_READY_ACTIONS, lambda f: {"batch_id": f.follower}, 4_400),
     Statement(
         cm.CLAIM_CANDIDATES, lambda f: {"tiers": ["standard"], "classes": ["build", "run"], "run_slots": 30}, 16_000
