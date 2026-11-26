@@ -68,11 +68,12 @@ For each attempt that failed for `memory` it logs a `memory attempt` line: the b
 many, whether it is retried, the action's tier and the worker's tiers, the record's `memory-cause` and `max-heap-mb`,
 the host (`boot8`) and worker, the age of the host's last report and its available and total memory, leases and
 `memory_short` in it, the other leases on the host, the checkpoint the attempt resumed from (its `resdepsn`, `resctxn`,
-`resfpn`, `resboundary` and `resstepn` phases) and the shared checkpoints it published (`pubckptn`). A retry's result
-logs a `memory retry outcome` line. A `memory shadow would-withhold` line, with a running count, marks a retry a rule
-under trial would withhold: after two attempts in a row that Poly/ML ran out of store under the same cap, resuming from
-the same checkpoint, the second publishing none. The lines only log: the retry runs. The coordinator keeps the last such
-attempt per action in memory, so a restart forgets it.
+`resfpn`, `resboundary` and `resstepn` phases) and the shared checkpoints it published (`pubckptn`). A retry's result,
+built or failed, memory included, logs a `memory retry outcome` line. A `memory shadow would-withhold` line, with a
+running count, marks a retry a rule under trial would withhold: after two attempts in a row that Poly/ML ran out of
+store under the same cap, resuming from the same checkpoint, the second publishing none. It is counted when the retry is
+queued, so one whose batch ends first counts too. The lines only log: the retry runs. The coordinator keeps the last
+such attempt per action in memory, so a restart forgets it.
 
 Without the image, from this directory: `uv sync`, then `uv run alembic
 upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090`.

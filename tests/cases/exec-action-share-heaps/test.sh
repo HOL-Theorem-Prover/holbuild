@@ -224,6 +224,11 @@ require_grep '^holbuild-shared-heap-v1$' \
 grep -qE '^holbuild shared-heap publish theory=share:[^ ]* heap=[0-9a-f]{64} result=non-target checkpoints=0$' \
   "$tmpdir/a-shared-v1.log" || { echo "A logged no non-target publish:" >&2; cat "$tmpdir/a-shared-v1.log" >&2; exit 1; }
 [[ ! -e "$shared/checkpoints" ]] || { echo "the private checkpoint tree outlived the action" >&2; exit 1; }
+# It counts the checkpoint entries it published.
+checkpoints_v1=$(sed -n 's/^holbuild shared-heap publish .* checkpoints=\([0-9]*\)$/\1/p' "$tmpdir/v1.log")
+[[ "$checkpoints_v1" -gt 0 &&
+   "$checkpoints_v1" == "$(grep -lx 'holbuild-shared-checkpoint-v1' "$tmpdir"/remote/ac/* | wc -l)" ]] || {
+  echo "v1 logged checkpoints=$checkpoints_v1, not the checkpoint entries the cache holds" >&2; exit 1; }
 
 # An edit of the first theorem resumes from the shared heap alone.
 write_t "T \\/ F" "simp[]"
@@ -351,6 +356,17 @@ for path in $(index_entries); do
   [[ "$(grep -cx "${path##*/}" "$tmpdir/control/no-cache-gets")" -ge 2 ]] || {
     echo "v3e's restore and publish didn't both ask the cache to check its copy of the index" >&2; exit 1; }
 done
+
+# Checkpoint entries the cache refuses aren't counted as published.
+echo "holbuild-shared-checkpoint-v1" > "$tmpdir/control/ac-put-reject-text"
+write_t "F \\/ T" "REFL_TAC"
+export_t v3f
+forget_local
+worker v3f "$shared_url" "$shared" "$spec_t" --share-heaps
+rm "$tmpdir/control/ac-put-reject-text"
+expect v3f 0 "status=built"
+grep -qE '^holbuild shared-heap publish theory=share:[^ ]* heap=[0-9a-f]{64} result=[a-z-]+ checkpoints=0$' \
+  "$tmpdir/v3f.log" || { echo "v3f counted refused checkpoint entries:" >&2; cat "$tmpdir/v3f.log" >&2; exit 1; }
 
 # A failed proof shares its failed prefix, and the fixed proof resumes from it.
 write_t "T \\/ F" "FAIL_TAC \"seeded failure\""

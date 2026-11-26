@@ -2207,8 +2207,10 @@ loaded the published one), `skipped-claimed` (another worker was publishing
 it), `refused` (the heap wasn't one this run may publish), `failed`, `none`
 (the run saved none), `non-target`, `no-checkpoint-saves` or `unvalidated`
 (the outputs failed their checks), then `checkpoints=<n>`, the shared
-checkpoint entries the run published. `heap` is the key the heap's entry has
-in the remote cache.
+checkpoint entries the cache took from the run. `heap` is the key the heap's
+entry has in the remote cache. A theory loaded ahead of its parents probes the
+heap too, unless it found a build to reuse, and prints a `hit` or `miss`
+lookup line; on a hit, the plain build that follows prints its own.
 
 A worker publishes a heap of its own only as the preload saved it: the
 preload waits while the worker hashes it, before the theory script runs, and

@@ -14474,6 +14474,10 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       in
         List.app (fn (path, ref (SOME sha)) => hashes := Redblackmap.insert (!hashes, path, sha) | _ => ()) unique
       end
+    (* Only an entry the cache took counts as published. *)
+    fun accepted HolbuildCacheBackend.Published = true
+      | accepted HolbuildCacheBackend.AlreadyPresent = true
+      | accepted _ = false
     fun publish_candidates heap =
       let
         val eligible = List.mapPartial eligible candidates
@@ -14496,12 +14500,12 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         fun publish ((c : shared_candidate, key, entries, _), sent) =
           (* A failed prefix's entry is replaced as the prefix grows, and
              any entry probe found to replace on every node. *)
-          (ignore ((if #kind c = "failed_prefix" orelse Redblackset.member (!replaced, key)
-                    then HolbuildRemoteCache.replace_action_everywhere
-                    else HolbuildRemoteCache.replace_action_unconditionally) remote
-            {key = key, text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
-                                 (("heap", heap, "") :: entries)});
-           sent := true)
+          sent := accepted
+            ((if #kind c = "failed_prefix" orelse Redblackset.member (!replaced, key)
+              then HolbuildRemoteCache.replace_action_everywhere
+              else HolbuildRemoteCache.replace_action_unconditionally) remote
+             {key = key, text = shared_manifest "holbuild-shared-checkpoint-v1" (SOME (#kind c))
+                                  (("heap", heap, "") :: entries)})
           handle e => warning c e
         val sending = map (fn item => (item, ref false)) complete
         (* Another worker may have replaced the heap since the probes:
@@ -14554,11 +14558,12 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                         (* The store family is the chain's lowest file. *)
                         val family = #2 (hd blobs)
                       in
-                        ignore (HolbuildRemoteCache.replace_action_everywhere remote
-                                  {key = standalone_key,
-                                   text = shared_manifest shared_standalone_header (SOME (#kind c)) entries ^
-                                          "key=" ^ #key c ^ "\n"});
-                        published_checkpoints := !published_checkpoints + 1;
+                        if accepted (HolbuildRemoteCache.replace_action_everywhere remote
+                                       {key = standalone_key,
+                                        text = shared_manifest shared_standalone_header (SOME (#kind c)) entries ^
+                                               "key=" ^ #key c ^ "\n"})
+                        then published_checkpoints := !published_checkpoints + 1
+                        else ();
                         List.app (fn (path, sha, save) => store_add store family {sha = sha, src = path, save = save})
                                  blobs
                       end
@@ -17700,7 +17705,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                prefix a theory with no heap shared.  A plain run starts over
                from an empty root. *)
             val shared_key = shared_heap_key tc root built_action
-            val hit =
+            val probes_shared = share_heaps andalso checkpoint_enabled (spec_policy spec)
+            val built =
               action_built remote spec orelse
               (* Only an earlier build's key: a record naming the action's
                  own key is what action_built judged. *)
@@ -17708,13 +17714,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                    SOME {pair_key, ...} =>
                      Option.isSome (Option.mapPartial (earlier_build_key spec)
                                       (HolbuildRemoteCache.get_action remote pair_key))
-                 | NONE => false) orelse
-              (share_heaps andalso checkpoint_enabled (spec_policy spec) andalso
+                 | NONE => false)
+            val shared_hit =
+              not built andalso probes_shared andalso
                (cached shared_key orelse
                 not deps_heap_only andalso resumes_from_checkpoints (spec_policy spec) built_action andalso
                 (* Only a restore that checks its key= line records its blobs. *)
                 Option.isSome (HolbuildRemoteCache.fetch_action remote
-                                 (shared_standalone_key shared_key built_action))))
+                                 (shared_standalone_key shared_key built_action)))
+            val hit = built orelse shared_hit
             (* The root's records still hold: the child wrote none of it,
                and the stems written here are the hydrate's scratch. *)
             fun restart () =
@@ -17750,10 +17758,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                             | (NONE, SOME (SOME e)) => raise e
                             | _ => ())})
                 pipelined
-            (* A hit builds plain, whose restore reports its own lookup. *)
+            (* Probed only when no build was found to reuse.  On a hit the plain
+               build that follows reports its own lookup too. *)
             val _ =
-              if not hit andalso share_heaps andalso checkpoint_enabled (spec_policy spec) then
-                shared_heap_line "lookup" (#package built_action ^ ":" ^ #logical built_action) shared_key "miss"
+              if probes_shared andalso not built then
+                shared_heap_line "lookup" (#package built_action ^ ":" ^ #logical built_action) shared_key
+                  (if shared_hit then "hit" else "miss")
               else ()
           in
             (* What a hit takes may not be what the parents' outlines

@@ -3422,17 +3422,19 @@ class Coordinator:
         last report and the other leases there, and the checkpoint it resumed from and published; and, for an
         action retried after such a failure, how its next result came out. A shadow line marks a retry that the
         rule under trial would withhold: one after two attempts that Poly/ML ran out of store under the same cap,
-        resuming from the same checkpoint, the second publishing none. It only logs: every retry still runs."""
+        resuming from the same checkpoint, the second publishing none. It is counted when that retry is queued, so a
+        batch that ends before the retry starts still counts it. It only logs: every retry still runs."""
         key = (batch_id, input_key)
         previous = self.memory_attempts.pop(key, None)
-        if result.failure != "memory":
-            if previous is not None and result.failure not in ("declined", "unavailable"):
-                memory_logger.info(
-                    "memory retry outcome batch=%s theory=%s attempt=%d after=%d status=%s failure=%s",
-                    batch_id, theory, attempt, previous[0], result.status, result.failure or "-",
-                )
-            elif previous is not None:
+        if previous is not None:
+            if result.failure in ("declined", "unavailable"):
                 self._remember_memory(key, previous)  # interrupted: the next attempt is the retry
+                return
+            memory_logger.info(
+                "memory retry outcome batch=%s theory=%s attempt=%d after=%d status=%s failure=%s",
+                batch_id, theory, attempt, previous[0], result.status, result.failure or "-",
+            )
+        if result.failure != "memory":
             return
         timings = result.timings or {}
         current = MemoryAttempt(

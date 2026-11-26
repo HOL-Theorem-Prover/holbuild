@@ -2821,6 +2821,10 @@ async def test_a_retry_after_two_like_out_of_store_failures_is_only_logged_as_on
     token = await claim_named(http, "a", "high")
     assert (await complete(http, token, result("a", "failed", "memory", **second))).status_code == 200
 
+    # A retry that fails for memory again has its outcome logged too.
+    assert f"memory retry outcome batch={batch_id} theory=pkg:a attempt=2 after=1 status=failed failure=memory" in (
+        memory_lines(caplog)
+    )
     shadow = [line for line in memory_lines(caplog) if line.startswith("memory shadow would-withhold")]
     assert shadow == (
         [f"memory shadow would-withhold batch={batch_id} theory=pkg:a attempt=3 max_heap_mb=12000 resumed=0,0,0,0,0 "
