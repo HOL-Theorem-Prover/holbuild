@@ -938,7 +938,9 @@ it may exit, so idle workers don't restart in a loop.
 
 Every request carries `Authorization: Bearer <token>`: the client token for
 `/v1/batches…` and `/v1/queue`, the worker token for `/v1/work…`. A wrong or missing token
-gets 401. Errors are JSON `{"detail": "<message>"}`. Any route answers 503
+gets 401. The client token can follow or cancel any batch by its id, and a held
+action's `held_by` names another client's batch: clients that share the token
+are trusted alike. Errors are JSON `{"detail": "<message>"}`. Any route answers 503
 `{"detail": "database busy"}`, with `Retry-After`, when no database connection
 came free within `REMOTE_EXEC_DATABASE_POOL_TIMEOUT_S` (3 s). Keep it under the
 workers' 15 s wait for a heartbeat or completion answer: past that a worker
@@ -1012,8 +1014,8 @@ These fields retain only the latest attempt, not its retry history.
 `held_by` and `held_since` are set while a ready build waits behind another
 batch's live lease of the same input key and spec (single-flight): that
 batch, and when it last claimed the key. Status and event streams read them
-on every read, so a hold that starts, or a holder that claims again, after the
-action became ready reaches the stream on its next read.
+on every read, so a hold that starts or ends, or a holder that claims again,
+after the action became ready reaches the stream on its next read.
 `interruptions` counts the claims of the action given back without counting
 an attempt, up to `REMOTE_EXEC_MAX_INTERRUPTIONS`: those that ended
 `unavailable` (a worker drained or scaled in, or the cache was out) and those

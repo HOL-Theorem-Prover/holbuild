@@ -99,7 +99,7 @@ class Fleet:
     finished batch past retention. ``token`` is a live lease of ``fresh``, ``expired`` an expired one of
     ``steady``. ``since`` numbers the transaction that changed a few of ``fresh``'s actions last.
     ``running_tokens`` are the leases of ``fresh``'s running actions, ``plain_tokens`` those of its running actions
-    not claimed ahead."""
+    not claimed ahead. ``follower`` has a ready copy of each of those, held back by its lease."""
 
     engine: AsyncEngine
     parents: list[list[int]]
@@ -113,6 +113,7 @@ class Fleet:
     since: int
     running_tokens: list[UUID]
     plain_tokens: list[UUID]
+    follower: UUID
 
     def parent_of_ahead(self) -> str:
         """A running action of ``fresh`` with children claimed ahead."""
@@ -201,7 +202,7 @@ async def seed(engine: AsyncEngine) -> Fleet:
     With no running or waiting actions in the statistics, the planner takes those of the new batches for a handful,
     as it did when a gate batch stalled the fleet's claims (holbuild#641)."""
     parents = dag()
-    fresh, steady, old = uuid4(), uuid4(), uuid4()
+    fresh, steady, old, follower = uuid4(), uuid4(), uuid4(), uuid4()
     waiting = Arrival.of(parents, done=0, running=0, gen1=0, gen2=0, release=True)
     steady_arrival = Arrival.of(parents, done=3000, running=100, gen1=0, gen2=0, release=True)
     arrival = Arrival.of(parents, done=300, running=400, gen1=8, gen2=4, release=False)
@@ -259,6 +260,8 @@ async def seed(engine: AsyncEngine) -> Fleet:
             {"id": steady},
         )
         await insert(connection, fresh, parents, arrival, priority=2, ahead_cap=1)
+        held = ["ready" if s == "running" and a == "no" else "done" for s, a in zip(arrival.state, arrival.ahead)]
+        await insert(connection, follower, [[]] * ACTIONS, Arrival(held, ["no"] * ACTIONS, [0] * ACTIONS))
         token = await connection.scalar(
             sa.text("SELECT attempt_token FROM leases WHERE batch_id = :id AND input_key = :key"),
             {"id": fresh, "key": arrival.keys("running")[0]},
@@ -280,7 +283,7 @@ async def seed(engine: AsyncEngine) -> Fleet:
         )
     return Fleet(
         engine, parents, fresh, steady, old, arrival, steady_arrival, token, expired, since,
-        running_tokens, plain_tokens,
+        running_tokens, plain_tokens, follower,
     )
 
 
@@ -376,8 +379,7 @@ STATEMENTS = [
     Statement(cm.RELEASABLE_BATCH, lambda f: {"batch_id": f.fresh}, 13_000),
     Statement(cm.CHANGED_ACTIONS, lambda f: {"batch_id": f.fresh, "since": str(f.since)}, 100),
     Statement(cm.ACTIONS_OF_KEYS, lambda f: {"batch_id": f.fresh, "keys": f.arrival.keys("ready")[:20]}, 100),
-    # Every live lease of the fresh batch, whose copies in the steady batch are done.
-    Statement(cm.HELD_READY_ACTIONS, lambda f: {"batch_id": f.steady}, 1_900),
+    Statement(cm.HELD_READY_ACTIONS, lambda f: {"batch_id": f.follower}, 4_400),
     Statement(
         cm.CLAIM_CANDIDATES, lambda f: {"tiers": ["standard"], "classes": ["build", "run"], "run_slots": 30}, 16_000
     ),

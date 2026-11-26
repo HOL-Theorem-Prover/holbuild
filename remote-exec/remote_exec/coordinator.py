@@ -16,7 +16,7 @@ import random
 import shlex
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Iterator
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NamedTuple, Self
@@ -1403,10 +1403,13 @@ class Coordinator:
         changed = await self.changes(batch_id, 0)
         return None if changed is None else changed[0]
 
-    async def changes(self, batch_id: UUID, since: int) -> tuple[BatchStatus, int] | None:
+    async def changes(
+        self, batch_id: UUID, since: int, held_before: Collection[str] = ()
+    ) -> tuple[BatchStatus, int] | None:
         """The batch with only the actions written by transactions numbered ``since`` or later, and the ``since``
         to pass next time; ``since`` 0 gives every action. Every ready build that single-flight holds back behind
-        another batch's lease is in it too, changed or not, with ``held_by`` and ``held_since``.
+        another batch's lease is in it too, changed or not, with ``held_by`` and ``held_since``, and so is each action
+        of ``held_before`` (those the caller last read held), so that a hold that ended is read too.
 
         The next ``since`` is the oldest transaction still running on the server when this one read, so an action
         written by a transaction that commits later is read next time, maybe again. A long transaction anywhere on
@@ -1429,15 +1432,17 @@ class Coordinator:
             held: dict[str, tuple[UUID, datetime | None]] = {}
             for key, held_by, held_since in await conn.execute(HELD_READY_ACTIONS, {"batch_id": batch_id}):
                 held.setdefault(key, (held_by, held_since))
-            # A hold that starts or changes after an action became ready writes nothing to its row, so the held
-            # actions are read again here for a follower to see it.
-            unchanged = held.keys() - {row.input_key for row in rows}
+            # A hold that starts, changes or ends after an action became ready writes nothing to its row, so the
+            # held actions, and those held before, are read again here for a follower to see it.
+            unchanged = (held.keys() | set(held_before)) - {row.input_key for row in rows}
             if unchanged:
                 rows += await conn.execute(ACTIONS_OF_KEYS, {"batch_id": batch_id, "keys": sorted(unchanged)})
                 rows.sort(key=lambda row: (row.theory, row.input_key))
             actions = [
                 ActionStatus(
-                    *row[:-1], json.loads(row[-1]) if row[-1] is not None else None, *held.get(row.input_key, (None, None))
+                    *row[:-1],
+                    json.loads(row[-1]) if row[-1] is not None else None,
+                    *held.get(row.input_key, (None, None)),
                 )
                 for row in rows
             ]

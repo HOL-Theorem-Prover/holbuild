@@ -295,6 +295,9 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
         async def lines() -> AsyncIterator[str]:
             # Each read gets only the actions written since the last one, maybe some again, so `seen` drops repeats.
             seen: dict[str, ActionStatus] = {}
+            # The actions last sent held, read again each time so that the end of a hold, which writes nothing to
+            # them, is sent too.
+            held: set[str] = set()
             batch, since = first
             actions = batch.actions
             last_line = last_read = time.monotonic()
@@ -305,6 +308,10 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                     for action in actions:
                         if seen.get(action.input_key) != action:
                             seen[action.input_key] = action
+                            if action.held_by is None:
+                                held.discard(action.input_key)
+                            else:
+                                held.add(action.input_key)
                             yield json.dumps(jsonable_encoder({"type": "action", **vars(action)})) + "\n"
                             last_line = time.monotonic()
                     if batch.state != "running":
@@ -337,7 +344,7 @@ def create_app(coordinator: Coordinator, settings: Settings) -> FastAPI:
                                           credit + (now - last_read) / settings.events_poll_seconds) - 1.0)
                     last_read = now
                     try:
-                        changed = await coordinator.changes(batch_id, since)
+                        changed = await coordinator.changes(batch_id, since, held)
                     except DATABASE_UNAVAILABLE as error:
                         # Ending the stream would make its client follow the batch again from the start; the next
                         # read from the same `since` gets what this one missed.

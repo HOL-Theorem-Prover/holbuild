@@ -1167,30 +1167,32 @@ async def test_a_held_ready_build_names_the_batch_holding_it_and_when_that_batch
         assert [(a["held_by"], a["held_since"]) for a in (await batch(http, other))["actions"]] == [(None, None)]
 
 
-async def test_a_hold_that_starts_or_is_claimed_again_after_ready_reaches_the_event_stream(
-    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any
+async def test_a_hold_that_starts_ends_or_is_claimed_again_after_ready_reaches_the_event_stream(
+    http: httpx.AsyncClient, coordinator: Coordinator, remote_exec_engine: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Neither the leader's claim nor its claim again after its lease expired writes the held copy's row."""
+    """Neither the leader's claim, nor the expiry of its lease, nor its claim again writes the held copy's row."""
     coordinator.settings.claim_ranking_seconds = 0
     follower = await submit(http, ["a"])
     reads = 0
     changes = coordinator.changes
 
-    async def counted(batch_id: UUID, since: int) -> Any:
+    async def counted(batch_id: UUID, since: int, held: Any = ()) -> Any:
         nonlocal reads
         reads += 1
-        return await changes(batch_id, since)
-
-    async def polled() -> None:
-        start = reads
-        while reads < start + 2:  # a poll that began after the write
-            await asyncio.sleep(0.01)
+        return await changes(batch_id, since, held)
 
     async def follow() -> list[dict[str, Any]]:
         async with http.stream("GET", f"/v1/batches/{follower}/events", headers=CLIENT) as response:
             return [json.loads(line) async for line in response.aiter_lines() if line]
 
-    coordinator.changes = counted  # type: ignore[method-assign]
+    async def polled() -> None:
+        start = reads
+        async with asyncio.timeout(5):
+            while reads < start + 2:  # a poll that began after the write
+                assert not stream.done()
+                await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(coordinator, "changes", counted)
     stream = asyncio.create_task(follow())
     await polled()
     leader = await submit(http, ["a"], priority="1")  # claimed ahead of the follower's older copy
@@ -1199,17 +1201,19 @@ async def test_a_hold_that_starts_or_is_claimed_again_after_ready_reaches_the_ev
     async with remote_exec_engine.begin() as connection:
         await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
     await coordinator.sweep()
+    await polled()
     await claim_named(http, "a")
     await polled()
     assert (await http.post(f"/v1/batches/{follower}/cancel", headers=CLIENT)).status_code == 200
 
-    events = [(e["state"], e["held_by"], e["held_since"]) for e in await stream if e["type"] == "action"]
+    async with asyncio.timeout(5):
+        events = [(e["state"], e["held_by"], e["held_since"]) for e in await stream if e["type"] == "action"]
     claimed_at = (await batch(http, leader))["actions"][0]["last_claimed_at"]
-    assert [state for state, _, _ in events] == ["ready", "ready", "ready", "cancelled"]
-    assert events[0][1:] == (None, None)
-    assert events[1][1] == events[2][1] == leader
-    assert datetime.fromisoformat(events[1][2]) < datetime.fromisoformat(events[2][2])
-    assert datetime.fromisoformat(events[2][2]) == datetime.fromisoformat(claimed_at)
+    assert [state for state, _, _ in events] == ["ready", "ready", "ready", "ready", "cancelled"]
+    assert events[0][1:] == events[2][1:] == events[4][1:] == (None, None)
+    assert events[1][1] == events[3][1] == leader
+    assert datetime.fromisoformat(events[1][2]) < datetime.fromisoformat(events[3][2])
+    assert datetime.fromisoformat(events[3][2]) == datetime.fromisoformat(claimed_at)
 
 
 async def test_a_held_build_leaves_the_idle_run_fallback_to_a_ready_run(
@@ -3584,9 +3588,9 @@ async def test_events_keep_a_quiet_stream_alive_with_blank_lines(
     polls: list[int] = []
     changes = coordinator.changes
 
-    async def counted(batch: UUID, since: int) -> Any:
+    async def counted(batch: UUID, since: int, held: Any = ()) -> Any:
         polls.append(since)
-        return await changes(batch, since)
+        return await changes(batch, since, held)
 
     monkeypatch.setattr(coordinator, "changes", counted)
     transport = httpx.ASGITransport(app=create_app(coordinator, settings))
@@ -3674,8 +3678,8 @@ async def test_event_streams_of_a_large_batch_poll_only_its_changes(
     reads: list[int] = []
     changes = coordinator.changes
 
-    async def counted(batch: UUID, since: int) -> Any:
-        changed = await changes(batch, since)
+    async def counted(batch: UUID, since: int, held: Any = ()) -> Any:
+        changed = await changes(batch, since, held)
         reads.append(0 if changed is None else len(changed[0].actions))
         return changed
 
@@ -3706,11 +3710,11 @@ async def test_an_event_stream_outlives_a_failed_read_and_resumes_where_it_was(
     sinces: list[int] = []
     changes = coordinator.changes
 
-    async def flaky(batch: UUID, since: int) -> Any:
+    async def flaky(batch: UUID, since: int, held: Any = ()) -> Any:
         sinces.append(since)
         if len(sinces) == 2:  # the stream's first read after the response started
             raise sa.exc.TimeoutError("QueuePool limit of size 50 overflow 0 reached")
-        return await changes(batch, since)
+        return await changes(batch, since, held)
 
     monkeypatch.setattr(coordinator, "changes", flaky)
     batch_id = await submit(http, ["a"])
@@ -3747,13 +3751,13 @@ async def test_an_event_stream_keeps_alive_while_its_reads_keep_failing(
     changes = coordinator.changes
     calls = 0
 
-    async def slow_failure(batch: UUID, since: int) -> Any:
+    async def slow_failure(batch: UUID, since: int, held: Any = ()) -> Any:
         nonlocal calls
         calls += 1
         if calls > 1 and failing:
             await asyncio.sleep(0.06)
             raise sa.exc.TimeoutError("QueuePool limit of size 50 overflow 0 reached")
-        return await changes(batch, since)
+        return await changes(batch, since, held)
 
     monkeypatch.setattr(coordinator, "changes", slow_failure)
     async with httpx.AsyncClient(
@@ -3786,10 +3790,10 @@ async def test_a_write_wakes_its_batchs_event_streams_and_idle_streams_wait_for_
     reads = 0
     changes = coordinator.changes
 
-    async def counted(batch: UUID, since: int) -> Any:
+    async def counted(batch: UUID, since: int, held: Any = ()) -> Any:
         nonlocal reads
         reads += 1
-        return await changes(batch, since)
+        return await changes(batch, since, held)
 
     monkeypatch.setattr(coordinator, "changes", counted)
     async with httpx.AsyncClient(
@@ -3826,9 +3830,9 @@ async def test_a_stream_reads_a_burst_of_writes_at_once_but_steady_writes_at_the
     reads: list[float] = []
     changes = coordinator.changes
 
-    async def counted(batch: UUID, since: int) -> Any:
+    async def counted(batch: UUID, since: int, held: Any = ()) -> Any:
         reads.append(time.monotonic())
-        return await changes(batch, since)
+        return await changes(batch, since, held)
 
     monkeypatch.setattr(coordinator, "changes", counted)
     async with httpx.AsyncClient(
