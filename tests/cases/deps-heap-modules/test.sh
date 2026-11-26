@@ -275,6 +275,13 @@ short_missing=$(sed -n 's/^missing=//p' "$short_entry")
 phase short-B "depsmissn:$short_missing"
 phase short-B 'rstdepskb:[1-9][0-9]*'
 cp "$short_entry" "$tmpdir/short.entry"
+# The checkpoint entries chained to the short heap, as published then.
+short_heap=$(awk '$1 ~ /^blob=/ && $2 == "heap" { print substr($1, 6) }' "$tmpdir/short.entry")
+mkdir "$tmpdir/short-checkpoints"
+for entry in $(grep -lx "blob=$short_heap heap.*" "$tmpdir"/remote/ac/*); do
+  [[ $entry == "$short_entry" ]] || cp "$entry" "$tmpdir/short-checkpoints/"
+done
+[[ -n $(ls "$tmpdir/short-checkpoints") ]] || { echo "no checkpoint entry names the short heap" >&2; exit 1; }
 exec_theory Z z unshared
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 server_log=$tmpdir/server/requests.log
@@ -788,18 +795,25 @@ resumed proof-edit-B 'theorem-context checkpoint after b_first'
 [[ $(find "$worker_modules" -name '*-A-*.pmo' | wc -l) == 2 ]] ||
   { echo "A's proof-only change didn't change ATheory.dat" >&2; exit 1; }
 
-# A cache in front of the store still serves B's short heap entry after
-# the store's was replaced: the run reads the store's past it, and resumes
-# on the replacement.
+# A cache in front of the store still serves B's short heap entry, and
+# the checkpoint entries chained to it, after the store's were replaced:
+# the run reads the store's past them, and resumes on the replacement.
 heap_key=${short_entry##*/}
 export HOLBUILD_TEST_MODULE_MIN_MISSING=1
 cp "$tmpdir/short.entry" "$tmpdir/control/ac-stale-$heap_key"
+for entry in "$tmpdir"/short-checkpoints/*; do
+  cp "$entry" "$tmpdir/control/ac-stale-${entry##*/}"
+done
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 edit_b stale-short
 exec_theory B stale-short
 grep -qx "$heap_key" "$tmpdir/control/no-cache-gets" && [[ ! -e "$tmpdir/control/ac-stale-$heap_key" ]] ||
   { echo "stale-short-B didn't read the heap entry past the cache's copy" >&2; exit 1; }
 resumed stale-short-B 'theorem-context checkpoint after b_first'
+if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/stale-short-B.result"; then
+  echo "stale-short-B rejected a checkpoint entry the cache served stale" >&2; cat "$tmpdir/stale-short-B.log" >&2; exit 1
+fi
+rm -f "$tmpdir"/control/ac-stale-*
 # A host declines a short heap once: the store's entry is short again, and
 # the second run on W restores it as it is.
 for run in redeclined kept; do
