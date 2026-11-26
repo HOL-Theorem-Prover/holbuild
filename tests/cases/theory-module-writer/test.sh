@@ -495,11 +495,12 @@ fun requests () = length (String.tokens (fn c => c = #"\n") (E.read_text "$tmpdi
 fun prefetch () = E.prefetch_modules remote "$tmpdir/root" (tc "hol7") wanted;
 val _ = prefetch ();
 val probed = OS.Path.concat (store "hol7", ".probed-missing");
+fun probed_lines () = String.tokens (fn c => c = #"\n") (E.read_text probed);
 val _ = check "published modules were not prefetched" (List.all (stored "hol7") (tl published16));
 val _ = check "a module whose blob is gone was stored" (not (stored "hol7" a));
 val _ = check "the unpublished modules were not recorded, or one whose blob is gone was"
           (exists probed andalso
-           E.sort_strings (String.tokens Char.isSpace (E.read_text probed)) =
+           E.sort_strings (map (hd o String.tokens Char.isSpace) (probed_lines ())) =
            E.sort_strings (List.mapPartial E.module_file_theory_part (List.drop (ps, 14))));
 val _ = E.write_text a7_blob a7_bytes;
 val _ = E.write_text (OS.Path.concat (store "hol7", a)) a7_bytes;
@@ -510,6 +511,24 @@ val before_requests = requests ();
 val _ = prefetch ();
 val _ = check "a store lacking 15 modules, besides 2 unpublished, was prefetched"
           (requests () = before_requests);
+(* Found unpublished over 10 minutes ago, or before lines had a time,
+   modules count as missing again: one published since it was found
+   unpublished is fetched, and the two still unpublished are recorded
+   again with their time. *)
+val late = List.nth (published16, 14);
+val _ = E.write_text probed
+          (valOf (E.module_file_theory_part late) ^ "\n" ^
+           String.concat (map (fn file => valOf (E.module_file_theory_part file) ^ " 0\n") (List.drop (ps, 14))));
+val _ = prefetch ();
+val _ = check "modules found unpublished long ago were not looked up again" (requests () > before_requests);
+val _ = check "a module published since it was found unpublished long ago was not fetched" (stored "hol7" late);
+val _ = check "the unpublished modules weren't recorded again, alone, with their time"
+          (E.sort_strings (map (hd o String.tokens Char.isSpace) (probed_lines ())) =
+           E.sort_strings (List.mapPartial E.module_file_theory_part (List.drop (ps, 14))) andalso
+           List.all (fn line => case String.tokens Char.isSpace line of [_, t] => t <> "0" | _ => false)
+                    (probed_lines ()));
+val _ = remove7 (List.take (published16, 15));
+val before_requests = requests ();
 val _ = remove7 [List.nth (published16, 15)];
 val holder = lock_store "hol7";
 val t0 = Time.now ();

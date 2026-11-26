@@ -355,7 +355,7 @@ async def test_a_child_another_batch_s_claim_is_leasing_is_passed_over_for_the_n
 
     async with remote_exec_engine.connect() as other, other.begin():
         # Another batch's claim of "b", between its lock of the key and its commit.
-        await other.execute(coordinator_module.LOCK_KEY, {"key": input_key("b")})
+        await other.execute(coordinator_module.LOCK_KEY, {"key": input_key("b"), "spec": spec("b")})
         claimed = await claim_ahead(http)
         assert claimed is not None and claimed["theory"] == "pkg:c"
         assert await claim_ahead(http) is None
