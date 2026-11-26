@@ -353,7 +353,8 @@ if grep -q '^peak-rss-mb=' "$tmpdir/missing-rss.result"; then
 fi
 
 # A script run without proof steps installs no proof runtime: its load,
-# script and export are still timed, from the marks the stage prints.
+# script and export are still timed, from the marks the stage prints, also
+# after output the script leaves without a newline.
 cat > "$project/src/PlainScript.sml" <<'SML'
 Theory Plain
 Ancestors bool
@@ -363,6 +364,8 @@ Theorem plain_thm:
 Proof
   simp[]
 QED
+
+val _ = TextIO.output (TextIO.stdErr, "no newline after this")
 SML
 hb action-spec --upload --skip-proof-steps PlainTheory > "$tmpdir/batch-plain.txt"
 worker plain "$(spec_for "$tmpdir/batch-plain.txt" worker:PlainTheory)"

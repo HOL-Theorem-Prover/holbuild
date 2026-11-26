@@ -2968,6 +2968,52 @@ async def test_a_memory_retry_interrupted_without_using_an_attempt_logs_its_outc
     ]
 
 
+async def test_a_memory_retry_held_back_for_an_input_the_batch_still_builds_logs_its_outcome_once_it_runs(
+    http: httpx.AsyncClient, cache: FakeCache, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="uvicorn.memory")
+    batch_id = await submit(http, ["a", "x"])
+    tokens = await claim_all(http, 2)
+    first = result("a", "failed", "memory", memory_cause="poly-out-of-store", max_heap_mb="12000")
+    assert (await complete(http, tokens["a"], first)).status_code == 200
+    # The retry finds "x", still running, missing: that costs it no attempt.
+    token = await claim_named(http, "a", "high")
+    record = result("a", "failed", "input-missing", missing=f"theory {input_key('x')}")
+    assert (await complete(http, token, record)).status_code == 200
+    cache.keys.add(ac_key("x"))
+    assert (await complete(http, tokens["x"], result("x", "built"))).status_code == 200
+    token = await claim_named(http, "a", "high")
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+
+    assert [line for line in memory_lines(caplog) if line.startswith("memory retry outcome")] == [
+        f"memory retry outcome batch={batch_id} theory=pkg:a attempt=2 after=1 status=built failure=-"
+    ]
+
+
+async def test_a_memory_retry_whose_lease_expires_logs_that_as_its_outcome(
+    http: httpx.AsyncClient, cache: FakeCache, coordinator: Coordinator, remote_exec_engine: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="uvicorn.memory")
+    batch_id = await submit(http, ["a"])
+    token = await claim_named(http, "a")
+    first = result("a", "failed", "memory", memory_cause="poly-out-of-store", max_heap_mb="12000")
+    assert (await complete(http, token, first)).status_code == 200
+    await claim_named(http, "a", "high")
+    async with remote_exec_engine.begin() as connection:
+        await connection.execute(sa.text("UPDATE leases SET expires_at = now() - interval '1 second'"))
+    await coordinator.sweep()
+    token = await claim_named(http, "a", "high")
+    cache.keys.add(ac_key("a"))
+    assert (await complete(http, token, result("a", "built"))).status_code == 200
+
+    # The expiry cost the retry's attempt, so the build after it isn't the retry's outcome.
+    assert [line for line in memory_lines(caplog) if line.startswith("memory retry outcome")] == [
+        f"memory retry outcome batch={batch_id} theory=pkg:a attempt=2 after=1 status=failed failure=lease-expired"
+    ]
+
+
 @pytest.mark.parametrize("failure", ["publish", "toolchain", "internal"])
 async def test_infrastructure_failures_retry_up_to_max_attempts(http: httpx.AsyncClient, failure: str) -> None:
     batch_id = await submit(http, ["a"])

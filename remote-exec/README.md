@@ -69,8 +69,9 @@ many, whether it is retried, the action's tier and the worker's tiers, the recor
 the host (`boot8`) and worker, the age of the host's last report and its available and total memory, leases and
 `memory_short` in it, the other leases on the host, the checkpoint the attempt resumed from (its `resdepsn`, `resctxn`,
 `resfpn`, `resboundary` and `resstepn` phases) and the shared checkpoints it published (`pubckptn`). A retry's result,
-built or failed, memory included, logs a `memory retry outcome` line; one that costs no attempt (a declined claim, a
-refunded interruption) leaves that to the next. A `memory shadow would-withhold` line, with a running count, marks a
+built or failed, memory included, logs a `memory retry outcome` line, as does a lease of it that expires and costs the
+attempt (`failure=lease-expired`); one that costs no attempt (a declined claim, a refunded interruption, an input the
+batch is still to build) leaves that to the next. A `memory shadow would-withhold` line, with a running count, marks a
 retry a rule under trial would withhold: after two attempts in a row that Poly/ML ran out of store under the same cap,
 resuming from the same checkpoint, the second publishing none. It is counted when the retry is queued, so one whose
 batch ends first counts too. The lines only log: the retry runs. The coordinator keeps the last such attempt per action

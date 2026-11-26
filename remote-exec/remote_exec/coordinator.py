@@ -3272,6 +3272,7 @@ class Coordinator:
         # alone. Peak hints are raised once the result committed, outside its locks: many copies of one theory
         # finishing together raise the same hint.
         built = result.status != "failed"
+        refunded = False  # an ``input-missing`` result that cost no attempt
         peaks: list[tuple[str, str, str, int]] = []
         async with self.engine.begin() as conn:
             batch_id = await conn.scalar(
@@ -3426,7 +3427,7 @@ class Coordinator:
                 await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)
             elif result.failure == "input-missing":
                 self._forget_cache_findings()
-                await self._input_missing(
+                refunded = await self._input_missing(
                     conn, batch_id, action.input_key, action.theory, action.attempts, result,
                     ahead_batch=action.ahead_batch,
                 )
@@ -3439,7 +3440,8 @@ class Coordinator:
             self._runs_changed()  # a run slot came free, or the run is ready again
         # As above: a result that cost no attempt interrupted the attempt rather than ending it.
         counted = not (
-            result.failure == "declined"
+            refunded
+            or result.failure == "declined"
             or (result.failure == "unavailable" and action.interruptions < self.settings.max_interruptions)
             or (result.failure == "ahead-abandoned" and action.ahead == "ahead")
         )
@@ -3492,16 +3494,9 @@ class Coordinator:
         resuming from the same checkpoint, the second publishing none. It is counted when that retry is queued, so a
         batch that ends before the retry starts still counts it. It only logs: every retry still runs. ``counted``: whether
         the result cost an attempt; one that didn't leaves the retry to the next."""
-        key = (batch_id, input_key)
-        previous = self.memory_attempts.pop(key, None)
-        if previous is not None:
-            if not counted:
-                self._remember_memory(key, previous)  # interrupted: the next attempt is the retry
-                return
-            memory_logger.info(
-                "memory retry outcome batch=%s theory=%s attempt=%d after=%d status=%s failure=%s",
-                batch_id, theory, attempt, previous[0], result.status, result.failure or "-",
-            )
+        if not counted:
+            return  # interrupted: the next attempt is the retry
+        previous = self._log_memory_outcome(batch_id, input_key, theory, attempt, result.status, result.failure)
         if result.failure != "memory":
             return
         timings = result.timings or {}
@@ -3548,12 +3543,22 @@ class Coordinator:
                 batch_id, theory, attempt + 1, current.max_heap_mb, ",".join(map(str, current.resumed)),
                 self.memory_withheld,
             )
-        self._remember_memory(key, (attempt, current))
-
-    def _remember_memory(self, key: tuple[UUID, str], attempt: tuple[int, MemoryAttempt]) -> None:
-        self.memory_attempts[key] = attempt
+        self.memory_attempts[(batch_id, input_key)] = (attempt, current)
         if len(self.memory_attempts) > MAX_LEASE_HOSTS:
             del self.memory_attempts[next(iter(self.memory_attempts))]
+
+    def _log_memory_outcome(
+        self, batch_id: UUID, input_key: str, theory: str, attempt: int, status: str, failure: str | None
+    ) -> tuple[int, MemoryAttempt] | None:
+        """Log how attempt ``attempt`` of an action retried after a memory failure came out, forgetting that failure;
+        return it, or ``None`` for an action with none remembered."""
+        previous = self.memory_attempts.pop((batch_id, input_key), None)
+        if previous is not None:
+            memory_logger.info(
+                "memory retry outcome batch=%s theory=%s attempt=%d after=%d status=%s failure=%s",
+                batch_id, theory, attempt, previous[0], status, failure or "-",
+            )
+        return previous
 
     def request_release(self, batch_id: UUID | None = None) -> None:
         """Have ``release`` run for ``batch_id``, or every batch, in the background, so neither a worker's
@@ -3778,6 +3783,9 @@ class Coordinator:
             else:
                 # The worker never reported, so all there is to go on is which workers lost it: the detail lists
                 # those of the expiries in a row.
+                self._log_memory_outcome(
+                    batch_id, lease.input_key, action.theory, action.attempts, "failed", "lease-expired"
+                )
                 final = action.attempts >= self.settings.max_attempts
                 detail = await conn.scalar(
                     sa.text(
@@ -4225,14 +4233,14 @@ class Coordinator:
     async def _input_missing(
         self, conn: AsyncConnection, batch_id: UUID, input_key: str, theory: str, attempts: int, result: Result,
         *, ahead_batch: bool,
-    ) -> None:
+    ) -> bool:
         """Handle ``input-missing``: re-queue a missing theory the batch builds, and retry on anything else, since a
         restore that fails on a network error reports its input missing too; once the action used up its
         attempts, fail the batch for resubmission.
 
         The missing theory may be a transitive dependency, which the batch has no edge for; the edge added here
         holds the action back until that theory is rebuilt and the cache holds it again. One the batch is still to
-        build costs the action no attempt, and holds it back from claims ahead too.
+        build costs the action no attempt, and holds it back from claims ahead too. Return whether it cost none.
         """
         missing = result.missing
         more = [f"{item.kind} {item.key}" for item in result.missing_more]
@@ -4249,7 +4257,7 @@ class Coordinator:
             if parent_state in ("failed", "cancelled"):
                 await self._skip(conn, batch_id, input_key, f"skipped because of {rebuilt} ({missing.key})")
                 await self._finish_if_done(conn, batch_id)
-                return
+                return False
             if parent_state in ("waiting", "ready", "running") and await self._add_edge(
                 conn, batch_id, input_key, missing.key
             ):
@@ -4267,7 +4275,7 @@ class Coordinator:
                 self._remember_missing(batch_id, input_key, more)
                 await self._back_to_waiting(conn, batch_id, input_key, ahead_batch=ahead_batch)
                 await self._requeue(conn, batch_id, missing.key, ahead_batch=ahead_batch)
-                return
+                return True
         if attempts >= self.settings.max_attempts:
             # What it found missing before is superseded by this last report.
             self.missing_inputs.get(batch_id, {}).pop(input_key, None)
@@ -4294,6 +4302,7 @@ class Coordinator:
         else:
             self._remember_missing(batch_id, input_key, ([f"{missing.kind} {missing.key}"] if missing else []) + more)
             await self._retry(conn, batch_id, input_key, ahead_batch=ahead_batch)
+        return False
 
     def _remember_missing(self, batch_id: UUID, input_key: str, items: list[str]) -> None:
         """Remember the inputs action ``input_key`` of the batch found missing, in place of those it found before."""

@@ -755,9 +755,10 @@ val pipeline_proof_threads = ref 1
 
 (* A line of SML printing the time now, in milliseconds since the epoch, as
    phase NAME of a "holbuild hol-phases" line (hol_log_phases).  It binds
-   nothing. *)
+   nothing.  The mark starts a line of its own even after output the
+   script left unterminated. *)
 fun phase_mark_line name =
-  "val _ = (TextIO.output (TextIO.stdErr, \"holbuild hol-phases " ^ name ^ "=\" ^ " ^
+  "val _ = (TextIO.output (TextIO.stdErr, \"\\nholbuild hol-phases " ^ name ^ "=\" ^ " ^
   "LargeInt.toString (Time.toMilliseconds (Time.now ())) ^ \"\\n\"); TextIO.flushOut TextIO.stdErr);"
 
 (* The stage file a theory child runs just before the script: it marks
@@ -17728,7 +17729,19 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                      Option.isSome (Option.mapPartial (earlier_build_key spec)
                                       (HolbuildRemoteCache.get_action remote pair_key))
                  | NONE => false)
-            val heap_hit = not built andalso probes_shared andalso cached shared_key
+            val heap_label = #package built_action ^ ":" ^ #logical built_action
+            val heap_hit =
+              not built andalso probes_shared andalso
+              (cached shared_key
+               handle e as HolbuildRemoteCache.Unavailable _ =>
+                 (shared_heap_line "lookup" heap_label shared_key "unavailable"; raise e))
+            (* Probed only when no build was found to reuse.  The line is
+               the heap's: a failed prefix published without one is a miss.
+               On a hit the plain build that follows reports its own lookup. *)
+            val _ =
+              if probes_shared andalso not built then
+                shared_heap_line "lookup" heap_label shared_key (if heap_hit then "hit" else "miss")
+              else ()
             val hit =
               built orelse heap_hit orelse
               (probes_shared andalso not deps_heap_only andalso
@@ -17771,14 +17784,6 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                             | (NONE, SOME (SOME e)) => raise e
                             | _ => ())})
                 pipelined
-            (* Probed only when no build was found to reuse.  The line is
-               the heap's: a failed prefix published without one is a miss.
-               On a hit the plain build that follows reports its own lookup. *)
-            val _ =
-              if probes_shared andalso not built then
-                shared_heap_line "lookup" (#package built_action ^ ":" ^ #logical built_action) shared_key
-                  (if heap_hit then "hit" else "miss")
-              else ()
           in
             (* What a hit takes may not be what the parents' outlines
                suggest: the action builds plain once they are built. *)
