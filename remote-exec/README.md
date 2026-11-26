@@ -843,9 +843,9 @@ A build's dependency graph narrows and widens: a few theories everything else
 waits on run alone, then many become ready together. Following the queue
 exactly would stop burst workers at every narrow point and start them again
 seconds later. So the target is the highest demand of the last
-`REMOTE_EXEC_SCALE_DOWN_HOLD_S` seconds: it rises at once and falls only after
-demand has stayed lower for that long. `REMOTE_EXEC_SCALE_UP_FREE_WORKERS`
-scales immediately, while demand above it must remain sustained for
+`REMOTE_EXEC_SCALE_DOWN_HOLD_S` seconds: it rises at once when demand is within
+`REMOTE_EXEC_SCALE_UP_FREE_WORKERS`, and falls only after demand has stayed
+lower for that long. Demand above that allowance must remain sustained for
 `REMOTE_EXEC_SCALE_UP_HOLD_S` seconds before the target rises further. Each
 scale check records its raw demand in the database, so a restarted coordinator
 keeps holding the target.

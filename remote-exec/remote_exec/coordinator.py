@@ -3954,7 +3954,7 @@ class Coordinator:
         ]
         return QueueStatus(
             counts,
-            max(desired, demand),
+            desired,
             sorted(hosts, key=lambda h: h.report.id),
             self._phase_totals(now),
             self.scaler,
@@ -4122,7 +4122,13 @@ class Coordinator:
             self.scaler = ScaleRun(desired, now, None)
 
     def _burst_demand_params(self, now: datetime) -> dict[str, object]:
-        return {"now": now, "hold": self.settings.scale_down_hold_s + self.settings.scale_up_hold_s}
+        return {
+            "now": now,
+            "hold": max(
+                self.settings.cache_scale_down_hold_s,
+                2 * (self.settings.scale_down_hold_s + self.settings.scale_up_hold_s),
+            ),
+        }
 
     async def _scale(self, scale_cmd: str, workers: int) -> None:
         process = await asyncio.create_subprocess_exec(*shlex.split(scale_cmd), str(workers))

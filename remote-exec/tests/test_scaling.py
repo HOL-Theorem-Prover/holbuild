@@ -105,6 +105,13 @@ def test_held_target_waits_for_sustained_demand_above_free_workers() -> None:
     assert held_target(samples, samples[2][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 120
 
 
+def test_held_target_uses_the_latest_sample_before_the_hold_cutoff() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    samples = [(start, 120), (start + timedelta(seconds=11), 120), (start + timedelta(seconds=187), 120)]
+
+    assert held_target(samples, samples[-1][0], down_hold_s=0.0, up_hold_s=180.0, free_workers=96, cap=540) == 120
+
+
 def test_held_target_drops_a_short_spike_without_scaling_above_free_workers() -> None:
     start = datetime(2026, 1, 1, tzinfo=UTC)
     samples = [(start, 120), (start + timedelta(seconds=90), 80), (start + timedelta(seconds=180), 80)]
