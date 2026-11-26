@@ -16604,12 +16604,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        linked there: a link, unlike a rename, never replaces a blob another
        action's child may already be granted.  Should that fail, the input
        is fetched into the root as any spec blob.  scratch_blobs keeps each
-       blob read across file systems and its identity: touched again after
-       each wait for a parent, so cache eviction takes it last, and a
-       failure after it left the cache is retried rather than reported. *)
-    val scratch_blobs : (string * (Posix.FileSys.dev * Posix.FileSys.ino) option) list ref = ref []
-    fun scratch_input_lost () = List.exists (fn (path, id) => file_id path <> id) (!scratch_blobs)
-    fun touch_scratch_blobs () = List.app (HolbuildCache.touch o #1) (!scratch_blobs)
+       blob staged in place, touched again after each wait for a parent so
+       cache eviction takes it last; scratch_symlinked keeps each one read
+       across file systems and its identity, so a failure after it left
+       the cache is retried rather than reported. *)
+    val scratch_blobs : string list ref = ref []
+    val scratch_symlinked : (string * (Posix.FileSys.dev * Posix.FileSys.ino) option) list ref = ref []
+    fun scratch_input_lost () = List.exists (fn (path, id) => file_id path <> id) (!scratch_symlinked)
+    fun touch_scratch_blobs () = List.app HolbuildCache.touch (!scratch_blobs)
     fun stage_scratch_input (spec : action_spec) =
       let
         val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
@@ -16646,7 +16648,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                            | id => id
               in
                 Posix.FileSys.symlink {old = target, new = path};
-                scratch_blobs := (target, id) :: !scratch_blobs;
+                scratch_symlinked := (target, id) :: !scratch_symlinked;
                 HolbuildActionSandbox.scratch_reads := target :: !HolbuildActionSandbox.scratch_reads
               end
             fun in_place () =
@@ -16654,6 +16656,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                if HolbuildCache.is_regular_entry blob then () else raise Error ("blob " ^ sha ^ " is not a file of the cache");
                Posix.FileSys.chmod (blob, read_only);
                HolbuildCache.touch blob;
+               scratch_blobs := blob :: !scratch_blobs;
                ensure_parent path;
                remove_file path;
                Posix.FileSys.link {old = blob, new = path}
@@ -16669,6 +16672,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           end
       in
         scratch_blobs := [];
+        scratch_symlinked := [];
         HolbuildActionSandbox.scratch_reads := [];
         case #scratch_inputs spec of
             [] => scratch_input_paths := []
