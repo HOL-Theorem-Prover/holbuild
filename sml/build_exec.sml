@@ -553,18 +553,18 @@ fun module_store_key tc =
           in module_store_keys := (toolchain, key) :: !module_store_keys; key end
   end
 
-(* The store, under the v3 prefix: named by the HOL directory and the
-   toolchain's exact key, since a HOL rebuilt in the same directory has a
-   base state of another id, and a store must not mix modules of two ids.
-   The remote cache's entries keep the HOL directory's id alone
-   (module_remote_key), and their key the toolchain's.  The v2 store (named
-   by the HOL directory alone) is left to the cache cap. *)
-fun module_store tc =
+(* The v3 and v4 stores use the HOL directory and the exact toolchain key:
+   rebuilding HOL in the same directory can change its base state id.
+   The v4 prefix isolates the store from older workers that can still
+   replace modules in v3.  Remote lookups keep using module_remote_key. *)
+fun exact_module_store prefix tc =
   Path.concat (module_stores (),
-               "v3-" ^ HolbuildHash.string_sha256
-                         (Path.mkAbsolute {path = #holdir tc, relativeTo = FS.getDir ()} ^ "\n" ^
-                          module_store_key tc))
+               prefix ^ HolbuildHash.string_sha256
+                          (Path.mkAbsolute {path = #holdir tc, relativeTo = FS.getDir ()} ^ "\n" ^
+                           module_store_key tc))
 
+fun module_store tc = exact_module_store "v4-" tc
+fun module_store_v3 tc = exact_module_store "v3-" tc
 fun module_store_v2 holdir = Path.concat (module_stores (), "v2-" ^ module_store_id holdir)
 
 (* Held by the worker process whose writer is filling a store
@@ -3289,7 +3289,7 @@ fun heap_runtime_identity () =
   case !heap_runtime_identity_memo of
       SOME identity => identity
     | NONE =>
-        let val identity = runtime_files_identity "holbuild-heap-runtime-v3" heap_runtime_source_files
+        let val identity = runtime_files_identity "holbuild-heap-runtime-v4" heap_runtime_source_files
         in heap_runtime_identity_memo := SOME identity; identity end
 
 (* Context checkpoints also hold the theorem numbering HOL assigned so far.
@@ -16254,29 +16254,34 @@ fun write_missing_modules remote root tc wanted deadline =
      published = !published, trace = module_store_trace {files = !listing, expected = expected_names, run = !run}}
   end
 
+(* A new store takes just the base-theories list from v3, or from v2 if
+   there is no v3 list.  This lets the first preload fetch modules from
+   the remote cache without inheriting older workers' module files. *)
+fun seed_module_store tc =
+  let
+    val store = module_store tc
+    fun base_theories dir = Path.concat (dir, module_store_base_theories)
+    val file = base_theories store
+  in
+    if file_exists file then ()
+    else
+      case List.find file_exists
+             [base_theories (module_store_v3 tc), base_theories (module_store_v2 (#holdir tc))] of
+          NONE => ()
+        | SOME old =>
+            let val tmp = store_temp file
+            in
+              ensure_dir store;
+              (copy_binary old tmp; FS.rename {old = tmp, new = file})
+              handle e => (remove_file tmp; raise e)
+            end
+  end
+  handle e => warn ("theory module store not seeded: " ^ General.exnMessage e)
+
 (* The writer for an action's theories, given until DEADLINE: how long it
    took, how many modules it stored of how many missing, how many entries it
    looked up in the remote cache, and how many modules it fetched and
    published. *)
-(* A new store takes its base theories from the v2 store's (module_store),
-   which lists the same: they're the HOL's base theories, whichever build
-   of its base state. *)
-fun seed_module_store tc =
-  let
-    val file = Path.concat (module_store tc, module_store_base_theories)
-    val old = Path.concat (module_store_v2 (#holdir tc), module_store_base_theories)
-  in
-    if file_exists file orelse not (file_exists old) then ()
-    else
-      let val tmp = store_temp file
-      in
-        ensure_dir (module_store tc);
-        (copy_binary old tmp; FS.rename {old = tmp, new = file})
-        handle e => (remove_file tmp; raise e)
-      end
-  end
-  handle e => warn ("theory module store not seeded: " ^ General.exnMessage e)
-
 fun fill_module_store remote root tc wanted deadline =
   let
     val t0 = Time.now ()
