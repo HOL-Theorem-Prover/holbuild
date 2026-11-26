@@ -373,8 +373,8 @@ fun run_action_help () = print
   \outputs are fetched into D/PACKAGE/THEORY (D/HOL/THEORY for a toolchain\n\
   \theory), beside KEY (the run key) and CONTEXT. Failed runs fetch LOG when\n\
   \available; a missing log warns without changing the run failure. A line is\n\
-  \printed: `CONTEXT RUN-KEY done|cached|failed CLASS|missing`. Runs never\n\
-  \execute locally.\n\n\
+  \printed: `CONTEXT RUN-KEY done|cached|failed CLASS|missing|held`. Runs\n\
+  \never execute locally.\n\n\
   \A TARGET is a project theory (a logical name as build takes, or\n\
   \PACKAGE:NAME), a theory of the HOL toolchain (hol:bool or hol:boolTheory),\n\
   \or hol:* for every theory of the toolchain. A project theory must be built\n\
@@ -390,9 +390,11 @@ fun run_action_help () = print
   \--remote-only   Exit 75, not 1, when no --remote-exec is given.\n\
   \--fetch-only    Fetch what the remote cache holds; submit nothing.\n\
   \--export-only   Only write and upload each run's spec and print\n\
-  \                `CONTEXT RUN-KEY SPEC-SHA256`.\n\n\
-  \Exits 0 when every run ended (done, cached, failed or, with --fetch-only,\n\
-  \missing), 75 when the coordinator can't take or finish the batch or an\n\
+  \                `CONTEXT RUN-KEY SPEC-SHA256`.\n\
+  \--held FILE     Run keys, one per line, whose outputs the caller already\n\
+  \                has: those runs are held, neither run nor fetched.\n\n\
+  \Exits 0 when every run ended (done, cached, failed, held or, with\n\
+  \--fetch-only, missing), 75 when the coordinator can't take or finish the batch or an\n\
   \ended run can't be fetched, and 1 on errors, a cancelled batch, or a\n\
   \TARGET that isn't built.\n\n\
   \Takes build's cache options. Needs --remote-cache.\n\n\
@@ -1254,7 +1256,7 @@ datatype build_mode =
   | ExportActionSpecs of {upload : bool}
   | ExportRunSpecs of HolbuildBuildExec.run_request
   | RemoteRun of {request : HolbuildBuildExec.run_request, url : string option, fetch_only : bool,
-                  outputs_dir : string, profile : string option}
+                  outputs_dir : string, profile : string option, held : string list}
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int,
                    speculative_loading : int option}
 
@@ -1686,12 +1688,13 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
     (* Runs the request's runs the remote cache lacks on remote workers, as
        one batch, then fetches every run's outputs into outputs_dir and
        prints a line per run.  A run never runs here. *)
-    fun remote_run {request, url, fetch_only, outputs_dir, profile} () =
+    fun remote_run {request, url, fetch_only, outputs_dir, profile, held} () =
       let
         val outputs = #outputs request
         fun run_keys runs = Binaryset.addList (Binaryset.empty String.compare,
                                                map (fn ({run_key, ...} : HolbuildBuildExec.run) => run_key) runs)
         fun has keys ({run_key, ...} : HolbuildBuildExec.run) = Binaryset.member (keys, run_key)
+        val held_keys = Binaryset.addList (Binaryset.empty String.compare, held)
         (* Why the runs didn't all end, and whether a later try may succeed. *)
         val stopped : (string * bool) option ref = ref NONE
         val (remote, runs, uncached, {exported, refused}) =
@@ -1707,7 +1710,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                     HolbuildBuildExec.failing_on_pool remote jobs "checking remote cache" "runs"
                       (fn remote => fn ({run_key, ...} : HolbuildBuildExec.run) =>
                           HolbuildBuildExec.run_already_done remote run_key outputs)
-                      runs
+                      (List.filter (not o has held_keys) runs)
                 val exported =
                   case (uncached, url) of
                       ([], _) => {exported = [], refused = []}
@@ -1769,12 +1772,14 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         val ended =
           map (fn run =>
                   (run,
-                   if fetch_only orelse not (has uncached_keys run) then "cached"
+                   if has held_keys run then "held"
+                   else if fetch_only orelse not (has uncached_keys run) then "cached"
                    else if has refused_keys run then "missing"
                    else ended_as run))
               runs
         val to_fetch = List.mapPartial (fn (run, status) =>
-                                           if status <> "missing" then SOME run else NONE)
+                                           if status <> "missing" andalso status <> "held" then SOME run
+                                           else NONE)
                                        ended
         (* A fetch that raises (an output directory it can't write, say)
            counts as not fetched; its error is raised once every line is out. *)
@@ -2671,6 +2676,7 @@ fun run_action_command tc cli_jobs args =
     val loads = ref []
     val outputs = ref []
     val timeout = ref NONE
+    val held = ref NONE
     fun push r x = r := !r @ [x]
     fun once flag r value =
       case !r of
@@ -2693,7 +2699,7 @@ fun run_action_command tc cli_jobs args =
       else raise Error ("run-action: --profile takes letters, digits, '.', '_' and '-', got " ^
                         HolbuildHash.quote text)
     val valued = ["--script", "--support", "--load", "--output", "--option", "--remote-exec",
-                  "--outputs-dir", "--profile"]
+                  "--outputs-dir", "--profile", "--held"]
     fun parse args =
       case args of
           [] => []
@@ -2713,6 +2719,7 @@ fun run_action_command tc cli_jobs args =
                    | "--option" => timeout := SOME (timeout_option value)
                    | "--remote-exec" => once flag url value
                    | "--outputs-dir" => once flag outputs_dir value
+                   | "--held" => once flag held value
                    | _ => once flag profile (profile_name value);
                parse rest)
             else flag :: parse (value :: rest)
@@ -2734,8 +2741,8 @@ fun run_action_command tc cli_jobs args =
         raise Error "run-action does not check proof steps: remove --tactic-timeout, --heavy-tactic-timeout, --proof-scope=all and --new-ir"
       else if !export_only andalso
               (!fetch_only orelse !remote_only orelse Option.isSome (!url) orelse
-               Option.isSome (!outputs_dir) orelse Option.isSome (!profile)) then
-        raise Error "run-action --export-only takes none of --fetch-only, --remote-exec, --remote-only, --outputs-dir and --profile"
+               Option.isSome (!outputs_dir) orelse Option.isSome (!profile) orelse Option.isSome (!held)) then
+        raise Error "run-action --export-only takes none of --fetch-only, --remote-exec, --remote-only, --outputs-dir, --profile and --held"
       else if not (!export_only orelse !fetch_only orelse Option.isSome (!url)) then
         if !remote_only then
           (HolbuildHolSharedCache.local_build_needed := true;
@@ -2759,7 +2766,12 @@ fun run_action_command tc cli_jobs args =
       else
         RemoteRun {request = request, url = !url, fetch_only = !fetch_only,
                    outputs_dir = OS.Path.mkAbsolute {path = valOf (!outputs_dir), relativeTo = OS.FileSys.getDir ()},
-                   profile = !profile}
+                   profile = !profile,
+                   held = case !held of
+                              NONE => []
+                            | SOME path =>
+                                String.tokens Char.isSpace (read_text path)
+                                handle IO.Io _ => raise Error ("run-action: could not read --held " ^ path)}
   in
     build_once_with_prepared_mode mode tc cli_jobs NONE
       (flags, HolbuildBuildExec.run_planning_targets request)
