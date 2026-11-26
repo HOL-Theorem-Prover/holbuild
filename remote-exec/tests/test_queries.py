@@ -496,7 +496,9 @@ STATEMENTS = [
         100,
     ),
     Statement("SELECT pg_advisory_xact_lock(1752132706, 1)", lambda f: {}, 100),
-    Statement(cm.READY_BUILD, lambda f: {"tiers": ["standard"]}, 1_100),
+    # It may pass the follower's 400 held copies before an unleased ready action, depending on the order the scan
+    # finds rows in: 1,020 rows handled when it doesn't, 1,412 when it does.
+    Statement(cm.READY_BUILD, lambda f: {"tiers": ["standard"]}, 2_900),
     # leases
     Statement(
         "UPDATE actions SET state = 'running', attempts = attempts + 1",
