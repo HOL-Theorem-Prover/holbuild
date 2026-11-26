@@ -960,10 +960,13 @@ GC should remove stale tmp dirs, remove old action manifests by refreshed mtime,
 mark blobs still reachable from non-expired manifests, and sweep old unreferenced
 blobs. Races with builds should degrade to cache misses and source rebuilds. Cache GC
 uses a cache-local POSIX file lock at `locks/gc.lock` to avoid concurrent GC runs.
-It unlinks a stale action lock only while holding it, and lockers retry when
-the file they locked is no longer at its path, so no holder is split from a
-new opener. Older holbuild versions kept one action lock per key in a flat
-`locks/`, which GC never prunes.
+For current sharded action locks, it unlinks a stale lock only while holding it,
+and lockers retry when the file they locked is no longer at its path, so no
+holder is split from a new opener. Older holbuild versions kept one action lock
+per key in a flat `locks/`; once no pre-0.14.87 client uses the cache, GC removes
+those regular files without an age gate. A pre-0.14.87 client that opened a
+flat lock before GC acquired it can publish without that lock after the unlink,
+but manifests use tmp-plus-rename and the result is only duplicated work.
 
 ## Heaps and checkpoints
 
