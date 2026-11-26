@@ -167,10 +167,14 @@ fun warn_restore_once message =
 fun cli_status timeout options url =
   let
     val _ = HolbuildOffline.require_online "contact the remote cache"
+    val maximum =
+      case HolbuildHttp.deadline () of
+          NONE => Int.toString HolbuildHttp.max_transfer_seconds
+        | SOME _ => Time.fmt 3 (Time.fromMilliseconds (Int.toLarge (HolbuildHttp.transfer_timeout_ms ())))
     val result =
       run "curl" (["-q", "-sS", "-L", "--connect-timeout", Int.toString HolbuildHttp.connect_timeout_seconds,
                    "--speed-limit", "1", "--speed-time", Int.toString timeout,
-                   "--max-time", Int.toString HolbuildHttp.max_transfer_seconds] @
+                   "--max-time", maximum] @
                   curl_config_args () @ options @ ["-w", "%{http_code}", url])
   in
     case (HolbuildSpawn.succeeded result, Int.fromString (first_token (#output result))) of
@@ -396,8 +400,8 @@ fun revalidating f =
 
 (* A HEAD inside `revalidating` asks the cache to check with its origin
    that it still holds the entry or blob. *)
-fun head_status url =
-  let val headers = if reads_revalidate () then ["Cache-Control: no-cache"] else []
+fun head_status_with revalidate url =
+  let val headers = if revalidate then ["Cache-Control: no-cache"] else []
   in
     if HolbuildRemoteCacheConfig.uses_libcurl () then
       HolbuildHttp.head {url = url, headers = headers, timeout = stall_timeout_seconds}
@@ -405,6 +409,8 @@ fun head_status url =
       cli_status stall_timeout_seconds
         (["-I", "--ignore-content-length", "-o", "/dev/null"] @ List.concat (map (fn h => ["-H", h]) headers)) url
   end
+
+fun head_status url = head_status_with (reads_revalidate ()) url
 
 (* A read's probes past its first nodes run on the caller's thread and on
    helper threads, at most probe_helpers of them in the whole process, so
@@ -440,7 +446,8 @@ fun probe_all probe urls =
              work ())
     fun release slots = with_mutex helpers_mutex (fn () => free_helpers := !free_helpers + slots)
     fun stopped () = with_mutex mutex (fn () => (running := !running - 1; ConditionVar.broadcast finished))
-    fun helper () = (work (); release 1; stopped ())
+    val deadline = HolbuildHttp.deadline ()
+    fun helper () = (HolbuildHttp.with_deadline deadline work; release 1; stopped ())
     fun start 0 = ()
       | start slots =
           (with_mutex mutex (fn () => running := !running + 1);
@@ -642,8 +649,12 @@ fun retrying_one_node method urls attempt =
     | _ => attempt ()
 
 fun send_urls_using usable method urls path request =
-  send_result method (hd urls) (fn () =>
-    retrying_one_node method urls (fn () => routed_status_using usable method head_status urls path request))
+  let
+    val probe = head_status_with (reads_revalidate ())
+  in
+    send_result method (hd urls) (fn () =>
+      retrying_one_node method urls (fn () => routed_status_using usable method probe urls path request))
+  end
 
 fun send_urls method urls path request = send_urls_using (fn _ => true) method urls path request
 

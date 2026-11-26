@@ -123,7 +123,7 @@ val CURLOPT_URL = 10002
 val CURLOPT_USERPWD = 10005
 val CURLOPT_READDATA = 10009
 val CURLOPT_ERRORBUFFER = 10010
-val CURLOPT_TIMEOUT = 13
+val CURLOPT_TIMEOUT_MS = 155
 val CURLOPT_LOW_SPEED_LIMIT = 19
 val CURLOPT_LOW_SPEED_TIME = 20
 val CURLOPT_CONNECTTIMEOUT = 78
@@ -154,6 +154,32 @@ val connect_timeout_seconds = 5
 (* The longest any transfer may take, in both remote cache clients, however
    steadily it moves data. *)
 val max_transfer_seconds = 1800
+
+val deadline_tag : Time.time option Universal.tag = Universal.tag ()
+
+fun deadline () = Option.join (Thread.getLocal deadline_tag)
+
+fun with_deadline limit f =
+  let
+    val outer = deadline ()
+    fun restore () = Thread.setLocal (deadline_tag, outer)
+  in
+    Thread.setLocal (deadline_tag, limit);
+    (f () before restore ()) handle e => (restore (); raise e)
+  end
+
+fun transfer_timeout_ms () =
+  let val maximum = 1000 * max_transfer_seconds
+  in
+    case deadline () of
+        NONE => maximum
+      | SOME limit =>
+          let val remaining = Time.toMilliseconds (Time.- (limit, Time.now ()))
+          in
+            if remaining <= 0 then raise Error "HTTP request deadline elapsed"
+            else LargeInt.toInt (LargeInt.min (remaining, Int.toLarge maximum))
+          end
+  end
 
 val userpwd : string option ref = ref NONE
 
@@ -502,7 +528,7 @@ fun request_once {url, timeout, files} =
       let
         val handle_ as {easy, ...} = new_handle ()
         val _ =
-          (check "TIMEOUT" (setopt_long (easy, CURLOPT_TIMEOUT, max_transfer_seconds));
+          (check "TIMEOUT_MS" (setopt_long (easy, CURLOPT_TIMEOUT_MS, transfer_timeout_ms ()));
            check "LOW_SPEED_LIMIT" (setopt_long (easy, CURLOPT_LOW_SPEED_LIMIT, 1));
            check "LOW_SPEED_TIME" (setopt_long (easy, CURLOPT_LOW_SPEED_TIME, timeout));
            check "URL" (setopt_str (easy, CURLOPT_URL, url));
