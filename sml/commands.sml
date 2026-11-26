@@ -107,6 +107,9 @@ fun build_help () = print
   \  --allow-cache-timeout-discrepancy\n\
   \  --no-stat-cache\n\
   \  --skip-checkpoints\n\
+  \  --no-checkpoint-saves\n\
+  \      Resume from checkpoints as usual, but save, remove and publish none, so\n\
+  \      the project's checkpoints stay as they were. Excludes --repl-on-failure.\n\
   \  --checkpoint-seconds SECONDS (default: 2)\n\
   \      Save a theorem or definition context only once SECONDS, and ten times\n\
   \      the last such save's duration, have passed since that save; 0 saves\n\
@@ -504,6 +507,8 @@ fun split_flags args =
       extract_flag "--all-checkpoints" args_without_allow_discrepancy
     val (fail_fast, args_without_fail_fast) = extract_flag "--fail-fast" args_without_all_checkpoints
     val (check_only, args_without_check_only) = extract_flag "--check-only" args_without_fail_fast
+    val (no_checkpoint_saves, args_without_no_checkpoint_saves) =
+      extract_flag "--no-checkpoint-saves" args_without_check_only
     fun extract_checkpoint_seconds seconds acc xs =
       case xs of
           [] => (seconds, rev acc)
@@ -517,7 +522,7 @@ fun split_flags args =
                 acc ys
             else extract_checkpoint_seconds seconds (y :: acc) ys
     val (checkpoint_seconds, args_without_checkpoint_seconds) =
-      extract_checkpoint_seconds HolbuildBuildExec.default_checkpoint_seconds [] args_without_check_only
+      extract_checkpoint_seconds HolbuildBuildExec.default_checkpoint_seconds [] args_without_no_checkpoint_saves
     fun extract_heavy_tactic_timeout timeout acc xs =
       case xs of
           [] => (timeout, rev acc)
@@ -538,6 +543,7 @@ fun split_flags args =
                   verify_cache = verify_cache,
                   no_stat_cache = no_stat_cache,
                   skip_checkpoints = skip_checkpoints,
+                  no_checkpoint_saves = no_checkpoint_saves,
                   checkpoint_seconds = checkpoint_seconds,
                   fail_fast = fail_fast, all_checkpoints = all_checkpoints,
                   proof_steps = proof_steps, new_ir = new_ir, proof_scope = proof_scope,
@@ -633,7 +639,7 @@ fun split_flags args =
 fun plain_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = true, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
+    skip_checkpoints = true, no_checkpoint_saves = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
     fail_fast = false, all_checkpoints = false, proof_steps = false, new_ir = false,
     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
     tactic_timeout = NONE, tactic_timeout_set = false, heavy_tactic_timeout = NONE,
@@ -649,7 +655,7 @@ fun plain_build_request targets =
 fun heap_build_request targets =
   ({dry_run = false, watch = false, force = HolbuildBuildExec.ForceNone,
     use_cache = true, verify_cache = true, no_stat_cache = false,
-    skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
+    skip_checkpoints = false, no_checkpoint_saves = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
     fail_fast = false, all_checkpoints = false, proof_steps = false, new_ir = false,
     proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
     tactic_timeout = NONE, tactic_timeout_set = false, heavy_tactic_timeout = NONE,
@@ -1252,7 +1258,7 @@ datatype build_mode =
   | RemoteExec of {url : string, remote_only : bool, detach : bool, attach : string option, priority : int,
                    speculative_loading : int option}
 
-fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, checkpoint_seconds, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, heavy_tactic_timeout, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, promote_preload, check_only}, targets) =
+fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, force, use_cache, verify_cache, no_stat_cache, skip_checkpoints, no_checkpoint_saves, checkpoint_seconds, fail_fast, all_checkpoints, proof_steps, new_ir, proof_scope, tactic_timeout, tactic_timeout_set, heavy_tactic_timeout, trace_steps, repl_on_failure, retain_debug_artifacts, warn_unreachable, emit_output_hashes, allow_cache_timeout_discrepancy, promote_preload, check_only}, targets) =
   let
     val project =
       case prepared of
@@ -1287,6 +1293,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
         raise Error "--json does not support --repl-on-failure"
       else if skip_checkpoints andalso repl_on_failure then
         raise Error "--repl-on-failure requires checkpoints; remove --skip-checkpoints"
+      else if no_checkpoint_saves andalso repl_on_failure then
+        raise Error "--repl-on-failure starts from the checkpoints a failure saves; remove --no-checkpoint-saves"
       else if not proof_steps andalso new_ir then
         raise Error "proof steps are required for proof IR; remove --skip-proof-steps"
       else if not proof_steps andalso tactic_timeout_set then
@@ -1330,6 +1338,7 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
        fail_fast = fail_fast,
        all_checkpoints = all_checkpoints,
        skip_checkpoints = skip_checkpoints,
+       no_checkpoint_saves = no_checkpoint_saves,
        checkpoint_seconds = checkpoint_seconds,
        proof_steps = proof_steps,
        new_ir = new_ir,
@@ -2926,7 +2935,11 @@ fun build tc cli_jobs args =
     val (speculative_loading, args) = split_speculative_loading args
     val args = split_scratch_input_flag (split_tool_cache_flag args)
     val ({url, remote_only, detach, attach}, args) = split_remote_exec_flags args
-    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, check_only, ...}, _) = split_flags args
+    val parsed as ({dry_run, watch, repl_on_failure, trace_steps, check_only, no_checkpoint_saves, ...}, _) =
+      split_flags args
+    (* Automatic GC evicts and reindexes checkpoints, which a build under
+       --no-checkpoint-saves leaves as they were. *)
+    val gc_after = not dry_run andalso not no_checkpoint_saves
     val _ =
       if watch andalso HolbuildStatus.json_mode () then
         raise Error "--json does not support build --watch yet"
@@ -2957,12 +2970,12 @@ fun build tc cli_jobs args =
              (RemoteExec {url = url, remote_only = remote_only, detach = detach, attach = attach, priority = priority,
                           speculative_loading = speculative_loading})
              tc cli_jobs NONE parsed;
-           if detach then () else auto_gc (SOME o load_project))
+           if detach orelse not gc_after then () else auto_gc (SOME o load_project))
       | NONE =>
           if watch then build_watch tc cli_jobs parsed
           else
             (build_once tc cli_jobs parsed;
-             if dry_run then () else auto_gc (SOME o load_project))
+             if gc_after then auto_gc (SOME o load_project) else ())
   end
 
 fun chomp text =
@@ -3072,7 +3085,7 @@ fun default_build_options trknl project index entry_plan plan =
      verify_cache = true,
      force = HolbuildBuildExec.ForceNone,
      force_targets = [], checkpoint_targets = [], check_only_targets = [],
-     skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
+     skip_checkpoints = false, no_checkpoint_saves = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
      proof_steps = true,
      new_ir = true,
      proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,
@@ -3121,7 +3134,7 @@ fun heap_build_options trknl =
    verify_cache = true,
    force = HolbuildBuildExec.ForceNone,
    force_targets = [], checkpoint_targets = [], check_only_targets = [],
-   skip_checkpoints = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
+   skip_checkpoints = false, no_checkpoint_saves = false, checkpoint_seconds = HolbuildBuildExec.default_checkpoint_seconds,
    proof_steps = false,
    new_ir = false,
    proof_scope = HolbuildTacticTimeoutPolicy.ProofRoot,

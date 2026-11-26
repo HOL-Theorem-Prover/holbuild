@@ -749,6 +749,22 @@ Hash every source file instead of trusting an unchanged file status.
 .B \-\-skip\-checkpoints
 Do not create checkpoints.
 .TP
+.B \-\-no\-checkpoint\-saves
+Resume from saved checkpoints and failed prefixes as usual, here and on remote
+workers, but save, remove and publish none: the project's checkpoints, the
+host's deps heap store and the shared heaps stay as they were, and no
+automatic GC runs after it.
+For throwaway builds, such as experiments or scratch copies, that must not
+replace a project's resume state.
+A checkpoint that cannot be resumed is kept, and the theory runs again
+restoring none.
+No cache or action key depends on it.
+With
+.B \-\-skip\-checkpoints
+nothing is restored either.
+Excludes
+.BR \-\-repl\-on\-failure .
+.TP
 .BI \-\-checkpoint\-seconds " SECONDS"
 Save a theorem or definition context checkpoint only once
 .I SECONDS
