@@ -86,6 +86,7 @@ val _ =
                 [("append", fn () => BinIO.closeOut (BinIO.openAppend path)),
                  ("rename", fn () => OS.FileSys.rename {old = path, new = path ^ ".moved"}),
                  ("remove", fn () => OS.FileSys.remove path),
+                 ("remove-blob", fn () => OS.FileSys.remove (OS.Path.concat (blobs, OS.Path.file path))),
                  ("list", fn () => OS.FileSys.closeDir (OS.FileSys.openDir blobs)),
                  ("other", fn () => TextIO.closeIn (TextIO.openIn (OS.Path.concat (blobs, "$other_blob"))))]
             in
@@ -210,7 +211,7 @@ in_place() {
   grep -qx "scratch path: $(realpath "$worker_cache/action")/.holbuild/scratch/$2" "$tmpdir/$1.hol" &&
     grep -qx "scratch links: $3" "$tmpdir/$1.hol" && grep -qx "scratch target: $4" "$tmpdir/$1.hol" || {
     echo "worker $1: the input is not staged as expected" >&2; grep "^scratch" "$tmpdir/$1.hol" >&2; exit 1; }
-  grep -qx "scratch tamper: append=denied rename=denied remove=denied list=denied other=denied" "$tmpdir/$1.hol" || {
+  grep -qx "scratch tamper: append=denied rename=denied remove=denied remove-blob=denied list=denied other=denied" "$tmpdir/$1.hol" || {
     echo "worker $1: the child could change the input, list the cache or read another blob" >&2
     grep "scratch tamper" "$tmpdir/$1.hol" >&2; exit 1; }
 }
