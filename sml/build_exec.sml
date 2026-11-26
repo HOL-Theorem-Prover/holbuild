@@ -4701,6 +4701,11 @@ val dropped_checkpoints = ref 0
    exec-action's rstmodrejn. *)
 val rejected_heap_modules = ref 0
 
+(* Whether the child, since the action started, gave up the deps heap
+   after failing to load it or a module it loads: the retry doesn't run
+   on it. *)
+val discarded_deps_heap = ref false
+
 fun write_theory_script capture defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker =
   let
     val _ = resume_steps := []
@@ -4928,6 +4933,10 @@ fun take_attached_child () =
 val capture_deps_heap = ref false
 val captured_deps_heap = ref (NONE : string option)
 
+(* Whether a preload of the action saved a deps heap and asked for its
+   capture, whether or not the capture then succeeded. *)
+val preloaded_deps_heap = ref false
+
 (* The theory modules the captured heap loads, linked from the host's store
    into a private directory when the preload saved it, with the ids it
    requires: the publication uploads these, as a restore may later replace
@@ -5022,7 +5031,8 @@ fun with_deps_heap_capture store deps_loaded f =
        it (HOLBUILD_TEST_CAPTURE_PAUSE) to change the heap's modules after
        the preload saved it. *)
     fun take () =
-      ((test_pause "HOLBUILD_TEST_CAPTURE_PAUSE";
+      ((preloaded_deps_heap := true;
+        test_pause "HOLBUILD_TEST_CAPTURE_PAUSE";
         if requires_refused () then
           warn "not sharing the deps-loaded heap: it requires a theory module HOL refused"
         else
@@ -5157,11 +5167,17 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     fun discard_loaded_checkpoint_after_load_failure msg =
       if Option.isSome (find_substring "Required module missing or changed" msg) then
         (rejected_heap_modules := !rejected_heap_modules + 1;
+         discarded_deps_heap := true;
          if discards then remove_deps_checkpoint_family checkpoint_base deps_key deps_loaded else ())
-      else if not discards then ()
       else
-        remove_loaded_checkpoint_descendants checkpoint_base deps_key deps_loaded theorem_checkpoints declaration_checkpoints
-          (hol_context_path (#context run_spec))
+        let val loaded = hol_context_path (#context run_spec)
+        in
+          if loaded = deps_loaded then discarded_deps_heap := true else ();
+          if discards then
+            remove_loaded_checkpoint_descendants checkpoint_base deps_key deps_loaded theorem_checkpoints
+              declaration_checkpoints loaded
+          else ()
+        end
     fun discard_failed_prefix_after_resume_failure msg =
       case #failed_prefix_context run_spec of
           NONE => false
@@ -13503,6 +13519,17 @@ fun shared_manifest header kind entries =
              "blob=" ^ sha ^ " " ^ role ^ (if arg = "" then "" else " " ^ arg) ^ "\n")
          entries)
 
+(* The fewest missing modules a writer starts for once the store has its
+   base theories.  A writer costs about as much to start as loading
+   sixteen theories from their .dat files instead of their modules, so an
+   action that lacks only the few parents just built loads those from
+   their .dat files. *)
+fun module_writer_min_missing () =
+  (* Tests lower it (HOLBUILD_TEST_MODULE_MIN_MISSING). *)
+  case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_TEST_MODULE_MIN_MISSING") of
+      SOME n => n
+    | NONE => 16
+
 fun shared_manifest_entries text =
   List.mapPartial
     (fn line =>
@@ -13514,6 +13541,50 @@ fun shared_manifest_entries text =
                 else raise Error ("malformed shared checkpoint manifest line: " ^ line)
             | _ => raise Error ("malformed shared checkpoint manifest line: " ^ line))
     (String.tokens (fn c => c = #"\n") text)
+
+(* Files the module writer leaves in a toolchain's store beside its
+   modules and its lock.  [module_store_unsupported]: the toolchain has
+   HOL's module helper but its runtime or Meta cannot write modules, so no
+   writer runs again for it (the store, named by the HOL directory, is per
+   Poly/ML runtime).  [module_store_base_theories]: the theories of the
+   toolchain's base state, one per line; they are in the state, so HOL
+   writes no module for them. *)
+val module_store_unsupported = "unsupported"
+val module_store_base_theories = "base-theories"
+
+(* Whether the toolchain's HOL can write theory modules, as far as is known
+   before trying. *)
+fun module_writer_supported tc =
+  file_exists (Path.concat (#holdir tc, "tools-poly/poly/theory_modules.ML")) andalso
+  not (path_exists (Path.concat (module_store tc, module_store_unsupported)))
+
+(* A deps heap entry's `missing=` line: how many of the modules its cone
+   expects the heap doesn't load, when its publisher knew.  Readers before
+   it take only `blob=` lines. *)
+fun heap_entry_missing text = Option.mapPartial Int.fromString (metadata_value "missing" (metadata_lines text))
+
+(* A deps heap entry saved short of its cone's modules: one that lacks
+   module_writer_min_missing or more, or, for a toolchain that writes
+   modules (MODULES), one that loads none and doesn't say, as published
+   before entries said.  A host whose store has since got the modules
+   saves a heap that loads them, and replaces it. *)
+fun short_heap_entry modules text =
+  case heap_entry_missing text of
+      SOME n => n >= module_writer_min_missing ()
+    | NONE => modules andalso not (List.exists (fn (role, _, _) => role = "module") (shared_manifest_entries text))
+
+(* The deps heap entry TEXT got under KEY, or, if it is short, the entry
+   read again checked with the store, as a cache in front of it may still
+   serve one another host has since replaced. *)
+fun fresh_heap_entry remote modules key text =
+  if (short_heap_entry modules text handle Error _ => false) then
+    (case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.get_action remote key) of
+         NONE => SOME text
+       | fresh => fresh)
+  else SOME text
+
+fun read_heap_entry remote modules key =
+  Option.mapPartial (fresh_heap_entry remote modules key) (HolbuildRemoteCache.get_action remote key)
 
 (* Which of a theory's checkpoints are published on a heap, most recently
    used first, so that a restore probes those rather than every boundary
@@ -13555,7 +13626,7 @@ fun shared_standalone_key heap_key (action : theory_action) =
 type shared_context =
   {store : string, checkpoint_root : string, heap_key : string, index_key : string, standalone_key : string,
    base_state : string, deps_key : string, deps_loaded : string, requested_timeout : real option,
-   candidates : shared_candidate list, module_store : string, heap_only : bool}
+   candidates : shared_candidate list, module_store : string, modules : bool, heap_only : bool}
 
 (* HEAP_ONLY (exec-action --share-deps-heap): the deps heap is shared, and
    no checkpoint the script saved: a script checkpoint's state, a failed
@@ -13573,7 +13644,7 @@ fun shared_context heap_only cache checkpoint_root tc root policy (action : theo
      deps_loaded = deps_loaded_path base (#deps_key action),
      requested_timeout = tactic_timeout policy,
      candidates = if heap_only then [] else shared_candidates policy base checkpoints,
-     module_store = module_store tc, heap_only = heap_only}
+     module_store = module_store tc, modules = module_writer_supported tc, heap_only = heap_only}
   end
 
 fun heap_parent_ok base_state heap =
@@ -13595,12 +13666,14 @@ fun tree_path root rel =
    blobs, which the publish replaces. *)
 (* POISONED: the heap entry, when it was found naming a module of another
    id than its heap loads, or a module blob the cache lost, which the
-   publish replaces unless it changed. *)
+   publish replaces unless it changed.  ENTRY: the entry of the heap
+   restored. *)
 type shared_restore =
   {heap : string option, files : (string * string) list, stale : string list, missing : string list,
-   poisoned : string option}
+   poisoned : string option, entry : string option}
 
-val nothing_restored : shared_restore = {heap = NONE, files = [], stale = [], missing = [], poisoned = NONE}
+val nothing_restored : shared_restore =
+  {heap = NONE, files = [], stale = [], missing = [], poisoned = NONE, entry = NONE}
 
 (* A module file, against the heap entry's digest and the heap's id. *)
 datatype heap_module_state = ModuleMatches | ModuleWrong | ModulePoisoned
@@ -13611,11 +13684,13 @@ datatype heap_module_state = ModuleMatches | ModuleWrong | ModulePoisoned
    is restored: a linked checkpoint would sit where it saves. *)
 (* FETCH_MODULES installs (digest, filename, id) triples from the heap
    entry into this host's module store, and returns the files whose blob
-   has another id and the digests of the blobs the cache has lost. *)
+   has another id and the digests of the blobs the cache has lost.
+   DECLINES says whether the run leaves the published heap and its
+   checkpoints, to preload afresh (declines_short_heap). *)
 fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
                                               deps_key, deps_loaded, module_store,
                                               requested_timeout, candidates, ...} : shared_context) resumes
-                               fetch_modules =
+                               fetch_modules declines =
   let
     val stale = ref ([] : string list)
     val missing = ref ([] : string list)
@@ -13936,9 +14011,10 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* No other checkpoint is published without its heap. *)
     val {heap, files} =
       or_standalone
-        (case (case restore_step "rstprobe" (fn () => HolbuildRemoteCache.get_action remote heap_key) of
+        (case (case restore_step "rstprobe" (fn () => read_heap_entry remote (#modules ctx) heap_key) of
                   NONE => restore_step "rstwait" (fn () =>
-                            await_shared_heap remote heap_key (Time.+ (Time.now (), shared_heap_wait)))
+                            Option.mapPartial (fresh_heap_entry remote (#modules ctx) heap_key)
+                              (await_shared_heap remote heap_key (Time.+ (Time.now (), shared_heap_wait))))
                 | found => found) of
             NONE => no_files
           | SOME text =>
@@ -13951,32 +14027,55 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                     handle e => (warn ("could not restore the shared heap: " ^ General.exnMessage e); NONE)) of
                   NONE => no_files
                 | SOME heap =>
-                    case first_window heap (if resumes then listed candidates else []) of
-                        SOME restored => restored
-                      | NONE => if modules_given_up () then no_files else try_heap heap)
+                    if declines {key = heap_key, heap = heap, entry = text} then no_files
+                    else
+                      case first_window heap (if resumes then listed candidates else []) of
+                          SOME restored => restored
+                        | NONE => if modules_given_up () then no_files else try_heap heap)
   in
-    {heap = heap, files = files, stale = !stale, missing = !missing, poisoned = !poisoned}
+    {heap = heap, files = files, stale = !stale, missing = !missing, poisoned = !poisoned,
+     entry = if Option.isSome heap then !heap_entry else NONE}
   end
   handle e => (warn ("shared checkpoint restore failed: " ^ General.exnMessage e);
                remove_tree (#checkpoint_root ctx); nothing_restored)
 
 (* After the run, successful or not: the heap if this run saved it, then,
-   if the heap under them is the published one, the new checkpoints. *)
+   if the heap under them is the published one, the new checkpoints.
+   CAPTURED: how many of its cone's expected modules the heap this run's
+   preload saved doesn't load, and how many the cone expects, when known. *)
 fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key, index_key, standalone_key, base_state,
                                               deps_key, deps_loaded, candidates, module_store, ...} : shared_context)
-                               ({heap = restored_heap, files = restored, stale, missing, poisoned} : shared_restore) =
+                               ({heap = restored_heap, files = restored, stale, missing, poisoned, ...} : shared_restore)
+                               (captured : {missing : int, cone : int} option) =
   let
     fun member x xs = List.exists (fn y => y = x) xs
     (* An entry naming a blob the cache lost is replaced, as if absent. *)
     fun present key = not (member key stale) andalso Option.isSome (HolbuildRemoteCache.get_action remote key)
     (* So is a heap entry the restore found naming a module of another id
        than its heap loads, or a module blob the cache lost, unless another
-       worker has replaced it since. *)
+       worker has replaced it since; and a short one (short_heap_entry) by
+       a heap that loads all but fewer than module_writer_min_missing of a
+       cone expecting at least as many. *)
+    val complete =
+      case captured of
+          SOME {missing, cone} => missing < module_writer_min_missing () andalso cone >= module_writer_min_missing ()
+        | NONE => false
+    (* A heap entry naming a blob the cache lost counts as absent only
+       while the store's copy still names one: another worker may have
+       replaced it since. *)
+    fun names_lost text =
+      List.exists (fn (_, sha, _) => member sha missing) (shared_manifest_entries text) handle Error _ => true
     fun heap_present () =
-      not (member heap_key stale) andalso
-      (case HolbuildRemoteCache.get_action remote heap_key of
-           NONE => false
-         | found => found <> poisoned)
+      let
+        val lost = member heap_key stale
+        fun read () = read_heap_entry remote (#modules ctx) heap_key
+      in
+        case (if lost then HolbuildRemoteCache.revalidating read else read ()) of
+            NONE => false
+          | found as SOME text =>
+              not (lost andalso names_lost text) andalso found <> poisoned andalso
+              not (complete andalso (short_heap_entry (#modules ctx) text handle Error _ => false))
+      end
     (* Every checkpoint's manifest names its whole spine, so the same files
        come up for each candidate; none changes while this runs.  A restored
        state still linked to the store is the blob it was restored from: the
@@ -14072,7 +14171,8 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
             let
               val manifest =
                 shared_manifest "holbuild-shared-heap-v1" NONE
-                  (("heap", sha, "") :: map (fn (path, module) => ("module", module, Path.file path)) modules)
+                  (("heap", sha, "") :: map (fn (path, module) => ("module", module, Path.file path)) modules) ^
+                (case captured of SOME {missing, ...} => "missing=" ^ Int.toString missing ^ "\n" | NONE => "")
               (* The host that wrote a module usually published it
                  (converge_modules), so only those the cache lacks are put.
                  Each is probed, even one named by an entry this run read:
@@ -14220,9 +14320,11 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       handle _ => false
     (* While HEAP is the published heap, an entry chained to another, as
        one published before the heap entry was replaced, is never
-       restored.  A run on a heap replaced since leaves the entries alone. *)
+       restored.  A run on a heap replaced since leaves the entries alone;
+       the heap entry is read past any cache's stale copy, since a replaced
+       short heap may still be served there. *)
     fun current heap =
-      case HolbuildRemoteCache.fetch_action remote heap_key of
+      case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.fetch_action remote heap_key) of
           SOME action => on_heap heap (#manifest action)
         | NONE => false
     fun probe heap (c, key, absent) =
@@ -14981,11 +15083,14 @@ fun module_file_wanted expected file =
       SOME part => List.exists (fn e => e = part) expected
     | NONE => false
 
-(* The most theory modules one worker-run writer saves; tests lower it. *)
+(* The most theory modules one worker-run writer saves; tests lower it.
+   High enough that module_writer_time, not the count, ends a writer on a
+   deep cone: fleet writers install about one module per 200 ms, fetches
+   included, so a 60 s child stores about 300. *)
 fun module_writer_limit () =
   case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_TEST_MODULE_WRITER_LIMIT") of
       SOME n => n
-    | NONE => 64
+    | NONE => 512
 
 (* How long a writer's HOL child may run.  The worker kills exec-action
    120 s after its result (POST_RESULT_SECONDS), so exec-action gives the
@@ -14998,27 +15103,6 @@ val module_writer_min_time = Time.fromSeconds 5
 (* The module writer's root after the result, in the cache root, named
    for its exec-action's process. *)
 val writer_root_prefix = "module-writer-"
-
-(* The fewest missing modules a writer starts for once the store has its
-   base theories.  A writer costs about as much to start as loading
-   sixteen theories from their .dat files instead of their modules, so an
-   action that lacks only the few parents just built loads those from
-   their .dat files. *)
-fun module_writer_min_missing () =
-  (* Tests lower it (HOLBUILD_TEST_MODULE_MIN_MISSING). *)
-  case Option.mapPartial Int.fromString (OS.Process.getEnv "HOLBUILD_TEST_MODULE_MIN_MISSING") of
-      SOME n => n
-    | NONE => 16
-
-(* Files the module writer leaves in a toolchain's store beside its
-   modules and its lock.  [module_store_unsupported]: the toolchain has
-   HOL's module helper but its runtime or Meta cannot write modules, so no
-   writer runs again for it (the store, named by the HOL directory, is per
-   Poly/ML runtime).  [module_store_base_theories]: the theories of the
-   toolchain's base state, one per line; they are in the state, so HOL
-   writes no module for them. *)
-val module_store_unsupported = "unsupported"
-val module_store_base_theories = "base-theories"
 
 (* The file the writer below leaves in its output for write_missing_modules:
    one line per fact, a key then its value.  `status`: `ineligible` (HOL
@@ -15560,6 +15644,86 @@ fun stored_modules store expected =
     List.filter is_wanted (HolbuildCache.children store)
   end
 
+(* The EXPECTED names (expected_modules) of which no file of LISTING, a
+   store's file names, is a module under any id. *)
+fun unstored_modules listing expected =
+  let
+    val stored = Binaryset.addList (Binaryset.empty String.compare, List.mapPartial module_file_theory_part listing)
+  in
+    List.filter (fn name => not (Binaryset.member (stored, name))) expected
+  end
+
+(* The expected module names (expected_modules) of the action's theories,
+   once found, by a fresh launch's grants (theory_module_grants) or a
+   restore's look at a short heap (declines_short_heap); and how many of
+   them the host's store lacks, for the action's modstoremissn. *)
+val cone_modules = ref (NONE : string list option)
+val store_missing_modules = ref (NONE : int option)
+
+fun cone_module_names root tc wanted =
+  case !cone_modules of
+      SOME names => names
+    | NONE =>
+        let val names = map #1 (#expected (expected_modules root tc wanted))
+        in cone_modules := SOME names; names end
+
+fun count_store_missing store names =
+  store_missing_modules := SOME (length (unstored_modules (map Path.file (HolbuildCache.children store)) names))
+
+(* The deps heaps a host declined (declines_short_heap), a file
+   `<heap key>-<heap SHA-256>` each, in a directory of its toolchain's
+   module store. *)
+val module_store_declined_heaps = ".declined-heaps"
+
+(* Whether a restore declines the published deps heap HEAP, whose entry
+   ENTRY is under KEY, to preload afresh: the entry is short
+   (short_heap_entry), the toolchain writes modules, the cone expects at
+   least module_writer_min_missing modules, of which this host's store now
+   lacks fewer, and no action on the host has declined that heap before.
+   The preload then saves a heap that loads them, which replaces the entry
+   (publish_shared_checkpoints).  The decline is reserved at once, by
+   creating its file exclusively, so that of the actions restoring the
+   heap at the same time only one preloads; it stays unless the run
+   preloads nothing (release_heap_decline).  Declining only once bounds
+   what a heap that comes out short again (HOL refused a module) costs, as
+   the host goes on restoring the published one. *)
+val declining_heap = ref (NONE : string option)
+
+fun reserve_heap_decline path =
+  let
+    val mode = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.iwusr,
+                                      Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
+  in
+    ensure_dir (Path.dir path);
+    Posix.IO.close (Posix.FileSys.createf (path, Posix.FileSys.O_WRONLY, Posix.FileSys.O.excl, mode));
+    true
+  end
+  handle e as OS.SysErr (_, SOME err) => if err = Posix.Error.exist then false else raise e
+
+fun declines_short_heap root tc wanted {key, heap, entry} =
+  module_writer_supported tc andalso short_heap_entry true entry andalso
+  let
+    val store = module_store tc
+    val names = cone_module_names root tc wanted
+    val _ = count_store_missing store names
+    val record = Path.concat (Path.concat (store, module_store_declined_heaps), key ^ "-" ^ heap)
+    val min = module_writer_min_missing ()
+  in
+    length names >= min andalso valOf (!store_missing_modules) < min andalso reserve_heap_decline record andalso
+    (declining_heap := SOME record;
+     add_restore_step "rstheapdeclinen" 1;
+     HolbuildStatus.message_stdout "declined the shared deps-loaded heap: it lacks theory modules this host has\n";
+     true)
+  end
+  handle e => (warn ("kept the shared deps-loaded heap: " ^ General.exnMessage e); false)
+
+(* Gives the restore's decline, if any, back, for a run that preloaded
+   nothing: a later action on the host may decline the heap. *)
+fun release_heap_decline () =
+  case !declining_heap before declining_heap := NONE of
+      NONE => ()
+    | SOME record => remove_file record
+
 (* For HolbuildActionSandbox.module_reads: what the sandboxed theory
    children of SPEC may read of their toolchain's store.  While their deps
    heap, DEPS_LOADED for DEPS_KEY, exists they start from it or from a
@@ -15575,7 +15739,8 @@ fun theory_module_grants root tc (spec : action_spec) deps_heap =
     val store = module_store tc
     fun granted find = find () handle e => (warn ("theory modules not granted: " ^ General.exnMessage e); [])
     fun theories () =
-      stored_modules store (map #1 (#expected (expected_modules root tc {deps = #deps spec, loads = #loads spec})))
+      let val names = cone_module_names root tc {deps = #deps spec, loads = #loads spec}
+      in count_store_missing store names; stored_modules store names end
     val found = ref NONE
     fun loaded () =
       case !found of
@@ -15725,10 +15890,9 @@ fun write_missing_modules remote root tc wanted deadline =
     fun missing_modules () =
       let
         val _ = listing := map Path.file (HolbuildCache.children store)
-        val stored =
-          Binaryset.addList (Binaryset.empty String.compare, List.mapPartial module_file_theory_part (!listing))
+        val names = Binaryset.addList (Binaryset.empty String.compare, unstored_modules (!listing) (map #1 expected))
       in
-        List.filter (fn (e, _) => not (Binaryset.member (stored, e))) expected
+        List.filter (fn (e, _) => Binaryset.member (names, e)) expected
       end
     fun worth_writing missing =
       not (null missing) andalso
@@ -15915,12 +16079,6 @@ fun write_missing_modules remote root tc wanted deadline =
    took, how many modules it stored of how many missing, how many entries it
    looked up in the remote cache, and how many modules it fetched and
    published. *)
-(* Whether the toolchain's HOL can write theory modules, as far as is known
-   before trying. *)
-fun module_writer_supported tc =
-  file_exists (Path.concat (#holdir tc, "tools-poly/poly/theory_modules.ML")) andalso
-  not (path_exists (Path.concat (module_store tc, module_store_unsupported)))
-
 (* A new store takes its base theories from the v2 store's (module_store),
    which lists the same: they're the HOL's base theories, whichever build
    of its base state. *)
@@ -15957,8 +16115,23 @@ fun fill_module_store remote root tc wanted deadline =
 
 (* The modules of a store whose remote cache entries were looked up and
    found missing (prefetch_modules), one `<theory>-<.dat SHA-1>.pmo` name
-   per line. *)
+   and the time it was looked up, in seconds, per line.  A line older than
+   module_probed_missing_life, or with no time, counts for nothing: another
+   host may have published the module since. *)
 val module_store_probed_missing = ".probed-missing"
+val module_probed_missing_life = Time.fromSeconds 600
+
+(* The lines of the probed-missing file TEXT still in force at NOW. *)
+fun probed_missing_lines now text =
+  let
+    val oldest = Time.toSeconds (Time.- (now, module_probed_missing_life))
+    fun fresh line =
+      case String.tokens Char.isSpace line of
+          [_, seconds] => (case LargeInt.fromString seconds of SOME t => t >= oldest | NONE => false)
+        | _ => false
+  in
+    List.filter fresh (String.tokens (fn c => c = #"\n") text)
+  end
 
 (* How long prefetch_modules waits for the store's writer lock, and has
    for its requests: time for a stalled one (module_request_fits), and
@@ -15982,6 +16155,8 @@ fun prefetch_modules remote root tc wanted =
       val store = module_store tc
       val _ = seed_module_store tc
       val probed_file = Path.concat (store, module_store_probed_missing)
+      fun probed () =
+        if file_exists probed_file then probed_missing_lines (Time.now ()) (read_text probed_file) else []
       fun unprobed () =
         let
           val {expected, base_theories, ...} = expected_modules root tc wanted
@@ -15989,7 +16164,7 @@ fun prefetch_modules remote root tc wanted =
             Binaryset.addList
               (Binaryset.empty String.compare,
                List.mapPartial (module_file_theory_part o Path.file) (HolbuildCache.children store) @
-               (if file_exists probed_file then String.tokens Char.isSpace (read_text probed_file) else []))
+               map (hd o String.tokens Char.isSpace) (probed ()))
           val missing = List.filter (fn (e, _) => not (Binaryset.member (known, e))) expected
         in
           if isSome base_theories andalso length missing >= module_writer_min_missing () then missing else []
@@ -16012,12 +16187,15 @@ fun prefetch_modules remote root tc wanted =
                     {store = store, staging = store_temp (Path.concat (store, ".prefetch")),
                      wanted = module_remote_keys tc missing,
                      deadline = Time.+ (Time.now (), module_prefetch_time)}
-                val old = if file_exists probed_file then read_text probed_file else ""
+                val now = LargeInt.toString (Time.toSeconds (Time.now ()))
                 val tmp = store_temp probed_file
               in
-                if null unpublished then ()
+                (* Rewritten whenever there is a record: it drops the
+                   expired lines. *)
+                if null unpublished andalso not (file_exists probed_file) then ()
                 else
-                  (write_text tmp (old ^ String.concat (map (fn name => name ^ "\n") unpublished));
+                  (write_text tmp (String.concat (map (fn line => line ^ "\n") (probed ()) @
+                                                  map (fn name => name ^ " " ^ now ^ "\n") unpublished));
                    FS.rename {old = tmp, new = probed_file})
                   handle e => (remove_file tmp; raise e)
               end
@@ -16739,10 +16917,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         end
     (* The theory modules the build's sandbox may read. *)
     and set_module_grants tc spec action =
-      HolbuildActionSandbox.module_reads :=
+      (cone_modules := NONE;
+       store_missing_modules := NONE;
+       HolbuildActionSandbox.module_reads :=
         theory_module_grants root tc spec
           (SOME {deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action),
-                 deps_key = #deps_key action})
+                 deps_key = #deps_key action}))
     (* Publishes the outline the pipelined theory child in STAGE published
        there, for children loading ahead of the theory.  A failure costs
        them only the wait for its entry. *)
@@ -16824,6 +17004,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val _ = if isSome ahead then () else last_child_start := NONE
         val _ = dropped_checkpoints := 0
         val _ = rejected_heap_modules := 0
+        val _ = discarded_deps_heap := false
+        val _ = preloaded_deps_heap := false
         (* Built on a late parent's outline, the run is the load ahead's:
            whatever stops it, nothing of it is published, and the action
            builds again plain. *)
@@ -16856,19 +17038,64 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               case (shared, ahead) of
                   (SOME ctx, NONE) =>
                     (restore_steps := [];
+                     declining_heap := NONE;
                      (phase "restore" (fn () =>
                         restore_shared_checkpoints remote ctx (resumes_from_checkpoints policy action)
-                          (fetch_heap_modules remote tc))
+                          (fetch_heap_modules remote tc)
+                          (* A check-only action, lightly hydrated, has
+                             no store to judge, and a non-target, or a run
+                             under --no-checkpoint-saves, publishes no
+                             heap: they restore it. *)
+                          (fn entry => not (#check_only spec) andalso saves_progress policy andalso
+                                       declines_short_heap root tc {deps = #deps spec, loads = #loads spec} entry))
                       before add_restore_steps ())
-                     handle e => (add_restore_steps (); raise e))
+                     handle e => (add_restore_steps (); release_heap_decline (); raise e))
                 | _ => nothing_restored
+            (* How many of its cone's expected modules the heap this run's
+               preload saved doesn't load, and how many the cone expects. *)
+            fun captured_missing () =
+              case (!cone_modules, !captured_heap_modules) of
+                  (SOME names, SOME {modules, ...}) =>
+                    SOME {missing = length (unstored_modules (map (Path.file o #2) modules) names),
+                          cone = length names}
+                | _ => NONE
+            (* The deps heap the run started from, the one its preload
+               saved or else the one restored: how many of its cone's
+               modules it doesn't load (depsmissn), when known, and its
+               size (rstdepskb); and how many of the cone's modules the
+               host's store lacked when it was looked at (modstoremissn). *)
+            fun deps_heap_phases () =
+              let
+                val captured = Option.isSome (!captured_deps_heap)
+                (* A decline whose action restored a failed prefix of its
+                   own instead preloaded nothing: it isn't spent. *)
+                val _ = if !preloaded_deps_heap then declining_heap := NONE else release_heap_decline ()
+                val deps_loaded = deps_loaded_path (action_checkpoint_base checkpoint_root action) (#deps_key action)
+                (* A restored heap discarded at load isn't the one the
+                   action ran on. *)
+                val missing =
+                  if captured then Option.map #missing (captured_missing ())
+                  else if !discarded_deps_heap then NONE
+                  else Option.mapPartial heap_entry_missing (#entry restored)
+                val kb =
+                  if !preloaded_deps_heap orelse Option.isSome (#heap restored)
+                  then SOME (file_kb deps_loaded) handle OS.SysErr _ => NONE
+                  else NONE
+                fun count name = Option.map (fn n => (name, LargeInt.fromInt n))
+              in
+                phases := List.mapPartial (fn p => p)
+                            [count "depsmissn" missing, Option.map (fn kb => ("rstdepskb", kb)) kb,
+                             count "modstoremissn" (!store_missing_modules)] @ !phases
+              end
             (* It fills the host's module store for later actions, which a
                check-only action leaves to them: it takes only the modules a
-               checkpoint it restores needs. *)
+               checkpoint it restores needs.  A decline is given back if the
+               run fails before HOL starts. *)
             val _ =
               if not (Option.isSome ahead) andalso not (Option.isSome (#heap restored)) andalso
                  not (#check_only spec)
               then prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
+                   handle e => (release_heap_decline (); raise e)
               else ()
             (* Under --no-checkpoint-saves the action restores shared
                checkpoints but publishes none, nor refreshes an index. *)
@@ -16878,14 +17105,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 case shared of
                     SOME ctx =>
                       (publishing_checkpoints := true;
-                       (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored)
+                       (phase "publish" (fn () => publish_shared_checkpoints remote ctx restored (captured_missing ()))
                         before publishing_checkpoints := false)
                        handle e => (publishing_checkpoints := false; raise e))
                   | NONE => ())
                before drop_heap_snapshot ())
               handle e => (drop_heap_snapshot (); raise e)
-            val tool_cache = case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec
-            val _ = if Option.isSome ahead then () else stage_scratch_input spec
+            val tool_cache =
+              (case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec)
+              handle e => (release_heap_decline (); raise e)
+            val _ = (if Option.isSome ahead then () else stage_scratch_input spec)
+                    handle e => (release_heap_decline (); raise e)
             fun publish_tools () =
               if not (!HolbuildActionSandbox.outputs_validated) then () else
               case tool_cache of
@@ -16902,7 +17132,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 if pipelined then with_outline_watch stage (fn () => publish_outline action policy stage) run_hol
                 else run_hol ())
               handle e =>
-                (set_attached_child NONE;
+                (deps_heap_phases ();
+                 set_attached_child NONE;
                  tools_first := (fn () => ());
                  deferred :=
                    (fn () =>
@@ -16915,6 +17146,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                     | _ => if outlined orelse checks_only policy then () else set_write_modules ());
                  raise e)
           in
+            deps_heap_phases ();
             tools_first := (fn () => if !cancelled orelse checks_only policy then () else publish_tools ());
             deferred :=
               (fn () =>
