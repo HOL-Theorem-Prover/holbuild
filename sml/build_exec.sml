@@ -761,10 +761,24 @@ fun phase_mark_line name =
   "val _ = (TextIO.output (TextIO.stdErr, \"\\nholbuild hol-phases " ^ name ^ "=\" ^ " ^
   "LargeInt.toString (Time.toMilliseconds (Time.now ())) ^ \"\\n\"); TextIO.flushOut TextIO.stdErr);"
 
-(* The stage file a theory child runs just before the script: it marks
-   when the script starts, holscriptstart.  Not part of the preload, whose
-   text the deps heap's key covers. *)
+(* This stage file runs after the preload, including on checkpoint resume. *)
 val script_start_file = "holbuild-script-start.sml"
+
+fun write_theory_script_start path source_file =
+  (* QUse checks for parse errors after evaluating the translated declaration.
+     A recovered proof can run indefinitely before that check. *)
+  write_text path (String.concatWith "\n"
+    [phase_mark_line "holscriptstart",
+     "val _ = let",
+     "  val file = " ^ HolbuildToolchain.sml_string (Path.file source_file),
+     "  fun parse_error msg = (TextIO.print msg; OS.Process.exit OS.Process.failure)",
+     "  val {read, fileline, eof} = HOLSource.fileToReader {quietOpen = false, print = parse_error} file",
+     "  fun line () = #line (fileline ()) + 1",
+     "in",
+     "  while not (eof ()) do (",
+     "    PolyML.compiler (read, [PolyML.Compiler.CPFileName file, PolyML.Compiler.CPLineNo line]) ();",
+     "    if !QUse.failOnError andalso QUse.hadError () then OS.Process.exit OS.Process.failure else ())",
+     "end;", ""])
 
 (* The exporter marks when the script ended (holscriptend) and, unless
    CHECK_ONLY, when the theory was exported (holexportend).
@@ -4930,7 +4944,7 @@ fun prepare_theory_stage speculative check_only tc root (action : theory_action)
     List.app stage_input (#inputs action);
     write_child_policy_with {module_cache = not speculative orelse HolbuildActionSandbox.active ()} tc
       (Path.concat(stage, "holbuild-child-policy.sml"));
-    write_text (Path.concat(stage, script_start_file)) (phase_mark_line "holscriptstart" ^ "\n");
+    write_theory_script_start (Path.concat(stage, script_start_file)) (#source_file action);
     write_theory_exporter
       {sig_path = staged_theory_file stage (#logical action) ".sig",
        path = Path.concat(stage, "holbuild-export-theory.sml"),
@@ -5258,8 +5272,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
               stage stage
               (#context run_spec)
               (child_policy ::
-                 (List.concat (map (fn file => if file = staged_script then [script_start, file] else [file])
-                                   (#files run_spec))
+                 (map (fn file => if file = staged_script then script_start else file) (#files run_spec)
                   @ [theory_exporter]))
               "holbuild-build.log"
               (SOME (current_build_log log_dir))
@@ -7802,7 +7815,7 @@ fun load_ahead_locally {tc, root, plan, base_context, view, dir, late, stand_in,
     val files =
       map (fn name => Path.concat (stage, name))
         ["holbuild-child-policy.sml", "holbuild-ahead-preload.sml", "holbuild-preload.sml",
-         script_start_file, Path.file (#source_file action), "holbuild-export-theory.sml"]
+         script_start_file, "holbuild-export-theory.sml"]
     val child : exn option option ref = ref NONE
     val result = ref NONE
     val owner = Thread.self ()
@@ -17513,7 +17526,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val files =
           map (fn name => Path.concat (stage, name))
             ["holbuild-child-policy.sml", "holbuild-ahead-preload.sml", "holbuild-preload.sml",
-             script_start_file, Path.file (#source_file action), "holbuild-export-theory.sml"]
+             script_start_file, "holbuild-export-theory.sml"]
         val outcome : exn option option ref = ref NONE
         val started = Time.now ()
         val _ = prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
