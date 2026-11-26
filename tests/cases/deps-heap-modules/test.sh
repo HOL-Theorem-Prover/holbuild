@@ -407,6 +407,8 @@ exec_theory B unlisted
 phase unlisted-B 'rstmoddropn:1'
 require_grep '^status=built$' "$tmpdir/unlisted-B.result"
 cmp "$tmpdir/A.pmo" "$modules"
+grep -qx "blob=$module_sha module ${modules##*/}" "$heap_entry" ||
+  { echo 'the heap entry with an unlisted module was not replaced' >&2; exit 1; }
 
 heap_sha=$(printf '%s' "$manifest" | sed -n 's/^blob=\([0-9a-f]*\) heap$/\1/p')
 set_heap_manifest "$manifest""blob=$heap_sha module ${modules##*/}"$'\n'
@@ -750,6 +752,23 @@ resumed warm-repaired-C 'theorem-context checkpoint after c_first'
 if grep -qE '^phase-ms=(.*,)?rstrejectn:' "$tmpdir/warm-repaired-C.result"; then
   echo "warm-repaired-C found a checkpoint entry on the replaced heap" >&2; cat "$tmpdir/warm-repaired-C.result" >&2; exit 1
 fi
+
+# The host cache still serves C's older, non-short heap. Its module is
+# valid for that heap, but fetching it would overwrite the warm module
+# already used by the replacement heap.
+c_heap_key=${c_heap_entry##*/}
+cp "$tmpdir/C-heap.entry" "$tmpdir/control/ac-stale-$c_heap_key"
+rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
+c_stale_requests=$(wc -l < "$server_log")
+edit_c stale-modules
+exec_theory C stale-modules
+[[ ! -e "$tmpdir/control/ac-stale-$c_heap_key" ]] ||
+  { echo "C's non-short heap entry was not revalidated" >&2; exit 1; }
+resumed stale-modules-C 'theorem-context checkpoint after c_first'
+if tail -n +"$((c_stale_requests + 1))" "$server_log" | grep -x "GET /cas/$module_sha" >/dev/null; then
+  echo "C fetched the superseded heap's module" >&2; exit 1
+fi
+[[ $(sha256sum "$modules" | cut -d' ' -f1) == "$alternate_sha" ]]
 
 # Two valid heaps need different copies of A's module: C's the other-ID
 # one, B's the first.  A restore of B's heap on the same host installs B's

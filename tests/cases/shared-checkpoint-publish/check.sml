@@ -35,7 +35,7 @@ val candidates = rev (List.tabulate (count, fn i => candidate (i + 1)));
 val ctx : BE.shared_context =
   {store = store, checkpoint_root = tree, heap_key = "heap", index_key = "index", standalone_key = "standalone", base_state = base,
    deps_key = "deps", deps_loaded = deps, requested_timeout = NONE,
-   candidates = candidates @ [candidate 1], module_store = "", heap_only = false, modules = false};
+   candidates = candidates @ [candidate 1], module_store = "", heap_only = false, modules = false, theory = "pkg:T"};
 val heap = HolbuildHash.file_sha256 deps;
 val bad = HolbuildHash.file_sha256 (path 12 ^ ".ok");
 val cache = RC.remote url;
@@ -70,8 +70,8 @@ fun restore_latest () =
 val _ = restore_latest ();
 val _ = checkpoint "published";
 (* Existing manifests skip all uploads. *)
-val _ = if failing then () else BE.publish_shared_checkpoints cache ctx
-  {heap = SOME heap, files = [], stale = [], missing = [], poisoned = NONE, entry = NONE} NONE;
+val _ = if failing then () else ignore (BE.publish_shared_checkpoints cache ctx
+  {heap = SOME heap, files = [], stale = [], missing = [], poisoned = NONE, entry = NONE} NONE);
 val _ = checkpoint "repeated";
 val _ = if failing then () else
   let

@@ -867,20 +867,23 @@ copying small theory files.
 
 The blobs linked rather than copied are a build's `--scratch-input` files on a
 worker: each can be large and is the same for many actions, so `exec-action`
-hard-links the local cache's blob into the action root and makes it read-only.
-Its hash was checked when it entered the cache; the staged path lies outside
-every sandbox write and scratch root, and the sandbox grants no cross-directory
-link and refuses chmod outside those roots, so the action can only read it;
-holbuild only unlinks it when it empties the root. Across file systems (a
-worker container's action root beside a host-mounted cache), or without the
-blob, it is a hard link to a read-only copy of that blob, not hashed again,
-kept in `action-scratch` beside the action root, where no action can read.
-Later actions link the same copy while it is a read-only regular file of the
-blob's size, so a worker copies an input once; the root is emptied around each
-action as before, so an action sees only the inputs its spec names. The store
-keeps at most eight copies (the action's inputs, then the most recently used),
-counts toward the worker's cache cap, and is emptied when the worker is short
-of disk.
+links the local cache's read-only blob into the action root as
+`.holbuild/scratch/<sha256>`, outside every sandbox write and scratch root, and
+the theory child reads it there. Its hash was checked when it entered the
+cache. On the same file system the link is a hard link; across file systems (a
+worker container's action root beside a host-mounted cache) it is a symbolic
+link, and the sandbox grants the child that one blob to read, as it grants
+single theory modules: the child can't list the blob cache, open another blob
+or write the one it reads, and the sandbox helper refuses any grant that would
+let an action write the blob cache or read it as a directory. A blob the cache
+lacks is fetched beside its name, made read-only and published with a link,
+which, unlike a rename, never replaces a blob another action's child may be
+reading; so a host fetches an input once, and every worker sharing its cache
+reads it from there. Should that fail, the input is fetched into the action
+root instead. The blob is touched at staging and again when a parent the action
+waits for arrives, so cache eviction takes it last; a child that fails after its
+input left the cache fails as the worker's fault, so the action is retried and
+the retry fetches the input again.
 
 Cache-to-cache transfers verify a resident filesystem blob before fetching it
 again. A missing or corrupt blob is fetched into a transfer-owned temporary

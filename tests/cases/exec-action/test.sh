@@ -352,6 +352,32 @@ if grep -q '^peak-rss-mb=' "$tmpdir/missing-rss.result"; then
   exit 1
 fi
 
+# A script run without proof steps installs no proof runtime: its load,
+# script and export are still timed, from the marks the stage prints, also
+# after output the script leaves without a newline.
+cat > "$project/src/PlainScript.sml" <<'SML'
+Theory Plain
+Ancestors bool
+
+Theorem plain_thm:
+  T
+Proof
+  simp[]
+QED
+
+val _ = TextIO.output (TextIO.stdErr, "no newline after this")
+SML
+hb action-spec --upload --skip-proof-steps PlainTheory > "$tmpdir/batch-plain.txt"
+worker plain "$(spec_for "$tmpdir/batch-plain.txt" worker:PlainTheory)"
+expect plain 0 "status=built"
+for phase in holload holscript holexport; do
+  grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/plain.result" || {
+    echo "the plain script's record lacks phase $phase:" >&2; cat "$tmpdir/plain.result" >&2; exit 1; }
+done
+if grep -qE '^phase-ms=(.*,)?(holtactics|holscriptstart|holscriptend|holexportend):' "$tmpdir/plain.result"; then
+  echo "the plain script's record has a proof runtime phase or a raw mark:" >&2; cat "$tmpdir/plain.result" >&2; exit 1
+fi
+
 # Rerunning a done action reports it cached.
 worker again "$spec_a"
 expect again 0 "status=cached"
@@ -397,7 +423,7 @@ expect b 0 "status=built"
 cmp "$tmpdir/dep.dat" "$tmpdir/worker-b/blobs/$dep_dat"
 # Its record times the action and its phases.
 require_grep '^wall-ms=[0-9][0-9]*$' "$tmpdir/b.result"
-for phase in hydrate hydfiles hyddeps hydcheck hydinst hydstale hydmisfit analyse hol check holload holleaves holtactics; do
+for phase in hydrate hydfiles hyddeps hydcheck hydinst hydstale hydmisfit analyse hol check holload holscript holexport holleaves holtactics; do
   grep -qE "^phase-ms=(.*,)?$phase:[0-9]+(,|\$)" "$tmpdir/b.result" || {
     echo "b's record lacks phase $phase:" >&2; cat "$tmpdir/b.result" >&2; exit 1; }
 done
@@ -410,6 +436,7 @@ assert timings['publishstart'] <= timings['publishend'] <= timings['finished']
 assert timings['started'] <= timings['logstart'] <= timings['logend'] <= timings['finished']
 assert timings['rebuilt']==1
 assert timings['holload'] <= timings['holend'] - timings['holstart']
+assert timings['holscript'] + timings['holexport'] <= timings['holend'] - timings['holstart']
 PY
 # A corrupt local payload is fetched by the same verified path.
 link_hol_toolchain_cache "$tmpdir/worker-c"
@@ -911,7 +938,7 @@ expected = collections.Counter()
 for line in lines:
     for item in line[len(prefix):].split():
         name, value = item.split('=')
-        if name != 'holloadend':
+        if name not in ('holloadend', 'holscriptstart', 'holscriptend', 'holexportend'):
             expected[name] += int(value)
 assert expected['holcompiledn'] > 0, lines
 timings = parse_result(pathlib.Path(sys.argv[2]).read_text()).timings

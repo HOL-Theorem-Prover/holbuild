@@ -129,6 +129,11 @@ fun wait 0 = raise Fail "no go from the test"
 val _ = wait 1200;
 val _ = raise Fail "the nested HOL child failed";
 SML
+# Fails as a script whose nested HOL Poly/ML ran out of store fails.
+cat > "$runner/store.sml" <<'SML'
+val _ = TextIO.output (TextIO.stdErr, "Run out of store - interrupting threads\n");
+val _ = raise Fail "the nested HOL child failed";
+SML
 cat > "$runner/fifo.sml" <<'SML'
 val dir = valOf (OS.Process.getEnv "HOLBUILD_RUN_OUTPUT_DIR");
 val _ = Posix.FileSys.mkfifo (OS.Path.concat (dir, "first"), Posix.FileSys.S.irwxu);
@@ -326,10 +331,20 @@ printf 'oom 1\noom_kill 1\n' > "$events"
 touch "$oom_output/oom-go"
 wait "$oomer"
 worker_status=$(< "$tmpdir/oom.status")
-expect oom 2 status=failed failure=memory
+expect oom 2 status=failed failure=memory memory-cause=kernel-oom
 require_no_file "$(ac_file "$key")"
 require_grep 'OOM killer killed a process of the action (cgroup oom_kill count 0 -> 1)' "$tmpdir/oom.log"
 require_grep 'the nested HOL child failed' "$tmpdir/oom.log"
+
+# The record says what the evidence of a memory failure was, so retries can
+# be told apart: Poly/ML out of store here, the OOM killer above.
+read -r key spec < <(export_run store.sml hol:bool)
+worker store "$spec"
+expect store 2 status=failed failure=memory memory-cause=poly-out-of-store
+if grep -q '^memory-cause=' "$tmpdir/raise-counted.result"; then
+  echo "a script failure has a memory cause" >&2
+  exit 1
+fi
 
 # An output that is not a regular file fails as script rather than blocking
 # the worker on it.

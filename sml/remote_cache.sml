@@ -167,11 +167,15 @@ fun warn_restore_once message =
 fun cli_status timeout options url =
   let
     val _ = HolbuildOffline.require_online "contact the remote cache"
+    val (default_limit, scoped_limit) =
+      case HolbuildHttp.deadline () of
+          NONE => (["--max-time", Int.toString HolbuildHttp.max_transfer_seconds], [])
+        | SOME _ => ([], ["--max-time",
+                     Time.fmt 3 (Time.fromMilliseconds (Int.toLarge (HolbuildHttp.transfer_timeout_ms ())))])
     val result =
       run "curl" (["-q", "-sS", "-L", "--connect-timeout", Int.toString HolbuildHttp.connect_timeout_seconds,
-                   "--speed-limit", "1", "--speed-time", Int.toString timeout,
-                   "--max-time", Int.toString HolbuildHttp.max_transfer_seconds] @
-                  curl_config_args () @ options @ ["-w", "%{http_code}", url])
+                   "--speed-limit", "1", "--speed-time", Int.toString timeout] @ default_limit @
+                  curl_config_args () @ options @ scoped_limit @ ["-w", "%{http_code}", url])
   in
     case (HolbuildSpawn.succeeded result, Int.fromString (first_token (#output result))) of
         (true, SOME http_code) => HolbuildHttp.Response http_code
@@ -282,18 +286,21 @@ fun begin_request () =
 
 fun record_transport_outcome (generation, probe) result =
   let
+    (* A transfer cut short by its caller's deadline does not tell us
+       whether the cache would have answered within its stall budget. *)
+    val expired = case result of HolbuildHttp.Failed _ => HolbuildHttp.deadline_elapsed () | _ => false
     val _ = Mutex.lock transport_mutex
     val current = generation = !transport_generation
     val _ =
-      if not current then ()
+      if not current orelse expired then ()
       else
         case result of
             HolbuildHttp.Failed _ =>
               if probe then () else transport_failures := !transport_failures + 1
           | HolbuildHttp.Response _ => transport_failures := 0
-    val tripped = current andalso
+    val tripped = current andalso not expired andalso
       !transport_failures >= max_consecutive_transport_failures
-    val recovered = current andalso probe andalso not tripped
+    val recovered = current andalso probe andalso not expired andalso not tripped
     val _ = if current then probe_in_flight := false else ()
     (* Ignore completions from requests admitted before this trip. *)
     val _ = if tripped then
@@ -396,8 +403,8 @@ fun revalidating f =
 
 (* A HEAD inside `revalidating` asks the cache to check with its origin
    that it still holds the entry or blob. *)
-fun head_status url =
-  let val headers = if reads_revalidate () then ["Cache-Control: no-cache"] else []
+fun head_status_with revalidate url =
+  let val headers = if revalidate then ["Cache-Control: no-cache"] else []
   in
     if HolbuildRemoteCacheConfig.uses_libcurl () then
       HolbuildHttp.head {url = url, headers = headers, timeout = stall_timeout_seconds}
@@ -405,6 +412,8 @@ fun head_status url =
       cli_status stall_timeout_seconds
         (["-I", "--ignore-content-length", "-o", "/dev/null"] @ List.concat (map (fn h => ["-H", h]) headers)) url
   end
+
+fun head_status url = head_status_with (reads_revalidate ()) url
 
 (* A read's probes past its first nodes run on the caller's thread and on
    helper threads, at most probe_helpers of them in the whole process, so
@@ -440,7 +449,8 @@ fun probe_all probe urls =
              work ())
     fun release slots = with_mutex helpers_mutex (fn () => free_helpers := !free_helpers + slots)
     fun stopped () = with_mutex mutex (fn () => (running := !running - 1; ConditionVar.broadcast finished))
-    fun helper () = (work (); release 1; stopped ())
+    val deadline = HolbuildHttp.deadline ()
+    fun helper () = (HolbuildHttp.with_deadline deadline work; release 1; stopped ())
     fun start 0 = ()
       | start slots =
           (with_mutex mutex (fn () => running := !running + 1);
@@ -585,9 +595,8 @@ fun wait_seconds n =
   if n <= 0 orelse not (!retry_one_node) then ()
   else (OS.Process.sleep (whole_seconds 1); wait_seconds (n - 1))
 
-(* A caller with a deadline of its own (the theory-module requests) runs F
-   under it: a retry then starts only if it could still end by DEADLINE
-   after a full stall_timeout_seconds.  Per thread, like `required`. *)
+(* A caller with a deadline of its own runs F under it. Reserve a full
+   stall timeout only when the HTTP client has no deadline of its own. *)
 val retry_deadline_tag : Time.time option Universal.tag = Universal.tag ()
 
 fun retry_deadline () = Option.join (Thread.getLocal retry_deadline_tag)
@@ -610,14 +619,18 @@ fun retrying_one_node method urls attempt =
             val delays = one_node_retry_delays ()
             val window = Time.+ (Time.now (), whole_seconds (foldl op+ 0 delays))
             val own = retry_deadline ()
+            val bounded = HolbuildHttp.deadline ()
+            fun within_deadline start =
+              case bounded of
+                  SOME limit => Time.< (start, limit) andalso
+                    (case own of SOME deadline => Time.< (start, deadline) | NONE => true)
+                | NONE =>
+                    (case own of
+                         SOME deadline => Time.<= (Time.+ (start, whole_seconds stall_timeout_seconds), deadline)
+                       | NONE => true)
             fun fits delay =
               let val start = Time.+ (Time.now (), whole_seconds delay)
-              in
-                Time.<= (start, window) andalso
-                (case own of
-                     SOME deadline => Time.<= (Time.+ (start, whole_seconds stall_timeout_seconds), deadline)
-                   | NONE => true)
-              end
+              in Time.<= (start, window) andalso within_deadline start end
             fun loop delays =
               let val (url, result) = attempt ()
               in
@@ -632,7 +645,8 @@ fun retrying_one_node method urls attempt =
                            "; retrying in " ^ Int.toString delay ^ " s\n");
                          TextIO.flushOut TextIO.stdErr;
                          wait_seconds delay;
-                         if !retry_one_node then loop rest else (url, result))
+                         if !retry_one_node andalso not (HolbuildHttp.deadline_elapsed ())
+                         then loop rest else (url, result))
                       else (url, result)
                   | [] => (url, result)
               end
@@ -642,8 +656,12 @@ fun retrying_one_node method urls attempt =
     | _ => attempt ()
 
 fun send_urls_using usable method urls path request =
-  send_result method (hd urls) (fn () =>
-    retrying_one_node method urls (fn () => routed_status_using usable method head_status urls path request))
+  let
+    val probe = head_status_with (reads_revalidate ())
+  in
+    send_result method (hd urls) (fn () =>
+      retrying_one_node method urls (fn () => routed_status_using usable method probe urls path request))
+  end
 
 fun send_urls method urls path request = send_urls_using (fn _ => true) method urls path request
 

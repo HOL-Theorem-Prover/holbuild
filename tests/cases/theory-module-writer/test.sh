@@ -17,15 +17,20 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 source "$ROOT/tests/lib.sh"
 tmpdir=$(make_temp_dir)
 other_fs=
-server_pid=
-server2_pid=
-trap '[[ -z $server_pid ]] || kill "$server_pid" 2>/dev/null; [[ -z $server2_pid ]] || kill "$server2_pid" 2>/dev/null; cleanup_temp_dir "$tmpdir"; [[ -z $other_fs ]] || rm -rf "$other_fs"' EXIT
+server_pids=()
+cleanup() {
+  for pid in "${server_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  cleanup_temp_dir "$tmpdir"
+  [[ -z $other_fs ]] || rm -rf "$other_fs"
+}
+trap cleanup EXIT
 mkdir -p "$tmpdir/cache" "$tmpdir/root/src" "$tmpdir/root/.holbuild"
 # A second node, for a cache of two.
 start_remote_cache_server "$tmpdir/remote2" "$tmpdir/server2"
-server2_pid=$server_pid
+server_pids+=("$server_pid")
 remote2_url=$remote_url
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
+server_pids+=("$server_pid")
 
 sha() { sha1sum "$1" | cut -d' ' -f1; }
 for hol in hol1 hol2 hol3 hol4 hol5 hol6 hol7 hol8 hol9 hol10; do
@@ -677,3 +682,199 @@ rebuilt() {
 rebuilt "ab12-A-$a_sha.pmo"
 printf 'rebuilt\n' > "$tmpdir/hol10/bin/hol.state"
 rebuilt "cd34-A-$a_sha.pmo"
+
+
+# Separate one-URL workers reach the same upstream. Each first sees a
+# miss, then both PUT. A third worker reads the first entry between the
+# PUTs. The first host cache keeps that entry until asked to revalidate.
+start_remote_cache_server "$tmpdir/upstream" "$tmpdir/host1" "$tmpdir/host1-control"
+host1_url=$remote_url
+server_pids+=("$server_pid")
+start_remote_cache_server "$tmpdir/upstream" "$tmpdir/host2" "$tmpdir/host2-control"
+host2_url=$remote_url
+server_pids+=("$server_pid")
+
+cat > "$tmpdir/worker-writer.sml" <<SML
+use "sml/holbuild-script.sml";
+structure E = HolbuildBuildExec;
+structure Cache = HolbuildRemoteCache;
+fun check message condition = if condition then () else raise Fail message;
+fun exists path = OS.FileSys.access (path, []);
+fun deadline seconds = Time.+ (Time.now (), Time.fromSeconds seconds);
+val host1 = Cache.remote "$host1_url";
+val host2 = Cache.remote "$host2_url";
+val _ = HolbuildRemoteCacheConfig.set_url "$host1_url";
+val _ = HolbuildRemoteCacheConfig.setup_client ();
+val _ = Cache.fail_closed := true;
+
+fun dir name = let val path = "$tmpdir/" ^ name in E.ensure_dir path; path end;
+fun install remote store staging modules until =
+  E.converge_modules remote {store = store, staging = staging, modules = modules, deadline = until};
+val store1 = dir "worker1-store";
+val store2 = dir "worker2-store";
+val reader_store = dir "reader-store";
+val staged1 = dir "worker1-stage";
+val staged2 = dir "worker2-stage";
+val reader_stage = dir "reader-stage";
+val control1 = "$tmpdir/host1-control/";
+val control2 = "$tmpdir/host2-control/";
+val file = "ab12-A-$a_sha.pmo";
+val race = HolbuildHash.string_sha256 "racing module";
+val key = Cache.remote_action_key race;
+val action = "$tmpdir/upstream/ac/" ^ key;
+val stale = control1 ^ "ac-stale-" ^ key;
+val first_action = "$tmpdir/first-module-action";
+val read_between_writes = "$tmpdir/read-between-writes";
+val _ = E.write_text (staged1 ^ "/" ^ file) "first module";
+val _ = E.write_text (staged2 ^ "/" ^ file) "second module";
+val _ = E.write_text (reader_stage ^ "/" ^ file) "reader module";
+fun put_gate control sequence phase = control ^ "action-put-" ^ Int.toString sequence ^ "-" ^ phase;
+fun enable control sequence phase = E.write_text (put_gate control sequence phase ^ "-enable") "";
+fun release control sequence phase = E.write_text (put_gate control sequence phase ^ "-release") "";
+fun await_event event =
+  let
+    val limit = deadline 10
+    fun wait () =
+      if exists event then ()
+      else if Time.< (Time.now (), limit) then (OS.Process.sleep (Time.fromMilliseconds 10); wait ())
+      else raise Fail ("worker did not reach " ^ event)
+  in wait () end;
+fun await control sequence phase = await_event (put_gate control sequence phase ^ "-event");
+val _ = List.app (fn control => (enable control 1 "before"; enable control 1 "after")) [control1, control2];
+val _ = E.write_text (control2 ^ "download-enable") "";
+fun interleave () =
+  (await control1 1 "before"; await control2 1 "before";
+   release control1 1 "before"; await control1 1 "after";
+   E.copy_binary action first_action;
+   E.copy_binary action stale;
+   E.write_text read_between_writes "";
+   await_event (control2 ^ "download-event");
+   check "the third worker did not read the first module between writes"
+     (String.isSubstring ("GET /cas/" ^ HolbuildHash.string_sha256 "first module" ^ "\n")
+       (E.read_text "$tmpdir/host2/requests.log"));
+   release control2 1 "before"; await control2 1 "after";
+   E.write_text (control2 ^ "download-release") "";
+   release control1 1 "after"; release control2 1 "after");
+val until = deadline 60;
+val interleaved = ref false;
+val _ = E.parallel_all 4 (fn f => f ()) [
+  fn () => ignore (install host1 store1 staged1 [(file, race)] until),
+  fn () => ignore (install host2 store2 staged2 [(file, race)] until),
+  fn () => (await_event read_between_writes; ignore (install host2 reader_store reader_stage [(file, race)] until)),
+  fn () => (interleave (); interleaved := true)];
+val _ = check "the two host-cache writes did not overlap" (!interleaved);
+val _ = check "single-URL workers did not install the upstream winner"
+  (E.read_text (store1 ^ "/" ^ file) = "second module" andalso
+   E.read_text (store2 ^ "/" ^ file) = "second module" andalso not (exists stale));
+val _ = check "the reader installed the first module before confirming the upstream winner"
+  (E.read_text (reader_store ^ "/" ^ file) = "second module");
+
+(* The first fill and prefetch use this path before the writer sees a
+   missing module. A stale host action still points to an intact blob. *)
+val _ = E.copy_binary first_action stale;
+val prefetch_store = dir "prefetch-store";
+val {installed, ...} = E.fetch_published_modules host1
+  {store = prefetch_store, staging = dir "prefetch-stage",
+   wanted = [(valOf (E.module_file_theory_part file), race)], deadline = deadline 15};
+val _ = check "prefetch installed the stale host-cache module"
+  (installed = 1 andalso E.read_text (prefetch_store ^ "/" ^ file) = "second module" andalso not (exists stale));
+
+(* Both workers see a broken entry. The first confirms and installs its
+   repair while the second's blob upload is still in flight. *)
+val repair = HolbuildHash.string_sha256 "repairing module";
+val repair_action = "$tmpdir/upstream/ac/" ^ Cache.remote_action_key repair;
+val repair_store1 = dir "repair-store1";
+val repair_store2 = dir "repair-store2";
+val _ = E.copy_binary first_action repair_action;
+val _ = OS.FileSys.remove ("$tmpdir/upstream/cas/" ^ HolbuildHash.string_sha256 "first module");
+val _ = E.write_text (staged1 ^ "/" ^ file) "first repair";
+val _ = E.write_text (staged2 ^ "/" ^ file) "second repair";
+val _ = E.write_text (control2 ^ "cas-put-enable") "";
+val repair_until = deadline 60;
+val _ = E.parallel_all 2 (fn f => f ()) [
+  fn () => ignore (install host2 repair_store2 staged2 [(file, repair)] repair_until),
+  fn () =>
+    (await_event (control2 ^ "cas-put-count");
+     check "the first worker did not confirm its repair"
+       (#published (install host1 repair_store1 staged1 [(file, repair)] repair_until) = 1);
+     E.write_text (control2 ^ "cas-put-release") "")];
+val _ = check "the second worker overwrote a confirmed repair"
+  (E.read_text (repair_store1 ^ "/" ^ file) = "first repair" andalso
+   E.read_text (repair_store2 ^ "/" ^ file) = "first repair");
+
+(* The action PUT has succeeded but becomes unreadable before the worker
+   can confirm it. The published bytes alone do not permit installation. *)
+val unconfirmed = HolbuildHash.string_sha256 "unconfirmed module";
+val unconfirmed_key = Cache.remote_action_key unconfirmed;
+val unconfirmed_store = dir "unconfirmed-store";
+val _ = enable control1 3 "after";
+val _ = E.parallel_all 2 (fn f => f ()) [
+  fn () => ignore (install host1 unconfirmed_store staged1 [(file, unconfirmed)] (deadline 15)),
+  fn () =>
+    (await control1 3 "after";
+     E.write_text (control1 ^ "ac-get-status-" ^ unconfirmed_key) "404";
+     release control1 3 "after")];
+val _ = check "the worker stored a module after the read-back missed"
+  (exists ("$tmpdir/upstream/ac/" ^ unconfirmed_key) andalso not (exists (unconfirmed_store ^ "/" ^ file)));
+
+(* A stopped deep writer gets a useful publish window even with less than
+   the 30 s stall timeout left. The fixture supplies the 512 finished files. *)
+val batch_store = dir "batch-store";
+val batch_stage = dir "batch-stage";
+val batch = List.tabulate (512, fn i =>
+  let
+    val name = "ab12-P" ^ Int.toString i ^ "-$a_sha.pmo"
+    val key = HolbuildHash.string_sha256 name
+  in
+    E.write_text (batch_stage ^ "/" ^ name) ("module " ^ name);
+    (name, key)
+  end);
+val {installed, published, ...} = install host1 batch_store batch_stage batch (deadline 25);
+val _ = check "the deep writer could not publish within the remaining budget"
+  (published >= 32 andalso published = length installed);
+val _ = check "the worker installed a module without its remote entry"
+  (List.all (fn (file, key) =>
+     not (exists (batch_store ^ "/" ^ file)) orelse exists ("$tmpdir/upstream/ac/" ^ Cache.remote_action_key key)) batch);
+
+(* A retryable failure within the short budget still allows publication. *)
+val retry_store = dir "retry-store";
+val retry = HolbuildHash.string_sha256 "module to retry";
+val _ = E.write_text (staged1 ^ "/" ^ file) "retry module upload";
+val _ = E.write_text (control1 ^ "cas-put-fail-once") "503\n";
+val {installed, published, ...} = install host1 retry_store staged1 [(file, retry)] (deadline 15);
+val _ = check "the worker did not retry publication within the deadline"
+  (published = 1 andalso installed = [file] andalso not (exists (control1 ^ "cas-put-fail-once")));
+
+(* Four transfers cut off by their caller must not trip the breaker or
+   admit unpublished files to the worker's store. *)
+fun check_stalled_lookups prefix =
+  let
+    val modules = List.tabulate (4, fn i =>
+      let val file = "ab12-" ^ prefix ^ Int.toString i ^ "-$b_sha.pmo"
+      in
+        E.write_text (staged1 ^ "/" ^ file) "unpublished module";
+        (file, HolbuildHash.string_sha256 file)
+      end)
+    val count = control1 ^ "action-get-count"
+    val _ = List.app (fn stem => E.remove_file (control1 ^ stem)) ["action-get-count", "action-get-release"]
+    val _ = E.write_text (control1 ^ "action-get-enable") ""
+    val until = deadline 7
+    val {installed, published, ...} = install host1 store1 staged1 modules until
+    val _ = E.write_text (control1 ^ "action-get-release") ""
+  in
+    check "stalled module lookups were not bounded by the publish deadline"
+      (exists count andalso Int.fromString (E.read_text count) = SOME 4 andalso
+       Time.< (Time.now (), Time.+ (until, Time.fromSeconds 1)));
+    check "a worker installed its unpublished module after a timeout"
+      (null installed andalso published = 0 andalso List.all (fn (file, _) => not (exists (store1 ^ "/" ^ file))) modules);
+    check "the scoped timeouts disabled subsequent cache requests"
+      (not (Cache.tripped ()) andalso isSome (Cache.get_action host1 retry))
+  end;
+val _ = if HolbuildRemoteCacheConfig.uses_libcurl () then check_stalled_lookups "B" else ();
+val _ = HolbuildRemoteCacheConfig.libcurl_ready := SOME false;
+val _ = E.write_text "$tmpdir/writer.curl" "max-time = 30\n";
+val _ = HolbuildRemoteCacheConfig.local_curl_config := SOME "$tmpdir/writer.curl";
+val _ = check_stalled_lookups "C";
+SML
+(cd "$ROOT" && HOLBUILD_CACHE="$tmpdir/cache" \
+  "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/worker-writer.sml")
