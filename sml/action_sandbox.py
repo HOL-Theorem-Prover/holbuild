@@ -329,6 +329,9 @@ class Policy:
     # Writable like the private roots, but never harvested, so not validated as outputs.
     scratch: list[Path] = field(default_factory=list)
     toolchain: bool = False
+    # Stores of the worker's (blobs, checkpoints, theory modules) whose files
+    # an action may read one by one, but neither write nor list.
+    keep_read_only: list[Path] = field(default_factory=list)
 
     def validate(self) -> None:
         for grant in self.writable + self.scratch:
@@ -338,6 +341,18 @@ class Policy:
         for grant in self.readable + self.writable + self.scratch:
             if exposes(grant):
                 raise SandboxError(f"sandbox grant contains protected worker state: {grant}")
+        # A writable directory may lie inside a store, where holbuild names
+        # one for a store's own writer (a theory-module store's .writer),
+        # but may not be or hold one, and no file of a store is writable;
+        # a readable directory may not touch one.
+        stores = {str(path) for path in self.keep_read_only}
+        holding = {str(parent) for path in self.keep_read_only for parent in path.parents}
+        stored = exposure(self.keep_read_only)
+        opened = ([grant for grant in self.writable + self.scratch
+                   if str(grant) in stores | holding or (not grant.is_dir() and stored(grant))] +
+                  [grant for grant in self.readable if grant.is_dir() and stored(grant)])
+        if opened:
+            raise SandboxError(f"sandbox grant opens a read-only store beyond single files: {opened[0]}")
 
     def usable_scratch(self, scratch: list[Path], passed: set[Path]) -> list[Path]:
         """The SCRATCH directories that hold no protected state, no read-only
@@ -1024,6 +1039,7 @@ def main() -> int:
             [path for name in args.forbid for path in spellings(name)[0]] +
             [path.resolve() for path in (args.completed, options) if path is not None],
             toolchain=args.toolchain,
+            keep_read_only=[path for name in args.keep_read_only for path in spellings(name)[0]],
         )
         # A scratch directory holding protected state, a read-only grant or a
         # --keep-read-only tree is left out rather than failing the action:

@@ -1408,8 +1408,9 @@ reused as is.
 
 `holbuild build --scratch-input FILE` gives each theory's HOL processes the
 environment variable `HOLBUILD_SCRATCH_INPUT`, the path of FILE, a regular file:
-locally FILE itself, on a remote worker a read-only copy fetched from the
-remote cache (see "Running one theory action as a remote worker"). It is a
+locally FILE itself, on a remote worker a link to the worker's read-only cached
+copy, fetched from the remote cache (see "Running one theory action as a remote
+worker"). It is a
 niche option for data a tool reads during a build that must not change what
 the build produces, such as the index a proof search consults to suggest
 tactics that the build then checks. No key covers it: not a theory's cache key nor any checkpoint's, so
@@ -2004,11 +2005,12 @@ renamed) and treat the directory as a cache it may find empty.
 A theory exported with `--scratch-input FILE` (see "Giving a tool a file it
 reads") names FILE by its SHA-256 in the spec's `option scratch-input` line,
 one line per FILE in the order given, and the client uploads each FILE with the
-spec's sources. Before HOL starts, the worker fetches each, through its host
-blob store like a source, to `.holbuild/scratch/<sha256>` under the action
-root, outside the directories the action may write, and gives the theory's HOL
-processes their paths as `HOLBUILD_SCRATCH_INPUT`. A missing blob fails the
-action like a missing source.
+spec's sources. Before HOL starts, the worker fetches each one its local
+cache lacks into that cache, links it to `.holbuild/scratch/<sha256>` under the
+action root, outside the directories the action may write, and gives the
+theory's HOL processes those paths as `HOLBUILD_SCRATCH_INPUT`. Across file
+systems the link is symbolic, and the sandbox lets them read that blob and no
+other in the cache. A missing blob fails the action like a missing source.
 
 With `--ahead-parent INPUT_KEY:SPEC-SHA256`, given once per dependency that
 another worker is still building from that spec (a late parent), the worker
@@ -2125,8 +2127,8 @@ manifests trusted on their recorded stat, `hydinstn` the dependencies the
 check sent to `hydinst`), `cutoff` (whether an earlier build stands), `analyse`
 (the script's proof steps and checkpoints), `restore` (shared
 checkpoints), `toolrestore` (the tool cache), `scratch` (staging the
-`--scratch-input` files, followed by the count `scratchcopyn` of those copied
-or fetched, 0 when each was linked), `hol`, `publish` (shared
+`--scratch-input` files, followed by the count `scratchcopyn` of those fetched,
+0 when the worker's cache held each), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
 checks) and `log`; stderr ends with the same times and `wall`.
 `peak-rss-mb` is the HOL process's peak resident memory, reported once the
