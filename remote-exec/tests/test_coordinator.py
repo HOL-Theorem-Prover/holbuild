@@ -1095,24 +1095,31 @@ async def test_one_release_finishes_the_copies_of_several_builds_in_a_batch_each
     assert (logs["pkg:a"], logs["pkg:b"]) == ("a" * 64, "b" * 64)
 
 
-async def test_a_copy_with_another_spec_wakes_a_waiting_claim_rather_than_being_done_with_a_build(
-    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache, monkeypatch: pytest.MonkeyPatch
+async def test_a_copy_with_another_spec_is_claimed_while_the_build_runs_and_not_done_by_it(
+    http: httpx.AsyncClient, coordinator: Coordinator, cache: FakeCache
 ) -> None:
-    """A forced or traced build has the same keys as a plain one, but its own spec: it must run itself."""
-    monkeypatch.setattr(coordinator_module, "CLAIM_RECHECK_SECONDS", 60)  # only the wake can end the wait in time
+    """A forced, traced or untimed build has the same keys as a plain one, but its own spec: the plain build can't
+    finish it, so it doesn't wait for it, as a timed build once waited hours on an untimed one."""
+
+    async def submit_forced(text: str) -> str:
+        response = await http.post("/v1/batches", content="holbuild-action-batch-v1\n" + text, headers=CLIENT)
+        assert response.status_code == 201, response.text
+        return response.json()["batch_id"]
+
     await submit(http, ["a"])
     token = await claim_named(http, "a")
-    forced = f"holbuild-action-batch-v1\naction {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
-    response = await http.post("/v1/batches", content=forced, headers=CLIENT)
-    assert response.status_code == 201, response.text
-    waiting = asyncio.create_task(coordinator.claim(["standard"], "w2", 30))
-    await asyncio.sleep(0.5)
-    assert not waiting.done()
+    forced_a = f"action {input_key('a')} {ac_key('a')} {spec('a forced')} pkg:a\n"
+    ready = await submit_forced(forced_a)
+    second = await claim_named(http, "a")
+    assert second != token
+    waiting = await submit_forced(
+        f"action {input_key('p')} {ac_key('p')} {spec('p')} pkg:p\n{forced_a}edge {input_key('a')} {input_key('p')}\n"
+    )
 
     cache.keys.add(ac_key("a"))
     assert (await complete(http, token, result("a", "built"))).status_code == 200
-    assert (await asyncio.wait_for(waiting, 10)).theory == "pkg:a"
-    assert await states(http, response.json()["batch_id"]) == {"a": "running"}
+    await coordinator.release()
+    assert (await states(http, ready), await states(http, waiting)) == ({"a": "running"}, {"p": "ready", "a": "waiting"})
 
 
 async def test_a_held_action_wakes_a_waiting_claim_once_its_leader_fails(
@@ -1179,7 +1186,7 @@ async def test_a_key_another_batch_s_claim_is_leasing_is_passed_over_for_the_nex
 
     async with remote_exec_engine.connect() as other, other.begin():
         # Another batch's claim of "a", between its lock of the key and its commit.
-        await other.execute(coordinator_module.LOCK_KEY, {"key": input_key("a")})
+        await other.execute(coordinator_module.LOCK_KEY, {"key": input_key("a"), "spec": spec("a")})
         await claim_named(http, "b")
         assert await claim(http) is None
 
