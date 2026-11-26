@@ -63,6 +63,7 @@ type t =
     groups : group list,
     root_tactic_timeouts : root_tactic_timeout list,
     theory_tactic_timeouts : theory_tactic_timeout list,
+    install_dependencies_first : bool,
     dependencies : dependency list,
     local_config : HolbuildLocalConfig.t,
     overrides : override list,
@@ -142,7 +143,7 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config, gc = _} = local_config
     val {definition, compatibility = _,
          tactic_timeout = manifest_timeout,
-         theory_tactic_timeouts} =
+         theory_tactic_timeouts, install_dependencies_first} =
       (HolbuildPackageDefinition.parse_table table
        handle HolbuildManifestUtil.Error msg => die msg)
     val {metadata = {name, version},
@@ -181,6 +182,7 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       groups = groups,
       root_tactic_timeouts = root_tactic_timeouts,
       theory_tactic_timeouts = theory_tactic_timeouts,
+      install_dependencies_first = install_dependencies_first,
       dependencies = dependencies,
       local_config = local_config,
       overrides = overrides,
@@ -310,6 +312,8 @@ fun root_tactic_timeout_for ({root_tactic_timeouts, ...} : t) root =
   Option.map #timeout (List.find (fn entry => #root entry = root) root_tactic_timeouts)
 fun theory_tactic_timeouts ({theory_tactic_timeouts, ...} : t) =
   theory_tactic_timeouts
+fun install_dependencies_first ({install_dependencies_first, ...} : t) =
+  install_dependencies_first
 fun package_generators (Package {generators, ...}) = generators
 fun artifact_root ({artifact_root, ...} : t) = artifact_root
 fun package_definition ({definition, ...} : t) = definition

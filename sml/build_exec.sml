@@ -9,9 +9,13 @@ exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
 exception RetryInvalidCheckpoint
 
 (* Run before a theory child starts from a fresh preload, not from a
-   checkpoint: a worker's check-only action installs its dependencies then
+   checkpoint: a worker's light action installs its dependencies then
    (exec_action, build_light). *)
 val before_fresh_preload = ref (fn () => ())
+(* Run with the child's build log once it passed, before its outputs are
+   installed in the root: a worker's light action installs its dependencies
+   then, as installing them empties the action's own output stem. *)
+val before_install_stage = ref (fn (_ : string) => ())
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
@@ -5346,11 +5350,12 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
         val _ =
           if speculative then ()
           else
+            (!before_install_stage build_log;
             install_theory_stage check_cancelled cache_allowed policy
               {stage = stage, logical = logical, source_file = source_file, input_key = input_key,
                outputs = {sig_path = sig_path, sml_path = sml_path, data_path = data_path},
                staged_extra_outputs = staged_extra_outputs,
-               generated_metadata = generated_metadata, log_dir = log_dir}
+               generated_metadata = generated_metadata, log_dir = log_dir})
       in
         generated_metadata
       end
@@ -10131,7 +10136,8 @@ fun dependency_spec_lines hash_file root plan keys token deps =
    worker restores shared checkpoints as usual but saves and publishes
    none (build --no-checkpoint-saves). *)
 fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
-                     {theorem_checkpoints, forced, skip_checkpoints, pipeline} (action : theory_action) node action_text =
+                     {theorem_checkpoints, forced, skip_checkpoints, pipeline, install_dependencies_first}
+                     (action : theory_action) node action_text =
   let
     val context = #package action ^ ":" ^ #logical action
     val token = spec_token context
@@ -10179,6 +10185,7 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
       (if forced then [bool_option "force" true] else []) @
       (if trace_steps policy then [bool_option "trace-steps" true] else []) @
       (if pipeline then [bool_option "pipeline" true] else []) @
+      (if install_dependencies_first then [bool_option "install-dependencies-first" true] else []) @
       (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []) @
       map (fn file => "option scratch-input=" ^ hash_file file) (!scratch_input_files) @
       (if timing_source_loads () then [bool_option "source-load-timing" true] else []) @
@@ -10495,9 +10502,14 @@ fun upload_spec_files hash_file remote jobs {known, learn} files =
    With defer, so do the theories early cutoff may reuse once their
    dependencies are built, and those that depend on them; deferred holds
    their keys, for settle_deferred.  Deferring only schedules: whether a
-   theory's outputs are reused is decided by early cutoff alone. *)
+   theory's outputs are reused is decided by early cutoff alone.
+   With named_targets, the build named its targets, the theories an edit
+   checks; without, every root-package theory is one, and, as under
+   --all-checkpoints, a target the build didn't name has a worker install its
+   dependencies before HOL starts, which a fresh preload, the usual start of
+   such a theory, needs. *)
 fun export_action_specs (options : build_options) tc project plan keys toolchain_key jobs
-      {upload, keep_specs, local_resumable, forced, skip, defer, publish, ledger} =
+      {upload, keep_specs, local_resumable, forced, skip, defer, publish, ledger, named_targets} =
   let
     val root = project_artifact_root project
     val {hash = hash_file, recorded} = export_file_hash (scratch_input_seed root)
@@ -10697,11 +10709,16 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
         val _ =
           if HolbuildToolchain.hash_text action_text = #input_key action then ()
           else raise Error ("internal error: action text of " ^ logical_name node ^ " does not hash to its input key")
+        val policy = checkpoint_policy_for_node options project node
         val {text, files} =
-          action_spec_text hash_file context (checkpoint_policy_for_node options project node)
+          action_spec_text hash_file context policy
             {theorem_checkpoints = true,
              forced = force_node options project node, skip_checkpoints = #skip_checkpoints options,
-             pipeline = pipelining andalso pipelinable options project plan node}
+             pipeline = pipelining andalso pipelinable options project plan node,
+             install_dependencies_first =
+               HolbuildProject.install_dependencies_first project orelse
+               (checkpoint_target_enabled policy andalso
+                not (named_targets andalso force_target_node (#checkpoint_targets options) node))}
             action node action_text
         val spec_sha256 = HolbuildHash.string_sha256 text
         val path = Path.concat(spec_dir, spec_sha256)
@@ -11340,7 +11357,7 @@ type action_spec =
    check_only : bool, no_checkpoint_saves : bool,
    checkpoint_seconds : real, force : bool, trace_steps : bool,
    pipeline : bool, tool_cache : string option, scratch_inputs : string list, source_load_timing : bool,
-   action_text : string}
+   install_dependencies_first : bool, action_text : string}
 
 (* A spec's lines, and the text after its SECTION line. *)
 fun split_spec_text section text =
@@ -11529,6 +11546,10 @@ fun parse_action_spec text : action_spec =
      source_load_timing =
        (case List.find (fn (k, _) => k = "option source-load-timing") (!values) of
             SOME (_, v) => spec_bool "source-load-timing" v
+          | NONE => false),
+     install_dependencies_first =
+       (case List.find (fn (k, _) => k = "option install-dependencies-first") (!values) of
+            SOME (_, v) => spec_bool "install-dependencies-first" v
           | NONE => false),
      action_text = action_text}
   end
@@ -11951,9 +11972,10 @@ fun remove_resident root (path, entry) =
    empty one would.  SCRATCH names the stems, with their keys, the action
    writes besides its dependencies; they are emptied for it.
 
-   With LIGHT, for a check-only action, which reads no dependency file when
-   it resumes from a heap that loaded them: the dependencies not kept are
-   removed and not installed, and their records, as an install would write
+   With LIGHT, for an action that reads no dependency file when it resumes
+   from a heap that loaded them: the dependencies not kept are removed and
+   not installed, kept ones are not checked against the remote, and their
+   records, as an install would write
    them, are returned with their load manifests' lines, for the early
    cutoff and the parent checks; or, when one's .dat hash isn't known
    without its .dat, all are installed and NONE returned, as it is without
@@ -12136,11 +12158,11 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
             (#deps spec)
         end)
     fun restore_deps () = hydrate_step "hyddeps" restore_deps_now
-    (* The direct dependencies' stale local copies go first, as the
-       refresh after an install would drop them. *)
+    (* Kept local copies are trusted by their records here: the install
+       (install_light) checks them against the remote's entries, and its
+       records against these. *)
     fun light_deps_now () =
       let
-        val _ = hydrate_step "hydstale" (fn () => drop_stale_dep_copies false remote spec direct)
         val checks = map (fn dep => (dep, ref false)) (#deps spec)
         val _ = hydrate_step "hydcheck" (fn () =>
                   (load_known ();
@@ -12233,16 +12255,22 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                    Resident.put resident path (Resident.Scratch key)
                 end)
              scratch;
-    Resident.prune resident (remove_resident root);
-    (* Extra outputs lie under their theory's key, so a directory there for
-       no recorded key (an early cutoff restores the action's own under its
-       earlier key) is nobody's. *)
     let
-      val extras = in_root root ".holbuild/action-extra"
-      val keys = Resident.keys resident
+      val pruned = ref 0
     in
-      List.app (fn key => if List.exists (fn k => k = key) keys then () else remove_tree (Path.concat (extras, key)))
-               (HolbuildBuildPlan.list_dir extras handle HolbuildBuildPlan.Error _ => [])
+      hydrate_step "hydprune" (fn () =>
+        (Resident.prune resident (fn entry => (pruned := !pruned + 1; remove_resident root entry));
+         (* Extra outputs lie under their theory's key, so a directory there
+            for no recorded key (an early cutoff restores the action's own
+            under its earlier key) is nobody's. *)
+         let
+           val extras = in_root root ".holbuild/action-extra"
+           val keys = Resident.keys resident
+         in
+           List.app (fn key => if List.exists (fn k => k = key) keys then () else remove_tree (Path.concat (extras, key)))
+                    (HolbuildBuildPlan.list_dir extras handle HolbuildBuildPlan.Error _ => [])
+         end));
+      hydrate_count "hydprunen" (!pruned)
     end;
     hydrate_step "hydfiles" (fn () =>
       (transfer_all fetch_file files;
@@ -12625,6 +12653,13 @@ fun classify_run_failure stage log_text oom_before msg =
     (failure, String.concatWith "\n" (msg :: kill_notes))
   end
 
+(* How HOL says a load or use found no file (tools-poly/poly/poly-init2.ML),
+   before the path it was given. *)
+val missing_file_messages = ["Cannot find file ", "non-existent file "]
+
+fun names_missing_file text =
+  List.exists (fn message => String.isSubstring message text) missing_file_messages
+
 (* Whether HOL's output says it couldn't find a file under the action root
    ROOT that the records RESIDENT say the hydrate put there: a dependency's
    file, a library manifest or a fetched file. *)
@@ -12665,7 +12700,7 @@ fun lost_restored_file resident root text =
       restored path orelse restored (hfs_remapped_path path) orelse
       (case unmapped path of SOME path => restored path | NONE => false)
   in
-    List.exists lost (List.concat (map paths ["Cannot find file ", "non-existent file "]))
+    List.exists lost (List.concat (map paths missing_file_messages))
   end
 
 (* The worker cache cap covers everything a worker keeps between
@@ -16667,8 +16702,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     (* Each phase's wall time, in the order they ran, for the result. *)
     val phases = ref ([] : (string * LargeInt.int) list)
     (* The hydrate time inside the current hol phase: a light hydrate's
-       install before HOL starts from a fresh preload, which is not HOL's
-       and is left out of the phase's time, not its span. *)
+       install before HOL starts from a fresh preload or after it passed,
+       which is not HOL's and is left out of the phase's time, not its
+       span. *)
     val hol_hydrate_ms = ref (0 : LargeInt.int)
     fun phase name f =
       let
@@ -16694,6 +16730,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     (* The records of the dependencies a light hydrate didn't install,
        until they are. *)
     val light_records = ref (NONE : HolbuildActionResident.t option)
+    (* A light build that passed though HOL found no file it asked for. *)
+    exception LightRerun
     (* A late parent's entry restores here, outside what the child may write;
        its outline in the other, and this action's own outline is copied to
        the third before it is published. *)
@@ -17019,10 +17057,14 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     and run_plain spec tc forced pipelined =
       let
         val _ = hydrate_steps := []
-        (* A check-only action resuming from a heap reads no dependency file:
-           they are installed only when it doesn't (build_light). *)
+        (* A check-only action, or a target, which resumes from a checkpoint
+           when it can, reads no dependency file then: they are installed
+           only when it doesn't, or once it passes (build_light). *)
+        val light_hydrate =
+          not forced andalso not pipelined andalso not (#install_dependencies_first spec) andalso
+          (#check_only spec orelse (#checkpoint_target spec andalso not (#skip_checkpoints spec) andalso share_heaps))
         val light =
-          (phase "hydrate" (fn () => hydrate_action_root remote root (!resident) spec (#check_only spec andalso not forced))
+          (phase "hydrate" (fn () => hydrate_action_root remote root (!resident) spec light_hydrate)
            before add_hydrate_steps ())
           handle e => (add_hydrate_steps (); raise e)
         val _ = light_records := Option.map #records light
@@ -17072,15 +17114,50 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         else build spec tc forced cutoff NONE false
       end
     (* A build on a light hydrate: the dependencies are installed before
-       HOL starts from a fresh preload, which loads them.  A run resuming
-       from a checkpoint reads none: the preload that saved its heap loaded
-       every dependency the script loads.  The installed files must give
+       HOL starts from a fresh preload, which loads them, and before a
+       passing run's outputs are installed.  A run resuming from a
+       checkpoint reads none, unless its script loads one the preload that
+       saved its heap didn't: HOL then finds no file, and the build runs
+       again on every dependency installed.  The installed files must give
        the records' hashes: the context the build restored, and publishes
        a failed prefix under, is keyed by those. *)
     and build_light spec tc forced cutoff =
-      (before_fresh_preload := (fn () => install_light spec tc cutoff);
-       build spec tc forced cutoff NONE false before before_fresh_preload := (fn () => ()))
-      handle e => (before_fresh_preload := (fn () => ()); raise e)
+      let
+        fun light () = Option.isSome (!light_records)
+        fun before_preload () =
+          (install_light spec tc cutoff;
+           if #check_only spec then ()
+           else prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec})
+        fun before_install log =
+          if light () andalso names_missing_file (read_text log) then raise LightRerun
+          else install_light spec tc cutoff
+        fun set_hooks preload install = (before_fresh_preload := preload; before_install_stage := install)
+        fun clear_hooks () = set_hooks (fn () => ()) (fn _ => ())
+        fun light_build () =
+          (set_hooks before_preload before_install;
+           build spec tc forced cutoff NONE false before clear_hooks ())
+          handle e => (clear_hooks (); raise e)
+        (* Nothing of the light run is kept: its failure, checkpoints and
+           publications were of a script that lacked a file. *)
+        fun rerun () =
+          (deferred := (fn () => ());
+           tools_first := (fn () => ());
+           write_modules := NONE;
+           drop_heap_snapshot ();
+           empty_writable true;
+           List.app ensure_dir (checkpoint_root :: writable_dirs);
+           install_light spec tc cutoff;
+           phases := ("lightrerun", 1) :: !phases;
+           build spec tc forced cutoff NONE false)
+      in
+        light_build ()
+        handle LightRerun => rerun ()
+             | e as ActionFailed (kind, msg) =>
+                 if (kind = ProofFailure orelse kind = TacticTimeoutFailure) andalso light () andalso
+                    names_missing_file (msg ^ "\n" ^ (read_text (build_log ()) handle _ => ""))
+                 then rerun ()
+                 else raise e
+      end
     (* Installs the dependencies a light hydrate left out, whose files must
        give the records' hashes; and the build's module grants then. *)
     and install_light spec tc cutoff =
@@ -17235,11 +17312,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                      (phase "restore" (fn () =>
                         restore_shared_checkpoints remote ctx (resumes_from_checkpoints policy action)
                           (fetch_heap_modules remote tc)
-                          (* A check-only action, lightly hydrated, has
-                             no store to judge, and a non-target, or a run
+                          (* A check-only action, or a light one, has no
+                             store to judge, and a non-target, or a run
                              under --no-checkpoint-saves, publishes no
                              heap: they restore it. *)
-                          (fn entry => not (#check_only spec) andalso saves_progress policy andalso
+                          (fn entry => not (#check_only spec) andalso not (Option.isSome (!light_records)) andalso
+                                       saves_progress policy andalso
                                        declines_short_heap root tc {deps = #deps spec, loads = #loads spec} entry))
                       before add_restore_steps ())
                      handle e => (add_restore_steps (); release_heap_decline (); raise e))
@@ -17282,11 +17360,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               end
             (* It fills the host's module store for later actions, which a
                check-only action leaves to them: it takes only the modules a
-               checkpoint it restores needs.  A decline is given back if the
-               run fails before HOL starts. *)
+               checkpoint it restores needs.  A light action, whose
+               dependencies' files aren't there yet, does so once they are
+               installed before a fresh preload (build_light).  A decline is
+               given back if the run fails before HOL starts. *)
             val _ =
               if not (Option.isSome ahead) andalso not (Option.isSome (#heap restored)) andalso
-                 not (#check_only spec)
+                 not (#check_only spec) andalso not (Option.isSome (!light_records))
               then prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
                    handle e => (release_heap_decline (); raise e)
               else ()
@@ -17343,7 +17423,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                     writes the modules after its own result. *)
                  (case e of
                       ActionFailed (AheadAbandoned, _) => ()
-                    | _ => if outlined orelse checks_only policy then () else set_write_modules ());
+                    | _ => if outlined orelse checks_only policy orelse Option.isSome (!light_records) then ()
+                           else set_write_modules ());
                  raise e)
           in
             deps_heap_phases ();

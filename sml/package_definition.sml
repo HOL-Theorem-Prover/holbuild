@@ -576,7 +576,7 @@ fun validate_manifest table =
      (require_known_fields "build"
        ["members", "exclude", "exclude_globs", "roots", "root_groups",
         "groups", "tactic_timeout", "root_tactic_timeouts",
-        "theory_tactic_timeouts"])
+        "theory_tactic_timeouts", "install_dependencies_first"])
      (table_field table ["build"]);
    Option.app (require_known_fields "run" ["heap", "loads"])
      (table_field table ["run"]);
@@ -598,7 +598,8 @@ fun validate_manifest table =
 type parsed =
   {definition : t, compatibility : compatibility,
    tactic_timeout : real option option,
-   theory_tactic_timeouts : theory_tactic_timeout list}
+   theory_tactic_timeouts : theory_tactic_timeout list,
+   install_dependencies_first : bool}
 
 val parsed_manifest_count = ref 0
 fun manifest_parse_count () = !parsed_manifest_count
@@ -613,6 +614,12 @@ fun parse_table table : parsed =
          root_tactic_timeouts, tactic_timeout} = parse_build table
     val theory_tactic_timeouts =
       theory_tactic_timeouts_from_manifest (table_field table ["build"])
+    (* For a project whose scripts read a dependency's files after the
+       preload: a worker installs every dependency before HOL starts. *)
+    val install_dependencies_first =
+      case table_field table ["build"] of
+          NONE => false
+        | SOME build => Option.getOpt (bool_at build ["install_dependencies_first"], false)
     val dependencies = parse_dependencies table
     val {run_heap, run_loads, heaps, generators} = parse_runtime table
     val action_policies = parse_action_policies table
@@ -629,7 +636,8 @@ fun parse_table table : parsed =
   in
     {definition = definition, compatibility = compatibility,
      tactic_timeout = tactic_timeout,
-     theory_tactic_timeouts = theory_tactic_timeouts}
+     theory_tactic_timeouts = theory_tactic_timeouts,
+     install_dependencies_first = install_dependencies_first}
   end
 
 fun bool_text value = if value then "true" else "false"

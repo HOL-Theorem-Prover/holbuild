@@ -759,6 +759,7 @@ exclude_globs = ["*/selftest.sml", "*/examples/*"]
 roots = ["src/MainScript.sml"]
 root_groups = ["@generated"]
 tactic_timeout = 10.0
+install_dependencies_first = false
 
 [build.groups.generated]
 include = ["gen/fixtures"]
@@ -820,6 +821,13 @@ allow_empty = false
 - `root_tactic_timeouts` lets individual root source files set timeout contracts
   for their dependency closures. Keys must spell the root exactly as it appears
   in `roots` (or, for a group root, as the member's package-root-relative path).
+- `install_dependencies_first`, for a root project whose scripts read a
+  dependency's `.sig`, `.sml`, `.dat`, `.ui` or `.uo` files themselves: a remote
+  worker then installs every dependency before HOL starts. By default a worker
+  checking a named target or a `--check-only` one that resumes from a
+  checkpoint installs none until the theory passes, since the checkpoint has
+  them loaded; a script that loads one it didn't fails to find its file, and the
+  worker installs them all and builds the theory again.
 
 ### Action overrides
 

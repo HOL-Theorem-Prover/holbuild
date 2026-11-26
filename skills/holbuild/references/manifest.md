@@ -29,6 +29,7 @@ exclude_globs = ["*/selftest.sml", "*/examples/*"]  # glob patterns, package-roo
 roots = ["MainTheory"]           # default roots: logical names, package-relative source paths, or @group refs
 root_groups = ["@generated"]  # additional default build groups; bare names also accepted
 tactic_timeout = 60.0            # root-package per-step timeout; CLI/local config override
+install_dependencies_first = false  # true if scripts read dependency files themselves: remote workers install all before HOL
 
 [build.groups.generated]
 include = ["gen/fixtures"]       # concrete package-relative paths/subtrees
