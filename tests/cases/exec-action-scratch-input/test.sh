@@ -86,6 +86,9 @@ val _ =
                 [("append", fn () => BinIO.closeOut (BinIO.openAppend path)),
                  ("rename", fn () => OS.FileSys.rename {old = path, new = path ^ ".moved"}),
                  ("remove", fn () => OS.FileSys.remove path),
+                 ("move-dir", fn () => OS.FileSys.rename {old = OS.Path.dir path, new = OS.Path.dir path ^ ".moved"}),
+                 ("rename-blob", fn () => OS.FileSys.rename {old = OS.Path.concat (blobs, OS.Path.file path),
+                                                             new = OS.Path.concat (blobs, OS.Path.file path ^ ".moved")}),
                  ("remove-blob", fn () => OS.FileSys.remove (OS.Path.concat (blobs, OS.Path.file path))),
                  ("list", fn () => OS.FileSys.closeDir (OS.FileSys.openDir blobs)),
                  ("other", fn () => TextIO.closeIn (TextIO.openIn (OS.Path.concat (blobs, "$other_blob"))))]
@@ -211,7 +214,7 @@ in_place() {
   grep -qx "scratch path: $(realpath "$worker_cache/action")/.holbuild/scratch/$2" "$tmpdir/$1.hol" &&
     grep -qx "scratch links: $3" "$tmpdir/$1.hol" && grep -qx "scratch target: $4" "$tmpdir/$1.hol" || {
     echo "worker $1: the input is not staged as expected" >&2; grep "^scratch" "$tmpdir/$1.hol" >&2; exit 1; }
-  grep -qx "scratch tamper: append=denied rename=denied remove=denied remove-blob=denied list=denied other=denied" "$tmpdir/$1.hol" || {
+  grep -qx "scratch tamper: append=denied rename=denied remove=denied move-dir=denied rename-blob=denied remove-blob=denied list=denied other=denied" "$tmpdir/$1.hol" || {
     echo "worker $1: the child could change the input, list the cache or read another blob" >&2
     grep "scratch tamper" "$tmpdir/$1.hol" >&2; exit 1; }
 }
@@ -322,6 +325,22 @@ if [[ -d /dev/shm && -w /dev/shm && "$(stat -c %d /dev/shm)" != "$(stat -c %d "$
   built u-evict two
   in_place u-evict "$sha_two" 1 "$(realpath "$xdev")/$sha_two"
   [[ "$(copies u-evict)" == 1 ]] || { echo "the retry did not fetch the input again" >&2; cat "$tmpdir/u-evict.result" >&2; exit 1; }
+  # A cache that can't take the input: it is fetched into the action root,
+  # and the child reads it there.  (Nor can the action publish its entry
+  # into such a cache, so it fails after.)
+  printf 'three\n' > "$tmpdir/three.txt"
+  sha_three=$(sha256sum "$tmpdir/three.txt" | cut -d' ' -f1)
+  write_u 'ALL_TAC >> ALL_TAC >> simp[]'
+  hb action-spec --upload --scratch-input "$tmpdir/three.txt" UTheory > "$tmpdir/batch-full.txt"
+  chmod a-w "$xdev"
+  worker_command u-full "$(field "$tmpdir/batch-full.txt" scratch:UTheory 4)" || true
+  chmod u+w "$xdev"
+  curl -fsS "$remote_url/cas/$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/u-full.result")" > "$tmpdir/u-full.hol"
+  grep -qx "scratch input: three" "$tmpdir/u-full.hol" || {
+    echo "worker u-full: U did not read 'three'" >&2; cat "$tmpdir/u-full.hol" "$tmpdir/u-full.log" >&2; exit 1; }
+  in_place u-full "$sha_three" 1 none
+  [[ "$(copies u-full)" == 1 && ! -e "$xdev/$sha_three" ]] || {
+    echo "the input was not fetched into the root" >&2; cat "$tmpdir/u-full.result" >&2; exit 1; }
 else
   echo "skipping the cross-file-system scratch input check: no writable /dev/shm on another device"
 fi

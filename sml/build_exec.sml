@@ -16602,7 +16602,6 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
       let
         val read_only = Posix.FileSys.S.flags [Posix.FileSys.S.irusr, Posix.FileSys.S.irgrp, Posix.FileSys.S.iroth]
         val copied = ref 0
-        fun regular path = Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false
         fun fetch_into_cache sha blob =
           let val tmp = HolbuildCacheTransfer.temp_blob_path (HolbuildCache.blobs_dir cache) sha
           in
@@ -16615,8 +16614,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                     Posix.FileSys.link {old = tmp, new = blob} handle OS.SysErr _ => ())
                | HolbuildCacheBackend.Miss =>
                    raise ActionFailed (InputMissing ["blob " ^ sha], "blob " ^ sha ^ " is not in the cache")
-               | HolbuildCacheBackend.Corrupt msg =>
-                   raise action_failed InternalFailure ("cannot fetch blob " ^ sha ^ ": " ^ msg);
+               (* Also a failed write into the cache, so the root is tried. *)
+               | HolbuildCacheBackend.Corrupt msg => raise Error ("cannot fetch blob " ^ sha ^ " into the cache: " ^ msg);
              remove_file tmp)
             handle e => (remove_file tmp; raise e)
           end
@@ -16634,8 +16633,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                 HolbuildActionSandbox.scratch_reads := target :: !HolbuildActionSandbox.scratch_reads
               end
             fun in_place () =
-              (if regular blob then () else (fetched := true; fetch_into_cache sha blob);
-               if regular blob then () else raise Error ("blob " ^ sha ^ " is not a file of the cache");
+              (if HolbuildCache.is_regular_entry blob then () else (fetched := true; fetch_into_cache sha blob);
+               if HolbuildCache.is_regular_entry blob then () else raise Error ("blob " ^ sha ^ " is not a file of the cache");
                Posix.FileSys.chmod (blob, read_only);
                HolbuildCache.touch blob;
                ensure_parent path;
