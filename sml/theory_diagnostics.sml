@@ -229,35 +229,32 @@ fun static_error_summary source_path source_text lines =
 fun proof_unit_label (checkpoint : HolbuildTheoryCheckpoints.boundary) =
   if #kind checkpoint = "resume" then "resume" else "theorem"
 
-fun source_span_text source_path source_text start_offset end_offset =
+fun source_span_end_location source_text start_offset end_offset =
+  let
+    val last_offset = Int.max(start_offset, end_offset - 1)
+  in
+    (line_number_at source_text last_offset, column_number_at source_text last_offset + 1)
+  end
+
+fun source_span_range source_text start_offset end_offset =
   let
     val start_line = line_number_at source_text start_offset
     val start_col = column_number_at source_text start_offset
-    val last_offset = Int.max(start_offset, end_offset - 1)
-    val end_line = line_number_at source_text last_offset
-    val end_col = column_number_at source_text last_offset + 1
-    val range =
-      if start_line = end_line then
-        String.concat [Int.toString start_line, ":", Int.toString start_col, "-", Int.toString end_col]
-      else
-        String.concat [Int.toString start_line, ":", Int.toString start_col, "-",
-                       Int.toString end_line, ":", Int.toString end_col]
+    val (end_line, end_col) = source_span_end_location source_text start_offset end_offset
+  in
+    if start_line = end_line then
+      String.concat [Int.toString start_line, ":", Int.toString start_col, "-", Int.toString end_col]
+    else
+      String.concat [Int.toString start_line, ":", Int.toString start_col, "-",
+                     Int.toString end_line, ":", Int.toString end_col]
+  end
+
+fun source_span_text source_path source_text start_offset end_offset =
+  let
+    val range = source_span_range source_text start_offset end_offset
   in
     String.concat ["source: ", source_path, ":", range, "\n",
                    source_context_text_span source_text {start_offset = start_offset, end_offset = end_offset}]
-  end
-
-fun checkpoint_source_summary source_path source_text (checkpoint : HolbuildTheoryCheckpoints.boundary) label {offset, width} =
-  let
-    val theorem_line = line_number_at source_text (#theorem_start checkpoint)
-    val proof_line = line_number_at source_text (#tactic_start checkpoint)
-    val end_offset = Int.min(size source_text, offset + Int.max(1, width))
-  in
-    String.concat
-      [proof_unit_label checkpoint, ": ", #name checkpoint, " (line ", Int.toString theorem_line, ")\n",
-       "proof: line ", Int.toString proof_line, "\n",
-       "fragment: ", label, "\n",
-       source_span_text source_path source_text offset end_offset]
   end
 
 val termination_goal_prefix = "holbuild termination condition goal for "
@@ -391,6 +388,93 @@ fun skip_whitespace source_text limit offset =
   else if Char.isSpace (String.sub(source_text, offset)) then skip_whitespace source_text limit (offset + 1)
   else offset
 
+fun skip_branch_close_layout source_text limit offset =
+  let
+    fun loop current =
+      if current >= limit then current
+      else if Char.isSpace (String.sub(source_text, current)) then loop (current + 1)
+      else if HolbuildTheoryCheckpoints.starts_with_bounded source_text limit current "(*" then
+        loop (HolbuildTheoryCheckpoints.skip_comment_bounded source_text limit current)
+      else current
+  in
+    loop offset
+  end
+
+val hol_quote_open = String.implode [Char.chr 226, Char.chr 128, Char.chr 152]
+val hol_quote_close = String.implode [Char.chr 226, Char.chr 128, Char.chr 153]
+val hol_double_quote_open = String.implode [Char.chr 226, Char.chr 128, Char.chr 156]
+val hol_double_quote_close = String.implode [Char.chr 226, Char.chr 128, Char.chr 157]
+
+fun symbolic_char c =
+  not (Char.isSpace c) andalso not (HolbuildDependencies.is_word_char c) andalso
+  not (List.exists (fn delimiter => c = delimiter)
+                 [#"(", #")", #"[", #"]", #"{", #"}", #",", #";", #"\"", #"`"])
+
+fun symbolic_token_boundary source_text limit offset =
+  offset >= limit orelse not (symbolic_char (String.sub(source_text, offset))) orelse
+  HolbuildTheoryCheckpoints.starts_with_bounded source_text limit offset hol_quote_open orelse
+  HolbuildTheoryCheckpoints.starts_with_bounded source_text limit offset hol_quote_close orelse
+  HolbuildTheoryCheckpoints.starts_with_bounded source_text limit offset hol_double_quote_open orelse
+  HolbuildTheoryCheckpoints.starts_with_bounded source_text limit offset hol_double_quote_close
+
+fun branch_close_continuation source_text limit offset =
+  let
+    val start = skip_branch_close_layout source_text limit offset
+    fun symbolic opn =
+      if HolbuildTheoryCheckpoints.starts_with_bounded source_text limit start opn then
+        let val next = start + size opn
+        in
+          if symbolic_token_boundary source_text limit next then SOME opn else NONE
+        end
+      else NONE
+    fun identifier opn =
+      if HolbuildTheoryCheckpoints.starts_with_bounded source_text limit start opn then
+        let val next = start + size opn
+        in
+          if next >= limit orelse not (HolbuildDependencies.is_word_char (String.sub(source_text, next))) then SOME opn
+          else NONE
+        end
+      else NONE
+  in
+    case first_some symbolic [">>>", ">>", "\\\\", ">-", ">|"] of
+        SOME opn => SOME opn
+      | NONE => first_some identifier ["THEN_LT", "THEN1", "THENL", "THEN"]
+  end
+
+fun branch_close_note source_text limit label branch_close start_offset end_offset =
+  if label <> "branch close" orelse not branch_close then ""
+  else
+    case branch_close_continuation source_text limit end_offset of
+        SOME opn =>
+          let val (end_line, end_col) = source_span_end_location source_text start_offset end_offset
+          in
+            String.concat
+              ["note: this 'by'/'suffices_by'/'>-' branch body ended at ",
+               Int.toString end_line, ":", Int.toString end_col,
+               " with unsolved goal(s); the '", opn,
+               " ...' tactics after it are outside this branch and did not run. ",
+               "Wrap a multi-step branch proof in parentheses: P by (tac1 >> tac2) or >- (tac1 >> tac2).\n"]
+          end
+      | NONE =>
+          String.concat
+            ["note: branch body at ", source_span_range source_text start_offset end_offset,
+             " left unsolved goal(s); if preceding steps were meant to stay inside one branch, ",
+             "check grouping: '>>' and '>-' associate left as (tac1 >> tac2) >- tac3.\n"]
+
+fun checkpoint_source_summary source_path source_text (checkpoint : HolbuildTheoryCheckpoints.boundary) label branch_close {offset, width} =
+  let
+    val theorem_line = line_number_at source_text (#theorem_start checkpoint)
+    val proof_line = line_number_at source_text (#tactic_start checkpoint)
+    val end_offset = Int.min(size source_text, offset + Int.max(1, width))
+  in
+    String.concat
+      [proof_unit_label checkpoint, ": ", #name checkpoint, " (line ", Int.toString theorem_line, ")\n",
+       "proof: line ", Int.toString proof_line, "\n",
+       "fragment: ", label, "\n",
+       source_span_text source_path source_text offset end_offset,
+       branch_close_note source_text (#tactic_end checkpoint) label branch_close offset end_offset]
+  end
+
 fun finish_span source_text (checkpoint : HolbuildTheoryCheckpoints.boundary) =
   let
     val finish_offset = skip_whitespace source_text (#theorem_stop checkpoint) (#tactic_end checkpoint)
@@ -398,11 +482,11 @@ fun finish_span source_text (checkpoint : HolbuildTheoryCheckpoints.boundary) =
     {offset = finish_offset, width = 1}
   end
 
-fun failed_theorem_source_summary source_path source_text checkpoints label theorem_name failed_span failed_end =
+fun failed_theorem_source_summary source_path source_text checkpoints label theorem_name failed_span failed_end branch_close =
   case List.find (fn (checkpoint : HolbuildTheoryCheckpoints.boundary) => #name checkpoint = theorem_name) checkpoints of
       NONE => NONE
     | SOME checkpoint =>
-        SOME (checkpoint_source_summary source_path source_text checkpoint label
+        SOME (checkpoint_source_summary source_path source_text checkpoint label branch_close
                 (case failed_span of
                      SOME (start_pos, end_pos) =>
                        if start_pos = end_pos andalso has_suffix " finish" label then finish_span source_text checkpoint
@@ -500,6 +584,18 @@ fun find_failed_fragment_span lines =
           parse_span_line (String.extract(line, size failed_fragment_span_prefix, NONE))
         else NONE)
     lines
+
+fun has_branch_close_plan_position lines =
+  Option.isSome
+    (first_some
+       (fn line =>
+           if String.isPrefix plan_position_prefix line then
+             case String.tokens Char.isSpace
+                                (String.extract(line, size plan_position_prefix, NONE)) of
+                 _ :: "end" :: ">-" :: "solved" :: _ => SOME ()
+               | _ => NONE
+           else NONE)
+       lines)
 
 fun truncate_goal_state text =
   let val limit = HolbuildDiagnosticLimits.goal_state ()
@@ -599,7 +695,7 @@ fun child_failure_summary path =
   end
   handle _ => NONE
 
-fun failed_termination_source_summary source_path source_text terminations label name failed_span failed_end =
+fun failed_termination_source_summary source_path source_text terminations label name failed_span failed_end branch_close =
   case List.find (fn (termination : HolbuildTheoryCheckpoints.termination) => #name termination = name) terminations of
       NONE => NONE
     | SOME termination =>
@@ -624,7 +720,8 @@ fun failed_termination_source_summary source_path source_text terminations label
              Int.toString (line_number_at source_text (#definition_start termination)), ")\n",
              "proof: line ", Int.toString (line_number_at source_text (#tactic_start termination)), "\n",
              "fragment: ", label, "\n",
-             source_span_text source_path source_text offset (Int.max(offset + 1, end_offset))])
+             source_span_text source_path source_text offset (Int.max(offset + 1, end_offset)),
+             branch_close_note source_text (#tactic_end termination) label branch_close offset (Int.max(offset + 1, end_offset))])
         end
 
 fun summarize_failed_fragment_source source_path source_text checkpoints terminations path =
@@ -633,12 +730,13 @@ fun summarize_failed_fragment_source source_path source_text checkpoints termina
     val label = find_failed_fragment_label lines
     val failed_end = find_failed_fragment_end lines
     val failed_span = find_failed_fragment_span lines
+    val branch_close = has_branch_close_plan_position lines andalso Option.isSome failed_span
   in
     case (label, find_failed_theorem_name lines) of
         (SOME label', SOME theorem_name) =>
-          (case failed_theorem_source_summary source_path source_text checkpoints label' theorem_name failed_span failed_end of
+          (case failed_theorem_source_summary source_path source_text checkpoints label' theorem_name failed_span failed_end branch_close of
                SOME summary => SOME summary
-             | NONE => failed_termination_source_summary source_path source_text terminations label' theorem_name failed_span failed_end)
+             | NONE => failed_termination_source_summary source_path source_text terminations label' theorem_name failed_span failed_end branch_close)
       | _ => NONE
   end
   handle _ => NONE

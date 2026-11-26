@@ -1176,6 +1176,216 @@ if not any(line.startswith(">") and ("|   )" in line or "|     ALL_TAC" in line)
     raise SystemExit("close_paren source location did not point at failing branch close/body")
 PY
 
+cat > "$tmpdir/branch-close-layout-test.sml" <<'SML'
+val root =
+  case OS.Process.getEnv "HOLBUILD_ROOT" of
+      SOME path => path
+    | NONE => raise Fail "HOLBUILD_ROOT not set";
+val _ = OS.FileSys.chDir root;
+use "sml/holbuild-script.sml";
+
+fun require label condition = if condition then () else raise Fail label;
+fun note_with_limit source limit end_offset =
+  HolbuildTheoryDiagnostics.branch_close_note source limit "branch close" true 0 end_offset;
+fun note source end_offset = note_with_limit source (size source) end_offset;
+
+val then_note = note "ALL_TAC THEN" 7;
+val _ = require "THEN continuation was not recognized"
+  (String.isSubstring "the 'THEN ...' tactics after it are outside this branch" then_note);
+
+val then_foo_note = note "ALL_TAC THEN_FOO" 7;
+val _ = require "THEN_FOO was treated as THEN"
+  (String.isSubstring "branch body at 1:1-8" then_foo_note andalso
+   not (String.isSubstring "the 'THEN ...' tactics after it are outside this branch" then_foo_note));
+
+val nested_comment_note = note "ALL_TAC (* outer (* nested *) comment *) >>" 7;
+val _ = require "nested comment did not reveal continuation"
+  (String.isSubstring "the '>> ...' tactics after it are outside this branch" nested_comment_note);
+
+val unlisted_symbolic_note = note "ALL_TAC >>~" 7;
+val _ = require "unlisted symbolic operator was treated as >>"
+  (String.isSubstring "branch body at 1:1-8" unlisted_symbolic_note andalso
+   not (String.isSubstring "the '>> ...' tactics after it are outside this branch" unlisted_symbolic_note));
+
+val unicode_quote_note =
+  note (String.concat
+          ["ALL_TAC >>", String.implode [Char.chr 226, Char.chr 128, Char.chr 152],
+           "T", String.implode [Char.chr 226, Char.chr 128, Char.chr 153]]) 7;
+val _ = require "Unicode quotation blocked a symbolic continuation"
+  (String.isSubstring "the '>> ...' tactics after it are outside this branch" unicode_quote_note);
+
+val unicode_double_quote_note =
+  note (String.concat
+          ["ALL_TAC >>", String.implode [Char.chr 226, Char.chr 128, Char.chr 156],
+           "T", String.implode [Char.chr 226, Char.chr 128, Char.chr 157]]) 7;
+val _ = require "Unicode double quotation blocked a symbolic continuation"
+  (String.isSubstring "the '>> ...' tactics after it are outside this branch" unicode_double_quote_note);
+
+val bounded_note = note_with_limit "ALL_TAC >> ACCEPT_TAC TRUTH" 7 7;
+val _ = require "continuation scan crossed the tactic boundary"
+  (String.isSubstring "branch body at 1:1-8" bounded_note andalso
+   not (String.isSubstring "the '>> ...' tactics after it are outside this branch" bounded_note));
+SML
+if ! (cd "$repo_root" && "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/branch-close-layout-test.sml") > "$tmpdir/branch-close-layout-test.log" 2>&1; then
+  cat "$tmpdir/branch-close-layout-test.log" >&2
+  exit 1
+fi
+
+run_branch_close_case() {
+  local name=$1
+  local expected_note=$2
+  local case_project=$tmpdir/branch-close-$name-project
+  local case_log=$tmpdir/branch-close-$name.log
+  mkdir -p "$case_project/src"
+  cp "$project/holproject.toml" "$case_project/holproject.toml"
+  cat > "$case_project/src/AScript.sml"
+  if (cd "$case_project" && "$HOLBUILD_BIN" build ATheory) > "$case_log" 2>&1; then
+    echo "expected branch-close case '$name' to fail build" >&2
+    exit 1
+  fi
+  require_grep "fragment: branch close" "$case_log"
+  python3 - "$case_log" "$expected_note" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+source = text.index("source: ")
+plan = text.index("plan position: ", source)
+expected_note = sys.argv[2]
+note = text.index("note: ", source)
+if not source < note < plan:
+    raise SystemExit("branch-close note was not between source and plan position")
+if expected_note not in text[note:plan].splitlines():
+    actual = next(line for line in text[note:plan].splitlines() if line.startswith("note: "))
+    raise SystemExit("branch-close note did not match its complete expected text\nexpected: " + expected_note + "\nactual: " + actual)
+PY
+}
+
+run_branch_close_case by "note: this 'by'/'suffices_by'/'>-' branch body ended at 6:17 with unsolved goal(s); the '>> ...' tactics after it are outside this branch and did not run. Wrap a multi-step branch proof in parentheses: P by (tac1 >> tac2) or >- (tac1 >> tac2)." <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem by_branch_close:
+  T
+Proof
+  `T` by ALL_TAC
+  >> ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+
+run_branch_close_case then-operator "note: this 'by'/'suffices_by'/'>-' branch body ended at 6:17 with unsolved goal(s); the 'THEN ...' tactics after it are outside this branch and did not run. Wrap a multi-step branch proof in parentheses: P by (tac1 >> tac2) or >- (tac1 >> tac2)." <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem then_operator_branch_close:
+  T
+Proof
+  `T` by ALL_TAC THEN ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+
+run_branch_close_case then "note: this 'by'/'suffices_by'/'>-' branch body ended at 6:22 with unsolved goal(s); the '>> ...' tactics after it are outside this branch and did not run. Wrap a multi-step branch proof in parentheses: P by (tac1 >> tac2) or >- (tac1 >> tac2)." <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem then_branch_close:
+  T /\ T
+Proof
+  CONJ_TAC >- ALL_TAC >> ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+
+run_branch_close_case comment "note: this 'by'/'suffices_by'/'>-' branch body ended at 6:17 with unsolved goal(s); the '>> ...' tactics after it are outside this branch and did not run. Wrap a multi-step branch proof in parentheses: P by (tac1 >> tac2) or >- (tac1 >> tac2)." <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem comment_branch_close:
+  T
+Proof
+  `T` by ALL_TAC (* outer (* nested *) comment *) >> ACCEPT_TAC TRUTH
+QED
+val _ = export_theory();
+SML
+
+run_branch_close_case end "note: branch body at 6:10-17 left unsolved goal(s); if preceding steps were meant to stay inside one branch, check grouping: '>>' and '>-' associate left as (tac1 >> tac2) >- tac3." <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Theorem end_branch_close:
+  T
+Proof
+  `T` by ALL_TAC
+QED
+val _ = export_theory();
+SML
+
+leaf_label_project=$tmpdir/branch-close-leaf-project
+mkdir -p "$leaf_label_project/src"
+cp "$project/holproject.toml" "$leaf_label_project/holproject.toml"
+cat > "$leaf_label_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+val close = ();
+fun branch (_ : unit) = NO_TAC;
+Theorem ordinary_branch_close_label:
+  T
+Proof
+  branch close
+QED
+val _ = export_theory();
+SML
+leaf_label_log=$tmpdir/branch-close-leaf.log
+if (cd "$leaf_label_project" && "$HOLBUILD_BIN" build ATheory) > "$leaf_label_log" 2>&1; then
+  echo "expected ordinary branch-close label case to fail build" >&2
+  exit 1
+fi
+require_grep "fragment: branch close" "$leaf_label_log"
+python3 - "$leaf_label_log" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+source = text.index("source: ")
+plan = text.index("plan position: ", source)
+if "note: " in text[source:plan]:
+    raise SystemExit("ordinary tactic labelled branch close received a grouping note")
+PY
+
+termination_branch_close_project=$tmpdir/branch-close-termination-project
+mkdir -p "$termination_branch_close_project/src"
+cp "$project/holproject.toml" "$termination_branch_close_project/holproject.toml"
+cat > "$termination_branch_close_project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib;
+val _ = new_theory "A";
+Definition test_def:
+  test n = if n = 0 then 0 else test (n - 1)
+Termination
+  ALL_TAC >- ALL_TAC >> ALL_TAC
+End
+val _ = export_theory();
+SML
+termination_branch_close_log=$tmpdir/branch-close-termination.log
+if (cd "$termination_branch_close_project" && "$HOLBUILD_BIN" build ATheory) > "$termination_branch_close_log" 2>&1; then
+  echo "expected termination branch-close case to fail build" >&2
+  exit 1
+fi
+require_grep "termination: test_def" "$termination_branch_close_log"
+require_grep "fragment: branch close" "$termination_branch_close_log"
+python3 - "$termination_branch_close_log" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+source = text.index("source: ")
+note = text.index("note: ", source)
+plan = text.index("plan position: ", note)
+if not source < note < plan:
+    raise SystemExit("termination branch-close note was not between source and plan position")
+expected = ("note: this 'by'/'suffices_by'/'>-' branch body ended at 6:21 with unsolved goal(s); the '>> ...' tactics after it "
+            "are outside this branch and did not run. Wrap a multi-step branch proof in parentheses: P by (tac1 >> tac2) or >- "
+            "(tac1 >> tac2).")
+if expected not in text[note:plan].splitlines():
+    raise SystemExit("termination branch-close note did not match its complete expected text")
+PY
+
 same_fragment_project=$tmpdir/same-fragment-project
 mkdir -p "$same_fragment_project/src"
 cp "$project/holproject.toml" "$same_fragment_project/holproject.toml"

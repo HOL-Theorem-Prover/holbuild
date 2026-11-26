@@ -36,23 +36,25 @@ type declaration_checkpoint = {name : string, safe_name : string,
                                context_path : string, context_ok : string,
                                deps_key : string, checkpoint_key : string}
 
-fun starts_with text i needle =
-  let val n = size text
-      val m = size needle
-  in i + m <= n andalso String.substring(text, i, m) = needle end
+fun starts_with_bounded text limit i needle =
+  i >= 0 andalso i + size needle <= limit andalso
+  String.substring(text, i, size needle) = needle
 
-fun skip_comment text i =
+fun starts_with text i needle = starts_with_bounded text (size text) i needle
+
+fun skip_comment_bounded text limit i =
   let
-    val n = size text
     fun loop j depth =
-      if j >= n then n
-      else if starts_with text j "(*" then loop (j + 2) (depth + 1)
-      else if starts_with text j "*)" then
+      if j >= limit then limit
+      else if starts_with_bounded text limit j "(*" then loop (j + 2) (depth + 1)
+      else if starts_with_bounded text limit j "*)" then
         if depth = 1 then j + 2 else loop (j + 2) (depth - 1)
       else loop (j + 1) depth
   in
     loop (i + 2) 1
   end
+
+fun skip_comment text i = skip_comment_bounded text (size text) i
 
 fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
                          failed_prefix_path, failed_prefix_ok,
