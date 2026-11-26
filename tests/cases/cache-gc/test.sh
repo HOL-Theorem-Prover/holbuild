@@ -9,8 +9,10 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 holder=
+legacy_holder=
 cleanup() {
   if [[ -n $holder ]]; then kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true; fi
+  if [[ -n $legacy_holder ]]; then kill "$legacy_holder" 2>/dev/null || true; wait "$legacy_holder" 2>/dev/null || true; fi
   chmod -R u+w "$tmpdir" 2>/dev/null || true; rm -rf "$tmpdir"
 }
 trap cleanup EXIT
@@ -21,6 +23,9 @@ mkdir -p "$cache/tmp/oldtmp" "$cache/blobs" "$cache/actions/live" "$cache/action
 : > "$cache/blobs/dead"
 : > "$cache/blobs/.dead.123-0123456789abcdef-1.tmp"
 : > "$cache/locks/action-regular.lock"
+: > "$cache/locks/action-held.lock"
+: > "$cache/locks/gc-growth.journal"
+: > "$cache/locks/worker-cache-cap-v3.state"
 : > "$cache/actions/stray-file"
 printf 'holbuild-cache-action-v2\nblob sig live\n' > "$cache/actions/live/manifest"
 printf 'holbuild-cache-action-v2\nblob=old\n' > "$cache/actions/old/manifest"
@@ -31,8 +36,19 @@ touch -d '10 days ago' \
   "$cache/blobs/.dead.123-0123456789abcdef-1.tmp" \
   "$cache/actions/old/manifest" \
   "$cache/actions/nomani" \
-  "$cache/locks/action-regular.lock" \
+  "$cache/locks/action-held.lock" \
   "$cache/locks/action-stale.lock"
+
+python3 -c '
+import fcntl, os, sys, time
+with open(sys.argv[1], "r+") as lock:
+    fcntl.lockf(lock, fcntl.LOCK_EX)
+    open(sys.argv[2], "w").close()
+    time.sleep(120)
+' "$cache/locks/action-held.lock" "$tmpdir/legacy-held-ready" &
+legacy_holder=$!
+for _ in $(seq 100); do [[ -e "$tmpdir/legacy-held-ready" ]] && break; sleep 0.1; done
+require_file "$tmpdir/legacy-held-ready"
 
 # Sharded action locks: GC unlinks stale ones nobody holds.
 mkdir -p "$cache/action-locks/ab"
@@ -57,7 +73,8 @@ holder=$!
 for _ in $(seq 100); do [[ -e "$tmpdir/held-ready" ]] && break; sleep 0.1; done
 require_file "$tmpdir/held-ready"
 
-env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/cache-gc.log"
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/cache-gc.log" 2>&1
 
 require_file "$cache/blobs/live"
 [[ $(stat -c %Y "$cache/blobs/live") -gt $(date -d '1 day ago' +%s) ]] ||
@@ -71,7 +88,18 @@ require_file "$cache/blobs/live"
 [[ ! -e "$cache/actions/nomani" ]] || { echo "stale incomplete action survived" >&2; exit 1; }
 [[ ! -e "$cache/tmp/oldtmp" ]] || { echo "stale tmp survived" >&2; exit 1; }
 [[ ! -e "$cache/locks/action-stale.lock" ]] || { echo "stale action lock survived" >&2; exit 1; }
-require_file "$cache/locks/action-regular.lock"
+[[ ! -e "$cache/locks/action-regular.lock" ]] || { echo "regular action lock survived" >&2; exit 1; }
+require_file "$cache/locks/action-held.lock"
+require_file "$cache/locks/gc-growth.journal"
+require_file "$cache/locks/worker-cache-cap-v3.state"
+require_grep 'cache gc: locks:' "$tmpdir/cache-gc.log"
+
+kill "$legacy_holder"; wait "$legacy_holder" 2>/dev/null || true
+legacy_holder=
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/drain-gc.log" 2>&1
+[[ ! -e "$cache/locks/action-held.lock" ]] || { echo "held action lock survived after release" >&2; exit 1; }
+[[ -s "$cache/locks/gc.lock" ]] || { echo "flat lock drain marker missing" >&2; exit 1; }
 kill "$holder"; wait "$holder" 2>/dev/null || true
 holder=
 require_file "$cache/action-locks/ab/ab-held.lock"

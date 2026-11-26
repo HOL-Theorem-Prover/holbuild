@@ -12738,8 +12738,8 @@ fun auto_cache_gc threshold =
   in
     if not (path_exists cache) orelse HolbuildCache.growth_since_gc cache < threshold then ()
     else
-      case HolbuildCache.try_with_lock cache (fn () =>
-             (HolbuildCache.collect_root cache HolbuildCache.default_retention_days,
+      case HolbuildCache.try_with_lock_value cache (fn lock =>
+             (HolbuildCache.collect_root cache HolbuildCache.default_retention_days lock,
               collect_checkpoint_store cache HolbuildCache.default_retention_days)) of
           SOME (counts, families) =>
             if HolbuildCache.gc_counts_removed counts orelse families > 0 then

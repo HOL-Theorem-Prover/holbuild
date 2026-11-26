@@ -286,19 +286,41 @@ fun remove_stale_children stage cutoff dir =
         if stale cutoff path then (defer_tree path; (removed + 1, true)) else (removed, false))
     0
 
-fun remove_obsolete_action_lock_dirs cutoff dir =
-  (* A conventional directory has two links plus one per subdirectory. Keep
-     regular lock inodes: unlinking one can split holders from new openers. *)
-  if (Posix.FileSys.ST.nlink (Posix.FileSys.stat dir) = 2 handle OS.SysErr _ => false) then 0
-  else gc_stage "locks" (children dir)
-    (fn (path, removed) =>
-        if has_prefix "action-" (Path.file path) andalso is_dir path andalso stale cutoff path then
-          (defer_tree path; (removed + 1, true))
-        else (removed, false))
-    0
+fun entry_exists path =
+  ((Posix.FileSys.lstat path; true) handle OS.SysErr _ => false)
 
 fun is_regular_entry path =
   Posix.FileSys.ST.isReg (Posix.FileSys.lstat path) handle OS.SysErr _ => false
+
+(* Legacy action locks were flat in locks/. Since 0.14.87 they are dead, so
+   regular files can be removed under their own fcntl lock. A nonempty gc.lock
+   records that a conventional locks/ directory was drained. *)
+fun remove_obsolete_action_lock_dirs cutoff dir gc_lock_path mark_drained =
+  let
+    fun conventional_links () =
+      (Posix.FileSys.ST.nlink (Posix.FileSys.stat dir) = 2 handle OS.SysErr _ => false)
+    val drained = (FS.fileSize gc_lock_path > 0 handle OS.SysErr _ => false)
+  in
+    if conventional_links () andalso drained then 0
+    else
+      let
+        val paths = List.filter (fn path => has_prefix "action-" (Path.file path)) (children dir)
+        fun step (path, (removed, survived)) =
+          if is_regular_entry path then
+            if HolbuildFileLock.remove_unheld {path = path} then
+              ((removed + 1, survived), true)
+            else
+              ((removed, survived orelse entry_exists path), false)
+          else if is_dir path andalso stale cutoff path then
+            (defer_tree path; ((removed + 1, survived), true))
+          else
+            ((removed, survived orelse entry_exists path), false)
+        val (removed, survived) = gc_stage "locks" paths step (0, false)
+        val _ = if not survived andalso conventional_links () then mark_drained () else ()
+      in
+        removed
+      end
+  end
 
 (* Never follows a symlinked shard or lock out of the cache. *)
 fun remove_stale_action_locks cutoff dir =
@@ -361,6 +383,11 @@ fun gc_lock_owner_path lock = lock ^ ".owner"
 
 datatype gc_lock = GcLock of HolbuildFileLock.t
 
+val flat_action_locks_drained = "holbuild-flat-action-locks-drained-v1\n"
+
+fun mark_flat_action_locks_drained (GcLock lock) =
+  HolbuildFileLock.write_held lock flat_action_locks_drained
+
 fun gc_lock_owner () =
   String.concatWith "\n"
     ["holbuild-cache-gc-lock-v1",
@@ -419,10 +446,19 @@ fun with_gc_lock lock f =
   (f () before release_gc_lock lock)
   handle e => (release_gc_lock lock; raise e)
 
+fun with_gc_lock_value lock f =
+  (f lock before release_gc_lock lock)
+  handle e => (release_gc_lock lock; raise e)
+
 fun with_lock root f = with_gc_lock (acquire_lock root) f
 
 (* NONE, without running f, while another process holds the lock. *)
 fun try_with_lock root f = Option.map (fn lock => with_gc_lock lock f) (try_acquire_lock root)
+
+(* As try_with_lock, passing the held lock to a caller that must write through
+   its descriptor without opening the lock path again. *)
+fun try_with_lock_value root f =
+  Option.map (fn lock => with_gc_lock_value lock f) (try_acquire_lock root)
 
 fun with_action_publish_lock root key publish skip =
   HolbuildFSCacheBackend.with_action_publish_lock (filesystem_cache root) key publish skip
@@ -438,14 +474,15 @@ type gc_counts =
 
 (* One full collection; the caller holds the GC lock. Writes made while it runs
    count towards the next automatic GC. *)
-fun collect_root root days : gc_counts =
+fun collect_root root days gc_lock : gc_counts =
   let
     val cutoff = retention_cutoff days
     val _ = HolbuildFSCacheBackend.reset_growth (filesystem_cache root)
     val tmp = remove_stale_children "tmp" cutoff (tmp_dir root)
     val modules = remove_stale_children "theory modules" cutoff (theory_modules_dir root)
     val analysis = remove_stale_children "analysis" cutoff (analysis_dir root)
-    val locks = remove_obsolete_action_lock_dirs cutoff (locks_dir root) +
+    val locks = remove_obsolete_action_lock_dirs cutoff (locks_dir root) (gc_lock_path root)
+                  (fn () => mark_flat_action_locks_drained gc_lock) +
                 remove_stale_action_locks cutoff (action_locks_dir root)
     val blob_paths = children (blobs_dir root)
     val candidates = stale_blob_candidates cutoff blob_paths
@@ -479,7 +516,8 @@ fun gc_root root days =
   if not (path_exists root) then
     print ("cache not found: " ^ root ^ "\n")
   else
-    with_lock root (fn () => print ("cache gc: " ^ gc_counts_text (collect_root root days) ^ "\n"))
+    with_gc_lock_value (acquire_lock root)
+      (fn lock => print ("cache gc: " ^ gc_counts_text (collect_root root days lock) ^ "\n"))
 
 (* Toolchain-only GC: gc_root's lock and toolchain stages, without the tmp,
    locks, actions, or blobs stages. *)
