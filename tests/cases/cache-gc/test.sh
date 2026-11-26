@@ -100,6 +100,19 @@ env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRE
   "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/drain-gc.log" 2>&1
 [[ ! -e "$cache/locks/action-held.lock" ]] || { echo "held action lock survived after release" >&2; exit 1; }
 [[ -s "$cache/locks/gc.lock" ]] || { echo "flat lock drain marker missing" >&2; exit 1; }
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/post-drain-gc.log" 2>&1
+! grep -q 'cache gc: locks:' "$tmpdir/post-drain-gc.log" ||
+  { echo "GC scanned drained legacy lock directory" >&2; exit 1; }
+
+# A new obsolete action-lock directory changes locks/ link count and must make
+# the flat-lock stage run again despite the drained marker.
+mkdir "$cache/locks/action-obsolete-dir"
+touch -d '10 days ago' "$cache/locks/action-obsolete-dir"
+env -u HOLDIR -u HOLBUILD_HOLDIR HOLBUILD_CACHE="$cache" HOLBUILD_TEST_GC_PROGRESS_INTERVAL=0 \
+  "$HOLBUILD_BIN" gc --cache-only > "$tmpdir/subdir-gc.log" 2>&1
+[[ ! -e "$cache/locks/action-obsolete-dir" ]] || { echo "obsolete action-lock directory survived" >&2; exit 1; }
+require_grep 'cache gc: locks:' "$tmpdir/subdir-gc.log"
 kill "$holder"; wait "$holder" 2>/dev/null || true
 holder=
 require_file "$cache/action-locks/ab/ab-held.lock"
