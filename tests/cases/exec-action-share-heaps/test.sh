@@ -172,7 +172,7 @@ forget_local() { rm -rf "$shared/checkpoints" "$shared/checkpoint-store"; }
 # lookup or publish line, which the worker prints once.
 heap_line() {
   local found
-  found=$(sed -n "s/^holbuild shared-heap $2 theory=share:[^ ]* heap=\([0-9a-f]\{64\}\) result=\([a-z-]*\)\$/\1 \2/p" \
+  found=$(sed -n "s/^holbuild shared-heap $2 theory=share:[^ ]* heap=\([0-9a-f]\{64\}\) result=\([a-z-]*\)\( checkpoints=[0-9]*\)\?\$/\1 \2/p" \
             "$tmpdir/$1.log")
   [[ $(printf '%s\n' "$found" | grep -c .) == 1 ]] || {
     echo "version $1: not one shared-heap $2 line:" >&2; cat "$tmpdir/$1.log" >&2; exit 1; }
@@ -221,7 +221,7 @@ read -r published_key published_v1 < <(heap_line v1 publish)
 require_grep '^holbuild-shared-heap-v1$' \
   "$tmpdir/remote/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "$heap_v1" | sha256sum | cut -d' ' -f1)"
 # A dependency that passed, not a target, publishes nothing, and says so.
-grep -qE '^holbuild shared-heap publish theory=share:[^ ]* heap=[0-9a-f]{64} result=non-target$' \
+grep -qE '^holbuild shared-heap publish theory=share:[^ ]* heap=[0-9a-f]{64} result=non-target checkpoints=0$' \
   "$tmpdir/a-shared-v1.log" || { echo "A logged no non-target publish:" >&2; cat "$tmpdir/a-shared-v1.log" >&2; exit 1; }
 [[ ! -e "$shared/checkpoints" ]] || { echo "the private checkpoint tree outlived the action" >&2; exit 1; }
 

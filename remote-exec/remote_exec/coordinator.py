@@ -3442,7 +3442,7 @@ class Coordinator:
             timings.get("pubckptn", 0),
         )
         retried = attempt < self.settings.max_attempts
-        host_id, worker = (leased[0], leased[1]) if leased is not None else ("-", "-")
+        host_id, worker, tiers = leased if leased is not None else ("-", "-", [])
         report = self.hosts.get(host_id)
         host = report[1] if report is not None else None
 
@@ -3451,10 +3451,11 @@ class Coordinator:
 
         others = sum(1 for other, (h, _, _) in self.lease_hosts.items() if h == host_id and other != token)
         memory_logger.info(
-            "memory attempt batch=%s theory=%s attempt=%d/%d retry=%s tier=%s cause=%s max_heap_mb=%s host=%s "
-            "worker=%s host_age_s=%s mem_available_mb=%s mem_total_mb=%s leases_mb=%s memory_short=%s "
-            "other_leases=%d resumed=%s published=%d",
-            batch_id, theory, attempt, self.settings.max_attempts, int(retried), tier, current.cause or "-",
+            "memory attempt batch=%s theory=%s input_key=%s attempt=%d/%d retry=%s tier=%s worker_tiers=%s cause=%s "
+            "max_heap_mb=%s host=%s worker=%s host_age_s=%s mem_available_mb=%s mem_total_mb=%s leases_mb=%s "
+            "memory_short=%s other_leases=%d resumed=%s published=%d",
+            batch_id, theory, input_key, attempt, self.settings.max_attempts, int(retried), tier,
+            ",".join(tiers) or "-", current.cause or "-",
             "-" if current.max_heap_mb is None else current.max_heap_mb, host_id[:8], worker,
             "-" if report is None else round((self.clock() - report[0]).total_seconds()),
             mb(host.mem_available if host else None), mb(host.mem_total if host else None),

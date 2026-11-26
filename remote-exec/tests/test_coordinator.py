@@ -2854,9 +2854,10 @@ async def test_a_memory_attempt_is_logged_with_its_host_and_its_retry_with_how_i
     assert (await complete(http, token, result("a", "built"))).status_code == 200
 
     assert memory_lines(caplog) == [
-        f"memory attempt batch={batch_id} theory=pkg:a attempt=1/3 retry=1 tier=standard cause=kernel-oom "
-        "max_heap_mb=12000 host=1f2e3d4c worker=1f2e3d4c/w1 host_age_s=0 mem_available_mb=3072 mem_total_mb=16384 "
-        "leases_mb=0 memory_short=0 other_leases=1 resumed=0,1,0,7,0 published=0",
+        f"memory attempt batch={batch_id} theory=pkg:a input_key={input_key('a')} attempt=1/3 retry=1 tier=standard "
+        "worker_tiers=standard cause=kernel-oom max_heap_mb=12000 host=1f2e3d4c worker=1f2e3d4c/w1 host_age_s=0 "
+        "mem_available_mb=3072 mem_total_mb=16384 leases_mb=0 memory_short=0 other_leases=1 resumed=0,1,0,7,0 "
+        "published=0",
         f"memory retry outcome batch={batch_id} theory=pkg:a attempt=2 after=1 status=built failure=-",
     ]
 

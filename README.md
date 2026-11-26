@@ -2206,8 +2206,9 @@ load a short heap), `unavailable` or `error`. A `publish` line says
 loaded the published one), `skipped-claimed` (another worker was publishing
 it), `refused` (the heap wasn't one this run may publish), `failed`, `none`
 (the run saved none), `non-target`, `no-checkpoint-saves` or `unvalidated`
-(the outputs failed their checks). `heap` is the key the heap's entry has in
-the remote cache.
+(the outputs failed their checks), then `checkpoints=<n>`, the shared
+checkpoint entries the run published. `heap` is the key the heap's entry has
+in the remote cache.
 
 A worker publishes a heap of its own only as the preload saved it: the
 preload waits while the worker hashes it, before the theory script runs, and

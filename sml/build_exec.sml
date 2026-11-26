@@ -17203,7 +17203,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                checkpoints but publishes none, nor refreshes an index. *)
             fun publish_line verdict =
               case shared of
-                  SOME ctx => shared_heap_line "publish" (#theory ctx) (#heap_key ctx) verdict
+                  SOME ctx =>
+                    shared_heap_line "publish" (#theory ctx) (#heap_key ctx)
+                      (verdict ^ " checkpoints=" ^ Int.toString (!published_checkpoints))
                 | NONE => ()
             fun publish_shared () =
               ((if not (!HolbuildActionSandbox.outputs_validated) then publish_line "unvalidated"

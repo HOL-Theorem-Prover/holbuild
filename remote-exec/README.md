@@ -64,15 +64,15 @@ count wasn't read), the ranking's running priority builds, cap and whether it wa
 each kept host's `boot8:memory_short:cpu_idle_pct:workers`. The waiting-ahead counts are read after the claim commits,
 on a connection of their own (at most 4 at a time); nothing in the line changes how claims are made.
 
-For each attempt that failed for `memory` it logs a `memory attempt` line: the batch, theory, attempt of how many,
-whether it is retried, the action's tier, the record's `memory-cause` and `max-heap-mb`, the host (`boot8`) and worker,
-the age of the host's last report and its available and total memory, leases and `memory_short` in it, the other leases
-on the host, the checkpoint the attempt resumed from (its `resdepsn`, `resctxn`, `resfpn`, `resboundary` and `resstepn`
-phases) and the shared checkpoints it published (`pubckptn`). A retry's result logs a `memory retry outcome` line. A
-`memory shadow would-withhold` line, with a running count, marks a retry a rule under trial would withhold: after two
-attempts in a row that Poly/ML ran out of store under the same cap, resuming from the same checkpoint, the second
-publishing none. The lines only log: the retry runs. The coordinator keeps the last such attempt per action in memory,
-so a restart forgets it.
+For each attempt that failed for `memory` it logs a `memory attempt` line: the batch, theory, input key, attempt of how
+many, whether it is retried, the action's tier and the worker's tiers, the record's `memory-cause` and `max-heap-mb`,
+the host (`boot8`) and worker, the age of the host's last report and its available and total memory, leases and
+`memory_short` in it, the other leases on the host, the checkpoint the attempt resumed from (its `resdepsn`, `resctxn`,
+`resfpn`, `resboundary` and `resstepn` phases) and the shared checkpoints it published (`pubckptn`). A retry's result
+logs a `memory retry outcome` line. A `memory shadow would-withhold` line, with a running count, marks a retry a rule
+under trial would withhold: after two attempts in a row that Poly/ML ran out of store under the same cap, resuming from
+the same checkpoint, the second publishing none. The lines only log: the retry runs. The coordinator keeps the last such
+attempt per action in memory, so a restart forgets it.
 
 Without the image, from this directory: `uv sync`, then `uv run alembic
 upgrade head` and `uv run uvicorn --factory remote_exec.app:app --port 8090`.
