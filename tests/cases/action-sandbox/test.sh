@@ -217,7 +217,7 @@ for refused in "$tmpdir/action/input:inside a writable directory" "$tmpdir/home/
 done
 
 # A store kept read-only, as the worker's blob cache: an action may read
-# one of its files, but no grant lets it write there or list it.
+# one of its files, but no grant lets it write the store itself or list it.
 mkdir -p "$tmpdir/blobs"
 printf 'blob\n' > "$tmpdir/blobs/one"
 keep_run() {
@@ -226,6 +226,9 @@ keep_run() {
 }
 keep_run --read "$tmpdir/blobs/one" > "$tmpdir/keep.out"
 cmp "$tmpdir/blobs/one" "$tmpdir/keep.out"
+# A directory inside it is writable, as a theory-module store's writer's.
+mkdir "$tmpdir/blobs/.writer"
+keep_run --read "$tmpdir/blobs/one" --write "$tmpdir/blobs/.writer" > /dev/null
 for refused in "--write $tmpdir/blobs" "--read $tmpdir/blobs" "--read $tmpdir"; do
   # shellcheck disable=SC2086
   if keep_run $refused > /dev/null 2> "$tmpdir/keep.err"; then

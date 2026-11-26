@@ -341,10 +341,16 @@ class Policy:
         for grant in self.readable + self.writable + self.scratch:
             if exposes(grant):
                 raise SandboxError(f"sandbox grant contains protected worker state: {grant}")
+        # A writable directory may lie inside a store, where holbuild names
+        # one for a store's own writer (a theory-module store's .writer),
+        # but may not be or hold one; a readable one may not touch one.
+        stores = {str(path) for path in self.keep_read_only}
+        holding = {str(parent) for path in self.keep_read_only for parent in path.parents}
         stored = exposure(self.keep_read_only)
-        for grant in self.writable + self.scratch + [grant for grant in self.readable if grant.is_dir()]:
-            if stored(grant):
-                raise SandboxError(f"sandbox grant opens a read-only store beyond single files: {grant}")
+        opened = ([grant for grant in self.writable + self.scratch if str(grant) in stores | holding] +
+                  [grant for grant in self.readable if grant.is_dir() and stored(grant)])
+        if opened:
+            raise SandboxError(f"sandbox grant opens a read-only store beyond single files: {opened[0]}")
 
     def usable_scratch(self, scratch: list[Path], passed: set[Path]) -> list[Path]:
         """The SCRATCH directories that hold no protected state, no read-only
