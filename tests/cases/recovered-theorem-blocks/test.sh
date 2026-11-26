@@ -108,3 +108,38 @@ if grep -q 'proof_ir_tactic' "$empty_log"; then
   echo "instrumented a theorem with no tactic" >&2
   exit 1
 fi
+
+# The parser recovers an executable proof here. The child must stop at the
+# parse error, before that proof can run.
+cat > "$project/src/AScript.sml" <<'SML'
+Theory A
+Ancestors bool
+
+Theorem unclosed:
+  T /\ T
+Proof
+  CONJ_TAC
+  >- (simp[]
+  >- simp[]
+QED
+
+Theorem later:
+  T
+Proof
+  simp[]
+QED
+SML
+unclosed_log=$tmpdir/unclosed-paren.log
+status=0
+(cd "$project" && timeout -k 5s 15s "$HOLBUILD_BIN" build ATheory) > "$unclosed_log" 2>&1 || status=$?
+if [[ $status != 1 ]]; then
+  cat "$unclosed_log" >&2
+  echo "expected the unclosed parenthesis to fail the build, got exit $status" >&2
+  exit 1
+fi
+require_grep 'AScript.sml:10:1: parse error: expected closing parenthesis' "$unclosed_log"
+if grep -q 'Failed to prove theorem "unclosed"' "$unclosed_log"; then
+  cat "$unclosed_log" >&2
+  echo "ran the proof of a theorem with an unclosed parenthesis" >&2
+  exit 1
+fi
