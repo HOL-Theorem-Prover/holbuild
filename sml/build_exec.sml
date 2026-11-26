@@ -15431,6 +15431,44 @@ fun install_module store {src, name} =
   (Posix.FileSys.link {old = src, new = Path.concat (store, name)}; true)
   handle e as OS.SysErr (_, SOME err) => if err = Posix.Error.exist then false else raise e
 
+fun revalidate_module_action remote key =
+  HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.get_action remote key)
+
+fun settle_module_actions _ [] = ()
+  | settle_module_actions confirm entries =
+      (OS.Process.sleep shared_heap_claim_settle;
+       parallel_all remote_probe_width confirm entries)
+
+datatype published_module =
+    DownloadedModule of {src : string, name : string}
+  | MissingModuleBlob
+  | UnusableModuleEntry
+
+(* Only a confirmed cache miss permits repairing an existing entry. *)
+fun download_published_module remote staging wanted fits text =
+  case (shared_manifest_entries text handle Error _ => []) of
+      [("file", sha, name)] =>
+        if not (plain_file_name name andalso module_file_theory_part name = SOME wanted) then
+          (warn ("ignoring the published theory module " ^ HolbuildHash.quote name ^ " for " ^ wanted);
+           UnusableModuleEntry)
+        else if not (fits ()) then UnusableModuleEntry
+        else
+          let
+            val tmp = store_temp (Path.concat (staging, name))
+            fun fetch () =
+              case HolbuildRemoteCache.fetch_unlisted_blob_within HolbuildRemoteCache.stall_timeout_seconds
+                     remote {hash = sha, dst = tmp} of
+                  HolbuildCacheBackend.Hit => DownloadedModule {src = tmp, name = name}
+                | HolbuildCacheBackend.Miss => (remove_file tmp; MissingModuleBlob)
+                | _ => (remove_file tmp; UnusableModuleEntry)
+          in
+            fetch () handle e => (remove_file tmp; raise e)
+          end
+    | _ => (warn ("ignoring a malformed published theory module entry for " ^ wanted); UnusableModuleEntry)
+
+fun install_downloaded_module store (file as {src, ...}) =
+  (install_module store file before remove_file src) handle e => (remove_file src; raise e)
+
 (* Fetches into STORE, by way of STAGING, the published ones of the
    WANTED modules, each a (`<theory>-<.dat SHA-1>.pmo`, remote key) pair,
    starting only requests that end by DEADLINE.  A module is installed
@@ -15440,47 +15478,48 @@ fun install_module store {src, name} =
    installed, and the modules with no entry. *)
 fun fetch_published_modules remote {store, staging, wanted, deadline} =
   let
+    val remote_required = !HolbuildRemoteCache.fail_closed
     val probes = ref 0
     val installed = ref 0
     val unpublished = ref ([] : string list)
+    val observed = ref []
     val mutex = Mutex.mutex ()
-    fun fetch (name, key) =
-      if not (module_request_fits deadline) then ()
-      else HolbuildRemoteCache.retrying_within deadline (fn () =>
-        (Mutex.lock mutex; probes := !probes + 1; Mutex.unlock mutex;
-         case HolbuildRemoteCache.probe_action remote key of
-             {found = NONE, missing} =>
-               if missing then (Mutex.lock mutex; unpublished := name :: !unpublished; Mutex.unlock mutex)
-               else ()
-           | {found = SOME text, ...} =>
-               case shared_manifest_entries text of
-                   [("file", sha, file)] =>
-                     if not (plain_file_name file andalso module_file_theory_part file = SOME name) then
-                       warn ("ignoring the published theory module " ^ HolbuildHash.quote file ^ " for " ^ name)
-                     else if not (module_request_fits deadline) then ()
-                     else
-                       let val tmp = Path.concat (staging, file)
-                       in
-                         (* The usual stall budget, which module_request_fits allows for,
-                            whatever the module's size. *)
-                         (case HolbuildRemoteCache.fetch_unlisted_blob_within
-                                 HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp} of
-                              HolbuildCacheBackend.Hit =>
-                                if install_module store {src = tmp, name = file}
-                                then (Mutex.lock mutex; installed := !installed + 1; Mutex.unlock mutex)
-                                else ()
-                            | _ => ();
-                          remove_file tmp)
-                       end
-                 | _ => warn ("ignoring a malformed published theory module entry for " ^ name)))
-    fun try item = fetch item handle e => warn ("theory module not fetched: " ^ General.exnMessage e)
+    fun count f = (Mutex.lock mutex; f (); Mutex.unlock mutex)
+    fun fits () = module_request_fits deadline
+    fun fetch name text =
+      case download_published_module remote staging name fits text of
+          DownloadedModule file =>
+            if install_downloaded_module store file then count (fn () => installed := !installed + 1) else ()
+        | _ => ()
+    fun probe (item as (name, key)) =
+      let fun get () = HolbuildRemoteCache.probe_action remote key
+      in
+        count (fn () => probes := !probes + 1);
+        case (if remote_required then HolbuildRemoteCache.revalidating get else get ()) of
+            {found = NONE, missing = true} => count (fn () => unpublished := name :: !unpublished)
+          | {found = SOME text, ...} =>
+              if remote_required then count (fn () => observed := item :: !observed) else fetch name text
+          | _ => ()
+      end
+    fun confirm (name, key) =
+      case HolbuildRemoteCache.required (fn () => revalidate_module_action remote key) of
+          SOME text => fetch name text
+        | NONE => ()
+    fun try work item =
+      if not (fits ()) then ()
+      else HolbuildRemoteCache.retrying_within deadline (fn () => work item)
+           handle Thread.Interrupt => raise Thread.Interrupt
+                | e => warn ("theory module not fetched: " ^ General.exnMessage e)
   in
     HolbuildRemoveTree.remove_untrusted staging;
     ensure_dir staging;
-    parallel_all remote_probe_width try wanted;
+    parallel_all remote_probe_width (try probe) wanted;
+    settle_module_actions (try confirm) (!observed);
     HolbuildRemoveTree.remove_untrusted staging;
     {probes = !probes, installed = !installed, unpublished = !unpublished}
   end
+
+datatype module_confirmation = WrittenModule | ObservedModule of {src : string, name : string}
 
 (* A worker stores only modules published in the remote cache. Its one
    URL can be a host cache in front of a shared store, so confirm even a
@@ -15506,7 +15545,7 @@ fun converge_modules remote {store, staging, modules, deadline} =
       then count (fn () => installed := file :: !installed) else ()
     fun local_fallback file = if remote_required then () else install_own file
     fun manifest file sha = shared_manifest module_remote_header NONE [("file", sha, file)]
-    fun lookup key = HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.get_action remote key)
+    fun lookup key = revalidate_module_action remote key
     fun upload file =
       let
         val path = Path.concat (staging, file)
@@ -15519,7 +15558,7 @@ fun converge_modules remote {store, staging, modules, deadline} =
       end
     fun finish_put (file, key, text) =
       if remote_required orelse length (HolbuildRemoteCache.action_urls remote key) > 1
-      then SOME (file, key, text)
+      then SOME (file, key, text, WrittenModule)
       else (published_one (); install_own file; NONE)
     fun heal (file, key) =
       case (if fits publish_by then upload file else NONE) of
@@ -15529,37 +15568,25 @@ fun converge_modules remote {store, staging, modules, deadline} =
               if fits publish_by andalso
                  HolbuildRemoteCache.replace_action_everywhere remote {key = key, text = text}
                  = HolbuildCacheBackend.Published
-              then if remote_required then SOME (file, key, text)
+              then if remote_required then SOME (file, key, text, WrittenModule)
                    else (published_one (); install_own file; NONE)
               else (local_fallback file; NONE)
             end
         | NONE => (local_fallback file; NONE)
-    (* Returns true only when every cache node is missing the blob. An
-       error or a malformed entry is no reason to replace that entry. *)
-    fun install_published limit file text =
-      case (shared_manifest_entries text handle Error _ => []) of
-          [("file", sha, name)] =>
-            if not (plain_file_name name andalso module_file_theory_part name = module_file_theory_part file) then
-              (warn ("ignoring the published theory module " ^ HolbuildHash.quote name ^ " for " ^ file); false)
-            else if not (fits limit) then false
-            else
-              let
-                val tmp = Path.concat (staging, name ^ ".published")
-                fun fetch () =
-                  case HolbuildRemoteCache.required (fn () =>
-                         HolbuildRemoteCache.fetch_unlisted_blob_within
-                           HolbuildRemoteCache.stall_timeout_seconds remote {hash = sha, dst = tmp}) of
-                      HolbuildCacheBackend.Hit =>
-                        (if install_module store {src = tmp, name = name} then count (fn () => won := file :: !won)
-                         else (); false)
-                    | HolbuildCacheBackend.Miss => true
-                    | _ => false
-              in
-                (fetch () before remove_file tmp) handle e => (remove_file tmp; raise e)
-              end
-        | _ => (warn ("ignoring a malformed published theory module entry for " ^ file); false)
-    fun take_existing (module as (file, _)) text =
-      if install_published publish_by file text then heal module else NONE
+    fun download limit file text =
+      case module_file_theory_part file of
+          SOME wanted => HolbuildRemoteCache.required (fn () =>
+            download_published_module remote staging wanted (fn () => fits limit) text)
+        | NONE => UnusableModuleEntry
+    fun install_winner file downloaded =
+      if install_downloaded_module store downloaded then count (fn () => won := file :: !won) else ()
+    fun take_existing (module as (file, key)) text =
+      case download publish_by file text of
+          DownloadedModule downloaded =>
+            if remote_required then SOME (file, key, text, ObservedModule downloaded)
+            else (install_winner file downloaded; NONE)
+        | MissingModuleBlob => heal module
+        | UnusableModuleEntry => NONE
     fun one (module as (file, key)) =
       if not (fits publish_by) then (local_fallback file; NONE)
       else
@@ -15584,22 +15611,32 @@ fun converge_modules remote {store, staging, modules, deadline} =
                               else (case lookup key of SOME winner => take_existing module winner | NONE => NONE)
                           | _ => (local_fallback file; NONE)
                     end
-    fun read_back (file, key, text) =
+    fun read_back (file, key, text, pending) =
       let
         fun unconfirmed () = if remote_required then () else (published_one (); install_own file)
+        fun confirmed () =
+          case pending of
+              ObservedModule downloaded => install_winner file downloaded
+            | WrittenModule =>
+                (HolbuildRemoteCache.refresh_action_replicas remote key
+                   (HolbuildRemoteCache.action_metadata remote key text)
+                   (SOME (hd (HolbuildRemoteCache.action_urls remote key)));
+                 published_one ();
+                 install_own file)
+        fun latest () =
+          if not (fits deadline) then unconfirmed ()
+          else
+            case HolbuildRemoteCache.required (fn () => lookup key) of
+                SOME found =>
+                  if found = text then confirmed ()
+                  else (case download deadline file found of
+                            DownloadedModule downloaded => install_winner file downloaded
+                          | _ => ())
+              | NONE => unconfirmed ()
       in
-        if not (fits deadline) then unconfirmed ()
-        else
-          case HolbuildRemoteCache.required (fn () => lookup key) of
-              SOME found =>
-                if found = text then
-                  (HolbuildRemoteCache.refresh_action_replicas remote key
-                     (HolbuildRemoteCache.action_metadata remote key text)
-                     (SOME (hd (HolbuildRemoteCache.action_urls remote key)));
-                   published_one ();
-                   install_own file)
-                else ignore (install_published deadline file found)
-            | NONE => unconfirmed ()
+        case pending of
+            ObservedModule {src, ...} => ((latest () before remove_file src) handle e => (remove_file src; raise e))
+          | WrittenModule => latest ()
       end
     fun guarded limit f file =
       let val http_deadline = if remote_required then SOME limit else NONE
@@ -15616,11 +15653,8 @@ fun converge_modules remote {store, staging, modules, deadline} =
               SOME pending => count (fn () => confirm := pending :: !confirm)
             | NONE => ()) file) modules
   in
-    if null (!confirm) then ()
-    else
-      (OS.Process.sleep shared_heap_claim_settle;
-       parallel_all remote_probe_width (fn pending as (file, _, _) =>
-         guarded deadline (fn () => read_back pending) file) (!confirm));
+    settle_module_actions (fn pending as (file, _, _, _) =>
+      guarded deadline (fn () => read_back pending) file) (!confirm);
     {installed = !installed, won = !won, published = !published}
   end
 

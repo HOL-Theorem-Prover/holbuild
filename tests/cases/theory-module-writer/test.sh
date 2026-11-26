@@ -685,8 +685,8 @@ rebuilt "cd34-A-$a_sha.pmo"
 
 
 # Separate one-URL workers reach the same upstream. Each first sees a
-# miss, then both PUT. The first worker's cache still serves its own
-# entry until the read-back checks upstream.
+# miss, then both PUT. A third worker reads the first entry between the
+# PUTs. The first host cache keeps that entry until asked to revalidate.
 start_remote_cache_server "$tmpdir/upstream" "$tmpdir/host1" "$tmpdir/host1-control"
 host1_url=$remote_url
 server_pids+=("$server_pid")
@@ -712,8 +712,10 @@ fun install remote store staging modules until =
   E.converge_modules remote {store = store, staging = staging, modules = modules, deadline = until};
 val store1 = dir "worker1-store";
 val store2 = dir "worker2-store";
+val reader_store = dir "reader-store";
 val staged1 = dir "worker1-stage";
 val staged2 = dir "worker2-stage";
+val reader_stage = dir "reader-stage";
 val control1 = "$tmpdir/host1-control/";
 val control2 = "$tmpdir/host2-control/";
 val file = "ab12-A-$a_sha.pmo";
@@ -721,36 +723,60 @@ val race = HolbuildHash.string_sha256 "racing module";
 val key = Cache.remote_action_key race;
 val action = "$tmpdir/upstream/ac/" ^ key;
 val stale = control1 ^ "ac-stale-" ^ key;
+val first_action = "$tmpdir/first-module-action";
+val read_between_writes = "$tmpdir/read-between-writes";
 val _ = E.write_text (staged1 ^ "/" ^ file) "first module";
 val _ = E.write_text (staged2 ^ "/" ^ file) "second module";
+val _ = E.write_text (reader_stage ^ "/" ^ file) "reader module";
 fun enable control phase = E.write_text (control ^ "action-put-1-" ^ phase ^ "-enable") "";
 fun release control phase = E.write_text (control ^ "action-put-1-" ^ phase ^ "-release") "";
-fun await control phase =
+fun await_event event =
   let
-    val event = control ^ "action-put-1-" ^ phase ^ "-event"
     val limit = deadline 10
     fun wait () =
       if exists event then ()
       else if Time.< (Time.now (), limit) then (OS.Process.sleep (Time.fromMilliseconds 10); wait ())
-      else raise Fail ("writer did not reach " ^ event)
+      else raise Fail ("worker did not reach " ^ event)
   in wait () end;
+fun await control phase = await_event (control ^ "action-put-1-" ^ phase ^ "-event");
 val _ = List.app (fn control => (enable control "before"; enable control "after")) [control1, control2];
+val _ = E.write_text (control2 ^ "download-enable") "";
 fun interleave () =
   (await control1 "before"; await control2 "before";
    release control1 "before"; await control1 "after";
+   E.copy_binary action first_action;
    E.copy_binary action stale;
+   E.write_text read_between_writes "";
+   await_event (control2 ^ "download-event");
+   check "the third worker did not read the first module between writes"
+     (String.isSubstring ("GET /cas/" ^ HolbuildHash.string_sha256 "first module" ^ "\n")
+       (E.read_text "$tmpdir/host2/requests.log"));
    release control2 "before"; await control2 "after";
+   E.write_text (control2 ^ "download-release") "";
    release control1 "after"; release control2 "after");
 val until = deadline 60;
 val interleaved = ref false;
-val _ = E.parallel_all 3 (fn f => f ()) [
+val _ = E.parallel_all 4 (fn f => f ()) [
   fn () => ignore (install host1 store1 staged1 [(file, race)] until),
   fn () => ignore (install host2 store2 staged2 [(file, race)] until),
+  fn () => (await_event read_between_writes; ignore (install host2 reader_store reader_stage [(file, race)] until)),
   fn () => (interleave (); interleaved := true)];
 val _ = check "the two host-cache writes did not overlap" (!interleaved);
 val _ = check "single-URL workers did not install the upstream winner"
   (E.read_text (store1 ^ "/" ^ file) = "second module" andalso
    E.read_text (store2 ^ "/" ^ file) = "second module" andalso not (exists stale));
+val _ = check "the reader installed the first module before confirming the upstream winner"
+  (E.read_text (reader_store ^ "/" ^ file) = "second module");
+
+(* The first fill and prefetch use this path before the writer sees a
+   missing module. A stale host action still points to an intact blob. *)
+val _ = E.copy_binary first_action stale;
+val prefetch_store = dir "prefetch-store";
+val {installed, ...} = E.fetch_published_modules host1
+  {store = prefetch_store, staging = dir "prefetch-stage",
+   wanted = [(valOf (E.module_file_theory_part file), race)], deadline = deadline 60};
+val _ = check "prefetch installed the stale host-cache module"
+  (installed = 1 andalso E.read_text (prefetch_store ^ "/" ^ file) = "second module" andalso not (exists stale));
 
 (* A stopped deep writer gets a useful publish window even with less than
    the 30 s stall timeout left. The fixture supplies the 512 finished files. *)
