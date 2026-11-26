@@ -13995,10 +13995,22 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               val restored =
                 restore_entry (candidate_key c) (fn () =>
                   let
-                    val entries = shared_manifest_entries (HolbuildRemoteCache.remember_action remote action)
-                    val (heap, _) = single "heap" entries
+                    fun on_published {blobs = _, manifest} =
+                      #1 (single "heap" (shared_manifest_entries manifest)) = published_heap
+                    (* A cache in front of the store may still serve an entry
+                       chained to a heap the store has since replaced, so the
+                       store's own is asked for before the entry is rejected. *)
+                    val current =
+                      if on_published action then SOME action
+                      else HolbuildRemoteCache.revalidating (fn () =>
+                             HolbuildRemoteCache.fetch_action remote (candidate_key c))
                   in
-                    if heap <> published_heap then NONE else restore_chain (candidate_key c) (SOME heap) c entries
+                    case current of
+                        SOME found =>
+                          if not (on_published found) then NONE
+                          else restore_chain (candidate_key c) (SOME published_heap) c
+                                 (shared_manifest_entries (HolbuildRemoteCache.remember_action remote found))
+                      | NONE => NONE
                   end)
             in
               if modules_given_up () then NONE else counting_rejection (#kind c) (candidate_key c) restored
