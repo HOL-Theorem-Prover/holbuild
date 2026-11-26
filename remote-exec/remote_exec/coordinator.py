@@ -462,6 +462,7 @@ def held_target(
     up_hold_s: float,
     free_workers: int,
     cap: int,
+    sweep_s: float = 5.0,
 ) -> int:
     """Return the burst target held by recent demand samples."""
     held_window: deque[tuple[datetime, int]] = deque()
@@ -476,7 +477,11 @@ def held_target(
         if workers < 0:
             target = min(cap, -workers)
         else:
-            if up_hold_s > 0 and previous_raw_at is not None and (at - previous_raw_at).total_seconds() > up_hold_s:
+            if (
+                up_hold_s > 0
+                and previous_raw_at is not None
+                and (at - previous_raw_at).total_seconds() > max(up_hold_s, 2 * sweep_s)
+            ):
                 raw_samples.clear()
                 min_deque.clear()
             previous_raw_at = at
@@ -3256,6 +3261,7 @@ class Coordinator:
             up_hold_s=self.settings.scale_up_hold_s,
             free_workers=self.settings.scale_up_free_workers,
             cap=self.settings.max_burst_workers,
+            sweep_s=self.settings.sweep_seconds,
         )
 
     def _burst_demand_params(self, now: datetime) -> dict[str, object]:
@@ -4107,6 +4113,8 @@ class Coordinator:
 
     async def scale(self) -> None:
         """Sample demand and apply its held target, serialized with intake and periodic checks."""
+        if self.settings.scale_cmd is None and self.cache_pool is None:
+            return
         async with self.scale_lock:
             leased = self.leased.copy()
             async with self.engine.connect() as conn:

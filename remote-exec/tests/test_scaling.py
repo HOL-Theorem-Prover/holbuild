@@ -140,6 +140,35 @@ def test_held_target_restarts_after_a_scale_up_gap() -> None:
     assert held_target(samples, samples[-1][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 96
 
 
+def test_held_target_allows_jitter_at_the_scale_sweep_interval() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+
+    assert (
+        held_target(
+            [(start, 120), (start + timedelta(seconds=6), 120)],
+            start + timedelta(seconds=6),
+            down_hold_s=60.0,
+            up_hold_s=5.0,
+            free_workers=96,
+            cap=540,
+            sweep_s=5.0,
+        )
+        == 120
+    )
+    assert (
+        held_target(
+            [(start, 120), (start + timedelta(seconds=11), 120)],
+            start + timedelta(seconds=11),
+            down_hold_s=60.0,
+            up_hold_s=5.0,
+            free_workers=96,
+            cap=540,
+            sweep_s=5.0,
+        )
+        == 96
+    )
+
+
 def test_held_target_holds_a_high_target_across_a_brief_dip() -> None:
     start = datetime(2026, 1, 1, tzinfo=UTC)
     samples = [
@@ -237,6 +266,52 @@ async def test_scale_command_does_not_scale_above_free_workers_for_a_short_spike
 
     assert calls.read_text().split() == ["96", "80"]
     await scaled.released()
+
+
+async def test_only_the_scaling_replica_records_demand(coordinator: Coordinator, tmp_path: Path) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = start
+    calls = tmp_path / "scaled"
+    command = tmp_path / "scale"
+    command.write_text(f'#!/bin/sh\necho "$1" >> {calls}\n')
+    command.chmod(0o755)
+    common = {
+        "max_burst_workers": 540,
+        "scale_down_hold_s": 60.0,
+        "scale_up_hold_s": 180.0,
+        "scale_up_free_workers": 96,
+        "sweep_seconds": 5.0,
+    }
+    primary = Coordinator(
+        coordinator.engine,
+        coordinator.cache,
+        coordinator.settings.model_copy(update={**common, "scale_cmd": str(command)}),
+    )
+    replica = Coordinator(
+        coordinator.engine,
+        coordinator.cache,
+        coordinator.settings.model_copy(update={**common, "scale_cmd": None}),
+    )
+    primary.clock = lambda: now
+    replica.clock = lambda: now
+    primary._burst_demand = lambda counts: 120
+    replica._burst_demand = lambda counts: 96
+    try:
+        for seconds in range(0, 181, 5):
+            now = start + timedelta(seconds=seconds)
+            await replica.sweep()
+            await primary.sweep()
+
+        assert calls.read_text().split() == ["96", "120"]
+        async with coordinator.engine.connect() as connection:
+            assert await connection.scalar(sa.text("SELECT count(*) FROM burst_demand WHERE workers = 96")) == 0
+            assert await connection.scalar(sa.text("SELECT count(*) FROM burst_demand")) == 38
+
+        assert (await primary.queue()).desired_burst_workers == 120
+        assert (await replica.queue()).desired_burst_workers == 120
+    finally:
+        await primary.released()
+        await replica.released()
 
 
 def scaled_coordinator(coordinator: Coordinator, tmp_path: Path, script: str) -> tuple[Coordinator, Path]:

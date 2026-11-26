@@ -862,7 +862,9 @@ set, the coordinator also runs `<command> <target>` after a start and whenever
 the target changes; a command that fails or runs over 60 seconds is logged
 and run again on the next sweep, and never stops the sweep's other work.
 `GET /v1/queue`'s `scaler` shows the command's last run in that process. With
-several coordinator replicas, give the command to one of them.
+several coordinator replicas, give `REMOTE_EXEC_SCALE_CMD` to one of them. That
+replica records `burst_demand` samples and drives scaling; the other replicas
+read those samples for `/v1/queue`.
 
 ## Workers
 
