@@ -162,6 +162,7 @@ async def test_scale_preserves_an_earned_target_after_its_samples_age_out(
             "scale_down_hold_s": 60.0,
             "scale_up_hold_s": 180.0,
             "scale_up_free_workers": 96,
+            "cache_scale_down_hold_s": 0.0,
         }
     )
     scaled = Coordinator(coordinator.engine, coordinator.cache, settings)
@@ -170,10 +171,14 @@ async def test_scale_preserves_an_earned_target_after_its_samples_age_out(
 
     for seconds in range(0, 1201, 5):
         now = start + timedelta(seconds=seconds)
-        demand = 80 if seconds >= 300 and seconds % 40 == 0 else 120
+        demand = 80 if seconds >= 300 and (seconds - 300) % 40 == 0 else 120
         await scaled.scale()
 
     assert (await scaled.queue()).desired_burst_workers == 120
+    async with coordinator.engine.connect() as connection:
+        assert await connection.scalar(
+            sa.text("SELECT workers FROM burst_demand WHERE at = :at"), {"at": start + timedelta(seconds=300)}
+        ) == 80
 
     for seconds in range(1205, 1266, 5):
         now = start + timedelta(seconds=seconds)
@@ -181,6 +186,10 @@ async def test_scale_preserves_an_earned_target_after_its_samples_age_out(
         await scaled.scale()
 
     assert (await scaled.queue()).desired_burst_workers == 80
+    async with coordinator.engine.connect() as connection:
+        assert await connection.scalar(
+            sa.text("SELECT count(*) FROM burst_demand WHERE at = :at"), {"at": start + timedelta(seconds=300)}
+        ) == 0
     await scaled.released()
 
 
