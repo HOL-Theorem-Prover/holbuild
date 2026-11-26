@@ -836,30 +836,45 @@ val _ = check "the worker installed a module without its remote entry"
   (List.all (fn (file, key) =>
      not (exists (batch_store ^ "/" ^ file)) orelse exists ("$tmpdir/upstream/ac/" ^ Cache.remote_action_key key)) batch);
 
-(* A server that never answers must neither consume the default stall
-   timeout nor admit the staged file to the worker's store. *)
-fun check_stalled_lookup theory =
+(* A retryable failure within the short budget still allows publication. *)
+val retry_store = dir "retry-store";
+val retry = HolbuildHash.string_sha256 "module to retry";
+val _ = E.write_text (staged1 ^ "/" ^ file) "retry module upload";
+val _ = E.write_text (control1 ^ "cas-put-fail-once") "503\n";
+val {installed, published, ...} = install host1 retry_store staged1 [(file, retry)] (deadline 15);
+val _ = check "the worker did not retry publication within the deadline"
+  (published = 1 andalso installed = [file] andalso not (exists (control1 ^ "cas-put-fail-once")));
+
+(* Four transfers cut off by their caller must not trip the breaker or
+   admit unpublished files to the worker's store. *)
+fun check_stalled_lookups prefix =
   let
-    val file = "ab12-" ^ theory ^ "-$b_sha.pmo"
-    val key = HolbuildHash.string_sha256 file
-    val _ = E.write_text (staged1 ^ "/" ^ file) "unpublished module"
-    val _ = E.write_text (control1 ^ "action-get-key") (Cache.remote_action_key key)
+    val modules = List.tabulate (4, fn i =>
+      let val file = "ab12-" ^ prefix ^ Int.toString i ^ "-$b_sha.pmo"
+      in
+        E.write_text (staged1 ^ "/" ^ file) "unpublished module";
+        (file, HolbuildHash.string_sha256 file)
+      end)
+    val count = control1 ^ "action-get-count"
     val _ = List.app (fn stem => E.remove_file (control1 ^ stem)) ["action-get-count", "action-get-release"]
     val _ = E.write_text (control1 ^ "action-get-enable") ""
-    val until = deadline 5
-    val {installed, published, ...} = install host1 store1 staged1 [(file, key)] until
+    val until = deadline 7
+    val {installed, published, ...} = install host1 store1 staged1 modules until
     val _ = E.write_text (control1 ^ "action-get-release") ""
   in
-    check "a stalled module lookup was not bounded by the publish deadline"
-      (exists (control1 ^ "action-get-count") andalso Time.< (Time.now (), Time.+ (until, Time.fromSeconds 1)));
+    check "stalled module lookups were not bounded by the publish deadline"
+      (exists count andalso Int.fromString (E.read_text count) = SOME 4 andalso
+       Time.< (Time.now (), Time.+ (until, Time.fromSeconds 1)));
     check "a worker installed its unpublished module after a timeout"
-      (null installed andalso published = 0 andalso not (exists (store1 ^ "/" ^ file)))
+      (null installed andalso published = 0 andalso List.all (fn (file, _) => not (exists (store1 ^ "/" ^ file))) modules);
+    check "the scoped timeouts disabled subsequent cache requests"
+      (not (Cache.tripped ()) andalso isSome (Cache.get_action host1 retry))
   end;
-val _ = if HolbuildRemoteCacheConfig.uses_libcurl () then check_stalled_lookup "B" else ();
+val _ = if HolbuildRemoteCacheConfig.uses_libcurl () then check_stalled_lookups "B" else ();
 val _ = HolbuildRemoteCacheConfig.libcurl_ready := SOME false;
 val _ = E.write_text "$tmpdir/writer.curl" "max-time = 30\n";
 val _ = HolbuildRemoteCacheConfig.local_curl_config := SOME "$tmpdir/writer.curl";
-val _ = check_stalled_lookup "C";
+val _ = check_stalled_lookups "C";
 SML
 (cd "$ROOT" && HOLBUILD_CACHE="$tmpdir/cache" \
   "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/worker-writer.sml")

@@ -286,18 +286,21 @@ fun begin_request () =
 
 fun record_transport_outcome (generation, probe) result =
   let
+    (* A transfer cut short by its caller's deadline does not tell us
+       whether the cache would have answered within its stall budget. *)
+    val expired = case result of HolbuildHttp.Failed _ => HolbuildHttp.deadline_elapsed () | _ => false
     val _ = Mutex.lock transport_mutex
     val current = generation = !transport_generation
     val _ =
-      if not current then ()
+      if not current orelse expired then ()
       else
         case result of
             HolbuildHttp.Failed _ =>
               if probe then () else transport_failures := !transport_failures + 1
           | HolbuildHttp.Response _ => transport_failures := 0
-    val tripped = current andalso
+    val tripped = current andalso not expired andalso
       !transport_failures >= max_consecutive_transport_failures
-    val recovered = current andalso probe andalso not tripped
+    val recovered = current andalso probe andalso not expired andalso not tripped
     val _ = if current then probe_in_flight := false else ()
     (* Ignore completions from requests admitted before this trip. *)
     val _ = if tripped then
@@ -592,9 +595,8 @@ fun wait_seconds n =
   if n <= 0 orelse not (!retry_one_node) then ()
   else (OS.Process.sleep (whole_seconds 1); wait_seconds (n - 1))
 
-(* A caller with a deadline of its own (the theory-module requests) runs F
-   under it: a retry then starts only if it could still end by DEADLINE
-   after a full stall_timeout_seconds.  Per thread, like `required`. *)
+(* A caller with a deadline of its own runs F under it. Reserve a full
+   stall timeout only when the HTTP client has no deadline of its own. *)
 val retry_deadline_tag : Time.time option Universal.tag = Universal.tag ()
 
 fun retry_deadline () = Option.join (Thread.getLocal retry_deadline_tag)
@@ -617,14 +619,18 @@ fun retrying_one_node method urls attempt =
             val delays = one_node_retry_delays ()
             val window = Time.+ (Time.now (), whole_seconds (foldl op+ 0 delays))
             val own = retry_deadline ()
+            val bounded = HolbuildHttp.deadline ()
+            fun within_deadline start =
+              case bounded of
+                  SOME limit => Time.< (start, limit) andalso
+                    (case own of SOME deadline => Time.< (start, deadline) | NONE => true)
+                | NONE =>
+                    (case own of
+                         SOME deadline => Time.<= (Time.+ (start, whole_seconds stall_timeout_seconds), deadline)
+                       | NONE => true)
             fun fits delay =
               let val start = Time.+ (Time.now (), whole_seconds delay)
-              in
-                Time.<= (start, window) andalso
-                (case own of
-                     SOME deadline => Time.<= (Time.+ (start, whole_seconds stall_timeout_seconds), deadline)
-                   | NONE => true)
-              end
+              in Time.<= (start, window) andalso within_deadline start end
             fun loop delays =
               let val (url, result) = attempt ()
               in
@@ -639,7 +645,8 @@ fun retrying_one_node method urls attempt =
                            "; retrying in " ^ Int.toString delay ^ " s\n");
                          TextIO.flushOut TextIO.stdErr;
                          wait_seconds delay;
-                         if !retry_one_node then loop rest else (url, result))
+                         if !retry_one_node andalso not (HolbuildHttp.deadline_elapsed ())
+                         then loop rest else (url, result))
                       else (url, result)
                   | [] => (url, result)
               end

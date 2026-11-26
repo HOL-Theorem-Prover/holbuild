@@ -159,6 +159,11 @@ val deadline_tag : Time.time option Universal.tag = Universal.tag ()
 
 fun deadline () = Option.join (Thread.getLocal deadline_tag)
 
+fun deadline_elapsed () =
+  case deadline () of
+      SOME limit => Time.>= (Time.now (), limit)
+    | NONE => false
+
 fun with_deadline limit f =
   let
     val outer = deadline ()
@@ -174,10 +179,12 @@ fun transfer_timeout_ms () =
     case deadline () of
         NONE => maximum
       | SOME limit =>
-          let val remaining = Time.toMilliseconds (Time.- (limit, Time.now ()))
+          let val remaining = Time.- (limit, Time.now ())
           in
-            if remaining <= 0 then raise Error "HTTP request deadline elapsed"
-            else LargeInt.toInt (LargeInt.min (remaining, Int.toLarge maximum))
+            if Time.<= (remaining, Time.zeroTime) then raise Error "HTTP request deadline elapsed"
+            (* Both transports take whole milliseconds. Do not time out
+               before the deadline used by the breaker. *)
+            else LargeInt.toInt (LargeInt.min (Time.toMilliseconds remaining + 1, Int.toLarge maximum))
           end
   end
 
