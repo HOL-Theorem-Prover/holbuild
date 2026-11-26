@@ -304,6 +304,10 @@ fun remove_obsolete_action_lock_dirs cutoff dir gc_lock_path mark_drained clear_
     if conventional_links () andalso drained then 0
     else
       let
+        (* Invalidate an old marker before gc_stage can flush a directory
+           removal. If the process stops between that flush and the next
+           marker write, a surviving flat lock must still be scanned later. *)
+        val _ = if drained then clear_marker () else ()
         val paths = List.filter (fn path => has_prefix "action-" (Path.file path)) (children dir)
         fun step (path, (removed, survived)) =
           if is_regular_entry path then
@@ -316,8 +320,7 @@ fun remove_obsolete_action_lock_dirs cutoff dir gc_lock_path mark_drained clear_
           else
             ((removed, survived orelse entry_exists path), false)
         val (removed, survived) = gc_stage "locks" paths step (0, false)
-        val _ = if survived then clear_marker ()
-                else if conventional_links () then mark_drained () else ()
+        val _ = if not survived andalso conventional_links () then mark_drained () else ()
       in
         removed
       end
