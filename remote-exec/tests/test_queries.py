@@ -447,7 +447,7 @@ STATEMENTS = [
     Statement(cm.COUNT_ACTIVE, lambda f: {"outlined": f.outlined()}, 18_000),
     Statement(cm.COUNT_ACTIVE, lambda f: {"outlined": f.outlined_plain()}, 18_000),
     Statement(cm.HELD_TARGET, lambda f: {"now": now(), "hold": 900.0, "cap": 100}, 1_800),
-    Statement(cm.BURST_DEMAND, lambda f: {"now": now()}, 7_200),
+    Statement(cm.BURST_DEMAND, lambda f: {"now": now(), "hold": 1_800.0}, 3_600),
     # submit
     Statement(
         "WITH locked AS (SELECT package, theory, profile FROM peak_hints WHERE profile = :profile",

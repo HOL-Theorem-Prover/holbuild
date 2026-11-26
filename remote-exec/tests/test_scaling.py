@@ -133,6 +133,13 @@ def test_held_target_ignores_samples_after_now() -> None:
     )
 
 
+def test_held_target_restarts_after_a_scale_up_gap() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    samples = [(start, 120), (start + timedelta(seconds=181), 120)]
+
+    assert held_target(samples, samples[-1][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 96
+
+
 def test_held_target_holds_a_high_target_across_a_brief_dip() -> None:
     start = datetime(2026, 1, 1, tzinfo=UTC)
     samples = [
@@ -162,7 +169,7 @@ async def test_scale_preserves_an_earned_target_after_its_samples_age_out(
             "scale_down_hold_s": 60.0,
             "scale_up_hold_s": 180.0,
             "scale_up_free_workers": 96,
-            "cache_scale_down_hold_s": 0.0,
+            "cache_scale_down_hold_s": 900.0,
         }
     )
     scaled = Coordinator(coordinator.engine, coordinator.cache, settings)
@@ -179,6 +186,8 @@ async def test_scale_preserves_an_earned_target_after_its_samples_age_out(
         assert await connection.scalar(
             sa.text("SELECT workers FROM burst_demand WHERE at = :at"), {"at": start + timedelta(seconds=300)}
         ) == 80
+        assert await connection.scalar(sa.text("SELECT min(at) FROM burst_demand")) >= start + timedelta(seconds=300)
+        assert await connection.scalar(sa.text("SELECT count(*) FROM burst_demand")) <= 2 * (900 // 5 + 1)
 
     for seconds in range(1205, 1266, 5):
         now = start + timedelta(seconds=seconds)

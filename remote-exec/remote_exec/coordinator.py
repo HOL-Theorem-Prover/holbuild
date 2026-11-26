@@ -464,25 +464,44 @@ def held_target(
     cap: int,
 ) -> int:
     """Return the burst target held by recent demand samples."""
-    samples = [(at, workers) for at, workers in samples if at <= now]
-    targets: list[tuple[datetime, int]] = []
+    held_window: deque[tuple[datetime, int]] = deque()
+    raw_samples: deque[tuple[int, datetime, int]] = deque()
+    min_deque: deque[tuple[int, datetime, int]] = deque()
+    previous_raw_at: datetime | None = None
     for i, (at, workers) in enumerate(samples):
-        held = max(
-            (target for prev_at, target in targets if (at - prev_at).total_seconds() <= down_hold_s),
-            default=0,
-        )
-        free = min(workers, max(free_workers, held))
-        if up_hold_s <= 0:
-            sustained = workers
+        if at > now:
+            continue
+        while held_window and (at - held_window[0][0]).total_seconds() > down_hold_s:
+            held_window.popleft()
+        if workers < 0:
+            target = min(cap, -workers)
         else:
-            cutoff = at - timedelta(seconds=up_hold_s)
-            starts = [j for j in range(i + 1) if samples[j][0] <= cutoff]
-            sustained = min(samples[j][1] for j in range(starts[-1], i + 1)) if starts else 0
-        targets.append((at, min(cap, max(free, sustained))))
-    return max(
-        (target for at, target in targets if 0 <= (now - at).total_seconds() <= down_hold_s),
-        default=0,
-    )
+            if up_hold_s > 0 and previous_raw_at is not None and (at - previous_raw_at).total_seconds() > up_hold_s:
+                raw_samples.clear()
+                min_deque.clear()
+            previous_raw_at = at
+            held = held_window[0][1] if held_window else 0
+            free = min(workers, max(free_workers, held))
+            if up_hold_s <= 0:
+                sustained = workers
+            else:
+                raw_samples.append((i, at, workers))
+                while min_deque and min_deque[-1][2] >= workers:
+                    min_deque.pop()
+                min_deque.append((i, at, workers))
+                cutoff = at - timedelta(seconds=up_hold_s)
+                while len(raw_samples) >= 2 and raw_samples[1][1] <= cutoff:
+                    old_i, _, _ = raw_samples.popleft()
+                    if min_deque and min_deque[0][0] == old_i:
+                        min_deque.popleft()
+                sustained = min_deque[0][2] if raw_samples[0][1] <= cutoff else 0
+            target = min(cap, max(free, sustained))
+        while held_window and held_window[-1][1] <= target:
+            held_window.pop()
+        held_window.append((at, target))
+    while held_window and (now - held_window[0][0]).total_seconds() > down_hold_s:
+        held_window.popleft()
+    return held_window[0][1] if held_window else 0
 
 
 @dataclass(frozen=True)
@@ -1157,7 +1176,9 @@ COUNT_CLAIMABLE = (
     f"AND (c.input_key, c.spec_sha256) NOT IN {LEASED_SPECS} GROUP BY c.tier, c.class"
 )
 BURST_DEMAND = sa.text(
-    "SELECT at, workers FROM burst_demand WHERE at <= CAST(:now AS timestamptz) ORDER BY at"
+    "SELECT at, workers FROM burst_demand "
+    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold) "
+    "AND at <= CAST(:now AS timestamptz) ORDER BY at, workers DESC"
 )
 COUNT_UNFINISHED = sa.text(
     "SELECT a.state, a.tier, a.class, b.priority > 0, count(*) FROM actions a "
@@ -3237,6 +3258,15 @@ class Coordinator:
             cap=self.settings.max_burst_workers,
         )
 
+    def _burst_demand_params(self, now: datetime) -> dict[str, object]:
+        return {
+            "now": now,
+            "hold": max(
+                self.settings.cache_scale_down_hold_s,
+                2 * (self.settings.scale_down_hold_s + self.settings.scale_up_hold_s),
+            ),
+        }
+
     def report_phases(self, report: PhaseReport) -> None:
         """Take a worker's report of where its time went."""
         if len(self.phase_reports) >= MAX_PHASE_REPORTS:
@@ -3938,7 +3968,7 @@ class Coordinator:
         async with self.engine.connect() as conn:
             samples = [
                 (row.at, row.workers)
-                for row in await conn.execute(BURST_DEMAND, {"now": now})
+                for row in await conn.execute(BURST_DEMAND, self._burst_demand_params(now))
             ]
             counts = await self._counts(conn, COUNT_UNFINISHED)
         self._count_ready(counts, leased)
@@ -4087,39 +4117,27 @@ class Coordinator:
             demand = self._burst_demand(counts)
             async with self.engine.begin() as conn:
                 await conn.execute(
+                    sa.text(
+                        "DELETE FROM burst_demand "
+                        "WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"
+                    ),
+                    # The cache pool reads these samples too, over its own hold.
+                    self._burst_demand_params(now),
+                )
+                await conn.execute(
                     sa.text("INSERT INTO burst_demand (at, workers) VALUES (:now, :workers)"),
                     {"now": now, "workers": demand},
                 )
                 samples = [
                     (row.at, row.workers)
-                    for row in await conn.execute(BURST_DEMAND, {"now": now})
+                    for row in await conn.execute(BURST_DEMAND, self._burst_demand_params(now))
                 ]
                 desired = self._held_target(samples, now)
-                hold = max(
-                    self.settings.cache_scale_down_hold_s,
-                    2 * (self.settings.scale_down_hold_s + self.settings.scale_up_hold_s),
-                )
-                retained = [
-                    (at, workers) for at, workers in samples if (now - at).total_seconds() <= hold
-                ]
-                horizons = (
-                    now,
-                    *(
-                        at + timedelta(seconds=self.settings.scale_down_hold_s)
-                        for at, _ in retained
-                        if (now - at).total_seconds() <= self.settings.scale_down_hold_s
-                    ),
-                )
-                if all(
-                    self._held_target(retained, at) == self._held_target(samples, at)
-                    for at in horizons
-                ):
+                earned = min(demand, desired)
+                if self.settings.scale_up_hold_s > 0 and earned > self.settings.scale_up_free_workers:
                     await conn.execute(
-                        sa.text(
-                            "DELETE FROM burst_demand "
-                            "WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"
-                        ),
-                        {"now": now, "hold": hold},
+                        sa.text("INSERT INTO burst_demand (at, workers) VALUES (:now, :workers)"),
+                        {"now": now, "workers": -earned},
                     )
             last = self.scaler
             if self.settings.scale_cmd is None or (last is not None and last.error is None and last.workers == desired):
