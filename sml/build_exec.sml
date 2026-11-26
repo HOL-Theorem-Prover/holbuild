@@ -16638,10 +16638,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             (* Set when this input is fetched, counted once. *)
             val fetched = ref false
             fun across_mounts () =
-              let val target = FS.fullPath blob
+              let
+                val target = FS.fullPath blob
+                (* Gone already: without its identity a later loss would go unseen. *)
+                val id = case file_id target of
+                             NONE => raise Error ("blob " ^ sha ^ " left the cache")
+                           | id => id
               in
                 Posix.FileSys.symlink {old = target, new = path};
-                scratch_blobs := (target, file_id target) :: !scratch_blobs;
+                scratch_blobs := (target, id) :: !scratch_blobs;
                 HolbuildActionSandbox.scratch_reads := target :: !HolbuildActionSandbox.scratch_reads
               end
             fun in_place () =
