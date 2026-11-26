@@ -7,11 +7,13 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from pydantic import ValidationError
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
-
 from conftest import CLIENT_TOKEN, WORKER_TOKEN
+from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from test_cache_pool import Provider
+from test_coordinator import claim, input_key, submit
+
 from remote_exec import app as app_module
 from remote_exec import coordinator as coordinator_module
 from remote_exec.cache_pool import CacheSlot
@@ -23,10 +25,9 @@ from remote_exec.coordinator import (
     ScaleRun,
     Settings,
     burst_demand,
+    held_target,
     is_auth_failure,
 )
-from test_cache_pool import Provider
-from test_coordinator import claim, input_key, submit
 
 CLIENT = {"Authorization": f"Bearer {CLIENT_TOKEN}"}
 WORKER = {"Authorization": f"Bearer {WORKER_TOKEN}"}
@@ -80,6 +81,49 @@ def counts(
 )
 def test_burst_demand(queue: QueueCounts, expected: int) -> None:
     assert burst_demand(queue, warm_workers=2, max_burst_workers=16) == expected
+
+
+def test_held_target_default_scales_like_the_existing_held_target() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    samples = [(now - timedelta(seconds=10), 2), (now, 12)]
+
+    assert held_target(samples, now, down_hold_s=60.0, up_hold_s=0.0, free_workers=0, cap=10) == 10
+
+
+def test_held_target_scales_first_free_workers_without_waiting() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    assert held_target([(now, 80)], now, down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 80
+    assert held_target([(now, 120)], now, down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 96
+
+
+def test_held_target_waits_for_sustained_demand_above_free_workers() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    samples = [(start, 120), (start + timedelta(seconds=179), 120), (start + timedelta(seconds=180), 120)]
+
+    assert held_target(samples[:2], samples[1][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 96
+    assert held_target(samples, samples[2][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 120
+
+
+def test_held_target_drops_a_short_spike_without_scaling_above_free_workers() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    samples = [(start, 120), (start + timedelta(seconds=90), 80), (start + timedelta(seconds=180), 80)]
+
+    assert held_target(samples, samples[-1][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 80
+
+
+def test_held_target_holds_a_high_target_across_a_brief_dip() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    samples = [
+        (start, 120),
+        (start + timedelta(seconds=180), 120),
+        (start + timedelta(seconds=200), 80),
+        (start + timedelta(seconds=220), 120),
+    ]
+
+    assert held_target(samples, samples[2][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 120
+    assert held_target(samples, samples[3][0], down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 120
+    assert held_target(samples[:3], start + timedelta(seconds=241), down_hold_s=60.0, up_hold_s=180.0, free_workers=96, cap=540) == 80
 
 
 def scaled_coordinator(coordinator: Coordinator, tmp_path: Path, script: str) -> tuple[Coordinator, Path]:
@@ -237,6 +281,24 @@ async def test_queue_reports_counts_and_the_desired_burst_workers(
     response = await http.get("/v1/queue", headers=CLIENT)
     assert response.json()["scaler"] == {"workers": 4, "at": "2026-01-01T12:00:00+00:00", "error": "scale 4 exited 1"}
     assert (await http.get("/v1/queue", headers=WORKER)).status_code == 401
+
+
+async def test_queue_reports_scale_up_hold_target(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    coordinator.settings = coordinator.settings.model_copy(
+        update={
+            "max_burst_workers": 540,
+            "scale_up_hold_s": 180.0,
+            "scale_up_free_workers": 96,
+        }
+    )
+    await submit(http, [f"a{i}" for i in range(120)])
+
+    response = await http.get("/v1/queue", headers=CLIENT)
+
+    assert response.status_code == 200
+    assert response.json()["desired_burst_workers"] == 96
 
 
 @pytest.mark.parametrize(("slots", "floor", "effective"), [(30, 4, 4), (2, 8, 2), (0, 4, 0)])

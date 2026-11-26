@@ -168,6 +168,8 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_LOCALITY` | steer builds to the hosts below the scale-in line that hold their checkpoints or dependency context (see Claims); `false` for the plain order | true |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
 | `REMOTE_EXEC_SCALE_DOWN_HOLD_S` | how long a higher burst worker count is kept after demand drops | 900 |
+| `REMOTE_EXEC_SCALE_UP_HOLD_S` | how long demand above `REMOTE_EXEC_SCALE_UP_FREE_WORKERS` must be sustained before scaling above that free-worker target | 0 |
+| `REMOTE_EXEC_SCALE_UP_FREE_WORKERS` | burst workers that scale up immediately, without the scale-up hold | 0 |
 | `REMOTE_EXEC_CACHE_SCALE_DOWN_HOLD_S` | how long the burst cache pool keeps the capacity a higher burst worker count needed (see "Temporary cache members") | 900 |
 | `REMOTE_EXEC_SCALE_CMD` | command run as `<command> <burst workers>` when that count changes | none |
 
@@ -842,8 +844,11 @@ waits on run alone, then many become ready together. Following the queue
 exactly would stop burst workers at every narrow point and start them again
 seconds later. So the target is the highest demand of the last
 `REMOTE_EXEC_SCALE_DOWN_HOLD_S` seconds: it rises at once and falls only after
-demand has stayed lower for that long. Each scale check records its demand
-in the database, so a restarted coordinator keeps holding the target.
+demand has stayed lower for that long. `REMOTE_EXEC_SCALE_UP_FREE_WORKERS`
+scales immediately, while demand above it must remain sustained for
+`REMOTE_EXEC_SCALE_UP_HOLD_S` seconds before the target rises further. Each
+scale check records its raw demand in the database, so a restarted coordinator
+keeps holding the target.
 
 Nonempty batch submissions request a background scale check immediately after
 making root actions ready. Concurrent requests are coalesced, and intake and
