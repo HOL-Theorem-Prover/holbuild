@@ -38,6 +38,8 @@ from remote_exec.membership import REFRESH_SECONDS, Membership
 logger = logging.getLogger(__name__)
 # Under uvicorn's own logger, which uvicorn sends to stderr at INFO, as app.py's request summary.
 claims_logger = logging.getLogger("uvicorn.claims")
+# Each memory failure's attempt, and what became of the retries; see _log_memory.
+memory_logger = logging.getLogger("uvicorn.memory")
 
 CLAIM_RECHECK_SECONDS = 5  # how often a waiting claim looks for actions another coordinator process made ready
 # How long a cache entry found is taken to still be there without asking the cache again.
@@ -74,6 +76,9 @@ RAN_FAILURES = frozenset({"proof", "timeout", "tactic-timeout", "memory"})
 PROBE_SECONDS = 60
 # Leases whose host the coordinator remembers at most, the oldest forgotten first.
 MAX_LEASE_HOSTS = 10_000
+# The exec-action phases that say which checkpoint an attempt resumed from: none, the deps heap, a context
+# checkpoint or a failed prefix, at which boundary and step.
+RESUME_PHASES = ("resdepsn", "resctxn", "resfpn", "resboundary", "resstepn")
 # Running batches whose missing inputs the coordinator remembers at most, the oldest forgotten first.
 MAX_MISSING_BATCHES = 1_000
 # The highest --host-rank a worker may report (worker.py checks the same bound at start).
@@ -296,6 +301,17 @@ class QueueCounts:
 
 # What a host report's counts and sizes may be: JSON's exact integers.
 Amount = Annotated[int, Field(ge=0, le=2**53)]
+
+
+@dataclass(frozen=True)
+class MemoryAttempt:
+    """What an attempt that failed for memory ran under and got done: what its evidence showed, its ``--max-heap``,
+    the checkpoint it resumed from (RESUME_PHASES) and how many shared checkpoints it published."""
+
+    cause: str | None
+    max_heap_mb: int | None
+    resumed: tuple[int, ...]
+    published: int
 
 
 @dataclass(frozen=True)
@@ -1268,6 +1284,10 @@ class Coordinator:
         # claim; and the workers that last claimed, reported or heartbeat from each host, when, and whether they are
         # burst workers. See _quarantine.
         self.lease_hosts: dict[UUID, tuple[str, str, list[str]]] = {}
+        # Also in memory, oldest first: each action's latest attempt that failed for memory, while it is retried, and
+        # how many retries the shadow rule would have withheld (see _log_memory). Only logged: no retry depends on them.
+        self.memory_attempts: dict[tuple[UUID, str], tuple[int, MemoryAttempt]] = {}
+        self.memory_withheld = 0
         # The attempt tokens of the leases whose action published its outline (see outlined), oldest first.
         self.outlined_tokens: dict[UUID, None] = {}
         # Per running batch, oldest first, the inputs each of its actions last found missing that the batch doesn't
@@ -3252,6 +3272,7 @@ class Coordinator:
         # alone. Peak hints are raised once the result committed, outside its locks: many copies of one theory
         # finishing together raise the same hint.
         built = result.status != "failed"
+        refunded = False  # an ``input-missing`` result that cost no attempt
         peaks: list[tuple[str, str, str, int]] = []
         async with self.engine.begin() as conn:
             batch_id = await conn.scalar(
@@ -3406,7 +3427,7 @@ class Coordinator:
                 await self._retry(conn, batch_id, action.input_key, ahead_batch=action.ahead_batch)
             elif result.failure == "input-missing":
                 self._forget_cache_findings()
-                await self._input_missing(
+                refunded = await self._input_missing(
                     conn, batch_id, action.input_key, action.theory, action.attempts, result,
                     ahead_batch=action.ahead_batch,
                 )
@@ -3417,6 +3438,17 @@ class Coordinator:
                 )
         if action.action_class == "run":
             self._runs_changed()  # a run slot came free, or the run is ready again
+        # As above: a result that cost no attempt interrupted the attempt rather than ending it.
+        counted = not (
+            refunded
+            or result.failure == "declined"
+            or (result.failure == "unavailable" and action.interruptions < self.settings.max_interruptions)
+            or (result.failure == "ahead-abandoned" and action.ahead == "ahead")
+        )
+        self._log_memory(
+            batch_id, action.input_key, action.theory, action.tier, action.attempts, result, leased, token,
+            counted=counted,
+        )
         for peak in peaks:
             await self._record_peak(*peak)
         if built:
@@ -3441,6 +3473,92 @@ class Coordinator:
             self.peers_done.setdefault(peer.batch_id, {})[action.input_key] = (result.log_sha256, peer.ahead_batch)
             self.request_release(peer.batch_id)
         return True
+
+    def _log_memory(
+        self,
+        batch_id: UUID,
+        input_key: str,
+        theory: str,
+        tier: str,
+        attempt: int,
+        result: Result,
+        leased: tuple[str, str, list[str]] | None,
+        token: UUID,
+        *,
+        counted: bool,
+    ) -> None:
+        """Log an attempt that failed for memory: what its evidence showed, the cap and tier it ran under, its host's
+        last report and the other leases there, and the checkpoint it resumed from and published; and, for an
+        action retried after such a failure, how its next result came out. A shadow line marks a retry that the
+        rule under trial would withhold: one after two attempts that Poly/ML ran out of store under the same cap,
+        resuming from the same checkpoint, the second publishing none. It is counted when that retry is queued, so a
+        batch that ends before the retry starts still counts it. It only logs: every retry still runs. ``counted``: whether
+        the result cost an attempt; one that didn't leaves the retry to the next."""
+        if not counted:
+            return  # interrupted: the next attempt is the retry
+        previous = self._log_memory_outcome(batch_id, input_key, theory, attempt, result.status, result.failure)
+        if result.failure != "memory":
+            return
+        timings = result.timings or {}
+        current = MemoryAttempt(
+            result.memory_cause,
+            result.max_heap_mb,
+            tuple(timings.get(name, 0) for name in RESUME_PHASES),
+            timings.get("pubckptn", 0),
+        )
+        retried = attempt < self.settings.max_attempts
+        host_id, worker, tiers = leased if leased is not None else ("-", "-", [])
+        report = self.hosts.get(host_id)
+        host = report[1] if report is not None else None
+
+        def mb(amount: int | None) -> str:
+            return "-" if amount is None else str(amount // (1 << 20))
+
+        others = sum(1 for other, (h, _, _) in self.lease_hosts.items() if h == host_id and other != token)
+        memory_logger.info(
+            "memory attempt batch=%s theory=%s input_key=%s attempt=%d/%d retry=%s tier=%s worker_tiers=%s cause=%s "
+            "max_heap_mb=%s host=%s worker=%s host_age_s=%s mem_available_mb=%s mem_total_mb=%s leases_mb=%s "
+            "memory_short=%s other_leases=%d resumed=%s published=%d",
+            batch_id, theory, input_key, attempt, self.settings.max_attempts, int(retried), tier,
+            ",".join(tiers) or "-", current.cause or "-",
+            "-" if current.max_heap_mb is None else current.max_heap_mb, host_id[:8], worker,
+            "-" if report is None else round((self.clock() - report[0]).total_seconds()),
+            mb(host.mem_available if host else None), mb(host.mem_total if host else None),
+            mb(host.leases if host else None), "-" if host is None else int(bool(host.memory_short)),
+            others, ",".join(map(str, current.resumed)), current.published,
+        )
+        if not retried:
+            return
+        if (
+            previous is not None
+            and previous[1].cause == current.cause == "poly-out-of-store"
+            and current.max_heap_mb is not None
+            and previous[1].max_heap_mb == current.max_heap_mb
+            and previous[1].resumed == current.resumed
+            and current.published == 0
+        ):
+            self.memory_withheld += 1
+            memory_logger.info(
+                "memory shadow would-withhold batch=%s theory=%s attempt=%d max_heap_mb=%d resumed=%s withheld=%d",
+                batch_id, theory, attempt + 1, current.max_heap_mb, ",".join(map(str, current.resumed)),
+                self.memory_withheld,
+            )
+        self.memory_attempts[(batch_id, input_key)] = (attempt, current)
+        if len(self.memory_attempts) > MAX_LEASE_HOSTS:
+            del self.memory_attempts[next(iter(self.memory_attempts))]
+
+    def _log_memory_outcome(
+        self, batch_id: UUID, input_key: str, theory: str, attempt: int, status: str, failure: str | None
+    ) -> tuple[int, MemoryAttempt] | None:
+        """Log how attempt ``attempt`` of an action retried after a memory failure came out, forgetting that failure;
+        return it, or ``None`` for an action with none remembered."""
+        previous = self.memory_attempts.pop((batch_id, input_key), None)
+        if previous is not None:
+            memory_logger.info(
+                "memory retry outcome batch=%s theory=%s attempt=%d after=%d status=%s failure=%s",
+                batch_id, theory, attempt, previous[0], status, failure or "-",
+            )
+        return previous
 
     def request_release(self, batch_id: UUID | None = None) -> None:
         """Have ``release`` run for ``batch_id``, or every batch, in the background, so neither a worker's
@@ -3665,6 +3783,9 @@ class Coordinator:
             else:
                 # The worker never reported, so all there is to go on is which workers lost it: the detail lists
                 # those of the expiries in a row.
+                self._log_memory_outcome(
+                    batch_id, lease.input_key, action.theory, action.attempts, "failed", "lease-expired"
+                )
                 final = action.attempts >= self.settings.max_attempts
                 detail = await conn.scalar(
                     sa.text(
@@ -4112,14 +4233,14 @@ class Coordinator:
     async def _input_missing(
         self, conn: AsyncConnection, batch_id: UUID, input_key: str, theory: str, attempts: int, result: Result,
         *, ahead_batch: bool,
-    ) -> None:
+    ) -> bool:
         """Handle ``input-missing``: re-queue a missing theory the batch builds, and retry on anything else, since a
         restore that fails on a network error reports its input missing too; once the action used up its
         attempts, fail the batch for resubmission.
 
         The missing theory may be a transitive dependency, which the batch has no edge for; the edge added here
         holds the action back until that theory is rebuilt and the cache holds it again. One the batch is still to
-        build costs the action no attempt, and holds it back from claims ahead too.
+        build costs the action no attempt, and holds it back from claims ahead too. Return whether it cost none.
         """
         missing = result.missing
         more = [f"{item.kind} {item.key}" for item in result.missing_more]
@@ -4136,7 +4257,7 @@ class Coordinator:
             if parent_state in ("failed", "cancelled"):
                 await self._skip(conn, batch_id, input_key, f"skipped because of {rebuilt} ({missing.key})")
                 await self._finish_if_done(conn, batch_id)
-                return
+                return False
             if parent_state in ("waiting", "ready", "running") and await self._add_edge(
                 conn, batch_id, input_key, missing.key
             ):
@@ -4154,7 +4275,7 @@ class Coordinator:
                 self._remember_missing(batch_id, input_key, more)
                 await self._back_to_waiting(conn, batch_id, input_key, ahead_batch=ahead_batch)
                 await self._requeue(conn, batch_id, missing.key, ahead_batch=ahead_batch)
-                return
+                return True
         if attempts >= self.settings.max_attempts:
             # What it found missing before is superseded by this last report.
             self.missing_inputs.get(batch_id, {}).pop(input_key, None)
@@ -4181,6 +4302,7 @@ class Coordinator:
         else:
             self._remember_missing(batch_id, input_key, ([f"{missing.kind} {missing.key}"] if missing else []) + more)
             await self._retry(conn, batch_id, input_key, ahead_batch=ahead_batch)
+        return False
 
     def _remember_missing(self, batch_id: UUID, input_key: str, items: list[str]) -> None:
         """Remember the inputs action ``input_key`` of the batch found missing, in place of those it found before."""

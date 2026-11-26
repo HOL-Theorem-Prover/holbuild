@@ -1654,7 +1654,12 @@ def test_action_killed_by_a_signal_without_a_record_is_reported_by_the_signal(
     )
 
     assert unavailable == (failure == "unavailable")
-    assert server.completed == [failed_record(SPEC, failure, detail)]
+    # Not knowing what the kernel killed, nor why, the worker can't say more of a kill's cause; with the cap it ran
+    # under, which the coordinator logs.
+    assert server.completed == (
+        [failed_record(SPEC, failure, detail, memory_cause="sigkill-unknown") + "max-heap-mb=12000\n"]
+        if failure == "memory" else [failed_record(SPEC, failure, detail)]
+    )
 
 
 def test_a_worker_on_a_full_disk_hands_the_action_back_and_claims_again_only_once_there_is_room(

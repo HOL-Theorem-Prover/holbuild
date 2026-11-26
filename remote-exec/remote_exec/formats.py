@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 SHA256 = re.compile(r"[0-9a-f]{64}")
 THEORY = re.compile(r"[^\s:]+:\S+")
 PHASE = re.compile(r"[a-z]+")
+MEMORY_CAUSE = re.compile(r"[a-z][a-z-]{0,31}")
 DETAIL_MAX = 500
 
 FAILURES = frozenset(
@@ -69,6 +70,10 @@ class Result:
     # The spec's deps-key, which the worker adds: the dependency context whose shared heap the action loaded.
     deps_key: str | None = None
     missing_more: tuple[Missing, ...] = ()  # the other inputs missing, which holbuild before 0.14.89 doesn't report
+    # What a memory failure's evidence shows: poly-out-of-store, kernel-oom, both, or sigkill-unknown (the worker's,
+    # for an exec-action killed without a record). Later holbuilds may name others.
+    memory_cause: str | None = None
+    max_heap_mb: int | None = None  # the --max-heap the worker ran exec-action under, which the worker adds
 
 
 def sanitize_detail(text: str) -> str:
@@ -172,6 +177,9 @@ def parse_result(text: str) -> Result:
     if peak is not None and not peak.isdigit():
         raise FormatError(f"bad peak-rss-mb: {peak!r}")
     log = fields.get("log")
+    max_heap = fields.get("max-heap-mb")
+    if max_heap is not None and not (max_heap.isascii() and max_heap.isdigit()):
+        raise FormatError(f"bad max-heap-mb: {max_heap!r}")
     timings: dict[str, int] = {}
     for item in fields["phase-ms"].split(",") if "phase-ms" in fields else []:
         name, sep, ms = item.partition(":")
@@ -195,4 +203,6 @@ def parse_result(text: str) -> Result:
         timings=timings or None,
         detail=sanitize_detail(fields["detail"]) if fields.get("detail") else None,
         deps_key=_expect(SHA256, fields["deps-key"], "deps-key") if fields.get("deps-key") else None,
+        memory_cause=_expect(MEMORY_CAUSE, fields["memory-cause"], "memory-cause") if fields.get("memory-cause") else None,
+        max_heap_mb=int(max_heap) if max_heap is not None else None,
     )

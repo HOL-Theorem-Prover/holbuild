@@ -168,6 +168,17 @@ same_outputs() {
 # Only the remote cache holds what an earlier run shared.
 forget_local() { rm -rf "$shared/checkpoints" "$shared/checkpoint-store"; }
 
+# heap_line VERSION WHAT: the deps heap's key and result in the worker's
+# lookup or publish line, which the worker prints once.
+heap_line() {
+  local found
+  found=$(sed -n "s/^holbuild shared-heap $2 theory=share:[^ ]* heap=\([0-9a-f]\{64\}\) result=\([a-z-]*\)\( checkpoints=[0-9]*\)\?\$/\1 \2/p" \
+            "$tmpdir/$1.log")
+  [[ $(printf '%s\n' "$found" | grep -c .) == 1 ]] || {
+    echo "version $1: not one shared-heap $2 line:" >&2; cat "$tmpdir/$1.log" >&2; exit 1; }
+  echo "$found"
+}
+
 # resumed VERSION FROM KIND: the sharing worker restored a KIND checkpoint,
 # resumed from it as FROM, and kept it.
 resumed() {
@@ -200,7 +211,24 @@ tail -n +"$((before_v1 + 1))" "$requests" | awk '$1 == "PUT" { exit } $1 == "GET
   fi
 done
 [[ -d "$shared/checkpoint-store" ]] || { echo "v1 added nothing to the store" >&2; exit 1; }
+# The worker's log names the heap it looked up and published, under the key
+# the cache holds it at, so a later miss joins to the publish.
+read -r heap_v1 lookup_v1 < <(heap_line v1 lookup)
+read -r published_key published_v1 < <(heap_line v1 publish)
+[[ "$lookup_v1 $published_v1 $published_key" == "miss published $heap_v1" ]] || {
+  echo "v1 logged lookup $lookup_v1 and publish $published_v1 of $published_key, not a miss and a publish of $heap_v1" >&2
+  exit 1; }
+require_grep '^holbuild-shared-heap-v1$' \
+  "$tmpdir/remote/ac/$(printf 'holbuild-remote-ac-v1\n%s\n' "$heap_v1" | sha256sum | cut -d' ' -f1)"
+# A dependency that passed, not a target, publishes nothing, and says so.
+grep -qE '^holbuild shared-heap publish theory=share:[^ ]* heap=[0-9a-f]{64} result=non-target checkpoints=0$' \
+  "$tmpdir/a-shared-v1.log" || { echo "A logged no non-target publish:" >&2; cat "$tmpdir/a-shared-v1.log" >&2; exit 1; }
 [[ ! -e "$shared/checkpoints" ]] || { echo "the private checkpoint tree outlived the action" >&2; exit 1; }
+# It counts the checkpoint entries it published.
+checkpoints_v1=$(sed -n 's/^holbuild shared-heap publish .* checkpoints=\([0-9]*\)$/\1/p' "$tmpdir/v1.log")
+[[ "$checkpoints_v1" -gt 0 &&
+   "$checkpoints_v1" == "$(grep -lx 'holbuild-shared-checkpoint-v1' "$tmpdir"/remote/ac/* | wc -l)" ]] || {
+  echo "v1 logged checkpoints=$checkpoints_v1, not the checkpoint entries the cache holds" >&2; exit 1; }
 
 # An edit of the first theorem resumes from the shared heap alone.
 write_t "T \\/ F" "simp[]"
@@ -210,6 +238,7 @@ forget_local
 HOLBUILD_CACHE_TRACE=1 worker v2 "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v2 0 "status=built"
 resumed v2 "deps-loaded checkpoint" "deps-loaded heap"
+[[ "$(heap_line v2 lookup)" == "$heap_v1 hit" ]] || { echo "v2 logged no hit on the heap v1 published" >&2; exit 1; }
 # The restore took its blobs zstd-encoded and decoded them itself.
 require_grep "remote cache decode .* zstd threads=4" "$tmpdir/v2.log"
 if grep -q "remote cache decode .* \(identity\|fallback\)" "$tmpdir/v2.log"; then
@@ -328,6 +357,17 @@ for path in $(index_entries); do
     echo "v3e's restore and publish didn't both ask the cache to check its copy of the index" >&2; exit 1; }
 done
 
+# Checkpoint entries the cache refuses aren't counted as published.
+echo "holbuild-shared-checkpoint-v1" > "$tmpdir/control/ac-put-reject-text"
+write_t "F \\/ T" "REFL_TAC"
+export_t v3f
+forget_local
+worker v3f "$shared_url" "$shared" "$spec_t" --share-heaps
+rm "$tmpdir/control/ac-put-reject-text"
+expect v3f 0 "status=built"
+grep -qE '^holbuild shared-heap publish theory=share:[^ ]* heap=[0-9a-f]{64} result=[a-z-]+ checkpoints=0$' \
+  "$tmpdir/v3f.log" || { echo "v3f counted refused checkpoint entries:" >&2; cat "$tmpdir/v3f.log" >&2; exit 1; }
+
 # A failed proof shares its failed prefix, and the fixed proof resumes from it.
 write_t "T \\/ F" "FAIL_TAC \"seeded failure\""
 export_t v4
@@ -353,6 +393,9 @@ shared_entries() {
   echo "v4 published no failed prefix" >&2; exit 1; }
 [[ -z "$(shared_entries "$tmpdir/v4.result")" ]] || {
   echo "v4 published its failed prefix after its result:" >&2; shared_entries "$tmpdir/v4.result" >&2; exit 1; }
+# Its record counts the checkpoint entries it published.
+grep -qE "^phase-ms=(.*,)?pubckptn:[1-9][0-9]*(,|\$)" "$tmpdir/v4.result" || {
+  echo "v4's record counts no published checkpoint:" >&2; cat "$tmpdir/v4.result" >&2; exit 1; }
 require_grep "exec-action after the result (ms): .* modules_ms=" "$tmpdir/v4.log"
 # A resume that gets past the shared failed prefix and fails later shares
 # the later prefix in its place, and the next resume starts from that.

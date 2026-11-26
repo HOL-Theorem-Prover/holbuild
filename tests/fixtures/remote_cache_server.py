@@ -309,6 +309,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(500)
             self.end_headers()
             return
+        if (
+            control is not None
+            and self.path.startswith("/ac/")
+            and (control / "ac-put-reject-text").exists()
+            and (control / "ac-put-reject-text").read_bytes() in data
+        ):
+            self.send_response(403)
+            self.end_headers()
+            return
         action_sequence = (
             next_action_put()
             if urllib.parse.urlparse(self.path).path.startswith("/ac/")

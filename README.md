@@ -2098,6 +2098,7 @@ status=built|cached|failed
 failure=proof|tactic-timeout|script|timeout|memory|input-missing|publish|toolchain|disk|spec-rejected|internal|unavailable
 missing=theory <input_key> | blob <sha256>
 missing-more=theory <input_key>,...
+memory-cause=poly-out-of-store|kernel-oom|both
 detail=<message>
 peak-rss-mb=<n>
 wall-ms=<n>
@@ -2134,7 +2135,10 @@ theory has been exported.
 of heap or the container's cgroup `memory.events` counted an OOM kill during
 a failed run, whether the OOM killer took the HOL process or a process it
 started (a nested HOL whose failure it caught, say); `disk` means the disk
-filled. When the HOL process dies by a signal or the OOM killer's count
+filled. `memory-cause` says which evidence a `memory` failure had: Poly/ML
+ran out of store, the OOM killer's count rose, or both (a worker reporting an
+`exec-action` killed without a record says `sigkill-unknown`). When the HOL
+process dies by a signal or the OOM killer's count
 rose, the log's last lines say which, and the largest resident set of any
 child process of the action so far. The exit status summarizes the record:
 
@@ -2190,6 +2194,24 @@ state, as the theory's one failed prefix. A heap is shared
 only between workers with the same toolchain bytes, cache root, action root,
 platform and holbuild runtime sources compiled into the heap, which is why
 every worker should use the same cache root.
+
+The worker's output names the heap it looked up and what became of it, in
+`holbuild shared-heap lookup theory=<package>:<theory> heap=<key>
+result=<result>` lines: `hit`, `miss`, `wait-hit` or `wait-miss` (another
+worker's claim held the heap, which it then published or released without
+it), `wait-timeout`, `stale` (the entry named lost blobs, failed validation or
+modules the host couldn't get), `declined` (the run preloads afresh rather than
+load a short heap), `unavailable` or `error`. A `publish` line says
+`published`, `present` (another worker's was there), `restored` (the run
+loaded the published one), `skipped-claimed` (another worker was publishing
+it), `refused` (the heap wasn't one this run may publish), `failed`, `none`
+(the run saved none), `non-target`, `no-checkpoint-saves` or `unvalidated`
+(the outputs failed their checks), then `checkpoints=<n>`, the shared
+checkpoint entries the cache took from the run. `heap` is the key the heap's
+entry has in the remote cache. A theory loaded ahead of its parents probes the
+heap too, unless it found a build to reuse, and prints a `hit` or `miss`
+lookup line for the heap's entry; on a hit, the plain build that follows
+prints its own.
 
 A worker publishes a heap of its own only as the preload saved it: the
 preload waits while the worker hashes it, before the theory script runs, and
