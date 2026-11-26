@@ -11,7 +11,9 @@ source "$SCRIPT_DIR/../../lib.sh"
 # HOLBUILD_SCRATCH_INPUT, here and on a worker, and nothing keys it: the
 # action, its dependencies and every checkpoint before the target are the
 # same with and without it, and whatever FILE holds.  Given more than once,
-# the variable holds the paths in order, separated by ":".
+# the variable holds the paths in order, separated by ":".  A worker's child
+# reads each through a link to the worker's blob cache, and no other blob
+# there.
 
 tmpdir=$(make_temp_dir)
 server_pid=""
@@ -72,26 +74,23 @@ val _ =
           in
             print ("scratch input: " ^ TextIO.inputAll input);
             TextIO.closeIn input;
-            print ("scratch links: " ^ Int.toString (Posix.FileSys.ST.nlink (Posix.FileSys.stat path)) ^ "\n");
-            print ("scratch mode: " ^ SysWord.fmt StringCvt.OCT
-                     (SysWord.andb (Posix.FileSys.S.toWord (Posix.FileSys.ST.mode (Posix.FileSys.stat path)), 0wx1ff)) ^ "\n");
-            (* A worker keeps the staged file for later actions, which
-               trust it unread: the child can't change, move or remove it. *)
+            print ("scratch path: " ^ path ^ "\n");
+            (* On a worker it links to the cache's blob, which other actions
+               trust unread: the child can't change, move or remove it, nor
+               list the cache or read the input of another build. *)
             if not (String.isSubstring "/.holbuild/scratch/" path) then () else
             let
-              val dir = OS.Path.dir path
+              val blobs = "$worker_cache/blobs"
               fun denied f = (f (); false) handle _ => true
               val tries =
                 [("append", fn () => BinIO.closeOut (BinIO.openAppend path)),
                  ("rename", fn () => OS.FileSys.rename {old = path, new = path ^ ".moved"}),
                  ("remove", fn () => OS.FileSys.remove path),
-                 ("move dir", fn () => OS.FileSys.rename {old = dir, new = dir ^ ".moved"})]
-              fun names stream =
-                case OS.FileSys.readDir stream of
-                    NONE => (OS.FileSys.closeDir stream; [])
-                  | SOME name => name :: names stream
+                 ("list", fn () => OS.FileSys.closeDir (OS.FileSys.openDir blobs)),
+                 ("other", fn () => TextIO.closeIn (TextIO.openIn (OS.Path.concat (blobs, "$other_blob"))))]
             in
-              print ("scratch dir: " ^ String.concatWith " " (names (OS.FileSys.openDir dir)) ^ "\n");
+              print ("scratch links: " ^ Int.toString (Posix.FileSys.ST.nlink (Posix.FileSys.stat path)) ^ "\n");
+              print ("scratch target: " ^ (Posix.FileSys.readlink path handle OS.SysErr _ => "none") ^ "\n");
               print ("scratch tamper: " ^
                      String.concatWith " " (map (fn (what, f) => what ^ (if denied f then "=denied" else "=allowed")) tries) ^ "\n")
             end
@@ -105,9 +104,13 @@ Proof
 QED
 SML
 }
-write_u 'simp[]'
 printf 'one\n' > "$tmpdir/one.txt"
 printf 'two\n' > "$tmpdir/two.txt"
+# The blob a child of a build with input two must not read, in the
+# worker's cache.
+other_blob=$(sha256sum "$tmpdir/one.txt" | cut -d' ' -f1)
+worker_cache=$tmpdir/worker
+write_u 'simp[]'
 
 hb() { (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" "$@"); }
 field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $col }' "$1"; }
@@ -181,7 +184,6 @@ if grep -q "$sha_one" "$stats"; then echo "a hash read within a second of a chan
 
 # worker_command NAME SPEC [OPTION...]: exec-action of SPEC in the worker's
 # cache root, sharing heaps.
-worker_cache=$tmpdir/worker
 link_hol_toolchain_cache "$worker_cache"
 worker_command() {
   local name=$1 spec=$2
@@ -200,8 +202,22 @@ built() {
     echo "worker $1: U did not read '$2'" >&2; cat "$tmpdir/$1.hol" "$tmpdir/$1.log" >&2; exit 1; }
 }
 
+copies() { sed -n 's/.*[=,]scratchcopyn:\([0-9]*\).*/\1/p' "$tmpdir/$1.result"; }
+# in_place NAME SHA LINKS TARGET: worker NAME's child read the input SHA
+# staged in its action root, a file with LINKS links, a symbolic link to
+# TARGET if not "none", and could neither change it nor see other blobs.
+in_place() {
+  grep -qx "scratch path: $(realpath "$worker_cache/action")/.holbuild/scratch/$2" "$tmpdir/$1.hol" &&
+    grep -qx "scratch links: $3" "$tmpdir/$1.hol" && grep -qx "scratch target: $4" "$tmpdir/$1.hol" || {
+    echo "worker $1: the input is not staged as expected" >&2; grep "^scratch" "$tmpdir/$1.hol" >&2; exit 1; }
+  grep -qx "scratch tamper: append=denied rename=denied remove=denied list=denied other=denied" "$tmpdir/$1.hol" || {
+    echo "worker $1: the child could change the input, list the cache or read another blob" >&2
+    grep "scratch tamper" "$tmpdir/$1.hol" >&2; exit 1; }
+}
+
 # A run loading ahead of a parent still building stages the input for the
-# child it starts.
+# child it starts: the input, which the worker's cache lacks, is fetched into
+# it read-only, and the child reads a hard link to it.
 waiting=$worker_cache/action/.holbuild/ahead/waiting-ATheory
 worker_command u-one "$(field "$tmpdir/batch-one.txt" scratch:UTheory 4)" \
   --ahead-parent "$(field "$tmpdir/batch-one.txt" scratch:ATheory 2):$(field "$tmpdir/batch-one.txt" scratch:ATheory 4)" &
@@ -220,6 +236,10 @@ HOLBUILD_CACHE=$tmpdir/worker-a "$HOLBUILD_BIN" --remote-cache "$remote_url" exe
   echo "worker a failed" >&2; cat "$tmpdir/a.log" >&2; exit 1; }
 wait "$u_pid" || true
 built u-one one
+in_place u-one "$sha_one" 2 none
+[[ "$(copies u-one)" == 1 && "$(stat -c %a "$worker_cache/blobs/$sha_one")" == 444 ]] || {
+  echo "the input was not fetched read-only into the cache" >&2; cat "$tmpdir/u-one.result" >&2
+  ls -la "$worker_cache/blobs" >&2; exit 1; }
 
 # Another input resumes from the theorem context the first shared.  The run
 # loads ahead of A, unpublished until U waits for it; then the heap U shared
@@ -244,10 +264,7 @@ done
 mv "$tmpdir/ac-A" "$tmpdir/remote/ac/$ac_A"
 wait "$u_pid" || true
 built u-two two
-# Staged again with the blob in the worker's cache, the input is a
-# read-only link to it.
-grep -qx "scratch links: 2" "$tmpdir/u-two.hol" && [[ "$(stat -c %a "$worker_cache/blobs/$sha_two")" == 444 ]] || {
-  echo "the restaged scratch input is not the cache's read-only blob" >&2; cat "$tmpdir/u-two.hol" >&2; exit 1; }
+in_place u-two "$sha_two" 2 none
 require_grep "loading ahead found a build to reuse; building plain" "$tmpdir/u-two.log"
 require_grep "from: theorem-context checkpoint after u1" "$tmpdir/u-two.log"
 
@@ -259,68 +276,51 @@ worker_command u-both "$(field "$tmpdir/batch-both.txt" scratch:UTheory 4)"
 built u-both one
 grep -A5 -x "scratch input: one" "$tmpdir/u-both.hol" | grep -qx "scratch input: two" || {
   echo "worker u-both: U did not read both inputs in order" >&2; cat "$tmpdir/u-both.hol" >&2; exit 1; }
+# Both are in the cache already: nothing is fetched.
+[[ "$(copies u-both)" == 0 ]] || { echo "u-both fetched an input the cache holds" >&2; cat "$tmpdir/u-both.result" >&2; exit 1; }
 
 # Across file systems, as a worker container's action root beside a
-# host-mounted cache, the input is a read-only copy of the cache's blob.
+# host-mounted cache, the input is a symbolic link to the cache's blob,
+# which the child may read alone of the cache.
 if [[ -d /dev/shm && -w /dev/shm && "$(stat -c %d /dev/shm)" != "$(stat -c %d "$worker_cache")" ]]; then
   xdev=$(mktemp -d /dev/shm/holbuild-test.XXXXXX)
   cp -a "$worker_cache/blobs/." "$xdev/"
   rm -rf "$worker_cache/blobs"
   ln -s "$xdev" "$worker_cache/blobs"
-  # As in a new container: nothing is kept yet.
-  rm -rf "$worker_cache/action-scratch"
   write_u 'ALL_TAC >> simp[]'
   hb action-spec --upload --scratch-input "$tmpdir/two.txt" UTheory > "$tmpdir/batch-xdev.txt"
   worker_command u-xdev "$(field "$tmpdir/batch-xdev.txt" scratch:UTheory 4)"
   built u-xdev two
-  # The input is a link to the worker's read-only copy, kept outside the
-  # root, which is emptied after the action.
-  kept=$worker_cache/action-scratch/$sha_two
-  grep -qx "scratch links: 2" "$tmpdir/u-xdev.hol" && grep -qx "scratch mode: 444" "$tmpdir/u-xdev.hol" &&
-    [[ "$(stat -c %a "$kept")" == 444 ]] || {
-    echo "across file systems the input is not a link to a read-only copy" >&2; cat "$tmpdir/u-xdev.hol" >&2; exit 1; }
-  [[ ! -e "$worker_cache/action/.holbuild/scratch" ]] || {
-    echo "the root kept its staged input" >&2; ls -la "$worker_cache/action/.holbuild/scratch" >&2; exit 1; }
-  grep -qx "scratch tamper: append=denied rename=denied remove=denied move dir=denied" "$tmpdir/u-xdev.hol" || {
-    echo "the child could change the staged input" >&2; grep "scratch tamper" "$tmpdir/u-xdev.hol" >&2; exit 1; }
-  copies() { sed -n 's/.*[=,]scratchcopyn:\([0-9]*\).*/\1/p' "$tmpdir/$1.result"; }
-  [[ "$(copies u-xdev)" == 1 ]] || { echo "u-xdev did not count its copy" >&2; cat "$tmpdir/u-xdev.result" >&2; exit 1; }
-  # The next action with the input links the same copy.
-  inode=$(stat -c %i "$kept")
-  write_u 'ALL_TAC >> ALL_TAC >> simp[]'
-  hb action-spec --upload --scratch-input "$tmpdir/two.txt" UTheory > "$tmpdir/batch-kept.txt"
-  worker_command u-kept "$(field "$tmpdir/batch-kept.txt" scratch:UTheory 4)"
-  built u-kept two
-  [[ "$(stat -c %i "$kept")" == "$inode" && "$(copies u-kept)" == 0 ]] || {
-    echo "the kept input was copied again" >&2; cat "$tmpdir/u-kept.result" >&2; exit 1; }
-  # One left writable, as by a copy interrupted before its chmod, is copied
-  # again.  At most eight copies are kept, this action's and then the latest
-  # used; anything else goes, a link but not its target.  The child sees
-  # only its own input.
-  chmod 644 "$kept"
-  store=$(dirname "$kept")
-  for i in 1 2 3 4 5 6 7 8 9; do
-    name=$(printf '%064d' "$i")
-    printf 'old %s\n' "$i" > "$store/$name"
-    chmod 444 "$store/$name"
-    touch -d "-$((10 - i)) minutes" "$store/$name"
+  in_place u-xdev "$sha_two" 1 "$(realpath "$xdev")/$sha_two"
+  [[ "$(copies u-xdev)" == 0 ]] || { echo "u-xdev fetched an input the cache holds" >&2; cat "$tmpdir/u-xdev.result" >&2; exit 1; }
+  # The blob leaves the cache while the child waits for a parent still
+  # building, so the child can't read it: the action fails as the worker's
+  # fault, to be retried, and the retry fetches the input again.
+  printf '\nTheorem a2:\n  T\nProof\n  simp[]\nQED\n' >> "$project/src/AScript.sml"
+  hb action-spec --upload --scratch-input "$tmpdir/two.txt" UTheory > "$tmpdir/batch-evict.txt"
+  worker_command u-evict "$(field "$tmpdir/batch-evict.txt" scratch:UTheory 4)" \
+    --ahead-parent "$(field "$tmpdir/batch-evict.txt" scratch:ATheory 2):$(field "$tmpdir/batch-evict.txt" scratch:ATheory 4)" &
+  u_pid=$!
+  background+=("$u_pid")
+  for _ in {1..1200}; do
+    [[ -e "$waiting" ]] && break
+    kill -0 "$u_pid" 2>/dev/null || break
+    sleep 0.1
   done
-  printf 'partial\n' > "$store/.$sha_two.1.tmp"
-  printf 'outside\n' > "$tmpdir/outside.txt"
-  ln -s "$tmpdir/outside.txt" "$store/$(printf 'a%063d' 0)"
-  mkdir "$store/$(printf 'b%063d' 0)"
-  write_u 'ALL_TAC >> ALL_TAC >> ALL_TAC >> simp[]'
-  hb action-spec --upload --scratch-input "$tmpdir/two.txt" UTheory > "$tmpdir/batch-pruned.txt"
-  worker_command u-pruned "$(field "$tmpdir/batch-pruned.txt" scratch:UTheory 4)"
-  built u-pruned two
-  [[ "$(stat -c %a "$kept")" == 444 && "$(copies u-pruned)" == 1 ]] || {
-    echo "a writable kept input was reused" >&2; cat "$tmpdir/u-pruned.result" >&2; exit 1; }
-  grep -qx "scratch dir: $sha_two" "$tmpdir/u-pruned.hol" || {
-    echo "the child saw other inputs" >&2; grep "scratch dir" "$tmpdir/u-pruned.hol" >&2; exit 1; }
-  expected=$(printf '%s\n' "$sha_two" $(for i in 3 4 5 6 7 8 9; do printf '%064d ' "$i"; done) | sort)
-  [[ "$(ls -A "$store" | sort)" == "$expected" ]] || {
-    echo "the kept inputs were not pruned to eight:" >&2; ls -lA "$store" >&2; exit 1; }
-  [[ -f "$tmpdir/outside.txt" ]] || { echo "pruning followed a link" >&2; exit 1; }
+  [[ -e "$waiting" ]] || { echo "U never waited for A" >&2; cat "$tmpdir/u-evict.log" >&2; exit 1; }
+  rm "$xdev/$sha_two"
+  HOLBUILD_CACHE=$tmpdir/worker-a "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action \
+    "$(field "$tmpdir/batch-evict.txt" scratch:ATheory 4)" --cache-limit-gb 1000 \
+    --result "$tmpdir/a-evict.result" > "$tmpdir/a-evict.log" 2>&1 || {
+    echo "worker a failed" >&2; cat "$tmpdir/a-evict.log" >&2; exit 1; }
+  wait "$u_pid" || true
+  grep -qx "failure=internal" "$tmpdir/u-evict.result" && require_grep "a scratch input left the worker's cache" "$tmpdir/u-evict.log" || {
+    echo "a child that lost its scratch input did not fail as the worker's fault" >&2
+    cat "$tmpdir/u-evict.result" "$tmpdir/u-evict.log" >&2; exit 1; }
+  worker_command u-evict "$(field "$tmpdir/batch-evict.txt" scratch:UTheory 4)"
+  built u-evict two
+  in_place u-evict "$sha_two" 1 "$(realpath "$xdev")/$sha_two"
+  [[ "$(copies u-evict)" == 1 ]] || { echo "the retry did not fetch the input again" >&2; cat "$tmpdir/u-evict.result" >&2; exit 1; }
 else
   echo "skipping the cross-file-system scratch input check: no writable /dev/shm on another device"
 fi

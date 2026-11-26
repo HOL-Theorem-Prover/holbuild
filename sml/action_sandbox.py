@@ -329,6 +329,9 @@ class Policy:
     # Writable like the private roots, but never harvested, so not validated as outputs.
     scratch: list[Path] = field(default_factory=list)
     toolchain: bool = False
+    # Stores of the worker's (blobs, checkpoints, theory modules) whose files
+    # an action may read one by one, but neither write nor list.
+    keep_read_only: list[Path] = field(default_factory=list)
 
     def validate(self) -> None:
         for grant in self.writable + self.scratch:
@@ -338,6 +341,10 @@ class Policy:
         for grant in self.readable + self.writable + self.scratch:
             if exposes(grant):
                 raise SandboxError(f"sandbox grant contains protected worker state: {grant}")
+        stored = exposure(self.keep_read_only)
+        for grant in self.writable + self.scratch + [grant for grant in self.readable if grant.is_dir()]:
+            if stored(grant):
+                raise SandboxError(f"sandbox grant opens a read-only store beyond single files: {grant}")
 
     def usable_scratch(self, scratch: list[Path], passed: set[Path]) -> list[Path]:
         """The SCRATCH directories that hold no protected state, no read-only
@@ -1024,6 +1031,7 @@ def main() -> int:
             [path for name in args.forbid for path in spellings(name)[0]] +
             [path.resolve() for path in (args.completed, options) if path is not None],
             toolchain=args.toolchain,
+            keep_read_only=[path for name in args.keep_read_only for path in spellings(name)[0]],
         )
         # A scratch directory holding protected state, a read-only grant or a
         # --keep-read-only tree is left out rather than failing the action:

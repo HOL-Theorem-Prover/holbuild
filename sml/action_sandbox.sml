@@ -15,6 +15,9 @@ val result_file : string option ref = ref NONE
    which no child writes or lists.  Called at each launch, so it sees
    modules installed since it was set. *)
 val module_reads : (unit -> string list) ref = ref (fn () => [])
+(* The scratch inputs a theory child reads in place from the host's blob
+   cache, each its own file: the blobs its action's spec names. *)
+val scratch_reads : string list ref = ref []
 (* While set, a child writes only these directories and may read, but not
    write, the private roots. *)
 val output_dirs : string list option ref = ref NONE
@@ -193,7 +196,7 @@ fun grant_options ({writable, readable = extra, toolchain} : grants) =
     val cache = absolute (HolbuildCacheConfig.cache_root ())
     val protected_paths =
       map (fn part => OS.Path.concat (cache, part))
-          ["actions", "blobs", "locks", "action-locks", "cooperate", "toolchain-trust", "git",
+          ["actions", "locks", "action-locks", "cooperate", "toolchain-trust", "git",
            "hol-toolchains/.locks", "action.lock"] @
       List.mapPartial
         (fn entry =>
@@ -220,8 +223,9 @@ fun grant_options ({writable, readable = extra, toolchain} : grants) =
     options "--read" (List.mapPartial (fn path => SOME (full path) handle OS.SysErr _ => NONE) readable) @
     options "--forbid" forbidden @
     (* Restored states link into the store, and theory children read
-       single modules of the theory module stores. *)
-    options "--keep-read-only" (map (fn dir => OS.Path.concat (cache, dir)) ["checkpoint-store", "theory-modules"]) @
+       single modules of the theory module stores and single scratch inputs
+       of the blob cache. *)
+    options "--keep-read-only" (map (fn dir => OS.Path.concat (cache, dir)) ["checkpoint-store", "theory-modules", "blobs"]) @
     (* Poly/ML's OS.FileSys.tmpName always creates files in /tmp, ignoring
        TMPDIR; HolSat and HolSmt need it.  The helper leaves it out if
        protected worker state, holbuild's TMPDIR included, lies beneath it. *)
@@ -339,14 +343,14 @@ fun checkpoint_grants checkpoints =
    Under with_output_dirs (the worker's module writer), the child writes
    only those directories and reads the action root; it runs after the
    action's checkpoints are gone.  Either reads the modules module_reads
-   names. *)
+   names; only the theory action the scratch inputs scratch_reads names. *)
 fun action_grants (root, checkpoints) : grants =
   case !output_dirs of
       NONE =>
         let val {writable = saves, readable = stored} = checkpoint_grants checkpoints
         in
           {writable = getOpt (!action_write_dirs, [root]) @ saves,
-           readable = [root, checkpoints] @ stored @ !module_reads (), toolchain = false}
+           readable = [root, checkpoints] @ stored @ !module_reads () @ !scratch_reads, toolchain = false}
         end
     | SOME dirs => {writable = dirs, readable = root :: !module_reads (), toolchain = false}
 
