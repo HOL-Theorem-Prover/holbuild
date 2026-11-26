@@ -158,11 +158,15 @@ def test_held_target_holds_a_high_target_across_a_brief_dip() -> None:
 
 
 async def test_scale_preserves_an_earned_target_after_its_samples_age_out(
-    coordinator: Coordinator,
+    coordinator: Coordinator, tmp_path: Path
 ) -> None:
     start = datetime(2026, 1, 1, tzinfo=UTC)
     now = start
     demand = 120
+    calls = tmp_path / "scaled"
+    command = tmp_path / "scale"
+    command.write_text(f'#!/bin/sh\necho "$1" >> {calls}\n')
+    command.chmod(0o755)
     settings = coordinator.settings.model_copy(
         update={
             "max_burst_workers": 540,
@@ -170,6 +174,7 @@ async def test_scale_preserves_an_earned_target_after_its_samples_age_out(
             "scale_up_hold_s": 180.0,
             "scale_up_free_workers": 96,
             "cache_scale_down_hold_s": 900.0,
+            "scale_cmd": str(command),
         }
     )
     scaled = Coordinator(coordinator.engine, coordinator.cache, settings)
@@ -195,10 +200,42 @@ async def test_scale_preserves_an_earned_target_after_its_samples_age_out(
         await scaled.scale()
 
     assert (await scaled.queue()).desired_burst_workers == 80
+    assert calls.read_text().split() == ["96", "120", "80"]
     async with coordinator.engine.connect() as connection:
         assert await connection.scalar(
             sa.text("SELECT count(*) FROM burst_demand WHERE at = :at"), {"at": start + timedelta(seconds=300)}
         ) == 0
+    await scaled.released()
+
+
+async def test_scale_command_does_not_scale_above_free_workers_for_a_short_spike(
+    coordinator: Coordinator, tmp_path: Path
+) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = start
+    demand = 120
+    calls = tmp_path / "scaled"
+    command = tmp_path / "scale"
+    command.write_text(f'#!/bin/sh\necho "$1" >> {calls}\n')
+    command.chmod(0o755)
+    settings = coordinator.settings.model_copy(
+        update={
+            "max_burst_workers": 540,
+            "scale_down_hold_s": 60.0,
+            "scale_up_hold_s": 180.0,
+            "scale_up_free_workers": 96,
+            "scale_cmd": str(command),
+        }
+    )
+    scaled = Coordinator(coordinator.engine, coordinator.cache, settings)
+    scaled.clock = lambda: now
+    scaled._burst_demand = lambda counts: demand
+
+    for seconds, demand in ((0, 120), (5, 80), (65, 80)):
+        now = start + timedelta(seconds=seconds)
+        await scaled.scale()
+
+    assert calls.read_text().split() == ["96", "80"]
     await scaled.released()
 
 
