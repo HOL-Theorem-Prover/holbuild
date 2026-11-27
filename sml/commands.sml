@@ -4500,21 +4500,17 @@ fun exec_action_command maxheap jobs args =
         (* Every worker must run the published archive's bytes, so a build
            whose own publish lost is replaced by the stored archive. *)
         val _ = HolbuildHolSharedCache.adopt_published_archive := true
-        (* The toolchain's own steps run confined too, and read this runtime. *)
-        val _ = HolbuildActionSandbox.poly_executable := HolbuildHolSharedCache.poly_executable_path ()
         val kernel_variant = HolbuildHolToolchainConfig.StandardKernel
         val holdir = HolbuildHolSharedCache.ensure_built_with_kernel jobs
                        {git = git, rev = rev, kernel_variant = kernel_variant}
         val tc = {holdir = holdir, maxheap = maxheap, kernel_variant = kernel_variant}
-        val _ = HolbuildActionSandbox.toolchain_root := holdir
       in
         configure_analyser_for_toolchain tc; tc
       end
     (* An error outside the action itself (no remote cache, the action lock,
        writing the record) is an infrastructure failure, never a final one. *)
     val code =
-      (HolbuildActionSandbox.protect_process ();
-       HolbuildRemoteCacheConfig.setup_client ();
+      (HolbuildRemoteCacheConfig.setup_client ();
        HolbuildBuildExec.exec_action
          {spec_sha256 = spec, result_file = result, cache_cap = cache_cap, share_heaps = share,
           deps_heap_only = deps_heap_only,
@@ -4549,11 +4545,9 @@ fun dispatch_with_options {holdir, source_dir, cache_dir, remote_cache, jobs, ma
    (* A build, explicit or implicit, under --remote-only must not build HOL. *)
    (HolbuildHolSharedCache.restore_only := List.exists (fn arg => arg = "--remote-only") args;
    case args of
-       ["sandbox-check"] =>
-         (ignore (HolbuildActionSandbox.trusted_repositories ());
-         if HolbuildToolchain.success
-              (OS.Process.system ("python3 -I " ^ HolbuildToolchain.quote (HolbuildActionSandbox.helper ()) ^ " --check"))
-         then () else raise Error "exec-action sandbox is unavailable")
+       (* Workers run it before a release's first action; exec-action has no
+          sandbox left to check, only its trust configuration. *)
+       ["sandbox-check"] => ignore (HolbuildActionSandbox.trusted_repositories ())
      | "gc" :: rest => (reject_json "gc"; gc rest)
      | "cache" :: rest => (reject_json "cache"; HolbuildCache.dispatch rest)
      | "import" :: rest => (reject_json "import"; import_archive rest)

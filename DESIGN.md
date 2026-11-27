@@ -203,7 +203,7 @@ On a remote worker an action only reads the store, so that no action can
 plant a module another one loads. After a theory action's result, built
 or failed, the worker first fetches from the remote cache the missing
 modules of the theories the action loads that another worker published, then
-has a sandboxed child that runs no project code write those still missing,
+has a child that runs no project code write those still missing,
 from their restored `.dat` files alone, moves into the store only the files
 named for those theories' `.dat` files, and publishes them. A published
 module's key names the toolchain's exact identity (its HOL state, so the base
@@ -868,15 +868,11 @@ copying small theory files.
 The blobs linked rather than copied are a build's `--scratch-input` files on a
 worker: each can be large and is the same for many actions, so `exec-action`
 links the local cache's read-only blob into the action root as
-`.holbuild/scratch/<sha256>`, outside every sandbox write and scratch root, and
-the theory child reads it there. Its hash was checked when it entered the
-cache. On the same file system the link is a hard link; across file systems (a
-worker container's action root beside a host-mounted cache) it is a symbolic
-link, and the sandbox grants the child that one blob to read, as it grants
-single theory modules: the child can't list the blob cache, open another blob
-or write the one it reads, and the sandbox helper refuses any grant that would
-let an action write the blob cache or read it as a directory. A blob the cache
-lacks is fetched beside its name, made read-only and published with a link,
+`.holbuild/scratch/<sha256>`, and the theory child reads it there. Its hash
+was checked when it entered the cache. On the same file system the link is a
+hard link; across file systems (a worker container's action root beside a
+host-mounted cache) it is a symbolic link. A blob the cache lacks is fetched
+beside its name, made read-only and published with a link,
 which, unlike a rename, never replaces a blob another action's child may be
 reading; so a host fetches an input once, and every worker sharing its cache
 reads it from there. Should that fail, the input is fetched into the action

@@ -162,6 +162,20 @@ fun run_interactive argv =
 fun run_in_dir dir argv =
   timed_shell "run_in_dir" argv NONE ("cd " ^ quote dir ^ " && " ^ command argv)
 
+(* Runs RUN, ARGV as wrapped for the child, in DIR with its output in OUTPUT;
+   exit status 125 if it can't enter DIR, open OUTPUT or find ARGV's program,
+   so a child's own exit status stays its result. *)
+fun child_script dir argv run output =
+  let
+    val program = hd argv
+    val found =
+      if CharVector.exists (fn c => c = #"/") program then "test -x " ^ quote program
+      else "command -v " ^ quote program ^ " > /dev/null"
+  in
+    "cd " ^ quote dir ^ " && true > " ^ quote output ^ " && " ^ found ^ " || exit 125; " ^
+    command run ^ " > " ^ quote output ^ " 2>&1"
+  end
+
 (* Theory children, generators and heap exports all start here, so this is
    where they take a machine memory reservation (--cooperate-dir). *)
 fun run_in_dir_to_file dir argv output =
@@ -169,13 +183,12 @@ fun run_in_dir_to_file dir argv output =
     (fn lease =>
         timed_system "run_in_dir_to_file" argv (SOME output)
           (fn () =>
-              HolbuildActionSandbox.launch argv (fn confined =>
-                HolbuildProcessGroup.run_shell_inheriting lease
-                  ("cd " ^ quote dir ^ " && " ^
-                   (if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
-                   command confined ^ " > " ^ quote output ^ " 2>&1"))))
+              HolbuildActionSandbox.launch argv
+                (fn run =>
+                    HolbuildProcessGroup.run_shell_inheriting lease
+                      (child_script dir argv run output))
+                (fn status => status)))
   handle HolbuildMachineMemory.Error msg => raise Error msg
-       | HolbuildActionSandbox.Error msg => raise Error msg
 
 (* As run_in_dir_to_file, killing the child at the time DEADLINE () gives
    once the memory reservation is granted. *)
@@ -189,17 +202,16 @@ fun run_in_dir_to_file_by dir argv output deadline =
               (fn () =>
                   let
                     val result =
-                      HolbuildActionSandbox.launch argv (fn confined =>
-                        HolbuildProcessGroup.run_shell_inheriting_until lease (deadline ())
-                          ("cd " ^ quote dir ^ " && " ^
-                           (if HolbuildActionSandbox.active () then "HOLBUILD_SANDBOX_PARENT=$$ " else "") ^
-                           command confined ^ " > " ^ quote output ^ " 2>&1"))
+                      HolbuildActionSandbox.launch argv
+                        (fn run =>
+                            HolbuildProcessGroup.run_shell_inheriting_until lease (deadline ())
+                              (child_script dir argv run output))
+                        #status
                   in
                     timed_out := #timed_out result;
                     #status result
                   end))
       handle HolbuildMachineMemory.Error msg => raise Error msg
-           | HolbuildActionSandbox.Error msg => raise Error msg
   in
     {status = status, timed_out = !timed_out}
   end

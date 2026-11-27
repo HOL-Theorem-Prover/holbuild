@@ -177,8 +177,8 @@ fun mutation_lease_setup NONE = []
 
 (* The watcher closes fd 9: it ignores TERM and can outlive the script by a
    few hundred milliseconds, and must not keep holding the mutation lease. *)
-(* The EXIT trap keeps this shell alive instead of exec'ing its last command;
-   sandbox launchers use that stable shell PID to detect parent death. *)
+(* The EXIT trap keeps this shell alive instead of exec'ing its last command,
+   so the watcher is stopped when the script ends. *)
 (* A cancelled leader stays a zombie until its output drains. kill -0 alone
    would keep the watcher waiting while a helper still holds stdout open.
    Read proc stat without forking on Linux; its last line and final ') '

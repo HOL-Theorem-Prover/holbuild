@@ -388,8 +388,7 @@ fun analyser_failure {status, stderr, pressure, ...} =
   (if stderr = "" then "" else "\n" ^ stderr)
 
 (* Capture every attempt's stderr; CAPTURE_STDERR retains successful stderr
-   for the caller instead of echoing it. A confined response is read only
-   after sandbox validation, and confined calls never retry. *)
+   for the caller instead of echoing it. *)
 fun run_analyser {analyser, request, capture_stderr} =
   HolbuildProcessGroup.with_cancellation_token (fn token =>
   let
@@ -411,28 +410,19 @@ fun run_analyser {analyser, request, capture_stderr} =
                     else NONE}
       end
     fun attempt () =
-      let val before_events = HolbuildMachineMemory.cgroup_memory_events ()
+      let
+        val before_events = HolbuildMachineMemory.cgroup_memory_events ()
+        (* tmpName swaps the process umask, racing parallel analysers. *)
+        val dir = HolbuildTempPath.temporary "analyser"
+        fun remove () = HolbuildRemoveTree.remove_untrusted dir handle _ => ()
+        fun go () =
+          (OS.FileSys.mkDir dir;
+           write_file (OS.Path.concat(dir, "request")) request;
+           result dir before_events
+             (HolbuildProcessGroup.run_shell_output_cancellable token
+                (HolbuildActionSandbox.child_shell (command dir))))
       in
-        case !HolbuildActionSandbox.private_roots of
-            SOME (root, checkpoints) =>
-              HolbuildActionSandbox.shell
-                {writable = [], readable = [OS.Path.dir (OS.Path.dir analyser), root, checkpoints], toolchain = false}
-                (fn work => (write_file (OS.Path.concat(work, "request")) request; command work))
-                (HolbuildProcessGroup.run_shell_output_cancellable token)
-                (fn (work, outcome) => result work before_events outcome)
-          | NONE =>
-              let
-                (* tmpName swaps the process umask, racing parallel analysers. *)
-                val dir = HolbuildTempPath.temporary "analyser"
-                fun remove () = HolbuildRemoveTree.remove_untrusted dir handle _ => ()
-                fun go () =
-                  (OS.FileSys.mkDir dir;
-                   write_file (OS.Path.concat(dir, "request")) request;
-                   result dir before_events
-                     (HolbuildProcessGroup.run_shell_output_cancellable token (command dir)))
-              in
-                (go () before remove ()) handle e => (remove (); raise e)
-              end
+        (go () before remove ()) handle e => (remove (); raise e)
       end
     fun run retries output =
       let
@@ -440,7 +430,7 @@ fun run_analyser {analyser, request, capture_stderr} =
         val outcome as {status, stderr, response, pressure, output = attempt_output} = attempt ()
         val output = output ^ attempt_output
       in
-        if not (HolbuildActionSandbox.active ()) andalso analyser_killed status andalso retries < 2 then
+        if analyser_killed status andalso retries < 2 then
           (HolbuildBoundedOutput.text (TextIO.stdErr, analyser_failure outcome ^
              "\nretrying analyser (" ^ Int.toString (retries + 1) ^ "/2)\n");
            HolbuildProcessGroup.require_uncancelled token;

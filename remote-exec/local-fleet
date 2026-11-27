@@ -19,8 +19,8 @@ usage: local-fleet [--workers N] [--dir DIR] [--toolchain DIR]... [--keep] TREE 
 
 TREE      a holbuild checkout with bin/holbuild built
 --workers workers to start (default 4)
---dir     run directory for logs, the database and caches: new or empty, not under
-          /tmp, a plain path (default: a new directory in ~/.cache/holbuild-local-fleet)
+--dir     run directory for logs, the database and caches: new or empty,
+          a plain path (default: a new directory in ~/.cache/holbuild-local-fleet)
 --toolchain
           a built HOL toolchain, one entry of a holbuild cache's hol-toolchains, to
           use without building it; repeatable. Its hol/ tree is used in place (HOL
@@ -38,7 +38,7 @@ first on PATH, e.g.
     sh -c 'holbuild build FooTheory --remote-exec "$LOCAL_FLEET_URL" --remote-only'
 The services, the workers and the tools that set them up start from an empty
 environment: of the caller's, only PATH reaches them, and the workers also get
-HOLBUILD_ACTION_READ_DIRS and the HOL4_* solver settings, which a worker image sets.
+the HOL4_* solver settings, which a worker image sets.
 Needs initdb, pg_ctl, createdb and psql on PATH, and uv.
 EOF
 }
@@ -88,9 +88,6 @@ fi
 dir=$(realpath -m "$dir")
 # Postgres's socket, $dir/.s.PGSQL.<port>, must fit a socket address (107 bytes).
 ((${#dir} <= 89)) || { echo "local-fleet: the run directory $dir is longer than 89 characters, too long for Postgres's socket path" >&2; exit 2; }
-# The action sandbox gives HOL /tmp, where Poly's temp files go (HolSat, intLib), only
-# when no worker state lies under it: the run directory and the workers' TMPDIR stay out.
-[[ $dir/ != /tmp/* ]] || { echo "local-fleet: the run directory $dir is under /tmp, which the action sandbox would then withhold from HOL" >&2; exit 2; }
 # It goes unquoted into Postgres's options and quoted into psql's commands.
 [[ $dir =~ ^[A-Za-z0-9/._+-]+$ ]] || { echo "local-fleet: the run directory $dir must be a plain path (letters, digits, / . _ + -)" >&2; exit 2; }
 mkdir -p -m 700 "$dir"
@@ -103,7 +100,6 @@ chmod 700 "$dir"
 if [[ -n $(ls -A "$dir") ]] || ! mkdir "$dir/logs" 2>/dev/null; then not_empty; fi
 mkdir -p "$dir"/{home,remote,baked,releases,cooperate,client-cache,hol-toolchains,tables,tmp}
 ln -sfn "$tree" "$dir/baked/v$version"
-read_dirs=${HOLBUILD_ACTION_READ_DIRS:-}
 for t in "${toolchains[@]}"; do
   t=$(realpath "$t")
   entry=$dir/hol-toolchains/$(basename "$t")
@@ -111,7 +107,6 @@ for t in "${toolchains[@]}"; do
   find "$t" -mindepth 1 -maxdepth 1 -type f ! -name last-used -exec cp -p -t "$entry/" {} +
   : > "$entry/last-used"
   ln -sfn "$t/hol" "$entry/hol"
-  read_dirs=${read_dirs:+$read_dirs:}$t/hol
 done
 # Each worker needs a cache of its own: exec-action locks it for the whole action.
 for c in client-cache $(seq -f worker-cache-%g "$workers"); do
@@ -268,10 +263,10 @@ for i in $(seq "$workers"); do
     cd "$dir"
     export REMOTE_EXEC_WORKER_TOKEN=$worker_token HOLBUILD_CACHE=$dir/worker-cache-$i \
       HOLBUILD_REMOTE_CACHE_CURL_CONFIG=$dir/cache.curl HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES='*' \
-      HOLBUILD_ACTION_READ_DIRS=$read_dirs PYTHONPATH=$tree/remote-exec
+      PYTHONPATH=$tree/remote-exec
     # The caller stands in for the worker image here: its HOL4_* solver settings pass, as the image's would.
     isolate REMOTE_EXEC_WORKER_TOKEN HOLBUILD_CACHE HOLBUILD_REMOTE_CACHE_CURL_CONFIG \
-      HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES HOLBUILD_ACTION_READ_DIRS PYTHONPATH $(compgen -e | grep '^HOL4_' || true)
+      HOLBUILD_EXEC_TRUSTED_HOL_REPOSITORIES PYTHONPATH $(compgen -e | grep '^HOL4_' || true)
     exec env "${unenv[@]}" setsid "$python" -m remote_exec.worker \
       --coordinator "$url" --remote-cache "$cache_url" --tier high --also-claim standard --load-ahead \
       --max-heap 12000 --drain-seconds 20 --share-heaps --cooperate-dir "$dir/cooperate" --cache-limit-gb 100 \

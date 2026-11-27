@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 tmpdir=$(make_temp_dir)
 trap 'cleanup_temp_dir "$tmpdir"' EXIT
 export HOLBUILD_CACHE=$tmpdir/cache
-mkdir -p "$HOLBUILD_CACHE" "$tmpdir/bin" "$tmpdir/group/child" "$tmpdir/root" "$tmpdir/checkpoints" "$tmpdir/toolchain/analyser/bin"
+mkdir -p "$HOLBUILD_CACHE" "$tmpdir/bin" "$tmpdir/group/child"
 
 cat > "$tmpdir/bin/analyser" <<'HELPER'
 #!/bin/sh
@@ -52,16 +52,13 @@ case "$mode" in
   wait)
     touch "$state/ready"
     while :; do sleep 1; done ;;
+  env)
+    printf '%s %s %s %s\n' "${HOLBUILD_ACTION_ROOT-unset}" "$HOME" "${TMPDIR-unset}" \
+      "${REMOTE_EXEC_WORKER_TOKEN-unset}" > "$state/env" ;;
 esac
 printf 'version 1\nok\nbegin-file 1\nend-file 1\nend\n' > "$response"
 HELPER
 chmod +x "$tmpdir/bin/analyser"
-cat > "$tmpdir/toolchain/analyser/bin/analyser" <<'HELPER'
-#!/bin/sh
-printf 'confined failure\n' >&2
-exit 137
-HELPER
-chmod +x "$tmpdir/toolchain/analyser/bin/analyser"
 
 cat > "$tmpdir/test.sml" <<'SML'
 val root = valOf (OS.Process.getEnv "HOLBUILD_ROOT");
@@ -69,7 +66,7 @@ val tmp = valOf (OS.Process.getEnv "ANALYSER_FAILURE_TEST_TMP");
 val _ = OS.FileSys.chDir root;
 use "sml/holbuild-script.sml";
 
-(* Count launches without replacing the real process or sandbox runners. *)
+(* Count launches without replacing the real process runner. *)
 structure RealProcessGroup = HolbuildProcessGroup;
 structure HolbuildProcessGroup =
 struct
@@ -174,19 +171,6 @@ val _ = write "group/memory.events" "oom invalid\noom_kill -3\n";
 val _ = assert "malformed optional counters ignored" (null (HolbuildMachineMemory.cgroup_memory_events ()));
 val _ = setenv ("HOLBUILD_TEST_CGROUP", "", 1);
 
-(* Sandbox validation stays real; the launch counter is in the trusted parent. *)
-val _ = if OS.Process.getEnv "ANALYSER_FAILURE_TEST_SANDBOX" = SOME "1" then
-  let
-    val _ = G.launches := 0
-    val _ = HolbuildActionSandbox.enable (path "root", path "checkpoints")
-    val _ = HolbuildActionSandbox.poly_executable := "/usr/bin/true"
-    val result = D.run_analyser {analyser = path "toolchain/analyser/bin/analyser", request = "test", capture_stderr = true}
-    val _ = HolbuildActionSandbox.disable ()
-  in
-    assert "sandbox failure not retried" (!G.launches = 1 andalso #response result = NONE);
-    assert "sandbox stderr preserved" (contains (#stderr result) "confined failure")
-  end else ();
-
 fun await label predicate =
   let val deadline = Time.+ (Time.now (), Time.fromSeconds 15)
       fun loop () = if predicate () then () else if Time.>= (Time.now (), deadline)
@@ -227,12 +211,34 @@ val _ = G.with_cancellation_token (fn token =>
   assert "new scope works after prior cancellation"
     (OS.Process.isSuccess (#status (G.run_shell_output_cancellable token "true"))));
 
+(* Under exec-action, the analyser gets the action's private home and none
+   of the worker's credentials. *)
+val _ = reset "env";
+val _ = OS.FileSys.mkDir (path "action");
+val _ = HolbuildActionSandbox.enable (path "action", path "checkpoints");
+val action_run = run () before HolbuildActionSandbox.disable ();
+val _ = assert "action analyser response" (isSome (#response action_run));
+val action_root = OS.FileSys.fullPath (path "action");
+val action_home = action_root ^ "/.holbuild/sandbox-home";
+val _ = assert "action analyser environment"
+  (read "env" = String.concatWith " " [action_root, action_home, action_home ^ "/tmp", "unset"] ^ "\n");
+
+(* A child's own exit status is its result, even 127; a program that isn't
+   there is the worker's failure. *)
+fun child argv = HolbuildToolchain.run_in_dir_to_file tmp argv (path "child.log");
+val _ = HolbuildActionSandbox.enable (path "action", path "checkpoints");
+val exited = child ["/bin/sh", "-c", "exit 127"];
+val exited_completed = !HolbuildActionSandbox.child_completed;
+val missing = (ignore (child [path "missing"]); false) handle HolbuildActionSandbox.Error _ => true;
+val _ = HolbuildActionSandbox.disable ();
+val _ = assert "child exit 127 is its result"
+  (Posix.Process.fromStatus exited = Posix.Process.W_EXITSTATUS 0w127 andalso exited_completed);
+val _ = assert "missing program never started" missing;
+
 val _ = print "analyser failure tests passed\n";
 SML
 
-sandbox=0
-[[ $(uname -s) != Linux ]] || sandbox=1
-ANALYSER_FAILURE_TEST_TMP="$tmpdir" ANALYSER_FAILURE_TEST_SANDBOX=$sandbox HOLBUILD_TEST_CGROUP= \
+ANALYSER_FAILURE_TEST_TMP="$tmpdir" HOLBUILD_TEST_CGROUP= REMOTE_EXEC_WORKER_TOKEN=worker-sentinel \
   "${HOLBUILD_POLY:-poly}" --error-exit --gcthreads=1 < "$tmpdir/test.sml" > "$tmpdir/test.log" 2>&1 || {
     tail -100 "$tmpdir/test.log" >&2
     exit 1
