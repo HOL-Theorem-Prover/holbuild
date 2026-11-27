@@ -159,6 +159,14 @@ reran() {
   phases "$1" | grep -qx "lightrerun:1" || {
     echo "worker $1 did not build again on every dependency:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1; }
 }
+# stayed_light NAME: the worker left dependencies uninstalled before HOL and
+# didn't build again.
+stayed_light() {
+  phases "$1" | grep -q "^hydlightn:[1-9]" || {
+    echo "worker $1 installed every dependency before HOL:" >&2; cat "$tmpdir/$1.result" >&2; exit 1; }
+  ! phases "$1" | grep -q "^lightrerun:" || {
+    echo "worker $1 built again on every dependency:" >&2; cat "$tmpdir/$1.result" "$tmpdir/$1.log" >&2; exit 1; }
+}
 # outputs NAME: T's entry in the remote cache, which names its outputs'
 # hashes.
 outputs() {
@@ -275,6 +283,21 @@ worker probe-full
 expect_worker probe-full 0 "status=built"
 hydrated probe-full full 2
 write_toml
+
+# A script that catches a failed load of a library no dependency has, by a
+# name the analyser doesn't see, would find it missing on a full install
+# too: the worker keeps its light run, passing or failing.
+catch_other='val _ = (load ("noSuch" ^ "Lib"); ()) handle _ => ();'
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" "$(printf '\n%s\n' "$catch_other")"
+worker other-catch
+expect_worker other-catch 0 "status=built"
+stayed_light other-catch
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" "$(printf '\n%s\n\nTheorem t3:\n  T\nProof\n  %s\nQED\n' \
+  "$catch_other" 'FAIL_TAC "after the other load"')"
+worker other-fail
+expect_worker other-fail 1 "status=failed" "failure=proof"
+require_grep "after the other load" "$tmpdir/other-fail.log"
+stayed_light other-fail
 
 # A target the build didn't name, as every root theory is one when it names
 # none, has its dependencies installed first.
