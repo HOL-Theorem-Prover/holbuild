@@ -16521,7 +16521,7 @@ fun outline_action_key input_key = HolbuildHash.string_sha256 ("holbuild-outline
 
 (* Copies into SNAPSHOT the outline that the theory child in STAGE
    published, and its load metadata, while the child may still write the
-   stage. *)
+   stage: only regular files, from the outline's own directory. *)
 fun snapshot_outline stage logical snapshot =
   let
     val names = [logical ^ ".dat", logical ^ ".sig", logical ^ ".sml",
@@ -16529,7 +16529,10 @@ fun snapshot_outline stage logical snapshot =
     val sources =
       map (fn name => Path.concat (stage_outline_dir stage, name)) (List.take (names, 3)) @
       map (fn name => Path.concat (stage, name)) (List.drop (names, 3))
+    fun is kind path = kind (Posix.FileSys.lstat path) handle OS.SysErr _ => false
   in
+    if is Posix.FileSys.ST.isDir (stage_outline_dir stage) andalso List.all (is Posix.FileSys.ST.isReg) sources
+    then () else raise Error "could not copy the outline";
     HolbuildRemoveTree.remove_untrusted_strict snapshot;
     ensure_dir snapshot;
     ListPair.appEq (fn (src, name) => copy_binary src (Path.concat (snapshot, name))) (sources, names)
