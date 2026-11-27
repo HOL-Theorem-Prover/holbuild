@@ -772,6 +772,7 @@ fun phase_mark_line name =
 
 (* This stage file runs after the preload, including on checkpoint resume. *)
 val script_start_file = "holbuild-script-start.sml"
+val generated_script_file = ".hol/holbuild-script.sml"
 val diagnostic_admit_marker = HolbuildTheoryCheckpoints.diagnostic_admit_marker
 
 fun write_theory_script_start path source_file =
@@ -788,7 +789,8 @@ fun write_theory_script_start path source_file =
      "  val file = " ^ HolbuildToolchain.sml_string (Path.file source_file),
      "  fun parse_error msg = (TextIO.print msg; (!holbuild_report_source_error) msg;",
      "                         OS.Process.exit OS.Process.failure)",
-     "  val {read, fileline, eof} = HOLSource.fileToReader {quietOpen = false, print = parse_error} file",
+     "  val input = HOLFileSys.openIn " ^ HolbuildToolchain.sml_string generated_script_file,
+     "  val {read, fileline, eof} = HOLSource.streamToReader {quietOpen = false, print = parse_error} file input",
      "  fun line () = #line (fileline ()) + 1",
      "  fun evaluate run = run ()",
      "    handle e => ((!holbuild_report_exception) e; PolyML.Exception.reraise e)",
@@ -797,7 +799,8 @@ fun write_theory_script_start path source_file =
      "    (!holbuild_before_declaration) ();",
      "    evaluate ((!holbuild_compile_declaration)",
      "      (read, [PolyML.Compiler.CPFileName file, PolyML.Compiler.CPLineNo line]));",
-     "    if !QUse.failOnError andalso QUse.hadError () then OS.Process.exit OS.Process.failure else ())",
+     "    if !QUse.failOnError andalso QUse.hadError () then OS.Process.exit OS.Process.failure else ());",
+     "  HOLFileSys.closeIn input",
      "end;", ""])
 
 (* The exporter marks when the script ended (holscriptend) and, unless
@@ -4802,17 +4805,18 @@ val rejected_heap_modules = ref 0
    on it. *)
 val discarded_deps_heap = ref false
 
-fun write_theory_script capture defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations staged_script preload timeout_marker =
+fun write_theory_script capture defer_proofs policy root checkpoint_root base_context (action : theory_action) source_text checkpoints declaration_checkpoints terminations script_start preload timeout_marker =
   let
     val _ = resume_steps := []
     val source_name = #source_name action
     val logical = #logical action
+    val generated_script = Path.concat (Path.dir script_start, generated_script_file)
     val load_lines = map (theory_load_line root) (#loads action)
   in
   if not (checkpoint_enabled policy) then
     ((if promotes_preload policy then write_promoting_preload else write_plain_preload) load_lines preload;
-     write_text staged_script (instrumented_source defer_proofs policy false (SOME timeout_marker) source_name source_text 0 checkpoints [] terminations);
-     {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
+     write_text generated_script (instrumented_source defer_proofs policy false (SOME timeout_marker) source_name source_text 0 checkpoints [] terminations);
+     {context = base_context, files = [preload, script_start], failure_checkpoints = [], failed_prefix_context = NONE})
   else
     let
       val base = action_checkpoint_base checkpoint_root action
@@ -4828,10 +4832,10 @@ fun write_theory_script capture defer_proofs policy root checkpoint_root base_co
            List.app (fn {context_path, ...} => ensure_parent context_path) declaration_checkpoints)
       fun run_from_deps_checkpoint () =
         (ensure_source_checkpoint_parents ();
-         write_text staged_script (instrumented_source NONE policy false (SOME timeout_marker) source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         write_text generated_script (instrumented_source NONE policy false (SOME timeout_marker) source_name source_text 0 checkpoints declaration_checkpoints terminations);
          deps_loaded_resume_message logical;
          resume_steps := [("resdepsn", 1)];
-         {context = HolState deps_loaded, files = [staged_script], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
+         {context = HolState deps_loaded, files = [script_start], failure_checkpoints = [deps_loaded], failed_prefix_context = NONE})
       (* A theory that isn't a target saves no deps heap: its failed
          prefix, if any, is then a child of the base state. *)
       fun run_from_fresh_preload () =
@@ -4839,29 +4843,29 @@ fun write_theory_script capture defer_proofs policy root checkpoint_root base_co
          ensure_source_checkpoint_parents ();
          if saves_progress policy then write_preload capture load_lines deps_loaded deps_ok preload
          else write_plain_preload load_lines preload;
-         write_text staged_script (instrumented_source NONE policy (not (saves_progress policy)) (SOME timeout_marker) source_name source_text 0 checkpoints declaration_checkpoints terminations);
-         {context = base_context, files = [preload, staged_script], failure_checkpoints = [], failed_prefix_context = NONE})
+         write_text generated_script (instrumented_source NONE policy (not (saves_progress policy)) (SOME timeout_marker) source_name source_text 0 checkpoints declaration_checkpoints terminations);
+         {context = base_context, files = [preload, script_start], failure_checkpoints = [], failed_prefix_context = NONE})
       fun run_from_failed_prefix {checkpoint, step_count, metadata_text} =
         let
           val path = #failed_prefix_path checkpoint
           val _ = ensure_source_checkpoint_parents ()
           val contexts = deps_checkpoint_exists deps_loaded deps_key
-          val _ = write_text staged_script (failed_prefix_resume_source policy contexts timeout_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
+          val _ = write_text generated_script (failed_prefix_resume_source policy contexts timeout_marker source_name source_text checkpoints declaration_checkpoints terminations checkpoint metadata_text)
           val _ = failed_prefix_resume_message logical checkpoint step_count
           val _ = resume_steps := [("resfpn", 1), ("resstepn", LargeInt.fromInt step_count),
                                    ("resboundary", LargeInt.fromInt (#boundary checkpoint))] @
                                   first_changed_byte path checkpoint
         in
-          {context = HolState path, files = [staged_script], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME (path, step_count)}
+          {context = HolState path, files = [script_start], failure_checkpoints = [path, deps_loaded], failed_prefix_context = SOME (path, step_count)}
         end
       fun run_from_replay {boundary, path, safe_name, kind, failure_checkpoints} =
         let
           val _ = ensure_source_checkpoint_parents ()
-          val _ = write_text staged_script (instrumented_source NONE policy false (SOME timeout_marker) source_name source_text boundary checkpoints declaration_checkpoints terminations)
+          val _ = write_text generated_script (instrumented_source NONE policy false (SOME timeout_marker) source_name source_text boundary checkpoints declaration_checkpoints terminations)
           val _ = source_context_resume_message logical (#source_file action) source_text kind safe_name boundary
           val _ = resume_steps := [("resctxn", 1), ("resboundary", LargeInt.fromInt boundary)]
         in
-          {context = HolState path, files = [staged_script], failure_checkpoints = failure_checkpoints @ [deps_loaded], failed_prefix_context = NONE}
+          {context = HolState path, files = [script_start], failure_checkpoints = failure_checkpoints @ [deps_loaded], failed_prefix_context = NONE}
         end
       fun failed_prefix_at_least_as_late failed NONE = true
         | failed_prefix_at_least_as_late failed (SOME replay) =
@@ -5001,8 +5005,8 @@ fun prepare_theory_stage speculative check_only tc root (action : theory_action)
        what stops it, and the stage was just emptied. *)
     FS.mkDir (Path.concat(stage, ".hol"));
     FS.mkDir (Path.concat(stage, ".hol/objs"));
-    (* Extra inputs go in first, so holbuild's own files (the instrumented
-       script above all) overwrite any input staged at the same path. *)
+    (* Extra inputs go in first, so holbuild's own files overwrite any
+       input staged at the same path. *)
     List.app stage_input (#inputs action);
     write_child_policy_with {module_cache = not speculative orelse HolbuildActionSandbox.active ()} tc
       (Path.concat(stage, "holbuild-child-policy.sml"));
@@ -5170,7 +5174,8 @@ fun with_deps_heap_capture store deps_loaded f =
    outline, or a proof on outlined parents), which logs there, produces no
    theory module, and leaves its outputs in the stage for the caller to
    install or drop. *)
-fun run_theory_action check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text theorem_checkpoints declaration_checkpoints termination_diagnostics =
+fun run_theory_action check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context (action : theory_action)
+      {original_source, script_source = source_text} theorem_checkpoints declaration_checkpoints termination_diagnostics =
   let
     val _ = check_cancelled ()
     val speculative = Option.isSome speculative_log
@@ -5179,7 +5184,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val source_file = #source_file action
     val stage_root = stage_root_at root input_key
     val stage = action_stage root action
-    val staged_script = Path.concat(stage, Path.file source_file)
+    val staged_source = Path.concat(stage, Path.file source_file)
     val child_policy = Path.concat(stage, "holbuild-child-policy.sml")
     val preload = Path.concat(stage, "holbuild-preload.sml")
     val theory_exporter = Path.concat(stage, "holbuild-export-theory.sml")
@@ -5199,6 +5204,8 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     (* A child started ahead of its parents runs in the stage already. *)
     val attached = take_attached_child ()
     val _ = if Option.isSome attached then () else prepare_theory_stage speculative (checks_only policy) tc root action
+    (* A script can read its own source even when the child runs only a suffix. *)
+    val _ = write_text staged_source original_source
     val _ = if checkpoint_enabled policy andalso checkpoint_saves_enabled policy then ensure_parent deps_loaded else ()
     val _ =
       if theorem_saves_enabled policy then
@@ -5210,8 +5217,9 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
     val capture = !capture_deps_heap andalso checkpoint_enabled policy andalso saves_progress policy
     val run_spec = write_theory_script capture (if speculative andalso proof_steps_enabled policy then SOME (has_suspension_pruning tc) else NONE) policy root checkpoint_root base_context action source_text
-                                    theorem_checkpoints declaration_checkpoints termination_diagnostics staged_script preload timeout_marker
-    val _ = if not (Option.isSome attached) andalso #files run_spec = [preload, staged_script] then !before_fresh_preload () else ()
+                                    theorem_checkpoints declaration_checkpoints termination_diagnostics script_start preload timeout_marker
+    val fresh_preload = #files run_spec = [preload, script_start]
+    val _ = if not (Option.isSome attached) andalso fresh_preload then !before_fresh_preload () else ()
     (* A speculative child runs no checkpoints, so it starts from the
        preload, which then also loads the runtime its deferred proofs use. *)
     val _ =
@@ -5321,7 +5329,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     fun run_child () =
       case attached of
           SOME join =>
-            if #files run_spec = [preload, staged_script] then join ()
+            if fresh_preload then join ()
             else raise Error "a child loading ahead needs a fresh preload"
         | NONE =>
             run_hol_files_to_log tc
@@ -5331,14 +5339,12 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
                   else "prefix"))
               stage stage
               (#context run_spec)
-              (child_policy ::
-                 (map (fn file => if file = staged_script then script_start else file) (#files run_spec)
-                  @ [theory_exporter]))
+              (child_policy :: (#files run_spec @ [theory_exporter]))
               "holbuild-build.log"
               (SOME (current_build_log log_dir))
               "hol run failed while building theory script"
     (* Only a fresh preload saves the deps heap, and waits to hand it over. *)
-    val captures = capture andalso #files run_spec = [preload, staged_script]
+    val captures = capture andalso fresh_preload
     val _ =
       (check_cancelled ();
        validate_hol_context (#context run_spec);
@@ -6259,16 +6265,16 @@ fun action_checkpoints policy checkpoint_root (action : theory_action) source_te
    `run_theory_action`, and the failed-prefix checkpoints a successful run
    made obsolete too: checkpoints saved after resuming from one are its
    children. *)
-fun run_theory_action_checkpoints check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context (action : theory_action) source_text
+fun run_theory_action_checkpoints check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context (action : theory_action) sources
       {theorem_checkpoints, declaration_checkpoints, termination_diagnostics} =
   let
     fun run retries_left =
-      run_theory_action check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context action source_text
+      run_theory_action check_cancelled speculative_log cache_allowed policy tc root checkpoint_root base_context action sources
                         theorem_checkpoints declaration_checkpoints termination_diagnostics
       handle RetryInvalidCheckpoint =>
         if not (checkpoint_saves_enabled policy) then
           run_theory_action check_cancelled speculative_log cache_allowed (without_checkpoints policy) tc root
-                            checkpoint_root base_context action source_text
+                            checkpoint_root base_context action sources
                             theorem_checkpoints declaration_checkpoints termination_diagnostics
         else if retries_left <= 0 then raise RetryInvalidCheckpoint
         else run (retries_left - 1)
@@ -6281,8 +6287,8 @@ fun build_theory_action cache_allowed policy tc root checkpoint_root base_contex
     val source_text = read_text (#source_file action)
     val checkpoints = action_checkpoints policy checkpoint_root action source_text
     val generated_metadata =
-      run_theory_action_checkpoints (fn () => ()) NONE cache_allowed policy tc root checkpoint_root base_context action source_text
-        checkpoints
+      run_theory_action_checkpoints (fn () => ()) NONE cache_allowed policy tc root checkpoint_root base_context action
+        {original_source = source_text, script_source = source_text} checkpoints
   in
     if checkpoint_saves_enabled policy then remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints) else ();
     generated_metadata
@@ -8028,7 +8034,8 @@ fun build_speculative options tc project base_context plan keys toolchain_key ru
           with_outline_watch stage (fn () => on_outline stage)
             (fn () =>
                 run_theory_action_checkpoints (fn () => ()) (SOME log_dir) false policy tc root checkpoint_root base_context
-                  action deferred (action_checkpoints policy checkpoint_root action deferred))
+                  action {original_source = source_text, script_source = deferred}
+                  (action_checkpoints policy checkpoint_root action deferred))
         val _ =
           if path_exists (stage_finalized_marker stage) then ()
           else raise Error (logical_name node ^ ": the pipelined build ended before its deferred proofs were finalized")
@@ -17516,12 +17523,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val generated_metadata =
           (let
             (* A child loading ahead can write the source by now. *)
-            val source_text =
+            val original_source =
               case ahead of SOME {source_text, ...} => source_text | NONE => read_text (#source_file action)
             val source_text =
-              if not pipelined orelse proof_steps_enabled policy then source_text
+              if not pipelined orelse proof_steps_enabled policy then original_source
               else
-                deferred_source (has_suspension_pruning tc) source_text (discover_theorem_boundaries_strict (#source_file action) source_text)
+                deferred_source (has_suspension_pruning tc) original_source
+                  (discover_theorem_boundaries_strict (#source_file action) original_source)
                 handle Error msg => raise ActionFailed (ScriptFailure, "cannot defer the proofs: " ^ msg)
             val checkpoints = phase "analyse" (fn () => action_checkpoints policy checkpoint_root action source_text)
             val shared =
@@ -17656,7 +17664,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             (* A pipelined run leaves its outputs in the stage. *)
             fun run_hol () =
               run_theory_action_checkpoints check_cancelled (if pipelined then SOME log_dir else NONE) true policy tc
-                root checkpoint_root (toolchain_base_context tc) action source_text checkpoints
+                root checkpoint_root (toolchain_base_context tc) action
+                {original_source = original_source, script_source = source_text} checkpoints
             val metadata =
               phase "hol" (fn () =>
                 if pipelined then with_outline_watch stage (fn () => publish_outline action policy stage) run_hol
