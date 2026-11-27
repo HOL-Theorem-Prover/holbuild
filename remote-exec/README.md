@@ -363,7 +363,7 @@ workers do when they aren't running HOL:
 
 Workers require Linux on x86_64 or aarch64. `holbuild sandbox-check` runs
 before a release's first action, and workers reject a release whose check
-fails. Releases before 0.13.58 are rejected. Releases before 0.15.15 run HOL
+fails. Releases before 0.13.58 are rejected. Releases before 0.15.16 run HOL
 under their own Landlock and seccomp confinement, which needs Landlock ABI 1
 or newer, Python 3, pidfds, `/proc` child lists and `libseccomp.so.2` with
 notification support; the supplied image includes the userspace dependencies.
@@ -378,19 +378,22 @@ child gets a home and temporary directory of its own, `HOME` and `TMPDIR`
 (also `TMP` and `TEMP`) under `.holbuild/sandbox-home` in the action root,
 emptied with the root before the next action; `HOLBUILD_ACTION_ROOT` names
 the root. Its environment has no `HOLBUILD_REMOTE_*` or `REMOTE_EXEC_*`
-variable, so no cache credential or worker token. Files the worker's caches
-share between actions (cache blobs, theory modules, shared checkpoint heaps
-and toolchains) are read-only, so that no action changes one by accident.
-These guard against mistakes, not against a hostile submitter: run workers
-only for submitters who trust each other. Actions on one worker see each
+variable, so no cache credential or worker token. Staged scratch inputs and
+toolchain source trees are read-only. Nothing else confines an action's
+child: it can change any file the worker's user can, the worker's caches
+(theory modules, checkpoint heaps, toolchains, the objects linked into the
+action root) included, and a process it leaves running outlives the action.
+These guards prevent mistakes, not a hostile submitter: run workers only for
+submitters who trust each other. Actions on one worker see each
 other's files in `/tmp`, where Poly/ML creates temporary files whatever
 `TMPDIR` says; the image sets `TMPDIR` to `/var/tmp` so that the worker keeps
 its credential, result and temporary files elsewhere.
 
-The child inherits only executable lookup, locale, timezone, certificate lookup,
-those solver locations and `HOLBUILD_RUN_*` settings. Other operator
-environment overrides use their runtime defaults. Cancellation kills the owned
-process tree, so buffered log tails may be lost.
+The child inherits `exec-action`'s environment less those variables: the
+worker passes `exec-action` only executable lookup, locale, certificate and
+proxy settings, the solver locations and `HOLBUILD_*` settings.
+Cancellation kills the child's process group, so buffered log tails may be
+lost.
 
 `--share-heaps` publishes heaps by dependency context and checkpoints by script
 prefix in the remote cache. Dependency heaps are shared even for older action
@@ -399,15 +402,15 @@ completed saves with valid metadata are published, including after interruption.
 A heap an action saved is published only with the bytes its preload saved,
 hashed before the theory script ran, so a script can't replace it. Script
 checkpoints carry no such guarantee: a failed prefix's state, for one, holds
-what its failing step did, which its key doesn't cover. So `--share-heaps`
-is for workers whose submitters trust each other; a worker serving users who
-don't shares only dependency heaps, with `--share-deps-heap` (actions of
-releases before 0.14.99 then share nothing). It restores whatever heap the
+what its failing step did, which its key doesn't cover. A worker that wants
+only the dependency heaps shared passes `--share-deps-heap` instead (actions
+of releases before 0.14.99 then share nothing). It restores whatever heap the
 remote cache holds under the key, and releases before 0.14.99 published
 whatever the script left: so such workers need a remote cache that no release
 before 0.14.99 has published heaps to, such as a new one, and no worker that
-passes `--share-heaps` to older releases may publish there. Neither provides tenant
-authorization for shared cache entries, and `build --tool-cache` directories
+passes `--share-heaps` to older releases may publish there. Neither mode makes
+a worker safe for submitters who don't trust each other, neither provides
+tenant authorization for shared cache entries, and `build --tool-cache` directories
 are shared by name, dependency key and toolchain whatever the mode.
 
 The worker builds the selected HOL toolchain itself: it clones the exact

@@ -16776,7 +16776,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                remove_file path;
                Posix.FileSys.link {old = blob, new = path}
                handle e as OS.SysErr (_, SOME err) => if err = Posix.Error.xdev then across_mounts () else raise e)
-            fun in_root () = (fetched := true; remove_file path; fetch_spec_blob remote {hash = sha, dst = path})
+            fun in_root () =
+              (fetched := true; remove_file path; fetch_spec_blob remote {hash = sha, dst = path};
+               Posix.FileSys.chmod (path, read_only))
           in
             (in_place ()
              handle OS.SysErr _ => in_root ()

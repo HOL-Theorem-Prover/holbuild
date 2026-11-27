@@ -52,6 +52,9 @@ case "$mode" in
   wait)
     touch "$state/ready"
     while :; do sleep 1; done ;;
+  env)
+    printf '%s %s %s %s\n' "${HOLBUILD_ACTION_ROOT-unset}" "$HOME" "${TMPDIR-unset}" \
+      "${REMOTE_EXEC_WORKER_TOKEN-unset}" > "$state/env" ;;
 esac
 printf 'version 1\nok\nbegin-file 1\nend-file 1\nend\n' > "$response"
 HELPER
@@ -208,10 +211,22 @@ val _ = G.with_cancellation_token (fn token =>
   assert "new scope works after prior cancellation"
     (OS.Process.isSuccess (#status (G.run_shell_output_cancellable token "true"))));
 
+(* Under exec-action, the analyser gets the action's private home and none
+   of the worker's credentials. *)
+val _ = reset "env";
+val _ = OS.FileSys.mkDir (path "action");
+val _ = HolbuildActionSandbox.enable (path "action", path "checkpoints");
+val action_run = run () before HolbuildActionSandbox.disable ();
+val _ = assert "action analyser response" (isSome (#response action_run));
+val action_root = OS.FileSys.fullPath (path "action");
+val action_home = action_root ^ "/.holbuild/sandbox-home";
+val _ = assert "action analyser environment"
+  (read "env" = String.concatWith " " [action_root, action_home, action_home ^ "/tmp", "unset"] ^ "\n");
+
 val _ = print "analyser failure tests passed\n";
 SML
 
-ANALYSER_FAILURE_TEST_TMP="$tmpdir" HOLBUILD_TEST_CGROUP= \
+ANALYSER_FAILURE_TEST_TMP="$tmpdir" HOLBUILD_TEST_CGROUP= REMOTE_EXEC_WORKER_TOKEN=worker-sentinel \
   "${HOLBUILD_POLY:-poly}" --error-exit --gcthreads=1 < "$tmpdir/test.sml" > "$tmpdir/test.log" 2>&1 || {
     tail -100 "$tmpdir/test.log" >&2
     exit 1

@@ -162,6 +162,12 @@ fun run_interactive argv =
 fun run_in_dir dir argv =
   timed_shell "run_in_dir" argv NONE ("cd " ^ quote dir ^ " && " ^ command argv)
 
+(* Runs ARGV in DIR with its output in OUTPUT; exit status 125 if it can't
+   enter DIR or open OUTPUT. *)
+fun child_script dir argv output =
+  "cd " ^ quote dir ^ " && true > " ^ quote output ^ " || exit 125; " ^
+  command argv ^ " > " ^ quote output ^ " 2>&1"
+
 (* Theory children, generators and heap exports all start here, so this is
    where they take a machine memory reservation (--cooperate-dir). *)
 fun run_in_dir_to_file dir argv output =
@@ -169,10 +175,11 @@ fun run_in_dir_to_file dir argv output =
     (fn lease =>
         timed_system "run_in_dir_to_file" argv (SOME output)
           (fn () =>
-              HolbuildActionSandbox.launch argv (fn argv =>
-                HolbuildProcessGroup.run_shell_inheriting lease
-                  ("cd " ^ quote dir ^ " && " ^
-                   command argv ^ " > " ^ quote output ^ " 2>&1"))))
+              HolbuildActionSandbox.launch argv
+                (fn argv =>
+                    HolbuildProcessGroup.run_shell_inheriting lease
+                      (child_script dir argv output))
+                (fn status => status)))
   handle HolbuildMachineMemory.Error msg => raise Error msg
 
 (* As run_in_dir_to_file, killing the child at the time DEADLINE () gives
@@ -187,10 +194,11 @@ fun run_in_dir_to_file_by dir argv output deadline =
               (fn () =>
                   let
                     val result =
-                      HolbuildActionSandbox.launch argv (fn argv =>
-                        HolbuildProcessGroup.run_shell_inheriting_until lease (deadline ())
-                          ("cd " ^ quote dir ^ " && " ^
-                           command argv ^ " > " ^ quote output ^ " 2>&1"))
+                      HolbuildActionSandbox.launch argv
+                        (fn argv =>
+                            HolbuildProcessGroup.run_shell_inheriting_until lease (deadline ())
+                              (child_script dir argv output))
+                        #status
                   in
                     timed_out := #timed_out result;
                     #status result

@@ -47,11 +47,14 @@ printf '/build-stamp\n' >> "$hol/.gitignore"
 # The fake Poly/ML runs configuration as shell.
 echo true > "$hol/tools/smart-configure.sml"
 cat >> "$hol/bin/build" <<'SH'
+printf 'build: HOLBUILD_ACTION_ROOT=%s HOME=%s TMPDIR=%s credentials=%s\n' "${HOLBUILD_ACTION_ROOT-unset}" \
+  "$HOME" "${TMPDIR-unset}" "${REMOTE_EXEC_WORKER_TOKEN-}${HOLBUILD_REMOTE_EXEC_SENTINEL-unset}" >> @ENVLOG@
 date +%s%N > build-stamp
 # The repository is out of reach: a .git planted here is discarded, never run.
 mkdir -p .git
 printf '[core]\n\tfsmonitor = planted-monitor\n' > .git/config
 SH
+sed -i "s|@ENVLOG@|$tmpdir/env.log|" "$hol/bin/build"
 hol_rev=$(init_git_repo "$hol")
 
 fakebin=$tmpdir/fakebin
@@ -107,8 +110,13 @@ run_worker() {
   set -e
 }
 
-# A toolchain from this repository builds.
-run_worker "$worker" "$(retarget "$hol_rev")" "$tmpdir/build.log"
+# A toolchain from this repository builds. Its build runs with the action's
+# private home and none of the worker's credentials.
+REMOTE_EXEC_WORKER_TOKEN=worker-sentinel HOLBUILD_REMOTE_EXEC_SENTINEL=worker-sentinel \
+  run_worker "$worker" "$(retarget "$hol_rev")" "$tmpdir/build.log"
+root=$(realpath "$worker/action")
+home=$root/.holbuild/sandbox-home
+require_grep "^build: HOLBUILD_ACTION_ROOT=$root HOME=$home TMPDIR=$home/tmp credentials=unset\$" "$tmpdir/env.log"
 entry=$(find "$worker/hol-toolchains" -mindepth 1 -maxdepth 1 -type d ! -name .locks)
 # Every toolchain step finished: only the spec's real toolchain can match.
 require_grep "the toolchain's identity does not match the action text" "$tmpdir/build.log"

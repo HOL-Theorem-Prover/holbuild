@@ -156,7 +156,10 @@ fun child_argv argv =
           val root = OS.FileSys.fullPath root
           val home = OS.Path.concat (root, ".holbuild/sandbox-home")
           val tmp = OS.Path.concat (home, "tmp")
-          fun mkdir path = OS.FileSys.mkDir path handle OS.SysErr _ => ()
+          fun mkdir path =
+            if (OS.FileSys.isDir path handle OS.SysErr _ => false) then ()
+            else OS.FileSys.mkDir path
+                 handle OS.SysErr (msg, _) => raise Error ("cannot create " ^ path ^ ": " ^ msg)
           val _ = List.app mkdir [OS.Path.concat (root, ".holbuild"), home, tmp]
           val scrubbed =
             List.filter (fn name => String.isPrefix "HOLBUILD_REMOTE_" name orelse String.isPrefix "REMOTE_EXEC_" name)
@@ -172,9 +175,22 @@ fun child_shell script =
   else script
 
 (* Runs ARGV through EXECUTE as a child; child_completed says whether it
-   returned. *)
-fun launch argv execute =
-  (child_completed := false;
-   execute (child_argv argv) before child_completed := true)
+   returned.  Under exec-action, exit status 125-127 says the child never ran
+   (its directory or log couldn't be opened, or env couldn't run ARGV): the
+   worker's failure, not the action's. *)
+fun launch argv execute status_of =
+  let
+    val _ = child_completed := false
+    val result = execute (child_argv argv)
+    val not_started =
+      active () andalso
+      (case Posix.Process.fromStatus (status_of result) of
+           Posix.Process.W_EXITSTATUS code => code >= 0w125 andalso code <= 0w127
+         | _ => false)
+  in
+    if not_started
+    then raise Error ("could not start " ^ String.concatWith " " argv ^ " (see its log)")
+    else result before child_completed := true
+  end
 
 end
