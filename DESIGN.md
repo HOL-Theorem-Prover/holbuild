@@ -839,9 +839,11 @@ against the files (`internal` if it changed):
 
 A failing check installs nothing else. When the log of a light run says HOL
 found no file to load (`Cannot find file`, `use: non-existent file`), passing or
-failing, the worker throws the run away, installs every dependency and builds
-the theory once more (`lightrerun`), whose verdict and diagnostics are
-reported.
+failing, and that file's name, extension aside, is a dependency's stem's, the
+worker throws the run away, installs every dependency and builds the theory
+once more (`lightrerun`), whose verdict and diagnostics are reported. A file no
+dependency has would be missing on a full install too, so the light run's
+verdict stands.
 
 ## Global cache
 
