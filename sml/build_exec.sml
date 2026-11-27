@@ -2873,9 +2873,10 @@ fun forget_checked_verdicts () =
    Mutex.unlock expected_remote_mutex)
 
 (* The keys of the theories build workers are restoring or building.  A
-   prefetch puts none of their entries into the local cache: a restore that
-   drops an entry not fitting its parents copies another, and the dropped
-   entry put back by a prefetch still in flight would stand in its way. *)
+   prefetch asks before it puts an entry into the local cache, under the
+   action publication lock, the lock a restore drops an entry not fitting
+   its parents under: a dropped entry put back by a prefetch still in flight
+   would stand in the way of the copy the restore takes instead. *)
 val demand_keys = ref (Redblackset.empty String.compare)
 val demand_keys_mutex = Mutex.mutex ()
 
