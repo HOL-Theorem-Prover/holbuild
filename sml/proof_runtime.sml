@@ -2103,7 +2103,7 @@ fun run_steps steps =
    reverse_group_lengths_ref := NONE;
    run_structural_steps 0 steps)
 
-fun report_secondary_failure name e =
+fun report_secondary_failure name at_finish e =
   let
     val message =
       case e of
@@ -2112,11 +2112,14 @@ fun report_secondary_failure name e =
         | Interrupt => "interrupted"
         | _ => Feedback.exn_to_string e
     fun field text = String.toString (String.substring (text, 0, Int.min (size text, 1024)))
-    val offset = case !failed_step_span_ref of SOME (start, _) => start | NONE => 0
+    val kind = case !theorem_info_ref of SOME (kind, _, _, _, _, _, _, _, _) => kind | NONE => "theorem"
+    val position =
+      if at_finish then "finish"
+      else case !failed_step_span_ref of SOME (start, _) => Int.toString start | NONE => "0"
     val goal = Option.getOpt (!secondary_goal_ref, "")
   in
     HolbuildBoundedOutput.text (TextIO.stdErr,
-      String.concat ["holbuild secondary failure: ", field name, "\t", Int.toString offset,
+      String.concat ["holbuild secondary failure: ", kind, "\t", field name, "\t", position,
                      "\t", field message, "\t", field goal, "\n"])
   end
 
@@ -2144,11 +2147,11 @@ fun print_first_failure name e =
       "holbuild: continuing after first failure\n")
   end
 
-fun proof_failure name goal e =
+fun proof_failure name goal at_finish e =
   let
     fun stop cause =
       if !tainted_ref then
-        (report_secondary_failure name cause; OS.Process.exit OS.Process.failure)
+        (report_secondary_failure name at_finish cause; OS.Process.exit OS.Process.failure)
       else PolyML.Exception.reraise cause
     val proof_error =
       case e of Feedback.HOL_ERR _ => true | Fail "Static Errors" => false | Fail _ => true | _ => false
@@ -2157,7 +2160,7 @@ fun proof_failure name goal e =
         (SOME marker, SOME g, true) =>
           let
             val _ =
-              if !tainted_ref then report_secondary_failure name e
+              if !tainted_ref then report_secondary_failure name at_finish e
               else
                 (print_first_failure name e;
                  write_text_file marker "";
@@ -2181,13 +2184,15 @@ fun proof_failure name goal e =
    needs their boundaries to resume. *)
 fun finish_proof name goal run top =
   let
+    val at_finish = ref false
     val th =
       (run ()
        handle e =>
          if !failed_goal_state_printed_ref then raise e
          else report_finish_failure name e;
+       at_finish := true;
        top () handle e => report_finish_failure name e)
-      handle e => proof_failure name goal e
+      handle e => proof_failure name goal (!at_finish) e
   in
     reset_built_leaves ();
     th
@@ -2210,7 +2215,7 @@ fun atomic_prove label g tac =
   handle e =>
     (init_history g 15;
      report_step_failure label e
-     handle failure => proof_failure label (SOME g) failure)
+     handle failure => proof_failure label (SOME g) false failure)
 
 fun with_theorem_trace name f =
   let

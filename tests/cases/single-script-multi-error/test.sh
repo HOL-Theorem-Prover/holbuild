@@ -142,7 +142,8 @@ QED
 Theorem last_failure:
   T
 Proof
-  FAIL_TAC "last proof error"
+  ALL_TAC >>
+  ALL_TAC
 QED
 SML
 run_failure "$tmpdir/default.log" build ATheory
@@ -152,6 +153,8 @@ require_grep 'theorem: local_failure' "$tmpdir/default.log"
 require_grep 'theorem: suspended\[left\]' "$tmpdir/default.log"
 require_grep 'theorem: failed_parent' "$tmpdir/default.log"
 require_grep 'theorem: last_failure' "$tmpdir/default.log"
+finish_line=$(awk '/^Theorem last_failure:/{proof=1} proof && /^QED$/{print NR; exit}' "$project/src/AScript.sml")
+require_grep "^  source line: $finish_line$" "$tmpdir/default.log"
 require_grep 'first proof error' "$tmpdir/default.log"
 require_file "$(find "$project/.holbuild/checkpoints" -name 'first_failed_prefix.save' -print -quit)"
 [[ $(find "$project/.holbuild/checkpoints" -name '*.save' ! -name 'deps_loaded.save' | wc -l) -eq 1 ]]
@@ -161,6 +164,18 @@ if grep -q 'unreachable resume body\|theorem: uses_later\|theorem: uses_local' "
   cat "$tmpdir/default.log" >&2
   exit 1
 fi
+
+run_failure "$tmpdir/default.json" --json build --skip-checkpoints ATheory
+python3 - "$tmpdir/default.json" "$finish_line" <<'PYTHON'
+import json
+from pathlib import Path
+import sys
+
+events = (json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines())
+failure = next(event["failure"] for event in events if event["event"] == "node_failed")
+last = failure["additional_failures"][-1]
+assert last["theorem"] == "last_failure" and last["source_line"] == int(sys.argv[2]), last
+PYTHON
 
 # A later timeout has its own message and cannot replace the primary fields.
 make_project timeout
@@ -234,18 +249,28 @@ for terminal in static parse termination; do
     parse) echo 'Theorem malformed: T Proof simp[] QED' >> "$project/src/AScript.sml"; error='parse error:' ;;
     termination)
       cat >> "$project/src/AScript.sml" <<'SML'
+Theorem countdown_def:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+
 Definition countdown_def:
   countdown n = if n = 0 then 0 else countdown (n - 1)
 Termination
   qexists_tac `measure I` >> FAIL_TAC "termination stopped"
 End
 SML
-      error='termination stopped' ;;
+      error='termination stopped'
+      termination_line=$(awk '/FAIL_TAC "termination stopped"/{print NR; exit}' "$project/src/AScript.sml") ;;
   esac
   echo 'val _ = print "AFTER_TERMINAL\n";' >> "$project/src/AScript.sml"
   run_failure "$tmpdir/$terminal.log" build ATheory
   require_grep '^additional failure 1 of 1:$' "$tmpdir/$terminal.log"
   require_grep "  error: .*$error" "$tmpdir/$terminal.log"
+  if [[ "$terminal" == termination ]]; then
+    require_grep "^  source line: $termination_line$" "$tmpdir/$terminal.log"
+  fi
   if grep -q '^AFTER_TERMINAL$' "$(child_log)"; then
     cat "$(child_log)" >&2
     exit 1

@@ -802,23 +802,33 @@ fun additional_failure_summary source_path source_text checkpoints terminations 
   let
     val text = read_text path
     val prefix = "holbuild secondary failure: "
-    fun source_line name offset =
+    fun source_line kind name position =
       let
-        fun line start stop = line_number_at source_text (Int.min (stop, start + Int.max (offset, 0)))
+        fun line start stop finish =
+          Option.map (line_number_at source_text)
+            (if position = "finish" then SOME finish
+             else Option.map (fn offset => Int.min (stop, start + Int.max (offset, 0)))
+                             (Int.fromString position))
       in
-        case List.find (fn checkpoint => #name checkpoint = name)
-                       (checkpoints : HolbuildTheoryCheckpoints.boundary list) of
-            SOME checkpoint => SOME (line (#tactic_start checkpoint) (#tactic_end checkpoint))
-          | NONE => Option.map (fn termination => line (#tactic_start termination) (#tactic_end termination))
-              (List.find (fn termination => #name termination = name)
-                         (terminations : HolbuildTheoryCheckpoints.termination list))
+        if kind = "termination" then
+          Option.mapPartial (fn termination =>
+            line (#tactic_start termination) (#tactic_end termination)
+                 (skip_whitespace source_text (#boundary termination) (#tactic_end termination)))
+            (List.find (fn termination => #name termination = name)
+                       (terminations : HolbuildTheoryCheckpoints.termination list))
+        else
+          Option.mapPartial (fn checkpoint =>
+            line (#tactic_start checkpoint) (#tactic_end checkpoint)
+                 (#offset (finish_span source_text checkpoint)))
+            (List.find (fn checkpoint => #name checkpoint = name)
+                       (checkpoints : HolbuildTheoryCheckpoints.boundary list))
       end
     fun decode line =
       case String.fields (fn c => c = #"\t") (String.extract (line, size prefix, NONE)) of
-          [name, offset, message, goal] =>
-            (case (String.fromString name, Int.fromString offset, String.fromString message, String.fromString goal) of
-                 (SOME name, SOME offset, SOME error, SOME top_goal) =>
-                   SOME {theorem = name, line = source_line name offset, error = error, top_goal = top_goal}
+          [kind, name, position, message, goal] =>
+            (case (String.fromString name, String.fromString message, String.fromString goal) of
+                 (SOME name, SOME error, SOME top_goal) =>
+                   SOME {theorem = name, line = source_line kind name position, error = error, top_goal = top_goal}
                | _ => NONE)
         | _ => NONE
     fun parse [] reports tail = (rev reports, rev tail)
