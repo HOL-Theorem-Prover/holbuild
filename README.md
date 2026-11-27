@@ -2006,13 +2006,19 @@ serve an entry the store has replaced), restores the files whose blobs are
 left, and warns for each lost one. After HOL exits, built or failed, the
 worker publishes the directory again if its files changed or the entry lost a
 blob, uploading every file, which renews each blob the entry names in a store
-that expires them (a later restore heals an entry whose blob expired first):
-at most 16 regular files, 256 MiB in all, with names of letters, digits,
-`.`, `_` and `-`. An entry that can't be restored otherwise, or a directory
-that breaks these limits, only warns: the action goes on without the tool
-cache. The newest publication replaces the
-entry, so a tool should write each file whole (to a temporary name, then
-renamed) and treat the directory as a cache it may find empty.
+that expires them (a later restore heals an entry whose blob expired first).
+Files must be regular, with names of letters, digits, `.`, `_` and `-`; the
+files HOL wrote or changed may be at most 16, 256 MiB in all. Right before
+replacing the entry, the worker reads it again with `Cache-Control: no-cache`
+and keeps the files other theories published to it since the restore, unless
+this action wrote a file of the same name or removed it; so theories built at
+the same time each add their files rather than drop the others'. The entry
+keeps at most 16 files: the ones HOL wrote, then the ones it kept as restored,
+in name order while they fit in 256 MiB, then the others' files. An entry that
+can't be restored otherwise, or a directory that breaks these limits, only
+warns: the action goes on without the tool cache. A tool should write each
+file whole (to a temporary name, then renamed) and treat the directory as a
+cache it may find empty or holding another theory's files.
 
 A theory exported with `--scratch-input FILE` (see "Giving a tool a file it
 reads") names FILE by its SHA-256 in the spec's `option scratch-input` line,

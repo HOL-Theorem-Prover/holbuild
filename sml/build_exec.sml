@@ -16587,16 +16587,24 @@ fun tool_cache_listing dir =
     handle e => (FS.closeDir stream; raise e)
   end
 
-(* The files the remote cache holds under KEY, placed in DIR, as
-   (name, sha256) pairs in name order, and whether the entry is stale: it
-   names a blob the remote cache no longer holds, so the next publish
-   replaces it even if the files are unchanged. *)
-fun restore_tool_cache remote store key dir =
+(* The (name, sha256) pairs a tool cache entry's TEXT lists, in its order. *)
+fun tool_cache_entry_files text =
   let
     fun file (role, sha, name) =
       if role <> "file" orelse not (plain_file_name name) then
         raise Error ("malformed tool cache entry: " ^ role ^ " " ^ HolbuildHash.quote name)
       else (name, sha)
+  in
+    map file (shared_manifest_entries text)
+  end
+
+(* The files the remote cache holds under KEY, placed in DIR, as
+   (name, sha256) pairs in name order; the names of the entry's files whose
+   blobs the remote cache no longer holds (lost); and whether the entry is
+   stale: it names such a blob, so the next publish replaces it even if
+   the files are unchanged. *)
+fun restore_tool_cache remote store key dir =
+  let
     (* The host store keeps the files under family KEY, so a worker fetches
        each blob from the remote cache once. *)
     fun place (name, sha) =
@@ -16606,11 +16614,11 @@ fun restore_tool_cache remote store key dir =
       handle MissingSharedBlob _ =>
         (warn ("the tool cache lost file " ^ HolbuildHash.quote name ^ ": the remote cache has no blob " ^ sha);
          NONE)
-    fun restored files stale =
+    fun restored files lost =
       (touch_dir (Path.concat(store, key));
        HolbuildStatus.message_stdout
          ("restored tool cache (" ^ Int.toString (length files) ^ " files)\n");
-       {files = files, stale = stale})
+       {files = files, lost = lost, stale = not (null lost)})
     (* A cache in front of the remote's store (a host's bazel-remote over
        S3) can keep serving an entry the store has since replaced, so the
        entry is read again from the store.  The files whose blobs survive
@@ -16621,70 +16629,108 @@ fun restore_tool_cache remote store key dir =
        case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.probe_action remote key) of
            {found = SOME text, ...} =>
              let
-               val files = map file (shared_manifest_entries text)
+               val files = tool_cache_entry_files text
                val placed = List.mapPartial place_surviving files
+               val placed_names = map #1 placed
              in
-               restored placed (length placed < length files)
+               restored placed
+                 (List.filter (fn name => not (member_string name placed_names)) (map #1 files))
              end
          | {found = NONE, missing = true} =>
              (warn "not restoring the tool cache: the remote cache no longer holds its entry";
-              {files = [], stale = true})
+              {files = [], lost = [], stale = true})
          | {found = NONE, missing = false} =>
              raise Error "could not read its entry again from the remote cache")
   in
     case HolbuildRemoteCache.get_action remote key of
-        NONE => {files = [], stale = false}
+        NONE => {files = [], lost = [], stale = false}
       | SOME text =>
-          let val files = map file (shared_manifest_entries text)
+          let val files = tool_cache_entry_files text
           in
-            (List.app place files; restored files false)
+            (List.app place files; restored files [])
             handle MissingSharedBlob _ => heal ()
           end
   end
   handle e => (warn ("not restoring the tool cache: " ^ tool_cache_failure e);
-               remove_tree dir; ensure_dir dir; {files = [], stale = false})
+               remove_tree dir; ensure_dir dir; {files = [], lost = [], stale = false})
 
 (* Publishes DIR's files under KEY unless they are the RESTORED ones and
-   the entry isn't stale.  A publish uploads every file, restored ones too:
-   a host may have restored a file from its store after the remote cache
-   dropped its blob, and the upload renews the blob there with the entry
-   that names it.  STOP () says to stop before the next upload. *)
-fun publish_tool_cache stop remote store key dir {files = restored, stale} =
+   the entry isn't stale.  Other actions of the same ancestry may have
+   published since this one restored, so the entry is read again right
+   before it is replaced, and its files are kept unless this action wrote a
+   file of the same name or the name is gone from DIR (deleted, dropped
+   below, or LOST).  The bounds refuse a publish only for the files this
+   action wrote (new, or changed since the restore); the files it kept are
+   admitted in name order while they fit, so an entry that grew past the
+   bounds from two publishes at once shrinks again.  A publish uploads
+   every file of DIR it keeps, restored ones too: a host may have restored
+   a file from its store after the remote cache dropped its blob, and the
+   upload renews the blob there with the entry that names it.  STOP () says
+   to stop before the next upload. *)
+fun publish_tool_cache stop remote store key dir {files = restored, lost, stale} =
   let
     fun file name =
       let val path = Path.concat(dir, name)
       in
         if not (plain_file_name name) orelse not (Posix.FileSys.ST.isReg (Posix.FileSys.lstat path)) then
           raise Error ("not a plain file: " ^ HolbuildHash.quote name)
-        else (name, path, Position.toInt (FS.fileSize path))
+        else (name, path, Position.toInt (FS.fileSize path), HolbuildHash.file_sha256 path)
       end
     val files = map file (tool_cache_listing dir)
-    val bytes = List.foldl (fn ((_, _, size), total) => total + size) 0 files
+    val (kept, touched) =
+      List.partition (fn (name, _, _, sha) => List.exists (fn r => r = (name, sha)) restored) files
+    fun bytes entries = List.foldl (fn ((_, _, size, _), total) => total + size) 0 entries
     val _ =
-      if length files > tool_cache_max_files orelse bytes > tool_cache_max_bytes then
-        raise Error (Int.toString (length files) ^ " files of " ^ Int.toString bytes ^
+      if length touched > tool_cache_max_files orelse bytes touched > tool_cache_max_bytes then
+        raise Error (Int.toString (length touched) ^ " files of " ^ Int.toString (bytes touched) ^
                      " bytes exceed the limit of " ^ Int.toString tool_cache_max_files ^ " files of " ^
                      Int.toString tool_cache_max_bytes ^ " bytes")
       else ()
-    val entries = map (fn (name, path, _) => (name, path, HolbuildHash.file_sha256 path)) files
-    fun upload (name, path, sha) =
+    fun admit (entry as (_, _, size, _), (admitted, count, total)) =
+      if count < tool_cache_max_files andalso total + size <= tool_cache_max_bytes then
+        (entry :: admitted, count + 1, total + size)
+      else (admitted, count, total)
+    val (admitted, _, _) = List.foldl admit ([], length touched, bytes touched) kept
+    val entries = touched @ admitted
+    val names = map #1 entries
+    val gone = List.filter (fn name => not (member_string name names)) (map #1 restored @ lost)
+    fun upload (name, path, _, sha) =
       (if stop () then raise Error "interrupted" else ();
        case HolbuildRemoteCache.publish_hashed_blob remote {hash = sha, src = path} of
            HolbuildCacheBackend.Published => ()
          | HolbuildCacheBackend.AlreadyPresent => ()
          | _ => raise Error ("could not upload " ^ name);
        store_add store key {sha = sha, src = path, save = false})
-    val manifest = shared_manifest tool_cache_header NONE (map (fn (name, _, sha) => ("file", sha, name)) entries)
+    (* The entry's files from other publishes, as the remote's store holds
+       them now; none when it holds no entry or one that can't be read. *)
+    fun others () =
+      case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.probe_action remote key) of
+          {found = SOME text, ...} =>
+            (List.filter (fn (name, _) => not (member_string name names orelse member_string name gone))
+               (tool_cache_entry_files text)
+             handle Error _ => [])
+        | _ => []
+    fun manifest files =
+      shared_manifest tool_cache_header NONE
+        (map (fn name => ("file", #2 (valOf (List.find (fn (n, _) => n = name) files)), name))
+             (sort_strings (map #1 files)))
   in
-    if not stale andalso map (fn (name, _, sha) => (name, sha)) entries = restored then ()
+    if not stale andalso null touched andalso length admitted = length restored then ()
     else
-      (List.app upload entries;
-       case HolbuildRemoteCache.replace_action_everywhere remote {key = key, text = manifest} of
-           HolbuildCacheBackend.Published =>
-             HolbuildStatus.message_stdout
-               ("published tool cache (" ^ Int.toString (length entries) ^ " files)\n")
-         | HolbuildCacheBackend.AlreadyPresent => ()
-         | _ => raise Error "could not publish the entry")
+      let
+        val _ = List.app upload entries
+        val others = others ()
+        val merged =
+          map (fn (name, _, _, sha) => (name, sha)) entries @
+          List.take (others, Int.min (length others, tool_cache_max_files - length entries))
+      in
+        case HolbuildRemoteCache.replace_action_everywhere remote {key = key, text = manifest merged} of
+            HolbuildCacheBackend.Published =>
+              HolbuildStatus.message_stdout
+                ("published tool cache (" ^ Int.toString (length merged) ^ " files)\n")
+          | HolbuildCacheBackend.AlreadyPresent => ()
+          | _ => raise Error "could not publish the entry"
+      end
   end
   handle e => warn ("not publishing the tool cache: " ^ tool_cache_failure e)
 
