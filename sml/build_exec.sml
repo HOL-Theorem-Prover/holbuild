@@ -4903,15 +4903,16 @@ fun failure_log output =
     | SOME path => read_text path handle IO.Io _ => ""
 
 fun failure_detail policy source_file source_text boundaries termination_diagnostics failure_output heading msg
-      {primary = text, records} =
+      {primary = text, legacy, records} =
   let
+    val child_output = if legacy then HolbuildTheoryDiagnostics.legacy_child_log text else text
     val goal_state = HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference (captured_output_has_retained_log failure_output) text
     val plan_position = HolbuildTheoryDiagnostics.plan_position_summary text
     val trace_context = if trace_steps policy then HolbuildTheoryDiagnostics.summarize_trace_steps text else NONE
-    val static_error = HolbuildTheoryDiagnostics.static_error_summary source_file source_text text
+    val static_error = HolbuildTheoryDiagnostics.static_error_summary source_file source_text child_output
     val source_context = HolbuildTheoryDiagnostics.summarize_failed_fragment_source source_file source_text boundaries termination_diagnostics text
     val termination_context = HolbuildTheoryDiagnostics.summarize_termination_goal_source source_file source_text termination_diagnostics text
-    val child_failure = if Option.isSome static_error then NONE else HolbuildTheoryDiagnostics.child_failure_summary text
+    val child_failure = if Option.isSome static_error then NONE else HolbuildTheoryDiagnostics.child_failure_summary child_output
     val additional_failures = HolbuildTheoryDiagnostics.additional_failures source_file source_text boundaries termination_diagnostics records
     val fallback =
       if Option.isSome child_failure then ""
@@ -5310,7 +5311,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
       in
         failure_detail policy source_file source_text
           (map HolbuildTheoryCheckpoints.checkpoint_boundary theorem_checkpoints) termination_diagnostics
-          failure_output "" msg {primary = primary, records = Option.getOpt (Option.map #records report, [])}
+          failure_output "" msg {primary = primary, legacy = false, records = Option.getOpt (Option.map #records report, [])}
       end
     val build_log = Path.concat(stage, "holbuild-build.log")
     (* A promoting child removes its transient heap itself, unless it
@@ -9964,8 +9965,8 @@ fun remote_proof_failure (options : build_options) tc project plan keys toolchai
             val text = failure_log output
             val diagnostic =
               case HolbuildTheoryDiagnostics.remote_diagnostic text of
-                  SOME report => report
-                | NONE => {primary = HolbuildTheoryDiagnostics.legacy_child_log text, records = []}
+                  SOME {primary, records} => {primary = primary, legacy = false, records = records}
+                | NONE => {primary = text, legacy = true, records = []}
           in
             SOME (failure_detail policy source_file source_text boundaries terminations output
                     (heading ^ "\n") "hol run failed while building theory script" diagnostic)
@@ -13524,21 +13525,29 @@ fun result_text (spec_sha256, input_key) {status, failure, memory_cause, wall_ms
      (if null phases then [] else ["phase-ms=" ^ phases_text "," ":" phases]) @
      (case log of SOME (sha, bytes) => ["log=" ^ sha ^ " " ^ bytes] | NONE => [])) ^ "\n"
 
-(* A fleet action's build.log goes to the cache whole up to this size.  A
-   longer one goes as its first log_head_bytes, a line saying how much was
-   cut, and its last log_tail_bytes: a multi-GB log is refused by the cache,
-   and a client restores every action log it is given. *)
+(* Cap log uploads with a retained head and tail. If continuation would
+   push the first failure into the gap, keep its own tail too, within the
+   same byte budget. *)
 val log_upload_limit = 64 * 1024 * 1024
 val log_head_bytes = 16 * 1024 * 1024
 val log_tail_bytes = log_upload_limit - log_head_bytes
+val log_primary_preview_bytes = 1024 * 1024
 
-fun write_truncated_log src dst =
+fun write_truncated_log src dst primary =
   let
-    val total = FS.fileSize src
-    val tail_start = total - Position.fromInt log_tail_bytes
-    val marker =
-      "\n... [holbuild: truncated " ^ Position.toString (total - Position.fromInt log_upload_limit) ^
-      " bytes of " ^ Position.toString total ^ "-byte build log] ...\n"
+    val total = Position.toInt (FS.fileSize src)
+    val tail_start = total - log_tail_bytes
+    val ranges =
+      (0, log_head_bytes) ::
+      (case primary of
+           SOME stop =>
+             let val start = Int.max (log_head_bytes, stop - log_primary_preview_bytes)
+             in
+               if start < stop andalso start < tail_start then
+                 [(start, stop), (tail_start + stop - start, total)]
+               else [(tail_start, total)]
+             end
+         | NONE => [(tail_start, total)])
     val fd = Posix.FileSys.openf (src, Posix.FileSys.O_RDONLY, Posix.FileSys.O.flags [])
     val out = BinIO.openOut dst
       handle e => (Posix.IO.close fd; raise e)
@@ -13549,18 +13558,30 @@ fun write_truncated_log src dst =
             if Word8Vector.length chunk = 0 then ()
             else (BinIO.output (out, chunk); copy (n - Word8Vector.length chunk))
           end
+    fun write_ranges _ _ [] = []
+      | write_ranges previous output_end ((start, stop) :: rest) =
+          let
+            val notice =
+              if previous = start then ""
+              else "\n... [holbuild: truncated " ^ Int.toString (start - previous) ^
+                   " bytes of " ^ Int.toString total ^ "-byte build log] ...\n"
+            val output_start = output_end + size notice
+            val _ = HolbuildBoundedOutput.binary (out, Byte.stringToBytes notice)
+            val _ = ignore (Posix.IO.lseek (fd, Position.fromInt start, Posix.IO.SEEK_SET))
+            val _ = copy (stop - start)
+          in
+            (start, stop, output_start) :: write_ranges stop (output_start + stop - start) rest
+          end
+    val written = write_ranges 0 0 ranges
+      handle e => (BinIO.closeOut out handle _ => (); Posix.IO.close fd handle _ => (); raise e)
   in
-    (copy log_head_bytes;
-     BinIO.output (out, Byte.stringToBytes marker);
-     ignore (Posix.IO.lseek (fd, tail_start, Posix.IO.SEEK_SET));
-     copy log_tail_bytes;
-     BinIO.closeOut out;
-     Posix.IO.close fd;
-     (* A position inside the omitted interval points after the notice. *)
-     fn position =>
-       if position <= log_head_bytes then position
-       else log_head_bytes + size marker + Int.max (0, position - Position.toInt tail_start))
-    handle e => (BinIO.closeOut out handle _ => (); Posix.IO.close fd handle _ => (); raise e)
+    (BinIO.closeOut out before Posix.IO.close fd)
+      handle e => (Posix.IO.close fd handle _ => (); raise e);
+    (* A position inside an omitted range points after its notice. *)
+    fn position =>
+      case List.find (fn (_, stop, _) => position <= stop) written of
+          SOME (start, _, output_start) => output_start + Int.max (0, position - start)
+        | NONE => raise Fail "invalid log position"
   end
 
 fun exception_failure e =
@@ -17095,7 +17116,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
              link in its place. *)
           let val truncated = temp_near (Path.concat (cache, "action-log"))
           in
-            upload truncated (write_truncated_log path truncated) before remove_file truncated
+            upload truncated (write_truncated_log path truncated (Option.map #primary_end (!diagnostic_log)))
+              before remove_file truncated
             handle e => (remove_file truncated; raise e)
           end
       end

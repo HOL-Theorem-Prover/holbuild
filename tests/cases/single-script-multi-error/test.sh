@@ -411,6 +411,30 @@ SML
   fi
 done
 
+# Machine-readable command summaries describe only the primary error.
+make_project command-summary
+cat >> "$project/src/AScript.sml" <<'SML'
+
+Theorem malformed: T Proof simp[] QED
+val _ = print "AFTER_TERMINAL\n";
+SML
+if (cd "$project" && HOLBUILD_COMMAND_RECORD="$tmpdir/command.json" exec env \
+      HOLBUILD_COMMAND_RECORD_PID="$BASHPID" "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" build ATheory) \
+    > "$tmpdir/command.log" 2>&1; then
+  echo "proof with an additional parse error passed" >&2
+  exit 1
+fi
+require_grep '^additional failure 1 of 1:$' "$tmpdir/command.log"
+python3 - "$tmpdir/command.json" <<'PYTHON'
+import json
+import sys
+
+with open(sys.argv[1]) as record:
+    failure, = json.load(record)["failures"]
+assert failure["kind"] == "proof_failure" and failure["theorem"] == "first", failure
+assert "first proof error" in failure["error"] and "additional failure" not in failure["error"], failure
+PYTHON
+
 make_project count-cap
 for n in {2..9}; do
   cat >> "$project/src/AScript.sml" <<SML

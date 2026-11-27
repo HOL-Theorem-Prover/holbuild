@@ -760,7 +760,7 @@ fun fail_with_debug_artifacts status key label detail artifacts =
                  TextIO.flushOut TextIO.stdOut)
               else ())
          end);
-   if failures_suppressed () then () else !command_failure (label, msg);
+   if failures_suppressed () then () else !command_failure (label, #primary detail);
    (* A diagnostic of several lines starts on a line of its own, as a remote
       one does, so that its "theorem: T (line N)" line stands alone. *)
    if failure_printed () then
@@ -770,8 +770,8 @@ fun fail_with_debug_artifacts status key label detail artifacts =
 
 (* A node that failed outside any build's status: a theory that failed on a
    remote worker.  Text mode reports it in the build's error. *)
-fun report_remote_failure_detail key label detail artifacts =
-  (!command_failure (label, failure_text detail);
+fun report_remote_failure_detail key label (detail : failure_detail) artifacts =
+  (!command_failure (label, #primary detail);
    if json_mode () then
      emit_json "node_failed"
        (json_node_fields key label @

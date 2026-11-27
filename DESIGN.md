@@ -1343,8 +1343,9 @@ the stage marker as failure even if the child exits successfully. The
 remaining continuation budget also bounds normally untimed tactics. The
 first timeout ends continuation immediately. The stage marker records the
 primary log's byte offset and the later failures. Workers put these
-records after the uploaded failure log and adjust the offset if they
-truncate the log. Status formats later failures from those records.
+records after the uploaded failure log. When truncating, they keep the
+end of the primary log and adjust the offsets. Status formats later
+failures from those records.
 A speculative child continues to use the deferred proof protocol.
 
 `--trace-steps` executes the build and records runtime plans plus before/after

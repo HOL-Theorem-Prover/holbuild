@@ -2034,7 +2034,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                 Mutex.lock early_mutex;
                                 early_diagnoses := Redblackmap.insert (!early_diagnoses, key, (sha, e));
                                 Mutex.unlock early_mutex;
-                                !HolbuildStatus.command_failure (HolbuildBuildPlan.logical_name node, msg);
+                                !HolbuildStatus.command_failure
+                                  (HolbuildBuildPlan.logical_name node, #primary (HolbuildBuildExec.build_error_detail e));
                                 if HolbuildStatus.json_mode () then ()
                                 else HolbuildStatus.message_stderr ("holbuild: " ^ msg ^ "\n")
                               end
