@@ -163,11 +163,12 @@ fun file_hash t path =
     else by_suffix 0 hashed_suffixes
   end
 
-(* Removes, with REMOVE, every entry the hydrate didn't want. *)
-fun prune (t as {entries, wanted, ...} : t) remove =
+(* Removes, with REMOVE, every entry the hydrate didn't want that SELECT
+   picks. *)
+fun prune_where (t as {entries, wanted, ...} : t) select remove =
   let
     val unwanted =
-      locked t (fn () => List.filter (fn (path, _) => not (Binaryset.member (!wanted, path)))
+      locked t (fn () => List.filter (fn e as (path, _) => not (Binaryset.member (!wanted, path)) andalso select e)
                                      (Binarymap.listItems (!entries)))
   in
     List.app (fn (path, entry) =>
@@ -175,5 +176,8 @@ fun prune (t as {entries, wanted, ...} : t) remove =
                  locked t (fn () => entries := #1 (Binarymap.remove (!entries, path)))))
              unwanted
   end
+
+(* Removes, with REMOVE, every entry the hydrate didn't want. *)
+fun prune t remove = prune_where t (fn _ => true) remove
 
 end
