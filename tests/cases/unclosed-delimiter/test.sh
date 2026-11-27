@@ -63,7 +63,8 @@ Proof
    >> (fn _ => ALL_TAC) `[ ^(fn x => ``{``) (* ( (* ] *) { *)`
    >> (fn _ => ALL_TAC) “(”
    (* ( (* [ *) { *) >>
-Type.mk_type
+Type.mk_type >>
+Datatype
 QED
 
 Theorem only_missing_qed:
@@ -85,13 +86,13 @@ warnings, staged = text.split("ATheory failed:", 1)
 _, recovering = warnings.split("HOL source parser recovered while instrumenting theorem boundaries", 1)
 unclosed, missing_qed = recovering.split("HOL source parse error: expected 'QED'", 1)
 note = f"note: unclosed '(' opened at {script}:11:3\n  |   (ALL_TAC (* tactic timed out *)"
-assert f"source: {script}:19:1" in unclosed and note in unclosed, unclosed
+assert f"source: {script}:20:1" in unclosed and note in unclosed, unclosed
 assert "note: unclosed" not in missing_qed, missing_qed
 assert "\nstatic error:\n" in staged, staged
-assert "AScript.sml:19:1: parse error: expected closing parenthesis" in staged and note in staged, staged
+assert "AScript.sml:20:1: parse error: expected closing parenthesis" in staged and note in staged, staged
 PY
 
-check_json_parse_failure 19
+check_json_parse_failure 20
 
 cat > "$script" <<'SML'
 Theory A

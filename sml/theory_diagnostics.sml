@@ -228,14 +228,13 @@ fun unclosed_delimiter source stop accepts =
              let
                val j = skip id (i + 1)
                val name = word i j
+               val hol_keyword =
+                 col_zero i andalso char j <> #"." andalso boundary name andalso
+                 (name <> "Datatype" orelse char (skip (Char.contains " \t") j) = #":")
              in
-               if col_zero i andalso char j <> #"." andalso boundary name then
+               if hol_keyword then
                  if Option.isSome (!opener) then finish ()
-                 else
-                   let val next_body =
-                     if name <> "Datatype" orelse char (skip (Char.contains " \t") j) = #":"
-                     then body name else NONE
-                   in code j [] next_body NONE end
+                 else code j [] (body name) NONE
                else code j stack pending resume
              end
            else if symbolic c then
