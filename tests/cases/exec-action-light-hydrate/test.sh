@@ -107,6 +107,12 @@ worker() {
   spec=$(field "$tmpdir/$name.batch" light:TTheory 4)
   remote_key=$(field "$tmpdir/$name.batch" light:TTheory 3)
   [[ -n "$spec" ]] || { cat "$tmpdir/$name.batch" >&2; exit 1; }
+  run_spec "$name" "${2:-}"
+}
+# run_spec NAME [keep]: runs the last worker's spec again, on a fresh worker
+# cache (the last one with keep).
+run_spec() {
+  local name=$1
   if [[ ${2:-} != keep ]]; then
     rm -rf "$worker_cache"
     link_hol_toolchain_cache "$worker_cache"
@@ -161,6 +167,13 @@ outputs() {
 }
 # Removes T's entry from the remote, so the next action builds it again.
 forget_t() { rm -f "$tmpdir/remote/ac/$remote_key"; }
+# report NAME: the log the worker reported, timings aside.
+report() {
+  local log
+  log=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/$1.result")
+  require_file "$tmpdir/remote/cas/$log"
+  grep -v '^holbuild hol-phases ' "$tmpdir/remote/cas/$log"
+}
 asks_dependencies_first() { grep -rqx "option install-dependencies-first=true" "$tmpdir/remote"; }
 
 # A and C are in the remote cache, as a batch's client leaves them.
@@ -189,6 +202,11 @@ worker resume-pass
 expect_worker resume-pass 0 "status=built"
 hydrated resume-pass 2 2
 outputs resume-pass
+# Run again on a fresh host, it restores its published entry, installs the
+# dependencies and restores it again against them.
+run_spec resume-cached
+expect_worker resume-cached 0 "status=cached"
+hydrated resume-cached 2 2
 forget_t
 write_toml "install_dependencies_first = true"
 worker full-pass
@@ -208,14 +226,34 @@ worker load-pass
 expect_worker load-pass 0 "status=built"
 reran load-pass
 write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" "$(load_c 'FAIL_TAC "after the load"')"
+# The full install below starts from the remote as this run finds it, and
+# reports the same log, timings aside; the light run's missing file is in
+# neither.
+cp -a "$tmpdir/remote" "$tmpdir/remote.before"
 worker load-fail
 expect_worker load-fail 1 "status=failed" "failure=proof"
 reran load-fail
 require_grep "after the load" "$tmpdir/load-fail.log"
+report load-fail > "$tmpdir/load-fail.report"
 write_toml "install_dependencies_first = true"
+rm -rf "$tmpdir/remote"/*
+cp -a "$tmpdir/remote.before"/. "$tmpdir/remote"/
 worker load-fail-full
 expect_worker load-fail-full 1 "status=failed" "failure=proof"
 require_grep "after the load" "$tmpdir/load-fail-full.log"
+diff "$tmpdir/load-fail.report" <(report load-fail-full) ||
+  { echo "the rerun and the full install reported different logs" >&2; exit 1; }
+! grep -q "Cannot find file" "$tmpdir/load-fail.report" ||
+  { echo "the rerun reported the light run's missing file" >&2; exit 1; }
+
+# A script that looks for C's file itself, which finds none on a light
+# install and says nothing HOL would, passes when its project asks for the
+# dependencies first.
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" "$(printf '\nTheorem t3:\n  T\nProof\n  %s\nQED\n' \
+  '(if OS.FileSys.access ("../../../obj/src/C" ^ "Theory.ui", []) then ACCEPT_TAC TRUTH else FAIL_TAC "no C")')"
+worker probe-full
+expect_worker probe-full 0 "status=built"
+hydrated probe-full full 2
 write_toml
 
 # A target the build didn't name, as every root theory is one when it names
