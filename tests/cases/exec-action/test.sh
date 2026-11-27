@@ -406,7 +406,7 @@ mv "$remote_root/cas/$data_blob" "$tmpdir/data.blob"
 worker lost-input "$spec_b"
 expect lost-input 3 "status=failed" "failure=input-missing" "missing=blob $data_blob"
 # A failed hydrate still reports the steps it ran.
-grep -qE "^phase-ms=(.*,)?hydrate:[0-9]+,hydfiles:[0-9]+(,|\$)" "$tmpdir/lost-input.result" || {
+grep -qE "^phase-ms=(.*,)?hydrate:[0-9]+,hydprune:[0-9]+,hydprunen:[0-9]+,hydfiles:[0-9]+(,|\$)" "$tmpdir/lost-input.result" || {
   echo "lost-input's record lacks hydrate's steps:" >&2; cat "$tmpdir/lost-input.result" >&2; exit 1; }
 mv "$tmpdir/data.blob" "$remote_root/cas/$data_blob"
 
