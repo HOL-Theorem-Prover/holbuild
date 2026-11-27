@@ -132,17 +132,257 @@ fun source_context_text_span source_text {start_offset, end_offset} =
     String.concat (loop start [])
   end
 
-fun parse_error source_path source_text _ (start, _) msg =
+(* A lexical scan for a diagnostic, after HOL has already rejected the script. *)
+local
+  datatype quotation = Delimited of string | Statement | Terms | Verbatim
+
+  fun body "Theorem" = SOME Statement
+    | body "Triviality" = SOME Statement
+    | body "Definition" = SOME Terms
+    | body "Datatype" = SOME Terms
+    | body "Inductive" = SOME Terms
+    | body "CoInductive" = SOME Terms
+    | body "Quote" = SOME Verbatim
+    | body _ = NONE
+
+  fun boundary word =
+    Option.isSome (body word) orelse
+    List.exists (fn kw => word = kw)
+      ["Theory", "Resume", "Finalise", "Type", "Overload", "Proof", "QED", "Termination", "End"]
+
+  fun body_stop word =
+    boundary word orelse
+    List.exists (fn kw => word = kw)
+      ["val", "fun", "structure", "signature", "datatype", "type", "local", "open", "include",
+       "exception", "infix", "infixr", "nonfix", "abstype", "eqtype", "functor"]
+
+  fun closing #"(" = #")"
+    | closing #"[" = #"]"
+    | closing _ = #"}"
+in
+fun unclosed_delimiter source stop accepts =
   let
-    val line = line_number_at source_text start
-    val col = column_number_at source_text start
+    val n = size source
+    fun char i = if i < n then String.sub (source, i) else #"\000"
+    fun at i token = i + size token <= n andalso String.substring (source, i, size token) = token
+    fun skip pred i = if i < n andalso pred (char i) then skip pred (i + 1) else i
+    fun id c = Char.isAlphaNum c orelse c = #"_" orelse c = #"'"
+    val symbolic = Char.contains "!%&$#+-/:<=>?@\\~^|*"
+    fun col_zero i = i = 0 orelse char (i - 1) = #"\n"
+    fun word i j = String.substring (source, i, j - i)
+
+    fun comment i depth =
+      if i >= n then i
+      else if at i "(*" then comment (i + 2) (depth + 1)
+      else if at i "*)" then if depth = 1 then i + 2 else comment (i + 2) (depth - 1)
+      else comment (i + 1) depth
+
+    fun literal i close multiline =
+      if i >= n orelse (not multiline andalso char i = #"\n") then i
+      else if at i close then i + size close
+      else if char i = #"\\" then
+        if Char.isSpace (char (i + 1)) then
+          let val gap = skip Char.isSpace (i + 1)
+          in literal (if char gap = #"\\" then gap + 1 else gap) close multiline end
+        else literal (Int.min (n, i + 2)) close multiline
+      else literal (i + 1) close multiline
+
+    val opener = ref NONE
+    exception Done of (char * int) option
+    fun finish () = raise Done (!opener)
+    fun site i stack =
+      if Option.isSome (!opener) orelse i < stop then ()
+      else
+        case stack of
+            (item as (c, _)) :: _ =>
+              if i = stop andalso accepts c then opener := SOME item else finish ()
+          | [] => finish ()
+
+    fun code i stack pending resume =
+      (site i stack;
+       if i >= n then finish ()
+       else if at i "(*" then code (comment (i + 2) 1) stack pending resume
+       else if at i "\"" orelse at i "#\"" then
+         code (literal (i + (if char i = #"#" then 2 else 1)) "\"" false) stack pending resume
+       else if at i "`" then
+         let val delimiter = if at i "``" then "``" else "`"
+         in quote (i + size delimiter) (Delimited delimiter) (fn j => code j stack pending resume) end
+       else if at i "\226\128\152" then
+         quote (i + 3) (Delimited "\226\128\153") (fn j => code j stack pending resume)
+       else if at i "\226\128\156" then
+         quote (i + 3) (Delimited "\226\128\157") (fn j => code j stack pending resume)
+       else
+         let val c = char i in
+           if Char.contains "([{" c then code (i + 1) ((c, i) :: stack) pending resume
+           else if Char.contains ")]}" c then
+             (case stack of
+                  (item as (left, _)) :: rest =>
+                    if closing left <> c then code (i + 1) stack pending resume
+                    else if SOME item = !opener then raise Done NONE
+                    else
+                      (case (rest, resume) of
+                           ([], SOME continue) => continue (i + 1)
+                         | _ => code (i + 1) rest pending resume)
+                | [] => code (i + 1) [] pending resume)
+           else if Char.isAlpha c orelse c = #"'" then
+             let
+               val j = skip id (i + 1)
+               val name = word i j
+             in
+               if col_zero i andalso boundary name then
+                 if Option.isSome (!opener) then finish ()
+                 else
+                   let val next_body =
+                     if name <> "Datatype" orelse char (skip (Char.contains " \t") j) = #":"
+                     then body name else NONE
+                   in code j [] next_body NONE end
+               else code j stack pending resume
+             end
+           else if symbolic c then
+             let val j = skip symbolic (i + 1) in
+               case (c, j = i + 1, pending, stack) of
+                   (#":", true, SOME kind, []) =>
+                     quote j kind (fn k => code k [] NONE NONE)
+                 | (#"=", true, SOME Statement, []) => code j [] NONE resume
+                 | _ => code j stack pending resume
+             end
+           else code (i + 1) stack pending resume
+         end)
+    and quote i kind continue =
+      (site i [];
+       if i >= n then finish ()
+       else
+         case kind of
+             Delimited close =>
+               if at i close andalso (close <> "`" orelse not (at i "``"))
+               then continue (i + size close)
+               else quote_body i kind continue
+           | _ => quote_body i kind continue)
+    and quote_body i kind continue =
+      if at i "(*" then quote (comment (i + 2) 1) kind continue
+      else if at i "``" then quote (i + 2) kind continue
+      else if at i "\"" then quote (literal (i + 1) "\"" true) kind continue
+      else if at i "\226\128\185" then quote (literal (i + 3) "\226\128\186" true) kind continue
+      else if at i "\194\171" then quote (literal (i + 2) "\194\187" true) kind continue
+      else if at i "^^" then quote (skip (fn c => c = #"^") (i + 2)) kind continue
+      else if at i "^(" then
+        code (i + 2) [(#"(", i + 1)] NONE (SOME (fn j => quote j kind continue))
+      else if col_zero i andalso Char.isAlpha (char i) then
+        let
+          val j = skip id (i + 1)
+          val name = word i j
+        in
+          case kind of
+              Verbatim => if name = "End" then continue i else quote j kind continue
+            | _ => if body_stop name then continue i else quote j kind continue
+        end
+      else quote (i + 1) kind continue
   in
-    raise Fail
-      (String.concat
-         ["HOL source parse error: ", msg, "\n",
-          "source: ", source_path, ":", Int.toString line, ":", Int.toString col, "\n",
-          source_context_text source_text line])
+    code 0 [] NONE NONE handle Done result => result
   end
+end
+
+fun decimal text =
+  if text <> "" andalso CharVector.all Char.isDigit text then Int.fromString text else NONE
+  handle Overflow => NONE
+
+(* HOL's child parser appends a range as C-C2 or C-L2:C2. *)
+fun source_position location =
+  let
+    fun position path line col =
+      case (decimal line, decimal col) of
+          (SOME l, SOME c) => SOME {path = String.concatWith ":" (rev path), line = l, col = c}
+        | _ => NONE
+    fun range text =
+      case String.fields (fn c => c = #"-") text of
+          [start, stop] =>
+            if Option.isSome (decimal stop) then SOME start else NONE
+        | _ => NONE
+  in
+    case rev (String.fields (fn c => c = #":") location) of
+        last :: previous :: rest =>
+          (case (range previous, decimal last, rest) of
+               (SOME start, SOME _, line :: (path as _ :: _)) => position path line start
+             | _ => if null rest then NONE else position rest previous (Option.getOpt (range last, last)))
+      | _ => NONE
+  end
+
+fun source_offset text line col =
+  let
+    val n = size text
+    fun seek i l =
+      if l = line then
+        let
+          fun column j c =
+            if c = col then SOME j
+            else if j >= n orelse String.sub (text, j) = #"\n" then NONE
+            else column (j + 1) (c + 1)
+        in column i 1 end
+      else if i >= n then NONE
+      else seek (i + 1) (if String.sub (text, i) = #"\n" then l + 1 else l)
+  in
+    if line < 1 orelse col < 1 then NONE else seek 0 1
+  end
+
+fun delimiter_note source_path source_text message (line, col) =
+  let
+    fun note accepts =
+      case Option.mapPartial (fn i => unclosed_delimiter source_text i accepts)
+                             (source_offset source_text line col) of
+          NONE => NONE
+        | SOME (c, i) =>
+            let val line = line_number_at source_text i
+            in SOME (String.concat
+                  [HolbuildStatus.unclosed_delimiter_note_prefix, String.str c, "' opened at ", source_path, ":",
+                  Int.toString line, ":", Int.toString (column_number_at source_text i), "\n",
+                  HolbuildStatus.unclosed_delimiter_excerpt_prefix, nth_line (source_lines source_text) line, "\n"])
+            end
+  in
+    case message of
+        "expected closing parenthesis" => note (fn c => c = #"(")
+      | "expected close delimiter" => note (fn _ => true)
+      | "expected 'QED'" => note (fn _ => true)
+      | "expected 'End'" => note (fn _ => true)
+      | _ => NONE
+  end
+
+fun append_note text NONE = text
+  | append_note text (SOME note) = text ^ (if String.isSuffix "\n" text then "" else "\n") ^ note
+
+fun annotate_analyser_parse_error source_path source_text text =
+  let
+    val error_prefix = "HOL source parse error: "
+    val source_prefix = "source: " ^ source_path ^ ":"
+    fun find (header :: location :: rest) =
+          if String.isPrefix error_prefix header andalso String.isPrefix source_prefix location then
+            let
+              val msg = String.extract (header, size error_prefix, NONE)
+            in
+              case source_position (String.extract (location, size "source: ", NONE)) of
+                  SOME {line, col, ...} => delimiter_note source_path source_text msg (line, col)
+                | NONE => NONE
+            end
+          else find (location :: rest)
+      | find _ = NONE
+  in
+    append_note text (find (source_lines text))
+  end
+
+fun child_parse_error_note source_path source_text line =
+  let val marker = ": parse error: " in
+    case find_substring marker line of
+        NONE => NONE
+      | SOME i =>
+          (case source_position (String.substring (line, 0, i)) of
+               SOME {path, line = source_line, col} =>
+                 if OS.Path.file path = OS.Path.file source_path then
+                   delimiter_note source_path source_text (String.extract (line, i + size marker, NONE)) (source_line, col)
+                 else NONE
+             | NONE => NONE)
+  end
+
+fun annotate_child_parse_error source_path source_text text =
+  append_note text (first_some (child_parse_error_note source_path source_text) (source_lines text))
 
 fun take_static_error_block [] acc = rev acc
   | take_static_error_block (line :: rest) acc =
@@ -183,19 +423,16 @@ fun parse_static_error_location line =
       NONE => NONE
     | SOME marker =>
         let
-          fun number text =
-            if text <> "" andalso CharVector.all Char.isDigit text then Int.fromString text else NONE
-          fun column text =
-            List.all (Option.isSome o number) (String.fields (fn c => c = #"-") text)
+          val location = String.substring (line, 0, marker)
           fun located path_fields line_no =
             {path = String.concatWith ":" (rev path_fields), line = line_no}
         in
-          case rev (String.fields (fn c => c = #":") (String.substring(line, 0, marker))) of
-              last :: previous :: rest =>
-                (case (column last, number previous, rest) of
-                     (true, SOME line_no, _ :: _) => SOME (located rest line_no)
-                   | _ => Option.map (located (previous :: rest)) (number last))
-            | _ => NONE
+          case source_position location of
+              SOME {path, line, ...} => SOME {path = path, line = line}
+            | NONE =>
+                (case rev (String.fields (fn c => c = #":") location) of
+                     last :: (path as _ :: _) => Option.map (located path) (decimal last)
+                   | _ => NONE)
         end
 
 (* Staged scripts carry location pragmas, so Poly reports lines of the source
@@ -253,10 +490,9 @@ fun static_error_summary source_path source_text text =
                     ["source: ", source_path, ":", Int.toString line, "\n",
                      source_context_text source_text line]
         in
-          SOME (String.concat
-            ["static error:\n",
-             String.concat (map (fn line => line ^ "\n") block),
-             source_context])
+          SOME (append_note
+            (String.concat ["static error:\n", String.concat (map (fn line => line ^ "\n") block), source_context])
+            (child_parse_error_note source_path source_text (hd block)))
         end
 
 fun proof_unit_label (checkpoint : HolbuildTheoryCheckpoints.boundary) =

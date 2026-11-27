@@ -62,8 +62,9 @@ fun parse_termination fields =
          proof_ir_plan = NONE}
     | _ => raise HolbuildTheoryCheckpoints.Error "bad analyser termination record"
 
-fun response_records wants source_path =
+fun response_records wants source_path source_text =
   let
+    val annotate = HolbuildTheoryDiagnostics.annotate_analyser_parse_error source_path source_text
     fun incomplete detail =
       raise HolbuildTheoryCheckpoints.Error
         ("incomplete analyser response for " ^ source_path ^ ": " ^ detail)
@@ -87,13 +88,18 @@ fun response_records wants source_path =
                    else if completed then (rev acc, rev errors)
                    else incomplete "missing file envelope"
                | ["parse-error", text] =>
-                   if in_file then loop rest in_file completed acc (text :: errors)
+                   if in_file then loop rest in_file completed acc (annotate text :: errors)
+                   else loop rest in_file completed acc errors
+               | ["terminations-error", text] =>
+                   if in_file then loop rest in_file completed (["terminations-error", annotate text] :: acc) errors
                    else loop rest in_file completed acc errors
                | fields =>
                    if in_file then loop rest in_file completed (fields :: acc) errors
                    else loop rest in_file completed acc errors)
   in
-    loop (run wants source_path) false false [] []
+    loop (run wants source_path
+          handle HolbuildTheoryCheckpoints.Error msg => raise HolbuildTheoryCheckpoints.Error (annotate msg))
+      false false [] []
   end
 
 fun boundary_record fields =
@@ -114,26 +120,26 @@ fun termination_error records =
     | SOME _ => raise HolbuildTheoryCheckpoints.Error "bad analyser terminations-error record"
     | NONE => NONE
 
-fun scan source_path _ =
-  let val (records, _) = response_records ["boundaries"] source_path
+fun scan source_path source_text =
+  let val (records, _) = response_records ["boundaries"] source_path source_text
   in map parse_boundary records end
 
-fun scan_strict source_path _ =
-  let val (records, _) = response_records ["boundaries-strict"] source_path
+fun scan_strict source_path source_text =
+  let val (records, _) = response_records ["boundaries-strict"] source_path source_text
   in map parse_boundary records end
 
-fun scan_with_recovery source_path _ =
-  let val (records, errors) = response_records ["boundaries-recovering"] source_path
+fun scan_with_recovery source_path source_text =
+  let val (records, errors) = response_records ["boundaries-recovering"] source_path source_text
   in {boundaries = map parse_boundary (List.filter boundary_record records),
       errors = errors} end
 
-fun scan_terminations_strict source_path _ =
-  let val (records, _) = response_records ["terminations-strict"] source_path
+fun scan_terminations_strict source_path source_text =
+  let val (records, _) = response_records ["terminations-strict"] source_path source_text
   in map parse_termination (List.filter termination_record records) end
 
-fun scan_boundaries_and_terminations_recovering_strict source_path _ =
+fun scan_boundaries_and_terminations_recovering_strict source_path source_text =
   let val (records, errors) =
-        response_records ["boundaries-recovering", "terminations-strict"] source_path
+        response_records ["boundaries-recovering", "terminations-strict"] source_path source_text
   in
     {boundaries = map parse_boundary (List.filter boundary_record records),
      errors = errors,
@@ -144,10 +150,10 @@ fun scan_boundaries_and_terminations_recovering_strict source_path _ =
 (* As scan_boundaries_and_terminations_recovering_strict, with each
    boundary's and termination's proof-IR plan expression and factories, in
    their order, from the same analyser process. *)
-fun scan_with_proof_ir_plans source_path _ =
+fun scan_with_proof_ir_plans source_path source_text =
   let
     val (records, errors) =
-      response_records ["boundaries-recovering", "terminations-strict", "proof-ir-plans"] source_path
+      response_records ["boundaries-recovering", "terminations-strict", "proof-ir-plans"] source_path source_text
     val boundaries = map parse_boundary (List.filter boundary_record records)
     val terminations = map parse_termination (List.filter termination_record records)
     val plans = List.mapPartial (fn "begin-proof-ir" :: fields => SOME fields | _ => NONE) records
