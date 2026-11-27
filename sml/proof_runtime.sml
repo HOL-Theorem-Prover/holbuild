@@ -26,15 +26,17 @@ val secondary_goal_ref = ref (NONE : string option)
 val diagnostic_seconds = 10.0
 val diagnostic_failure_limit = 8
 
+val secondary_preview_limit = 1024
+
 fun secondary_preview text =
   let
-    val limit = 1024
     fun boundary i =
       if i > 0 andalso Char.ord (String.sub (text, i)) div 64 = 2
       then boundary (i - 1)
       else i
   in
-    if size text <= limit then text else String.substring (text, 0, boundary limit)
+    if size text <= secondary_preview_limit then text
+    else String.substring (text, 0, boundary secondary_preview_limit)
   end
 
 fun diagnostic_time_left () =
@@ -51,15 +53,6 @@ val _ = Theory.register_hook
    fn TheoryDelta.ExportTheory _ =>
         if !tainted_ref then OS.Process.exit OS.Process.failure else ()
     | _ => ())
-
-fun install_diagnostics before_declaration report_source_error finish_script marker =
-  (diagnostic_marker_ref := SOME marker;
-   before_declaration := check_diagnostic_deadline;
-   report_source_error := (fn () =>
-     if !tainted_ref then HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild secondary source error\n")
-     else ());
-   finish_script := (fn record_peak_rss =>
-     if !tainted_ref then (record_peak_rss (); OS.Process.exit OS.Process.failure) else ()))
 
 val checkpoint_enabled_ref = ref false
 val context_checkpoints_ref = ref false
@@ -2135,33 +2128,87 @@ fun report_secondary_failure name at_finish e =
     val goal = Option.getOpt (!secondary_goal_ref, "")
   in
     HolbuildBoundedOutput.text (TextIO.stdErr,
-      String.concat ["holbuild secondary failure: ", kind, "\t", Int.toString (!diagnostic_declaration_start_ref),
+      String.concat ["\nholbuild secondary failure: ", kind, "\t", Int.toString (!diagnostic_declaration_start_ref),
                      "\t", field name, "\t", position, "\t", field message, "\t", field goal, "\n"])
   end
 
-fun print_first_failure name e =
+(* Match the native HOL driver's uncaught exception line. *)
+fun uncaught_exception_text e =
+  "Uncaught exception" ^
+  (case PolyML.Exception.exceptionLocation e of
+       NONE => ""
+     | SOME {file, startLine, ...} => " at " ^ file ^ ":" ^ FixedInt.toString startLine) ^
+  ": " ^ General.exnMessage e
+
+fun raise_proof_error e = raise e
+
+fun print_first_failure name goal e =
   let
     val text =
-      case (e, !theorem_info_ref) of
-          (Feedback.HOL_ERR err, SOME ("theorem", _, _, _, _, _, _, _, _)) =>
-            if !failed_prefix_resume_active_ref then Feedback.exn_to_string e
-            else
-              Feedback.exn_to_string (Feedback.wrap_exn "boolLib" "store_thm_at"
-                (Feedback.HOL_ERR (Feedback.set_message
-                  ("Failed to prove theorem " ^ Lib.quote name ^ ":\n" ^
-                   Feedback.message_of err) err)))
-        | (Feedback.HOL_ERR _, _) => Feedback.exn_to_string e
-        | _ =>
-            "Uncaught exception" ^
-            (case PolyML.Exception.exceptionLocation e of
-                 NONE => ""
-               | SOME {file, startLine, ...} => " at " ^ file ^ ":" ^ FixedInt.toString startLine) ^
-            ": " ^ Feedback.exn_to_string e
+      case (e, !theorem_info_ref, !failed_prefix_resume_active_ref) of
+          (Feedback.HOL_ERR err, SOME ("theorem", _, _, _, _, _, _, _, _), false) =>
+            Feedback.exn_to_string (Feedback.wrap_exn "boolLib" "store_thm_at"
+              (Feedback.HOL_ERR (Feedback.set_message
+                ("Failed to prove theorem " ^ Lib.quote name ^ ":\n" ^
+                 Feedback.message_of err) err)))
+        | (Feedback.HOL_ERR _, SOME ("resume", _, _, _, _, _, _, _, _), false) =>
+            (* Resume lets Tactical print its usual feedback and rethrow. The
+               already active proof bypasses instrumentation on this call. *)
+            let
+              val failure = HolbuildTacticCompat.lift_tactic (fn _ => PolyML.Exception.reraise e)
+            in
+              (ignore (HolbuildTacticCompat.prove_goal (current_proof_context ()) (goal, failure));
+               uncaught_exception_text e)
+              handle reported => uncaught_exception_text reported
+            end
+        | _ => (raise_proof_error e handle reported => uncaught_exception_text reported)
   in
+    TextIO.flushOut TextIO.stdOut;
     HolbuildBoundedOutput.text (TextIO.stdErr,
       text ^ (if String.isSuffix "\n" text then "" else "\n") ^
       "holbuild: continuing after first failure\n")
   end
+
+fun report_terminal_error kind message =
+  if !tainted_ref then
+    HolbuildBoundedOutput.text (TextIO.stdErr,
+      "\nholbuild secondary terminal error: " ^ kind ^ "\t" ^
+      String.toString (secondary_preview message) ^ "\n")
+  else ()
+
+(* This stream receives Poly's own messages while compiling a declaration.
+   Evaluation follows separately, so ordinary script output never enters it. *)
+fun compile_declaration (read, parameters) =
+  if not (!tainted_ref) then PolyML.compiler (read, parameters)
+  else
+    let
+      val pieces = ref []
+      (* Keep the byte after the limit so the preview can trim a partial
+         UTF-8 character even when the compiler splits it across chunks. *)
+      val remaining = ref (secondary_preview_limit + 1)
+      fun compiler_output text =
+        let val count = Int.min (!remaining, size text)
+        in
+          HolbuildBoundedOutput.text (TextIO.stdOut, text);
+          if count = 0 then ()
+          else (pieces := String.substring (text, 0, count) :: !pieces;
+                remaining := !remaining - count)
+        end
+    in
+      PolyML.compiler (read, PolyML.Compiler.CPPrintStream compiler_output :: parameters)
+      handle e as Fail "Static Errors" =>
+        (report_terminal_error "source" (String.concat (rev (!pieces)));
+         PolyML.Exception.reraise e)
+    end
+
+fun install_diagnostics before_declaration compile report_source_error report_exception finish_script marker =
+  (diagnostic_marker_ref := SOME marker;
+   before_declaration := check_diagnostic_deadline;
+   compile := compile_declaration;
+   report_source_error := report_terminal_error "source";
+   report_exception := (fn e => if !tainted_ref then report_terminal_error "exception" (uncaught_exception_text e) else ());
+   finish_script := (fn record_peak_rss =>
+     if !tainted_ref then (record_peak_rss (); OS.Process.exit OS.Process.failure) else ()))
 
 fun proof_failure name goal at_finish e =
   let
@@ -2180,7 +2227,7 @@ fun proof_failure name goal at_finish e =
             val _ =
               if !tainted_ref then report_secondary_failure name at_finish e
               else
-                (print_first_failure name e;
+                (print_first_failure name g e;
                  write_text_file marker "";
                  diagnostic_timer_ref := SOME (Timer.startRealTimer ());
                  tainted_ref := true)
@@ -2707,7 +2754,7 @@ fun finish_failed_prefix name declaration_start metadata_text tactic_text failed
           val _ = drop_all()
           val _ = theorem_info_ref := NONE
         in th end)))
-      handle e => (restore_resume_flag (); raise e)
+      handle e => (restore_resume_flag (); raise_proof_error e)
     val _ = restore_resume_flag ()
   in
     result
@@ -2741,7 +2788,7 @@ fun proof_ir_prover ctxt (g, tac) =
              theorem_info_ref := NONE;
              context_info_ref := NONE;
              drop_all();
-             raise e)
+             raise_proof_error e)
 
 fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
   (hol_phases_ref := [("holloadend", Time.toMilliseconds (Time.now ()))];

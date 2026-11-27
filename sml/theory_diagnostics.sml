@@ -796,8 +796,7 @@ fun failed_trace_theorem lines =
     | failed => field_after "theorem" (List.last failed)
 
 (* The runtime quotes fields so user text and goal layout never introduce
-   marker lines. The final raw suffix can also contain a static or parse
-   error from HOL's declaration reader, before the prover runs. *)
+   marker lines. The declaration reader reports failures outside a proof. *)
 fun additional_failure_summary source_path source_text checkpoints terminations path =
   let
     val text = read_text path
@@ -832,43 +831,38 @@ fun additional_failure_summary source_path source_text checkpoints terminations 
                          error = error, top_goal = top_goal}
                | _ => NONE)
         | _ => NONE
-    fun parse [] reports tail = (rev reports, rev tail)
-      | parse (line :: rest) reports tail =
-          if worker_report line then (rev reports, rev tail)
-          else if String.isPrefix prefix line then
-            (case decode line of
-                 SOME report => parse rest (report :: reports) []
-               | NONE => parse rest reports tail)
-          else parse rest reports (line :: tail)
+    val terminal_prefix = "holbuild secondary terminal error: "
+    fun terminal line =
+      case String.fields (fn c => c = #"\t") (String.extract (line, size terminal_prefix, NONE)) of
+          [kind, encoded] =>
+            Option.map (fn error =>
+              let
+                val block = if kind = "source" then find_static_error_block (source_lines error) else NONE
+              in
+                case block of
+                    SOME lines =>
+                      {theorem = "", line = static_error_source_line source_path source_text lines,
+                       error = String.concatWith " " (take_n 3 lines []), top_goal = ""}
+                  | NONE => {theorem = "", line = NONE, error = error, top_goal = ""}
+              end)
+              (String.fromString encoded)
+        | _ => NONE
+    fun parse [] reports = rev reports
+      | parse (line :: rest) reports =
+          if worker_report line then rev reports
+          else
+            case (if String.isPrefix prefix line then decode line
+                  else if String.isPrefix terminal_prefix line then terminal line
+                  else NONE) of
+                SOME report => parse rest (report :: reports)
+              | NONE => parse rest reports
     fun compact value = String.concatWith " " (String.tokens Char.isSpace value)
-    fun terminal tail =
-      let
-        val lines = List.filter (not o String.isPrefix "holbuild ") tail
-        val block =
-          if List.exists (fn line => line = "holbuild secondary source error") tail
-          then find_static_error_block lines else NONE
-        val exception_line =
-          List.find (fn line => String.isPrefix "Uncaught exception" line orelse
-                                String.isPrefix "Exception raised" line) lines
-      in
-        case (block, exception_line) of
-            (SOME lines, _) =>
-              [{theorem = "", line = static_error_source_line source_path source_text lines,
-                error = String.concatWith " " (take_n 3 lines []), top_goal = ""}]
-          | (NONE, SOME error) =>
-              [{theorem = "", line = NONE, error = error, top_goal = ""}]
-          | _ => []
-      end
     val failures =
       case continuation_start text of
           NONE => []
         | SOME i =>
-            let
-              val after = String.extract (text, i + size continuation_marker + 2, NONE)
-              val (reports, tail) = parse (source_lines after) [] []
-            in
-              reports @ terminal tail
-            end
+            let val after = String.extract (text, i + size continuation_marker + 2, NONE)
+            in parse (source_lines after) [] end
     fun block (i, {theorem, line, error, top_goal}) =
       String.concat
         ["additional failure ", Int.toString (i + 1), " of ", Int.toString (length failures), ":\n",

@@ -193,7 +193,8 @@ fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed
    "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"] @
   (case (multi_error, timeout_marker) of
        (true, SOME path) =>
-         ["val _ = HolbuildProofRuntime.install_diagnostics holbuild_before_declaration holbuild_report_source_error holbuild_finish_script " ^
+         ["val _ = HolbuildProofRuntime.install_diagnostics holbuild_before_declaration " ^
+          "holbuild_compile_declaration holbuild_report_source_error holbuild_report_exception holbuild_finish_script " ^
           HolbuildToolchain.sml_string (OS.Path.concat (OS.Path.dir path, diagnostic_admit_marker)) ^ ";"]
      | _ => [])
 

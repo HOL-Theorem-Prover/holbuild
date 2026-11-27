@@ -1337,8 +1337,10 @@ memory so subsequent declarations can use the theorem and its attributes.
 From then on, the child cannot save proof or declaration checkpoints. HOL's
 export hook aborts a tainted export, the generated exporter rejects the child
 before writing anything except its peak memory report, and the driver treats
-the stage marker as failure even if the child exits successfully. A
-speculative child continues to use the deferred proof protocol.
+the stage marker as failure even if the child exits successfully. The
+remaining continuation budget also bounds normally untimed tactics. The
+first timeout ends continuation immediately. A speculative child continues
+to use the deferred proof protocol.
 
 `--trace-steps` executes the build and records runtime plans plus before/after
 trace lines for all instrumented proofs in the child log. The internal proof-step

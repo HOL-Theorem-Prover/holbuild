@@ -81,7 +81,8 @@ QED
 Theorem later[simp]:
   tag 1
 Proof
-  FAIL_TAC (String.concat (List.tabulate (400, fn _ => "\240\159\152\128")))
+  (fn g => (print "progress..."; TextIO.flushOut TextIO.stdOut;
+            FAIL_TAC (String.concat (List.tabulate (400, fn _ => "\240\159\152\128"))) g))
 QED
 
 Triviality uses_later:
@@ -153,6 +154,7 @@ Proof
 QED
 
 val _ = print "AScript.sml:1: error: output from a successful declaration\n";
+val _ = print "Exception raised by a successful declaration\n";
 SML
 run_failure "$tmpdir/default.log" build ATheory
 require_grep '^additional failure 6 of 6:$' "$tmpdir/default.log"
@@ -233,6 +235,54 @@ assert "TacticTimeout" not in second["error"] and "timeout after" in second["err
 assert continued == fail_fast and continued["kind"] == "proof_failure", (continued, fail_fast)
 PY
 
+# A first Resume error and a first replay error keep the native driver's
+# uncaught exception diagnostic in both modes.
+make_project resume-primary
+cat > "$project/src/AScript.sml" <<'SML'
+open HolKernel Parse boolLib bossLib markerLib;
+val _ = new_theory "A";
+
+Theorem suspended:
+  T /\ T
+Proof
+  CONJ_TAC >- suspend "left" >- ACCEPT_TAC TRUTH
+QED
+
+Resume suspended[left]:
+  FAIL_TAC "resume primary"
+QED
+
+Finalise suspended
+SML
+run_failure "$tmpdir/resume-fast.log" build --skip-checkpoints --fail-fast ATheory
+run_failure "$tmpdir/resume-default.log" build --skip-checkpoints ATheory
+
+make_project replay-primary
+sed -i 's/FAIL_TAC "first proof error"/ALL_TAC >> FAIL_TAC "first proof error"/' "$project/src/AScript.sml"
+run_failure "$tmpdir/replay-seed.log" build --fail-fast ATheory
+require_file "$(find "$project/.holbuild/checkpoints" -name 'first_failed_prefix.save' -print -quit)"
+run_failure "$tmpdir/replay-fast.log" build --fail-fast ATheory
+run_failure "$tmpdir/replay-default.log" build ATheory
+require_grep 'from: failed-prefix checkpoint in first' "$tmpdir/replay-fast.log"
+require_grep 'from: failed-prefix checkpoint in first' "$tmpdir/replay-default.log"
+
+python3 - "$tmpdir" <<'PYTHON'
+from pathlib import Path
+import sys
+
+def primary(path):
+    text = path.read_text()
+    detail = text.split("\nchild failure:\n", 1)[1].split("\ninstrumented log:", 1)[0]
+    return detail.rstrip(), text.splitlines()[-1]
+
+directory = Path(sys.argv[1])
+for kind, message in [("resume", "resume primary"), ("replay", "first proof error")]:
+    fast = primary(directory / f"{kind}-fast.log")
+    default = primary(directory / f"{kind}-default.log")
+    assert fast[0].startswith("Uncaught exception") and message in fast[0], fast
+    assert default == fast, (default, fast)
+PYTHON
+
 # Plain builds use both child gates. A script that exits successfully
 # exercises the driver's separate gate, including the check-only path.
 for gate in export exit-success; do
@@ -254,10 +304,15 @@ for gate in export exit-success; do
   fi
 done
 
-for terminal in static dynamic-static parse termination; do
+for terminal in static dynamic-static parse exception termination; do
   make_project "$terminal"
+  cat >> "$project/src/AScript.sml" <<'SML'
+val _ = print "AScript.sml:1: error: output from a successful declaration\n";
+val _ = print "Exception raised by a successful declaration\n";
+SML
   case "$terminal" in
-    static) echo 'val _ : int = true;' >> "$project/src/AScript.sml"; error='error:' ;;
+    static) echo 'val _ : int = true;' >> "$project/src/AScript.sml"; error='incompatible types' ;;
+    exception) echo 'val _ = raise Fail "terminal declaration";' >> "$project/src/AScript.sml"; error='terminal declaration' ;;
     dynamic-static)
       cat >> "$project/src/AScript.sml" <<'SML'
 Theorem compiles_invalid_ml:
@@ -290,6 +345,11 @@ SML
   run_failure "$tmpdir/$terminal.log" build ATheory
   require_grep '^additional failure 1 of 1:$' "$tmpdir/$terminal.log"
   require_grep "  error: .*$error" "$tmpdir/$terminal.log"
+  if sed -n '/^additional failure /,/^instrumented log:/p' "$tmpdir/$terminal.log" |
+      grep -qE 'by a successful declaration|output from a successful declaration'; then
+    cat "$tmpdir/$terminal.log" >&2
+    exit 1
+  fi
   if [[ "$terminal" == termination ]]; then
     require_grep "^  source line: $termination_line$" "$tmpdir/$terminal.log"
   fi
