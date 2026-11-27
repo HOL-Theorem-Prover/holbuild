@@ -865,7 +865,29 @@ fun with_cached_grammar_term_printer f =
           handle e => (ignore (Parse.set_term_printer old); raise e)
         end
 
-fun goal_text goal = PP.pp_to_string 100 goalStack.std_pp_goal goal ^ "\n"
+val goal_text_printer_ref =
+  ref (fn goal => PP.pp_to_string 100 goalStack.std_pp_goal goal)
+
+fun install_goal_fv_printer () =
+  let
+    (* HOL's traces and flags moved from Feedback and refs into HOLFlags.  The
+       source is compiled after this structure has loaded, so old HOL pins
+       never type-check a name from the other API. *)
+    val text =
+      if Option.isSome (#lookupStruct PolyML.globalNameSpace "HOLFlags") then
+        "val _ = HolbuildProofRuntime.goal_text_printer_ref := (fn goal => \
+        \HOLFlags.with_bflags [(goalStack.print_fvs, true)] \
+        \(fn () => PP.pp_to_string 100 goalStack.std_pp_goal goal) ());"
+      else
+        "val _ = HolbuildProofRuntime.goal_text_printer_ref := (fn goal => \
+        \Feedback.trace (\"Goalstack.print_goal_fvs\", 1) \
+        \(fn () => PP.pp_to_string 100 goalStack.std_pp_goal goal) ());"
+    val stream = TextIO.openString text
+  in
+    PolyML.compiler (fn () => TextIO.input1 stream, []) ()
+  end
+
+fun goal_text goal = (!goal_text_printer_ref) goal ^ "\n"
 
 fun top_goal_text [] = "<no open goals>\n"
   | top_goal_text (goal :: _) = goal_text goal
@@ -2581,7 +2603,8 @@ fun proof_ir_prover ctxt (g, tac) =
              raise e)
 
 fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, plan_theorem, trace_all, plan_only_marker} : config) =
-  (hol_phases_ref := [("holloadend", Time.toMilliseconds (Time.now ()))];
+  (install_goal_fv_printer ();
+   hol_phases_ref := [("holloadend", Time.toMilliseconds (Time.now ()))];
    hol_phase_nested_ms_ref := 0;
    OS.Process.atExit print_hol_phases;
    checkpoint_enabled_ref := checkpoint_enabled;
