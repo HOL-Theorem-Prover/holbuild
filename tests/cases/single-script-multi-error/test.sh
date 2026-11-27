@@ -173,6 +173,10 @@ require_file "$(find "$project/.holbuild/checkpoints" -name 'first_failed_prefix
 [[ $(find "$project/.holbuild/checkpoints" -name '*.save' ! -name 'deps_loaded.save' | wc -l) -eq 1 ]]
 reject_artifacts
 require_file "$(find "$project/.holbuild/stage" -name 'holbuild-peak-rss.txt' -print -quit)"
+if grep -q 'holscriptend=' "$(child_log)"; then
+  echo "tainted script entered the exporter at EOF" >&2
+  exit 1
+fi
 if grep -q 'unreachable resume body\|theorem: uses_later\|theorem: uses_local' "$tmpdir/default.log"; then
   cat "$tmpdir/default.log" >&2
   exit 1
@@ -354,7 +358,7 @@ SML
   fi
 done
 
-for terminal in static dynamic-static parse exception interrupt termination; do
+for terminal in static dynamic-static dynamic-try dynamic-choice dynamic-repeat parse exception interrupt termination; do
   make_project "$terminal"
   cat >> "$project/src/AScript.sml" <<'SML'
 val _ = print "AScript.sml:1: error: output from a successful declaration\n";
@@ -363,16 +367,27 @@ SML
   case "$terminal" in
     static) echo 'val _ : int = true;' >> "$project/src/AScript.sml"; error='incompatible types' ;;
     exception) echo 'val _ = raise Fail "terminal declaration";' >> "$project/src/AScript.sml"; error='terminal declaration' ;;
-    dynamic-static)
-      cat >> "$project/src/AScript.sml" <<'SML'
+    dynamic-*)
+      case "$terminal" in
+        dynamic-static) tactic='compile_invalid_ml' ;;
+        dynamic-try) tactic='TRY compile_invalid_ml >> ACCEPT_TAC TRUTH' ;;
+        dynamic-choice) tactic='compile_invalid_ml ORELSE ACCEPT_TAC TRUTH' ;;
+        dynamic-repeat) tactic='REPEAT compile_invalid_ml >> ACCEPT_TAC TRUTH' ;;
+      esac
+      cat >> "$project/src/AScript.sml" <<SML
+fun compile_invalid_ml g =
+  let val input = TextIO.openString "val _ : int = true;"
+  in PolyML.compiler (fn () => TextIO.input1 input, []) (); ALL_TAC g end;
+
 Theorem compiles_invalid_ml:
-  T
+  T /\ T
 Proof
-  (fn g => let val input = TextIO.openString "val _ : int = true;"
-           in PolyML.compiler (fn () => TextIO.input1 input, []) (); ALL_TAC g end)
+  CONJ_TAC >>
+  $tactic
 QED
 SML
-      error='Static Errors' ;;
+      error='Static Errors'
+      dynamic_line=$(awk '/^  (TRY |REPEAT )?compile_invalid_ml/{print NR; exit}' "$project/src/AScript.sml") ;;
     interrupt)
       cat >> "$project/src/AScript.sml" <<'SML'
 val overflow_tac : tactic = fn _ => raise Interrupt;
@@ -414,6 +429,9 @@ SML
   fi
   if [[ "$terminal" == termination ]]; then
     require_grep "^  source line: $termination_line$" "$tmpdir/$terminal.log"
+  elif [[ "$terminal" == dynamic-* ]]; then
+    require_grep "^  source line: $dynamic_line$" "$tmpdir/$terminal.log"
+    require_grep '^  top goal: T$' "$tmpdir/$terminal.log"
   fi
   if grep -q '^AFTER_TERMINAL$' "$(child_log)"; then
     cat "$(child_log)" >&2

@@ -798,7 +798,10 @@ fun write_theory_script_start path source_file =
      "    evaluate ((!holbuild_compile_declaration)",
      "      (read, [PolyML.Compiler.CPFileName file, PolyML.Compiler.CPLineNo line]));",
      "    if !QUse.failOnError andalso QUse.hadError () then OS.Process.exit OS.Process.failure else ())",
-     "end;", ""])
+     "end;",
+     "fun holbuild_record_peak_rss () = " ^
+       peak_rss_report (Path.concat(Path.dir path, peak_rss_report_name)) ^ ";",
+     "val _ = (!holbuild_finish_script) holbuild_record_peak_rss;", ""])
 
 (* The exporter marks when the script ended (holscriptend) and, unless
    CHECK_ONLY, when the theory was exported (holexportend).
@@ -807,12 +810,9 @@ fun write_theory_script_start path source_file =
    the child exports nothing, and only reports its peak memory. *)
 fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipelined, check_only} =
   let
-    val peak_rss = peak_rss_report (Path.concat(Path.dir path, peak_rss_report_name))
     val record_peak_rss = "val _ = holbuild_record_peak_rss ();"
     val lines =
-      [phase_mark_line "holscriptend",
-       "fun holbuild_record_peak_rss () = " ^ peak_rss ^ ";",
-       "val _ = (!holbuild_finish_script) holbuild_record_peak_rss;"] @
+      [phase_mark_line "holscriptend"] @
       (if check_only then [record_peak_rss] else
       generated_metadata_report_lines {parents_report = parents_report,
                                        mldeps_report = mldeps_report} @

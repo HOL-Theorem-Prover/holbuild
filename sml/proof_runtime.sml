@@ -313,6 +313,10 @@ exception TacticInterrupted of string
 exception TacticStaticError of string
 exception InvalidFailedPrefix of string
 
+fun tainted_static_error (Fail "Static Errors") = !tainted_ref
+  | tainted_static_error (TacticStaticError _) = !tainted_ref
+  | tainted_static_error _ = false
+
 fun display_label label =
   String.translate (fn #"\n" => "\\n" | #"\t" => "\\t" | c => String.str c) label
 
@@ -1121,7 +1125,8 @@ fun emit_step_failure_diagnostic label goals =
    combinator recovers from it.  It saves no failed-prefix checkpoint inside
    the body: resuming there would commit to that body without rerunning the
    combinator that chose it.  raise_body_timeout saves one where the outermost
-   combinator started the body instead. *)
+   combinator started the body instead.  After admission, a static error also
+   stops the proof and needs the goal and position of the failing step. *)
 fun report_step_failure_with_goals label goals e =
   case (e, !suppress_expected_failure_diagnostics_ref) of
       (TacticTimeout _, true) =>
@@ -1131,7 +1136,8 @@ fun report_step_failure_with_goals label goals e =
         (print_step_failure_goal_state label goals;
          raise e)
     | (_, true) =>
-        (suppressed_failure_diagnostic_ref := SOME (fn () => emit_step_failure_diagnostic label goals);
+        (if tainted_static_error e then print_step_failure_goal_state label goals
+         else suppressed_failure_diagnostic_ref := SOME (fn () => emit_step_failure_diagnostic label goals);
          raise e)
     | (_, false) =>
         (emit_step_failure_diagnostic label goals;
@@ -1973,8 +1979,9 @@ fun run_built_steps resume_after_path display_index steps =
                   | SOME (e as TacticTimeout _) => raise_body_timeout saved e
                   | SOME (e as TacticInterrupted _) => raise_body_timeout saved e
                   | SOME e =>
-                      (restore_runtime_state saved;
-                       attempt (n + 1) (alt_line + 1 + HolbuildProofIr.display_line_count_list body) rest (SOME (e, diagnostic)))
+                      if tainted_static_error e then raise e
+                      else (restore_runtime_state saved;
+                            attempt (n + 1) (alt_line + 1 + HolbuildProofIr.display_line_count_list body) rest (SOME (e, diagnostic)))
               end
       in
         if not (!resume_reached_ref) then
@@ -2011,10 +2018,11 @@ fun run_built_steps resume_after_path display_index steps =
                  NONE => record_or_replay_event (HolbuildProofIr.TryEvent (path, true))
                | SOME (e as TacticTimeout _) => raise_body_timeout saved e
                | SOME (e as TacticInterrupted _) => raise_body_timeout saved e
-               | SOME _ =>
-                   (restore_runtime_state saved;
-                    discard_suppressed_failure_diagnostic ();
-                    record_or_replay_event (HolbuildProofIr.TryEvent (path, false)))
+               | SOME e =>
+                   if tainted_static_error e then raise e
+                   else (restore_runtime_state saved;
+                         discard_suppressed_failure_diagnostic ();
+                         record_or_replay_event (HolbuildProofIr.TryEvent (path, false)))
           end;
         d + HolbuildProofIr.display_line_count proof_step
       end)
@@ -2033,10 +2041,11 @@ fun run_built_steps resume_after_path display_index steps =
                in case result of
                       SOME (e as TacticTimeout _) => raise_body_timeout saved e
                     | SOME (e as TacticInterrupted _) => raise_body_timeout saved e
-                    | SOME _ =>
-                        (restore_runtime_state saved;
-                         discard_suppressed_failure_diagnostic ();
-                         record_or_replay_event (HolbuildProofIr.RepeatStopEvent (path, iter)))
+                    | SOME e =>
+                        if tainted_static_error e then raise e
+                        else (restore_runtime_state saved;
+                              discard_suppressed_failure_diagnostic ();
+                              record_or_replay_event (HolbuildProofIr.RepeatStopEvent (path, iter)))
                     | NONE =>
                         (record_or_replay_event (HolbuildProofIr.RepeatIterEvent (path, iter));
                          loop (iter + 1))
