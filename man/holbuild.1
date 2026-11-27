@@ -686,11 +686,9 @@ or
 .BR \-\-repl\-on\-failure .
 .TP
 .B \-\-fail\-fast
-Stop at the first failure in a script and cancel unfinished work.
-By default, independent work finishes and an inline, step-instrumented
-script can report further theorem and resumption failures.
-Continuation stops after eight failures, a ten-second budget, or a
-terminal error such as a tactic timeout or a static error.
+Stop after the first failure and cancel unfinished work.
+The default is to finish independent work and skip only the dependents of
+failures.
 .TP
 .B \-\-check\-only
 Build the targets no other target depends on for their verdict alone: each
