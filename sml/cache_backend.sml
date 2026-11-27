@@ -73,6 +73,10 @@ sig
   val with_action_publish_lock : t -> string -> (unit -> 'a) -> (unit -> 'a) -> 'a
   (* Waits for a concurrent publisher before running the callback. *)
   val with_action_publish_lock_wait : t -> string -> (unit -> 'a) -> 'a
+  (* put_action, which skips the put (Skipped) unless FITS (), asked under
+     the action publication lock. *)
+  val put_action_if : (unit -> bool) -> t -> HolbuildCacheBackend.action_publish_policy ->
+                      {key : string, text : string} -> HolbuildCacheBackend.publish_result
   (* Unlinks an action lock file under action_locks_dir unless a process or one
      of this process's threads holds it; true if it did. *)
   val remove_unheld_action_lock : string -> bool
