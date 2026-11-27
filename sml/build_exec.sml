@@ -12291,6 +12291,10 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
            end));
         hydrate_count "hydprunen" (!pruned)
       end
+    fun write_files () =
+      hydrate_step "hydfiles" (fn () =>
+        (transfer_all fetch_file files;
+         List.app write_lib (#libs spec)))
     (* Every path an item writes: two items sharing one would let a kept
        item stand for files another replaced or removed. *)
     fun theory_files stem = List.concat (map (fn suffix => objects (in_root root stem ^ suffix)) theory_suffixes)
@@ -12316,14 +12320,14 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                 end)
              scratch;
     if light then () else prune ();
-    hydrate_step "hydfiles" (fn () =>
-      (transfer_all fetch_file files;
-       List.app write_lib (#libs spec)));
+    write_files ();
     let
       val light_records = if light then hydrate_step "hyddeps" light_deps_now else NONE
     in
     if Option.isSome light_records then () else
-    ((if light then prune () else ());
+    (* The prune may remove an earlier entry that shared a path the files
+       were just written to. *)
+    ((if light then (prune (); write_files ()) else ());
     restore_deps ();
     ignore (refresh false direct);
     case misfits () of

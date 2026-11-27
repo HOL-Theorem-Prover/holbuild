@@ -812,8 +812,8 @@ target the build didn't name). A light hydrate keeps the action's own files
 and the kept items whose stat matches, removes its outdated copies of the
 spec's own dependencies, but installs no other dependency, makes no stale check
 and leaves the rest of the root as earlier actions left it: the prune above
-waits for the full install, so a failing check, and a passing `--check-only`
-action, never prunes. Their records, as an install would
+waits for the full install, so a check that resumes and fails, or a
+`--check-only` action that resumes and passes, never prunes. Their records, as an install would
 write them, come from their cache manifests (the remote's read without copying
 its blobs) and `.sml` blobs (the `.dat` hash from the hash the `.sml` carries;
 a theory whose `.sml` carries none makes the hydrate install them all), and the
