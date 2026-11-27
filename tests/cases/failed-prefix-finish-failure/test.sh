@@ -70,8 +70,7 @@ PY
 
 expect_failure() {
   local log=$1 message=$2
-  # Count work only through the proof whose checkpoint this run seeds.
-  if (cd "$project" && "$HOLBUILD_BIN" build --fail-fast ATheory) >"$log" 2>&1; then
+  if (cd "$project" && "$HOLBUILD_BIN" build ATheory) >"$log" 2>&1; then
     cat "$log" >&2
     echo "expected the build to fail with $message" >&2
     exit 1

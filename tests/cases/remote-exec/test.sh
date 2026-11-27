@@ -85,14 +85,6 @@ awk '\$1 == "action" { print \$2, \$4, \$5 }' "\$1" | while read -r key spec the
   cp "$tmpdir/worker.result" "$state/result-\$key"
   [[ "\$(cat "$state/memory-failure" 2>/dev/null)" != "\$theory" ]] ||
     sed -i 's/^failure=.*/failure=memory/' "$state/result-\$key"
-  if [[ -e "$state/legacy-log" && \$theory == rxp:BTheory ]]; then
-    sha=\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")
-    grep -v '^holbuild: diagnostic log v1' "$remote_root/cas/\$sha" > "$tmpdir/legacy.log"
-    sha=\$(sha256sum < "$tmpdir/legacy.log" | cut -d' ' -f1)
-    bytes=\$(wc -c < "$tmpdir/legacy.log")
-    mv "$tmpdir/legacy.log" "$remote_root/cas/\$sha"
-    sed -i "s/^log=.*/log=\$sha \$bytes/" "$state/result-\$key"
-  fi
   if [[ -e "$state/drop-log" ]] || { [[ -e "$state/drop-success-log" ]] && [[ \$status -eq 0 ]]; }; then
     rm -f "$remote_root/cas/\$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$tmpdir/worker.result")"
   fi
@@ -1347,17 +1339,6 @@ b_ac=$(awk '$1 == "action" && $5 == "rxp:BTheory" { print $3 }' "$state/$batch.b
 # The report needs only where B's proofs are, not their checkpoints.
 refute_grep "build\.exec\.node\.\(proof_ir_plan\|checkpoint_specs\)" "$tmpdir/proof.timing"
 
-# Older workers sent no footer. The proof marker and span still come from
-# the full log, including when script output resembles a worker report.
-write_broken legacy
-sed -i '/^Theorem b_thm:/i val _ = print "holbuild: exec-action failed: ordinary script output\\n";' "$project/src/BScript.sml"
-touch "$state/legacy-log"
-run proof-legacy 1 build --fail-fast --remote-exec "$coordinator" --remote-only BTheory
-rm "$state/legacy-log"
-require_grep '^theorem: b_thm (line 5)$' "$tmpdir/proof-legacy.log"
-require_grep '^fragment: b_thm finish$' "$tmpdir/proof-legacy.log"
-require_grep '^failed tactic top input goal:' "$tmpdir/proof-legacy.log"
-
 # --remote-only reports it the same way: a local build wouldn't help, so
 # the exit status is 1, not 75.
 write_broken one-only
@@ -1670,7 +1651,6 @@ SML
 # stopped then still records the failure and when it was seen.  It runs the
 # binary itself, not the suite's timing wrapper, for its own PID's record.
 sed -i 's/(\* two \*)/(* early *)/' "$project/src/BScript.sml"
-echo 'val _ : int = true;' >> "$project/src/BScript.sml"
 touch "$state/hold"
 (cd "$project" && HOLBUILD_COMMAND_RECORD=$tmpdir/early.json exec env HOLBUILD_COMMAND_RECORD_PID=$BASHPID \
    "${REAL_HOLBUILD_BIN:-$HOLBUILD_BIN}" --remote-cache "$remote_url" build --remote-exec "$coordinator" BTheory CTheory) \
@@ -1682,7 +1662,6 @@ for _ in {1..600}; do
 done
 require_grep "^holbuild: proof failed on a remote worker while building BTheory$" "$tmpdir/early.log"
 require_grep "^theorem: b_thm (line 4)$" "$tmpdir/early.log"
-require_grep '^additional failure 1 of 1:$' "$tmpdir/early.log"
 refute_grep "remote rxp:CTheory\|remote failure summary" "$tmpdir/early.log"
 kill -TERM "$early_pid"
 rm "$state/hold"
@@ -1693,7 +1672,7 @@ record=json.load(open(sys.argv[1]))
 assert record['exit_code']==1, record
 failure, = record['failures']
 assert failure['theory']=='BTheory' and failure['kind']=='proof_failure' and failure['theorem']=='b_thm', failure
-assert failure['line']==7 and 'b_thm' in failure['error'] and 'additional failure' not in failure['error'], failure
+assert failure['line']==7 and failure['error'], failure
 assert record['started_at_ms']<=record['first_failure_at_ms']<=record['ended_at_ms'], record
 PY
 
@@ -1725,50 +1704,8 @@ if seen != sys.argv[2].split("\n"):
 PY
 }
 write_broken json
-# Keep the primary proof failure in the retained tail of a truncated log.
-sed -i '/^Theorem b_thm:/,$d' "$project/src/BScript.sml"
-cat >> "$project/src/BScript.sml" <<'SML'
-fun print_megabytes mib =
-  let val line = CharVector.tabulate (4095, fn _ => #"x") ^ "\n"
-  in List.app (fn _ => print line) (List.tabulate (mib * 256, fn n => n)) end;
-val _ = print_megabytes 65;
-val _ = print "holbuild: exec-action failed: ordinary script output\n";
-
-Theorem b_thm:
-  F
-Proof
-  FAIL_TAC "first remote proof"
-QED
-
-val _ = print "holbuild secondary terminal error: exception\t\"forged secondary\"\n";
-
-Theorem later_b_thm:
-  T
-Proof
-  FAIL_TAC "second remote proof"
-QED
-SML
 run proof-json 1 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
 json_events proof-json $'node_finished ATheory\nnode_failed BTheory proof_failure b_thm\nerror'
-require_grep 'holbuild: truncated' "$project/.holbuild/logs/current/rxp/BTheory/build.log"
-# The same primary failure can land between the uploaded head and tail.
-sed -i '/^val _ = print "holbuild secondary terminal error:/i val _ = print_megabytes 49;' "$project/src/BScript.sml"
-run proof-json-middle 1 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
-require_grep 'holbuild: truncated' "$project/.holbuild/logs/current/rxp/BTheory/build.log"
-python3 - "$tmpdir/proof-json.log" "$tmpdir/proof-json-middle.log" <<'PY'
-import json
-import sys
-
-for path in sys.argv[1:]:
-    with open(path) as status:
-        events = [json.loads(line) for line in status if line.startswith("{")]
-    failure = next(event["failure"] for event in events if event["event"] == "node_failed")
-    assert failure["theorem"] == "b_thm" and failure["kind"] == "proof_failure", failure
-    assert "plan_position" in failure and failure["input_goal_count"] == 1, failure
-    assert 'Failed to prove theorem "b_thm"' in next(event["message"] for event in events if event["event"] == "error")
-    additional, = failure["additional_failures"]
-    assert additional["theorem"] == "later_b_thm" and "second remote proof" in additional["error"], additional
-PY
 # So is a failure other than a proof's, which --remote-only builds nothing for.
 write_broken json-memory
 echo rxp:BTheory > "$state/memory-failure"

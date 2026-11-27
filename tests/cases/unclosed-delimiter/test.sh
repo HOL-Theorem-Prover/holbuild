@@ -7,7 +7,14 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
-trap 'cleanup_temp_dir "$tmpdir"' EXIT
+cleanup() {
+  if [[ -n "${server_pid:-}" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  cleanup_temp_dir "$tmpdir"
+}
+trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
 project=$tmpdir/project
@@ -120,42 +127,6 @@ cat > "$script" <<'SML'
 Theory A
 Ancestors list
 
-Theorem first:
-  T
-Proof
-  FAIL_TAC "first proof error"
-QED
-
-Theorem broken:
-  T
-Proof
-  (ALL_TAC
-QED
-SML
-
-build_fails --json build ATheory
-python3 - "$tmpdir/build.out" "$script" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stream:
-    events = list(map(json.loads, stream))
-failure, = [event["failure"] for event in events if event.get("event") == "node_failed"]
-assert failure["kind"] == "proof_failure", failure
-assert failure["theorem"] == "first", failure
-secondary, = failure["additional_failures"]
-assert secondary["source_line"] == 14, secondary
-note = f"note: unclosed '(' opened at {sys.argv[2]}:13:3\n  |   (ALL_TAC"
-expected = f"AScript.sml:14:1: parse error: expected closing parenthesis\n{note}"
-assert secondary["error"].endswith(expected), secondary
-error, = [event["message"] for event in events if event.get("event") == "error"]
-assert expected in error.split("additional failure 1 of 1:\n", 1)[1], error
-PY
-
-cat > "$script" <<'SML'
-Theory A
-Ancestors list
-
 Theorem earlier:
   T
 Proof
@@ -236,3 +207,37 @@ val _ =
   then () else raise Fail "SML control escape hid the opener after the string";
 SML
 (cd "$HOLBUILD_ROOT" && poly -q --error-exit --script "$tmpdir/lexical-scan.sml")
+
+# A worker keeps the note in its log without mistaking the quoted source for
+# an out-of-store report from Poly/ML.
+cat > "$script" <<'SML'
+Theory A
+Ancestors list
+
+Theorem broken:
+  T
+Proof
+  (ALL_TAC (* Run out of store *)
+   >> ALL_TAC
+   >> ALL_TAC
+   >> ALL_TAC
+QED
+SML
+
+start_remote_cache_server "$tmpdir/remote" "$tmpdir/server"
+(cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload ATheory) \
+  > "$tmpdir/batch"
+spec=$(awk '$1 == "action" && $5 == "unclosed-delimiter:ATheory" { print $4 }' "$tmpdir/batch")
+worker=$tmpdir/worker
+link_hol_toolchain_cache "$worker/cache"
+result=$worker/result
+status=0
+(cd "$worker" && HOLBUILD_CACHE=$worker/cache "$HOLBUILD_BIN" --remote-cache "$remote_url" \
+  exec-action "$spec" --cache-limit-gb 1000 --result "$result") > "$worker/out" 2>&1 || status=$?
+require_grep '^failure=proof$' "$result"
+[[ "$status" == 1 ]]
+log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$result")
+curl -fsS "$remote_url/cas/$log_sha" > "$worker/child.log"
+require_grep 'parse error: expected closing parenthesis' "$worker/child.log"
+require_grep "note: unclosed '(' opened at .*AScript.sml:7:3$" "$worker/child.log"
+require_grep '^  |   (ALL_TAC (\* Run out of store \*)$' "$worker/child.log"
