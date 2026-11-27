@@ -378,10 +378,10 @@ child gets a home and temporary directory of its own, `HOME` and `TMPDIR`
 (also `TMP` and `TEMP`) under `.holbuild/sandbox-home` in the action root,
 emptied with the root before the next action; `HOLBUILD_ACTION_ROOT` names
 the root. Its environment has no `HOLBUILD_REMOTE_*` or `REMOTE_EXEC_*`
-variable, so no cache credential or worker token. Staged scratch inputs and
-toolchain source trees are read-only. Nothing else confines an action's
-child: it can change any file the worker's user can, the worker's caches
-(theory modules, checkpoint heaps, toolchains, the objects linked into the
+variable, so no cache credential or worker token. Staged scratch inputs are
+read-only. Nothing else confines an action's child: it can change any file
+the worker's user can, the worker's caches (theory modules, checkpoint heaps,
+toolchains, the objects linked into the
 action root) included, and a process it leaves running outlives the action.
 These guards prevent mistakes, not a hostile submitter: run workers only for
 submitters who trust each other. Actions on one worker see each
