@@ -227,5 +227,12 @@ fun check_header entry =
     then () else raise Fail ("a later closer hid the header opener before " ^ entry)
   end;
 val _ = List.app check_header ["Ancestors list", "Libs bossLib"];
+val control_literal = String.implode [#"\"", #"\\", #"^", #"\\", #"\""];
+val prefix = "Proof\n  (fn _ => ALL_TAC) " ^ control_literal ^ " >> ";
+val tactic = "(ALL_TAC\n";
+val _ =
+  if HolbuildTheoryDiagnostics.unclosed_delimiter (prefix ^ tactic ^ "QED\n")
+       (size prefix + size tactic) (fn _ => true) = SOME (#"(", size prefix)
+  then () else raise Fail "SML control escape hid the opener after the string";
 SML
 (cd "$HOLBUILD_ROOT" && poly -q --error-exit --script "$tmpdir/lexical-scan.sml")

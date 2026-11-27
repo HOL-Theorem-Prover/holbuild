@@ -505,9 +505,24 @@ QED
 val _ = OS.Process.exit OS.Process.success;
 SML
 start_remote_cache_server "$tmpdir/remote" "$tmpdir/server" "$tmpdir/control"
-for mode in default fail-fast; do
+for mode in default fail-fast parse; do
   flags=()
   [[ "$mode" != fail-fast ]] || flags=(--fail-fast)
+  if [[ "$mode" == parse ]]; then
+    cat > "$project/src/AScript.sml" <<'SML'
+Theory A
+Ancestors list
+
+Theorem broken:
+  T
+Proof
+  (ALL_TAC (* Run out of store *)
+   >> ALL_TAC
+   >> ALL_TAC
+   >> ALL_TAC
+QED
+SML
+  fi
   (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$remote_url" action-spec --upload "${flags[@]}" ATheory) \
     > "$tmpdir/$mode.batch"
   spec=$(awk '$1 == "action" && $5 == "diagnostics:ATheory" { print $4 }' "$tmpdir/$mode.batch")
@@ -536,6 +551,10 @@ for mode in default fail-fast; do
       cat "$worker/child.log" >&2
       exit 1
     fi
+  elif [[ "$mode" == parse ]]; then
+    require_grep 'parse error: expected closing parenthesis' "$worker/child.log"
+    require_grep "note: unclosed '(' opened at .*AScript.sml:7:3" "$worker/child.log"
+    require_grep '^  |   (ALL_TAC (\* Run out of store \*)$' "$worker/child.log"
   else
     require_grep '^additional failure 1 of 1:$' "$worker/child.log"
     require_grep 'second worker proof error' "$worker/child.log"

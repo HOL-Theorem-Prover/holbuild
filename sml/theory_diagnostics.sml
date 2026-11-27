@@ -184,6 +184,7 @@ fun unclosed_delimiter source stop accepts =
         if Char.isSpace (char (i + 1)) then
           let val gap = skip Char.isSpace (i + 1)
           in literal (if char gap = #"\\" then gap + 1 else gap) close multiline end
+        else if not multiline andalso at i "\\^" then literal (Int.min (n, i + 3)) close multiline
         else literal (Int.min (n, i + 2)) close multiline
       else literal (i + 1) close multiline
 

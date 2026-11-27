@@ -12769,7 +12769,8 @@ fun classify_run_failure stage log_text oom_before msg =
              SOME mb => ["largest child resident set so far: " ^ Int.toString mb ^ " MB"]
            | NONE => []
        else [])
-    val out_of_store = String.isSubstring "Run out of store" (msg ^ "\n" ^ log_text)
+    val diagnostic = HolbuildStatus.without_source_excerpts msg
+    val out_of_store = String.isSubstring "Run out of store" (diagnostic ^ "\n" ^ log_text)
     val _ =
       memory_cause :=
         (case (Option.isSome oom_kills, out_of_store) of
@@ -12781,9 +12782,9 @@ fun classify_run_failure stage log_text oom_before msg =
       if path_exists (Path.concat (stage, diagnostic_admit_marker)) then ProofFailure
       else if Option.isSome oom_kills orelse out_of_store then MemoryFailure
       else if (if child_failed then child_reports_no_space log_text orelse disk_full stage
-               else String.isSubstring no_space msg) then DiskFailure
+               else String.isSubstring no_space diagnostic) then DiskFailure
       else if not child_failed then InternalFailure
-      else if String.isPrefix "tactic timed out" msg then TacticTimeoutFailure
+      else if String.isPrefix "tactic timed out" diagnostic then TacticTimeoutFailure
       else if Option.isSome signal then InternalFailure
       else ProofFailure
   in
