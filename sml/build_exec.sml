@@ -2698,10 +2698,13 @@ fun fs_cache_source cache : HolbuildCacheTransfer.source =
   {get_action = HolbuildFSCacheBackend.get_action cache,
    fetch_blob = HolbuildFSCacheBackend.fetch_blob cache}
 
-fun fs_cache_destination cache : HolbuildCacheTransfer.destination =
+(* FITS: as HolbuildFSCacheBackend.put_action_if. *)
+fun fs_cache_destination_if fits cache : HolbuildCacheTransfer.destination =
   {has_blob = HolbuildFSCacheBackend.verify_blob cache,
-   put_action = HolbuildFSCacheBackend.put_action cache,
+   put_action = HolbuildFSCacheBackend.put_action_if fits cache,
    publish_blob = HolbuildFSCacheBackend.consume_verified_blob cache}
+
+fun fs_cache_destination cache = fs_cache_destination_if (fn () => true) cache
 
 (* The HTTP cache has no compare-and-swap operation.  Re-read after each
    authorized replacement and retry a weaker observation, but retain the
@@ -2869,10 +2872,34 @@ fun forget_checked_verdicts () =
    checked_verdict_keys := Redblackset.empty String.compare;
    Mutex.unlock expected_remote_mutex)
 
+(* The keys of the theories build workers are restoring or building.  A
+   prefetch asks before it puts an entry into the local cache, under the
+   action publication lock, the lock a restore drops an entry not fitting
+   its parents under: a dropped entry put back by a prefetch still in flight
+   would stand in the way of the copy the restore takes instead. *)
+val demand_keys = ref (Redblackset.empty String.compare)
+val demand_keys_mutex = Mutex.mutex ()
+
+fun demand_owns key =
+  (Mutex.lock demand_keys_mutex;
+   Redblackset.member (!demand_keys, key)
+   before Mutex.unlock demand_keys_mutex)
+
+fun with_demand_key key f =
+  let
+    fun update g = (Mutex.lock demand_keys_mutex; demand_keys := g (!demand_keys); Mutex.unlock demand_keys_mutex)
+    fun release () =
+      update (fn keys => if Redblackset.member (keys, key) then Redblackset.delete (keys, key) else keys)
+  in
+    update (fn keys => Redblackset.add (keys, key));
+    (f () before release ()) handle e => (release (); raise e)
+  end
+
 (* Copies the remote entry for key into the local cache, from the first node
-   whose manifest passes `usable`.  Returns false on a remote miss and raises
-   if the entry is unusable. *)
-fun copy_remote_cache_entry_using usable root url key =
+   whose manifest passes `usable`, if FITS () when it puts the manifest (as
+   HolbuildFSCacheBackend.put_action_if).  Returns false on a remote miss or
+   a skipped put, and raises if the entry is unusable. *)
+fun copy_remote_cache_entry_if fits usable root url key =
   let
     val remote = HolbuildRemoteCache.remote url
     val local_cache = HolbuildFSCacheBackend.filesystem root
@@ -2884,15 +2911,19 @@ fun copy_remote_cache_entry_using usable root url key =
              (* Before the copy, which a build worker may restore as soon as
                 its manifest lands. *)
              note_remote_copy key;
-             HolbuildCacheTransfer.copy_entry
-               {source = remote_cache_source_with_action remote key manifest,
-                destination = fs_cache_destination local_cache,
-                stage_dir = HolbuildFSCacheBackend.blobs_dir local_cache}
-               key;
-             true)
+             case #action (HolbuildCacheTransfer.copy_entry
+                             {source = remote_cache_source_with_action remote key manifest,
+                              destination = fs_cache_destination_if fits local_cache,
+                              stage_dir = HolbuildFSCacheBackend.blobs_dir local_cache}
+                             key) of
+                 HolbuildCacheBackend.Skipped => false
+               | _ => true)
   in
     if remote_entry_expected key then HolbuildRemoteCache.required copy else copy ()
   end
+
+fun copy_remote_cache_entry_using usable root url key =
+  copy_remote_cache_entry_if (fn () => true) usable root url key
 
 fun copy_remote_cache_entry root url key = copy_remote_cache_entry_using (fn _ => true) root url key
 
@@ -2914,10 +2945,11 @@ fun hydrate_remote_cache_key_using usable root key =
              false)
 
 (* Copies the first replica whose manifest passes USABLE, as a restore would
-   take: a weaker one copied here would stand in the restore's way. *)
+   take: a weaker one copied here would stand in the restore's way.  A key a
+   build worker restores (demand_keys) is left to it. *)
 fun prefetch_remote_cache_key usable root url key =
-  if Option.isSome (HolbuildCache.get_action root key) then ()
-  else if copy_remote_cache_entry_using usable root url key then
+  if demand_owns key orelse Option.isSome (HolbuildCache.get_action root key) then ()
+  else if copy_remote_cache_entry_if (fn () => not (demand_owns key)) usable root url key then
     cache_trace ("remote cache prefetched: " ^ key)
   else ()
 
@@ -6709,6 +6741,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
        interrupted restore or build are never taken for those of the last one
        (by the up-to-date check or early cutoff). *)
     fun restore_or_build () =
+      with_demand_key input_key (fn () =>
       (remove_file (metadata_path project node);
        if not cache_restore_allowed then build_from_source ()
        else
@@ -6720,7 +6753,7 @@ fun build_theory_node speculated dat_hash_cache (options : build_options) tc pro
                    restore_misses := (input_key, !parents_differ) :: !restore_misses;
                    Mutex.unlock restore_misses_mutex)
                 else ();
-                build_from_source ()))
+                build_from_source ())))
     fun reuse_outputs text =
       (remove_tree stage;
        if cache_allowed then

@@ -430,10 +430,14 @@ fun with_action_publish_lock_wait cache key publish =
       handle e => (HolbuildFileLock.release lock; raise e)
     end)
 
-fun put_action cache policy {key, text} =
+fun put_action_if fits cache policy {key, text} =
   with_action_publish_lock_wait cache key (fn () =>
-    case get_action cache key of
-        SOME old => existing_action_result cache policy key text old
-      | NONE => (write_action cache {key = key, text = text}; HolbuildCacheBackend.Published))
+    if not (fits ()) then HolbuildCacheBackend.Skipped
+    else
+      case get_action cache key of
+          SOME old => existing_action_result cache policy key text old
+        | NONE => (write_action cache {key = key, text = text}; HolbuildCacheBackend.Published))
+
+fun put_action cache policy entry = put_action_if (fn () => true) cache policy entry
 
 end

@@ -88,6 +88,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         while not (control / "action-get-release").exists():
             time.sleep(0.01)
 
+    def hold_stale_get(self, key: str) -> None:
+        """control/ac-stale-hold-<key>: the first GET served the stale entry
+        of <key> (a prefetch's) is held until a GET with Cache-Control:
+        no-cache for <key> arrives, or 10 s pass, and then answered with the
+        stale entry; control/ac-stale-hold-<key>-released says which."""
+        if not (control / f"ac-stale-hold-{key}").exists():
+            return
+        try:
+            os.close(os.open(control / f"ac-stale-hold-{key}-held", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            return
+        recheck = control / f"ac-stale-hold-{key}-recheck"
+        deadline = time.monotonic() + 10
+        while not recheck.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        released = "recheck" if recheck.exists() else "timeout"
+        (control / f"ac-stale-hold-{key}-released").write_text(released + "\n", encoding="utf-8")
+
+    def release_stale_hold(self, key: str) -> None:
+        """Releases the GET hold_stale_get holds, then waits up to 2 s for the
+        path in control/ac-stale-hold-<key> (the client's local manifest of
+        <key>) to appear before answering, so the released copy can land
+        first."""
+        hold = control / f"ac-stale-hold-{key}"
+        if not hold.exists() or not (control / f"ac-stale-hold-{key}-held").exists():
+            return
+        (control / f"ac-stale-hold-{key}-recheck").write_text("observed\n", encoding="utf-8")
+        watched = pathlib.Path(hold.read_text(encoding="utf-8").strip())
+        deadline = time.monotonic() + 2
+        while not watched.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
     def gate_cas_put(self, size: int) -> None:
         """Hold a CAS PUT until control/cas-put-release exists: every one while control/cas-put-enable exists, and
         those of at least the byte count in control/cas-put-enable-min-bytes while that exists."""
@@ -174,8 +206,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     following = control / f"ac-stale-next-{key}"
                     if following.exists():
                         following.rename(stale)
+                    self.release_stale_hold(key)
                 else:
                     data = stale.read_bytes()
+                    self.hold_stale_get(key)
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()

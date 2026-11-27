@@ -507,6 +507,10 @@ ac_b=$(printf 'holbuild-remote-ac-v1\n%s\n' "$b_key" | sha256sum | cut -d' ' -f1
 cp "$tmpdir/stale-b" "$remote_control/ac-stale-$ac_b"
 fresh_cache=$tmpdir/fallback-fresh-cache
 link_hol_toolchain_cache "$fresh_cache"
+# The prefetch copies the stale BTheory too: hold its read until the build
+# asks the cache to check, and the check's answer until the prefetch's copy
+# could land, so the prefetch finishes after the build dropped the entry.
+echo "$fresh_cache/actions/$b_key/manifest" > "$remote_control/ac-stale-hold-$ac_b"
 rm -rf "$fallback_project/.holbuild"
 stale_log=$tmpdir/stale-remote-restore.log
 (cd "$fallback_project" && HOLBUILD_CACHE="$fresh_cache" HOLBUILD_CACHE_TRACE=1 \
@@ -520,6 +524,9 @@ if grep -q "BTheory built" "$stale_log"; then
 fi
 [[ ! -e "$remote_control/ac-stale-$ac_b" ]] || {
   echo "the build didn't ask the cache to check its copy of BTheory" >&2; exit 1; }
+[[ "$(cat "$remote_control/ac-stale-hold-$ac_b-released" 2>/dev/null)" == recheck ]] || {
+  echo "no prefetch of BTheory was held until the build's check" >&2; exit 1; }
+rm -f "$remote_control/ac-stale-hold-$ac_b"*
 
 # The same with the stale BTheory already in the local cache, as an earlier
 # build left it: dropping it, the build asks the cache to check its copy too.
