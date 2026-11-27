@@ -15953,13 +15953,25 @@ fun reserve_heap_decline path =
   end
   handle e as OS.SysErr (_, SOME err) => if err = Posix.Error.exist then false else raise e
 
-fun declines_short_heap root tc wanted {key, heap, entry} =
-  module_writer_supported tc andalso short_heap_entry true entry andalso
+fun heap_decline_record tc {key, heap, entry = _} =
+  Path.concat (Path.concat (module_store tc, module_store_declined_heaps), key ^ "-" ^ heap)
+
+(* Whether declines_short_heap may decline FOUND, judged without naming
+   its cone's modules, which needs the dependencies' files: the entry is
+   short, the toolchain writes modules, the host's store holds one at
+   least, and no action on the host has declined that heap before. *)
+fun may_decline_short_heap tc found =
+  module_writer_supported tc andalso short_heap_entry true (#entry found) andalso
+  List.exists (Option.isSome o module_file_theory_part o Path.file) (HolbuildCache.children (module_store tc)) andalso
+  not (path_exists (heap_decline_record tc found))
+
+fun declines_short_heap root tc wanted found =
+  may_decline_short_heap tc found andalso
   let
     val store = module_store tc
     val names = cone_module_names root tc wanted
     val _ = count_store_missing store names
-    val record = Path.concat (Path.concat (store, module_store_declined_heaps), key ^ "-" ^ heap)
+    val record = heap_decline_record tc found
     val min = module_writer_min_missing ()
   in
     length names >= min andalso valOf (!store_missing_modules) < min andalso reserve_heap_decline record andalso
@@ -17347,20 +17359,39 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             val restored =
               case (shared, ahead) of
                   (SOME ctx, NONE) =>
-                    (restore_steps := [];
-                     declining_heap := NONE;
-                     (phase "restore" (fn () =>
-                        restore_shared_checkpoints remote ctx (resumes_from_checkpoints policy action)
-                          (fetch_heap_modules remote tc)
-                          (* A check-only action, or a light one, has no
-                             store to judge, and a non-target, or a run
-                             under --no-checkpoint-saves, publishes no
-                             heap: they restore it. *)
-                          (fn entry => not (#check_only spec) andalso not (Option.isSome (!light_records)) andalso
-                                       saves_progress policy andalso
-                                       declines_short_heap root tc {deps = #deps spec, loads = #loads spec} entry))
-                      before add_restore_steps ())
-                     handle e => (add_restore_steps (); release_heap_decline (); raise e))
+                    let
+                      (* The restore turns its failures into a fresh
+                         preload; a failed install fails the action. *)
+                      val install_failure = ref (NONE : exn option)
+                      fun install () =
+                        (install_light spec tc cutoff; true)
+                        handle e => (install_failure := SOME e; raise e)
+                      val restored =
+                        (restore_steps := [];
+                         declining_heap := NONE;
+                         (phase "restore" (fn () =>
+                            restore_shared_checkpoints remote ctx (resumes_from_checkpoints policy action)
+                              (fetch_heap_modules remote tc)
+                              (* A check-only action has no store to
+                                 judge, and a non-target, or a run under
+                                 --no-checkpoint-saves, publishes no heap:
+                                 they restore it.  A light action's
+                                 dependencies, whose files name the
+                                 modules the decline counts, are installed
+                                 first, only for a heap it may decline. *)
+                              (fn found =>
+                                 not (#check_only spec) andalso saves_progress policy andalso
+                                 (not (Option.isSome (!light_records)) orelse
+                                  not (may_decline_short_heap tc found) orelse
+                                  install ()) andalso
+                                 declines_short_heap root tc {deps = #deps spec, loads = #loads spec} found))
+                          before add_restore_steps ())
+                         handle e => (add_restore_steps (); release_heap_decline (); raise e))
+                    in
+                      case !install_failure of
+                          SOME e => raise e
+                        | NONE => restored
+                    end
                 | _ => nothing_restored
             (* How many of its cone's expected modules the heap this run's
                preload saved doesn't load, and how many the cone expects. *)
