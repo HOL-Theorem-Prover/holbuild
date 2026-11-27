@@ -14905,9 +14905,10 @@ fun spec_early_cutoff_with {dat_hash, file_hashes, skip_loaded} root (spec : act
   end
   handle e => (warn ("no early cutoff: " ^ General.exnMessage e); NONE)
 
-(* The hashes spec_early_cutoff_with reads, from the first of RECORDS
-   (the action root's, and those of a light hydrate) to cover a file; a
-   file none covers is hashed. *)
+(* The hashes spec_early_cutoff_with reads, from the first of RECORDS to
+   cover a file (a light hydrate's records come before the action root's,
+   which may still describe an earlier copy); a file none covers is
+   hashed. *)
 fun resident_hashes records =
   let
     fun hash compute path =
