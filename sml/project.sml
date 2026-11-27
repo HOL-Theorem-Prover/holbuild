@@ -34,7 +34,8 @@ datatype package =
       groups : group list,
       artifact_root : string,
       action_policies : action_policy list,
-      generators : generator list }
+      generators : generator list,
+      install_dependencies_first : bool }
 
 type project_graph_edge =
   {declaring_package : string, dependency_name : string,
@@ -63,6 +64,7 @@ type t =
     groups : group list,
     root_tactic_timeouts : root_tactic_timeout list,
     theory_tactic_timeouts : theory_tactic_timeout list,
+    install_dependencies_first : bool,
     dependencies : dependency list,
     local_config : HolbuildLocalConfig.t,
     overrides : override list,
@@ -142,7 +144,7 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
     val LocalConfig {overrides, build_excludes, build_exclude_globs, build_jobs, build_tactic_timeout, checkpoint_limit_gb, remote_cache_url, remote_cache_curl_config, gc = _} = local_config
     val {definition, compatibility = _,
          tactic_timeout = manifest_timeout,
-         theory_tactic_timeouts} =
+         theory_tactic_timeouts, install_dependencies_first} =
       (HolbuildPackageDefinition.parse_table table
        handle HolbuildManifestUtil.Error msg => die msg)
     val {metadata = {name, version},
@@ -181,6 +183,7 @@ fun parse_table_at table {manifest, root, artifact_root, graph_artifact_root, lo
       groups = groups,
       root_tactic_timeouts = root_tactic_timeouts,
       theory_tactic_timeouts = theory_tactic_timeouts,
+      install_dependencies_first = install_dependencies_first,
       dependencies = dependencies,
       local_config = local_config,
       overrides = overrides,
@@ -339,6 +342,10 @@ fun checkpoint_limit_gb ({checkpoint_limit_gb, ...} : t) = checkpoint_limit_gb
 fun remote_cache_url ({remote_cache_url, ...} : t) = remote_cache_url
 fun remote_cache_curl_config ({remote_cache_curl_config, ...} : t) = remote_cache_curl_config
 fun package_action_policies (Package {action_policies, ...}) = action_policies
+(* Whether the package's scripts read their dependencies' files themselves,
+   so a worker installs them before HOL starts. *)
+fun package_install_dependencies_first (Package {install_dependencies_first, ...}) =
+  install_dependencies_first
 
 fun generator_name (Generator {name, ...}) = name
 fun generator_command (Generator {command, ...}) = command
@@ -435,7 +442,7 @@ fun dependency_to_string project (dep as Dependency {name, source, ...}) =
 fun override_to_string (OverridePath {name, path}) = name ^ " path -> " ^ path
   | override_to_string (OverrideGit {name, git}) = name ^ " git -> " ^ git
 
-fun project_package ({root, artifact_root, graph_artifact_root, manifest, definition, name, members, excludes, exclude_globs, roots, root_groups, groups, action_policies, generators, ...} : t) =
+fun project_package ({root, artifact_root, graph_artifact_root, manifest, definition, name, members, excludes, exclude_globs, roots, root_groups, groups, action_policies, generators, install_dependencies_first, ...} : t) =
   let
     val provenance =
       {snapshot = HolbuildPackageProvenance.WorkingTreeSnapshot,
@@ -451,7 +458,8 @@ fun project_package ({root, artifact_root, graph_artifact_root, manifest, defini
            roots = roots, root_groups = root_groups, groups = groups,
            artifact_root = if artifact_root = graph_artifact_root then Path.concat(artifact_root, ".holbuild") else artifact_root,
            action_policies = action_policies,
-           generators = generators}
+           generators = generators,
+           install_dependencies_first = install_dependencies_first}
   end
 
 fun root_package_name project = package_name (project_package project)
@@ -651,7 +659,8 @@ fun package_of_dependency_project resolution artifact_parent project
               roots = #roots dep_project, root_groups = #root_groups dep_project,
               groups = #groups dep_project, artifact_root = artifact_root,
               action_policies = #action_policies dep_project,
-              generators = #generators dep_project},
+              generators = #generators dep_project,
+              install_dependencies_first = #install_dependencies_first dep_project},
      dep_project)
   end
 
