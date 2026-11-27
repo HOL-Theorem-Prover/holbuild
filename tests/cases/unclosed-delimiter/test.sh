@@ -31,6 +31,20 @@ build_fails() {
   cat "$tmpdir/build.out" "$tmpdir/build.err" > "$tmpdir/build.log"
 }
 
+check_json_parse_failure() {
+  build_fails --json build ATheory
+  python3 - "$tmpdir/build.out" "$1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    failure, = [event["failure"] for event in map(json.loads, stream)
+                if event.get("event") == "node_failed"]
+assert failure["kind"] == "parse_error", failure
+assert failure["source_line"] == int(sys.argv[2]), failure
+PY
+}
+
 cat > "$script" <<'SML'
 Theory A
 Ancestors list string
@@ -77,18 +91,7 @@ assert "\nstatic error:\n" in staged, staged
 assert "AScript.sml:19:1: parse error: expected closing parenthesis" in staged and note in staged, staged
 PY
 
-build_fails --json build ATheory
-python3 - "$tmpdir/build.out" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stream:
-    failures = [event["failure"] for event in map(json.loads, stream)
-                if event.get("event") == "node_failed"]
-assert len(failures) == 1, failures
-assert failures[0]["kind"] == "parse_error", failures
-assert failures[0]["source_line"] == 19, failures
-PY
+check_json_parse_failure 19
 
 cat > "$script" <<'SML'
 Theory A
@@ -99,16 +102,54 @@ Theorem broken:
 Proof
   simp [TRUTH
 QED
+(* tactic timed out *)
 SML
 
 build_fails build ATheory
 require_grep 'AScript.sml:8:1[^:]*: parse error: expected close delimiter' "$log"
 require_grep "note: unclosed '\[' opened at .*AScript.sml:7:8$" "$log"
 require_grep '  |   simp \[TRUTH$' "$log"
+check_json_parse_failure 8
 
 build_fails execution-plan ATheory:termination:any
 require_grep 'HOL source parse error: expected close delimiter' "$log"
 require_grep "note: unclosed '\[' opened at .*AScript.sml:7:8$" "$log"
+
+cat > "$script" <<'SML'
+Theory A
+Ancestors list
+
+Theorem first:
+  T
+Proof
+  FAIL_TAC "first proof error"
+QED
+
+Theorem broken:
+  T
+Proof
+  (ALL_TAC
+QED
+SML
+
+build_fails --json build ATheory
+python3 - "$tmpdir/build.out" "$script" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    events = list(map(json.loads, stream))
+failure, = [event["failure"] for event in events if event.get("event") == "node_failed"]
+assert failure["kind"] == "proof_failure", failure
+assert failure["theorem"] == "first", failure
+secondary, = failure["additional_failures"]
+assert secondary["source_line"] == 14, secondary
+note = f"note: unclosed '(' opened at {sys.argv[2]}:13:3\n  |   (ALL_TAC"
+expected = f"AScript.sml:14:1: parse error: expected closing parenthesis\n{note}"
+assert secondary["error"].endswith(expected), secondary
+error, = [event["message"] for event in events if event.get("event") == "error"]
+assert expected in error.split("additional failure 1 of 1:\n", 1)[1], error
+PY
 
 cat > "$script" <<'SML'
 Theory A

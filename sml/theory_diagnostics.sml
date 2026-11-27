@@ -336,7 +336,7 @@ fun delimiter_note source_path source_text message (line, col) =
             in SOME (String.concat
                   [HolbuildStatus.unclosed_delimiter_note_prefix, String.str c, "' opened at ", source_path, ":",
                   Int.toString line, ":", Int.toString (column_number_at source_text i), "\n",
-                  HolbuildStatus.unclosed_delimiter_excerpt_prefix, nth_line (source_lines source_text) line, "\n"])
+                  HolbuildStatus.unclosed_delimiter_excerpt_prefix, nth_line (source_lines source_text) line])
             end
   in
     case message of
@@ -348,7 +348,7 @@ fun delimiter_note source_path source_text message (line, col) =
   end
 
 fun append_note text NONE = text
-  | append_note text (SOME note) = text ^ (if String.isSuffix "\n" text then "" else "\n") ^ note
+  | append_note text (SOME note) = text ^ (if String.isSuffix "\n" text then "" else "\n") ^ note ^ "\n"
 
 fun annotate_analyser_parse_error source_path source_text text =
   let
@@ -381,6 +381,10 @@ fun child_parse_error source_path line =
                  else NONE
              | NONE => NONE)
   end
+
+fun child_delimiter_note source_path source_text line =
+  Option.mapPartial (fn (message, location) => delimiter_note source_path source_text message location)
+                    (child_parse_error source_path line)
 
 fun has_child_parse_error source_path text =
   List.exists (Option.isSome o child_parse_error source_path) (source_lines text)
@@ -493,8 +497,7 @@ fun static_error_summary source_path source_text text =
         in
           SOME (append_note
             (String.concat ["static error:\n", String.concat (map (fn line => line ^ "\n") block), source_context])
-            (Option.mapPartial (fn (msg, location) => delimiter_note source_path source_text msg location)
-                               (child_parse_error source_path (hd block))))
+            (child_delimiter_note source_path source_text (hd block)))
         end
 
 fun proof_unit_label (checkpoint : HolbuildTheoryCheckpoints.boundary) =
@@ -1071,13 +1074,16 @@ fun additional_failures source_path source_text checkpoints terminations records
             (List.find (fn checkpoint => #theorem_start checkpoint = declaration_start)
                        (checkpoints : HolbuildTheoryCheckpoints.boundary list))
       end
+    fun compact value =
+      String.map (fn #"\n" => #" " | #"\r" => #" " | c => c)
+        (Substring.string (Substring.dropl Char.isSpace (Substring.dropr Char.isSpace (Substring.full value))))
     fun decode line =
       case String.fields (fn c => c = #"\t") (String.extract (line, size prefix, NONE)) of
           [kind, start, name, position, message, goal] =>
             (case (Int.fromString start, String.fromString name, String.fromString message, String.fromString goal) of
                  (SOME declaration_start, SOME name, SOME error, SOME top_goal) =>
-                   SOME {theorem = name, line = source_line kind declaration_start position,
-                         error = error, top_goal = top_goal}
+                   SOME {theorem = compact name, line = source_line kind declaration_start position,
+                         error = compact error, top_goal = compact top_goal}
                | _ => NONE)
         | _ => NONE
     val terminal_prefix = "holbuild secondary terminal error: "
@@ -1089,10 +1095,16 @@ fun additional_failures source_path source_text checkpoints terminations records
                 val block = if kind = "source" then find_static_error_block (source_lines error) else NONE
               in
                 case block of
-                    SOME lines =>
-                      {theorem = "", line = static_error_source_line source_path source_text lines,
-                       error = String.concatWith " " (take_n 3 lines []), top_goal = ""}
-                  | NONE => {theorem = "", line = NONE, error = error, top_goal = ""}
+                    SOME (lines as first :: _) =>
+                      let
+                        val summary = compact (String.concatWith " " (take_n 3 lines []))
+                        val note = child_delimiter_note source_path source_text first
+                        val error = summary ^ (case note of SOME text => "\n" ^ text | NONE => "")
+                      in
+                        {theorem = "", line = static_error_source_line source_path source_text lines,
+                         error = error, top_goal = ""}
+                      end
+                  | _ => {theorem = "", line = NONE, error = compact error, top_goal = ""}
               end)
               (String.fromString encoded)
         | _ => NONE
@@ -1100,13 +1112,8 @@ fun additional_failures source_path source_text checkpoints terminations records
       if String.isPrefix prefix line then decode line
       else if String.isPrefix terminal_prefix line then terminal line
       else NONE
-    fun compact value =
-      String.map (fn #"\n" => #" " | #"\r" => #" " | c => c)
-        (Substring.string (Substring.dropl Char.isSpace (Substring.dropr Char.isSpace (Substring.full value))))
-    fun compact_failure {theorem, line, error, top_goal} =
-      {theorem = compact theorem, line = line, error = compact error, top_goal = compact top_goal}
   in
-    List.mapPartial (Option.map compact_failure o parse) records
+    List.mapPartial parse records
   end
 
 fun summarize_trace_steps text =
