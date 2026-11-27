@@ -234,8 +234,12 @@ result=$worker/result
 status=0
 (cd "$worker" && HOLBUILD_CACHE=$worker/cache "$HOLBUILD_BIN" --remote-cache "$remote_url" \
   exec-action "$spec" --cache-limit-gb 1000 --result "$result") > "$worker/out" 2>&1 || status=$?
+require_grep '^status=failed$' "$result"
 require_grep '^failure=proof$' "$result"
 [[ "$status" == 1 ]]
+input_key=$(sed -n 's/^input-key=//p' "$result")
+cache_entry=$(printf 'holbuild-remote-ac-v1\n%s\n' "$input_key" | sha256sum | cut -d' ' -f1)
+require_no_file "$tmpdir/remote/ac/$cache_entry"
 log_sha=$(sed -n 's/^log=\([0-9a-f]*\) .*/\1/p' "$result")
 curl -fsS "$remote_url/cas/$log_sha" > "$worker/child.log"
 require_grep 'parse error: expected closing parenthesis' "$worker/child.log"
