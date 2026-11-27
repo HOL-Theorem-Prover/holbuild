@@ -12271,6 +12271,26 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       end
     fun refresh revalidate wanted =
       hydrate_step "hydstale" (fn () => drop_stale_dep_copies revalidate remote spec wanted) andalso (restore_deps (); true)
+    (* A light hydrate leaves what earlier actions installed in place: the
+       resumed HOL reads none of it, and install_light prunes. *)
+    fun prune () =
+      let
+        val pruned = ref 0
+      in
+        hydrate_step "hydprune" (fn () =>
+          (Resident.prune resident (fn entry => (pruned := !pruned + 1; remove_resident root entry));
+           (* Extra outputs lie under their theory's key, so a directory there
+              for no recorded key (an early cutoff restores the action's own
+              under its earlier key) is nobody's. *)
+           let
+             val extras = in_root root ".holbuild/action-extra"
+             val keys = Resident.keys resident
+           in
+             List.app (fn key => if List.exists (fn k => k = key) keys then () else remove_tree (Path.concat (extras, key)))
+                      (HolbuildBuildPlan.list_dir extras handle HolbuildBuildPlan.Error _ => [])
+           end));
+        hydrate_count "hydprunen" (!pruned)
+      end
     (* Every path an item writes: two items sharing one would let a kept
        item stand for files another replaced or removed. *)
     fun theory_files stem = List.concat (map (fn suffix => objects (in_root root stem ^ suffix)) theory_suffixes)
@@ -12295,23 +12315,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                    Resident.put resident path (Resident.Scratch key)
                 end)
              scratch;
-    let
-      val pruned = ref 0
-    in
-      hydrate_step "hydprune" (fn () =>
-        (Resident.prune resident (fn entry => (pruned := !pruned + 1; remove_resident root entry));
-         (* Extra outputs lie under their theory's key, so a directory there
-            for no recorded key (an early cutoff restores the action's own
-            under its earlier key) is nobody's. *)
-         let
-           val extras = in_root root ".holbuild/action-extra"
-           val keys = Resident.keys resident
-         in
-           List.app (fn key => if List.exists (fn k => k = key) keys then () else remove_tree (Path.concat (extras, key)))
-                    (HolbuildBuildPlan.list_dir extras handle HolbuildBuildPlan.Error _ => [])
-         end));
-      hydrate_count "hydprunen" (!pruned)
-    end;
+    if light then () else prune ();
     hydrate_step "hydfiles" (fn () =>
       (transfer_all fetch_file files;
        List.app write_lib (#libs spec)));
@@ -12319,7 +12323,8 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       val light_records = if light then hydrate_step "hyddeps" light_deps_now else NONE
     in
     if Option.isSome light_records then () else
-    (restore_deps ();
+    ((if light then prune () else ());
+    restore_deps ();
     ignore (refresh false direct);
     case misfits () of
         [] => ()
@@ -17091,7 +17096,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val (done, cutoff, earlier) =
           phase "cutoff" (fn () =>
             let
-              val {dat_hash, file_hashes} = resident_hashes (!resident :: (case light of SOME {records, ...} => [records] | NONE => []))
+              val {dat_hash, file_hashes} = resident_hashes ((case light of SOME {records, ...} => [records] | NONE => []) @ [!resident])
               val cutoff =
                 spec_early_cutoff_with
                   {dat_hash = dat_hash, file_hashes = file_hashes,
