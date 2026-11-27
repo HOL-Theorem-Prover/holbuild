@@ -201,7 +201,36 @@ fun take_before marker text =
       NONE => text
     | SOME i => String.substring(text, 0, i)
 
-fun failure_kind message =
+val unclosed_delimiter_note_prefix = "note: unclosed '"
+val unclosed_delimiter_excerpt_prefix = "  | "
+
+fun numbered_source_row line =
+  if String.isPrefix "  " line orelse String.isPrefix "> " line then
+    let
+      val row = Substring.dropl (fn c => c = #" ") (Substring.extract (line, 2, NONE))
+      val (number, rest) = Substring.splitl Char.isDigit row
+    in
+      Substring.size number > 0 andalso Substring.isPrefix " | " rest
+    end
+  else false
+
+(* Source excerpts can contain text that looks like failure metadata. *)
+fun without_source_excerpts detail =
+  let
+    fun keep (line :: excerpt :: rest) acc =
+          if String.isPrefix unclosed_delimiter_note_prefix line andalso
+             String.isPrefix unclosed_delimiter_excerpt_prefix excerpt
+          then keep rest acc
+          else keep (excerpt :: rest) (if numbered_source_row line then acc else line :: acc)
+      | keep [line] acc = rev (if numbered_source_row line then acc else line :: acc)
+      | keep [] acc = rev acc
+  in
+    if String.isSubstring " | " detail then
+      String.concatWith "\n" (keep (String.fields (fn c => c = #"\n") detail) [])
+    else detail
+  end
+
+fun classify_failure message =
   if String.isSubstring "tactic timed out" message then "tactic_timeout"
   else if String.isSubstring "termination condition goal" message orelse
           String.isSubstring "\ntermination: " message orelse String.isPrefix "termination: " message then
@@ -224,6 +253,8 @@ fun failure_kind message =
           String.isSubstring "Uncaught exception" message then
     "child_failure"
   else "unknown"
+
+fun failure_kind detail = classify_failure (without_source_excerpts detail)
 
 fun theorem_from_lines lines =
   Option.map (fn text => take_before " (line " text)
@@ -273,6 +304,7 @@ fun source_location_from_lines lines = first_some source_location_from_line line
 
 fun json_failure_fields source_override message =
   let
+    val message = without_source_excerpts message
     val lines = String.fields (fn c => c = #"\n") message
     val source_location = source_location_from_lines lines
     val source_file =
@@ -281,7 +313,7 @@ fun json_failure_fields source_override message =
         | NONE => Option.map #file source_location
     val source_line = Option.map #line source_location
   in
-    [json_string_field "kind" (failure_kind message)] @
+    [json_string_field "kind" (classify_failure message)] @
     json_optional_string_field "theorem" (theorem_from_lines lines) @
     json_optional_string_field "source_file" source_file @
     json_optional_int_field "source_line" source_line @
