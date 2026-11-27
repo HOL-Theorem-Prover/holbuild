@@ -21,9 +21,21 @@ val diagnostic_marker_ref = ref (NONE : string option)
 val tainted_ref = ref false
 val diagnostic_timer_ref = ref (NONE : Timer.real_timer option)
 val diagnostic_failure_count_ref = ref 0
+val diagnostic_declaration_start_ref = ref 0
 val secondary_goal_ref = ref (NONE : string option)
 val diagnostic_seconds = 10.0
 val diagnostic_failure_limit = 8
+
+fun secondary_preview text =
+  let
+    val limit = 1024
+    fun boundary i =
+      if i > 0 andalso Char.ord (String.sub (text, i)) div 64 = 2
+      then boundary (i - 1)
+      else i
+  in
+    if size text <= limit then text else String.substring (text, 0, boundary limit)
+  end
 
 fun diagnostic_time_left () =
   Option.map (fn timer => diagnostic_seconds - Time.toReal (Timer.checkRealTimer timer))
@@ -40,9 +52,12 @@ val _ = Theory.register_hook
         if !tainted_ref then OS.Process.exit OS.Process.failure else ()
     | _ => ())
 
-fun install_diagnostics before_declaration finish_script marker =
+fun install_diagnostics before_declaration report_source_error finish_script marker =
   (diagnostic_marker_ref := SOME marker;
    before_declaration := check_diagnostic_deadline;
+   report_source_error := (fn () =>
+     if !tainted_ref then HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild secondary source error\n")
+     else ());
    finish_script := (fn record_peak_rss =>
      if !tainted_ref then (record_peak_rss (); OS.Process.exit OS.Process.failure) else ()))
 
@@ -843,12 +858,13 @@ fun restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path
 
 fun set_theorem_plan plan = active_plan_ref := plan
 
-fun begin_theorem (kind, name, tactic_text, context_path, context_ok,
+fun begin_theorem (kind, name, declaration_start, tactic_text, context_path, context_ok,
                    failed_prefix_path, failed_prefix_ok, proof_attrs) =
   let val depth = length (PolyML.SaveState.showHierarchy())
   in
     theorem_info_ref := SOME (kind, name, tactic_text, context_path, context_ok,
                               failed_prefix_path, failed_prefix_ok, proof_attrs, depth);
+    diagnostic_declaration_start_ref := declaration_start;
     context_info_ref := SOME (context_path, context_ok, depth)
   end
 
@@ -1061,7 +1077,7 @@ fun print_goal_state label goals = timed_hol_phase "holprint" (fn () =>
   (failed_goal_state_printed_ref := true;
    if !tainted_ref then
      let val goal = with_cached_grammar_term_printer (fn () => top_goal_text goals)
-     in secondary_goal_ref := SOME (String.substring (goal, 0, Int.min (size goal, 1024))) end
+     in secondary_goal_ref := SOME (secondary_preview goal) end
    else HolbuildBoundedOutput.text (TextIO.stdErr, with_cached_grammar_term_printer (fn () =>
     String.concat ["\nholbuild goal state at failed fragment: ", diagnostic_fragment_label label,
                    failed_theorem_line (),
@@ -2111,7 +2127,7 @@ fun report_secondary_failure name at_finish e =
         | TacticInterrupted detail => detail
         | Interrupt => "interrupted"
         | _ => Feedback.exn_to_string e
-    fun field text = String.toString (String.substring (text, 0, Int.min (size text, 1024)))
+    val field = String.toString o secondary_preview
     val kind = case !theorem_info_ref of SOME (kind, _, _, _, _, _, _, _, _) => kind | NONE => "theorem"
     val position =
       if at_finish then "finish"
@@ -2119,8 +2135,8 @@ fun report_secondary_failure name at_finish e =
     val goal = Option.getOpt (!secondary_goal_ref, "")
   in
     HolbuildBoundedOutput.text (TextIO.stdErr,
-      String.concat ["holbuild secondary failure: ", kind, "\t", field name, "\t", position,
-                     "\t", field message, "\t", field goal, "\n"])
+      String.concat ["holbuild secondary failure: ", kind, "\t", Int.toString (!diagnostic_declaration_start_ref),
+                     "\t", field name, "\t", position, "\t", field message, "\t", field goal, "\n"])
   end
 
 fun print_first_failure name e =
@@ -2153,6 +2169,8 @@ fun proof_failure name goal at_finish e =
       if !tainted_ref then
         (report_secondary_failure name at_finish cause; OS.Process.exit OS.Process.failure)
       else PolyML.Exception.reraise cause
+    (* Poly/ML's use can compile more source during a tactic. Its compiler
+       raises Fail "Static Errors" through that tactic. *)
     val proof_error =
       case e of Feedback.HOL_ERR _ => true | Fail "Static Errors" => false | Fail _ => true | _ => false
   in
@@ -2275,12 +2293,13 @@ fun proof_ir_prove name g original_tac tactic_text =
     th
   end
 
-fun termination_tactic name tactic_text plan original_tac =
+fun termination_tactic name declaration_start tactic_text plan original_tac =
   HolbuildTacticCompat.lift_context_tactic (fn ctxt => fn g =>
   let
     val depth = length (PolyML.SaveState.showHierarchy())
     val _ = theorem_info_ref := SOME ("termination", name, tactic_text,
                                       "", "", "", "", [], depth)
+    val _ = diagnostic_declaration_start_ref := declaration_start
     val _ = failed_step_end_ref := NONE
     val _ = failed_step_span_ref := NONE
     val _ = failed_plan_position_ref := NONE
@@ -2613,7 +2632,7 @@ fun rewind_past_shared_leaves plan metadata =
       end
   end
 
-fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok =
+fun finish_failed_prefix name declaration_start metadata_text tactic_text failed_prefix_path failed_prefix_ok =
   let
     val old_resume_active = !failed_prefix_resume_active_ref
     val old_resumed_step_count = !failed_prefix_resumed_step_count_ref
@@ -2624,6 +2643,7 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
     val result =
       with_proof_ir_execution (current_proof_context ()) (fn () =>
        (restore_failed_prefix_checkpoint_info (name, tactic_text, failed_prefix_path, failed_prefix_ok);
+        diagnostic_declaration_start_ref := declaration_start;
         with_theorem_trace name (fn () =>
         let
           val _ = active_tactic_text_ref := tactic_text

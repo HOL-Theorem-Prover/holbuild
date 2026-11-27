@@ -58,7 +58,7 @@ fun skip_comment_bounded text limit i =
 
 fun skip_comment text i = skip_comment_bounded text (size text) i
 
-fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
+fun begin_theorem_line ({kind, name, theorem_start, tactic_text, context_path, context_ok,
                          failed_prefix_path, failed_prefix_ok,
                          proof_attrs, proof_ir_plan, ...} : checkpoint) =
   String.concat
@@ -68,6 +68,7 @@ fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
      "val _ = holbuild_begin_theorem(",
      HolbuildToolchain.sml_string kind, ", ",
      HolbuildToolchain.sml_string name, ", ",
+     Int.toString theorem_start, ", ",
      HolbuildToolchain.sml_string tactic_text, ", ",
      HolbuildToolchain.sml_string context_path, ", ",
      HolbuildToolchain.sml_string context_ok, ", ",
@@ -103,6 +104,7 @@ fun termination_tactic_prefix ({name, definition_start, tactic_text, proof_ir_pl
            String.concat
              ["(HolbuildProofRuntime.termination_tactic ",
               HolbuildToolchain.sml_string name, " ",
+              Int.toString definition_start, " ",
               HolbuildToolchain.sml_string tactic_text, " (", plan, ") (",
               "HolbuildTacticCompat.delay_tactic (fn () => ("]]
 
@@ -191,7 +193,7 @@ fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed
    "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"] @
   (case (multi_error, timeout_marker) of
        (true, SOME path) =>
-         ["val _ = HolbuildProofRuntime.install_diagnostics holbuild_before_declaration holbuild_finish_script " ^
+         ["val _ = HolbuildProofRuntime.install_diagnostics holbuild_before_declaration holbuild_report_source_error holbuild_finish_script " ^
           HolbuildToolchain.sml_string (OS.Path.concat (OS.Path.dir path, diagnostic_admit_marker)) ^ ";"]
      | _ => [])
 

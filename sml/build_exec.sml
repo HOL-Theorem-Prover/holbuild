@@ -779,16 +779,21 @@ fun write_theory_script_start path source_file =
   write_text path (String.concatWith "\n"
     [phase_mark_line "holscriptstart",
      "val holbuild_before_declaration = ref (fn () => ());",
+     "val holbuild_report_source_error = ref (fn () => ());",
      "val holbuild_finish_script = ref (fn (_ : unit -> unit) => ());",
      "val _ = let",
      "  val file = " ^ HolbuildToolchain.sml_string (Path.file source_file),
-     "  fun parse_error msg = (TextIO.print msg; OS.Process.exit OS.Process.failure)",
+     "  fun parse_error msg = (TextIO.print msg; (!holbuild_report_source_error) ();",
+     "                         OS.Process.exit OS.Process.failure)",
      "  val {read, fileline, eof} = HOLSource.fileToReader {quietOpen = false, print = parse_error} file",
      "  fun line () = #line (fileline ()) + 1",
+     "  fun compile () =",
+     "    PolyML.compiler (read, [PolyML.Compiler.CPFileName file, PolyML.Compiler.CPLineNo line])",
+     "    handle e as Fail \"Static Errors\" => ((!holbuild_report_source_error) (); PolyML.Exception.reraise e)",
      "in",
      "  while not (eof ()) do (",
      "    (!holbuild_before_declaration) ();",
-     "    PolyML.compiler (read, [PolyML.Compiler.CPFileName file, PolyML.Compiler.CPLineNo line]) ();",
+     "    compile () ();",
      "    if !QUse.failOnError andalso QUse.hadError () then OS.Process.exit OS.Process.failure else ())",
      "end;", ""])
 
@@ -4458,6 +4463,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker source_name sourc
       String.concat
         ["HolbuildProofRuntime.finish_failed_prefix ",
          HolbuildToolchain.sml_string (#name checkpoint), " ",
+         Int.toString (#theorem_start checkpoint), " ",
          HolbuildToolchain.sml_string metadata_text, " ",
          HolbuildToolchain.sml_string (#tactic_text checkpoint),
          " " ^ HolbuildToolchain.sml_string (#failed_prefix_path checkpoint) ^

@@ -802,7 +802,7 @@ fun additional_failure_summary source_path source_text checkpoints terminations 
   let
     val text = read_text path
     val prefix = "holbuild secondary failure: "
-    fun source_line kind name position =
+    fun source_line kind declaration_start position =
       let
         fun line start stop finish =
           Option.map (line_number_at source_text)
@@ -814,21 +814,22 @@ fun additional_failure_summary source_path source_text checkpoints terminations 
           Option.mapPartial (fn termination =>
             line (#tactic_start termination) (#tactic_end termination)
                  (skip_whitespace source_text (#boundary termination) (#tactic_end termination)))
-            (List.find (fn termination => #name termination = name)
+            (List.find (fn termination => #definition_start termination = declaration_start)
                        (terminations : HolbuildTheoryCheckpoints.termination list))
         else
           Option.mapPartial (fn checkpoint =>
             line (#tactic_start checkpoint) (#tactic_end checkpoint)
                  (#offset (finish_span source_text checkpoint)))
-            (List.find (fn checkpoint => #name checkpoint = name)
+            (List.find (fn checkpoint => #theorem_start checkpoint = declaration_start)
                        (checkpoints : HolbuildTheoryCheckpoints.boundary list))
       end
     fun decode line =
       case String.fields (fn c => c = #"\t") (String.extract (line, size prefix, NONE)) of
-          [kind, name, position, message, goal] =>
-            (case (String.fromString name, String.fromString message, String.fromString goal) of
-                 (SOME name, SOME error, SOME top_goal) =>
-                   SOME {theorem = name, line = source_line kind name position, error = error, top_goal = top_goal}
+          [kind, start, name, position, message, goal] =>
+            (case (Int.fromString start, String.fromString name, String.fromString message, String.fromString goal) of
+                 (SOME declaration_start, SOME name, SOME error, SOME top_goal) =>
+                   SOME {theorem = name, line = source_line kind declaration_start position,
+                         error = error, top_goal = top_goal}
                | _ => NONE)
         | _ => NONE
     fun parse [] reports tail = (rev reports, rev tail)
@@ -843,7 +844,9 @@ fun additional_failure_summary source_path source_text checkpoints terminations 
     fun terminal tail =
       let
         val lines = List.filter (not o String.isPrefix "holbuild ") tail
-        val block = find_static_error_block lines
+        val block =
+          if List.exists (fn line => line = "holbuild secondary source error") tail
+          then find_static_error_block lines else NONE
         val exception_line =
           List.find (fn line => String.isPrefix "Uncaught exception" line orelse
                                 String.isPrefix "Exception raised" line) lines

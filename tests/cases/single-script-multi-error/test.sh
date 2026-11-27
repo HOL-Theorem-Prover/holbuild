@@ -72,10 +72,16 @@ Definition predicate_def:
   tag n = (n = 0)
 End
 
+Triviality last_failure:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+
 Theorem later[simp]:
   tag 1
 Proof
-  FAIL_TAC "simp theorem failure"
+  FAIL_TAC (String.concat (List.tabulate (400, fn _ => "\240\159\152\128")))
 QED
 
 Triviality uses_later:
@@ -145,6 +151,8 @@ Proof
   ALL_TAC >>
   ALL_TAC
 QED
+
+val _ = print "AScript.sml:1: error: output from a successful declaration\n";
 SML
 run_failure "$tmpdir/default.log" build ATheory
 require_grep '^additional failure 6 of 6:$' "$tmpdir/default.log"
@@ -173,7 +181,11 @@ import sys
 
 events = (json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines())
 failure = next(event["failure"] for event in events if event["event"] == "node_failed")
-last = failure["additional_failures"][-1]
+reports = failure["additional_failures"]
+assert len(reports) == 6, reports
+message = reports[0]["error"]
+assert 1000 <= len(message.encode()) <= 1024 and message.endswith(chr(0x1F600)), message
+last = reports[-1]
 assert last["theorem"] == "last_failure" and last["source_line"] == int(sys.argv[2]), last
 PYTHON
 
@@ -242,10 +254,20 @@ for gate in export exit-success; do
   fi
 done
 
-for terminal in static parse termination; do
+for terminal in static dynamic-static parse termination; do
   make_project "$terminal"
   case "$terminal" in
     static) echo 'val _ : int = true;' >> "$project/src/AScript.sml"; error='error:' ;;
+    dynamic-static)
+      cat >> "$project/src/AScript.sml" <<'SML'
+Theorem compiles_invalid_ml:
+  T
+Proof
+  (fn g => let val input = TextIO.openString "val _ : int = true;"
+           in PolyML.compiler (fn () => TextIO.input1 input, []) (); ALL_TAC g end)
+QED
+SML
+      error='Static Errors' ;;
     parse) echo 'Theorem malformed: T Proof simp[] QED' >> "$project/src/AScript.sml"; error='parse error:' ;;
     termination)
       cat >> "$project/src/AScript.sml" <<'SML'
