@@ -198,10 +198,11 @@ PYTHON
 make_project construction
 cat >> "$project/src/AScript.sml" <<'SML'
 
-fun make_tactic () : tactic = raise Fail "could not construct tactic";
+open stringTheory;
+fun make_tactic () : tactic = raise Fail "could not  construct tactic";
 
 Theorem construction_failed:
-  T
+  "a  b" = "a b"
 Proof
   make_tactic () >> ACCEPT_TAC TRUTH
 QED
@@ -215,8 +216,8 @@ with open(sys.argv[1]) as output:
     events = (json.loads(line) for line in output)
     failure = next(event["failure"] for event in events if event["event"] == "node_failed")
 report, = failure["additional_failures"]
-assert report["theorem"] == "construction_failed" and report["top_goal"] == "T", report
-assert "could not construct tactic" in report["error"], report
+assert report["theorem"] == "construction_failed" and '"a  b"' in report["top_goal"], report
+assert "could not  construct tactic" in report["error"], report
 PYTHON
 
 # A later timeout has its own message and cannot replace the primary fields.

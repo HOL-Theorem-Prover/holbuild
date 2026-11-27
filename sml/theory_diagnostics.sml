@@ -862,7 +862,9 @@ fun additional_failures source_path source_text checkpoints terminations records
       if String.isPrefix prefix line then decode line
       else if String.isPrefix terminal_prefix line then terminal line
       else NONE
-    fun compact value = String.concatWith " " (String.tokens Char.isSpace value)
+    fun compact value =
+      String.map (fn #"\n" => #" " | #"\r" => #" " | c => c)
+        (Substring.string (Substring.dropl Char.isSpace (Substring.dropr Char.isSpace (Substring.full value))))
     fun compact_failure {theorem, line, error, top_goal} =
       {theorem = compact theorem, line = line, error = compact error, top_goal = compact top_goal}
   in

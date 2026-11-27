@@ -944,7 +944,11 @@ from pathlib import Path
 
 text = Path(sys.argv[1]).read_text()
 assert 'handled diagnostic' in text and 'Saved theorem' in text, text
-summary = text.split('\nholbuild: exec-action failed: ', 1)[1].split('child failure:\n', 1)[1]
+raw, report = text.split('\nholbuild: exec-action failed: ', 1)
+report, footer = report.rstrip('\n').rsplit('\n', 1)
+child_end = str(len(raw.encode()))
+assert footer.split('\t') == ['holbuild: diagnostic log v1', child_end, child_end, '0'], footer
+summary = report.split('child failure:\n', 1)[1]
 assert summary.startswith('Uncaught exception'), summary
 assert 'terminal child failure' in summary.splitlines()[0], summary
 assert 'preceding HOL output:' in summary and 'HOL message: terminal context' in summary, summary
