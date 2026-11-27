@@ -12009,7 +12009,7 @@ fun remove_resident root (path, entry) =
    RESIDENT records what ROOT holds already (DESIGN.md, "Persistent action
    root on workers"): an item installed from what the spec names is kept,
    and an item the spec doesn't name is removed, so the root ends as an
-   empty one would.  SCRATCH names the stems, with their keys, the action
+   empty one would; with LIGHT, that waits for the full install.  SCRATCH names the stems, with their keys, the action
    writes besides its dependencies; they are emptied for it.
 
    With LIGHT, for an action that reads no dependency file when it resumes

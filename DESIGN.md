@@ -808,9 +808,12 @@ cache cap doesn't count the root: it holds one spec's dependencies.
 A hydrate is light for a `--check-only` action and for a checkpoint target
 the build named, unless its package sets `[build] install_dependencies_first`
 or the client marks it so (`option install-dependencies-first=true`, for a
-target the build didn't name). A light hydrate prunes the root as above, keeps
-the action's own files and the kept items whose stat matches, but installs no
-other dependency and makes no stale check. Their records, as an install would
+target the build didn't name). A light hydrate keeps the action's own files
+and the kept items whose stat matches, removes its outdated copies of the
+spec's own dependencies, but installs no other dependency, makes no stale check
+and leaves the rest of the root as earlier actions left it: the prune above
+waits for the full install, so a failing check, and a passing `--check-only`
+action, never prunes. Their records, as an install would
 write them, come from their cache manifests (the remote's read without copying
 its blobs) and `.sml` blobs (the `.dat` hash from the hash the `.sml` carries;
 a theory whose `.sml` carries none makes the hydrate install them all), and the

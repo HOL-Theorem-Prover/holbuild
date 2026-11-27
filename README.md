@@ -827,8 +827,9 @@ allow_empty = false
   checking a named target or a `--check-only` one that resumes from a
   checkpoint installs none until the theory passes, since the checkpoint has
   them loaded (a host that may rebuild the checkpoint's heap with theory
-  modules installs them first); a script that loads one it didn't fails to find its file, and the
-  worker installs them all and builds the theory again. The key needs holbuild
+  modules installs them first); a script that loads one it didn't either reads a
+  current copy the worker kept or fails to find its file, and then the worker
+  installs them all and builds the theory again. The key needs holbuild
   0.15.16 or later: earlier clients reject it as an unknown field.
 
 ### Action overrides
