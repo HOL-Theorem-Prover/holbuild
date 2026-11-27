@@ -11980,22 +11980,31 @@ val theory_suffixes = [".sig", ".sml", ".dat", ".tr.gz", ".ui", ".uo"]
 
 (* Removes what an entry of the action root's records stands for, and the
    directories that leaves empty, which a cold root wouldn't have. *)
-fun remove_resident root (path, entry) =
+(* The files an entry of the action root's records stands for, its extra
+   outputs aside. *)
+fun resident_files (path, entry) =
+  let
+    fun objects path = [path, hfs_remapped_path path]
+  in
+    case entry of
+        Resident.File _ => [path]
+      | Resident.Manifest _ => objects path
+      | _ => List.concat (map (fn suffix => objects (path ^ suffix)) theory_suffixes)
+  end
+
+fun remove_resident root (entry as (_, kind)) =
   let
     fun remove_empty dir =
       if dir = root orelse not (String.isPrefix (root ^ "/") dir) then ()
       else (FS.rmDir dir; remove_empty (Path.dir dir)) handle OS.SysErr _ => ()
     fun remove path = (remove_file path; remove_empty (Path.dir path))
-    fun remove_object path = (remove path; remove (hfs_remapped_path path))
-    fun remove_theory key =
-      (List.app (fn suffix => remove_object (path ^ suffix)) theory_suffixes;
-       remove_tree (in_root root (Path.concat (".holbuild/action-extra", key))))
+    fun remove_extra key = remove_tree (in_root root (Path.concat (".holbuild/action-extra", key)))
   in
-    case entry of
-        Resident.Theory {key, ...} => remove_theory key
-      | Resident.Scratch key => remove_theory key
-      | Resident.File _ => remove path
-      | Resident.Manifest _ => remove_object path
+    List.app remove (resident_files entry);
+    case kind of
+        Resident.Theory {key, ...} => remove_extra key
+      | Resident.Scratch key => remove_extra key
+      | _ => ()
   end
 
 (* Step 3: the caller's files, given as {hash, dst}, the spec's libraries
@@ -12009,8 +12018,10 @@ fun remove_resident root (path, entry) =
    RESIDENT records what ROOT holds already (DESIGN.md, "Persistent action
    root on workers"): an item installed from what the spec names is kept,
    and an item the spec doesn't name is removed, so the root ends as an
-   empty one would; with LIGHT, that waits for the full install.  SCRATCH names the stems, with their keys, the action
-   writes besides its dependencies; they are emptied for it.
+   empty one would; with LIGHT, that waits for the full install, but for
+   what stands in the way of a path the spec writes.  SCRATCH names the
+   stems, with their keys, the action writes besides its dependencies; they
+   are emptied for it.
 
    With LIGHT, for an action that reads no dependency file when it resumes
    from a heap that loaded them: the dependencies not kept are removed and
@@ -12307,6 +12318,25 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                     if Binaryset.member (seen, path) then reject_spec ("two items of the spec write " ^ path)
                     else Binaryset.add (seen, path))
                  (Binaryset.empty String.compare) claims
+    (* A light hydrate keeps what it doesn't want, but not where it would
+       stand in the way of a file it writes before HOL: at it, at a
+       directory above it, or under it.  Dependencies are written only by
+       the full install, which prunes first. *)
+    fun clear_conflicts () =
+      let
+        fun dirs path =
+          let val dir = Path.dir path
+          in if dir = root orelse not (String.isPrefix (root ^ "/") dir) then [] else dir :: dirs dir end
+        val written =
+          map #dst files @ List.concat (map (fn {stem, suffix, ...} => objects (in_root root (stem ^ suffix))) (#libs spec))
+        val claimed = Binaryset.addList (Binaryset.empty String.compare, written)
+        val above = Binaryset.addList (Binaryset.empty String.compare, List.concat (map dirs written))
+        fun conflicts path =
+          Binaryset.member (claimed, path) orelse Binaryset.member (above, path) orelse
+          List.exists (fn dir => Binaryset.member (claimed, dir)) (dirs path)
+      in
+        Resident.prune_where resident (List.exists conflicts o resident_files) (remove_resident root)
+      end
   in
     Resident.discard resident;
     Resident.start resident;
@@ -12319,7 +12349,7 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                    Resident.put resident path (Resident.Scratch key)
                 end)
              scratch;
-    if light then () else prune ();
+    if light then clear_conflicts () else prune ();
     write_files ();
     let
       val light_records = if light then hydrate_step "hyddeps" light_deps_now else NONE
