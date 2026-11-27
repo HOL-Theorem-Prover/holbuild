@@ -12784,22 +12784,46 @@ fun classify_run_failure stage log_text oom_before msg =
    before the path it was given. *)
 val missing_file_messages = ["Cannot find file ", "Use: non-existent file "]
 
-(* Whether TEXT has a line HOL starts with one of those: it writes the
-   message on a line of its own before raising it. *)
-fun names_missing_file text =
-  List.exists (fn message => String.isPrefix message text orelse String.isSubstring ("\n" ^ message) text)
-    missing_file_messages
+(* Whether TEXT has a line HOL starts with one of those, naming a file
+   WANTED holds of: it writes the message on a line of its own before
+   raising it. *)
+fun names_missing_file wanted text =
+  let
+    fun named message =
+      let
+        fun from s =
+          let val (_, found) = Substring.position message s
+          in
+            if Substring.isEmpty found then false
+            else
+              let
+                val (whole, at, _) = Substring.base found
+                val (name, rest) = Substring.splitl (not o Char.isSpace) (Substring.triml (size message) found)
+                (* What the message wraps the name in: an exception's
+                   quotes, a following colon. *)
+                val name = Substring.dropr (fn c => c = #"\"" orelse c = #"'" orelse c = #":") name
+              in
+                ((at = 0 orelse String.sub (whole, at - 1) = #"\n") andalso wanted (Substring.string name))
+                orelse from rest
+              end
+          end
+      in
+        from (Substring.full text)
+      end
+  in
+    List.exists named missing_file_messages
+  end
 
-(* Whether the log at PATH names a missing file, read a chunk at a time: a
-   passing child's log may be large.  A missing log names none. *)
-fun log_names_missing_file path limit =
+(* Whether the log at PATH names a missing file WANTED holds of, read a
+   chunk at a time. LIMIT stops a continued run at its primary failure. *)
+fun log_names_missing_file wanted path limit =
   if not (file_exists path) then false
   else
     let
       val input = TextIO.openIn path
-      (* A message split across two chunks, with the line break before
-         it, lies within the kept tail. *)
-      val keep = List.foldl (fn (message, n) => Int.max (size message + 1, n)) 0 missing_file_messages
+      (* Keep a message, its file name and the preceding newline across
+         chunk boundaries. *)
+      val keep = 4096
       fun scan tail remaining =
         let val n = case remaining of NONE => 1048576 | SOME bytes => Int.min (1048576, bytes)
         in
@@ -12809,7 +12833,7 @@ fun log_names_missing_file path limit =
             | chunk =>
                 let val text = tail ^ chunk
                 in
-                  names_missing_file text orelse
+                  names_missing_file wanted text orelse
                     scan (String.extract (text, Int.max (0, size text - keep), NONE))
                          (Option.map (fn bytes => bytes - size chunk) remaining)
                 end
@@ -17275,8 +17299,15 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           (install_light spec tc cutoff;
            if #check_only spec then ()
            else prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec})
+        (* A file a full install gives: one of a dependency's, by its
+           stem's name, wherever the script looked for it.  A file no
+           dependency has stays missing on a full install. *)
+        fun dependency_file name =
+          let val base = Path.base (Path.file name)
+          in List.exists (fn {stem, ...} => Path.file stem = base) (#deps spec) end
+        val missing_dependency = names_missing_file dependency_file
         fun after_pass log =
-          if light () andalso log_names_missing_file log NONE then raise LightRerun
+          if light () andalso log_names_missing_file dependency_file log NONE then raise LightRerun
           else if #check_only spec then ()
           else install_light spec tc cutoff
         fun set_hooks preload passed = (before_fresh_preload := preload; after_child_passed := passed)
@@ -17302,8 +17333,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         handle LightRerun => rerun ()
              | e as ActionFailed (kind, msg) =>
                  if (kind = ProofFailure orelse kind = TacticTimeoutFailure) andalso light () andalso
-                    ((not (Option.isSome (!diagnostic_log)) andalso names_missing_file msg) orelse
-                     (log_names_missing_file (build_log ()) (Option.map #primary_end (!diagnostic_log)) handle _ => false))
+                    ((not (Option.isSome (!diagnostic_log)) andalso missing_dependency msg) orelse
+                     (log_names_missing_file dependency_file (build_log ())
+                        (Option.map #primary_end (!diagnostic_log)) handle _ => false))
                  then rerun ()
                  else raise e
       end
