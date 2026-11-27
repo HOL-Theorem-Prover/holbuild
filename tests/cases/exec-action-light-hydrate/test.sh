@@ -344,3 +344,57 @@ cat "$tmpdir/kept-stale.result" "$tmpdir/kept-stale.log" > "$tmpdir/kept-stale.b
 require_grep "the dependencies installed differ from the records the build started from" "$tmpdir/kept-stale.both"
 worker kept-retry keep
 expect_worker kept-retry 0 "status=built"
+
+# A light check leaves what an earlier action installed in the worker's
+# root, though its spec doesn't name it: a failing one never prunes the root;
+# a passing one prunes it as it installs.  Here T drops C, which the host
+# holds from the checks above.
+cp -a "$worker_cache" "$tmpdir/worker.with-c"
+write_toml
+sed -i '/^\[actions\.TTheory\]/,$d' "$project/holproject.toml"
+write_t 'FAIL_TAC "without C"'
+worker drop-c-first
+expect_worker drop-c-first 1 "status=failed" "failure=proof"
+c_files() { find "$worker_cache" -path '*/obj/src/CTheory.dat' | grep -q .; }
+rm -rf "$worker_cache"
+cp -a "$tmpdir/worker.with-c" "$worker_cache"
+c_files || { echo "the host holds no copy of C" >&2; exit 1; }
+# Nor may it decline the heap, which would install first.
+rm -rf "$worker_cache/theory-modules"
+write_t 'ALL_TAC >> FAIL_TAC "resumed without C"'
+worker drop-c-fail keep
+expect_worker drop-c-fail 1 "status=failed" "failure=proof"
+require_grep "resumed without C" "$tmpdir/drop-c-fail.log"
+! phases drop-c-fail | grep -q "^hydprune" ||
+  { echo "a failing light check pruned the root" >&2; cat "$tmpdir/drop-c-fail.result" >&2; exit 1; }
+c_files || { echo "a failing light check removed C" >&2; exit 1; }
+write_t "ALL_TAC >> ACCEPT_TAC TRUTH"
+worker drop-c-pass keep
+expect_worker drop-c-pass 0 "status=built"
+require_grep "from: failed-prefix checkpoint in t2" "$tmpdir/drop-c-pass.log"
+phases drop-c-pass | grep -qx "hydprunen:[1-9][0-9]*" ||
+  { echo "a passing light check did not prune the root" >&2; cat "$tmpdir/drop-c-pass.result" >&2; exit 1; }
+! c_files || { echo "a passing light check kept C" >&2; exit 1; }
+
+# A light check writes its own files over what an earlier action left in
+# their way: here an input file where it now needs a directory, and back.
+write_toml
+printf 'extra_inputs = ["data/x"]\n' >> "$project/holproject.toml"
+mkdir -p "$project/data"
+echo file > "$project/data/x"
+write_t 'FAIL_TAC "input file"'
+worker input-file
+expect_worker input-file 1 "status=failed" "failure=proof"
+rm "$project/data/x"
+mkdir "$project/data/x"
+echo nested > "$project/data/x/y"
+write_toml
+printf 'extra_inputs = ["data/x/y"]\n' >> "$project/holproject.toml"
+worker input-dir keep
+expect_worker input-dir 1 "status=failed" "failure=proof"
+rm -r "$project/data/x"
+echo file > "$project/data/x"
+write_toml
+printf 'extra_inputs = ["data/x"]\n' >> "$project/holproject.toml"
+worker input-back keep
+expect_worker input-back 1 "status=failed" "failure=proof"

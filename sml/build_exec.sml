@@ -12010,22 +12010,31 @@ val theory_suffixes = [".sig", ".sml", ".dat", ".tr.gz", ".ui", ".uo"]
 
 (* Removes what an entry of the action root's records stands for, and the
    directories that leaves empty, which a cold root wouldn't have. *)
-fun remove_resident root (path, entry) =
+(* The files an entry of the action root's records stands for, its extra
+   outputs aside. *)
+fun resident_files (path, entry) =
+  let
+    fun objects path = [path, hfs_remapped_path path]
+  in
+    case entry of
+        Resident.File _ => [path]
+      | Resident.Manifest _ => objects path
+      | _ => List.concat (map (fn suffix => objects (path ^ suffix)) theory_suffixes)
+  end
+
+fun remove_resident root (entry as (_, kind)) =
   let
     fun remove_empty dir =
       if dir = root orelse not (String.isPrefix (root ^ "/") dir) then ()
       else (FS.rmDir dir; remove_empty (Path.dir dir)) handle OS.SysErr _ => ()
     fun remove path = (remove_file path; remove_empty (Path.dir path))
-    fun remove_object path = (remove path; remove (hfs_remapped_path path))
-    fun remove_theory key =
-      (List.app (fn suffix => remove_object (path ^ suffix)) theory_suffixes;
-       remove_tree (in_root root (Path.concat (".holbuild/action-extra", key))))
+    fun remove_extra key = remove_tree (in_root root (Path.concat (".holbuild/action-extra", key)))
   in
-    case entry of
-        Resident.Theory {key, ...} => remove_theory key
-      | Resident.Scratch key => remove_theory key
-      | Resident.File _ => remove path
-      | Resident.Manifest _ => remove_object path
+    List.app remove (resident_files entry);
+    case kind of
+        Resident.Theory {key, ...} => remove_extra key
+      | Resident.Scratch key => remove_extra key
+      | _ => ()
   end
 
 (* Step 3: the caller's files, given as {hash, dst}, the spec's libraries
@@ -12039,8 +12048,10 @@ fun remove_resident root (path, entry) =
    RESIDENT records what ROOT holds already (DESIGN.md, "Persistent action
    root on workers"): an item installed from what the spec names is kept,
    and an item the spec doesn't name is removed, so the root ends as an
-   empty one would.  SCRATCH names the stems, with their keys, the action
-   writes besides its dependencies; they are emptied for it.
+   empty one would; with LIGHT, that waits for the full install, but for
+   what stands in the way of a path the spec writes.  SCRATCH names the
+   stems, with their keys, the action writes besides its dependencies; they
+   are emptied for it.
 
    With LIGHT, for an action that reads no dependency file when it resumes
    from a heap that loaded them: the dependencies not kept are removed and
@@ -12301,6 +12312,30 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
       end
     fun refresh revalidate wanted =
       hydrate_step "hydstale" (fn () => drop_stale_dep_copies revalidate remote spec wanted) andalso (restore_deps (); true)
+    (* A light hydrate leaves what earlier actions installed in place: the
+       resumed HOL reads none of it, and install_light prunes. *)
+    fun prune () =
+      let
+        val pruned = ref 0
+      in
+        hydrate_step "hydprune" (fn () =>
+          (Resident.prune resident (fn entry => (pruned := !pruned + 1; remove_resident root entry));
+           (* Extra outputs lie under their theory's key, so a directory there
+              for no recorded key (an early cutoff restores the action's own
+              under its earlier key) is nobody's. *)
+           let
+             val extras = in_root root ".holbuild/action-extra"
+             val keys = Resident.keys resident
+           in
+             List.app (fn key => if List.exists (fn k => k = key) keys then () else remove_tree (Path.concat (extras, key)))
+                      (HolbuildBuildPlan.list_dir extras handle HolbuildBuildPlan.Error _ => [])
+           end));
+        hydrate_count "hydprunen" (!pruned)
+      end
+    fun write_files () =
+      hydrate_step "hydfiles" (fn () =>
+        (transfer_all fetch_file files;
+         List.app write_lib (#libs spec)))
     (* Every path an item writes: two items sharing one would let a kept
        item stand for files another replaced or removed. *)
     fun theory_files stem = List.concat (map (fn suffix => objects (in_root root stem ^ suffix)) theory_suffixes)
@@ -12313,6 +12348,25 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                     if Binaryset.member (seen, path) then reject_spec ("two items of the spec write " ^ path)
                     else Binaryset.add (seen, path))
                  (Binaryset.empty String.compare) claims
+    (* A light hydrate keeps what it doesn't want, but not where it would
+       stand in the way of a file it writes before HOL: at it, at a
+       directory above it, or under it.  Dependencies are written only by
+       the full install, which prunes first. *)
+    fun clear_conflicts () =
+      let
+        fun dirs path =
+          let val dir = Path.dir path
+          in if dir = root orelse not (String.isPrefix (root ^ "/") dir) then [] else dir :: dirs dir end
+        val written =
+          map #dst files @ List.concat (map (fn {stem, suffix, ...} => objects (in_root root (stem ^ suffix))) (#libs spec))
+        val claimed = Binaryset.addList (Binaryset.empty String.compare, written)
+        val above = Binaryset.addList (Binaryset.empty String.compare, List.concat (map dirs written))
+        fun conflicts path =
+          Binaryset.member (claimed, path) orelse Binaryset.member (above, path) orelse
+          List.exists (fn dir => Binaryset.member (claimed, dir)) (dirs path)
+      in
+        Resident.prune_where resident (List.exists conflicts o resident_files) (remove_resident root)
+      end
   in
     Resident.discard resident;
     Resident.start resident;
@@ -12325,31 +12379,16 @@ fun hydrate_spec_deps remote root resident scratch files (spec : spec_deps) dire
                    Resident.put resident path (Resident.Scratch key)
                 end)
              scratch;
-    let
-      val pruned = ref 0
-    in
-      hydrate_step "hydprune" (fn () =>
-        (Resident.prune resident (fn entry => (pruned := !pruned + 1; remove_resident root entry));
-         (* Extra outputs lie under their theory's key, so a directory there
-            for no recorded key (an early cutoff restores the action's own
-            under its earlier key) is nobody's. *)
-         let
-           val extras = in_root root ".holbuild/action-extra"
-           val keys = Resident.keys resident
-         in
-           List.app (fn key => if List.exists (fn k => k = key) keys then () else remove_tree (Path.concat (extras, key)))
-                    (HolbuildBuildPlan.list_dir extras handle HolbuildBuildPlan.Error _ => [])
-         end));
-      hydrate_count "hydprunen" (!pruned)
-    end;
-    hydrate_step "hydfiles" (fn () =>
-      (transfer_all fetch_file files;
-       List.app write_lib (#libs spec)));
+    if light then clear_conflicts () else prune ();
+    write_files ();
     let
       val light_records = if light then hydrate_step "hyddeps" light_deps_now else NONE
     in
     if Option.isSome light_records then () else
-    (restore_deps ();
+    (* The prune may remove an earlier entry that shared a path the files
+       were just written to. *)
+    ((if light then (prune (); write_files ()) else ());
+    restore_deps ();
     ignore (refresh false direct);
     case misfits () of
         [] => ()
@@ -14937,9 +14976,10 @@ fun spec_early_cutoff_with {dat_hash, file_hashes, skip_loaded} root (spec : act
   end
   handle e => (warn ("no early cutoff: " ^ General.exnMessage e); NONE)
 
-(* The hashes spec_early_cutoff_with reads, from the first of RECORDS
-   (the action root's, and those of a light hydrate) to cover a file; a
-   file none covers is hashed. *)
+(* The hashes spec_early_cutoff_with reads, from the first of RECORDS to
+   cover a file (a light hydrate's records come before the action root's,
+   which may still describe an earlier copy); a file none covers is
+   hashed. *)
 fun resident_hashes records =
   let
     fun hash compute path =
@@ -17128,7 +17168,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val (done, cutoff, earlier) =
           phase "cutoff" (fn () =>
             let
-              val {dat_hash, file_hashes} = resident_hashes (!resident :: (case light of SOME {records, ...} => [records] | NONE => []))
+              val {dat_hash, file_hashes} = resident_hashes ((case light of SOME {records, ...} => [records] | NONE => []) @ [!resident])
               val cutoff =
                 spec_early_cutoff_with
                   {dat_hash = dat_hash, file_hashes = file_hashes,
