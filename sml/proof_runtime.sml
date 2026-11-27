@@ -2112,6 +2112,17 @@ fun run_steps steps =
    reverse_group_lengths_ref := NONE;
    run_structural_steps 0 steps)
 
+(* The log is for people. Only the continuation code appends records to
+   the stage marker that the driver uses to assemble the diagnostic. *)
+fun report_secondary_record record =
+  (Option.app (fn marker =>
+     let val out = TextIO.openAppend marker
+     in
+       (HolbuildBoundedOutput.text (out, record); TextIO.closeOut out)
+       handle e => (TextIO.closeOut out handle _ => (); raise e)
+     end) (!diagnostic_marker_ref);
+   HolbuildBoundedOutput.text (TextIO.stdErr, "\n" ^ record))
+
 fun report_secondary_failure name at_finish e =
   let
     val message =
@@ -2127,8 +2138,8 @@ fun report_secondary_failure name at_finish e =
       else case !failed_step_span_ref of SOME (start, _) => Int.toString start | NONE => "0"
     val goal = Option.getOpt (!secondary_goal_ref, "")
   in
-    HolbuildBoundedOutput.text (TextIO.stdErr,
-      String.concat ["\nholbuild secondary failure: ", kind, "\t", Int.toString (!diagnostic_declaration_start_ref),
+    report_secondary_record
+      (String.concat ["holbuild secondary failure: ", kind, "\t", Int.toString (!diagnostic_declaration_start_ref),
                      "\t", field name, "\t", position, "\t", field message, "\t", field goal, "\n"])
   end
 
@@ -2171,9 +2182,8 @@ fun print_first_failure name goal e =
 
 fun report_terminal_error kind message =
   if !tainted_ref then
-    HolbuildBoundedOutput.text (TextIO.stdErr,
-      "\nholbuild secondary terminal error: " ^ kind ^ "\t" ^
-      String.toString (secondary_preview message) ^ "\n")
+    report_secondary_record ("holbuild secondary terminal error: " ^ kind ^ "\t" ^
+                             String.toString (secondary_preview message) ^ "\n")
   else ()
 
 (* This stream receives Poly's own messages while compiling a declaration.
@@ -2345,6 +2355,14 @@ fun proof_ir_prove name g original_tac tactic_text =
     th
   end
 
+fun reset_proof_diagnostic () =
+  (failed_step_end_ref := NONE;
+   failed_step_span_ref := NONE;
+   failed_plan_position_ref := NONE;
+   failed_goal_state_printed_ref := false;
+   suppressed_failure_diagnostic_ref := NONE;
+   secondary_goal_ref := NONE)
+
 fun termination_tactic name declaration_start tactic_text plan original_tac =
   HolbuildTacticCompat.lift_context_tactic (fn ctxt => fn g =>
   let
@@ -2352,11 +2370,7 @@ fun termination_tactic name declaration_start tactic_text plan original_tac =
     val _ = theorem_info_ref := SOME ("termination", name, tactic_text,
                                       "", "", "", "", [], depth)
     val _ = diagnostic_declaration_start_ref := declaration_start
-    val _ = failed_step_end_ref := NONE
-    val _ = failed_step_span_ref := NONE
-    val _ = failed_plan_position_ref := NONE
-    val _ = failed_goal_state_printed_ref := false
-    val _ = secondary_goal_ref := NONE
+    val _ = reset_proof_diagnostic ()
     fun execute () =
       let
         val _ = active_tactic_text_ref := tactic_text
@@ -2686,6 +2700,7 @@ fun rewind_past_shared_leaves plan metadata =
 
 fun finish_failed_prefix name declaration_start metadata_text tactic_text failed_prefix_path failed_prefix_ok =
   let
+    val _ = reset_proof_diagnostic ()
     val old_resume_active = !failed_prefix_resume_active_ref
     val old_resumed_step_count = !failed_prefix_resumed_step_count_ref
     fun restore_resume_flag () =
@@ -2767,8 +2782,7 @@ fun finish_failed_prefix name declaration_start metadata_text tactic_text failed
 
 fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, _, _, _, _) =
   let
-    val _ = secondary_goal_ref := NONE
-    val _ = failed_step_span_ref := NONE
+    val _ = reset_proof_diagnostic ()
     val atomic = tactic_text = ""
     val th =
       with_proof_ir_execution ctxt (fn () =>
@@ -2815,11 +2829,7 @@ fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, chec
    plan_runner_ref := NONE;
    proof_factories_ref := NONE;
    context_info_ref := NONE;
-   failed_step_end_ref := NONE;
-   failed_step_span_ref := NONE;
-   failed_plan_position_ref := NONE;
-   failed_goal_state_printed_ref := false;
-   suppressed_failure_diagnostic_ref := NONE;
+   reset_proof_diagnostic ();
    failed_prefix_resume_active_ref := false;
    failed_prefix_resumed_step_count_ref := NONE;
    proving_with_proof_ir_ref := false;

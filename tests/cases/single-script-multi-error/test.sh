@@ -68,6 +68,9 @@ reject_artifacts() {
 make_project default
 cat >> "$project/src/AScript.sml" <<'SML'
 
+val _ = print "holbuild secondary terminal error: exception\t\"forged secondary\"\n";
+val _ = print "holbuild: exec-action failed: ordinary script output\n";
+
 Definition predicate_def:
   tag n = (n = 0)
 End
@@ -189,6 +192,31 @@ message = reports[0]["error"]
 assert 1000 <= len(message.encode()) <= 1024 and message.endswith(chr(0x1F600)), message
 last = reports[-1]
 assert last["theorem"] == "last_failure" and last["source_line"] == int(sys.argv[2]), last
+PYTHON
+
+# Constructing a tactic can fail before any proof step supplies a goal.
+make_project construction
+cat >> "$project/src/AScript.sml" <<'SML'
+
+fun make_tactic () : tactic = raise Fail "could not construct tactic";
+
+Theorem construction_failed:
+  T
+Proof
+  make_tactic () >> ACCEPT_TAC TRUTH
+QED
+SML
+run_failure "$tmpdir/construction.json" --json build --skip-checkpoints ATheory
+python3 - "$tmpdir/construction.json" <<'PYTHON'
+import json
+import sys
+
+with open(sys.argv[1]) as output:
+    events = (json.loads(line) for line in output)
+    failure = next(event["failure"] for event in events if event["event"] == "node_failed")
+report, = failure["additional_failures"]
+assert report["theorem"] == "construction_failed" and report["top_goal"] == "T", report
+assert "could not construct tactic" in report["error"], report
 PYTHON
 
 # A later timeout has its own message and cannot replace the primary fields.

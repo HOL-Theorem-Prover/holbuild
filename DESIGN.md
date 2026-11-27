@@ -1340,10 +1340,10 @@ before writing anything except its peak memory report, and the driver treats
 the stage marker as failure even if the child exits successfully. The
 remaining continuation budget also bounds normally untimed tactics. The
 first timeout ends continuation immediately. The stage marker records the
-byte offset where the primary log ends. Workers append it to the uploaded
-failure log so clients can recover the same primary diagnostic. Status
-formats later failures from their own records. A speculative child
-continues to use the deferred proof protocol.
+primary log's byte offset and the later failures. Workers put these
+records after the uploaded failure log and adjust the offset if they
+truncate the log. Status formats later failures from those records.
+A speculative child continues to use the deferred proof protocol.
 
 `--trace-steps` executes the build and records runtime plans plus before/after
 trace lines for all instrumented proofs in the child log. The internal proof-step

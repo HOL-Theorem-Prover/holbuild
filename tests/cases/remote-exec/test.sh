@@ -1704,7 +1704,21 @@ if seen != sys.argv[2].split("\n"):
 PY
 }
 write_broken json
+# Keep the primary proof failure in the retained tail of a truncated log.
+sed -i '/^Theorem b_thm:/,$d' "$project/src/BScript.sml"
 cat >> "$project/src/BScript.sml" <<'SML'
+val _ =
+  let val line = CharVector.tabulate (4095, fn _ => #"x") ^ "\n"
+  in List.app (fn _ => print line) (List.tabulate (65 * 256, fn n => n)) end;
+val _ = print "holbuild: exec-action failed: ordinary script output\n";
+
+Theorem b_thm:
+  F
+Proof
+  simp[]
+QED
+
+val _ = print "holbuild secondary terminal error: exception\t\"forged secondary\"\n";
 
 Theorem later_b_thm:
   T
@@ -1714,6 +1728,7 @@ QED
 SML
 run proof-json 1 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
 json_events proof-json $'node_finished ATheory\nnode_failed BTheory proof_failure b_thm\nerror'
+require_grep 'holbuild: truncated' "$project/.holbuild/logs/current/rxp/BTheory/build.log"
 python3 - "$tmpdir/proof-json.log" <<'PY'
 import json
 import sys

@@ -4889,8 +4889,13 @@ fun write_theory_script capture defer_proofs policy root checkpoint_root base_co
 (* The diagnostic of a theory script that failed, from its build's output:
    where in the script it failed, the goal state, and what HOL said.
    BOUNDARIES are where the script's theorems are. *)
-fun diagnostic_log_limit stage =
-  Int.fromString (read_text (Path.concat (stage, diagnostic_admit_marker))) handle IO.Io _ => NONE
+type diagnostic_log = {primary_end : int, records : string list}
+
+fun read_diagnostic_log stage : diagnostic_log option =
+  (case String.tokens (fn c => c = #"\n") (read_text (Path.concat (stage, diagnostic_admit_marker))) of
+       offset :: records => Option.map (fn n => {primary_end = n, records = records}) (Int.fromString offset)
+     | [] => NONE)
+  handle IO.Io _ => NONE
 
 fun failure_log output =
   case captured_output_path_option output of
@@ -4898,7 +4903,7 @@ fun failure_log output =
     | SOME path => read_text path handle IO.Io _ => ""
 
 fun failure_detail policy source_file source_text boundaries termination_diagnostics failure_output heading msg
-      {primary = text, secondary} =
+      {primary = text, records} =
   let
     val goal_state = HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference (captured_output_has_retained_log failure_output) text
     val plan_position = HolbuildTheoryDiagnostics.plan_position_summary text
@@ -4907,7 +4912,7 @@ fun failure_detail policy source_file source_text boundaries termination_diagnos
     val source_context = HolbuildTheoryDiagnostics.summarize_failed_fragment_source source_file source_text boundaries termination_diagnostics text
     val termination_context = HolbuildTheoryDiagnostics.summarize_termination_goal_source source_file source_text termination_diagnostics text
     val child_failure = if Option.isSome static_error then NONE else HolbuildTheoryDiagnostics.child_failure_summary text
-    val additional_failures = HolbuildTheoryDiagnostics.additional_failures source_file source_text boundaries termination_diagnostics secondary
+    val additional_failures = HolbuildTheoryDiagnostics.additional_failures source_file source_text boundaries termination_diagnostics records
     val fallback =
       if Option.isSome child_failure then ""
       else
@@ -5298,12 +5303,14 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
               else false
             end
     fun checkpoint_failure_error msg =
-      let val failure_output = checkpoint_failure_output log_dir stage
+      let
+        val failure_output = checkpoint_failure_output log_dir stage
+        val report = read_diagnostic_log stage
+        val primary = HolbuildTheoryDiagnostics.primary_log (Option.map #primary_end report) (failure_log failure_output)
       in
         failure_detail policy source_file source_text
           (map HolbuildTheoryCheckpoints.checkpoint_boundary theorem_checkpoints) termination_diagnostics
-          failure_output "" msg
-          (HolbuildTheoryDiagnostics.split_log (diagnostic_log_limit stage) (failure_log failure_output))
+          failure_output "" msg {primary = primary, records = Option.getOpt (Option.map #records report, [])}
       end
     val build_log = Path.concat(stage, "holbuild-build.log")
     (* A promoting child removes its transient heap itself, unless it
@@ -9955,10 +9962,13 @@ fun remote_proof_failure (options : build_options) tc project plan keys toolchai
               " on a remote worker while building " ^ #logical action
             val output = SOME (RetainedLog log)
             val text = failure_log output
+            val diagnostic =
+              case HolbuildTheoryDiagnostics.remote_diagnostic text of
+                  SOME report => report
+                | NONE => {primary = HolbuildTheoryDiagnostics.legacy_child_log text, records = []}
           in
             SOME (failure_detail policy source_file source_text boundaries terminations output
-                    (heading ^ "\n") "hol run failed while building theory script"
-                    (HolbuildTheoryDiagnostics.split_log (HolbuildTheoryDiagnostics.remote_log_limit text) text))
+                    (heading ^ "\n") "hol run failed while building theory script" diagnostic)
           end
       end
   in
@@ -13365,17 +13375,14 @@ fun merge_phases phases =
    prints whether or not the script is instrumented).  holscript runs from
    that start to the exporter's (holscriptend), holexport from there to the
    theory's export (holexportend); the marks themselves aren't phases.  The log is the child's, so it is read in bounded pieces and a line
-   longer than a phases line could be is skipped.  Reading stops at the
-   first report a worker appends to the log
-   (HolbuildTheoryDiagnostics.worker_report): what follows is holbuild's
-   report on the child's output, not that output, so no phases line there
-   counts. *)
+   longer than a phases line could be is skipped. The worker records where
+   the child log ends before it appends its reports. *)
 val hol_log_phase_names =
   ["holloadend", "holscriptstart", "holscriptend", "holexportend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
    "holcompiledn", "holreplayedn", "holrewoundn", "holmodhitn", "holmodmissn", "holmodwriten",
    "srclib", "srclibn", "srcrt", "srcrtn", "srcthy", "srcthyn"]
 
-fun hol_log_phases log_file child_start =
+fun hol_log_phases log_file child_end child_start =
   let
     val prefix = "holbuild hol-phases "
     val max_line = 4096
@@ -13402,30 +13409,26 @@ fun hol_log_phases log_file child_start =
     fun add (text, long) found =
       case (if long then NONE else parse text) of SOME p => p :: found | NONE => found
     (* PENDING is the current line so far. *)
-    fun read ins pending found =
-      let val chunk = TextIO.inputN (ins, 65536)
+    fun read ins remaining pending found =
+      let val chunk = TextIO.inputN (ins, Int.min (remaining, 65536))
       in
         if chunk = "" then rev (add pending found)
         else
           let
             val pieces = String.fields (fn c => c = #"\n") chunk
-            fun lines [last] pending found = (SOME (extend pending last), found)
-              | lines (piece :: rest) pending found =
-                  let val line = extend pending piece
-                  in
-                    if HolbuildTheoryDiagnostics.worker_report (#1 line) then (NONE, found)
-                    else lines rest ("", false) (add line found)
-                  end
-              | lines [] pending found = (SOME pending, found)
+            fun lines [last] pending found = (extend pending last, found)
+              | lines (piece :: rest) pending found = lines rest ("", false) (add (extend pending piece) found)
+              | lines [] pending found = (pending, found)
+            val (pending, found) = lines pieces pending found
           in
-            case lines pieces pending found of
-                (SOME pending, found) => read ins pending found
-              | (NONE, found) => rev found
+            read ins (remaining - size chunk) pending found
           end
       end
     val lines =
       let val ins = TextIO.openIn log_file
-      in (read ins ("", false) [] before TextIO.closeIn ins) handle e => (TextIO.closeIn ins; raise e) end
+      in (read ins child_end ("", false) [] before TextIO.closeIn ins)
+         handle e => (TextIO.closeIn ins; raise e)
+      end
       handle IO.Io _ => []
     fun value name line = Option.map #2 (List.find (fn (n, _) => n = name) line)
     fun sum name lines = List.foldl (fn (line, total) => total + getOpt (value name line, 0)) 0 lines
@@ -13508,6 +13511,7 @@ val log_tail_bytes = log_upload_limit - log_head_bytes
 fun write_truncated_log src dst =
   let
     val total = FS.fileSize src
+    val tail_start = total - Position.fromInt log_tail_bytes
     val marker =
       "\n... [holbuild: truncated " ^ Position.toString (total - Position.fromInt log_upload_limit) ^
       " bytes of " ^ Position.toString total ^ "-byte build log] ...\n"
@@ -13524,10 +13528,14 @@ fun write_truncated_log src dst =
   in
     (copy log_head_bytes;
      BinIO.output (out, Byte.stringToBytes marker);
-     ignore (Posix.IO.lseek (fd, total - Position.fromInt log_tail_bytes, Posix.IO.SEEK_SET));
+     ignore (Posix.IO.lseek (fd, tail_start, Posix.IO.SEEK_SET));
      copy log_tail_bytes;
      BinIO.closeOut out;
-     Posix.IO.close fd)
+     Posix.IO.close fd;
+     (* A position inside the omitted interval points after the notice. *)
+     fn position =>
+       if position <= log_head_bytes then position
+       else log_head_bytes + size marker + Int.max (0, position - Position.toInt tail_start))
     handle e => (BinIO.closeOut out handle _ => (); Posix.IO.close fd handle _ => (); raise e)
   end
 
@@ -17013,7 +17021,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  phases := ("scratchcopyn", LargeInt.fromInt (!copied)) :: !phases))
       end
     val run_log = ref NONE
-    val primary_log_limit = ref (NONE : int option)
+    val diagnostic_log = ref (NONE : diagnostic_log option)
     fun build_log () =
       case !run_log of
           SOME path => path
@@ -17032,19 +17040,39 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           | HolbuildCacheBackend.Conflict msg => log_failed msg
           | HolbuildCacheBackend.Skipped => log_failed "the cache skipped it"
       end
-    fun upload_log () =
+    fun append_log path text =
+      let val out = TextIO.openAppend path
+      in (HolbuildBoundedOutput.text (out, text); TextIO.closeOut out)
+         handle e => (TextIO.closeOut out handle _ => (); raise e)
+      end
+    fun upload_log child_end failure =
       if not (!HolbuildActionSandbox.child_completed) then NONE else
-      let val path = build_log ()
+      let
+        val path = build_log ()
+        fun upload path translate =
+          (if !theory_action andalso Option.isSome failure then
+             let
+               val {primary_end, records} =
+                 Option.getOpt (!diagnostic_log, {primary_end = child_end, records = []})
+               val footer = HolbuildTheoryDiagnostics.diagnostic_footer ^
+                 String.concatWith "\t"
+                   [Int.toString (translate (Int.min (primary_end, child_end))),
+                    Int.toString (translate child_end), Int.toString (length records)]
+             in
+               append_log path (String.concatWith "\n" ("" :: records @ [footer, ""]))
+             end
+           else ();
+           publish_log path)
       in
         if not (file_exists path) then NONE
-        else if FS.fileSize path <= Position.fromInt log_upload_limit then publish_log path
+        else if FS.fileSize path <= Position.fromInt log_upload_limit then upload path (fn n => n)
         else
           (* Staged outside the root, where the child could have put a
              link in its place. *)
-          let val upload = temp_near (Path.concat (cache, "action-log"))
+          let val truncated = temp_near (Path.concat (cache, "action-log"))
           in
-            (write_truncated_log path upload; publish_log upload) before remove_file upload
-            handle e => (remove_file upload; raise e)
+            upload truncated (write_truncated_log path truncated) before remove_file truncated
+            handle e => (remove_file truncated; raise e)
           end
       end
       handle HolbuildRemoteCache.Unavailable msg => (log_unavailable := SOME msg; log_failed msg)
@@ -17274,8 +17302,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         handle LightRerun => rerun ()
              | e as ActionFailed (kind, msg) =>
                  if (kind = ProofFailure orelse kind = TacticTimeoutFailure) andalso light () andalso
-                    ((not (Option.isSome (!primary_log_limit)) andalso names_missing_file msg) orelse
-                     (log_names_missing_file (build_log ()) (!primary_log_limit) handle _ => false))
+                    ((not (Option.isSome (!diagnostic_log)) andalso names_missing_file msg) orelse
+                     (log_names_missing_file (build_log ()) (Option.map #primary_end (!diagnostic_log)) handle _ => false))
                  then rerun ()
                  else raise e
       end
@@ -17376,7 +17404,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
             | NONE => ()
         val stage = action_stage root action
-        val _ = primary_log_limit := NONE
+        val _ = diagnostic_log := NONE
         val policy =
           if pipelined then speculative_policy (spec_policy spec)
           else if not share_heaps then unshared_checkpoints_policy false (spec_policy spec)
@@ -17414,9 +17442,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
              else
              let
                val log_text = read_text (build_log ()) handle _ => ""
-               val limit = diagnostic_log_limit stage
-               val _ = primary_log_limit := limit
-               val primary_log = #primary (HolbuildTheoryDiagnostics.split_log limit log_text)
+               val report = read_diagnostic_log stage
+               val _ = diagnostic_log := report
+               val primary_log = HolbuildTheoryDiagnostics.primary_log (Option.map #primary_end report) log_text
                val (failure, text) = classify_run_failure stage primary_log oom_before msg
              in
                (* HOL found a file of the root missing, which the hydrate
@@ -18140,27 +18168,17 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                        reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false})
                 end
               val (status, failure) = attempt ()
+              val child_log_end = Position.toInt (FS.fileSize (build_log ())) handle OS.SysErr _ => 0
               (* The plain build's child rewrote the log, so the reason its
                  pipelined attempt was given up goes after it. *)
               fun append_to_log line =
-                let
-                  val path = build_log ()
-                  val _ = ensure_parent path
-                  val out = TextIO.openAppend path
-                in
-                  HolbuildBoundedOutput.text (out, "\n" ^ line ^ "\n");
-                  TextIO.closeOut out
-                end
+                let val path = build_log ()
+                in ensure_parent path; append_log path ("\n" ^ line ^ "\n") end
                 handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e)
               val _ =
                 if not (!HolbuildActionSandbox.child_completed) then () else
                 (Option.app (fn msg => append_to_log ("holbuild: pipeline: building plain: " ^ msg)) (!fallback);
-                 Option.app (fn (_, msg) =>
-                   (append_to_log ("holbuild: exec-action failed: " ^ msg);
-                    if !theory_action then
-                      append_to_log (HolbuildTheoryDiagnostics.continuation_footer ^
-                        (case !primary_log_limit of SOME offset => Int.toString offset | NONE => "none"))
-                    else ())) failure)
+                 Option.app (fn (_, msg) => append_to_log ("holbuild: exec-action failed: " ^ msg)) failure)
               fun share () =
                 let val t0 = Time.now ()
                 in
@@ -18171,7 +18189,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   publish_tools_now ();
                   phases := ("share", Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
                 end
-              val log = phase "log" upload_log
+              val log = phase "log" (fn () => upload_log child_log_end failure)
               (* A failed action's go after its log, whose upload they could
                  otherwise stop by tripping the breaker, but before its
                  result: the next build, which often starts as soon as the
@@ -18205,7 +18223,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
               (* The log is read only once the child has returned. *)
               val hol_phases =
-                if !HolbuildActionSandbox.child_completed then hol_log_phases (build_log ()) (!last_child_start)
+                if !HolbuildActionSandbox.child_completed then hol_log_phases (build_log ()) child_log_end (!last_child_start)
                 else []
               fun count (name, n) = if !n > 0 then [(name, LargeInt.fromInt (!n))] else []
               val drops = count ("rstdropn", dropped_checkpoints) @ count ("rstmodrejn", rejected_heap_modules) @

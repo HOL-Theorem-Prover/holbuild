@@ -22,27 +22,48 @@ fun find_substring needle haystack =
     if n = 0 then NONE else loop 0
   end
 
-val continuation_footer = "holbuild: primary log end: "
+val diagnostic_footer = "holbuild: diagnostic log v1\t"
 
-fun split_log limit text =
-  case limit of
-      SOME i =>
-        if i >= 0 andalso i <= size text then
-          {primary = String.substring (text, 0, i), secondary = String.extract (text, i, NONE)}
-        else {primary = text, secondary = ""}
-    | NONE => {primary = text, secondary = ""}
+fun primary_log NONE text = text
+  | primary_log (SOME end_pos) text = String.substring (text, 0, Int.max (0, Int.min (end_pos, size text)))
 
-(* The worker appends this after its reports, including a record for
-   fail-fast runs. Older workers do not produce a footer. *)
-fun remote_log_limit text =
+(* Metadata follows the worker's own reports at EOF. Read only the record
+   count the worker gave, even if the child printed similar text. *)
+fun remote_diagnostic text =
   let
-    fun start i = if i < 0 orelse String.sub (text, i) = #"\n" then i + 1 else start (i - 1)
-    val line = String.extract (text, start (Int.max (~1, size text - 2)), NONE)
+    fun previous_line stop =
+      let
+        fun start i =
+          if i < 0 orelse String.sub (text, i) = #"\n" then i + 1 else start (i - 1)
+        val ending = stop - 1
+        val begin = start (ending - 1)
+      in
+        (begin, String.substring (text, begin, ending - begin))
+      end
+    val (footer_start, footer) = if String.isSuffix "\n" text then previous_line (size text) else (0, "")
+    fun records 0 start acc = SOME (start, acc)
+      | records n start acc =
+          if start = 0 orelse String.sub (text, start - 1) <> #"\n" then NONE
+          else let val (begin, record) = previous_line start
+               in records (n - 1) begin (record :: acc) end
   in
-    if String.isPrefix continuation_footer line
-    then Int.fromString (String.extract (line, size continuation_footer, NONE))
-    else NONE
+    if not (String.isPrefix diagnostic_footer footer) then NONE
+    else
+      case String.fields (fn c => c = #"\t") (String.extract (footer, size diagnostic_footer, NONE)) of
+          [primary, child, count] =>
+            (case (Int.fromString primary, Int.fromString child, Int.fromString count) of
+                 (SOME primary_end, SOME child_end, SOME n) =>
+                   if primary_end < 0 orelse primary_end > child_end orelse n < 0 orelse n > 8 then NONE
+                   else
+                     (case records n footer_start [] of
+                          SOME (start, records) =>
+                            if child_end > start then NONE
+                            else SOME {primary = primary_log (SOME primary_end) text, records = records}
+                        | NONE => NONE)
+               | _ => NONE)
+        | _ => NONE
   end
+  handle Overflow => NONE
 
 fun line_number_at text offset =
   let
@@ -208,19 +229,19 @@ fun worker_report line =
   String.isPrefix "holbuild: pipeline: building plain:" line orelse
   String.isPrefix "holbuild: exec-action failed:" line
 
-(* The primary diagnostic precedes continuation and any appended worker
-   report, which can quote an earlier run's errors. *)
-fun child_output lines =
+(* Older workers do not record where their own reports begin. *)
+fun legacy_child_log text =
   let
+    val lines = source_lines text
     fun take [] acc = rev acc
       | take (line :: rest) acc =
           if worker_report line then rev acc else take rest (line :: acc)
   in
-    take lines []
+    String.concatWith "\n" (take lines [])
   end
 
 fun static_error_summary source_path source_text text =
-  case find_static_error_block (child_output (source_lines text)) of
+  case find_static_error_block (source_lines text) of
       NONE => NONE
     | SOME block =>
         let
@@ -677,15 +698,12 @@ fun take_n n lines acc =
 
 fun child_failure_excerpt lines =
   let
-    (* A worker appends its reports to the raw log.  Diagnose only
-       the raw output, and keep preceding output separate from the cause.
-       Leave out holbuild's own runtime marker lines (`holbuild hol-phases
-       ...`): they carry per-run values, not HOL output. *)
+    (* Keep preceding output separate from the cause. Leave out the
+       runtime markers that carry per-run values. *)
     fun runtime_marker line = String.isPrefix "holbuild " line
     fun scan [] _ failure terminal = (failure, terminal)
       | scan (remaining as line :: rest) preceding failure terminal =
-          if worker_report line then (failure, terminal)
-          else if runtime_marker line then scan rest preceding failure terminal
+          if runtime_marker line then scan rest preceding failure terminal
           else
             scan rest (take_n 10 (line :: preceding) [])
               (if child_failure_line line then SOME remaining else failure)
@@ -693,8 +711,7 @@ fun child_failure_excerpt lines =
                else terminal)
     fun raw_excerpt [] = []
       | raw_excerpt (line :: rest) =
-          if worker_report line then []
-          else if runtime_marker line then raw_excerpt rest
+          if runtime_marker line then raw_excerpt rest
           else line :: raw_excerpt rest
   in
     case scan lines [] NONE NONE of
@@ -792,7 +809,7 @@ fun failed_trace_theorem lines =
 
 (* The runtime quotes fields so user text and goal layout never introduce
    marker lines. The declaration reader reports failures outside a proof. *)
-fun additional_failures source_path source_text checkpoints terminations text : HolbuildStatus.additional_failure list =
+fun additional_failures source_path source_text checkpoints terminations records : HolbuildStatus.additional_failure list =
   let
     val prefix = "holbuild secondary failure: "
     fun source_line kind declaration_start position =
@@ -841,20 +858,15 @@ fun additional_failures source_path source_text checkpoints terminations text : 
               end)
               (String.fromString encoded)
         | _ => NONE
-    fun parse [] reports = rev reports
-      | parse (line :: rest) reports =
-          if worker_report line then rev reports
-          else
-            case (if String.isPrefix prefix line then decode line
-                  else if String.isPrefix terminal_prefix line then terminal line
-                  else NONE) of
-                SOME report => parse rest (report :: reports)
-              | NONE => parse rest reports
+    fun parse line =
+      if String.isPrefix prefix line then decode line
+      else if String.isPrefix terminal_prefix line then terminal line
+      else NONE
     fun compact value = String.concatWith " " (String.tokens Char.isSpace value)
     fun compact_failure {theorem, line, error, top_goal} =
       {theorem = compact theorem, line = line, error = compact error, top_goal = compact top_goal}
   in
-    map compact_failure (parse (source_lines text) [])
+    List.mapPartial (Option.map compact_failure o parse) records
   end
 
 fun summarize_trace_steps text =
