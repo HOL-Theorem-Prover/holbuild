@@ -829,7 +829,9 @@ allow_empty = false
   them loaded (a host that may rebuild the checkpoint's heap with theory
   modules installs them first); a script that loads one it didn't either reads a
   current copy the worker kept or fails to find its file, and then the worker
-  installs them all and builds the theory again. The key needs holbuild
+  installs them all and builds the theory again. A script that loads, by a
+  path it builds itself, a theory its dependencies don't name may find an
+  earlier action's copy, current or not. The key needs holbuild
   0.15.16 or later: earlier clients reject it as an unknown field.
 
 ### Action overrides

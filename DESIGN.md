@@ -803,7 +803,9 @@ the tree and writes it back once it passed, so a worker stopped part way
 starts from an empty root. Script runs put every object directory under the
 root on `loadPath`, so they start from an empty root, leave no records, and the root is removed
 after them. The
-cache cap doesn't count the root: it holds one spec's dependencies.
+cache cap doesn't count the root: it holds one spec's dependencies, plus,
+after light hydrates, what earlier actions left until the next full install
+prunes it.
 
 A hydrate is light for a `--check-only` action and for a checkpoint target
 the build named, unless its package sets `[build] install_dependencies_first`
@@ -811,8 +813,8 @@ or the client marks it so (`option install-dependencies-first=true`, for a
 target the build didn't name). A light hydrate keeps the action's own files
 and the kept items whose stat matches, removes its outdated copies of the
 spec's own dependencies, but installs no other dependency, makes no stale check
-and leaves the rest of the root as earlier actions left it: the prune above
-waits for the full install, so a check that resumes and fails, or a
+and leaves the rest of the root as earlier actions left it, but for what stands
+in the way of a file it writes: the prune above waits for the full install, so a check that resumes and fails, or a
 `--check-only` action that resumes and passes, never prunes. Their records, as an install would
 write them, come from their cache manifests (the remote's read without copying
 its blobs) and `.sml` blobs (the `.dat` hash from the hash the `.sml` carries;
