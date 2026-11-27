@@ -1,6 +1,8 @@
 structure HolbuildTheoryCheckpoints =
 struct
 
+val diagnostic_admit_marker = "holbuild-diagnostic-admit.txt"
+
 exception Error of string
 
 type boundary = {kind : string, name : string, safe_name : string, theorem_start : int,
@@ -56,7 +58,7 @@ fun skip_comment_bounded text limit i =
 
 fun skip_comment text i = skip_comment_bounded text (size text) i
 
-fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
+fun begin_theorem_line ({kind, name, theorem_start, tactic_text, context_path, context_ok,
                          failed_prefix_path, failed_prefix_ok,
                          proof_attrs, proof_ir_plan, ...} : checkpoint) =
   String.concat
@@ -66,6 +68,7 @@ fun begin_theorem_line ({kind, name, tactic_text, context_path, context_ok,
      "val _ = holbuild_begin_theorem(",
      HolbuildToolchain.sml_string kind, ", ",
      HolbuildToolchain.sml_string name, ", ",
+     Int.toString theorem_start, ", ",
      HolbuildToolchain.sml_string tactic_text, ", ",
      HolbuildToolchain.sml_string context_path, ", ",
      HolbuildToolchain.sml_string context_ok, ", ",
@@ -101,6 +104,7 @@ fun termination_tactic_prefix ({name, definition_start, tactic_text, proof_ir_pl
            String.concat
              ["(HolbuildProofRuntime.termination_tactic ",
               HolbuildToolchain.sml_string name, " ",
+              Int.toString definition_start, " ",
               HolbuildToolchain.sml_string tactic_text, " (", plan, ") (",
               "HolbuildTacticCompat.delay_tactic (fn () => ("]]
 
@@ -118,7 +122,7 @@ fun save_declaration_context_line timed ({safe_name, context_path, context_ok, .
          ", ok_text = ", HolbuildToolchain.sml_string context_ok,
          ", depth = HolbuildRuntime.save_hierarchy_depth ()}"]
   in
-    if timed then "\nval _ = HolbuildProofRuntime.timed_hol_phase \"holsave\" (fn () => " ^ save ^ ");\n"
+    if timed then "\nval _ = HolbuildProofRuntime.save_declaration_context (fn () => " ^ save ^ ");\n"
     else "\nval _ = " ^ save ^ ";\n"
   end
 
@@ -173,7 +177,7 @@ fun use_checkpoint_save_runtime () =
   if_structure_missing "HolbuildCheckpointSaveRuntime"
     (use_runtime_source "sml/checkpoint_save_runtime.sml")
 
-fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, trace_all, new_ir} =
+fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, multi_error, trace_all, new_ir} =
   ["val _ = HolbuildProofRuntime.install {checkpoint_enabled = " ^
      (if checkpoint_enabled then "true" else "false") ^
      ", context_checkpoints = " ^ (if context_checkpoints then "true" else "false") ^
@@ -186,7 +190,13 @@ fun runtime_install_lines {checkpoint_enabled, context_checkpoints, share_failed
      ", trace_all = " ^ (if trace_all then "true" else "false") ^
      ", plan_only_marker = NONE : string option};",
    "val holbuild_begin_theorem = HolbuildProofRuntime.begin_theorem;",
-   "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"]
+   "val holbuild_save_theorem_context = HolbuildProofRuntime.save_theorem_context;"] @
+  (case (multi_error, timeout_marker) of
+       (true, SOME path) =>
+         ["val _ = HolbuildProofRuntime.install_diagnostics holbuild_before_declaration " ^
+          "holbuild_compile_declaration holbuild_report_source_error holbuild_report_exception holbuild_finish_script " ^
+          HolbuildToolchain.sml_string (OS.Path.concat (OS.Path.dir path, diagnostic_admit_marker)) ^ ";"]
+     | _ => [])
 
 (* A process resuming from a heap that holds the save runtime starts its
    share of the theory's CPU time here, as loading checkpoint_save_runtime.sml
@@ -296,14 +306,14 @@ datatype deferral =
    after the script has run, where later bindings would shadow the
    theorem's; a theorem without them is not deferred, nor is a group with
    a block without them (build_exec's checkpoint_deferral). *)
-fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, trace_all, new_ir, runtime_installed, defer} :
+fun instrument ({source, source_name, start_offset, checkpoints, declaration_checkpoints, terminations, save_checkpoints, context_checkpoints, share_failed_prefix, checkpoint_seconds, tactic_timeout, heavy_tactic_timeout, timeout_marker, multi_error, trace_all, new_ir, runtime_installed, defer} :
                 {source : string, source_name : string, start_offset : int, checkpoints : checkpoint list,
                  declaration_checkpoints : declaration_checkpoint list,
                  terminations : termination list, save_checkpoints : bool,
                  context_checkpoints : bool, share_failed_prefix : bool,
                  checkpoint_seconds : real,
                  tactic_timeout : real option, heavy_tactic_timeout : real option,
-                 timeout_marker : string option,
+                 timeout_marker : string option, multi_error : bool,
                  trace_all : bool, new_ir : bool,
                  runtime_installed : bool,
                  defer : checkpoint -> deferral}) =
@@ -338,9 +348,10 @@ fun instrument ({source, source_name, start_offset, checkpoints, declaration_che
        tactic_timeout = tactic_timeout,
        heavy_tactic_timeout = heavy_tactic_timeout,
        timeout_marker = timeout_marker,
+       multi_error = multi_error,
        trace_all = trace_all,
        new_ir = new_ir}
-    val proof_runtime = not (null active_checkpoints andalso null active_terminations)
+    val proof_runtime = runtime_installed orelse not (null active_checkpoints andalso null active_terminations)
     fun prelude () =
       (if runtime_installed then ""
        else if proof_runtime then runtime_prelude (runtime_config ())

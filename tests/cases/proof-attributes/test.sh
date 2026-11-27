@@ -235,7 +235,8 @@ Proof[exclude_simps=attr_a_def,exclude_frags=ATTR_FRAG]
   >- (later (); FAIL_TAC "attribute leaf failure")
 QED
 SML
-  flags=(--no-cache)
+  # Exercise the unwinding of a proof exception through the prover hook.
+  flags=(--no-cache --fail-fast)
   [[ "$mode" != plain ]] || flags+=(--skip-proof-steps)
   if (cd "$project" && HOLBUILD_ECHO_CHILD_LOGS=1 "$HOLBUILD_BIN" build "${flags[@]}" ATheory) > "$tmpdir/failure-$mode.log" 2>&1; then
     echo "attributed failure unexpectedly succeeded ($mode)" >&2

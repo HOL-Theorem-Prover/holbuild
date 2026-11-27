@@ -6,6 +6,7 @@ structure FS = OS.FileSys
 
 exception Error of string
 exception ErrorWithDebugArtifacts of string * HolbuildStatus.debug_artifacts
+exception TheoryFailure of HolbuildStatus.failure_detail * HolbuildStatus.debug_artifacts
 exception RetryInvalidCheckpoint
 
 (* Run before a theory child starts from a fresh preload, not from a
@@ -729,13 +730,13 @@ fun export_theory_if_needed_line sig_path =
    itself, where it can, for a remote worker's result record. *)
 val peak_rss_report_name = "holbuild-peak-rss.txt"
 
-fun peak_rss_report_line path =
+fun peak_rss_report path =
   String.concat
-    ["val _ = let fun find s = case TextIO.inputLine s of NONE => \"\" ",
+    ["(let fun find s = case TextIO.inputLine s of NONE => \"\" ",
      "| SOME l => if String.isPrefix \"VmHWM:\" l then l else find s; ",
      "val s = TextIO.openIn \"/proc/self/status\"; val l = find s before TextIO.closeIn s; ",
      "val out = TextIO.openOut ", HolbuildToolchain.sml_string path, " ",
-     "in TextIO.output (out, l); TextIO.closeOut out end handle _ => ();"]
+     "in HolbuildBoundedOutput.text (out, l); TextIO.closeOut out end handle _ => ())"]
 
 (* Where a pipelined theory child in STAGE copies its outline, ending with
    the file `ready` (HolbuildDeferred.publish_outline). *)
@@ -771,20 +772,31 @@ fun phase_mark_line name =
 
 (* This stage file runs after the preload, including on checkpoint resume. *)
 val script_start_file = "holbuild-script-start.sml"
+val diagnostic_admit_marker = HolbuildTheoryCheckpoints.diagnostic_admit_marker
 
 fun write_theory_script_start path source_file =
   (* QUse checks for parse errors after evaluating the translated declaration.
      A recovered proof can run indefinitely before that check. *)
   write_text path (String.concatWith "\n"
     [phase_mark_line "holscriptstart",
+     "val holbuild_before_declaration = ref (fn () => ());",
+     "val holbuild_compile_declaration = ref PolyML.compiler;",
+     "val holbuild_report_source_error = ref (fn (_ : string) => ());",
+     "val holbuild_report_exception = ref (fn (_ : exn) => ());",
+     "val holbuild_finish_script = ref (fn (_ : unit -> unit) => ());",
      "val _ = let",
      "  val file = " ^ HolbuildToolchain.sml_string (Path.file source_file),
-     "  fun parse_error msg = (TextIO.print msg; OS.Process.exit OS.Process.failure)",
+     "  fun parse_error msg = (TextIO.print msg; (!holbuild_report_source_error) msg;",
+     "                         OS.Process.exit OS.Process.failure)",
      "  val {read, fileline, eof} = HOLSource.fileToReader {quietOpen = false, print = parse_error} file",
      "  fun line () = #line (fileline ()) + 1",
+     "  fun evaluate run = run ()",
+     "    handle e => ((!holbuild_report_exception) e; PolyML.Exception.reraise e)",
      "in",
      "  while not (eof ()) do (",
-     "    PolyML.compiler (read, [PolyML.Compiler.CPFileName file, PolyML.Compiler.CPLineNo line]) ();",
+     "    (!holbuild_before_declaration) ();",
+     "    evaluate ((!holbuild_compile_declaration)",
+     "      (read, [PolyML.Compiler.CPFileName file, PolyML.Compiler.CPLineNo line]));",
      "    if !QUse.failOnError andalso QUse.hadError () then OS.Process.exit OS.Process.failure else ())",
      "end;", ""])
 
@@ -795,10 +807,13 @@ fun write_theory_script_start path source_file =
    the child exports nothing, and only reports its peak memory. *)
 fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipelined, check_only} =
   let
-    val peak_rss = peak_rss_report_line (Path.concat(Path.dir path, peak_rss_report_name))
+    val peak_rss = peak_rss_report (Path.concat(Path.dir path, peak_rss_report_name))
+    val record_peak_rss = "val _ = holbuild_record_peak_rss ();"
     val lines =
-      phase_mark_line "holscriptend" ::
-      (if check_only then [peak_rss] else
+      [phase_mark_line "holscriptend",
+       "fun holbuild_record_peak_rss () = " ^ peak_rss ^ ";",
+       "val _ = (!holbuild_finish_script) holbuild_record_peak_rss;"] @
+      (if check_only then [record_peak_rss] else
       generated_metadata_report_lines {parents_report = parents_report,
                                        mldeps_report = mldeps_report} @
       [export_theory_if_needed_line sig_path] @
@@ -813,7 +828,7 @@ fun write_theory_exporter {sig_path, path, parents_report, mldeps_report, pipeli
        else
          ["val _ = HolbuildRuntime.normalize_theory_export " ^ HolbuildToolchain.sml_string sig_path ^ ";",
           phase_mark_line "holexportend"]) @
-      [peak_rss])
+      [record_peak_rss])
   in
     write_text path (String.concatWith "\n" lines ^ "\n")
   end
@@ -3703,12 +3718,12 @@ type build_options = {use_cache : bool, verify_cache : bool, force : force_level
    --no-checkpoint-saves, which restores checkpoints as checkpoint says but
    saves, removes and publishes none. *)
 datatype checkpoint_policy =
-  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_saves : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, heavy_tactic_timeout : real option, trace_steps : bool, repl_on_failure : bool, trknl : bool, promote_preload : bool, check_only : bool}
+  CheckpointPolicy of {checkpoint : bool, theorem_checkpoints : bool, checkpoint_saves : bool, checkpoint_target : bool, checkpoint_seconds : real, proof_steps : bool, new_ir : bool, tactic_timeout : real option, heavy_tactic_timeout : real option, trace_steps : bool, repl_on_failure : bool, fail_fast : bool, trknl : bool, promote_preload : bool, check_only : bool}
 
 val default_checkpoint_seconds = 2.0
 
 val no_checkpoint_policy =
-  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_saves = true, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, heavy_tactic_timeout = NONE, trace_steps = false, repl_on_failure = false, trknl = false, promote_preload = false, check_only = false}
+  CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_saves = true, checkpoint_target = false, checkpoint_seconds = default_checkpoint_seconds, proof_steps = false, new_ir = false, tactic_timeout = NONE, heavy_tactic_timeout = NONE, trace_steps = false, repl_on_failure = false, fail_fast = false, trknl = false, promote_preload = false, check_only = false}
 
 fun checkpoint_enabled (CheckpointPolicy {checkpoint, ...}) = checkpoint
 fun theorem_checkpoints_enabled (CheckpointPolicy {theorem_checkpoints, ...}) = theorem_checkpoints
@@ -3730,17 +3745,19 @@ fun tactic_timeout (CheckpointPolicy {tactic_timeout, ...}) = tactic_timeout
 fun heavy_tactic_timeout (CheckpointPolicy {heavy_tactic_timeout, ...}) = heavy_tactic_timeout
 fun trace_steps (CheckpointPolicy {trace_steps, ...}) = trace_steps
 fun repl_on_failure (CheckpointPolicy {repl_on_failure, ...}) = repl_on_failure
+fun fail_fast (CheckpointPolicy {fail_fast, ...}) = fail_fast
 fun trknl_enabled (CheckpointPolicy {trknl, ...}) = trknl
 fun promotes_preload (CheckpointPolicy {promote_preload, ...}) = promote_preload
 fun checks_only (CheckpointPolicy {check_only, ...}) = check_only
+fun multi_error policy = not (fail_fast policy orelse repl_on_failure policy orelse trknl_enabled policy)
 
 (* POLICY restoring and saving no checkpoints. *)
-fun without_checkpoints (CheckpointPolicy {checkpoint_saves, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, check_only, ...}) =
+fun without_checkpoints (CheckpointPolicy {checkpoint_saves, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, trace_steps, repl_on_failure, fail_fast, trknl, promote_preload, check_only, ...}) =
   CheckpointPolicy {checkpoint = false, theorem_checkpoints = false, checkpoint_saves = checkpoint_saves,
                     checkpoint_target = checkpoint_target, checkpoint_seconds = checkpoint_seconds,
                     proof_steps = proof_steps, new_ir = new_ir, tactic_timeout = tactic_timeout,
                     heavy_tactic_timeout = heavy_tactic_timeout, trace_steps = trace_steps,
-                    repl_on_failure = repl_on_failure, trknl = trknl,
+                    repl_on_failure = repl_on_failure, fail_fast = fail_fast, trknl = trknl,
                     promote_preload = promote_preload, check_only = check_only}
 
 fun bool_text true = "true"
@@ -4389,6 +4406,7 @@ fun instrumented_source defer_proofs policy share_failed_prefix timeout_marker s
        tactic_timeout = tactic_timeout policy,
        heavy_tactic_timeout = heavy_tactic_timeout policy,
        timeout_marker = timeout_marker,
+       multi_error = not (Option.isSome defer_proofs) andalso multi_error policy,
        trace_all = trace_steps policy,
        new_ir = proof_ir_enabled policy,
        runtime_installed = false,
@@ -4439,6 +4457,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker source_name sourc
        tactic_timeout = tactic_timeout policy,
        heavy_tactic_timeout = heavy_tactic_timeout policy,
        timeout_marker = SOME timeout_marker,
+       multi_error = multi_error policy,
        trace_all = trace_steps policy,
        new_ir = proof_ir_enabled policy}
     val prelude = HolbuildTheoryCheckpoints.runtime_reinstall_prelude runtime_config
@@ -4447,6 +4466,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker source_name sourc
       String.concat
         ["HolbuildProofRuntime.finish_failed_prefix ",
          HolbuildToolchain.sml_string (#name checkpoint), " ",
+         Int.toString (#theorem_start checkpoint), " ",
          HolbuildToolchain.sml_string metadata_text, " ",
          HolbuildToolchain.sml_string (#tactic_text checkpoint),
          " " ^ HolbuildToolchain.sml_string (#failed_prefix_path checkpoint) ^
@@ -4501,6 +4521,7 @@ fun failed_prefix_resume_source policy contexts timeout_marker source_name sourc
          tactic_timeout = tactic_timeout policy,
          heavy_tactic_timeout = heavy_tactic_timeout policy,
          timeout_marker = SOME timeout_marker,
+         multi_error = multi_error policy,
          trace_all = trace_steps policy,
          new_ir = proof_ir_enabled policy,
          (* The prelude installed the proof runtime; the suffix's theorems
@@ -4868,29 +4889,31 @@ fun write_theory_script capture defer_proofs policy root checkpoint_root base_co
 (* The diagnostic of a theory script that failed, from its build's output:
    where in the script it failed, the goal state, and what HOL said.
    BOUNDARIES are where the script's theorems are. *)
-fun failure_detail policy source_file source_text boundaries termination_diagnostics failure_output msg =
+type diagnostic_log = {primary_end : int, records : string list}
+
+fun read_diagnostic_log stage : diagnostic_log option =
+  (case String.tokens (fn c => c = #"\n") (read_text (Path.concat (stage, diagnostic_admit_marker))) of
+       offset :: records => Option.map (fn n => {primary_end = n, records = records}) (Int.fromString offset)
+     | [] => NONE)
+  handle IO.Io _ => NONE
+
+fun failure_log output =
+  case captured_output_path_option output of
+      NONE => ""
+    | SOME path => read_text path handle IO.Io _ => ""
+
+fun failure_detail policy source_file source_text boundaries termination_diagnostics failure_output heading msg
+      {primary = text, legacy, records} =
   let
-    val failure_output_path = captured_output_path_option failure_output
-    val goal_state =
-      Option.mapPartial
-        (HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference
-           (captured_output_has_retained_log failure_output))
-        failure_output_path
-    val plan_position = Option.mapPartial HolbuildTheoryDiagnostics.plan_position_summary failure_output_path
-    val trace_context = if trace_steps policy then Option.mapPartial HolbuildTheoryDiagnostics.summarize_trace_steps failure_output_path else NONE
-    val static_error = Option.mapPartial (fn path => HolbuildTheoryDiagnostics.static_error_summary source_file source_text (String.fields (fn c => c = #"\n") (read_text path))) failure_output_path
-    val source_context = Option.mapPartial
-      (HolbuildTheoryDiagnostics.summarize_failed_fragment_source
-         source_file source_text boundaries termination_diagnostics)
-      failure_output_path
-    val termination_context =
-      Option.mapPartial
-        (HolbuildTheoryDiagnostics.summarize_termination_goal_source
-           source_file source_text termination_diagnostics)
-        failure_output_path
-    val child_failure =
-      if Option.isSome static_error then NONE
-      else Option.mapPartial HolbuildTheoryDiagnostics.child_failure_summary failure_output_path
+    val child_output = if legacy then HolbuildTheoryDiagnostics.legacy_child_log text else text
+    val goal_state = HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference (captured_output_has_retained_log failure_output) text
+    val plan_position = HolbuildTheoryDiagnostics.plan_position_summary text
+    val trace_context = if trace_steps policy then HolbuildTheoryDiagnostics.summarize_trace_steps text else NONE
+    val static_error = HolbuildTheoryDiagnostics.static_error_summary source_file source_text child_output
+    val source_context = HolbuildTheoryDiagnostics.summarize_failed_fragment_source source_file source_text boundaries termination_diagnostics text
+    val termination_context = HolbuildTheoryDiagnostics.summarize_termination_goal_source source_file source_text termination_diagnostics text
+    val child_failure = if Option.isSome static_error then NONE else HolbuildTheoryDiagnostics.child_failure_summary child_output
+    val additional_failures = HolbuildTheoryDiagnostics.additional_failures source_file source_text boundaries termination_diagnostics records
     val fallback =
       if Option.isSome child_failure then ""
       else
@@ -4899,17 +4922,17 @@ fun failure_detail policy source_file source_text boundaries termination_diagnos
           | first :: _ =>
               first ^ "\n" ^
               (case hol_silent_exit_line msg of SOME line => line ^ "\n" | NONE => "")
+    val primary = heading ^
+      String.concat
+        (List.mapPartial (fn part => part)
+          [trace_context, static_error, source_context, termination_context, plan_position, goal_state,
+           SOME (Option.getOpt (child_failure, fallback)),
+           Option.map (fn line => line ^ "\n") (hol_exit_line hol_signal_marker msg)])
+    val log_reference = retained_log_reference failure_output
   in
-    String.concat
-      [case trace_context of NONE => "" | SOME text => text,
-       case static_error of NONE => "" | SOME text => text,
-       case source_context of NONE => "" | SOME text => text,
-       case termination_context of NONE => "" | SOME text => text,
-       case plan_position of NONE => "" | SOME text => text,
-       case goal_state of NONE => "" | SOME text => text,
-       case child_failure of NONE => fallback | SOME text => text,
-       case hol_exit_line hol_signal_marker msg of NONE => "" | SOME line => line ^ "\n",
-       retained_log_reference failure_output]
+    if null additional_failures then error_with_captured_output (primary ^ log_reference) failure_output
+    else TheoryFailure ({primary = primary, additional_failures = additional_failures, log_reference = log_reference},
+                         captured_output_debug_artifacts failure_output)
   end
 
 (* Runs a theory action in action root `root`: stages its inputs, runs HOL,
@@ -5164,6 +5187,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
     val parents_report = Path.concat(stage, "holbuild-theory-parents.txt")
     val mldeps_report = Path.concat(stage, "holbuild-theory-mldeps.txt")
     val timeout_marker = Path.concat(stage, "holbuild-tactic-timeout.txt")
+    val taint_marker = Path.concat(stage, diagnostic_admit_marker)
     val log_dir = getOpt (speculative_log, current_log_dir root (#package action) logical)
     val checkpoint_base = action_checkpoint_base checkpoint_root action
     val deps_key = #deps_key action
@@ -5182,7 +5206,7 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
                     (ensure_parent context_path; ensure_parent failed_prefix_path))
                  theorem_checkpoints
       else ()
-    val _ = remove_file timeout_marker
+    val _ = (remove_file timeout_marker; remove_file taint_marker)
     val _ = List.app (ensure_parent o #2) staged_extra_outputs
     val capture = !capture_deps_heap andalso checkpoint_enabled policy andalso saves_progress policy
     val run_spec = write_theory_script capture (if speculative andalso proof_steps_enabled policy then SOME (has_suspension_pruning tc) else NONE) policy root checkpoint_root base_context action source_text
@@ -5201,20 +5225,16 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
       let
         val words = String.tokens Char.isSpace (read_text timeout_marker)
         val failure_output = checkpoint_failure_output log_dir stage
-        val failure_output_path = captured_output_path_option failure_output
+        val text = failure_log failure_output
         val source_context =
-          Option.mapPartial
-            (HolbuildTheoryDiagnostics.summarize_failed_fragment_source
-               source_file source_text (map HolbuildTheoryCheckpoints.checkpoint_boundary theorem_checkpoints)
-               termination_diagnostics)
-            failure_output_path
+          HolbuildTheoryDiagnostics.summarize_failed_fragment_source
+            source_file source_text (map HolbuildTheoryCheckpoints.checkpoint_boundary theorem_checkpoints)
+            termination_diagnostics text
         val goal_state =
-          Option.mapPartial
-            (HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference
-               (captured_output_has_retained_log failure_output))
-            failure_output_path
-        val plan_position = Option.mapPartial HolbuildTheoryDiagnostics.plan_position_summary failure_output_path
-        val child_failure = Option.mapPartial HolbuildTheoryDiagnostics.child_failure_summary failure_output_path
+          HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference
+            (captured_output_has_retained_log failure_output) text
+        val plan_position = HolbuildTheoryDiagnostics.plan_position_summary text
+        val child_failure = HolbuildTheoryDiagnostics.child_failure_summary text
         val detail =
           String.concat
             [case source_context of NONE => "" | SOME text => text,
@@ -5284,13 +5304,14 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
               else false
             end
     fun checkpoint_failure_error msg =
-      let val failure_output = checkpoint_failure_output log_dir stage
+      let
+        val failure_output = checkpoint_failure_output log_dir stage
+        val report = read_diagnostic_log stage
+        val primary = HolbuildTheoryDiagnostics.primary_log (Option.map #primary_end report) (failure_log failure_output)
       in
-        error_with_captured_output
-          (failure_detail policy source_file source_text
-             (map HolbuildTheoryCheckpoints.checkpoint_boundary theorem_checkpoints) termination_diagnostics
-             failure_output msg)
-          failure_output
+        failure_detail policy source_file source_text
+          (map HolbuildTheoryCheckpoints.checkpoint_boundary theorem_checkpoints) termination_diagnostics
+          failure_output "" msg {primary = primary, legacy = false, records = Option.getOpt (Option.map #records report, [])}
       end
     val build_log = Path.concat(stage, "holbuild-build.log")
     (* A promoting child removes its transient heap itself, unless it
@@ -5323,12 +5344,19 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
        validate_hol_context (#context run_spec);
        detail_time_phase "build.exec.node.child_run"
          (fn () =>
-             ((if captures then with_deps_heap_capture (module_store tc) deps_loaded run_child else run_child ())
-              before remove_promote_scratch ())
+             ((if captures then with_deps_heap_capture (module_store tc) deps_loaded run_child else run_child ());
+              remove_promote_scratch ();
+              if path_exists taint_marker then raise Error "hol run failed while building theory script" else ())
              handle e => (remove_promote_scratch (); raise e)))
       handle Error msg =>
         (check_cancelled ();
-        if invalid_checkpoint_retryable base_context (#context run_spec) msg then
+        if path_exists taint_marker then
+          let val failure = checkpoint_failure_error msg
+          in
+            if HolbuildActionSandbox.active () then () else cleanup_json_stage stage_root;
+            raise failure
+          end
+        else if invalid_checkpoint_retryable base_context (#context run_spec) msg then
           let
             val invalid = hol_context_path (#context run_spec)
             val _ = discard_loaded_checkpoint_after_load_failure msg
@@ -5888,7 +5916,7 @@ fun checkpoint_target_node (options as {all_checkpoints, repl_on_failure, checkp
 (* An impure action never replays checkpoints: its script may compute
    different values on each run (a timestamp, a version string), and
    resuming past that code would restore the values of an earlier run. *)
-fun checkpoint_policy_for_node (options as {skip_checkpoints, no_checkpoint_saves, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, ...} : build_options) project node =
+fun checkpoint_policy_for_node (options as {skip_checkpoints, no_checkpoint_saves, checkpoint_seconds, proof_steps, new_ir, proof_scope, node_tactic_timeouts, heavy_tactic_timeout, trace_steps, repl_on_failure, fail_fast, trknl, promote_preload, ...} : build_options) project node =
   if HolbuildTacticTimeoutPolicy.includes_node proof_scope project node then
     let val timeout = effective_tactic_timeout proof_steps
                         (HolbuildTacticTimeoutPolicy.timeout_of node_tactic_timeouts (HolbuildBuildPlan.key node))
@@ -5904,6 +5932,7 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, no_checkpoint_save
                       heavy_tactic_timeout = heavy_budget heavy_tactic_timeout timeout,
                       trace_steps = proof_steps andalso trace_steps,
                       repl_on_failure = repl_on_failure,
+                      fail_fast = fail_fast,
                       trknl = trknl,
                       promote_preload = promote_preload,
                       check_only = check_only_node options node}
@@ -5920,6 +5949,7 @@ fun checkpoint_policy_for_node (options as {skip_checkpoints, no_checkpoint_save
                       heavy_tactic_timeout = NONE,
                       trace_steps = false,
                       repl_on_failure = false,
+                      fail_fast = fail_fast,
                       trknl = trknl,
                       promote_preload = promote_preload,
                       check_only = check_only_node options node}
@@ -7735,19 +7765,19 @@ fun speculative_policy (CheckpointPolicy {proof_steps, new_ir, tactic_timeout, h
                     checkpoint_seconds = default_checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout,
                     heavy_tactic_timeout = heavy_tactic_timeout,
-                    trace_steps = false, repl_on_failure = false, trknl = false,
+                    trace_steps = false, repl_on_failure = false, fail_fast = false, trknl = false,
                     promote_preload = promote_preload, check_only = false}
 
 (* An exec-action's checkpoint tree starts empty and is emptied after it,
    so a checkpoint nothing shares would only cost the child time: under
    --share-deps-heap it saves the deps heap alone (SAVE_HEAP), and without
    sharing nothing.  Proof steps and their timeouts stay as the spec says. *)
-fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_saves, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, trace_steps, repl_on_failure, trknl, promote_preload, check_only, ...}) =
+fun unshared_checkpoints_policy save_heap (CheckpointPolicy {checkpoint, checkpoint_saves, checkpoint_target, checkpoint_seconds, proof_steps, new_ir, tactic_timeout, heavy_tactic_timeout, trace_steps, repl_on_failure, fail_fast, trknl, promote_preload, check_only, ...}) =
   CheckpointPolicy {checkpoint = checkpoint andalso save_heap, theorem_checkpoints = false, checkpoint_saves = checkpoint_saves, checkpoint_target = checkpoint_target,
                     checkpoint_seconds = checkpoint_seconds, proof_steps = proof_steps,
                     new_ir = new_ir, tactic_timeout = tactic_timeout,
                     heavy_tactic_timeout = heavy_tactic_timeout,
-                    trace_steps = trace_steps, repl_on_failure = repl_on_failure, trknl = trknl,
+                    trace_steps = trace_steps, repl_on_failure = repl_on_failure, fail_fast = fail_fast, trknl = trknl,
                     promote_preload = promote_preload, check_only = check_only}
 
 fun signature_companion plan node =
@@ -8017,11 +8047,18 @@ fun build_error_message e =
   case e of
       Error msg => msg
     | ErrorWithDebugArtifacts (msg, _) => msg
+    | TheoryFailure (detail, _) => HolbuildStatus.failure_text detail
     | _ => General.exnMessage e
+
+fun build_error_detail e =
+  case e of
+      TheoryFailure (detail, _) => detail
+    | _ => HolbuildStatus.plain_failure (build_error_message e)
 
 fun build_error_debug_artifacts e =
   case e of
       ErrorWithDebugArtifacts (_, artifacts) => artifacts
+    | TheoryFailure (_, artifacts) => artifacts
     | _ => HolbuildStatus.no_debug_artifacts
 
 (* E once fail_with_debug_artifacts has reported it: when that printed its
@@ -8032,6 +8069,8 @@ fun reported_failure e =
     case e of
         Error msg => Error (HolbuildStatus.failure_brief msg)
       | ErrorWithDebugArtifacts (msg, artifacts) => ErrorWithDebugArtifacts (HolbuildStatus.failure_brief msg, artifacts)
+      | TheoryFailure ({primary, ...}, artifacts) =>
+          ErrorWithDebugArtifacts (HolbuildStatus.failure_brief primary, artifacts)
       | _ => e
   else e
 
@@ -8070,7 +8109,7 @@ fun build_serial is_settled is_failed dat_hash_cache status (options : build_opt
               handle Thread.Interrupt => raise Thread.Interrupt
                    | e =>
                        (HolbuildStatus.fail_with_debug_artifacts status key name
-                          (build_error_message e) (build_error_debug_artifacts e);
+                          (build_error_detail e) (build_error_debug_artifacts e);
                         if #fail_fast options then raise reported_failure e
                         else (blocked := Redblackmap.insert (!blocked, key, name);
                               failures := (name, reported_failure e) :: !failures; NONE))
@@ -9189,12 +9228,12 @@ fun build_parallel is_settled is_failed dat_hash_cache status options tc project
                     loop ())
                    handle e =>
                      let
-                       val msg = build_error_message e
+                       val detail = build_error_detail e
                        val artifacts = build_error_debug_artifacts e
                      in
                        (HolbuildStatus.fail_with_debug_artifacts
                          status (HolbuildBuildPlan.key node) (HolbuildBuildPlan.logical_name node)
-                         msg artifacts
+                         detail artifacts
                         handle IO.Io _ => ());
                        finish_failure id (reported_failure e);
                        loop ()
@@ -9657,6 +9696,7 @@ fun settle_deferred (settled : settled option) (options : build_options) tc proj
            Binaryset.member (deferred, key))
           handle Error _ => (unsettled := Binaryset.add (!unsettled, key); false)
                | ErrorWithDebugArtifacts _ => (unsettled := Binaryset.add (!unsettled, key); false)
+               | TheoryFailure _ => (unsettled := Binaryset.add (!unsettled, key); false)
       end
     (* As in build_checked, the checked nodes keep their digests. *)
     fun forget_unchecked_digests () =
@@ -9828,7 +9868,7 @@ fun restore_remote_build_logs (options : build_options) tc project plan keys too
                           (current_log_dir (project_artifact_root project) (package node) (logical_name node))
         in
           ignore (preserve_log path trace);
-          Option.app HolbuildStatus.message_stdout (HolbuildTheoryDiagnostics.summarize_trace_steps path);
+          Option.app HolbuildStatus.message_stdout (HolbuildTheoryDiagnostics.summarize_trace_steps (read_text path handle IO.Io _ => ""));
           HolbuildStatus.message_stdout ("proof step trace log: " ^ trace ^ "\n")
         end
   in
@@ -9922,12 +9962,14 @@ fun remote_proof_failure (options : build_options) tc project plan keys toolchai
               (if kind = "tactic-timeout" then "tactic timed out" else "proof failed") ^
               " on a remote worker while building " ^ #logical action
             val output = SOME (RetainedLog log)
+            val text = failure_log output
+            val diagnostic =
+              case HolbuildTheoryDiagnostics.remote_diagnostic text of
+                  SOME {primary, records} => {primary = primary, legacy = false, records = records}
+                | NONE => {primary = text, legacy = true, records = []}
           in
-            SOME (error_with_captured_output
-                    (heading ^ "\n" ^
-                     failure_detail policy source_file source_text boundaries terminations
-                       output "hol run failed while building theory script")
-                    output)
+            SOME (failure_detail policy source_file source_text boundaries terminations output
+                    (heading ^ "\n") "hol run failed while building theory script" diagnostic)
           end
       end
   in
@@ -10220,6 +10262,7 @@ fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime,
        else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
       (if forced then [bool_option "force" true] else []) @
       (if trace_steps policy then [bool_option "trace-steps" true] else []) @
+      (if fail_fast policy then [bool_option "fail-fast" true] else []) @
       (if pipeline then [bool_option "pipeline" true] else []) @
       (if install_dependencies_first then [bool_option "install-dependencies-first" true] else []) @
       (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []) @
@@ -11395,7 +11438,7 @@ type action_spec =
    heavy_tactic_timeout : real option option, new_ir : bool,
    theorem_checkpoints : bool, checkpoint_target : bool, skip_checkpoints : bool, promote_preload : bool,
    check_only : bool, no_checkpoint_saves : bool,
-   checkpoint_seconds : real, force : bool, trace_steps : bool,
+   checkpoint_seconds : real, force : bool, trace_steps : bool, fail_fast : bool,
    pipeline : bool, tool_cache : string option, scratch_inputs : string list, source_load_timing : bool,
    install_dependencies_first : bool, action_text : string}
 
@@ -11570,6 +11613,10 @@ fun parse_action_spec text : action_spec =
      trace_steps =
        (case List.find (fn (k, _) => k = "option trace-steps") (!values) of
             SOME (_, v) => spec_bool "trace-steps" v
+          | NONE => false),
+     fail_fast =
+       (case List.find (fn (k, _) => k = "option fail-fast") (!values) of
+            SOME (_, v) => spec_bool "fail-fast" v
           | NONE => false),
      pipeline =
        (case List.find (fn (k, _) => k = "option pipeline") (!values) of
@@ -11789,6 +11836,7 @@ fun spec_policy (spec : action_spec) =
                     heavy_tactic_timeout = heavy_budget (#heavy_tactic_timeout spec) timeout,
                     trace_steps = #trace_steps spec,
                     repl_on_failure = false,
+                    fail_fast = #fail_fast spec,
                     trknl = false,
                     promote_preload = #promote_preload spec,
                     check_only = #check_only spec}
@@ -12721,7 +12769,8 @@ fun classify_run_failure stage log_text oom_before msg =
            | (false, true) => SOME "poly-out-of-store"
            | (false, false) => NONE)
     val failure =
-      if Option.isSome oom_kills orelse out_of_store then MemoryFailure
+      if path_exists (Path.concat (stage, diagnostic_admit_marker)) then ProofFailure
+      else if Option.isSome oom_kills orelse out_of_store then MemoryFailure
       else if (if child_failed then child_reports_no_space log_text orelse disk_full stage
                else String.isSubstring no_space msg) then DiskFailure
       else if not child_failed then InternalFailure
@@ -12767,27 +12816,31 @@ fun names_missing_file wanted text =
   end
 
 (* Whether the log at PATH names a missing file WANTED holds of, read a
-   chunk at a time: a passing child's log may be large.  A missing log
-   names none. *)
-fun log_names_missing_file wanted path =
+   chunk at a time. LIMIT stops a continued run at its primary failure. *)
+fun log_names_missing_file wanted path limit =
   if not (file_exists path) then false
   else
     let
       val input = TextIO.openIn path
-      (* A message and its file name split across two chunks, with the line
-         break before them, lie within the kept tail. *)
+      (* Keep a message, its file name and the preceding newline across
+         chunk boundaries. *)
       val keep = 4096
-      fun scan tail =
-        case TextIO.inputN (input, 1048576) of
-            "" => false
-          | chunk =>
-              let val text = tail ^ chunk
-              in
-                names_missing_file wanted text orelse
-                scan (String.extract (text, Int.max (0, size text - keep), NONE))
-              end
+      fun scan tail remaining =
+        let val n = case remaining of NONE => 1048576 | SOME bytes => Int.min (1048576, bytes)
+        in
+          if n <= 0 then false
+          else case TextIO.inputN (input, n) of
+              "" => false
+            | chunk =>
+                let val text = tail ^ chunk
+                in
+                  names_missing_file wanted text orelse
+                    scan (String.extract (text, Int.max (0, size text - keep), NONE))
+                         (Option.map (fn bytes => bytes - size chunk) remaining)
+                end
+        end
     in
-      (scan "" before TextIO.closeIn input) handle e => (TextIO.closeIn input; raise e)
+      (scan "" limit before TextIO.closeIn input) handle e => (TextIO.closeIn input; raise e)
     end
 
 (* Whether HOL's output says it couldn't find a file under the action root
@@ -13347,17 +13400,14 @@ fun merge_phases phases =
    prints whether or not the script is instrumented).  holscript runs from
    that start to the exporter's (holscriptend), holexport from there to the
    theory's export (holexportend); the marks themselves aren't phases.  The log is the child's, so it is read in bounded pieces and a line
-   longer than a phases line could be is skipped.  Reading stops at the
-   first report a worker appends to the log
-   (HolbuildTheoryDiagnostics.worker_report): what follows is holbuild's
-   report on the child's output, not that output, so no phases line there
-   counts. *)
+   longer than a phases line could be is skipped. The worker records where
+   the child log ends before it appends its reports. *)
 val hol_log_phase_names =
   ["holloadend", "holscriptstart", "holscriptend", "holexportend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
    "holcompiledn", "holreplayedn", "holrewoundn", "holmodhitn", "holmodmissn", "holmodwriten",
    "srclib", "srclibn", "srcrt", "srcrtn", "srcthy", "srcthyn"]
 
-fun hol_log_phases log_file child_start =
+fun hol_log_phases log_file child_end child_start =
   let
     val prefix = "holbuild hol-phases "
     val max_line = 4096
@@ -13384,30 +13434,26 @@ fun hol_log_phases log_file child_start =
     fun add (text, long) found =
       case (if long then NONE else parse text) of SOME p => p :: found | NONE => found
     (* PENDING is the current line so far. *)
-    fun read ins pending found =
-      let val chunk = TextIO.inputN (ins, 65536)
+    fun read ins remaining pending found =
+      let val chunk = TextIO.inputN (ins, Int.min (remaining, 65536))
       in
         if chunk = "" then rev (add pending found)
         else
           let
             val pieces = String.fields (fn c => c = #"\n") chunk
-            fun lines [last] pending found = (SOME (extend pending last), found)
-              | lines (piece :: rest) pending found =
-                  let val line = extend pending piece
-                  in
-                    if HolbuildTheoryDiagnostics.worker_report (#1 line) then (NONE, found)
-                    else lines rest ("", false) (add line found)
-                  end
-              | lines [] pending found = (SOME pending, found)
+            fun lines [last] pending found = (extend pending last, found)
+              | lines (piece :: rest) pending found = lines rest ("", false) (add (extend pending piece) found)
+              | lines [] pending found = (pending, found)
+            val (pending, found) = lines pieces pending found
           in
-            case lines pieces pending found of
-                (SOME pending, found) => read ins pending found
-              | (NONE, found) => rev found
+            read ins (remaining - size chunk) pending found
           end
       end
     val lines =
       let val ins = TextIO.openIn log_file
-      in (read ins ("", false) [] before TextIO.closeIn ins) handle e => (TextIO.closeIn ins; raise e) end
+      in (read ins child_end ("", false) [] before TextIO.closeIn ins)
+         handle e => (TextIO.closeIn ins; raise e)
+      end
       handle IO.Io _ => []
     fun value name line = Option.map #2 (List.find (fn (n, _) => n = name) line)
     fun sum name lines = List.foldl (fn (line, total) => total + getOpt (value name line, 0)) 0 lines
@@ -13479,20 +13525,29 @@ fun result_text (spec_sha256, input_key) {status, failure, memory_cause, wall_ms
      (if null phases then [] else ["phase-ms=" ^ phases_text "," ":" phases]) @
      (case log of SOME (sha, bytes) => ["log=" ^ sha ^ " " ^ bytes] | NONE => [])) ^ "\n"
 
-(* A fleet action's build.log goes to the cache whole up to this size.  A
-   longer one goes as its first log_head_bytes, a line saying how much was
-   cut, and its last log_tail_bytes: a multi-GB log is refused by the cache,
-   and a client restores every action log it is given. *)
+(* Cap log uploads with a retained head and tail. If continuation would
+   push the first failure into the gap, keep its own tail too, within the
+   same byte budget. *)
 val log_upload_limit = 64 * 1024 * 1024
 val log_head_bytes = 16 * 1024 * 1024
 val log_tail_bytes = log_upload_limit - log_head_bytes
+val log_primary_preview_bytes = 1024 * 1024
 
-fun write_truncated_log src dst =
+fun write_truncated_log src dst primary =
   let
-    val total = FS.fileSize src
-    val marker =
-      "\n... [holbuild: truncated " ^ Position.toString (total - Position.fromInt log_upload_limit) ^
-      " bytes of " ^ Position.toString total ^ "-byte build log] ...\n"
+    val total = Position.toInt (FS.fileSize src)
+    val tail_start = total - log_tail_bytes
+    val ranges =
+      (0, log_head_bytes) ::
+      (case primary of
+           SOME stop =>
+             let val start = Int.max (log_head_bytes, stop - log_primary_preview_bytes)
+             in
+               if start < stop andalso start < tail_start then
+                 [(start, stop), (tail_start + stop - start, total)]
+               else [(tail_start, total)]
+             end
+         | NONE => [(tail_start, total)])
     val fd = Posix.FileSys.openf (src, Posix.FileSys.O_RDONLY, Posix.FileSys.O.flags [])
     val out = BinIO.openOut dst
       handle e => (Posix.IO.close fd; raise e)
@@ -13503,14 +13558,30 @@ fun write_truncated_log src dst =
             if Word8Vector.length chunk = 0 then ()
             else (BinIO.output (out, chunk); copy (n - Word8Vector.length chunk))
           end
+    fun write_ranges _ _ [] = []
+      | write_ranges previous output_end ((start, stop) :: rest) =
+          let
+            val notice =
+              if previous = start then ""
+              else "\n... [holbuild: truncated " ^ Int.toString (start - previous) ^
+                   " bytes of " ^ Int.toString total ^ "-byte build log] ...\n"
+            val output_start = output_end + size notice
+            val _ = HolbuildBoundedOutput.binary (out, Byte.stringToBytes notice)
+            val _ = ignore (Posix.IO.lseek (fd, Position.fromInt start, Posix.IO.SEEK_SET))
+            val _ = copy (stop - start)
+          in
+            (start, stop, output_start) :: write_ranges stop (output_start + stop - start) rest
+          end
+    val written = write_ranges 0 0 ranges
+      handle e => (BinIO.closeOut out handle _ => (); Posix.IO.close fd handle _ => (); raise e)
   in
-    (copy log_head_bytes;
-     BinIO.output (out, Byte.stringToBytes marker);
-     ignore (Posix.IO.lseek (fd, total - Position.fromInt log_tail_bytes, Posix.IO.SEEK_SET));
-     copy log_tail_bytes;
-     BinIO.closeOut out;
-     Posix.IO.close fd)
-    handle e => (BinIO.closeOut out handle _ => (); Posix.IO.close fd handle _ => (); raise e)
+    (BinIO.closeOut out before Posix.IO.close fd)
+      handle e => (Posix.IO.close fd handle _ => (); raise e);
+    (* A position inside an omitted range points after its notice. *)
+    fn position =>
+      case List.find (fn (_, stop, _) => position <= stop) written of
+          SOME (start, _, output_start) => output_start + Int.max (0, position - start)
+        | NONE => raise Fail "invalid log position"
   end
 
 fun exception_failure e =
@@ -16993,6 +17064,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  phases := ("scratchcopyn", LargeInt.fromInt (!copied)) :: !phases))
       end
     val run_log = ref NONE
+    val diagnostic_log = ref (NONE : diagnostic_log option)
     fun build_log () =
       case !run_log of
           SOME path => path
@@ -17011,19 +17083,40 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           | HolbuildCacheBackend.Conflict msg => log_failed msg
           | HolbuildCacheBackend.Skipped => log_failed "the cache skipped it"
       end
-    fun upload_log () =
+    fun append_log path text =
+      let val out = TextIO.openAppend path
+      in (HolbuildBoundedOutput.text (out, text); TextIO.closeOut out)
+         handle e => (TextIO.closeOut out handle _ => (); raise e)
+      end
+    fun upload_log child_end failure =
       if not (!HolbuildActionSandbox.child_completed) then NONE else
-      let val path = build_log ()
+      let
+        val path = build_log ()
+        fun upload path translate =
+          (if !theory_action andalso Option.isSome failure then
+             let
+               val {primary_end, records} =
+                 Option.getOpt (!diagnostic_log, {primary_end = child_end, records = []})
+               val footer = HolbuildTheoryDiagnostics.diagnostic_footer ^
+                 String.concatWith "\t"
+                   [Int.toString (translate (Int.min (primary_end, child_end))),
+                    Int.toString (translate child_end), Int.toString (length records)]
+             in
+               append_log path (String.concatWith "\n" ("" :: records @ [footer, ""]))
+             end
+           else ();
+           publish_log path)
       in
         if not (file_exists path) then NONE
-        else if FS.fileSize path <= Position.fromInt log_upload_limit then publish_log path
+        else if FS.fileSize path <= Position.fromInt log_upload_limit then upload path (fn n => n)
         else
           (* Staged outside the root, where the child could have put a
              link in its place. *)
-          let val upload = temp_near (Path.concat (cache, "action-log"))
+          let val truncated = temp_near (Path.concat (cache, "action-log"))
           in
-            (write_truncated_log path upload; publish_log upload) before remove_file upload
-            handle e => (remove_file upload; raise e)
+            upload truncated (write_truncated_log path truncated (Option.map #primary_end (!diagnostic_log)))
+              before remove_file truncated
+            handle e => (remove_file truncated; raise e)
           end
       end
       handle HolbuildRemoteCache.Unavailable msg => (log_unavailable := SOME msg; log_failed msg)
@@ -17234,7 +17327,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           in List.exists (fn {stem, ...} => Path.file stem = base) (#deps spec) end
         val missing_dependency = names_missing_file dependency_file
         fun after_pass log =
-          if light () andalso log_names_missing_file dependency_file log then raise LightRerun
+          if light () andalso log_names_missing_file dependency_file log NONE then raise LightRerun
           else if #check_only spec then ()
           else install_light spec tc cutoff
         fun set_hooks preload passed = (before_fresh_preload := preload; after_child_passed := passed)
@@ -17260,7 +17353,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         handle LightRerun => rerun ()
              | e as ActionFailed (kind, msg) =>
                  if (kind = ProofFailure orelse kind = TacticTimeoutFailure) andalso light () andalso
-                    (missing_dependency msg orelse (log_names_missing_file dependency_file (build_log ()) handle _ => false))
+                    ((not (Option.isSome (!diagnostic_log)) andalso missing_dependency msg) orelse
+                     (log_names_missing_file dependency_file (build_log ())
+                        (Option.map #primary_end (!diagnostic_log)) handle _ => false))
                  then rerun ()
                  else raise e
       end
@@ -17361,6 +17456,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                  else remove_checkpoint_family (action_checkpoint_base checkpoint_root action))
             | NONE => ()
         val stage = action_stage root action
+        val _ = diagnostic_log := NONE
         val policy =
           if pipelined then speculative_policy (spec_policy spec)
           else if not share_heaps then unshared_checkpoints_policy false (spec_policy spec)
@@ -17386,6 +17482,37 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
            raise ActionFailed (AheadAbandoned,
                                "built on an outline: " ^
                                (case e of ActionFailed (_, msg) => msg | _ => General.exnMessage e)))
+        fun report_hol_failure detail =
+          let
+            val msg = HolbuildStatus.failure_text detail
+            (* The child's exporter may have recorded its peak before
+               a later step failed. *)
+            val _ = peak := peak_rss_mb stage
+          in
+             if not (!HolbuildActionSandbox.child_completed) then
+               raise action_failed InternalFailure msg
+             else
+             let
+               val log_text = read_text (build_log ()) handle _ => ""
+               val report = read_diagnostic_log stage
+               val _ = diagnostic_log := report
+               val primary_log = HolbuildTheoryDiagnostics.primary_log (Option.map #primary_end report) log_text
+               val (failure, text) = classify_run_failure stage primary_log oom_before msg
+             in
+               (* HOL found a file of the root missing, which the hydrate
+                  left in place: no fault of the proof.  The records can't
+                  be trusted, so the next action starts from an empty root. *)
+               if failure = ProofFailure andalso lost_restored_file (!resident) root
+                    (#primary detail ^ "\n" ^ primary_log) then
+                 (remove_file resident_file;
+                  raise ActionFailed (InternalFailure, "the action root lost a file the hydrate restored:\n" ^ text))
+               (* The child may have failed for want of it; the retry
+                  fetches it again. *)
+               else if (failure = ProofFailure orelse failure = TacticTimeoutFailure) andalso scratch_input_lost () then
+                 raise ActionFailed (InternalFailure, "a scratch input left the worker's cache while the action ran:\n" ^ text)
+               else raise ActionFailed (failure, text)
+             end
+          end
         val generated_metadata =
           (let
             (* A child loading ahead can write the source by now. *)
@@ -17563,29 +17690,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   remove_failed_prefix_checkpoints (#theorem_checkpoints checkpoints)));
             metadata
           end
-          handle Error msg =>
-            (* The child's exporter may have recorded its peak before
-               a later step failed. *)
-            (peak := peak_rss_mb stage;
-             if not (!HolbuildActionSandbox.child_completed) then
-               raise action_failed InternalFailure msg
-             else
-             let
-               val log_text = read_text (build_log ()) handle _ => ""
-               val (failure, text) = classify_run_failure stage log_text oom_before msg
-             in
-               (* HOL found a file of the root missing, which the hydrate
-                  left in place: no fault of the proof.  The records can't
-                  be trusted, so the next action starts from an empty root. *)
-               if failure = ProofFailure andalso lost_restored_file (!resident) root (msg ^ "\n" ^ log_text) then
-                 (remove_file resident_file;
-                  raise ActionFailed (InternalFailure, "the action root lost a file the hydrate restored:\n" ^ text))
-               (* The child may have failed for want of it; the retry
-                  fetches it again. *)
-               else if (failure = ProofFailure orelse failure = TacticTimeoutFailure) andalso scratch_input_lost () then
-                 raise ActionFailed (InternalFailure, "a scratch input left the worker's cache while the action ran:\n" ^ text)
-               else raise ActionFailed (failure, text)
-             end))
+          handle Error msg => report_hol_failure (HolbuildStatus.plain_failure msg)
+               | TheoryFailure (detail, _) => report_hol_failure detail)
           handle e => if outlined then abandon_failure e else raise e
         val _ = peak := peak_rss_mb stage
         val cutoff =
@@ -18114,17 +18220,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                        reserve_bytes = reserve_bytes, min_free_bytes = min_free_bytes, refresh = false})
                 end
               val (status, failure) = attempt ()
+              val child_log_end = Position.toInt (FS.fileSize (build_log ())) handle OS.SysErr _ => 0
               (* The plain build's child rewrote the log, so the reason its
                  pipelined attempt was given up goes after it. *)
               fun append_to_log line =
-                let
-                  val path = build_log ()
-                  val _ = ensure_parent path
-                  val out = TextIO.openAppend path
-                in
-                  HolbuildBoundedOutput.text (out, "\n" ^ line ^ "\n");
-                  TextIO.closeOut out
-                end
+                let val path = build_log ()
+                in ensure_parent path; append_log path ("\n" ^ line ^ "\n") end
                 handle e => warn ("could not write the action diagnostic: " ^ General.exnMessage e)
               val _ =
                 if not (!HolbuildActionSandbox.child_completed) then () else
@@ -18140,7 +18241,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   publish_tools_now ();
                   phases := ("share", Time.toMilliseconds (Time.-(Time.now (), t0))) :: !phases
                 end
-              val log = phase "log" upload_log
+              val log = phase "log" (fn () => upload_log child_log_end failure)
               (* A failed action's go after its log, whose upload they could
                  otherwise stop by tripping the breaker, but before its
                  result: the next build, which often starts as soon as the
@@ -18174,7 +18275,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
               (* The log is read only once the child has returned. *)
               val hol_phases =
-                if !HolbuildActionSandbox.child_completed then hol_log_phases (build_log ()) (!last_child_start)
+                if !HolbuildActionSandbox.child_completed then hol_log_phases (build_log ()) child_log_end (!last_child_start)
                 else []
               fun count (name, n) = if !n > 0 then [(name, LargeInt.fromInt (!n))] else []
               val drops = count ("rstdropn", dropped_checkpoints) @ count ("rstmodrejn", rejected_heap_modules) @

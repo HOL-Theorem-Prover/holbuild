@@ -59,6 +59,7 @@ local
     "  fun run_list_tactic (_ : proof_context) (list_tactic : Tactical.list_tactic) goals = list_tactic goals\n" ^
     "  fun delay_tactic make = lift_context_tactic (fn ctxt => fn goal => run_tactic ctxt (make ()) goal)\n" ^
     "  fun tac_proof (_ : proof_context) goal_tactic = Tactical.TAC_PROOF goal_tactic\n" ^
+    "  fun prove_goal (_ : proof_context) goal_tactic = Tactical.prove_goal goal_tactic\n" ^
     "  fun expand_listf (_ : proof_context) list_tactic gstk = goalStack.expand_listf list_tactic gstk\n" ^
     "  fun install_prover (prover : proof_context -> Tactical.goal * Tactical.tactic -> Thm.thm) = Tactical.set_prover (prover ())\n" ^
     proof_interception ^
@@ -81,6 +82,7 @@ local
     "  fun run_list_tactic ctxt (list_tactic : Tactical.list_tactic) goals = list_tactic goals ctxt\n" ^
     "  fun delay_tactic make = lift_context_tactic (fn ctxt => fn goal => run_tactic ctxt (make ()) goal)\n" ^
     "  fun tac_proof ctxt goal_tactic = Tactical.TAC_PROOF_in ctxt goal_tactic\n" ^
+    "  fun prove_goal ctxt goal_tactic = Tactical.prove_goal_in ctxt goal_tactic\n" ^
     contextual_expand_listf ^
     "  fun install_prover (prover : proof_context -> Tactical.goal * Tactical.tactic -> Thm.thm) = Tactical.set_prover prover\n" ^
     proof_interception ^
