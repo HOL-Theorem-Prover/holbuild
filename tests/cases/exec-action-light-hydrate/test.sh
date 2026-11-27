@@ -195,6 +195,21 @@ expect_worker resume-fail 1 "status=failed" "failure=proof"
 require_grep "resumed failure" "$tmpdir/resume-fail.log"
 hydrated resume-fail 2 0
 
+# A missing file after the primary proof failure doesn't invalidate the
+# failed-prefix run or force an install of the dependencies.
+write_t 'ALL_TAC >> FAIL_TAC "primary proof failure"' 'Theorem late_missing:
+  T
+Proof
+  (fn g => (load ("../../../obj/src/C" ^ "Theory"); ACCEPT_TAC TRUTH g))
+QED'
+worker secondary-missing
+expect_worker secondary-missing 1 "status=failed" "failure=proof"
+hydrated secondary-missing 2 0
+require_grep "^additional failure 1 of 1:$" "$tmpdir/secondary-missing.log"
+require_grep "^  theorem: late_missing$" "$tmpdir/secondary-missing.log"
+report secondary-missing > "$tmpdir/secondary-missing.report"
+require_grep "^Cannot find file " "$tmpdir/secondary-missing.report"
+
 # A passing one installs its dependencies after HOL, and publishes the
 # outputs a full install gives.
 write_t "ALL_TAC >> ACCEPT_TAC TRUTH"

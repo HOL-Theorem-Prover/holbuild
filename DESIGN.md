@@ -1325,6 +1325,16 @@ optimization must preserve the same diagnostic and failed-prefix path semantics.
 The goal is that a developer can debug a divergence by inspecting the plan and
 knowing the HOL tactic combinator semantics.
 
+An inline theory child can continue after a failed theorem or resumption to
+report later proof failures. It saves the first failure's clean prefix,
+records a failure marker in the stage, and then uses an oracle theorem in
+memory so subsequent declarations can use the theorem and its attributes.
+From then on, the child cannot save proof or declaration checkpoints. HOL's
+export hook aborts a tainted export, the generated exporter rejects the child
+before writing anything except its peak memory report, and the driver treats
+the stage marker as failure even if the child exits successfully. A
+speculative child continues to use the deferred proof protocol.
+
 `--trace-steps` executes the build and records runtime plans plus before/after
 trace lines for all instrumented proofs in the child log. The internal proof-step
 trace can also be forced with `HOLBUILD_PROOF_STEPS_TRACE=1` for debugging.

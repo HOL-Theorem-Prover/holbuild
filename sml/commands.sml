@@ -96,7 +96,7 @@ fun build_help () = print
   \Build project targets. With no TARGET, build the project's default targets.\n\n\
   \Options:\n\
   \  --watch\n\
-  \  --fail-fast  Stop after the first failure (default: finish independent work).\n\
+  \  --fail-fast  Report only the first failure in each script and cancel unfinished work.\n\
   \  --check-only\n\
   \      Build the targets no other target depends on for their verdict alone:\n\
   \      no outputs are written or cached, and earlier ones stay as they were.\n\

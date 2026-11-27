@@ -317,8 +317,18 @@ Builds finish independent work after a theory or library fails. Nodes that
 depend on a failure are skipped, with the failed dependency named in the
 diagnostic. Successful outputs are cached normally; failed or skipped nodes
 publish no successful outputs. Every failure is reported as it happens and in
-the final diagnostic, and the build exits nonzero. Pass `build --fail-fast`
-to stop after the first failure and cancel unfinished work instead.
+the final diagnostic, and the build exits nonzero.
+
+With proof steps enabled, an inline build can report several failing
+`Theorem`, `Triviality`, or `Resume` proofs in one script. The first failure
+has the full diagnostic. Later failures are shown below it and in
+`failure.additional_failures` on the JSON `node_failed` event. Continuation
+ends after eight failures or a ten-second budget, and stops at a timeout,
+interrupt, termination-proof failure, or source error. A script that continues
+after a failure cannot publish theory outputs. This also applies to
+`--check-only`. Pass
+`build --fail-fast` to stop at the first failure in the script and cancel
+unfinished work. `--repl-on-failure` and `--trknl` also disable continuation.
 
 `build --check-only` builds the targets no other target depends on for their
 verdict alone, locally or on remote workers: the theory script runs as in a

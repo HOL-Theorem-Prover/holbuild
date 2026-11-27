@@ -17,6 +17,35 @@ type config = {checkpoint_enabled : bool,
                trace_all : bool,
                plan_only_marker : string option}
 
+val diagnostic_marker_ref = ref (NONE : string option)
+val tainted_ref = ref false
+val diagnostic_timer_ref = ref (NONE : Timer.real_timer option)
+val diagnostic_failure_count_ref = ref 0
+val secondary_goal_ref = ref (NONE : string option)
+val diagnostic_seconds = 10.0
+val diagnostic_failure_limit = 8
+
+fun diagnostic_time_left () =
+  Option.map (fn timer => diagnostic_seconds - Time.toReal (Timer.checkRealTimer timer))
+             (!diagnostic_timer_ref)
+
+fun check_diagnostic_deadline () =
+  case diagnostic_time_left () of
+      SOME seconds => if seconds <= 0.0 then OS.Process.exit OS.Process.failure else ()
+    | NONE => ()
+
+val _ = Theory.register_hook
+  ("holbuild diagnostic continuation",
+   fn TheoryDelta.ExportTheory _ =>
+        if !tainted_ref then OS.Process.exit OS.Process.failure else ()
+    | _ => ())
+
+fun install_diagnostics before_declaration finish_script marker =
+  (diagnostic_marker_ref := SOME marker;
+   before_declaration := check_diagnostic_deadline;
+   finish_script := (fn record_peak_rss =>
+     if !tainted_ref then (record_peak_rss (); OS.Process.exit OS.Process.failure) else ()))
+
 val checkpoint_enabled_ref = ref false
 val context_checkpoints_ref = ref false
 val share_failed_prefix_ref = ref false
@@ -159,7 +188,8 @@ fun print_hol_phases () =
                    map (fn (name, n) => " " ^ name ^ "=" ^ LargeInt.toString n) (rev (!hol_phases_ref))) ^ "\n")
 
 fun write_timeout_marker label seconds =
-  case !tactic_timeout_marker_ref of
+  if !tainted_ref then ()
+  else case !tactic_timeout_marker_ref of
       NONE => ()
     | SOME path =>
         let val out = TextIO.openOut path
@@ -272,6 +302,8 @@ exception TacticTimeout of string
    such as a runaway recursion) and, when the heap is exhausted, every thread.
    Combinators propagate it like TacticTimeout. *)
 exception TacticInterrupted of string
+exception TacticStaticError of string
+exception InvalidFailedPrefix of string
 
 fun display_label label =
   String.translate (fn #"\n" => "\\n" | #"\t" => "\\t" | c => String.str c) label
@@ -361,9 +393,19 @@ fun step_budget program =
   in scan 0 false end
 
 fun with_tactic_timeout label program f x =
-  case (case (!tactic_timeout_ref, !heavy_tactic_timeout_ref) of
-            (NONE, NONE) => NONE
-          | _ => step_budget program) of
+  let
+    val step =
+      case (!tactic_timeout_ref, !heavy_tactic_timeout_ref) of
+          (NONE, NONE) => NONE
+        | _ => step_budget program
+    val budget =
+      case (diagnostic_time_left (), step) of
+          (NONE, _) => step
+        | (SOME remaining, NONE) => SOME remaining
+        | (SOME remaining, SOME seconds) => SOME (Real.min (remaining, seconds))
+    val _ = check_diagnostic_deadline ()
+  in
+    case budget of
       NONE => f x
     | SOME seconds =>
         let
@@ -373,7 +415,9 @@ fun with_tactic_timeout label program f x =
           val position = !failed_plan_position_ref
           val result = capture_timeout (fn () =>
             timeout seconds f x
-            handle FunctionTimeout => retry_after_timeout label seconds first_attempt f x
+            handle FunctionTimeout =>
+                     if !tainted_ref then raise TacticTimeout (timeout_message label seconds)
+                     else retry_after_timeout label seconds first_attempt f x
                  | FunctionInterrupted => raise tactic_interrupted label) ()
           val elapsed = Time.toReal (Timer.checkRealTimer wall)
           val _ =
@@ -395,6 +439,7 @@ fun with_tactic_timeout label program f x =
         in
           release_timeout result
         end
+  end
 
 fun save_checkpoint label default_share path ok_text depth =
   if not (!checkpoint_enabled_ref) then ()
@@ -754,7 +799,9 @@ fun discard_failed_prefix path =
    fails at the same step would save the same state again.  A first save that
    can't write its files leaves none, as advance_failed_prefix_checkpoint
    does. *)
-fun save_failed_prefix_checkpoint () = timed_hol_phase "holsave" (fn () =>
+fun save_failed_prefix_checkpoint () =
+  if !tainted_ref then ()
+  else timed_hol_phase "holsave" (fn () =>
   case !theorem_info_ref of
       NONE => ()
     | SOME (kind, _, _, _, _, failed_prefix_path, failed_prefix_ok, proof_attrs, depth) =>
@@ -810,12 +857,15 @@ fun save_theorem_context () =
       NONE => ()
     | SOME (context_path, context_ok, depth) =>
         (context_info_ref := NONE;
-         if not (!checkpoint_enabled_ref andalso !context_checkpoints_ref) then ()
+         if !tainted_ref orelse not (!checkpoint_enabled_ref andalso !context_checkpoints_ref) then ()
          else
            timed_hol_phase "holsave" (fn () =>
              HolbuildCheckpointSaveRuntime.save_context_checkpoint
                {label = "theorem_context", default_share = false, path = context_path,
                 ok_text = context_ok, depth = depth}))
+
+fun save_declaration_context save =
+  if !tainted_ref then () else timed_hol_phase "holsave" save
 
 (* Parse.pp_term rebuilds the printer's token splitter from the whole grammar
    for every term (about 17 ms each with vyper-hol's grammar), so a goal with
@@ -1009,7 +1059,10 @@ fun diagnostic_fragment_label label =
 
 fun print_goal_state label goals = timed_hol_phase "holprint" (fn () =>
   (failed_goal_state_printed_ref := true;
-   HolbuildBoundedOutput.text (TextIO.stdErr, with_cached_grammar_term_printer (fn () =>
+   if !tainted_ref then
+     let val goal = with_cached_grammar_term_printer (fn () => top_goal_text goals)
+     in secondary_goal_ref := SOME (String.substring (goal, 0, Int.min (size goal, 1024))) end
+   else HolbuildBoundedOutput.text (TextIO.stdErr, with_cached_grammar_term_printer (fn () =>
     String.concat ["\nholbuild goal state at failed fragment: ", diagnostic_fragment_label label,
                    failed_theorem_line (),
                    failed_step_end_line (),
@@ -1111,7 +1164,7 @@ fun compile_tactic label program =
         if (add_hol_phase "holcompiledn" 1;
             quse_string ("HolbuildProofRuntime.compiled_tactic_ref := (fn () => (" ^ program ^ "));")) then
           !compiled_tactic_ref
-        else raise Fail ("tactic fragment did not compile: " ^ label)
+        else raise TacticStaticError ("tactic fragment did not compile: " ^ label)
 
 fun compile_list_tactic label program =
   case Option.mapPartial (fn {list_tactics, ...} => List.find (fn (text, _) => text = program) list_tactics) (!proof_factories_ref) of
@@ -1120,7 +1173,7 @@ fun compile_list_tactic label program =
         if (add_hol_phase "holcompiledn" 1;
             quse_string ("HolbuildProofRuntime.compiled_list_tactic_ref := (fn () => (" ^ program ^ "));")) then
           !compiled_list_tactic_ref
-        else raise Fail ("list tactic fragment did not compile: " ^ label)
+        else raise TacticStaticError ("list tactic fragment did not compile: " ^ label)
 
 (* Plain HOL evaluates a proof's whole tactic expression before it applies
    any of it, so a leaf whose construction raises fails the proof wherever
@@ -1595,6 +1648,7 @@ fun run_maybe_traced_step index display_index proof_step =
         end
       else run ()
   in
+    check_diagnostic_deadline ();
     with_plan_position display_index (HolbuildProofIr.step_kind proof_step) (HolbuildProofIr.step_label proof_step)
       (HolbuildProofIr.step_start proof_step, HolbuildProofIr.step_end proof_step) traced
   end
@@ -1615,6 +1669,7 @@ fun construct_plan_leaves display_index steps =
       | construct (CompiledListTactic make) = BuiltListTactic (make ())
     fun build d proof_step start_pos end_pos label program kind compile =
       let
+        val _ = check_diagnostic_deadline ()
         val key = leaf_key start_pos end_pos program
         val compile_key = kind ^ ":" ^ program
         val _ = leaf_keys := Binarymap.insert (!leaf_keys, key, ())
@@ -1699,11 +1754,11 @@ fun run_built_steps resume_after_path display_index steps =
       case !resume_events_ref of
           event :: rest =>
             if event = expected then resume_events_ref := rest
-            else raise Fail (String.concat ["proof-ir dynamic replay mismatch: expected ",
+            else raise InvalidFailedPrefix (String.concat ["proof-ir dynamic replay mismatch: expected ",
                                             dynamic_event_text expected,
                                             ", found ", dynamic_event_text event])
         | [] =>
-            raise Fail ("proof-ir dynamic replay mismatch: missing " ^ dynamic_event_text expected)
+            raise InvalidFailedPrefix ("proof-ir dynamic replay mismatch: missing " ^ dynamic_event_text expected)
     fun event_path event =
       case event of
           HolbuildProofIr.ChoiceEvent (p, _) => p
@@ -2006,7 +2061,8 @@ fun run_built_steps resume_after_path display_index steps =
   in
     run_list display_index [] 0 steps;
     case resume_after_path of
-        SOME _ => if !resume_reached_ref then () else raise Fail "failed-prefix proof path is not present in current proof-ir plan"
+        SOME _ => if !resume_reached_ref then ()
+                  else raise InvalidFailedPrefix "failed-prefix proof path is not present in current proof-ir plan"
       | NONE => ()
   end
 
@@ -2047,10 +2103,83 @@ fun run_steps steps =
    reverse_group_lengths_ref := NONE;
    run_structural_steps 0 steps)
 
+fun report_secondary_failure name e =
+  let
+    val message =
+      case e of
+          TacticTimeout detail => detail
+        | TacticInterrupted detail => detail
+        | Interrupt => "interrupted"
+        | _ => Feedback.exn_to_string e
+    fun field text = String.toString (String.substring (text, 0, Int.min (size text, 1024)))
+    val offset = case !failed_step_span_ref of SOME (start, _) => start | NONE => 0
+    val goal = Option.getOpt (!secondary_goal_ref, "")
+  in
+    HolbuildBoundedOutput.text (TextIO.stdErr,
+      String.concat ["holbuild secondary failure: ", field name, "\t", Int.toString offset,
+                     "\t", field message, "\t", field goal, "\n"])
+  end
+
+fun print_first_failure name e =
+  let
+    val text =
+      case (e, !theorem_info_ref) of
+          (Feedback.HOL_ERR err, SOME ("theorem", _, _, _, _, _, _, _, _)) =>
+            if !failed_prefix_resume_active_ref then Feedback.exn_to_string e
+            else
+              Feedback.exn_to_string (Feedback.wrap_exn "boolLib" "store_thm_at"
+                (Feedback.HOL_ERR (Feedback.set_message
+                  ("Failed to prove theorem " ^ Lib.quote name ^ ":\n" ^
+                   Feedback.message_of err) err)))
+        | (Feedback.HOL_ERR _, _) => Feedback.exn_to_string e
+        | _ =>
+            "Uncaught exception" ^
+            (case PolyML.Exception.exceptionLocation e of
+                 NONE => ""
+               | SOME {file, startLine, ...} => " at " ^ file ^ ":" ^ FixedInt.toString startLine) ^
+            ": " ^ Feedback.exn_to_string e
+  in
+    HolbuildBoundedOutput.text (TextIO.stdErr,
+      text ^ (if String.isSuffix "\n" text then "" else "\n") ^
+      "holbuild: continuing after first failure\n")
+  end
+
+fun proof_failure name goal e =
+  let
+    fun stop cause =
+      if !tainted_ref then
+        (report_secondary_failure name cause; OS.Process.exit OS.Process.failure)
+      else PolyML.Exception.reraise cause
+    val proof_error =
+      case e of Feedback.HOL_ERR _ => true | Fail "Static Errors" => false | Fail _ => true | _ => false
+  in
+    case (!diagnostic_marker_ref, goal, proof_error) of
+        (SOME marker, SOME g, true) =>
+          let
+            val _ =
+              if !tainted_ref then report_secondary_failure name e
+              else
+                (print_first_failure name e;
+                 write_text_file marker "";
+                 diagnostic_timer_ref := SOME (Timer.startRealTimer ());
+                 tainted_ref := true)
+            val _ = diagnostic_failure_count_ref := !diagnostic_failure_count_ref + 1
+          in
+            if !diagnostic_failure_count_ref >= diagnostic_failure_limit then
+              OS.Process.exit OS.Process.failure
+            else Thm.mk_oracle_thm "holbuild_diagnostic_admit" g
+          end
+      | _ =>
+          (case e of
+               TacticStaticError message => stop (Fail message)
+             | InvalidFailedPrefix message => stop (Fail message)
+             | _ => stop e)
+  end
+
 (* Runs a proof's steps and returns its theorem.  The leaves stay built until
    it returns: a failed-prefix checkpoint that report_finish_failure saves
    needs their boundaries to resume. *)
-fun finish_proof name run top =
+fun finish_proof name goal run top =
   let
     val th =
       (run ()
@@ -2058,6 +2187,7 @@ fun finish_proof name run top =
          if !failed_goal_state_printed_ref then raise e
          else report_finish_failure name e;
        top () handle e => report_finish_failure name e)
+      handle e => proof_failure name goal e
   in
     reset_built_leaves ();
     th
@@ -2077,7 +2207,10 @@ fun drop_all () = clear_history ()
 fun atomic_prove label g tac =
   with_tactic_timeout label ""
     (fn () => HolbuildTacticCompat.tac_proof (current_proof_context ()) (g, tac)) ()
-  handle e => (init_history g 15; report_step_failure label e)
+  handle e =>
+    (init_history g 15;
+     report_step_failure label e
+     handle failure => proof_failure label (SOME g) failure)
 
 fun with_theorem_trace name f =
   let
@@ -2120,7 +2253,7 @@ fun proof_ir_prove name g original_tac tactic_text =
         val _ = proof_factories_ref := factories
         val result = TraceOk (with_proof_ir_execution ctxt (fn () =>
           (init_history goal (HolbuildProofIr.display_step_count plan + 1);
-           finish_proof name (fn () => run_steps plan) (fn () => history_top_thm goal))))
+           finish_proof name (SOME goal) (fn () => run_steps plan) (fn () => history_top_thm goal))))
           handle e => TraceError e
         val _ = proof_factories_ref := old_factories
       in
@@ -2147,6 +2280,7 @@ fun termination_tactic name tactic_text plan original_tac =
     val _ = failed_step_span_ref := NONE
     val _ = failed_plan_position_ref := NONE
     val _ = failed_goal_state_printed_ref := false
+    val _ = secondary_goal_ref := NONE
     fun execute () =
       let
         val _ = active_tactic_text_ref := tactic_text
@@ -2154,7 +2288,7 @@ fun termination_tactic name tactic_text plan original_tac =
         val _ = trace_plan name plan
         val _ = stop_after_plan_if_requested ()
         val _ = init_history g (HolbuildProofIr.display_step_count plan + 1)
-        val th = finish_proof name (fn () => run_steps plan) (fn () => history_top_thm g)
+        val th = finish_proof name NONE (fn () => run_steps plan) (fn () => history_top_thm g)
         val _ = drop_all ()
         val _ = theorem_info_ref := NONE
       in
@@ -2538,11 +2672,13 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
           val _ = dynamic_events_ref := rev (#events metadata)
           val _ = resume_events_ref := #events metadata
           val th =
-            finish_proof name
+            let val goal = project_history goalStack.initial_goal
+            in finish_proof name (SOME goal)
               (fn () =>
                  if #step_count metadata = 0 then run_structural_steps 0 plan
                  else run_steps_from_path (#path metadata) 0 plan)
-              (fn () => history_top_thm (project_history goalStack.initial_goal))
+              (fn () => history_top_thm goal)
+            end
           val _ = drop_all()
           val _ = theorem_info_ref := NONE
         in th end)))
@@ -2554,6 +2690,8 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
 
 fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, _, _, _, _) =
   let
+    val _ = secondary_goal_ref := NONE
+    val _ = failed_step_span_ref := NONE
     val atomic = tactic_text = ""
     val th =
       with_proof_ir_execution ctxt (fn () =>
@@ -2584,6 +2722,7 @@ fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, chec
   (hol_phases_ref := [("holloadend", Time.toMilliseconds (Time.now ()))];
    hol_phase_nested_ms_ref := 0;
    OS.Process.atExit print_hol_phases;
+   diagnostic_marker_ref := NONE;
    checkpoint_enabled_ref := checkpoint_enabled;
    context_checkpoints_ref := context_checkpoints;
    share_failed_prefix_ref := share_failed_prefix;

@@ -34,6 +34,17 @@ fun find_substring needle haystack =
     if n = 0 then NONE else loop 0
   end
 
+val continuation_marker = "holbuild: continuing after first failure"
+
+fun continuation_start text = find_substring ("\n" ^ continuation_marker ^ "\n") text
+
+fun primary_log text =
+  case continuation_start text of
+      SOME i => String.substring (text, 0, i + 1)
+    | NONE => text
+
+fun read_primary_log path = primary_log (read_text path)
+
 fun line_number_at text offset =
   let
     val limit = Int.min(offset, size text)
@@ -154,15 +165,16 @@ fun parse_static_error_location line =
         let
           fun number text =
             if text <> "" andalso CharVector.all Char.isDigit text then Int.fromString text else NONE
+          fun column text =
+            List.all (Option.isSome o number) (String.fields (fn c => c = #"-") text)
           fun located path_fields line_no =
-            SOME {path = String.concatWith ":" (rev path_fields), line = line_no}
+            {path = String.concatWith ":" (rev path_fields), line = line_no}
         in
           case rev (String.fields (fn c => c = #":") (String.substring(line, 0, marker))) of
               last :: previous :: rest =>
-                (case (number last, number previous, rest) of
-                     (SOME _, SOME line_no, _ :: _) => located rest line_no
-                   | (SOME line_no, _, _) => located (previous :: rest) line_no
-                   | _ => NONE)
+                (case (column last, number previous, rest) of
+                     (true, SOME line_no, _ :: _) => SOME (located rest line_no)
+                   | _ => Option.map (located (previous :: rest)) (number last))
             | _ => NONE
         end
 
@@ -197,12 +209,13 @@ fun worker_report line =
   String.isPrefix "holbuild: pipeline: building plain:" line orelse
   String.isPrefix "holbuild: exec-action failed:" line
 
-(* The child's own output in a log's LINES: those before a worker's first
+(* The primary diagnostic precedes continuation and any appended worker
    report, which can quote an earlier run's errors. *)
 fun child_output lines =
   let
     fun take [] acc = rev acc
-      | take (line :: rest) acc = if worker_report line then rev acc else take rest (line :: acc)
+      | take (line :: rest) acc =
+          if line = continuation_marker orelse worker_report line then rev acc else take rest (line :: acc)
   in
     take lines []
   end
@@ -344,7 +357,7 @@ fun termination_source_summary source_path source_text (termination : HolbuildTh
   end
 
 fun summarize_termination_goal_source source_path source_text terminations path =
-  case last_termination_goal (source_lines (read_text path)) of
+  case last_termination_goal (source_lines (read_primary_log path)) of
       NONE => NONE
     | SOME (TerminationGoal {definition_start, lines, ...}) =>
         Option.map (fn termination => termination_source_summary source_path source_text termination lines)
@@ -553,7 +566,7 @@ fun plan_position_from_text text =
    push the goal state any distance from its start. *)
 fun read_goal_state path =
   let
-    val text = read_text path
+    val text = read_primary_log path
   in
     case top_goal_state_from_text text of
         NONE => NONE
@@ -650,7 +663,7 @@ fun summarize_goal_state_with_log_reference log_available path =
 
 fun plan_position_summary path =
   Option.map (fn position => "plan position: " ^ position ^ "\n")
-             (plan_position_from_text (read_text path))
+             (plan_position_from_text (read_primary_log path))
   handle _ => NONE
 
 fun child_failure_line line =
@@ -696,7 +709,7 @@ fun child_failure_excerpt lines =
   end
 
 fun child_failure_summary path =
-  let val lines = String.fields (fn c => c = #"\n") (read_text path)
+  let val lines = source_lines (read_primary_log path)
   in
     case child_failure_excerpt lines of
         NONE => NONE
@@ -736,7 +749,7 @@ fun failed_termination_source_summary source_path source_text terminations label
 
 fun summarize_failed_fragment_source source_path source_text checkpoints terminations path =
   let
-    val lines = String.fields (fn c => c = #"\n") (read_text path)
+    val lines = source_lines (read_primary_log path)
     val label = find_failed_fragment_label lines
     val failed_end = find_failed_fragment_end lines
     val failed_span = find_failed_fragment_span lines
@@ -782,9 +795,82 @@ fun failed_trace_theorem lines =
       [] => NONE
     | failed => field_after "theorem" (List.last failed)
 
+(* The runtime quotes fields so user text and goal layout never introduce
+   marker lines. The final raw suffix can also contain a static or parse
+   error from HOL's declaration reader, before the prover runs. *)
+fun additional_failure_summary source_path source_text checkpoints terminations path =
+  let
+    val text = read_text path
+    val prefix = "holbuild secondary failure: "
+    fun source_line name offset =
+      let
+        fun line start stop = line_number_at source_text (Int.min (stop, start + Int.max (offset, 0)))
+      in
+        case List.find (fn checkpoint => #name checkpoint = name)
+                       (checkpoints : HolbuildTheoryCheckpoints.boundary list) of
+            SOME checkpoint => SOME (line (#tactic_start checkpoint) (#tactic_end checkpoint))
+          | NONE => Option.map (fn termination => line (#tactic_start termination) (#tactic_end termination))
+              (List.find (fn termination => #name termination = name)
+                         (terminations : HolbuildTheoryCheckpoints.termination list))
+      end
+    fun decode line =
+      case String.fields (fn c => c = #"\t") (String.extract (line, size prefix, NONE)) of
+          [name, offset, message, goal] =>
+            (case (String.fromString name, Int.fromString offset, String.fromString message, String.fromString goal) of
+                 (SOME name, SOME offset, SOME error, SOME top_goal) =>
+                   SOME {theorem = name, line = source_line name offset, error = error, top_goal = top_goal}
+               | _ => NONE)
+        | _ => NONE
+    fun parse [] reports tail = (rev reports, rev tail)
+      | parse (line :: rest) reports tail =
+          if worker_report line then (rev reports, rev tail)
+          else if String.isPrefix prefix line then
+            (case decode line of
+                 SOME report => parse rest (report :: reports) []
+               | NONE => parse rest reports tail)
+          else parse rest reports (line :: tail)
+    fun compact value = String.concatWith " " (String.tokens Char.isSpace value)
+    fun terminal tail =
+      let
+        val lines = List.filter (not o String.isPrefix "holbuild ") tail
+        val block = find_static_error_block lines
+        val exception_line =
+          List.find (fn line => String.isPrefix "Uncaught exception" line orelse
+                                String.isPrefix "Exception raised" line) lines
+      in
+        case (block, exception_line) of
+            (SOME lines, _) =>
+              [{theorem = "", line = static_error_source_line source_path source_text lines,
+                error = String.concatWith " " (take_n 3 lines []), top_goal = ""}]
+          | (NONE, SOME error) =>
+              [{theorem = "", line = NONE, error = error, top_goal = ""}]
+          | _ => []
+      end
+    val failures =
+      case continuation_start text of
+          NONE => []
+        | SOME i =>
+            let
+              val after = String.extract (text, i + size continuation_marker + 2, NONE)
+              val (reports, tail) = parse (source_lines after) [] []
+            in
+              reports @ terminal tail
+            end
+    fun block (i, {theorem, line, error, top_goal}) =
+      String.concat
+        ["additional failure ", Int.toString (i + 1), " of ", Int.toString (length failures), ":\n",
+         if theorem = "" then "" else "  theorem: " ^ compact theorem ^ "\n",
+         case line of SOME n => "  source line: " ^ Int.toString n ^ "\n" | NONE => "",
+         "  error: ", compact error, "\n",
+         if top_goal = "" then "" else "  top goal: " ^ compact top_goal ^ "\n"]
+  in
+    String.concat (ListPair.map block (List.tabulate (length failures, fn i => i), failures))
+  end
+  handle IO.Io _ => ""
+
 fun summarize_trace_steps path =
   let
-    val lines = String.fields (fn c => c = #"\n") (read_text path)
+    val lines = source_lines (read_primary_log path)
     val trace_lines = List.filter proof_trace_line lines
     val focused =
       case failed_trace_theorem trace_lines of

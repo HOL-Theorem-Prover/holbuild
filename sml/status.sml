@@ -271,8 +271,40 @@ fun source_location_from_line line =
 
 fun source_location_from_lines lines = first_some source_location_from_line lines
 
-fun json_failure_fields source_override message =
+val additional_failure_marker = "\nadditional failure "
+
+fun primary_failure message = take_before additional_failure_marker message
+
+fun json_additional_failures message =
   let
+    fun blocks text =
+      case find_substring additional_failure_marker text of
+          NONE => []
+        | SOME i =>
+            let
+              val rest = String.extract (text, i + size additional_failure_marker, NONE)
+              val lines = String.fields (fn c => c = #"\n") (primary_failure rest)
+            in
+              (case first_line_after "  error: " lines of
+                   NONE => []
+                 | SOME error =>
+                     ["{" ^ String.concatWith ","
+                        (json_optional_string_field "theorem" (first_line_after "  theorem: " lines) @
+                         json_optional_int_field "source_line"
+                           (Option.mapPartial Int.fromString (first_line_after "  source line: " lines)) @
+                         [json_string_field "error" error] @
+                         json_optional_string_field "top_goal" (first_line_after "  top goal: " lines)) ^ "}"]) @
+              blocks rest
+            end
+  in
+    case blocks message of
+        [] => []
+      | failures => ["\"additional_failures\":[" ^ String.concatWith "," failures ^ "]"]
+  end
+
+fun json_failure_fields source_override detail =
+  let
+    val message = primary_failure detail
     val lines = String.fields (fn c => c = #"\n") message
     val source_location = source_location_from_lines lines
     val source_file =
@@ -288,7 +320,8 @@ fun json_failure_fields source_override message =
     json_optional_string_field "plan_position" (plan_position_from_lines lines) @
     json_optional_int_field "input_goal_count" (input_goal_count_from_lines lines) @
     json_optional_bool_field "top_goal_truncated" (top_goal_truncated message) @
-    json_evidence_limit_fields message
+    json_evidence_limit_fields message @
+    json_additional_failures detail
   end
 
 (* The error a diagnostic MESSAGE reports, on one line of at most 300
@@ -296,7 +329,7 @@ fun json_failure_fields source_override message =
    static error in a child log's tail), else its first line. *)
 fun failure_error message =
   let
-    val lines = String.fields (fn c => c = #"\n") message
+    val lines = String.fields (fn c => c = #"\n") (primary_failure message)
     fun until_blank [] = []
       | until_blank (line :: rest) = if line = "" then [] else line :: until_blank rest
     fun child_failure [] = []
@@ -313,7 +346,7 @@ fun failure_error message =
    line, the theorem it names unless that line does, and its error. *)
 fun failure_brief message =
   let
-    val lines = String.fields (fn c => c = #"\n") message
+    val lines = String.fields (fn c => c = #"\n") (primary_failure message)
     val error = failure_error message
   in
     hd lines ^
