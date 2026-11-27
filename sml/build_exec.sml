@@ -13628,18 +13628,14 @@ fun shared_checkpoint_key heap_key kind checkpoint_key =
                     "\ncheckpoint-key=", checkpoint_key, "\n"])
 
 (* A worker claims a cold heap before uploading it, so other workers that
-   built the same heap skip their own upload. The cache has no conditional
-   write, so a worker uploads if it reads back its own claim after the
-   settle delay: one uploader, unless a competitor's claim write lands more
-   than the settle delay after its read, when that competitor uploads too.
-   The claimant releases its claim when its upload ends; a claim lapses
-   after shared_heap_claim_seconds, so an upload killed before it published
-   keeps the heap cold no longer than that. *)
+   see the claim skip their own upload. The cache has no conditional
+   write, so workers can both claim and upload. Recheck ownership before
+   publishing the heap entry and before releasing the claim. An abandoned
+   claim lapses after shared_heap_claim_seconds. *)
 fun shared_heap_claim_key heap_key =
   HolbuildHash.string_sha256 ("holbuild-shared-heap-claim-v1\nheap=" ^ heap_key ^ "\n")
 
 val shared_heap_claim_seconds = 300
-val shared_heap_claim_settle = Time.fromSeconds 1
 
 fun shared_heap_claim_text owner seconds =
   String.concat ["holbuild-shared-heap-claim-v1\nowner=", owner,
@@ -13672,6 +13668,13 @@ val shared_heap_wait = Time.fromSeconds 60
 val shared_heap_upload_seconds = 125
 val shared_heap_poll = Time.fromMilliseconds 500
 
+fun read_heap_entry remote key =
+  HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.get_action remote key)
+
+fun read_shared_heap_claim remote key =
+  HolbuildRemoteCache.revalidating (fn () =>
+    Option.map #manifest (HolbuildRemoteCache.fetch_action remote key))
+
 (* The heap under HEAP_KEY once the worker whose claim holds it has
    published it, polled until DEADLINE; NONE if no claim holds it, it is
    released without the heap, or the deadline passes.  With it, the
@@ -13683,12 +13686,12 @@ val shared_heap_poll = Time.fromMilliseconds 500
 fun await_shared_heap remote heap_key deadline =
   let
     val claim_key = shared_heap_claim_key heap_key
-    fun heap () = HolbuildRemoteCache.get_action remote heap_key
+    fun heap () = read_heap_entry remote heap_key
     (* A restore holds no claim, so any claim is another worker's. *)
     fun claimed () =
-      case HolbuildRemoteCache.fetch_action remote claim_key of
-          SOME {manifest, ...} =>
-            shared_heap_claim_holds shared_heap_upload_seconds "" (Time.toSeconds (Time.now ())) manifest
+      case read_shared_heap_claim remote claim_key of
+          SOME text =>
+            shared_heap_claim_holds shared_heap_upload_seconds "" (Time.toSeconds (Time.now ())) text
         | NONE => false
     (* The claimant publishes the heap before releasing its claim. *)
     fun found seen heap =
@@ -13816,18 +13819,6 @@ fun short_heap_entry modules text =
       SOME n => n >= module_writer_min_missing ()
     | NONE => modules andalso not (List.exists (fn (role, _, _) => role = "module") (shared_manifest_entries text))
 
-(* The deps heap entry and whether its copy was checked with the store.
-   Check a short entry up front: another host may have replaced it. *)
-fun fresh_heap_entry remote modules key text =
-  if (short_heap_entry modules text handle Error _ => false) then
-    (case HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.get_action remote key) of
-         NONE => (text, false)
-       | SOME fresh => (fresh, true))
-  else (text, false)
-
-fun read_heap_entry remote modules key =
-  Option.map (fresh_heap_entry remote modules key) (HolbuildRemoteCache.get_action remote key)
-
 (* Which of a theory's checkpoints are published on a heap, most recently
    used first, so that a restore probes those rather than every boundary
    of the script, most of which no build saved.  Only a hint: a listed
@@ -13949,7 +13940,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     val stale = ref ([] : string list)
     val missing = ref ([] : string list)
     val heap_entry = ref (NONE : string option)
-    val heap_revalidated = ref false
+    val heap_rechecked = ref false
     val poisoned = ref (NONE : string option)
     exception RefreshHeap of string option
     fun missing_blob key sha =
@@ -14021,17 +14012,17 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
       (poisoned := !heap_entry; add_restore_step "rstmoddropn" 1; warn (why ^ ": " ^ module); false)
     fun drop_poisoned module =
       drop_heap "the shared deps-loaded heap's entry names a theory module of another id" module
-    (* A superseded entry can name a valid module of another ID. Do not
-       let it replace the one the current heap and other workers use. *)
+    (* The heap entry may have changed while we checked its modules.
+       Recheck once before acting on a module of another ID. *)
     fun refresh_heap_on_mismatch checks =
-      if !heap_revalidated orelse List.all (fn (_, state) => state = ModuleMatches) checks then ()
+      if !heap_rechecked orelse List.all (fn (_, state) => state = ModuleMatches) checks then ()
       else
         let
           val fresh = restore_step "rstprobe" (fn () =>
-            HolbuildRemoteCache.revalidating (fn () =>
-              HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote heap_key)))
+            HolbuildRemoteCache.required (fn () => read_heap_entry remote heap_key))
+          val _ = heap_rechecked := true
         in
-          if fresh = !heap_entry then heap_revalidated := true else raise RefreshHeap fresh
+          if fresh = !heap_entry then () else raise RefreshHeap fresh
         end
     fun heap_modules_ok () =
       case !modules_ok of
@@ -14293,9 +14284,8 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                SOME standalone => standalone
              | NONE => restored)
       | or_standalone restored = restored
-    fun restore_heap (text, revalidated) =
+    fun restore_heap text =
       (heap_entry := SOME text;
-       heap_revalidated := revalidated;
        case (let val entries = shared_manifest_entries text
              in
                heap_modules := List.foldl add_digest (Redblackmap.mkDict String.compare) entries;
@@ -14314,17 +14304,17 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
         (wipe ();
          case fresh of
              NONE => (lookup := "stale"; no_files)
-           | SOME text => restore_heap (text, true))
+           | SOME text => restore_heap text)
     (* No other checkpoint is published without its heap. *)
     val initial =
-      case restore_step "rstprobe" (fn () => read_heap_entry remote (#modules ctx) heap_key) of
+      case restore_step "rstprobe" (fn () => read_heap_entry remote heap_key) of
           NONE =>
             let
               val (heap, verdict) = restore_step "rstwait" (fn () =>
                 await_shared_heap remote heap_key (Time.+ (Time.now (), shared_heap_wait)))
               val _ = lookup := verdict
             in
-              Option.map (fn text => restore_step "rstwait" (fn () => fresh_heap_entry remote (#modules ctx) heap_key text)) heap
+              heap
             end
         | found => (lookup := "hit"; found)
     val {heap, files} = or_standalone (case initial of NONE => no_files | SOME entry => restore_heap entry)
@@ -14369,11 +14359,9 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     fun heap_present () =
       let
         val lost = member heap_key stale
-        fun revalidated () = HolbuildRemoteCache.revalidating (fn () => HolbuildRemoteCache.get_action remote heap_key)
+        fun read () = read_heap_entry remote heap_key
         val found =
-          if Option.isSome poisoned then HolbuildRemoteCache.required revalidated
-          else if lost then revalidated ()
-          else Option.map #1 (read_heap_entry remote (#modules ctx) heap_key)
+          if Option.isSome poisoned then HolbuildRemoteCache.required read else read ()
       in
         case found of
             NONE => false
@@ -14449,21 +14437,24 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
           val claim_key = shared_heap_claim_key heap_key
           val owner = HolbuildTempPath.new_token ()
           fun now () = Time.toSeconds (Time.now ())
-          fun read_claim () = Option.map #manifest (HolbuildRemoteCache.fetch_action remote claim_key)
-          fun write_claim seconds =
-            let val text = shared_heap_claim_text owner seconds
-            in ignore (HolbuildRemoteCache.publish_action remote {key = claim_key, text = text}); text end
+          fun read_claim () = read_shared_heap_claim remote claim_key
+          fun write_claim text = HolbuildRemoteCache.publish_action remote {key = claim_key, text = text}
           fun claim_new () =
-            let val text = write_claim (now ())
-            in OS.Process.sleep shared_heap_claim_settle; HolbuildRemoteCache.required read_claim = SOME text end
+            let val text = shared_heap_claim_text owner (now ())
+            in
+              case write_claim text of
+                  HolbuildCacheBackend.Published => SOME text
+                | _ => NONE
+            end
           fun claim () =
             case read_claim () of
-                SOME text => not (shared_heap_claim_active owner (now ()) text) andalso claim_new ()
+                SOME text => if shared_heap_claim_active owner (now ()) text then NONE else claim_new ()
               | NONE => claim_new ()
-          (* A lapsed claim frees the heap at once: for the next worker if
-             this upload failed, and for a repair if the cache later loses
-             the heap's blob. *)
-          fun release () = ignore (write_claim 0) handle HolbuildRemoteCache.Unavailable _ => ()
+          fun owns_claim text = HolbuildRemoteCache.required read_claim = SOME text
+          (* Release also after failure so another worker can repair the heap. *)
+          fun release text =
+            (if owns_claim text then ignore (write_claim (shared_heap_claim_text owner 0)) else ())
+            handle HolbuildRemoteCache.Unavailable _ => ()
           (* The theory modules the heap loads, as linked when the preload
              saved it. *)
           fun with_snapshot f =
@@ -14473,7 +14464,7 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                          warn "not publishing the shared deps-loaded heap: its theory modules weren't linked"; NONE)
           (* With the theory modules the heap loads, for the hosts that lack
              them (fetch_heap_modules). *)
-          fun upload_modules modules =
+          fun upload_modules claim_text modules =
             let
               val manifest =
                 shared_manifest "holbuild-shared-heap-v1" NONE
@@ -14496,19 +14487,22 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                       Mutex.unlock absent_mutex)
               val _ = parallel_all remote_probe_width probe modules
               val _ = upload_all ((heap_file, sha) :: modules)
-              val _ =
-                case List.find (fn (_, blob) => needs_upload blob) ((heap_file, sha) :: modules) of
-                    SOME (path, _) => raise Error ("could not upload " ^ path)
-                  | NONE => ()
-              (* Every node: one still holding an entry this replaces would
-                 go on serving it. *)
-              val _ = HolbuildRemoteCache.replace_action_everywhere remote {key = heap_key, text = manifest}
             in
-              if HolbuildRemoteCache.required (fn () => HolbuildRemoteCache.get_action remote heap_key) = SOME manifest then
-                (verdict "published"; store_add store sha {sha = sha, src = heap_file, save = true}; SOME sha)
-              else (verdict "failed"; NONE)
+              if not (owns_claim claim_text) then (verdict "claim-lost"; NONE)
+              else
+                let
+                  val _ =
+                    case List.find (fn (_, blob) => needs_upload blob) ((heap_file, sha) :: modules) of
+                        SOME (path, _) => raise Error ("could not upload " ^ path)
+                      | NONE => ()
+                  val _ = HolbuildRemoteCache.replace_action_everywhere remote {key = heap_key, text = manifest}
+                in
+                  if HolbuildRemoteCache.required (fn () => read_heap_entry remote heap_key) = SOME manifest then
+                    (verdict "published"; store_add store sha {sha = sha, src = heap_file, save = true}; SOME sha)
+                  else (verdict "failed"; NONE)
+                end
             end
-          fun upload () =
+          fun upload claim_text =
             if heap_present () then (verdict "present"; NONE)
             else with_snapshot (fn snapshot =>
               case List.find (not o module_file_has_id) snapshot of
@@ -14517,12 +14511,14 @@ fun publish_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                      warn ("not publishing the shared deps-loaded heap: its theory module " ^ Path.file copy ^
                            " was replaced by one of another id");
                      NONE)
-                | NONE => upload_modules (map (fn (_, copy) => (copy, HolbuildHash.file_sha256 copy)) snapshot))
+                | NONE => upload_modules claim_text (map (fn (_, copy) => (copy, HolbuildHash.file_sha256 copy)) snapshot))
         in
-          if claim () then (upload () before release ()) handle e => (release (); raise e)
-          else (verdict "skipped-claimed";
-                HolbuildStatus.message_stdout "another worker is publishing the shared deps-loaded heap\n";
-                NONE)
+          case claim () of
+              SOME text => ((upload text before release text) handle e => (release text; raise e))
+            | NONE =>
+                (verdict "skipped-claimed";
+                 HolbuildStatus.message_stdout "another worker is publishing the shared deps-loaded heap\n";
+                 NONE)
         end
     fun publish_heap sha =
       if heap_present () then (verdict "present"; NONE)
@@ -15615,9 +15611,11 @@ fun with_module_deadline bounded deadline f =
   HolbuildHttp.with_deadline (if bounded then SOME deadline else NONE)
     (fn () => HolbuildRemoteCache.retrying_within deadline f)
 
+val module_confirmation_settle = Time.fromSeconds 1
+
 (* Reserve one settle and a confirmation wave, even if the last transfer stalls. *)
 fun module_confirmation_reserve deadline =
-  Time.- (deadline, Time.+ (shared_heap_claim_settle, Time.fromSeconds 2))
+  Time.- (deadline, Time.+ (module_confirmation_settle, Time.fromSeconds 2))
 
 (* Puts the module file SRC in STORE as NAME, unless the store has a
    module of that name: a name keeps the module it first held, whose id
@@ -15632,7 +15630,7 @@ fun revalidate_module_action remote key =
 
 fun settle_module_actions _ [] = ()
   | settle_module_actions confirm entries =
-      (OS.Process.sleep shared_heap_claim_settle;
+      (OS.Process.sleep module_confirmation_settle;
        parallel_all remote_probe_width confirm entries)
 
 datatype published_module =
@@ -18013,7 +18011,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
             val heap_label = #package built_action ^ ":" ^ #logical built_action
             val heap_hit =
               not built andalso probes_shared andalso
-              (cached shared_key
+              (Option.isSome (read_heap_entry remote shared_key)
                handle e as HolbuildRemoteCache.Unavailable _ =>
                  (shared_heap_line "lookup" heap_label shared_key "unavailable"; raise e))
             (* Probed only when no build was found to reuse.  The line is
