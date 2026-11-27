@@ -389,6 +389,16 @@ shared_entries() {
   find "$tmpdir/remote/ac" -type f -newer "$1" -print0 |
     xargs -0r grep -lE "^(kind=failed_prefix|holbuild-shared-checkpoint-index-v1)\$" || true
 }
+failed_prefix_entry() {
+  local path
+  for path in "$tmpdir"/remote/ac/*; do
+    if grep -qx "holbuild-shared-checkpoint-v1" "$path" &&
+       grep -qx "kind=failed_prefix" "$path"; then
+      printf '%s\n' "$path"
+      return
+    fi
+  done
+}
 [[ -n "$(shared_entries "$tmpdir/before-v4")" ]] || {
   echo "v4 published no failed prefix" >&2; exit 1; }
 [[ -z "$(shared_entries "$tmpdir/v4.result")" ]] || {
@@ -397,6 +407,15 @@ shared_entries() {
 grep -qE "^phase-ms=(.*,)?pubckptn:[1-9][0-9]*(,|\$)" "$tmpdir/v4.result" || {
   echo "v4's record counts no published checkpoint:" >&2; cat "$tmpdir/v4.result" >&2; exit 1; }
 require_grep "exec-action after the result (ms): .* modules_ms=" "$tmpdir/v4.log"
+# Keep the old manifest in a simulated front cache while the worker advances
+# the same failed-prefix key in the remote store.  The next stale copy keeps
+# the setup active for the following restore as well.
+failed_prefix=$(failed_prefix_entry)
+[[ -n "$failed_prefix" ]] || { echo "v4 published no failed-prefix manifest" >&2; exit 1; }
+failed_prefix_key=${failed_prefix##*/}
+cp "$failed_prefix" "$tmpdir/control/ac-stale-$failed_prefix_key"
+cp "$failed_prefix" "$tmpdir/control/ac-stale-next-$failed_prefix_key"
+rm -f "$tmpdir/control/no-cache-gets"
 # A resume that gets past the shared failed prefix and fails later shares
 # the later prefix in its place, and the next resume starts from that.
 restored_steps() {
@@ -409,6 +428,8 @@ worker v4a "$shared_url" "$shared" "$spec_t" --share-heaps
 expect v4a 1 "status=failed" "failure=proof"
 require_grep "later failure" "$tmpdir/v4a.log"
 resumed v4a "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
+[[ "$(grep -cx "$failed_prefix_key" "$tmpdir/control/no-cache-gets")" -ge 1 ]] || {
+  echo "v4a did not revalidate the failed-prefix manifest" >&2; exit 1; }
 # A failed action's record still has the HOL child's phases and the resume.
 for step in resfpn resstepn resboundary holload holsalvage holrewind holleaves holtactics holprint holsave resbyten; do
   grep -qE "^phase-ms=(.*,)?$step:[0-9]+(,|\$)" "$tmpdir/v4a.result" || {
@@ -430,6 +451,8 @@ v4b_steps=$(restored_steps v4b)
   cat "$tmpdir/v4b.log" >&2
   exit 1
 }
+[[ "$(grep -cx "$failed_prefix_key" "$tmpdir/control/no-cache-gets")" -ge 2 ]] || {
+  echo "v4b did not revalidate the advanced failed-prefix manifest" >&2; exit 1; }
 
 # A spec of build --no-checkpoint-saves: the worker resumes from the shared
 # failed prefix, and shares nothing, neither the later prefix a failure past
@@ -483,6 +506,8 @@ if grep -qlE '^holbuild-shared-' "$tmpdir"/remote-cold/ac/*; then
   exit 1
 fi
 
+# An edit after the stale-manifest advance still rewinds to the divergence
+# point represented by the shared failed prefix.
 write_t "T \\/ F" "rw[]"
 export_t v5
 cold v5 0
@@ -841,3 +866,84 @@ if grep -q "restored shared deps-loaded heap" "$tmpdir/x4.log"; then
   cat "$tmpdir/x4.log" >&2
   exit 1
 fi
+
+# A non-target theory has no dependency heap, so its failed prefix uses the
+# standalone key.  Exercise the same stale-manifest race on that path.
+write_u() {
+  cat > "$project/src/UScript.sml" <<SML
+Theory U
+Ancestors bool
+
+Theorem u1:
+  T
+Proof
+  simp[]
+QED
+
+Theorem u2:
+  T /\\ T
+Proof
+  CONJ_TAC >- ACCEPT_TAC TRUTH >> $1
+QED
+SML
+}
+cat > "$project/src/VScript.sml" <<'SML'
+Theory V
+Ancestors U
+
+Theorem v:
+  T
+Proof
+  ACCEPT_TAC TRUTH
+QED
+SML
+export_u() {
+  (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$shared_url" action-spec --upload VTheory) \
+    > "$tmpdir/u-$1.batch"
+  spec_u=$(field "$tmpdir/u-$1.batch" share:UTheory 4)
+  [[ -n "$spec_u" ]] || { cat "$tmpdir/u-$1.batch" >&2; exit 1; }
+}
+standalone_entry() {
+  local path
+  for path in "$tmpdir"/remote/ac/*; do
+    if grep -qx "holbuild-shared-failed-prefix-v1" "$path" &&
+       grep -qx "kind=failed_prefix" "$path"; then
+      printf '%s\n' "$path"
+      return
+    fi
+  done
+}
+write_u 'FAIL_TAC "standalone seeded failure"'
+export_u seed
+forget_local
+worker u-seed "$shared_url" "$shared" "$spec_u" --share-heaps
+expect u-seed 1 "status=failed" "failure=proof"
+standalone=$(standalone_entry)
+[[ -n "$standalone" ]] || { echo "u-seed published no standalone failed prefix" >&2; exit 1; }
+standalone_key=${standalone##*/}
+cp "$standalone" "$tmpdir/control/ac-stale-$standalone_key"
+cp "$standalone" "$tmpdir/control/ac-stale-next-$standalone_key"
+rm -f "$tmpdir/control/no-cache-gets"
+
+write_u 'ALL_TAC >> FAIL_TAC "standalone later failure"'
+export_u advance
+forget_local
+worker u-advance "$shared_url" "$shared" "$spec_u" --share-heaps
+expect u-advance 1 "status=failed" "failure=proof"
+resumed u-advance "failed-prefix checkpoint in u2" "standalone failed_prefix checkpoint"
+[[ "$(grep -cx "$standalone_key" "$tmpdir/control/no-cache-gets")" -ge 1 ]] || {
+  echo "u-advance did not revalidate the standalone failed-prefix manifest" >&2; exit 1; }
+
+forget_local
+worker u-repeat "$shared_url" "$shared" "$spec_u" --share-heaps
+expect u-repeat 1 "status=failed" "failure=proof"
+resumed u-repeat "failed-prefix checkpoint in u2" "standalone failed_prefix checkpoint"
+u_advance_steps=$(restored_steps u-advance)
+u_repeat_steps=$(restored_steps u-repeat)
+[[ -n "$u_advance_steps" && -n "$u_repeat_steps" && "$u_repeat_steps" -gt "$u_advance_steps" ]] || {
+  echo "u-repeat restored $u_repeat_steps steps, the stale u-advance prefix had $u_advance_steps" >&2
+  cat "$tmpdir/u-repeat.log" >&2
+  exit 1
+}
+[[ "$(grep -cx "$standalone_key" "$tmpdir/control/no-cache-gets")" -ge 2 ]] || {
+  echo "u-repeat did not revalidate the advanced standalone failed-prefix manifest" >&2; exit 1; }
