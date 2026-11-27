@@ -249,6 +249,16 @@ fun source_span_range source_text start_offset end_offset =
                      Int.toString end_line, ":", Int.toString end_col]
   end
 
+fun source_span_range_explicit source_text start_offset end_offset =
+  let
+    val start_line = line_number_at source_text start_offset
+    val start_col = column_number_at source_text start_offset
+    val (end_line, end_col) = source_span_end_location source_text start_offset end_offset
+  in
+    String.concat [Int.toString start_line, ":", Int.toString start_col, "-",
+                   Int.toString end_line, ":", Int.toString end_col]
+  end
+
 fun source_span_text source_path source_text start_offset end_offset =
   let
     val range = source_span_range source_text start_offset end_offset
@@ -457,7 +467,7 @@ fun branch_close_note source_text limit label branch_close start_offset end_offs
           end
       | NONE =>
           String.concat
-            ["note: branch body at ", source_span_range source_text start_offset end_offset,
+            ["note: branch body at ", source_span_range_explicit source_text start_offset end_offset,
              " left unsolved goal(s); if preceding steps were meant to stay inside one branch, ",
              "check grouping: '>>' and '>-' associate left as (tac1 >> tac2) >- tac3.\n"]
 

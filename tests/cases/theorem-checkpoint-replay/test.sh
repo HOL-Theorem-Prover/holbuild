@@ -1195,7 +1195,7 @@ val _ = require "THEN continuation was not recognized"
 
 val then_foo_note = note "ALL_TAC THEN_FOO" 7;
 val _ = require "THEN_FOO was treated as THEN"
-  (String.isSubstring "branch body at 1:1-8" then_foo_note andalso
+  (String.isSubstring "branch body at 1:1-1:8" then_foo_note andalso
    not (String.isSubstring "the 'THEN ...' tactics after it are outside this branch" then_foo_note));
 
 val nested_comment_note = note "ALL_TAC (* outer (* nested *) comment *) >>" 7;
@@ -1204,7 +1204,7 @@ val _ = require "nested comment did not reveal continuation"
 
 val unlisted_symbolic_note = note "ALL_TAC >>~" 7;
 val _ = require "unlisted symbolic operator was treated as >>"
-  (String.isSubstring "branch body at 1:1-8" unlisted_symbolic_note andalso
+  (String.isSubstring "branch body at 1:1-1:8" unlisted_symbolic_note andalso
    not (String.isSubstring "the '>> ...' tactics after it are outside this branch" unlisted_symbolic_note));
 
 val unicode_quote_note =
@@ -1223,7 +1223,7 @@ val _ = require "Unicode double quotation blocked a symbolic continuation"
 
 val bounded_note = note_with_limit "ALL_TAC >> ACCEPT_TAC TRUTH" 7 7;
 val _ = require "continuation scan crossed the tactic boundary"
-  (String.isSubstring "branch body at 1:1-8" bounded_note andalso
+  (String.isSubstring "branch body at 1:1-1:8" bounded_note andalso
    not (String.isSubstring "the '>> ...' tactics after it are outside this branch" bounded_note));
 SML
 if ! (cd "$repo_root" && "${HOLBUILD_POLY:-poly}" -q --error-exit --script "$tmpdir/branch-close-layout-test.sml") > "$tmpdir/branch-close-layout-test.log" 2>&1; then
@@ -1306,7 +1306,7 @@ QED
 val _ = export_theory();
 SML
 
-run_branch_close_case end "note: branch body at 6:10-17 left unsolved goal(s); if preceding steps were meant to stay inside one branch, check grouping: '>>' and '>-' associate left as (tac1 >> tac2) >- tac3." <<'SML'
+run_branch_close_case end "note: branch body at 6:10-6:17 left unsolved goal(s); if preceding steps were meant to stay inside one branch, check grouping: '>>' and '>-' associate left as (tac1 >> tac2) >- tac3." <<'SML'
 open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
 Theorem end_branch_close:
