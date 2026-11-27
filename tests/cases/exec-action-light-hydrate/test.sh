@@ -200,6 +200,7 @@ hydrated resume-fail 2 0
 write_t "ALL_TAC >> ACCEPT_TAC TRUTH"
 worker resume-pass
 expect_worker resume-pass 0 "status=built"
+require_grep "from: failed-prefix checkpoint in t2" "$tmpdir/resume-pass.log"
 hydrated resume-pass 2 2
 outputs resume-pass
 # Run again on a fresh host, it restores its published entry, installs the

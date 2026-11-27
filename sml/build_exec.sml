@@ -12660,10 +12660,13 @@ fun classify_run_failure stage log_text oom_before msg =
 
 (* How HOL says a load or use found no file (tools-poly/poly/poly-init2.ML),
    before the path it was given. *)
-val missing_file_messages = ["Cannot find file ", "non-existent file "]
+val missing_file_messages = ["Cannot find file ", "Use: non-existent file "]
 
+(* Whether TEXT has a line HOL starts with one of those: it writes the
+   message on a line of its own before raising it. *)
 fun names_missing_file text =
-  List.exists (fn message => String.isSubstring message text) missing_file_messages
+  List.exists (fn message => String.isPrefix message text orelse String.isSubstring ("\n" ^ message) text)
+    missing_file_messages
 
 (* Whether the log at PATH names a missing file, read a chunk at a time: a
    passing child's log may be large.  A missing log names none. *)
@@ -12672,8 +12675,9 @@ fun log_names_missing_file path =
   else
     let
       val input = TextIO.openIn path
-      (* A message split across two chunks lies within the kept tail. *)
-      val keep = List.foldl (fn (message, n) => Int.max (size message, n)) 0 missing_file_messages
+      (* A message split across two chunks, with the line break before
+         it, lies within the kept tail. *)
+      val keep = List.foldl (fn (message, n) => Int.max (size message + 1, n)) 0 missing_file_messages
       fun scan tail =
         case TextIO.inputN (input, 1048576) of
             "" => false
