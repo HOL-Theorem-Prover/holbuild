@@ -564,7 +564,7 @@ members = ["src"]
 TOML
 python3 - <<PY
 from pathlib import Path
-long_var = "p" * 5000
+long_var = "0 < " + "1" * 5000
 Path("$multi_goal_large_project/src/AScript.sml").write_text(fr'''open HolKernel Parse boolLib bossLib;
 val _ = new_theory "A";
 
@@ -605,7 +605,7 @@ text = Path(sys.argv[1]).read_text()
 goals = text.split("holbuild all failed tactic input goals:\n", 1)[1].split(
     "holbuild end all failed tactic input goals", 1)[0]
 assert "truncated after" not in goals, goals[-200:]
-assert goals.count("p" * 5000) == 2, "missing full input goals"
+assert goals.count("1" * 5000) == 2, "missing full input goals"
 PYTHON
 done
 
@@ -690,7 +690,7 @@ for event in failures:
     if truncated:
         assert failure["top_goal_preview_bytes"] == 128, failure
     else:
-        assert any("p" * 5000 in e.get("message", "") for e in events), failure
+        assert any("1" * 5000 in e.get("message", "") for e in events), failure
 PYTHON
 done
 

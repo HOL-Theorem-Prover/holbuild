@@ -52,9 +52,14 @@ def between(start, end):
 expected = between("expected goal:\n", "\nexpected goal end\n")
 printed = between("holbuild failed tactic top input goal:\n",
                   "holbuild end failed tactic top input goal\n")
+if "\nFree variables:" not in printed:
+    raise SystemExit("holbuild's goal is missing the free-variable block:\n" + printed)
+printed_goal, free_variables = printed.split("\nFree variables:", 1)
+if "x :num" not in free_variables or "p :bool" not in free_variables:
+    raise SystemExit("free-variable block lost expected types:\n" + free_variables)
 if "FLD:" not in expected or "0.  " not in expected:
     raise SystemExit("fixture goal lost its user-printed field or assumptions:\n" + expected)
-if printed != expected + "\n":
+if printed_goal != expected + "\n":
     raise SystemExit("holbuild's goal differs from HOL's printer:\n--- HOL\n" + expected +
-                     "\n--- holbuild\n" + printed)
+                     "\n--- holbuild\n" + printed_goal)
 PY
