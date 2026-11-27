@@ -208,10 +208,9 @@ if grep -q 'note: unclosed' "$log"; then
   exit 1
 fi
 
-# Some HOL parsers can recover at a column-zero keyword before seeing the
-# quote's delimiter. Exercise the scan with a later error offset directly.
-cat > "$tmpdir/quote-scan.sml" <<'SML'
+cat > "$tmpdir/lexical-scan.sml" <<'SML'
 use "sml/holbuild-script.sml";
+(* Some HOL parsers can recover before seeing an explicit quote's delimiter. *)
 val header = "Theorem broken:\n  T\nProof\n";
 val proof = "  (ALL_TAC >> Q.SUBGOAL_THEN `(\nval )` ASSUME_TAC\n";
 val source = header ^ proof ^ "QED\n";
@@ -219,5 +218,14 @@ val _ =
   if HolbuildTheoryDiagnostics.unclosed_delimiter source (size header + size proof) (fn _ => true)
      = SOME (#"(", size header + 2)
   then () else raise Fail "column-zero keyword inside quotation hid the outer opener";
+val header = "Theory A[bare\n";
+fun check_header entry =
+  let val source = header ^ entry ^ "\nval next = [1];\n]\n"
+  in
+    if HolbuildTheoryDiagnostics.unclosed_delimiter source (size header) (fn _ => true)
+       = SOME (#"[", size "Theory A")
+    then () else raise Fail ("a later closer hid the header opener before " ^ entry)
+  end;
+val _ = List.app check_header ["Ancestors list", "Libs bossLib"];
 SML
-(cd "$HOLBUILD_ROOT" && poly -q --error-exit --script "$tmpdir/quote-scan.sml")
+(cd "$HOLBUILD_ROOT" && poly -q --error-exit --script "$tmpdir/lexical-scan.sml")

@@ -229,7 +229,8 @@ fun unclosed_delimiter source stop accepts =
                val j = skip id (i + 1)
                val name = word i j
                val hol_keyword =
-                 col_zero i andalso char j <> #"." andalso boundary name andalso
+                 col_zero i andalso char j <> #"." andalso
+                 (boundary name orelse name = "Ancestors" orelse name = "Libs") andalso
                  (name <> "Datatype" orelse char (skip (Char.contains " \t") j) = #":")
              in
                if hol_keyword then
