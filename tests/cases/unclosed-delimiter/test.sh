@@ -48,7 +48,8 @@ Proof
      \  {"
    >> (fn _ => ALL_TAC) `[ ^(fn x => ``{``) (* ( (* ] *) { *)`
    >> (fn _ => ALL_TAC) “(”
-   (* ( (* [ *) { *)
+   (* ( (* [ *) { *) >>
+Type.mk_type
 QED
 
 Theorem only_missing_qed:
@@ -60,21 +61,21 @@ SML
 build_fails build ATheory
 log=$tmpdir/build.log
 require_grep 'HOL source parse error: expected closing parenthesis' "$log"
-require_grep 'source: .*AScript.sml:18:1$' "$log"
-require_grep 'AScript.sml:18:1: parse error: expected closing parenthesis' "$log"
-require_grep "note: unclosed '(' opened at .*AScript.sml:11:3$" "$log"
-require_grep '  |   (ALL_TAC (\* tactic timed out \*)$' "$log"
-if [[ $(grep -c "note: unclosed '(' opened at .*AScript.sml:11:3$" "$log") -lt 3 ]]; then
-  echo "missing an opener note from the analyser or the staged build" >&2
-  cat "$log" >&2
-  exit 1
-fi
-require_grep "expected 'QED'" "$log"
-if grep -A 6 "expected 'QED'" "$log" | grep 'note: unclosed'; then
-  echo "the later missing QED inherited an opener from the first theorem" >&2
-  cat "$log" >&2
-  exit 1
-fi
+python3 - "$log" "$script" <<'PY'
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+script = sys.argv[2]
+warnings, staged = text.split("ATheory failed:", 1)
+_, recovering = warnings.split("HOL source parser recovered while instrumenting theorem boundaries", 1)
+unclosed, missing_qed = recovering.split("HOL source parse error: expected 'QED'", 1)
+note = f"note: unclosed '(' opened at {script}:11:3\n  |   (ALL_TAC (* tactic timed out *)"
+assert f"source: {script}:19:1" in unclosed and note in unclosed, unclosed
+assert "note: unclosed" not in missing_qed, missing_qed
+assert "\nstatic error:\n" in staged, staged
+assert "AScript.sml:19:1: parse error: expected closing parenthesis" in staged and note in staged, staged
+PY
 
 build_fails --json build ATheory
 python3 - "$tmpdir/build.out" <<'PY'
@@ -86,6 +87,7 @@ with open(sys.argv[1], encoding="utf-8") as stream:
                 if event.get("event") == "node_failed"]
 assert len(failures) == 1, failures
 assert failures[0]["kind"] == "parse_error", failures
+assert failures[0]["source_line"] == 19, failures
 PY
 
 cat > "$script" <<'SML'
@@ -163,3 +165,17 @@ if grep -q 'note: unclosed' "$log"; then
   cat "$log" >&2
   exit 1
 fi
+
+# Some HOL parsers can recover at a column-zero keyword before seeing the
+# quote's delimiter. Exercise the scan with a later error offset directly.
+cat > "$tmpdir/quote-scan.sml" <<'SML'
+use "sml/holbuild-script.sml";
+val header = "Theorem broken:\n  T\nProof\n";
+val proof = "  (ALL_TAC >> Q.SUBGOAL_THEN `(\nval )` ASSUME_TAC\n";
+val source = header ^ proof ^ "QED\n";
+val _ =
+  if HolbuildTheoryDiagnostics.unclosed_delimiter source (size header + size proof) (fn _ => true)
+     = SOME (#"(", size header + 2)
+  then () else raise Fail "column-zero keyword inside quotation hid the outer opener";
+SML
+(cd "$HOLBUILD_ROOT" && poly -q --error-exit --script "$tmpdir/quote-scan.sml")

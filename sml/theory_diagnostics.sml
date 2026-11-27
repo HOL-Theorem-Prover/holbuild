@@ -229,7 +229,7 @@ fun unclosed_delimiter source stop accepts =
                val j = skip id (i + 1)
                val name = word i j
              in
-               if col_zero i andalso boundary name then
+               if col_zero i andalso char j <> #"." andalso boundary name then
                  if Option.isSome (!opener) then finish ()
                  else
                    let val next_body =
@@ -273,7 +273,8 @@ fun unclosed_delimiter source stop accepts =
           val name = word i j
         in
           case kind of
-              Verbatim => if name = "End" then continue i else quote j kind continue
+              Delimited _ => quote j kind continue
+            | Verbatim => if name = "End" then continue i else quote j kind continue
             | _ => if body_stop name then continue i else quote j kind continue
         end
       else quote (i + 1) kind continue
@@ -368,7 +369,7 @@ fun annotate_analyser_parse_error source_path source_text text =
     append_note text (find (source_lines text))
   end
 
-fun child_parse_error_note source_path source_text line =
+fun child_parse_error source_path line =
   let val marker = ": parse error: " in
     case find_substring marker line of
         NONE => NONE
@@ -376,13 +377,13 @@ fun child_parse_error_note source_path source_text line =
           (case source_position (String.substring (line, 0, i)) of
                SOME {path, line = source_line, col} =>
                  if OS.Path.file path = OS.Path.file source_path then
-                   delimiter_note source_path source_text (String.extract (line, i + size marker, NONE)) (source_line, col)
+                   SOME (String.extract (line, i + size marker, NONE), (source_line, col))
                  else NONE
              | NONE => NONE)
   end
 
-fun annotate_child_parse_error source_path source_text text =
-  append_note text (first_some (child_parse_error_note source_path source_text) (source_lines text))
+fun has_child_parse_error source_path text =
+  List.exists (Option.isSome o child_parse_error source_path) (source_lines text)
 
 fun take_static_error_block [] acc = rev acc
   | take_static_error_block (line :: rest) acc =
@@ -492,7 +493,8 @@ fun static_error_summary source_path source_text text =
         in
           SOME (append_note
             (String.concat ["static error:\n", String.concat (map (fn line => line ^ "\n") block), source_context])
-            (child_parse_error_note source_path source_text (hd block)))
+            (Option.mapPartial (fn (msg, location) => delimiter_note source_path source_text msg location)
+                               (child_parse_error source_path (hd block))))
         end
 
 fun proof_unit_label (checkpoint : HolbuildTheoryCheckpoints.boundary) =

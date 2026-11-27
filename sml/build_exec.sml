@@ -5380,8 +5380,9 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
           let
             val failure_error =
               if file_exists timeout_marker then tactic_timeout_error ()
-              else if null theorem_checkpoints andalso null termination_diagnostics then
-                Error (HolbuildTheoryDiagnostics.annotate_child_parse_error source_file source_text msg)
+              else if null theorem_checkpoints andalso null termination_diagnostics andalso
+                      not (HolbuildTheoryDiagnostics.has_child_parse_error source_file msg)
+              then Error msg
               else checkpoint_failure_error msg
             val _ = run_failure_repl tc policy theorem_checkpoints (#failure_checkpoints run_spec) deps_loaded stage
             val _ = cleanup_json_stage stage_root
