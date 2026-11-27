@@ -271,40 +271,42 @@ fun source_location_from_line line =
 
 fun source_location_from_lines lines = first_some source_location_from_line lines
 
-val additional_failure_marker = "\nadditional failure "
+type additional_failure = {theorem : string, line : int option, error : string, top_goal : string}
+type failure_detail = {primary : string, additional_failures : additional_failure list, log_reference : string}
 
-fun primary_failure message = take_before additional_failure_marker message
+fun plain_failure text : failure_detail = {primary = text, additional_failures = [], log_reference = ""}
 
-fun json_additional_failures message =
+fun failure_text ({primary, additional_failures, log_reference} : failure_detail) =
   let
-    fun blocks text =
-      case find_substring additional_failure_marker text of
-          NONE => []
-        | SOME i =>
-            let
-              val rest = String.extract (text, i + size additional_failure_marker, NONE)
-              val lines = String.fields (fn c => c = #"\n") (primary_failure rest)
-            in
-              (case first_line_after "  error: " lines of
-                   NONE => []
-                 | SOME error =>
-                     ["{" ^ String.concatWith ","
-                        (json_optional_string_field "theorem" (first_line_after "  theorem: " lines) @
-                         json_optional_int_field "source_line"
-                           (Option.mapPartial Int.fromString (first_line_after "  source line: " lines)) @
-                         [json_string_field "error" error] @
-                         json_optional_string_field "top_goal" (first_line_after "  top goal: " lines)) ^ "}"]) @
-              blocks rest
-            end
+    val total = Int.toString (length additional_failures)
+    fun block (i, {theorem, line, error, top_goal}) =
+      String.concat
+        ["additional failure ", Int.toString (i + 1), " of ", total, ":\n",
+         if theorem = "" then "" else "  theorem: " ^ theorem ^ "\n",
+         case line of SOME n => "  source line: " ^ Int.toString n ^ "\n" | NONE => "",
+         "  error: ", error, "\n",
+         if top_goal = "" then "" else "  top goal: " ^ top_goal ^ "\n"]
   in
-    case blocks message of
-        [] => []
-      | failures => ["\"additional_failures\":[" ^ String.concatWith "," failures ^ "]"]
+    primary ^ String.concat (ListPair.map block (List.tabulate (length additional_failures, fn i => i), additional_failures)) ^
+    log_reference
   end
 
-fun json_failure_fields source_override detail =
+fun json_additional_failures [] = []
+  | json_additional_failures failures =
+      let
+        fun optional "" = NONE | optional text = SOME text
+        fun fields ({theorem, line, error, top_goal} : additional_failure) =
+          "{" ^ String.concatWith ","
+            (json_optional_string_field "theorem" (optional theorem) @
+             json_optional_int_field "source_line" line @
+             [json_string_field "error" error] @
+             json_optional_string_field "top_goal" (optional top_goal)) ^ "}"
+      in
+        ["\"additional_failures\":[" ^ String.concatWith "," (map fields failures) ^ "]"]
+      end
+
+fun json_failure_fields source_override ({primary = message, additional_failures, ...} : failure_detail) =
   let
-    val message = primary_failure detail
     val lines = String.fields (fn c => c = #"\n") message
     val source_location = source_location_from_lines lines
     val source_file =
@@ -321,7 +323,7 @@ fun json_failure_fields source_override detail =
     json_optional_int_field "input_goal_count" (input_goal_count_from_lines lines) @
     json_optional_bool_field "top_goal_truncated" (top_goal_truncated message) @
     json_evidence_limit_fields message @
-    json_additional_failures detail
+    json_additional_failures additional_failures
   end
 
 (* The error a diagnostic MESSAGE reports, on one line of at most 300
@@ -329,7 +331,7 @@ fun json_failure_fields source_override detail =
    static error in a child log's tail), else its first line. *)
 fun failure_error message =
   let
-    val lines = String.fields (fn c => c = #"\n") (primary_failure message)
+    val lines = String.fields (fn c => c = #"\n") message
     fun until_blank [] = []
       | until_blank (line :: rest) = if line = "" then [] else line :: until_blank rest
     fun child_failure [] = []
@@ -346,7 +348,7 @@ fun failure_error message =
    line, the theorem it names unless that line does, and its error. *)
 fun failure_brief message =
   let
-    val lines = String.fields (fn c => c = #"\n") (primary_failure message)
+    val lines = String.fields (fn c => c = #"\n") message
     val error = failure_error message
   in
     hd lines ^
@@ -375,12 +377,13 @@ fun json_message stream_name text =
     [json_string_field "stream" stream_name,
      json_string_field "message" text]
 
-fun error_with_debug_artifacts msg artifacts =
+fun error_detail_with_debug_artifacts detail artifacts =
   emit_json "error"
-    (json_string_field "message" msg ::
-     json_failure_field msg @
+    (json_string_field "message" (failure_text detail) ::
+     json_failure_field detail @
      json_debug_artifacts_fields artifacts)
 
+fun error_with_debug_artifacts msg artifacts = error_detail_with_debug_artifacts (plain_failure msg) artifacts
 fun error msg = error_with_debug_artifacts msg no_debug_artifacts
 
 fun env_truthy s = s = "1" orelse s = "true" orelse s = "yes" orelse s = "on"
@@ -733,7 +736,9 @@ fun cache_trace line =
    error the build then exits with names it in one line (failure_brief). *)
 fun failure_printed () = not (json_mode () orelse failures_suppressed ())
 
-fun fail_with_debug_artifacts status key label msg artifacts =
+fun fail_with_debug_artifacts status key label detail artifacts =
+  let val msg = failure_text detail
+  in
   (with_lock status
      (fn () =>
          let val {enabled, active, ended, finished, failed, ...} = status
@@ -748,7 +753,7 @@ fun fail_with_debug_artifacts status key label msg artifacts =
               else if json_mode () then
                 emit_json "node_failed"
                   (json_node_fields key label @
-                   json_failure_field_for_node key msg @
+                   json_failure_field_for_node key detail @
                    json_debug_artifacts_fields artifacts)
               else if enabled then
                 (HolbuildBoundedOutput.text (TextIO.stdOut, "\r" ^ clear_to_eol);
@@ -761,20 +766,24 @@ fun fail_with_debug_artifacts status key label msg artifacts =
    if failure_printed () then
      message_stderr (label ^ " failed:" ^ (if CharVector.exists (fn c => c = #"\n") msg then "\n" else " ") ^ msg ^ "\n")
    else ())
+  end
 
 (* A node that failed outside any build's status: a theory that failed on a
    remote worker.  Text mode reports it in the build's error. *)
-fun report_remote_failure key label msg artifacts =
-  (!command_failure (label, msg);
+fun report_remote_failure_detail key label detail artifacts =
+  (!command_failure (label, failure_text detail);
    if json_mode () then
      emit_json "node_failed"
        (json_node_fields key label @
-        json_failure_field_for_node key msg @
+        json_failure_field_for_node key detail @
         json_debug_artifacts_fields artifacts)
    else ())
 
+fun report_remote_failure key label msg artifacts =
+  report_remote_failure_detail key label (plain_failure msg) artifacts
+
 fun fail status key label msg =
-  fail_with_debug_artifacts status key label msg no_debug_artifacts
+  fail_with_debug_artifacts status key label (plain_failure msg) no_debug_artifacts
 
 fun skip status key label reason =
   (with_lock status (fn () => if !suppress_failures_ref then () else #finished status := !(#finished status) + 1);

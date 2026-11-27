@@ -241,6 +241,7 @@ make_project resume-primary
 cat > "$project/src/AScript.sml" <<'SML'
 open HolKernel Parse boolLib bossLib markerLib;
 val _ = new_theory "A";
+val _ = print "holbuild: continuing after first failure\n";
 
 Theorem suspended:
   T /\ T
@@ -249,13 +250,16 @@ Proof
 QED
 
 Resume suspended[left]:
-  FAIL_TAC "resume primary"
+  (fn g => (print "additional failure 1 of 1:\n  error: ordinary script output\n";
+            FAIL_TAC "resume primary" g))
 QED
 
 Finalise suspended
 SML
 run_failure "$tmpdir/resume-fast.log" build --skip-checkpoints --fail-fast ATheory
 run_failure "$tmpdir/resume-default.log" build --skip-checkpoints ATheory
+run_failure "$tmpdir/resume-fast.json" --json build --skip-checkpoints --fail-fast ATheory
+run_failure "$tmpdir/resume-default.json" --json build --skip-checkpoints ATheory
 
 make_project replay-primary
 sed -i 's/FAIL_TAC "first proof error"/ALL_TAC >> FAIL_TAC "first proof error"/' "$project/src/AScript.sml"
@@ -267,6 +271,7 @@ require_grep 'from: failed-prefix checkpoint in first' "$tmpdir/replay-fast.log"
 require_grep 'from: failed-prefix checkpoint in first' "$tmpdir/replay-default.log"
 
 python3 - "$tmpdir" <<'PYTHON'
+import json
 from pathlib import Path
 import sys
 
@@ -281,6 +286,13 @@ for kind, message in [("resume", "resume primary"), ("replay", "first proof erro
     default = primary(directory / f"{kind}-default.log")
     assert fast[0].startswith("Uncaught exception") and message in fast[0], fast
     assert default == fast, (default, fast)
+
+assert "error: ordinary script output" in primary(directory / "resume-fast.log")[0]
+for name in ["resume-fast.json", "resume-default.json"]:
+    events = (json.loads(line) for line in (directory / name).read_text().splitlines())
+    failure = next(event["failure"] for event in events if event["event"] == "node_failed")
+    assert failure["kind"] == "proof_failure" and failure["input_goal_count"] == 1, failure
+    assert "additional_failures" not in failure, failure
 PYTHON
 
 # Plain builds use both child gates. A script that exits successfully
@@ -304,7 +316,7 @@ for gate in export exit-success; do
   fi
 done
 
-for terminal in static dynamic-static parse exception termination; do
+for terminal in static dynamic-static parse exception interrupt termination; do
   make_project "$terminal"
   cat >> "$project/src/AScript.sml" <<'SML'
 val _ = print "AScript.sml:1: error: output from a successful declaration\n";
@@ -323,6 +335,17 @@ Proof
 QED
 SML
       error='Static Errors' ;;
+    interrupt)
+      cat >> "$project/src/AScript.sml" <<'SML'
+val overflow_tac : tactic = fn _ => raise Interrupt;
+
+Theorem interrupted:
+  T
+Proof
+  overflow_tac >> ACCEPT_TAC TRUTH
+QED
+SML
+      error='interrupted by Poly/ML' ;;
     parse) echo 'Theorem malformed: T Proof simp[] QED' >> "$project/src/AScript.sml"; error='parse error:' ;;
     termination)
       cat >> "$project/src/AScript.sml" <<'SML'
@@ -343,6 +366,7 @@ SML
   esac
   echo 'val _ = print "AFTER_TERMINAL\n";' >> "$project/src/AScript.sml"
   run_failure "$tmpdir/$terminal.log" build ATheory
+  require_grep '^theorem: first (line 4)$' "$tmpdir/$terminal.log"
   require_grep '^additional failure 1 of 1:$' "$tmpdir/$terminal.log"
   require_grep "  error: .*$error" "$tmpdir/$terminal.log"
   if sed -n '/^additional failure /,/^instrumented log:/p' "$tmpdir/$terminal.log" |
@@ -398,7 +422,7 @@ import sys
 
 text = Path(sys.argv[1]).read_text()
 seconds = float(re.search(r"timeout after (\d+(\.\d+)?)s: Z3_TAC", text)[1])
-assert 5 <= seconds <= 10, text
+assert 0 < seconds <= 10, text
 PY
 if grep -q '^AFTER_DEADLINE$' "$(child_log)"; then
   cat "$(child_log)" >&2

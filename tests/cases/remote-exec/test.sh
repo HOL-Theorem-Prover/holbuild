@@ -1704,8 +1704,26 @@ if seen != sys.argv[2].split("\n"):
 PY
 }
 write_broken json
+cat >> "$project/src/BScript.sml" <<'SML'
+
+Theorem later_b_thm:
+  T
+Proof
+  FAIL_TAC "second remote proof"
+QED
+SML
 run proof-json 1 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
 json_events proof-json $'node_finished ATheory\nnode_failed BTheory proof_failure b_thm\nerror'
+python3 - "$tmpdir/proof-json.log" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as status:
+    events = (json.loads(line) for line in status if line.startswith("{"))
+    failure = next(event["failure"] for event in events if event["event"] == "node_failed")
+additional, = failure["additional_failures"]
+assert additional["theorem"] == "later_b_thm" and "second remote proof" in additional["error"], additional
+PY
 # So is a failure other than a proof's, which --remote-only builds nothing for.
 write_broken json-memory
 echo rxp:BTheory > "$state/memory-failure"

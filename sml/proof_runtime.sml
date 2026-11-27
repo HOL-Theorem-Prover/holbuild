@@ -2165,8 +2165,8 @@ fun print_first_failure name goal e =
   in
     TextIO.flushOut TextIO.stdOut;
     HolbuildBoundedOutput.text (TextIO.stdErr,
-      text ^ (if String.isSuffix "\n" text then "" else "\n") ^
-      "holbuild: continuing after first failure\n")
+      text ^ (if String.isSuffix "\n" text then "" else "\n"));
+    TextIO.flushOut TextIO.stdErr
   end
 
 fun report_terminal_error kind message =
@@ -2228,7 +2228,12 @@ fun proof_failure name goal at_finish e =
               if !tainted_ref then report_secondary_failure name at_finish e
               else
                 (print_first_failure name g e;
-                 write_text_file marker "";
+                 let val log = OS.Path.concat (OS.Path.dir marker, "holbuild-build.log")
+                     val limit = OS.FileSys.fileSize log
+                 in
+                   HolbuildBoundedOutput.text (TextIO.stdErr, "holbuild: continuing after first failure\n");
+                   write_text_file marker (Position.toString limit ^ "\n")
+                 end;
                  diagnostic_timer_ref := SOME (Timer.startRealTimer ());
                  tainted_ref := true)
             val _ = diagnostic_failure_count_ref := !diagnostic_failure_count_ref + 1

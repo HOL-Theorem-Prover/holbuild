@@ -13,14 +13,16 @@ val local_build_needed_status : OS.Process.status = RunCall.unsafeCast (75 : int
    else the interrupt does, since build threads may still fail after it. *)
 val interrupted = ref false
 
-fun err_with_debug_artifacts msg artifacts =
+fun err_detail_with_debug_artifacts detail artifacts =
   (HolbuildCommandSummary.exit_code :=
      (if !HolbuildHolSharedCache.local_build_needed andalso not (!interrupted) then 75 else 1);
-   if HolbuildStatus.json_mode () then HolbuildStatus.error_with_debug_artifacts msg artifacts
-   else HolbuildStatus.message_stderr ("holbuild: " ^ msg ^ "\n");
+   if HolbuildStatus.json_mode () then HolbuildStatus.error_detail_with_debug_artifacts detail artifacts
+   else HolbuildStatus.message_stderr ("holbuild: " ^ HolbuildStatus.failure_text detail ^ "\n");
    OS.Process.exit (if !HolbuildHolSharedCache.local_build_needed andalso not (!interrupted)
                     then local_build_needed_status
                     else OS.Process.failure))
+
+fun err_with_debug_artifacts msg artifacts = err_detail_with_debug_artifacts (HolbuildStatus.plain_failure msg) artifacts
 
 fun err msg = err_with_debug_artifacts msg HolbuildStatus.no_debug_artifacts
 
@@ -1967,11 +1969,11 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                 val later_errors = later ()
                 val _ = restore_finished_logs ()
                 fun report (SOME key, name, e, _) =
-                      HolbuildStatus.report_remote_failure key name (HolbuildBuildExec.build_error_message e)
+                      HolbuildStatus.report_remote_failure_detail key name (HolbuildBuildExec.build_error_detail e)
                         (HolbuildBuildExec.build_error_debug_artifacts e)
                   | report (NONE, _, _, _) = ()
                 fun final_error (_, name, e, printed) =
-                  (name, if printed then HolbuildBuildExec.Error (HolbuildStatus.failure_brief (HolbuildBuildExec.build_error_message e))
+                  (name, if printed then HolbuildBuildExec.Error (HolbuildStatus.failure_brief (#primary (HolbuildBuildExec.build_error_detail e)))
                          else e)
               in
                 List.app report diagnosed;
@@ -2154,7 +2156,8 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                    HolbuildBuildExec.build_checked settled failed (HolbuildBuildExec.remote_restore_options true build_options)
                      tc project plan keys toolchain_key jobs))
                handle HolbuildBuildExec.Error _ => ()
-                    | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ();
+                    | HolbuildBuildExec.ErrorWithDebugArtifacts _ => ()
+                    | HolbuildBuildExec.TheoryFailure _ => ();
                HolbuildHolSharedCache.local_build_needed := false)
             (* A theory the remote cache holds may not fit the parents it holds,
                as when a nondeterministic theory was built twice, or the cache
@@ -2797,6 +2800,7 @@ fun build_iteration_error_message exn =
     | HolbuildBuildPlan.UnknownTarget unknown => SOME (HolbuildBuildPlan.unknown_target_message unknown)
     | HolbuildBuildExec.Error msg => SOME msg
     | HolbuildBuildExec.ErrorWithDebugArtifacts (msg, _) => SOME msg
+    | HolbuildBuildExec.TheoryFailure (detail, _) => SOME (HolbuildStatus.failure_text detail)
     | HolbuildHolSharedCache.Error msg => SOME msg
     | HolbuildCache.Error msg => SOME msg
     | HolbuildCacheConfig.Error msg => SOME msg
@@ -4688,6 +4692,7 @@ fun main raw_args =
        | HolbuildBuildPlan.UnknownTarget unknown => err (HolbuildBuildPlan.unknown_target_message unknown)
        | HolbuildBuildExec.Error msg => err msg
        | HolbuildBuildExec.ErrorWithDebugArtifacts (msg, artifacts) => err_with_debug_artifacts msg artifacts
+       | HolbuildBuildExec.TheoryFailure (detail, artifacts) => err_detail_with_debug_artifacts detail artifacts
        | HolbuildHolSharedCache.Error msg => err msg
        | HolbuildProcessGroup.Error msg => err msg
        | HolbuildCache.Error msg => err msg
