@@ -75,16 +75,15 @@ val _ =
             TextIO.closeIn input;
             print ("scratch path: " ^ path ^ "\n");
             (* On a worker it links to the cache's blob, which other actions
-               trust unread: the child can't write it. *)
+               trust unread: it is read-only. *)
             if not (String.isSubstring "/.holbuild/scratch/" path) then () else
             let
-              fun denied f = (f (); false) handle _ => true
-              val tries = [("append", fn () => BinIO.closeOut (BinIO.openAppend path))]
+              val st = Posix.FileSys.stat path
+              val mode = SysWord.andb (Posix.FileSys.S.toWord (Posix.FileSys.ST.mode st), 0wx1ff)
             in
-              print ("scratch links: " ^ Int.toString (Posix.FileSys.ST.nlink (Posix.FileSys.stat path)) ^ "\n");
+              print ("scratch links: " ^ Int.toString (Posix.FileSys.ST.nlink st) ^ "\n");
               print ("scratch target: " ^ (Posix.FileSys.readlink path handle OS.SysErr _ => "none") ^ "\n");
-              print ("scratch tamper: " ^
-                     String.concatWith " " (map (fn (what, f) => what ^ (if denied f then "=denied" else "=allowed")) tries) ^ "\n")
+              print ("scratch mode: " ^ SysWord.fmt StringCvt.OCT mode ^ "\n")
             end
           end) (String.fields (fn c => c = #":") paths)
     | NONE => print "scratch input: none\n";
@@ -194,14 +193,14 @@ built() {
 copies() { sed -n 's/.*[=,]scratchcopyn:\([0-9]*\).*/\1/p' "$tmpdir/$1.result"; }
 # in_place NAME SHA LINKS TARGET: worker NAME's child read the input SHA
 # staged in its action root, a file with LINKS links, a symbolic link to
-# TARGET if not "none", and could not write it.
+# TARGET if not "none", and read-only.
 in_place() {
   grep -qx "scratch path: $(realpath "$worker_cache/action")/.holbuild/scratch/$2" "$tmpdir/$1.hol" &&
     grep -qx "scratch links: $3" "$tmpdir/$1.hol" && grep -qx "scratch target: $4" "$tmpdir/$1.hol" || {
     echo "worker $1: the input is not staged as expected" >&2; grep "^scratch" "$tmpdir/$1.hol" >&2; exit 1; }
-  grep -qx "scratch tamper: append=denied" "$tmpdir/$1.hol" || {
-    echo "worker $1: the child could write the input" >&2
-    grep "scratch tamper" "$tmpdir/$1.hol" >&2; exit 1; }
+  grep -qx "scratch mode: 444" "$tmpdir/$1.hol" || {
+    echo "worker $1: the input is not read-only" >&2
+    grep "scratch mode" "$tmpdir/$1.hol" >&2; exit 1; }
 }
 
 # A run loading ahead of a parent still building stages the input for the

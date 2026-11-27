@@ -223,6 +223,18 @@ val action_home = action_root ^ "/.holbuild/sandbox-home";
 val _ = assert "action analyser environment"
   (read "env" = String.concatWith " " [action_root, action_home, action_home ^ "/tmp", "unset"] ^ "\n");
 
+(* A child's own exit status is its result, even 127; a program that isn't
+   there is the worker's failure. *)
+fun child argv = HolbuildToolchain.run_in_dir_to_file tmp argv (path "child.log");
+val _ = HolbuildActionSandbox.enable (path "action", path "checkpoints");
+val exited = child ["/bin/sh", "-c", "exit 127"];
+val exited_completed = !HolbuildActionSandbox.child_completed;
+val missing = (ignore (child [path "missing"]); false) handle HolbuildActionSandbox.Error _ => true;
+val _ = HolbuildActionSandbox.disable ();
+val _ = assert "child exit 127 is its result"
+  (Posix.Process.fromStatus exited = Posix.Process.W_EXITSTATUS 0w127 andalso exited_completed);
+val _ = assert "missing program never started" missing;
+
 val _ = print "analyser failure tests passed\n";
 SML
 

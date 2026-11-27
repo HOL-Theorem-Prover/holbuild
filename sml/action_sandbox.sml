@@ -175,9 +175,9 @@ fun child_shell script =
   else script
 
 (* Runs ARGV through EXECUTE as a child; child_completed says whether it
-   returned.  Under exec-action, exit status 125-127 says the child never ran
-   (its directory or log couldn't be opened, or env couldn't run ARGV): the
-   worker's failure, not the action's. *)
+   returned.  Under exec-action, EXECUTE exits 125 when the child never ran
+   (its directory, its log or its program wasn't there): the worker's
+   failure, not the action's. *)
 fun launch argv execute status_of =
   let
     val _ = child_completed := false
@@ -185,7 +185,7 @@ fun launch argv execute status_of =
     val not_started =
       active () andalso
       (case Posix.Process.fromStatus (status_of result) of
-           Posix.Process.W_EXITSTATUS code => code >= 0w125 andalso code <= 0w127
+           Posix.Process.W_EXITSTATUS code => code = 0w125
          | _ => false)
   in
     if not_started
