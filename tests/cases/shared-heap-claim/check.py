@@ -20,13 +20,17 @@ def action_key(key: str) -> str:
     return hashlib.sha256(f"holbuild-remote-ac-v1\n{key}\n".encode()).hexdigest()
 
 
+def heap_path(heap_key: str) -> Path:
+    return remote / "ac" / action_key(heap_key)
+
+
 def claim_path(heap_key: str) -> Path:
     claim = hashlib.sha256(f"holbuild-shared-heap-claim-v1\nheap={heap_key}\n".encode()).hexdigest()
     return remote / "ac" / action_key(claim)
 
 
 def published_heap(heap_key: str) -> str | None:
-    path = remote / "ac" / action_key(heap_key)
+    path = heap_path(heap_key)
     if not path.exists():
         return None
     manifest = path.read_text().split("manifest-text-v1\n", 1)[1]
@@ -44,6 +48,22 @@ def claim_gets(heap_key: str) -> int:
 
 def action_writes() -> int:
     return sum(line.startswith("PUT /ac/") for line in requests.read_text().splitlines())
+
+
+def stale_copy(path: Path, data: str, *, next_copy: bool = False) -> None:
+    prefix = "ac-stale-next-" if next_copy else "ac-stale-"
+    (control / f"{prefix}{path.name}").write_text(data)
+
+
+def claim_at(data: str, seconds: int) -> str:
+    header, manifest = data.split("manifest-text-v1\n", 1)
+    manifest = manifest.rsplit("time=", 1)[0] + f"time={seconds}\n"
+    return (
+        f"{header.splitlines()[0]}\n"
+        f"manifest-sha256 {hashlib.sha256(manifest.encode()).hexdigest()}\n"
+        f"manifest-size {len(manifest)}\n"
+        f"manifest-text-v1\n{manifest}"
+    )
 
 
 class Publisher:
@@ -88,13 +108,20 @@ def concurrent_publishers_upload_once() -> None:
     first = Publisher("first", "one")
     uploads = control / "cas-put-count"
     first.wait_until(lambda: uploads.exists() and uploads.read_text() == "1")
+    # The old settle slept and read back the claim before starting the transfer.
+    calls = requests.read_text().splitlines()
+    claim = claim_path("one")
+    put = calls.index(f"PUT /ac/{claim.name}")
+    upload = calls.index(f"PUT /cas/{first.heap()}")
+    assert put < upload and f"GET /ac/{claim.name}" not in calls[put:upload], calls
     # The first publisher is mid-upload: the second skips its own copy.
+    stale_copy(claim, claim_at(claim.read_text(), 0))
     second = Publisher("second", "one")
     try:
         log = second.finish()
     finally:
         (control / "cas-put-release").touch()
-    assert "another worker is publishing the shared deps-loaded heap" in log, log
+    assert "result=skipped-claimed" in log, log
     first.finish()
     assert uploads.read_text() == "1", "a second publisher uploaded the claimed heap"
     assert published_heap("one") == first.heap(), "the claimant's heap was not published"
@@ -104,11 +131,12 @@ def concurrent_publishers_upload_once() -> None:
         (control / name).unlink()
 
 
-def late_claim_write_also_uploads() -> None:
-    """The cache has no conditional write: a claim written after the
-    claimant's settle delay wins too, so its writer uploads as well."""
-    late_write = f"action-put-{action_writes() + 1}-before"
+def late_claim_write_supersedes_uploader() -> None:
+    sequence = action_writes() + 1
+    late_write = f"action-put-{sequence}-before"
+    late_ack = f"action-put-{sequence}-after"
     (control / f"{late_write}-enable").touch()
+    (control / f"{late_ack}-enable").touch()
     late = Publisher("late", "three")
     late.wait_until(lambda: (control / f"{late_write}-event").exists())
     # The late publisher read no claim and its claim write is held back.
@@ -116,12 +144,27 @@ def late_claim_write_also_uploads() -> None:
     uploads = control / "cas-put-count"
     early = Publisher("early", "three")
     early.wait_until(lambda: uploads.exists() and uploads.read_text() == "1")
-    (control / f"{late_write}-release").touch()
-    late.wait_until(lambda: uploads.read_text() == "2")
-    (control / "cas-put-release").touch()
-    early.finish()
+    claim = claim_path("three")
+    early_claim = claim.read_text()
+    try:
+        (control / f"{late_write}-release").touch()
+        late.wait_until(lambda: (control / f"{late_ack}-event").exists())
+        winning_claim = claim.read_text()
+        assert winning_claim != early_claim
+        # The first uploader's host still has its own claim cached.
+        stale_copy(claim, early_claim)
+        stale_copy(claim, early_claim, next_copy=True)
+        (control / "cas-put-release").touch()
+        log = early.finish()
+        assert "result=claim-lost" in log, log
+        assert claim.read_text() == winning_claim, "the loser released the winner's claim"
+        assert not heap_path("three").exists(), "the loser wrote the shared heap entry"
+        assert not (early.dir / "store" / early.heap() / early.heap()).exists(), "the loser retained its heap"
+    finally:
+        (control / "cas-put-release").touch()
+        (control / f"{late_ack}-release").touch()
     late.finish()
-    assert published_heap("three") in (early.heap(), late.heap())
+    assert published_heap("three") == late.heap()
     for name in ("cas-put-enable", "cas-put-release", "cas-put-count"):
         (control / name).unlink()
 
@@ -134,6 +177,11 @@ def failed_upload_releases_claim() -> None:
     assert claim_path("two").read_text().endswith("\ntime=0\n"), "the failed upload kept its claim"
     (control / "cas-put-status").unlink()
     before = heap_uploads()
+    # A host's stale entry must not stop the repair of a missing heap.
+    path = heap_path("two")
+    stale_heap = heap_path("one").read_text()
+    stale_copy(path, stale_heap)
+    stale_copy(path, stale_heap, next_copy=True)
     retry = Publisher("retry", "two")
     retry.finish()
     assert heap_uploads() == before + 1
@@ -157,29 +205,58 @@ def restore_waits_for_claimed_upload() -> None:
     # Claimed and mid-upload: a restore waits no longer than its deadline.
     started = time.monotonic()
     bounded.go()
-    assert bounded.result() == "none", "the wait outlived an upload that never ends"
+    assert bounded.result() == "wait-timeout", "the wait outlived an upload that never ends"
     assert time.monotonic() - started < 30, "the wait ignored its deadline"
     claim_reads = claim_gets("four")
+    # The restore sees the origin's initial miss and then waits for the new heap.
+    path = heap_path("four")
+    stale_heap = heap_path("one").read_text()
+    stale_copy(path, stale_heap)
+    stale_copy(path, stale_heap, next_copy=True)
     waiting.go()
     waiting.wait_until(lambda: claim_gets("four") >= claim_reads + 2)
     (control / "cas-put-release").touch()
     uploader.finish()
     assert waiting.result() == f"{uploader.heap()} waited", "the restore missed the uploaded heap"
-    # Nothing claims an unbuilt heap: a restore goes on at once.
-    started = time.monotonic()
-    unclaimed = Publisher("unclaimed", "five", restore_script, WAIT_SECONDS="60")
-    assert unclaimed.result() == "none"
-    assert time.monotonic() - started < 30, "the restore waited for an unclaimed heap"
+    assert "result=wait-hit" in waiting.log.read_text()
     for name in ("cas-put-enable", "cas-put-release", "cas-put-count"):
         (control / name).unlink()
+
+
+def restore_sees_foreign_release() -> None:
+    path = claim_path("five")
+    released = claim_path("four").read_text()
+    waiting = Publisher("released", "five", restore_script, WAIT_SECONDS="10", GATED="1")
+    waiting.wait_until(lambda: (waiting.dir / "ready").exists())
+    active = claim_at(released, int(time.time()))
+    path.write_text(active)
+    waiting.go()
+    waiting.wait_until(lambda: claim_gets("five") >= 2)
+    stale_copy(path, active)
+    replacement = directory / "released.claim"
+    replacement.write_text(released)
+    replacement.replace(path)
+    assert waiting.result() == "wait-miss", "the restore waited on a released claim"
+
+
+def claim_and_heap_reads_revalidate() -> None:
+    calls = requests.read_text().splitlines()
+    revalidated = (control / "no-cache-gets").read_text().splitlines()
+    for heap_key in ("one", "two", "three", "four", "five"):
+        for key in (heap_path(heap_key).name, claim_path(heap_key).name):
+            assert calls.count(f"GET /ac/{key}") == revalidated.count(key), (
+                f"{heap_key}: a heap or claim GET omitted Cache-Control: no-cache"
+            )
 
 
 if __name__ == "__main__":
     try:
         concurrent_publishers_upload_once()
-        late_claim_write_also_uploads()
+        late_claim_write_supersedes_uploader()
         failed_upload_releases_claim()
         restore_waits_for_claimed_upload()
+        restore_sees_foreign_release()
+        claim_and_heap_reads_revalidate()
     except BaseException:
         for log in sorted(directory.glob("*/poly.log")):
             print(f"== {log.parent.name}\n{log.read_text()}")

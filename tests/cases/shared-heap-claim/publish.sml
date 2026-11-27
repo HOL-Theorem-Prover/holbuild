@@ -34,11 +34,14 @@ val ctx : BE.shared_context =
    deps_key = "deps", deps_loaded = deps, requested_timeout = NONE, candidates = [], module_store = "", heap_only = false, modules = false, theory = "pkg:T"};
 val _ = HolbuildRemoteCacheConfig.set_url url;
 val _ = RC.fail_closed := true;
+(* A failed transfer is sufficient to exercise claim cleanup. *)
+val _ = RC.retry_one_node := false;
 val _ = BE.write_text (dir ^ "/heap.sha") (HolbuildHash.file_sha256 deps);
 (* As if the preload had saved it, with no theory modules: a heap no
    capture saw isn't published. *)
 val _ = BE.captured_deps_heap := SOME (HolbuildHash.file_sha256 deps);
 val _ = BE.ensure_dir (tree ^ "/modules");
 val _ = BE.captured_heap_modules := SOME {dir = tree ^ "/modules", modules = []};
-val _ = BE.publish_shared_checkpoints (RC.remote url) ctx
+val verdict = BE.publish_shared_checkpoints (RC.remote url) ctx
   {heap = NONE, files = [], stale = [], missing = [], poisoned = NONE, entry = NONE} NONE;
+val _ = BE.shared_heap_line "publish" (#theory ctx) (#heap_key ctx) verdict;
