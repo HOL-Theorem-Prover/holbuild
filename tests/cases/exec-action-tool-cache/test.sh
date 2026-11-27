@@ -301,6 +301,56 @@ require_grep "not restoring the tool cache: could not read its entry again" "$tm
   echo "worker v15 replaced an entry it could not read" >&2; cat "$tmpdir/v15.log" >&2; exit 1; }
 cp "$tmpdir/entry-v13" "$tmpdir/remote/ac/$tool_ac"
 
+# Two actions that restored the same entry and wrote different files keep
+# both: the later publish reads the entry again and keeps the earlier one's
+# file.  v17 restores the entry as it was before v16 published, as a cache in
+# front of the store serves it, so it ran alongside v16.
+held='val _ = List.app (fn name => print (name ^ " held: " ^ (let val input = TextIO.openIn (OS.Path.concat (tool_dir, name)) in TextIO.inputAll input before TextIO.closeIn input end handle IO.Io _ => "nothing") ^ "\n")) ["idx", "snap"];'
+write_t v16 'val _ = tool_put "idx" "index";'
+export_t v16 --tool-cache probe
+worker v16 "$spec_t"
+expect v16 0 v13
+require_grep "published tool cache (3 files)" "$tmpdir/v16.log"
+cp "$tmpdir/entry-v13" "$control/ac-stale-$tool_ac"
+write_t v17 'val _ = tool_put "snap" "snapshot";'
+export_t v17 --tool-cache probe
+worker v17 "$spec_t"
+expect v17 0 v13
+require_grep "restored tool cache (2 files)" "$tmpdir/v17.log"
+require_grep "published tool cache (4 files)" "$tmpdir/v17.log"
+write_t v18 "$held"
+export_t v18 --tool-cache probe
+worker v18 "$spec_t"
+expect v18 0 v13
+grep -qxF "idx held: index" "$tmpdir/v18.hol" && grep -qxF "snap held: snapshot" "$tmpdir/v18.hol" || {
+  echo "worker v18 did not find both writers' files" >&2; cat "$tmpdir/v18.hol" "$tmpdir/v18.log" >&2; exit 1; }
+
+# Two such publishes can merge into an entry over the size limit.  The next
+# publish shrinks it rather than refusing: the files an action kept as
+# restored are admitted in name order while they fit.  big1 and big2 are
+# sparse, 129 MiB each.
+big='fun big name = let val fd = Posix.FileSys.creat (OS.Path.concat (tool_dir, name), Posix.FileSys.S.irwxu) in Posix.IO.lseek (fd, Position.fromInt (129 * 1024 * 1024 - 4), Posix.IO.SEEK_SET); Posix.IO.writeVec (fd, Word8VectorSlice.full (Byte.stringToBytes name)); Posix.IO.close fd end;'
+cp "$tmpdir/remote/ac/$tool_ac" "$tmpdir/entry-v18"
+write_t v19 "$big"' val _ = big "big1";'
+export_t v19 --tool-cache probe
+worker v19 "$spec_t"
+expect v19 0 v13
+require_grep "published tool cache (5 files)" "$tmpdir/v19.log"
+cp "$tmpdir/entry-v18" "$control/ac-stale-$tool_ac"
+write_t v20 "$big"' val _ = big "big2";'
+export_t v20 --tool-cache probe
+worker v20 "$spec_t"
+expect v20 0 v13
+require_grep "published tool cache (6 files)" "$tmpdir/v20.log"
+write_t v21 'val _ = tool_put "seen" "v21";'
+export_t v21 --tool-cache probe
+worker v21 "$spec_t"
+expect v21 0 v13
+require_grep "restored tool cache (6 files)" "$tmpdir/v21.log"
+require_grep "published tool cache (5 files)" "$tmpdir/v21.log"
+grep -q ' file big1$' "$tmpdir/remote/ac/$tool_ac" && ! grep -q ' file big2$' "$tmpdir/remote/ac/$tool_ac" || {
+  echo "worker v21 did not drop big2 alone from the entry" >&2; cat "$tmpdir/remote/ac/$tool_ac" >&2; exit 1; }
+
 # The option leaves checkpoint reuse alone: a worker sharing heaps resumes a
 # --tool-cache build of U from the theorem context a build without it shared.
 write_u() {
