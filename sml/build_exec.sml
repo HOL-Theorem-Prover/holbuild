@@ -14070,7 +14070,9 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
     (* The theory's standalone failed prefix: the failed-prefix candidate at
        the path its manifest names. *)
     fun try_standalone () =
-      case restore_step "rstprobe" (fn () => HolbuildRemoteCache.fetch_action remote standalone_key) of
+      case restore_step "rstprobe" (fn () =>
+             HolbuildRemoteCache.revalidating (fn () =>
+               HolbuildRemoteCache.fetch_action remote standalone_key)) of
           NONE => NONE
         | SOME action =>
             counting_rejection "standalone failed_prefix" standalone_key (restore_entry standalone_key (fn () =>
@@ -14100,7 +14102,15 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               val window = map (fn c => (c, ref NONE)) (List.take (candidates, n))
               val _ = restore_step "rstprobe" (fn () =>
                         parallel_all n (fn (c, fetched) =>
-                                          fetched := HolbuildRemoteCache.fetch_action remote (candidate_key c))
+                                          let
+                                            val fetch = fn () =>
+                                              HolbuildRemoteCache.fetch_action remote (candidate_key c)
+                                          in
+                                            fetched :=
+                                              (if #kind c = "failed_prefix" then
+                                                 HolbuildRemoteCache.revalidating fetch
+                                               else fetch ())
+                                          end)
                                        window)
             in
               case first_some (try_candidate heap) (map (fn (c, fetched) => (c, !fetched)) window) of
@@ -17863,8 +17873,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               (probes_shared andalso not deps_heap_only andalso
                resumes_from_checkpoints (spec_policy spec) built_action andalso
                (* Only a restore that checks its key= line records its blobs. *)
-               Option.isSome (HolbuildRemoteCache.fetch_action remote
-                                (shared_standalone_key shared_key built_action)))
+               Option.isSome (HolbuildRemoteCache.revalidating (fn () =>
+                                HolbuildRemoteCache.fetch_action remote
+                                  (shared_standalone_key shared_key built_action))))
             (* The root's records still hold: the child wrote none of it,
                and the stems written here are the hydrate's scratch. *)
             fun restart () =
