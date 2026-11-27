@@ -397,7 +397,8 @@ fun require_substring needle text =
   else (TextIO.output(TextIO.stdErr, "missing substring: " ^ needle ^ "\\n");
         OS.Process.exit OS.Process.failure);
 val summary =
-  case HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference true "$synthetic_large_goal_log" of
+  case HolbuildTheoryDiagnostics.summarize_goal_state_with_log_reference true
+         (HolbuildBuildExec.read_text "$synthetic_large_goal_log") of
       SOME text => text
     | NONE => (TextIO.output(TextIO.stdErr, "missing large-goal summary\\n");
                OS.Process.exit OS.Process.failure);
@@ -418,7 +419,8 @@ printf 'holbuild end failed tactic top input goal\n' >> "$synthetic_large_goal_l
 cat > "$synthetic_large_goal_check" <<SML
 OS.FileSys.chDir "$repo_root";
 use "sml/holbuild-script.sml";
-val state = valOf (HolbuildTheoryDiagnostics.read_goal_state "$synthetic_large_goal_log");
+val log = HolbuildBuildExec.read_text "$synthetic_large_goal_log";
+val state = valOf (HolbuildTheoryDiagnostics.read_goal_state log);
 val _ = if size (#top_goal state) = 70001 andalso not (#marker_truncated state) then ()
         else raise Fail "large preview was cut by the log reader";
 val summary = HolbuildTheoryDiagnostics.goal_state_summary true state;
@@ -448,11 +450,12 @@ OS.FileSys.chDir "$repo_root";
 use "sml/holbuild-script.sml";
 val _ = if OS.FileSys.fileSize "$chatter_log" > 65536 + 4096 then ()
         else raise Fail "the chatter is too short to test anything";
-val state = valOf (HolbuildTheoryDiagnostics.read_goal_state "$chatter_log");
+val log = HolbuildBuildExec.read_text "$chatter_log";
+val state = valOf (HolbuildTheoryDiagnostics.read_goal_state log);
 val _ = if #top_goal state = "    late goal\n" andalso #remaining_goals state = SOME 2 andalso
            not (#marker_truncated state) then ()
         else raise Fail "goal state after the chatter";
-val _ = if HolbuildTheoryDiagnostics.plan_position_summary "$chatter_log" =
+val _ = if HolbuildTheoryDiagnostics.plan_position_summary log =
            SOME "plan position: 3 tactic simp []\n" then ()
         else raise Fail "plan position after the chatter";
 val _ = OS.Process.exit OS.Process.success;

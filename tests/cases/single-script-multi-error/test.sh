@@ -326,18 +326,27 @@ PYTHON
 
 # Plain builds use both child gates. A script that exits successfully
 # exercises the driver's separate gate, including the check-only path.
-for gate in export exit-success; do
+for gate in export exit-success unreadable-marker; do
   make_project "$gate"
   if [[ "$gate" == export ]]; then
-    echo 'val _ = export_theory ();' >> "$project/src/AScript.sml"
+    echo 'val _ = export_theory () handle _ => print "AFTER_GATE\n";' >> "$project/src/AScript.sml"
     flags=()
   else
+    if [[ "$gate" == unreadable-marker ]]; then
+      cat >> "$project/src/AScript.sml" <<'SML'
+val _ = Posix.FileSys.chmod ("holbuild-diagnostic-admit.txt", Posix.FileSys.S.flags []);
+val _ = print "MARKER_UNREADABLE\n";
+SML
+    fi
     echo 'val _ = OS.Process.exit OS.Process.success;' >> "$project/src/AScript.sml"
     flags=(--check-only)
   fi
   echo 'val _ = print "AFTER_GATE\n";' >> "$project/src/AScript.sml"
   run_failure "$tmpdir/$gate.log" build "${flags[@]}" ATheory
   require_grep 'first proof error' "$tmpdir/$gate.log"
+  if [[ "$gate" == unreadable-marker ]]; then
+    require_grep '^MARKER_UNREADABLE$' "$(child_log)"
+  fi
   reject_artifacts
   if grep -q 'AFTER_GATE\|holscriptend=' "$(child_log)"; then
     cat "$(child_log)" >&2

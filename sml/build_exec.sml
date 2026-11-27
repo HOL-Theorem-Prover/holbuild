@@ -5346,11 +5346,11 @@ fun run_theory_action check_cancelled speculative_log cache_allowed policy tc ro
          (fn () =>
              ((if captures then with_deps_heap_capture (module_store tc) deps_loaded run_child else run_child ());
               remove_promote_scratch ();
-              if file_exists taint_marker then raise Error "hol run failed while building theory script" else ())
+              if path_exists taint_marker then raise Error "hol run failed while building theory script" else ())
              handle e => (remove_promote_scratch (); raise e)))
       handle Error msg =>
         (check_cancelled ();
-        if file_exists taint_marker then
+        if path_exists taint_marker then
           let val failure = checkpoint_failure_error msg
           in
             if HolbuildActionSandbox.active () then () else cleanup_json_stage stage_root;
@@ -12769,7 +12769,7 @@ fun classify_run_failure stage log_text oom_before msg =
            | (false, true) => SOME "poly-out-of-store"
            | (false, false) => NONE)
     val failure =
-      if file_exists (Path.concat (stage, diagnostic_admit_marker)) then ProofFailure
+      if path_exists (Path.concat (stage, diagnostic_admit_marker)) then ProofFailure
       else if Option.isSome oom_kills orelse out_of_store then MemoryFailure
       else if (if child_failed then child_reports_no_space log_text orelse disk_full stage
                else String.isSubstring no_space msg) then DiskFailure
