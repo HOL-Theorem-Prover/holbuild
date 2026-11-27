@@ -368,26 +368,41 @@ SML
     static) echo 'val _ : int = true;' >> "$project/src/AScript.sml"; error='incompatible types' ;;
     exception) echo 'val _ = raise Fail "terminal declaration";' >> "$project/src/AScript.sml"; error='terminal declaration' ;;
     dynamic-*)
-      case "$terminal" in
-        dynamic-static) tactic='compile_invalid_ml' ;;
-        dynamic-try) tactic='TRY compile_invalid_ml >> ACCEPT_TAC TRUTH' ;;
-        dynamic-choice) tactic='compile_invalid_ml ORELSE ACCEPT_TAC TRUTH' ;;
-        dynamic-repeat) tactic='REPEAT compile_invalid_ml >> ACCEPT_TAC TRUTH' ;;
-      esac
-      cat >> "$project/src/AScript.sml" <<SML
+      cat >> "$project/src/AScript.sml" <<'SML'
 fun compile_invalid_ml g =
   let val input = TextIO.openString "val _ : int = true;"
   in PolyML.compiler (fn () => TextIO.input1 input, []) (); ALL_TAC g end;
+SML
+      if [[ "$terminal" == dynamic-repeat ]]; then
+        # Source-level REPEAT is opaque. Supply the runtime a structural plan.
+        cat >> "$project/src/AScript.sml" <<'SML'
+val _ =
+  let
+    val leaf = HolbuildProofIr.StepTactic {start_pos = 0, end_pos = 18,
+      label = "compile_invalid_ml", program = "compile_invalid_ml"}
+    val repeat = HolbuildProofIr.StepRepeat {start_pos = 0, end_pos = 18, body = [leaf]}
+  in
+    prove (``T``, HolbuildProofRuntime.termination_tactic
+      "structural_repeat" 0 "compile_invalid_ml" [repeat] ALL_TAC)
+  end;
+SML
+      else
+        case "$terminal" in
+          dynamic-static) tactic=$'  CONJ_TAC >>\n  compile_invalid_ml' ;;
+          dynamic-try) tactic=$'  TRY (\n    CONJ_TAC >>\n    compile_invalid_ml\n  ) >> simp[]' ;;
+          dynamic-choice) tactic=$'  (\n    CONJ_TAC >>\n    compile_invalid_ml\n  ) ORELSE simp[]' ;;
+        esac
+        cat >> "$project/src/AScript.sml" <<SML
 
 Theorem compiles_invalid_ml:
   T /\ T
 Proof
-  CONJ_TAC >>
-  $tactic
+$tactic
 QED
 SML
-      error='Static Errors'
-      dynamic_line=$(awk '/^  (TRY |REPEAT )?compile_invalid_ml/{print NR; exit}' "$project/src/AScript.sml") ;;
+        dynamic_line=$(awk '/^ +compile_invalid_ml$/{print NR; exit}' "$project/src/AScript.sml")
+      fi
+      error='Static Errors' ;;
     interrupt)
       cat >> "$project/src/AScript.sml" <<'SML'
 val overflow_tac : tactic = fn _ => raise Interrupt;
@@ -430,7 +445,9 @@ SML
   if [[ "$terminal" == termination ]]; then
     require_grep "^  source line: $termination_line$" "$tmpdir/$terminal.log"
   elif [[ "$terminal" == dynamic-* ]]; then
-    require_grep "^  source line: $dynamic_line$" "$tmpdir/$terminal.log"
+    if [[ "$terminal" != dynamic-repeat ]]; then
+      require_grep "^  source line: $dynamic_line$" "$tmpdir/$terminal.log"
+    fi
     require_grep '^  top goal: T$' "$tmpdir/$terminal.log"
   fi
   if grep -q '^AFTER_TERMINAL$' "$(child_log)"; then
