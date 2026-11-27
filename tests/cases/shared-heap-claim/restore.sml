@@ -31,8 +31,7 @@ val _ =
         (* The wait alone, with a deadline the test can afford. *)
         write (case BE.await_shared_heap remote heap_key
                       (Time.+ (Time.now (), Time.fromSeconds (valOf (LargeInt.fromString seconds)))) of
-                   (SOME _, _) => "heap"
-                 | (NONE, _) => "none")
+                   (_, verdict) => verdict)
     | NONE =>
         let
           val tree = dir ^ "/checkpoints"
