@@ -805,20 +805,38 @@ root on `loadPath`, so they start from an empty root, leave no records, and the 
 after them. The
 cache cap doesn't count the root: it holds one spec's dependencies.
 
-A check-only action's hydrate is light: the stale check, the kept items and
-the removal of the rest run as above, but the dependencies not kept aren't
-installed. Their records, as an install would write them, come from their
-cache manifests (the remote's read without copying its blobs) and `.sml` blobs (the `.dat` hash from the hash the
-`.sml` carries; a theory whose `.sml` carries none makes the hydrate install
-them all), and the early cutoff, the parent checks and the preload skip read
-them, so the context key is the one the installed files would give. The
-dependencies' parent-fit check is skipped: a heap keyed by that context loaded
-them, past HOL's own parent check. HOL reads no dependency file once it
-resumes from one, since the preload that saved it loaded every dependency the
-script loads. When the run would start from a fresh preload instead, the worker
-installs them all first and checks the context key against the files
-(`internal` if it changed); so it does before passing the action on its cached
-entry or an early-cutoff pair, which no heap vouches for.
+A hydrate is light for a `--check-only` action and for a checkpoint target
+the build named, unless its package sets `[build] install_dependencies_first`
+or the client marks it so (`option install-dependencies-first=true`, for a
+target the build didn't name). A light hydrate prunes the root as above, keeps
+the action's own files and the kept items whose stat matches, but installs no
+other dependency and makes no stale check. Their records, as an install would
+write them, come from their cache manifests (the remote's read without copying
+its blobs) and `.sml` blobs (the `.dat` hash from the hash the `.sml` carries;
+a theory whose `.sml` carries none makes the hydrate install them all), and the
+early cutoff, the parent checks and the preload skip read them, so the context
+key is the one the installed files would give. The dependencies' parent-fit
+check is skipped: a heap keyed by that context loaded them, past HOL's own
+parent check. HOL reads no dependency file once it resumes from one, unless the
+script loads one the preload that saved it didn't.
+
+The full install, with its stale check, runs later, and checks the context key
+against the files (`internal` if it changed):
+
+- before a fresh preload;
+- before passing the action on its cached entry or an early-cutoff pair, which
+  no heap vouches for;
+- for a named target, after HOL passes and before its outputs are installed or
+  published, so they are those a full install gives;
+- before a restore weighs declining a short deps heap whose decline is still
+  possible (the store holds a module and no action on the host declined that
+  heap), since naming the cone's modules reads the dependencies' files.
+
+A failing check installs nothing else. When the log of a light run says HOL
+found no file to load (`Cannot find file`, `use: non-existent file`), passing or
+failing, the worker throws the run away, installs every dependency and builds
+the theory once more (`lightrerun`), whose verdict and diagnostics are
+reported.
 
 ## Global cache
 

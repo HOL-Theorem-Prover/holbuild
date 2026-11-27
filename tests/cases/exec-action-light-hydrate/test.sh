@@ -246,6 +246,25 @@ diff "$tmpdir/load-fail.report" <(report load-fail-full) ||
 ! grep -q "Cannot find file" "$tmpdir/load-fail.report" ||
   { echo "the rerun reported the light run's missing file" >&2; exit 1; }
 
+# A script that catches the failed load and passes, exporting what it found,
+# is caught by its log: the worker builds T again on every dependency, and
+# publishes what a full install gives.
+write_toml
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" "$(printf '\n%s\n%s\n' \
+  'val c_loaded = (load ("../../../obj/src/C" ^ "Theory"); true) handle _ => false;' \
+  'val _ = save_thm (if c_loaded then "c_loaded" else "c_missing", TRUTH);')"
+worker load-catch
+expect_worker load-catch 0 "status=built"
+reran load-catch
+outputs load-catch
+forget_t
+write_toml "install_dependencies_first = true"
+worker load-catch-full
+expect_worker load-catch-full 0 "status=built"
+outputs load-catch-full
+cmp "$tmpdir/load-catch.entry" "$tmpdir/load-catch-full.entry" ||
+  { echo "the rerun and the full install published different entries" >&2; exit 1; }
+
 # A script that looks for C's file itself, which finds none on a light
 # install and says nothing HOL would, passes when its project asks for the
 # dependencies first.
@@ -267,7 +286,8 @@ hydrated unnamed full 2
 # built again: a failing check resumes from the checkpoint the copy's records
 # give, and reports its verdict; a passing one finds the install differs from
 # those records, an internal failure, which the retry, on the remote's copy,
-# passes.
+# passes.  So does a failing one on a host that may decline the checkpoint's
+# short deps heap, which installs the dependencies first to weigh it.
 write_t "ALL_TAC >> ALL_TAC >> ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH"
 worker kept-pass
 expect_worker kept-pass 0 "status=built"
@@ -279,11 +299,28 @@ require_file "$a_entry"
 rm -r "$a_entry" "$tmpdir/cache/actions/$a_key"
 (cd "$project" && "$HOLBUILD_BIN" --remote-cache "$url" build --force-theory ATheory) \
   > "$tmpdir/republish.log" 2>&1 || { cat "$tmpdir/republish.log" >&2; exit 1; }
+# Each check below starts from this host, with its stale copy of A.
+cp -a "$worker_cache" "$tmpdir/worker.kept"
+restore_kept() { rm -rf "$worker_cache"; cp -a "$tmpdir/worker.kept" "$worker_cache"; }
+# A host whose module store holds none can decline no heap.
+rm -rf "$worker_cache/theory-modules"
 write_t 'ALL_TAC >> FAIL_TAC "kept failure"'
 worker kept-fail keep
 expect_worker kept-fail 1 "status=failed" "failure=proof"
 require_grep "kept failure" "$tmpdir/kept-fail.log"
 hydrated kept-fail 0 0
+if [[ ${HOLBUILD_TEST_REQUIRE_THEORY_MODULES:-0} == 1 ]]; then
+  # The earlier checks stored modules, and the heap the first one published
+  # loads none.
+  restore_kept
+  find "$worker_cache/theory-modules" -mindepth 2 -maxdepth 2 -type f -name '[0-9a-fA-F]*-*' | grep -q . ||
+    { echo "the host stored no theory module" >&2; exit 1; }
+  run_spec kept-short keep
+  expect_worker kept-short 3 "status=failed" "failure=internal"
+  cat "$tmpdir/kept-short.result" "$tmpdir/kept-short.log" > "$tmpdir/kept-short.both"
+  require_grep "the dependencies installed differ from the records the build started from" "$tmpdir/kept-short.both"
+fi
+restore_kept
 write_t "ALL_TAC >> ALL_TAC >> ALL_TAC >> ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH"
 worker kept-stale keep
 expect_worker kept-stale 3 "status=failed" "failure=internal"
