@@ -340,6 +340,7 @@ exec_theory B fetch
 remote_url=$primary_url
 rm "$miss_control/cas-get-status-$module_sha"
 phase fetch-B 'rstmodn:1'
+phase fetch-B 'rstmodhashn:[1-9][0-9]*'
 require_grep 'restored shared' "$tmpdir/fetch-B.log"
 resumed fetch-B
 [[ -f "$modules" ]] || { echo "A's module wasn't fetched to $modules" >&2; exit 1; }
