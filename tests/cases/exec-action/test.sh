@@ -924,7 +924,7 @@ expected = collections.Counter()
 for line in lines:
     for item in line[len(prefix):].split():
         name, value = item.split('=')
-        if name not in ('holloadend', 'holscriptstart', 'holscriptend', 'holexportend'):
+        if name not in ('holloadend', 'holscriptstart', 'holscriptend', 'holexportend', 'holpartend', 'holexitmark'):
             expected[name] += int(value)
 assert expected['holcompiledn'] > 0, lines
 timings = parse_result(pathlib.Path(sys.argv[2]).read_text()).timings
