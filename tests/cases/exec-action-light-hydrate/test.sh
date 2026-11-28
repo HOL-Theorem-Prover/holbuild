@@ -27,6 +27,32 @@ cleanup() {
 trap cleanup EXIT
 use_case_cache "$tmpdir/cache"
 
+# The worker reads a child's log a chunk at a time, keeping each chunk's
+# tail: a missing file mid-line at the tail's first byte starts no line.
+cat > "$tmpdir/scan.sml" <<'SML'
+val _ = OS.FileSys.chDir (valOf (OS.Process.getEnv "HOLBUILD_ROOT"));
+use "sml/holbuild-script.sml";
+val log = valOf (OS.Process.getEnv "SCAN_LOG");
+fun check (before_message, expected) =
+  let
+    val out = TextIO.openOut log
+    val message = "Cannot find file CTheory.ui\n"
+  in
+    TextIO.output (out, CharVector.tabulate (1048576 - 4096 - 1, fn _ => #"x"));
+    TextIO.output (out, before_message ^ message ^ CharVector.tabulate (8192, fn _ => #"y"));
+    TextIO.closeOut out;
+    if HolbuildBuildExec.log_names_missing_file (fn name => name = "CTheory.ui") log = expected then ()
+    else (TextIO.output (TextIO.stdErr, "wrong answer after " ^ String.toString before_message ^ "\n");
+          OS.Process.exit OS.Process.failure)
+  end;
+val _ = List.app check [("x", false), ("\n", true)];
+val _ = OS.Process.exit OS.Process.success;
+SML
+SCAN_LOG=$tmpdir/scan.log "${HOLBUILD_POLY:-poly}" --script "$tmpdir/scan.sml" > "$tmpdir/scan.out" 2>&1 || {
+  cat "$tmpdir/scan.out" >&2
+  exit 1
+}
+
 project=$tmpdir/project
 mkdir -p "$project/src"
 # write_toml [EXTRA]: the manifest, with EXTRA in its [build] table.
@@ -273,6 +299,21 @@ expect_worker load-catch-full 0 "status=built"
 outputs load-catch-full
 cmp "$tmpdir/load-catch.entry" "$tmpdir/load-catch-full.entry" ||
   { echo "the rerun and the full install published different entries" >&2; exit 1; }
+
+# So does a quiet load, for which HOL writes nothing: uncaught, and caught.
+write_toml
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" "$(printf '\n%s\n\nTheorem t3:\n  T\nProof\n  %s\nQED\n' \
+  'val _ = qload ("../../../obj/src/C" ^ "Theory");' 'ACCEPT_TAC (DB.fetch "C" "c")')"
+worker qload-pass
+expect_worker qload-pass 0 "status=built"
+reran qload-pass
+write_t "ALL_TAC >> ALL_TAC >> ACCEPT_TAC TRUTH" "$(printf '\n%s\n%s\n' \
+  'val c_loaded = (qload ("../../../obj/src/C" ^ "Theory"); true) handle _ => false;' \
+  'val _ = save_thm (if c_loaded then "c_loaded" else "c_missing", TRUTH);')"
+worker qload-catch
+expect_worker qload-catch 0 "status=built"
+reran qload-catch
+write_toml "install_dependencies_first = true"
 
 # A script that looks for C's file itself, which finds none on a light
 # install and says nothing HOL would, passes when its project asks for the
