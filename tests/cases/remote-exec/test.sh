@@ -3382,3 +3382,77 @@ holbuild: remote rxcheck:BTheory: ready
 holbuild: remote rxcheck:BTheory: held by batch holder since 2026-01-01T00:00:00+00:00
 holbuild: remote rxcheck:BTheory: held by batch holder since 2026-01-01T01:00:00+00:00
 LINES
+
+# A batch is submitted and followed through libcurl, with the curl config's
+# headers, when libcurl is loaded, and through the curl command when it
+# isn't or the config holds more than headers (libcurl names no user agent,
+# the curl command curl/...).  Both retry a submission answered 502, ride out
+# a coordinator restart (a dropped stream, then 503s), and reattach a cut
+# stream, saying the same.
+project=$tmpdir/transport
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxt"
+[build]
+members = ["src"]
+TOML
+printf 'header = "Authorization: Bearer stub-token"\n' > "$tmpdir/transport.curl"
+printf 'header = "Authorization: Bearer stub-token"\nconnect-timeout = 10\n' > "$tmpdir/transport-more.curl"
+# through AGENT LOG: the last run's submissions and event streams all went
+# through AGENT (libcurl or curl) with the stub's token.
+through() {
+  local agent=$1 log=$2 batch
+  batch=$(sed -n 's/^holbuild: remote batch \(b[0-9]*\)$/\1/p' "$tmpdir/$log.log")
+  grep -E "^(POST /v1/batches |GET /v1/batches/$batch/events )" "$state/agents.log" > "$tmpdir/$log.agents"
+  [[ -s "$tmpdir/$log.agents" ]] || { cat "$state/agents.log" >&2; exit 1; }
+  if [[ $agent == libcurl ]]; then
+    refute_grep " curl/" "$tmpdir/$log.agents"
+  else
+    [[ $(grep -vc " curl/" "$tmpdir/$log.agents") -eq 0 ]] || { cat "$tmpdir/$log.agents" >&2; exit 1; }
+  fi
+  [[ $(grep -Ec "^(POST /v1/batches |GET /v1/batches/$batch/events )" "$state/requests.log") -eq \
+     $(grep -Ec "^(POST /v1/batches |GET /v1/batches/$batch/events )Bearer stub-token$" "$state/requests.log") ]] ||
+    { cat "$state/requests.log" >&2; exit 1; }
+}
+# A run of the whole case forced to the curl command checks only that.
+forced=${HOLBUILD_TEST_LIBCURL:-}
+agents=(libcurl curl)
+[[ -z $forced ]] || agents=(curl)
+for agent in "${agents[@]}"; do
+  [[ $agent == libcurl ]] || export HOLBUILD_TEST_LIBCURL=${forced:-libholbuild-test-no-such-curl.so}
+  : > "$state/agents.log"
+  : > "$state/requests.log"
+  rm -f "$state/submitted-ids"
+  write_theories "restart-$agent"
+  echo 2 > "$state/unavailable"
+  echo 2 > "$state/restarting"
+  touch "$state/drop"
+  HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/transport.curl \
+    run "restart-$agent" 0 build --remote-exec "$coordinator" --remote-only BTheory
+  through "$agent" "restart-$agent"
+  [[ $(grep -c "coordinator refused the batch (HTTP 502): .*restarting.*; retrying" "$tmpdir/restart-$agent.log") -eq 2 ]] ||
+    { cat "$tmpdir/restart-$agent.log" >&2; exit 1; }
+  [[ $(wc -l < "$state/submitted-ids") -eq 3 && $(sort -u "$state/submitted-ids" | wc -l) -eq 1 ]] ||
+    { cat "$state/submitted-ids" >&2; exit 1; }
+  [[ $(grep -c "answered HTTP 503 to the event stream for batch b[0-9]*: .*restarting.*; reattaching" "$tmpdir/restart-$agent.log") -eq 2 ]] ||
+    { cat "$tmpdir/restart-$agent.log" >&2; exit 1; }
+  require_grep "lost the event stream for batch b[0-9]*; reattaching" "$tmpdir/restart-$agent.log"
+  require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/restart-$agent.log"
+  rm "$state/unavailable" "$state/restarting"
+  : > "$state/agents.log"
+  write_theories "cut-$agent"
+  touch "$state/cut"
+  HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/transport.curl \
+    run "cut-$agent" 0 build --remote-exec "$coordinator" --remote-only BTheory
+  through "$agent" "cut-$agent"
+  require_grep 'lost the event stream for batch b[0-9]*: {"type": "action", "input_key"curl: (18) .*; reattaching' "$tmpdir/cut-$agent.log"
+  require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/cut-$agent.log"
+done
+[[ -n $forced ]] || unset HOLBUILD_TEST_LIBCURL
+: > "$state/agents.log"
+write_theories more-config
+HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/transport-more.curl \
+  run more-config 0 build --remote-exec "$coordinator" --remote-only BTheory
+through curl more-config

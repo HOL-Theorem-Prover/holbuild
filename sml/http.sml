@@ -50,7 +50,7 @@ in
   val setopt_ptr = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cPointer, cInt))
   val setopt_str = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cString, cInt))
   val setopt_fn = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cFunction, cInt))
-  val setopt_header_fn = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cFunction, cInt))
+  val setopt_data_fn = variadic (buildCall9 (curl "curl_easy_setopt", variadic_conv cFunction, cInt))
   val getinfo_ptr = variadic (buildCall9 (curl "curl_easy_getinfo", variadic_conv cPointer, cInt))
   val slist_append = buildCall2 (curl "curl_slist_append", (cPointer, cString), cPointer)
   val slist_free_all = buildCall1 (curl "curl_slist_free_all", cPointer, cVoid)
@@ -141,6 +141,9 @@ val CURLOPT_INFILESIZE_LARGE = 30115
 val CURLOPT_SOCKOPTFUNCTION = 20148
 val CURLOPT_HEADERFUNCTION = 20079
 val CURLOPT_HEADERDATA = 10029
+val CURLOPT_WRITEFUNCTION = 20011
+val CURLOPT_POSTFIELDSIZE_LARGE = 30120
+val CURLOPT_COPYPOSTFIELDS = 10165
 val CURLINFO_RESPONSE_CODE = 0x200002
 val CURLMOPT_MAXCONNECTS = 6
 val CURLE_PEER_FAILED_VERIFICATION = 60
@@ -587,7 +590,7 @@ fun get_zstd {url, dst, timeout} =
         (check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1));
          check "ACCEPT_ENCODING" (setopt_ptr (easy, CURLOPT_ACCEPT_ENCODING, Foreign.Memory.null));
          check "HTTPHEADER" (setopt_ptr (easy, CURLOPT_HTTPHEADER, header_list));
-         check "HEADERFUNCTION" (setopt_header_fn (easy, CURLOPT_HEADERFUNCTION, header_encoding));
+         check "HEADERFUNCTION" (setopt_data_fn (easy, CURLOPT_HEADERFUNCTION, header_encoding));
          check "HEADERDATA" (setopt_ptr (easy, CURLOPT_HEADERDATA, encoding)))
       val _ = Foreign.Memory.set8 (encoding, 0w0, 0w0)
       (* The handle is closed before this frees the list. *)
@@ -647,5 +650,121 @@ fun put {url, src, headers, timeout} =
         before slist_free_all header_list
         handle e => (slist_free_all header_list; raise e)
       end))}
+
+(* Streamed responses: each streaming request's key, the address its write
+   callback is given, with the body that came and its caller hasn't taken,
+   newest first, and whether its caller gave up on it.  Under pool_mutex. *)
+val streams : (Foreign.Memory.voidStar * (string list ref * bool ref)) list ref = ref []
+
+(* Hands a streaming request the bytes libcurl received, on the pump thread;
+   0, which fails the transfer, once its caller gave up on it. *)
+val write_stream =
+  Foreign.buildCallback4 ((Foreign.cPointer, Foreign.cSize, Foreign.cSize, Foreign.cPointer), Foreign.cSize)
+    (fn (data, item_size, items, key) =>
+      let
+        val n = item_size * items
+        val text = CharVector.tabulate (n, fn i => Byte.byteToChar (Foreign.Memory.get8 (data, Word.fromInt i)))
+      in
+        with_pool_lock (fn () =>
+          case List.find (fn (k, _) => k = key) (!streams) of
+              SOME (_, (pending, ref false)) => (pending := text :: !pending; ConditionVar.broadcast pool_changed; n)
+            | _ => 0)
+      end
+      handle _ => 0)
+
+(* Runs easy's transfer on the shared multi handle, passing the body it
+   receives to on_data on this thread as it comes, and returns once the
+   transfer has finished.  When on_data raises, the transfer is failed and
+   waited for before the exception goes on, since the pump still uses the
+   handle until then. *)
+fun run_streaming easy key pending on_data =
+  uninterruptible (fn () =>
+    let
+      fun next () =
+        with_pool_lock (fn () =>
+          let
+            fun look () =
+              case !pending of
+                  [] =>
+                    (case List.partition (fn (e, _) => e = easy) (!finished) of
+                         ([(_, outcome)], others) => (finished := others; ([], SOME outcome))
+                       | _ => (ConditionVar.wait (pool_changed, pool_mutex); look ()))
+                | chunks => (pending := []; (rev chunks, NONE))
+          in
+            look ()
+          end)
+      fun loop deliver =
+        case next () of
+            (_, SOME outcome) => outcome
+          | (chunks, NONE) => (deliver chunks; loop deliver)
+      fun give_up () =
+        with_pool_lock (fn () =>
+          List.app (fn (k, (_, aborted)) => if k = key then aborted := true else ()) (!streams))
+    in
+      with_pool_lock (fn () =>
+        (mcheck "curl_multi_wakeup" (multi_wakeup (current_multi ()));
+         queued := easy :: !queued;
+         ConditionVar.signal pump_wake));
+      loop (List.app on_data)
+      handle e => (give_up (); ignore (loop ignore); raise e)
+    end)
+
+(* Sends one request as the curl command does by default, the way the
+   remote-exec client used to through it: no redirects followed, no
+   Accept-Encoding, and none of the remote cache's credentials, only the
+   given headers.  BODY, when given, is POSTed.  The response body goes to
+   on_data on this thread as it arrives, so a stream such as an event feed is
+   read while it lasts.  A transport error is described as the curl command
+   prints it, `curl: (CODE) detail`.  max_time bounds the whole request,
+   when given; connect_timeout its connection.  Shares the multi handle's
+   connections with every other request. *)
+fun stream_once {url, headers, body, connect_timeout, max_time, on_data} =
+  (HolbuildOffline.require_online "send an HTTP request";
+   enter ();
+   (let
+      val handle_ as {easy, errors, no_ca_directory} = new_handle ()
+      val key = Foreign.Memory.malloc 0w1
+      val pending = ref []
+      val header_list = List.foldl (fn (h, l) => slist_append (l, h)) Foreign.Memory.null headers
+      fun release () =
+        (with_pool_lock (fn () => streams := List.filter (fn (k, _) => k <> key) (!streams));
+         close handle_; slist_free_all header_list; Foreign.Memory.free key)
+      fun result outcome =
+        case outcome of
+            Raised e => raise e
+          | Code code =>
+              if code = CURLE_PEER_FAILED_VERIFICATION andalso no_ca_directory then raise CaDirectoryNeeded
+              else if code <> 0 then
+                Failed ("curl: (" ^ Int.toString code ^ ") " ^
+                        (case c_string_at errors of "" => easy_strerror code | detail => detail))
+              else
+                Foreign.Memory.alloca (0w8, fn status =>
+                  (check "RESPONSE_CODE" (getinfo_ptr (easy, CURLINFO_RESPONSE_CODE, status));
+                   Response (SysWord.toInt (Foreign.Memory.get64 (status, 0w0)))))
+    in
+      (check "CONNECTTIMEOUT" (setopt_long (easy, CURLOPT_CONNECTTIMEOUT, connect_timeout));
+       check "TIMEOUT_MS" (setopt_long (easy, CURLOPT_TIMEOUT_MS, 1000 * Option.getOpt (max_time, 0)));
+       check "FOLLOWLOCATION" (setopt_long (easy, CURLOPT_FOLLOWLOCATION, 0));
+       check "ACCEPT_ENCODING" (setopt_ptr (easy, CURLOPT_ACCEPT_ENCODING, Foreign.Memory.null));
+       check "USERPWD" (setopt_ptr (easy, CURLOPT_USERPWD, Foreign.Memory.null));
+       check "URL" (setopt_str (easy, CURLOPT_URL, url));
+       check "HTTPHEADER" (setopt_ptr (easy, CURLOPT_HTTPHEADER, header_list));
+       check "WRITEFUNCTION" (setopt_data_fn (easy, CURLOPT_WRITEFUNCTION, write_stream));
+       check "WRITEDATA" (setopt_ptr (easy, CURLOPT_WRITEDATA, key));
+       case body of
+           NONE => check "HTTPGET" (setopt_long (easy, CURLOPT_HTTPGET, 1))
+         | SOME text =>
+             (check "POSTFIELDSIZE_LARGE" (setopt_long (easy, CURLOPT_POSTFIELDSIZE_LARGE, size text));
+              check "COPYPOSTFIELDS" (setopt_str (easy, CURLOPT_COPYPOSTFIELDS, text)));
+       with_pool_lock (fn () => streams := (key, (pending, ref false)) :: !streams);
+       result (run_streaming easy key pending on_data) before release ())
+      handle e => (release (); raise e)
+    end
+    before leave ())
+   handle e => (leave (); raise e))
+
+fun stream args =
+  stream_once args
+  handle CaDirectoryNeeded => (clear_ca_directory := false; stream_once args)
 
 end

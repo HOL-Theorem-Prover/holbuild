@@ -13,7 +13,8 @@ reported from its result (failed `internal` without one) and the batch ends
 done all the same, as the coordinator ends a run batch whose actions failed;
 its query is in the request log.  Control files in STATE change the answers: `refuse` makes POST answer
 400, `unavailable`, holding a count, makes that many POSTs answer 502 (or the
-status `unavailable-status` holds), `drop`
+status `unavailable-status` holds), `restarting`, holding a count, makes that
+many event streams answer 503, `drop`
 ends the next event stream before the final event (and is removed), `cut`
 ends it midway through its first action event (and is removed), `replay`,
 holding a count, makes that many event streams send the first action's running
@@ -42,8 +43,8 @@ fails having written what it found missing to `missing` (which is removed), as
 comma-separated, the batch fails for resubmission naming them, as the coordinator does, and its
 final events are recorded as STATE/<id>.events for a later read.  Otherwise
 the cancel answers that it cancelled the batch.  Every request is logged to
-STATE/requests.log, and each POST /v1/batches's Holbuild-Batch-Id header to
-STATE/submitted-ids.
+STATE/requests.log, with its User-Agent to STATE/agents.log, and each POST
+/v1/batches's Holbuild-Batch-Id header to STATE/submitted-ids.
 """
 
 import hashlib
@@ -66,6 +67,8 @@ class Handler(BaseHTTPRequestHandler):
     def log_request_line(self):
         with open(state / "requests.log", "a") as log:
             log.write(f"{self.command} {self.path} {self.headers.get('Authorization', '-')}\n")
+        with open(state / "agents.log", "a") as log:
+            log.write(f"{self.command} {self.path} {self.headers.get('User-Agent', '-')}\n")
 
     def answer(self, code, body, separators=(",", ":")):
         data = json.dumps(body, separators=separators).encode()
@@ -122,6 +125,10 @@ class Handler(BaseHTTPRequestHandler):
         if batch is None or not batch.exists():
             return self.answer(404, {"detail": "no such batch"})
         if (state / "down").exists() or (state / "ended").exists():
+            return self.answer(503, {"detail": "restarting"})
+        restarting = state / "restarting"
+        if restarting.exists() and int(restarting.read_text()) > 0:
+            restarting.write_text(str(int(restarting.read_text()) - 1))
             return self.answer(503, {"detail": "restarting"})
         recorded = state / f"{parts[3]}.events"
         if recorded.exists():
