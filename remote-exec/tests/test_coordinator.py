@@ -999,6 +999,14 @@ async def test_a_claim_whose_worker_left_as_the_endpoint_answered_gives_its_acti
     monkeypatch.setattr(coordinator, "release_unheld", leaving)
     monkeypatch.setattr(Request, "is_disconnected", gone)
     batch_id = await submit(http, ["a"])
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(
+            sa.text(
+                "UPDATE actions SET interruptions = 2, last_failure = 'memory', failure_detail = 'earlier' "
+                "WHERE batch_id = :batch_id"
+            ),
+            {"batch_id": batch_id},
+        )
     response = await http.post("/v1/work/claim", json={"tier": "standard", "worker": "w9"}, headers=WORKER)
     assert response.status_code == 204 and left
     await coordinator.released()
@@ -1006,7 +1014,7 @@ async def test_a_claim_whose_worker_left_as_the_endpoint_answered_gives_its_acti
     assert (
         action["state"], action["attempts"], action["interruptions"], action["last_failure"], action["failure_detail"]
     ) == (
-        "ready", 0, 0, None, None
+        "ready", 0, 2, "memory", "earlier"
     )
 
 
@@ -2463,7 +2471,7 @@ async def test_a_waiting_claim_whose_worker_left_leases_nothing(
 
 
 async def test_a_disconnected_ahead_claim_after_candidates_read_leases_nothing(
-    http: httpx.AsyncClient, coordinator: Coordinator
+    http: httpx.AsyncClient, coordinator: Coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     batch_id = await submit(http, ["a", "b"], [("b", "a")], speculative_loading="1")
     parent = await coordinator.claim(["standard"], "parent")
@@ -2472,7 +2480,17 @@ async def test_a_disconnected_ahead_claim_after_candidates_read_leases_nothing(
     async def gone() -> bool:
         return True
 
+    calls = 0
+    claim_ahead = coordinator._claim_ahead
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return await claim_ahead(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator, "_claim_ahead", spy)
     assert await coordinator.claim(["standard"], "w", disconnected=gone, ahead=True) is None
+    assert calls == 0
     assert await states(http, batch_id) == {"a": "running", "b": "waiting"}
 
 

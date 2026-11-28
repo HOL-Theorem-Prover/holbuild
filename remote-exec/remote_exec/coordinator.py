@@ -1664,6 +1664,9 @@ class Coordinator:
                 # One read of claims ahead for the attempt, so the scale-in line for claims ahead counts the actions
                 # the attempt may claim ahead, not those of an older read (see _ahead_ready).
                 read = await self._ahead_candidates() if ahead else None
+                if ahead and disconnected is not None and await disconnected():
+                    self._pass_wake(woken)
+                    return None
                 rank = self._waiter_rank(tiers, host_id, host_rank)  # as the host's workers are now
                 eligible_tiers = undeferred(ahead_only=False)
                 # A better-ranked waiter that can't claim ahead leaves the actions claimed ahead to this one.
@@ -1703,6 +1706,9 @@ class Coordinator:
                     if claimed is None and disconnected is not None and await disconnected():
                         self._pass_wake(woken)
                         return None
+                if claimed is None and disconnected is not None and await disconnected():
+                    self._pass_wake(woken)
+                    return None
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
                     # Recorded before the answer, so the scale-in line counts a lease while it waits (as _claim
@@ -2020,6 +2026,8 @@ class Coordinator:
                 claimed = await self._claim_ahead_in(read, batch_id, tier, worker, kept=kept, disconnected=disconnected)
                 if claimed is not None:
                     return claimed
+                if disconnected is not None and await disconnected():
+                    return None
         return None
 
     async def _claim_ahead_in(
