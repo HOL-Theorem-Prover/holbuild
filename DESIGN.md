@@ -843,7 +843,10 @@ failing, and that file's name, extension aside, is a dependency's stem's, the
 worker throws the run away, installs every dependency and builds the theory
 once more (`lightrerun`), whose verdict and diagnostics are reported. A file no
 dependency has would be missing on a full install too, so the light run's
-verdict stands.
+verdict stands. A light child writes that message on a line of its own for
+every `load` or `qload` that finds no file, a quiet one too (for which HOL
+writes nothing), and the log scan, a chunk at a time, takes a message for a
+line's start only after a line break.
 
 ## Global cache
 

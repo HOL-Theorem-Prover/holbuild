@@ -17,6 +17,16 @@ val before_fresh_preload = ref (fn () => ())
    found no file it asked for, and installs its dependencies otherwise,
    which empties the action's own output stem (exec_action, build_light). *)
 val after_child_passed = ref (fn (_ : string) => ())
+(* Whether a theory child writes, on a line of its own, each load that found
+   no file, a quiet one too: a worker's light action reruns on what its log
+   names (exec_action, build_light; missing_loads_line). *)
+val report_missing_loads = ref false
+(* The environment variable that has such a child write them. *)
+val report_missing_loads_env = "HOLBUILD_REPORT_MISSING_LOADS"
+
+(* How HOL says a load or use found no file (tools-poly/poly/poly-init2.ML),
+   before the path it was given. *)
+val missing_file_messages = ["Cannot find file ", "Use: non-existent file "]
 
 fun normalize_path path = Path.mkCanonical path handle Path.InvalidArc => path
 
@@ -672,6 +682,35 @@ val start_source_load_report_line =
   "val _ = if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HolbuildRuntime\") " ^
   "then CompilerSpecific.quietbind \"val _ = HolbuildRuntime.timing_source_loads ();\" else ();\n"
 
+(* Wraps load and qload, top-level and Meta's, so that one finding no file
+   writes HOL's message on a line of its own, when the child's environment
+   asks for it (report_missing_loads): HOL writes none for a quiet load, and
+   a message after output left unterminated starts no line.  A heap the
+   wrapped names were saved in keeps them, so they are wrapped once, and a
+   child whose environment doesn't ask writes nothing more than HOL. *)
+val missing_loads_line =
+  let
+    val messages = HolbuildToolchain.sml_list missing_file_messages
+    val env = HolbuildToolchain.sml_string report_missing_loads_env
+    val code =
+      ["structure HolbuildMissingLoads = struct " ^
+       "val load = Meta.load val qload = Meta.qload " ^
+       "fun reporting f name = f name handle e as Fail msg => " ^
+       "((if OS.Process.getEnv " ^ env ^ " = SOME \"1\" andalso " ^
+       "List.exists (fn m => String.isPrefix m msg) " ^ messages ^ " " ^
+       "then (TextIO.flushOut TextIO.stdOut; TextIO.output (TextIO.stdErr, \"\\n\" ^ msg ^ \"\\n\"); " ^
+       "TextIO.flushOut TextIO.stdErr) else ()); PolyML.Exception.reraise e) end",
+       "structure Meta = struct open Meta " ^
+       "val load = HolbuildMissingLoads.reporting HolbuildMissingLoads.load " ^
+       "val qload = HolbuildMissingLoads.reporting HolbuildMissingLoads.qload end",
+       "val load = Meta.load",
+       "val qload = Meta.qload"]
+  in
+    "val _ = if Option.isSome (#lookupStruct PolyML.globalNameSpace \"HolbuildMissingLoads\") then () else (" ^
+    String.concatWith "; " (map (fn c => "CompilerSpecific.quietbind " ^ HolbuildToolchain.sml_string c) code) ^
+    ");\n"
+  end
+
 (* A speculative child (pipelined builds) configures no theory module cache,
    so nothing it compiles is published there; a remote one only reads
    it (module_policy). *)
@@ -692,6 +731,7 @@ fun write_child_policy_with {module_cache = use_module_cache} tc path =
        String.concat
          (map (fn trace => trace_line ("set_trace " ^ HolbuildToolchain.sml_string trace ^ " 0") ^ "\n")
               child_policy_traces) ^ (if use_module_cache then module_cache else "") ^ "\n" ^
+       (if !report_missing_loads then missing_loads_line else "") ^
        (if timing_source_loads () then start_source_load_report_line else ""))
   end
 
@@ -2277,7 +2317,8 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
          | paths => ["HOLBUILD_SCRATCH_INPUT=" ^ String.concatWith ":" paths]) @
       (if timing_source_loads ()
        then ["HOLBUILD_TIMING_SOURCE_LOADS=1", "HOLBUILD_SOURCE_LOAD_CONTEXT=" ^ load_context]
-       else [])
+       else []) @
+      (if !report_missing_loads then [report_missing_loads_env ^ "=1"] else [])
     val status =
       HolbuildToolchain.run_in_dir_to_file workdir
         ((if null tool_env then [] else "env" :: tool_env) @
@@ -12742,14 +12783,10 @@ fun classify_run_failure stage log_text oom_before msg =
     (failure, String.concatWith "\n" (msg :: kill_notes))
   end
 
-(* How HOL says a load or use found no file (tools-poly/poly/poly-init2.ML),
-   before the path it was given. *)
-val missing_file_messages = ["Cannot find file ", "Use: non-existent file "]
-
 (* Whether TEXT has a line HOL starts with one of those, naming a file
    WANTED holds of: it writes the message on a line of its own before
-   raising it. *)
-fun names_missing_file wanted text =
+   raising it.  TEXT starts a line if STARTS_LINE. *)
+fun names_missing_file_in starts_line wanted text =
   let
     fun named message =
       let
@@ -12765,7 +12802,7 @@ fun names_missing_file wanted text =
                    quotes, a following colon. *)
                 val name = Substring.dropr (fn c => c = #"\"" orelse c = #"'" orelse c = #":") name
               in
-                ((at = 0 orelse String.sub (whole, at - 1) = #"\n") andalso wanted (Substring.string name))
+                ((if at = 0 then starts_line else String.sub (whole, at - 1) = #"\n") andalso wanted (Substring.string name))
                 orelse from rest
               end
           end
@@ -12776,6 +12813,8 @@ fun names_missing_file wanted text =
     List.exists named missing_file_messages
   end
 
+fun names_missing_file wanted text = names_missing_file_in true wanted text
+
 (* Whether the log at PATH names a missing file WANTED holds of, read a
    chunk at a time: a passing child's log may be large.  A missing log
    names none. *)
@@ -12785,19 +12824,23 @@ fun log_names_missing_file wanted path =
     let
       val input = TextIO.openIn path
       (* A message and its file name split across two chunks, with the line
-         break before them, lie within the kept tail. *)
+         break before them, lie within the kept tail, which starts a line
+         only if the byte before it ends one. *)
       val keep = 4096
-      fun scan tail =
+      fun scan (tail, starts_line) =
         case TextIO.inputN (input, 1048576) of
             "" => false
           | chunk =>
-              let val text = tail ^ chunk
+              let
+                val text = tail ^ chunk
+                val cut = Int.max (0, size text - keep)
               in
-                names_missing_file wanted text orelse
-                scan (String.extract (text, Int.max (0, size text - keep), NONE))
+                names_missing_file_in starts_line wanted text orelse
+                scan (String.extract (text, cut, NONE),
+                      if cut = 0 then starts_line else String.sub (text, cut - 1) = #"\n")
               end
     in
-      (scan "" before TextIO.closeIn input) handle e => (TextIO.closeIn input; raise e)
+      (scan ("", true) before TextIO.closeIn input) handle e => (TextIO.closeIn input; raise e)
     end
 
 (* Whether HOL's output says it couldn't find a file under the action root
@@ -17252,15 +17295,19 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        passing run's outputs are checked and installed (a check-only run
        has none).  A run resuming from a
        checkpoint reads none, unless its script loads one the preload that
-       saved its heap didn't: HOL then finds no file, and the build runs
-       again on every dependency installed.  The installed files must give
+       saved its heap didn't: HOL then finds no file, which the child
+       writes on a line of its own even for a quiet load (missing_loads_line),
+       and the build runs again on every dependency installed.  The installed files must give
        the records' hashes: the context the build restored, and publishes
        a failed prefix under, is keyed by those. *)
     and build_light spec tc forced cutoff =
       let
         fun light () = Option.isSome (!light_records)
+        (* A child on every dependency installed finds what a full install
+           gives, and writes no more than one. *)
         fun before_preload () =
           (install_light spec tc cutoff;
+           report_missing_loads := false;
            if #check_only spec then ()
            else prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec})
         (* A file a full install gives: one of a dependency's, by its
@@ -17274,10 +17321,11 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
           if light () andalso log_names_missing_file dependency_file log then raise LightRerun
           else if #check_only spec then ()
           else install_light spec tc cutoff
-        fun set_hooks preload passed = (before_fresh_preload := preload; after_child_passed := passed)
-        fun clear_hooks () = set_hooks (fn () => ()) (fn _ => ())
+        fun set_hooks preload passed report =
+          (before_fresh_preload := preload; after_child_passed := passed; report_missing_loads := report)
+        fun clear_hooks () = set_hooks (fn () => ()) (fn _ => ()) false
         fun light_build () =
-          (set_hooks before_preload after_pass;
+          (set_hooks before_preload after_pass true;
            build spec tc forced cutoff NONE false before clear_hooks ())
           handle e => (clear_hooks (); raise e)
         (* Nothing of the light run is kept: its failure, checkpoints and
