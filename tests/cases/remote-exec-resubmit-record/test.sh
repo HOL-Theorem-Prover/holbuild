@@ -14,7 +14,7 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 cleanup() {
-  for pid in ${server_pid:-} ${coordinator_pid:-}; do
+  for pid in ${server_pid:-} ${coordinator_pid:-} ${landed_pid:-}; do
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
@@ -205,27 +205,33 @@ shadow reset state=declined "reason=the execution options changed"
 write_b 10
 check reset-done 0
 shadow reset-done state=compared mismatches=0
+write_b 11
+HOLBUILD_TIMING_SOURCE_LOADS=1 check timing 0
+shadow timing state=declined "reason=the execution options changed"
+write_b 12
+check timing-reset 0
+shadow timing-reset state=declined "reason=the execution options changed"
 
 sed -i 's/simp\[\]/simp[] (* A edited *)/' "$project/src/AScript.sml"
-write_b 11
+write_b 13
 check cone-stat 0
 shadow cone-stat state=declined "reason~file changed: " "reason~file changed: $project/src/AScript.sml"
 cat > "$project/src/CScript.sml" <<'SML'
 Theory C
 Ancestors bool
 SML
-write_b 12
+write_b 14
 check new-file 0
 shadow new-file state=declined "reason=files added, removed or renamed in $project/src"
-write_b 13 'A bool'
+write_b 15 'A bool'
 check deps 0
 shadow deps state=declined "reason=the script's dependency facts changed"
-write_b 14 'A bool'
+write_b 16 'A bool'
 check deps-done 0
 shadow deps-done state=compared mismatches=0
 
 echo "rr:BTheory blob $(printf 'f%.0s' {1..64})" > "$state/fail-missing"
-write_b 15 'A bool'
+write_b 17 'A bool'
 check missing 0
 shadow missing state=declined "reason=the batch came back for missing inputs" fields.action_bytes=match
 require_grep "resubmitting" "$tmpdir/missing.log"
@@ -233,7 +239,7 @@ require_grep "resubmitting" "$tmpdir/missing.log"
 # An edit landing after the batch ran, before the check reads its answer.
 gate=$tmpdir/followed-gate
 mkfifo "$gate"
-write_b 16 'A bool'
+write_b 18 'A bool'
 HOLBUILD_TEST_RESUBMIT_FOLLOWED_GATE=$gate check landed 0 &
 landed_pid=$!
 for _ in {1..600}; do
@@ -241,9 +247,17 @@ for _ in {1..600}; do
   sleep 0.1
 done
 require_grep "remote rr:BTheory: done" "$tmpdir/landed.log"
-write_b 17 'A bool'
-echo go > "$gate"
+write_b 19 'A bool'
+# The client opens the gate only if the fast path was ready; don't hang if not.
+timeout 60 bash -c 'echo go > "$1"' _ "$gate" || { echo "the check never reached the gate" >&2; exit 1; }
 wait "$landed_pid"
 shadow landed state=declined "reason=an edit landed while the check ran" fields.action_bytes=match \
   fields.verdict=mismatch fields.diagnostics=mismatch fields.exit_status=mismatch fields.json_events=mismatch
 echo "PASS fast path declines on each change it can't take"
+
+# A full path that sends no action (the script is back to a version the
+# cache holds) differs from the fast path's.
+write_b 16 'A bool'
+check cached 0
+shadow cached state=compared matches=0 mismatches=1 fields.action_bytes=mismatch "detail~action_bytes: the full path"
+echo "PASS a full path that sends no action is counted as a mismatch"

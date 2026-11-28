@@ -51,11 +51,13 @@ type record =
    blobs : (string * string) list}
 
 (* What, besides the plan record's inputs, decides the action and its spec:
-   holbuild itself, the command line (the execution options), the runtime
-   the worker loads and the toolchain the action keys on. *)
+   holbuild itself, the execution options (the command line, and source-load
+   timing, which the plan record's fingerprint leaves out), the runtime the
+   worker loads and the toolchain the action keys on. *)
 fun identity {runtime, action_toolchain_key} =
   ["version=" ^ HolbuildVersion.version,
    "argv=" ^ String.concatWith "\003" (CommandLine.arguments ()),
+   "source-load-timing=" ^ Bool.toString (BE.timing_source_loads ()),
    "runtime=" ^ runtime,
    "action-toolchain=" ^ action_toolchain_key]
 
@@ -208,7 +210,8 @@ fun attempt {project, graph, tc : HolbuildToolchain.t, fingerprint} =
            if now = recorded then ()
            else if String.isPrefix "action-toolchain=" now then decline "the action toolchain key changed"
            else if String.isPrefix "runtime=" now then decline "the runtime identity changed"
-           else if String.isPrefix "argv=" now then decline "the execution options changed"
+           else if String.isPrefix "argv=" now orelse String.isPrefix "source-load-timing=" now
+           then decline "the execution options changed"
            else decline "holbuild changed")
         (identity {runtime = runtime, action_toolchain_key = action_toolchain_key}, #identity record)
       handle ListPair.UnequalLengths => decline "malformed re-submit record: identity"
@@ -325,33 +328,36 @@ fun stop () = shadow := Off
 fun active () = case !shadow of Off => false | Shadow _ => true
 
 (* Compares the full path's first export with the fast path's action, and
-   says whether its batch held only ROOT, of which a record can be written. *)
+   says whether its batch held only ROOT, of which a record can be written.
+   Any other batch differs from the fast path's. *)
 fun compare_export root (exported : BE.exported_spec list) =
   if not (active ()) orelse !exported_once then false
   else
-    (exported_once := true;
-     case exported of
-         [spec as {node, ...}] =>
-           BP.key node = BP.key root andalso
-           (case ready () of
-                SOME {input_key, spec_sha256, text, blobs, ...} =>
-                  let
-                    fun sorted pairs = BP.sort_pairs (fn ((a, _), (b, _)) => String.compare (a, b)) pairs
-                    val what =
-                      List.mapPartial (fn (differs, field) => if differs then SOME field else NONE)
-                        [(input_key <> #input_key spec, "input key"),
-                         (spec_sha256 <> #spec_sha256 spec orelse text <> #text spec, "spec"),
-                         (sorted blobs <> sorted (#blobs spec), "blobs")]
-                  in
-                    compare "action_bytes" (null what) (String.concatWith ", " what ^ " differ"); true
-                  end
-              | NONE => true)
-       | _ =>
-           (case ready () of
-                SOME _ => compare "action_bytes" false
-                            ("the full path sent " ^ Int.toString (length exported) ^ " actions")
-              | NONE => ();
-            false))
+    let
+      val _ = exported_once := true
+      fun differ what = case ready () of SOME _ => compare "action_bytes" false what | NONE => ()
+    in
+      case exported of
+          [spec as {node, ...}] =>
+            if BP.key node <> BP.key root then
+              (differ ("the full path sent " ^ BP.logical_name node ^ "'s action"); false)
+            else
+              ((case ready () of
+                    SOME {input_key, spec_sha256, text, blobs, ...} =>
+                      let
+                        fun sorted pairs = BP.sort_pairs (fn ((a, _), (b, _)) => String.compare (a, b)) pairs
+                        val what =
+                          List.mapPartial (fn (differs, field) => if differs then SOME field else NONE)
+                            [(input_key <> #input_key spec, "input key"),
+                             (spec_sha256 <> #spec_sha256 spec orelse text <> #text spec, "spec"),
+                             (sorted blobs <> sorted (#blobs spec), "blobs")]
+                      in
+                        compare "action_bytes" (null what) (String.concatWith ", " what ^ " differ")
+                      end
+                  | NONE => ());
+               true)
+        | _ => (differ ("the full path sent " ^ Int.toString (length exported) ^ " actions"); false)
+    end
 
 (* The batch's state for an action; the fast path's own is kept. *)
 fun observe_action (key, state) =
@@ -386,7 +392,8 @@ fun compare_outcomes () =
   case ready () of
       NONE => ()
     | SOME _ =>
-        if not (List.exists (fn (field, matched) => field = "action_bytes" andalso matched) (!compared)) then ()
+        if not (!exported_once) then compare "action_bytes" false "the full path exported no action"
+        else if not (List.exists (fn (field, matched) => field = "action_bytes" andalso matched) (!compared)) then ()
         else
           let
             val perturbed =

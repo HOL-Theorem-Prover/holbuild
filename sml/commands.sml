@@ -1897,11 +1897,12 @@ fun build_once_with_prepared_mode mode tc cli_jobs prepared ({dry_run, watch, fo
                                  defer = defer, publish = !held_back, ledger = true,
                                  named_targets = not (null targets)})
                 val record =
-                  case (HolbuildBuildPlan.root_nodes plan, !last_plan_record) of
-                      ([root], SOME plan_record) =>
-                        if HolbuildResubmit.compare_export root exported
-                        then (fn () => (record (); write_resubmit_record plan_record (hd exported)))
-                        else record
+                  case HolbuildBuildPlan.root_nodes plan of
+                      [root] =>
+                        (case (HolbuildResubmit.compare_export root exported, !last_plan_record) of
+                             (true, SOME plan_record) =>
+                               (fn () => (record (); write_resubmit_record plan_record (hd exported)))
+                           | _ => record)
                     | _ => record
               in
                 deferred := held;

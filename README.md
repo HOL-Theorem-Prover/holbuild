@@ -2371,11 +2371,16 @@ two compared. `state` is `declined` with a `reason` when the fast path
 couldn't take the build (no record, a changed toolchain, action toolchain
 key, runtime or command line, a changed file or directory, changed
 dependency facts, a batch that came back for missing inputs, or an edit that
-landed while the build ran), and `compared` otherwise. `fields` gives
+landed while the build ran), and `compared` otherwise; a full path that
+sent no action, or one other than the fast path's, is an `action_bytes`
+mismatch. `fields` gives
 `match` or `mismatch` for `action_bytes` (the action's input key, spec and
 blobs), `verdict`, `diagnostics`, `exit_status` and `json_events`, counted in
 `matches` and `mismatches`, with `detail` saying what differed, and
-`fast_ms` is the fast path's time.
+`fast_ms` is the fast path's time. Both paths share one batch, so the fast
+path's verdict and exit status are the batch's answer for its action, and
+its diagnostics and events are the build's own: those can differ from the
+full path's only when the script changed while the build ran.
 
 Supervisors can set `HOLBUILD_COMMAND_RECORD` to a destination file and
 `HOLBUILD_COMMAND_RECORD_PID` to the process ID which will exec holbuild.
