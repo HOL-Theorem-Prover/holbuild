@@ -431,10 +431,25 @@ resumed v4a "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
 [[ "$(grep -cx "$failed_prefix_key" "$tmpdir/control/no-cache-gets")" -ge 1 ]] || {
   echo "v4a did not revalidate the failed-prefix manifest" >&2; exit 1; }
 # A failed action's record still has the HOL child's phases and the resume.
-for step in resfpn resstepn resboundary holload holsalvage holrewind holleaves holtactics holprint holsave resbyten; do
+for step in resfpn resstepn resboundary holload holsalvage holrewind holleaves holtactics holprint holsave resbyten \
+            reset cap rstmodhash holplan holreplay holresume holgap holtail holexit holdriver; do
   grep -qE "^phase-ms=(.*,)?$step:[0-9]+(,|\$)" "$tmpdir/v4a.result" || {
     echo "v4a's record lacks phase $step:" >&2; cat "$tmpdir/v4a.result" >&2; exit 1; }
 done
+# Its hol phase splits into the driver's time outside the child, the load,
+# the runtime's parts and the gaps between them, the tail and the exit,
+# up to each part's rounding to a millisecond.
+phase_ms() {
+  grep '^phase-ms=' "$tmpdir/$1.result" | tr ',=' '\n\n' | sed -n "s/^$2:\([0-9]*\)\$/\1/p"
+}
+hol_ms=$(phase_ms v4a hol)
+parts_ms=0
+for step in holdriver holload holplan holreplay holresume holgap holsalvage holrewind holleaves holtactics holprint holsave \
+            holtail holexit; do
+  parts_ms=$((parts_ms + $(phase_ms v4a "$step")))
+done
+(( hol_ms - parts_ms <= 20 && parts_ms - hol_ms <= 20 )) || {
+  echo "v4a's hol phase took ${hol_ms} ms, its parts ${parts_ms} ms:" >&2; cat "$tmpdir/v4a.result" >&2; exit 1; }
 # v4 ran "CONJ_TAC >- ACCEPT_TAC TRUTH" before failing, and v4a's tactic
 # still starts with it: no byte before its end changed.
 tactic=$(grep -bo 'CONJ_TAC >- ACCEPT_TAC TRUTH >> ALL_TAC' "$project/src/TScript.sml" | cut -d: -f1)
@@ -488,6 +503,10 @@ assert free['holadmit'] < 2000, free
 assert held['holadmit'] >= 5000, held
 assert held['holload'] < held['holadmit'], held
 assert held['holload'] < free['holload'] + 2500, (free, held)
+# The wait is a part of the hol phase, beside the ones v4a's add up to.
+parts = ('holdriver holadmit holload holplan holreplay holresume holgap holsalvage holrewind holleaves '
+         'holtactics holprint holsave holtail holexit').split()
+assert abs(held['hol'] - sum(held.get(p, 0) for p in parts)) <= 20, held
 PY
 
 # A spec of build --no-checkpoint-saves: the worker resumes from the shared
