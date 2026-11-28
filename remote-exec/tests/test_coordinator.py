@@ -2497,19 +2497,25 @@ async def test_a_disconnected_ahead_claim_after_candidates_read_leases_nothing(
 async def test_a_disconnected_claim_after_its_ahead_turn_leases_nothing(
     http: httpx.AsyncClient, coordinator: Coordinator
 ) -> None:
-    batch_id = await submit(http, ["a", "b"], [("b", "a")], speculative_loading="1")
+    batch_id = UUID(await submit(http, ["a", "b"], [("b", "a")], speculative_loading="1"))
     parent = await coordinator.claim(["standard"], "parent")
     assert parent is not None and parent.theory == "pkg:a"
-    read = await coordinator._ahead_candidates()
-    ahead_batch, _, tier, *_ = read.candidates[0]
+
+    gone_state = False
 
     async def gone() -> bool:
-        return True
+        return gone_state
 
-    assert (
-        await coordinator._claim_ahead_in(read, ahead_batch, tier, "w", kept=lambda _: True, disconnected=gone)
-        is None
-    )
+    turn = coordinator._ahead_turn(batch_id)
+    await turn.__aenter__()
+    waiting = asyncio.create_task(coordinator.claim(["standard"], "w", 30, gone, ahead=True))
+    try:
+        await wait_until(lambda: coordinator.ahead_turns[batch_id].claims == 2 or waiting.done())
+        assert not waiting.done()
+        gone_state = True
+    finally:
+        await turn.__aexit__(None, None, None)
+    assert await asyncio.wait_for(waiting, 10) is None
     assert await states(http, batch_id) == {"a": "running", "b": "waiting"}
 
 

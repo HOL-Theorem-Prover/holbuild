@@ -1703,9 +1703,6 @@ class Coordinator:
                         self._pass_wake(woken)
                         return None
                     claimed = await self._claim_ahead(read, ahead_tiers, worker, kept=kept, disconnected=disconnected)
-                    if claimed is None and disconnected is not None and await disconnected():
-                        self._pass_wake(woken)
-                        return None
                 if claimed is None and disconnected is not None and await disconnected():
                     self._pass_wake(woken)
                     return None
@@ -1892,6 +1889,8 @@ class Coordinator:
             # Builds of tiers hint_only not held for this host are no candidates.
             if not any(e[7] not in hint_only for e in ranking.heap) and (not ranking.ranked or ranking.at >= started):
                 if not run_tiers:
+                    return None, None
+                if disconnected is not None and await disconnected():
                     return None, None
                 claimed, retry_builds = await self._claim_run(
                     run_tiers, worker, self.settings.run_slots, builds_first=True
