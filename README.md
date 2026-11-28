@@ -1380,6 +1380,7 @@ Important paths:
 .holbuild/src/<package>               # dependency source checkouts (links into git/checkouts)
 .holbuild/packages/<package>          # package build artefacts
 .holbuild/plan/<fingerprint>          # plan records
+.holbuild/resubmit/<fingerprint>      # re-submit records
 $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
 $HOLBUILD_CACHE/git/checkouts/        # read-only dependency source checkouts
 $HOLBUILD_CACHE/analysis/             # sources' dependency analyses
@@ -2356,6 +2357,30 @@ observed: polling cannot certify that no execution happened between snapshots.
 Untimed failure payloads are retained too, deduplicated by their failure fields
 without assigning an execution identity.
 These diagnostic snapshots do not participate in build or cache keys.
+
+A `--remote-exec` build of one named theory also keeps a re-submit record in
+`.holbuild/resubmit/` after a batch that held that theory alone: the stats
+and hashes of the files and directories its plan read, the script's
+dependency facts, and the parts of its action that the script's text doesn't
+decide. The next such build first computes from the record alone the action
+it would send, checking the record's files and directories with `stat` as the
+plan record does, hashing the script, and analysing it again when its hash
+moved. This fast path runs in shadow mode: the full path still plans, sends
+and decides every build, and the summary's `resubmit_shadow` says how the
+two compared. `state` is `declined` with a `reason` when the fast path
+couldn't take the build (no record, a changed toolchain, action toolchain
+key, runtime, command line or scratch inputs, a changed file, directory or
+file mode, changed dependency facts, a batch that came back for missing inputs, or an edit that
+landed while the build ran), and `compared` otherwise; a full path that
+sent no action, or one other than the fast path's, is an `action_bytes`
+mismatch. `fields` gives
+`match` or `mismatch` for `action_bytes` (the action's input key, spec and
+blobs), `verdict`, `diagnostics`, `exit_status` and `json_events`, counted in
+`matches` and `mismatches`, with `detail` saying what differed, and
+`fast_ms` is the fast path's time. Both paths share one batch, so the fast
+path's verdict and exit status are the batch's answer for its action, and
+its diagnostics and events are the build's own: those can differ from the
+full path's only when the script changed while the build ran.
 
 Supervisors can set `HOLBUILD_COMMAND_RECORD` to a destination file and
 `HOLBUILD_COMMAND_RECORD_PID` to the process ID which will exec holbuild.

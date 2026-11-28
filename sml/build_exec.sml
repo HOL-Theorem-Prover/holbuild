@@ -10223,6 +10223,94 @@ fun dependency_spec_lines hash_file root plan keys token deps =
      library_files = map source_file libraries}
   end
 
+(* A spec's lines but those its source and action text decide, which
+   action_spec_assemble puts with these: TARGET is its target and source
+   lines up to the source's hash, BODY its file and output lines, OPTIONS
+   its option lines before the scratch inputs' hashes and TIMING those
+   after, FILES the files besides the source it names, whose hashes it
+   holds. *)
+type spec_parts =
+  {runtime : string, toolchain_line : string, deps_key : string, target : string list,
+   body : string list, options : string list, timing : string list, files : string list}
+
+fun action_spec_parts hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
+                      {theorem_checkpoints, forced, skip_checkpoints, pipeline, install_dependencies_first}
+                      (action : theory_action) node : spec_parts =
+  let
+    val context = #package action ^ ":" ^ #logical action
+    val token = spec_token context
+    val {sig_path, sml_path, data_path} = #outputs action
+    val input_lines =
+      map (fn {path, from} => file_line hash_file "input" (token path) from) (#inputs action)
+    val {library_lines, dep_lines, lib_lines, library_files} =
+      dependency_spec_lines hash_file root plan keys token (HolbuildBuildPlan.transitive_project_deps plan node)
+  in
+    {runtime = runtime, toolchain_line = toolchain_line,
+     deps_key = dependency_input_context_key action_toolchain_key plan keys node,
+     target = ["target " ^ token context, "source " ^ token (#package action) ^ " " ^ token (#relative_path action)],
+     body =
+       input_lines @
+       library_lines @
+       dep_lines @
+       lib_lines @
+       map (theory_load_spec_line token) (#loads action) @
+       ["output sig " ^ token sig_path,
+        "output sml " ^ token sml_path,
+        "output dat " ^ token data_path] @
+       map (fn decl => "output extra " ^ token decl) (#extra_outputs action),
+     options =
+       [bool_option "proof-steps" (proof_steps_enabled policy),
+        "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
+        bool_option "new-ir" (proof_ir_enabled policy)] @
+       (if timeout_text (heavy_tactic_timeout policy) =
+           timeout_text (heavy_budget NONE (tactic_timeout policy)) then []
+        else ["option heavy-tactic-timeout=" ^ timeout_text (heavy_tactic_timeout policy)]) @
+       (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
+       (if checkpoint_target_enabled policy then [bool_option "checkpoint-target" true] else []) @
+       (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
+       (if promotes_preload policy then [bool_option "promote-preload" true] else []) @
+       (if checks_only policy then [bool_option "check-only" true] else []) @
+       (if checkpoint_saves_enabled policy then [] else [bool_option "no-checkpoint-saves" true]) @
+       (if Real.== (checkpoint_seconds policy, default_checkpoint_seconds) then []
+        else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
+       (if forced then [bool_option "force" true] else []) @
+       (if trace_steps policy then [bool_option "trace-steps" true] else []) @
+       (if pipeline then [bool_option "pipeline" true] else []) @
+       (if install_dependencies_first then [bool_option "install-dependencies-first" true] else []) @
+       (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []),
+     timing = if timing_source_loads () then [bool_option "source-load-timing" true] else [],
+     files = map #from (#inputs action) @ library_files}
+  end
+
+(* An exported theory action: its node, input key, spec and its sha256,
+   the files the spec names with their hashes, and the parts its action
+   text and spec are made of. *)
+type exported_spec =
+  {node : HolbuildBuildPlan.node, input_key : string, spec_sha256 : string, text : string,
+   blobs : (string * string) list,
+   action_parts : {head : string list, tail : string list}, spec_parts : spec_parts}
+
+(* The spec of the action with these PARTS whose source hashes to
+   SOURCE_HASH and has SOURCE_SIZE bytes, whose action text is ACTION_TEXT
+   and whose scratch inputs hash to SCRATCH_HASHES. *)
+fun action_spec_assemble ({runtime, toolchain_line, deps_key, target, body, options, timing, ...} : spec_parts)
+                         {input_key, action_text, source_hash, source_size, scratch_hashes} =
+  String.concatWith "\n"
+    ([action_spec_header,
+      "holbuild-version=" ^ HolbuildVersion.version,
+      "holbuild-runtime=" ^ runtime,
+      toolchain_line,
+      "input-key=" ^ input_key,
+      "action-text-sha256=" ^ HolbuildToolchain.hash_text action_text,
+      "deps-key=" ^ deps_key] @
+     List.take (target, length target - 1) @
+     [String.concatWith " " [List.last target, source_hash, Position.toString source_size]] @
+     body @
+     options @
+     map (fn hash => "option scratch-input=" ^ hash) scratch_hashes @
+     timing @
+     ["action-text"]) ^ "\n" ^ action_text
+
 (* The spec text and the files a worker fetches by content hash for it. *)
 (* A worker saves theorem checkpoints unless the spec says otherwise: a
    spec without the line, as older clients write, means true.  Likewise a
@@ -10236,65 +10324,16 @@ fun dependency_spec_lines hash_file root plan keys token deps =
    --check-only) and publishes no outputs.  no-checkpoint-saves=true: the
    worker restores shared checkpoints as usual but saves and publishes
    none (build --no-checkpoint-saves). *)
-fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
-                     {theorem_checkpoints, forced, skip_checkpoints, pipeline, install_dependencies_first}
-                     (action : theory_action) node action_text =
+fun action_spec_text hash_file context policy flags (action : theory_action) node action_text =
   let
-    val context = #package action ^ ":" ^ #logical action
-    val token = spec_token context
+    val parts = action_spec_parts hash_file context policy flags action node
     val source = #source_file action
-    val {sig_path, sml_path, data_path} = #outputs action
-    val input_lines =
-      map (fn {path, from} => file_line hash_file "input" (token path) from) (#inputs action)
-    val {library_lines, dep_lines, lib_lines, library_files} =
-      dependency_spec_lines hash_file root plan keys token (HolbuildBuildPlan.transitive_project_deps plan node)
-    val lines =
-      [action_spec_header,
-       "holbuild-version=" ^ HolbuildVersion.version,
-       "holbuild-runtime=" ^ runtime,
-       toolchain_line,
-       "input-key=" ^ #input_key action,
-       "action-text-sha256=" ^ HolbuildToolchain.hash_text action_text,
-       "deps-key=" ^ dependency_input_context_key action_toolchain_key plan keys node,
-       "target " ^ token context,
-       String.concatWith " "
-         ["source", token (#package action), token (#relative_path action),
-          hash_file source, Position.toString (FS.fileSize source)]] @
-      input_lines @
-      library_lines @
-      dep_lines @
-      lib_lines @
-      map (theory_load_spec_line token) (#loads action) @
-      ["output sig " ^ token sig_path,
-       "output sml " ^ token sml_path,
-       "output dat " ^ token data_path] @
-      map (fn decl => "output extra " ^ token decl) (#extra_outputs action) @
-      [bool_option "proof-steps" (proof_steps_enabled policy),
-       "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
-       bool_option "new-ir" (proof_ir_enabled policy)] @
-      (if timeout_text (heavy_tactic_timeout policy) =
-          timeout_text (heavy_budget NONE (tactic_timeout policy)) then []
-       else ["option heavy-tactic-timeout=" ^ timeout_text (heavy_tactic_timeout policy)]) @
-      (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
-      (if checkpoint_target_enabled policy then [bool_option "checkpoint-target" true] else []) @
-      (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
-      (if promotes_preload policy then [bool_option "promote-preload" true] else []) @
-      (if checks_only policy then [bool_option "check-only" true] else []) @
-      (if checkpoint_saves_enabled policy then [] else [bool_option "no-checkpoint-saves" true]) @
-      (if Real.== (checkpoint_seconds policy, default_checkpoint_seconds) then []
-       else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
-      (if forced then [bool_option "force" true] else []) @
-      (if trace_steps policy then [bool_option "trace-steps" true] else []) @
-      (if pipeline then [bool_option "pipeline" true] else []) @
-      (if install_dependencies_first then [bool_option "install-dependencies-first" true] else []) @
-      (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []) @
-      map (fn file => "option scratch-input=" ^ hash_file file) (!scratch_input_files) @
-      (if timing_source_loads () then [bool_option "source-load-timing" true] else []) @
-      ["action-text"]
   in
-    {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
-     files = source :: map #from (#inputs action) @ library_files @
-             !scratch_input_files}
+    {parts = parts,
+     text = action_spec_assemble parts
+              {input_key = #input_key action, action_text = action_text, source_hash = hash_file source,
+               source_size = FS.fileSize source, scratch_hashes = map hash_file (!scratch_input_files)},
+     files = source :: #files parts @ !scratch_input_files}
   end
 
 (* A theory waits for the nearest uncached theories it depends on, looking
@@ -10809,13 +10848,13 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
     fun export (node, _) =
       let
         val action = theory_action root plan keys toolchain_key "" node
-        val action_text =
-          HolbuildBuildPlan.action_text_with plan config_lines action_toolchain_key keys node
+        val {parts = action_parts, text = action_text} =
+          HolbuildBuildPlan.action_parts_with plan config_lines action_toolchain_key keys node
         val _ =
           if HolbuildToolchain.hash_text action_text = #input_key action then ()
           else raise Error ("internal error: action text of " ^ logical_name node ^ " does not hash to its input key")
         val policy = checkpoint_policy_for_node options project node
-        val {text, files} =
+        val {parts = spec_parts, text, files} =
           action_spec_text hash_file context policy
             {theorem_checkpoints = true,
              forced = force_node options project node, skip_checkpoints = #skip_checkpoints options,
@@ -10833,7 +10872,10 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
           ["action", #input_key action, HolbuildRemoteCache.remote_action_key (#input_key action),
            spec_sha256, package node ^ ":" ^ logical_name node] ::
         map (fn parent => "edge " ^ #input_key action ^ " " ^ HolbuildBuildPlan.input_key_for keys parent)
-            (uncached_parents plan uncached node)}
+            (uncached_parents plan uncached node),
+         exported = {node = node, input_key = #input_key action, spec_sha256 = spec_sha256, text = text,
+                     blobs = map (fn file => (file, hash_file file)) files,
+                     action_parts = action_parts, spec_parts = spec_parts} : exported_spec}
       end
     val exported = detail_time_phase "action_spec.export.specs" (fn () => map export uncached_actions)
     val action_lines = List.concat (map #lines exported)
@@ -10863,6 +10905,7 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
   in
     {batch = String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n",
      deferred = map (HolbuildBuildPlan.key o #1) deferred, record = record,
+     exported = map #exported exported,
      (* The cache entries the build may restore that aren't here, for
         start_remote_exec_prefetch. *)
      prefetch = List.mapPartial (fn (node, action) =>
