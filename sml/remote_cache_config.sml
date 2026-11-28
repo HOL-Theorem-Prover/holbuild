@@ -99,7 +99,9 @@ fun curl_config () =
 (* The options of a curl config file, in order, as (name, value) pairs, a
    name without its leading `--`.  Follows curl's syntax: `#` comment lines,
    `name value`, `name = value`, `name: value` and `--name value`, values in
-   double quotes with backslash escapes. *)
+   double quotes with backslash escapes.  `--name = value` or `--name: value`,
+   which curl reads differently (the value then starts with `=` or `:`),
+   raises Error. *)
 fun parse_curl_config text =
   let
     fun is_separator c = Char.isSpace c orelse c = #"=" orelse c = #":"
@@ -127,9 +129,13 @@ fun parse_curl_config text =
         val s = drop_spaces (Substring.full line)
         val (name, rest) = Substring.splitl (not o is_separator) s
         val name = Substring.string name
+        val dashed = String.isPrefix "--" name
+        val after = drop_spaces rest
       in
         if Substring.isEmpty s orelse Substring.isPrefix "#" s then NONE
-        else SOME (if String.isPrefix "--" name then String.extract (name, 2, NONE) else name, value rest)
+        else if dashed andalso (Substring.isPrefix "=" after orelse Substring.isPrefix ":" after) then
+          raise Error ("unsupported separator after " ^ name ^ " (curl reads it as part of the value)")
+        else SOME (if dashed then String.extract (name, 2, NONE) else name, value rest)
       end
   in
     List.mapPartial option (String.fields (fn c => c = #"\n") text)

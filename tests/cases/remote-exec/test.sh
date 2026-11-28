@@ -3467,6 +3467,9 @@ for agent in "${agents[@]}"; do
     [[ ! -e $state/rotate && $(head -1 "$tmpdir/rotate.requests") == *" Bearer stub-token" &&
        $(tail -1 "$tmpdir/rotate.requests") == *" Bearer rotated-token" ]] ||
       { cat "$tmpdir/rotate.requests" >&2; exit 1; }
+    [[ $refusal != unavailable ||
+       $(grep '^POST /v1/batches ' "$tmpdir/rotate.requests" | sed -n 2p) == *" Bearer rotated-token" ]] ||
+      { cat "$tmpdir/rotate.requests" >&2; exit 1; }
     rm "$state/$refusal"
   done
 done

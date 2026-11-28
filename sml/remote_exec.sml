@@ -61,18 +61,25 @@ fun curl_args url options =
 (* The coordinator's headers from HOLBUILD_REMOTE_EXEC_CURL_CONFIG, when
    libcurl can send its requests: SOME [] without a config.  NONE leaves them
    to the curl command: the remote cache doesn't use libcurl, or the config
-   can't be read or holds what only the curl command knows, an option other
-   than `header` or a header file (`@path`). *)
+   isn't a regular file (a pipe can be read only once), can't be read, or
+   holds what only the curl command knows, an option other than `header` or a
+   header file (`@path`). *)
 fun libcurl_headers () =
   if not (HolbuildRemoteCacheConfig.uses_libcurl ()) then NONE
   else
     case OS.Process.getEnv "HOLBUILD_REMOTE_EXEC_CURL_CONFIG" of
         NONE => SOME []
       | SOME path =>
-          (let val options = HolbuildRemoteCacheConfig.parse_curl_config (HolbuildHash.read_all path)
-           in if List.all (fn (name, value) => name = "header" andalso not (String.isPrefix "@" value)) options then SOME (map #2 options) else NONE end
+          ((if not (Posix.FileSys.ST.isReg (Posix.FileSys.stat path)) then NONE
+            else
+              let val options = HolbuildRemoteCacheConfig.parse_curl_config (HolbuildHash.read_all path)
+              in
+                if List.all (fn (name, value) => name = "header" andalso not (String.isPrefix "@" value)) options
+                then SOME (map #2 options) else NONE
+              end)
            handle HolbuildRemoteCacheConfig.Error _ => NONE
-                | IO.Io _ => NONE)
+                | IO.Io _ => NONE
+                | OS.SysErr _ => NONE)
 
 (* Sends a request through libcurl with HEADERS, passing each line of the
    response to on_line as HolbuildSpawn.run_lines passes the curl command's
