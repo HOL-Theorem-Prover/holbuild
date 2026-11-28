@@ -2148,9 +2148,9 @@ checkpoints), `toolrestore` (the tool cache), `scratch` (staging the
 0 when the worker's cache held each), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
 checks) and `log`; stderr ends with the same times and `wall`.
-Under `--cooperate-dir`, `holadmit` is the part of `hol` that its HOL
-children waited for their machine memory reservations, which the HOL
-child's start-up time (`holload`) leaves out.
+Under `--cooperate-dir`, `holadmit` is the time the theory's HOL children
+waited for their machine memory reservations, which their start-up time
+(`holload`, and a load ahead's `aheadload`) leaves out.
 `peak-rss-mb` is the HOL process's peak resident memory, reported once the
 theory has been exported.
 `log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
