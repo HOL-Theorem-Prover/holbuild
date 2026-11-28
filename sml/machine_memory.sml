@@ -548,7 +548,7 @@ fun with_reservation launch =
           val start = Time.now ()
           val lease = acquire s
           val _ = admissions := !admissions + 1
-          val _ = admission_ms := !admission_ms + Time.toMilliseconds (Time.- (Time.now (), start))
+          val _ = admission_ms := !admission_ms + LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))
         in
           (launch (SOME (#fd lease)) before release lease)
           handle e => (release lease; raise e)

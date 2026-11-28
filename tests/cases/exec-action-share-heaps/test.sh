@@ -455,7 +455,8 @@ v4b_steps=$(restored_steps v4b)
   echo "v4b did not revalidate the advanced failed-prefix manifest" >&2; exit 1; }
 # Under machine memory admission a resumed check's record has the time its
 # child took to be admitted, and holload starts once it was: here first with
-# nothing else reserved, then behind a lease filling the budget for 5 s.
+# nothing else reserved, then behind a lease filling the budget for 5 s from
+# when the worker starts waiting.
 coop=$tmpdir/coop
 mkdir -p "$coop"
 admitted() {
@@ -467,9 +468,15 @@ admitted() {
 }
 admitted v4c
 printf '%s\n' $((2048 * 1024 * 1024)) > "$coop/lease-held"
-(flock 9; touch "$tmpdir/lease-held"; sleep 5) 9< "$coop/lease-held" &
+(flock 9; touch "$tmpdir/lease-held"
+ for _ in $(seq 1 600); do
+   grep -qs 'waiting for machine memory' "$tmpdir/v4d.log" && break
+   sleep 0.1
+ done
+ sleep 5) 9< "$coop/lease-held" &
 held_pid=$!
-until [[ -e "$tmpdir/lease-held" ]]; do sleep 0.1; done
+for _ in $(seq 1 100); do [[ -e "$tmpdir/lease-held" ]] && break; sleep 0.1; done
+require_file "$tmpdir/lease-held"
 admitted v4d
 wait "$held_pid"
 require_grep "waiting for machine memory" "$tmpdir/v4d.log"
@@ -478,7 +485,7 @@ import pathlib,sys
 from remote_exec.formats import parse_result
 free,held=(parse_result(pathlib.Path(p).read_text()).timings for p in sys.argv[1:])
 assert free['holadmit'] < 2000, free
-assert held['holadmit'] >= 4000, held
+assert held['holadmit'] >= 5000, held
 assert held['holload'] < held['holadmit'], held
 PY
 
