@@ -2188,8 +2188,9 @@ fun hol_run_file_arg stage file =
 val last_child_status : OS.Process.status option ref = ref NONE
 
 (* When the latest HOL child of run_hol_files_to_log started (ms since the
-   epoch), for its holload; NONE for a child started otherwise.  A load
-   ahead's join moves it past the child's waits for late parents. *)
+   epoch), for its holload: when its machine memory reservation was granted,
+   so a wait for memory is not HOL's; NONE for a child started otherwise.  A
+   load ahead's join moves it past the child's waits for late parents. *)
 val last_child_start : LargeInt.int option ref = ref NONE
 
 (* HOL's `use` remembers a source parse error in the heap and, with
@@ -2270,6 +2271,12 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
     val _ = create_current_log_link log current_log
     val _ = last_child_status := NONE
     val _ = last_child_start := SOME (Time.toMilliseconds (Time.now ()))
+    (* The child is the only one this process admits meanwhile: a load
+       ahead's driver starts none while its child runs. *)
+    val admission_before = !HolbuildMachineMemory.admission_ms
+    fun start_at_admission () =
+      last_child_start :=
+        Option.map (fn start => start + !HolbuildMachineMemory.admission_ms - admission_before) (!last_child_start)
     val tool_env =
       (case !tool_cache_dir of SOME dir => ["HOLBUILD_TOOL_CACHE_DIR=" ^ dir] | NONE => []) @
       (case !scratch_input_paths of
@@ -2284,10 +2291,12 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
          HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @
          hol_context_args context @ file_args)
         log
+      before start_at_admission ()
       handle HolbuildToolchain.Error msg =>
-        if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.child_completed) then
-          raise HolbuildActionSandbox.Error msg
-        else raise Error msg
+        (start_at_admission ();
+         if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.child_completed) then
+           raise HolbuildActionSandbox.Error msg
+         else raise Error msg)
     val _ = last_child_status := SOME status
     val detail_log = finalize_current_log log current_log
   in
@@ -13350,8 +13359,8 @@ fun merge_phases phases =
    the lines; a value that isn't a nonnegative integer is dropped.  Each
    line in which HOL says it refused a theory's module counts one
    holmodrefusedn.  holload runs from CHILD_START, when the child that
-   wrote the log started, to its first runtime install (the least
-   holloadend: a runtime loaded again later prints its line first), less
+   wrote the log was admitted to start, to its first runtime install (the
+   least holloadend: a runtime loaded again later prints its line first), less
    the preload's save (holsave in a line without holloadend); without a
    runtime install, to the script's start (holscriptstart, which the stage
    prints whether or not the script is instrumented).  holscript runs from
@@ -16809,6 +16818,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     val _ = HolbuildOffline.require_online "execute a remote action"
     val _ = HolbuildRemoteCache.fail_closed := true
     val start = Time.now ()
+    val admissions_before = !HolbuildMachineMemory.admissions
+    val admission_ms_before = !HolbuildMachineMemory.admission_ms
     val remote =
       case HolbuildRemoteCacheConfig.url () of
           SOME url => HolbuildRemoteCache.remote url
@@ -18218,7 +18229,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               fun count (name, n) = if !n > 0 then [(name, LargeInt.fromInt (!n))] else []
               val drops = count ("rstdropn", dropped_checkpoints) @ count ("rstmodrejn", rejected_heap_modules) @
                           count ("pubckptn", published_checkpoints)
-              val _ = phases := rev (hol_phases @ !resume_steps @ drops) @ !phases
+              (* holadmit: the time the action's children waited for their
+                 machine memory reservations, which holload leaves out. *)
+              val admission =
+                if !HolbuildMachineMemory.admissions = admissions_before then []
+                else [("holadmit", !HolbuildMachineMemory.admission_ms - admission_ms_before)]
+              val _ = phases := rev (admission @ hol_phases @ !resume_steps @ drops) @ !phases
               val phases = merge_phases (rev (!phases)) @
                 [("started", Time.toMilliseconds start),
                  ("finished", Time.toMilliseconds (Time.now ()))] @
