@@ -60,8 +60,9 @@ fun curl_args url options =
 
 (* The coordinator's headers from HOLBUILD_REMOTE_EXEC_CURL_CONFIG, when
    libcurl can send its requests: SOME [] without a config.  NONE leaves them
-   to the curl command: libcurl isn't loaded, or the config can't be read or
-   holds an option other than `header`, which only the curl command knows. *)
+   to the curl command: the remote cache doesn't use libcurl, or the config
+   can't be read or holds what only the curl command knows, an option other
+   than `header` or a header file (`@path`). *)
 fun libcurl_headers () =
   if not (HolbuildRemoteCacheConfig.uses_libcurl ()) then NONE
   else
@@ -69,7 +70,7 @@ fun libcurl_headers () =
         NONE => SOME []
       | SOME path =>
           (let val options = HolbuildRemoteCacheConfig.parse_curl_config (HolbuildHash.read_all path)
-           in if List.all (fn (name, _) => name = "header") options then SOME (map #2 options) else NONE end
+           in if List.all (fn (name, value) => name = "header" andalso not (String.isPrefix "@" value)) options then SOME (map #2 options) else NONE end
            handle HolbuildRemoteCacheConfig.Error _ => NONE
                 | IO.Io _ => NONE)
 
@@ -89,14 +90,14 @@ fun libcurl_lines headers {url, body, max_time} on_line =
       in
         lines (String.fields (fn c => c = #"\n") (!partial ^ text))
       end
-    val result =
+    val {status, failure} =
       HolbuildHttp.stream {url = url, headers = headers, body = body, connect_timeout = connect_timeout_seconds,
                            max_time = max_time, on_data = on_data}
-      handle HolbuildHttp.Error message => HolbuildHttp.Failed message
-    val last = !partial ^ (case result of HolbuildHttp.Failed message => message | HolbuildHttp.Response _ => "")
+      handle HolbuildHttp.Error message => {status = 0, failure = SOME message}
+    val last = !partial ^ Option.getOpt (failure, "")
   in
     if last = "" then () else on_line last;
-    case result of HolbuildHttp.Response status => status | HolbuildHttp.Failed _ => 0
+    status
   end
 
 fun endpoint base path =

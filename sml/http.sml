@@ -147,6 +147,7 @@ val CURLOPT_COPYPOSTFIELDS = 10165
 val CURLINFO_RESPONSE_CODE = 0x200002
 val CURLMOPT_MAXCONNECTS = 6
 val CURLE_PEER_FAILED_VERIFICATION = 60
+val CURLE_ABORTED_BY_CALLBACK = 42
 val CURL_GLOBAL_DEFAULT = 3
 val CURL_VERSION_ASYNCHDNS = 0wx80 : Word32.word
 val CURL_ERROR_SIZE = 0w256
@@ -333,6 +334,9 @@ val pump_thread : Thread.thread option ref = ref NONE
 (* Easy handles waiting for the pump to add them. *)
 val queued : Foreign.Memory.voidStar list ref = ref []
 
+(* Easy handles whose requests gave up on them, for the pump to stop. *)
+val aborting : Foreign.Memory.voidStar list ref = ref []
+
 datatype outcome = Code of int  (* CURLcode *)
                  | Raised of exn
 
@@ -407,16 +411,25 @@ fun pump m =
     fun take_queued () =
       with_pool_lock (fn () =>
         if not (null (!running)) orelse wait_for_work (Time.+ (Time.now (), idle_timeout ()))
-        then SOME (!queued before queued := [])
+        then SOME (!queued before queued := [], !aborting before aborting := [])
         else NONE)
+    (* Stops a running transfer its request gave up on, as a callback
+       aborting it would. *)
+    fun stop easy =
+      if List.exists (fn e => e = easy) (!running) then
+        (mcheck "curl_multi_remove_handle" (multi_remove_handle (m, easy));
+         running := List.filter (fn e => e <> easy) (!running);
+         hand_back [(easy, Code CURLE_ABORTED_BY_CALLBACK)])
+      else ()
     fun loop () =
       case take_queued () of
           NONE => ignore (multi_cleanup m)
-        | SOME added =>
+        | SOME (added, stopped) =>
             (* Running before they're added, so a failed add fails the whole
                batch below; removing a handle never added is harmless. *)
             (running := added @ !running;
              List.app (fn easy => mcheck "curl_multi_add_handle" (multi_add_handle (m, easy))) added;
+             List.app stop stopped;
              mcheck "curl_multi_perform" (multi_perform (m, ref 0));
              read_done ();
              if null (!running) then ()
@@ -674,8 +687,8 @@ val write_stream =
 
 (* Runs easy's transfer on the shared multi handle, passing the body it
    receives to on_data on this thread as it comes, and returns once the
-   transfer has finished.  When on_data raises, the transfer is failed and
-   waited for before the exception goes on, since the pump still uses the
+   transfer has finished.  When on_data raises, the pump stops the transfer,
+   which is waited for before the exception goes on, since the pump uses the
    handle until then. *)
 fun run_streaming easy key pending on_data =
   uninterruptible (fn () =>
@@ -699,14 +712,19 @@ fun run_streaming easy key pending on_data =
           | (chunks, NONE) => (deliver chunks; loop deliver)
       fun give_up () =
         with_pool_lock (fn () =>
-          List.app (fn (k, (_, aborted)) => if k = key then aborted := true else ()) (!streams))
+          (List.app (fn (k, (_, aborted)) => if k = key then aborted := true else ()) (!streams);
+           aborting := easy :: !aborting;
+           ConditionVar.signal pump_wake))
+      (* Once the transfer is handed back, a stop the pump hasn't taken
+         must not reach a later handle at the same address. *)
+      fun forget () = with_pool_lock (fn () => aborting := List.filter (fn e => e <> easy) (!aborting))
     in
       with_pool_lock (fn () =>
         (mcheck "curl_multi_wakeup" (multi_wakeup (current_multi ()));
          queued := easy :: !queued;
          ConditionVar.signal pump_wake));
       loop (List.app on_data)
-      handle e => (give_up (); ignore (loop ignore); raise e)
+      handle e => (give_up (); ignore (loop ignore); forget (); raise e)
     end)
 
 (* Sends one request as the curl command does by default, the way the
@@ -714,10 +732,12 @@ fun run_streaming easy key pending on_data =
    Accept-Encoding, and none of the remote cache's credentials, only the
    given headers.  BODY, when given, is POSTed.  The response body goes to
    on_data on this thread as it arrives, so a stream such as an event feed is
-   read while it lasts.  A transport error is described as the curl command
-   prints it, `curl: (CODE) detail`.  max_time bounds the whole request,
-   when given; connect_timeout its connection.  Shares the multi handle's
-   connections with every other request. *)
+   read while it lasts.  Returns the HTTP status, 0 when no answer came, as
+   the curl command's `%{http_code}` gives it, also after a transport error,
+   and that error, described as the curl command prints it,
+   `curl: (CODE) detail`.  max_time bounds the whole request, when given;
+   connect_timeout its connection.  Shares the multi handle's connections
+   with every other request. *)
 fun stream_once {url, headers, body, connect_timeout, max_time, on_data} =
   (HolbuildOffline.require_online "send an HTTP request";
    enter ();
@@ -729,18 +749,21 @@ fun stream_once {url, headers, body, connect_timeout, max_time, on_data} =
       fun release () =
         (with_pool_lock (fn () => streams := List.filter (fn (k, _) => k <> key) (!streams));
          close handle_; slist_free_all header_list; Foreign.Memory.free key)
+      fun status () =
+        Foreign.Memory.alloca (0w8, fn status =>
+          (check "RESPONSE_CODE" (getinfo_ptr (easy, CURLINFO_RESPONSE_CODE, status));
+           SysWord.toInt (Foreign.Memory.get64 (status, 0w0))))
       fun result outcome =
         case outcome of
             Raised e => raise e
           | Code code =>
               if code = CURLE_PEER_FAILED_VERIFICATION andalso no_ca_directory then raise CaDirectoryNeeded
-              else if code <> 0 then
-                Failed ("curl: (" ^ Int.toString code ^ ") " ^
-                        (case c_string_at errors of "" => easy_strerror code | detail => detail))
               else
-                Foreign.Memory.alloca (0w8, fn status =>
-                  (check "RESPONSE_CODE" (getinfo_ptr (easy, CURLINFO_RESPONSE_CODE, status));
-                   Response (SysWord.toInt (Foreign.Memory.get64 (status, 0w0)))))
+                {status = status (),
+                 failure =
+                   if code = 0 then NONE
+                   else SOME ("curl: (" ^ Int.toString code ^ ") " ^
+                              (case c_string_at errors of "" => easy_strerror code | detail => detail))}
     in
       (check "CONNECTTIMEOUT" (setopt_long (easy, CURLOPT_CONNECTTIMEOUT, connect_timeout));
        check "TIMEOUT_MS" (setopt_long (easy, CURLOPT_TIMEOUT_MS, 1000 * Option.getOpt (max_time, 0)));

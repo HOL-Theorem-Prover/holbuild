@@ -2377,9 +2377,10 @@ the build restores those theories from the local cache, or from the remote cache
 whatever is not there yet. The coordinator's credentials go
 in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 `header = "Authorization: Bearer <token>"`, so they stay off the command line.
-holbuild submits and follows the batch through libcurl, as it talks to the
-remote cache; when libcurl can't be loaded, or this file holds an option other
-than `header`, it runs the `curl` command instead, which reads the whole file.
+holbuild submits and follows the batch through libcurl when it talks to the
+remote cache through libcurl (above); otherwise, or when this file holds
+anything but `header` lines or names a header file (`header = "@path"`), it
+runs the `curl` command instead, which reads the whole file.
 
 If a local cache entry has a weaker tactic-timeout contract than requested,
 restore refreshes it from the remote cache once. This picks up a stronger

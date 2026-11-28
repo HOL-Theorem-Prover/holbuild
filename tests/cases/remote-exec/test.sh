@@ -936,9 +936,10 @@ run unavailable-detach 1 build --remote-exec "$coordinator" --remote-only --deta
 [[ $(grep -c "coordinator refused the batch (HTTP 502)" "$tmpdir/unavailable-detach.log") -eq 5 ]] ||
   { cat "$tmpdir/unavailable-detach.log" >&2; exit 1; }
 rm "$state/unavailable"
-# The coordinator's own 500 under load, and a 429, are retried the same way;
-# another 4xx is refused at once.
-for status in 500 429; do
+# A restarting coordinator's 503, its proxy's 504, the coordinator's own 500
+# under load, and a 429, are retried the same way; another 4xx is refused at
+# once.
+for status in 503 504 500 429; do
   write_theories "overloaded-$status"
   echo 1 > "$state/unavailable"
   echo "$status" > "$state/unavailable-status"
@@ -3385,10 +3386,10 @@ LINES
 
 # A batch is submitted and followed through libcurl, with the curl config's
 # headers, when libcurl is loaded, and through the curl command when it
-# isn't or the config holds more than headers (libcurl names no user agent,
-# the curl command curl/...).  Both retry a submission answered 502, ride out
-# a coordinator restart (a dropped stream, then 503s), and reattach a cut
-# stream, saying the same.
+# isn't or the config holds more than headers, or a header file (libcurl
+# names no user agent, the curl command curl/...).  Both retry a submission
+# answered 502, ride out a coordinator restart (503s, then a dropped stream),
+# and reattach a cut stream, saying the same.
 project=$tmpdir/transport
 mkdir -p "$project/src"
 cat > "$project/holproject.toml" <<TOML
@@ -3400,6 +3401,8 @@ members = ["src"]
 TOML
 printf 'header = "Authorization: Bearer stub-token"\n' > "$tmpdir/transport.curl"
 printf 'header = "Authorization: Bearer stub-token"\nconnect-timeout = 10\n' > "$tmpdir/transport-more.curl"
+printf 'Authorization: Bearer stub-token\n' > "$tmpdir/transport.headers"
+printf 'header = "@%s"\n' "$tmpdir/transport.headers" > "$tmpdir/transport-file.curl"
 # through AGENT LOG: the last run's submissions and event streams all went
 # through AGENT (libcurl or curl) with the stub's token.
 through() {
@@ -3456,3 +3459,8 @@ write_theories more-config
 HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/transport-more.curl \
   run more-config 0 build --remote-exec "$coordinator" --remote-only BTheory
 through curl more-config
+: > "$state/agents.log"
+write_theories header-file
+HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/transport-file.curl \
+  run header-file 0 build --remote-exec "$coordinator" --remote-only BTheory
+through curl header-file
