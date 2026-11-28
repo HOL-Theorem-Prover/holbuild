@@ -1989,7 +1989,9 @@ miss or a conflict: the cache failed, not the action.
 A theory exported with `--tool-cache NAME` (see "Keeping a tool's files
 between builds" below) gets a tool cache: before HOL starts, the worker
 fills `.holbuild/tool-cache/NAME` under the action root from the remote
-cache's entry for the key
+cache's entry for the key, read with `Cache-Control: no-cache` (a cache in
+front of the store, such as a host's, may serve an entry another host's
+publish has replaced since)
 
 ```text
 sha256("holbuild-tool-cache-v1\nname=" ^ NAME ^ "\ndeps_key=" ^ <deps_key> ^ "\ntoolchain=" ^ <toolchain key>)
@@ -2000,10 +2002,8 @@ and gives the theory's HOL processes that directory as
 every theory with the same dependencies and toolchain shares the entry, on
 any worker. The worker keeps the entry's files in its host store
 (`<cache root>/checkpoint-store`), so it fetches each from the remote cache
-once. If the remote cache has lost a file's blob, the worker reads the
-entry again with `Cache-Control: no-cache` (a cache in front of the store may
-serve an entry the store has replaced), restores the files whose blobs are
-left, and warns for each lost one. After HOL exits, built or failed, the
+once. If the remote cache has lost a file's blob, the worker restores the
+files whose blobs are left and warns for each lost one. After HOL exits, built or failed, the
 worker publishes the directory again if its files changed or the entry lost a
 blob, uploading every file, which renews each blob the entry names in a store
 that expires them (a later restore heals an entry whose blob expired first).
