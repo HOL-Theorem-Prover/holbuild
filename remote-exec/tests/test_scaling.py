@@ -11,7 +11,7 @@ from pydantic import ValidationError
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from conftest import CLIENT_TOKEN, WORKER_TOKEN
+from conftest import CLIENT_TOKEN, WORKER_TOKEN, Settled
 from remote_exec import app as app_module
 from remote_exec import coordinator as coordinator_module
 from remote_exec.cache_pool import CacheSlot
@@ -23,6 +23,7 @@ from remote_exec.coordinator import (
     ScaleRun,
     Settings,
     burst_demand,
+    held_target,
     is_auth_failure,
 )
 from test_cache_pool import Provider
@@ -80,6 +81,73 @@ def counts(
 )
 def test_burst_demand(queue: QueueCounts, expected: int) -> None:
     assert burst_demand(queue, warm_workers=2, max_burst_workers=16) == expected
+
+
+START = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("demand", "seconds", "expected"),
+    [
+        ([(0, 48)], 0, 48),
+        ([(0, 128)], 0, 96),
+        ([(0, 128), (179, 128)], 179, 96),
+        ([(0, 128), (180, 128)], 180, 128),
+        ([(0, 128), (181, 160)], 181, 128),  # carry the sample immediately before the left edge
+        ([(0, 128), (174, 128), (175, 48)], 180, 96),  # hold the free workers after a brief spike
+        ([(0, 128), (180, 128), (195, 48)], 240, 128),
+        ([(0, 128), (180, 128), (195, 48), (241, 48)], 241, 48),
+        ([(0, 700), (180, 700)], 180, 576),
+    ],
+)
+def test_held_target(demand: list[tuple[int, int]], seconds: int, expected: int) -> None:
+    samples = [(START + timedelta(seconds=at), workers) for at, workers in demand]
+    assert held_target(
+        samples, START + timedelta(seconds=seconds), down_hold_s=60, up_hold_s=180, free_workers=96, cap=576
+    ) == expected
+
+
+@pytest.mark.parametrize(("wave_seconds", "expected_after_old_wave"), [(190, 128), (45, 96)])
+def test_short_dips_keep_the_higher_target_while_sustained_waves_renew_it(
+    wave_seconds: int, expected_after_old_wave: int
+) -> None:
+    samples: list[tuple[datetime, int]] = []
+    for second in range(0, 1001, 5):
+        now = START + timedelta(seconds=second)
+        # First qualify at 180 s, then alternate waves with 5 s dips.
+        low = second >= 195 and (second - 195) % (wave_seconds + 5) == 0
+        samples.append((now, 96 if low else 128))
+        target = held_target(samples, now, down_hold_s=60, up_hold_s=180, free_workers=96, cap=576)
+        if expected_after_old_wave == 128 or second <= 480:
+            assert target == (96 if second < 180 else 128)
+        elif second >= 500:
+            assert target == expected_after_old_wave
+
+
+async def test_queue_reports_the_same_gated_target_as_the_scaler(
+    coordinator: Coordinator, tmp_path: Path
+) -> None:
+    scaled, calls = scaled_coordinator(coordinator, tmp_path, "")
+    settings = scaled.settings.model_copy(update={
+        "max_burst_workers": 576,
+        "scale_down_hold_s": 60.0,
+        "scale_up_hold_s": 180.0,
+        "scale_up_free_workers": 96,
+    })
+    scaled = Coordinator(coordinator.engine, coordinator.cache, settings)
+    now = START
+    scaled.clock = lambda: now
+    transport = Settled(app_module.create_app(scaled, settings), scaled)
+    async with httpx.AsyncClient(transport=transport, base_url="http://coordinator.test") as http:
+        await submit(http, [f"a{i}" for i in range(129)])
+        await scaled.scale()
+        for second, expected in [(0, 96), (179, 96), (180, 128)]:
+            now = START + timedelta(seconds=second)
+            response = await http.get("/v1/queue", headers=CLIENT)
+            assert response.status_code == 200
+            assert response.json()["desired_burst_workers"] == expected
+            await scaled.scale()
+            assert calls.read_text().split()[-1] == str(expected)
 
 
 def scaled_coordinator(coordinator: Coordinator, tmp_path: Path, script: str) -> tuple[Coordinator, Path]:

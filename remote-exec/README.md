@@ -168,6 +168,8 @@ The coordinator reads its settings from the environment:
 | `REMOTE_EXEC_LOCALITY` | steer builds to the hosts below the scale-in line that hold their checkpoints or dependency context (see Claims); `false` for the plain order | true |
 | `REMOTE_EXEC_MAX_BURST_WORKERS` | most burst workers to ask for | 0 |
 | `REMOTE_EXEC_SCALE_DOWN_HOLD_S` | how long a higher burst worker count is kept after demand drops | 900 |
+| `REMOTE_EXEC_SCALE_UP_HOLD_S` | how long higher burst demand must persist before raising the target beyond the immediate allowance or the held count, whichever is greater. Set to 0 to disable the scale-up hold | 0 |
+| `REMOTE_EXEC_SCALE_UP_FREE_WORKERS` | burst workers that can be requested as soon as demand calls for them | 0 |
 | `REMOTE_EXEC_CACHE_SCALE_DOWN_HOLD_S` | how long the burst cache pool keeps the capacity a higher burst worker count needed (see "Temporary cache members") | 900 |
 | `REMOTE_EXEC_SCALE_CMD` | command run as `<command> <burst workers>` when that count changes | none |
 
@@ -780,9 +782,8 @@ most `REMOTE_EXEC_MAX_BURST_WORKERS`. Runs contribute only up to
 `REMOTE_EXEC_RUN_SLOTS` in both the total and high-tier demand terms;
 high-tier builds remain uncapped except by `MAX_BURST_WORKERS`. Actions
 claimed ahead and still waiting for a parent count apart, one burst worker
-each: only burst workers load ahead, so warm workers never take them, and the
-burst workers holding them stay while a narrow point of the graph leaves no
-ready work.
+each. Only burst workers load ahead, so those leases continue to count
+toward burst demand while a narrow point of the graph leaves no ready work.
 
 ```text
 active = ready_build + running_build - waiting_ahead + min(RUN_SLOTS, ready_run + running_run)
@@ -793,10 +794,21 @@ demand = min(MAX_BURST_WORKERS, max(0, active - WARM_WORKERS, high) + waiting_ah
 A build's dependency graph narrows and widens: a few theories everything else
 waits on run alone, then many become ready together. Following the queue
 exactly would stop burst workers at every narrow point and start them again
-seconds later. So the target is the highest demand of the last
-`REMOTE_EXEC_SCALE_DOWN_HOLD_S` seconds: it rises at once and falls only after
-demand has stayed lower for that long. Each scale check records its demand
-in the database, so a restarted coordinator keeps holding the target.
+seconds later. The target holds the highest admitted worker count over the
+last `REMOTE_EXEC_SCALE_DOWN_HOLD_S` seconds. By default, all burst demand is
+admitted immediately.
+
+With a positive `REMOTE_EXEC_SCALE_UP_HOLD_S`, demand can raise the target
+immediately up to the greater of `REMOTE_EXEC_SCALE_UP_FREE_WORKERS` and the
+held worker count. Demand beyond that count must persist for the full
+scale-up hold before raising the target. Brief dips can keep a higher count
+while sustained waves keep renewing it. If demand stays choppy, an earlier
+qualifying wave eventually ages out of the replay window, which spans twice
+the sum of the two holds.
+
+Each scale check records raw demand in the database. A restarted coordinator
+replays those samples to compute the same target, and the cache pool keeps
+using raw demand over its own scale-down hold.
 
 Nonempty batch submissions request a background scale check immediately after
 making root actions ready. Concurrent requests are coalesced, and intake and
