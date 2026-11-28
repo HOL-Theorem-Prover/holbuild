@@ -2232,6 +2232,14 @@ val last_child_status : OS.Process.status option ref = ref NONE
    ahead's join moves it past the child's waits for late parents. *)
 val last_child_start : LargeInt.int option ref = ref NONE
 
+(* When that child ended, as its parent saw it; NONE until it has. *)
+val last_child_end : LargeInt.int option ref = ref NONE
+
+(* How long the children run_hol_files_to_log started have run in all, for
+   exec-action's holdriver; NONE once a load ahead's child, started before
+   the hol phase, has joined it. *)
+val hol_children_ms : LargeInt.int option ref = ref (SOME 0)
+
 (* HOL's `use` remembers a source parse error in the heap and, with
    failOnError set as `hol run` sets it, exits with failure after the next
    top-level declaration.  A checkpoint saved after such an error (holbuild
@@ -2309,7 +2317,9 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
     val _ = ensure_parent log
     val _ = create_current_log_link log current_log
     val _ = last_child_status := NONE
-    val _ = last_child_start := SOME (Time.toMilliseconds (Time.now ()))
+    val started = Time.toMilliseconds (Time.now ())
+    val _ = last_child_start := SOME started
+    val _ = last_child_end := NONE
     val tool_env =
       (case !tool_cache_dir of SOME dir => ["HOLBUILD_TOOL_CACHE_DIR=" ^ dir] | NONE => []) @
       (case !scratch_input_paths of
@@ -2330,6 +2340,9 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
           raise HolbuildActionSandbox.Error msg
         else raise Error msg
     val _ = last_child_status := SOME status
+    val ended = Time.toMilliseconds (Time.now ())
+    val _ = last_child_end := SOME ended
+    val _ = hol_children_ms := Option.map (fn ms => ms + (ended - started)) (!hol_children_ms)
     val detail_log = finalize_current_log log current_log
   in
     if HolbuildToolchain.success status then
@@ -4528,6 +4541,8 @@ fun failed_prefix_resume_source policy contexts timeout_marker source_name sourc
       case #proof_ir_plan checkpoint of
           SOME expr => "val _ = HolbuildProofRuntime.set_theorem_plan (SOME (" ^ expr ^ "));\n"
         | NONE => "val _ = HolbuildProofRuntime.set_theorem_plan NONE;\n"
+    (* The time from the runtime's install to here is the plan's (holplan). *)
+    val plan_line = plan_line ^ "val _ = HolbuildProofRuntime.end_gap \"holplan\";\n"
     val replay_block =
       plan_line ^ (if #kind checkpoint = "resume" then resume_replay () else theorem_replay ())
     val suffix =
@@ -13399,18 +13414,25 @@ fun merge_phases phases =
    runtime install, to the script's start (holscriptstart, which the stage
    prints whether or not the script is instrumented).  holscript runs from
    that start to the exporter's (holscriptend), holexport from there to the
-   theory's export (holexportend); the marks themselves aren't phases.  The log is the child's, so it is read in bounded pieces and a line
+   theory's export (holexportend); the marks themselves aren't phases.
+   Each runtime's line also marks when its last top-level part ended
+   (holpartend) and when the exit began (holexitmark): a runtime loaded
+   again later ends the earlier one's time, the gap to its install counted
+   as holgap; holtail runs from the last runtime's holpartend to the exit,
+   and holexit from there to CHILD_END, when the parent saw the child end.  The log is the child's, so it is read in bounded pieces and a line
    longer than a phases line could be is skipped.  Reading stops at the
    first report a worker appends to the log
    (HolbuildTheoryDiagnostics.worker_report): what follows is holbuild's
    report on the child's output, not that output, so no phases line there
    counts. *)
 val hol_log_phase_names =
-  ["holloadend", "holscriptstart", "holscriptend", "holexportend", "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
+  ["holloadend", "holscriptstart", "holscriptend", "holexportend", "holpartend", "holexitmark",
+   "holsalvage", "holleaves", "holrewind", "holtactics", "holprint", "holsave",
+   "holgap", "holplan", "holreplay", "holresume",
    "holcompiledn", "holreplayedn", "holrewoundn", "holmodhitn", "holmodmissn", "holmodwriten",
    "srclib", "srclibn", "srcrt", "srcrtn", "srcthy", "srcthyn"]
 
-fun hol_log_phases log_file child_start =
+fun hol_log_phases log_file child_start child_end =
   let
     val prefix = "holbuild hol-phases "
     val max_line = 4096
@@ -13480,10 +13502,31 @@ fun hol_log_phases log_file child_start =
             let val ms = first - start - sum "holsave" preload
             in if ms >= 0 then [("holload", ms)] else [] end
         | _ => []
-    val marks = ["holloadend", "holscriptstart", "holscriptend", "holexportend"]
+    (* The runtimes' lines, in the order they were installed. *)
+    fun insert (r, []) = [r]
+      | insert (r, x :: xs) = if #1 r <= #1 x then r :: x :: xs else x :: insert (r, xs)
+    val runtimes =
+      List.foldl insert []
+        (List.mapPartial
+           (fn line =>
+               case (value "holloadend" line, value "holpartend" line, value "holexitmark" line) of
+                   (SOME install, SOME part_end, SOME exit) => SOME (install, part_end, exit)
+                 | _ => NONE)
+           lines)
+    fun gaps ((_, part_end, _) :: (rest as (install, _, _) :: _)) =
+          LargeInt.max (0, install - part_end) + gaps rest
+      | gaps _ = 0
+    val exit = List.foldl (fn ((_, _, e), m) => LargeInt.max (e, m)) 0 runtimes
+    val tail =
+      case List.rev runtimes of
+          (_, part_end, _) :: _ =>
+            [("holgap", gaps runtimes), ("holtail", LargeInt.max (0, exit - part_end))] @
+            (case child_end of SOME ended => [("holexit", LargeInt.max (0, ended - exit))] | NONE => [])
+        | [] => []
+    val marks = ["holloadend", "holscriptstart", "holscriptend", "holexportend", "holpartend", "holexitmark"]
   in
     load @ span "holscript" (script_start, script_end) @ span "holexport" (script_end, mark "holexportend") @
-    List.filter (fn (name, _) => not (List.exists (fn mark => mark = name) marks)) (List.concat lines)
+    List.filter (fn (name, _) => not (List.exists (fn mark => mark = name) marks)) (List.concat lines) @ tail
   end
 
 (* A failure message as one line of a result record: printable ASCII, every
@@ -14037,7 +14080,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               fun observe file =
                 if not (Posix.FileSys.ST.isReg (Posix.FileSys.lstat file)) then ModuleWrong
                 else
-                  case (module_file_id file, HolbuildHash.file_sha256 file = sha) of
+                  case (module_file_id file, (add_restore_step "rstmodhashn" 1; HolbuildHash.file_sha256 file = sha)) of
                       (_, false) => ModuleWrong
                     | (NONE, true) => ModuleMatches
                     | (SOME found, true) => if found = id then ModuleMatches else ModulePoisoned
@@ -14053,10 +14096,12 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 | state => state
             end
             handle OS.SysErr _ => ModuleWrong | IO.Io _ => ModuleWrong
+    (* The time checking the modules the heap loads (rstmodhash); each
+       file hashed counts one rstmodhashn. *)
     fun module_states modules =
       let val checks = map (fn module => (module, ref ModuleWrong)) modules
       in
-        transfer_all (fn (module, state) => state := module_state module) checks;
+        restore_step "rstmodhash" (fn () => transfer_all (fn (module, state) => state := module_state module) checks);
         map (fn (module, state) => (module, !state)) checks
       end
     fun in_state state checks = List.mapPartial (fn (module, s) => if s = state then SOME module else NONE) checks
@@ -17123,7 +17168,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        write_text resident_marker "")
     fun run () =
       let
-        val _ = reset ()
+        val _ = phase "reset" reset
         val spec_path = Path.concat(root, ".holbuild/action-spec")
         (* Only a spec the cache doesn't have is rejected; a failed fetch is
            retryable. *)
@@ -17455,7 +17500,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val oom_before = cgroup_oom_kills ()
         val _ = last_child_status := NONE
         (* A load ahead's child is already running: it set the start. *)
-        val _ = if isSome ahead then () else last_child_start := NONE
+        val _ = if isSome ahead then () else (last_child_start := NONE; last_child_end := NONE)
         val _ = dropped_checkpoints := 0
         val _ = rejected_heap_modules := 0
         val _ = published_checkpoints := 0
@@ -18146,6 +18191,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                           record_timings ();
                           (* holload leaves out the waits aheadwait reports. *)
                           last_child_start := Option.map (fn start => start + !waited_ms) (!last_child_start);
+                          hol_children_ms := NONE;
                           case (abandoned (), !outcome) of
                               (SOME reason, _) => abandon reason
                             | (NONE, SOME (SOME e)) => raise e
@@ -18261,13 +18307,23 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               val wall_ms = Time.toMilliseconds (Time.-(Time.now (), start))
               (* The log is read only once the child has returned. *)
               val hol_phases =
-                if !HolbuildActionSandbox.child_completed then hol_log_phases (build_log ()) (!last_child_start)
+                if !HolbuildActionSandbox.child_completed then hol_log_phases (build_log ()) (!last_child_start) (!last_child_end)
                 else []
               fun count (name, n) = if !n > 0 then [(name, LargeInt.fromInt (!n))] else []
               val drops = count ("rstdropn", dropped_checkpoints) @ count ("rstmodrejn", rejected_heap_modules) @
                           count ("pubckptn", published_checkpoints)
               val _ = phases := rev (hol_phases @ !resume_steps @ drops) @ !phases
-              val phases = merge_phases (rev (!phases)) @
+              val merged = merge_phases (rev (!phases))
+              (* The hol phases' time outside their HOL children: the
+                 driver's own, around and between the children. *)
+              val driver =
+                case (List.find (fn (name, _) => name = "hol") merged, !hol_children_ms) of
+                    (SOME (_, hol), SOME children) =>
+                      if !HolbuildActionSandbox.child_completed
+                      then [("holdriver", LargeInt.max (0, hol - children))]
+                      else []
+                  | _ => []
+              val phases = merged @ driver @
                 [("started", Time.toMilliseconds start),
                  ("finished", Time.toMilliseconds (Time.now ()))] @
                 (if !theory_action then [("rebuilt", if status = "built" then 1 else 0)] else [])
