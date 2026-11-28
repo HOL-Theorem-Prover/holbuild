@@ -491,7 +491,7 @@ val execution_env_prefixes =
    "HOLBUILD_REMOTE_CACHE_ALLOWED_URLS=", "HOLBUILD_REMOTE_CACHE_DISCOVERY_URL=",
    "HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG=", "HOLBUILD_REMOTE_EXEC_CURL_CONFIG=",
    "HOLBUILD_COOPERATE_DIR=", "HOLBUILD_COOPERATE_LOCK_TIMEOUT=", "HOLBUILD_AUTO_GC=",
-   "HOLBUILD_STATUS=", "HOLBUILD_CACHE_TRACE=", "HOLBUILD_ECHO_CHILD_LOGS="]
+   "HOLBUILD_STATUS=", "HOLBUILD_CACHE_TRACE=", "HOLBUILD_ECHO_CHILD_LOGS=", "HOLBUILD_TEST_RESUBMIT_"]
 
 fun recorded_env_var entry =
   String.isPrefix "HOLBUILD_" entry andalso
@@ -760,16 +760,18 @@ fun not_written (Unencodable text) = NotWritten ("a path or name holds a control
 (* The write of the record of PLAN and its KEYS into DIR, which says why
    not if it can't; PRIOR is the record PLAN was restored from.  The record
    is built now, so the stamps of the files planning hashed are taken now:
-   a stamp taken later could pair a replaced file with the old hash. *)
-fun writer dir context prior plan keys : unit -> write_outcome =
+   a stamp taken later could pair a replaced file with the old hash.  With
+   the write, the record, if it could be built. *)
+fun writer dir context prior plan keys : t option * (unit -> write_outcome) =
   let val record = build context prior plan keys
   in
-    fn () => (write_record (OS.Path.concat (dir, #fingerprint record)) (encode record);
-              prune_records dir;
-              Written)
-             handle e => not_written e
+    (SOME record,
+     fn () => (write_record (OS.Path.concat (dir, #fingerprint record)) (encode record);
+               prune_records dir;
+               Written)
+              handle e => not_written e)
   end
-  handle e => let val outcome = not_written e in fn () => outcome end
+  handle e => let val outcome = not_written e in (NONE, fn () => outcome) end
 
 (* ---- Reading ---- *)
 

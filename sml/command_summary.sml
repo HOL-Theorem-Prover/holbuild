@@ -18,6 +18,8 @@ val counts = Array.array (4, 0)
 val failures = ref ([] : (string * bool * string) list)
 val max_failures = 20
 val first_failure = ref (NONE : Time.time option)
+(* Fields a later part of holbuild adds to the summary, made at exit. *)
+val extra_fields = ref (fn () => [] : string list)
 val mutex = Mutex.mutex ()
 
 (* Polling cannot certify that no execution occurred between snapshots. *)
@@ -224,7 +226,8 @@ fun finish () = best_effort (fn () =>
           (case !first_failure of SOME t => [timestamp "first_failure_at_ms" t] | NONE => []) @
           [J.json_object_field "local_outcomes"
              (ListPair.mapEq (fn (name, i) => J.json_int_field name (Array.sub (counts, i)))
-               (["built", "restored_local", "restored_remote", "up_to_date"], [0, 1, 2, 3]))]) ^ "\n"))
+               (["built", "restored_local", "restored_remote", "up_to_date"], [0, 1, 2, 3]))] @
+          !extra_fields ()) ^ "\n"))
 
 fun initialize () =
   (started := Time.now ();

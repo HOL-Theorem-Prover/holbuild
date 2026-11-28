@@ -1527,13 +1527,13 @@ fun source_name plan node =
       SOME name => name
     | NONE => default_source_name (package node) (#relative_path (source_of node))
 
-(* The lines of a node's action, with each project dependency written by
-   DEP_TEXT and the node's extra inputs as INPUT_LINES. *)
-fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_lines node =
+(* The lines of a node's action but the one naming its source's hash,
+   which goes between HEAD and TAIL, with each project dependency written
+   by DEP_TEXT and the node's extra inputs as INPUT_LINES. *)
+fun action_lines_around plan config_lines_for_node toolchain_key dep_text input_lines node =
   let
     val source = source_of node
     val analysis = analysis_state plan
-    val source_hash = source_hash_of analysis node
     (* In load order, so a change of order changes the key. *)
     val project_deps = map (fn dep => (load_order plan dep, dep_text dep)) (direct_project_deps plan node)
     (* Toolchain objects are a function of the theory toolchain identity, so
@@ -1551,35 +1551,50 @@ fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_li
       map (fn output => "source_extra_output=" ^ output)
           (#extra_outputs (deps_of analysis node))
   in
-    ["holbuild-action-v1",
-     "toolchain=" ^ toolchain_key,
-     "kind=" ^ kind_name source,
-     "package=" ^ #package source,
-     "logical=" ^ #logical_name source,
-     "source=" ^ #relative_path source,
-     "source-sha256=" ^ source_hash] @
-    (case (#kind source, toolchain_source_name plan node) of
-         (HolbuildSourceIndex.TheoryScript, SOME name) => ["source-name=" ^ name]
-       | _ => []) @
-    ["cache=" ^ bool_text (HolbuildProject.action_cache_enabled policy),
-     "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
-    config_lines_for_node node @
-    declared_dep_lines @
-    declared_load_lines @
-    input_lines @
-    source_extra_output_lines @
-    map (fn (_, dep) => "dep=" ^ dep) (sort_by_load_order #1 (project_deps @ external_deps @ external_libs))
+    {head =
+       ["holbuild-action-v1",
+        "toolchain=" ^ toolchain_key,
+        "kind=" ^ kind_name source,
+        "package=" ^ #package source,
+        "logical=" ^ #logical_name source,
+        "source=" ^ #relative_path source],
+     tail =
+       (case (#kind source, toolchain_source_name plan node) of
+            (HolbuildSourceIndex.TheoryScript, SOME name) => ["source-name=" ^ name]
+          | _ => []) @
+       ["cache=" ^ bool_text (HolbuildProject.action_cache_enabled policy),
+        "always_reexecute=" ^ bool_text (HolbuildProject.action_always_reexecute policy)] @
+       config_lines_for_node node @
+       declared_dep_lines @
+       declared_load_lines @
+       input_lines @
+       source_extra_output_lines @
+       map (fn (_, dep) => "dep=" ^ dep) (sort_by_load_order #1 (project_deps @ external_deps @ external_libs))}
   end
 
-fun action_text_with plan config_lines_for_node toolchain_key keys node =
+(* The lines of an action whose source hashes to SOURCE_HASH. *)
+fun action_lines_of {head, tail} source_hash = head @ ["source-sha256=" ^ source_hash] @ tail
+
+(* The text of those lines, which the action's input key hashes. *)
+fun action_text_of parts source_hash = String.concatWith "\n" (action_lines_of parts source_hash) ^ "\n"
+
+fun action_lines_with plan config_lines_for_node toolchain_key dep_text input_lines node =
+  action_lines_of (action_lines_around plan config_lines_for_node toolchain_key dep_text input_lines node)
+    (source_hash_of (analysis_state plan) node)
+
+(* The node's action text, from its parts. *)
+fun action_parts_with plan config_lines_for_node toolchain_key keys node =
   let
     val input_lines = extra_input_lines plan node
     val _ = remember_extra_inputs_key plan node input_lines
     fun dep_text dep = package dep ^ ":" ^ logical_name dep ^ "@" ^ lookup_key keys dep
+    val parts = action_lines_around plan config_lines_for_node toolchain_key dep_text input_lines node
   in
-    String.concatWith "\n"
-      (action_lines_with plan config_lines_for_node toolchain_key dep_text input_lines node) ^ "\n"
+    {parts = parts, text = action_text_of parts (source_hash_of (analysis_state plan) node)}
   end
+
+fun action_text_with plan config_lines_for_node toolchain_key keys node =
+  #text (action_parts_with plan config_lines_for_node toolchain_key keys node)
 
 (* What the node's action key commits to besides its dependencies' keys: the
    action lines with each project dependency named but not keyed.  Two builds

@@ -40,7 +40,7 @@ bin/holbuild: sml/holbuild-script.sml sml/sha256.sml sml/bounded_output.sml sml/
 # links one input, so both objects go in an archive, from which the linker takes
 # that main before reaching libpolymain's. Merging them with ld -r instead made
 # GNU ld's LTO plugin crash in some final links.
-bin/holbuild: sml/action_sandbox.sml sml/action_resident.sml sml/process_group.sml sml/tactic_timeout_policy.sml sml/command_summary.sml sml/driver_main.c
+bin/holbuild: sml/action_sandbox.sml sml/action_resident.sml sml/process_group.sml sml/tactic_timeout_policy.sml sml/command_summary.sml sml/resubmit_record.sml sml/driver_main.c
 	@mkdir -p bin
 	echo 'val () = use "sml/holbuild-script.sml"; val () = PolyML.export("$@.ml.o", main);' | \
 		HOLBUILD_COMPILE_DATADIR="$(abspath $(DATADIR))" $(POLY) -q --error-exit --gcthreads=1
