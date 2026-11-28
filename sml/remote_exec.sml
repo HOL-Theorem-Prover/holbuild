@@ -3,10 +3,12 @@ struct
 
 (* Client of a remote-execution coordinator: submits an action batch, as
    `action-spec --upload` prints it, and follows the batch's events until it
-   finishes.  Requests go through the curl command; a curl config file named
-   by HOLBUILD_REMOTE_EXEC_CURL_CONFIG supplies the coordinator's credentials
-   (an `Authorization: Bearer` header), so they never appear on a command
-   line.  See README, "Building on remote workers". *)
+   finishes.  A curl config file named by HOLBUILD_REMOTE_EXEC_CURL_CONFIG
+   supplies the coordinator's credentials (an `Authorization: Bearer`
+   header), so they never appear on a command line.  A batch is submitted
+   and followed through the remote cache's libcurl client when it is loaded
+   and the config holds only headers; otherwise, and for every other request,
+   through the curl command.  See README, "Building on remote workers". *)
 
 (* A step that yields text (a batch, a batch id) or says why it couldn't. *)
 datatype attempt = Ok of string | Refused of string
@@ -55,6 +57,55 @@ fun curl_config_args () =
 fun curl_args url options =
   ["-q", "-sS", "--connect-timeout", Int.toString connect_timeout_seconds] @
   curl_config_args () @ options @ [url]
+
+(* The coordinator's headers from HOLBUILD_REMOTE_EXEC_CURL_CONFIG, when
+   libcurl can send its requests: SOME [] without a config.  NONE leaves them
+   to the curl command: the remote cache doesn't use libcurl, or the config
+   isn't a regular file (a pipe can be read only once), can't be read, or
+   holds what only the curl command knows, an option other than `header` or a
+   header file (`@path`). *)
+fun libcurl_headers () =
+  if not (HolbuildRemoteCacheConfig.uses_libcurl ()) then NONE
+  else
+    case OS.Process.getEnv "HOLBUILD_REMOTE_EXEC_CURL_CONFIG" of
+        NONE => SOME []
+      | SOME path =>
+          ((if not (Posix.FileSys.ST.isReg (Posix.FileSys.stat path)) then NONE
+            else
+              let val options = HolbuildRemoteCacheConfig.parse_curl_config (HolbuildHash.read_all path)
+              in
+                if List.all (fn (name, value) => name = "header" andalso not (String.isPrefix "@" value)) options
+                then SOME (map #2 options) else NONE
+              end)
+           handle HolbuildRemoteCacheConfig.Error _ => NONE
+                | IO.Io _ => NONE
+                | OS.SysErr _ => NONE)
+
+(* Sends a request through libcurl with HEADERS, passing each line of the
+   response to on_line as HolbuildSpawn.run_lines passes the curl command's
+   output, a transport error, as the curl command prints it, ending the last.
+   BODY, if any, is POSTed.  Returns the HTTP status, 0 when no answer
+   came. *)
+fun libcurl_lines headers {url, body, max_time} on_line =
+  let
+    val partial = ref ""
+    fun on_data text =
+      let
+        fun lines [last] = partial := last
+          | lines (line :: rest) = (on_line (line ^ "\n"); lines rest)
+          | lines [] = ()
+      in
+        lines (String.fields (fn c => c = #"\n") (!partial ^ text))
+      end
+    val {status, failure} =
+      HolbuildHttp.stream {url = url, headers = headers, body = body, connect_timeout = connect_timeout_seconds,
+                           max_time = max_time, on_data = on_data}
+      handle HolbuildHttp.Error message => {status = 0, failure = SOME message}
+    val last = !partial ^ Option.getOpt (failure, "")
+  in
+    if last = "" then () else on_line last;
+    status
+  end
 
 fun endpoint base path =
   (if String.isSuffix "/" base then String.substring (base, 0, size base - 1) else base) ^ path
@@ -139,21 +190,36 @@ fun submit_with_query wait_unreachable url query maxheap batch_text : attempt =
     val query = query ^ (case maxheap of
         NONE => ""
       | SOME n => (if query = "" then "?" else "&") ^ "max_heap_mb=" ^ Int.toString n)
+    val id = new_batch_id ()
+    val target = endpoint url ("/v1/batches" ^ query)
+    val request_headers = ["Content-Type: text/plain", "Holbuild-Batch-Id: " ^ id]
     val body = HolbuildTempPath.temporary "remote-exec-batch"
     val _ = write_text body batch_text
-    val id = new_batch_id ()
+    (* The HTTP status, 0 when no answer came, and the answer's lines.  Each
+       attempt reads the curl config afresh, as the curl command does. *)
+    fun send () =
+      case libcurl_headers () of
+          SOME headers =>
+            let
+              val lines = ref []
+              val status =
+                libcurl_lines (headers @ request_headers)
+                  {url = target, body = SOME batch_text, max_time = SOME request_max_time_seconds}
+                  (fn line => lines := line :: !lines)
+            in
+              (String.tokens (fn c => c = #"\n") (String.concat (rev (!lines))), status)
+            end
+        | NONE =>
+            split_status (#output (HolbuildSpawn.run
+              {program = "curl",
+               args = curl_args target
+                        (["--max-time", Int.toString request_max_time_seconds, "-X", "POST"] @
+                         List.concat (map (fn header => ["-H", header]) request_headers) @
+                         ["--data-binary", "@" ^ body, "-w", "\n%{http_code}"]),
+               stderr = HolbuildSpawn.Merge}))
     fun post delays =
       let
-        val result =
-          HolbuildSpawn.run
-            {program = "curl",
-             args = curl_args (endpoint url ("/v1/batches" ^ query))
-                      ["--max-time", Int.toString request_max_time_seconds, "-X", "POST",
-                       "-H", "Content-Type: text/plain", "-H", "Holbuild-Batch-Id: " ^ id,
-                       "--data-binary", "@" ^ body,
-                       "-w", "\n%{http_code}"],
-             stderr = HolbuildSpawn.Merge}
-        val (lines, status) = split_status (#output result)
+        val (lines, status) = send ()
         val text = String.concatWith "\n" lines
         val refusal =
           if status = 0 then
@@ -390,14 +456,19 @@ fun follow url batch_id (on_change : string * string * string option * string op
         val outcome : outcome option ref = ref NONE
         val changed = ref false
         val others : string list ref = ref []
-        val _ =
-          HolbuildSpawn.run_lines
-            {program = "curl",
-             args = curl_args (endpoint url ("/v1/batches/" ^ batch_id ^ "/events"))
-                      ["-N", "-w", "\n%{http_code}"],
-             stderr = HolbuildSpawn.Merge}
-            (on_line outcome changed others)
-        val (lines, status) = split_status (String.concat (rev (!others)))
+        val events = endpoint url ("/v1/batches/" ^ batch_id ^ "/events")
+        val (lines, status) =
+          case libcurl_headers () of
+              SOME headers =>
+                let val status = libcurl_lines headers {url = events, body = NONE, max_time = NONE}
+                                   (on_line outcome changed others)
+                in (String.tokens (fn c => c = #"\n") (String.concat (rev (!others))), status) end
+            | NONE =>
+                (ignore (HolbuildSpawn.run_lines
+                   {program = "curl", args = curl_args events ["-N", "-w", "\n%{http_code}"],
+                    stderr = HolbuildSpawn.Merge}
+                   (on_line outcome changed others));
+                 split_status (String.concat (rev (!others))))
         val text = String.concatWith "\n" lines
         val broken = status = 0 orelse (status >= 200 andalso status < 300) orelse status >= 500
         val reason =
