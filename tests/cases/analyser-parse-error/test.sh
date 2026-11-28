@@ -21,16 +21,24 @@ name = "analyser-parse-error"
 roots = ["AScript.sml"]
 TOML
 
+require_parse_error() {
+  local status=0
+  "$HOLBUILD_BIN" build --dry-run ATheory > dry.log 2>&1 || status=$?
+  if [[ $status != 1 ]]; then
+    cat dry.log >&2
+    echo "expected exit 1 for malformed source, got $status" >&2
+    exit 1
+  fi
+  require_grep "$1" dry.log
+}
+
 # The lone opening quote leaves no string body for HOL's dependency reader.
 printf 'Theory A\nval _ = print "' > AScript.sml
-status=0
-"$HOLBUILD_BIN" build --dry-run ATheory > dry.log 2>&1 || status=$?
-if [[ $status != 1 ]]; then
-  cat dry.log >&2
-  echo "expected exit 1 for the unclosed string, got $status" >&2
-  exit 1
-fi
-require_grep 'AScript\.sml:2:15: parse error: unclosed string literal' dry.log
+require_parse_error 'AScript\.sml:2:15: parse error: unclosed string literal'
+
+# An earlier recoverable error should win over the later decoder error.
+printf 'Theory A\nval _ = ;\nval _ = print "' > AScript.sml
+require_parse_error 'AScript\.sml:2:9: parse error: expected an expression'
 
 printf 'Theory A\nval _ = print ""\n' > AScript.sml
 "$HOLBUILD_BIN" build --dry-run ATheory > dry.log 2>&1
