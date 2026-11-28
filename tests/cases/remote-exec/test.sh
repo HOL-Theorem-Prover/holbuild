@@ -1711,7 +1711,7 @@ write_broken json-memory
 echo rxp:BTheory > "$state/memory-failure"
 run memory-json 75 --json build --remote-exec "$coordinator" --remote-only BTheory CTheory
 rm "$state/memory-failure"
-json_events memory-json $'node_finished ATheory\nnode_failed BTheory unknown\nerror'
+json_events memory-json $'node_finished ATheory\nnode_failed BTheory memory\nerror'
 write_broken json-nolog
 touch "$state/drop-log"
 run proof-json-nolog 1 --json build --remote-exec "$coordinator" BTheory CTheory

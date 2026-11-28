@@ -2,6 +2,8 @@ use "sml/holbuild-script.sml";
 
 fun reset () = (HolbuildCommandSummary.actions := Binarymap.mkDict String.compare;
                 HolbuildCommandSummary.batches := Binaryset.empty String.compare);
+fun reset_failures () = (HolbuildCommandSummary.failures := [];
+                         HolbuildCommandSummary.first_failure := NONE);
 fun event state attempt timing =
   "{\"input_key\":\"key\",\"state\":\"" ^ state ^ "\",\"attempts\":" ^ Int.toString attempt ^ timing ^ "}";
 fun result state attempt started failure = event state attempt
@@ -100,5 +102,34 @@ val _ = assert (HolbuildStatus.failure_brief diagnostic =
                 "proof failed on a remote worker while building BTheory: theorem b_thm (line 4): " ^
                 "Exception raised at boolLib.store_thm_at: no solution found (full diagnostic above)")
   "brief failure line";
+
+(* A non-proof worker failure keeps its kind in both report message forms. *)
+fun failed_kind theory kind =
+  "{\"input_key\":\"k-" ^ theory ^ "\",\"theory\":\"pkg:" ^ theory ^
+  "\",\"state\":\"failed\",\"attempts\":1,\"last_failure\":\"" ^ kind ^ "\"}";
+val _ = reset ();
+val _ = reset_failures ();
+val _ = HolbuildCommandSummary.observe_failure
+          ("MemoryTheory", "MemoryTheory failed on a remote worker: memory");
+val _ = assert (failures () =
+                  ["{\"theory\":\"MemoryTheory\",\"kind\":\"memory\",\"error\":" ^
+                   "\"MemoryTheory failed on a remote worker: memory\"}"])
+  "remote worker kind was not retained in the summary";
+val _ = reset ();
+val _ = reset_failures ();
+val _ = HolbuildCommandSummary.observe_failure
+          ("MissingLogTheory", "could not fetch the failed theory's build log: MissingLogTheory (publish)");
+val _ = assert (failures () =
+                  ["{\"theory\":\"MissingLogTheory\",\"kind\":\"publish\",\"error\":" ^
+                   "\"could not fetch the failed theory's build log: MissingLogTheory (publish)\"}"])
+  "missing-log worker kind was not retained in the summary";
+val _ = reset ();
+val _ = reset_failures ();
+val _ = observe (failed_kind "UnknownDiagnosticTheory" "memory");
+val _ = HolbuildCommandSummary.observe_failure
+          ("UnknownDiagnosticTheory", "unrecognized diagnostic");
+val _ = assert (failures () =
+                  ["{\"theory\":\"UnknownDiagnosticTheory\",\"kind\":\"memory\",\"error\":\"unrecognized diagnostic\"}"])
+  "an unknown diagnostic downgraded the fleet failure kind";
 val _ = List.app (fn i => observe (failed ("T" ^ Int.toString i ^ "Theory"))) (List.tabulate (30, fn i => i));
 val _ = assert (length (failures ()) = HolbuildCommandSummary.max_failures) "failures not capped";

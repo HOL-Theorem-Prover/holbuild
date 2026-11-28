@@ -201,6 +201,35 @@ fun take_before marker text =
       NONE => text
     | SOME i => String.substring(text, 0, i)
 
+fun remote_failure_kind_after marker line =
+  case find_substring marker line of
+      NONE => NONE
+    | SOME i =>
+        let val kind = String.extract (line, i + size marker, NONE)
+        in if kind = "" then NONE else SOME kind end
+
+fun remote_failure_kind message =
+  let
+    val line = case String.fields (fn c => c = #"\n") message of
+                   first :: _ => first
+                 | [] => ""
+    val failed_marker = " failed on a remote worker: "
+    val log_marker = "could not fetch the failed theory's build log: "
+  in
+    case remote_failure_kind_after failed_marker line of
+        SOME kind => SOME kind
+      | NONE =>
+          case remote_failure_kind_after log_marker line of
+              NONE => NONE
+            | SOME detail =>
+                (case find_substring " (" detail of
+                     NONE => NONE
+                   | SOME i =>
+                       if String.isSuffix ")" detail andalso i + 3 < size detail then
+                         SOME (String.substring (detail, i + 2, size detail - i - 3))
+                       else NONE)
+  end
+
 val unclosed_delimiter_note_prefix = "note: unclosed '"
 val unclosed_delimiter_excerpt_prefix = "  | "
 
@@ -252,7 +281,7 @@ fun classify_failure message =
           String.isSubstring "Couldn't load HOL base-state" message orelse
           String.isSubstring "Uncaught exception" message then
     "child_failure"
-  else "unknown"
+  else Option.getOpt (remote_failure_kind message, "unknown")
 
 fun failure_kind detail = classify_failure (without_source_excerpts detail)
 

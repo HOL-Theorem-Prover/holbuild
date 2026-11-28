@@ -117,12 +117,29 @@ fun observe_plan project plan = best_effort (fn () =>
 (* Records theory LABEL's failure as soon as it is seen, so that a build
    stopped after it still records it.  DETAIL holds the record's fields; a
    record from the diagnostic (DIAGNOSED) replaces one from the fleet's
-   failure kind alone. *)
+   failure kind alone.  If the diagnostic is unknown, its kind is retained. *)
 fun record_failure label diagnosed detail = locked (fn () =>
   let
     val record = object (J.json_string_field "theory" label :: detail)
     fun replace (entry as (name, seen, _)) =
-      if name = label andalso diagnosed andalso not seen then (name, true, record) else entry
+      if name = label andalso diagnosed andalso not seen then
+        let
+          val current_kind =
+            getOpt (HolbuildRemoteExec.json_string_field "kind" record, "unknown")
+          val previous_kind =
+            getOpt (HolbuildRemoteExec.json_string_field "kind" (#3 entry), "unknown")
+          val replacement =
+            if current_kind <> "unknown" orelse previous_kind = "unknown" then record
+            else object
+              (J.json_string_field "theory" label ::
+               map (fn field =>
+                 if field = J.json_string_field "kind" "unknown" then
+                   J.json_string_field "kind" previous_kind
+                 else field) detail)
+        in
+          (name, true, replacement)
+        end
+      else entry
   in
     if Option.isSome (!first_failure) then () else first_failure := SOME (Time.now ());
     if List.exists (fn (name, _, _) => name = label) (!failures) then failures := map replace (!failures)
