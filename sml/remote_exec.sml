@@ -186,12 +186,12 @@ fun submit_with_query wait_unreachable url query maxheap batch_text : attempt =
     val id = new_batch_id ()
     val target = endpoint url ("/v1/batches" ^ query)
     val request_headers = ["Content-Type: text/plain", "Holbuild-Batch-Id: " ^ id]
-    val libcurl = libcurl_headers ()
     val body = HolbuildTempPath.temporary "remote-exec-batch"
-    val _ = if Option.isSome libcurl then () else write_text body batch_text
-    (* The HTTP status, 0 when no answer came, and the answer's lines. *)
+    val _ = write_text body batch_text
+    (* The HTTP status, 0 when no answer came, and the answer's lines.  Each
+       attempt reads the curl config afresh, as the curl command does. *)
     fun send () =
-      case libcurl of
+      case libcurl_headers () of
           SOME headers =>
             let
               val lines = ref []
@@ -341,7 +341,6 @@ fun follow url batch_id (on_change : string * string * string option * string op
   let
     val followed_at = Time.now ()
     val _ = HolbuildOffline.require_online "follow a remote batch"
-    val libcurl = libcurl_headers ()
     val states : (string * (string * string option * string option)) list ref = ref []
     val names = ref ([] : (string * string) list)
     (* Each action's last failure detail: a new one is a change too. *)
@@ -452,7 +451,7 @@ fun follow url batch_id (on_change : string * string * string option * string op
         val others : string list ref = ref []
         val events = endpoint url ("/v1/batches/" ^ batch_id ^ "/events")
         val (lines, status) =
-          case libcurl of
+          case libcurl_headers () of
               SOME headers =>
                 let val status = libcurl_lines headers {url = events, body = NONE, max_time = NONE}
                                    (on_line outcome changed others)
