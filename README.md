@@ -1413,9 +1413,10 @@ directory the tool may read and write. NAME is letters, digits, `.`, `_` and
 every build that names it and never cleaned by holbuild. A theory built on a
 remote worker (`--remote-exec`) gets a directory filled from the remote cache
 and saved back to it after the build, keyed by the theory's dependencies and
-toolchain (see "Running one theory action as a remote worker"). The flag
-doesn't change a theory's cache key: a theory built or cached without it is
-reused as is.
+toolchain. Edits that leave the dependency outputs and load context unchanged
+keep the same entry (see "Running one theory action as a remote worker").
+The flag doesn't change a theory's cache key: a theory built or cached
+without it is reused as is.
 
 ### Giving a tool a file it reads
 
@@ -1988,8 +1989,8 @@ publishing, the action fails as `unavailable` rather than reading that as a
 miss or a conflict: the cache failed, not the action.
 
 A theory exported with `--tool-cache NAME` (see "Keeping a tool's files
-between builds" below) gets a tool cache: before HOL starts, the worker
-fills `.holbuild/tool-cache/NAME` under the action root from the remote
+between builds" above) gets a tool cache. Before the theory script runs, the
+worker fills `.holbuild/tool-cache/NAME` under the action root from the remote
 cache's entry for the key, read with `Cache-Control: no-cache` (a cache in
 front of the store, such as a host's, may serve an entry another host's
 publish has replaced since)
@@ -1999,9 +2000,30 @@ sha256("holbuild-tool-cache-v1\nname=" ^ NAME ^ "\ndeps_key=" ^ <deps_key> ^ "\n
 ```
 
 and gives the theory's HOL processes that directory as
-`HOLBUILD_TOOL_CACHE_DIR`. The key leaves out the theory's own source, so
-every theory with the same dependencies and toolchain shares the entry, on
-any worker. The worker keeps the entry's files in its host store
+`HOLBUILD_TOOL_CACHE_DIR`. The `<deps_key>` is the dependency context key
+used by the shared dependency heap, computed from the built dependency
+outputs and the preload order with skipped loads removed.
+
+```text
+deps_output_key = sha256(lines("holbuild-remote-deps-output-v1", theory files, libraries, library manifests))
+deps_key = sha256(lines("holbuild-remote-dependency-context-v2", "toolchain=" ^ <toolchain key>,
+                        "deps-output=" ^ deps_output_key, effective dep lines))
+```
+
+Here `lines` joins the records with newlines and ends with a newline.
+The output records are `theory-file <path> <digest>` for each dependency's
+`.dat` and then each dependency's `.sig`, `.sml`, `.ui` and `.uo`, followed
+by `library <path> <sha256>` and `lib <target> <stem> <suffix> <loads...>`
+records from the spec. A `.dat`
+uses the digest from its generated theory source, or its SHA-1 if that
+digest is unavailable. The other files use SHA-256. The effective `dep=`
+lines come from the action text with input keys and skipped loads removed.
+An ancestor edit that leaves this context unchanged keeps the same entry.
+If the worker cannot compute the output context, it uses the input-based
+`deps-key` from the spec. The output context includes paths under the
+action root, so workers use the same action-root path to share an entry.
+
+The worker keeps the entry's files in its host store
 (`<cache root>/checkpoint-store`), so it fetches each from the remote cache
 once. If the remote cache has lost a file's blob, the worker restores the
 files whose blobs are left and warns for each lost one. After HOL exits, built or failed, the
