@@ -18,7 +18,7 @@ import time
 from collections import Counter, defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Iterator
 from dataclasses import dataclass, fields, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, NamedTuple, Self
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -31,7 +31,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from remote_exec.cache import cache_nodes, node_identity, ranked_nodes
-from remote_exec.cache_pool import HELD_TARGET, CachePool, CacheSlot, CommandAdapter
+from remote_exec.cache_pool import CachePool, CacheSlot, CommandAdapter
 from remote_exec.formats import Batch, Result
 from remote_exec.membership import REFRESH_SECONDS, Membership
 
@@ -171,6 +171,8 @@ class Settings(BaseSettings):
     on_demand_burst_hosts: int = Field(default=1, ge=0)
     max_burst_workers: int = 0
     scale_down_hold_s: float = 900.0
+    scale_up_hold_s: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    scale_up_free_workers: int = Field(default=0, ge=0)
     # The burst cache pool's own hold on the worker floor. Worker hosts get a further scale-in delay from their
     # capacity provider, which lets scale_down_hold_s stay short; cache nodes get none, and each one terminated
     # loses its warm disk.
@@ -450,6 +452,56 @@ def burst_demand(counts: QueueCounts, warm_workers: int, max_burst_workers: int,
     )
     demand = max(0, active - warm_workers, high) + ahead
     return min(demand, max_burst_workers)
+
+
+def _burst_demand_window(down_hold_s: float, up_hold_s: float) -> float:
+    return 2 * (down_hold_s + up_hold_s)
+
+
+def held_target(
+    samples: Iterable[tuple[datetime, int]],
+    now: datetime,
+    *,
+    down_hold_s: float,
+    up_hold_s: float,
+    free_workers: int,
+    cap: int,
+) -> int:
+    """Replay time-ordered demand. Only sustained demand can raise the target beyond the free or held workers."""
+    down_hold = timedelta(seconds=down_hold_s)
+    down_since = now - down_hold
+    if up_hold_s <= 0:
+        most_recent_peak = max((workers for at, workers in samples if down_since <= at <= now), default=0)
+        return min(cap, max(0, most_recent_peak))
+
+    up_hold = timedelta(seconds=up_hold_s)
+    start = now - timedelta(seconds=_burst_demand_window(down_hold_s, up_hold_s))
+    history = [(at, workers) for at, workers in samples if start <= at <= now]
+    # Rolling extrema in linear time. Keep the latest raw sample at or before the up-hold boundary:
+    # its demand still applies at that edge, even if there was no sample exactly at the edge.
+    raw_min: deque[int] = deque()
+    effective_max: deque[tuple[datetime, int]] = deque()
+    first = 0
+    for index, (at, workers) in enumerate(history):
+        since = at - up_hold
+        while first < index and history[first + 1][0] <= since:
+            first += 1
+        while raw_min and raw_min[0] < first:
+            raw_min.popleft()
+        while raw_min and history[raw_min[-1]][1] >= workers:
+            raw_min.pop()
+        raw_min.append(index)
+        sustained = history[raw_min[0]][1] if history[first][0] <= since else 0
+
+        while effective_max and effective_max[0][0] < at - down_hold:
+            effective_max.popleft()
+        held = effective_max[0][1] if effective_max else 0
+        effective = min(max(0, workers), max(free_workers, held, sustained), cap)
+        while effective_max and effective_max[-1][1] <= effective:
+            effective_max.pop()
+        effective_max.append((at, effective))
+
+    return next((workers for at, workers in effective_max if at >= down_since), 0)
 
 
 @dataclass(frozen=True)
@@ -1139,6 +1191,10 @@ COUNT_ACTIVE = sa.text(
     "UNION ALL SELECT 'ahead', w.tier, w.class, false, count(*) FROM actions w "
     f"WHERE {WAITING_AHEAD.format(w='w')} GROUP BY w.tier, w.class "
     f"UNION ALL {COUNT_CLAIMABLE}"
+)
+BURST_DEMAND = sa.text(
+    "SELECT at, workers FROM burst_demand "
+    "WHERE at >= CAST(:now AS timestamptz) - make_interval(secs => :hold) ORDER BY at"
 )
 
 
@@ -3886,17 +3942,16 @@ class Coordinator:
             )
 
     async def queue(self) -> QueueStatus:
-        """The unfinished actions, the burst worker target: the highest demand of the last ``scale_down_hold_s``
-        seconds, which the sweeps of every replica record, and of now, the hosts whose workers reported to this
-        process in the last ``HOST_REPORT_SECONDS``, by id, and this process's last run of the scale command."""
+        """Unfinished actions, the burst target including current demand, recent hosts, and the last scale run."""
         leased = self.leased.copy()
         async with self.engine.connect() as conn:
-            desired = await conn.scalar(HELD_TARGET, self._held_target_params(self.clock()))
+            samples = await self._burst_samples(conn, self.clock())
             counts = await self._counts(conn, COUNT_UNFINISHED)
         self._count_ready(counts, leased)
         now = self.clock()
         self._forget_silent_hosts(now)
-        demand = self._burst_demand(counts)
+        samples.append((now, self._burst_demand(counts)))
+        desired = self._held_burst_target(samples, now)
         hosts = [
             HostStatus(
                 report,
@@ -3908,7 +3963,7 @@ class Coordinator:
         ]
         return QueueStatus(
             counts,
-            max(desired, demand),
+            desired,
             sorted(hosts, key=lambda h: h.report.id),
             self._phase_totals(now),
             self.scaler,
@@ -4040,13 +4095,14 @@ class Coordinator:
                 await conn.execute(
                     sa.text("DELETE FROM burst_demand WHERE at < CAST(:now AS timestamptz) - make_interval(secs => :hold)"),
                     # The cache pool reads these samples too, over its own hold.
-                    {"now": now, "hold": max(self.settings.scale_down_hold_s, self.settings.cache_scale_down_hold_s)},
+                    {"now": now, "hold": max(self._burst_demand_history_s, self.settings.cache_scale_down_hold_s)},
                 )
                 await conn.execute(
                     sa.text("INSERT INTO burst_demand (at, workers) VALUES (:now, :workers)"),
                     {"now": now, "workers": demand},
                 )
-                desired = await conn.scalar(HELD_TARGET, self._held_target_params(now))
+                samples = await self._burst_samples(conn, now)
+            desired = self._held_burst_target(samples, now)
             last = self.scaler
             if self.settings.scale_cmd is None or (last is not None and last.error is None and last.workers == desired):
                 return
@@ -4058,8 +4114,23 @@ class Coordinator:
                 return
             self.scaler = ScaleRun(desired, now, None)
 
-    def _held_target_params(self, now: datetime) -> dict[str, object]:
-        return {"now": now, "hold": self.settings.scale_down_hold_s, "cap": self.settings.max_burst_workers}
+    @property
+    def _burst_demand_history_s(self) -> float:
+        return _burst_demand_window(self.settings.scale_down_hold_s, self.settings.scale_up_hold_s)
+
+    async def _burst_samples(self, conn: AsyncConnection, now: datetime) -> list[tuple[datetime, int]]:
+        rows = await conn.execute(BURST_DEMAND, {"now": now, "hold": self._burst_demand_history_s})
+        return [(at, workers) for at, workers in rows]
+
+    def _held_burst_target(self, samples: list[tuple[datetime, int]], now: datetime) -> int:
+        return held_target(
+            samples,
+            now,
+            down_hold_s=self.settings.scale_down_hold_s,
+            up_hold_s=self.settings.scale_up_hold_s,
+            free_workers=self.settings.scale_up_free_workers,
+            cap=self.settings.max_burst_workers,
+        )
 
     async def _scale(self, scale_cmd: str, workers: int) -> None:
         process = await asyncio.create_subprocess_exec(*shlex.split(scale_cmd), str(workers))

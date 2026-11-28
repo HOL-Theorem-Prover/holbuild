@@ -31,7 +31,7 @@ from conftest import upgrade
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from remote_exec import coordinator as coordinator_module
+from remote_exec import cache_pool, coordinator as coordinator_module
 
 # The shape of a gate batch: its actions, the first ROOTS of which have no parents, and each later one up to FAN
 # parents among those before it (about 85,000 edges).
@@ -308,7 +308,9 @@ async def fleet() -> AsyncIterator[Fleet]:
 
 
 def module_statements() -> dict[str, sa.TextClause]:
-    return {name: value for name, value in vars(coordinator_module).items() if isinstance(value, sa.TextClause)}
+    statements = {name: value for name, value in vars(coordinator_module).items() if isinstance(value, sa.TextClause)}
+    statements["HELD_TARGET"] = cache_pool.HELD_TARGET
+    return statements
 
 
 def inline_statements() -> set[str]:
@@ -446,7 +448,9 @@ STATEMENTS = [
     Statement(cm.COUNT_UNFINISHED, lambda f: {"outlined": f.outlined_plain()}, 93_000),
     Statement(cm.COUNT_ACTIVE, lambda f: {"outlined": f.outlined()}, 18_000),
     Statement(cm.COUNT_ACTIVE, lambda f: {"outlined": f.outlined_plain()}, 18_000),
-    Statement(cm.HELD_TARGET, lambda f: {"now": now(), "hold": 900.0, "cap": 100}, 1_800),
+    Statement(cache_pool.HELD_TARGET, lambda f: {"now": now(), "hold": 900.0, "cap": 100}, 1_800),
+    Statement(cm.BURST_DEMAND, lambda f: {"now": now(), "hold": 480.0}, 960),
+    Statement(cm.BURST_DEMAND, lambda f: {"now": now(), "hold": 1800.0}, 7_200),
     # submit
     Statement(
         "WITH locked AS (SELECT package, theory, profile FROM peak_hints WHERE profile = :profile",
