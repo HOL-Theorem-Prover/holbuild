@@ -109,7 +109,6 @@ fun failed_kind theory kind =
   "\",\"state\":\"failed\",\"attempts\":1,\"last_failure\":\"" ^ kind ^ "\"}";
 val _ = reset ();
 val _ = reset_failures ();
-val _ = observe (failed_kind "MemoryTheory" "memory");
 val _ = HolbuildCommandSummary.observe_failure
           ("MemoryTheory", "MemoryTheory failed on a remote worker: memory");
 val _ = assert (failures () =
@@ -118,7 +117,6 @@ val _ = assert (failures () =
   "remote worker kind was not retained in the summary";
 val _ = reset ();
 val _ = reset_failures ();
-val _ = observe (failed_kind "MissingLogTheory" "publish");
 val _ = HolbuildCommandSummary.observe_failure
           ("MissingLogTheory", "could not fetch the failed theory's build log: MissingLogTheory (publish)");
 val _ = assert (failures () =
