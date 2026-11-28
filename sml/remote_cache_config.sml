@@ -98,10 +98,10 @@ fun curl_config () =
 
 (* The options of a curl config file, in order, as (name, value) pairs, a
    name without its leading `--`.  Follows curl's syntax: `#` comment lines,
-   `name value`, `name = value`, `name: value` and `--name value`, values in
-   double quotes with backslash escapes.  `--name = value` or `--name: value`,
-   which curl reads differently (the value then starts with `=` or `:`),
-   raises Error. *)
+   a name and its value separated by any run of spaces, `=` and `:` (only
+   spaces after `--name`), values in double quotes with backslash escapes.
+   `--name = value` or `--name: value`, which curl reads differently (the
+   value then starts with `=` or `:`), raises Error. *)
 fun parse_curl_config text =
   let
     fun is_separator c = Char.isSpace c orelse c = #"=" orelse c = #":"
@@ -116,9 +116,7 @@ fun parse_curl_config text =
         | c :: rest => quoted rest (c :: acc)
     fun value s =
       let
-        val s = drop_spaces s
-        val s = drop_spaces (if Substring.isPrefix "=" s orelse Substring.isPrefix ":" s
-                             then Substring.triml 1 s else s)
+        val s = Substring.dropl is_separator s
       in
         case Substring.getc s of
             SOME (#"\"", rest) => quoted (Substring.explode rest) []

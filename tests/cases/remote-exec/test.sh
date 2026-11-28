@@ -3399,7 +3399,8 @@ name = "rxt"
 [build]
 members = ["src"]
 TOML
-printf 'header = "Authorization: Bearer stub-token"\n' > "$tmpdir/transport.curl"
+# curl reads any run of spaces, = and : between an option and its value.
+printf 'header == "Authorization: Bearer stub-token"\n' > "$tmpdir/transport.curl"
 printf 'header = "Authorization: Bearer stub-token"\nconnect-timeout = 10\n' > "$tmpdir/transport-more.curl"
 printf 'Authorization: Bearer stub-token\n' > "$tmpdir/transport.headers"
 printf 'header = "@%s"\n' "$tmpdir/transport.headers" > "$tmpdir/transport-file.curl"
