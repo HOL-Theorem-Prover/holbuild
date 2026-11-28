@@ -273,7 +273,7 @@ grep -qx "PUT /cas/$(blob_sha kept)" "$request_log" || {
 
 # A cache in front of the remote's store can keep serving an entry the store
 # has since replaced: here v11's, whose blob is lost.  The worker reads the
-# entry again from the store and restores its files whole.
+# entry from the store and restores its files whole.
 cp "$tmpdir/entry-v11" "$control/ac-stale-$tool_ac"
 write_t v14 "$keep_held"
 export_t v14 --tool-cache probe
@@ -286,38 +286,39 @@ if grep -q "lost file\|published tool cache" "$tmpdir/v14.log"; then
   echo "worker v14 found the store's entry incomplete" >&2; cat "$tmpdir/v14.log" >&2; exit 1
 fi
 
-# A store's answer the worker can't read on that second look leaves the
-# entry as it was: only an entry the store lost blobs of, or holds no more,
-# is replaced.
+# An entry the worker can't read gives an empty directory and stays as it
+# was.
 cp "$tmpdir/remote/ac/$tool_ac" "$tmpdir/entry-v13"
 printf 'not an entry\n' > "$tmpdir/remote/ac/$tool_ac"
-cp "$tmpdir/entry-v11" "$control/ac-stale-$tool_ac"
 write_t v15 ''
 export_t v15 --tool-cache probe
 worker v15 "$spec_t"
 expect v15 0 nothing
-require_grep "not restoring the tool cache: could not read its entry again" "$tmpdir/v15.log"
 [[ "$(cat "$tmpdir/remote/ac/$tool_ac")" == "not an entry" ]] || {
   echo "worker v15 replaced an entry it could not read" >&2; cat "$tmpdir/v15.log" >&2; exit 1; }
 cp "$tmpdir/entry-v13" "$tmpdir/remote/ac/$tool_ac"
 
 # Two actions that restored the same entry and wrote different files keep
 # both: the later publish reads the entry again and keeps the earlier one's
-# file.  v17 restores the entry as it was before v16 published, as a cache in
-# front of the store serves it, so it ran alongside v16.
+# file.  v17 restores the entry as it was before v16 published, so it ran
+# alongside v16.
 held='val _ = List.app (fn name => print (name ^ " held: " ^ (let val input = TextIO.openIn (OS.Path.concat (tool_dir, name)) in TextIO.inputAll input before TextIO.closeIn input end handle IO.Io _ => "nothing") ^ "\n")) ["idx", "snap"];'
 write_t v16 'val _ = tool_put "idx" "index";'
 export_t v16 --tool-cache probe
 worker v16 "$spec_t"
 expect v16 0 v13
 require_grep "published tool cache (3 files)" "$tmpdir/v16.log"
-cp "$tmpdir/entry-v13" "$control/ac-stale-$tool_ac"
+cp "$tmpdir/remote/ac/$tool_ac" "$control/ac-then-$tool_ac"
+cp "$tmpdir/entry-v13" "$tmpdir/remote/ac/$tool_ac"
 write_t v17 'val _ = tool_put "snap" "snapshot";'
 export_t v17 --tool-cache probe
 worker v17 "$spec_t"
 expect v17 0 v13
 require_grep "restored tool cache (2 files)" "$tmpdir/v17.log"
 require_grep "published tool cache (4 files)" "$tmpdir/v17.log"
+# A cache in front of the store, as on a third host, still serves the entry
+# from before both publishes: the worker restores the store's.
+cp "$tmpdir/entry-v13" "$control/ac-stale-$tool_ac"
 write_t v18 "$held"
 export_t v18 --tool-cache probe
 worker v18 "$spec_t"
@@ -336,7 +337,8 @@ export_t v19 --tool-cache probe
 worker v19 "$spec_t"
 expect v19 0 v13
 require_grep "published tool cache (5 files)" "$tmpdir/v19.log"
-cp "$tmpdir/entry-v18" "$control/ac-stale-$tool_ac"
+cp "$tmpdir/remote/ac/$tool_ac" "$control/ac-then-$tool_ac"
+cp "$tmpdir/entry-v18" "$tmpdir/remote/ac/$tool_ac"
 write_t v20 "$big"' val _ = big "big2";'
 export_t v20 --tool-cache probe
 worker v20 "$spec_t"

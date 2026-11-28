@@ -242,6 +242,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+        # control/ac-then-<key>: the entry the store holds once it has
+        # answered the next GET of <key>, as if another action published it
+        # right after that read.
+        if control is not None and self.path.startswith("/ac/"):
+            then = control / f"ac-then-{path.name}"
+            if then.exists():
+                os.replace(then, path)
 
     def do_HEAD(self):
         self.record_request()
